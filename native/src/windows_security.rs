@@ -127,8 +127,8 @@ mod platform {
         CreateDirectoryW, CreateFileW, GetFileInformationByHandleEx, SetFileInformationByHandle,
         FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, SYNCHRONIZE,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -212,13 +212,14 @@ mod platform {
         }
 
         pub(crate) fn names(&self) -> io::Result<Vec<String>> {
+            const MAX_NAMES: usize = 1024;
             let _guard = self
                 .names_lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut names = Vec::new();
             let mut restart = true;
-            loop {
+            'query: loop {
                 let mut buffer = vec![0u64; 8192];
                 // SAFETY: This zeroed status block and aligned output buffer are valid for the call.
                 let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
@@ -283,6 +284,9 @@ mod platform {
                         .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
                     if name != "." && name != ".." {
                         names.push(name);
+                        if names.len() == MAX_NAMES {
+                            break 'query;
+                        }
                     }
                     if record.NextEntryOffset == 0 {
                         break;
@@ -304,6 +308,7 @@ mod platform {
             0xC000_0034 | 0xC000_003A => io::Error::from(io::ErrorKind::NotFound),
             0xC000_0035 => io::Error::from(io::ErrorKind::AlreadyExists),
             0xC000_050B => io::Error::from(io::ErrorKind::PermissionDenied),
+            0xC000_00BA | 0xC000_0103 => io::Error::from(io::ErrorKind::InvalidInput),
             _ => io::Error::other("storage I/O failed"),
         }
     }
@@ -328,6 +333,8 @@ mod platform {
             Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
             RootDirectory: parent.as_raw_handle(),
             ObjectName: &mut unicode,
+            // NTFS lookup is case-insensitive by default; create-time folded checks keep
+            // this API consistent while preserving the backing filesystem's lookup mode.
             Attributes: policy.object_attributes,
             SecurityDescriptor: ptr::null_mut(),
             SecurityQualityOfService: ptr::null_mut(),
@@ -543,7 +550,10 @@ mod platform {
         let handle = unsafe {
             CreateFileW(
                 path_wide.as_ptr(),
-                FILE_READ_ATTRIBUTES | windows_sys::Win32::Storage::FileSystem::READ_CONTROL,
+                FILE_READ_ATTRIBUTES
+                    | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+                    | FILE_LIST_DIRECTORY
+                    | SYNCHRONIZE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 ptr::null(),
                 OPEN_EXISTING,

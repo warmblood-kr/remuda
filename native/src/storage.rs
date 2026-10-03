@@ -329,6 +329,8 @@ struct FileLocation {
     directory: crate::windows_security::StorageDirectory,
     #[cfg(windows)]
     name: String,
+    #[cfg(windows)]
+    path: PathBuf,
     #[cfg(not(any(unix, windows)))]
     path: PathBuf,
 }
@@ -677,11 +679,9 @@ fn write_location(location: &FileLocation, bytes: &[u8]) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        let mut file = location.directory.open_file(&location.name, true)?;
-        file.set_len(0)?;
-        use std::io::Write;
-        file.write_all(bytes)?;
-        file.sync_all()
+        location.directory.open_file(&location.name, true)?;
+        // The handle walk validated the leaf and every parent; D2 makes this handle-relative.
+        crate::fs_atomic::write_atomic_lua_private(&location.path, bytes)
     }
     #[cfg(all(not(unix), not(windows)))]
     {
@@ -701,6 +701,7 @@ fn exists_location(location: &FileLocation) -> io::Result<bool> {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -786,17 +787,36 @@ fn collect_windows(
         if name.len() > 1024 {
             continue;
         }
-        if let Ok(child) = directory.open_directory(&component, false) {
-            if name.starts_with(prefix) || prefix.starts_with(&format!("{name}/")) {
-                collect_windows(&child, &name, prefix, parts + 1, names, limit)?;
-            }
-        } else if name.starts_with(prefix) && checked_name(&name).is_ok() {
-            if directory.open_file(&component, false).is_ok() {
-                names.push(name);
-                if names.len() >= limit {
-                    break;
+        match directory.open_directory(&component, false) {
+            Ok(child) => {
+                if name.starts_with(prefix) || prefix.starts_with(&format!("{name}/")) {
+                    collect_windows(&child, &name, prefix, parts + 1, names, limit)?;
                 }
             }
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                if name.starts_with(prefix) && checked_name(&name).is_ok() {
+                    match directory.open_file(&component, false) {
+                        Ok(_) => names.push(name),
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::NotFound
+                                    | io::ErrorKind::PermissionDenied
+                                    | io::ErrorKind::InvalidInput
+                            ) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        if names.len() >= limit {
+            break;
         }
     }
     Ok(())
@@ -1006,6 +1026,7 @@ impl KindHandle {
             Ok(FileLocation {
                 directory,
                 name: leaf.to_owned(),
+                path: root.path.join(&self.namespace).join(name),
             })
         }
         #[cfg(all(not(unix), not(windows)))]
@@ -1468,17 +1489,11 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn symlink_result(result: io::Result<()>) -> bool {
-        match result {
-            Ok(()) => true,
-            Err(error)
-                if error.kind() == io::ErrorKind::Unsupported
-                    || error.raw_os_error() == Some(1314) =>
-            {
-                false
-            }
-            Err(error) => panic!("create symlink fixture: {error}"),
-        }
+    fn require_symlink(result: io::Result<()>) {
+        assert!(
+            result.is_ok(),
+            "Windows CI must create symlink fixtures: {result:?}"
+        );
     }
 
     #[test]
@@ -1870,6 +1885,26 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn xdg_lists_names_from_a_populated_namespace() {
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"
+            local files = remuda.storage.get("listed"):data()
+            files:write("nested/item", "x")
+            files:write("top", "y")
+            local names = files:list()
+            assert(#names == 2, "list populated namespace count")
+            assert(names[1] == "nested/item" and names[2] == "top", "list populated namespace names")
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn xdg_handle_walk_refuses_reparse_components_for_all_operations() {
         use std::os::windows::fs::{symlink_dir, symlink_file};
 
@@ -1880,42 +1915,36 @@ mod tests {
         let namespace_target = root.0.join("outside-namespace");
         fs::create_dir(&namespace_target).unwrap();
         fs::write(namespace_target.join("item"), b"outside").unwrap();
-        if !symlink_result(symlink_dir(
+        require_symlink(symlink_dir(
             &namespace_target,
             storage.join("linked-namespace"),
-        )) {
-            return;
-        }
+        ));
 
         let intermediate = storage.join("real-namespace/intermediate");
         let intermediate_target = root.0.join("outside-intermediate");
         fs::create_dir_all(storage.join("real-namespace")).unwrap();
         fs::create_dir(&intermediate_target).unwrap();
         fs::write(intermediate_target.join("item"), b"outside").unwrap();
-        if !symlink_result(symlink_dir(&intermediate_target, &intermediate)) {
-            return;
-        }
+        require_symlink(symlink_dir(&intermediate_target, &intermediate));
 
         let leaf_namespace = storage.join("leaf-namespace");
         let leaf_target = root.0.join("outside-leaf");
         fs::create_dir(&leaf_namespace).unwrap();
         fs::write(&leaf_target, b"outside").unwrap();
-        if !symlink_result(symlink_file(&leaf_target, leaf_namespace.join("item"))) {
-            return;
-        }
+        require_symlink(symlink_file(&leaf_target, leaf_namespace.join("item")));
 
         lua.load(
             r#"
             local function denied(namespace, name)
                 local files = remuda.storage.get(namespace):data()
                 local ok, value, reason = pcall(function() return files:read(name) end)
-                assert(not ok or value == nil, "read " .. namespace .. "/" .. name)
+                assert(not ok or (value == nil and reason ~= nil and reason ~= "not_found"), "read " .. namespace .. "/" .. name)
                 ok, value = pcall(function() return files:exists(name) end)
                 assert(not ok or value == false, "exists " .. namespace .. "/" .. name)
                 ok, value = pcall(function() return files:list() end)
                 assert(not ok or #value == 0, "list " .. namespace)
-                ok, value = pcall(function() return files:delete(name) end)
-                assert(not ok or value ~= true, "delete " .. namespace .. "/" .. name)
+                ok, value, reason = pcall(function() return files:delete(name) end)
+                assert(not ok or (value ~= true and reason ~= nil and reason ~= "not_found"), "delete " .. namespace .. "/" .. name)
                 ok = pcall(function() files:write(name, "replacement") end)
                 assert(not ok, "write " .. namespace .. "/" .. name)
             end
