@@ -2922,6 +2922,9 @@ fn attempt_paste_cleanup(
     }
     let deadline = std::time::Instant::now() + PASTE_CLEANUP_TIMEOUT;
     let cancelled = || std::time::Instant::now() >= deadline;
+    // The deadline bounds this wait, not an already queued PTY write: a
+    // cancelled cleanup can still land late. A cleanup observed as successful
+    // follows the ordinary completion path, which clears late-submit state.
     if write(PASTE_CLOSE, &cancelled).is_ok() {
         state.observe_attempt(PASTE_CLOSE);
         true
@@ -3006,12 +3009,7 @@ fn pump_attach_input<'a, 'session>(
     }
     done.store(true, std::sync::atomic::Ordering::SeqCst);
     if let Some(reason) = cleanup_reason {
-        let mut bytes_dropped = 0usize;
-        while let Ok(bytes) = keys.recv() {
-            bytes_dropped = bytes_dropped.saturating_add(bytes.len());
-        }
-        bytes_dropped =
-            bytes_dropped.saturating_add(dropped_input.load(std::sync::atomic::Ordering::SeqCst));
+        let bytes_dropped = drain_queued_attach_input(&keys, dropped_input);
         let mut state = paste_state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3030,6 +3028,16 @@ fn pump_attach_input<'a, 'session>(
 fn report_attach_input_failure(output: &mut impl Write) -> std::io::Result<()> {
     output.write_all(ATTACH_INPUT_FAILURE_NOTICE.as_bytes())?;
     output.flush()
+}
+
+fn drain_queued_attach_input(
+    keys: &std::sync::mpsc::Receiver<Vec<u8>>,
+    dropped_input: &std::sync::atomic::AtomicUsize,
+) -> usize {
+    keys.try_iter()
+        .map(|bytes| bytes.len())
+        .fold(0usize, usize::saturating_add)
+        .saturating_add(dropped_input.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 fn forward_attach_input(
@@ -3100,10 +3108,10 @@ fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
 mod tests {
     use super::{
         acquire_sync_permit, attempt_paste_cleanup, auto_listener_addresses,
-        auto_listener_ip_changed, forward_attach_input, paste_cleanup_trace,
-        paste_write_started_callback, report_attach_input_failure, runtime_base_for,
-        shell_or_default, PasteCleanupState, SyncPermit, ATTACH_INPUT_FAILURE_NOTICE,
-        MAX_CONCURRENT_SYNCS,
+        auto_listener_ip_changed, drain_queued_attach_input, forward_attach_input,
+        paste_cleanup_trace, paste_write_started_callback, report_attach_input_failure,
+        runtime_base_for, shell_or_default, PasteCleanupState, SyncPermit,
+        ATTACH_INPUT_FAILURE_NOTICE, MAX_CONCURRENT_SYNCS,
     };
     #[cfg(not(windows))]
     use super::{AutoAddressDetector, ListenerStatus, ListenerTask};
@@ -3119,6 +3127,18 @@ mod tests {
     use std::time::Duration;
 
     static SYNC_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn queued_input_drain_returns_while_the_key_sender_is_still_open() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(b"queued".to_vec()).unwrap();
+        let dropped = std::sync::atomic::AtomicUsize::new(3);
+        let started = std::time::Instant::now();
+
+        assert_eq!(drain_queued_attach_input(&receiver, &dropped), 9);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(sender.send(b"later".to_vec()).is_ok());
+    }
 
     #[test]
     fn paste_cleanup_ignores_queued_bytes_until_the_write_starts() {
