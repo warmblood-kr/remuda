@@ -186,6 +186,13 @@ returns by its deadline. If a Unix leader exits while a `setsid` descendant
 keeps its output pipe open, `process.run` waits until that deadline, returns
 the leader's exit code with `timed_out=false`, and may return incomplete output.
 
+Both process forms accept `env={NAME="value"}` to add or override string
+variables while inheriting the daemon's environment. `clear_env=true` starts
+with an empty environment and then applies `env`. Names must be non-empty
+strings without `=` or NUL; values must be strings without NUL. Clearing the
+environment clears every variable on Windows too, including `SystemRoot`, so
+callers must pass everything the child needs, such as `SystemRoot` and `PATH`.
+
 The buffer between the reader thread and the Image is capped, on purpose.
 When it fills, the reader thread simply stops reading — the child's own
 `write()` blocks against the now-full OS pipe, exactly the way a slow

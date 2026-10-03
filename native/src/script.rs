@@ -423,12 +423,12 @@ const WORDS: &[(&str, &str, &str)] = &[
     (
         "_process_run",
         "Run an argv process synchronously with a bounded timeout and captured output; internal, called by `remuda.process.run`. Its optional stdin_hold_until_lines keeps stdin open until stdout has that many newlines, the child exits, or timeout.",
-        "_process_run(argv, stdin?, timeout, cwd?, stdin_hold_until_lines?) -> result | nil, refusal",
+        "_process_run(argv, stdin?, timeout, cwd?, stdin_hold_until_lines?, env?, clear_env?) -> result | nil, refusal",
     ),
     (
         "_process_spawn",
         "Spawn a plain-pipe child process; internal, wrapped by `remuda.process`.",
-        "_process_spawn(argv, on_line?, on_exit?, cwd?) -> id | nil, refusal",
+        "_process_spawn(argv, on_line?, on_exit?, cwd?, env?, clear_env?) -> id | nil, refusal",
     ),
     (
         "_process_drain",
@@ -1840,6 +1840,44 @@ fn parse_stdin_hold_until_lines(value: Value) -> Result<Option<usize>, String> {
     }
 }
 
+fn parse_process_environment(
+    env: Value,
+    clear_env: Value,
+    word: &str,
+) -> Result<crate::process::ChildEnvironment, String> {
+    let clear = match clear_env {
+        Value::Nil => false,
+        Value::Boolean(clear) => clear,
+        _ => return Err(format!("{word} clear_env must be a boolean")),
+    };
+    let mut vars = Vec::new();
+    match env {
+        Value::Nil => {}
+        Value::Table(table) => {
+            for pair in table.pairs::<Value, Value>() {
+                let (key, value) = pair.map_err(|_| format!("{word} env must be a string map"))?;
+                let name = match key {
+                    Value::String(name) => name
+                        .to_str()
+                        .map_err(|_| format!("{word} env names must be UTF-8 strings"))?
+                        .to_owned(),
+                    _ => return Err(format!("{word} env names must be strings")),
+                };
+                let value = match value {
+                    Value::String(value) => value
+                        .to_str()
+                        .map_err(|_| format!("{word} env values must be UTF-8 strings"))?
+                        .to_owned(),
+                    _ => return Err(format!("{word} env values must be strings")),
+                };
+                vars.push((name, value));
+            }
+        }
+        _ => return Err(format!("{word} env must be a table of strings")),
+    }
+    crate::process::ChildEnvironment::new(word, clear, vars)
+}
+
 /// `remuda.process`'s Rust half — split out of `bindings` to stay under its
 /// line cap.
 // `remuda.process` itself (the validated, Lua-facing spec-table word) lives
@@ -1847,72 +1885,11 @@ fn parse_stdin_hold_until_lines(value: Value) -> Result<Option<usize>, String> {
 // plain Rust words with nothing to validate.
 fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlua::Result<()> {
     let processes = crate::process::Processes::new();
-
-    let spawner = processes.clone();
-    let spawn_image = image.clone();
     table.set(
         "_process_spawn",
-        lua.create_function(
-            move |_,
-                  (mut argv, on_line, on_exit, cwd): (
-                Vec<String>,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-            )| {
-                let cwd = match crate::process::checked_cwd("process", cwd.as_deref(), &mut argv) {
-                    Ok(cwd) => cwd,
-                    Err(refused) => return Ok((None, Some(refused))),
-                };
-                let id = spawner
-                    .spawn(spawn_image.clone(), argv, on_line, on_exit, cwd)
-                    .map_err(mlua::Error::external)?;
-                Ok((Some(id), None))
-            },
-        )?,
+        process_spawn_binding(lua, processes.clone(), image.clone())?,
     )?;
-
-    table.set(
-        "_process_run",
-        lua.create_function(
-            |lua,
-             (mut argv, stdin, timeout, cwd, stdin_hold_until_lines): (
-                Vec<String>,
-                Option<mlua::LuaString>,
-                f64,
-                Option<String>,
-                Value,
-            )| {
-                let stdin_hold_until_lines =
-                    match parse_stdin_hold_until_lines(stdin_hold_until_lines) {
-                        Ok(lines) => lines,
-                        Err(refused) => return Ok((Value::Nil, Some(refused))),
-                    };
-                let cwd =
-                    match crate::process::checked_cwd("process.run", cwd.as_deref(), &mut argv) {
-                        Ok(cwd) => cwd,
-                        Err(refused) => return Ok((Value::Nil, Some(refused))),
-                    };
-                let output = crate::process::run_sync(
-                    argv,
-                    stdin.map(|value| value.as_bytes().to_vec()),
-                    timeout,
-                    cwd,
-                    stdin_hold_until_lines,
-                )
-                .map_err(mlua::Error::runtime)?;
-                let result = lua.create_table()?;
-                result.set("code", output.code)?;
-                result.set("stdout", lua.create_string(&output.stdout)?)?;
-                result.set("stderr", lua.create_string(&output.stderr)?)?;
-                result.set("timed_out", output.timed_out)?;
-                if let Some(signal) = output.signal {
-                    result.set("signal", signal)?;
-                }
-                Ok((Value::Table(result), None))
-            },
-        )?,
-    )?;
+    table.set("_process_run", process_run_binding(lua)?)?;
 
     let drainer = processes.clone();
     let drain_image = image;
@@ -1942,6 +1919,91 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
             }
             Ok(rows)
         })?,
+    )
+}
+
+fn process_spawn_binding(
+    lua: &Lua,
+    spawner: crate::process::Processes,
+    image: crate::image::Image,
+) -> mlua::Result<mlua::Function> {
+    lua.create_function(
+        move |_,
+              (mut argv, on_line, on_exit, cwd, env, clear_env): (
+            Vec<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Value,
+            Value,
+        )| {
+            let child_environment = match parse_process_environment(env, clear_env, "process") {
+                Ok(environment) => environment,
+                Err(refused) => return Ok((None, Some(refused))),
+            };
+            let cwd = match crate::process::checked_cwd("process", cwd.as_deref(), &mut argv) {
+                Ok(cwd) => cwd,
+                Err(refused) => return Ok((None, Some(refused))),
+            };
+            let id = spawner
+                .spawn_with_env(
+                    image.clone(),
+                    argv,
+                    on_line,
+                    on_exit,
+                    cwd,
+                    child_environment,
+                )
+                .map_err(mlua::Error::external)?;
+            Ok((Some(id), None))
+        },
+    )
+}
+
+fn process_run_binding(lua: &Lua) -> mlua::Result<mlua::Function> {
+    lua.create_function(
+        |lua,
+         (mut argv, stdin, timeout, cwd, stdin_hold_until_lines, env, clear_env): (
+            Vec<String>,
+            Option<mlua::LuaString>,
+            f64,
+            Option<String>,
+            Value,
+            Value,
+            Value,
+        )| {
+            let child_environment = match parse_process_environment(env, clear_env, "process.run") {
+                Ok(environment) => environment,
+                Err(refused) => return Ok((Value::Nil, Some(refused))),
+            };
+            let stdin_hold_until_lines = match parse_stdin_hold_until_lines(stdin_hold_until_lines)
+            {
+                Ok(lines) => lines,
+                Err(refused) => return Ok((Value::Nil, Some(refused))),
+            };
+            let cwd = match crate::process::checked_cwd("process.run", cwd.as_deref(), &mut argv) {
+                Ok(cwd) => cwd,
+                Err(refused) => return Ok((Value::Nil, Some(refused))),
+            };
+            let output = crate::process::run_sync_with_env(
+                argv,
+                stdin.map(|value| value.as_bytes().to_vec()),
+                timeout,
+                cwd,
+                stdin_hold_until_lines,
+                child_environment,
+            )
+            .map_err(mlua::Error::runtime)?;
+            let result = lua.create_table()?;
+            result.set("code", output.code)?;
+            result.set("stdout", lua.create_string(&output.stdout)?)?;
+            result.set("stderr", lua.create_string(&output.stderr)?)?;
+            result.set("timed_out", output.timed_out)?;
+            if let Some(signal) = output.signal {
+                result.set("signal", signal)?;
+            }
+            Ok((Value::Table(result), None))
+        },
     )
 }
 
