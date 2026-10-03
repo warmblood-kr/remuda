@@ -9,7 +9,9 @@ use std::fs;
 use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::path::{Path, PathBuf};
+#[cfg(any(not(windows), test))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 pub(crate) type Env<'a> = &'a dyn Fn(&str) -> Option<OsString>;
@@ -260,13 +262,21 @@ fn register_path_binding(
                 return Err(mlua::Error::runtime("remuda.storage.path: unknown kind"));
             };
             checked_name(&name)?;
-            Ok(path_roots
+            #[cfg(windows)]
+            let path = path_roots
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .and_then(|roots| roots.get(kind.as_str()))
-                .map(|root| root.join("storage").join("default").join(name))
-                .and_then(|path| path.into_os_string().into_string().ok()))
+                .map(|root| root.path.join("default").join(name));
+            #[cfg(not(windows))]
+            let path = path_roots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(|roots| roots.get(kind.as_str()))
+                .map(|root| root.join("storage").join("default").join(name));
+            Ok(path.and_then(|path| path.into_os_string().into_string().ok()))
         })?,
     )?;
     Ok(())
@@ -294,6 +304,9 @@ impl HandleKind {
 }
 
 type MemoryFiles = Arc<Mutex<BTreeMap<(String, String, String), Vec<u8>>>>;
+#[cfg(windows)]
+type FileRoots = BTreeMap<&'static str, WindowsFileRoot>;
+#[cfg(not(windows))]
 type FileRoots = BTreeMap<&'static str, PathBuf>;
 const ATOMIC_TEMP_PREFIX: &str = ".remuda-atomic-";
 const MAX_STORAGE_VALUE_BYTES: usize = 1024 * 1024;
@@ -301,12 +314,24 @@ const MAX_STORAGE_FILES: usize = 1024;
 const MAX_STORAGE_ENTRIES: usize = 1024;
 const MAX_STORAGE_PARTS: usize = 8;
 
+#[cfg(windows)]
+struct WindowsFileRoot {
+    path: PathBuf,
+    directory: crate::windows_security::StorageDirectory,
+}
+
 struct FileLocation {
     #[cfg(unix)]
     directory: fs::File,
     #[cfg(unix)]
     name: CString,
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    directory: crate::windows_security::StorageDirectory,
+    #[cfg(windows)]
+    name: String,
+    #[cfg(windows)]
+    path: PathBuf,
+    #[cfg(not(any(unix, windows)))]
     path: PathBuf,
 }
 
@@ -314,7 +339,7 @@ fn io_denied() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, "unsafe storage path")
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn reject_path_case_clash(parent: &Path, wanted: &str) -> io::Result<()> {
     let entries = match fs::read_dir(parent) {
         Ok(entries) => entries,
@@ -635,7 +660,13 @@ fn read_location(location: &FileLocation) -> io::Result<Vec<u8>> {
     {
         read_at(location)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let file = location.directory.open_file(&location.name, false)?;
+        let metadata = file.metadata()?;
+        read_limited(file, metadata.len())
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         read_regular_file(&location.path)
     }
@@ -646,7 +677,13 @@ fn write_location(location: &FileLocation, bytes: &[u8]) -> io::Result<()> {
     {
         write_at(location, bytes)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        location.directory.open_file(&location.name, true)?;
+        // The handle walk validated the leaf and every parent; D2 makes this handle-relative.
+        crate::fs_atomic::write_atomic_lua_private(&location.path, bytes)
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         fs::create_dir_all(location.path.parent().unwrap())?;
         crate::fs_atomic::write_atomic_lua_private(&location.path, bytes)
@@ -658,7 +695,17 @@ fn exists_location(location: &FileLocation) -> io::Result<bool> {
     {
         exists_at(location)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        match location.directory.open_file(&location.name, false) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         match fs::symlink_metadata(&location.path) {
             Ok(metadata) => Ok(metadata.file_type().is_file()),
@@ -673,7 +720,11 @@ fn delete_location(location: &FileLocation) -> io::Result<bool> {
     {
         delete_at(location)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        location.directory.delete_file(&location.name)
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         match fs::symlink_metadata(&location.path) {
             Ok(metadata) if metadata.file_type().is_file() => {
@@ -695,12 +746,80 @@ fn list_location(location: &FileLocation, prefix: &str, limit: usize) -> io::Res
         names.sort();
         Ok(names)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let mut names = Vec::new();
+        collect_windows(&location.directory, "", prefix, 0, &mut names, limit)?;
+        names.sort();
+        Ok(names)
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         let mut names = collect_files_matching(&location.path, prefix, limit)?;
         names.sort();
         Ok(names)
     }
+}
+
+#[cfg(windows)]
+fn collect_windows(
+    directory: &crate::windows_security::StorageDirectory,
+    relative: &str,
+    prefix: &str,
+    parts: usize,
+    names: &mut Vec<String>,
+    limit: usize,
+) -> io::Result<()> {
+    if names.len() >= limit || parts >= MAX_STORAGE_PARTS {
+        return Ok(());
+    }
+    for component in directory.names()? {
+        if component.starts_with(ATOMIC_TEMP_PREFIX)
+            || crate::windows_security::relative_component_utf16(&component).is_none()
+        {
+            continue;
+        }
+        let name = if relative.is_empty() {
+            component.clone()
+        } else {
+            format!("{relative}/{component}")
+        };
+        if name.len() > 1024 {
+            continue;
+        }
+        match directory.open_directory(&component, false) {
+            Ok(child) => {
+                if name.starts_with(prefix) || prefix.starts_with(&format!("{name}/")) {
+                    collect_windows(&child, &name, prefix, parts + 1, names, limit)?;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                if name.starts_with(prefix) && checked_name(&name).is_ok() {
+                    match directory.open_file(&component, false) {
+                        Ok(_) => names.push(name),
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::NotFound
+                                    | io::ErrorKind::PermissionDenied
+                                    | io::ErrorKind::InvalidInput
+                            ) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        if names.len() >= limit {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn select_list_names(mut names: Vec<String>, prefix: &str, limit: usize) -> Vec<String> {
@@ -728,9 +847,16 @@ fn file_roots(env: Env<'_>) -> Result<FileRoots, String> {
                 Some(root) => root.join(kind.as_str()),
                 None => resolve_dir_for(kind.as_str(), true, env)?,
             };
-            crate::windows_security::ensure_storage_root(&root.join("storage"))
+            let storage_path = root.join("storage");
+            let directory = crate::windows_security::ensure_storage_root(&storage_path)
                 .map_err(|_| "unavailable: storage root security check failed".to_owned())?;
-            Ok((kind.as_str(), root))
+            Ok((
+                kind.as_str(),
+                WindowsFileRoot {
+                    path: storage_path,
+                    directory,
+                },
+            ))
         })
         .collect();
     #[cfg(not(windows))]
@@ -746,7 +872,7 @@ fn file_roots(env: Env<'_>) -> Result<FileRoots, String> {
         .collect()
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn collect_files(
     base: &std::path::Path,
     dir: &std::path::Path,
@@ -781,19 +907,19 @@ fn collect_files(
     Ok(())
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn collect_files_if_present(base: &Path) -> io::Result<Vec<String>> {
     collect_files_matching(base, "", MAX_STORAGE_ENTRIES)
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn collect_files_matching(base: &Path, prefix: &str, limit: usize) -> io::Result<Vec<String>> {
     let mut names = Vec::new();
     collect_files(base, base, prefix, &mut names, limit)?;
     Ok(names)
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn lua_relative_name(path: &Path) -> Option<String> {
     path.components()
         .map(|component| component.as_os_str().to_str())
@@ -801,7 +927,7 @@ fn lua_relative_name(path: &Path) -> Option<String> {
         .map(|components| components.join("/"))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn read_regular_file(path: &Path) -> io::Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
@@ -885,9 +1011,26 @@ impl KindHandle {
                 name: c_name(leaf)?,
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            // Windows keeps the plain path implementation; no-follow directory handles are Unix-only.
+            let mut directory = root.directory.open_directory(&self.namespace, create)?;
+            let mut parts = if name.is_empty() {
+                Vec::new()
+            } else {
+                name.split('/').collect::<Vec<_>>()
+            };
+            let leaf = parts.pop().unwrap_or(".");
+            for part in parts {
+                directory = directory.open_directory(part, create)?;
+            }
+            Ok(FileLocation {
+                directory,
+                name: leaf.to_owned(),
+                path: root.path.join(&self.namespace).join(name),
+            })
+        }
+        #[cfg(all(not(unix), not(windows)))]
+        {
             let mut parent = root.clone();
             let name_parts = name.split('/').collect::<Vec<_>>();
             for component in ["storage", self.namespace.as_str()].into_iter().chain(
@@ -925,7 +1068,7 @@ impl KindHandle {
             if matches!(self.kind, HandleKind::Secret) {
                 return Ok((
                     None,
-                    Some("unavailable: file secrets require reparse-safe storage".into()),
+                    Some("unavailable: file secrets require a dedicated protected root".into()),
                 ));
             }
             let location = match self.file_path(&key.2, false) {
@@ -967,7 +1110,7 @@ impl KindHandle {
         if self.roots.is_some() {
             if matches!(self.kind, HandleKind::Secret) {
                 return Err(mlua::Error::runtime(
-                    "unavailable: file secrets require reparse-safe storage",
+                    "unavailable: file secrets require a dedicated protected root",
                 ));
             }
             let location = self
@@ -1043,7 +1186,7 @@ impl KindHandle {
             if matches!(self.kind, HandleKind::Secret) {
                 return Ok((
                     None,
-                    Some("unavailable: file secrets require reparse-safe storage".into()),
+                    Some("unavailable: file secrets require a dedicated protected root".into()),
                 ));
             }
             let location = match self.file_path(&key.2, false) {
@@ -1077,7 +1220,7 @@ impl KindHandle {
         if self.roots.is_some() {
             if matches!(self.kind, HandleKind::Secret) {
                 return Err(mlua::Error::runtime(
-                    "unavailable: file secrets require reparse-safe storage",
+                    "unavailable: file secrets require a dedicated protected root",
                 ));
             }
             let location = match self.file_path("", false) {
@@ -1142,11 +1285,14 @@ impl UserData for SecretHandle {
                         "remuda.storage.secret.put secret must be 1..=2048 bytes",
                     ));
                 }
-                // File secrets stay unavailable until Windows uses reparse-safe file handles.
+                // File secrets stay unavailable until Windows has a dedicated protected root.
                 if this.0.roots.is_some() {
                     return Ok((
                         None,
-                        Some("unavailable: file secrets require reparse-safe storage".to_string()),
+                        Some(
+                            "unavailable: file secrets require a dedicated protected root"
+                                .to_string(),
+                        ),
                     ));
                 }
                 this.0.write(name, &secret.as_bytes())?;
@@ -1340,6 +1486,14 @@ mod tests {
         let root = TestRoot::new();
         let missing = root.0.join("not-created");
         assert!(collect_files_if_present(&missing).unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    fn require_symlink(result: io::Result<()>) {
+        assert!(
+            result.is_ok(),
+            "Windows CI must create symlink fixtures: {result:?}"
+        );
     }
 
     #[test]
@@ -1727,6 +1881,86 @@ mod tests {
     fn run_handle_conformance(lua: &Lua, backend: &str) {
         select_backend(lua, backend);
         lua.load(HANDLE_CONFORMANCE).exec().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn xdg_lists_names_from_a_populated_namespace() {
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"
+            local files = remuda.storage.get("listed"):data()
+            files:write("nested/item", "x")
+            files:write("top", "y")
+            local names = files:list()
+            assert(#names == 2, "list populated namespace count")
+            assert(names[1] == "nested/item" and names[2] == "top", "list populated namespace names")
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn xdg_handle_walk_refuses_reparse_components_for_all_operations() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        let storage = root.0.join("data/storage");
+        let namespace_target = root.0.join("outside-namespace");
+        fs::create_dir(&namespace_target).unwrap();
+        fs::write(namespace_target.join("item"), b"outside").unwrap();
+        require_symlink(symlink_dir(
+            &namespace_target,
+            storage.join("linked-namespace"),
+        ));
+
+        let intermediate = storage.join("real-namespace/intermediate");
+        let intermediate_target = root.0.join("outside-intermediate");
+        fs::create_dir_all(storage.join("real-namespace")).unwrap();
+        fs::create_dir(&intermediate_target).unwrap();
+        fs::write(intermediate_target.join("item"), b"outside").unwrap();
+        require_symlink(symlink_dir(&intermediate_target, &intermediate));
+
+        let leaf_namespace = storage.join("leaf-namespace");
+        let leaf_target = root.0.join("outside-leaf");
+        fs::create_dir(&leaf_namespace).unwrap();
+        fs::write(&leaf_target, b"outside").unwrap();
+        require_symlink(symlink_file(&leaf_target, leaf_namespace.join("item")));
+
+        lua.load(
+            r#"
+            local function denied(namespace, name)
+                local files = remuda.storage.get(namespace):data()
+                local ok, value, reason = pcall(function() return files:read(name) end)
+                assert(not ok or (value == nil and reason ~= nil and reason ~= "not_found"), "read " .. namespace .. "/" .. name)
+                ok, value = pcall(function() return files:exists(name) end)
+                assert(not ok or value == false, "exists " .. namespace .. "/" .. name)
+                ok, value = pcall(function() return files:list() end)
+                assert(not ok or #value == 0, "list " .. namespace)
+                ok, value, reason = pcall(function() return files:delete(name) end)
+                assert(not ok or (value ~= true and reason ~= nil and reason ~= "not_found"), "delete " .. namespace .. "/" .. name)
+                ok = pcall(function() files:write(name, "replacement") end)
+                assert(not ok, "write " .. namespace .. "/" .. name)
+            end
+            denied("linked-namespace", "item")
+            denied("real-namespace", "intermediate/item")
+            denied("leaf-namespace", "item")
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(fs::read(namespace_target.join("item")).unwrap(), b"outside");
+        assert_eq!(
+            fs::read(intermediate_target.join("item")).unwrap(),
+            b"outside"
+        );
+        assert_eq!(fs::read(&leaf_target).unwrap(), b"outside");
     }
 
     #[cfg(windows)]

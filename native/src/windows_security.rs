@@ -4,6 +4,54 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct NtOpenPolicy {
+    pub(crate) object_attributes: u32,
+    pub(crate) create_options: u32,
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn relative_component_utf16(component: &str) -> Option<Vec<u16>> {
+    if component.is_empty()
+        || component == "."
+        || component == ".."
+        || component.len() > 255
+        || !component.bytes().all(|byte| byte.is_ascii_graphic())
+        || component
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'\\' | b':' | b'\0'))
+    {
+        return None;
+    }
+    Some(component.encode_utf16().chain(Some(0)).collect())
+}
+
+#[cfg(any(windows, test))]
+const OBJ_DONT_REPARSE: u32 = 0x0000_1000;
+#[cfg(any(windows, test))]
+const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(any(windows, test))]
+const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+#[cfg(any(windows, test))]
+const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+#[cfg(any(windows, test))]
+const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+
+#[cfg(any(windows, test))]
+pub(crate) fn nt_open_policy(directory: bool) -> NtOpenPolicy {
+    NtOpenPolicy {
+        object_attributes: OBJ_DONT_REPARSE,
+        create_options: FILE_OPEN_REPARSE_POINT
+            | FILE_SYNCHRONOUS_IO_NONALERT
+            | if directory {
+                FILE_DIRECTORY_FILE
+            } else {
+                FILE_NON_DIRECTORY_FILE
+            },
+    }
+}
+
+#[cfg(any(windows, test))]
 fn ace_sid_fits(ace_size: usize, fixed_size: usize, sid_size: usize) -> bool {
     fixed_size
         .checked_add(sid_size)
@@ -49,7 +97,7 @@ pub(crate) fn storage_root_for(env: &dyn Fn(&str) -> Option<OsString>) -> Result
 
 #[cfg(windows)]
 mod platform {
-    use super::{ace_sid_fits, protected_storage_sddl};
+    use super::{ace_sid_fits, nt_open_policy, protected_storage_sddl, relative_component_utf16};
     use std::ffi::{c_void, OsStr};
     use std::fs;
     use std::io;
@@ -57,8 +105,13 @@ mod platform {
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::Path;
     use std::ptr;
+    use std::sync::Mutex;
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        NtCreateFile, NtOpenFile, NtQueryDirectoryFile, FILE_NAMES_INFORMATION,
+    };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, LocalFree, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, GetLastError, LocalFree, HANDLE, INVALID_HANDLE_VALUE, UNICODE_STRING,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -71,12 +124,14 @@ mod platform {
         TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateDirectoryW, CreateFileW, GetFileInformationByHandleEx, FILE_ALL_ACCESS,
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        CreateDirectoryW, CreateFileW, GetFileInformationByHandleEx, SetFileInformationByHandle,
+        FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, SYNCHRONIZE,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     struct Handle(HANDLE);
     impl Drop for Handle {
@@ -100,6 +155,259 @@ mod platform {
         _buffer: Vec<usize>,
         sid: *mut c_void,
         text: String,
+    }
+
+    pub(crate) struct StorageDirectory {
+        file: std::fs::File,
+        names_lock: Mutex<()>,
+    }
+
+    impl StorageDirectory {
+        pub(crate) fn open_directory(&self, name: &str, create: bool) -> io::Result<Self> {
+            if create
+                && self
+                    .names()?
+                    .iter()
+                    .any(|existing| existing != name && existing.eq_ignore_ascii_case(name))
+            {
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+            }
+            let file = open_relative(&self.file, name, true, create, 0x0010_0087)?;
+            Ok(Self {
+                file,
+                names_lock: Mutex::new(()),
+            })
+        }
+
+        pub(crate) fn open_file(&self, name: &str, write: bool) -> io::Result<std::fs::File> {
+            open_relative(
+                &self.file,
+                name,
+                false,
+                write,
+                if write { 0x0010_0082 } else { 0x0010_0081 },
+            )
+        }
+
+        pub(crate) fn delete_file(&self, name: &str) -> io::Result<bool> {
+            let file = match open_relative(&self.file, name, false, false, 0x0011_0080) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            // SAFETY: file is a no-follow regular-file handle with DELETE access.
+            if unsafe {
+                SetFileInformationByHandle(
+                    file.as_raw_handle(),
+                    4,
+                    (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(last_error());
+            }
+            Ok(true)
+        }
+
+        pub(crate) fn names(&self) -> io::Result<Vec<String>> {
+            const MAX_NAMES: usize = 1024;
+            let _guard = self
+                .names_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut names = Vec::new();
+            let mut restart = true;
+            'query: loop {
+                let mut buffer = vec![0u64; 8192];
+                // SAFETY: This zeroed status block and aligned output buffer are valid for the call.
+                let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+                // SAFETY: This is a synchronous query on an owned directory handle.
+                let status = unsafe {
+                    NtQueryDirectoryFile(
+                        self.file.as_raw_handle(),
+                        ptr::null_mut(),
+                        None,
+                        ptr::null(),
+                        &mut status_block,
+                        buffer.as_mut_ptr().cast(),
+                        (buffer.len() * std::mem::size_of::<u64>()) as u32,
+                        12,
+                        false,
+                        ptr::null(),
+                        restart,
+                    )
+                };
+                if status as u32 == 0x8000_0006 {
+                    break;
+                }
+                if status < 0 {
+                    return Err(nt_error(status));
+                }
+                restart = false;
+                let used = status_block.Information;
+                if used == 0 {
+                    break;
+                }
+                if used > buffer.len() * std::mem::size_of::<u64>() {
+                    return Err(io::Error::from(io::ErrorKind::InvalidData));
+                }
+                let header = std::mem::offset_of!(FILE_NAMES_INFORMATION, FileName);
+                let mut offset = 0usize;
+                loop {
+                    if offset.checked_add(header).is_none_or(|end| end > used) {
+                        return Err(io::Error::from(io::ErrorKind::InvalidData));
+                    }
+                    // SAFETY: The buffer is aligned and this record header is within `used`.
+                    let record = unsafe {
+                        &*buffer
+                            .as_ptr()
+                            .cast::<u8>()
+                            .add(offset)
+                            .cast::<FILE_NAMES_INFORMATION>()
+                    };
+                    let name_bytes = record.FileNameLength as usize;
+                    if name_bytes % 2 != 0
+                        || offset
+                            .checked_add(header)
+                            .and_then(|start| start.checked_add(name_bytes))
+                            .is_none_or(|end| end > used)
+                    {
+                        return Err(io::Error::from(io::ErrorKind::InvalidData));
+                    }
+                    // SAFETY: The validated name range is fully inside the returned buffer.
+                    let units = unsafe {
+                        std::slice::from_raw_parts(record.FileName.as_ptr(), name_bytes / 2)
+                    };
+                    let name = String::from_utf16(units)
+                        .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+                    if name != "." && name != ".." {
+                        names.push(name);
+                        if names.len() == MAX_NAMES {
+                            break 'query;
+                        }
+                    }
+                    if record.NextEntryOffset == 0 {
+                        break;
+                    }
+                    if (record.NextEntryOffset as usize) < header + name_bytes {
+                        return Err(io::Error::from(io::ErrorKind::InvalidData));
+                    }
+                    offset = offset
+                        .checked_add(record.NextEntryOffset as usize)
+                        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+                }
+            }
+            Ok(names)
+        }
+    }
+
+    fn nt_error(status: i32) -> io::Error {
+        match status as u32 {
+            0xC000_0034 | 0xC000_003A => io::Error::from(io::ErrorKind::NotFound),
+            0xC000_0035 => io::Error::from(io::ErrorKind::AlreadyExists),
+            0xC000_050B => io::Error::from(io::ErrorKind::PermissionDenied),
+            0xC000_00BA | 0xC000_0103 => io::Error::from(io::ErrorKind::InvalidInput),
+            _ => io::Error::other("storage I/O failed"),
+        }
+    }
+
+    fn open_relative(
+        parent: &std::fs::File,
+        component: &str,
+        directory: bool,
+        create: bool,
+        access: u32,
+    ) -> io::Result<std::fs::File> {
+        let name = relative_component_utf16(component)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let length = ((name.len() - 1) * std::mem::size_of::<u16>()) as u16;
+        let mut unicode = UNICODE_STRING {
+            Length: length,
+            MaximumLength: (name.len() * std::mem::size_of::<u16>()) as u16,
+            Buffer: name.as_ptr().cast_mut(),
+        };
+        let policy = nt_open_policy(directory);
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent.as_raw_handle(),
+            ObjectName: &mut unicode,
+            // NTFS lookup is case-insensitive by default; create-time folded checks keep
+            // this API consistent while preserving the backing filesystem's lookup mode.
+            Attributes: policy.object_attributes,
+            SecurityDescriptor: ptr::null_mut(),
+            SecurityQualityOfService: ptr::null_mut(),
+        };
+        // SAFETY: The initialized object/name/status structures outlive the synchronous NT call.
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        let mut raw = ptr::null_mut();
+        // SAFETY: Parent is an owned directory handle and all pointers reference live buffers.
+        let status = unsafe {
+            if create {
+                NtCreateFile(
+                    &mut raw,
+                    access,
+                    &attributes,
+                    &mut status_block,
+                    ptr::null(),
+                    if directory {
+                        FILE_ATTRIBUTE_DIRECTORY
+                    } else {
+                        0x80
+                    },
+                    7,
+                    3,
+                    policy.create_options,
+                    ptr::null(),
+                    0,
+                )
+            } else {
+                NtOpenFile(
+                    &mut raw,
+                    access,
+                    &attributes,
+                    &mut status_block,
+                    7,
+                    policy.create_options,
+                )
+            }
+        };
+        if status < 0 {
+            if !raw.is_null() {
+                // SAFETY: A non-null output handle from a failed open must be released.
+                unsafe { CloseHandle(raw) };
+            }
+            return Err(nt_error(status));
+        }
+        if raw.is_null() {
+            return Err(io::Error::other("storage open returned no handle"));
+        }
+        // SAFETY: A successful NT open returned an owned handle.
+        let file = unsafe { std::fs::File::from_raw_handle(raw) };
+        verify_handle(&file, directory)?;
+        Ok(file)
+    }
+
+    fn verify_handle(file: &std::fs::File, directory: bool) -> io::Result<()> {
+        let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
+        // SAFETY: tag is a writable buffer of the exact size; file owns the queried handle.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                windows_sys::Win32::Storage::FileSystem::FileAttributeTagInfo,
+                (&mut tag as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+                std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        let is_directory = tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || is_directory != directory {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        Ok(())
     }
 
     impl UserSid {
@@ -209,7 +517,7 @@ mod platform {
         Ok(descriptor)
     }
 
-    pub(crate) fn ensure_storage_root(path: &Path) -> io::Result<()> {
+    pub(crate) fn ensure_storage_root(path: &Path) -> io::Result<StorageDirectory> {
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -236,13 +544,16 @@ mod platform {
         verify_storage_root(path)
     }
 
-    pub(crate) fn verify_storage_root(path: &Path) -> io::Result<()> {
+    pub(crate) fn verify_storage_root(path: &Path) -> io::Result<StorageDirectory> {
         let path_wide = wide(path.as_os_str());
         // SAFETY: path_wide is NUL-terminated; null optional pointers are permitted by CreateFileW.
         let handle = unsafe {
             CreateFileW(
                 path_wide.as_ptr(),
-                FILE_READ_ATTRIBUTES | windows_sys::Win32::Storage::FileSystem::READ_CONTROL,
+                FILE_READ_ATTRIBUTES
+                    | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+                    | FILE_LIST_DIRECTORY
+                    | SYNCHRONIZE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 ptr::null(),
                 OPEN_EXISTING,
@@ -408,7 +719,10 @@ mod platform {
         if principals != expected {
             return Err(policy_error("storage root principals mismatch"));
         }
-        Ok(())
+        Ok(StorageDirectory {
+            file,
+            names_lock: Mutex::new(()),
+        })
     }
 
     fn policy_error(message: &str) -> io::Error {
@@ -417,7 +731,7 @@ mod platform {
 }
 
 #[cfg(windows)]
-pub(crate) use platform::ensure_storage_root;
+pub(crate) use platform::{ensure_storage_root, StorageDirectory};
 
 #[cfg(all(windows, test))]
 pub(crate) use platform::verify_storage_root;
@@ -433,6 +747,42 @@ mod tests {
             .map(|(key, value)| (key.to_string(), OsString::from(value)))
             .collect();
         move |name| values.get(name).cloned()
+    }
+
+    #[test]
+    fn windows_component_validation_rejects_path_syntax() {
+        for component in ["", ".", "..", "a/b", r"a\b", "nul\0byte"] {
+            assert!(
+                relative_component_utf16(component).is_none(),
+                "{component:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_relative_name_builder_encodes_one_nul_terminated_component() {
+        assert_eq!(
+            relative_component_utf16("mail_1.bin"),
+            Some("mail_1.bin\0".encode_utf16().collect())
+        );
+    }
+
+    #[test]
+    fn windows_open_flag_calculation_requires_no_reparse_and_expected_type() {
+        assert_eq!(
+            nt_open_policy(true),
+            NtOpenPolicy {
+                object_attributes: 0x0000_1000, // OBJ_DONT_REPARSE
+                create_options: 0x0020_0021,    // FILE_OPEN_REPARSE_POINT | sync | directory
+            }
+        );
+        assert_eq!(
+            nt_open_policy(false),
+            NtOpenPolicy {
+                object_attributes: 0x0000_1000,
+                create_options: 0x0020_0060, // FILE_OPEN_REPARSE_POINT | sync | non-directory
+            }
+        );
     }
 
     #[test]
