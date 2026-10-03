@@ -1406,7 +1406,7 @@ fn input_line_empty_uses_styled_prompt_snapshots_and_returns_unknown_safely() {
 
         local word = remuda._registry.input_line_empty
         assert(word and word.signature == "input_line_empty(session, opts?) -> true | nil, reason")
-        assert(word.about:find("opts.kind", 1, true) and word.about:find("every earlier row is blank", 1, true))
+        assert(word.about:find("opts.kind", 1, true) and word.about:find("contiguous composer block", 1, true))
         assert(word.about:find("'? for shortcuts' for every kind", 1, true))
         assert(word.about:find("Unlike Butler's helper", 1, true))
         "#,
@@ -1429,6 +1429,17 @@ fn input_line_empty_rejects_draft_content_above_the_cursor() {
           local answer, reason = remuda.input_line_empty("fixture", { kind = kind })
           assert(answer == nil and type(reason) == "string", tostring(answer) .. " / " .. tostring(reason))
         end
+        local function expect_empty(snapshot, kind)
+          current = snapshot
+          local answer, reason = remuda.input_line_empty("fixture", { kind = kind })
+          assert(answer == true, tostring(answer) .. " / " .. tostring(reason))
+        end
+
+        expect_empty(screen({ row("ls output"), row(""), row("❯ ") }, 3), "shell")
+        expect_empty(screen({
+          row("history"), row(""), row("╭──────╮"), row("│ ❯  │"), row("╰──────╯"), row("? for shortcuts")
+        }, 4), "claude")
+        expect_empty(screen({ row("transcript line"), row(""), row("> Ask Codex to do anything"), row("gpt 5 · 40%") }, 3), "codex")
 
         expect_unknown(screen({ row("❯ draft"), row("❯ ") }, 2), "shell")
         expect_unknown(screen({ row("❯ draft"), row("> "), row("❯ ") }, 3), "shell")

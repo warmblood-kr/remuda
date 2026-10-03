@@ -2013,16 +2013,22 @@ local function input_line_empty_from_snapshot(kind, screen)
     lines[index] = input_line_row_text(row, index == cursor.row):gsub("\194\160", " ")
   end
 
-  -- A blank cursor prompt cannot prove emptiness when any earlier row might
-  -- be draft text, a wrapped continuation, or a glyph-less primary prompt.
-  for index = 1, cursor.row - 1 do
+  -- Only inspect the contiguous composer block. A blank row ends the block;
+  -- Claude's top frame border ends it without counting as composer content.
+  for index = cursor.row - 1, 1, -1 do
     local row = lines[index]:gsub("^%s+", "")
+    if has_claude_frame then
+      local is_top_border = false
+      for _, border in ipairs({ "╭", "┌", "─" }) do
+        if row:sub(1, #border) == border then is_top_border = true; break end
+      end
+      if is_top_border then break end
+    end
     if has_claude_frame and row:sub(1, 3) == "│" then
       row = row:sub(4):gsub("│%s*$", "")
     end
-    if input_line_trim(row) ~= "" then
-      return nil, "non-blank rows appear above the cursor prompt"
-    end
+    if input_line_trim(row) == "" then break end
+    return nil, "non-blank rows appear above the cursor prompt"
   end
 
   local cursor_line = lines[cursor.row]:gsub("^%s+", "")
@@ -2067,7 +2073,7 @@ end
 
 register(
   "input_line_empty",
-  "Return true only when a recognized empty prompt is on the visible cursor row and every earlier row is blank; otherwise return nil and a reason. Dim ghost text on the cursor row is ignored; visible paste placeholders count as content. The exact Codex placeholder counts as empty for codex or generic mode. Pass opts.kind = 'shell', 'claude', or 'codex' for that policy; kind is optional, but agent-specific layouts can be ambiguous without it. Rows below the cursor are footer area, including '? for shortcuts' for every kind. Unlike Butler's helper, this word requires a visible cursor, rejects unknown kinds, and recognizes only the built-in Codex placeholder.",
+  "Return true only when a recognized empty prompt is on the visible cursor row and its contiguous composer block above contains no non-blank rows; a blank row ends the block, and a Claude top frame border ends its frame. Other ambiguous screens return nil and a reason. Dim ghost text on the cursor row is ignored; visible paste placeholders count as content. The exact Codex placeholder counts as empty for codex or generic mode. Pass opts.kind = 'shell', 'claude', or 'codex' for that policy; kind is optional, but agent-specific layouts can be ambiguous without it. Rows below the cursor are footer area, including '? for shortcuts' for every kind. Unlike Butler's helper, this word requires a visible cursor, rejects unknown kinds, and recognizes only the built-in Codex placeholder.",
   "input_line_empty(session, opts?) -> true | nil, reason"
 )
 
