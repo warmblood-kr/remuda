@@ -155,6 +155,25 @@ pub(crate) fn secret_owner_matches(actual_sid: &str, current_user_sid: &str) -> 
 }
 
 #[cfg(any(windows, test))]
+fn secret_storage_sddl(owner_sid: &str, directory: bool) -> String {
+    let inheritance = if directory { "OICI" } else { "" };
+    format!(
+        "O:{owner_sid}D:P(A;{inheritance};FA;;;OW)(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;BA)"
+    )
+}
+
+#[cfg(any(windows, test))]
+fn nt_status_error_kind(status: u32) -> std::io::ErrorKind {
+    match status {
+        0xC000_0034 | 0xC000_003A => std::io::ErrorKind::NotFound,
+        0xC000_0035 => std::io::ErrorKind::AlreadyExists,
+        0xC000_0022 | 0xC000_050B => std::io::ErrorKind::PermissionDenied,
+        0xC000_00BA | 0xC000_0103 => std::io::ErrorKind::InvalidInput,
+        _ => std::io::ErrorKind::Other,
+    }
+}
+
+#[cfg(any(windows, test))]
 pub(crate) fn secret_dacl_matches(
     is_directory: bool,
     protected: bool,
@@ -209,8 +228,9 @@ mod platform {
     use super::FAIL_NEXT_STORAGE_RENAME;
     use super::{
         ace_sid_fits, build_nt_file_rename_info, inherited_child_ace_matches, nt_open_policy,
-        protected_storage_sddl, relative_component_utf16, secret_dacl_matches,
-        secret_owner_matches, trusted_storage_owner, FILE_RENAME_INFORMATION_EX_CLASS,
+        nt_status_error_kind, protected_storage_sddl, relative_component_utf16,
+        secret_dacl_matches, secret_owner_matches, secret_storage_sddl, trusted_storage_owner,
+        FILE_RENAME_INFORMATION_EX_CLASS,
     };
     use std::ffi::{c_void, OsStr};
     use std::fs;
@@ -303,7 +323,10 @@ mod platform {
                 return Err(io::Error::from(io::ErrorKind::AlreadyExists));
             }
             let security = if secret {
-                Some(secret_descriptor(&UserSid::current()?.text, true)?)
+                Some(
+                    secret_descriptor(&UserSid::current()?.text, true)
+                        .map_err(|_| policy_error("secret owner/DACL setup failed"))?,
+                )
             } else {
                 None
             };
@@ -316,7 +339,14 @@ mod platform {
                 security
                     .as_ref()
                     .map_or(ptr::null_mut(), |descriptor| descriptor.0),
-            )?;
+            )
+            .map_err(|error| {
+                if secret && error.kind() == io::ErrorKind::PermissionDenied {
+                    policy_error("secret owner assignment failed")
+                } else {
+                    error
+                }
+            })?;
             if secret {
                 verify_secret_security(&file, true)?;
             } else {
@@ -366,7 +396,10 @@ mod platform {
                 Err(error) => return Err(error),
             }
             let security = if secret {
-                Some(secret_descriptor(&UserSid::current()?.text, false)?)
+                Some(
+                    secret_descriptor(&UserSid::current()?.text, false)
+                        .map_err(|_| policy_error("secret owner/DACL setup failed"))?,
+                )
             } else {
                 None
             };
@@ -389,6 +422,9 @@ mod platform {
                         break;
                     }
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) if secret && error.kind() == io::ErrorKind::PermissionDenied => {
+                        return Err(policy_error("secret owner assignment failed"))
+                    }
                     Err(error) => return Err(error),
                 }
             }
@@ -655,12 +691,11 @@ mod platform {
     }
 
     fn nt_error(status: i32) -> io::Error {
-        match status as u32 {
-            0xC000_0034 | 0xC000_003A => io::Error::from(io::ErrorKind::NotFound),
-            0xC000_0035 => io::Error::from(io::ErrorKind::AlreadyExists),
-            0xC000_050B => io::Error::from(io::ErrorKind::PermissionDenied),
-            0xC000_00BA | 0xC000_0103 => io::Error::from(io::ErrorKind::InvalidInput),
-            _ => io::Error::other("storage I/O failed"),
+        let kind = nt_status_error_kind(status as u32);
+        if kind == io::ErrorKind::Other {
+            io::Error::other("storage I/O failed")
+        } else {
+            io::Error::new(kind, "storage I/O failed")
         }
     }
 
@@ -1051,10 +1086,7 @@ mod platform {
     }
 
     fn secret_descriptor(owner_sid: &str, directory: bool) -> io::Result<LocalMemory> {
-        let inheritance = if directory { "OICI" } else { "" };
-        let sddl = format!(
-            "O:{owner_sid}D:P(A;{inheritance};FA;;;OW)(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;BA)"
-        );
+        let sddl = secret_storage_sddl(owner_sid, directory);
         let encoded: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
         let mut descriptor = ptr::null_mut();
         // SAFETY: encoded is NUL-terminated and descriptor is a valid output pointer.
@@ -1067,13 +1099,10 @@ mod platform {
             )
         } == 0
         {
-            return Err(last_error());
+            return Err(policy_error("secret owner/DACL setup failed"));
         }
         if descriptor.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "secret security descriptor conversion failed",
-            ));
+            return Err(policy_error("secret owner/DACL setup failed"));
         }
         Ok(LocalMemory(descriptor.cast()))
     }

@@ -1101,10 +1101,18 @@ impl KindHandle {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     Ok((None, Some("not_found".into())))
                 }
-                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok((
-                    None,
-                    Some("denied: storage path is not a regular file".into()),
-                )),
+                Err(error)
+                    if error.kind() == io::ErrorKind::PermissionDenied
+                        && !matches!(self.kind, HandleKind::Secret) =>
+                {
+                    Ok((
+                        None,
+                        Some("denied: storage path is not a regular file".into()),
+                    ))
+                }
+                Err(error) if matches!(self.kind, HandleKind::Secret) => {
+                    Ok((None, Some(storage_io_error(error))))
+                }
                 Err(_) => Ok((None, Some("unavailable: storage read failed".into()))),
             };
         }
