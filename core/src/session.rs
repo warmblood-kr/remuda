@@ -728,15 +728,16 @@ impl Session {
     /// The one place that touches the backend. PTY handles wait without the
     /// process mutex; callers hold `input_lock` except an attachment writer.
     fn write_one_burst(&self, bytes: &[u8]) -> Result<()> {
-        self.write_one_burst_with(bytes, false, &|| false)
+        self.write_one_burst_with(bytes, false, &|| false, None)
     }
 
-    fn write_one_burst_to_completion_while(
+    fn write_one_burst_to_completion_while_started(
         &self,
         bytes: &[u8],
         cancelled: &dyn Fn() -> bool,
+        on_start: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<()> {
-        self.write_one_burst_with(bytes, true, cancelled)
+        self.write_one_burst_with(bytes, true, cancelled, Some(on_start))
     }
 
     fn write_one_burst_with(
@@ -744,6 +745,7 @@ impl Session {
         bytes: &[u8],
         wait_to_completion: bool,
         cancelled: &dyn Fn() -> bool,
+        on_start: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<()> {
         let writer = {
             let mut agent = self
@@ -757,7 +759,11 @@ impl Session {
         };
         let result = if let Some(writer) = writer {
             if wait_to_completion {
-                writer.write_to_completion_while(bytes, cancelled)
+                if let Some(on_start) = on_start {
+                    writer.write_to_completion_while_started(bytes, cancelled, on_start)
+                } else {
+                    writer.write_to_completion_while(bytes, cancelled)
+                }
             } else {
                 writer.write_bounded(bytes)
             }
@@ -766,6 +772,9 @@ impl Session {
                 .agent
                 .lock()
                 .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+            if let Some(on_start) = on_start {
+                on_start();
+            }
             agent.write(bytes)
         };
         if let Err(error) = result {
@@ -1131,6 +1140,16 @@ impl Attached<'_> {
     /// A takeover may still let one pending buffer land after `attach()` returns.
     /// Single-flight writes do not interleave, and the buffer is never replayed.
     pub fn write_raw_while(&self, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
+        self.write_raw_while_started(bytes, cancelled, Arc::new(|| {}))
+    }
+
+    /// Write bytes while notifying when the backend starts the PTY write.
+    pub fn write_raw_while_started(
+        &self,
+        bytes: &[u8],
+        cancelled: &dyn Fn() -> bool,
+        on_start: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<()> {
         {
             let slot = self
                 .session
@@ -1145,8 +1164,11 @@ impl Attached<'_> {
                 return Err(AgentError::Attached);
             }
         }
-        self.session
-            .write_one_burst_to_completion_while(bytes, &|| self.is_displaced() || cancelled())?;
+        self.session.write_one_burst_to_completion_while_started(
+            bytes,
+            &|| self.is_displaced() || cancelled(),
+            on_start,
+        )?;
         // Only after the write lands, as `last_input_at` is.
         if let Ok(mut at) = self.session.last_human_input_at.lock() {
             *at = Some(self.session.clock.now());
