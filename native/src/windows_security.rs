@@ -124,6 +124,17 @@ fn ace_sid_fits(ace_size: usize, fixed_size: usize, sid_size: usize) -> bool {
         .is_some_and(|required| ace_size >= required)
 }
 
+#[cfg(any(windows, test))]
+fn inherited_child_ace_matches(is_directory: bool, flags: u8, mask: u32) -> bool {
+    const INHERITED_ACE: u8 = 0x10;
+    const FILE_INHERITANCE_FLAGS: u8 = 0x01 | 0x02 | 0x08;
+    const FILE_ALL_ACCESS_MASK: u32 = 0x001F_01FF;
+
+    flags & INHERITED_ACE != 0
+        && mask == FILE_ALL_ACCESS_MASK
+        && (is_directory || flags & FILE_INHERITANCE_FLAGS == 0)
+}
+
 #[allow(dead_code)]
 pub(crate) fn protected_storage_sddl(owner_sid: &str) -> String {
     // Protect the root from parent ACLs; let its three trusted principals inherit to children.
@@ -171,8 +182,8 @@ mod platform {
     #[cfg(test)]
     use super::FAIL_NEXT_STORAGE_RENAME;
     use super::{
-        ace_sid_fits, build_file_rename_info, nt_open_policy, protected_storage_sddl,
-        relative_component_utf16, trusted_storage_owner,
+        ace_sid_fits, build_file_rename_info, inherited_child_ace_matches, nt_open_policy,
+        protected_storage_sddl, relative_component_utf16, trusted_storage_owner,
     };
     use std::ffi::{c_void, OsStr};
     use std::fs;
@@ -254,7 +265,7 @@ mod platform {
                 return Err(io::Error::from(io::ErrorKind::AlreadyExists));
             }
             let file = open_relative(&self.file, name, true, create, 0x0012_0087)?;
-            verify_inherited_acl(&file, "storage child directory")?;
+            verify_inherited_acl(&file, "storage child directory", true)?;
             Ok(Self {
                 file,
                 names_lock: Mutex::new(()),
@@ -269,7 +280,7 @@ mod platform {
                 write,
                 if write { 0x0012_0082 } else { 0x0012_0081 },
             )?;
-            verify_inherited_acl(&file, "storage child file")?;
+            verify_inherited_acl(&file, "storage child file", false)?;
             Ok(file)
         }
 
@@ -296,7 +307,7 @@ mod platform {
             }
             let mut temporary =
                 temporary.ok_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists))?;
-            verify_inherited_acl(&temporary.file, "storage temporary file")?;
+            verify_inherited_acl(&temporary.file, "storage temporary file", false)?;
             temporary.file.write_all(bytes)?;
             temporary.file.sync_all()?;
 
@@ -332,7 +343,7 @@ mod platform {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => return Err(error),
             };
-            verify_inherited_acl(&file, "storage child file")?;
+            verify_inherited_acl(&file, "storage child file", false)?;
             let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
             // SAFETY: file is a no-follow regular-file handle with DELETE access.
             if unsafe {
@@ -644,7 +655,11 @@ mod platform {
         Ok(())
     }
 
-    fn verify_inherited_acl(file: &std::fs::File, subject: &str) -> io::Result<()> {
+    fn verify_inherited_acl(
+        file: &std::fs::File,
+        subject: &str,
+        is_directory: bool,
+    ) -> io::Result<()> {
         let mut owner = ptr::null_mut();
         let mut dacl = ptr::null_mut();
         let mut raw_descriptor = ptr::null_mut();
@@ -730,12 +745,9 @@ mod platform {
             }
             // SAFETY: GetAce returned an ACE pointer owned by the live DACL.
             let header = unsafe { &*(raw_ace.cast::<ACE_HEADER>()) };
-            if header.AceSize as usize > info.AclBytesInUse as usize
-                || header.AceType != 0
-                || header.AceFlags & 0x10 == 0
-            {
+            if header.AceSize as usize > info.AclBytesInUse as usize || header.AceType != 0 {
                 return Err(policy_error(&format!(
-                    "{subject} ACE type or inheritance mismatch"
+                    "{subject} ACE size or type mismatch"
                 )));
             }
             let fixed_size = std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>();
@@ -744,8 +756,10 @@ mod platform {
             }
             // SAFETY: AceSize covers the ACCESS_ALLOWED_ACE prefix checked above.
             let ace = unsafe { &*(raw_ace.cast::<ACCESS_ALLOWED_ACE>()) };
-            if ace.Mask != FILE_ALL_ACCESS {
-                return Err(policy_error(&format!("{subject} ACE mask mismatch")));
+            if !inherited_child_ace_matches(is_directory, header.AceFlags, ace.Mask) {
+                return Err(policy_error(&format!(
+                    "{subject} ACE flags or mask mismatch"
+                )));
             }
             let sid = (&ace.SidStart as *const u32).cast_mut().cast::<c_void>();
             let sid_bytes = sid.cast::<u8>();
