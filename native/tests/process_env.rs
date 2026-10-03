@@ -96,7 +96,12 @@ fn probe_environment(line: &str) -> BTreeMap<String, String> {
     let json = line
         .strip_prefix(PROBE_PREFIX)
         .expect("probe result prefix");
-    serde_json::from_str(json).expect("probe environment JSON")
+    let mut environment: BTreeMap<String, String> =
+        serde_json::from_str(json).expect("probe environment JSON");
+    // LLVM's coverage runtime adds this marker when an instrumented child
+    // starts, even if the parent's clear_env removed it before exec.
+    environment.remove("__LLVM_PROFILE_RT_INIT_ONCE");
+    environment
 }
 
 fn extract_probe(stdout: &str) -> BTreeMap<String, String> {
@@ -159,6 +164,16 @@ fn process_env_child_probe() {
     }
     let vars: BTreeMap<String, String> = std::env::vars().collect();
     println!("{PROBE_PREFIX}{}", serde_json::to_string(&vars).unwrap());
+}
+
+#[test]
+fn process_env_probe_ignores_llvm_coverage_startup_marker() {
+    assert_eq!(
+        probe_environment(
+            "PROCESS_ENV_RESULT={\"KEEP\":\"value\",\"__LLVM_PROFILE_RT_INIT_ONCE\":\"__LLVM_PROFILE_RT_INIT_ONCE\"}"
+        ),
+        BTreeMap::from([("KEEP".to_string(), "value".to_string())])
+    );
 }
 
 #[test]
