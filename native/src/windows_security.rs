@@ -1231,6 +1231,50 @@ mod tests {
     }
 
     #[test]
+    fn secret_policy_requires_exact_current_owner_and_protected_aces() {
+        const ALL: u32 = 0x001F_01FF;
+        let file_aces = [
+            ("S-1-3-4", 0, ALL, 0),
+            ("S-1-5-18", 0, ALL, 0),
+            ("S-1-5-32-544", 0, ALL, 0),
+        ];
+        let directory_aces = [
+            ("S-1-3-4", 0x03, ALL, 0),
+            ("S-1-5-18", 0x03, ALL, 0),
+            ("S-1-5-32-544", 0x03, ALL, 0),
+        ];
+        let current = "S-1-5-21-42";
+
+        assert!(secret_owner_matches(current, current));
+        for near_miss in ["S-1-5-32-5440", "S-1-5-18x", "s-1-5-18"] {
+            assert!(!secret_owner_matches(near_miss, current), "{near_miss}");
+        }
+        assert!(secret_dacl_matches(false, true, &file_aces));
+        assert!(secret_dacl_matches(true, true, &directory_aces));
+        assert!(!secret_dacl_matches(false, false, &file_aces));
+        assert!(!secret_dacl_matches(true, true, &file_aces));
+        assert!(!secret_dacl_matches(false, true, &directory_aces));
+
+        let widened = [file_aces[0], file_aces[1], ("S-1-1-0", 0, ALL, 0)];
+        assert!(!secret_dacl_matches(false, true, &widened));
+        let extra = [
+            file_aces[0],
+            file_aces[1],
+            file_aces[2],
+            ("S-1-1-0", 0, ALL, 0),
+        ];
+        assert!(!secret_dacl_matches(false, true, &extra));
+        let wrong_mask = [
+            file_aces[0],
+            file_aces[1],
+            ("S-1-5-32-544", 0, 0x001F_01FE, 0),
+        ];
+        assert!(!secret_dacl_matches(false, true, &wrong_mask));
+        let deny_ace = [file_aces[0], file_aces[1], ("S-1-5-32-544", 0, ALL, 1)];
+        assert!(!secret_dacl_matches(false, true, &deny_ace));
+    }
+
+    #[test]
     fn ace_size_must_contain_the_full_sid() {
         assert!(ace_sid_fits(28, 8, 20));
         assert!(!ace_sid_fits(27, 8, 20));

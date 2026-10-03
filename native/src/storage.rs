@@ -1731,6 +1731,7 @@ mod tests {
         DIRECTORY_ENUMERATIONS.with(|count| assert_eq!(count.get(), 1));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn xdg_secret_operations_stay_unavailable_without_creating_files() {
         let root = TestRoot::new();
@@ -1752,6 +1753,51 @@ mod tests {
         assert!(!contains_regular_file(&root.0).unwrap());
         #[cfg(unix)]
         assert!(fs::read_dir(&root.0).unwrap().next().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_secrets_support_put_get_exists_and_delete() {
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"
+            local storage = remuda.storage
+            local secret = storage.get("d3-secrets"):secret()
+            assert(storage.path("secret", "token") == nil)
+            assert(secret:exists("token") == false)
+            assert(secret:put("token", "secret-bytes") == true)
+            assert(secret:exists("token") == true)
+            local value, reason = secret:get("token")
+            assert(value == "secret-bytes" and reason == nil)
+            assert(secret:delete("token") == true)
+            assert(secret:exists("token") == false)
+            assert(not pcall(function() secret:list() end))
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_secret_policy_refuses_wrong_owner_and_widened_acl() {
+        const ALL: u32 = 0x001F_01FF;
+        let current = "S-1-5-21-42";
+        let widened = [
+            ("S-1-3-4", 0, ALL, 0),
+            ("S-1-5-18", 0, ALL, 0),
+            ("S-1-5-32-544", 0, ALL, 0),
+            ("S-1-1-0", 0, ALL, 0),
+        ];
+        assert!(!crate::windows_security::secret_owner_matches(
+            "S-1-5-32-544",
+            current
+        ));
+        assert!(!crate::windows_security::secret_dacl_matches(
+            false, true, &widened
+        ));
     }
 
     #[cfg(windows)]
