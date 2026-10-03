@@ -229,7 +229,7 @@ input.type_text
 input_line_empty
 ----------------
 
-``input_line_empty(session, opts?) -> true | false | nil, reason`` — Report whether a session has a visibly empty input line. Returns nil and a reason unless the cursor and prompt are visible. Dim ghost text on the cursor row is ignored; visible paste placeholders count as content. Pass opts.kind = 'shell', 'claude', or 'codex' for that exact policy. Kind is optional; without it, shared prompt glyphs, the visible Claude frame, and the exact Codex placeholder are recognized. In generic mode, visible Codex footer and trace cues are applied regardless of agent kind; other agent-specific layouts remain ambiguous, and an unfamiliar footer may be mistaken for composer text. Unlike Butler's helper, this word requires a visible cursor, rejects unknown kinds, and recognizes only the built-in Codex placeholder.
+``input_line_empty(session, opts?) -> true | nil, reason`` — Return true only when a recognized empty prompt is on the visible cursor row and every earlier row is blank; otherwise return nil and a reason. Dim ghost text on the cursor row is ignored; visible paste placeholders count as content. The exact Codex placeholder counts as empty for codex or generic mode. Pass opts.kind = 'shell', 'claude', or 'codex' for that policy; kind is optional, but agent-specific layouts can be ambiguous without it. Rows below the cursor are footer area, including '? for shortcuts' for every kind. Unlike Butler's helper, this word requires a visible cursor, rejects unknown kinds, and recognizes only the built-in Codex placeholder.
 
 insert
 ------
