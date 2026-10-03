@@ -192,6 +192,10 @@ with an empty environment and then applies `env`. Names must be non-empty
 strings without `=` or NUL; values must be strings without NUL. Clearing the
 environment clears every variable on Windows too, including `SystemRoot`, so
 callers must pass everything the child needs, such as `SystemRoot` and `PATH`.
+On Windows, environment names that differ only by case refer to the same
+variable; which value wins is undefined, so callers must not pass both. With
+`cwd`, a bare program name is looked up in the daemon's `PATH`; without `cwd`,
+lookup uses the child's `PATH` (including any supplied or cleared environment).
 
 The buffer between the reader thread and the Image is capped, on purpose.
 When it fills, the reader thread simply stops reading — the child's own

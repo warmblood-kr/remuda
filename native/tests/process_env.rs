@@ -129,13 +129,17 @@ fn clear_env_entries() -> BTreeMap<String, String> {
     env
 }
 
-fn expected_after_clear(mut requested: BTreeMap<String, String>) -> BTreeMap<String, String> {
+fn expected_after_clear(requested: BTreeMap<String, String>) -> BTreeMap<String, String> {
     // macOS adds this per-user encoding marker when a Rust test executable
     // starts, even when the parent launches it with an otherwise empty env.
     #[cfg(target_os = "macos")]
-    if let Ok(value) = std::env::var("__CF_USER_TEXT_ENCODING") {
-        requested.insert("__CF_USER_TEXT_ENCODING".to_string(), value);
-    }
+    let requested = {
+        let mut requested = requested;
+        if let Ok(value) = std::env::var("__CF_USER_TEXT_ENCODING") {
+            requested.insert("__CF_USER_TEXT_ENCODING".to_string(), value);
+        }
+        requested
+    };
     requested
 }
 
