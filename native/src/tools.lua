@@ -1093,7 +1093,7 @@ local function clear_imperative_module_registrations(name, activation)
 end
 
 local function stop_module_activation(name, module)
-  if not module or not module.stop or module.stopped then return end
+  if not module or not module.started or not module.stop or module.stopped then return end
   module.stopped = true
   local ok, err = pcall(module.stop, module.state)
   if not ok then
@@ -1173,7 +1173,7 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
   if reactivate == false and modules[name] ~= nil then
     local active = modules[name]
     if not commands_only and not active.started and active.start then
-      return false, active.state, active.start, nil, nil
+      return false, active.state, active.start, active.rollback, nil
     end
     return false
   end
@@ -1602,6 +1602,7 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
       end
     end
   end
+  activation.rollback = rollback
   local launch_start = start
   if commands_only and commands then launch_start = nil end
   return true, state, launch_start, rollback, commands

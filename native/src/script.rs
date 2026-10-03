@@ -1477,7 +1477,7 @@ fn activate_package(
             activate.call((name, declaration, require_lifecycle, commands_only))?;
         active.set(true);
         if let Value::Function(commands) = &commands {
-            if let Err(error) = commands.call::<()>(state.clone()) {
+            if let Err(error) = call_lifecycle_callback(lua, commands, state.clone()) {
                 if let Value::Function(rollback) = &rollback {
                     rollback.call::<()>(())?;
                 }
@@ -1485,13 +1485,7 @@ fn activate_package(
             }
         }
         if let Value::Function(start) = &start {
-            let remuda_global: Table = lua.globals().get("remuda")?;
-            let was_active: bool = remuda_global
-                .get("_lifecycle_start_active")
-                .unwrap_or(false);
-            remuda_global.set("_lifecycle_start_active", true)?;
-            let result = start.call::<()>(state);
-            remuda_global.set("_lifecycle_start_active", was_active)?;
+            let result = call_lifecycle_callback(lua, start, state);
             if let Err(error) = result {
                 if let Value::Function(rollback) = &rollback {
                     rollback.call::<()>(())?;
@@ -1505,6 +1499,17 @@ fn activate_package(
             .set_name(package.chunk_name)
             .exec()
     }
+}
+
+/// Run lifecycle callbacks under the same error policy, so errors from hooks
+/// they emit are propagated to the activation transaction for rollback.
+fn call_lifecycle_callback(lua: &Lua, callback: &mlua::Function, state: Value) -> mlua::Result<()> {
+    let remuda: Table = lua.globals().get("remuda")?;
+    let was_active: bool = remuda.get("_lifecycle_start_active").unwrap_or(false);
+    remuda.set("_lifecycle_start_active", true)?;
+    let result = callback.call::<()>(state);
+    remuda.set("_lifecycle_start_active", was_active)?;
+    result
 }
 
 /// Keep the Lua lifecycle manager callable by the loader without exposing its
