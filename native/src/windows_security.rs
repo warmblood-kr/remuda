@@ -254,7 +254,7 @@ mod platform {
                 return Err(io::Error::from(io::ErrorKind::AlreadyExists));
             }
             let file = open_relative(&self.file, name, true, create, 0x0012_0087)?;
-            verify_inherited_acl(&file)?;
+            verify_inherited_acl(&file, "storage child directory")?;
             Ok(Self {
                 file,
                 names_lock: Mutex::new(()),
@@ -269,7 +269,7 @@ mod platform {
                 write,
                 if write { 0x0012_0082 } else { 0x0012_0081 },
             )?;
-            verify_inherited_acl(&file)?;
+            verify_inherited_acl(&file, "storage child file")?;
             Ok(file)
         }
 
@@ -296,7 +296,7 @@ mod platform {
             }
             let mut temporary =
                 temporary.ok_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists))?;
-            verify_inherited_acl(&temporary.file)?;
+            verify_inherited_acl(&temporary.file, "storage temporary file")?;
             temporary.file.write_all(bytes)?;
             temporary.file.sync_all()?;
 
@@ -332,7 +332,7 @@ mod platform {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => return Err(error),
             };
-            verify_inherited_acl(&file)?;
+            verify_inherited_acl(&file, "storage child file")?;
             let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
             // SAFETY: file is a no-follow regular-file handle with DELETE access.
             if unsafe {
@@ -644,7 +644,7 @@ mod platform {
         Ok(())
     }
 
-    fn verify_inherited_acl(file: &std::fs::File) -> io::Result<()> {
+    fn verify_inherited_acl(file: &std::fs::File, subject: &str) -> io::Result<()> {
         let mut owner = ptr::null_mut();
         let mut dacl = ptr::null_mut();
         let mut raw_descriptor = ptr::null_mut();
@@ -670,11 +670,11 @@ mod platform {
         let descriptor = LocalMemory(raw_descriptor.cast());
         let user = UserSid::current()?;
         if owner.is_null() {
-            return Err(policy_error("storage child owner mismatch"));
+            return Err(policy_error(&format!("{subject} owner is missing")));
         }
         // Elevated setup can create children as Administrators or SYSTEM; trust those SIDs only.
         if !trusted_storage_owner(&sid_text(owner)?, &user.text) {
-            return Err(policy_error("storage child owner mismatch"));
+            return Err(policy_error(&format!("{subject} owner is untrusted")));
         }
         let mut control = 0;
         let mut revision = 0;
@@ -685,7 +685,7 @@ mod platform {
             return Err(last_error());
         }
         if control & SE_DACL_PROTECTED != 0 {
-            return Err(policy_error("storage child DACL does not inherit"));
+            return Err(policy_error(&format!("{subject} DACL is protected")));
         }
         let mut present = 0;
         let mut actual_dacl = ptr::null_mut();
@@ -703,7 +703,7 @@ mod platform {
             return Err(last_error());
         }
         if present == 0 || actual_dacl.is_null() {
-            return Err(policy_error("storage child DACL missing"));
+            return Err(policy_error(&format!("{subject} DACL is missing")));
         }
         let mut info = ACL_SIZE_INFORMATION::default();
         // SAFETY: actual_dacl is owned by descriptor; info is a sized output buffer.
@@ -719,7 +719,7 @@ mod platform {
             return Err(last_error());
         }
         if info.AceCount != 3 {
-            return Err(policy_error("storage child ACE set mismatch"));
+            return Err(policy_error(&format!("{subject} ACE count mismatch")));
         }
         let mut principals = Vec::with_capacity(3);
         for index in 0..info.AceCount {
@@ -734,27 +734,29 @@ mod platform {
                 || header.AceType != 0
                 || header.AceFlags & 0x10 == 0
             {
-                return Err(policy_error("storage child ACE policy mismatch"));
+                return Err(policy_error(&format!(
+                    "{subject} ACE type or inheritance mismatch"
+                )));
             }
             let fixed_size = std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>();
             if (header.AceSize as usize) < fixed_size + 8 {
-                return Err(policy_error("storage child ACE is truncated"));
+                return Err(policy_error(&format!("{subject} ACE header is truncated")));
             }
             // SAFETY: AceSize covers the ACCESS_ALLOWED_ACE prefix checked above.
             let ace = unsafe { &*(raw_ace.cast::<ACCESS_ALLOWED_ACE>()) };
             if ace.Mask != FILE_ALL_ACCESS {
-                return Err(policy_error("storage child ACE mask mismatch"));
+                return Err(policy_error(&format!("{subject} ACE mask mismatch")));
             }
             let sid = (&ace.SidStart as *const u32).cast_mut().cast::<c_void>();
             let sid_bytes = sid.cast::<u8>();
             // SAFETY: the checked ACE prefix includes the initial eight-byte SID header.
             let (revision, sub_authority_count) = unsafe { (*sid_bytes, *sid_bytes.add(1)) };
             if revision != 1 || sub_authority_count > 15 {
-                return Err(policy_error("storage child ACE SID is invalid"));
+                return Err(policy_error(&format!("{subject} ACE SID is invalid")));
             }
             let sid_size = 8 + usize::from(sub_authority_count) * std::mem::size_of::<u32>();
             if !ace_sid_fits(header.AceSize as usize, fixed_size, sid_size) {
-                return Err(policy_error("storage child ACE SID is truncated"));
+                return Err(policy_error(&format!("{subject} ACE SID is truncated")));
             }
             principals.push(sid_text(sid)?);
         }
@@ -766,7 +768,7 @@ mod platform {
         ];
         expected.sort();
         if principals != expected {
-            return Err(policy_error("storage child principals mismatch"));
+            return Err(policy_error(&format!("{subject} principal set mismatch")));
         }
         Ok(())
     }

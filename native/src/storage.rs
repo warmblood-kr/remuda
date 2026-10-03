@@ -561,7 +561,7 @@ fn storage_io_error(error: io::Error) -> String {
             | io::ErrorKind::AlreadyExists
             | io::ErrorKind::InvalidInput
     ) {
-        "denied: storage path is unsafe".into()
+        format!("denied: storage path is unsafe: {error}")
     } else {
         "unavailable: storage I/O failed".into()
     }
@@ -1474,6 +1474,15 @@ mod tests {
             .unwrap();
         lua.globals().set("remuda", remuda).unwrap();
         lua
+    }
+
+    #[test]
+    fn denied_storage_errors_include_the_underlying_message() {
+        let error = io::Error::new(io::ErrorKind::PermissionDenied, "child ACE mask mismatch");
+        assert_eq!(
+            storage_io_error(error),
+            "denied: storage path is unsafe: child ACE mask mismatch"
+        );
     }
 
     #[test]
