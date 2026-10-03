@@ -1238,7 +1238,8 @@ impl Drop for Cleanup {
     }
 }
 
-fn new_session(path: &Path, name: &str) {
+fn new_session(path: &Path, name: &str) -> Instant {
+    let created_at = Instant::now();
     let response = client::request(
         path,
         &Request::New {
@@ -1255,6 +1256,7 @@ fn new_session(path: &Path, name: &str) {
         Response::Value(name.to_string()),
         "New answers with the name it gave the session"
     );
+    created_at
 }
 
 #[cfg(unix)]
@@ -2357,7 +2359,8 @@ fn start_reader_waiting_session(socket: &Path, runtime: &Path) -> PathBuf {
     marker
 }
 
-fn start_shell_session(socket: &Path, script: &str) {
+fn start_shell_session(socket: &Path, script: &str) -> Instant {
+    let created_at = Instant::now();
     let response = client::request(
         socket,
         &Request::New {
@@ -2370,6 +2373,7 @@ fn start_shell_session(socket: &Path, script: &str) {
     )
     .expect("start session");
     assert!(matches!(response, Response::Value(_)));
+    created_at
 }
 
 #[cfg(unix)]
@@ -2700,11 +2704,11 @@ fn sync_reports_bracketed_paste_mode_enabled_by_child() {
     let _cleanup = RemoveDirectoryOnDrop(runtime.clone());
     let socket = daemon::socket_path_in(&runtime, "s");
     let mut running = spawn::Daemon::spawn(&runtime);
-    start_shell_session(
+    let created_at = start_shell_session(
         &socket,
         "stty raw -echo; printf '\\033[?2004h'; printf 'bracketed-sync-ready\\n'; sleep 30",
     );
-    wait_for(&socket, "versioned", "bracketed-sync-ready");
+    wait_for(&socket, "versioned", "bracketed-sync-ready", created_at);
     let session = listed_session(&socket);
     let response = client::request(
         &socket,
@@ -3097,7 +3101,7 @@ fn capture_styled_snapshot(path: &Path, name: &str, scrollback: usize) -> (Strin
     }
 }
 
-fn wait_for(path: &Path, name: &str, needle: &str) -> String {
+fn wait_for(path: &Path, name: &str, needle: &str, created_at: Instant) -> String {
     let mut deadline = Instant::now() + EMPTY_SCREEN_STARTUP_PATIENCE;
     let mut saw_output = false;
     loop {
@@ -3111,10 +3115,56 @@ fn wait_for(path: &Path, name: &str, needle: &str) -> String {
         }
         assert!(
             Instant::now() < deadline,
-            "{needle:?} never appeared in {name}. screen:\n{screen}"
+            "{needle:?} never appeared in {name}. screen:\n{screen}\n{}",
+            wait_for_diagnostics(path, name, created_at.elapsed())
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn wait_for_diagnostics(path: &Path, name: &str, elapsed: Duration) -> String {
+    let sessions = match client::request(path, &Request::List) {
+        Ok(Response::Sessions(sessions)) => format!(
+            "List sessions (name, alive, output_version, output_idle, size): {:?}",
+            sessions
+                .into_iter()
+                .map(|session| (
+                    session.name,
+                    session.alive,
+                    session.output_version,
+                    session.output_idle,
+                    session.size,
+                ))
+                .collect::<Vec<_>>()
+        ),
+        other => format!("List request failed: {other:?}"),
+    };
+    let capture = match client::request(
+        path,
+        &Request::CaptureStyled {
+            name: name.to_string(),
+            scrollback: 0,
+        },
+    ) {
+        Ok(Response::StyledScreen {
+            rows,
+            scrollback_len,
+            scrollback_total,
+            cursor,
+            ..
+        }) => {
+            let viewport = rows
+                .into_iter()
+                .map(|row| row.into_iter().map(|run| run.text).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "CaptureStyled viewport (scrollback_len/total={scrollback_len}/{scrollback_total}, cursor={cursor:?}):\n{viewport}"
+            )
+        }
+        other => format!("CaptureStyled request failed: {other:?}"),
+    };
+    format!("elapsed since session creation: {elapsed:?}\n{sessions}\n{capture}")
 }
 
 fn wait_for_session_screen(session: &Session, needle: &str) {
@@ -3249,7 +3299,7 @@ fn sessions_are_listed_and_kept_apart() {
         other => panic!("unexpected: {other:?}"),
     }
 
-    new_session(&path, "alpha");
+    let alpha_created_at = new_session(&path, "alpha");
     new_session(&path, "bravo");
 
     let names = match client::request(&path, &Request::List).expect("list") {
@@ -3260,16 +3310,19 @@ fn sessions_are_listed_and_kept_apart() {
 
     // Instructions must land in the session they name and nowhere else — the
     // property a shared pty would break.
-    client::request(
+    let send = client::request(
         &path,
         &Request::SendLine {
             name: "alpha".into(),
             text: "echo $((6*7))-alpha".into(),
         },
-    )
-    .expect("send");
+    );
+    assert!(
+        matches!(&send, Ok(Response::Ok)),
+        "SendLine response: {send:?}"
+    );
 
-    wait_for(&path, "alpha", "42-alpha");
+    wait_for(&path, "alpha", "42-alpha", alpha_created_at);
     let bravo = capture(&path, "bravo");
     assert!(
         !bravo.contains("42-alpha"),
@@ -3346,6 +3399,7 @@ fn a_session_launches_into_the_cwd_it_is_given() {
     let _daemon = daemon_at(&path);
 
     let dir = scratch_dir("cwd-target");
+    let created_at = Instant::now();
     let response = client::request(
         &path,
         &Request::New {
@@ -3367,14 +3421,14 @@ fn a_session_launches_into_the_cwd_it_is_given() {
         .and_then(|n| n.to_str())
         .expect("scratch dir has a name")
         .to_string();
-    wait_for(&path, "in-tmp", &needle);
+    wait_for(&path, "in-tmp", &needle, created_at);
 }
 
 #[test]
 fn a_live_session_resizes_and_reports_its_new_size() {
     let path = scratch("resize");
     let _daemon = daemon_at(&path);
-    new_session(&path, "resizable");
+    let created_at = new_session(&path, "resizable");
 
     let target = Size::new(120, 36);
     assert_eq!(
@@ -3401,7 +3455,7 @@ fn a_live_session_resizes_and_reports_its_new_size() {
         },
     )
     .expect("ask terminal size");
-    wait_for(&path, "resizable", "36 120");
+    wait_for(&path, "resizable", "36 120", created_at);
 }
 
 #[test]
@@ -3528,7 +3582,7 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     let dir = scratch_dir("attach");
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
-    new_session(&path, "target");
+    let created_at = new_session(&path, "target");
     let target_instance = match client::request(&path, &Request::List).expect("list target") {
         Response::Sessions(sessions) => sessions
             .into_iter()
@@ -3548,7 +3602,7 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
         },
     )
     .expect("send");
-    wait_for(&path, "target", "121-before");
+    wait_for(&path, "target", "121-before", created_at);
 
     // The real binary, on a real pty, so raw mode is actually entered.
     let trace_path = scratch_dir("attach-input-trace").join("input.hex");
@@ -3584,7 +3638,7 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
 
     // 2. Keystrokes reach the far session, and its output comes back.
     held.write_raw(b"echo $((6*7))-typed\r").expect("type");
-    wait_for(&path, "target", "42-typed");
+    wait_for(&path, "target", "42-typed", created_at);
     // ...and the attached human's keystrokes are what `human_idle` counts,
     // in the listing and in Lua's `ls()` row.
     assert!(
@@ -3636,7 +3690,7 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
         },
     );
     assert!(matches!(resumed, Ok(Response::Ok)), "{resumed:?}");
-    wait_for(&path, "target", "81-after");
+    wait_for(&path, "target", "81-after", created_at);
 
     // The server drops the hold asynchronously after Ctrl-\, so poll: close
     // must succeed once the release lands, and never before the deadline.
@@ -3870,7 +3924,7 @@ fn an_exited_conpty_session_is_reaped_by_list() {
 fn a_new_attach_takes_over_and_old_raw_clients_get_a_plain_notice() {
     let path = scratch("takeover");
     let _daemon = daemon_at(&path);
-    new_session(&path, "target");
+    let created_at = new_session(&path, "target");
 
     // This connection models a pre-upgrade client: it knows only the existing
     // Attach request followed by a raw byte stream, and treats EOF as ordinary.
@@ -3889,7 +3943,7 @@ fn a_new_attach_takes_over_and_old_raw_clients_get_a_plain_notice() {
     current
         .write_all(b"echo takeover-input\r")
         .expect("current client input");
-    wait_for(&path, "target", "takeover-input");
+    wait_for(&path, "target", "takeover-input", created_at);
     assert_eq!(target_row(&path, "r.attached"), "true");
 
     // A third attach is accepted immediately, even while the second daemon
@@ -3908,7 +3962,7 @@ fn a_new_attach_takes_over_and_old_raw_clients_get_a_plain_notice() {
 fn an_agent_printing_the_takeover_notice_does_not_end_a_tracked_attach() {
     let path = scratch("spoof-notice");
     let _daemon = daemon_at(&path);
-    new_session(&path, "target");
+    let created_at = new_session(&path, "target");
     let (stream, generation) = raw_attach_tracked(&path, "target");
 
     client::request(
@@ -3919,7 +3973,7 @@ fn an_agent_printing_the_takeover_notice_does_not_end_a_tracked_attach() {
         },
     )
     .expect("print the exact courtesy notice from the session");
-    wait_for(&path, "target", "attached elsewhere, detached");
+    wait_for(&path, "target", "attached elsewhere, detached", created_at);
     assert_eq!(
         client::request(
             &path,
@@ -4037,7 +4091,7 @@ fn a_tracked_client_exits_on_takeover_without_waiting_for_another_key() {
 fn session_listing_reports_the_child_mouse_tracking_mode() {
     let path = scratch("mouse-tracking-list");
     let _daemon = daemon_at(&path);
-    new_session(&path, "target");
+    let created_at = new_session(&path, "target");
 
     let listed = || match client::request(&path, &Request::List) {
         Ok(Response::Sessions(sessions)) => sessions
@@ -4056,7 +4110,7 @@ fn session_listing_reports_the_child_mouse_tracking_mode() {
         },
     )
     .expect("enable mouse tracking");
-    wait_for(&path, "target", "ready-mode");
+    wait_for(&path, "target", "ready-mode", created_at);
     assert!(listed().mouse_tracking);
 }
 
@@ -4066,7 +4120,7 @@ fn direct_attach_mouse_scrolls_the_full_history_and_returns_to_live_output() {
     let dir = scratch_dir("attach-mouse-scroll");
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
-    new_session(&path, "target");
+    let created_at = new_session(&path, "target");
 
     client::request(
         &path,
@@ -4078,8 +4132,8 @@ fn direct_attach_mouse_scrolls_the_full_history_and_returns_to_live_output() {
     .expect("write retained history");
     // `history-end` appears in the echoed shell command before execution; wait
     // for a generated row that is not present in the command text.
-    wait_for(&path, "target", "history-09999");
-    wait_for(&path, "target", "history-end");
+    wait_for(&path, "target", "history-09999", created_at);
+    wait_for(&path, "target", "history-end", created_at);
     let oldest = capture_styled(&path, "target", 10_000);
     assert!(
         oldest.contains("history-00014"),
@@ -4124,7 +4178,7 @@ fn direct_attach_mouse_scrolls_the_full_history_and_returns_to_live_output() {
         },
     )
     .expect("write after scroll mode");
-    wait_for(&path, "target", "resume-391");
+    wait_for(&path, "target", "resume-391", created_at);
     let resumed = collect_until_bytes(&output, b"resume-391");
     assert!(
         resumed
@@ -4142,7 +4196,7 @@ fn direct_attach_keeps_scrolled_content_anchored_as_output_arrives() {
     let dir = scratch_dir("attach-scroll-anchor");
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
-    new_session(&path, "target");
+    let created_at = new_session(&path, "target");
     client::request(
         &path,
         &Request::SendLine {
@@ -4151,7 +4205,7 @@ fn direct_attach_keeps_scrolled_content_anchored_as_output_arrives() {
         },
     )
     .expect("start output stream");
-    wait_for(&path, "target", "seed-039");
+    wait_for(&path, "target", "seed-039", created_at);
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
     cmd.args(["attach", "target"]);
@@ -4177,7 +4231,7 @@ fn direct_attach_keeps_scrolled_content_anchored_as_output_arrives() {
         .to_string();
     let (anchor_view, _, anchor_total) = capture_styled_snapshot(&path, "target", 3);
 
-    wait_for(&path, "target", "burst-003");
+    wait_for(&path, "target", "burst-003", created_at);
     let (_, history_rows, latest_total) = capture_styled_snapshot(&path, "target", 0);
     assert!(latest_total > anchor_total, "history did not advance");
     let expected_offset = 3usize
@@ -4210,7 +4264,7 @@ fn direct_attach_clears_stale_scrollback_indicator_when_history_is_clamped_to_ze
     let dir = scratch_dir("a-clamp");
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
-    new_session(&path, "target");
+    let created_at = new_session(&path, "target");
     client::request(
         &path,
         &Request::SendLine {
@@ -4219,7 +4273,7 @@ fn direct_attach_clears_stale_scrollback_indicator_when_history_is_clamped_to_ze
         },
     )
     .expect("start history then enter alternate screen");
-    wait_for(&path, "target", "clearseed-039");
+    wait_for(&path, "target", "clearseed-039", created_at);
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
     cmd.args(["attach", "target"]);
@@ -4342,6 +4396,7 @@ fn direct_attach_forwards_paging_keys_when_the_child_tracks_mouse() {
     let dir = scratch_dir("a-pg-mouse");
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
+    let created_at = Instant::now();
     let created = client::request(
         &path,
         &Request::New {
@@ -4358,7 +4413,7 @@ fn direct_attach_forwards_paging_keys_when_the_child_tracks_mouse() {
     )
     .expect("start mouse-reporting child");
     assert_eq!(created, Response::Value("target".into()));
-    wait_for(&path, "target", "mouse-page-ready");
+    wait_for(&path, "target", "mouse-page-ready", created_at);
     let deadline = Instant::now() + PATIENCE;
     loop {
         match client::request(
@@ -4485,6 +4540,7 @@ fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
     let script = "stty raw -echo; printf '\\033[?1000h\\033[?1006h\\033[?2004h'; dd bs=1 count=12 2>/dev/null | od -An -tx1; printf '\\nmouse-forwarded\\n'";
+    let created_at = Instant::now();
     let created = client::request(
         &path,
         &Request::New {
@@ -4533,7 +4589,7 @@ fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
     let output = held.subscribe().expect("capture viewer output");
     held.write_raw(b"\x1b[<64;10;10M")
         .expect("deliver host wheel report");
-    wait_for(&path, "target", "mouse-forwarded");
+    wait_for(&path, "target", "mouse-forwarded", created_at);
     let screen = capture(&path, "target").replace([' ', '\n'], "");
     assert!(
         screen.contains("1b5b3c36343b31303b31304d"),
@@ -4555,6 +4611,7 @@ fn mouse_off_knob_and_toggle_pass_reports_to_the_child_and_restore_host_modes() 
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
     let script = "stty raw -echo; printf 'child-ready\\n'; cat";
+    let created_at = Instant::now();
     let created = client::request(
         &path,
         &Request::New {
@@ -4567,7 +4624,7 @@ fn mouse_off_knob_and_toggle_pass_reports_to_the_child_and_restore_host_modes() 
     )
     .expect("start raw child");
     assert_eq!(created, Response::Value("target".into()));
-    wait_for(&path, "target", "child-ready");
+    wait_for(&path, "target", "child-ready", created_at);
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
     cmd.args(["attach", "target", "--mouse=false"]);
