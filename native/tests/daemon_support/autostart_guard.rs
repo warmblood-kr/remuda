@@ -29,17 +29,23 @@ impl Drop for AutostartDaemonGuard {
             .output();
 
         for pid in &pids {
-            let _ = Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .status();
+            if process_matches_runtime(*pid, &self.runtime) {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+            }
         }
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline && pids.iter().any(|pid| process_exists(*pid)) {
+        while Instant::now() < deadline
+            && pids
+                .iter()
+                .any(|pid| process_matches_runtime(*pid, &self.runtime))
+        {
             std::thread::sleep(Duration::from_millis(20));
         }
         for pid in pids {
-            if process_exists(pid) {
+            if process_matches_runtime(pid, &self.runtime) {
                 let _ = Command::new("kill")
                     .args(["-KILL", &pid.to_string()])
                     .status();
@@ -49,7 +55,7 @@ impl Drop for AutostartDaemonGuard {
         while Instant::now() < deadline
             && daemon_pids_for_runtime(&self.runtime)
                 .into_iter()
-                .any(process_exists)
+                .any(|pid| process_matches_runtime(pid, &self.runtime))
         {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -67,7 +73,6 @@ fn daemon_pids_for_runtime(runtime: &Path) -> Vec<u32> {
     if !output.status.success() {
         return Vec::new();
     }
-    let runtime_marker = format!("REMUDA_RUNTIME_DIR={}", runtime.display());
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
@@ -77,35 +82,73 @@ fn daemon_pids_for_runtime(runtime: &Path) -> Vec<u32> {
             (Path::new(executable)
                 .file_name()
                 .and_then(|name| name.to_str())
-                == Some("remuda"))
+                .is_some_and(|name| name.starts_with("remuda")))
             .then_some(pid)
         })
-        .filter(|pid| {
-            let pid = pid.to_string();
-            let output = Command::new("ps")
-                .args(["eww", "-p", &pid, "-o", "command="])
-                .output();
-            output.is_ok_and(|output| {
-                String::from_utf8_lossy(&output.stdout).contains(&runtime_marker)
-            })
-        })
+        .filter(|pid| process_matches_runtime(*pid, runtime))
         .collect()
 }
 
+#[cfg(unix)]
+/// Confirm the PID still belongs to a remuda process with this exact runtime.
+/// The `remuda` prefix also survives `ps` implementations that truncate `comm`.
+fn process_matches_runtime(pid: u32, runtime: &Path) -> bool {
+    let pid_arg = pid.to_string();
+    let comm = Command::new("ps")
+        .args(["-p", &pid_arg, "-o", "comm="])
+        .output();
+    let Ok(comm) = comm else {
+        return false;
+    };
+    if !comm.status.success()
+        || !String::from_utf8_lossy(&comm.stdout)
+            .lines()
+            .next()
+            .and_then(|name| Path::new(name.trim()).file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("remuda"))
+    {
+        return false;
+    }
+
+    let command = Command::new("ps")
+        .args(["eww", "-p", &pid_arg, "-o", "command="])
+        .output();
+    let Ok(command) = command else {
+        return false;
+    };
+    command.status.success()
+        && runtime_env_token_matches(
+            &String::from_utf8_lossy(&command.stdout),
+            &format!("REMUDA_RUNTIME_DIR={}", runtime.display()),
+        )
+}
+
+fn runtime_env_token_matches(command: &str, expected_token: &str) -> bool {
+    command
+        .split_whitespace()
+        .any(|token| token == expected_token)
+}
+
+/// Windows has no `ps`-based PID discovery here; cleanup uses the graceful CLI stop only.
 #[cfg(not(unix))]
 fn daemon_pids_for_runtime(_runtime: &Path) -> Vec<u32> {
     Vec::new()
 }
 
-#[cfg(unix)]
-fn process_exists(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .is_ok_and(|status| status.success())
-}
+#[cfg(test)]
+mod tests {
+    use super::runtime_env_token_matches;
 
-#[cfg(not(unix))]
-fn process_exists(_pid: u32) -> bool {
-    false
+    #[test]
+    fn runtime_match_requires_an_exact_environment_token() {
+        assert!(runtime_env_token_matches(
+            "remuda daemon REMUDA_RUNTIME_DIR=/tmp/rcx-123 -s s",
+            "REMUDA_RUNTIME_DIR=/tmp/rcx-123"
+        ));
+        assert!(!runtime_env_token_matches(
+            "remuda daemon REMUDA_RUNTIME_DIR=/tmp/rcx-1234 -s s",
+            "REMUDA_RUNTIME_DIR=/tmp/rcx-123"
+        ));
+    }
 }
