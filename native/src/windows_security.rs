@@ -1214,6 +1214,17 @@ mod tests {
     }
 
     #[test]
+    fn inherited_ace_matcher_applies_file_and_directory_rules() {
+        let file_all_access = 0x001F_01FF;
+        assert!(inherited_child_ace_matches(true, 0x13, file_all_access));
+        assert!(inherited_child_ace_matches(false, 0x10, file_all_access));
+        assert!(!inherited_child_ace_matches(false, 0x11, file_all_access));
+        assert!(!inherited_child_ace_matches(false, 0x18, file_all_access));
+        assert!(!inherited_child_ace_matches(false, 0x00, file_all_access));
+        assert!(!inherited_child_ace_matches(false, 0x10, 0x1000_0000));
+    }
+
+    #[test]
     fn localappdata_mapping_prefers_absolute_localappdata() {
         assert_eq!(
             storage_root_for(&env(&[
