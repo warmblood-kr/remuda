@@ -90,15 +90,7 @@ pub(crate) fn base_dir_for(kind: Kind, windows: bool, env: Env<'_>) -> Result<Pa
         return Ok(path);
     }
     if windows {
-        if let Some(path) = env_absolute(env, "LOCALAPPDATA", true) {
-            return Ok(path);
-        }
-        if let Some(profile) = env_absolute(env, "USERPROFILE", true) {
-            return Ok(profile.join("AppData").join("Local"));
-        }
-        return Err(
-            "unavailable: LOCALAPPDATA and USERPROFILE are not set to absolute paths".into(),
-        );
+        return crate::windows_security::local_appdata_for(env);
     }
     if let Some(home) = env_absolute(env, "HOME", false) {
         return Ok(home.join(kind.unix_subdir()));
@@ -728,6 +720,20 @@ fn file_roots(env: Env<'_>) -> Result<FileRoots, String> {
     {
         return Err("REMUDA_STORAGE_ROOT must be an absolute path".into());
     }
+    #[cfg(windows)]
+    return [Kind::Config, Kind::Data, Kind::State, Kind::Cache]
+        .into_iter()
+        .map(|kind| {
+            let root = match &override_root {
+                Some(root) => root.join(kind.as_str()),
+                None => resolve_dir_for(kind.as_str(), true, env)?,
+            };
+            crate::windows_security::ensure_storage_root(&root.join("storage"))
+                .map_err(|_| "unavailable: storage root security check failed".to_owned())?;
+            Ok((kind.as_str(), root))
+        })
+        .collect();
+    #[cfg(not(windows))]
     [Kind::Config, Kind::Data, Kind::State, Kind::Cache]
         .into_iter()
         .map(|kind| {
@@ -919,7 +925,7 @@ impl KindHandle {
             if matches!(self.kind, HandleKind::Secret) {
                 return Ok((
                     None,
-                    Some("unavailable: file secrets are disabled until PR C".into()),
+                    Some("unavailable: file secrets require reparse-safe storage".into()),
                 ));
             }
             let location = match self.file_path(&key.2, false) {
@@ -961,7 +967,7 @@ impl KindHandle {
         if self.roots.is_some() {
             if matches!(self.kind, HandleKind::Secret) {
                 return Err(mlua::Error::runtime(
-                    "unavailable: file secrets are disabled until PR C",
+                    "unavailable: file secrets require reparse-safe storage",
                 ));
             }
             let location = self
@@ -1037,7 +1043,7 @@ impl KindHandle {
             if matches!(self.kind, HandleKind::Secret) {
                 return Ok((
                     None,
-                    Some("unavailable: file secrets are disabled until PR C".into()),
+                    Some("unavailable: file secrets require reparse-safe storage".into()),
                 ));
             }
             let location = match self.file_path(&key.2, false) {
@@ -1071,7 +1077,7 @@ impl KindHandle {
         if self.roots.is_some() {
             if matches!(self.kind, HandleKind::Secret) {
                 return Err(mlua::Error::runtime(
-                    "unavailable: file secrets are disabled until PR C",
+                    "unavailable: file secrets require reparse-safe storage",
                 ));
             }
             let location = match self.file_path("", false) {
@@ -1136,11 +1142,11 @@ impl UserData for SecretHandle {
                         "remuda.storage.secret.put secret must be 1..=2048 bytes",
                     ));
                 }
-                // File secrets stay unavailable until PR C adds the protected Windows DACL root.
+                // File secrets stay unavailable until Windows uses reparse-safe file handles.
                 if this.0.roots.is_some() {
                     return Ok((
                         None,
-                        Some("unavailable: file secrets are disabled until PR C".to_string()),
+                        Some("unavailable: file secrets require reparse-safe storage".to_string()),
                     ));
                 }
                 this.0.write(name, &secret.as_bytes())?;
@@ -1401,6 +1407,8 @@ mod tests {
     fn xdg_list_skips_and_reserves_atomic_temporary_names() {
         let root = TestRoot::new();
         let namespace = root.0.join("data/storage/listed");
+        #[cfg(windows)]
+        crate::windows_security::ensure_storage_root(&root.0.join("data/storage")).unwrap();
         fs::create_dir_all(&namespace).unwrap();
         fs::write(namespace.join("regular"), b"file").unwrap();
         fs::write(namespace.join(".remuda-atomic-123.tmp"), b"temporary").unwrap();
@@ -1461,7 +1469,22 @@ mod tests {
         )
         .exec()
         .unwrap();
+        #[cfg(windows)]
+        assert!(!contains_regular_file(&root.0).unwrap());
+        #[cfg(unix)]
         assert!(fs::read_dir(&root.0).unwrap().next().is_none());
+    }
+
+    #[cfg(windows)]
+    fn contains_regular_file(path: &Path) -> io::Result<bool> {
+        for entry in fs::read_dir(path)? {
+            let child = entry?.path();
+            let file_type = fs::symlink_metadata(&child)?.file_type();
+            if file_type.is_file() || (file_type.is_dir() && contains_regular_file(&child)?) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     #[cfg(unix)]
@@ -1487,6 +1510,8 @@ mod tests {
     fn xdg_read_rejects_files_larger_than_one_mib() {
         let root = TestRoot::new();
         let namespace = root.0.join("data/storage/reader");
+        #[cfg(windows)]
+        crate::windows_security::ensure_storage_root(&root.0.join("data/storage")).unwrap();
         fs::create_dir_all(&namespace).unwrap();
         fs::write(namespace.join("large"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
         let lua = lua_with_xdg_root(&root.0);
@@ -1702,6 +1727,19 @@ mod tests {
     fn run_handle_conformance(lua: &Lua, backend: &str) {
         select_backend(lua, backend);
         lua.load(HANDLE_CONFORMANCE).exec().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn setting_file_backend_creates_verified_storage_root() {
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        for kind in ["config", "data", "state", "cache"] {
+            let storage_root = root.0.join(kind).join("storage");
+            assert!(storage_root.is_dir());
+            crate::windows_security::verify_storage_root(&storage_root).unwrap();
+        }
     }
 
     #[test]

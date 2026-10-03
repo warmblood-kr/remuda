@@ -37,6 +37,7 @@ pub(crate) mod storage;
 pub mod text;
 pub mod tick;
 pub mod tui;
+pub(crate) mod windows_security;
 
 /// Path used to persist command history for the REPL binary.
 #[doc(hidden)]
