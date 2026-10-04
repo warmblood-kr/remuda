@@ -2857,10 +2857,10 @@ mod tests {
     #[cfg(unix)]
     use super::trace_input_read;
     use super::{
-        client_timeout_from, detach_offset, interpret, report_attach_input_dropped, reset_input_modes, route_tokens,
-        truncate_terminal_text, write_input_trace, AttachInputQueue, AttachRoute, Hold,
-        HoldInputWriter, SecretPromptMode, SecretPromptTerminal, ATTACH_INPUT_STALL, DETACH,
-        RESET_INPUT_MODES,
+        client_timeout_from, detach_offset, interpret, report_attach_input_dropped,
+        reset_input_modes, route_tokens, truncate_terminal_text, write_input_trace,
+        AttachInputQueue, AttachRoute, Hold, HoldInputWriter, SecretPromptMode,
+        SecretPromptTerminal, ATTACH_INPUT_STALL, DETACH, RESET_INPUT_MODES,
     };
     #[cfg(unix)]
     use super::{read_response_with_timeout, request_with_timeout};
