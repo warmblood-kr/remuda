@@ -92,10 +92,56 @@ fn probe_argv() -> String {
     )
 }
 
+/// Child output for a failure message. The probe line carries the child's whole
+/// environment, API keys included, so it shows variable names only.
+fn redact_probe(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let Some(at) = line.find(PROBE_PREFIX) else {
+                return line.to_string();
+            };
+            let (head, rest) = (&line[..at], &line[at + PROBE_PREFIX.len()..]);
+            match serde_json::from_str::<BTreeMap<String, serde_json::Value>>(rest) {
+                Ok(vars) => {
+                    let names = vars.keys().cloned().collect::<Vec<_>>().join(",");
+                    format!("{head}{PROBE_PREFIX}<{} vars: {names}>", vars.len())
+                }
+                Err(_) => format!("{head}{PROBE_PREFIX}<unparsable, redacted>"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `assert_eq!` on two environments would print both, values included.
+fn assert_same_environment(
+    actual: &BTreeMap<String, String>,
+    expected: &BTreeMap<String, String>,
+    context: &str,
+) {
+    let names = |from: &BTreeMap<String, String>, other: &BTreeMap<String, String>| {
+        from.keys()
+            .filter(|name| !other.contains_key(*name))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let changed = expected
+        .iter()
+        .filter(|(name, value)| actual.get(*name).is_some_and(|got| got != *value))
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        actual == expected,
+        "{context}: child environment differs (names only): unexpected {:?}, missing {:?}, wrong value {changed:?}",
+        names(actual, expected),
+        names(expected, actual),
+    );
+}
+
 fn probe_environment(line: &str) -> BTreeMap<String, String> {
     let json = line
         .strip_prefix(PROBE_PREFIX)
-        .unwrap_or_else(|| panic!("probe result prefix missing in {line:?}"));
+        .unwrap_or_else(|| panic!("probe result prefix missing in {:?}", redact_probe(line)));
     let mut environment: BTreeMap<String, String> =
         serde_json::from_str(json).expect("probe environment JSON");
     // LLVM's coverage runtime adds this marker when an instrumented child
@@ -109,7 +155,12 @@ fn extract_probe(stdout: &str) -> BTreeMap<String, String> {
         stdout
             .lines()
             .find(|line| line.starts_with(PROBE_PREFIX))
-            .unwrap_or_else(|| panic!("child did not report environment: {stdout:?}")),
+            .unwrap_or_else(|| {
+                panic!(
+                    "child did not report environment: {:?}",
+                    redact_probe(stdout)
+                )
+            }),
     )
 }
 
@@ -178,6 +229,61 @@ fn process_env_probe_ignores_llvm_coverage_startup_marker() {
     );
 }
 
+const FAKE_SECRET: &str = "sk-fake-SECRET-123";
+
+fn panic_text(run: impl FnOnce() + std::panic::UnwindSafe) -> String {
+    let payload = std::panic::catch_unwind(run).expect_err("expected a panic");
+    match payload.downcast::<String>() {
+        Ok(text) => *text,
+        Err(payload) => payload
+            .downcast_ref::<&str>()
+            .map(|text| text.to_string())
+            .unwrap_or_default(),
+    }
+}
+
+#[test]
+fn a_probe_failure_message_never_contains_an_environment_value() {
+    let line = format!("test x ... {PROBE_PREFIX}{{\"K\":\"{FAKE_SECRET}\"}}");
+    let message = panic_text(|| {
+        probe_environment(&line);
+    });
+    assert!(message.contains("probe result prefix"), "{message}");
+    assert!(!message.contains(FAKE_SECRET), "secret leaked: {message}");
+}
+
+#[test]
+fn redact_probe_keeps_variable_names_and_drops_values() {
+    let text = format!(
+        "running 1 test\ntest process_env_child_probe ... {PROBE_PREFIX}{{\"OPENAI_API_KEY\":\"{FAKE_SECRET}\",\"KEEP\":\"v\"}}"
+    );
+    let redacted = redact_probe(&text);
+    assert!(!redacted.contains(FAKE_SECRET), "{redacted}");
+    assert!(!redacted.contains("v\""), "{redacted}");
+    assert!(redacted.contains("OPENAI_API_KEY") && redacted.contains("KEEP"));
+    assert!(redacted.starts_with("running 1 test\ntest process_env_child_probe ... "));
+    assert_eq!(
+        redact_probe(&format!("{PROBE_PREFIX}{{\"A\":\"{FAKE_SECRET}\",")),
+        format!("{PROBE_PREFIX}<unparsable, redacted>")
+    );
+    assert_eq!(
+        redact_probe("no probe here\nat all"),
+        "no probe here\nat all"
+    );
+}
+
+#[test]
+fn a_mismatched_environment_reports_names_not_values() {
+    let actual = BTreeMap::from([
+        ("OPENAI_API_KEY".to_string(), FAKE_SECRET.to_string()),
+        ("SAME".to_string(), "x".to_string()),
+    ]);
+    let expected = BTreeMap::from([("SAME".to_string(), "x".to_string())]);
+    let message = panic_text(|| assert_same_environment(&actual, &expected, "ctx"));
+    assert!(message.contains("OPENAI_API_KEY"), "{message}");
+    assert!(!message.contains(FAKE_SECRET), "secret leaked: {message}");
+}
+
 #[test]
 fn process_run_adds_env_on_top_of_the_inherited_environment() {
     let node = Node::start();
@@ -186,7 +292,7 @@ fn process_run_adds_env_on_top_of_the_inherited_environment() {
         probe_argv()
     ));
     let (status, stdout) = output.split_once('\n').expect("run status and stdout");
-    assert_eq!(status, "0", "{output}");
+    assert_eq!(status, "0", "{}", redact_probe(&output));
     let env = extract_probe(stdout);
     assert_eq!(
         env.get("REMUDA_PROCESS_ENV_PARENT").map(String::as_str),
@@ -208,8 +314,12 @@ fn process_run_clear_env_passes_exactly_the_requested_variables() {
         lua_env(&expected)
     ));
     let (status, stdout) = output.split_once('\n').expect("run status and stdout");
-    assert_eq!(status, "0", "{output}");
-    assert_eq!(extract_probe(stdout), expected_after_clear(expected));
+    assert_eq!(status, "0", "{}", redact_probe(&output));
+    assert_same_environment(
+        &extract_probe(stdout),
+        &expected_after_clear(expected),
+        "process.run clear_env",
+    );
 }
 
 #[test]
@@ -248,11 +358,12 @@ fn process_async_applies_additive_and_cleared_environments() {
         let text = node.eval("return table.concat(process_env_lines, '\\n')");
         assert!(
             text.lines().any(|line| line.starts_with(PROBE_PREFIX)),
-            "clear_env={clear}: child did not report environment: {text:?}"
+            "clear_env={clear}: child did not report environment: {:?}",
+            redact_probe(&text)
         );
         let actual = extract_probe(&text);
         if clear {
-            assert_eq!(actual, expected_after_clear(env));
+            assert_same_environment(&actual, &expected_after_clear(env), "process clear_env");
         } else {
             assert_eq!(
                 actual.get("REMUDA_PROCESS_ENV_PARENT").map(String::as_str),
