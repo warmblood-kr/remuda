@@ -9,7 +9,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// CI injects the full version (including a nightly suffix); a local `cargo
 /// build` falls back to the manifest.
@@ -131,6 +131,54 @@ fn is_stale(cache: &Path) -> bool {
         .unwrap_or(true)
 }
 
+/// Pure display policy, kept separate from the cache and environment reads.
+pub fn should_show_update_notice(
+    stderr_is_terminal: bool,
+    agent_id_set: bool,
+    no_update_check_env: bool,
+    last_shown: Option<SystemTime>,
+    now: SystemTime,
+) -> bool {
+    if !stderr_is_terminal || agent_id_set || no_update_check_env {
+        return false;
+    }
+    match last_shown {
+        Some(last) => now
+            .duration_since(last)
+            .map(|elapsed| elapsed >= CHECK_INTERVAL)
+            .unwrap_or(false),
+        None => true,
+    }
+}
+
+fn notice_stamp_path(cache: &Path) -> PathBuf {
+    cache.with_file_name("update-notice-stamp")
+}
+
+/// The timestamp file sits next to the update index. Its contents are Unix
+/// seconds in decimal, followed by a newline; any read or parse error is silent.
+pub fn update_notice_last_shown() -> Option<SystemTime> {
+    read_notice_stamp(&notice_stamp_path(&cache_path()))
+}
+
+fn read_notice_stamp(path: &Path) -> Option<SystemTime> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let seconds = text.trim().parse::<u64>().ok()?;
+    UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
+}
+
+/// Persist a successfully displayed notice. Errors are intentionally silent.
+pub fn record_update_notice_shown(now: SystemTime) {
+    write_notice_stamp(&notice_stamp_path(&cache_path()), now);
+}
+
+fn write_notice_stamp(path: &Path, now: SystemTime) {
+    let Ok(elapsed) = now.duration_since(UNIX_EPOCH) else {
+        return;
+    };
+    let _ = std::fs::write(path, format!("{}\n", elapsed.as_secs()));
+}
+
 /// Fetch the index in the background and never wait for it. The trailing stamp
 /// is what stops an offline machine from spawning a fetch per command: a failed
 /// fetch still touches the cache, so the next attempt is a day away.
@@ -214,7 +262,9 @@ fn cache_path() -> PathBuf {
     cache_path_for(cfg!(windows), &|name| std::env::var_os(name))
 }
 
-/// The data home, parent of `remuda/`: `$XDG_DATA_HOME`, else `%LOCALAPPDATA%` on Windows or `$HOME/.local/share`; `None` if unknown.
+/// Data base directory, parent of `remuda/`: an absolute `$XDG_DATA_HOME`,
+/// else `%LOCALAPPDATA%` (or `%USERPROFILE%/AppData/Local`) on Windows or
+/// `$HOME/.local/share`; relative XDG values are ignored. `None` if unknown.
 pub(crate) fn data_home() -> Option<PathBuf> {
     data_home_for(cfg!(windows), &|name| std::env::var_os(name))
 }
@@ -229,7 +279,7 @@ fn set(env: Env, name: &str) -> Option<PathBuf> {
 
 // Platform and environment are arguments so every arm runs on any host.
 fn data_home_for(windows: bool, env: Env) -> Option<PathBuf> {
-    set(env, "XDG_DATA_HOME").or_else(|| home_dir_for(windows, env, ".local/share"))
+    crate::storage::base_dir_for(crate::storage::Kind::Data, windows, env).ok()
 }
 
 fn cache_path_for(windows: bool, env: Env) -> PathBuf {
@@ -261,6 +311,61 @@ fn home_dir_for(windows: bool, env: Env, unix_sub: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_notice_policy() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(2 * 24 * 60 * 60);
+        let cases = [
+            ("first terminal notice", true, false, false, None, true),
+            (
+                "shown less than a day ago",
+                true,
+                false,
+                false,
+                Some(now - Duration::from_secs(24 * 60 * 60 - 1)),
+                false,
+            ),
+            (
+                "shown a day ago",
+                true,
+                false,
+                false,
+                Some(now - Duration::from_secs(24 * 60 * 60)),
+                true,
+            ),
+            ("stderr is not a terminal", false, false, false, None, false),
+            ("managed agent", true, true, false, None, false),
+            ("opted out", true, false, true, None, false),
+        ];
+        for (name, tty, agent, disabled, last_shown, expected) in cases {
+            assert_eq!(
+                should_show_update_notice(tty, agent, disabled, last_shown, now),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_notice_stamp_uses_epoch_seconds_and_ignores_io_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "remuda-update-stamp-{}-{}",
+            std::process::id(),
+            UNIX_EPOCH.elapsed().unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let stamp = root.join("update-notice-stamp");
+        let now = UNIX_EPOCH + Duration::from_secs(123_456);
+        write_notice_stamp(&stamp, now);
+        assert_eq!(std::fs::read_to_string(&stamp).unwrap(), "123456\n");
+        assert_eq!(read_notice_stamp(&stamp), Some(now));
+
+        let bad_stamp = root.join("directory");
+        std::fs::create_dir(&bad_stamp).unwrap();
+        write_notice_stamp(&bad_stamp, now);
+        assert_eq!(read_notice_stamp(&bad_stamp), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn a_release_outranks_its_own_nightlies_and_the_triple_wins_first() {
@@ -354,22 +459,29 @@ mod tests {
     #[test]
     fn windows_xdg_wins_and_localappdata_falls_back_to_the_profile() {
         let env = env_of(&[
-            ("XDG_DATA_HOME", "/x"),
+            ("XDG_DATA_HOME", r"C:\xdg\data"),
             ("XDG_CACHE_HOME", "/c"),
-            ("LOCALAPPDATA", "L"),
+            ("LOCALAPPDATA", r"C:\Users\user\AppData\Local"),
         ]);
-        assert_eq!(data_home_for(true, &env), Some(PathBuf::from("/x")));
+        assert_eq!(
+            data_home_for(true, &env),
+            Some(PathBuf::from(r"C:\xdg\data"))
+        );
         assert_eq!(
             cache_path_for(true, &env),
             PathBuf::from("/c/remuda/update-check.json")
         );
         for env in [
-            env_of(&[("USERPROFILE", "P")]),
-            env_of(&[("LOCALAPPDATA", ""), ("USERPROFILE", "P")]),
+            env_of(&[("USERPROFILE", r"C:\Users\user")]),
+            env_of(&[("LOCALAPPDATA", ""), ("USERPROFILE", r"C:\Users\user")]),
         ] {
             assert_eq!(
                 data_home_for(true, &env),
-                Some(PathBuf::from("P").join("AppData").join("Local"))
+                Some(
+                    PathBuf::from(r"C:\Users\user")
+                        .join("AppData")
+                        .join("Local")
+                )
             );
         }
         assert_eq!(data_home_for(true, &env_of(&[("HOME", "/h")])), None);
@@ -387,13 +499,17 @@ mod tests {
             PathBuf::from("/h/.cache/remuda/update-check.json")
         );
         let env = env_of(&[("USERPROFILE", "/p")]);
-        assert_eq!(
-            data_home_for(false, &env),
-            Some(PathBuf::from("/p/.local/share"))
-        );
+        assert_eq!(data_home_for(false, &env), None);
         assert_eq!(
             data_home_for(false, &env_of(&[("XDG_DATA_HOME", "")])),
             None
+        );
+        assert_eq!(
+            data_home_for(
+                false,
+                &env_of(&[("XDG_DATA_HOME", "relative"), ("HOME", "/h")]),
+            ),
+            Some(PathBuf::from("/h/.local/share"))
         );
         assert_eq!(
             data_home_for(false, &env_of(&[("XDG_DATA_HOME", "/x")])),

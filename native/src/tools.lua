@@ -90,6 +90,7 @@ register("tools", "The `remuda.tool` registry table, keyed by tool name.", "tabl
 register("_extension_commands", "Handlers registered for installed mod commands.", "table")
 register("extension_command", "Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind and session fields, plus forwarded env/stdin values; kind outside does not establish operator identity.", "extension_command(name, handler(args, caller)) -> nil")
 register("_dispatch_extension_command", "Dispatch arguments and caller context to a loaded mod command handler.", "_dispatch_extension_command(name, args, caller) -> value")
+register("_exec_commands", "Load a mod and run its optional commands hook without starting it; legacy mods keep their existing start behavior.", "_exec_commands(name) -> nil")
 
 -- #394: a mod subcommand loads its mod on first use, so the first command
 -- after an install works. OWNER names an installed mod (`exec` resolves
@@ -98,7 +99,7 @@ register("_dispatch_extension_command", "Dispatch arguments and caller context t
 -- readiness, load from the CLI instead (probe, `remuda exec`, dispatch).
 function remuda._load_extension_command(name, owner)
   if remuda._extension_commands[name] then return false end
-  local loaded, err = pcall(remuda.exec, owner)
+  local loaded, err = pcall(remuda._exec_commands, owner)
   if loaded and remuda._extension_commands[name] then return true end
   remuda._extension_commands[name], extension_command_owners[name] = nil, nil
   local reason = loaded and ("it did not register the command " .. tostring(name))
@@ -1092,7 +1093,8 @@ local function clear_imperative_module_registrations(name, activation)
 end
 
 local function stop_module_activation(name, module)
-  if not module or not module.stop or module.stopped then return end
+  if not module or not module.stop or module.stopped
+    or (module.start and not module.start_attempted) then return end
   module.stopped = true
   local ok, err = pcall(module.stop, module.state)
   if not ok then
@@ -1161,14 +1163,19 @@ local function array_length(value, label)
   return length
 end
 
--- REACTIVATE false is `exec`: ensure the mod is active, but leave an active
--- one (and its `start` effects) alone — only `reload` re-runs `start` (#116).
+-- REACTIVATE false is `exec`: ensure the mod is active and launch a
+-- commands-only activation once; leave a started mod alone. Only `reload`
+-- replaces an activation and re-runs its hooks (#116).
 -- A `start` that failed rolls back (#129), so the next `exec` retries it.
-function remuda._activate_module(name, candidate, reactivate)
+function remuda._activate_module(name, candidate, reactivate, commands_only)
   if type(name) ~= "string" or name == "" then
     error("module name must be a non-empty string", 0)
   end
   if reactivate == false and modules[name] ~= nil then
+    local active = modules[name]
+    if not commands_only and not active.started and active.start then
+      return false, active.state, active.start, active.rollback, nil
+    end
     return false
   end
   if type(candidate) ~= "table" or candidate.api ~= "remuda-module-v1" then
@@ -1183,6 +1190,9 @@ function remuda._activate_module(name, candidate, reactivate)
   end
   if candidate.start ~= nil and type(candidate.start) ~= "function" then
     error("module start must be a function", 0)
+  end
+  if candidate.commands ~= nil and type(candidate.commands) ~= "function" then
+    error("module commands must be a function", 0)
   end
   if candidate.stop ~= nil and type(candidate.stop) ~= "function" then
     error("module stop must be a function", 0)
@@ -1450,13 +1460,20 @@ function remuda._activate_module(name, candidate, reactivate)
   local stop = candidate.stop and function(stopped_state)
     return with_owner(name, candidate.stop, stopped_state)
   end
+  local activation
   local start = candidate.start and function(started_state)
-    return with_owner(name, candidate.start, started_state)
+    activation.start_attempted = true
+    local result = with_owner(name, candidate.start, started_state)
+    activation.started = true
+    return result
+  end
+  local commands = candidate.commands and function(command_state)
+    return with_owner(name, candidate.commands, command_state)
   end
   local ready = candidate.ready and function(ready_state)
     return with_owner(name, candidate.ready, ready_state)
   end
-  local activation = {
+  activation = {
     version = version,
     state = state,
     tools = tool_names,
@@ -1465,6 +1482,9 @@ function remuda._activate_module(name, candidate, reactivate)
     contributions = declared_contributions,
     stop = stop,
     start = start,
+    commands = commands,
+    started = false,
+    start_attempted = false,
     ready = ready,
     timeout_ms = timeout_ms,
     stopped = false,
@@ -1585,7 +1605,10 @@ function remuda._activate_module(name, candidate, reactivate)
       end
     end
   end
-  return true, state, start, rollback
+  activation.rollback = rollback
+  local launch_start = start
+  if commands_only and commands then launch_start = nil end
+  return true, state, launch_start, rollback, commands
 end
 
 -- Called by the daemon's clean shutdown path. A snapshot avoids mutation
@@ -1941,6 +1964,144 @@ register("_call", "Dispatch one MCP tools/call by name.", "_call(name, arguments
 -- separately-timed submit key after the composer shows the text.
 remuda.input = {}
 
+local input_line_prompt_glyphs = { "❯", ">", "›" }
+local input_line_codex_placeholder = "Ask Codex to do anything"
+
+local function input_line_trim(text)
+  local first = text:find("%S")
+  if not first then return "" end
+  local last = #text
+  while last >= first and text:sub(last, last):match("%s") do
+    last = last - 1
+  end
+  return text:sub(first, last)
+end
+
+local function input_line_row_text(row, ignore_dim)
+  local parts = {}
+  for _, span in ipairs(row or {}) do
+    if not (ignore_dim and span.dim) then
+      parts[#parts + 1] = span.text or ""
+    end
+  end
+  return table.concat(parts)
+end
+
+-- true means only that the cursor row matches the empty-prompt shape; callers
+-- must add per-kind checks. Require a visible cursor and no draft rows in its
+-- contiguous composer block. Dim spans are dropped before cursor-column math,
+-- and Claude frame bars must start in column one (indented frames return nil).
+-- A continuation prompt after a blank row can still read as empty; rows below
+-- the cursor are not checked, and the Codex placeholder is empty regardless.
+local function input_line_empty_from_snapshot(kind, screen)
+  if kind ~= nil and kind ~= "shell" and kind ~= "claude" and kind ~= "codex" then
+    return nil, "opts.kind must be shell, claude, or codex"
+  end
+  if type(screen) ~= "table" or type(screen.rows) ~= "table" or type(screen.cursor) ~= "table" then
+    return nil, "capture_styled did not return rows and cursor metadata"
+  end
+  local cursor = screen.cursor
+  if cursor.visible ~= true then return nil, "session cursor is hidden" end
+  if type(cursor.row) ~= "number" or cursor.row % 1 ~= 0
+      or cursor.row < 1 or cursor.row > #screen.rows then
+    return nil, "session cursor row is outside the captured screen"
+  end
+
+  local lines = {}
+  local has_claude_frame = kind == "claude"
+  for index, row in ipairs(screen.rows) do
+    -- Butler's notify policy discards dim spans on the cursor row before
+    -- checking it: dim ghost suggestions are not unsent user input.
+    lines[index] = input_line_row_text(row, index == cursor.row):gsub("\194\160", " ")
+  end
+
+  -- In generic mode, a stray vertical box character elsewhere on screen is
+  -- not enough to classify the cursor row as a Claude composer frame.
+  if kind == nil then
+    local cursor_raw = lines[cursor.row]
+    if cursor_raw:sub(1, 3) == "│" then
+      local after_frame = cursor_raw:sub(4):gsub("^ +", "")
+      for _, glyph in ipairs(input_line_prompt_glyphs) do
+        if after_frame:sub(1, #glyph) == glyph then has_claude_frame = true; break end
+      end
+    end
+  end
+
+  -- Only inspect the contiguous composer block. A blank row ends the block;
+  -- Claude's top frame border ends it without counting as composer content.
+  for index = cursor.row - 1, 1, -1 do
+    local row = lines[index]:gsub("^%s+", "")
+    if has_claude_frame then
+      local is_top_border = false
+      for _, border in ipairs({ "╭", "┌", "─" }) do
+        if row:sub(1, #border) == border then is_top_border = true; break end
+      end
+      if is_top_border then break end
+    end
+    if has_claude_frame and row:sub(1, 3) == "│" then
+      row = row:sub(4):gsub("│%s*$", "")
+    end
+    if input_line_trim(row) == "" then break end
+    return nil, "non-blank rows appear above the cursor prompt"
+  end
+
+  local raw_cursor_line = lines[cursor.row]
+  local is_framed_prompt = has_claude_frame and raw_cursor_line:sub(1, 3) == "│"
+  local prompt_line = raw_cursor_line
+  if is_framed_prompt then prompt_line = prompt_line:sub(4) end
+  local cursor_line = prompt_line:gsub("^ +", "")
+  local prompt_glyph, text
+  for _, glyph in ipairs(input_line_prompt_glyphs) do
+    if cursor_line:sub(1, #glyph) == glyph then
+      prompt_glyph, text = glyph, cursor_line:sub(#glyph + 1)
+      break
+    end
+  end
+  if not prompt_glyph then return nil, "cursor row has no supported prompt glyph" end
+
+  -- capture_styled converts the terminal's zero-based cursor to a 1-based
+  -- cell column for Lua. These prompt glyphs and the frame bar each occupy
+  -- one cell; allow the caret immediately after the glyph or one trailing
+  -- space, and fail closed for every other cursor position.
+  local leading_spaces = prompt_line:match("^( *)") or ""
+  local prompt_prefix_cells = #leading_spaces + (is_framed_prompt and 1 or 0) + 1
+  if cursor.col ~= prompt_prefix_cells + 1 and cursor.col ~= prompt_prefix_cells + 2 then
+    return nil, "cursor column is not immediately after the prompt glyph"
+  end
+
+  text = input_line_trim(text:gsub("│%s*$", ""))
+  if (kind == "codex" or kind == nil) and text == input_line_codex_placeholder then
+    return true
+  end
+  if text ~= "" then return nil, "cursor prompt contains visible text" end
+
+  -- Rows below the cursor are footer area (`? for shortcuts` applies to all
+  -- kinds); they never change the cursor-row allow-list result.
+  return true
+end
+
+function remuda.input_line_empty(session, opts)
+  if type(session) ~= "string" or session == "" then
+    return nil, "session must be a non-empty name"
+  end
+  if opts ~= nil and type(opts) ~= "table" then
+    return nil, "opts must be a table"
+  end
+  local kind = opts and opts.kind
+  if kind ~= nil and kind ~= "shell" and kind ~= "claude" and kind ~= "codex" then
+    return nil, "opts.kind must be shell, claude, or codex"
+  end
+  local ok, screen = pcall(remuda.capture_styled, session)
+  if not ok then return nil, tostring(screen) end
+  return input_line_empty_from_snapshot(kind, screen)
+end
+
+register(
+  "input_line_empty",
+  "true means only that the cursor row matches the empty-prompt shape; callers must add per-kind checks. Return true only when the cursor is immediately after a recognized prompt glyph (or one optional space) and its contiguous composer block above contains no non-blank rows; a blank row ends the block, and a Claude top frame border ends its frame. Other ambiguous screens return nil and a reason. Dim ghost spans are dropped before cursor-column math; dim ghost text is ignored, and visible paste placeholders count as content. Claude frame bars must start in column one; an indented frame returns nil. The exact Codex placeholder counts as empty for codex or generic mode. Pass opts.kind = 'shell', 'claude', or 'codex' for that policy; kind is optional, but agent-specific layouts can be ambiguous without it. Limit: a continuation prompt after a blank row inside the composer can still read as empty; rows below the cursor are not inspected (including '? for shortcuts' for every kind), and the Codex placeholder counts as empty regardless of rows below. Use stricter agent-specific recognizers in Butler Lua per kind. Unlike Butler's helper, this word requires a visible cursor, rejects unknown kinds, and recognizes only the built-in Codex placeholder.",
+  "input_line_empty(session, opts?) -> true | nil, reason"
+)
+
 function remuda.input.text(session, text)
   remuda._input_text(session, tostring(text))
 end
@@ -2256,7 +2417,9 @@ local function process_start(spec)
   if spec.cwd ~= nil and (type(spec.cwd) ~= "string" or not utf8.len(spec.cwd)) then
     error("process cwd must be an absolute path to an existing directory. Next: pass the directory's full path.", 2)
   end
-  local id, refused = remuda._process_spawn(spec.argv, spec.on_line, spec.on_exit, spec.cwd)
+  local id, refused = remuda._process_spawn(
+    spec.argv, spec.on_line, spec.on_exit, spec.cwd, spec.env, spec.clear_env
+  )
   if id == nil then error(refused, 2) end
   return id
 end
@@ -2288,15 +2451,17 @@ local function process_run(spec)
   if spec.cwd ~= nil and (type(spec.cwd) ~= "string" or not utf8.len(spec.cwd)) then
     error("process.run cwd must be an absolute path to an existing directory. Next: pass the directory's full path.", 2)
   end
-  local result, refused = remuda._process_run(spec.argv, spec.stdin, timeout, spec.cwd, stdin_hold_until_lines)
+  local result, refused = remuda._process_run(
+    spec.argv, spec.stdin, timeout, spec.cwd, stdin_hold_until_lines, spec.env, spec.clear_env
+  )
   if result == nil then error(refused, 2) end
   return result
 end
 remuda.process = setmetatable({ run = process_run }, {
   __call = function(_, spec) return process_start(spec) end,
 })
-register("process", "Spawn an asynchronous plain-pipe child; process.run executes argv synchronously with bounded timeout and output. `cwd`, when given, is an absolute path to an existing directory where the child starts; with it argv[1] must be an absolute path or a bare command name, and a bare name is searched on the absolute entries of PATH only (never in cwd). Use this word, not process.run, for a command that can take longer than 30 seconds.", "process{argv, on_line?, on_exit?, cwd?} -> id; process.run(spec) -> {code, stdout, stderr, timed_out}")
-register("process.run", "Run argv directly without a shell; inherits the daemon's environment and, unless `cwd` is given, its working directory. `cwd` is an absolute path to an existing directory where the child starts; with it argv[1] must be an absolute path or a bare command name, and a bare name is searched on the absolute entries of PATH only (never in cwd). Blocks the Lua image until exit or timeout (default 5s, max 30s; longer commands use remuda.process), captures each stream up to 1 MiB. `stdin_hold_until_lines`, when set to an integer from 1 through 1000, keeps stdin open until stdout has that many newlines, the child exits, or timeout. Surviving descendants can keep pipes open; at most 16 background output readers are allowed.", "process.run{argv, stdin?, timeout?, cwd?, stdin_hold_until_lines?} -> {code, stdout, stderr, timed_out, signal?}")
+register("process", "Spawn an asynchronous plain-pipe child; process.run executes argv synchronously with bounded timeout and output. `env`, when given, sets string variables on top of the daemon's environment. `clear_env=true` starts with an empty environment before applying `env`; callers must pass every variable the child needs, including SystemRoot and PATH on Windows. Names cannot be empty or contain '=' or NUL; names and values must be strings, and values cannot contain NUL. On Windows, environment names are case-insensitive: names differing only by case refer to the same variable, and which value wins is undefined; do not pass both. `cwd`, when given, is an absolute path to an existing directory where the child starts. With `cwd`, a bare argv[1] is searched in the daemon's absolute PATH entries; without `cwd`, lookup uses the child's PATH. With `cwd`, `argv[1]` must be an absolute path or a bare command name, and a bare name is never searched in `cwd`. Use this word, not process.run, for a command that can take longer than 30 seconds.", "process{argv, on_line?, on_exit?, cwd?, env?, clear_env?} -> id; process.run(spec) -> {code, stdout, stderr, timed_out}")
+register("process.run", "Run argv directly without a shell; inherits the daemon's environment unless `clear_env=true`, then applies `env` string variables. Callers using a cleared environment must pass every variable the child needs, including SystemRoot and PATH on Windows. Names cannot be empty or contain '=' or NUL; names and values must be strings, and values cannot contain NUL. On Windows, environment names are case-insensitive: names differing only by case refer to the same variable, and which value wins is undefined; do not pass both. Unless `cwd` is given, the child inherits the daemon's working directory. `cwd` is an absolute path to an existing directory where the child starts. With `cwd`, a bare argv[1] is searched in the daemon's absolute PATH entries; without `cwd`, lookup uses the child's PATH. With `cwd`, `argv[1]` must be an absolute path or a bare command name, and a bare name is never searched in `cwd`. Blocks the Lua image until exit or timeout (default 5s, max 30s; longer commands use remuda.process), captures each stream up to 1 MiB. `stdin_hold_until_lines`, when set to an integer from 1 through 1000, keeps stdin open until stdout has that many newlines, the child exits, or timeout. Surviving descendants can keep pipes open; at most 16 background output readers are allowed.", "process.run{argv, stdin?, timeout?, cwd?, stdin_hold_until_lines?, env?, clear_env?} -> {code, stdout, stderr, timed_out, signal?}")
 
 -- Everything defined so far is core's; a mod may not replace it (#145).
 for key in pairs(remuda) do core_fields[key] = true end

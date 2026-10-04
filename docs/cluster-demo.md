@@ -28,7 +28,7 @@ Initialize A with `remuda -s node-a cluster init` and B with `remuda -s node-b c
 1. On A, run `remuda -s node-a cluster invite --bind 127.0.0.1:7441`.
    Expected: A prints its node fingerprint and a one-line `remuda-join-v1` invite.
 2. On B, run `remuda -s node-b cluster join 'FINGERPRINT' 'ONE-LINE-INVITE' --bind 127.0.0.1:7442`, substituting the fingerprint and invite from A.
-   Expected: B prints `Joined cluster.`
+   Expected: B prints `Joined NODE-A (fingerprint SHA256:...).` with A's fingerprint, then `Next: remuda cluster remote`.
 3. On B, run `remuda -s node-b cluster remote NODE-A/demo`, substituting A's node name from `cluster init`.
    Expected: the TUI tree shows A and its live `demo` session selected.
 4. In B's remote TUI, type `hello-from-b` and press Enter.

@@ -188,6 +188,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sh scripts/check-cold-install.sh
+      - run: sh scripts/check-install-path-line.sh
 
   cold-room:
     # cold-install above runs check-cold-install.sh directly on the runner,

@@ -9,8 +9,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn remuda(dir: &Path, args: &[&str]) -> Output {
+    remuda_command(dir, ["-s", "s"].into_iter().chain(args.iter().copied()))
+}
+
+fn remuda_command<'a>(dir: &Path, args: impl IntoIterator<Item = &'a str>) -> Output {
     Command::new(env!("CARGO_BIN_EXE_remuda"))
-        .args(["-s", "s"])
         .args(args)
         .env("REMUDA_RUNTIME_DIR", dir)
         .env("XDG_DATA_HOME", dir.join("data"))
@@ -25,6 +28,34 @@ fn scratch(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+#[test]
+fn non_terminal_version_command_suppresses_cached_update_notice() {
+    let dir = scratch("non-tty-update-notice");
+    let cache_dir = dir.join("cache").join("remuda");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(
+        cache_dir.join("update-check.json"),
+        r#"{"stable":"999.0.0"}"#,
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .arg("version")
+        .env("HOME", &dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .env_remove("REMUDA_NO_UPDATE_CHECK")
+        .env_remove("REMUDA_BUTLER_AGENT_ID")
+        .output()
+        .expect("run remuda without a terminal");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        !stderr.contains("is out on the stable channel"),
+        "non-terminal command printed update notice: {stderr}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 struct SessionAutoStartScratch {
@@ -166,6 +197,52 @@ fn session_clients_block_default_autostart_but_explicit_other_still_starts() {
         scratch.socket(&server).exists(),
         "explicit other daemon did not start"
     );
+}
+
+#[test]
+fn empty_or_whitespace_server_names_are_refused_before_daemon_access() {
+    for (tag, server, verb) in [
+        ("empty-autostart", "", &["-e", "return true"][..]),
+        ("empty-read-only", "", &["ls"][..]),
+        ("spaces-autostart", " ", &["-e", "return true"][..]),
+        ("spaces-read-only", " ", &["ls"][..]),
+    ] {
+        let scratch = SessionAutoStartScratch::new(tag, None);
+        let out = Command::new(env!("CARGO_BIN_EXE_remuda"))
+            .args(["-s", server])
+            .args(verb)
+            .env("REMUDA_RUNTIME_DIR", &scratch.root)
+            .env("XDG_RUNTIME_DIR", &scratch.root)
+            .env("HOME", &scratch.root)
+            .env("XDG_CONFIG_HOME", scratch.root.join("config"))
+            .env("XDG_DATA_HOME", scratch.root.join("data"))
+            .env("REMUDA_NO_UPDATE_CHECK", "1")
+            .output()
+            .expect("run remuda with an invalid server name");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let socket = scratch.socket(server);
+
+        assert!(!out.status.success(), "accepted server {server:?}: {out:?}");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "invalid server name should be a usage error: {out:?}"
+        );
+        assert_eq!(
+            stderr,
+            "remuda: session name cannot be empty or whitespace.\nNext: name the session with -s NAME, or omit -s.\n",
+            "invalid server name should have one line plus Next:"
+        );
+        assert!(!socket.exists(), "started a daemon at {socket:?}: {stderr}");
+        assert!(
+            !scratch.root.join("remuda").exists(),
+            "created a runtime socket directory: {stderr}"
+        );
+        assert!(
+            daemon_pids_for_runtime(&scratch.root).is_empty(),
+            "left a daemon running for server {server:?}: {stderr}"
+        );
+    }
 }
 
 /// Run `args` against a stand-in at the private server's socket that only
@@ -317,10 +394,227 @@ fn help_flags_write_usage_to_stdout_and_mod_commands_to_stderr() {
 }
 
 #[test]
-fn upgrade_help_flags_explain_channels_and_daemon_lifecycle() {
-    let dir = scratch("upgrade-help-flags");
-    for args in [&["upgrade", "--help"][..], &["upgrade", "-h"]] {
+fn mod_verb_help_does_not_start_a_daemon_or_install_a_mod() {
+    let dir = scratch("mod-verb-help");
+    for verb in ["install", "list", "info", "test", "update", "remove"] {
+        let out = remuda(&dir, &["mod", verb, "--help"]);
+        assert!(out.status.success(), "{verb}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&format!("Usage: remuda mod {verb}")),
+            "{verb}: {out:?}"
+        );
+        assert!(out.stderr.is_empty(), "{verb}: {out:?}");
+        assert!(
+            !remuda_native::daemon::socket_path_in(&dir, "s").exists(),
+            "{verb} --help started a daemon"
+        );
+    }
+    assert!(!dir.join("data/remuda/mods").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn mod_parse_errors_use_exit_two_and_include_help_and_next() {
+    let dir = scratch("mod-parse-error");
+    for args in [
+        &["mod", "list", "--formta", "json"][..],
+        &["mod", "install"][..],
+    ] {
         let out = remuda(&dir, args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if args[1] == "list" {
+            assert!(stderr.contains("Did you mean '--format'?"), "{stderr}");
+        }
+        assert!(stderr.contains("Fix: run `remuda mod"), "{stderr}");
+        assert!(stderr.contains("Next:"), "{stderr}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn assert_invalid_mod_command_has_no_side_effects(tag: &str, args: &[&str]) {
+    let dir = scratch(tag);
+    let out = remuda(&dir, args);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+    assert!(
+        stderr.contains("Usage:") && stderr.contains("Fix:") && stderr.contains("Next:"),
+        "{args:?}: {stderr}"
+    );
+    assert!(
+        !dir.join("data/remuda/mods").exists(),
+        "{args:?} created the mods directory: {out:?}"
+    );
+    assert!(
+        !remuda_native::daemon::socket_path_in(&dir, "s").exists(),
+        "{args:?} created a daemon socket: {out:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn invalid_mod_install_flags_do_not_touch_the_filesystem_or_daemon() {
+    assert_invalid_mod_command_has_no_side_effects(
+        "mod-install-bogus-flag",
+        &["mod", "install", "owner/repo", "--bogus"],
+    );
+}
+
+#[test]
+fn update_all_with_a_name_does_not_touch_the_filesystem_or_daemon() {
+    assert_invalid_mod_command_has_no_side_effects(
+        "mod-update-all-name",
+        &["mod", "update", "--all", "sample"],
+    );
+}
+
+#[test]
+fn remove_extra_argument_does_not_touch_the_filesystem_or_daemon() {
+    assert_invalid_mod_command_has_no_side_effects(
+        "mod-remove-extra-argument",
+        &["mod", "remove", "sample", "extra"],
+    );
+}
+
+#[test]
+fn invalid_mod_list_format_does_not_touch_the_filesystem_or_daemon() {
+    assert_invalid_mod_command_has_no_side_effects(
+        "mod-list-bad-format",
+        &["mod", "list", "--format", "bad"],
+    );
+}
+
+#[test]
+fn stop_parser_handles_valid_flags_help_and_errors_before_connecting() {
+    for args in [
+        &["stop"][..],
+        &["stop", "-f"],
+        &["stop", "--force"],
+        &["stop", "--yes"],
+        &["stop", "--i-am-inside"],
+        &["stop", "-f", "--yes", "--i-am-inside"],
+    ] {
+        let dir = scratch("stop-valid");
+        let out = remuda(&dir, args);
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        assert!(
+            !remuda_native::daemon::socket_path_in(&dir, "s").exists(),
+            "{args:?} created a daemon socket"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    for (tag, args, code) in [
+        ("stop-bogus-flag", &["stop", "--bogus"][..], Some(2)),
+        ("stop-extra-arg", &["stop", "stray"], Some(2)),
+        ("stop-help", &["stop", "--help"], Some(0)),
+    ] {
+        let (out, touched) = touches_daemon(tag, args);
+        assert!(!touched, "{args:?} connected to the daemon socket");
+        assert_eq!(out.status.code(), code, "{args:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if args[1] == "--help" {
+            assert!(stdout.contains("Usage: remuda stop"), "{stdout}");
+            assert!(stderr.is_empty(), "{stderr}");
+        } else {
+            assert!(stderr.contains("Usage: remuda stop"), "{stderr}");
+            assert!(stderr.contains("Fix:"), "{stderr}");
+            assert!(stderr.contains("Next:"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn doc_parser_handles_formats_help_and_errors_before_connecting() {
+    for args in [
+        &["doc"][..],
+        &["doc", "--format", "rst"],
+        &["doc", "--format", "markdown"],
+        &["doc", "--format", "json"],
+    ] {
+        let (out, touched) = touches_daemon("doc-valid", args);
+        assert!(touched, "valid {args:?} did not reach the daemon");
+        assert_ne!(out.status.code(), Some(2), "{args:?}: {out:?}");
+    }
+
+    for (tag, args, code) in [
+        ("doc-bogus-flag", &["doc", "--bogus"][..], Some(2)),
+        ("doc-missing-format", &["doc", "--format"], Some(2)),
+        ("doc-bad-format", &["doc", "--format", "bad"], Some(2)),
+        ("doc-help-cold", &["doc", "--help"], Some(0)),
+    ] {
+        let (out, touched) = touches_daemon(tag, args);
+        assert!(!touched, "{args:?} connected to the daemon socket");
+        assert_eq!(out.status.code(), code, "{args:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if args[1] == "--help" {
+            assert!(stdout.contains("Usage: remuda doc"), "{stdout}");
+            assert!(stderr.is_empty(), "{stderr}");
+        } else {
+            assert!(stderr.contains("Usage: remuda doc"), "{stderr}");
+            assert!(stderr.contains("Fix:"), "{stderr}");
+            assert!(stderr.contains("Next:"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn resize_parser_handles_arity_help_and_range_errors_before_connecting() {
+    let (valid, touched) = touches_daemon("resize-valid", &["resize", "session", "80", "24"]);
+    assert!(touched, "valid resize did not reach the daemon");
+    assert_ne!(valid.status.code(), Some(2), "{valid:?}");
+
+    for (tag, args, code) in [
+        (
+            "resize-bogus-flag",
+            &["resize", "session", "80", "24", "--bogus"][..],
+            Some(2),
+        ),
+        ("resize-wrong-arity", &["resize", "session", "80"], Some(2)),
+        (
+            "resize-out-of-range",
+            &["resize", "session", "19", "24"],
+            Some(2),
+        ),
+        ("resize-help-cold", &["resize", "--help"], Some(0)),
+    ] {
+        let (out, touched) = touches_daemon(tag, args);
+        assert!(!touched, "{args:?} connected to the daemon socket");
+        assert_eq!(out.status.code(), code, "{args:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if args[1] == "--help" {
+            assert!(
+                stdout.contains("Usage: remuda resize NAME COLS ROWS"),
+                "{stdout}"
+            );
+            assert!(stderr.is_empty(), "{stderr}");
+        } else {
+            assert!(
+                stderr.contains("Usage: remuda resize NAME COLS ROWS"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("Fix:"), "{stderr}");
+            assert!(stderr.contains("Next:"), "{stderr}");
+            if tag == "resize-out-of-range" {
+                assert!(
+                    stderr.starts_with(
+                        "resize dimensions must be integers: cols 20..1000, rows 24..500\n"
+                    ),
+                    "range error wording changed: {stderr}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn upgrade_help_flags_explain_channels_and_daemon_lifecycle() {
+    for args in [&["upgrade", "--help"][..], &["upgrade", "-h"]] {
+        let (out, touched) = touches_daemon("upgrade-help-flags", args);
+        assert!(!touched, "{args:?} connected to the daemon socket");
         assert!(out.status.success(), "{args:?}: {out:?}");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.contains("--channel stable|nightly"), "{stdout}");
@@ -337,7 +631,6 @@ fn upgrade_help_flags_explain_channels_and_daemon_lifecycle() {
             "{stdout}"
         );
     }
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -347,9 +640,7 @@ fn invalid_upgrade_channel_suggests_supported_channels_and_next_step() {
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains(
-            "use --channel stable or --channel nightly, e.g. remuda upgrade --channel nightly"
-        ),
+        stderr.contains("choose --channel stable or --channel nightly"),
         "missing supported channel suggestion: {stderr}"
     );
     assert!(
@@ -360,6 +651,8 @@ fn invalid_upgrade_channel_suggests_supported_channels_and_next_step() {
             .starts_with("Next:"),
         "{stderr}"
     );
+    assert!(stderr.contains("Fix:"), "{stderr}");
+    assert!(stderr.contains("Usage: remuda upgrade"), "{stderr}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -451,12 +744,36 @@ fn upgrade_explains_daemon_and_session_lifecycle() {
 /// A bad channel fails before any download, after the handshake would have run.
 #[test]
 fn upgrade_never_connects_to_a_daemon() {
-    let (out, touched) = touches_daemon("upgrade", &["upgrade", "--channel", "bogus"]);
-    assert!(
-        !out.status.success(),
-        "a bogus channel was accepted: {out:?}"
-    );
-    assert!(!touched, "upgrade connected to the daemon socket");
+    for args in [
+        &["upgrade", "--channel", "bogus"][..],
+        &["upgrade", "--bogus"][..],
+        &["upgrade", "--channel"][..],
+        &["upgrade", "unexpected"][..],
+    ] {
+        let (out, touched) = touches_daemon("upgrade", args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        assert!(!touched, "{args:?} connected to the daemon socket");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("Fix:"), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("Usage: remuda upgrade"),
+            "{args:?}: {stderr}"
+        );
+        assert!(stderr.contains("Next:"), "{args:?}: {stderr}");
+        if args.get(1) == Some(&"--bogus") {
+            assert!(
+                stderr.contains("remuda: upgrade: unknown option"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("remuda: upgrade: remuda:"), "{stderr}");
+        }
+        if args.get(1) == Some(&"--channel") && args.get(2) == Some(&"bogus") {
+            assert!(
+                stderr.contains("--channel stable or --channel nightly"),
+                "{stderr}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -477,6 +794,85 @@ fn a_socket_path_over_sun_path_names_the_length_not_a_second_daemon() {
         "blamed a second daemon: {said}"
     );
     assert!(said.contains("REMUDA_RUNTIME_DIR"), "no cure named: {said}");
+}
+
+#[test]
+fn stop_reports_a_blocked_socket_connect_error() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skip: directory permissions do not block root from connecting to the socket");
+        return;
+    }
+
+    let dir = scratch("stop-blocked-socket");
+    let socket = remuda_native::daemon::socket_path_in(&dir, "s");
+    std::fs::create_dir_all(socket.parent().unwrap()).expect("create socket parent");
+    let _listener = UnixListener::bind(&socket).expect("bind a live socket");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000))
+        .expect("make the socket path inaccessible");
+
+    let out = remuda(&dir, &["stop", "-f"]);
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore runtime directory access");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !out.status.success(),
+        "blocked socket stop succeeded: {out:?}"
+    );
+    assert!(
+        stderr.contains("cannot connect to daemon for \"s\""),
+        "missing connect error: {stderr:?}"
+    );
+    assert!(stderr.contains("Next:"), "missing next step: {stderr:?}");
+    assert!(
+        !stderr.contains("no daemon running"),
+        "blocked socket was reported as absent: {stderr:?}"
+    );
+}
+
+#[test]
+fn long_socket_path_errors_are_clear_for_each_cli_entry_point() {
+    let dir = scratch("long-entry-points").join("x".repeat(120));
+    std::fs::create_dir_all(&dir).unwrap();
+    let limit = if cfg!(any(target_os = "linux", target_os = "android")) {
+        107
+    } else {
+        103
+    };
+    let cases: [(&str, &[&str], &str); 4] = [
+        ("ls", &["ls"], "default"),
+        ("exec", &["-s", "x", "-e", "1"], "x"),
+        ("daemon", &["daemon"], "default"),
+        ("stop", &["stop"], "default"),
+    ];
+
+    for (label, args, server) in cases {
+        let socket = remuda_native::daemon::socket_path_in(&dir, server);
+        let out = remuda_command(&dir, args.iter().copied());
+        let expected = format!(
+            "remuda: socket path too long ({} bytes, limit {limit})\nNext: set a shorter REMUDA_RUNTIME_DIR\n",
+            socket.as_os_str().len()
+        );
+        assert_eq!(out.status.code(), Some(1), "{label} exit code");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            expected,
+            "{label} stderr"
+        );
+        assert!(
+            !socket.exists(),
+            "{label} left a socket behind at {}",
+            socket.display()
+        );
+        assert!(
+            daemon_pids_for_runtime(&dir).is_empty(),
+            "{label} left a daemon running"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
 }
 
 /// `mod install --reload` reaches the daemon through its own connect path; a

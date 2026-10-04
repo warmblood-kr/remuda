@@ -4,7 +4,7 @@
 use std::fs::{self, File};
 #[cfg(not(windows))]
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -290,7 +290,77 @@ pub(super) fn check_private_file(_file: &File, description: &str, path: &Path) -
 
 #[cfg(not(windows))]
 pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    crate::fs_atomic::write_atomic(path, bytes, 0o600)
+    crate::fs_atomic::write_atomic_exact_mode(path, bytes, 0o600)
+}
+
+const CLUSTER_INIT_MARKER: &str = "cluster-initialized";
+
+pub(super) fn read_cluster_init_marker(state_dir: &Path) -> io::Result<Option<String>> {
+    let path = state_dir.join(CLUSTER_INIT_MARKER);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is not a regular cluster initialization marker",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    #[cfg(not(windows))]
+    let file = {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        options.open(&path)?
+    };
+    #[cfg(windows)]
+    let file = super::windows_security::open_for_read(&path)?;
+    check_private_file(&file, "cluster initialization marker", &path)?;
+    if !file.metadata()?.is_file() || file.metadata()?.len() != 50 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cluster initialization marker must contain one public fingerprint",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(50);
+    file.take(51).read_to_end(&mut bytes)?;
+    if !is_public_fingerprint(&bytes) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cluster initialization marker contains an invalid fingerprint",
+        ));
+    }
+    // The accepted byte set is ASCII, so this conversion cannot fail.
+    Ok(Some(
+        String::from_utf8(bytes).expect("validated ASCII fingerprint"),
+    ))
+}
+
+pub(super) fn write_cluster_init_marker(state_dir: &Path, fingerprint: &str) -> io::Result<()> {
+    if !is_public_fingerprint(fingerprint.as_bytes()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cluster initialization marker requires a public fingerprint",
+        ));
+    }
+    atomic_write(&state_dir.join(CLUSTER_INIT_MARKER), fingerprint.as_bytes())
+}
+
+fn is_public_fingerprint(bytes: &[u8]) -> bool {
+    bytes.len() == 50
+        && bytes.starts_with(b"SHA256:")
+        && bytes[7..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
 }
 
 #[cfg(not(windows))]

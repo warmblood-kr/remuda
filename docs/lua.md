@@ -16,6 +16,28 @@ notices, set `REMUDA_SUPPRESS_DEPRECATIONS=1` in the daemon's environment when
 the daemon starts; setting it only on a CLI process cannot change the
 environment of a running daemon.
 
+## Screen capture
+
+`remuda.capture(name)` returns the current screen as plain text.
+`remuda.capture_styled(name)` returns screen rows as arrays of `{text, dim}`
+spans, plus a `cursor` table with `row`, `col`, and `visible` fields:
+
+```lua
+local screen = remuda.capture_styled("work")
+local cursor = screen.cursor
+-- row and col are 1-based; visible says whether the terminal displays the cursor.
+print(cursor.row, cursor.col, cursor.visible)
+for _, row in ipairs(screen.rows) do
+  for _, span in ipairs(row) do
+    print(span.text, span.dim)
+  end
+end
+```
+
+The `dim` field preserves terminal dim styling, which can identify placeholder
+or suggestion text. Cursor position and styled spans are observations only;
+mods interpret them according to the prompt or terminal application they know.
+
 ## Generate the reference
 
 ```sh
@@ -55,7 +77,9 @@ When a manifest declares `command = "NAME"`, `remuda NAME` loads that
 mod explicitly and opens the regular Remuda screen when attached to a terminal.
 Use `remuda NAME --headless` to load it without opening the screen. Further
 words (`remuda NAME ...`) are dispatched to the already-loaded mod's Lua
-command handler; the core does not embed a mod-specific parser.
+command handler; the core does not embed a mod-specific parser. A mod may hand
+its declaration to `remuda.cli.parse`; the handler still receives the raw word
+list.
 
 `remuda mod update NAME` and `remuda mod update --all` reuse each installed
 mod's recorded GitHub source and ref, validate the new checkout, and replace
@@ -230,9 +254,18 @@ mod's own no-argument command) on an already-active mod does nothing, so
 opening a mod's screen does not restart it. The mod owns its declared hooks,
 tools and schedules, and also every `remuda.on` hook and
 `remuda.extension_command` registered while its own code runs (`initialize`,
-`start`, or one of its declared hooks, tools or schedules). `hook_list` shows
-that `owner`. A mod may also create new top-level `remuda.*` fields (for
-example `function remuda._sample_notify(...) end` in `start`); they are its own.
+`commands`, `start`, or one of its declared hooks, tools or schedules).
+`hook_list` shows the owner of event hooks.
+
+An optional `commands(state)` hook lets a lifecycle mod register its CLI
+handlers without launching its background work. When Remuda loads a mod to
+serve one of its subcommands, it runs `commands` and skips `start`; running
+`remuda MOD` with no subcommand runs `commands` and then `start` once. A later
+bare invocation starts a mod that was previously loaded only for commands.
+Mods without `commands` keep the old behavior: loading their subcommand runs
+`start` as before. Keep `commands` limited to registration; put launch work in
+`start`. A mod may also create new top-level `remuda.*` fields (for example
+`function remuda._sample_notify(...) end` in `start`); they are its own.
 Assigning a field core defines, or one another mod owns, is an error. A field
 left by a legacy script is taken over only in the mod's own namespace,
 `remuda._NAME_*` or `remuda.NAME_*`; any other existing field is an error. Reload replaces everything the mod owns,

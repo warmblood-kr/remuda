@@ -77,13 +77,14 @@ impl Daemon {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn daemon");
+        let daemon = Self(child);
         let path = daemon::socket_path_in(dir, "s");
         let deadline = Instant::now() + PATIENCE;
         while remuda_native::ipc::connect(&path).is_err() {
             assert!(Instant::now() < deadline, "daemon never bound {path:?}");
             std::thread::sleep(Duration::from_millis(10));
         }
-        Self(child)
+        daemon
     }
 }
 

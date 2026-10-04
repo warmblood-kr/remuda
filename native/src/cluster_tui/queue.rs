@@ -25,6 +25,7 @@ pub struct PendingBatch {
     retry_at: Instant,
     io_retries: u8,
     rate_retries: u8,
+    busy_retries: u8,
 }
 
 pub struct InputTarget {
@@ -37,6 +38,7 @@ pub struct InputTarget {
 pub enum SendOutcome {
     Ack { duplicate: bool },
     Uncertain,
+    Busy,
     WrongInstance,
     RateLimited,
     RemoteControlDisabled,
@@ -58,6 +60,7 @@ pub enum QueueEvent {
 
 pub const MAX_IO_RETRIES: u8 = 3;
 pub const MAX_RATE_LIMIT_RETRIES: u8 = 3;
+pub const MAX_BUSY_RETRIES: u8 = 3;
 pub const MAX_QUEUED_BATCHES: usize = 128;
 
 #[derive(Default)]
@@ -114,6 +117,7 @@ impl InputQueue {
             retry_at: now,
             io_retries: 0,
             rate_retries: 0,
+            busy_retries: 0,
         });
         true
     }
@@ -239,6 +243,18 @@ impl InputQueue {
                         reason: batch.status.clone(),
                     })
                 }
+                SendOutcome::Busy => {
+                    if batch.busy_retries < MAX_BUSY_RETRIES {
+                        batch.busy_retries += 1;
+                        schedule_retry(batch, now, "input busy; retrying")
+                    } else {
+                        let reason =
+                            format!("busy after {MAX_BUSY_RETRIES} retries; no bytes were written");
+                        batch.state = QueueState::Failed;
+                        batch.status = reason.clone();
+                        Some(QueueEvent::Failed { seq, reason })
+                    }
+                }
                 SendOutcome::WrongInstance => {
                     batch.state = QueueState::Dropped;
                     batch.status = "session restarted; input dropped".into();
@@ -313,7 +329,8 @@ impl InputQueue {
 }
 
 fn schedule_retry(batch: &mut PendingBatch, now: Instant, status: &str) -> Option<QueueEvent> {
-    let retry_count = batch.io_retries as u32 + u32::from(batch.rate_retries);
+    let retry_count =
+        batch.io_retries as u32 + u32::from(batch.rate_retries) + u32::from(batch.busy_retries);
     batch.retry_at = now + retry_delay(retry_count);
     batch.state = QueueState::Waiting;
     batch.status = status.into();
