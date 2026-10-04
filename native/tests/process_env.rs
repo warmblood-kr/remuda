@@ -95,7 +95,7 @@ fn probe_argv() -> String {
 fn probe_environment(line: &str) -> BTreeMap<String, String> {
     let json = line
         .strip_prefix(PROBE_PREFIX)
-        .expect("probe result prefix");
+        .unwrap_or_else(|| panic!("probe result prefix missing in {line:?}"));
     let mut environment: BTreeMap<String, String> =
         serde_json::from_str(json).expect("probe environment JSON");
     // LLVM's coverage runtime adds this marker when an instrumented child
@@ -163,7 +163,9 @@ fn process_env_child_probe() {
         return;
     }
     let vars: BTreeMap<String, String> = std::env::vars().collect();
-    println!("{PROBE_PREFIX}{}", serde_json::to_string(&vars).unwrap());
+    // The leading newline keeps the result on its own line even when libtest
+    // has printed "test <name> ... " first (one test thread).
+    println!("\n{PROBE_PREFIX}{}", serde_json::to_string(&vars).unwrap());
 }
 
 #[test]
@@ -230,12 +232,10 @@ fn process_async_applies_additive_and_cleared_environments() {
     .into_iter()
     {
         let lua = format!(
-            "process_env_line = nil; process_env_done = false; \
-             remuda.on('process-env-line', function(line) if string.sub(line, 1, {prefix_len}) == {prefix} then process_env_line = line end end); \
+            "process_env_lines = {{}}; process_env_done = false; \
+             remuda.on('process-env-line', function(line) table.insert(process_env_lines, line) end); \
              remuda.on('process-env-exit', function() process_env_done = true end); \
              remuda.process({{ argv = {argv}, env = {env}, clear_env = {clear}, on_line = 'process-env-line', on_exit = 'process-env-exit' }}); return 'started'",
-            prefix_len = PROBE_PREFIX.len(),
-            prefix = lua_string(PROBE_PREFIX),
             env = lua_env(&env),
             clear = if clear { "true" } else { "false" },
         );
@@ -245,8 +245,12 @@ fn process_async_applies_additive_and_cleared_environments() {
             assert!(Instant::now() < deadline, "process child did not exit");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let line = node.eval("return process_env_line or ''");
-        let actual = probe_environment(&line);
+        let text = node.eval("return table.concat(process_env_lines, '\\n')");
+        assert!(
+            text.lines().any(|line| line.starts_with(PROBE_PREFIX)),
+            "clear_env={clear}: child did not report environment: {text:?}"
+        );
+        let actual = extract_probe(&text);
         if clear {
             assert_eq!(actual, expected_after_clear(env));
         } else {
