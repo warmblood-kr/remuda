@@ -21,25 +21,33 @@ const MARKER: &str = "marker.txt";
 struct Case {
     name: &'static str,
     args: &'static [&'static str],
-    /// The session route must refuse it; `process.run` may refuse or deliver.
-    refused: bool,
+    /// The session route must refuse it, naming this argument position and
+    /// reason; `process.run` may refuse or deliver.
+    refused: Option<(usize, &'static str)>,
 }
 
 const fn delivered(name: &'static str, args: &'static [&'static str]) -> Case {
     Case {
         name,
         args,
-        refused: false,
+        refused: None,
     }
 }
 
-const fn refused(name: &'static str, args: &'static [&'static str]) -> Case {
+const fn refused(
+    name: &'static str,
+    args: &'static [&'static str],
+    position: usize,
+    reason: &'static str,
+) -> Case {
     Case {
         name,
         args,
-        refused: true,
+        refused: Some((position, reason)),
     }
 }
+
+const OUTSIDE: &str = "it has a cmd.exe special character outside quotes";
 
 const CASES: &[Case] = &[
     delivered("none", &[]),
@@ -47,10 +55,20 @@ const CASES: &[Case] = &[
     delivered("quote", &["say \"hi\""]),
     // It holds a space, so the pty quotes it and cmd.exe reads `&` as text.
     delivered("amp-quoted", &["a&echo INJECTED>marker.txt"]),
-    refused("newline", &["line1\necho INJECTED>marker.txt"]),
-    refused("percent", &["100%", "%OS%"]),
-    refused("amp-bare", &["a&echo.INJECTED>marker.txt"]),
-    refused("quote-amp", &["\"&echo INJECTED>marker.txt&rem "]),
+    refused(
+        "newline",
+        &["line1\necho INJECTED>marker.txt"],
+        1,
+        "it contains a line break",
+    ),
+    refused("percent", &["100%", "%OS%"], 1, "it contains %"),
+    refused("amp-bare", &["a&echo.INJECTED>marker.txt"], 1, OUTSIDE),
+    refused(
+        "quote-amp",
+        &["\"&echo INJECTED>marker.txt&rem "],
+        1,
+        OUTSIDE,
+    ),
 ];
 
 /// What the session route says when it refuses, on the first line.
@@ -147,7 +165,7 @@ fn wait_for(file: &Path) -> bool {
 /// the rule decides which cases are refused and how the refusal reads.
 fn judge(case: &Case, dir: &Path, refusal: Option<&str>, strict: bool) -> Option<String> {
     let Some(message) = refusal else {
-        if strict && case.refused {
+        if strict && case.refused.is_some() {
             return Some("started, but this argument must be refused".into());
         }
         let finished = wait_for(&dir.join("done.txt"));
@@ -160,11 +178,18 @@ fn judge(case: &Case, dir: &Path, refusal: Option<&str>, strict: bool) -> Option
     };
     // Only the first line: a Rust error read through pcall carries a traceback.
     let first = message.lines().next().unwrap_or_default();
-    if !case.refused {
+    let Some((position, reason)) = case.refused else {
         return Some(format!("refused: {first:?}"));
+    };
+    // The program behind a refusal must never have started.
+    for file in ["argv.txt", "done.txt"] {
+        if dir.join(file).exists() {
+            return Some(format!("refused, but {file} exists"));
+        }
     }
-    if strict && !(first.contains(REFUSAL) && first.contains(NEXT)) {
-        return Some(format!("the refusal does not say what to do: {first:?}"));
+    let want = format!("argument {position} {REFUSAL}: {reason}.");
+    if strict && !(first.contains(&want) && first.contains(NEXT)) {
+        return Some(format!("the refusal is not {want:?} plus Next: {first:?}"));
     }
     // The argument may be a prompt: it is never echoed.
     case.args

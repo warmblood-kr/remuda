@@ -53,6 +53,10 @@ pub fn pty_text(arg: &str) -> String {
 /// does not know `\"`: every `"` flips its quote state, so the text is walked
 /// that way and a special character outside quotes is refused.
 pub fn cmd_argument_refusal(arg: &str) -> Option<&'static str> {
+    // portable-pty rejects NUL itself, but its error prints the whole argument.
+    if arg.contains('\0') {
+        return Some("it contains a NUL character");
+    }
     if arg.contains(['\r', '\n']) {
         return Some("it contains a line break");
     }
@@ -187,6 +191,26 @@ mod tests {
         ] {
             assert_eq!(cmd_argument_refusal(arg), Some(reason), "{arg:?}");
         }
+    }
+
+    #[test]
+    fn a_nul_is_refused_with_position_and_next_and_without_the_text() {
+        assert_eq!(
+            cmd_argument_refusal("secret\0tail"),
+            Some("it contains a NUL character")
+        );
+        let argv = [
+            "a.cmd".to_string(),
+            "ok".to_string(),
+            "secret\0tail".to_string(),
+        ];
+        let refusal = batch_arguments_refusal(&argv).unwrap();
+        assert_eq!(
+            refusal,
+            "argument 2 cannot be passed to a .cmd or .bat program safely: it contains a NUL \
+             character. Next: start the .exe, or pass this text in a file."
+        );
+        assert!(!refusal.contains("secret") && !refusal.contains("tail"));
     }
 
     #[test]
