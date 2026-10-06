@@ -256,14 +256,14 @@ pub fn open_response(mut request: SealedRequest, message: &[u8]) -> io::Result<V
 }
 
 // Deviation from the design note: no flags byte and no FINAL flag. The authenticated total length
-// (msg2 in PR2) is mandatory and proves completeness, so FINAL is redundant; empty input is zero
+// (msg2 header) is mandatory and proves completeness, so FINAL is redundant; empty input is zero
 // records with total 0.
 /// Largest plaintext carried by a single transport record (Noise message cap minus the AEAD tag).
 pub const MAX_RECORD_PLAINTEXT: usize = MAX_FRAME_SIZE - AEAD_TAG_SIZE;
 /// Hard cap on the total plaintext of a chunked response.
 pub const MAX_RESPONSE_TOTAL: usize = 4 * 1024 * 1024;
 /// Hard cap on the number of records: ceil(MAX_RESPONSE_TOTAL / MAX_RECORD_PLAINTEXT) = 65.
-/// Enough because msg2 (PR2) carries chunk0 outside these records, so records hold at most the cap.
+/// Enough because msg2 carries chunk0 outside these records, so records hold at most the cap.
 pub const MAX_RECORDS: usize = MAX_RESPONSE_TOTAL.div_ceil(MAX_RECORD_PLAINTEXT);
 
 // ponytail: PR1 is pure functions; wired into client/listener in later PRs.
@@ -283,6 +283,13 @@ pub fn seal_records(transport: &mut snow::TransportState, plaintext: &[u8]) -> i
         out.extend_from_slice(&buf[..n]);
     }
     Ok(out)
+}
+
+/// Marker for PR3: the peer sent a response version we do not understand (`ErrorKind::Unsupported`).
+pub const NEWER_FORMAT_MSG: &str = "peer uses newer cluster response format";
+
+fn newer_format() -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, NEWER_FORMAT_MSG)
 }
 
 fn too_large() -> io::Error {
@@ -448,11 +455,10 @@ pub fn open_response_chunked_from(
     let mut msg = vec![0; u16::from_be_bytes(len) as usize];
     reader.read_exact(&mut msg)?;
     let plain = decrypt_msg2(&mut request, &msg)?;
-    if plain.first() != Some(&RESPONSE_V2) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "peer uses newer cluster response format",
-        ));
+    match plain.first() {
+        Some(&RESPONSE_V2) => {}
+        Some(_) => return Err(newer_format()),
+        None => return Err(invalid_frame()),
     }
     let header: [u8; 4] = plain
         .get(1..MSG2_HEADER)
@@ -460,7 +466,10 @@ pub fn open_response_chunked_from(
         .ok_or_else(invalid_frame)?;
     let total = u32::from_be_bytes(header) as usize;
     if total > MAX_RESPONSE_TOTAL {
-        return Err(too_large());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response total_len exceeds the size cap",
+        ));
     }
     let chunk0 = &plain[MSG2_HEADER..];
     let expected = total.checked_sub(chunk0.len()).ok_or_else(invalid_frame)?;
@@ -492,6 +501,10 @@ pub fn open_response_chunked_from(
 pub fn open_response_any(mut request: SealedRequest, body: &[u8]) -> io::Result<Vec<u8>> {
     // A failed read_message restores the handshake state, so trying v1 first is safe.
     if let Ok(payload) = decrypt_msg2(&mut request, body) {
+        // JSON never starts with the v2 version byte; a prefix-stripped v2 msg2 would land here.
+        if payload.first() == Some(&RESPONSE_V2) {
+            return Err(invalid_frame());
+        }
         return Ok(payload);
     }
     open_response_chunked(request, body)
@@ -874,7 +887,8 @@ mod tests {
         assert!(seal_response_chunked(o, &data(MAX_RESPONSE_TOTAL + 1)).is_err());
         let (o, s) = pair();
         let body = forge(o, 1, MAX_RESPONSE_TOTAL as u32 + 1, b"x", b"");
-        assert!(open_response_chunked(s, &body).is_err());
+        let err = open_response_chunked(s, &body).unwrap_err();
+        assert_eq!(err.to_string(), "response total_len exceeds the size cap");
     }
 
     #[test]
@@ -892,7 +906,8 @@ mod tests {
         let (o, s) = pair();
         let body = forge(o, 1, u32::MAX, b"x", b"");
         let msg_end = 2 + u16::from_be_bytes([body[0], body[1]]) as usize;
-        assert!(open_response_chunked_from(s, &mut Tripwire(&body[..msg_end])).is_err());
+        let err = open_response_chunked_from(s, &mut Tripwire(&body[..msg_end])).unwrap_err();
+        assert_eq!(err.to_string(), "response total_len exceeds the size cap");
     }
 
     #[test]
@@ -901,6 +916,7 @@ mod tests {
         let body = forge(o, 2, 1, b"x", b"");
         let err = open_response_chunked(s, &body).unwrap_err();
         assert_eq!(err.to_string(), "peer uses newer cluster response format");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
     #[test]
@@ -916,12 +932,55 @@ mod tests {
     }
 
     #[test]
-    fn v2_oversized_chunk0_is_rejected() {
+    fn v2_chunk0_at_max_fills_msg2_exactly_and_one_more_spills() {
         let (o, _s) = pair();
-        let mut o = o;
-        let mut msg = vec![0; MAX_FRAME_SIZE + 100];
-        let plain = vec![1; MAX_CHUNK0 + MSG2_HEADER + 1];
-        assert!(o.handshake.write_message(&plain, &mut msg).is_err());
+        let body = seal_response_chunked(o, &data(MAX_CHUNK0)).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([body[0], body[1]]) as usize,
+            MAX_FRAME_SIZE
+        );
+        assert_eq!(body.len(), 2 + MAX_FRAME_SIZE);
+        let (o, _s) = pair();
+        let body = seal_response_chunked(o, &data(MAX_CHUNK0 + 1)).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([body[0], body[1]]) as usize,
+            MAX_FRAME_SIZE
+        );
+        assert_eq!(body.len(), 2 + MAX_FRAME_SIZE + 2 + 1 + AEAD_TAG_SIZE);
+    }
+
+    #[test]
+    fn v2_lies_high_with_too_few_records_is_rejected() {
+        let (o, s) = pair();
+        let body = forge(o, 1, 10 + 100, &data(10), &data(50));
+        assert!(open_response_chunked(s, &body).is_err());
+    }
+
+    #[test]
+    fn v2_short_msg2_plaintext_is_invalid_not_newer() {
+        for len in [0usize, 1, 3, 4] {
+            let (mut o, s) = pair();
+            let mut plain = vec![RESPONSE_V2; len];
+            plain.truncate(len);
+            let mut msg = vec![0; MAX_FRAME_SIZE];
+            let n = o.handshake.write_message(&plain, &mut msg).unwrap();
+            let mut body = (n as u16).to_be_bytes().to_vec();
+            body.extend_from_slice(&msg[..n]);
+            let err = open_response_chunked(s, &body).unwrap_err();
+            assert_ne!(err.kind(), io::ErrorKind::Unsupported, "len {len}");
+        }
+    }
+
+    #[test]
+    fn open_response_any_rejects_stripped_prefix_and_corruption() {
+        let (o, s) = pair();
+        let body = seal_response_chunked(o, b"hi").unwrap();
+        assert!(open_response_any(s, &body[2..]).is_err());
+        let (o, s) = pair();
+        let mut body = seal_response_chunked(o, b"hi").unwrap();
+        body[10] ^= 1;
+        let err = open_response_any(s, &body).unwrap_err();
+        assert_ne!(err.kind(), io::ErrorKind::Unsupported);
     }
 
     #[test]
@@ -931,12 +990,14 @@ mod tests {
         let body = seal_response_chunked(o, &plain).unwrap();
         let rec = 2 + MAX_RECORD_PLAINTEXT + AEAD_TAG_SIZE;
         let msg_end = 2 + u16::from_be_bytes([body[0], body[1]]) as usize;
-        assert!(open_response_chunked(s, &body[..body.len() - rec]).is_err());
+        assert!(open_response_chunked(s, &body[..msg_end + rec]).is_err()); // record boundary
+        let (o, s) = pair();
+        let b = seal_response_chunked(o, &plain).unwrap();
+        assert!(open_response_chunked(s, &b[..b.len() - 7]).is_err()); // mid-record
         let (o, s) = pair();
         let mut long = seal_response_chunked(o, &plain).unwrap();
         long.push(0);
         assert!(open_response_chunked(s, &long).is_err());
-        let recs: Vec<&[u8]> = body[msg_end..].chunks(rec).collect();
         for order in [[0, 0, 2], [1, 0, 2]] {
             let (o, s) = pair();
             let b = seal_response_chunked(o, &plain).unwrap();
@@ -955,7 +1016,6 @@ mod tests {
         b.truncate(msg_end);
         b.extend_from_slice(&other[other_end..]);
         assert!(open_response_chunked(s, &b).is_err());
-        let _ = recs;
     }
 
     fn recs_of(b: &[u8], msg_end: usize, rec: usize) -> Vec<&[u8]> {
