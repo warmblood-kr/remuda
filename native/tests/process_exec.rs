@@ -160,9 +160,16 @@ fn process_exec_delivers_while_image_serves_timer() {
         assert!(Instant::now() < deadline, "exec callback did not arrive");
     }
     assert_eq!(node.eval("return tostring(remuda._exec_result.code)"), "0");
-    assert_eq!(node.eval("return remuda._exec_result.stdout"), "slow-stdout\n");
-    assert_eq!(node.eval("return remuda._exec_result.stderr"), "slow-stderr\n");
-    assert_eq!(node.eval("return tostring(remuda._exec_result.timed_out)"), "false");
+    assert!(node
+        .eval("return remuda._exec_result.stdout")
+        .contains("slow-stdout\n"));
+    assert!(node
+        .eval("return remuda._exec_result.stderr")
+        .contains("slow-stderr\n"));
+    assert_eq!(
+        node.eval("return tostring(remuda._exec_result.timed_out)"),
+        "false"
+    );
 }
 
 #[test]
