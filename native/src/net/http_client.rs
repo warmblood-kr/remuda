@@ -52,7 +52,7 @@ impl HttpClient {
         let admitted = self
             .inner
             .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < MAX_IN_FLIGHT).then_some(n + 1)
             })
             .is_ok();
@@ -84,7 +84,7 @@ impl HttpClient {
         let admitted = self
             .inner
             .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < MAX_IN_FLIGHT).then_some(n + 1)
             })
             .is_ok();
@@ -298,7 +298,7 @@ fn resolve_addresses(
     dns_active: Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<Vec<SocketAddr>, String> {
     if dns_active
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
             (count < 32).then_some(count + 1)
         })
         .is_err()

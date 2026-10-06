@@ -120,6 +120,49 @@ outcome as possibly delivered. The fixed one-second budget window can allow up
 to 2×256 KiB across a window boundary. Identical retries are charged again at
 the listener, while the daemon deduplicates them to prevent repeated writes.
 
+## Response chunking (v2)
+
+A Noise message is capped at 65,535 bytes, so a v1 response (one handshake
+message, 65,519 B payload) cannot carry a large screen snapshot. A requester
+that sends exactly one `X-Remuda-Chunked: 1` header (any other value, or a
+repeated header, means v1) gets a v2 body in the same HTTP response:
+
+```
+body   = [u16 BE len][msg2] ( [u16 BE len][Noise transport record] )*
+msg2   plaintext = [0x01 ver][u32 BE total_len][chunk0]
+record plaintext = data
+```
+
+- The handshake and prologue (`remuda-cluster-v1`) are unchanged. After msg2
+  both ends switch to transport mode; the record nonce is an implicit counter
+  (0, 1, ...), so a reordered, duplicated, dropped, or spliced record fails
+  AEAD. Any error rejects the whole response; there is no partial output.
+- `total_len` is authenticated (inside msg2) and is the completeness proof:
+  the response is complete exactly when the plaintext bytes received equal
+  `total_len`. There is no FINAL flag. A clean cut at a record boundary, or
+  trailing bytes, is an error.
+- Limits: 4 MiB total, 65,519 B per record plaintext, 65 records. The client
+  checks `total_len` against the cap before reading further records and bounds
+  the HTTP body accordingly; v1 stays at 65,535.
+- Compatibility: no header gets v1. An oversized v1 reply is the error
+  "cluster response exceeds the Noise frame limit; upgrade the requesting node
+  to read it", so a mixed-version pair fails with a clear message, not a wrong
+  payload. A new client against an old listener gets v1 (the header is
+  ignored) and detects it because v2 msg2 starts with `0x01`, never JSON. An
+  unknown version byte is `BadResponse` ("peer uses newer cluster response
+  format").
+- Resources: a v2 response larger than one frame needs a large-response
+  permit (4 global, 1 per peer). When none is free the peer receives a
+  `cluster busy` error and retries. Large writes have an absolute 30 s
+  deadline, enforced by a watchdog that shuts the socket down, since a
+  per-wait send timeout alone can restart on every partial write.
+- Requests are not chunked: the listener still caps a request body at 65,535
+  bytes (the request-cap inconsistency is tracked in #592).
+- Known limits: the built payload is bounded only after it is serialized,
+  about 256 MiB worst case (#595); remaining low-severity hardening is in #596.
+- The blank-tail trim (#591) stays as a size reducer: v1 peers still hit the
+  65,519 B cap, and v2 responses over 4 MiB are trimmed before being refused.
+
 ## Threat model
 
 An admitted peer can submit bounded Input batches to any session while remote

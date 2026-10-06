@@ -7,6 +7,7 @@
 
 pub mod child_guard;
 pub mod cli_parse;
+pub mod cli_spec_check;
 pub mod client;
 pub mod cluster;
 pub mod cluster_remote;

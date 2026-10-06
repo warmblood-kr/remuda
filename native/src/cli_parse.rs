@@ -59,7 +59,7 @@ impl Report {
         }
     }
 
-    fn failure(kind: &str, text: String, code: i32) -> Self {
+    pub fn failure(kind: &str, text: String, code: i32) -> Self {
         Self {
             ok: false,
             verb: None,
@@ -69,6 +69,45 @@ impl Report {
             code,
         }
     }
+}
+
+/// Versions and features this parser supports, for `remuda.cli.capabilities()`.
+pub const SPEC_VERSIONS: &[u32] = &[1, 2];
+pub const REPORT_VERSIONS: &[u32] = &[1, 2];
+pub const FEATURES: &[&str] = &["stable_report", "strict_v2"];
+
+/// Shape a report as the v2 envelope; vectors are always arrays.
+/// Error text is the legacy diagnostic and may quote input until G7b safe_errors;
+/// no sensitive-command consumer may migrate to report v2 before then.
+pub fn report_v2(spec: &Spec, report: &Report) -> Value {
+    let verb = report
+        .verb
+        .as_deref()
+        .and_then(|name| spec.verbs.iter().find(|verb| verb.name == name));
+    let mut values = report.values.clone();
+    for arg in verb
+        .iter()
+        .flat_map(|verb| &verb.args)
+        .filter(|a| a.multiple)
+    {
+        let items = match values.remove(&arg.name) {
+            Some(Value::Array(items)) => items,
+            Some(one) => vec![one],
+            None if report.ok => Vec::new(),
+            None => continue,
+        };
+        values.insert(arg.name.clone(), Value::Array(items));
+    }
+    let kind = report.kind.as_deref().unwrap_or("success");
+    let mut out = serde_json::json!({
+        "ok": report.ok, "kind": kind, "code": report.code, "text": report.text,
+        "values": values, "path": [], "handler": "", "shape": "",
+        "origins": {}, "boundaries": {}, "bodies": {},
+    });
+    if let Some(name) = &report.verb {
+        out["verb"] = Value::String(name.clone());
+    }
+    out
 }
 
 /// Parse a verb's raw argument words with a runtime-built clap command.

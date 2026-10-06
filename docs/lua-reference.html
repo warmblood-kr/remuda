@@ -25,8 +25,12 @@
 <p><code>clear_hooks(opts) -&gt; nil</code> — Remove every hook registered under a group.</p>
 <h2 id="cli">cli</h2>
 <p><code>table</code> — Declarative command-line parsing for extension handlers.</p>
+<h2 id="cli.capabilities">cli.capabilities</h2>
+<p><code>cli.capabilities() -&gt; {spec_versions, report_versions, features}</code> — Report the spec versions, report versions and features this core supports; set report_version = 2 on a spec for the stable report envelope.</p>
 <h2 id="cli.parse">cli.parse</h2>
-<p><code>cli.parse(spec, argv) -&gt; report</code> — Parse a word list against a runtime command declaration without printing or exiting. Returns {ok, verb?, values, kind?, text, code}; set multiple = true on the final positional argument to collect message body words.</p>
+<p><code>cli.parse(spec, argv) -&gt; report</code> — Parse a word list against a runtime command declaration without printing or exiting. Returns {ok, verb?, values, kind?, text, code}; set required = false on an optional positional (positionals are required by default), and set multiple = true on the final positional argument to collect message body words.</p>
+<h2 id="cli.require">cli.require</h2>
+<p><code>cli.require(need) -&gt; true | false, text</code> — Check remuda.cli.capabilities() before sending a v2 spec: need = {features?, spec_version?, report_version?}. Returns true, or false and a diagnostic ending in 'Next: remuda upgrade'; a core without capabilities counts as old.</p>
 <h2 id="click">click</h2>
 <p><code>click(name, col, row, button?) -&gt; nil</code> — Send a mouse click at a terminal cell.</p>
 <h2 id="clock">clock</h2>
@@ -72,7 +76,7 @@
 <h2 id="fs.realpath">fs.realpath</h2>
 <p><code>fs.realpath(path) -&gt; path | nil, reason</code> — Resolve a path to the absolute path of what it names, following every symlink and removing '.' and '..'; the file or directory must exist. Pass an absolute path: a relative one is resolved against the daemon's working directory. On Windows the answer is a verbatim path: a prefix of two backslashes, a question mark and one backslash, then the drive (C:) or, for a network path, UNC and the server and share; a junction is followed like a symlink. Returns nil and a reason: 'not_found' (nothing there, or a link whose target is gone), or one starting with 'denied: ' or 'unavailable: '. An empty or non-string path raises a Lua error. The answer is true when it is made: a link changed afterwards is not seen.</p>
 <h2 id="fs.write_atomic">fs.write_atomic</h2>
-<p><code>fs.write_atomic(path, bytes, options?) -&gt; true, nil | nil, error</code> — Write bytes through a same-directory temporary file and atomically replace the target; private mode uses owner-only permissions on Unix.</p>
+<p><code>fs.write_atomic(path, bytes, options?) -&gt; true, nil | nil, error</code> — Write bytes through a same-directory temporary file and atomically replace the target; private mode makes the file owner-only (mode 0600 on Unix, owner-only ACL on Windows).</p>
 <h2 id="hook_list">hook_list</h2>
 <p><code>hook_list(event?) -&gt; {{event, group, id, depth, owner, src, errors, last_error}...}</code> — Copies of the registered hooks, for one event or all, in run order.</p>
 <h2 id="hooks">hooks</h2>

@@ -2306,6 +2306,74 @@ function remuda._registry_dump(format)
 end
 register("_registry_dump", "Render the live word registry as documentation.", "_registry_dump(format?) -> string")
 
+-- Boot/upgrade gate: new Lua checks this before sending a v2 spec, because an
+-- old core silently ignores unknown spec fields. Pure: raw reads only (no
+-- metamethods), no I/O, and the text never echoes caller strings beyond the
+-- reviewed public feature names below.
+-- The only caller strings ever echoed. Reviewed list: adding a public feature
+-- to cli_parse.rs FEATURES is a conscious edit here too.
+local public_features = { stable_report = true, strict_v2 = true, repeat_policy = true }
+local function cap_list_has(caps, key, want)
+  local list = rawget(caps, key)
+  if type(list) ~= "table" then return false end
+  for i = 1, math.min(rawlen(list), 1024) do
+    if rawequal(rawget(list, i), want) then return true end
+  end
+  return false
+end
+local function cap_int(need, key)
+  local v = rawget(need, key)
+  if v == nil then return nil, true end
+  if math.type(v) ~= "integer" then return nil, false end
+  return v, true
+end
+-- Unit-test images load this file without the native cli binding.
+if remuda.cli then
+  function remuda.cli.require(need)
+    local next_line = "\nNext: remuda upgrade"
+    local bad = "remuda: invalid requirement.\nNext: remuda doc"
+    if type(need) ~= "table" then return false, bad end
+    local spec_v, ok1 = cap_int(need, "spec_version")
+    local report_v, ok2 = cap_int(need, "report_version")
+    local features = rawget(need, "features")
+    if not (ok1 and ok2) or (features ~= nil and type(features) ~= "table") then return false, bad end
+    features = features or {}
+    -- Fail closed: a dense array of at most 1024 strings, no other keys.
+    local n, keys = rawlen(features), 0
+    if n > 1024 then return false, bad end
+    for i = 1, n do
+      if type(rawget(features, i)) ~= "string" then return false, bad end
+    end
+    for _ in next, features do
+      keys = keys + 1
+      if keys > n then return false, bad end
+    end
+    local cli = rawget(remuda, "cli")
+    local getter = type(cli) == "table" and rawget(cli, "capabilities") or nil
+    local called, caps = false, nil
+    if type(getter) == "function" then called, caps = pcall(getter) end
+    if not called or type(caps) ~= "table" then
+      return false, "remuda: this core predates CLI capabilities; upgrade it." .. next_line
+    end
+    local missing = {}
+    if spec_v and not cap_list_has(caps, "spec_versions", spec_v) then
+      missing[#missing + 1] = "spec_version " .. spec_v
+    end
+    if report_v and not cap_list_has(caps, "report_versions", report_v) then
+      missing[#missing + 1] = "report_version " .. report_v
+    end
+    for i = 1, n do
+      local name = rawget(features, i)
+      if not cap_list_has(caps, "features", name) then
+        missing[#missing + 1] = public_features[name] and name or "<feature>"
+      end
+    end
+    if #missing == 0 then return true end
+    return false, "remuda: this core is too old: missing " .. table.concat(missing, ", ") .. "." .. next_line
+  end
+  register("cli.require", "Check remuda.cli.capabilities() before sending a v2 spec: need = {features?, spec_version?, report_version?}. Returns true, or false and a diagnostic ending in 'Next: remuda upgrade'; a core without capabilities counts as old.", "cli.require(need) -> true | false, text")
+end
+
 -- The first word, and the one `steps/008` found missing: readiness. Driving an
 -- agent means waiting for it, and every caller so far has written this loop
 -- again — `tests/api/v1.lua` has its own copy.

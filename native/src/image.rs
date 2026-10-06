@@ -1284,6 +1284,18 @@ mod tests {
         lua
     }
 
+    #[test]
+    fn prelude_loads_without_the_native_cli_binding() {
+        let lua = lifecycle_lua();
+        let cli: mlua::Value = lua.load("return remuda.cli").eval().unwrap();
+        assert!(cli.is_nil(), "harness must stay cli-less");
+        let reg: mlua::Value = lua
+            .load("return remuda._registry['cli.require']")
+            .eval()
+            .unwrap();
+        assert!(reg.is_nil(), "cli.require exists only with the cli binding");
+    }
+
     /// What `remuda -e <code>` would print, without a daemon in the way.
     fn shown(code: &str) -> String {
         let lua = Lua::new();

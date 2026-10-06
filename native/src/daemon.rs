@@ -84,7 +84,7 @@ struct SyncPermit;
 impl SyncPermit {
     fn acquire() -> Option<Self> {
         ACTIVE_SYNCS
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
                 (active < MAX_CONCURRENT_SYNCS).then_some(active + 1)
             })
             .ok()
