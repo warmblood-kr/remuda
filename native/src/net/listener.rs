@@ -31,6 +31,7 @@ pub const MAX_PEER_REQUESTS: usize = 8;
 const MAX_LARGE_GLOBAL: usize = 4;
 const MAX_LARGE_PER_PEER: usize = 1;
 /// Absolute deadline for writing one large response (mirrors the client total).
+const WRITE_SLICE: usize = 1024;
 const LARGE_WRITE_TOTAL: Duration = Duration::from_secs(30);
 pub const MAX_PREAUTH_PER_IP: usize = 4;
 pub const MAX_PREAUTH_PER_IPV6_48: usize = 16;
@@ -241,8 +242,6 @@ struct RequestLimiter {
     preauth_limit_override: AtomicUsize,
     active_peers: Mutex<HashMap<String, usize>>,
     large: Mutex<HashMap<String, usize>>,
-    /// Test hook: total large-response write deadline in ms (0 = default).
-    large_write_override_ms: AtomicUsize,
     join_attempts: Mutex<HashMap<std::net::IpAddr, VecDeque<Instant>>>,
     registry_requests: Mutex<HashMap<String, RegistryTokenBucket>>,
     remote_inputs: Mutex<RemoteInputRateLimiter>,
@@ -1593,13 +1592,7 @@ fn send_dispatched_response(
     }
     match limiter.acquire_large(peer_fp) {
         Some(_permit) => {
-            let ms = limiter.large_write_override_ms.load(Ordering::Relaxed);
-            let limit = if ms == 0 {
-                LARGE_WRITE_TOTAL
-            } else {
-                Duration::from_millis(ms as u64)
-            };
-            send_encrypted_response_within(stream, opened, payload, Some(limit))
+            send_encrypted_response_within(stream, opened, payload, Some(LARGE_WRITE_TOTAL))
         }
         None => {
             let busy = encode_error("cluster busy: too many large responses in flight; retry");
@@ -1769,34 +1762,79 @@ fn write_http_response_until(
         503 => "Service Unavailable",
         _ => "Error",
     };
-    write!(
-        stream,
+    let head = format!(
         "HTTP/1.1 {status} {label}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
-    )?;
+    );
     let Some(deadline) = deadline else {
+        stream.write_all(head.as_bytes())?;
         stream.write_all(body)?;
         return stream.flush();
     };
-    for piece in body.chunks(64 * 1024) {
+    // Headers and body share one absolute deadline; every path shuts down on failure.
+    let result = write_parts_until(&mut stream, head.as_bytes(), body, deadline);
+    if result.is_err() {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+    result
+}
+
+/// A writer whose blocking time per call can be capped (SO_SNDTIMEO for TCP).
+trait DeadlineWrite: Write {
+    fn cap_write_time(&mut self, limit: Duration) -> io::Result<()>;
+}
+
+impl DeadlineWrite for TcpStream {
+    fn cap_write_time(&mut self, limit: Duration) -> io::Result<()> {
+        self.set_write_timeout(Some(limit.min(Duration::from_secs(5))))
+    }
+}
+
+/// Headers, body, flush: completing exactly at the deadline is fine, after it
+/// is TimedOut.
+fn write_parts_until(
+    writer: &mut impl DeadlineWrite,
+    head: &[u8],
+    body: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    write_all_until(writer, head, deadline)?;
+    write_all_until(writer, body, deadline)?;
+    writer.flush()?;
+    if Instant::now() > deadline {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    Ok(())
+}
+
+/// `write` loop: re-checks the deadline and re-caps the write time to what
+/// remains before EVERY write, so partial writes cannot stretch it.
+fn write_all_until(
+    writer: &mut impl DeadlineWrite,
+    mut buf: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    while !buf.is_empty() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            let _ = stream.shutdown(Shutdown::Both);
             return Err(io::ErrorKind::TimedOut.into());
         }
-        stream.set_write_timeout(Some(remaining.min(Duration::from_secs(5))))?;
-        if let Err(error) = stream.write_all(piece) {
-            // The per-write timeout equals the remaining time, so it can fire first.
-            let expired = Instant::now() >= deadline;
-            let _ = stream.shutdown(Shutdown::Both);
-            return Err(if expired {
-                io::ErrorKind::TimedOut.into()
-            } else {
-                error
-            });
+        writer.cap_write_time(remaining)?;
+        // Small slices: one blocking write can otherwise outlive the timeout while
+        // a reader keeps making partial progress (SO_SNDTIMEO resets on progress).
+        let slice = &buf[..buf.len().min(WRITE_SLICE)];
+        match writer.write(slice) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => buf = &buf[n..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) if Instant::now() >= deadline => {
+                // The per-write timeout raced the deadline.
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            Err(error) => return Err(error),
         }
     }
-    stream.flush()
+    Ok(())
 }
 
 fn ignore_response_error(result: io::Result<()>) {
@@ -3949,16 +3987,129 @@ mod tests {
             let deadline = Some(Instant::now() + Duration::from_millis(400));
             write_http_response_until(server, 200, &body, deadline)
         });
-        // Steady progress, far below the per-write timeout, far too slow overall.
-        let mut buf = [0u8; 1024];
+        // A few hundred bytes per 20 ms: partial writes inside a single piece.
+        let mut buf = [0u8; 300];
         while !writer.is_finished() {
             std::thread::sleep(Duration::from_millis(20));
             let _ = client.read(&mut buf);
-            assert!(started.elapsed() < Duration::from_secs(5), "never cut");
         }
         let error = writer.join().unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(started.elapsed() >= Duration::from_millis(400));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
+    }
+
+    /// Scripted writer: `n` bytes accepted per call after `delay`; `stall` sleeps
+    /// the capped time, then WouldBlock, instead of accepting anything.
+    struct Scripted {
+        n: usize,
+        delay: Duration,
+        stall: bool,
+        cap: Duration,
+    }
+
+    impl Write for Scripted {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.stall {
+                std::thread::sleep(self.cap);
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            std::thread::sleep(self.delay);
+            Ok(self.n.min(buf.len()))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl DeadlineWrite for Scripted {
+        fn cap_write_time(&mut self, limit: Duration) -> io::Result<()> {
+            self.cap = limit;
+            Ok(())
+        }
+    }
+
+    fn scripted(n: usize, delay_ms: u64, stall: bool) -> Scripted {
+        Scripted {
+            n,
+            delay: Duration::from_millis(delay_ms),
+            stall,
+            cap: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn scripted_partial_writes_hit_the_deadline_not_the_end_of_the_body() {
+        // 2 bytes per 5 ms would need ~460 ms for 200 bytes; deadline is 40 ms.
+        let mut writer = scripted(2, 5, false);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(40);
+        let error = write_parts_until(&mut writer, b"HEAD", &[1; 200], deadline).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_millis(120),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn writer_stalled_in_the_headers_times_out_at_the_deadline() {
+        let mut writer = scripted(0, 0, true);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(60);
+        let error = write_parts_until(&mut writer, b"HEAD", b"body", deadline).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn final_piece_completing_after_the_deadline_is_timed_out() {
+        // One call takes 60 ms and accepts everything, past a 20 ms deadline.
+        let mut writer = scripted(usize::MAX, 60, false);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let error = write_parts_until(&mut writer, b"H", b"b", deadline).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let mut ok = scripted(usize::MAX, 0, false);
+        write_parts_until(&mut ok, b"H", b"b", Instant::now() + Duration::from_secs(5)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cut_connection_is_shut_down_and_frees_the_large_pool_for_another_peer() {
+        let limiter = Arc::new(RequestLimiter::default());
+        let permit = limiter.acquire_large("peer-a").unwrap();
+        let (server, mut client) = tiny_buffer_pair();
+        let started = Instant::now();
+        let writer = std::thread::spawn(move || {
+            let _permit = permit; // released when the write path ends
+            let deadline = Some(Instant::now() + Duration::from_millis(400));
+            write_http_response_until(server, 200, &vec![7u8; 4 * 1024 * 1024], deadline)
+        });
+        let mut buf = [0u8; 300];
+        while !writer.is_finished() {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = client.read(&mut buf);
+        }
+        assert_eq!(
+            writer.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
+        assert_eq!(limiter.large_active(), 0);
+        assert!(limiter.acquire_large("peer-b").is_some());
+        // Shut down: draining what was buffered ends in EOF, not a hang.
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest).unwrap();
     }
 
     #[cfg(unix)]
