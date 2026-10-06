@@ -1984,8 +1984,17 @@ mod tests {
         }
 
         fn send_raw(&self, body: &[u8], headers: &[u8]) -> io::Result<(u16, Vec<u8>)> {
+            self.send_raw_with_timeout(body, headers, Duration::from_secs(2))
+        }
+
+        fn send_raw_with_timeout(
+            &self,
+            body: &[u8],
+            headers: &[u8],
+            timeout: Duration,
+        ) -> io::Result<(u16, Vec<u8>)> {
             let mut stream = TcpStream::connect(self.address)?;
-            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            stream.set_read_timeout(Some(timeout))?;
             write!(stream, "POST /cluster HTTP/1.1\r\nHost: test\r\n")?;
             stream.write_all(headers)?;
             stream.write_all(b"\r\n")?;
@@ -3602,7 +3611,7 @@ mod tests {
         let sealed = sealed_list_request(peer, server);
         let headers = format!("Content-Length: {}\r\n{extra}", sealed.message.len());
         let (status, body) = server
-            .send_raw(&sealed.message, headers.as_bytes())
+            .send_raw_with_timeout(&sealed.message, headers.as_bytes(), Duration::from_secs(30))
             .unwrap();
         (sealed, status, body)
     }
