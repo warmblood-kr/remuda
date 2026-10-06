@@ -1,0 +1,5 @@
+Already initialized
+Node: <NODE>
+Fingerprint: <FINGERPRINT>
+Listener off (--no-listen)
+Next: run `remuda cluster invite` here, then run its printed `remuda cluster join ...` command on the other node.

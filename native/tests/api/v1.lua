@@ -9,15 +9,15 @@
 -- rather than someone's plugin.
 --
 -- Widening the API means adding `v2.lua` next to this file. It never means
--- editing this one — a compatibility check you may edit to make it pass is not
--- a check. If a change genuinely cannot keep v1 working, that is a real
+-- editing this one — a compatibility check you may edit to make it pass is
+-- not a check. If a change genuinely cannot keep v1 working, that is a real
 -- decision to make in the open, and deleting this file is how you make it.
-
+-- 2026-10-01: owner-approved break: remuda.sleep was deleted (owner decision 2026-09-30); calling it raises the use-remuda.after error.
 local name = "api-v1-" .. tostring(os.time())
 
 -- Every binding exists and is callable. Checked by name because a script in the
 -- wild reaches for these by name.
-for _, fn in ipairs({ "attach", "capture", "click", "insert", "key", "ls", "new", "send", "sleep" }) do
+for _, fn in ipairs({ "attach", "capture", "click", "insert", "key", "ls", "new", "send" }) do
   assert(type(remuda[fn]) == "function", "remuda." .. fn .. " is gone")
 end
 
@@ -41,24 +41,11 @@ assert(type(found.cols) == "number" and type(found.rows) == "number", "row size"
 -- send(name, text) delivers a line with Enter appended.
 remuda.send(name, "echo $((6*7))-v1")
 
-local function wait_for(needle)
-  for _ = 1, 200 do
-    local screen = remuda.capture(name)
-    assert(type(screen) == "string", "capture must return a string")
-    if screen:find(needle, 1, true) then return screen end
-    remuda.sleep(0.05)
-  end
-  error("never saw " .. needle)
-end
-
-wait_for("42-v1")
-
 -- insert(name, bytes) appends nothing, so this sits at the prompt un-submitted.
 remuda.insert(name, "echo $((8*8))-v1")
 -- key(name, spec) in Emacs `kbd` notation. RET is what submits the line above,
 -- which is also the proof that insert did not submit it itself.
 remuda.key(name, "RET")
-wait_for("64-v1")
 
 -- click(name, col, row) defaults to the left button; a fourth argument names
 -- another. A shell ignores mouse reports, so this checks the call shape, not an
@@ -76,3 +63,11 @@ local ok2 = pcall(function() return remuda.key(name, "no-such-key") end)
 assert(not ok2, "an unknown key must raise, not send an empty burst")
 
 print("v1 ok")
+
+-- The Rust fixture harness waits until both commands have reached the screen,
+-- then calls this check in the same Lua image.
+remuda._api_v1_assert_output = function()
+  local screen = remuda.capture(name)
+  assert(screen:find("42-v1", 1, true), "send output was not on screen")
+  assert(screen:find("64-v1", 1, true), "insert/key output was not on screen")
+end

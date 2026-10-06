@@ -19,7 +19,8 @@
 //! transport. Adding those here would put a socket in the policy layer, which
 //! `core/clippy.toml` denies outright.
 
-use crate::agent::{Cursor, Result, ScreenSnapshot, Size, StyledCell};
+use crate::agent::{AgentError, Cursor, ExitInfo, Result, ScreenSnapshot, Size, StyledCell};
+use crate::input::{InputBatch, InputError, InputOutcome};
 use crate::protocol::Step;
 use crate::session::Session;
 use core::time::Duration;
@@ -35,6 +36,12 @@ pub struct SessionSummary {
     #[serde(default)]
     pub id: String,
     pub name: String,
+    /// Unique to this particular start, even when a later process reuses its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// Increases for each processed PTY output chunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_version: Option<u64>,
     pub alive: bool,
     /// Time since the last accepted input; unchanged by agent output.
     pub idle: Duration,
@@ -84,6 +91,15 @@ pub struct Registry {
 }
 
 impl Registry {
+    pub fn apply_input_batch(
+        &self,
+        name: &str,
+        batch: InputBatch<'_>,
+    ) -> Option<core::result::Result<InputOutcome, InputError>> {
+        self.get(name)
+            .map(|session| session.apply_input_batch(batch))
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -134,11 +150,23 @@ impl Registry {
     }
 
     /// Process IDs for the live session children. Exited sessions remain
-    /// listed, but cannot be parents of an active shutdown requester.
+    /// listed, but cannot identify an active caller.
     pub fn live_process_ids(&self) -> Vec<u32> {
+        self.live_processes()
+            .into_iter()
+            .map(|(_, pid)| pid)
+            .collect()
+    }
+
+    /// Names paired with the process IDs used to identify session ancestry.
+    pub fn live_processes(&self) -> Vec<(String, u32)> {
         self.lock()
             .values()
-            .filter_map(|session| session.process_id_if_alive())
+            .filter_map(|session| {
+                session
+                    .process_id_if_alive()
+                    .map(|pid| (session.name().to_string(), pid))
+            })
             .collect()
     }
 
@@ -151,6 +179,8 @@ impl Registry {
             .map(|s| SessionSummary {
                 id: s.id().to_string(),
                 name: s.name().to_string(),
+                instance_id: Some(s.instance_id().to_string()),
+                output_version: s.output_version(),
                 alive: s.is_alive(),
                 idle: s.idle_for(),
                 output_idle: Some(s.output_idle_for()),
@@ -173,16 +203,43 @@ impl Registry {
 
     /// Drop every session whose process has exited, returning their names.
     pub fn reap(&self) -> Vec<String> {
+        self.reap_with_exit_info()
+            .into_iter()
+            .map(|(name, _, _, _, _)| name)
+            .collect()
+    }
+
+    /// Drop exited sessions and retain any status their backend observed.
+    pub fn reap_with_exit_info(
+        &self,
+    ) -> Vec<(String, String, String, &'static str, Option<ExitInfo>)> {
         let mut sessions = self.lock();
-        let dead: Vec<String> = sessions
+        let dead: Vec<_> = sessions
             .iter()
             .filter(|(_, s)| !s.is_alive())
-            .map(|(n, _)| n.clone())
+            .map(|(name, session)| {
+                (
+                    name.clone(),
+                    session.id().to_string(),
+                    session.instance_id().to_string(),
+                    if session.is_closing() {
+                        "closed"
+                    } else {
+                        "exited"
+                    },
+                    Arc::clone(session),
+                )
+            })
             .collect();
-        for name in &dead {
+        for (name, _, _, _, _) in &dead {
             sessions.remove(name);
         }
-        dead
+        drop(sessions);
+        dead.into_iter()
+            .map(|(name, id, instance_id, reason, session)| {
+                (name, id, instance_id, reason, session.exit_info())
+            })
+            .collect()
     }
 
     /// A panic under this lock cannot leave the map half-updated — an entry is
@@ -250,6 +307,16 @@ impl Registry {
         self.get(name).map(|s| s.screen_snapshot_at(scrollback))
     }
 
+    /// A screen and its output generation read within one session-lock interval.
+    pub fn screen_snapshot_version_at(
+        &self,
+        name: &str,
+        scrollback: usize,
+    ) -> Option<Result<crate::agent::VersionedSnapshot>> {
+        self.get(name)
+            .map(|session| session.screen_snapshot_version_at(scrollback))
+    }
+
     pub fn cursor(&self, name: &str) -> Option<Result<Cursor>> {
         self.get(name).map(|s| s.cursor())
     }
@@ -257,7 +324,41 @@ impl Registry {
     /// End and stop tracking a session; an attached one refuses and stays.
     /// `Ok(false)`: a concurrent `reap` removed it first and owns the notice.
     pub fn close(&self, name: &str) -> Option<Result<bool>> {
-        let session = self.get(name)?;
-        Some(session.terminate().map(|()| self.remove(name).is_some()))
+        let session = {
+            let sessions = self.lock();
+            let session = Arc::clone(sessions.get(name)?);
+            session.mark_closing();
+            session
+        };
+        Some(match session.terminate_for_close() {
+            Ok(()) => {
+                let removed = self.remove(name).is_some();
+                session.wake_sync_waiters();
+                Ok(removed)
+            }
+            Err(error) => {
+                session.clear_closing();
+                Err(error)
+            }
+        })
+    }
+
+    /// Close only the session start named by `instance_id`. The registry lock
+    /// covers identity validation, termination, and removal so a same-name
+    /// replacement can never be closed by a stale request.
+    pub fn close_instance(&self, name: &str, instance_id: &str) -> Option<Result<bool>> {
+        let mut sessions = self.lock();
+        let session = sessions.get(name)?.clone();
+        if session.instance_id() != instance_id {
+            return Some(Err(AgentError::Io(
+                "session restarted; close was refused".into(),
+            )));
+        }
+        session.mark_closing();
+        if let Err(error) = session.terminate() {
+            session.clear_closing();
+            return Some(Err(error));
+        }
+        Some(Ok(sessions.remove(name).is_some()))
     }
 }

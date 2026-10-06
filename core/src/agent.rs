@@ -9,11 +9,83 @@
 //! Drill the hole once and both are satisfied: a scripted double for tests,
 //! and a second vendor later, are the same substitution.
 
+use crate::clock::Clock;
 use core::fmt;
 use serde::{Deserialize, Serialize};
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, SyncSender};
+use std::sync::Arc;
 
-/// Terminal dimensions, clamped to the smallest usable interactive terminal.
+/// A coalesced wake signal for consumers that only need to know that output
+/// changed. The PTY reader stores the latest version separately, so wakeups
+/// never need to copy output bytes.
+pub struct OutputSignal {
+    sender: SyncSender<()>,
+    pending: Arc<AtomicBool>,
+}
+
+impl OutputSignal {
+    /// Notify a subscriber once until it acknowledges the wake. `false` means
+    /// its receiver has gone away and the watcher can be removed.
+    pub fn wake(&self) -> bool {
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        match self.sender.try_send(()) {
+            Ok(()) | Err(mpsc::TrySendError::Full(())) => true,
+            Err(mpsc::TrySendError::Disconnected(())) => {
+                self.pending.store(false, Ordering::Release);
+                false
+            }
+        }
+    }
+}
+
+/// Receiver for coalesced output wakes. Call `version_after_wake` after
+/// handling a wake to reopen the single pending slot and sample the latest
+/// output generation without losing a concurrent update.
+pub struct OutputWakeup {
+    receiver: Receiver<()>,
+    pending: Arc<AtomicBool>,
+    output_version: Arc<AtomicU64>,
+}
+
+impl OutputWakeup {
+    pub fn pair(output_version: Arc<AtomicU64>) -> (OutputSignal, Self) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let pending = Arc::new(AtomicBool::new(false));
+        (
+            OutputSignal {
+                sender,
+                pending: Arc::clone(&pending),
+            },
+            Self {
+                receiver,
+                pending,
+                output_version,
+            },
+        )
+    }
+
+    pub fn recv(&self) -> core::result::Result<(), RecvError> {
+        self.receiver.recv()
+    }
+
+    pub fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> core::result::Result<(), RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
+
+    pub fn version_after_wake(&self) -> u64 {
+        self.pending.store(false, Ordering::Release);
+        self.output_version.load(Ordering::Acquire)
+    }
+}
+
+/// Terminal dimensions, normally clamped to the smallest usable interactive
+/// terminal. A pane may explicitly retain its narrower visible width.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Size {
     cols: u16,
@@ -26,12 +98,25 @@ impl Size {
     /// split spawned a session at 11 columns and input vanished with no error.
     pub const MIN_COLS: u16 = 80;
     pub const MIN_ROWS: u16 = 24;
+    pub const MIN_RESIZE_COLS: u16 = 20;
+    pub const MAX_RESIZE_COLS: u16 = 1000;
+    pub const MAX_RESIZE_ROWS: u16 = 500;
 
     /// Clamps up to the floor. A caller cannot construct a size that drops
     /// keystrokes, so no downstream code has to remember to check.
     pub fn new(cols: u16, rows: u16) -> Self {
         Self {
             cols: cols.max(Self::MIN_COLS),
+            rows: rows.max(Self::MIN_ROWS),
+        }
+    }
+
+    /// A pane must tell its child the width the user can actually see. This
+    /// keeps the ordinary 80-column safety floor everywhere else while
+    /// allowing a constrained pane to opt into a narrower terminal.
+    pub fn for_pane(cols: u16, rows: u16) -> Self {
+        Self {
+            cols: cols.max(1),
             rows: rows.max(Self::MIN_ROWS),
         }
     }
@@ -116,6 +201,8 @@ pub enum MouseEncoding {
 pub struct MouseState {
     pub mode: MouseMode,
     pub encoding: MouseEncoding,
+    #[serde(default)]
+    pub bracketed_paste: bool,
 }
 
 #[derive(Debug)]
@@ -126,6 +213,21 @@ pub enum AgentError {
     /// Someone is attached and driving this session by hand. Orchestrated
     /// input is refused rather than queued — see [`crate::session::Session`].
     Attached,
+    /// A previous PTY write is still active; no second write was queued.
+    Busy,
+    /// The bounded write deadline elapsed; bytes may still finish later.
+    WriteTimeout {
+        timeout: core::time::Duration,
+    },
+    /// A stalled text write outlived its submit bound; its Return was dropped.
+    LateSubmitAbandoned {
+        bound: core::time::Duration,
+    },
+    /// Text is still being written; its Return will follow if it lands in time.
+    SubmitPending,
+    /// The body landed, but a Return write was refused while busy, whether
+    /// that Return was meant to submit or add a composer newline.
+    SubmitUncertain,
     /// A `feed` act's `Pause`s summed past the caller's cap — refused before
     /// anything is written, not clamped, so a seconds/millis mixup errors
     /// instead of silently running a shorter pause than asked for.
@@ -140,7 +242,31 @@ impl fmt::Display for AgentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AgentError::Exited => write!(f, "agent process has exited"),
-            AgentError::Attached => write!(f, "a human is attached to this session"),
+            AgentError::Attached => write!(
+                f,
+                "a human is attached to this session; detach it first (Ctrl-\\ in that terminal), then retry"
+            ),
+            AgentError::Busy => write!(f, "a session input write is already in flight"),
+            AgentError::WriteTimeout { timeout } => {
+                write!(
+                    f,
+                    "PTY write exceeded {timeout:?}; delivery may be partial or late"
+                )
+            }
+            AgentError::LateSubmitAbandoned { bound } => {
+                write!(
+                    f,
+                    "an earlier write to this pane stalled for over {bound:?} and its Return was not sent; the pane may hold unsent text; this text was not typed"
+                )
+            }
+            AgentError::SubmitPending => write!(
+                f,
+                "text is still being written to a slow pane; Return follows when it lands or is dropped after the bound; check the pane before resending"
+            ),
+            AgentError::SubmitUncertain => write!(
+                f,
+                "text may be in the pane, but submission is unconfirmed.\nNext: inspect it with `remuda capture NAME` before resending."
+            ),
             AgentError::PauseTooLong { total, cap } => {
                 write!(f, "feed's pauses total {total:?}, over the {cap:?} cap")
             }
@@ -150,6 +276,73 @@ impl fmt::Display for AgentError {
 }
 
 pub type Result<T> = core::result::Result<T, AgentError>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainOutcome {
+    Chained,
+    Landed,
+    Unsupported,
+}
+
+/// A backend writer that can wait independently of the locked process object.
+pub trait AgentWriter: Send + Sync {
+    /// Give the writer the session's clock for policy deadlines. Backends that
+    /// do not keep time-based writer state can ignore it.
+    fn set_clock(&self, _clock: Arc<dyn Clock>) {}
+    fn write_bounded(&self, bytes: &[u8]) -> Result<()>;
+    /// Ask the write that timed out to be followed by FOLLOW_UP once it lands.
+    /// `Landed` means the timed-out write is no longer the active write; `Unsupported` means it cannot chain.
+    fn chain_after_stalled(
+        &self,
+        _follow_up: &[u8],
+        _settle: core::time::Duration,
+    ) -> ChainOutcome {
+        ChainOutcome::Unsupported
+    }
+    /// Write these bytes once and wait for their actual completion. Interactive
+    /// input uses this path so a timeout cannot silently drop a keystroke or
+    /// cause a possibly partial write to be replayed.
+    fn write_to_completion(&self, bytes: &[u8]) -> Result<()> {
+        self.write_bounded(bytes)
+    }
+    /// As `write_to_completion`, but stop waiting if the caller is no longer
+    /// allowed to deliver this input. Backends with blocking completion paths
+    /// should poll `cancelled` while waiting.
+    fn write_to_completion_while(&self, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
+        if cancelled() {
+            return Err(AgentError::Attached);
+        }
+        self.write_to_completion(bytes)
+    }
+    /// As `write_to_completion_while`, notifying when the backend begins its
+    /// actual write attempt.
+    fn write_to_completion_while_started(
+        &self,
+        bytes: &[u8],
+        cancelled: &dyn Fn() -> bool,
+        on_start: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<()> {
+        if cancelled() {
+            return Err(AgentError::Attached);
+        }
+        on_start();
+        self.write_to_completion_while(bytes, cancelled)
+    }
+    fn is_busy(&self) -> bool;
+    /// Whether an active write has exceeded its backend's bounded-write deadline.
+    /// Healthy writes remain busy but callers may wait for them to finish.
+    fn is_timed_out(&self) -> bool {
+        false
+    }
+}
+
+/// Exit information retained by a process-backed agent after it is reaped.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExitInfo {
+    pub exit_code: Option<u32>,
+    pub signal: Option<i32>,
+    pub signal_name: Option<String>,
+}
 
 /// A styled screen and its scrollback measurements from one parser snapshot.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -161,6 +354,14 @@ pub struct ScreenSnapshot {
     pub scrollback_total: usize,
 }
 
+/// A captured screen with the session identity and generation captured with it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct VersionedSnapshot {
+    pub snapshot: ScreenSnapshot,
+    pub output_version: Option<u64>,
+    pub instance_id: Option<String>,
+}
+
 /// A live agent process: a screen we can read, a keyboard we can type on.
 /// Caution: every method is sync for correctness, not simplicity — awaiting a
 /// body write and its Enter separately lets a second writer land between them.
@@ -168,6 +369,12 @@ pub trait AgentProcess: Send {
     /// Type raw bytes. Not public API on [`Session`] — see
     /// [`crate::session::Session::send_line`] for why callers never get this.
     fn write(&mut self, bytes: &[u8]) -> Result<()>;
+
+    /// An optional writer handle that can outlive the process lock while it
+    /// waits for a bounded PTY write. Simpler agents keep using `write`.
+    fn input_writer(&mut self) -> Option<Arc<dyn AgentWriter>> {
+        None
+    }
 
     /// The visible screen, rendered as text, newline-separated.
     fn screen_text(&mut self) -> Result<String>;
@@ -231,10 +438,15 @@ pub trait AgentProcess: Send {
         Ok(Vec::new())
     }
 
+    /// A backend generation, if it can synchronize it with screen capture.
+    fn output_version(&mut self) -> Option<u64> {
+        None
+    }
+
     /// Capture the screen and its scrollback counters together when the
     /// backend can provide an atomic snapshot. The default preserves support
     /// for simpler agents that expose these values through separate calls.
-    fn screen_snapshot_at(&mut self, scrollback: usize) -> Result<ScreenSnapshot> {
+    fn screen_snapshot_at(&mut self, scrollback: usize) -> Result<VersionedSnapshot> {
         let cells = self.screen_cells_at(scrollback)?;
         let wrapped = self.row_wrapped_at(scrollback)?;
         let scrollback_len = self.scrollback_len();
@@ -248,12 +460,16 @@ pub trait AgentProcess: Send {
                 visible: false,
             }
         };
-        Ok(ScreenSnapshot {
-            cells,
-            wrapped,
-            cursor,
-            scrollback_len,
-            scrollback_total,
+        Ok(VersionedSnapshot {
+            snapshot: ScreenSnapshot {
+                cells,
+                wrapped,
+                cursor,
+                scrollback_len,
+                scrollback_total,
+            },
+            output_version: self.output_version(),
+            instance_id: None,
         })
     }
 
@@ -264,9 +480,20 @@ pub trait AgentProcess: Send {
         None
     }
 
+    /// Subscribe to coalesced notifications of output changes. The backend
+    /// owns the shared output version and updates it before waking subscribers.
+    fn subscribe_output_wakeup(&mut self) -> Option<OutputWakeup> {
+        None
+    }
+
     fn cursor(&mut self) -> Result<Cursor>;
 
     fn is_alive(&mut self) -> bool;
+
+    /// The known exit status, if this backend has observed one.
+    fn exit_info(&mut self) -> Option<ExitInfo> {
+        None
+    }
 
     /// End the child. Idempotent: calling it on an already-exited process is
     /// not an error, because a caller that raced a self-exit (step 006) must

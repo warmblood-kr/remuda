@@ -30,7 +30,7 @@ pub enum Guard {
 
 /// Apply the guard to a not-yet-spawned `Command` — the only function in
 /// this codebase that may call `pre_exec`/`process_group` for this purpose.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn harden(command: &mut Command) -> Guard {
     use std::os::unix::process::CommandExt;
     let daemon_pid = std::process::id() as libc::pid_t;
@@ -63,7 +63,7 @@ pub fn harden(command: &mut Command) -> Guard {
     Guard::LinuxPdeathsig
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 pub fn harden(command: &mut Command) -> Guard {
     use std::os::unix::process::CommandExt;
     // Same group as Linux, so `killpg` on a clean shutdown reaches the child

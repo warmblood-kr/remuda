@@ -6,9 +6,10 @@
 //! for a later run to read — so a notice can arrive one run late, and no command
 //! ever waits on the network. That is the trade: staleness instead of latency.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// CI injects the full version (including a nightly suffix); a local `cargo
 /// build` falls back to the manifest.
@@ -54,8 +55,7 @@ pub fn upgrade(channel: Option<&str>) -> Result<(), String> {
         return Err(format!("unknown channel {channel:?} — stable or nightly"));
     }
     eprintln!("remuda: upgrading on the {channel} channel…");
-    let status = installer_command()
-        .env("REMUDA_CHANNEL", &channel)
+    let status = installer_command(&channel)
         .status()
         .map_err(|e| format!("cannot run the installer: {e}"))?;
     if status.success() {
@@ -69,12 +69,15 @@ pub fn upgrade(channel: Option<&str>) -> Result<(), String> {
 /// `curl … | sh`: a pipeline reports the *last* status, so a 404 fed an empty
 /// script to a shell that exited 0 — a failed upgrade that looked finished.
 #[cfg(unix)]
-fn installer_command() -> Command {
+fn installer_command(channel: &str) -> Command {
     let mut command = Command::new("sh");
     command.arg("-c").arg(format!(
         "set -e; t=$(mktemp); trap 'rm -f \"$t\"' EXIT; \
          curl -fsSL --max-time 120 -o \"$t\" {INSTALL_URL}; sh \"$t\""
     ));
+    command
+        .env("REMUDA_CHANNEL", channel)
+        .env_remove("REMUDA_INSTALL_BUTLER");
     command
 }
 
@@ -82,7 +85,7 @@ fn installer_command() -> Command {
 /// what makes `Invoke-WebRequest` raise on a 404 instead of returning an error
 /// page for the next line to execute.
 #[cfg(windows)]
-fn installer_command() -> Command {
+fn installer_command(channel: &str) -> Command {
     let mut command = Command::new("powershell");
     command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]);
     command.arg(format!(
@@ -92,6 +95,9 @@ fn installer_command() -> Command {
          & powershell -NoProfile -ExecutionPolicy Bypass -File $t; exit $LASTEXITCODE }} \
          finally {{ Remove-Item -Force -ErrorAction SilentlyContinue $t }}"
     ));
+    command
+        .env("REMUDA_CHANNEL", channel)
+        .env_remove("REMUDA_INSTALL_BUTLER");
     command
 }
 
@@ -123,6 +129,54 @@ fn is_stale(cache: &Path) -> bool {
         .and_then(|m| m.modified())
         .map(|t| t.elapsed().map(|d| d > CHECK_INTERVAL).unwrap_or(true))
         .unwrap_or(true)
+}
+
+/// Pure display policy, kept separate from the cache and environment reads.
+pub fn should_show_update_notice(
+    stderr_is_terminal: bool,
+    agent_id_set: bool,
+    no_update_check_env: bool,
+    last_shown: Option<SystemTime>,
+    now: SystemTime,
+) -> bool {
+    if !stderr_is_terminal || agent_id_set || no_update_check_env {
+        return false;
+    }
+    match last_shown {
+        Some(last) => now
+            .duration_since(last)
+            .map(|elapsed| elapsed >= CHECK_INTERVAL)
+            .unwrap_or(false),
+        None => true,
+    }
+}
+
+fn notice_stamp_path(cache: &Path) -> PathBuf {
+    cache.with_file_name("update-notice-stamp")
+}
+
+/// The timestamp file sits next to the update index. Its contents are Unix
+/// seconds in decimal, followed by a newline; any read or parse error is silent.
+pub fn update_notice_last_shown() -> Option<SystemTime> {
+    read_notice_stamp(&notice_stamp_path(&cache_path()))
+}
+
+fn read_notice_stamp(path: &Path) -> Option<SystemTime> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let seconds = text.trim().parse::<u64>().ok()?;
+    UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
+}
+
+/// Persist a successfully displayed notice. Errors are intentionally silent.
+pub fn record_update_notice_shown(now: SystemTime) {
+    write_notice_stamp(&notice_stamp_path(&cache_path()), now);
+}
+
+fn write_notice_stamp(path: &Path, now: SystemTime) {
+    let Ok(elapsed) = now.duration_since(UNIX_EPOCH) else {
+        return;
+    };
+    let _ = std::fs::write(path, format!("{}\n", elapsed.as_secs()));
 }
 
 /// Fetch the index in the background and never wait for it. The trailing stamp
@@ -184,7 +238,7 @@ fn shell_quote(path: &Path) -> String {
 /// Semver-ish ordering: the numeric triple first, then a release outranks any
 /// prerelease, then prerelease strings compare lexically — which is why the
 /// nightly suffix is `YYYYMMDD.<sha>` and not `<sha>`.
-fn is_newer(candidate: &str, current: &str) -> bool {
+pub fn is_newer(candidate: &str, current: &str) -> bool {
     rank(candidate) > rank(current)
 }
 
@@ -198,39 +252,120 @@ fn rank(version: &str) -> ([u64; 3], bool, String) {
 }
 
 fn channel_path() -> PathBuf {
-    data_home().join("remuda").join("channel")
+    data_home()
+        .unwrap_or_else(|| PathBuf::from(".local/share"))
+        .join("remuda")
+        .join("channel")
 }
 
 fn cache_path() -> PathBuf {
-    base_dir("XDG_CACHE_HOME", ".cache")
-        .join("remuda")
-        .join("update-check.json")
+    cache_path_for(cfg!(windows), &|name| std::env::var_os(name))
 }
 
-fn data_home() -> PathBuf {
-    base_dir("XDG_DATA_HOME", ".local/share")
+/// Data base directory, parent of `remuda/`: an absolute `$XDG_DATA_HOME`,
+/// else `%LOCALAPPDATA%` (or `%USERPROFILE%/AppData/Local`) on Windows or
+/// `$HOME/.local/share`; relative XDG values are ignored. `None` if unknown.
+pub(crate) fn data_home() -> Option<PathBuf> {
+    data_home_for(cfg!(windows), &|name| std::env::var_os(name))
 }
 
-fn base_dir(variable: &str, fallback: &str) -> PathBuf {
-    match std::env::var_os(variable) {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => home().join(fallback),
-    }
-}
+type Env<'a> = &'a dyn Fn(&str) -> Option<OsString>;
 
-/// `$HOME`, or `%USERPROFILE%` where that is what the OS calls it. The XDG
-/// layout underneath is kept on both, so the installer and this binary derive
-/// the channel file from one rule rather than two.
-fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+fn set(env: Env, name: &str) -> Option<PathBuf> {
+    env(name)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_default()
+}
+
+// Platform and environment are arguments so every arm runs on any host.
+fn data_home_for(windows: bool, env: Env) -> Option<PathBuf> {
+    crate::storage::base_dir_for(crate::storage::Kind::Data, windows, env).ok()
+}
+
+fn cache_path_for(windows: bool, env: Env) -> PathBuf {
+    let dir = match set(env, "XDG_CACHE_HOME") {
+        Some(dir) => dir.join("remuda"),
+        None if windows => home_dir_for(true, env, "")
+            .unwrap_or_default()
+            .join("remuda")
+            .join("cache"),
+        None => home_dir_for(false, env, ".cache")
+            .unwrap_or_else(|| PathBuf::from(".cache"))
+            .join("remuda"),
+    };
+    dir.join("update-check.json")
+}
+
+/// Windows keeps app data in `%LOCALAPPDATA%`; elsewhere `$HOME` (or
+/// `%USERPROFILE%`) plus the XDG layout `unix_sub`.
+fn home_dir_for(windows: bool, env: Env, unix_sub: &str) -> Option<PathBuf> {
+    if windows {
+        return set(env, "LOCALAPPDATA")
+            .or_else(|| set(env, "USERPROFILE").map(|home| home.join("AppData").join("Local")));
+    }
+    env("HOME")
+        .or_else(|| env("USERPROFILE"))
+        .map(|home| PathBuf::from(home).join(unix_sub))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_notice_policy() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(2 * 24 * 60 * 60);
+        let cases = [
+            ("first terminal notice", true, false, false, None, true),
+            (
+                "shown less than a day ago",
+                true,
+                false,
+                false,
+                Some(now - Duration::from_secs(24 * 60 * 60 - 1)),
+                false,
+            ),
+            (
+                "shown a day ago",
+                true,
+                false,
+                false,
+                Some(now - Duration::from_secs(24 * 60 * 60)),
+                true,
+            ),
+            ("stderr is not a terminal", false, false, false, None, false),
+            ("managed agent", true, true, false, None, false),
+            ("opted out", true, false, true, None, false),
+        ];
+        for (name, tty, agent, disabled, last_shown, expected) in cases {
+            assert_eq!(
+                should_show_update_notice(tty, agent, disabled, last_shown, now),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_notice_stamp_uses_epoch_seconds_and_ignores_io_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "remuda-update-stamp-{}-{}",
+            std::process::id(),
+            UNIX_EPOCH.elapsed().unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let stamp = root.join("update-notice-stamp");
+        let now = UNIX_EPOCH + Duration::from_secs(123_456);
+        write_notice_stamp(&stamp, now);
+        assert_eq!(std::fs::read_to_string(&stamp).unwrap(), "123456\n");
+        assert_eq!(read_notice_stamp(&stamp), Some(now));
+
+        let bad_stamp = root.join("directory");
+        std::fs::create_dir(&bad_stamp).unwrap();
+        write_notice_stamp(&bad_stamp, now);
+        assert_eq!(read_notice_stamp(&bad_stamp), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn a_release_outranks_its_own_nightlies_and_the_triple_wins_first() {
@@ -278,5 +413,111 @@ mod tests {
     #[test]
     fn the_version_is_never_empty() {
         assert!(!VERSION.is_empty());
+    }
+
+    #[test]
+    fn upgrade_installer_does_not_inherit_butler_install_opt_in() {
+        // `Command` inherits parent variables unless it explicitly removes
+        // them. Inspect the builder instead of running its network installer.
+        let command = installer_command("nightly");
+        assert!(
+            command.get_envs().any(|(name, value)| {
+                name == std::ffi::OsStr::new("REMUDA_INSTALL_BUTLER") && value.is_none()
+            }),
+            "upgrade installer must remove REMUDA_INSTALL_BUTLER from its child environment"
+        );
+    }
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| OsString::from(v))
+        }
+    }
+
+    const HANGUL: &str = r"C:\Users\박 정수\AppData\Local";
+
+    #[test]
+    fn windows_data_home_is_localappdata_and_the_cache_nests_under_it() {
+        let env = env_of(&[("LOCALAPPDATA", HANGUL), ("HOME", "/ignored")]);
+        assert_eq!(data_home_for(true, &env), Some(PathBuf::from(HANGUL)));
+        assert_eq!(
+            cache_path_for(true, &env),
+            PathBuf::from(HANGUL)
+                .join("remuda")
+                .join("cache")
+                .join("update-check.json")
+        );
+    }
+
+    #[test]
+    fn windows_xdg_wins_and_localappdata_falls_back_to_the_profile() {
+        let env = env_of(&[
+            ("XDG_DATA_HOME", r"C:\xdg\data"),
+            ("XDG_CACHE_HOME", "/c"),
+            ("LOCALAPPDATA", r"C:\Users\user\AppData\Local"),
+        ]);
+        assert_eq!(
+            data_home_for(true, &env),
+            Some(PathBuf::from(r"C:\xdg\data"))
+        );
+        assert_eq!(
+            cache_path_for(true, &env),
+            PathBuf::from("/c/remuda/update-check.json")
+        );
+        for env in [
+            env_of(&[("USERPROFILE", r"C:\Users\user")]),
+            env_of(&[("LOCALAPPDATA", ""), ("USERPROFILE", r"C:\Users\user")]),
+        ] {
+            assert_eq!(
+                data_home_for(true, &env),
+                Some(
+                    PathBuf::from(r"C:\Users\user")
+                        .join("AppData")
+                        .join("Local")
+                )
+            );
+        }
+        assert_eq!(data_home_for(true, &env_of(&[("HOME", "/h")])), None);
+    }
+
+    #[test]
+    fn unix_rule_is_unchanged() {
+        let env = env_of(&[("HOME", "/h"), ("USERPROFILE", "/p"), ("LOCALAPPDATA", "L")]);
+        assert_eq!(
+            data_home_for(false, &env),
+            Some(PathBuf::from("/h/.local/share"))
+        );
+        assert_eq!(
+            cache_path_for(false, &env),
+            PathBuf::from("/h/.cache/remuda/update-check.json")
+        );
+        let env = env_of(&[("USERPROFILE", "/p")]);
+        assert_eq!(data_home_for(false, &env), None);
+        assert_eq!(
+            data_home_for(false, &env_of(&[("XDG_DATA_HOME", "")])),
+            None
+        );
+        assert_eq!(
+            data_home_for(
+                false,
+                &env_of(&[("XDG_DATA_HOME", "relative"), ("HOME", "/h")]),
+            ),
+            Some(PathBuf::from("/h/.local/share"))
+        );
+        assert_eq!(
+            data_home_for(false, &env_of(&[("XDG_DATA_HOME", "/x")])),
+            Some(PathBuf::from("/x"))
+        );
+        assert_eq!(
+            cache_path_for(false, &env_of(&[])),
+            PathBuf::from(".cache/remuda/update-check.json")
+        );
     }
 }

@@ -85,26 +85,39 @@ The butler spawns a lead; a worker can spawn its own workers (cascading).
 No stable release has been published yet (see [Channels](#channels) below),
 so install from `nightly` — every commit on `main`:
 
-**Linux and macOS** (x86_64, and Apple Silicon):
+**Linux** (x86_64) and **macOS** (Apple Silicon/aarch64):
 
 ```sh
-curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly sh
+curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly REMUDA_INSTALL_BUTLER=1 sh
 ```
 
 It downloads a signed-by-checksum tarball, verifies it against the release's
-`SHA256SUMS`, and lands `remuda` in `~/.local/bin`. Set `REMUDA_INSTALL_DIR` to
-put it elsewhere.
+`SHA256SUMS`, installs `remuda` in `~/.local/bin`, and installs the Butler mod.
+Set `REMUDA_INSTALL_DIR` to put Remuda elsewhere. This installs the mod without
+asking you to create a Matrix token or config; the command ends by printing
+`Next: remuda butler doctor`.
+
+Nightly does not publish an ARM Linux (`aarch64-linux`) or Intel Mac
+(`x86_64-apple-darwin`) binary; build from source on those platforms.
 
 **Windows** (x86_64), in PowerShell:
 
 ```powershell
-$env:REMUDA_CHANNEL='nightly'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
+$env:REMUDA_CHANNEL='nightly'; $env:REMUDA_INSTALL_BUTLER='1'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
 ```
 
-Same shape: verified against `SHA256SUMS`, landed in `~\.local\bin`, and
-`$env:REMUDA_INSTALL_DIR` moves it. The daemon speaks over a named pipe instead
-of a unix socket, and the terminal handling is the console API instead of
-termios; both live behind one seam, so there is one code path rather than two.
+The tarball is verified against `SHA256SUMS`, Remuda is installed in
+`%LOCALAPPDATA%\Programs\remuda\bin` (added to your user `PATH`), and the Butler
+mod is installed. Set
+`$env:REMUDA_INSTALL_DIR` to put Remuda elsewhere, and
+`$env:REMUDA_NO_MODIFY_PATH='1'` to have the installer leave `PATH` alone and
+only say so when the directory is not on it. `remuda upgrade` re-runs the
+installer, so to opt out for good, set it as a user environment variable
+rather than for one session. No Matrix token or config is required for this
+install; the command ends by printing
+`Next: remuda butler doctor`. The daemon speaks over a named pipe instead of a
+unix socket, and the terminal handling is the console API instead of termios;
+both live behind one seam, so there is one code path rather than two.
 
 ⚠ **What is proven on Windows, and what is not.** CI builds and runs the whole
 suite on `windows-latest` — including tests that open real ConPTYs and drive the
@@ -125,13 +138,19 @@ Two, in the shape rustup uses:
 | `stable` (default) | a `vX.Y.Z` tag | `0.1.0` |
 | `nightly` | every commit on `main` | `0.1.0-nightly.20260910.abc1234` |
 
+Nightly installs read a versioned release tag from `latest.json`; those releases
+are immutable and the newest ten are retained. The rolling `nightly` release is
+updated last for older installer copies, which may see a brief 404 while that
+compatibility URL is being replaced.
+
 No stable release has been published yet, so the [Install](#install) command
 above already pins `REMUDA_CHANNEL` to `nightly` explicitly — the plain
 one-liner without it would hit the missing `stable` default and fail. Once a
 `stable` build exists, switch by passing `REMUDA_CHANNEL=stable` (sh) or
 setting `$env:REMUDA_CHANNEL='stable'` (PowerShell) instead.
 
-The chosen channel is remembered in `$XDG_DATA_HOME/remuda/channel`, so
+The chosen channel is remembered in `$XDG_DATA_HOME/remuda/channel` (on Windows
+`%LOCALAPPDATA%\remuda\channel`), so
 upgrading stays on the track you picked:
 
 ```sh

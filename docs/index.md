@@ -7,6 +7,9 @@ A terminal orchestrator with a programmable layer. You keep a herd of agent
 sessions running, attach to one and ride it, swap to another. The herd outlives
 any single ride.
 
+New here? [Getting started](getting-started.md) takes you from install to a
+Butler you can reach from your phone, on three machines.
+
 ### Cascading spawn
 
 ![A terminal session tree: butler has spawned a lead session, which has in
@@ -39,6 +42,9 @@ exposed by `remuda mod list`.
 
 The same herd is reachable over MCP — `new`, `ls`, `send`, `capture` — so an
 agent can drive other agents.
+
+What a running agent can change about its own environment, and which of those
+changes survive a daemon restart, is in [Self-modification](self-modification.md).
 
 ### Design notes
 

@@ -225,6 +225,12 @@ fn size_is_clamped_to_the_floor_that_keeps_input_visible() {
 }
 
 #[test]
+fn narrow_pane_size_is_an_explicit_floor_exception() {
+    let pane = Size::for_pane(75, 29);
+    assert_eq!((pane.cols(), pane.rows()), (75, 29));
+}
+
+#[test]
 fn session_size_tracks_a_resize() {
     let agent = ScriptedAgent::new(vec![]).with_size(Size::new(120, 40));
     let (session, _clock) = session_with(Box::new(agent));
@@ -603,6 +609,10 @@ fn close_is_refused_while_attached_and_the_session_survives() {
         "tearing the pty out from under an attached human is worse than \
          making them detach first"
     );
+    assert_eq!(
+        AgentError::Attached.to_string(),
+        "a human is attached to this session; detach it first (Ctrl-\\ in that terminal), then retry"
+    );
     assert!(
         alive.load(Ordering::SeqCst),
         "a refused close must not have touched the process"
@@ -614,6 +624,37 @@ fn close_is_refused_while_attached_and_the_session_survives() {
         matches!(registry.close("worker"), Some(Ok(true))),
         "detaching lets close through, exactly as it does for send"
     );
+}
+
+#[test]
+fn confirmed_close_clears_its_closing_marker_when_attachment_refuses_it() {
+    let registry = Registry::new();
+    let alive = Arc::new(AtomicBool::new(true));
+    registry
+        .register(named(
+            "worker",
+            Box::new(FlagAgent {
+                alive: alive.clone(),
+            }),
+        ))
+        .expect("registration");
+    let session = registry.get("worker").expect("handle");
+    let instance_id = session.instance_id().to_owned();
+    let held = session.attach();
+
+    assert!(matches!(
+        registry.close_instance("worker", &instance_id),
+        Some(Err(AgentError::Attached))
+    ));
+    assert!(!session.is_closing());
+    assert!(alive.load(Ordering::SeqCst));
+    assert!(registry.get("worker").is_some());
+
+    drop(held);
+    assert!(matches!(
+        registry.close_instance("worker", &instance_id),
+        Some(Ok(true))
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +765,16 @@ fn advance_until_finished<T>(
     );
 }
 
+fn retry_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    for _ in 0..100_000 {
+        match operation() {
+            Err(AgentError::Busy) => std::thread::yield_now(),
+            result => return result,
+        }
+    }
+    Err(AgentError::Busy)
+}
+
 #[test]
 fn feed_bursts_and_pauses_are_one_indivisible_act() {
     let writes = Arc::new(Mutex::new(Vec::new()));
@@ -734,13 +785,14 @@ fn feed_bursts_and_pauses_are_one_indivisible_act() {
     let feeder = {
         let session = session.clone();
         std::thread::spawn(move || {
-            session
-                .feed(&[
+            retry_busy(|| {
+                session.feed(&[
                     Step::Burst(b"first".to_vec()),
                     Step::Pause(1000),
                     Step::Burst(b"second".to_vec()),
                 ])
-                .unwrap();
+            })
+            .unwrap();
         })
     };
 
@@ -755,7 +807,7 @@ fn feed_bursts_and_pauses_are_one_indivisible_act() {
         let barrier = barrier.clone();
         std::thread::spawn(move || {
             barrier.wait();
-            session.send(b"interloper").unwrap();
+            retry_busy(|| session.send(b"interloper")).unwrap();
         })
     };
     barrier.wait();

@@ -2,29 +2,44 @@
 
 Remote mode continues the existing Remuda TUI: the list stays on the left and the selected session stays on the right. The difference is that the left side becomes a virtual tree of nodes and their sessions, addressed as `node/session`. The selected remote screen keeps refreshing over short requests and survives network loss. There is no separate remote-client look. The name `control tower` remains reserved for a later composed multi-node control experience.
 
-The approved command tree is `remuda cluster init`, `remuda cluster join <line>`, `remuda cluster nodes`, `remuda cluster revoke <node>`, and `remuda cluster remote [node/session]`. These subcommands are not implemented yet. Example addresses, fingerprints, tokens, and output are illustrative.
+The command tree is `remuda cluster init`, `remuda cluster join [FINGERPRINT] <line>`, `remuda cluster nodes`, `remuda cluster revoke <node>`, and `remuda cluster remote [node/session]`. A terminal join may omit `FINGERPRINT`; outside a terminal, provide a fingerprint checked independently with the inviting machine. Example addresses, fingerprints, tokens, and output are illustrative.
 
 ## Journey 0: form a cluster
 
-On the first machine, initialize a cluster of one. `remuda cluster init` creates the node key pair and starts the cluster endpoint on the VPN address. Bare `remuda cluster` shows cluster status after initialization, or the init hint when no cluster exists. Initialization prints the address, public-key fingerprint, and a short-lived, single-use join line:
+On the first machine, initialize a cluster of one. `remuda cluster init` creates the node key pair. Bare `remuda cluster` shows cluster status after initialization, or the init hint when no cluster exists. Initialization prints the node and public-key fingerprint, then points to the next step. Invite prints one complete command to paste on the other machine:
+
+If the cluster directory is missing but a saved fingerprint shows this machine had an identity before, `remuda cluster init` creates a new identity and warns that peers were not restored. Ask an admitted machine for a new invite, then join with it. Clusters initialized before this recovery marker was introduced do not have a saved fingerprint and cannot trigger this notice.
 
 ```text
 $ remuda cluster init
+Starting the listener for cluster nodes (port 7441 by default). Peers can reach the port, but an unadmitted peer cannot join without a valid invitation; admitted nodes authenticate with their registered key. To skip opening a port, use remuda cluster init --no-listen; to stop it later, run remuda cluster listen --off; to limit its address, run remuda cluster listen --bind IP[:PORT] (127.0.0.1:7441 for local-only).
 Cluster initialized
 Node: studio
-Address: 100.80.0.12:7443
 Fingerprint: SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=
-Join line (expires in 10 minutes; single use):
-remuda-join://100.80.0.12:7443?fingerprint=SHA256%3AQmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU%3D&token=eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu
+Listening for cluster nodes on 192.168.1.20:7441 (reachable from your LAN)
+Peers can reach the port, but an unadmitted peer cannot join without a valid invitation; admitted nodes authenticate with their registered key.
+To skip opening a port on init, use `remuda cluster init --no-listen`; to stop it later, run `remuda cluster listen --off`; to limit the address, run `remuda cluster listen --bind IP[:PORT]` (use `127.0.0.1:7441` for local-only).
+Next: run `remuda cluster invite` here, then run its printed `remuda cluster join ...` command on the other node.
+
+$ remuda cluster invite --bind 100.80.0.12:7443
+Invitation for one machine, valid 10 minutes. Run this on the other machine:
+
+  remuda cluster join 'SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=' 'remuda-join-v1 100.80.0.12:7443 SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU= a2V5LWV4YW1wbGU= eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu'
+
+Fingerprint of this machine: SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU= (the other machine must show the same one)
+
+Next: after it joins, run `remuda cluster nodes` here to see it.
 ```
 
-The operator shares the join line with the intended machine over a trusted channel. The line is a bearer secret: it is shown once, expires quickly, and is consumed once. On the joining machine, run `remuda cluster join <line>` with the received line. The first node's fingerprint is pinned before the secure channel is established, then the joiner registers its own public key. No public discovery or NAT traversal is implied; both nodes are expected to reach one another on the same VPN.
+The operator shares the printed command with the intended machine over a trusted channel. Its invitation expires in 10 minutes and can be used once. When the join line is pasted by itself in a terminal, Remuda shows the inviter address and fingerprint and asks for confirmation; compare that fingerprint with `remuda cluster` on the inviting machine over an independent channel or screen before answering yes. The fingerprint copied inside the join command is not an independent trust check. If stdin or stderr is not a terminal, pass a fingerprint checked independently with the inviter. The joiner then registers its own public key. No public discovery or NAT traversal is implied; both nodes are expected to reach one another on the same VPN.
 
 ```text
-$ remuda cluster join 'remuda-join://100.80.0.12:7443?fingerprint=SHA256%3AQmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU%3D&token=eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu'
-Pinned cluster node fingerprint verified
-Joining cluster…
-Joined cluster as node: field-laptop
+$ remuda cluster join 'remuda-join-v1 100.80.0.12:7443 SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU= a2V5LWV4YW1wbGU= eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu'
+Joining node-qmfzzty0 at 100.80.0.12:7443
+Fingerprint: SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=
+Check the inviting machine shows this fingerprint (run remuda cluster there). Continue? [y/N] y
+Joined node-qmfzzty0 (fingerprint SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=).
+Next: remuda cluster remote
 ```
 
 Every member knows the public keys of every cluster member through a replicated, signed `authorized_nodes` list. Any member can admit or revoke a node; membership changes are pushed to peers, and nodes fetch the current list at startup. Operators can inspect membership and revoke a node key from any member:
@@ -60,7 +75,7 @@ remuda run -n dev claude
 
 From an already joined node, run `remuda cluster remote` to open the same Remuda TUI with the cluster tree on the left and selected-session screen on the right. `remuda cluster remote studio/dev` opens that same UI with the target selected. The daemon keeps the session alive when the initiating terminal goes away.
 
-At first open, expand the local/current node and collapse other nodes. Use ↑/↓ to move through the tree, ←/→ to collapse or expand node groups, and Enter to select a session and focus its line composer. The current target is always named `node / session` in the right pane. A terminal snapshot is shown there with its capture age; the line composer remains in the familiar Remuda footer area.
+At first open, expand the local/current node and collapse other nodes. Use ↑/↓ to move through the tree, ←/→ to collapse or expand node groups, and Enter to select a session and focus its line composer. Press `k` (`k keys` in the footer) on a live selected session to enter fullscreen keys mode; Ctrl-\\ returns to the tree. The current target is always named `node / session` in the right pane. A terminal snapshot is shown there with its capture age; the line composer remains in the familiar Remuda footer area.
 
 ### 2. Phone or laptop view on an unstable network
 
@@ -173,7 +188,7 @@ The selected session pane stays a snapshot, with the line editor integrated into
 
 While offline, characters accumulate in the current draft. Enter freezes that line into the pending queue; pending batches preserve local submission order and retry with the same IDs and bytes. Two viewers’ batches are atomically applied in daemon arrival order. A timeout or reconnect never changes the batch ID. If a batch cannot be proven applied or unapplied, report uncertainty rather than silently duplicating it. Show a small `input from <node/user>` hint when a remote batch arrives, without assigning exclusive input ownership.
 
-The remote line editor handles ordinary text, not arbitrary terminal key timing. Arrows edit the local line; Ctrl-C cancels its current draft; Ctrl-\ returns from session focus to the list; `q` from list/tree focus detaches from the TUI; `x` on the selected session invokes the same termination confirmation as local Remuda. Special application keys remain outside this line-oriented first UX.
+The remote line editor handles ordinary text, not arbitrary terminal key timing. Arrows edit the local line; Ctrl-C cancels its current draft; Ctrl-\ returns from session focus to the list. In keys mode, Esc, Ctrl-C, arrows, Tab, Enter, and other supported terminal key events are forwarded to the selected remote session; Ctrl-\ exits keys mode without forwarding. Paste markers are added only when the remote app has enabled mode 2004. Otherwise the filtered text, including LF and CR, is sent raw as it would be in a local terminal, where each newline may submit a line. Embedded paste markers and other control characters are filtered (TAB, LF, and CR are preserved). `q` from list/tree focus detaches from the TUI; `x` on the selected session invokes the same termination confirmation as local Remuda.
 
 ## Open UX decision
 
@@ -183,11 +198,33 @@ The tree may offer an attention-only filter (`!`) in addition to `/` name search
 
 Sync returns the selected session’s latest snapshot plus an output version; a reconnect resumes from the last version. Enter submits `input(session, batch_id, bytes)`, and retries reuse the same ID and bytes. The host deduplicates each viewer’s batch and applies whole batches atomically in arrival order. Local calls reuse the daemon socket; remote calls use Remuda’s authenticated short request/response channel over the VPN, with joined node keys and pinned peers. The channel uses off-the-shelf Noise IK via `snow`; a per-session output event from #190 can later wake sync without changing the TUI.
 
+PTY writes have a two-second caller deadline. A `WriteTimeout` means the bytes
+may have been partially written or may finish later; `Send` and `SendLine` are
+not idempotent, so callers must not blindly replay them. A `SendLine` whose text
+write stalls answers with a pending error instead: the text is still being
+written and its Return follows when it lands, or is dropped if that takes more
+than 30 seconds; check the pane before resending. An idempotent `Input`
+retry uses the same client ID and sequence and receives `Uncertain` after a
+timed-out attempt, even if its worker finishes later. A `Busy` response means
+the session already has one in-flight write and did not queue this request;
+it does not consume the input rate budget. Attached human input waits for the
+same writer to finish before forwarding the next bytes, preserving the input
+buffer without replaying a possibly partial write.
+
+On Unix and Windows/ConPTY, the PTY write runs on one background worker per
+session. The caller deadline and `WriteTimeout` response are the same on both
+platforms; after timeout, that worker retains the PTY until the underlying
+write completes or fails. A child that never reads can therefore keep that
+session's input busy while captures and listings continue. `Busy` and
+`WriteTimeout` are additive response variants: clients built against the older
+wire enum may reject them as unknown variants and should upgrade before using
+the bounded input path.
+
 ### Security and implementation constraints
 
 - The allowlisted request front comes first, initially on a local socket. It exposes only the operations required by this UX; never forward the general daemon protocol or arbitrary Lua remotely. The network listener is a later layer over that restricted front.
-- If the listener needs TCP, allow exactly one scoped clippy TCP-ban exception in its module (`#[allow]` at that module), with a `clippy.toml` and documentation note that names #191. Bind only to the configured VPN address; never default to `0.0.0.0`. Start the listener only after `remuda cluster init`.
-- Join commands pin the first node’s key fingerprint and carry a one-time, expiring token that authorizes the joining node. Subsequent requests authenticate with registered node keys. Revoking a node key immediately rejects its later requests.
+- If the listener needs TCP, allow exactly one scoped clippy TCP-ban exception in its module (`#[allow]` at that module), with a `clippy.toml` and documentation note that names #191. Auto mode detects the default-route RFC 1918 address and binds only that address; it re-detects every five seconds and on listener reload. Never default to `0.0.0.0`; require `remuda cluster listen --bind 0.0.0.0 --allow-public` for a wildcard. Start the listener only after `remuda cluster init`. Peers may reach its port, but unadmitted nodes need a valid invitation to join; admitted nodes authenticate by registered key.
+- The invite output carries a one-time, expiring token and prints the first node’s fingerprint separately for comparison with `remuda cluster` on the inviting machine. The copied fingerprint in the join command is not an independent trust check. Subsequent requests authenticate with registered node keys. Revoking a node key immediately rejects its later requests.
 
 ## Prior art
 
@@ -201,15 +238,19 @@ These references inform the user experience and trust boundaries; they are patte
 
 ### Cluster joining and identity
 
-- [kubeadm join](https://kubernetes.io/docs/reference/setup-tools/kubeadm/kubeadm-join/) puts a bootstrap token and `--discovery-token-ca-cert-hash` pin in one copyable command. Borrow the one-line join UX and the rule that a token alone must not establish trust in an unknown server. Remuda pins the node fingerprint before using the one-time token; do not offer an unsafe skip-verification switch.
+- [kubeadm join](https://kubernetes.io/docs/reference/setup-tools/kubeadm/kubeadm-join/) puts a bootstrap token and `--discovery-token-ca-cert-hash` pin in one copyable command. Borrow the one-line join UX and the rule that a token alone must not establish trust in an unknown server. Remuda asks the operator to compare the separately printed node fingerprint with `remuda cluster` on the inviting machine before accepting; do not offer an unsafe skip-verification switch.
 - [K3s](https://docs.k3s.io/quick-start) makes joining a node a concise install command with `K3S_URL` and `K3S_TOKEN`. Borrow combining installation and joining in one pasteable line. Reject an unscoped, long-lived shared cluster secret; Remuda’s bootstrap token is one-use and expires, then the registered node key identifies that node.
 - [Tailscale auth keys and node keys](https://tailscale.com/docs/features/access-control/auth-keys) distinguish a provisioning credential from the key a node uses afterward, and surface key expiry/revocation. [Headscale pre-auth keys](https://headscale.net/stable/ref/registration/) also default to one use and a limited lifetime. Borrow separate one-time join credentials, node identity, expiry, and a visible revoke action. Do not assume VPN membership alone grants Remuda session access; the Remuda node registry still authorizes requests.
-- [Nebula](https://nebula.defined.net/docs/guides/quick-start/) uses CA-signed host certificates with host names, addresses, and groups, plus lighthouses for discovery. Borrow human-readable node identities and explicit membership. Reject making a CA ceremony, lighthouse, NAT traversal, or discovery service a prerequisite: this first cluster assumes VPN reachability and pins its first node directly.
+- [Nebula](https://nebula.defined.net/docs/guides/quick-start/) uses CA-signed host certificates with host names, addresses, and groups, plus lighthouses for discovery. Borrow human-readable node identities and explicit membership. Reject making a CA ceremony, lighthouse, NAT traversal, or discovery service a prerequisite: this first cluster assumes VPN reachability and an out-of-band fingerprint comparison with the inviting machine.
 - [Syncthing](https://docs.syncthing.net/users/security) turns a certificate fingerprint into a human-friendly Device ID and requires peers to know/approve device identities; its [introducer](https://docs.syncthing.net/users/introducer.html) can propagate new devices. Borrow a short identity label backed by a fingerprint and a visible node list. Do not silently trust transitive introductions: every Remuda node join is explicit, and revocation names the affected node.
-- [Magic Wormhole](https://magic-wormhole.readthedocs.io/en/latest/welcome.html) uses a one-time, human-sized PAKE code to establish a protected transfer. Borrow short-lived, single-use bootstrap material and clear expiry errors. Remuda’s join command also pins the first node’s fingerprint; do not rely on a short code alone to authenticate the cluster or add a public mailbox/relay service to this VPN-first UX.
+- [Magic Wormhole](https://magic-wormhole.readthedocs.io/en/latest/welcome.html) uses a one-time, human-sized PAKE code to establish a protected transfer. Borrow short-lived, single-use bootstrap material and clear expiry errors. Remuda prints the first node’s fingerprint separately for an out-of-band comparison; do not rely on the copied command or a short code alone to authenticate the cluster or add a public mailbox/relay service to this VPN-first UX.
 - [WireGuard](https://www.wireguard.com/protocol/) demonstrates the Noise IK handshake with static peer keys; the [Noise Protocol Framework](https://www.noiseprotocol.org/) provides reviewed protocol patterns. Borrow established handshake primitives and pinned node keys. Do not invent cryptographic primitives or treat an encrypted channel as authorization: the request allowlist, node registry, and revocation checks remain required.
-- [OpenSSH known_hosts and authorized_keys](https://man.openbsd.org/ssh) make host-key checking and an operator-managed authorized-key list familiar. Borrow a displayed, pinned fingerprint and a registry with explicit revocation. Reject SSH as the remote transport for this design, and never silently accept a changed key (TOFU); a mismatch stops the join with an actionable error.
+- [OpenSSH known_hosts and authorized_keys](https://man.openbsd.org/ssh) make host-key checking and an operator-managed authorized-key list familiar. Borrow a displayed fingerprint checked against the inviting machine and a registry with explicit revocation. Reject SSH as the remote transport for this design, and never silently accept a changed key (TOFU); a mismatch stops the join with an actionable error.
 
 ### Tree navigation prior art
 
 For long lists, borrow the hierarchy of [tmux `choose-tree`](https://github.com/tmux/tmux/wiki/Getting-Started/86df5fe449a2d0499cf47a7e16245a3c6d6562d5), which groups sessions/windows/panes and supports collapsed branches; borrow context awareness and search from [k9s](https://k9scli.io/topics/commands/), the host tree pattern from [VS Code Remote Explorer](https://code.visualstudio.com/docs/remote/ssh), and reachability/last-seen filtering from the [Tailscale device list](https://tailscale.com/docs/features/access-control/device-management/how-to/filter). Recommendation: one collapsible node group per host, sessions nested beneath it, local/current node expanded by default and other groups collapsed. Keep the selected session preview on the right in the existing Remuda layout; show reachability and last-sync age on each node row. `/` searches names and `!` filters for attention states. Do not make nodes mutually exclusive contexts that hide the rest of the cluster.
+
+## Layout and small terminals
+
+At 60 columns or wider, `remuda cluster remote` draws the node/session tree in a left column (24-48 columns, sized to its content, at most half the terminal) and the selected session on the right, split by `│`. Notices, queued input and the footer span the full width below. Keys mode (`k`, or Enter on a live session's keys view) hides the left pane only while you type; `Ctrl-\` brings it back. Below 60 columns (Termux and similar) there is no room for two panes, so the tree stacks above the selected session instead.

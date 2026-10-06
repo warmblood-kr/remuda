@@ -179,7 +179,7 @@ pub fn install(
         None,
         false,
     );
-    let _ = fs::remove_dir_all(&checkout);
+    cleanup_tree(&checkout);
     result
 }
 
@@ -225,7 +225,7 @@ fn update_inner(name: &str, require_lifecycle: bool) -> Result<InstallReport, St
         Some(name),
         require_lifecycle,
     );
-    let _ = fs::remove_dir_all(&checkout);
+    cleanup_tree(&checkout);
     result
 }
 
@@ -295,7 +295,7 @@ pub fn remove(name: &str) -> Result<RemoveReport, String> {
             "mod {name} is required by {list}; remove {list} first"
         ));
     }
-    fs::remove_dir_all(&root).map_err(|error| format!("cannot remove mod {name}: {error}"))?;
+    remove_tree(&root).map_err(|error| format!("cannot remove mod {name}: {error}"))?;
     Ok(RemoveReport {
         manifest: manifest_from_spec(spec, "removed"),
         path: root,
@@ -321,6 +321,7 @@ pub fn test_path(path: &Path) -> Result<ModSpec, String> {
     let package_root = entry_path
         .parent()
         .ok_or_else(|| "manifest entry has no package directory".to_string())?;
+    checked_package_root(path, package_root)?;
     validate_package(package_root, path, &spec)?;
     Ok(spec)
 }
@@ -373,20 +374,17 @@ fn install_from_checkout(
     let package_root = entry_path
         .parent()
         .ok_or_else(|| "manifest entry has no package directory".to_string())?;
+    let (canonical_checkout, canonical_package) = checked_package_root(checkout, package_root)?;
     validate_package(package_root, checkout, &spec)?;
-    let package_relative = package_root
-        .strip_prefix(checkout)
+    let package_relative = canonical_package
+        .strip_prefix(&canonical_checkout)
         .map_err(|_| "manifest entry escaped checkout".to_string())?;
     let data = mods_dir()?;
-    fs::create_dir_all(&data)
-        .map_err(|error| format!("cannot create {}: {error}", data.display()))?;
     let target = data.join(&spec.name);
-    let staging = temporary_path_in(&data, "install")?;
-    let staging_package = staging.join(package_relative);
     let asset_paths = package_assets(package_root, checkout, &spec)?;
-    copy_tree_with_assets(package_root, &staging_package, &asset_paths)?;
-    fs::copy(&manifest_path, staging.join("extension.toml"))
-        .map_err(|error| format!("cannot copy extension.toml: {error}"))?;
+    let mut staging =
+        stage_package_tree(&data, &canonical_package, package_relative, &asset_paths)?;
+    copy_file_with_safe_mode(&manifest_path, &staging.path().join("extension.toml"))?;
     let commit = git_commit(checkout)?;
     let mut source = format!("https://github.com/{owner}/{repo}.git\ncommit={commit}\n");
     if let Some(reference) = &reference {
@@ -394,11 +392,12 @@ fn install_from_checkout(
         source.push_str(reference);
         source.push('\n');
     }
-    fs::write(staging.join("source"), source)
+    let source_path = staging.path().join("source");
+    fs::write(&source_path, source)
         .map_err(|error| format!("cannot write source metadata: {error}"))?;
+    mask_installed_file_mode(&source_path)?;
     if fs::symlink_metadata(&target).is_ok() {
         if !force {
-            let _ = fs::remove_dir_all(&staging);
             return Err(format!(
                 "mod {} is already installed; pass --force to replace it",
                 spec.name
@@ -410,16 +409,16 @@ fn install_from_checkout(
             .map_err(|error| format!("cannot prepare backup {}: {error}", backup.display()))?;
         fs::rename(&target, &backup)
             .map_err(|error| format!("cannot stage existing mod {}: {error}", target.display()))?;
-        if let Err(error) = fs::rename(&staging, &target) {
+        fs::rename(staging.path(), &target).map_err(|error| {
             let _ = fs::rename(&backup, &target);
-            let _ = fs::remove_dir_all(&staging);
-            return Err(format!("cannot commit mod install: {error}"));
-        }
-        fs::remove_dir_all(&backup)
-            .map_err(|error| format!("cannot remove old mod backup: {error}"))?;
+            format!("cannot commit mod install: {error}")
+        })?;
+        staging.disarm();
+        remove_tree(&backup).map_err(|error| format!("cannot remove old mod backup: {error}"))?;
     } else {
-        fs::rename(&staging, &target)
+        fs::rename(staging.path(), &target)
             .map_err(|error| format!("cannot commit mod install: {error}"))?;
+        staging.disarm();
     }
     Ok(InstallReport {
         manifest: manifest_from_spec(spec, "disk"),
@@ -464,7 +463,8 @@ fn github_repository(input: &str) -> Result<(String, String, String), String> {
     ))
 }
 
-fn valid_component(value: &str) -> bool {
+/// Whether a mod name or command is one valid package path component.
+pub fn valid_component(value: &str) -> bool {
     !value.is_empty()
         && value != "."
         && value != ".."
@@ -758,7 +758,8 @@ fn package_assets(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                validate_asset_mode(metadata.mode()).map_err(|reason| format!("declared asset {asset:?} {reason}"))?;
+                validate_asset_mode(metadata.mode())
+                    .map_err(|reason| format!("declared asset {asset:?} {reason}"))?;
             }
             if metadata.len() > MAX_ASSET_BYTES {
                 return Err(format!(
@@ -871,6 +872,64 @@ fn validate_lua_tree(path: &Path, relative: &Path, assets: &[PathBuf]) -> Result
         }
     }
     Ok(())
+}
+
+/// Resolve the package directory without following any symlinked component
+/// between the checkout root and the package root.
+fn checked_package_root(
+    checkout: &Path,
+    package_root: &Path,
+) -> Result<(PathBuf, PathBuf), String> {
+    let checkout_metadata = fs::symlink_metadata(checkout)
+        .map_err(|error| format!("cannot inspect checkout {}: {error}", checkout.display()))?;
+    if checkout_metadata.file_type().is_symlink() || !checkout_metadata.is_dir() {
+        return Err(format!(
+            "checkout {} must be a real directory",
+            checkout.display()
+        ));
+    }
+    let relative = package_root
+        .strip_prefix(checkout)
+        .map_err(|_| "manifest entry escaped checkout".to_string())?;
+    let mut current = checkout.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::Normal(name) => current.push(name),
+            Component::CurDir => continue,
+            _ => return Err("manifest entry escaped checkout".into()),
+        }
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            format!("cannot inspect package path {}: {error}", current.display())
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "mod package path contains symlink {}",
+                current.display()
+            ));
+        }
+    }
+    let canonical_checkout = fs::canonicalize(checkout).map_err(|error| {
+        format!(
+            "cannot canonicalize checkout {}: {error}",
+            checkout.display()
+        )
+    })?;
+    let canonical_package = fs::canonicalize(package_root).map_err(|error| {
+        format!(
+            "cannot canonicalize package root {}: {error}",
+            package_root.display()
+        )
+    })?;
+    if !canonical_package.starts_with(&canonical_checkout) {
+        return Err("manifest entry escaped checkout".into());
+    }
+    if !canonical_package.is_dir() {
+        return Err(format!(
+            "mod package root {} is not a directory",
+            canonical_package.display()
+        ));
+    }
+    Ok((canonical_checkout, canonical_package))
 }
 
 fn safe_relative_path(value: &str, label: &str) -> Result<PathBuf, String> {
@@ -1053,7 +1112,12 @@ fn check_requirement(owner: &str, dependency: &str, constraint: &str) -> Result<
             "mod {owner} requires {dependency}, which is not installed"
         ));
     }
-    let spec = read_manifest(&path)?;
+    let spec = read_manifest(&path).map_err(|error| {
+        format!(
+            "mod {owner} requires {dependency}, but its manifest at {} is unreadable (partially installed or mid-update?): {error}",
+            path.display()
+        )
+    })?;
     let met = satisfies(&spec.version, constraint)
         .map_err(|error| format!("mod {owner} requires {dependency} {constraint}, but installed {dependency} {} is unreadable: {error}", spec.version))?;
     if !met {
@@ -1102,11 +1166,7 @@ pub fn requirement_order(name: &str) -> Result<Vec<String>, String> {
 }
 
 fn mods_dir() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| home.map(|home| PathBuf::from(home).join(".local/share")))
+    let base = crate::dist::data_home()
         .ok_or_else(|| "HOME or XDG_DATA_HOME is required for mods".to_string())?;
     let remuda = base.join("remuda");
     let mods = remuda.join("mods");
@@ -1120,7 +1180,106 @@ fn mods_dir() -> Result<PathBuf, String> {
             )
         })?;
     }
-    Ok(mods)
+    resolve_mods_root(&mods)
+}
+
+fn resolve_mods_root(path: &Path) -> Result<PathBuf, String> {
+    if let Some(data_dir) = path.parent() {
+        if data_dir.exists() {
+            validate_data_dir(data_dir)?;
+        }
+    }
+    if !path.exists() {
+        return Ok(path.to_path_buf());
+    }
+    let Some(resolved) = canonicalize_mods_root(path)? else {
+        return Ok(path.to_path_buf());
+    };
+    validate_mods_root(&resolved)?;
+    Ok(resolved)
+}
+
+fn canonicalize_mods_root(path: &Path) -> Result<Option<PathBuf>, String> {
+    match fs::canonicalize(path) {
+        Ok(resolved) => Ok(Some(resolved)),
+        // The directory may disappear after resolve_mods_root's exists check.
+        // Treat that the same as a directory that was already absent.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "cannot resolve mods directory {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn validate_data_dir(path: &Path) -> Result<(), String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        // Its caller checks existence first, so a missing path here means it
+        // disappeared in between and should be treated as absent.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect Remuda data directory {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if !metadata.is_dir() {
+        return Err(format!(
+            "Remuda data path {} is not a directory",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no preconditions and returns the current effective uid.
+        let euid = unsafe { libc::geteuid() };
+        if metadata.uid() != euid {
+            return Err(format!(
+                "Remuda data directory {} must be owned by the current user",
+                path.display()
+            ));
+        }
+        if metadata.permissions().mode() & 0o002 != 0 {
+            return Err(format!(
+                "Remuda data directory {} must not be world-writable",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_mods_root(path: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("cannot inspect mods directory {}: {error}", path.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "mods directory {} is not a directory",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no preconditions and returns the current effective uid.
+        let euid = unsafe { libc::geteuid() };
+        if metadata.uid() != euid {
+            return Err(format!(
+                "mods directory {} must be owned by the current user",
+                path.display()
+            ));
+        }
+        if metadata.permissions().mode() & 0o002 != 0 {
+            return Err(format!(
+                "mods directory {} must not be world-writable",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn temporary_path(label: &str) -> Result<PathBuf, String> {
@@ -1133,8 +1292,65 @@ fn temporary_path_in(parent: &Path, label: &str) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())?
         .as_nanos();
     let path = parent.join(format!("remuda-mod-{label}-{}-{stamp}", std::process::id()));
-    fs::create_dir(&path).map_err(|error| format!("cannot create temporary directory: {error}"))?;
+    create_dir_secure(&path)
+        .map_err(|error| format!("cannot create temporary directory: {error}"))?;
     Ok(path)
+}
+
+fn stage_package_tree(
+    data: &Path,
+    package_root: &Path,
+    package_relative: &Path,
+    assets: &[PathBuf],
+) -> Result<StagingDir, String> {
+    create_dir_all_secure(data)
+        .map_err(|error| format!("cannot create {}: {error}", data.display()))?;
+    validate_mods_root(data)?;
+    if let Some(data_dir) = data.parent() {
+        validate_data_dir(data_dir)?;
+    }
+    let staging = StagingDir::create(temporary_path_in(data, "install")?);
+    let package_parent_relative = package_relative.parent().unwrap_or_else(|| Path::new(""));
+    let staging_package_parent = staging.path().join(package_parent_relative);
+    create_dir_all_secure(&staging_package_parent).map_err(|error| {
+        format!(
+            "cannot create {}: {error}",
+            staging_package_parent.display()
+        )
+    })?;
+    copy_tree_with_assets(package_root, &staging.path().join(package_relative), assets)?;
+    set_installed_directory_mode(&staging_package_parent)?;
+    Ok(staging)
+}
+
+struct StagingDir {
+    path: PathBuf,
+    cleanup: bool,
+}
+
+impl StagingDir {
+    fn create(path: PathBuf) -> Self {
+        Self {
+            path,
+            cleanup: true,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup = false;
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        if self.cleanup {
+            cleanup_tree(&self.path);
+        }
+    }
 }
 
 fn ensure_regular_file(path: &Path, label: &str) -> Result<(), String> {
@@ -1170,7 +1386,7 @@ fn copy_tree_inner(
         return Err(format!("mod package contains symlink {}", source.display()));
     }
     if metadata.is_dir() {
-        fs::create_dir_all(target)
+        create_dir_all_secure(target)
             .map_err(|error| format!("cannot create {}: {error}", target.display()))?;
         for entry in fs::read_dir(source)
             .map_err(|error| format!("cannot read {}: {error}", source.display()))?
@@ -1185,6 +1401,7 @@ fn copy_tree_inner(
                 copied_asset_bytes,
             )?;
         }
+        set_installed_directory_mode(target)?;
     } else if metadata.is_file() {
         let is_asset = assets.iter().any(|asset| asset == relative);
         if source.extension() != Some(std::ffi::OsStr::new("lua")) && !is_asset {
@@ -1201,10 +1418,8 @@ fn copy_tree_inner(
             let copied = copy_asset_file(source, target, *copied_asset_bytes)?;
             *copied_asset_bytes = copied_asset_bytes.saturating_add(copied);
         } else {
-            fs::copy(source, target)
-                .map_err(|error| format!("cannot copy {}: {error}", source.display()))?;
+            copy_file_with_safe_mode(source, target)?;
         }
-        set_safe_file_mode(target, &metadata)?;
     } else {
         return Err(format!(
             "mod package contains unsupported file {}",
@@ -1224,21 +1439,104 @@ fn copy_asset_file(source: &Path, target: &Path, already_copied: u64) -> Result<
             source.display()
         )
     })?;
-    set_safe_file_mode(target, &metadata)?;
+    set_safe_installed_permissions(target, &metadata.permissions())?;
     Ok(copied)
 }
 
-fn set_safe_file_mode(target: &Path, metadata: &fs::Metadata) -> Result<(), String> {
+fn create_dir_secure(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let mode = safe_mode_bits(metadata.mode());
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o755).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path)
+    }
+}
+
+fn create_dir_all_secure(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o755).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+fn set_owner_writable_directory(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        let mode = metadata.permissions().mode() & 0o7777;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700))
+            .map_err(|error| format!("cannot make {} writable: {error}", path.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+fn cleanup_tree(path: &Path) {
+    let _ = remove_tree(path);
+}
+
+fn remove_tree(path: &Path) -> std::io::Result<()> {
+    make_directories_writable(path);
+    fs::remove_dir_all(path)
+}
+
+fn make_directories_writable(path: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return;
+    }
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            make_directories_writable(&entry.path());
+        }
+    }
+    set_owner_writable_directory(path).ok();
+}
+
+fn copy_file_with_safe_mode(source: &Path, target: &Path) -> Result<(), String> {
+    let permissions = fs::metadata(source)
+        .map_err(|error| format!("cannot inspect {}: {error}", source.display()))?
+        .permissions();
+    fs::copy(source, target)
+        .map_err(|error| format!("cannot copy {}: {error}", source.display()))?;
+    set_safe_installed_permissions(target, &permissions)
+}
+
+fn mask_installed_file_mode(path: &Path) -> Result<(), String> {
+    let permissions = fs::metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
+        .permissions();
+    set_safe_installed_permissions(path, &permissions)
+}
+
+fn set_safe_installed_permissions(target: &Path, source: &fs::Permissions) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = source.mode() & 0o755;
         fs::set_permissions(target, fs::Permissions::from_mode(mode))
             .map_err(|error| format!("cannot set safe mode for {}: {error}", target.display()))
     }
     #[cfg(not(unix))]
     {
-        fs::set_permissions(target, metadata.permissions())
+        fs::set_permissions(target, source.clone())
             .map_err(|error| format!("cannot preserve mode for {}: {error}", target.display()))
     }
 }
@@ -1250,11 +1548,6 @@ fn validate_asset_mode(mode: u32) -> Result<(), &'static str> {
     } else {
         Ok(())
     }
-}
-
-#[cfg(unix)]
-fn safe_mode_bits(mode: u32) -> u32 {
-    mode & 0o755
 }
 
 fn copy_asset_reader<R: std::io::Read>(
@@ -1283,6 +1576,32 @@ fn copy_asset_reader<R: std::io::Read>(
         return Err(message.into());
     }
     Ok(copied)
+}
+
+fn set_installed_directory_mode(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(|error| {
+            format!(
+                "cannot set installed directory mode for {}: {error}",
+                path.display()
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = fs::metadata(path)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
+            .permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions).map_err(|error| {
+            format!(
+                "cannot make installed directory writable {}: {error}",
+                path.display()
+            )
+        })
+    }
 }
 
 fn ensure_safe_extension_target(path: &Path) -> Result<(), String> {
@@ -1333,14 +1652,336 @@ fn valid_package_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_manifest, parse_repository, satisfies, update_all_with, validate_reference,
-        InstallReport, Manifest, MOD_LIFECYCLE_API,
+        canonicalize_mods_root, parse_manifest, parse_repository, satisfies, stage_package_tree,
+        update_all_with, validate_data_dir, validate_reference, InstallReport, Manifest,
+        MOD_LIFECYCLE_API,
     };
+    #[cfg(unix)]
+    use super::{
+        cleanup_tree, copy_tree_with_assets, create_dir_all_secure, remove_tree, resolve_mods_root,
+        test_path,
+    };
+    use std::path::Path;
 
     fn with_requires(line: &str) -> Result<super::ModSpec, String> {
         parse_manifest(&format!(
             "name = \"guest\"\nentry = \"packages/guest/init.lua\"\napi = \"remuda-lua-v1\"\n{line}\n"
         ))
+    }
+
+    #[test]
+    fn vanished_data_directory_is_tolerated() {
+        let path =
+            std::env::temp_dir().join(format!("remuda-data-not-found-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        assert!(validate_data_dir(&path).is_ok());
+    }
+
+    #[test]
+    fn mods_directory_removed_before_canonicalize_is_tolerated() {
+        let path =
+            std::env::temp_dir().join(format!("remuda-mods-not-found-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        assert_eq!(canonicalize_mods_root(&path).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_mod_validation_rejects_a_symlinked_packages_ancestor() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("remuda-mod-ancestor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let checkout = root.join("checkout");
+        let outside = root.join("outside/packages/guest");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("init.lua"), "return {}\n").unwrap();
+        std::fs::write(
+            checkout.join("extension.toml"),
+            "name = \"guest\"\nentry = \"packages/guest/init.lua\"\napi = \"remuda-lua-v1\"\n",
+        )
+        .unwrap();
+        symlink(root.join("outside/packages"), checkout.join("packages")).unwrap();
+
+        let error = test_path(&checkout).expect_err("symlinked package ancestor must be rejected");
+        assert!(error.contains("symlink"), "{error}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_lua_file_mode_is_masked_to_0755() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("remuda-mod-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source/guest");
+        let target = root.join("installed/guest");
+        std::fs::create_dir_all(&source).unwrap();
+        let init = source.join("init.lua");
+        std::fs::write(&init, "return {}\n").unwrap();
+        std::fs::set_permissions(&init, std::fs::Permissions::from_mode(0o4777)).unwrap();
+
+        copy_tree_with_assets(&source, &target, &[]).unwrap();
+        assert_eq!(
+            std::fs::metadata(target.join("init.lua"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_directory_modes_are_masked_to_0755() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("remuda-mod-dirmode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source/packages/guest/nested");
+        let data = root.join("installed");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(source.join("init.lua"), "return {}\n").unwrap();
+
+        let staging = stage_package_tree(
+            &data,
+            &root.join("source/packages/guest"),
+            Path::new("packages/guest"),
+            &[],
+        )
+        .unwrap();
+        for directory in [
+            data.clone(),
+            staging.path().to_path_buf(),
+            staging.path().join("packages"),
+            staging.path().join("packages/guest"),
+            staging.path().join("packages/guest/nested"),
+        ] {
+            assert_eq!(
+                std::fs::metadata(directory).unwrap().permissions().mode() & 0o7777,
+                0o755
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_handles_read_only_source_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("remuda-mod-readonly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source/packages/guest/sub");
+        let target = root.join("target/packages/guest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("x.lua"), "return {}\n").unwrap();
+        std::fs::set_permissions(
+            root.join("source/packages/guest"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        std::fs::set_permissions(source, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        copy_tree_with_assets(&root.join("source/packages/guest"), &target, &[]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("sub/x.lua")).unwrap(),
+            "return {}\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let _ = std::fs::set_permissions(
+            root.join("source/packages/guest"),
+            std::fs::Permissions::from_mode(0o755),
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_mods_root_resolves_but_world_writable_target_is_refused() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = std::env::temp_dir().join(format!("remuda-mod-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let target = root.join("real-mods");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = root.join("mods");
+        symlink(&target, &link).unwrap();
+        assert_eq!(
+            resolve_mods_root(&link).unwrap(),
+            std::fs::canonicalize(&target).unwrap()
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert_eq!(
+            resolve_mods_root(&target).unwrap(),
+            std::fs::canonicalize(&target).unwrap()
+        );
+        assert_eq!(
+            resolve_mods_root(&link).unwrap(),
+            std::fs::canonicalize(&target).unwrap()
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o775,
+            "an existing group-writable mods root must not be chmodded"
+        );
+
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = resolve_mods_root(&link).unwrap_err();
+        assert!(error.contains("must not be world-writable"), "{error}");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn world_writable_remuda_parent_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("remuda-mod-parent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let remuda = root.join("remuda");
+        let mods = remuda.join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&remuda, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&mods, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = resolve_mods_root(&mods).unwrap_err();
+        assert!(error.contains("Remuda data directory"), "{error}");
+        assert!(error.contains("must not be world-writable"), "{error}");
+        let _ = std::fs::set_permissions(&remuda, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_installed_tree_can_be_replaced_and_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("remuda-mod-force-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("checkout/packages/guest/sub");
+        let data = root.join("mods");
+        let target = data.join("guest");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("init.lua"), "return {}\n").unwrap();
+        std::fs::set_permissions(
+            root.join("checkout/packages/guest"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        std::fs::set_permissions(source, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let initial = stage_package_tree(
+            &data,
+            &root.join("checkout/packages/guest"),
+            Path::new("packages/guest"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(initial.path().join("packages/guest"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        std::fs::rename(initial.path(), &target).unwrap();
+
+        let replacement = stage_package_tree(
+            &data,
+            &root.join("checkout/packages/guest"),
+            Path::new("packages/guest"),
+            &[],
+        )
+        .unwrap();
+        let backup = data.join("remuda-mod-backup-test");
+        std::fs::rename(&target, &backup).unwrap();
+        std::fs::rename(replacement.path(), &target).unwrap();
+        remove_tree(&backup).unwrap();
+        assert!(!backup.exists(), "force install leaves no backup directory");
+        std::fs::set_permissions(
+            target.join("packages/guest"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o555)).unwrap();
+        remove_tree(&target).unwrap();
+        assert!(
+            !target.exists(),
+            "mod remove handles historical 0555 directories"
+        );
+
+        let _ = std::fs::set_permissions(
+            root.join("checkout/packages/guest"),
+            std::fs::Permissions::from_mode(0o755),
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_data_root_and_mods_are_created_with_safe_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("remuda-mod-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("remuda/mods");
+        create_dir_all_secure(&data).unwrap();
+        for directory in [root.join("remuda"), data] {
+            assert_eq!(
+                std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_tree_removes_read_only_checkout_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("remuda-mod-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let readonly = root.join("sub");
+        std::fs::create_dir_all(&readonly).unwrap();
+        std::fs::write(readonly.join("x.lua"), "return {}\n").unwrap();
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o555)).unwrap();
+        cleanup_tree(&root);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn failed_package_copy_removes_its_staging_directory() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("remuda-mod-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("mods");
+        let package = root.join("checkout/packages/guest");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(package.join("not-lua.txt"), "not allowed\n").unwrap();
+
+        assert!(stage_package_tree(&data, &package, Path::new("packages/guest"), &[]).is_err());
+        assert_eq!(std::fs::read_dir(&data).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1592,7 +2233,10 @@ api = "remuda-lua-v1""#
         fs::write(checkout.join("extension.toml"), "name = \"guest\"\nentry = \"packages/guest/init.lua\"\napi = \"remuda-lua-v1\"\nassets = [\"packages/guest/asset.py\"]\n").unwrap();
         symlink(root.join("outside/packages"), checkout.join("packages")).unwrap();
         let error = super::test_path(&checkout).unwrap_err();
-        assert!(error.contains("symlinked checkout path"), "{error}");
+        assert!(
+            error.contains("mod package path contains symlink"),
+            "{error}"
+        );
         fs::remove_file(checkout.join("packages")).unwrap();
         fs::create_dir_all(checkout.join("packages/guest")).unwrap();
         fs::write(checkout.join("packages/guest/init.lua"), "return {}\n").unwrap();

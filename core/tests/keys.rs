@@ -5,7 +5,7 @@
 //! then *arrive* is `native/tests/live_sessions.rs`; whether they are the right
 //! bytes is here.
 
-use remuda_core::keys::{key, mouse};
+use remuda_core::keys::{key, mouse, RETURN_BYTES};
 
 fn bytes(spec: &str) -> Vec<u8> {
     key(spec).unwrap_or_else(|| panic!("{spec:?} should be a key we know"))
@@ -56,7 +56,8 @@ fn all_seven_emacs_shorthands_are_spellable() {
     // Not just the four an author reaches for first. Read from the manual, node
     // *Changing Key Bindings*: NUL RET TAB LFD ESC SPC DEL.
     assert_eq!(bytes("NUL"), [0x00]);
-    assert_eq!(bytes("RET"), b"\r", "the same CR send_line appends");
+    assert_eq!(bytes("RET"), RETURN_BYTES);
+    assert_eq!(RETURN_BYTES, b"\r", "the byte used by input.submit");
     assert_eq!(bytes("TAB"), b"\t");
     assert_eq!(bytes("LFD"), b"\n", "and LFD is not RET");
     assert_eq!(bytes("ESC"), [0x1b]);

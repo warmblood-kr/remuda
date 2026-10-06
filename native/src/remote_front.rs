@@ -2,6 +2,7 @@
 
 use crate::ipc::TryClone as _;
 use interprocess::local_socket::traits::ListenerExt as _;
+use remuda_core::input::validate_batch;
 use remuda_core::protocol::Request;
 use std::io::{BufRead, Read, Write};
 use std::path::Path;
@@ -9,11 +10,41 @@ use std::path::Path;
 /// Maximum single JSON frame accepted by this front (512 KiB).
 pub const MAX_FRAME_BYTES: usize = 512 * 1024;
 /// Maximum bytes accepted in one atomic input batch (64 KiB).
-pub const MAX_INPUT_BYTES: usize = 64 * 1024;
+pub const MAX_INPUT_BYTES: usize = remuda_core::input::MAX_INPUT_BYTES;
+/// Maximum bytes accepted in one remote Input batch (12 KiB).
+pub const MAX_REMOTE_INPUT_BATCH_BYTES: usize = 12 * 1024;
 /// Maximum simultaneous local front connections.
 pub const MAX_CONNECTIONS: usize = 8;
-/// A connection is closed if one request takes longer than this.
+/// Time allowed to submit a single request frame or complete an ordinary request.
 pub const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const SYNC_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+/// Keep at least half of the daemon's 16 Sync slots available to local callers.
+pub(crate) const MAX_REMOTE_SYNCS: usize = 8;
+const _: () = assert!(MAX_REMOTE_SYNCS * 2 <= crate::daemon::MAX_CONCURRENT_SYNCS);
+static ACTIVE_REMOTE_SYNCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static SYNC_CAPACITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct RemoteSyncPermit;
+
+impl RemoteSyncPermit {
+    fn acquire() -> Option<Self> {
+        ACTIVE_REMOTE_SYNCS
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |active| (active < MAX_REMOTE_SYNCS).then_some(active + 1),
+            )
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for RemoteSyncPermit {
+    fn drop(&mut self) {
+        ACTIVE_REMOTE_SYNCS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// Decode and authorize exactly one JSON frame. This is the front's trust
 /// boundary: callers must send the returned Request to the local daemon, never
@@ -22,8 +53,8 @@ pub fn decode_frame(frame: &[u8]) -> Result<Request, String> {
     if frame.len() > MAX_FRAME_BYTES {
         return Err(format!("remote frame exceeds {MAX_FRAME_BYTES} bytes"));
     }
-    let request: Request = serde_json::from_slice(frame)
-        .map_err(|error| format!("invalid remote request: {error}"))?;
+    let request: Request =
+        serde_json::from_slice(frame).map_err(|_| "invalid remote request".to_owned())?;
     authorize(&request)?;
     Ok(request)
 }
@@ -31,8 +62,35 @@ pub fn decode_frame(frame: &[u8]) -> Result<Request, String> {
 /// Forward an authorized frame to the existing local daemon and encode its
 /// typed response afresh. Request bytes are never copied to the daemon socket.
 pub fn forward_frame(path: &std::path::Path, frame: &[u8]) -> Result<Vec<u8>, String> {
+    forward_frame_with_timeout(path, frame, std::time::Duration::from_secs(30))
+}
+
+/// Forward a frame with an explicit bound on the local daemon response wait.
+pub fn forward_frame_with_timeout(
+    path: &std::path::Path,
+    frame: &[u8],
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, String> {
     let request = decode_frame(frame)?;
-    let response = crate::client::request(path, &request).map_err(|error| error.to_string())?;
+    forward_request_with_timeout(path, &request, timeout)
+}
+
+fn forward_request_with_timeout(
+    path: &Path,
+    request: &Request,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, String> {
+    let _remote_sync_permit = if matches!(request, Request::Sync { .. }) {
+        let Some(permit) = RemoteSyncPermit::acquire() else {
+            return serde_json::to_vec(&remuda_core::protocol::Response::SyncAtCapacity)
+                .map_err(|error| error.to_string());
+        };
+        Some(permit)
+    } else {
+        None
+    };
+    let response = crate::client::request_with_timeout(path, request, timeout)
+        .map_err(|error| error.to_string())?;
     serde_json::to_vec(&response).map_err(|error| error.to_string())
 }
 
@@ -112,75 +170,188 @@ impl Drop for ConnectionSlot {
 }
 
 fn serve_connection(mut stream: crate::ipc::Stream, daemon_path: &Path) -> std::io::Result<()> {
-    let wake_stream = stream.try_clone()?;
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let timer = std::thread::spawn(move || {
-        if done_rx.recv_timeout(CONNECTION_TIMEOUT).is_err() {
-            crate::ipc::wake(&wake_stream);
+    let (read_done, read_timer) = timeout_timer(&stream, CONNECTION_TIMEOUT)?;
+    let mut frame = Vec::new();
+    let limited = (&mut stream).take((MAX_FRAME_BYTES + 1) as u64);
+    let mut reader = std::io::BufReader::new(limited);
+    let read_result = reader.read_until(b'\n', &mut frame);
+    let _ = read_done.send(());
+    let _ = read_timer.join();
+    read_result?;
+    if frame.last() == Some(&b'\n') {
+        frame.pop();
+    }
+    let request = match decode_frame(&frame) {
+        Ok(request) => request,
+        Err(reason) => {
+            return write_response(
+                &mut stream,
+                serde_json::to_vec(&remuda_core::protocol::Response::error(reason))
+                    .expect("response serializes"),
+            );
         }
-    });
-    let result = (|| {
-        let mut frame = Vec::new();
-        let limited = (&mut stream).take((MAX_FRAME_BYTES + 1) as u64);
-        let mut reader = std::io::BufReader::new(limited);
-        reader.read_until(b'\n', &mut frame)?;
-        if frame.last() == Some(&b'\n') {
-            frame.pop();
-        }
-        let reply = match forward_frame(daemon_path, &frame) {
-            Ok(response) => response,
-            Err(reason) => serde_json::to_vec(&remuda_core::protocol::Response::error(reason))
-                .expect("response serializes"),
-        };
-        stream.write_all(&reply)?;
-        stream.write_all(b"\n")?;
-        stream.flush()
-    })();
-    let _ = done_tx.send(());
+    };
+    let timeout = request_timeout(&request);
+    let (done, timer) = timeout_timer(&stream, timeout)?;
+    let reply = match forward_request_with_timeout(daemon_path, &request, timeout) {
+        Ok(response) => response,
+        Err(reason) => serde_json::to_vec(&remuda_core::protocol::Response::error(reason))
+            .expect("response serializes"),
+    };
+    let result = write_response(&mut stream, reply);
+    let _ = done.send(());
     let _ = timer.join();
     result
 }
 
-/// Validate the deliberately small request surface. The explicit deny arms
-/// make the compiler require a policy decision for every new Request variant.
-/// Exhaustive on purpose: no wildcard arm, a new Request variant must be classified here.
+fn request_timeout(request: &Request) -> std::time::Duration {
+    match request {
+        Request::Sync { timeout_ms, .. } => {
+            std::time::Duration::from_millis((*timeout_ms).min(remuda_core::sync::MAX_TIMEOUT_MS))
+                + SYNC_TIMEOUT_MARGIN
+        }
+        _ => CONNECTION_TIMEOUT,
+    }
+}
+
+fn timeout_timer(
+    stream: &crate::ipc::Stream,
+    timeout: std::time::Duration,
+) -> std::io::Result<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)> {
+    let wake_stream = stream.try_clone()?;
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let timer = std::thread::spawn(move || {
+        if done_rx.recv_timeout(timeout).is_err() {
+            crate::ipc::wake(&wake_stream);
+        }
+    });
+    Ok((done_tx, timer))
+}
+
+fn write_response(stream: &mut crate::ipc::Stream, reply: Vec<u8>) -> std::io::Result<()> {
+    stream.write_all(&reply)?;
+    stream.write_all(b"\n")?;
+    stream.flush()
+}
+
+/// Explicit request allowlist; new variants need a policy decision.
+/// Threat model: Sync is read-only and bounded; Eval and writes stay refused.
 pub fn authorize(request: &Request) -> Result<(), String> {
     match request {
-        Request::List | Request::CaptureStyled { .. } => Ok(()),
-        Request::Input { bytes, .. } if !bytes.is_empty() && bytes.len() <= MAX_INPUT_BYTES => {
-            Ok(())
+        Request::List | Request::CaptureStyled { .. } | Request::Sync { .. } => Ok(()),
+        Request::Input {
+            client_id,
+            seq,
+            bytes,
+            ..
+        } => {
+            if bytes.len() > MAX_REMOTE_INPUT_BATCH_BYTES {
+                return Err(format!(
+                    "remote Input batch exceeds {MAX_REMOTE_INPUT_BATCH_BYTES} bytes"
+                ));
+            }
+            validate_batch(client_id, *seq, bytes).map(|_| ())
         }
-        Request::Input { .. } => Err(format!(
-            "remote input must contain 1 to {MAX_INPUT_BYTES} bytes"
-        )),
-        Request::New { .. }
-        | Request::SendLine { .. }
-        | Request::Send { .. }
-        | Request::Feed { .. }
-        | Request::Resize { .. }
-        | Request::Capture { .. }
-        | Request::MouseState { .. }
-        | Request::Attach { .. }
-        | Request::AttachTracked { .. }
-        | Request::AttachStatus { .. }
-        | Request::Close { .. }
-        | Request::ListDir { .. }
-        | Request::Mkdir { .. }
-        | Request::RemoveDirAll { .. }
-        | Request::Version
-        | Request::Shutdown { .. }
-        | Request::Eval { .. } => Err(format!("remote front refuses {request:?}")),
+        Request::New { .. } => Err(refusal("New")),
+        Request::SendLine { .. } => Err(refusal("SendLine")),
+        Request::Send { .. } => Err(refusal("Send")),
+        Request::Feed { .. } => Err(refusal("Feed")),
+        Request::Resize { .. } => Err(refusal("Resize")),
+        Request::Capture { .. } => Err(refusal("Capture")),
+        Request::MouseState { .. } => Err(refusal("MouseState")),
+        Request::Attach { .. } => Err(refusal("Attach")),
+        Request::AttachTracked { .. } => Err(refusal("AttachTracked")),
+        Request::AttachStatus { .. } => Err(refusal("AttachStatus")),
+        Request::Close {
+            instance_id: Some(_),
+            confirm: Some(true),
+            ..
+        } => Ok(()),
+        Request::Close { .. } => Err(refusal("Close")),
+        Request::ListDir { .. } => Err(refusal("ListDir")),
+        Request::Mkdir { .. } => Err(refusal("Mkdir")),
+        Request::RemoveDirAll { .. } => Err(refusal("RemoveDirAll")),
+        Request::Version => Err(refusal("Version")),
+        Request::ClusterRegistrySync { .. } => Err(refusal("ClusterRegistrySync")),
+        Request::ClusterRegistryUpdate { .. } => Err(refusal("ClusterRegistryUpdate")),
+        Request::ClusterListener(_) => Err(refusal("ClusterListener")),
+        Request::Shutdown { .. } => Err(refusal("Shutdown")),
+        Request::Eval { .. } => Err(refusal("Eval")),
+        Request::SecretAnswer { .. } => Err(refusal("SecretAnswer")),
+        Request::LineAnswer { .. } => Err(refusal("LineAnswer")),
     }
+}
+
+fn refusal(variant: &str) -> String {
+    format!("remote front refuses {variant}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remuda_core::protocol::Request;
+    use remuda_core::protocol::{Request, Response};
+
+    #[test]
+    fn remote_sync_capacity_refusal_is_typed_on_wire() {
+        let _lock = SYNC_CAPACITY_TEST_LOCK.lock().unwrap();
+        let permits: Vec<_> = (0..MAX_REMOTE_SYNCS)
+            .map(|_| RemoteSyncPermit::acquire().expect("permit within remote sub-cap"))
+            .collect();
+        let request = Request::Sync {
+            name: "dev".into(),
+            instance_id: None,
+            since: 0,
+            timeout_ms: 100,
+        };
+        let frame = serde_json::to_vec(&request).expect("encode Sync request");
+        let wire_response = forward_frame(Path::new("no-daemon-needed-at-cap"), &frame)
+            .expect("remote over-cap response frame");
+        let response: Response =
+            serde_json::from_slice(&wire_response).expect("decode remote response");
+        assert_eq!(response, Response::SyncAtCapacity);
+        drop(permits);
+        assert!(RemoteSyncPermit::acquire().is_some());
+    }
+
+    #[test]
+    fn sync_front_deadline_is_capped_and_allows_the_server_wait() {
+        assert_eq!(
+            request_timeout(&Request::Sync {
+                name: "dev".into(),
+                instance_id: None,
+                since: 0,
+                timeout_ms: u64::MAX,
+            }),
+            std::time::Duration::from_secs(25)
+        );
+        assert_eq!(request_timeout(&Request::List), CONNECTION_TIMEOUT);
+    }
+
+    #[test]
+    fn legacy_close_requests_deserialize_and_keep_the_old_wire_shape() {
+        let old_wire = br#"{"Close":{"name":"dev"}}"#;
+        let request: Request = serde_json::from_slice(old_wire).unwrap();
+        assert_eq!(
+            request,
+            Request::Close {
+                name: "dev".into(),
+                instance_id: None,
+                confirm: None,
+            }
+        );
+        assert_eq!(serde_json::to_vec(&request).unwrap(), old_wire);
+    }
 
     #[test]
     fn permits_only_the_read_and_batched_input_surface() {
         assert!(authorize(&Request::List).is_ok());
+        assert!(authorize(&Request::Sync {
+            name: "dev".into(),
+            instance_id: None,
+            since: 4,
+            timeout_ms: 30_000,
+        })
+        .is_ok());
         assert!(authorize(&Request::CaptureStyled {
             name: "dev".into(),
             scrollback: 0
@@ -188,6 +359,9 @@ mod tests {
         .is_ok());
         assert!(authorize(&Request::Input {
             name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
             bytes: b"hello\r".to_vec()
         })
         .is_ok());
@@ -206,6 +380,26 @@ mod tests {
             steps: vec![]
         })
         .is_err());
+    }
+
+    #[test]
+    fn sync_is_allowlisted_but_eval_remains_refused() {
+        let sync = Request::Sync {
+            name: "dev".into(),
+            instance_id: Some("instance".into()),
+            since: 7,
+            timeout_ms: 30_000,
+        };
+        assert!(decode_frame(&serde_json::to_vec(&sync).unwrap()).is_ok());
+
+        let eval = Request::Eval {
+            code: "return secret".into(),
+            name: None,
+        };
+        assert_eq!(
+            decode_frame(&serde_json::to_vec(&eval).unwrap()).unwrap_err(),
+            "remote front refuses Eval"
+        );
     }
 
     #[test]
@@ -234,11 +428,23 @@ mod tests {
                 name: "dev".into(),
                 generation: 0,
             },
-            Request::Close { name: "dev".into() },
+            Request::Close {
+                name: "dev".into(),
+                instance_id: None,
+                confirm: None,
+            },
             Request::ListDir { path: "/".into() },
             Request::Mkdir { path: "/".into() },
             Request::RemoveDirAll { path: "/".into() },
             Request::Version,
+            Request::ClusterRegistrySync {
+                digest: None,
+                offset: 0,
+            },
+            Request::ClusterRegistryUpdate {
+                update_json: "private-registry-update".into(),
+            },
+            Request::ClusterListener(remuda_core::protocol::ListenerOp::Status),
             Request::Shutdown {
                 requester_daemon_id: None,
                 requester_session_id: None,
@@ -256,24 +462,145 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversize_frames_and_batches() {
+    fn malformed_request_errors_do_not_echo_payload_fragments() {
+        let error = decode_frame(br#"{"Eval":{"code":"SECRET_PAYLOAD_XYZ""#).unwrap_err();
+        assert_eq!(error, "invalid remote request");
+        assert!(!error.contains("SECRET_PAYLOAD_XYZ"));
+    }
+
+    #[test]
+    fn refusal_names_the_variant_without_echoing_its_contents() {
+        let error = authorize(&Request::Send {
+            name: "private-session-name".into(),
+            bytes: b"secret-input-payload".to_vec(),
+        })
+        .unwrap_err();
+        assert_eq!(error, "remote front refuses Send");
+
+        assert_eq!(
+            authorize(&Request::ClusterRegistrySync {
+                digest: Some("private-digest".into()),
+                offset: 12,
+            })
+            .unwrap_err(),
+            "remote front refuses ClusterRegistrySync"
+        );
+        assert_eq!(
+            authorize(&Request::ClusterRegistryUpdate {
+                update_json: "private-registry-update".into(),
+            })
+            .unwrap_err(),
+            "remote front refuses ClusterRegistryUpdate"
+        );
+        assert_eq!(
+            authorize(&Request::ClusterListener(
+                remuda_core::protocol::ListenerOp::Reload
+            ))
+            .unwrap_err(),
+            "remote front refuses ClusterListener"
+        );
+    }
+
+    #[test]
+    fn rejects_oversize_frames_and_remote_batches() {
         assert!(decode_frame(&vec![b' '; MAX_FRAME_BYTES + 1])
             .unwrap_err()
             .contains("exceeds"));
         let oversized = Request::Input {
             name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
             bytes: vec![0; MAX_INPUT_BYTES + 1],
         };
         assert!(decode_frame(&serde_json::to_vec(&oversized).unwrap())
             .unwrap_err()
-            .contains("input"));
+            .contains("remote Input batch exceeds"));
         let empty = Request::Input {
             name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
             bytes: Vec::new(),
         };
         assert!(decode_frame(&serde_json::to_vec(&empty).unwrap())
             .unwrap_err()
             .contains("input"));
+    }
+
+    #[test]
+    fn remote_input_batch_limit_accepts_12288_and_refuses_12289() {
+        let request = |length| Request::Input {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
+            bytes: vec![u8::MAX; length],
+        };
+        assert!(
+            decode_frame(&serde_json::to_vec(&request(MAX_REMOTE_INPUT_BATCH_BYTES)).unwrap())
+                .is_ok()
+        );
+        assert_eq!(
+            decode_frame(&serde_json::to_vec(&request(MAX_REMOTE_INPUT_BATCH_BYTES + 1)).unwrap())
+                .unwrap_err(),
+            format!("remote Input batch exceeds {MAX_REMOTE_INPUT_BATCH_BYTES} bytes")
+        );
+    }
+
+    #[test]
+    fn input_validation_errors_never_echo_batch_bytes() {
+        let request = Request::Input {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "malformed".into(),
+            seq: 0,
+            bytes: b"secret-input-payload".to_vec(),
+        };
+        let error = authorize(&request).unwrap_err();
+        assert!(!error.contains("secret-input-payload"));
+        assert!(error.contains("client_id"));
+    }
+
+    #[test]
+    fn close_requires_explicit_confirmation_and_instance_without_echoing_fields() {
+        let request = Request::Close {
+            name: "secret-session-name".into(),
+            instance_id: Some("secret-instance-id".into()),
+            confirm: None,
+        };
+        let error = authorize(&request).unwrap_err();
+        assert_eq!(error, "remote front refuses Close");
+        assert!(!error.contains("secret-session-name"));
+        assert!(!error.contains("secret-instance-id"));
+
+        let request = Request::Close {
+            name: "dev".into(),
+            instance_id: None,
+            confirm: Some(true),
+        };
+        assert_eq!(
+            authorize(&request).unwrap_err(),
+            "remote front refuses Close"
+        );
+    }
+
+    #[test]
+    fn close_is_allowlisted_only_with_identity_and_confirmation() {
+        assert!(authorize(&Request::Close {
+            name: "dev".into(),
+            instance_id: Some("instance-1".into()),
+            confirm: Some(true),
+        })
+        .is_ok());
+        assert_eq!(
+            authorize(&Request::Eval {
+                code: "return 1".into(),
+                name: None
+            })
+            .unwrap_err(),
+            "remote front refuses Eval"
+        );
     }
 
     fn test_socket_path() -> std::path::PathBuf {

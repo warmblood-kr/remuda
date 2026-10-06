@@ -28,6 +28,23 @@ pub fn scroll_offset(current: usize, delta: isize, limit: usize) -> usize {
     }
 }
 
+/// Keep a scrolled offset attached to the same absolute history rows as output
+/// grows, or pinned to the oldest row once retained history is full.
+pub(crate) fn anchor_offset_to_new_history(
+    offset: usize,
+    previous_total: usize,
+    current_total: usize,
+    current_rows: usize,
+) -> usize {
+    if offset == 0 {
+        0
+    } else {
+        offset
+            .saturating_add(current_total.saturating_sub(previous_total))
+            .min(current_rows)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MouseAction {
     Forward(Vec<u8>),
@@ -73,22 +90,38 @@ pub fn route_mouse_event(
 pub enum InputToken {
     Bytes(Vec<u8>),
     Mouse(SgrMouse),
-    /// Bytes between bracketed-paste markers, including both markers. They
-    /// bypass mouse parsing and attach hotkeys verbatim.
-    Paste(Vec<u8>),
+    /// A bracketed paste, markers included; it bypasses mouse parsing and
+    /// hotkeys. An embedded end marker closes the child's paste early, as
+    /// it does in a regular terminal.
+    Paste(PasteChunk),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PasteChunk {
+    pub bytes: Vec<u8>,
+    /// True when this token contains the opening marker.
+    pub starts: bool,
+    /// True when this token contains the parser-recognized closing marker.
+    pub ends: bool,
 }
 
 const PASTE_START: &[u8] = b"\x1b[200~";
-const PASTE_END: &[u8] = b"\x1b[201~";
+pub(crate) const PASTE_END: &[u8] = b"\x1b[201~";
 
 #[derive(Default)]
 pub struct SgrParser {
     pending: Vec<u8>,
     pending_since: Option<std::time::Instant>,
+    paste_last_input_at: Option<std::time::Instant>,
+    paste_scan_offset: usize,
     in_paste: bool,
+    paste_token_started: bool,
 }
 
 const ESC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(25);
+const PASTE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const PASTE_HARD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const PASTE_BUFFER_LIMIT: usize = 1024 * 1024;
 
 /// Translate a host SGR event into the live child terminal's selected wire
 /// format. Unsupported release or motion reports are omitted.
@@ -144,11 +177,18 @@ pub fn encode_for_child(event: SgrMouse, state: MouseState) -> Option<Vec<u8>> {
 
 impl SgrParser {
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<InputToken> {
-        if self.pending.is_empty() && bytes.contains(&0x1b) {
-            self.pending_since = Some(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        if self.in_paste {
+            self.pending_since = Some(now);
+            self.paste_last_input_at = Some(now);
+        } else if self.pending.is_empty() && bytes.contains(&0x1b) {
+            self.pending_since = Some(now);
         }
         self.pending.extend_from_slice(bytes);
         let tokens = self.parse(false);
+        if self.in_paste {
+            self.paste_last_input_at = Some(now);
+        }
         if self.pending.is_empty() {
             self.pending_since = None;
         }
@@ -158,6 +198,9 @@ impl SgrParser {
     pub fn finish(&mut self) -> Vec<InputToken> {
         let tokens = self.parse(true);
         self.pending_since = None;
+        self.paste_last_input_at = None;
+        self.in_paste = false;
+        self.paste_token_started = false;
         tokens
     }
 
@@ -165,17 +208,99 @@ impl SgrParser {
         !self.pending.is_empty()
     }
 
+    pub fn paste_open(&self) -> bool {
+        self.in_paste
+    }
+
+    pub fn paste_idle_at_least(&self, duration: std::time::Duration) -> bool {
+        self.in_paste
+            && self
+                .paste_last_input_at
+                .is_some_and(|since| since.elapsed() >= duration)
+    }
+
+    /// Find a hotkey byte outside bracketed paste spans, accounting for a
+    /// marker prefix buffered by the previous read.
+    pub fn first_byte_outside_paste(&self, bytes: &[u8], target: u8) -> Option<usize> {
+        let prefix_len = self.pending.len().min(PASTE_START.len() - 1);
+        let mut scan = self.pending[self.pending.len() - prefix_len..].to_vec();
+        scan.extend_from_slice(bytes);
+        let mut in_paste = self.in_paste;
+        let mut at = 0;
+        while at < scan.len() {
+            if in_paste && scan[at..].starts_with(PASTE_END) {
+                in_paste = false;
+                at += PASTE_END.len();
+            } else if !in_paste && scan[at..].starts_with(PASTE_START) {
+                in_paste = true;
+                at += PASTE_START.len();
+            } else {
+                if !in_paste && scan[at] == target && at >= prefix_len {
+                    return Some(at - prefix_len);
+                }
+                at += 1;
+            }
+        }
+        None
+    }
+
     pub fn timeout_remaining(&self) -> Option<std::time::Duration> {
-        self.pending_since
-            .map(|since| ESC_TIMEOUT.saturating_sub(since.elapsed()))
+        let timeout = if self.in_paste {
+            PASTE_IDLE_TIMEOUT
+        } else {
+            ESC_TIMEOUT
+        };
+        let pending = self
+            .pending_since
+            .map(|since| timeout.saturating_sub(since.elapsed()));
+        let hard = self.in_paste.then(|| {
+            self.paste_last_input_at
+                .map(|since| PASTE_HARD_IDLE_TIMEOUT.saturating_sub(since.elapsed()))
+                .unwrap_or(PASTE_HARD_IDLE_TIMEOUT)
+        });
+        match (pending, hard) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        }
     }
 
     pub fn flush_expired(&mut self) -> Vec<InputToken> {
-        if self
-            .pending_since
-            .is_some_and(|since| since.elapsed() >= ESC_TIMEOUT)
+        let timeout = if self.in_paste {
+            PASTE_IDLE_TIMEOUT
+        } else {
+            ESC_TIMEOUT
+        };
+        if self.in_paste
+            && self
+                .paste_last_input_at
+                .is_some_and(|since| since.elapsed() >= PASTE_HARD_IDLE_TIMEOUT)
         {
-            self.finish()
+            self.in_paste = false;
+            self.pending_since = None;
+            self.paste_last_input_at = None;
+            self.paste_scan_offset = 0;
+            let pending = std::mem::take(&mut self.pending);
+            let tokens = self.close_paste(pending);
+            self.in_paste = false;
+            tokens
+        } else if self
+            .pending_since
+            .is_some_and(|since| since.elapsed() >= timeout)
+        {
+            if self.in_paste {
+                let held = longest_suffix_prefix(&self.pending, PASTE_END);
+                let safe_len = self.pending.len().saturating_sub(held);
+                let chunk = self.drain_paste_prefix(safe_len);
+                self.pending_since = (!self.pending.is_empty()).then(std::time::Instant::now);
+                if chunk.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![self.paste_chunk(chunk, false)]
+                }
+            } else {
+                self.finish()
+            }
         } else {
             Vec::new()
         }
@@ -185,23 +310,8 @@ impl SgrParser {
         let mut out = Vec::new();
         loop {
             if self.in_paste {
-                if let Some(end) = self
-                    .pending
-                    .windows(PASTE_END.len())
-                    .position(|window| window == PASTE_END)
-                {
-                    let len = end + PASTE_END.len();
-                    out.push(InputToken::Paste(self.pending.drain(..len).collect()));
-                    self.in_paste = false;
+                if self.parse_paste(&mut out, finishing) {
                     continue;
-                }
-                let held = longest_suffix_prefix(&self.pending, PASTE_END);
-                let deliver = self.pending.len().saturating_sub(held);
-                if deliver > 0 {
-                    out.push(InputToken::Paste(self.pending.drain(..deliver).collect()));
-                }
-                if finishing && !self.pending.is_empty() {
-                    out.push(InputToken::Paste(std::mem::take(&mut self.pending)));
                 }
                 break;
             }
@@ -215,10 +325,10 @@ impl SgrParser {
                 out.push(InputToken::Bytes(self.pending.drain(..at).collect()));
             }
             if self.pending.starts_with(PASTE_START) {
-                out.push(InputToken::Paste(
-                    self.pending.drain(..PASTE_START.len()).collect(),
-                ));
                 self.in_paste = true;
+                self.paste_token_started = false;
+                self.paste_last_input_at = Some(std::time::Instant::now());
+                self.paste_scan_offset = 0;
                 continue;
             }
             if PASTE_START.starts_with(&self.pending) {
@@ -283,6 +393,76 @@ impl SgrParser {
         }
         merged
     }
+
+    /// Consume available paste input; return whether parsing can continue.
+    fn parse_paste(&mut self, out: &mut Vec<InputToken>, finishing: bool) -> bool {
+        let search_from = self.paste_scan_offset.min(self.pending.len());
+        let end = self.pending[search_from..]
+            .windows(PASTE_END.len())
+            .position(|window| window == PASTE_END)
+            .map(|offset| search_from + offset);
+        if let Some(end) = end {
+            let len = end + PASTE_END.len();
+            if len <= PASTE_BUFFER_LIMIT {
+                let bytes = self.pending.drain(..len).collect();
+                out.push(self.paste_chunk(bytes, true));
+                self.in_paste = false;
+                self.paste_last_input_at = None;
+                self.paste_scan_offset = 0;
+            } else {
+                let bytes = self.drain_paste_prefix(end.min(PASTE_BUFFER_LIMIT));
+                out.push(self.paste_chunk(bytes, false));
+            }
+            return true;
+        }
+        self.paste_scan_offset = self.pending.len().saturating_sub(PASTE_END.len() - 1);
+        if self.pending.len() > PASTE_BUFFER_LIMIT {
+            let held = longest_suffix_prefix(&self.pending, PASTE_END);
+            let safe_len = self.pending.len().saturating_sub(held);
+            let chunk = safe_len.min(PASTE_BUFFER_LIMIT);
+            if chunk > 0 {
+                let bytes = self.drain_paste_prefix(chunk);
+                out.push(self.paste_chunk(bytes, false));
+                return true;
+            }
+        }
+        if finishing {
+            let pending = std::mem::take(&mut self.pending);
+            out.extend(self.close_paste(pending));
+            self.in_paste = false;
+            self.paste_scan_offset = 0;
+            return true;
+        }
+        false
+    }
+
+    fn drain_paste_prefix(&mut self, len: usize) -> Vec<u8> {
+        let chunk = self.pending.drain(..len).collect();
+        self.paste_scan_offset = self.paste_scan_offset.saturating_sub(len);
+        chunk
+    }
+
+    fn paste_chunk(&mut self, bytes: Vec<u8>, ends: bool) -> InputToken {
+        let chunk = PasteChunk {
+            bytes,
+            starts: !self.paste_token_started,
+            ends,
+        };
+        self.paste_token_started = !ends;
+        InputToken::Paste(chunk)
+    }
+
+    fn close_paste(&mut self, mut bytes: Vec<u8>) -> Vec<InputToken> {
+        let mut tokens = Vec::new();
+        let final_chunk_limit = PASTE_BUFFER_LIMIT - PASTE_END.len();
+        while bytes.len() > final_chunk_limit {
+            let chunk_len = (bytes.len() - final_chunk_limit).min(PASTE_BUFFER_LIMIT);
+            tokens.push(self.paste_chunk(bytes.drain(..chunk_len).collect(), false));
+        }
+        bytes.extend_from_slice(PASTE_END);
+        tokens.push(self.paste_chunk(bytes, true));
+        tokens
+    }
 }
 
 fn longest_suffix_prefix(bytes: &[u8], prefix: &[u8]) -> usize {
@@ -341,10 +521,18 @@ fn parse_sgr(bytes: &[u8]) -> Parse {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_for_child, route_mouse_event, scroll_offset, wheel_delta, InputToken, MouseAction,
-        SgrMouse, SgrParser,
+        anchor_offset_to_new_history, encode_for_child, route_mouse_event, scroll_offset,
+        wheel_delta, InputToken, MouseAction, SgrMouse, SgrParser, PASTE_END,
     };
     use remuda_core::agent::{MouseEncoding, MouseMode, MouseState};
+
+    fn paste_token(bytes: &[u8], starts: bool, ends: bool) -> InputToken {
+        InputToken::Paste(super::PasteChunk {
+            bytes: bytes.to_vec(),
+            starts,
+            ends,
+        })
+    }
 
     #[test]
     fn parses_a_fragmented_wheel_report_without_changing_surrounding_keys() {
@@ -396,17 +584,11 @@ mod tests {
     fn split_bracketed_paste_preserves_sgr_and_hotkey_bytes() {
         let mut parser = SgrParser::default();
         assert!(parser.feed(b"\x1b[20").is_empty());
-        assert_eq!(
-            parser.feed(b"0~\x1b[<64;1;2M\x1d\x1b[20"),
-            vec![
-                InputToken::Paste(b"\x1b[200~".to_vec()),
-                InputToken::Paste(b"\x1b[<64;1;2M\x1d".to_vec())
-            ]
-        );
+        assert!(parser.feed(b"0~\x1b[<64;1;2M\x1d\x1b[20").is_empty());
         assert_eq!(
             parser.feed(b"1~\x1b[<64;2;3M"),
             vec![
-                InputToken::Paste(b"\x1b[201~".to_vec()),
+                paste_token(b"\x1b[200~\x1b[<64;1;2M\x1d\x1b[201~", true, true),
                 InputToken::Mouse(SgrMouse {
                     button: 64,
                     x: 2,
@@ -415,6 +597,131 @@ mod tests {
                 })
             ]
         );
+    }
+
+    #[test]
+    fn bracketed_paste_is_one_intact_token() {
+        let mut parser = SgrParser::default();
+        assert_eq!(
+            parser.feed(b"\x1b[200~first line\nsecond line\x1b[201~"),
+            vec![paste_token(
+                b"\x1b[200~first line\nsecond line\x1b[201~",
+                true,
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn stalled_paste_flushes_chunk_but_keeps_late_tail_in_paste() {
+        let mut parser = SgrParser::default();
+        let initial = b"\x1b[200~unfinished paste";
+        assert!(parser.feed(initial).is_empty());
+
+        parser.pending_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        assert_eq!(
+            parser.flush_expired(),
+            vec![paste_token(b"\x1b[200~unfinished paste", true, false)]
+        );
+        assert!(parser.paste_open());
+        assert!(parser.feed(b"tail\n").is_empty());
+        parser.pending_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        parser.paste_last_input_at = parser.pending_since;
+        assert_eq!(
+            parser.flush_expired(),
+            vec![paste_token(b"tail\n", false, false)]
+        );
+        assert!(parser.paste_open());
+        parser.pending_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(11));
+        parser.paste_last_input_at = parser.pending_since;
+        assert_eq!(
+            parser.flush_expired(),
+            vec![paste_token(b"\x1b[201~", false, true)]
+        );
+        assert!(!parser.paste_open());
+        assert_eq!(
+            parser.feed(b"typed\n"),
+            vec![InputToken::Bytes(b"typed\n".to_vec())]
+        );
+    }
+
+    #[test]
+    fn idle_flush_keeps_a_partial_paste_end_marker_buffered() {
+        let mut parser = SgrParser::default();
+        assert!(parser.feed(b"\x1b[200~body\x1b[20").is_empty());
+        parser.pending_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        assert_eq!(
+            parser.flush_expired(),
+            vec![paste_token(b"\x1b[200~body", true, false)]
+        );
+        assert!(parser.paste_open());
+        assert_eq!(
+            parser.feed(b"1~"),
+            vec![paste_token(b"\x1b[201~", false, true)]
+        );
+        assert!(!parser.paste_open());
+    }
+
+    #[test]
+    fn finishing_unterminated_paste_closes_child_paste_mode() {
+        let mut parser = SgrParser::default();
+        assert!(parser.feed(b"\x1b[200~unfinished").is_empty());
+
+        assert_eq!(
+            parser.finish(),
+            vec![paste_token(b"\x1b[200~unfinished\x1b[201~", true, true)]
+        );
+    }
+
+    #[test]
+    fn unterminated_paste_flushes_at_the_buffer_limit() {
+        let mut parser = SgrParser::default();
+        let limit = 1024 * 1024;
+        let mut paste = b"\x1b[200~".to_vec();
+        paste.resize(limit + b"\x1b[200~".len(), b'x');
+
+        let tokens = parser.feed(&paste);
+
+        assert!(
+            tokens
+                .iter()
+                .any(|token| matches!(token, InputToken::Paste(_))),
+            "the parser must forward a bounded chunk before the end marker"
+        );
+        assert!(
+            parser.pending.len() <= limit,
+            "pending paste buffer exceeds its cap: {}",
+            parser.pending.len()
+        );
+    }
+
+    #[test]
+    fn two_megabyte_paste_is_bounded_across_eight_kib_reads() {
+        let mut parser = SgrParser::default();
+        let mut output = Vec::new();
+        let mut input = b"\x1b[200~".to_vec();
+        input.resize(2 * 1024 * 1024, b'x');
+        for chunk in input.chunks(8 * 1024) {
+            output.extend(parser.feed(chunk));
+            assert!(parser.pending.len() <= 1024 * 1024);
+        }
+        assert!(parser.paste_open());
+        assert!(output.iter().all(|t| matches!(t, InputToken::Paste(_))));
+        assert!(
+            output
+                .iter()
+                .map(|t| match t {
+                    InputToken::Paste(b) => b.bytes.len(),
+                    _ => 0,
+                })
+                .sum::<usize>()
+                > 0
+        );
+        let end_tokens = parser.feed(b"\x1b[201~");
+        assert!(
+            matches!(end_tokens.last(), Some(InputToken::Paste(chunk)) if chunk.ends && chunk.bytes.ends_with(PASTE_END))
+        );
+        assert!(!parser.paste_open());
     }
 
     #[test]
@@ -430,7 +737,8 @@ mod tests {
                 event,
                 MouseState {
                     mode: MouseMode::Press,
-                    encoding: MouseEncoding::Sgr
+                    encoding: MouseEncoding::Sgr,
+                    bracketed_paste: false,
                 }
             ),
             None
@@ -440,7 +748,8 @@ mod tests {
                 event,
                 MouseState {
                     mode: MouseMode::PressRelease,
-                    encoding: MouseEncoding::Sgr
+                    encoding: MouseEncoding::Sgr,
+                    bracketed_paste: false,
                 }
             )
             .unwrap(),
@@ -454,7 +763,8 @@ mod tests {
                 },
                 MouseState {
                     mode: MouseMode::Press,
-                    encoding: MouseEncoding::Default
+                    encoding: MouseEncoding::Default,
+                    bracketed_paste: false,
                 }
             )
             .unwrap(),
@@ -469,7 +779,8 @@ mod tests {
                 },
                 MouseState {
                     mode: MouseMode::PressRelease,
-                    encoding: MouseEncoding::Sgr
+                    encoding: MouseEncoding::Sgr,
+                    bracketed_paste: false,
                 }
             ),
             None
@@ -494,6 +805,16 @@ mod tests {
     }
 
     #[test]
+    fn history_anchor_tracks_new_rows_clamps_at_oldest_and_follows_at_bottom() {
+        assert_eq!(anchor_offset_to_new_history(6, 40, 43, 100), 9);
+        assert_eq!(anchor_offset_to_new_history(0, 40, 43, 100), 0);
+        assert_eq!(
+            anchor_offset_to_new_history(9_998, 10_000, 10_010, 10_000),
+            10_000
+        );
+    }
+
+    #[test]
     fn fake_attach_routes_wheel_by_child_mode_and_respects_the_mouse_knob() {
         let wheel = SgrMouse {
             button: 64,
@@ -511,6 +832,7 @@ mod tests {
                 MouseState {
                     mode: MouseMode::Press,
                     encoding: MouseEncoding::Sgr,
+                    bracketed_paste: false,
                 },
                 true,
                 0,

@@ -1,0 +1,460 @@
+//! `cwd` on `remuda.process.run` and `remuda.process`: the child starts in
+//! the directory the caller names, and a bad `cwd` is refused in one line.
+
+use remuda_core::protocol::{Request, Response};
+use remuda_native::{client, daemon};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+#[path = "daemon_support/spawn.rs"]
+mod spawn;
+
+/// A directory of our own, short enough for `sun_path` (~108 bytes), removed
+/// when the test ends, passing or not.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        // macOS refuses a runtime directory reached through the /tmp symlink.
+        let root = if cfg!(unix) {
+            PathBuf::from("/tmp")
+                .canonicalize()
+                .expect("canonical /tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let dir = root.join(format!("remuda-c{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch");
+        Self(dir)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// One daemon process in its own runtime directory, with a work directory
+/// that holds one marker file. Fields drop in order: the daemon dies first.
+struct Node {
+    _daemon: spawn::Daemon,
+    dir: Scratch,
+    work: PathBuf,
+}
+
+const MARKER: &str = "remuda-cwd-marker.txt";
+
+impl Node {
+    fn start(tag: &str) -> Self {
+        Self::start_with_path(tag, None)
+    }
+
+    /// `path`, when given, becomes the daemon's PATH; `{bin}` in it stands
+    /// for this node's own `bin` directory.
+    fn start_with_path(tag: &str, path: Option<&str>) -> Self {
+        let dir = Scratch::new(tag);
+        let work = dir.0.join("work");
+        std::fs::create_dir_all(&work).expect("create work directory");
+        std::fs::write(work.join(MARKER), "x").expect("write marker");
+        let mut command = spawn::base_command(&dir.0);
+        if let Some(path) = path {
+            let bin = dir.0.join("bin");
+            std::fs::create_dir_all(&bin).expect("create bin directory");
+            command.env("PATH", path.replace("{bin}", bin.to_str().unwrap()));
+        }
+        let daemon = spawn::spawn_and_wait(command, &dir.0);
+        Self {
+            _daemon: daemon,
+            dir,
+            work,
+        }
+    }
+
+    fn request(&self, code: &str) -> Response {
+        let socket = daemon::socket_path_in(&self.dir.0, "s");
+        let request = Request::Eval {
+            code: code.to_string(),
+            name: None,
+        };
+        client::request(&socket, &request).expect("eval request")
+    }
+
+    fn eval(&self, code: &str) -> String {
+        match self.request(code) {
+            Response::Value(value) => value,
+            other => panic!("eval failed: {other:?}"),
+        }
+    }
+
+    /// The message of the Lua error `code` raises.
+    fn error_of(&self, code: &str) -> String {
+        self.eval(&format!(
+            "local ok, err = pcall(function() {code} end)
+             return ok and 'no error' or tostring(err)"
+        ))
+    }
+}
+
+fn lua_string(path: &Path) -> String {
+    format!("{:?}", path.to_str().expect("utf-8 scratch path"))
+}
+
+/// A Lua argv that lists the names in the child's working directory.
+fn list_argv() -> &'static str {
+    if cfg!(windows) {
+        "{ 'cmd.exe', '/c', 'dir', '/b' }"
+    } else {
+        "{ '/bin/ls' }"
+    }
+}
+
+fn assert_refused(message: &str, shown_nowhere: &Path) {
+    assert!(
+        message.contains("cwd must be an absolute path to an existing directory")
+            && message.contains("Next: pass the directory's full path."),
+        "{message}"
+    );
+    assert!(!message.contains('\n'), "one line: {message}");
+    let path = shown_nowhere.to_str().unwrap();
+    assert!(!message.contains(path), "the path is not echoed: {message}");
+}
+
+#[test]
+fn process_run_starts_the_child_in_cwd() {
+    let node = Node::start("run");
+    let argv = list_argv();
+    let listed = node.eval(&format!(
+        "local result = remuda.process.run({{ argv = {argv}, cwd = {} }})
+         return tostring(result.code) .. '|' .. result.stdout",
+        lua_string(&node.work)
+    ));
+    assert!(
+        listed.starts_with("0|") && listed.contains(MARKER),
+        "{listed}"
+    );
+
+    // Without cwd nothing changes: the child inherits the daemon's directory.
+    let inherited = node.eval(&format!(
+        "return remuda.process.run({{ argv = {argv} }}).stdout"
+    ));
+    assert!(!inherited.contains(MARKER), "{inherited}");
+}
+
+#[test]
+fn process_run_refuses_a_bad_cwd_in_one_line_without_the_path() {
+    let node = Node::start("refuse");
+    let argv = list_argv();
+    let file = node.work.join(MARKER);
+    let missing = node.work.join("no-such-directory");
+    for bad in [&file, &missing] {
+        let message = node.error_of(&format!(
+            "remuda.process.run({{ argv = {argv}, cwd = {} }})",
+            lua_string(bad)
+        ));
+        assert_refused(&message, bad);
+    }
+    for bad in [
+        "'work'",
+        "'.'",
+        "''",
+        "42",
+        "{}",
+        "'/tmp/\\255'",
+        "'/tmp\\0'",
+    ] {
+        let message = node.error_of(&format!(
+            "remuda.process.run({{ argv = {argv}, cwd = {bad} }})"
+        ));
+        assert_refused(&message, &node.work);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_stdin_hold_times_out_when_child_never_prints() {
+    let node = Node::start("stdin-hold-timeout");
+    let child = node.dir.0.join("read-until-eof");
+    std::fs::write(&child, "#!/bin/sh\ncat >/dev/null\n").expect("write child script");
+    let mut permissions = std::fs::metadata(&child)
+        .expect("child metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&child, permissions).expect("make child executable");
+
+    let started = Instant::now();
+    let result = node.eval(&format!(
+        "local r = remuda.process.run({{ argv = {{ {} }}, stdin = 'payload', timeout = 2, stdin_hold_until_lines = 1 }})
+         return tostring(r.timed_out) .. '|' .. tostring(r.code)",
+        lua_string(&child)
+    ));
+    let elapsed = started.elapsed();
+
+    assert_eq!(result.split('|').next(), Some("true"), "result: {result}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "returned after {elapsed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_stdin_hold_returns_reply_line() {
+    let node = Node::start("stdin-hold-reply");
+    let child = node.dir.0.join("read-one-line");
+    std::fs::write(
+        &child,
+        "#!/bin/sh\nread -r request\nexec 3<&0\n( cat <&3 >/dev/null; kill $$ ) >/dev/null 2>&1 &\nsleep 1\nprintf 'reply\\n'\n",
+    )
+    .expect("write child script");
+    let mut permissions = std::fs::metadata(&child)
+        .expect("child metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&child, permissions).expect("make child executable");
+
+    let result = node.eval(&format!(
+        "return remuda.process.run({{ argv = {{ {} }}, stdin = 'request\\n', timeout = 5, stdin_hold_until_lines = 1 }}).stdout",
+        lua_string(&child)
+    ));
+
+    assert_eq!(result, "reply\n");
+}
+
+#[test]
+fn process_run_stdin_hold_refuses_out_of_range_line_counts_in_one_line() {
+    let node = Node::start("stdin-hold-invalid");
+    for count in ["0", "1001", "-1", "1.5", "0 / 0", "'1'"] {
+        let error = node.error_of(&format!(
+            "remuda.process.run({{ argv = {{ '/bin/cat' }}, stdin_hold_until_lines = {count} }})"
+        ));
+        assert!(error.contains("stdin_hold_until_lines"), "{error}");
+        assert!(
+            error.contains("Next: pass a whole number in that range"),
+            "{error}"
+        );
+        assert!(!error.contains('\n'), "error must be one line: {error}");
+    }
+}
+
+#[test]
+fn process_run_stdin_hold_binding_rejects_invalid_numbers() {
+    let node = Node::start("stdin-hold-binding-invalid");
+    for count in ["1.5", "0 / 0", "math.huge", "-1", "1001", "'1'"] {
+        let error = node.error_of(&format!(
+            "local result, refused = remuda._process_run({{ '/bin/cat' }}, nil, 0.1, nil, {count}); if result == nil then error(refused, 2) end"
+        ));
+        assert!(
+            error.contains("stdin_hold_until_lines must be an integer from 1 through 1000"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Next: pass a whole number in that range"),
+            "{error}"
+        );
+        assert!(!error.contains('\n'), "error must be one line: {error}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_stdin_hold_returns_promptly_when_child_exits_early() {
+    let node = Node::start("stdin-hold-early-exit");
+    let started = Instant::now();
+    let result = node.eval(
+        "local r = remuda.process.run({ argv = { '/bin/echo', 'one' }, stdin = 'payload', timeout = 5, stdin_hold_until_lines = 2 })
+         return tostring(r.timed_out) .. '|' .. r.stdout",
+    );
+
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "returned after {:?}",
+        started.elapsed()
+    );
+    assert_eq!(result, "false|one\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_stdin_hold_accepts_two_and_one_thousand_lines() {
+    let node = Node::start("stdin-hold-lines");
+    let child = node.dir.0.join("two-lines-then-read");
+    std::fs::write(
+        &child,
+        "#!/bin/sh\nprintf 'one\\ntwo\\n'\ncat >/dev/null\nprintf 'done\\n'\n",
+    )
+    .expect("write child script");
+    let mut permissions = std::fs::metadata(&child)
+        .expect("child metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&child, permissions).expect("make child executable");
+
+    let two = node.eval(&format!(
+        "return remuda.process.run({{ argv = {{ {} }}, stdin = 'payload', timeout = 3, stdin_hold_until_lines = 2 }}).stdout",
+        lua_string(&child)
+    ));
+    assert_eq!(two, "one\ntwo\ndone\n");
+
+    let thousand = node.eval(
+        "local r = remuda.process.run({ argv = { '/usr/bin/seq', '1000' }, timeout = 3, stdin_hold_until_lines = 1000 })
+         return tostring(r.code) .. '|' .. tostring(r.timed_out) .. '|' .. tostring(select(2, r.stdout:gsub('\\n', '')))",
+    );
+    assert_eq!(thousand, "0|false|1000");
+}
+
+#[test]
+fn async_process_starts_in_cwd_and_refuses_a_bad_one() {
+    let node = Node::start("async");
+    let argv = list_argv();
+    node.eval(&format!(
+        "_G.cwd_lines = {{}}
+         remuda.on('cwd-line', function(line) _G.cwd_lines[#_G.cwd_lines + 1] = line end)
+         remuda.process({{ argv = {argv}, cwd = {}, on_line = 'cwd-line' }})
+         return 'started'",
+        lua_string(&node.work)
+    ));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = String::new();
+    while Instant::now() < deadline && !seen.contains(MARKER) {
+        std::thread::sleep(Duration::from_millis(50));
+        seen = node.eval("return table.concat(_G.cwd_lines, ',')");
+    }
+    assert!(seen.contains(MARKER), "lines: {seen:?}");
+
+    let missing = node.work.join("no-such-directory");
+    let message = node.error_of(&format!(
+        "remuda.process({{ argv = {argv}, cwd = {} }})",
+        lua_string(&missing)
+    ));
+    assert_refused(&message, &missing);
+    let message = node.error_of(&format!(
+        "remuda.process({{ argv = {argv}, cwd = 'work' }})"
+    ));
+    assert_refused(&message, &node.work);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_to_a_directory_is_a_directory() {
+    let node = Node::start("link");
+    let link = node.dir.0.join("link");
+    std::os::unix::fs::symlink(&node.work, &link).expect("symlink");
+    let listed = node.eval(&format!(
+        "return remuda.process.run({{ argv = {}, cwd = {} }}).stdout",
+        list_argv(),
+        lua_string(&link)
+    ));
+    assert!(listed.contains(MARKER), "{listed}");
+}
+
+/// With `cwd`, a relative program path would resolve differently per OS
+/// (std calls that case platform specific and unstable), so it is refused.
+#[test]
+fn a_relative_program_path_with_cwd_is_refused_on_every_os() {
+    let node = Node::start("rel");
+    let cwd = lua_string(&node.work);
+    let mut relative = vec!["'./tool'", "'bin/tool'"];
+    if cfg!(windows) {
+        // Drive-relative: no separator needed to be a relative path there.
+        relative.extend([
+            "'.\\\\tool.cmd'",
+            "'bin\\\\tool'",
+            "'C:tool'",
+            "'C:bin\\\\tool'",
+        ]);
+    } else {
+        // Elsewhere `C:tool` is an ordinary bare name, searched on PATH.
+        let message = node.error_of(&format!(
+            "remuda.process.run({{ argv = {{ 'C:tool' }}, cwd = {cwd} }})"
+        ));
+        assert!(!message.contains("with cwd needs"), "{message}");
+    }
+    for program in relative {
+        for word in ["remuda.process.run", "remuda.process"] {
+            let message = node.error_of(&format!(
+                "{word}({{ argv = {{ {program} }}, cwd = {cwd} }})"
+            ));
+            assert!(
+                message.contains("with cwd needs an absolute program path or a bare command name")
+                    && message.contains("Next: pass the full path of the program."),
+                "{word} {program}: {message}"
+            );
+            assert!(!message.contains('\n'), "one line: {message}");
+        }
+        // Without cwd the word is unchanged: no such refusal.
+        let message = node.error_of(&format!("remuda.process.run({{ argv = {{ {program} }} }})"));
+        assert!(!message.contains("with cwd needs"), "{program}: {message}");
+    }
+
+    // A bare command name is searched on PATH and still runs in cwd.
+    let bare = if cfg!(windows) {
+        "{ 'cmd.exe', '/c', 'dir', '/b' }"
+    } else {
+        "{ 'ls' }"
+    };
+    let listed = node.eval(&format!(
+        "return remuda.process.run({{ argv = {bare}, cwd = {cwd} }}).stdout"
+    ));
+    assert!(listed.contains(MARKER), "{listed}");
+}
+
+/// A program `mytool` that says who it is and leaves `ran.txt` where it ran.
+fn write_mytool(dir: &Path, says: &str) {
+    if cfg!(windows) {
+        let body = format!("@echo {says}\r\n@echo x> ran.txt\r\n");
+        std::fs::write(dir.join("mytool.cmd"), body).expect("write mytool");
+    } else {
+        let file = dir.join("mytool");
+        std::fs::write(&file, format!("#!/bin/sh\necho {says}\necho x > ran.txt\n"))
+            .expect("write mytool");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod mytool");
+        }
+    }
+}
+
+const PATH_SEPARATOR: &str = if cfg!(windows) { ";" } else { ":" };
+
+/// SEC L1: a relative PATH entry would be resolved in the child's directory,
+/// which is now `cwd`. A file planted there must never be what runs.
+#[test]
+fn a_bare_name_with_cwd_runs_the_one_on_an_absolute_path_entry() {
+    let path = [".", "", "{bin}"].join(PATH_SEPARATOR);
+    let node = Node::start_with_path("planted", Some(&path));
+    write_mytool(&node.work, "planted");
+    write_mytool(&node.dir.0.join("bin"), "real");
+    let said = node.eval(&format!(
+        "return remuda.process.run({{ argv = {{ 'mytool' }}, cwd = {} }}).stdout",
+        lua_string(&node.work)
+    ));
+    assert!(said.contains("real") && !said.contains("planted"), "{said}");
+    // The real one ran in cwd; the planted one never ran anywhere.
+    assert!(node.work.join("ran.txt").exists(), "it did not run in cwd");
+}
+
+#[test]
+fn a_bare_name_found_only_through_a_relative_path_entry_is_refused() {
+    let path = [".", ""].join(PATH_SEPARATOR);
+    let node = Node::start_with_path("only-dot", Some(&path));
+    write_mytool(&node.work, "planted");
+    for word in ["remuda.process.run", "remuda.process"] {
+        let message = node.error_of(&format!(
+            "{word}({{ argv = {{ 'mytool' }}, cwd = {} }})",
+            lua_string(&node.work)
+        ));
+        assert!(
+            message.contains("with cwd could not find")
+                && message.contains("Next: pass the full path of the program."),
+            "{word}: {message}"
+        );
+        assert!(!message.contains('\n'), "one line: {message}");
+    }
+    assert!(!node.work.join("ran.txt").exists(), "the planted file ran");
+}

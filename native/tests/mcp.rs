@@ -427,6 +427,68 @@ fn wait_for_answers_a_screen_and_refuses_a_deadline() {
     assert!(text_of(&never).contains("never matched"), "{never}");
 }
 
+#[test]
+fn wait_for_mcp_call_does_not_hold_the_image() {
+    let dir = scratch("waitfor-deferred-turn");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+    assert_eq!(
+        call(&path, "new", json!({"name": "waited", "command": ["sh"]}))["result"]["isError"],
+        false
+    );
+
+    let waiting_path = path.clone();
+    let (started, ready) = std::sync::mpsc::channel();
+    let waiting = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        call(
+            &waiting_path,
+            "wait_for",
+            json!({"session": "waited", "pattern": "never-matches", "seconds": "1"}),
+        )
+    });
+    ready.recv_timeout(Duration::from_secs(1)).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+
+    let started = Instant::now();
+    let response = client::request(
+        &path,
+        &Request::Eval {
+            code: "return 'responsive'".into(),
+            name: None,
+        },
+    )
+    .expect("client eval while wait_for is pending");
+    let elapsed = started.elapsed();
+    assert_eq!(response, Response::Value("responsive".into()));
+
+    let deadline = waiting.join().expect("wait_for MCP call");
+    assert_eq!(deadline["result"]["isError"], true, "{deadline}");
+    assert!(text_of(&deadline).contains("never matched"), "{deadline}");
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "client eval waited {elapsed:?} behind a pending wait_for MCP call"
+    );
+}
+
+#[test]
+fn wait_for_rejects_a_deadline_longer_than_the_eval_limit() {
+    let dir = scratch("waitfor-deadline-cap");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    let too_long = call(
+        &path,
+        "wait_for",
+        json!({"session": "anything", "pattern": "anything", "seconds": "301"}),
+    );
+    assert_eq!(too_long["result"]["isError"], true, "{too_long}");
+    assert!(
+        text_of(&too_long).contains("positive and no greater than 300"),
+        "{too_long}"
+    );
+}
+
 /// [MEASURED] `request_counts`/`schedule_skips` (steps/033's follow-up)
 /// existed as plain Lua bindings, readable from a script but not MCP — MCP's
 /// `tools/call` only reaches `remuda.tools`, a separate registry. This is

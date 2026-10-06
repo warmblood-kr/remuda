@@ -6,6 +6,38 @@ Every installed mod and registered tool writes metadata to the same runtime
 registry; the reference output is generated from that registry at request
 time.
 
+The session API is available under `remuda.session`. Calling
+`remuda.session(name)` returns a handle onto the named session; the namespace
+also provides `list`, `new`, `close`, and `attach`. `remuda.session.list()`
+reaps exited sessions unless `REMUDA_KEEP_EXITED=1` is set in the daemon's
+environment. The older top-level `remuda.new`, `remuda.close`, `remuda.ls`,
+and `remuda.attach` names are deprecated aliases. To suppress their deprecation
+notices, set `REMUDA_SUPPRESS_DEPRECATIONS=1` in the daemon's environment when
+the daemon starts; setting it only on a CLI process cannot change the
+environment of a running daemon.
+
+## Screen capture
+
+`remuda.capture(name)` returns the current screen as plain text.
+`remuda.capture_styled(name)` returns screen rows as arrays of `{text, dim}`
+spans, plus a `cursor` table with `row`, `col`, and `visible` fields:
+
+```lua
+local screen = remuda.capture_styled("work")
+local cursor = screen.cursor
+-- row and col are 1-based; visible says whether the terminal displays the cursor.
+print(cursor.row, cursor.col, cursor.visible)
+for _, row in ipairs(screen.rows) do
+  for _, span in ipairs(row) do
+    print(span.text, span.dim)
+  end
+end
+```
+
+The `dim` field preserves terminal dim styling, which can identify placeholder
+or suggestion text. Cursor position and styled spans are observations only;
+mods interpret them according to the prompt or terminal application they know.
+
 ## Generate the reference
 
 ```sh
@@ -51,7 +83,9 @@ When a manifest declares `command = "NAME"`, `remuda NAME` loads that
 mod explicitly and opens the regular Remuda screen when attached to a terminal.
 Use `remuda NAME --headless` to load it without opening the screen. Further
 words (`remuda NAME ...`) are dispatched to the already-loaded mod's Lua
-command handler; the core does not embed a mod-specific parser.
+command handler; the core does not embed a mod-specific parser. A mod may hand
+its declaration to `remuda.cli.parse`; the handler still receives the raw word
+list.
 
 `remuda mod update NAME` and `remuda mod update --all` reuse each installed
 mod's recorded GitHub source and ref, validate the new checkout, and replace
@@ -61,6 +95,73 @@ convenient.
 `remuda mod remove NAME` removes an installed mod directory. It does not
 restart a daemon or stop sessions; already-loaded Lua definitions remain live
 until the next daemon restart.
+
+## Atomic file writes
+
+`remuda.fs.write_atomic(path, bytes, options?)` replaces one file from trusted Lua code.
+It writes a unique temporary file beside the target, syncs the bytes, and
+renames the temporary file over the target. Unix also syncs the parent
+directory. The target path is replaced as a directory entry, so a symlink at
+that path is not followed. The parent directory must already exist.
+
+On success the function returns `true, nil`; on an I/O error it returns
+`nil, error`. By default, new files use mode `0644` filtered through the
+process umask, and existing regular-file permissions are preserved. Pass
+`{ private = true }` to make the file owner-only (mode `0600` on Unix, an
+owner-only ACL on Windows), including when replacing an existing file; it is
+applied at temporary-file creation.
+The options table accepts only the boolean `private` key; unknown keys or a
+non-boolean value raise a Lua argument error.
+This word does not restrict paths: the Lua runtime already provides trusted
+scripts with `io.open` and `os.rename`.
+On Windows 10 version 1903 and later those C-library words (`os.getenv`,
+`io.open`, `os.rename`, `os.remove`) read and return paths in UTF-8, the same
+bytes the `remuda.*` words use; on older Windows they use the system code page,
+so a non-ASCII path from one side is not valid on the other.
+Bytes that are not valid UTF-8, given to `io.open` or `os.rename` on Windows,
+are replaced by the system with U+FFFD, so two different invalid byte strings
+can name the same file: do not treat byte-distinct paths as file-distinct there.
+
+## New directory creation
+
+`remuda.fs.mkdir_new(path)` creates one directory without creating its parent.
+The path must be absolute and must not end in a path separator. On Unix, new
+directories use mode `0700`.
+
+The function returns `true` only when this call created the directory. It
+returns `nil, "exists"` if the target already exists, including when it is any
+kind of symlink; treat that result as **not Butler-created**. The caller must
+also check that the path is under its own home before trusting the directory.
+Other failures return `nil, error`.
+
+## JSON values
+
+`remuda.json.decode(text)` reads at most 8 MiB of UTF-8 JSON and returns
+`value, nil` on success or `nil, error` on bad input. Objects become Lua tables
+with string keys; arrays become 1-based Lua tables; integers that fit a Lua
+integer stay integers, and other finite JSON numbers become Lua numbers.
+JSON `null` becomes the sentinel `remuda.json.null`, so it can appear as a
+table value without disappearing like Lua `nil`.
+
+Decoded tables carry hidden array/object tags, so even empty arrays and objects
+keep their JSON kind when encoded again. For new Lua tables, use
+`remuda.json.array(table)` or `remuda.json.object(table)` to tag empty or
+ambiguous tables. Nonempty contiguous `1..n` tables encode as arrays; nonempty
+string-keyed tables encode as objects. Empty untagged tables, mixed keys,
+sparse numeric keys, and tables that cannot be classified as one shape are
+rejected. Tagging refuses a table that already has a non-JSON metatable.
+
+`remuda.json.encode(value, { pretty = true })` returns formatted JSON when
+requested; the default is compact JSON. It refuses nil, non-finite numbers,
+invalid UTF-8 strings or keys, cycles, functions, threads, userdata, and values
+that do not form a valid array or object. Decode and encode cap nesting at 64
+containers, JSON text/output at 8 MiB, and each document at 100,000 JSON values
+to bound memory use. Object key order is not preserved; encoded keys are
+sorted. Decode rejects duplicate object keys with
+`nil, "duplicate key"` instead of choosing one value. Integer JSON numbers
+outside Lua's signed integer range are represented as finite Lua numbers when
+possible. Very small non-integer values can underflow to `0.0`, and negative
+zero remains the floating-point value `-0.0`.
 
 A manifest can declare the mods it needs: `requires = { butler = ">=0.4, <0.5" }`.
 - **Constraints:** each is a comma-separated list of `>=`, `>`, `<=`, `<` and `=`, all of which must hold. `*` means any version. An installed version is compared on its numeric core, so `0.1.0-nightly.X` counts as `0.1.0`.
@@ -159,9 +260,18 @@ mod's own no-argument command) on an already-active mod does nothing, so
 opening a mod's screen does not restart it. The mod owns its declared hooks,
 tools and schedules, and also every `remuda.on` hook and
 `remuda.extension_command` registered while its own code runs (`initialize`,
-`start`, or one of its declared hooks, tools or schedules). `hook_list` shows
-that `owner`. A mod may also create new top-level `remuda.*` fields (for
-example `function remuda._sample_notify(...) end` in `start`); they are its own.
+`commands`, `start`, or one of its declared hooks, tools or schedules).
+`hook_list` shows the owner of event hooks.
+
+An optional `commands(state)` hook lets a lifecycle mod register its CLI
+handlers without launching its background work. When Remuda loads a mod to
+serve one of its subcommands, it runs `commands` and skips `start`; running
+`remuda MOD` with no subcommand runs `commands` and then `start` once. A later
+bare invocation starts a mod that was previously loaded only for commands.
+Mods without `commands` keep the old behavior: loading their subcommand runs
+`start` as before. Keep `commands` limited to registration; put launch work in
+`start`. A mod may also create new top-level `remuda.*` fields (for example
+`function remuda._sample_notify(...) end` in `start`); they are its own.
 Assigning a field core defines, or one another mod owns, is an error. A field
 left by a legacy script is taken over only in the mod's own namespace,
 `remuda._NAME_*` or `remuda.NAME_*`; any other existing field is an error. Reload replaces everything the mod owns,
@@ -170,6 +280,42 @@ and a reload whose `start` fails restores the previous set. A field the new
 recreate keeps its advice. Other imperative effects
 (`remuda.schedule`, `remuda.process`, `remuda.new`, and so on) are not owned
 and survive reload; the mod must find and reuse or cancel them itself.
+
+An optional `ready(state)` lets the CLI's `remuda exec NAME` wait for an
+asynchronous start to finish. It returns `true` when ready, `nil` while it is
+still working, or `nil, "message"` when startup failed. A Lua error from the
+callback is also a failure. `timeout_ms` on the same declaration sets the
+readiness deadline; it defaults to 30000 and must be an integer from 1 through
+240000. The CLI checks every 250 ms, issuing a separate short Eval each time.
+Failure exits 1 and prints `mod NAME failed to become ready: message`; timeout
+exits 124 and prints `mod NAME did not become ready within Ns`. Keep the
+callback quick: each Eval still has the daemon's 305-second client deadline.
+Ctrl-C during this wait abandons only the CLI wait; it does not cancel startup
+or deactivate the module. `start` has already run once, and a later
+`remuda exec NAME` resumes checking readiness without running `start` again.
+Mods without `ready` keep today's immediate-success behavior. This is a
+declaration field alongside `start` and `stop`, not another `remuda.*` word:
+
+```lua
+return {
+  api = "remuda-module-v1",
+  state_version = 1,
+  initialize = function() return { connected = false } end,
+  start = function(state) connect_async(state) end,
+  ready = function(state)
+    if state.error then return nil, state.error end
+    return state.connected or nil
+  end,
+  timeout_ms = 45000,
+}
+```
+
+An optional `stop(state)` runs for the old activation before a reload starts
+its replacement, while the old activation still owns its registrations. It
+also runs for each active lifecycle mod during a clean daemon shutdown.
+Failures are logged and cleanup continues; shutdown waits at most two seconds
+for the whole stop pass. A forced daemon termination cannot run Lua stop
+callbacks.
 
 The runtime registry also covers words added with `remuda.tool`, so an
 extension can document itself when it registers its function:
@@ -209,6 +355,13 @@ A hook that raises an error is logged with its group and id, and counted on that
 
 `remuda.hook_list(event?)` returns copies of `{event, group, id, depth, owner, src, errors, last_error}` in run order. Use it to inspect hooks.
 
+The daemon emits `session_output(name, details)` after terminal output changes.
+`details.version` is the session's output version. Notifications are coalesced
+for up to 50 ms per active session, and a busy Lua image keeps only the latest
+pending wake for each session. `remuda.expect` uses this event to check matching
+sessions promptly; its periodic tick remains the fallback for deadlines and
+sessions whose backend cannot stream output.
+
 `remuda.hooks` is deprecated for reading, and will become read-only once no mod edits it by hand.
 
 ```lua
@@ -232,6 +385,32 @@ contributes = {
   ["butler.command"] = {{ id = "inbox", order = 20, usage = "inbox [NAME]",
     run = function(state, args, caller) return "..." end }},
 }
+```
+
+## Periodic schedules
+
+`if remuda.sleep` now raises the migration error instead of returning `nil`;
+use `remuda.after` to schedule non-blocking work.
+
+`remuda.schedule({every, after?, name?, run})` runs a callback on the daemon's
+periodic tick. `after` is an optional finite, non-negative number of seconds
+from schedule creation to the first callback; later callbacks are spaced by
+`every` seconds from the preceding firing. The scheduler checks about once per
+second, so a callback runs on the first tick at or after its deadline.
+
+Without `after`, the existing first-fire default depends on daemon uptime. The
+first callback is due when the daemon's elapsed-time clock reaches `every`:
+if the daemon has already been running that long, a new schedule can fire on
+the next tick; otherwise it waits until the daemon reaches that uptime. This
+default is not a delay measured from schedule creation.
+
+```lua
+remuda.schedule({
+  name = "refresh",
+  every = 60,
+  after = 10,
+  run = function() refresh_status() end,
+})
 ```
 
 ## Advice

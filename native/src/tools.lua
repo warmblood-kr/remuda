@@ -25,6 +25,7 @@ remuda._extension_commands = {}
 -- it registers imperatively is tagged with its name, so reload and rollback
 -- can replace it like the declared registrations.
 local current_owner = nil
+local module_tool_owners = {}
 local function with_owner(owner, fn, ...)
   local outer = current_owner
   current_owner = owner
@@ -32,6 +33,27 @@ local function with_owner(owner, fn, ...)
   current_owner = outer
   if not result[1] then error(result[2], 0) end
   return table.unpack(result, 2, result.n)
+end
+local function timer_callback(owner, fn)
+  if owner == nil then return fn end
+  return function(...) return with_owner(owner, fn, ...) end
+end
+local native_timer_after = remuda._timer_after
+local native_timer_every = remuda._timer_every
+local native_timer_cancel_owner = remuda._timer_cancel_owner
+remuda._timer_after = nil
+remuda._timer_every = nil
+remuda._timer_cancel_owner = nil
+local function cancel_owner_timers(owner)
+  if native_timer_cancel_owner then native_timer_cancel_owner(owner) end
+end
+function remuda.after(seconds, fn)
+  local owner = current_owner
+  return native_timer_after(seconds, timer_callback(owner, fn), owner)
+end
+function remuda.every(seconds, fn)
+  local owner = current_owner
+  return native_timer_every(seconds, timer_callback(owner, fn), owner)
 end
 local extension_command_owners = {}
 
@@ -41,14 +63,20 @@ function remuda.extension_command(name, handler)
   remuda._extension_commands[name] = handler
   extension_command_owners[name] = current_owner
 end
--- `caller` is what the CLI knows and the daemon does not: `caller.env` holds
--- the caller's `REMUDA_*` variables (`os.getenv` here reads the daemon's).
+-- The handler's `caller.env` holds forwarded CLI environment values and must
+-- not be used for authorization. Capture the native word before user Lua can
+-- replace remuda.caller; its result is merged into the handler's caller data.
+local native_caller = remuda.caller
 function remuda._dispatch_extension_command(name, args, caller)
   local handler = remuda._extension_commands[name]
   if not handler then
     error("mod command " .. tostring(name) .. " is not loaded; run `remuda " .. tostring(name) .. "` first", 2)
   end
-  return handler(args or {}, caller or {})
+  local context = native_caller()
+  local caller_data = type(caller) == "table" and caller or {}
+  caller_data.kind = context.kind
+  caller_data.session = context.session
+  return handler(args or {}, caller_data)
 end
 
 -- One row per word, Rust's own bindings included (`script.rs`'s `WORDS`
@@ -56,10 +84,130 @@ end
 local function register(name, about, signature)
   remuda._registry[name] = { name = name, about = about, signature = signature }
 end
+register("after", "Run a callback once after a delay without blocking the Lua image; cancel with handle:cancel().", "after(seconds, fn) -> handle")
+register("every", "Run a callback periodically without blocking the Lua image; cancel with handle:cancel(). If a callback finishes late, the next tick comes one interval after it ends, so the phase shifts and ticks do not burst to catch up.", "every(seconds, fn) -> handle")
 register("tools", "The `remuda.tool` registry table, keyed by tool name.", "table")
 register("_extension_commands", "Handlers registered for installed mod commands.", "table")
-register("extension_command", "Register a handler for an installed mod command.", "extension_command(name, handler(args, caller)) -> nil")
+register("extension_command", "Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind and session fields, plus forwarded env/stdin values; kind outside does not establish operator identity.", "extension_command(name, handler(args, caller)) -> nil")
 register("_dispatch_extension_command", "Dispatch arguments and caller context to a loaded mod command handler.", "_dispatch_extension_command(name, args, caller) -> value")
+register("_exec_commands", "Load a mod and run its optional commands hook without starting it; legacy mods keep their existing start behavior.", "_exec_commands(name) -> nil")
+
+-- #394: a mod subcommand loads its mod on first use, so the first command
+-- after an install works. OWNER names an installed mod (`exec` resolves
+-- nothing else, never a path). A failed load leaves no handler behind.
+-- ponytail: no wait for a declared `ready` callback; if a handler ever needs
+-- readiness, load from the CLI instead (probe, `remuda exec`, dispatch).
+function remuda._load_extension_command(name, owner)
+  if remuda._extension_commands[name] then return false end
+  local loaded, err = pcall(remuda._exec_commands, owner)
+  if loaded and remuda._extension_commands[name] then return true end
+  remuda._extension_commands[name], extension_command_owners[name] = nil, nil
+  local reason = loaded and ("it did not register the command " .. tostring(name))
+    or tostring(err):match("^[^\n]*")
+  remuda.fail("remuda: mod " .. tostring(owner) .. " could not be loaded: " .. reason
+    .. "\nNext: remuda mod info " .. tostring(owner))
+end
+register("_load_extension_command", "Load the installed mod that owns a mod command unless its handler is already registered. Fails with one line and a Next: line when the mod cannot be loaded.", "_load_extension_command(name, owner) -> boolean")
+register("pending", "Return a bounded handle for an extension command's deferred result, including secret and visible line prompts.", "pending({timeout?, on_cancel?}) -> handle")
+register("_pending_create", "Create a private pending reply handle.", "_pending_create(timeout?) -> id, handle")
+register("_pending_events", "Drain pending completion and cancellation notifications.", "_pending_events() -> {{id, reason?}...}")
+
+local pending_cancel_handlers = {}
+local pending_secret_handlers = {}
+local pending_line_handlers = {}
+local function new_pending_handle(timeout, on_cancel)
+  local id, native_handle = remuda._pending_create(timeout)
+  if on_cancel then pending_cancel_handlers[id] = on_cancel end
+  local handle = {}
+  handle.__remuda_pending_handle = native_handle
+  function handle:resolve(...) return native_handle:resolve(...) end
+  function handle:reject(...) return native_handle:reject(...) end
+  function handle:prompt_secret(prompt)
+    if type(prompt) ~= "table" or type(prompt.label) ~= "string" or type(prompt.callback) ~= "function" then
+      error("prompt_secret needs a label and callback", 2)
+    end
+    local prompt_id = native_handle:prompt_secret(prompt.label)
+    local callbacks = pending_secret_handlers[id] or {}
+    pending_secret_handlers[id] = callbacks
+    callbacks[prompt_id] = prompt.callback
+    return prompt_id
+  end
+  function handle:prompt_line(prompt)
+    if type(prompt) ~= "table" or type(prompt.label) ~= "string" or type(prompt.callback) ~= "function" then
+      error("prompt_line needs a label and callback", 2)
+    end
+    if prompt.default ~= nil and type(prompt.default) ~= "string" then
+      error("prompt_line default must be a string", 2)
+    end
+    if prompt.preface ~= nil and type(prompt.preface) ~= "string" then
+      error("prompt_line preface must be a string", 2)
+    end
+    local prompt_id = native_handle:prompt_line(prompt.label, prompt.default, prompt.preface)
+    local callbacks = pending_line_handlers[id] or {}
+    pending_line_handlers[id] = callbacks
+    callbacks[prompt_id] = prompt.callback
+    return prompt_id
+  end
+  return handle
+end
+function remuda.pending(options)
+  if type(options) ~= "table" then
+    error("pending needs an options table", 2)
+  end
+  local timeout = options.timeout
+  if timeout ~= nil and (type(timeout) ~= "number" or timeout <= 0 or timeout > 300) then
+    error("pending timeout must be a positive number no greater than 300 seconds", 2)
+  end
+  local on_cancel = options.on_cancel
+  if on_cancel ~= nil and type(on_cancel) ~= "function" then
+    error("pending on_cancel must be a function", 2)
+  end
+  return new_pending_handle(timeout, on_cancel)
+end
+
+local function deliver_pending_events()
+  for _, event in ipairs(remuda._pending_events()) do
+    local callback = pending_cancel_handlers[event.id]
+    pending_cancel_handlers[event.id] = nil
+    pending_secret_handlers[event.id] = nil
+    pending_line_handlers[event.id] = nil
+    if event.reason and callback then
+      local ok, err = pcall(callback, event.reason)
+      if not ok then
+        io.stderr:write("remuda.pending on_cancel failed: " .. tostring(err) .. "\n")
+      end
+    end
+  end
+  for _, event in ipairs(remuda._pending_secret_events()) do
+    local callbacks = pending_secret_handlers[event.id]
+    local callback = callbacks and callbacks[event.prompt_id]
+    if callbacks then
+      callbacks[event.prompt_id] = nil
+      if next(callbacks) == nil then pending_secret_handlers[event.id] = nil end
+    end
+    if callback then
+      local ok, err = pcall(callback, event.secret, event.error)
+      if not ok then
+        io.stderr:write("remuda.pending prompt callback failed\n")
+      end
+    end
+  end
+  for _, event in ipairs(remuda._pending_line_events()) do
+    local callbacks = pending_line_handlers[event.id]
+    local callback = callbacks and callbacks[event.prompt_id]
+    if callbacks then
+      callbacks[event.prompt_id] = nil
+      if next(callbacks) == nil then pending_line_handlers[event.id] = nil end
+    end
+    if callback then
+      local ok, err = pcall(callback, event.line, event.error)
+      if not ok then
+        io.stderr:write("remuda.pending prompt callback failed\n")
+      end
+    end
+  end
+end
+_G.__remuda_pending_tick = deliver_pending_events
 
 -- Required names first (a caller's own order, via `needs`), then everything
 -- else marked optional — the same order a hand-written signature would use.
@@ -137,7 +285,13 @@ end
 
 function remuda.tool(spec)
   local word = make_tool(spec)
+  local owner = current_owner
+  if owner then
+    local run = word.run
+    word.run = function(arguments, caller) return with_owner(owner, run, arguments, caller) end
+  end
   remuda.tools[word.name] = word
+  module_tool_owners[word.name] = owner
   register(word.name, word.about, word.name .. "(" .. arg_list(word.args, word.needs) .. ") -> string")
   return word
 end
@@ -161,6 +315,7 @@ register(
 
 local Schedule = {}
 Schedule.__index = Schedule
+local schedule_clock_now = 0
 
 -- Schedules are multi-registrant, using the same split as `remuda.tool`:
 -- native code provides the fixed tick while this table owns the interval and
@@ -177,19 +332,28 @@ function remuda.schedule(spec)
   if type(spec.every) ~= "number" or spec.every <= 0 then
     error("a schedule needs a positive `every` (seconds)", 2)
   end
+  if spec.after ~= nil and (type(spec.after) ~= "number" or spec.after < 0
+    or spec.after ~= spec.after or spec.after == math.huge) then
+    error("a schedule's `after`, when given, must be a finite non-negative number of seconds", 2)
+  end
   if type(spec.run) ~= "function" then
     error("a schedule needs a `run` function", 2)
   end
+  local owner = current_owner
   local handle = setmetatable({ name = spec.name }, Schedule)
+  -- With no `after`, last_run=0 preserves the daemon-uptime-dependent first
+  -- firing. An explicit delay instead anchors the first deadline at creation.
+  local last_run = spec.after == nil and 0 or schedule_clock_now + spec.after - spec.every
   remuda.schedules[handle] = {
     name = spec.name,
     every = spec.every,
-    run = spec.run,
-    last_run = 0,
+    run = owner and function(...) return with_owner(owner, spec.run, ...) end or spec.run,
+    last_run = last_run,
+    owner = owner,
   }
   return handle
 end
-register("schedule", "Register a periodic callback, run every `every` seconds.", "schedule(spec) -> handle")
+register("schedule", "Register a periodic callback, run every `every` seconds; optional `after` sets the first firing delay from creation. Without it, the first firing depends on daemon uptime.", "schedule(spec) -> handle")
 
 -- A no-op on an already-cancelled or unrecognized handle — a caller racing
 -- its own cancel, or cancelling twice, gets silence rather than an error for
@@ -221,7 +385,7 @@ end
 -- One step is kept separate from the wake-up source: the current driver is
 -- the one-second clock below, and a future PTY output event can call this same
 -- function without changing remuda.expect's API.
-local function expect_step(handle, now)
+local function expect_step(handle, now, force)
   local state, options = handle.state, handle.options
   if state.status ~= "pending" then return state.status, state.branch, state.screen end
   state.last_result = nil
@@ -238,9 +402,9 @@ local function expect_step(handle, now)
   if not state.deadline then
     state.deadline = now + handle.timeout
     state.next_at = now + (tonumber(options.interval) or 1)
-    return "waiting"
+    if not force then return "waiting" end
   end
-  if now < state.next_at then return "waiting" end
+  if not force and now < state.next_at then return "waiting" end
   local capture = options.capture or remuda.capture
   local captured, screen = pcall(capture, handle.session)
   if not captured then
@@ -356,11 +520,41 @@ local function expect_tick(now)
   end
   pending_expects = keep
 end
+
+local function expect_output(name)
+  local keep = {}
+  for _, handle in ipairs(pending_expects) do
+    if handle.state.status == "pending" then
+      if handle.session == name then
+        local ok, err = pcall(expect_step, handle, expect_clock_now, true)
+        if not ok then
+          handle.state.status, handle.state.error = "error", err
+          if handle.options.on_error then pcall(handle.options.on_error, err, handle) end
+        end
+      end
+      if handle.state.status == "pending" then keep[#keep + 1] = handle end
+    end
+  end
+  pending_expects = keep
+end
+
 function remuda.expect_option(screen, matches)
   if type(screen) ~= "string" or type(matches) ~= "function" then return nil end
   local found
+  local markers = { "│", "┃", "❯", "›", ">" }
   for line in (screen .. "\n"):gmatch("(.-)\n") do
-    line = line:gsub("^%s*[│┃]%s*", ""):gsub("^%s*[❯›>]%s*", "")
+    line = line:gsub("^%s+", "")
+    for _ = 1, #markers do
+      local stripped = false
+      for _, marker in ipairs(markers) do
+        if line:sub(1, #marker) == marker then
+          line = line:sub(#marker + 1):gsub("^%s+", "")
+          stripped = true
+          break
+        end
+      end
+      if not stripped then break end
+    end
     local number, label = line:match("^%s*(%d+)[%.)]%s*(.-)%s*$")
     if number and matches(label) then
       if found then return nil end
@@ -374,20 +568,26 @@ register("expect_option", "Pick a unique numbered menu option by its label.", "e
 -- Called once per native tick with the current time (seconds, native's
 -- clock). Fires every schedule whose own interval has elapsed since ITS OWN
 -- last run — native never sees or compares an individual interval itself.
-function remuda._run_due_schedules(now)
+function remuda._take_due_schedules(now)
+  deliver_pending_events()
+  local schedule_now = now or expect_clock_now or schedule_clock_now
+  schedule_clock_now = schedule_now
   -- Expectations are advanced from the same native one-second clock. A
   -- future PTY output event may call this local directly to reduce latency.
+  -- Preserve expectation-specific injected clocks: nil here lets each
+  -- expectation's options.now() supply its own time, while schedule_now is
+  -- the fallback clock only for periodic schedules.
   local expect_ok, expect_err = pcall(expect_tick, now)
   if not expect_ok and io and io.stderr then
     io.stderr:write("remuda.expect tick failed: " .. tostring(expect_err) .. "\n")
   end
-  local schedule_now = now or expect_clock_now or 0
   -- Snapshot the handles, as `emit` does: a run() that schedules must not add
   -- keys mid-`pairs` (undefined in Lua). A cancel mid-tick still takes effect.
   local handles = {}
   for handle in pairs(remuda.schedules) do
     handles[#handles + 1] = handle
   end
+  local due = {}
   for _, handle in ipairs(handles) do
     local schedule = remuda.schedules[handle]
     if schedule and schedule_now - schedule.last_run >= schedule.every then
@@ -395,18 +595,41 @@ function remuda._run_due_schedules(now)
       if schedule.name then
         remuda._schedule_fire_counts[schedule.name] = (remuda._schedule_fire_counts[schedule.name] or 0) + 1
       end
+      due[#due + 1] = { name = schedule.name or "unnamed", handle = handle }
+    end
+  end
+  return due
+end
+
+function remuda._run_due_schedules(now)
+  for _, due in ipairs(remuda._take_due_schedules(now)) do
+    local schedule = remuda.schedules[due.handle]
+    if schedule then
       local ok, err = pcall(schedule.run)
       if not ok then
-        io.stderr:write("remuda schedule error for " .. (schedule.name or "unnamed") .. ": " .. tostring(err) .. "\n")
+        io.stderr:write("remuda schedule error for " .. due.name .. ": " .. tostring(err) .. "\n")
       end
     end
   end
+end
+
+function remuda._run_schedule(handle)
+  local schedule = remuda.schedules[handle]
+  if not schedule then return false end
+  schedule.run()
+  return true
 end
 register(
   "_run_due_schedules",
   "Fire every schedule whose interval has elapsed. Called once per native tick.",
   "_run_due_schedules(now) -> nil"
 )
+register(
+  "_take_due_schedules",
+  "Mark and return the schedules due at `now`, for the native tick to run each under its own budget.",
+  "_take_due_schedules(now) -> table"
+)
+register("_run_schedule", "Run one schedule by handle (native tick only).", "_run_schedule(handle) -> boolean")
 
 -- A shallow copy, the same discipline `emit`'s own hook snapshot already
 -- keeps — a caller mutating what it was handed must never reach back into
@@ -470,6 +693,9 @@ function remuda.on(event, fn, opts)
     src = source_of(fn), errors = 0, owner = current_owner })
 end
 register("on", "Register a callback to run when an event fires. `opts`: `group`, `id` (same group+id replaces), `depth` (-100..100, lower first).", "on(event, fn, opts?) -> nil")
+
+remuda.on("session_output", function(name) expect_output(name) end,
+  { group = "remuda.expect", id = "session-output" })
 
 -- A snapshot, not a live reference to `remuda.hooks[event]` — a hook that
 -- calls `clear_hooks` on its own group must not skip or re-run a sibling
@@ -817,6 +1043,64 @@ register("contributions", "A point's entries as {id, owner, entry} rows, entry a
 -- declare registrations as data. Reload stages the declaration and migrations
 -- before replacing the mod's hook group and tools.
 local modules = {}
+local field_owners = {}
+
+-- Rollback restores the old activation's declared registrations from the
+-- snapshot. Its start() must rebuild only the imperative registrations it
+-- created, so discard those owner-tagged effects before running it again.
+local function clear_imperative_module_registrations(name, activation)
+  cancel_owner_timers(name)
+  local declared_schedules, declared_tools, declared_advice, declared_contributions = {}, {}, {}, {}
+  for _, handle in ipairs(activation.schedules or {}) do declared_schedules[handle] = true end
+  for _, tool_name in ipairs(activation.tools or {}) do declared_tools[tool_name] = true end
+  for _, advice in ipairs(activation.advice or {}) do declared_advice[advice] = true end
+  for _, contribution in ipairs(activation.contributions or {}) do declared_contributions[contribution] = true end
+
+  for event, registered in pairs(remuda.hooks) do
+    local kept = {}
+    for _, hook in ipairs(registered) do
+      if hook.owner ~= name then kept[#kept + 1] = hook end
+    end
+    remuda.hooks[event] = kept
+  end
+  for handle, schedule in pairs(remuda.schedules) do
+    if schedule.owner == name and not declared_schedules[handle] then remuda.cancel(handle) end
+  end
+  for tool_name, owner in pairs(module_tool_owners) do
+    if owner == name and not declared_tools[tool_name] then
+      remuda.tools[tool_name], remuda._registry[tool_name], module_tool_owners[tool_name] = nil, nil, nil
+    end
+  end
+  for path, entry in pairs(advised) do
+    for index = #entry.list, 1, -1 do
+      local advice = entry.list[index]
+      if advice.owner == name and not declared_advice[advice] then
+        remuda.unadvise(path, advice.id)
+      end
+    end
+  end
+  for _, items in pairs(contributions) do
+    for id, item in pairs(items) do
+      if item.owner == name and not declared_contributions[item] then items[id] = nil end
+    end
+  end
+  for command, owner in pairs(extension_command_owners) do
+    if owner == name then remuda._extension_commands[command], extension_command_owners[command] = nil, nil end
+  end
+  for key, owner in pairs(field_owners) do
+    if owner == name then remuda[key], field_owners[key] = nil, nil end
+  end
+end
+
+local function stop_module_activation(name, module)
+  if not module or not module.stop or module.stopped
+    or (module.start and not module.start_attempted) then return end
+  module.stopped = true
+  local ok, err = pcall(module.stop, module.state)
+  if not ok then
+    io.stderr:write("remuda module stop error for " .. name .. ": " .. tostring(err) .. "\n")
+  end
+end
 
 -- #145: a lifecycle mod sees `remuda` through a proxy, so its assignments
 -- come here. It may create new top-level fields, which it then owns; core's
@@ -824,7 +1108,6 @@ local modules = {}
 -- refused. A field left by a legacy exec, unowned, is adopted only in the
 -- mod's own namespace.
 local core_fields = {}
-local field_owners = {}
 local function set_module_field(name, key, value)
   if type(key) ~= "string" then error("mod " .. name .. " may only set string-named remuda fields", 2) end
   if core_fields[key] then
@@ -845,7 +1128,6 @@ local function set_module_field(name, key, value)
   remuda[key] = value
 end
 remuda._module_set_field = set_module_field
-local module_tool_owners = {}
 
 local function clone_module_state(value, seen)
   local kind = type(value)
@@ -881,14 +1163,19 @@ local function array_length(value, label)
   return length
 end
 
--- REACTIVATE false is `exec`: ensure the mod is active, but leave an active
--- one (and its `start` effects) alone — only `reload` re-runs `start` (#116).
+-- REACTIVATE false is `exec`: ensure the mod is active and launch a
+-- commands-only activation once; leave a started mod alone. Only `reload`
+-- replaces an activation and re-runs its hooks (#116).
 -- A `start` that failed rolls back (#129), so the next `exec` retries it.
-function remuda._activate_module(name, candidate, reactivate)
+function remuda._activate_module(name, candidate, reactivate, commands_only)
   if type(name) ~= "string" or name == "" then
     error("module name must be a non-empty string", 0)
   end
   if reactivate == false and modules[name] ~= nil then
+    local active = modules[name]
+    if not commands_only and not active.started and active.start then
+      return false, active.state, active.start, active.rollback, nil
+    end
     return false
   end
   if type(candidate) ~= "table" or candidate.api ~= "remuda-module-v1" then
@@ -903,6 +1190,24 @@ function remuda._activate_module(name, candidate, reactivate)
   end
   if candidate.start ~= nil and type(candidate.start) ~= "function" then
     error("module start must be a function", 0)
+  end
+  if candidate.commands ~= nil and type(candidate.commands) ~= "function" then
+    error("module commands must be a function", 0)
+  end
+  if candidate.stop ~= nil and type(candidate.stop) ~= "function" then
+    error("module stop must be a function", 0)
+  end
+  if candidate.ready ~= nil and type(candidate.ready) ~= "function" then
+    error("module ready must be a function", 0)
+  end
+  local timeout_ms = candidate.timeout_ms
+  if timeout_ms == nil then timeout_ms = 30000 end
+  if candidate.ready ~= nil and (type(timeout_ms) ~= "number" or timeout_ms % 1 ~= 0
+    or timeout_ms < 1 or timeout_ms > 240000) then
+    error("module timeout_ms must be an integer from 1 through 240000", 0)
+  end
+  if candidate.ready == nil and candidate.timeout_ms ~= nil then
+    error("module timeout_ms requires a ready function", 0)
   end
 
   local hooks = candidate.hooks or {}
@@ -949,8 +1254,10 @@ function remuda._activate_module(name, candidate, reactivate)
     local schedule = schedules[index]
     if type(schedule) ~= "table" or type(schedule.every) ~= "number" or schedule.every <= 0
       or type(schedule.run) ~= "function"
+      or (schedule.after ~= nil and (type(schedule.after) ~= "number" or schedule.after < 0
+        or schedule.after ~= schedule.after or schedule.after == math.huge))
       or (schedule.name ~= nil and (type(schedule.name) ~= "string" or schedule.name == "")) then
-      error("each module schedule needs a positive every, a run function, and an optional non-empty name", 0)
+      error("each module schedule needs a positive every, a run function, an optional finite non-negative after, and an optional non-empty name", 0)
     end
   end
 
@@ -972,6 +1279,7 @@ function remuda._activate_module(name, candidate, reactivate)
   if type(contributes) ~= "table" then
     error("module contributes must be a table keyed by point", 0)
   end
+  local declared_contributions = {}
   for point, entries in pairs(contributes) do
     local seen = {}
     for index = 1, array_length(entries, "module contributes for " .. tostring(point)) do
@@ -1024,9 +1332,15 @@ function remuda._activate_module(name, candidate, reactivate)
     end
   end
 
+  -- Stop the previous activation while it still owns its registrations and
+  -- before the replacement's start can run. A cleanup error is diagnostic,
+  -- not a reason to prevent reload.
+  stop_module_activation(name, previous)
+  cancel_owner_timers(name)
+
   -- Snapshot what this activation replaces, so a failing `start` can put the
   -- previous activation back (#129). State mutated by that `start` stays.
-  local saved_hooks, saved_tools, saved_schedules, saved_commands = {}, {}, {}, {}
+  local saved_hooks, saved_tools, saved_schedules, saved_owner_schedules, saved_commands = {}, {}, {}, {}, {}
   local saved_advice = snapshot_advice()
   local saved_fields = {}
   for key, owner in pairs(field_owners) do
@@ -1041,8 +1355,16 @@ function remuda._activate_module(name, candidate, reactivate)
   for _, tool_name in ipairs(previous and previous.tools or {}) do
     saved_tools[tool_name] = { remuda.tools[tool_name], remuda._registry[tool_name], module_tool_owners[tool_name] }
   end
+  for tool_name, owner in pairs(module_tool_owners) do
+    if owner == name then
+      saved_tools[tool_name] = { remuda.tools[tool_name], remuda._registry[tool_name], owner }
+    end
+  end
   for _, handle in ipairs(previous and previous.schedules or {}) do
     saved_schedules[handle] = remuda.schedules[handle]
+  end
+  for handle, schedule in pairs(remuda.schedules) do
+    if schedule.owner == name then saved_owner_schedules[handle] = true end
   end
   local saved_contributions = {}
   for point, items in pairs(contributions) do
@@ -1120,21 +1442,68 @@ function remuda._activate_module(name, candidate, reactivate)
       for key, field in pairs(entry) do
         bound[key] = type(field) == "function" and function(...) return field(state, ...) end or field
       end
-      contributions[point][entry.id] = { owner = name, entry = bound }
+      local contribution = { owner = name, entry = bound }
+      contributions[point][entry.id] = contribution
+      declared_contributions[#declared_contributions + 1] = contribution
     end
   end
   local schedule_handles = {}
   for index = 1, schedule_count do
     local declared = schedules[index]
-    schedule_handles[index] = remuda.schedule({
+    schedule_handles[index] = with_owner(name, remuda.schedule, {
       name = declared.name,
       every = declared.every,
+      after = declared.after,
       run = function() return with_owner(name, declared.run, state) end,
     })
   end
-  modules[name] = { version = version, state = state, tools = tool_names, schedules = schedule_handles }
+  local stop = candidate.stop and function(stopped_state)
+    return with_owner(name, candidate.stop, stopped_state)
+  end
+  local activation
+  local start = candidate.start and function(started_state)
+    activation.start_attempted = true
+    local result = with_owner(name, candidate.start, started_state)
+    activation.started = true
+    return result
+  end
+  local commands = candidate.commands and function(command_state)
+    return with_owner(name, candidate.commands, command_state)
+  end
+  local ready = candidate.ready and function(ready_state)
+    return with_owner(name, candidate.ready, ready_state)
+  end
+  activation = {
+    version = version,
+    state = state,
+    tools = tool_names,
+    schedules = schedule_handles,
+    advice = {},
+    contributions = declared_contributions,
+    stop = stop,
+    start = start,
+    commands = commands,
+    started = false,
+    start_attempted = false,
+    ready = ready,
+    timeout_ms = timeout_ms,
+    stopped = false,
+  }
+  for index = 1, advice_count do
+    local declared = declared_advice[index]
+    local entry = advised[declared.path]
+    for _, advice in ipairs(entry and entry.list or {}) do
+      if advice.owner == name and advice.id == declared.id then
+        activation.advice[#activation.advice + 1] = advice
+        break
+      end
+    end
+  end
+  modules[name] = activation
 
   local function rollback()
+    stop_module_activation(name, activation)
+    cancel_owner_timers(name)
     for event, registered in pairs(remuda.hooks) do
       local restored = saved_hooks[event] or {}
       local known = {}
@@ -1162,6 +1531,15 @@ function remuda._activate_module(name, candidate, reactivate)
     for _, handle in ipairs(schedule_handles) do
       remuda.cancel(handle)
     end
+    -- A failing start can register schedules imperatively. They have the
+    -- module owner but are absent from the declaration's schedule_handles.
+    -- Preserve schedules that existed before activation; the previous
+    -- activation's restart path will rebuild its own imperative schedules.
+    for handle, schedule in pairs(remuda.schedules) do
+      if schedule.owner == name and not saved_owner_schedules[handle] then
+        remuda.cancel(handle)
+      end
+    end
     for handle, schedule in pairs(saved_schedules) do
       remuda.schedules[handle] = schedule
     end
@@ -1186,12 +1564,86 @@ function remuda._activate_module(name, candidate, reactivate)
       contributions[point] = restored
     end
     modules[name] = previous
+    if previous and previous.stopped and previous.start then
+      clear_imperative_module_registrations(name, previous)
+      local was_active = remuda._lifecycle_start_active
+      remuda._lifecycle_start_active = true
+      local ok, err = pcall(previous.start, previous.state)
+      remuda._lifecycle_start_active = was_active
+      if ok then
+        previous.stopped = false
+      else
+        io.stderr:write("remuda module restart error for " .. name .. ": " .. tostring(err) .. "\n")
+        for event, registered in pairs(remuda.hooks) do
+          local kept = {}
+          for _, hook in ipairs(registered) do
+            if not owned(hook) then kept[#kept + 1] = hook end
+          end
+          remuda.hooks[event] = kept
+        end
+        for _, tool_name in ipairs(previous.tools) do
+          if module_tool_owners[tool_name] == name then
+            remuda.tools[tool_name], remuda._registry[tool_name], module_tool_owners[tool_name] = nil, nil, nil
+          end
+        end
+        for _, handle in ipairs(previous.schedules) do remuda.cancel(handle) end
+        for command, owner in pairs(extension_command_owners) do
+          if owner == name then
+            remuda._extension_commands[command], extension_command_owners[command] = nil, nil
+          end
+        end
+        for key, owner in pairs(field_owners) do
+          if owner == name then remuda[key], field_owners[key] = nil, nil end
+        end
+        drop_owned_advice(name)
+        for _, items in pairs(contributions) do
+          for id, item in pairs(items) do
+            if item.owner == name then items[id] = nil end
+          end
+        end
+        modules[name] = nil
+      end
+    end
   end
-  local start = candidate.start and function(started_state)
-    return with_owner(name, candidate.start, started_state)
-  end
-  return true, state, start, rollback
+  activation.rollback = rollback
+  local launch_start = start
+  if commands_only and commands then launch_start = nil end
+  return true, state, launch_start, rollback, commands
 end
+
+-- Called by the daemon's clean shutdown path. A snapshot avoids mutation
+-- hazards if a stop callback activates another module.
+function remuda._stop_modules()
+  local active = {}
+  for name, module in pairs(modules) do active[#active + 1] = { name, module } end
+  for _, pair in ipairs(active) do
+    local name, module = pair[1], pair[2]
+    stop_module_activation(name, module)
+    cancel_owner_timers(name)
+  end
+end
+
+-- The CLI polls this small lifecycle result between Eval requests. Keep the
+-- readiness callback in the declaration table, not as another public remuda
+-- word; an absent callback preserves today's immediate exec completion.
+function remuda._module_readiness(name)
+  local module = modules[name]
+  if not module or not module.ready then return { status = "ready" } end
+  local ok, ready, message = pcall(module.ready, module.state)
+  if not ok then return { status = "failed", message = tostring(ready) } end
+  if ready == true and message == nil then return { status = "ready" } end
+  if ready == nil and message == nil then
+    return { status = "pending", timeout_ms = module.timeout_ms }
+  end
+  if ready == nil and type(message) == "string" then
+    return { status = "failed", message = message }
+  end
+  return {
+    status = "failed",
+    message = "ready must return true, nil, or nil, message",
+  }
+end
+register("_module_readiness", "Internal readiness poll for remuda exec.", "_module_readiness(name) -> {status, timeout_ms?, message?}")
 
 local escapes = {
   ['"'] = '\\"',
@@ -1232,6 +1684,40 @@ end
 
 remuda.buffers = {}
 register("buffers", "The `remuda.buffer` registry table, keyed by buffer name.", "table")
+
+-- Deprecated flat spellings keep resolving dynamically through this table.
+-- That matters for API v1-v4 callers which wrap/replace a flat function path:
+-- namespace words still pass through the old slot during the compatibility
+-- window. The alias itself calls the captured primitive, avoiding a cycle.
+local deprecated_notices = {}
+local through_namespace = {}
+local function call_flat(name, ...)
+  local prior = through_namespace[name]
+  through_namespace[name] = true
+  local result = table.pack(pcall(remuda[name], ...))
+  through_namespace[name] = prior
+  if not result[1] then error(result[2], 0) end
+  return table.unpack(result, 2, result.n)
+end
+
+local function deprecated_alias(name, replacement, primitive)
+  return function(...)
+    if not through_namespace[name]
+      and os.getenv("REMUDA_SUPPRESS_DEPRECATIONS") ~= "1"
+      and not deprecated_notices[name] then
+      deprecated_notices[name] = true
+      io.stderr:write("deprecated: remuda." .. name .. "; use remuda.session." .. replacement .. "\n")
+    end
+    return primitive(...)
+  end
+end
+
+local flat_session_words = {
+  ls = remuda.ls,
+  new = remuda.new,
+  close = remuda.close,
+  attach = remuda.attach,
+}
 
 local Buffer = {}
 Buffer.__index = Buffer
@@ -1279,13 +1765,13 @@ end
 -- session ≠ buffer: a session is a live process this daemon runs, a buffer
 -- is Lua-owned text. `session.buffer` is the buffer named after the session
 -- (create-if-absent, same as `buffer.new`) — a convenience, never the session
--- itself, so nothing here duplicates what `remuda.ls()` already reports.
+-- itself, so nothing here duplicates what `remuda.session.list()` reports.
 local Session = {}
 Session.__index = function(self, key)
   if key == "buffer" then
     return remuda.buffer.new(self.name)
   elseif key == "is_busy" then
-    for _, row in ipairs(remuda.ls()) do
+    for _, row in ipairs(remuda.session.list()) do
       if row.name == self.name then
         -- No output for a couple of seconds is a useful working/idle heuristic.
         -- `row.idle` remains since-input for callers that use that measure.
@@ -1302,13 +1788,40 @@ end
 -- of busy or of a context budget, whichever session's content it happens to
 -- hold. (`context_left` is not implemented: a generic pty has no channel a
 -- caller's token budget would arrive on. Named so a future one lands here.)
-function remuda.session(name)
+local function session_handle(name)
   if type(name) ~= "string" or name == "" then
     error("a session needs a name", 2)
   end
   return setmetatable({ name = name }, Session)
 end
-register("session", "A handle onto an existing session, by name.", "session(name) -> session")
+
+remuda.session = {
+  list = function(...) return call_flat("ls", ...) end,
+  new = function(...) return call_flat("new", ...) end,
+  close = function(...) return call_flat("close", ...) end,
+  attach = function(...) return call_flat("attach", ...) end,
+  resize = function(...) return remuda._session_resize(...) end,
+}
+setmetatable(remuda.session, {
+  __call = function(_, name) return session_handle(name) end,
+})
+register("session", "Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach and resize.",
+  "session(name) -> handle; table {list, new, close, attach, resize}")
+register("session.list", "List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.", "session.list() -> {session...}")
+register("session.new", "Start a session, defaulting the command to the user's shell.",
+  "session.new(name?, argv?, cwd?, env?) -> string")
+register("session.close", "End a session, live or already self-exited.", "session.close(name) -> nil")
+register("session.attach", "Enter raw mode on a session.", "session.attach(name) -> nil")
+register("session.resize", "Resize a session's terminal (cols 20..1000, rows 24..500).", "session.resize(name, cols, rows) -> true | nil, err")
+
+remuda.ls = deprecated_alias("ls", "list", flat_session_words.ls)
+remuda.new = deprecated_alias("new", "new", flat_session_words.new)
+remuda.close = deprecated_alias("close", "close", flat_session_words.close)
+remuda.attach = deprecated_alias("attach", "attach", flat_session_words.attach)
+register("ls", "Deprecated alias for `remuda.session.list`.", "ls() -> {session...}")
+register("new", "Deprecated alias for `remuda.session.new`.", "new(name?, argv?, cwd?, env?) -> string")
+register("close", "Deprecated alias for `remuda.session.close`.", "close(name) -> nil")
+register("attach", "Deprecated alias for `remuda.session.attach`.", "attach(name) -> nil")
 
 -- window: a screen rectangle showing exactly one buffer or attached session,
 -- owning the lifetime of neither — closing one kills nothing it showed
@@ -1440,30 +1953,178 @@ function remuda._call(name, arguments, caller)
   if answer == nil then
     return ""
   end
+  if type(answer) == "table" and rawget(answer, "__remuda_pending_handle") ~= nil then
+    return answer
+  end
   return tostring(answer)
 end
 register("_call", "Dispatch one MCP tools/call by name.", "_call(name, arguments, caller) -> string")
 
--- Type TEXT into SESSION and submit it with Return, as one act `remuda.feed`
--- will not let a second sender split. Not an MCP tool — a plain stdlib
--- function beside `send`/`insert`, since remuda itself frames none of this
--- (no default pause, no paste sequence) and this is the caller that does.
--- SETTLE (seconds before the submitting Return) defaults to 0.1. Like
--- `remuda.feed`, this blocks the calling Image for SETTLE seconds.
-function remuda.type_text(session, text, settle)
-  local body = tostring(text):gsub("\r\n?", "\n"):gsub("\27", "")
-  settle = settle or 0.1
-  local typed = body:find("\n", 1, true) and ("\27[200~" .. body .. "\27[201~") or body
-  remuda.feed(session, {
-    { burst = typed },
-    { pause = settle },
-    { burst = "\r" },
-  })
+-- Input is expressed as two words: one contiguous text burst, then a
+-- separately-timed submit key after the composer shows the text.
+remuda.input = {}
+
+local input_line_prompt_glyphs = { "❯", ">", "›" }
+local input_line_codex_placeholder = "Ask Codex to do anything"
+
+local function input_line_trim(text)
+  local first = text:find("%S")
+  if not first then return "" end
+  local last = #text
+  while last >= first and text:sub(last, last):match("%s") do
+    last = last - 1
+  end
+  return text:sub(first, last)
 end
+
+local function input_line_row_text(row, ignore_dim)
+  local parts = {}
+  for _, span in ipairs(row or {}) do
+    if not (ignore_dim and span.dim) then
+      parts[#parts + 1] = span.text or ""
+    end
+  end
+  return table.concat(parts)
+end
+
+-- true means only that the cursor row matches the empty-prompt shape; callers
+-- must add per-kind checks. Require a visible cursor and no draft rows in its
+-- contiguous composer block. Dim spans are dropped before cursor-column math,
+-- and Claude frame bars must start in column one (indented frames return nil).
+-- A continuation prompt after a blank row can still read as empty; rows below
+-- the cursor are not checked, and the Codex placeholder is empty regardless.
+local function input_line_empty_from_snapshot(kind, screen)
+  if kind ~= nil and kind ~= "shell" and kind ~= "claude" and kind ~= "codex" then
+    return nil, "opts.kind must be shell, claude, or codex"
+  end
+  if type(screen) ~= "table" or type(screen.rows) ~= "table" or type(screen.cursor) ~= "table" then
+    return nil, "capture_styled did not return rows and cursor metadata"
+  end
+  local cursor = screen.cursor
+  if cursor.visible ~= true then return nil, "session cursor is hidden" end
+  if type(cursor.row) ~= "number" or cursor.row % 1 ~= 0
+      or cursor.row < 1 or cursor.row > #screen.rows then
+    return nil, "session cursor row is outside the captured screen"
+  end
+
+  local lines = {}
+  local has_claude_frame = kind == "claude"
+  for index, row in ipairs(screen.rows) do
+    -- Butler's notify policy discards dim spans on the cursor row before
+    -- checking it: dim ghost suggestions are not unsent user input.
+    lines[index] = input_line_row_text(row, index == cursor.row):gsub("\194\160", " ")
+  end
+
+  -- In generic mode, a stray vertical box character elsewhere on screen is
+  -- not enough to classify the cursor row as a Claude composer frame.
+  if kind == nil then
+    local cursor_raw = lines[cursor.row]
+    if cursor_raw:sub(1, 3) == "│" then
+      local after_frame = cursor_raw:sub(4):gsub("^ +", "")
+      for _, glyph in ipairs(input_line_prompt_glyphs) do
+        if after_frame:sub(1, #glyph) == glyph then has_claude_frame = true; break end
+      end
+    end
+  end
+
+  -- Only inspect the contiguous composer block. A blank row ends the block;
+  -- Claude's top frame border ends it without counting as composer content.
+  for index = cursor.row - 1, 1, -1 do
+    local row = lines[index]:gsub("^%s+", "")
+    if has_claude_frame then
+      local is_top_border = false
+      for _, border in ipairs({ "╭", "┌", "─" }) do
+        if row:sub(1, #border) == border then is_top_border = true; break end
+      end
+      if is_top_border then break end
+    end
+    if has_claude_frame and row:sub(1, 3) == "│" then
+      row = row:sub(4):gsub("│%s*$", "")
+    end
+    if input_line_trim(row) == "" then break end
+    return nil, "non-blank rows appear above the cursor prompt"
+  end
+
+  local raw_cursor_line = lines[cursor.row]
+  local is_framed_prompt = has_claude_frame and raw_cursor_line:sub(1, 3) == "│"
+  local prompt_line = raw_cursor_line
+  if is_framed_prompt then prompt_line = prompt_line:sub(4) end
+  local cursor_line = prompt_line:gsub("^ +", "")
+  local prompt_glyph, text
+  for _, glyph in ipairs(input_line_prompt_glyphs) do
+    if cursor_line:sub(1, #glyph) == glyph then
+      prompt_glyph, text = glyph, cursor_line:sub(#glyph + 1)
+      break
+    end
+  end
+  if not prompt_glyph then return nil, "cursor row has no supported prompt glyph" end
+
+  -- capture_styled converts the terminal's zero-based cursor to a 1-based
+  -- cell column for Lua. These prompt glyphs and the frame bar each occupy
+  -- one cell; allow the caret immediately after the glyph or one trailing
+  -- space, and fail closed for every other cursor position.
+  local leading_spaces = prompt_line:match("^( *)") or ""
+  local prompt_prefix_cells = #leading_spaces + (is_framed_prompt and 1 or 0) + 1
+  if cursor.col ~= prompt_prefix_cells + 1 and cursor.col ~= prompt_prefix_cells + 2 then
+    return nil, "cursor column is not immediately after the prompt glyph"
+  end
+
+  text = input_line_trim(text:gsub("│%s*$", ""))
+  if (kind == "codex" or kind == nil) and text == input_line_codex_placeholder then
+    return true
+  end
+  if text ~= "" then return nil, "cursor prompt contains visible text" end
+
+  -- Rows below the cursor are footer area (`? for shortcuts` applies to all
+  -- kinds); they never change the cursor-row allow-list result.
+  return true
+end
+
+function remuda.input_line_empty(session, opts)
+  if type(session) ~= "string" or session == "" then
+    return nil, "session must be a non-empty name"
+  end
+  if opts ~= nil and type(opts) ~= "table" then
+    return nil, "opts must be a table"
+  end
+  local kind = opts and opts.kind
+  if kind ~= nil and kind ~= "shell" and kind ~= "claude" and kind ~= "codex" then
+    return nil, "opts.kind must be shell, claude, or codex"
+  end
+  local ok, screen = pcall(remuda.capture_styled, session)
+  if not ok then return nil, tostring(screen) end
+  return input_line_empty_from_snapshot(kind, screen)
+end
+
+register(
+  "input_line_empty",
+  "true means only that the cursor row matches the empty-prompt shape; callers must add per-kind checks. Return true only when the cursor is immediately after a recognized prompt glyph (or one optional space) and its contiguous composer block above contains no non-blank rows; a blank row ends the block, and a Claude top frame border ends its frame. Other ambiguous screens return nil and a reason. Dim ghost spans are dropped before cursor-column math; dim ghost text is ignored, and visible paste placeholders count as content. Claude frame bars must start in column one; an indented frame returns nil. The exact Codex placeholder counts as empty for codex or generic mode. Pass opts.kind = 'shell', 'claude', or 'codex' for that policy; kind is optional, but agent-specific layouts can be ambiguous without it. Limit: a continuation prompt after a blank row inside the composer can still read as empty; rows below the cursor are not inspected (including '? for shortcuts' for every kind), and the Codex placeholder counts as empty regardless of rows below. Use stricter agent-specific recognizers in Butler Lua per kind. Unlike Butler's helper, this word requires a visible cursor, rejects unknown kinds, and recognizes only the built-in Codex placeholder.",
+  "input_line_empty(session, opts?) -> true | nil, reason"
+)
+
+function remuda.input.text(session, text)
+  remuda._input_text(session, tostring(text))
+end
+
+register("input", "Terminal input words for text delivery and submission.", "table")
+register("input.text", "Deliver text as one burst, using bracketed paste when enabled by the child.", "input.text(session, text) -> nil")
+
+function remuda.input.submit(session, expect)
+  return remuda._input_submit(session, tostring(expect))
+end
+
+register("input.submit", "Submit visible composer text; returns 'submitted' or 'unverified'.", "input.submit(session, expect) -> status")
+
+-- Composite: hold the session input lock across text, settle, and submission.
+function remuda.type_text(session, text, settle)
+  return remuda._input_type_text(session, tostring(text), settle or 0.1)
+end
+remuda.input.type_text = remuda.type_text
+register("input.type_text", "Type text, honor the settle pause, then return 'submitted', 'unverified' or 'late'. 'late': the text is still being written to a slow pane and its Return follows when it lands (dropped after 30 s); do not resend, check the pane.", "input.type_text(session, text, settle?) -> status")
 register(
   "type_text",
-  "Type text into a session and submit it with Return.",
-  "type_text(session, text, settle?) -> nil"
+  "Type text into a session and submit it with Return; returns 'submitted', 'unverified' or 'late'. 'late': the text is still being written to a slow pane and its Return follows when it lands (dropped after 30 s); do not resend, check the pane.",
+  "type_text(session, text, settle?) -> status"
 )
 
 -- The left session list, re-expressed as the "*sessions*" buffer instead of
@@ -1477,7 +2138,7 @@ register(
 -- WIDTH travels with the bridge call so any budget-aware row detail can be
 -- chosen here; Rust still fits the resulting rows to the caller's pane.
 function remuda._refresh_sessions_buffer(width, selected, selected_name)
-  local sessions = remuda.ls()
+  local sessions = remuda.session.list()
   local ordered = sessions
   local has_order = false
   -- The private order line is tab-delimited. A daemon normally receives names
@@ -1582,13 +2243,15 @@ register(
 local function registry_rows()
   local rows = {}
   for _, name in ipairs(sorted_keys(remuda._registry)) do
-    local word = remuda._registry[name]
-    rows[#rows + 1] = {
-      name = word.name,
-      signature = word.signature,
-      description = word.about,
-      kind = word.signature == "table" and "variable" or "function",
-    }
+    if name:sub(1, 1) ~= "_" then
+      local word = remuda._registry[name]
+      rows[#rows + 1] = {
+        name = word.name,
+        signature = word.signature,
+        description = word.about,
+        kind = word.signature == "table" and "variable" or "function",
+      }
+    end
   end
   return rows
 end
@@ -1650,35 +2313,61 @@ remuda.tool({
   name = "wait_for",
   about = "Wait until a session's screen matches a Lua pattern, then answer with "
     .. "that screen. Fails when the deadline passes instead of answering with a "
-    .. "screen that does not match. Use it after `send` rather than guessing a sleep.",
+    .. "screen that does not match. Use it after `send` rather than guessing a delay.",
   args = {
     session = "The session to watch.",
     pattern = "A Lua pattern the screen must match. `%$ %s*$` is a shell prompt.",
-    seconds = "How long to wait before giving up. Default 30.",
+    seconds = "How long to wait before giving up. Default 30; positive and at most 300.",
   },
   needs = { "session", "pattern" },
   run = function(a)
     -- MCP argument values arrive as strings; every schema this frame emits says
     -- so. A number is what this one means, and `tonumber` is where that is said.
     local seconds = tonumber(a.seconds) or 30
-    local screen
-    for _ = 1, math.max(1, math.ceil(seconds / 0.1)) do
-      screen = remuda.capture(a.session)
-      if branch_matches({ match = a.pattern }, screen) then
-        return screen
-      end
-      remuda.sleep(0.1)
+    if seconds ~= seconds or seconds <= 0 or seconds > 300 then
+      error("wait_for seconds must be positive and no greater than 300", 0)
     end
-    error(
-      string.format(
+    local deadline = remuda.clock() + seconds * 1000
+    local screen = remuda.capture(a.session)
+    if branch_matches({ match = a.pattern }, screen) then
+      return screen
+    end
+
+    local timer
+    local pending = new_pending_handle(seconds + 1, function()
+      if timer then timer:cancel() end
+    end)
+    local function reject_deadline()
+      pending:reject(string.format(
         "%s never matched %q within %gs. last screen:\n%s",
         a.session,
         a.pattern,
         seconds,
         screen or ""
-      ),
-      0
-    )
+      ))
+    end
+    local poll
+    poll = function()
+      timer = nil
+      local ok, latest = pcall(remuda.capture, a.session)
+      if not ok then
+        pending:reject(tostring(latest))
+        return
+      end
+      screen = latest
+      if branch_matches({ match = a.pattern }, screen) then
+        pending:resolve(0, screen, "")
+        return
+      end
+      local remaining = (deadline - remuda.clock()) / 1000
+      if remaining <= 0 then
+        reject_deadline()
+        return
+      end
+      timer = remuda.after(math.max(0.01, math.min(0.1, remaining)), poll)
+    end
+    timer = remuda.after(math.max(0.01, math.min(0.1, seconds)), poll)
+    return pending
   end,
 })
 
@@ -1709,9 +2398,15 @@ remuda.tool({
   end,
 })
 
-function remuda.process(spec)
+local function process_start(spec)
+  if type(spec) ~= "table" then error("a process needs a spec table", 2) end
   if type(spec.argv) ~= "table" or #spec.argv == 0 then
     error("a process needs a non-empty `argv`", 2)
+  end
+  for i, arg in ipairs(spec.argv) do
+    if type(arg) ~= "string" or (i == 1 and arg == "") then
+      error("a process argv must contain strings and a non-empty executable", 2)
+    end
   end
   if spec.on_line ~= nil and (type(spec.on_line) ~= "string" or spec.on_line == "") then
     error("a process's `on_line`, when given, must be a non-empty string", 2)
@@ -1719,9 +2414,54 @@ function remuda.process(spec)
   if spec.on_exit ~= nil and (type(spec.on_exit) ~= "string" or spec.on_exit == "") then
     error("a process's `on_exit`, when given, must be a non-empty string", 2)
   end
-  return remuda._process_spawn(spec.argv, spec.on_line, spec.on_exit)
+  if spec.cwd ~= nil and (type(spec.cwd) ~= "string" or not utf8.len(spec.cwd)) then
+    error("process cwd must be an absolute path to an existing directory. Next: pass the directory's full path.", 2)
+  end
+  local id, refused = remuda._process_spawn(
+    spec.argv, spec.on_line, spec.on_exit, spec.cwd, spec.env, spec.clear_env
+  )
+  if id == nil then error(refused, 2) end
+  return id
 end
-register("process", "Spawn a plain-pipe child process; its stdout lines and exit arrive as emit events.", "process(spec) -> id")
+local function process_run(spec)
+  if type(spec) ~= "table" then error("process.run needs a spec table", 2) end
+  if type(spec.argv) ~= "table" or #spec.argv == 0 then
+    error("process.run needs a non-empty `argv`", 2)
+  end
+  for i, arg in ipairs(spec.argv) do
+    if type(arg) ~= "string" or (i == 1 and arg == "") then
+      error("process.run argv must contain strings and a non-empty executable", 2)
+    end
+  end
+  if spec.stdin ~= nil and type(spec.stdin) ~= "string" then
+    error("process.run stdin must be a string", 2)
+  end
+  local timeout = spec.timeout
+  if timeout == nil then timeout = 5 end
+  if type(timeout) ~= "number" or timeout ~= timeout or timeout <= 0 or timeout > 30 then
+    error("process.run timeout must be positive and at most 30 seconds", 2)
+  end
+  local stdin_hold_until_lines = spec.stdin_hold_until_lines
+  if stdin_hold_until_lines ~= nil and (type(stdin_hold_until_lines) ~= "number"
+      or stdin_hold_until_lines ~= stdin_hold_until_lines
+      or stdin_hold_until_lines % 1 ~= 0
+      or stdin_hold_until_lines < 1 or stdin_hold_until_lines > 1000) then
+    error("process.run stdin_hold_until_lines must be an integer from 1 through 1000. Next: pass a whole number in that range.", 2)
+  end
+  if spec.cwd ~= nil and (type(spec.cwd) ~= "string" or not utf8.len(spec.cwd)) then
+    error("process.run cwd must be an absolute path to an existing directory. Next: pass the directory's full path.", 2)
+  end
+  local result, refused = remuda._process_run(
+    spec.argv, spec.stdin, timeout, spec.cwd, stdin_hold_until_lines, spec.env, spec.clear_env
+  )
+  if result == nil then error(refused, 2) end
+  return result
+end
+remuda.process = setmetatable({ run = process_run }, {
+  __call = function(_, spec) return process_start(spec) end,
+})
+register("process", "Spawn an asynchronous plain-pipe child; process.run executes argv synchronously with bounded timeout and output. `env`, when given, sets string variables on top of the daemon's environment. `clear_env=true` starts with an empty environment before applying `env`; callers must pass every variable the child needs, including SystemRoot and PATH on Windows. Names cannot be empty or contain '=' or NUL; names and values must be strings, and values cannot contain NUL. On Windows, environment names are case-insensitive: names differing only by case refer to the same variable, and which value wins is undefined; do not pass both. `cwd`, when given, is an absolute path to an existing directory where the child starts. With `cwd`, a bare argv[1] is searched in the daemon's absolute PATH entries; without `cwd`, lookup uses the child's PATH. With `cwd`, `argv[1]` must be an absolute path or a bare command name, and a bare name is never searched in `cwd`. Use this word, not process.run, for a command that can take longer than 30 seconds.", "process{argv, on_line?, on_exit?, cwd?, env?, clear_env?} -> id; process.run(spec) -> {code, stdout, stderr, timed_out}")
+register("process.run", "Run argv directly without a shell; inherits the daemon's environment unless `clear_env=true`, then applies `env` string variables. Callers using a cleared environment must pass every variable the child needs, including SystemRoot and PATH on Windows. Names cannot be empty or contain '=' or NUL; names and values must be strings, and values cannot contain NUL. On Windows, environment names are case-insensitive: names differing only by case refer to the same variable, and which value wins is undefined; do not pass both. Unless `cwd` is given, the child inherits the daemon's working directory. `cwd` is an absolute path to an existing directory where the child starts. With `cwd`, a bare argv[1] is searched in the daemon's absolute PATH entries; without `cwd`, lookup uses the child's PATH. With `cwd`, `argv[1]` must be an absolute path or a bare command name, and a bare name is never searched in `cwd`. Blocks the Lua image until exit or timeout (default 5s, max 30s; longer commands use remuda.process), captures each stream up to 1 MiB. `stdin_hold_until_lines`, when set to an integer from 1 through 1000, keeps stdin open until stdout has that many newlines, the child exits, or timeout. Surviving descendants can keep pipes open; at most 16 background output readers are allowed.", "process.run{argv, stdin?, timeout?, cwd?, stdin_hold_until_lines?, env?, clear_env?} -> {code, stdout, stderr, timed_out, signal?}")
 
 -- Everything defined so far is core's; a mod may not replace it (#145).
 for key in pairs(remuda) do core_fields[key] = true end

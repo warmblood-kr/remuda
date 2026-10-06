@@ -2,10 +2,11 @@
 # remuda installer — also the upgrader. `remuda upgrade` re-runs this exact
 # script, so there is one download-and-verify path rather than two.
 #
-#   curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | sh
+#   curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly REMUDA_INSTALL_BUTLER=1 sh
 #
 #   REMUDA_CHANNEL=stable|nightly   default: the channel already installed, else stable
-#   REMUDA_INSTALL_DIR=<dir>        default: ~/.local/bin
+#   REMUDA_INSTALL_DIR=<dir>        default: ~/.local/bin (Termux: $PREFIX/bin)
+#   REMUDA_INSTALL_BUTLER=1         also install warmblood-kr/remuda-butler
 #
 # Windows has its own installer, docs/install.ps1, because a `uname` case arm
 # cannot run there. The two hold disjoint halves of one platform list and
@@ -58,10 +59,36 @@ esac
 # fails the build when they drift.
 os=$(uname -s)
 arch=$(uname -m)
+# Termux runs on Android but normally reports Linux from `uname -s`. Its
+# package prefix or `uname -o` identifies the Android environment explicitly.
+termux=no
+case "${PREFIX:-}" in
+*com.termux*) termux=yes ;;
+esac
+if [ "$termux" != yes ]; then
+	os_type=$(uname -o 2>/dev/null || true)
+	[ "$os_type" = Android ] && termux=yes
+fi
+if [ "$termux" = yes ]; then
+	os=Android
+fi
 case "$os/$arch" in
 Linux/x86_64) target=x86_64-unknown-linux-gnu ;;
+Android/aarch64|Android/arm64) target=aarch64-linux-android ;;
 Darwin/arm64) target=aarch64-apple-darwin ;;
-*) die "no prebuilt binary for $os/$arch — build from source: cargo install --git https://github.com/$REPO" ;;
+*)
+	if [ "$channel" = nightly ]; then
+		case "$os/$arch" in
+		Linux/aarch64|Linux/arm64)
+			die "no nightly build for aarch64-linux (ARM Linux) — build from source: cargo install --git https://github.com/$REPO"
+			;;
+		Darwin/x86_64|Darwin/i386)
+			die "no nightly build for x86_64-apple-darwin (Intel macOS) — build from source: cargo install --git https://github.com/$REPO"
+			;;
+		esac
+	fi
+	die "no prebuilt binary for $os/$arch — build from source: cargo install --git https://github.com/$REPO"
+	;;
 esac
 
 version=$(fetch "$INDEX" | tr -d ' \n\r\t' | sed -n "s/.*\"$channel\":\"\([^\"]*\)\".*/\1/p")
@@ -74,9 +101,15 @@ if [ -z "$version" ] || [ "$version" = 0.0.0 ]; then
 	die "no '$channel' version published at $INDEX"
 fi
 
+# latest.json is public input. Validate before using the value as a tag or URL
+# path component; the release workflow and prune job accept this same shape.
+if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-nightly\.[0-9]{14}\.[0-9a-f]{7})?$'; then
+	die "invalid '$channel' version in $INDEX: '$version'"
+fi
+
 case "$channel" in
 stable) tag="v$version" ;;
-nightly) tag=nightly ;;
+nightly) tag=$version ;;
 esac
 
 base="https://github.com/$REPO/releases/download/$tag"
@@ -84,21 +117,21 @@ base="https://github.com/$REPO/releases/download/$tag"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
-fetch "$base/SHA256SUMS" >"$tmp/SHA256SUMS" || die "cannot download $base/SHA256SUMS"
-
-if [ "$channel" = nightly ]; then
-	# nightly's tag is fixed and every release replaces its assets, so a
-	# version read from latest.json's cached copy (cache-control: max-age=600)
-	# can already name a build whose assets no longer exist under that name —
-	# for up to ten minutes after every push to main. SHA256SUMS lives on the
-	# tag itself and lists exactly what is published right now, so derive the
-	# asset name (and the version to report) from that instead of constructing
-	# it from the index.
+if fetch "$base/SHA256SUMS" >"$tmp/SHA256SUMS" 2>/dev/null; then
+	asset="remuda-$version-$target.tar.gz"
+elif [ "$channel" = nightly ]; then
+	# Migration bridge for an index published before nightly releases became
+	# immutable version tags. New indexes resolve above; old ones still install
+	# from the compatibility alias until the first versioned index is published.
+	tag=nightly
+	base="https://github.com/$REPO/releases/download/$tag"
+	fetch "$base/SHA256SUMS" >"$tmp/SHA256SUMS" || die "cannot download $base/SHA256SUMS"
 	asset=$(awk -v t="$target" '{ n = $2; sub(/^\.\//, "", n); if (n ~ ("^remuda-.*-" t "\\.tar\\.gz$")) print n }' "$tmp/SHA256SUMS" | head -n1)
 	[ -n "$asset" ] || die "no nightly build published for $target"
-	version=$(printf '%s' "$asset" | sed -n "s/^remuda-\(.*\)-$target\.tar\.gz\$/\1/p")
+	version=${asset#remuda-}
+	version=${version%-$target.tar.gz}
 else
-	asset="remuda-$version-$target.tar.gz"
+	die "cannot download $base/SHA256SUMS"
 fi
 
 echo "install.sh: fetching remuda $version ($channel, $target)" >&2
@@ -115,7 +148,11 @@ sha256 -c expected >/dev/null || die "checksum mismatch on $asset — refusing t
 tar -xzf "$asset"
 [ -f remuda ] || die "$asset does not contain ./remuda"
 
-install_dir="${REMUDA_INSTALL_DIR:-$HOME/.local/bin}"
+install_dir_default="$HOME/.local/bin"
+if [ "$termux" = yes ] && [ -n "${PREFIX:-}" ]; then
+	install_dir_default="$PREFIX/bin"
+fi
+install_dir="${REMUDA_INSTALL_DIR:-$install_dir_default}"
 mkdir -p "$install_dir" "$data_dir"
 
 # Land it by rename, never by writing in place: `remuda upgrade` runs this while
@@ -131,5 +168,23 @@ echo "$channel" >"$channel_file"
 echo "install.sh: remuda $version -> $install_dir/remuda ($channel channel)" >&2
 case ":$PATH:" in
 *":$install_dir:"*) ;;
-*) echo "install.sh: $install_dir is not on your PATH — add it to your shell profile" >&2 ;;
+*)
+	echo "install.sh: $install_dir is not on your PATH — add it to your shell profile" >&2
+	# The dir is the person's own input and the line is made to be pasted:
+	# single quotes keep `$(...)`, backticks and `"` in it inert. A newline
+	# cannot be one line at all, so that dir gets no command.
+	case "$install_dir" in
+	*"
+"*) ;;
+	*)
+		printf "Next: export PATH='%s':\"\$PATH\"\n" "$(printf '%s' "$install_dir" | sed "s/'/'\\\\''/g")" >&2
+		echo "Add that line to your shell profile to keep it." >&2
+		;;
+	esac
+	;;
 esac
+
+if [ "${REMUDA_INSTALL_BUTLER:-}" = 1 ]; then
+	"$install_dir/remuda" mod install warmblood-kr/remuda-butler --force || die "could not install the Butler mod (Next: remuda mod install warmblood-kr/remuda-butler --force)"
+	printf '%s\n' 'Next: remuda butler doctor'
+fi

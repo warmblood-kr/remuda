@@ -11,16 +11,75 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lua-shell-call-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh scripts/test-no-shell-lua.sh
+
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: cargo test --workspace --all-targets --no-fail-fast
+
+  test-aarch64-linux:
+    # The owner runs remuda on Termux (aarch64 Android). Nothing else here
+    # builds for aarch64 Linux, so arch-specific breakage (ring's asm, pty
+    # ioctls, atomics) would first show up on the phone. Same arch and kernel
+    # as Termux; bionic libc is still untested.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - run: command -v cargo || { curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"; }
+      - run: cargo test --workspace --all-targets --no-fail-fast
+
+  build-android:
+    # Prove the Termux release build and smoke on pull requests, before this
+    # target becomes part of release.yml's strict all-platform publish gate.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: set up Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
+        with:
+          ndk-version: r27d
+      - name: configure Android API 24 linker
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -eu
+          toolchain="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          # Termux supports Android 7.0+ (API 24) for full package support.
+          linker="$toolchain/aarch64-linux-android24-clang"
+          {
+            echo "CC_aarch64_linux_android=$linker"
+            echo "AR_aarch64_linux_android=$toolchain/llvm-ar"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$linker"
+          } >> "$GITHUB_ENV"
+      - run: rustup target add aarch64-linux-android
+      - name: build Android release binary
+        run: cargo build --release --bin remuda --target aarch64-linux-android
+      - name: set up QEMU for Termux smoke
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          platforms: arm64
+      - name: smoke Android binary in Termux
+        timeout-minutes: 10
+        run: |
+          set -eu
+          docker run --rm --platform linux/arm64/v8 \
+            -v "$GITHUB_WORKSPACE/target/aarch64-linux-android/release/remuda:/tmp/remuda:ro" \
+            termux/termux-docker:aarch64 \
+            login -c '/tmp/remuda --version && /tmp/remuda -s smoke -e "return 1"'
 
   test-windows:
     # The port's only evidence. Nobody here has a Windows machine, so this
@@ -112,11 +171,9 @@ jobs:
       - run: python3 scripts/check-butler-path-convention.py
 
   nightly-stale-index:
-    # latest.json is cached for up to ten minutes, but the nightly tag is
-    # fixed and every release replaces its assets — so a real install can hit
-    # a version string that no longer names anything downloadable. See
-    # scripts/check-nightly-stale-index.sh's own header for how this is
-    # provoked without waiting for the real race.
+    # latest.json is cached for up to ten minutes. A cached nightly version
+    # must keep resolving to its immutable release after the index advances.
+    # See scripts/check-nightly-stale-index.sh for the install-level check.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -131,6 +188,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sh scripts/check-cold-install.sh
+      - run: sh scripts/check-install-path-line.sh
 
   cold-room:
     # cold-install above runs check-cold-install.sh directly on the runner,

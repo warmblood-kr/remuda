@@ -1,5 +1,84 @@
 use super::*;
 use remuda_core::Size;
+use std::sync::{Arc, Mutex};
+
+const REAL_OUTPUT_WAIT: Duration = Duration::from_secs(60);
+const REAL_OUTPUT_POLL: Duration = Duration::from_millis(50);
+
+#[test]
+fn paste_input_strips_escape_and_wraps_only_when_child_mode_is_enabled() {
+    assert_eq!(
+        paste_input("first\n\x1b[201~second", true),
+        b"\x1b[200~first\n[201~second\x1b[201~"
+    );
+    assert_eq!(paste_input("first\nsecond", false), b"first\nsecond");
+}
+
+#[test]
+fn paste_input_strips_c0_controls_except_tab_line_feed_and_carriage_return() {
+    assert_eq!(
+        paste_input("a\u{3}\u{4}\u{1a}\u{1c}\t\n\r\u{7f}z", false),
+        b"a\t\n\rz"
+    );
+}
+
+#[test]
+fn paste_input_strips_del_and_c1_without_corrupting_utf8() {
+    assert_eq!(paste_input("한\u{9b}글\u{7f}!", false), "한글!".as_bytes());
+}
+
+#[test]
+fn old_mouse_state_wire_shape_defaults_bracketed_paste_to_off() {
+    let state: remuda_core::agent::MouseState =
+        serde_json::from_str(r#"{"mode":"None","encoding":"Default"}"#).unwrap();
+    assert!(!state.bracketed_paste);
+}
+
+#[derive(Clone)]
+struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn bracketed_paste_capture_toggles_and_drop_resets_the_terminal() {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    {
+        let mut capture = BracketedPasteCapture::new(SharedWriter(Arc::clone(&output)));
+        capture.set(true).unwrap();
+        capture.set(true).unwrap();
+        capture.set(false).unwrap();
+        capture.set(false).unwrap();
+        capture.set(true).unwrap();
+    }
+    assert_eq!(
+        *output.lock().unwrap(),
+        b"\x1b[?2004h\x1b[?2004l\x1b[?2004h\x1b[?2004l"
+    );
+}
+
+fn wait_for_output<T>(
+    mut check: impl FnMut() -> Option<T>,
+    timeout_message: impl FnMut() -> String,
+) -> T {
+    let deadline = Instant::now() + REAL_OUTPUT_WAIT;
+    let mut timeout_message = timeout_message;
+    loop {
+        if let Some(value) = check() {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "{}", timeout_message());
+        std::thread::sleep(REAL_OUTPUT_POLL);
+    }
+}
 
 #[test]
 fn anchor_capture_retries_when_history_advances_between_captures() {
@@ -112,6 +191,8 @@ fn row(name: &str, alive: bool, attached: bool) -> SessionSummary {
     SessionSummary {
         id: String::new(),
         name: name.into(),
+        instance_id: Some("test-session".into()),
+        output_version: Some(0),
         alive,
         idle: Duration::from_secs(4),
         output_idle: Some(Duration::from_secs(4)),
@@ -272,6 +353,109 @@ fn selected_session_stays_visible_when_the_list_exceeds_a_short_terminal() {
 }
 
 #[test]
+fn list_wheel_scrolls_one_session_and_moves_selection_with_the_viewport() {
+    let mut ui = make_ui(
+        (0..12)
+            .map(|index| row(&format!("session-{index}"), true, false))
+            .collect(),
+    );
+    let wheel = |kind| MouseEvent {
+        kind,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert_eq!(
+        ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24),
+        Action::Nothing
+    );
+    assert_eq!(ui.list_first_visible, Some(1));
+    assert_eq!(ui.selected, 1, "selection follows the viewport when needed");
+
+    ui.on_mouse(wheel(MouseEventKind::ScrollUp), 80, 24);
+    assert_eq!(ui.list_first_visible, Some(0));
+    assert_eq!(ui.selected, 1, "selection stays visible while scrolling up");
+}
+
+#[test]
+fn list_wheel_clamps_at_both_ends() {
+    let mut ui = make_ui(
+        (0..12)
+            .map(|index| row(&format!("session-{index}"), true, false))
+            .collect(),
+    );
+    let wheel = |kind| MouseEvent {
+        kind,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    ui.on_mouse(wheel(MouseEventKind::ScrollUp), 80, 24);
+    assert_eq!(ui.list_first_visible, Some(0));
+    for _ in 0..20 {
+        ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24);
+    }
+    assert_eq!(ui.list_first_visible, Some(5));
+    assert_eq!(ui.selected, 5);
+    for _ in 0..20 {
+        ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24);
+    }
+    assert_eq!(ui.list_first_visible, Some(5));
+    assert_eq!(ui.selected, 5);
+}
+
+#[test]
+fn clicking_the_top_visible_session_keeps_the_list_under_the_pointer() {
+    let mut ui = make_ui(
+        (0..12)
+            .map(|index| row(&format!("session-{index}"), true, false))
+            .collect(),
+    );
+    for _ in 0..11 {
+        ui.on_key(press(KeyCode::Down));
+    }
+
+    let before = render(&ui, "", "test", 80, 24);
+    let before_top = before.split("\x1b[2;1H").next().expect("first row exists");
+    assert!(
+        before_top.contains("session-5"),
+        "top row before click: {before_top:?}"
+    );
+
+    assert_eq!(
+        ui.on_mouse(click(5, 0), 80, 24),
+        Action::Focus("session-5".into())
+    );
+    assert_eq!(ui.selected, 5);
+
+    let after = render(&ui, "", "test", 80, 24);
+    let after_top = after.split("\x1b[2;1H").next().expect("first row exists");
+    assert!(
+        after_top.contains("session-5"),
+        "clicking the first visible row must not move the list: {after_top:?}"
+    );
+    assert!(
+        !after_top.contains("session-0"),
+        "the list must not snap back to its first row: {after_top:?}"
+    );
+
+    ui.on_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+    ui.on_key(press(KeyCode::Up));
+    assert_eq!(ui.selected, 4);
+    let after_navigation = render(&ui, "", "test", 80, 24);
+    let navigation_top = after_navigation
+        .split("\x1b[2;1H")
+        .next()
+        .expect("first row exists");
+    assert!(
+        navigation_top.contains("session-4"),
+        "keyboard movement should scroll just enough to keep selection visible: {navigation_top:?}"
+    );
+}
+
+#[test]
 fn enter_points_the_keyboard_at_the_selected_session() {
     let mut ui = make_ui(vec![row("a", true, false), row("b", true, false)]);
     ui.on_key(press(KeyCode::Char('j')));
@@ -280,6 +464,51 @@ fn enter_points_the_keyboard_at_the_selected_session() {
     assert_eq!(ui.selected().unwrap().name, "b");
     // The list stays on screen: nothing about entering removes a session.
     assert_eq!(ui.sessions.len(), 2);
+}
+
+#[test]
+fn timed_out_input_sets_notice_and_ctrl_backslash_keeps_the_list_focus() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    ui.focus = Focus::Session;
+    let mut held = Some(());
+
+    input_write_failed(
+        &mut ui,
+        "a",
+        &std::io::Error::new(std::io::ErrorKind::TimedOut, "write deadline"),
+        &mut held,
+    );
+
+    assert_eq!(ui.focus, Focus::List);
+    assert!(held.is_none(), "a failed Hold must be released");
+    assert!(ui
+        .notice
+        .as_deref()
+        .unwrap()
+        .contains("this key batch may not have been delivered"));
+    assert!(ui
+        .notice
+        .as_deref()
+        .unwrap()
+        .contains("a large paste may be cut mid-way; check the session"));
+    assert!(!ui.notice.as_deref().unwrap().contains("dropped"));
+    ui.on_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+    assert_eq!(ui.focus, Focus::List, "the next Ctrl-\\ event is handled");
+}
+
+#[test]
+fn closed_input_pipe_has_a_distinct_notice_from_a_stuck_write() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    let mut held = None::<()>;
+    input_write_failed(
+        &mut ui,
+        "a",
+        &std::io::Error::new(std::io::ErrorKind::BrokenPipe, "peer closed"),
+        &mut held,
+    );
+
+    assert!(ui.notice.as_deref().unwrap().contains("input pipe closed"));
+    assert!(!ui.notice.as_deref().unwrap().contains("input stuck"));
 }
 
 fn click(col: u16, row: u16) -> MouseEvent {
@@ -468,6 +697,58 @@ fn shift_wheel_is_forwarded_to_the_child_tui() {
 }
 
 #[test]
+fn any_session_key_returns_scrollback_to_live_follow() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    assert_eq!(ui.on_key(press(KeyCode::Enter)), Action::Focus("a".into()));
+    ui.scrollback.insert(
+        "a".into(),
+        ScrollState {
+            offset: 7,
+            history_rows: 20,
+            ..ScrollState::default()
+        },
+    );
+
+    assert_eq!(ui.on_key(press(KeyCode::Null)), Action::Nothing);
+    assert_eq!(ui.scrollback["a"].offset, 0);
+}
+
+#[test]
+fn scrolled_preview_shows_indicator_in_plain_and_styled_frames_until_live() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    ui.scrollback.insert(
+        "a".into(),
+        ScrollState {
+            offset: 3,
+            history_rows: 20,
+            ..ScrollState::default()
+        },
+    );
+    let indicator = "[scrollback: 3 rows — any key returns]";
+    let plain = render(&ui, "older content", "test", 80, 24);
+    assert!(plain.contains(indicator), "plain frame: {plain:?}");
+
+    let cells = vec![vec![remuda_core::agent::StyledCell::default(); 80]; 24];
+    let styled = render_styled(
+        &ui,
+        &cells,
+        Cursor {
+            row: 0,
+            col: 0,
+            visible: false,
+        },
+        "test",
+        80,
+        24,
+    );
+    assert!(styled.contains(indicator), "styled frame: {styled:?}");
+
+    scroll_selected(&mut ui, -3);
+    let live = render(&ui, "current content", "test", 80, 24);
+    assert!(!live.contains("[scrollback:"), "live frame: {live:?}");
+}
+
+#[test]
 fn paging_moves_by_one_preview_page_and_end_returns_to_follow() {
     let mut ui = make_ui(vec![row("a", true, false)]);
     ui.scrollback.insert(
@@ -606,18 +887,13 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     assert_eq!(response, Response::Value("stream".into()));
 
     let mut ui = make_ui(vec![row("stream", true, false)]);
-    let history_deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        capture_preview(&path, &mut ui, "stream").expect("initial live preview");
-        if ui.scrollback["stream"].history_rows >= 40 {
-            break;
-        }
-        assert!(
-            Instant::now() < history_deadline,
-            "output did not reach scrollback"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_output(
+        || {
+            capture_preview(&path, &mut ui, "stream").expect("initial live preview");
+            (ui.scrollback["stream"].history_rows >= 40).then_some(())
+        },
+        || "output did not reach scrollback".into(),
+    );
     let wheel = |kind| MouseEvent {
         kind,
         column: 19,
@@ -635,7 +911,7 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     }
     assert!(ui.scrollback["stream"].offset >= 30);
 
-    for _ in 0..30 {
+    for _ in 0..60 {
         assert_eq!(
             ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24),
             Action::Scroll(-3)
@@ -649,24 +925,28 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     }
     assert_eq!(ui.scrollback["stream"].offset, 0);
 
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let (cells, _, cursor) =
-            capture_preview(&path, &mut ui, "stream").expect("capture the streaming preview");
-        let frame = render_styled(&ui, &cells, cursor, "default", 80, 25);
-        if frame.contains("newest-199") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "latest output never appeared after returning to bottom: {frame:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let last_frame = std::cell::RefCell::new(String::new());
+    wait_for_output(
+        || {
+            let (cells, _, cursor) =
+                capture_preview(&path, &mut ui, "stream").expect("capture the streaming preview");
+            let frame = render_styled(&ui, &cells, cursor, "default", 80, 25);
+            *last_frame.borrow_mut() = frame.clone();
+            frame.contains("newest-199").then_some(())
+        },
+        || {
+            format!(
+                "latest output never appeared after returning to bottom: {:?}",
+                last_frame.borrow()
+            )
+        },
+    );
     let _ = client::request(
         &path,
         &Request::Close {
             name: "stream".into(),
+            instance_id: None,
+            confirm: None,
         },
     );
 }
@@ -693,15 +973,13 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
     assert_eq!(response, Response::Value("stream".into()));
 
     let mut ui = make_ui(vec![row("stream", true, false)]);
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        capture_preview(&path, &mut ui, "stream").expect("capture preview");
-        if ui.scrollback["stream"].history_rows >= 3 {
-            break;
-        }
-        assert!(Instant::now() < deadline, "output did not reach scrollback");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_output(
+        || {
+            capture_preview(&path, &mut ui, "stream").expect("capture preview");
+            (ui.scrollback["stream"].history_rows >= 3).then_some(())
+        },
+        || "output did not reach scrollback".into(),
+    );
     assert_eq!(
         ui.on_mouse(
             MouseEvent {
@@ -720,32 +998,113 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
     let anchor_text = terminal_rows_text(&anchor_cells);
     let anchor_history = ui.scrollback["stream"].history_rows;
 
-    loop {
-        let (cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("capture output");
-        let state = ui.scrollback["stream"];
-        if state.history_rows >= anchor_history + 3 {
-            assert_eq!(
-                state.offset,
-                3 + (state.history_rows - anchor_history),
-                "the offset must advance with appended history rows"
-            );
-            assert_eq!(
-                terminal_rows_text(&cells),
-                anchor_text,
-                "new output must not move the scrolled content"
-            );
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "history did not grow while scrolled"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_output(
+        || {
+            let (cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("capture output");
+            let state = ui.scrollback["stream"];
+            if state.history_rows >= anchor_history + 3 {
+                assert_eq!(
+                    state.offset,
+                    3 + (state.history_rows - anchor_history),
+                    "the offset must advance with appended history rows"
+                );
+                assert_eq!(
+                    terminal_rows_text(&cells),
+                    anchor_text,
+                    "new output must not move the scrolled content"
+                );
+                Some(())
+            } else {
+                None
+            }
+        },
+        || "history did not grow while scrolled".into(),
+    );
     let _ = client::request(
         &path,
         &Request::Close {
             name: "stream".into(),
+            instance_id: None,
+            confirm: None,
+        },
+    );
+}
+
+#[test]
+fn real_preview_keeps_content_anchored_after_wheel_down_enters_settle() {
+    let path = scratch_socket("preview-settle-content-anchor");
+    daemon_at(&path);
+    let command = streaming_command(
+        "i=0; while [ $i -lt 90 ]; do printf 'settle-%03d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 2",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 90; $i++) { Write-Output ('settle-{0:D3}' -f $i); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 2",
+    );
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("stream".into()),
+            command,
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("new streaming session");
+    assert_eq!(response, Response::Value("stream".into()));
+
+    let mut ui = make_ui(vec![row("stream", true, false)]);
+    wait_for_output(
+        || {
+            capture_preview(&path, &mut ui, "stream").expect("capture preview");
+            (ui.scrollback["stream"].history_rows >= 40).then_some(())
+        },
+        || "output did not reach scrollback".into(),
+    );
+    let wheel = |kind| MouseEvent {
+        kind,
+        column: 19,
+        row: 4,
+        modifiers: KeyModifiers::NONE,
+    };
+    for _ in 0..5 {
+        assert_eq!(
+            ui.on_mouse(wheel(MouseEventKind::ScrollUp), 80, 24),
+            Action::Scroll(3)
+        );
+        scroll_selected(&mut ui, 3);
+        capture_preview(&path, &mut ui, "stream").expect("capture scroll-up");
+    }
+    assert_eq!(
+        ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24),
+        Action::Scroll(-3)
+    );
+    scroll_selected(&mut ui, -3);
+    let (anchor_cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("enter settle");
+    let anchor_text = terminal_rows_text(&anchor_cells);
+    let anchor_history = ui.scrollback["stream"].history_rows;
+
+    wait_for_output(
+        || {
+            let (cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("capture output");
+            let state = ui.scrollback["stream"];
+            if state.history_rows >= anchor_history + 3 {
+                assert_eq!(
+                    terminal_rows_text(&cells),
+                    anchor_text,
+                    "wheel-down settle must preserve the visible history rows"
+                );
+                Some(())
+            } else {
+                None
+            }
+        },
+        || "history did not grow while in wheel-down settle".into(),
+    );
+    let _ = client::request(
+        &path,
+        &Request::Close {
+            name: "stream".into(),
+            instance_id: None,
+            confirm: None,
         },
     );
 }
@@ -845,6 +1204,8 @@ fn real_preview_keeps_content_anchored_after_scrollback_reaches_its_cap() {
         &path,
         &Request::Close {
             name: "stream".into(),
+            instance_id: None,
+            confirm: None,
         },
     );
 }
@@ -2319,9 +2680,76 @@ fn a_session_started_here_is_sized_to_the_pane_not_the_terminal() {
 }
 
 #[test]
-fn a_pane_below_the_floor_is_raised_rather_than_dropping_keystrokes() {
+fn a_narrow_pane_opts_out_of_the_default_size_floor() {
     let size = pane_size(&make_ui(vec![]), 80, 24);
-    assert_eq!((size.cols(), size.rows()), (80, 24), "Size::new's floor");
+    assert_eq!((size.cols(), size.rows()), (63, 24));
+    assert_eq!(
+        (Size::new(11, 3).cols(), Size::new(11, 3).rows()),
+        (Size::MIN_COLS, Size::MIN_ROWS),
+        "ordinary sizes keep the safety floor"
+    );
+}
+
+#[test]
+fn a_narrow_shown_list_pane_passes_its_visible_width_to_the_child() {
+    let mut ui = make_ui(vec![row("agent", true, false)]);
+    ui.set_list_width(24, 100);
+    assert_eq!(ui_layout(&ui, 100), (24, 75));
+
+    let size = pane_size(&ui, 100, 30);
+    assert_eq!(size.cols(), 75);
+    assert_eq!(size.rows(), 29);
+
+    let encoded = serde_json::to_vec(&size).expect("serialize pane size");
+    let decoded: Size = serde_json::from_slice(&encoded).expect("deserialize pane size");
+    assert_eq!(decoded, size, "the daemon must preserve the visible width");
+
+    let ordinary: Size =
+        serde_json::from_str(r#"{"cols":75,"rows":29}"#).expect("deserialize ordinary size");
+    assert_eq!(
+        ordinary.cols(),
+        Size::MIN_COLS,
+        "ordinary requests stay floored"
+    );
+}
+
+/// A list preview is observational: only an attached pane may send a Resize.
+#[test]
+fn a_narrow_preview_does_not_send_a_resize_request() {
+    let mut ui = make_ui(vec![row("background", true, false)]);
+    let shown = Some(ShownTarget::Session("background".into()));
+    let mut requests = Vec::new();
+    resize_shown_session_with(&mut ui, &shown, None, 36, 24, |name, size| {
+        requests.push((name.to_owned(), size));
+        Ok(())
+    });
+    assert!(
+        requests.is_empty(),
+        "a list preview must not resize its child PTY"
+    );
+}
+
+#[test]
+fn a_focused_narrow_attach_still_sends_its_pane_resize() {
+    let mut ui = make_ui(vec![row("agent", true, false)]);
+    ui.focus = Focus::Session;
+    let shown = Some(ShownTarget::Session("agent".into()));
+
+    let mut requests = Vec::new();
+    resize_shown_session_with(&mut ui, &shown, Some("agent"), 36, 24, |name, size| {
+        requests.push((name.to_owned(), size));
+        Ok(())
+    });
+
+    let [(name, target)] = requests.as_slice() else {
+        panic!("the focused, held session should receive one resize: {requests:?}");
+    };
+    assert_eq!(name, "agent");
+    assert_eq!(*target, pane_size(&ui, 36, 24));
+    assert!(
+        target.cols() < Size::MIN_COLS,
+        "focused pane should use its narrow width"
+    );
 }
 
 #[test]
@@ -2539,14 +2967,24 @@ fn refused_socket_is_definitive_only_when_its_lifetime_lock_is_free() {
 #[test]
 fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
     use std::os::fd::AsRawFd;
-    use std::os::unix::net::UnixListener;
 
-    let dir = std::env::temp_dir().join(format!("remuda-tui-busy-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("make private busy daemon directory");
-    let socket = dir.join("s.sock");
-    drop(UnixListener::bind(&socket).expect("bind private endpoint"));
-    let lock_path = dir.join("s.sock.lock");
+    struct TestDir(std::path::PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the Unix epoch")
+        .as_nanos();
+    let dir = TestDir(std::env::temp_dir().join(format!("r{:x}-{nonce:x}", std::process::id())));
+    std::fs::create_dir(&dir.0).expect("create unique busy daemon directory");
+    let socket = dir.0.join("s.sock");
+    std::fs::write(&socket, b"stale endpoint").expect("make endpoint exist");
+    let lock_path = dir.0.join("s.sock.lock");
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -2558,19 +2996,43 @@ fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0
     );
-    let connect_error = crate::ipc::connect(&socket).expect_err("placeholder is not a socket");
-    assert_eq!(
-        connect_error.kind(),
-        std::io::ErrorKind::ConnectionRefused,
-        "{connect_error:?}"
+    let refused = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
+    assert!(
+        !socket_lock_is_free(&socket),
+        "the fixture must hold the daemon lifetime lock"
     );
-    assert!(!daemon_is_definitively_gone(&socket, &connect_error));
+    assert!(
+        !daemon_is_definitively_gone(&socket, &refused),
+        "the held flock is why this refusal is not definitive"
+    );
 
     let mut ui = make_ui(vec![row("remembered", true, false)]);
     ui.consecutive_transport_failures = 2;
+    record_daemon_probe_failure(
+        &socket,
+        &mut ui,
+        "synthetic connection refusal".into(),
+        refused,
+    );
+    assert!(
+        ui.daemon_gone.is_none(),
+        "held lifetime lock means the daemon may be busy"
+    );
+    assert_eq!(
+        ui.consecutive_transport_failures, 0,
+        "busy refusal must not count"
+    );
+
+    // Exercise the refresh path while the flock is still held. Connecting to
+    // this regular file fails with ENOTSOCK on macOS and ECONNREFUSED on Linux;
+    // the latter is non-definitive specifically because the lock is held.
     let mut held = None;
     let mut painted = String::new();
     let mut shown = None;
+    assert!(
+        !socket_lock_is_free(&socket),
+        "refresh runs under the held flock"
+    );
     refresh(
         &socket,
         "test",
@@ -2581,18 +3043,22 @@ fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
         false,
         false,
     )
-    .expect("refresh handles refused private endpoint");
+    .expect("refresh handles a non-socket endpoint");
+    assert!(ui.daemon_gone.is_none());
     assert!(
-        ui.daemon_gone.is_none(),
-        "held lifetime lock means the daemon may be busy"
-    );
-    assert_eq!(
-        ui.consecutive_transport_failures, 0,
-        "busy refusal must not count"
+        ui.consecutive_transport_failures <= 1,
+        "one endpoint transport error must not mark the daemon gone while the flock is held"
     );
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    assert!(socket_lock_is_free(&socket));
+    assert!(
+        daemon_is_definitively_gone(
+            &socket,
+            &std::io::Error::from_raw_os_error(libc::ECONNREFUSED)
+        ),
+        "after releasing the flock, the same refusal is definitive"
+    );
     drop(lock);
-    std::fs::remove_dir_all(dir).expect("remove private busy daemon directory");
 }
 
 #[test]
@@ -3662,4 +4128,128 @@ fn a_type_forced_refresh_with_a_real_session_and_a_shown_buffer_costs_one_daemon
              request — got {total} (list={list}, eval={eval_calls}, \
              capture_styled={capture_styled})"
     );
+}
+
+#[test]
+fn list_wheel_scrolls_while_a_session_is_focused_without_moving_selection() {
+    let mut ui = make_ui(
+        (0..30)
+            .map(|index| row(&format!("session-{index}"), true, false))
+            .collect(),
+    );
+    ui.focus = Focus::Session;
+    let down = MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    for _ in 0..40 {
+        assert_eq!(ui.on_mouse(down, 80, 24), Action::Nothing);
+    }
+    assert_eq!(ui.selected, 0, "the focused session keeps the selection");
+    let frame = render(&ui, "", "test", 80, 24);
+    assert!(
+        frame.contains("session-29"),
+        "last session missing: {frame:?}"
+    );
+    // The status line names the focused session-0, so probe session-1 instead.
+    assert!(
+        !frame.contains("session-1 "),
+        "top of the list still visible: {frame:?}"
+    );
+
+    assert_eq!(
+        ui.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            80,
+            24,
+        ),
+        Action::Focus("session-23".into())
+    );
+    assert_eq!(ui.selected, 23, "click follows the scrolled row");
+}
+
+/// The session name drawn in the first list row of a rendered frame.
+fn top_list_row(ui: &Ui) -> String {
+    let frame = render(ui, "", "test", 80, 24);
+    let row = frame.split("\x1b[1;1H").nth(1).expect("first row");
+    let row = row.strip_prefix("\x1b[7m").unwrap_or(row);
+    row.chars()
+        .take_while(|c| !c.is_whitespace() && *c != '\x1b')
+        .collect()
+}
+
+fn thirty_sessions_with_a_stale_viewport() -> Ui {
+    let mut ui = make_ui(
+        (0..30)
+            .map(|index| row(&format!("session-{index}"), true, false))
+            .collect(),
+    );
+    ui.selected = 0;
+    ui.list_first_visible = Some(20);
+    ui
+}
+
+#[test]
+fn returning_to_list_normalizes_the_focused_viewport() {
+    let mut ui = thirty_sessions_with_a_stale_viewport();
+    ui.focus = Focus::Session;
+    let detach = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+    assert_eq!(ui.on_key(detach), Action::Nothing);
+    assert_eq!(ui.focus, Focus::List);
+    assert_eq!(top_list_row(&ui), "session-0");
+    ui.on_key(press(KeyCode::Down));
+    assert_eq!(ui.selected, 1);
+    assert_eq!(
+        top_list_row(&ui),
+        "session-0",
+        "down must not jump the viewport"
+    );
+}
+
+#[test]
+fn a_stale_viewport_does_not_jump_the_list_on_the_next_key() {
+    let mut ui = thirty_sessions_with_a_stale_viewport();
+    assert_eq!(ui.focus, Focus::List);
+    assert_eq!(top_list_row(&ui), "session-0");
+    ui.on_key(press(KeyCode::Down));
+    assert_eq!(ui.selected, 1);
+    assert_eq!(
+        top_list_row(&ui),
+        "session-0",
+        "down must not jump the viewport"
+    );
+}
+
+#[test]
+fn list_wheel_is_a_no_op_when_the_list_fits_in_either_focus() {
+    for (count, focus) in [0, 1, 6]
+        .into_iter()
+        .flat_map(|count| [(count, Focus::List), (count, Focus::Session)])
+    {
+        let mut ui = make_ui(
+            (0..count)
+                .map(|index| row(&format!("session-{index}"), true, false))
+                .collect(),
+        );
+        ui.focus = focus;
+        for kind in [MouseEventKind::ScrollDown, MouseEventKind::ScrollUp] {
+            let wheel = MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert_eq!(ui.on_mouse(wheel, 80, 24), Action::Nothing);
+        }
+        assert_eq!(ui.selected, 0);
+        assert_eq!(ui.list_first_visible.unwrap_or(0), 0);
+    }
 }

@@ -22,7 +22,6 @@ use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
 use remuda_core::Size;
 use std::collections::HashMap;
-#[cfg(not(test))]
 use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -40,7 +39,6 @@ const DAEMON_FAILURES_BEFORE_GONE: u8 = 3;
 /// than `TICK` so a keypress is never left waiting to be noticed. Used to
 /// also be the redraw cadence; see steps/017 for why that was the bug.
 const TICK_TYPING: Duration = Duration::from_millis(40);
-const SCROLL_DOWN_SETTLE: Duration = Duration::from_millis(1500);
 const MAX_ANCHOR_CAPTURES: usize = 3;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -103,6 +101,9 @@ enum WordClass {
 pub struct Ui {
     pub sessions: Vec<SessionSummary>,
     pub selected: usize,
+    /// A mouse selection can move focus without making the list scroll under
+    /// the pointer. Keyboard navigation resumes selection-following scroll.
+    list_first_visible: Option<usize>,
     pub pan: u16,
     /// `None` follows the normal content-aware width; `Some` is a user drag.
     pub list_width: Option<u16>,
@@ -153,7 +154,6 @@ struct ScrollState {
     /// Total corresponding to `offset`; can lag `history_total` when output
     /// keeps arriving through the bounded capture retries.
     anchor_total: usize,
-    last_scroll_down: Option<Instant>,
     scroll_direction: i8,
     recent_up_output: usize,
 }
@@ -163,6 +163,7 @@ impl Ui {
         Self {
             sessions,
             selected: 0,
+            list_first_visible: None,
             pan: 0,
             list_width: None,
             list_visible: true,
@@ -204,20 +205,49 @@ impl Ui {
 
     /// Keep the cursor on a real row after the herd changes underneath it.
     pub fn clamp(&mut self) {
+        let selected = self.selected;
         if self.selected >= self.sessions.len() {
             self.selected = self.sessions.len().saturating_sub(1);
         }
+        if self.selected != selected {
+            self.track_list_selection();
+        }
+    }
+
+    fn track_list_selection(&mut self) {
+        let Some(first) = self.list_first_visible else {
+            return;
+        };
+        let visible = (self.preview_rows as usize / self.session_rows).max(1);
+        let max_first = self.sessions.len().saturating_sub(visible);
+        let mut first = first.min(max_first);
+        if self.selected < first {
+            first = self.selected;
+        } else if self.selected >= first.saturating_add(visible) {
+            first = self.selected.saturating_sub(visible - 1);
+        }
+        self.list_first_visible = Some(first.min(max_first));
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
-        if self.focus == Focus::Session {
-            return self.session_key(key);
+        let selected = self.selected;
+        // Whatever left focus on the list, step from the viewport that is drawn.
+        if self.focus == Focus::List && self.list_first_visible.is_some() {
+            self.list_first_visible = Some(list_viewport(self, self.preview_rows));
         }
-        match self.mode.clone() {
-            Mode::Prompt(buffer) => self.prompt_key(key, buffer),
-            Mode::Confirm(name) => self.confirm_key(key, name),
-            Mode::Browse => self.browse_key(key),
+        let action = if self.focus == Focus::Session {
+            self.session_key(key)
+        } else {
+            match self.mode.clone() {
+                Mode::Prompt(buffer) => self.prompt_key(key, buffer),
+                Mode::Confirm(name) => self.confirm_key(key, name),
+                Mode::Browse => self.browse_key(key),
+            }
+        };
+        if self.selected != selected {
+            self.track_list_selection();
         }
+        action
     }
 
     /// A press in the list column switches to that row's session, even if
@@ -247,6 +277,19 @@ impl Ui {
         }
 
         let preview_offset = if self.list_visible { list_w + 1 } else { 0 };
+        if self.list_visible && col <= list_w {
+            match event.kind {
+                MouseEventKind::ScrollUp => self.scroll_list(-1, body),
+                MouseEventKind::ScrollDown => self.scroll_list(1, body),
+                _ => {}
+            }
+            if matches!(
+                event.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) {
+                return Action::Nothing;
+            }
+        }
         if matches!(event.kind, MouseEventKind::ScrollUp)
             && event.modifiers.contains(KeyModifiers::SHIFT)
             && col > preview_offset
@@ -316,6 +359,30 @@ impl Ui {
         self.click_session_pane(event.kind, row, col - preview_offset, body, preview_w)
     }
 
+    fn scroll_list(&mut self, delta: isize, body: u16) {
+        let visible = (body as usize / self.session_rows).max(1);
+        let max_first = self.sessions.len().saturating_sub(visible);
+        let first = list_viewport(self, body);
+        let first = first.saturating_add_signed(delta).min(max_first);
+        self.list_first_visible = Some(first);
+        // A focused session owns the selection; only the viewport moves.
+        if self.focus == Focus::Session {
+            return;
+        }
+
+        let before = self.selected;
+        if self.selected < first {
+            self.selected = first;
+        } else if self.selected >= first.saturating_add(visible) {
+            self.selected = first
+                .saturating_add(visible - 1)
+                .min(self.sessions.len().saturating_sub(1));
+        }
+        if self.selected != before {
+            self.pan = 0;
+        }
+    }
+
     fn select_session_text(
         &mut self,
         kind: MouseEventKind,
@@ -376,10 +443,12 @@ impl Ui {
         if row < 1 || row > body {
             return Action::Nothing;
         }
-        let index = ((row - 1) as usize / self.session_rows) + list_viewport(self, body);
+        let viewport = list_viewport(self, body);
+        let index = ((row - 1) as usize / self.session_rows) + viewport;
         if index >= self.sessions.len() {
             return Action::Nothing;
         }
+        self.list_first_visible = Some(viewport);
         self.selected = index;
         self.pan = 0;
         self.focus_session()
@@ -435,7 +504,11 @@ impl Ui {
             return Action::Nothing;
         };
         if !session.mouse_tracking {
-            return Action::Nothing;
+            return match button {
+                "wheel-up" => Action::Scroll(3),
+                "wheel-down" => Action::Scroll(-3),
+                _ => Action::Nothing,
+            };
         }
         let row_offset = if self.visual_screen.is_empty() {
             (session.size.rows() as usize).saturating_sub(body as usize)
@@ -452,17 +525,15 @@ impl Ui {
     /// first and unconditionally, so no remuda command can be typed by accident
     /// into a shell — the whole reason focus exists rather than modeless keys.
     fn session_key(&mut self, key: KeyEvent) -> Action {
+        if let Some(name) = self.selected().map(|session| session.name.clone()) {
+            self.scrollback.entry(name).or_default().offset = 0;
+        }
         if is_detach(key) {
             self.focus = Focus::List;
             self.notice = None;
             return Action::Nothing;
         }
         let bytes = to_bytes(key);
-        if bytes.is_some() {
-            if let Some(name) = self.selected().map(|session| session.name.clone()) {
-                self.scrollback.entry(name).or_default().offset = 0;
-            }
-        }
         bytes.map_or(Action::Nothing, Action::Type)
     }
 
@@ -472,7 +543,12 @@ impl Ui {
     pub fn follow_focus(&mut self, name: Option<&str>) {
         let Some(name) = name else { return };
         match self.sessions.iter().position(|s| s.name == name && s.alive) {
-            Some(at) => self.selected = at,
+            Some(at) => {
+                if self.selected != at {
+                    self.selected = at;
+                    self.track_list_selection();
+                }
+            }
             // With sessions closing themselves on exit, this is how a ride
             // ordinarily ends: you type `exit`, and you are on the list.
             None => self.focus = Focus::List,
@@ -956,7 +1032,7 @@ fn is_detach(key: KeyEvent) -> bool {
 /// A keypress as the bytes a terminal would have sent, or `None` for a key we
 /// cannot spell — refused rather than sent as an empty burst, the rule
 /// `remuda_core::keys` already states. The spelling is that module's, reused.
-fn to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+pub(crate) fn to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     let base = match key.code {
         KeyCode::Char(c) => c.to_string(),
         KeyCode::Enter => "RET".into(),
@@ -1231,6 +1307,8 @@ mod visual_mode_tests {
             vec![SessionSummary {
                 id: String::new(),
                 name: "agent".into(),
+                instance_id: Some("test-agent".into()),
+                output_version: Some(0),
                 alive: true,
                 idle: Duration::ZERO,
                 output_idle: Some(Duration::ZERO),
@@ -1525,7 +1603,9 @@ mod visual_mode_tests {
             ),
             Ok(Response::Value(_))
         ));
-        let capture_deadline = Instant::now() + Duration::from_secs(5);
+        // ConPTY can take several seconds to launch the shell and flush its
+        // first output on a loaded Windows CI worker.
+        let capture_deadline = Instant::now() + Duration::from_secs(30);
         let (cells, wrapped) = loop {
             let (cells, wrapped, _, _, _) = capture_styled(&path, name, 0).expect("real capture");
             let captured: String = cells[0].iter().map(|cell| cell.text.as_str()).collect();
@@ -1536,7 +1616,7 @@ mod visual_mode_tests {
                 Instant::now() < capture_deadline,
                 "fixture text not captured: {captured:?}"
             );
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(25));
         };
         assert_eq!(cells[0].iter().filter(|cell| cell.wide).count(), 6);
 
@@ -1566,7 +1646,14 @@ mod visual_mode_tests {
         press(&mut ui, "vb");
         assert_eq!(at(&ui), TextPoint { row: 0, col: 15 });
 
-        let _ = crate::client::request(&path, &Request::Close { name: name.into() });
+        let _ = crate::client::request(
+            &path,
+            &Request::Close {
+                name: name.into(),
+                instance_id: None,
+                confirm: None,
+            },
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1835,7 +1922,12 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
         ""
     };
 
-    let (lines, cut) = crop(screen, preview_w, body, ui.pan);
+    let (mut lines, cut) = crop(screen, preview_w, body, ui.pan);
+    if let Some(indicator) = scrollback_indicator(ui) {
+        if let Some(first) = lines.first_mut() {
+            *first = indicator;
+        }
+    }
     let mut out = String::from("\x1b[H\x1b[2J");
     for row in 0..body {
         out.push_str(&format!("\x1b[{};1H", row + 1));
@@ -2037,6 +2129,14 @@ fn ui_preview_row_offset(ui: &Ui, height: u16) -> usize {
     )
 }
 
+fn scrollback_indicator(ui: &Ui) -> Option<String> {
+    let offset = ui
+        .selected()
+        .and_then(|session| ui.scrollback.get(&session.name))
+        .map_or(0, |state| state.offset);
+    (offset > 0).then(|| format!("[scrollback: {offset} rows — any key returns]"))
+}
+
 /// The one text-width rule the list renderer uses. Ambiguous-width
 /// characters (East Asian Width A, e.g. the status dot) count as narrow.
 fn char_width(c: char) -> usize {
@@ -2139,7 +2239,12 @@ pub fn render_styled(
         .and_then(|session| ui.scrollback.get(&session.name))
         .is_some_and(|state| state.offset > 0);
     let row_offset = preview_row_offset(cells, cursor, body, preserve_history);
-    let (lines, cut) = crop_styled_at_offset(&selected, preview_w, body, ui.pan, row_offset);
+    let (mut lines, cut) = crop_styled_at_offset(&selected, preview_w, body, ui.pan, row_offset);
+    if let Some(indicator) = scrollback_indicator(ui) {
+        if let Some(first) = lines.first_mut() {
+            *first = indicator;
+        }
+    }
     let caret = locate_cursor(
         cells,
         cursor,
@@ -2242,16 +2347,27 @@ fn list_viewport(ui: &Ui, body: u16) -> usize {
     if visible == 0 {
         return 0;
     }
-    ui.selected
-        .saturating_sub(visible - 1)
-        .min(ui.sessions.len().saturating_sub(visible))
+    let max_first = ui.sessions.len().saturating_sub(visible);
+    let follows_selection = ui.selected.saturating_sub(visible - 1).min(max_first);
+    let Some(first) = ui.list_first_visible.map(|first| first.min(max_first)) else {
+        return follows_selection;
+    };
+    // A focused session lets the wheel scroll the list past the selection.
+    if ui.focus == Focus::Session
+        || (ui.selected >= first && ui.selected < first.saturating_add(visible))
+    {
+        first
+    } else {
+        follows_selection
+    }
 }
 
-/// The current size requested for the selected session panel. `Size::new`
-/// still floors it at 80×24 so agent TUIs retain a usable compositor.
+/// The current size requested for the selected session panel. The pane opts
+/// out of the column floor so the child lays out to the visible width; the
+/// ordinary `Size::new` path keeps its 80-column safety floor.
 pub fn pane_size(ui: &Ui, cols: u16, rows: u16) -> Size {
     let (_, preview_w) = ui_layout(ui, cols);
-    Size::new(preview_w, rows.saturating_sub(1))
+    Size::for_pane(preview_w, rows.saturating_sub(1))
 }
 
 /// A row that degrades instead of being cut. When the preview claims most of
@@ -2458,7 +2574,7 @@ fn refresh(
     if !skip_list && ui.daemon_gone.is_none() {
         sync_shown_session(path, ui, shown, selection_moved);
     }
-    resize_shown_session(path, ui, shown, cols, rows);
+    resize_held_shown_session(path, ui, shown, held, cols, rows);
     let (cells, wrapped, cursor) = if ui.daemon_gone.is_some() {
         (Vec::new(), Vec::new(), hidden)
     } else {
@@ -2540,20 +2656,70 @@ fn resize_shown_session(
     path: &Path,
     ui: &mut Ui,
     shown: &Option<ShownTarget>,
+    held_name: Option<&str>,
     cols: u16,
     rows: u16,
 ) {
-    if let Some(ShownTarget::Session(name)) = shown.as_ref() {
-        let target = pane_size(ui, cols, rows);
+    resize_shown_session_with(ui, shown, held_name, cols, rows, |name, target| {
+        resize(path, name, target)
+    });
+}
+
+fn resize_held_shown_session(
+    path: &Path,
+    ui: &mut Ui,
+    shown: &Option<ShownTarget>,
+    held: &Option<(String, Hold)>,
+    cols: u16,
+    rows: u16,
+) {
+    resize_shown_session(
+        path,
+        ui,
+        shown,
+        held.as_ref().map(|(name, _)| name.as_str()),
+        cols,
+        rows,
+    );
+}
+
+fn resize_shown_session_with(
+    ui: &mut Ui,
+    shown: &Option<ShownTarget>,
+    held_name: Option<&str>,
+    cols: u16,
+    rows: u16,
+    mut send_resize: impl FnMut(&str, Size) -> Result<(), String>,
+) {
+    if let Some((name, target)) = shown_session_resize_target(ui, shown, held_name, cols, rows) {
         if ui.last_resized.as_ref() != Some(&(name.clone(), target)) {
-            match resize(path, name, target) {
-                Ok(()) => ui.last_resized = Some((name.clone(), target)),
+            match send_resize(&name, target) {
+                Ok(()) => ui.last_resized = Some((name, target)),
                 Err(e) => ui.notice = Some(format!("{name}: {e}")),
             }
         }
     } else {
         ui.last_resized = None;
     }
+}
+
+/// Only an actively held session is attached to this pane. A session shown
+/// while list-focused is a preview, so its PTY keeps its creation or last
+/// attached size even when the client itself is narrow.
+fn shown_session_resize_target(
+    ui: &Ui,
+    shown: &Option<ShownTarget>,
+    held_name: Option<&str>,
+    cols: u16,
+    rows: u16,
+) -> Option<(String, Size)> {
+    if ui.focus != Focus::Session {
+        return None;
+    }
+    let Some(ShownTarget::Session(name)) = shown.as_ref() else {
+        return None;
+    };
+    (held_name == Some(name.as_str())).then(|| (name.clone(), pane_size(ui, cols, rows)))
 }
 
 /// Enables SGR mouse reporting on construction, disables it on drop — for
@@ -2574,9 +2740,66 @@ impl Drop for MouseCapture {
     }
 }
 
+pub(crate) struct BracketedPasteCapture<W: Write> {
+    output: W,
+    enabled: bool,
+}
+
+impl<W: Write> BracketedPasteCapture<W> {
+    pub(crate) fn new(output: W) -> Self {
+        Self {
+            output,
+            enabled: false,
+        }
+    }
+
+    pub(crate) fn set(&mut self, enabled: bool) -> std::io::Result<()> {
+        if self.enabled == enabled {
+            return Ok(());
+        }
+        if enabled {
+            crossterm::execute!(&mut self.output, crossterm::event::EnableBracketedPaste)?;
+        } else {
+            crossterm::execute!(&mut self.output, crossterm::event::DisableBracketedPaste)?;
+        }
+        self.enabled = enabled;
+        Ok(())
+    }
+}
+
+impl<W: Write> Drop for BracketedPasteCapture<W> {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = crossterm::execute!(&mut self.output, crossterm::event::DisableBracketedPaste);
+        }
+    }
+}
+
+pub(crate) fn paste_input(text: &str, bracketed: bool) -> Vec<u8> {
+    let text: String = text
+        .chars()
+        .filter(|character| {
+            let codepoint = *character as u32;
+            matches!(codepoint, 0x09 | 0x0a | 0x0d)
+                || (0x20..=0x7e).contains(&codepoint)
+                || codepoint >= 0xa0
+        })
+        .collect();
+    let mut bytes = Vec::new();
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[200~");
+    }
+    bytes.extend_from_slice(text.as_bytes());
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[201~");
+    }
+    bytes
+}
+
 /// Draw the herd until the user quits. One screen for the whole run: focus
 /// moves between the panes, and the terminal is never handed over, so the
 /// alternate screen is entered exactly once. `notice` is what stderr cannot reach.
+#[allow(clippy::too_many_lines)]
 pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result<()> {
     let _terminal = RawMode::enable()?;
     // Scoped to the herd screen, not `RawMode` itself: `attach` uses `RawMode`
@@ -2597,6 +2820,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     // The exclusive hold on the focused session, and the name it was taken on.
     // Its `Drop` is the detach, so letting it fall out of scope is the release.
     let mut held: Option<(String, Hold)> = None;
+    let mut paste_capture = BracketedPasteCapture::new(std::io::stdout());
     // What the window last reported showing — refreshed only on a
     // non-skip_list wake, and reused as-is on a Type-forced one.
     let mut shown: Option<ShownTarget> = None;
@@ -2630,6 +2854,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 skip_list,
                 selection_moved,
             )?;
+            paste_capture.set(held.is_some())?;
             skip_list = false;
             selection_moved = false;
         }
@@ -2647,6 +2872,20 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 let action = ui.on_key(key);
                 selection_moved = ui.selected != before;
                 action
+            }
+            Event::Paste(text) => {
+                // Crossterm emits this only after finding the matching end
+                // marker; it buffers an unterminated host paste internally.
+                let Some((name, _)) = &held else { continue };
+                match client::request(path, &Request::MouseState { name: name.clone() }) {
+                    Ok(Response::MouseState(state)) => {
+                        Action::Type(paste_input(&text, state.bracketed_paste))
+                    }
+                    other => {
+                        ui.notice = Some(format!("{name}: cannot determine paste mode: {other:?}"));
+                        Action::Nothing
+                    }
+                }
             }
             Event::Mouse(m) => ui.on_mouse(m, cols, rows),
             Event::Resize(_, _) => {
@@ -2668,11 +2907,11 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 Err(error) => ui.notice = Some(error),
             },
             Action::Type(bytes) => {
-                if let Some((name, hold)) = &held {
-                    if let Err(e) = hold.keys(&bytes) {
-                        ui.notice = Some(format!("{name}: {e}"));
-                        ui.focus = Focus::List;
-                    }
+                let failure = held.as_ref().and_then(|(name, hold)| {
+                    hold.keys(&bytes).err().map(|error| (name.clone(), error))
+                });
+                if let Some((name, error)) = failure {
+                    input_write_failed(&mut ui, &name, &error, &mut held);
                 }
             }
             Action::Start(command) => {
@@ -2690,7 +2929,9 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
             }
             Action::Copy(name) => copy_screen(path, &mut ui, &name),
             Action::CopySelection(name) => copy_selection(path, &mut ui, &name),
-            Action::Paste => paste(path, &mut ui, &held),
+            Action::Paste => {
+                paste(path, &mut ui, &mut held);
+            }
         }
         // Not `painted.clear()`: the frame-vs-`painted` compare in `refresh`
         // already skips the write when a key changed nothing visible — see
@@ -2763,6 +3004,8 @@ fn restart_daemon(path: &Path, server: &str) -> Result<(), String> {
             });
         }
     }
+    #[cfg(windows)]
+    crate::daemon::own_console(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| format!("cannot restart daemon: {error}"))?;
@@ -2803,7 +3046,6 @@ fn scroll_state(state: &mut ScrollState, delta: i16) {
             state.recent_up_output = 0;
         }
         state.scroll_direction = -1;
-        state.last_scroll_down = Some(Instant::now());
         state.offset = state.offset.saturating_sub(delta.unsigned_abs() as usize);
     }
 }
@@ -2820,13 +3062,7 @@ fn anchor_offset_to_new_history(
     current_total: usize,
     current_rows: usize,
 ) -> usize {
-    if offset == 0 {
-        0
-    } else {
-        offset
-            .saturating_add(current_total.saturating_sub(previous_total))
-            .min(current_rows)
-    }
+    crate::mouse::anchor_offset_to_new_history(offset, previous_total, current_total, current_rows)
 }
 
 /// Capture at the offset computed from the history total in that capture.
@@ -2860,22 +3096,12 @@ fn capture_anchored<T>(
 /// Keep a scrolled preview on the same history rows as output pushes new rows.
 fn capture_preview(path: &Path, ui: &mut Ui, name: &str) -> Result<PreviewCapture, String> {
     let state = ui.scrollback.entry(name.to_string()).or_default();
-    let scrolling_down = state
-        .last_scroll_down
-        .is_some_and(|last| last.elapsed() < SCROLL_DOWN_SETTLE);
-    let (cells, wrapped, cursor, history_rows, history_total, anchored, anchor_total) =
-        if scrolling_down {
-            let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, state.offset)?;
-            (cells, wrapped, cursor, rows, total, state.offset, total)
-        } else {
-            let (capture, rows, total, anchored, anchor_total) =
-                capture_anchored(state.offset, state.anchor_total, |offset| {
-                    let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, offset)?;
-                    Ok(((cells, wrapped, cursor), rows, total))
-                })?;
-            let (cells, wrapped, cursor) = capture;
-            (cells, wrapped, cursor, rows, total, anchored, anchor_total)
-        };
+    let (capture, history_rows, history_total, anchored, anchor_total) =
+        capture_anchored(state.offset, state.anchor_total, |offset| {
+            let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, offset)?;
+            Ok(((cells, wrapped, cursor), rows, total))
+        })?;
+    let (cells, wrapped, cursor) = capture;
     state.offset = anchored;
     if state.scroll_direction == 1 {
         state.recent_up_output = state
@@ -2888,12 +3114,24 @@ fn capture_preview(path: &Path, ui: &mut Ui, name: &str) -> Result<PreviewCaptur
     Ok((cells, wrapped, cursor))
 }
 
-fn paste(path: &Path, ui: &mut Ui, held: &Option<(String, Hold)>) {
+fn input_write_failed<T>(ui: &mut Ui, name: &str, error: &std::io::Error, held: &mut Option<T>) {
+    let message = if error.kind() == std::io::ErrorKind::BrokenPipe {
+        format!("{name}: input pipe closed ({error})")
+    } else {
+        format!("{name}: input stuck; this key batch may not have been delivered (a large paste may be cut mid-way; check the session) ({error})")
+    };
+    ui.notice = Some(message);
+    ui.focus = Focus::List;
+    *held = None;
+}
+
+fn paste(path: &Path, ui: &mut Ui, held: &mut Option<(String, Hold)>) {
     if ui.yank.is_empty() {
         ui.notice = Some("kill ring is empty".into());
-    } else if let Some((name, hold)) = &held {
+    } else if let Some((name, hold)) = &*held {
         if let Err(e) = hold.keys(ui.yank.as_bytes()) {
-            ui.notice = Some(format!("{name}: {e}"));
+            let name = name.clone();
+            input_write_failed(ui, &name, &e, held);
         }
     } else if let Some(name) = ui.selected().map(|session| session.name.clone()) {
         match client::request(
@@ -3150,6 +3388,7 @@ fn capture_styled(path: &Path, name: &str, scrollback: usize) -> Result<StyledCa
             cursor,
             scrollback_len,
             scrollback_total,
+            ..
         }) => Ok((
             rows.iter().map(|row| expand_runs(row)).collect(),
             wrapped,
@@ -3288,6 +3527,8 @@ fn resize(path: &Path, name: &str, size: Size) -> Result<(), String> {
 fn kill(path: &Path, name: &str) -> Result<(), String> {
     let request = Request::Close {
         name: name.to_string(),
+        instance_id: None,
+        confirm: None,
     };
     match client::request(path, &request) {
         Ok(Response::Ok) => Ok(()),
@@ -3299,3 +3540,23 @@ fn kill(path: &Path, name: &str) -> Result<(), String> {
 #[cfg(test)]
 #[path = "../tests/tui_support/tui_unit.rs"]
 mod tui_unit;
+
+#[cfg(test)]
+mod key_bytes_tests {
+    use super::to_bytes;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
+        to_bytes(KeyEvent::new(code, modifiers)).expect("terminal key spelling")
+    }
+
+    #[test]
+    fn terminal_key_events_spell_the_expected_pty_bytes() {
+        assert_eq!(key(KeyCode::Esc, KeyModifiers::NONE), b"\x1b");
+        assert_eq!(key(KeyCode::Char('c'), KeyModifiers::CONTROL), b"\x03");
+        assert_eq!(key(KeyCode::Up, KeyModifiers::NONE), b"\x1b[A");
+        assert_eq!(key(KeyCode::Tab, KeyModifiers::NONE), b"\t");
+        assert_eq!(key(KeyCode::Enter, KeyModifiers::NONE), b"\r");
+        assert_eq!(key(KeyCode::Char('y'), KeyModifiers::NONE), b"y");
+    }
+}

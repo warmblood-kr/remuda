@@ -1,0 +1,3 @@
+remuda: cluster control: expected on or off
+usage: remuda cluster control on|off
+example: remuda cluster control off

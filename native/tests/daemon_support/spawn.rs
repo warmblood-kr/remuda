@@ -34,6 +34,7 @@ pub fn base_command(dir: &Path) -> std::process::Command {
     cmd.args(["-s", "s", "daemon"])
         .env("REMUDA_RUNTIME_DIR", dir)
         .env("HOME", &home)
+        .env("LOCALAPPDATA", &home)
         .env_remove("XDG_CONFIG_HOME")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -45,11 +46,18 @@ pub fn base_command(dir: &Path) -> std::process::Command {
 /// its socket under `dir` -- the connect-poll every helper below used to
 /// duplicate.
 pub fn spawn_and_wait(mut cmd: std::process::Command, dir: &Path) -> Daemon {
-    let child = cmd.spawn().expect("spawn daemon");
+    let mut child = cmd.spawn().expect("spawn daemon");
     let path = daemon::socket_path_in(dir, "s");
     let deadline = Instant::now() + PATIENCE;
     while remuda_native::ipc::connect(&path).is_err() {
-        assert!(Instant::now() < deadline, "daemon never bound {path:?}");
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("daemon exited before binding {path:?}: {status}");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("daemon never bound {path:?}");
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
     Daemon(child)

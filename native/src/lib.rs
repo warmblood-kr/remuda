@@ -6,27 +6,82 @@
 //! depend on this crate and cannot be made to.
 
 pub mod child_guard;
+pub mod cli_parse;
 pub mod client;
+pub mod cluster;
+pub mod cluster_remote;
+pub mod cluster_tui;
+pub(crate) mod credential;
 pub mod daemon;
 pub mod dist;
+pub mod find_command;
+pub(crate) mod fs_atomic;
+pub mod fs_lock;
+pub mod hostname;
 pub mod image;
 pub mod ipc;
+pub mod json;
 pub mod mcp;
 pub mod mouse;
+#[allow(clippy::disallowed_types)]
+pub mod net;
 pub mod packages;
+pub mod pending;
 pub mod process;
 mod process_ancestry;
 pub mod pty;
 pub mod remote_front;
+pub mod reply_limit;
 pub mod script;
+pub(crate) mod storage;
+pub mod text;
 pub mod tick;
 pub mod tui;
+pub(crate) mod windows_security;
+
+/// Path used to persist command history for the REPL binary.
+#[doc(hidden)]
+pub fn repl_history_path() -> Option<std::path::PathBuf> {
+    storage::user_file_path_for(
+        storage::Kind::State,
+        "repl-history",
+        cfg!(windows),
+        &|name| std::env::var_os(name),
+    )
+}
 
 pub use portable_pty::CommandBuilder;
 pub use pty::PtyAgent;
 
-use remuda_core::{Clock, Size};
+/// Shared guidance for input writes refused because the session is busy.
+pub const BUSY_RETRY_MESSAGE: &str = "session input is busy; nothing was written, retry\nNext: wait for the previous write to finish (see it with remuda capture NAME), then run the command again.";
+
+use remuda_core::{Clock, Size, WallClock};
 use std::time::{Duration, Instant};
+
+/// The host implementation of persistent Unix wall time.
+pub struct SystemWallClock;
+
+impl SystemWallClock {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SystemWallClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WallClock for SystemWallClock {
+    fn unix_seconds(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+}
 
 /// This terminal's size, or the floor if it cannot be determined (no tty, a
 /// pipe, a cron job). `Size::new` clamps anyway, so the worst case is a session
@@ -45,12 +100,18 @@ pub fn terminal_size() -> Size {
 /// host facility and the policy layer receives a clock rather than reading one.
 pub struct SystemClock {
     origin: Instant,
+    instance_id_seed: u128,
 }
 
 impl SystemClock {
     pub fn new() -> Self {
         Self {
             origin: Instant::now(),
+            instance_id_seed: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                ^ ((std::process::id() as u128) << 64),
         }
     }
 }
@@ -68,6 +129,10 @@ impl Clock for SystemClock {
 
     fn sleep(&self, duration: Duration) {
         std::thread::sleep(duration);
+    }
+
+    fn instance_id_seed(&self) -> u128 {
+        self.instance_id_seed
     }
 }
 

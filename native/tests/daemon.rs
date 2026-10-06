@@ -11,16 +11,24 @@
 //! remuda, and that is not circular — the pty under the test is this crate's,
 //! the terminal under test is the binary's.
 
+#[cfg(not(windows))]
+use remuda_core::protocol::{ListenerOp, ListenerStatus};
 use remuda_core::protocol::{Request, Response};
 use remuda_core::{Session, Size};
 use remuda_native::{client, daemon, ipc, CommandBuilder, PtyAgent, SystemClock};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PATIENCE: Duration = Duration::from_secs(10);
+const EMPTY_SCREEN_STARTUP_PATIENCE: Duration = Duration::from_secs(30);
+#[cfg(unix)]
+const STALL_FLOOD_CHUNK_BYTES: usize = 4 * 1024;
+#[cfg(unix)]
+const STALL_FLOOD_CAP_BYTES: usize = 32 * 1024 * 1024;
 
 #[path = "daemon_support/spawn.rs"]
 mod spawn;
@@ -68,6 +76,68 @@ fn scratch_dir(tag: &str) -> PathBuf {
     dir
 }
 
+#[cfg(unix)]
+fn wait_for_send_writer_busy(socket: &Path, send_finished: &Receiver<()>) {
+    let busy_deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        match client::request(
+            socket,
+            &Request::Send {
+                name: "target".into(),
+                bytes: Vec::new(),
+            },
+        )
+        .expect("probe whether the large Send owns the writer")
+        {
+            Response::Busy => return,
+            Response::Ok => {
+                assert!(
+                    send_finished.try_recv().is_err(),
+                    "large Send ended before the writer became busy"
+                );
+            }
+            other => panic!("unexpected empty Send probe response: {other:?}"),
+        }
+        assert!(
+            Instant::now() < busy_deadline,
+            "large Send never occupied the session writer"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn spawn_stalled_send(
+    socket: PathBuf,
+    bytes: Vec<u8>,
+    send_finished: std::sync::mpsc::Sender<()>,
+) -> std::thread::JoinHandle<std::io::Result<Response>> {
+    std::thread::spawn(move || {
+        let result = loop {
+            match client::request(
+                &socket,
+                &Request::Send {
+                    name: "target".into(),
+                    bytes: bytes.clone(),
+                },
+            ) {
+                Ok(Response::Busy) => std::thread::sleep(Duration::from_millis(10)),
+                result => break result,
+            }
+        };
+        let _ = send_finished.send(());
+        result
+    })
+}
+
+fn unique_scratch_dir(tag: &str) -> PathBuf {
+    static NEXT_RUNTIME: AtomicU64 = AtomicU64::new(1);
+    let run = NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("remuda-u{}-{run}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create unique test runtime directory");
+    dir
+}
+
 /// The address, derived the way the shipped binary derives it. Hand-building
 /// one that merely resembles it is what made the attach test fail first time.
 fn scratch(tag: &str) -> PathBuf {
@@ -91,6 +161,477 @@ fn daemon_at(path: &Path) -> impl Drop {
     Cleanup(path.to_path_buf())
 }
 
+#[test]
+#[allow(clippy::disallowed_types)]
+fn daemon_keeps_answering_ls_when_cluster_listener_bind_fails() {
+    use remuda_native::cluster::listener_config::{ListenerBind, ListenerConfig};
+    use std::process::Command;
+
+    let runtime =
+        std::fs::canonicalize(unique_scratch_dir("lf")).expect("canonicalize private test runtime");
+    let _cleanup = RemoveDirectoryOnDrop(runtime.clone());
+    let home = runtime.join("home");
+    let state = runtime.join("state");
+    std::fs::create_dir_all(&home).expect("create isolated HOME");
+    std::fs::create_dir_all(&state).expect("create isolated state home");
+
+    let environment = IsolatedClusterStateEnvironment::set(&home, &state);
+    remuda_native::cluster::init().expect("initialize isolated cluster state");
+    drop(environment);
+    let blocker = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("reserve a loopback address for the failed bind test");
+    let cluster_dir = state.join("remuda/cluster");
+    remuda_native::cluster::listener_config::write_at(
+        &cluster_dir,
+        &ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit(blocker.local_addr().unwrap()),
+            allow_public: false,
+        },
+    )
+    .expect("write explicit ephemeral loopback listener config");
+
+    let mut command = spawn::base_command(&runtime);
+    command
+        .env("XDG_STATE_HOME", &state)
+        .env("LOCALAPPDATA", &state)
+        .env("USERPROFILE", &home)
+        .stderr(std::process::Stdio::inherit());
+    let _daemon = spawn::spawn_and_wait(command, &runtime);
+    let listed = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "s", "ls"])
+        .env("REMUDA_RUNTIME_DIR", &runtime)
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state)
+        .env("LOCALAPPDATA", &state)
+        .env("USERPROFILE", &home)
+        .output()
+        .expect("run ls against the live daemon");
+    assert!(
+        listed.status.success(),
+        "daemon stopped answering ls after its listener bind failed: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+#[allow(clippy::disallowed_types)]
+fn daemon_keeps_answering_ls_with_an_explicit_ephemeral_cluster_listener() {
+    use std::process::Command;
+
+    let daemon = cluster_listener_test_daemon(
+        "explicit-ephemeral-listener",
+        Some(explicit_listener_config("127.0.0.1:0".parse().unwrap())),
+    );
+    let response = client::request(
+        &daemon.socket,
+        &Request::ClusterListener(ListenerOp::Status),
+    )
+    .expect("read listener status from the isolated daemon");
+    assert!(matches!(
+        response,
+        Response::ClusterListenerStatus(ListenerStatus::On { addr, .. })
+            if addr.ip().is_loopback() && addr.port() != 0
+    ));
+    let listed = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "s", "ls"])
+        .env("REMUDA_RUNTIME_DIR", &daemon.runtime)
+        .env("HOME", &daemon.home)
+        .env("XDG_STATE_HOME", &daemon.state)
+        .env("LOCALAPPDATA", &daemon.state)
+        .env("USERPROFILE", &daemon.home)
+        .output()
+        .expect("run ls against the live daemon");
+    assert!(
+        listed.status.success(),
+        "daemon stopped answering ls with its listener enabled: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+}
+
+struct RemoveDirectoryOnDrop(PathBuf);
+
+impl Drop for RemoveDirectoryOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct ClusterListenerTestDaemon {
+    _daemon: Daemon,
+    _cleanup: RemoveDirectoryOnDrop,
+    runtime: PathBuf,
+    socket: PathBuf,
+    home: PathBuf,
+    state: PathBuf,
+}
+
+static CLUSTER_LISTENER_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct IsolatedClusterStateEnvironment {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    old_home: Option<std::ffi::OsString>,
+    old_state: Option<std::ffi::OsString>,
+    old_local_app_data: Option<std::ffi::OsString>,
+    old_user_profile: Option<std::ffi::OsString>,
+}
+
+impl IsolatedClusterStateEnvironment {
+    fn set(home: &Path, state: &Path) -> Self {
+        let lock = CLUSTER_LISTENER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let environment = Self {
+            _lock: lock,
+            old_home: std::env::var_os("HOME"),
+            old_state: std::env::var_os("XDG_STATE_HOME"),
+            old_local_app_data: std::env::var_os("LOCALAPPDATA"),
+            old_user_profile: std::env::var_os("USERPROFILE"),
+        };
+        std::env::set_var("HOME", home);
+        std::env::set_var("XDG_STATE_HOME", state);
+        std::env::set_var("LOCALAPPDATA", state);
+        std::env::set_var("USERPROFILE", home);
+        environment
+    }
+}
+
+impl Drop for IsolatedClusterStateEnvironment {
+    fn drop(&mut self) {
+        match self.old_home.take() {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match self.old_state.take() {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        match self.old_local_app_data.take() {
+            Some(value) => std::env::set_var("LOCALAPPDATA", value),
+            None => std::env::remove_var("LOCALAPPDATA"),
+        }
+        match self.old_user_profile.take() {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn cluster_listener_test_daemon(
+    tag: &str,
+    config: Option<remuda_native::cluster::listener_config::ListenerConfig>,
+) -> ClusterListenerTestDaemon {
+    static NEXT_LISTENER_TEST: AtomicU64 = AtomicU64::new(1);
+    let temp_root = if cfg!(target_os = "macos") {
+        PathBuf::from("/private/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let root = temp_root.join(format!(
+        "l3-{}-{}-{tag}",
+        std::process::id(),
+        NEXT_LISTENER_TEST.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&root).expect("create private listener test directory");
+    let root = std::fs::canonicalize(root).expect("canonicalize listener test directory");
+    let cleanup = RemoveDirectoryOnDrop(root.clone());
+    let runtime = root.join("runtime");
+    let home = root.join("home");
+    let state = root.join("state");
+    std::fs::create_dir(&runtime).expect("create private listener runtime");
+    std::fs::create_dir(&home).expect("create isolated listener HOME");
+    std::fs::create_dir(&state).expect("create isolated listener state home");
+
+    let environment = IsolatedClusterStateEnvironment::set(&home, &state);
+    remuda_native::cluster::init().expect("initialize isolated cluster state");
+    drop(environment);
+    if let Some(config) = config {
+        remuda_native::cluster::listener_config::write_at(&state.join("remuda/cluster"), &config)
+            .expect("write isolated listener configuration");
+    }
+
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut command = spawn::base_command(&runtime);
+    command
+        .env("XDG_STATE_HOME", &state)
+        .env("LOCALAPPDATA", &state)
+        .env("USERPROFILE", &home);
+    let child = spawn::spawn_and_wait(command, &runtime);
+    ClusterListenerTestDaemon {
+        _daemon: child,
+        _cleanup: cleanup,
+        runtime,
+        socket,
+        home,
+        state,
+    }
+}
+
+#[cfg(not(windows))]
+fn explicit_listener_config(
+    bind: std::net::SocketAddr,
+) -> remuda_native::cluster::listener_config::ListenerConfig {
+    use remuda_native::cluster::listener_config::{ListenerBind, ListenerConfig};
+    ListenerConfig {
+        enabled: true,
+        bind: ListenerBind::Explicit(bind),
+        allow_public: false,
+    }
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::disallowed_types)]
+fn wait_for_tcp_listener(address: std::net::SocketAddr) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_secs(10)).is_ok() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "TCP listener never opened {address}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::disallowed_types)]
+fn assert_tcp_listener_closed(address: std::net::SocketAddr) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_secs(10)).is_err() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "TCP listener remained open at {address}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+#[allow(clippy::disallowed_types)]
+fn cluster_listener_control_starts_stops_and_switches_ports() {
+    use std::process::Command;
+
+    let output = Command::new(std::env::current_exe().expect("test executable path"))
+        .args([
+            "--exact",
+            "cluster_listener_control_starts_stops_and_switches_ports_child",
+            "--nocapture",
+        ])
+        .env("REMUDA_TEST_LISTENER_CONTROL_CHILD", "1")
+        .output()
+        .expect("run listener control test in an isolated caller process");
+    assert!(
+        output.status.success(),
+        "listener control child failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn cluster_listener_control_starts_stops_and_switches_ports_child() {
+    if std::env::var_os("REMUDA_TEST_LISTENER_CONTROL_CHILD").as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+    {
+        return;
+    }
+    cluster_listener_control_round_trip();
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::disallowed_types)]
+fn cluster_listener_control_round_trip() {
+    use remuda_native::cluster::listener_control;
+
+    let daemon = cluster_listener_test_daemon("listener-start-stop", None);
+    let _environment = IsolatedClusterStateEnvironment::set(&daemon.home, &daemon.state);
+    let first = listener_control::start(
+        &daemon.socket,
+        Some(explicit_listener_config("127.0.0.1:0".parse().unwrap())),
+    )
+    .expect("start and reload the named daemon's listener");
+    let ListenerStatus::On {
+        addr: first_addr, ..
+    } = first
+    else {
+        panic!("expected listener On, got {first:?}");
+    };
+    assert_eq!(listener_control::status(&daemon.socket), first);
+    wait_for_tcp_listener(first_addr);
+
+    let second_socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let second_addr = second_socket.local_addr().unwrap();
+    assert_ne!(second_addr, first_addr);
+    let stopped = listener_control::stop(&daemon.socket).expect("stop the listener");
+    assert_eq!(stopped, ListenerStatus::Off);
+    drop(second_socket);
+    assert_tcp_listener_closed(first_addr);
+
+    let restarted =
+        listener_control::start(&daemon.socket, Some(explicit_listener_config(second_addr)))
+            .expect("restart the listener at its new explicit address");
+    assert_eq!(
+        restarted,
+        ListenerStatus::On {
+            addr: second_addr,
+            auto: false,
+            advertise_addr: Some(second_addr),
+            listen_addrs: vec![second_addr],
+        }
+    );
+    wait_for_tcp_listener(second_addr);
+}
+
+#[cfg(not(windows))]
+#[test]
+#[allow(clippy::disallowed_types)]
+fn cluster_listener_reload_without_config_turns_off() {
+    let address = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let daemon = cluster_listener_test_daemon(
+        "listener-reload-empty",
+        Some(explicit_listener_config(address)),
+    );
+    wait_for_tcp_listener(address);
+    std::fs::remove_file(daemon.state.join("remuda/cluster/listener.json"))
+        .expect("remove listener config before Reload");
+
+    let response = client::request(
+        &daemon.socket,
+        &Request::ClusterListener(ListenerOp::Reload),
+    )
+    .expect("ask the isolated named daemon to reload listener config");
+    assert_eq!(
+        response,
+        Response::ClusterListenerStatus(ListenerStatus::Off)
+    );
+    assert_tcp_listener_closed(address);
+}
+
+#[cfg(unix)]
+#[test]
+fn autostart_reports_the_pid_and_recovery_for_a_held_socket_lock() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = scratch_dir("lock-holder");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create isolated runtime dir");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let mut lock_name = socket.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    std::fs::create_dir_all(lock_path.parent().unwrap()).expect("create socket directory");
+    let mut lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .expect("create socket lock");
+    let holder_pid = std::process::id();
+    writeln!(lock_file, "{holder_pid}").expect("write holder pid");
+    assert_eq!(
+        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "hold private socket lock"
+    );
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "s", "-e", "return 1"])
+        .env("REMUDA_RUNTIME_DIR", &dir)
+        .env("HOME", dir.join("home"))
+        .env_remove("XDG_CONFIG_HOME")
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run a client that autostarts the daemon");
+    let stderr = child.stderr.take().expect("captured client stderr");
+    let (first_send, first_receive) = std::sync::mpsc::channel();
+    let (rest_send, rest_receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut line = String::new();
+        let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+        let _ = first_send.send(line);
+        let mut rest = String::new();
+        let _ = std::io::Read::read_to_string(&mut reader, &mut rest);
+        let _ = rest_send.send(rest);
+    });
+    let early_notice = first_receive.recv_timeout(Duration::from_millis(2500));
+    let status = child.wait().expect("wait for failed autostart");
+    let notice_was_early = early_notice.is_ok();
+    let mut stderr = early_notice.unwrap_or_default();
+    stderr.push_str(&rest_receive.recv().unwrap_or_default());
+    let success = status.success();
+    let names_holder = stderr.contains(&format!("pid {holder_pid}"));
+    let explains_recovery = stderr.contains("kill -CONT")
+        && stderr.contains(&format!("kill {holder_pid}"))
+        && stderr.contains("retry");
+    let announced_wait =
+        stderr.contains("waiting for the socket lock held by another remuda daemon");
+
+    assert_eq!(
+        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) },
+        0
+    );
+    drop(lock_file);
+    std::fs::remove_dir_all(&dir).expect("remove private runtime dir");
+    assert!(!success, "autostart must fail while lock is held: {stderr}");
+    assert!(names_holder, "{stderr}");
+    assert!(explains_recovery, "{stderr}");
+    assert!(announced_wait, "{stderr}");
+    assert!(
+        notice_was_early,
+        "the one-second socket-lock notice should reach the client before the three-second lock timeout"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn request_to_stopped_daemon_times_out_with_recovery_instructions() {
+    let dir = scratch_dir("stopped-request");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create isolated runtime dir");
+    let daemon = Daemon::spawn(&dir);
+    let pid = daemon.0.id();
+    let socket = daemon::socket_path_in(&dir, "s");
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
+
+    let (send, receive) = std::sync::mpsc::channel();
+    let request_socket = socket.clone();
+    std::thread::spawn(move || {
+        let result = client::request(&request_socket, &Request::List);
+        let _ = send.send(result);
+    });
+    let result = receive.recv_timeout(Duration::from_secs(12));
+
+    let _ = unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+    let result = result.expect("request to stopped daemon must have a bounded timeout");
+    let message = result
+        .expect_err("stopped daemon did not answer")
+        .to_string();
+    assert!(message.contains(&socket.display().to_string()), "{message}");
+    assert!(message.contains(&format!("pid {pid}")), "{message}");
+    assert!(message.contains("kill -CONT"), "{message}");
+    assert!(message.contains(&format!("kill {pid}")), "{message}");
+    assert!(message.contains("verify"), "{message}");
+    drop(daemon);
+    std::fs::remove_dir_all(&dir).expect("remove private runtime dir");
+}
+
 #[cfg(unix)]
 #[test]
 fn daemon_lock_file_is_private() {
@@ -102,6 +643,12 @@ fn daemon_lock_file_is_private() {
     let lock = socket.with_extension("sock.lock");
     let metadata = std::fs::metadata(&lock).expect("daemon lock file exists");
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::read_to_string(&lock)
+            .expect("daemon lock holder is recorded")
+            .trim(),
+        daemon.0.id().to_string()
+    );
     assert_eq!(
         client::request(
             &socket,
@@ -122,6 +669,179 @@ fn daemon_lock_file_is_private() {
     assert!(!socket.exists(), "owned socket removed after shutdown");
     let metadata = std::fs::metadata(&lock).expect("lock inode remains for waiters");
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_socket_and_directory_are_private_on_first_start() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("private-socket-fresh");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create isolated runtime directory");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let daemon = Daemon::spawn(&dir);
+    let directory_mode = std::fs::metadata(socket.parent().unwrap())
+        .expect("socket directory exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    let socket_mode = std::fs::metadata(&socket)
+        .expect("daemon socket exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    drop(daemon);
+    std::fs::remove_dir_all(&dir).expect("remove isolated runtime directory");
+
+    assert_eq!(directory_mode, 0o700, "socket directory must be private");
+    assert_eq!(socket_mode, 0o600, "daemon socket must be private");
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_tightens_a_preexisting_socket_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("private-socket-existing");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create isolated runtime directory");
+    let socket = daemon::socket_path_in(&dir, "s");
+    std::fs::create_dir_all(socket.parent().unwrap()).expect("create socket directory");
+    std::fs::set_permissions(
+        socket.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("make a permissive preexisting socket directory");
+
+    let daemon = Daemon::spawn(&dir);
+    let directory_mode = std::fs::metadata(socket.parent().unwrap())
+        .expect("socket directory exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    let socket_mode = std::fs::metadata(&socket)
+        .expect("daemon socket exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    drop(daemon);
+    std::fs::remove_dir_all(&dir).expect("remove isolated runtime directory");
+
+    assert_eq!(
+        directory_mode, 0o700,
+        "existing directory must be tightened"
+    );
+    assert_eq!(socket_mode, 0o600, "daemon socket must be private");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_custom_absolute_socket_path_does_not_change_its_parent_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let runtime = scratch_dir("custom-absolute-socket");
+    let custom = runtime.join("chosen");
+    std::fs::create_dir(&custom).expect("create user-selected socket directory");
+    std::fs::set_permissions(&custom, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let custom_server = custom.join("X").to_string_lossy().into_owned();
+    let output = remuda_timed(&runtime, &["-s", &custom_server, "-e", "return true"]);
+
+    assert!(
+        output.status.success(),
+        "custom socket path failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::metadata(&custom).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    let _ = remuda_timed(&runtime, &["-s", &custom_server, "stop"]);
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_nested_socket_name_keeps_the_runtime_directory_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let runtime = scratch_dir("nested-socket-name");
+    let output = remuda_timed(&runtime, &["-s", "sub/X", "-e", "return true"]);
+
+    assert!(
+        output.status.success(),
+        "nested socket path failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::metadata(runtime.join("remuda"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let _ = remuda_timed(&runtime, &["-s", "sub/X", "stop"]);
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_runtime_directory_is_rejected_before_a_startup_log_is_created() {
+    let runtime = scratch_dir("symlink-runtime");
+    let target = runtime.join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, runtime.join("remuda")).unwrap();
+
+    let output = remuda_timed(&runtime, &["-s", "s", "-e", "return true"]);
+
+    assert!(!output.status.success());
+    assert!(
+        !target.join("s.log").exists(),
+        "must not create log through symlink"
+    );
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_runtime_base_is_rejected_with_trailing_separators_and_dot() {
+    let root = scratch_dir("symlink-runtime-base");
+    let target = root.join("target");
+    let link = root.join("link");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    for runtime in [link.clone(), root.join("link/"), root.join("link/.")] {
+        let socket = runtime.join("remuda").join("s.sock");
+        let result = daemon::prepare_socket_path(&socket, Some(&runtime));
+        assert!(result.is_err(), "accepted symlink runtime {runtime:?}");
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_custom_socket_parents_are_rejected_after_path_normalization() {
+    let root = scratch_dir("symlink-custom-parent");
+    let target = root.join("target");
+    let link = root.join("link");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    for parent in [
+        link.clone(),
+        PathBuf::from(format!("{}/", link.display())),
+        PathBuf::from(format!("{}/.", link.display())),
+    ] {
+        let socket = parent.join("s.sock");
+        let result = daemon::prepare_socket_path(&socket, Some(&root.join("runtime")));
+        assert!(result.is_err(), "accepted symlink socket parent {parent:?}");
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[cfg(unix)]
@@ -147,6 +867,312 @@ fn daemon_signal_cleanup_preserves_a_replacement_socket_path() {
         std::fs::read(&socket).expect("replacement remains after cleanup"),
         b"replacement owned by another process"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigusr1_rebinds_a_deleted_socket() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("daemon-sigusr1-rebind");
+    let mut daemon = Daemon::spawn(&dir);
+    let socket = daemon::socket_path_in(&dir, "s");
+    let result = (|| {
+        for cycle in 1..=20 {
+            signal_rebind_and_wait(&daemon, &socket)
+                .map_err(|error| format!("rebind cycle {cycle}/20: {error}"))?;
+            let socket_mode = std::fs::metadata(&socket)
+                .map_err(|error| error.to_string())?
+                .permissions()
+                .mode()
+                & 0o777;
+            let directory_mode = std::fs::metadata(socket.parent().unwrap())
+                .map_err(|error| error.to_string())?
+                .permissions()
+                .mode()
+                & 0o777;
+            if socket_mode != 0o600 || directory_mode != 0o700 {
+                return Err(format!(
+                    "rebind cycle {cycle}/20 modes were socket {socket_mode:04o}, directory {directory_mode:04o}"
+                ));
+            }
+        }
+        Ok::<(), String>(())
+    })();
+
+    let socket_removed = stop_and_clean(&mut daemon, &dir, &socket);
+    assert!(result.is_ok(), "{}", result.unwrap_err());
+    assert!(socket_removed, "shutdown removes the rebound socket");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigusr1_rebind_refreshes_cleanup_identity() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let dir = scratch_dir("daemon-sigusr1-owner");
+    let mut daemon = Daemon::spawn(&dir);
+    let socket = daemon::socket_path_in(&dir, "s");
+    let original = std::fs::symlink_metadata(&socket).expect("original socket");
+    let result = signal_rebind_and_wait(&daemon, &socket).and_then(|()| {
+        let rebound = std::fs::symlink_metadata(&socket).map_err(|error| error.to_string())?;
+        if !rebound.file_type().is_socket() {
+            return Err("rebound path is not a socket".into());
+        }
+        if (original.dev(), original.ino()) == (rebound.dev(), rebound.ino()) {
+            return Err("rebind kept the old socket inode".into());
+        }
+        std::fs::remove_file(&socket).map_err(|error| error.to_string())?;
+        std::fs::write(&socket, b"replacement after rebind").map_err(|error| error.to_string())?;
+        Ok(())
+    });
+
+    let _ = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    let stopped = daemon.left_on_its_own();
+    let preserved = std::fs::read(&socket).ok().as_deref() == Some(b"replacement after rebind");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(result.is_ok(), "{}", result.unwrap_err());
+    assert!(stopped, "daemon handles SIGTERM after rebinding");
+    assert!(preserved, "cleanup preserves a replacement path inode");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigusr1_on_the_owned_socket_is_silent() {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd;
+
+    let dir = scratch_dir("daemon-sigusr1-owned");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let mut command = spawn::base_command(&dir);
+    command.stderr(std::process::Stdio::piped());
+    let mut daemon = spawn::spawn_and_wait(command, &dir);
+
+    let signalled = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGUSR1) };
+    assert_eq!(signalled, 0, "send SIGUSR1");
+    assert!(matches!(
+        client::request(&socket, &Request::Version),
+        Ok(Response::Value(_))
+    ));
+
+    // If SIGUSR1 takes the erroneous ipc::listen path, it writes its failure
+    // promptly. Wait on the captured pipe for that output without relying on
+    // whether a subsequent request happened to race the signal thread.
+    let mut stderr = daemon.0.stderr.take().expect("captured daemon stderr");
+    let mut pending = libc::pollfd {
+        fd: stderr.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let readable = unsafe { libc::poll(&mut pending, 1, 200) };
+
+    let stopped = stop_and_clean(&mut daemon, &dir, &socket);
+    let mut output = String::new();
+    stderr
+        .read_to_string(&mut output)
+        .expect("read daemon stderr");
+    assert_eq!(
+        readable, 0,
+        "SIGUSR1 wrote stderr before shutdown: {output}"
+    );
+    assert!(stopped, "daemon stops and removes its socket");
+    assert!(
+        !output.contains("could not rebind socket"),
+        "a signal on the daemon's own live socket is a no-op: {output}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigusr1_with_a_queued_old_listener_client_does_not_strand_shutdown() {
+    use interprocess::local_socket::traits::Stream as _;
+
+    let dir = scratch_dir("daemon-sigusr1-queued");
+    let mut daemon = Daemon::spawn(&dir);
+    let socket = daemon::socket_path_in(&dir, "s");
+    let pid = daemon.0.id() as libc::pid_t;
+
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0, "stop daemon");
+    let mut stopped_status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut stopped_status, libc::WUNTRACED) },
+        pid,
+        "wait until daemon is stopped"
+    );
+    assert!(libc::WIFSTOPPED(stopped_status), "daemon reached SIGSTOP");
+
+    let mut queued = ipc::connect(&socket).expect("queue a client on the old listener");
+    let mut request = serde_json::to_vec(&Request::Version).expect("serialize version request");
+    request.push(b'\n');
+    queued.write_all(&request).expect("write queued request");
+    queued
+        .set_nonblocking(true)
+        .expect("make queued client nonblocking");
+    std::fs::remove_file(&socket).expect("remove old listener path");
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGUSR1) },
+        0,
+        "send rebind signal"
+    );
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGCONT) },
+        0,
+        "resume daemon"
+    );
+
+    let rebind_deadline = Instant::now() + Duration::from_secs(2);
+    while std::fs::symlink_metadata(&socket).is_err() {
+        assert!(Instant::now() < rebind_deadline, "socket was not rebound");
+        std::thread::yield_now();
+    }
+
+    let signalled_at = Instant::now();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0, "send SIGTERM");
+    let exit_deadline = signalled_at + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = daemon.0.try_wait().expect("poll daemon exit") {
+            break status;
+        }
+        assert!(
+            Instant::now() < exit_deadline,
+            "SIGTERM was stranded behind stale listener readiness"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    let mut response = Vec::new();
+    let read_deadline = Instant::now() + Duration::from_secs(2);
+    let client_closed_cleanly = loop {
+        let mut bytes = [0u8; 256];
+        match queued.read(&mut bytes) {
+            Ok(0) => break true,
+            Ok(count) => {
+                response.extend_from_slice(&bytes[..count]);
+                if response.contains(&b'\n') {
+                    break serde_json::from_slice::<Response>(
+                        response
+                            .split(|byte| *byte == b'\n')
+                            .next()
+                            .unwrap_or_default(),
+                    )
+                    .is_ok();
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= read_deadline {
+                    break false;
+                }
+                std::thread::yield_now();
+            }
+            Err(_) => break true,
+        }
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(status.success(), "SIGTERM exits successfully: {status}");
+    assert!(
+        signalled_at.elapsed() < Duration::from_secs(2),
+        "SIGTERM exits within two seconds"
+    );
+    assert!(
+        client_closed_cleanly,
+        "queued old-listener client gets a response or a clean connection close"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigusr1_refuses_to_displace_a_live_replacement_socket() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::net::UnixListener;
+
+    let dir = scratch_dir("sigusr1-live");
+    let mut daemon = Daemon::spawn(&dir);
+    let socket = daemon::socket_path_in(&dir, "s");
+    std::fs::remove_file(&socket).expect("remove original socket");
+    let replacement = UnixListener::bind(&socket).expect("bind live replacement");
+    replacement
+        .set_nonblocking(true)
+        .expect("make replacement accept nonblocking");
+    let replacement_id = std::fs::symlink_metadata(&socket).expect("replacement metadata");
+    let result = (|| -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // The second accepted probe proves the first refused bind completed
+        // before the test asks the daemon to stop.
+        for _ in 0..2 {
+            let signalled = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGUSR1) };
+            if signalled != 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            loop {
+                match replacement.accept() {
+                    Ok((_stream, _address)) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Err("daemon did not probe the live replacement".into());
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+
+        let after = std::fs::symlink_metadata(&socket).map_err(|error| error.to_string())?;
+        if (after.dev(), after.ino()) != (replacement_id.dev(), replacement_id.ino()) {
+            return Err("live replacement socket inode changed".into());
+        }
+        if daemon
+            .0
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err("daemon exited while handling SIGUSR1".into());
+        }
+        Ok(())
+    })();
+
+    let _ = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    let stopped = daemon.left_on_its_own();
+    let after_shutdown = std::fs::symlink_metadata(&socket).expect("replacement remains");
+    let remains = (after_shutdown.dev(), after_shutdown.ino())
+        == (replacement_id.dev(), replacement_id.ino());
+    drop(replacement);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(result.is_ok(), "{}", result.unwrap_err());
+    assert!(stopped, "daemon handles SIGTERM after failed rebind");
+    assert!(remains, "shutdown preserves the live replacement socket");
+}
+
+#[cfg(unix)]
+fn signal_rebind_and_wait(daemon: &Daemon, socket: &Path) -> Result<(), String> {
+    std::fs::remove_file(socket).map_err(|error| error.to_string())?;
+    let signalled = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGUSR1) };
+    if signalled != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while ipc::connect(socket).is_err() {
+        if Instant::now() >= deadline {
+            return Err(format!("daemon did not rebind {socket:?} after SIGUSR1"));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    match client::request(socket, &Request::List) {
+        Ok(Response::Sessions(_)) => Ok(()),
+        Ok(response) => Err(format!("unexpected response: {response:?}")),
+        Err(error) => Err(format!("rebound socket did not serve requests: {error}")),
+    }
+}
+
+#[cfg(unix)]
+fn stop_and_clean(daemon: &mut Daemon, dir: &Path, socket: &Path) -> bool {
+    let _ = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    let stopped = daemon.left_on_its_own();
+    let socket_removed = !socket.exists();
+    let _ = std::fs::remove_dir_all(dir);
+    stopped && socket_removed
 }
 
 #[cfg(unix)]
@@ -229,6 +1255,1738 @@ fn new_session(path: &Path, name: &str) {
         Response::Value(name.to_string()),
         "New answers with the name it gave the session"
     );
+}
+
+#[cfg(unix)]
+fn new_byte_capture_session(
+    path: &Path,
+    name: &str,
+    capture_path: &Path,
+    byte_count: usize,
+    wait_for_marker: Option<&Path>,
+    slow_reader: bool,
+    ready_marker: Option<&Path>,
+) {
+    let reader = if wait_for_marker.is_some() {
+        "while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; ".to_string()
+            + if slow_reader {
+                "perl -e 'my $n=$ENV{BYTE_COUNT}; open(my $f, \">\", $ENV{CAPTURE_PATH}) or die; binmode $f; while($n>0){my $r=read(STDIN,my $b,1024); last unless $r; print $f $b; $n-=$r; select(undef,undef,undef,0.002)}'"
+            } else {
+                "perl -e 'my $n=$ENV{BYTE_COUNT}; open(my $f, \">\", $ENV{CAPTURE_PATH}) or die; binmode $f; while($n>0){my $r=read(STDIN,my $b,$n); last unless $r; print $f $b; $n-=$r}'"
+            }
+    } else if slow_reader {
+        "perl -e 'my $n=$ENV{BYTE_COUNT}; open(my $f, \">\", $ENV{CAPTURE_PATH}) or die; binmode $f; while($n>0){my $r=read(STDIN,my $b,1024); last unless $r; print $f $b; $n-=$r; select(undef,undef,undef,0.002)}'"
+            .to_string()
+    } else {
+        "perl -e 'my $n=$ENV{BYTE_COUNT}; open(my $f, \">\", $ENV{CAPTURE_PATH}) or die; binmode $f; while($n>0){my $r=read(STDIN,my $b,$n); last unless $r; print $f $b; $n-=$r}'"
+            .to_string()
+    };
+    let ready_wait = if ready_marker.is_some() {
+        "while [ ! -e \"$READY_MARKER\" ]; do sleep 0.02; done; "
+    } else {
+        ""
+    };
+    let script = format!("stty raw -echo; {ready_wait}printf READY; {reader}");
+    let mut env = std::collections::HashMap::from([
+        ("CAPTURE_PATH".into(), capture_path.display().to_string()),
+        ("BYTE_COUNT".into(), byte_count.to_string()),
+    ]);
+    if let Some(marker) = wait_for_marker {
+        env.insert("READER_MARKER".into(), marker.display().to_string());
+    }
+    if let Some(marker) = ready_marker {
+        env.insert("READY_MARKER".into(), marker.display().to_string());
+    }
+    let response = client::request(
+        path,
+        &Request::New {
+            name: Some(name.into()),
+            command: vec!["sh".into(), "-c".into(), script],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start byte-capture child");
+    assert_eq!(response, Response::Value(name.into()));
+}
+
+#[cfg(unix)]
+fn wait_until_attached(path: &Path, name: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if let Ok(Response::Sessions(sessions)) = client::request(path, &Request::List) {
+            if sessions
+                .iter()
+                .any(|session| session.name == name && session.attached)
+            {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "attach client never acquired {name}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_cli_exit(viewer: &Session, name: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    while viewer.is_alive() {
+        assert!(
+            Instant::now() < deadline,
+            "attach client {name} did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn attach_detach_during_stalled_input_reports_loss_and_exits() {
+    let runtime = scratch_dir("attach-detach-stall");
+    let path = daemon::socket_path_in(&runtime, "s");
+    let _daemon = Daemon::spawn(&runtime);
+    let capture_path = runtime.join("captured");
+    let dropped_count_path = runtime.join("dropped-count");
+    let marker = runtime.join("start-reading");
+    let name = "target";
+    let script = "stty raw -echo min 1 time 0 </dev/tty; printf READY; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; cat > \"$CAPTURE_PATH\"";
+    let env = std::collections::HashMap::from([
+        ("CAPTURE_PATH".into(), capture_path.display().to_string()),
+        ("READER_MARKER".into(), marker.display().to_string()),
+    ]);
+    assert!(matches!(
+        client::request(
+            &path,
+            &Request::New {
+                name: Some(name.into()),
+                command: vec!["sh".into(), "-c".into(), script.into()],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: Some(env),
+            },
+        )
+        .expect("start child blocked until reading is released"),
+        Response::Value(_)
+    ));
+
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    command.args(["-s", "s", "attach", name]);
+    command.env("REMUDA_RUNTIME_DIR", &runtime);
+    command.env("REMUDA_TEST_INPUT_HOOKS", "1");
+    command.env("REMUDA_TEST_ATTACH_DROPPED_COUNT", &dropped_count_path);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture attach terminal");
+    wait_until_attached(&path, name);
+    wait_for_session_screen(&viewer, "READY");
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut output_bytes = Vec::new();
+    std::thread::scope(|scope| {
+        let sender = scope.spawn(|| {
+            let chunk = [b'x'; STALL_FLOOD_CHUNK_BYTES];
+            while !stop.load(Ordering::SeqCst) {
+                let current = sent.load(Ordering::SeqCst);
+                if current >= STALL_FLOOD_CAP_BYTES {
+                    break;
+                }
+                let count = (STALL_FLOOD_CAP_BYTES - current).min(chunk.len());
+                if held.write_raw(&chunk[..count]).is_err() {
+                    break;
+                }
+                sent.fetch_add(count, Ordering::SeqCst);
+            }
+            done.store(true, Ordering::SeqCst);
+        });
+        let notice = b"dropping input until the writer recovers";
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !output_bytes
+            .windows(notice.len())
+            .any(|window| window == notice)
+        {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stalled-child flood timed out before a drop notice: sent={}, dropped={}, child_total={}",
+                sent.load(Ordering::SeqCst),
+                std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+                std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len())
+            );
+            if let Ok(chunk) = output.recv_timeout(Duration::from_millis(100)) {
+                output_bytes.extend_from_slice(&chunk);
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        sender.join().expect("join adaptive flood writer");
+    });
+    assert!(
+        output_bytes
+            .windows(b"dropping input until the writer recovers".len())
+            .any(|window| window == b"dropping input until the writer recovers"),
+        "stalled-child flood reached the 32 MiB cap without a drop notice: sent={}, dropped={}, child_total={}",
+        sent.load(Ordering::SeqCst),
+        std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+        std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len())
+    );
+    held.write_raw(&[client::DETACH]).expect("send Ctrl-\\");
+    wait_for_cli_exit(&viewer, name);
+    let output_deadline = Instant::now() + PATIENCE;
+    while !output_bytes
+        .windows(b"input dropped".len())
+        .any(|window| window == b"input dropped")
+    {
+        assert!(
+            Instant::now() < output_deadline,
+            "loss notice absent: sent={}, dropped={}, child_total={}, output tail: {}",
+            sent.load(Ordering::SeqCst),
+            std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+            std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len()),
+            escaped_tail(&output_bytes)
+        );
+        match output.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => output_bytes.extend_from_slice(&chunk),
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+    assert!(
+        output_bytes
+            .windows(b"input dropped".len())
+            .any(|window| window == b"input dropped"),
+        "client exited without loss notice: sent={}, dropped={}, child_total={}, output tail: {}",
+        sent.load(Ordering::SeqCst),
+        std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+        std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len()),
+        escaped_tail(&output_bytes)
+    );
+    std::fs::write(&marker, b"start").expect("release child for cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_keys_before_detach_in_one_read_reach_the_child() {
+    let runtime = scratch_dir("attach-detach-prefix");
+    let path = daemon::socket_path_in(&runtime, "s");
+    let _daemon = Daemon::spawn(&runtime);
+    let prefix = b"prefix!\r";
+    for run in 0..5 {
+        let name = format!("target-{run}");
+        let capture_path = runtime.join(format!("captured-{run}"));
+        let ready_marker = runtime.join(format!("ready-{run}"));
+        new_byte_capture_session(
+            &path,
+            &name,
+            &capture_path,
+            prefix.len(),
+            None,
+            false,
+            Some(&ready_marker),
+        );
+        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+        command.args(["-s", "s", "attach", &name]);
+        command.env("REMUDA_RUNTIME_DIR", &runtime);
+        let viewer = Session::new(
+            format!("viewer-{run}"),
+            Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
+            Arc::new(SystemClock::new()),
+        );
+        let held = viewer.attach();
+        wait_until_attached(&path, &name);
+        std::fs::write(&ready_marker, b"attached").expect("release child readiness");
+        wait_for_session_screen(&viewer, "READY");
+
+        let mut input = prefix.to_vec();
+        input.push(client::DETACH);
+        held.write_raw(&input)
+            .expect("write prefix and detach in one key buffer");
+        wait_for_cli_exit(&viewer, &name);
+        let deadline = Instant::now() + PATIENCE;
+        while std::fs::read(&capture_path).ok().as_deref() != Some(prefix.as_slice()) {
+            assert!(
+                Instant::now() < deadline,
+                "pre-detach prefix was lost on run {run}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_large_paste_survives_a_slow_but_reading_child() {
+    let runtime = scratch_dir("paste-slow");
+    let path = daemon::socket_path_in(&runtime, "s");
+    let _daemon = Daemon::spawn(&runtime);
+    let name = "target";
+    let capture_path = runtime.join("captured");
+    let paste = vec![b'p'; 256 * 1024];
+    new_byte_capture_session(&path, name, &capture_path, paste.len(), None, true, None);
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    command.args(["-s", "s", "attach", name]);
+    command.env("REMUDA_RUNTIME_DIR", &runtime);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    wait_until_attached(&path, name);
+    wait_for_session_screen(&viewer, "READY");
+
+    held.write_raw(&paste).expect("send 256 KiB paste");
+    let deadline = Instant::now() + PATIENCE;
+    while std::fs::read(&capture_path).ok().as_deref() != Some(paste.as_slice()) {
+        assert!(
+            Instant::now() < deadline,
+            "slow reader did not receive the complete paste"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = held.write_raw(&[client::DETACH]);
+    wait_for_cli_exit(&viewer, name);
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
+    let runtime = scratch_dir("input-recovery");
+    let path = daemon::socket_path_in(&runtime, "s");
+    let _daemon = Daemon::spawn(&runtime);
+    let child_input_path = runtime.join("child-input");
+    let dropped_count_path = runtime.join("dropped-count");
+    let input_state_path = runtime.join("input-state");
+    let barrier_result_path = runtime.join("barrier-result");
+    let ready_marker = runtime.join("ready");
+    let reader_marker = runtime.join("start-reading");
+    let script = "stty raw -echo min 1 time 0 </dev/tty; while [ ! -e \"$READY_MARKER\" ]; do sleep 0.02; done; printf READY; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; cat > \"$CAPTURE_PATH\"";
+    let env = std::collections::HashMap::from([
+        (
+            "CAPTURE_PATH".into(),
+            child_input_path.display().to_string(),
+        ),
+        ("READY_MARKER".into(), ready_marker.display().to_string()),
+        ("READER_MARKER".into(), reader_marker.display().to_string()),
+    ]);
+    assert!(matches!(
+        client::request(
+            &path,
+            &Request::New {
+                name: Some("target".into()),
+                command: vec!["sh".into(), "-c".into(), script.into()],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: Some(env),
+            },
+        )
+        .expect("start child that can resume reading"),
+        Response::Value(_)
+    ));
+
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    command.args(["-s", "s", "attach", "target"]);
+    command.env("REMUDA_RUNTIME_DIR", &runtime);
+    command.env("REMUDA_TEST_ATTACH_STALL_MS", "250");
+    command.env("REMUDA_TEST_INPUT_HOOKS", "1");
+    command.env("REMUDA_TEST_ATTACH_BARRIER_RESULT", &barrier_result_path);
+    command.env("REMUDA_TEST_ATTACH_DROPPED_COUNT", &dropped_count_path);
+    command.env("REMUDA_TEST_ATTACH_INPUT_STATE", &input_state_path);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture attach terminal");
+    wait_until_attached(&path, "target");
+    std::fs::write(&ready_marker, b"attached").expect("release child readiness");
+    wait_for_session_screen(&viewer, "READY");
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+        let sender = scope.spawn(|| {
+            let chunk = [b'x'; STALL_FLOOD_CHUNK_BYTES];
+            while !stop.load(Ordering::SeqCst) {
+                let current = sent.load(Ordering::SeqCst);
+                if current >= STALL_FLOOD_CAP_BYTES {
+                    break;
+                }
+                let count = (STALL_FLOOD_CAP_BYTES - current).min(chunk.len());
+                if held.write_raw(&chunk[..count]).is_err() {
+                    break;
+                }
+                sent.fetch_add(count, Ordering::SeqCst);
+            }
+            done.store(true, Ordering::SeqCst);
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut seen = Vec::new();
+        let drop_notice = b"dropping input until the writer recovers";
+        while !seen
+            .windows(drop_notice.len())
+            .any(|window| window == drop_notice)
+        {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stall drop notice was not printed: sent={}, dropped={}, child_total={}, input_state={}",
+                sent.load(Ordering::SeqCst),
+                std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+                std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()),
+                std::fs::read_to_string(&input_state_path).unwrap_or_default()
+            );
+            if let Ok(chunk) = output.recv_timeout(Duration::from_millis(100)) {
+                seen.extend_from_slice(&chunk);
+            }
+        }
+        assert!(
+            seen.windows(drop_notice.len()).any(|window| window == drop_notice),
+            "stalled-child flood reached the 32 MiB cap without a drop notice: sent={}, dropped={}, child_total={}, input_state={}",
+            sent.load(Ordering::SeqCst),
+            std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+            std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()),
+            std::fs::read_to_string(&input_state_path).unwrap_or_default()
+        );
+        stop.store(true, Ordering::SeqCst);
+        sender.join().expect("join adaptive flood writer");
+        std::fs::write(&reader_marker, b"read").expect("resume child PTY reads");
+        let progress_deadline = Instant::now() + Duration::from_secs(15);
+        while std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()) == 0 {
+            assert!(
+                Instant::now() < progress_deadline,
+                "child did not receive buffered input after recovery"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut last_total = None;
+        let mut stable_since = Instant::now();
+        let sent = sent.load(Ordering::SeqCst) as u64;
+        let drain_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(
+                Instant::now() < drain_deadline,
+                "child input did not drain to a stable recovered state: total={}, dropped={}, sent={sent}; notices={}",
+                std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()),
+                std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+                String::from_utf8_lossy(&seen)
+                    .replace('\n', " ")
+                    .chars()
+                    .rev()
+                    .take(180)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            );
+            if let Ok(chunk) = output.recv_timeout(Duration::from_millis(20)) {
+                seen.extend_from_slice(&chunk);
+            }
+            let total = std::fs::metadata(&child_input_path)
+                .ok()
+                .map(|metadata| metadata.len());
+            let dropped = std::fs::read_to_string(&dropped_count_path)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok());
+            if total.is_some() && total != last_total {
+                last_total = total;
+                stable_since = Instant::now();
+            }
+            let drained = total
+                .zip(dropped)
+                .is_some_and(|(total, dropped)| dropped <= sent && total == sent - dropped);
+            if drained && stable_since.elapsed() >= Duration::from_millis(500) {
+                break;
+            }
+        }
+
+        let drop_notice = b"dropping input until the writer recovers";
+        let recovery_notice = b"input writer recovered; queued input resumed";
+        let last_drop = seen
+            .windows(drop_notice.len())
+            .rposition(|window| window == drop_notice);
+        let last_recovery = seen
+            .windows(recovery_notice.len())
+            .rposition(|window| window == recovery_notice);
+        assert!(
+            last_recovery.is_some_and(|at| last_drop.is_none_or(|drop_at| at > drop_at)),
+            "input writer recovery notice was not printed after the latest drop notice"
+        );
+
+        let barrier = b"DRAINED-BARRIER\n";
+        held.write_raw(barrier)
+            .expect("send one ordered drain barrier after the child read total stabilizes");
+        let enqueue_deadline = Instant::now() + Duration::from_secs(3);
+        let barrier_result = loop {
+            if let Ok(result) = std::fs::read_to_string(&barrier_result_path) {
+                if !result.is_empty() {
+                    break result;
+                }
+            }
+            assert!(
+                Instant::now() < enqueue_deadline,
+                "attach key pump did not classify the single drain barrier"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            barrier_result, "queued",
+            "recovered attach queue dropped the single drain barrier"
+        );
+
+        let barrier_deadline = Instant::now() + Duration::from_secs(3);
+        while !std::fs::read(&child_input_path).is_ok_and(|bytes| {
+            bytes
+                .windows(b"DRAINED-BARRIER".len())
+                .any(|window| window == b"DRAINED-BARRIER")
+        }) {
+            if let Ok(chunk) = output.recv_timeout(Duration::from_millis(20)) {
+                seen.extend_from_slice(&chunk);
+            }
+            assert!(
+                Instant::now() < barrier_deadline,
+                "recovered attach input queue did not deliver the single ordered drain barrier; child received {} bytes; notices: {}; dropped count: {}",
+                std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()),
+                String::from_utf8_lossy(&seen)
+                    .replace('\n', " ")
+                    .chars()
+                    .rev()
+                    .take(180)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>(),
+                std::fs::read_to_string(&dropped_count_path).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    let _ = held.write_raw(&[client::DETACH]);
+    wait_for_cli_exit(&viewer, "target");
+}
+
+#[test]
+fn session_identity_survives_as_a_new_value_after_daemon_restart_and_output_versions_advance() {
+    let runtime = scratch_dir("ver-restart");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut first_daemon = spawn::Daemon::spawn(&runtime);
+    start_shell_session(
+        &socket,
+        "sleep 1; printf first; sleep 1; printf later; sleep 30",
+    );
+    let first_summary = listed_session(&socket);
+    let first_version = wait_for_quiet_output_version(&socket);
+    let front_request = serde_json::to_vec(&Request::CaptureStyled {
+        name: "versioned".into(),
+        scrollback: 0,
+    })
+    .expect("encode front request");
+    let front_capture: Response = serde_json::from_slice(
+        &remuda_native::remote_front::forward_frame(&socket, &front_request)
+            .expect("front forwards capture"),
+    )
+    .expect("decode front response");
+    assert!(
+        matches!(front_capture, Response::StyledScreen { instance_id, output_version, .. }
+        if instance_id == first_summary.instance_id && output_version == Some(first_version))
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(capture_version(&socket), first_version);
+    wait_for_output_version(&socket, first_version);
+
+    client::request(
+        &socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("stop first daemon");
+    assert!(
+        first_daemon.left_on_its_own(),
+        "first daemon should stop cleanly"
+    );
+
+    let mut second_daemon = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "printf second; sleep 30");
+    let second_summary = listed_session(&socket);
+    assert_ne!(first_summary.instance_id, second_summary.instance_id);
+    let _ = client::request(
+        &socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
+    assert!(
+        second_daemon.left_on_its_own(),
+        "second daemon should stop cleanly"
+    );
+}
+
+#[test]
+fn input_batches_acknowledge_duplicates_and_check_instance_before_deduplication() {
+    let runtime = scratch_dir("input-dedup");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let session = listed_session(&socket);
+    let request = |instance_id: String| Request::Input {
+        name: "versioned".into(),
+        instance_id,
+        client_id: "01010101010101010101010101010101".into(),
+        seq: 1,
+        bytes: b"one batch\r".to_vec(),
+    };
+    let instance_id = session.instance_id.expect("instance identity");
+    assert_eq!(
+        client::request(&socket, &request(instance_id.clone())).expect("first input"),
+        Response::Ack { duplicate: false }
+    );
+    assert_eq!(
+        client::request(&socket, &request(instance_id)).expect("retry input"),
+        Response::Ack { duplicate: true }
+    );
+    assert_eq!(
+        client::request(&socket, &request("stale-instance".into())).expect("stale input"),
+        Response::WrongInstance
+    );
+    let _ = client::request(
+        &socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
+    assert!(running.left_on_its_own(), "daemon should stop cleanly");
+}
+
+#[cfg(unix)]
+#[test]
+fn stalled_pty_write_times_out_without_blocking_reads_and_recovers() {
+    let runtime = scratch_dir("pty-write-timeout");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    let reader_marker = start_reader_waiting_session(&socket, &runtime);
+
+    let bytes = vec![b'\n'; 1024 * 1024];
+    let send_socket = socket.clone();
+    let (sent, result) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    let sender = std::thread::spawn(move || {
+        let result = client::request(
+            &send_socket,
+            &Request::Send {
+                name: "versioned".into(),
+                bytes,
+            },
+        );
+        let _ = sent.send(result);
+    });
+
+    // Wait until the first writer has had time to fill the PTY, then prove an
+    // independent request can make progress and a second input is not queued.
+    let busy_deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        match client::request(
+            &socket,
+            &Request::Send {
+                name: "versioned".into(),
+                bytes: b"later\n".to_vec(),
+            },
+        )
+        .expect("second send")
+        {
+            Response::Busy => break,
+            Response::Ok => {
+                assert!(
+                    Instant::now() < busy_deadline,
+                    "the large write never occupied the session writer"
+                );
+                if let Ok(result) = result.try_recv() {
+                    panic!("large write finished before a second write was refused: {result:?}");
+                }
+            }
+            other => panic!("unexpected second send response: {other:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let read_started = Instant::now();
+    let _ = listed_session(&socket);
+    let _ = capture_version(&socket);
+    assert!(
+        read_started.elapsed() < Duration::from_millis(500),
+        "list and capture should stay responsive during the blocked write"
+    );
+
+    assert_eq!(
+        result
+            .recv_timeout(Duration::from_secs(4))
+            .expect("bounded send response")
+            .expect("send request"),
+        Response::WriteTimeout
+    );
+    sender.join().expect("send client thread");
+    assert!(started.elapsed() < Duration::from_secs(6));
+    std::fs::write(&reader_marker, b"read now").expect("allow child to read input");
+
+    // Under CPU saturation the resumed child and PTY writer took 7-23s to drain the queued write.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match client::request(
+            &socket,
+            &Request::Send {
+                name: "versioned".into(),
+                bytes: b"after recovery\n".to_vec(),
+            },
+        )
+        .expect("retry after child begins reading")
+        {
+            Response::Ok => break,
+            Response::Busy => {
+                assert!(Instant::now() < deadline, "PTY writer did not recover");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            other => panic!("unexpected recovery response: {other:?}"),
+        }
+    }
+
+    let _ = client::request(
+        &socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
+    assert!(
+        running.left_on_its_own(),
+        "daemon exits after shutdown request"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn attached_keystrokes_survive_a_pty_write_timeout_without_detaching() {
+    let runtime = scratch_dir("attach-write-timeout");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&socket);
+    let marker = runtime.join("start-reader");
+    let capture_path = runtime.join("typed-bytes");
+    let mut env = std::collections::HashMap::new();
+    env.insert("READER_MARKER".into(), marker.display().to_string());
+    env.insert("CAPTURE_PATH".into(), capture_path.display().to_string());
+    let response = client::request(
+        &socket,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty raw -echo; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; cat >\"$CAPTURE_PATH\"".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start non-reading child");
+    assert!(matches!(response, Response::Value(_)));
+
+    let stream = raw_attach(&socket, "target");
+    let mut typed = vec![b'\n'; 1024 * 1024];
+    typed.extend_from_slice(b"last-human-keystrokes\n");
+    let expected = typed.clone();
+    let (stream_tx, stream_rx) = std::sync::mpsc::channel();
+    let sender = std::thread::spawn(move || {
+        let mut stream = stream;
+        let result = stream.write_all(&typed);
+        let _ = stream_tx.send((stream, result));
+    });
+
+    // Let the attach pump reach its write deadline while the child does not
+    // read, then prove the connection remains attached while waiting.
+    std::thread::sleep(Duration::from_millis(2300));
+    assert_eq!(target_row(&socket, "r.attached"), "true");
+    assert!(
+        !capture_path.exists(),
+        "the child has not begun draining its terminal input"
+    );
+
+    std::fs::write(&marker, b"read now").expect("allow child to read typed bytes");
+    let (stream, result) = stream_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("attach client write completes after child starts reading");
+    result.expect("send all human input to attach socket");
+    sender.join().expect("attach client writer thread");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::fs::read(&capture_path).ok().as_deref() == Some(expected.as_slice()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "attached bytes did not drain exactly"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(target_row(&socket, "r.attached"), "true");
+    drop(stream);
+    let detached_deadline = Instant::now() + PATIENCE;
+    while target_row(&socket, "r.attached") == "true" {
+        assert!(
+            Instant::now() < detached_deadline,
+            "attach did not release on EOF"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn attached_slow_reader_accepts_a_paste_larger_than_the_input_queue() {
+    let runtime = scratch_dir("attach-slow-reader-paste");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&socket);
+    let capture_path = runtime.join("typed-bytes");
+    let ready_path = runtime.join("reader-ready");
+    let mut env = std::collections::HashMap::new();
+    env.insert("CAPTURE_PATH".into(), capture_path.display().to_string());
+    env.insert("READY_PATH".into(), ready_path.display().to_string());
+    let response = client::request(
+        &socket,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty raw -echo; : >\"$READY_PATH\"; i=0; while [ \"$i\" -lt 192 ]; do dd bs=64 count=1 2>/dev/null >>\"$CAPTURE_PATH\"; i=$((i+1)); sleep 0.05; done; while :; do sleep 1; done".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start slow raw reader");
+    assert!(matches!(response, Response::Value(_)));
+    let ready_deadline = Instant::now() + PATIENCE;
+    while !ready_path.exists() {
+        assert!(
+            Instant::now() < ready_deadline,
+            "slow reader did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut stream = raw_attach(&socket, "target");
+    let expected = vec![b'x'; 12_288];
+    stream
+        .write_all(&expected)
+        .expect("paste into attached session");
+    assert_eq!(target_row(&socket, "r.attached"), "true");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if std::fs::read(&capture_path).ok().as_deref() == Some(expected.as_slice()) {
+            break;
+        }
+        assert_eq!(
+            target_row(&socket, "r.attached"),
+            "true",
+            "slow input must not tear down the healthy attachment"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "slow reader did not receive the paste (captured {} of {} bytes)",
+            std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len()),
+            expected.len()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        std::fs::read(&capture_path).expect("read captured paste"),
+        expected,
+        "every byte arrives in order"
+    );
+    drop(stream);
+    let detach_deadline = Instant::now() + PATIENCE;
+    while target_row(&socket, "r.attached") == "true" {
+        assert!(
+            Instant::now() < detach_deadline,
+            "EOF did not release attach"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_eof_drains_input_already_read_by_the_key_pump() {
+    let runtime = scratch_dir("attach-eof-drains-keys");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&socket);
+    let capture_path = runtime.join("typed-bytes");
+    let ready_path = runtime.join("reader-ready");
+    let mut env = std::collections::HashMap::new();
+    env.insert("CAPTURE_PATH".into(), capture_path.display().to_string());
+    env.insert("READY_PATH".into(), ready_path.display().to_string());
+    let response = client::request(
+        &socket,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty raw echo; : >\"$READY_PATH\"; i=0; while [ \"$i\" -lt 12 ]; do dd bs=1024 count=1 iflag=fullblock 2>/dev/null >>\"$CAPTURE_PATH\"; i=$((i+1)); sleep 0.05; done; while :; do sleep 1; done".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start gated raw reader");
+    assert!(matches!(response, Response::Value(_)));
+    let ready_deadline = Instant::now() + PATIENCE;
+    while !ready_path.exists() {
+        assert!(
+            Instant::now() < ready_deadline,
+            "gated reader did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut stream = ipc::connect(&socket).expect("connect attach client");
+    let mut request = serde_json::to_vec(&Request::Attach {
+        name: "target".to_string(),
+    })
+    .expect("serialize Attach");
+    request.push(b'\n');
+    stream.write_all(&request).expect("send Attach");
+    // The daemon's acknowledgement and initial screen paint now encounter
+    // EPIPE, while the client can still send input on the other half.
+    let ipc::Stream::UdSocket(unix_socket) = &stream;
+    use std::os::fd::{AsFd, AsRawFd};
+    nix::sys::socket::shutdown(
+        unix_socket.as_fd().as_raw_fd(),
+        nix::sys::socket::Shutdown::Read,
+    )
+    .expect("shut down attach output half");
+    let expected = vec![b'y'; 12_288];
+    stream
+        .write_all(&expected)
+        .expect("send keys after shutting down output half");
+    drop(stream);
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if std::fs::read(&capture_path).ok().as_deref() == Some(expected.as_slice()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "EOF discarded buffered attach keys (captured {} of {} bytes)",
+            std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len()),
+            expected.len()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read(&capture_path).expect("read bytes delivered before detach"),
+        expected
+    );
+    while target_row(&socket, "r.attached") == "true" {
+        assert!(
+            Instant::now() < deadline,
+            "drained EOF did not release attach"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_during_stalled_send_preserves_human_input_before_and_after_timeout() {
+    let runtime = unique_scratch_dir("probe-attach-stall");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&socket);
+    let marker = runtime.join("start-reader");
+    let capture_path = runtime.join("typed-bytes");
+    let mut env = std::collections::HashMap::new();
+    env.insert("READER_MARKER".into(), marker.display().to_string());
+    env.insert("CAPTURE_PATH".into(), capture_path.display().to_string());
+    assert!(matches!(
+        client::request(
+            &socket,
+            &Request::New {
+                name: Some("target".into()),
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "stty raw -echo; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; cat >\"$CAPTURE_PATH\"".into(),
+                ],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: Some(env),
+            },
+        )
+        .expect("start non-reading child"),
+        Response::Value(_)
+    ));
+
+    let mut send_bytes = vec![b'\n'; 1024 * 1024];
+    send_bytes.extend_from_slice(b"SEND-END\n");
+    let expected_send = send_bytes.clone();
+    let started = Instant::now();
+    let (send_finished_tx, send_finished_rx) = std::sync::mpsc::channel();
+    let sender = spawn_stalled_send(socket.clone(), send_bytes, send_finished_tx);
+
+    // Empty sends make safe probes: they cannot affect the captured bytes.
+    // Observe Busy before attaching, rather than assuming a fixed delay.
+    wait_for_send_writer_busy(&socket, &send_finished_rx);
+    let mut stream = raw_attach(&socket, "target");
+    stream
+        .write_all(b"HUMAN-ONE\n")
+        .expect("type during blocked Send");
+    let send_result = sender
+        .join()
+        .expect("send client thread")
+        .expect("send request");
+    eprintln!(
+        "probe: send -> {send_result:?} after {:?}",
+        started.elapsed()
+    );
+    assert_eq!(send_result, Response::WriteTimeout);
+
+    // The attach pump must retain input across the timeout without replaying
+    // or detaching; this second write arrives after the original call expired.
+    stream
+        .write_all(b"HUMAN-TWO\n")
+        .expect("type after Send timeout");
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(
+        target_row(&socket, "r.attached"),
+        "true",
+        "detached during stall"
+    );
+    assert!(
+        !capture_path.exists(),
+        "child must stay unread until the test releases it"
+    );
+
+    std::fs::write(&marker, b"go").expect("allow child to drain input");
+    let mut expected = expected_send;
+    expected.extend_from_slice(b"HUMAN-ONE\nHUMAN-TWO\n");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let got = std::fs::read(&capture_path).unwrap_or_default();
+        if got == expected {
+            break;
+        }
+        if Instant::now() > deadline {
+            let tail = String::from_utf8_lossy(&got[got.len().saturating_sub(60)..]);
+            let position = |needle: &[u8]| {
+                got.windows(needle.len())
+                    .position(|window| window == needle)
+            };
+            panic!(
+                "mismatch: got {} want {}, SEND-END@{:?} ONE@{:?} TWO@{:?} tail {tail:?}",
+                got.len(),
+                expected.len(),
+                position(b"SEND-END"),
+                position(b"HUMAN-ONE"),
+                position(b"HUMAN-TWO"),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(target_row(&socket, "r.attached"), "true");
+    drop(stream);
+}
+
+#[cfg(unix)]
+fn start_reader_waiting_session(socket: &Path, runtime: &Path) -> PathBuf {
+    // Keep the master unread until the test signals it, then drain input so
+    // recovery is deterministic regardless of parallel test scheduling.
+    let marker = runtime.join("start-reader");
+    let mut env = std::collections::HashMap::new();
+    env.insert("READER_MARKER".into(), marker.display().to_string());
+    assert!(matches!(
+        client::request(
+            socket,
+            &Request::New {
+                name: Some("versioned".into()),
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "stty -echo; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; cat >/dev/null".into(),
+                ],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: Some(env),
+            },
+        )
+        .expect("start non-reading child"),
+        Response::Value(_)
+    ));
+    marker
+}
+
+fn start_shell_session(socket: &Path, script: &str) {
+    let response = client::request(
+        socket,
+        &Request::New {
+            name: Some("versioned".into()),
+            command: vec!["sh".into(), "-c".into(), script.into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start session");
+    assert!(matches!(response, Response::Value(_)));
+}
+
+#[cfg(unix)]
+#[test]
+fn session_output_wakes_coalesce_while_lua_is_busy_and_list_stays_responsive() {
+    let path = scratch("session-output-coalescing");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            remuda._session_output_test_calls = 0
+            remuda.on("session_output", function(name)
+                if name == "chatty" then
+                    remuda._session_output_test_calls = remuda._session_output_test_calls + 1
+                    if remuda._session_output_test_calls == 1 then
+                        local busy_until = remuda.clock() + 500
+                        while remuda.clock() < busy_until do end
+                    end
+                end
+            end, { group = "session-output-test", id = "coalesce" })
+        "#,
+    );
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("chatty".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "yes x & writer=$!; sleep 0.4; kill $writer 2>/dev/null; wait $writer 2>/dev/null; sleep 5".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start chatty session");
+    assert_eq!(response, Response::Value("chatty".into()));
+
+    let until = Instant::now() + Duration::from_millis(750);
+    let mut max_list_latency = Duration::ZERO;
+    while Instant::now() < until {
+        let started = Instant::now();
+        let response = client::request(&path, &Request::List).expect("list during output hook");
+        max_list_latency = max_list_latency.max(started.elapsed());
+        assert!(matches!(response, Response::Sessions(_)));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        max_list_latency < Duration::from_millis(100),
+        "session list stalled behind output hook: {max_list_latency:?}"
+    );
+    let calls: u32 = eval(&path, "return remuda._session_output_test_calls")
+        .parse()
+        .expect("output hook call count");
+    assert!(
+        (1..=2).contains(&calls),
+        "chatty output queued redundant Lua wakes: {calls} calls"
+    );
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::Close {
+                name: "chatty".into(),
+                instance_id: None,
+                confirm: None,
+            },
+        )
+        .expect("close chatty session"),
+        Response::Ok
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn final_session_output_is_notified_once_before_session_exit() {
+    let path = scratch("session-output-before-exit");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            remuda._final_output_order = {}
+            remuda.on("session_output", function(name, details)
+                if name == "last-before-exit" then
+                    table.insert(remuda._final_output_order, "output:" .. tostring(details.version))
+                end
+            end, { group = "final-output-test", id = "output" })
+            remuda.on("session_exited", function(name)
+                if name == "last-before-exit" then
+                    table.insert(remuda._final_output_order, "exit")
+                end
+            end, { group = "final-output-test", id = "exit" })
+        "#,
+    );
+
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::New {
+                name: Some("last-before-exit".into()),
+                command: vec!["sh".into(), "-c".into(), "sleep 0.1; printf BYE".into()],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: None,
+            },
+        )
+        .expect("start short output session"),
+        Response::Value("last-before-exit".into())
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let sessions = match client::request(&path, &Request::List).expect("reap short session") {
+            Response::Sessions(sessions) => sessions,
+            other => panic!("unexpected list response: {other:?}"),
+        };
+        if !sessions
+            .iter()
+            .any(|session| session.name == "last-before-exit")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "short output session did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let order = eval(
+        &path,
+        "return table.concat(remuda._final_output_order, ',')",
+    );
+    let events: Vec<_> = order.split(',').collect();
+    assert_eq!(
+        events.len(),
+        2,
+        "expected one final output and one exit: {order:?}"
+    );
+    assert!(
+        events[0].starts_with("output:"),
+        "final output event came after exit: {order:?}"
+    );
+    let version: u64 = events[0]["output:".len()..]
+        .parse()
+        .expect("final output version");
+    assert!(
+        version > 0,
+        "final output version must include BYE: {order:?}"
+    );
+    assert_eq!(
+        events[1], "exit",
+        "session_exited must follow final output: {order:?}"
+    );
+}
+
+fn listed_session(socket: &Path) -> remuda_core::SessionSummary {
+    match client::request(socket, &Request::List).expect("list session") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "versioned")
+            .expect("session is listed"),
+        other => panic!("unexpected list response: {other:?}"),
+    }
+}
+
+fn capture_version(socket: &Path) -> u64 {
+    match client::request(
+        socket,
+        &Request::CaptureStyled {
+            name: "versioned".into(),
+            scrollback: 0,
+        },
+    )
+    .expect("capture session")
+    {
+        Response::StyledScreen {
+            output_version: Some(version),
+            ..
+        } => version,
+        Response::StyledScreen {
+            output_version: None,
+            ..
+        } => panic!("daemon did not provide an output version"),
+        other => panic!("unexpected capture response: {other:?}"),
+    }
+}
+
+#[test]
+fn sync_returns_immediately_when_since_is_older_than_current_output() {
+    let runtime = scratch_dir("sync-immediate");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "printf ready; sleep 30");
+    let current = wait_for_quiet_output_version(&socket);
+    assert!(current > 0, "fixture must produce a versioned frame");
+    let started = Instant::now();
+    let response = client::request(
+        &socket,
+        &Request::Sync {
+            name: "versioned".into(),
+            instance_id: None,
+            since: current - 1,
+            timeout_ms: 30_000,
+        },
+    )
+    .expect("sync response");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "new output must return immediately"
+    );
+    assert!(matches!(response, Response::Sync { output_version, .. } if output_version == current));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_waits_for_output_and_returns_the_new_snapshot() {
+    let runtime = scratch_dir("sync-output");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let trigger = runtime.join("release-sync-output");
+    let trigger_arg = shell_test_path(&trigger);
+    let script =
+        format!("while [ ! -e {trigger_arg} ]; do sleep 0.02; done; printf after-sync; sleep 30");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, &script);
+    let since = wait_for_quiet_output_version(&socket);
+    let request_socket = socket.clone();
+    let request = std::thread::spawn(move || {
+        client::request(
+            &request_socket,
+            &Request::Sync {
+                name: "versioned".into(),
+                instance_id: None,
+                since,
+                timeout_ms: 5_000,
+            },
+        )
+        .expect("sync response")
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !request.is_finished(),
+        "sync should wait while the version is unchanged"
+    );
+    let triggered_at = Instant::now();
+    std::fs::write(&trigger, b"go").expect("release shell output");
+    let response = request.join().expect("sync worker");
+    assert!(
+        matches!(response, Response::Sync { output_version, snapshot, .. }
+        if output_version > since && snapshot.rows.iter().flatten().any(|run| run.text.contains("after-sync")))
+    );
+    assert!(
+        triggered_at.elapsed() < Duration::from_secs(1),
+        "output notification should wake Sync well before its 5s timeout"
+    );
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_waiter_wakes_when_session_is_resized() {
+    let runtime = scratch_dir("sync-resize");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let since = wait_for_quiet_output_version(&socket);
+    let request_socket = socket.clone();
+    let request = std::thread::spawn(move || {
+        client::request(
+            &request_socket,
+            &Request::Sync {
+                name: "versioned".into(),
+                instance_id: None,
+                since,
+                timeout_ms: 5_000,
+            },
+        )
+        .expect("sync response after resize")
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(matches!(
+        client::request(
+            &socket,
+            &Request::Resize {
+                name: "versioned".into(),
+                size: Size::new(100, 30),
+            },
+        ),
+        Ok(Response::Ok)
+    ));
+    let triggered_at = Instant::now();
+    let response = request.join().expect("sync worker");
+    assert!(matches!(response, Response::Sync { output_version, .. } if output_version > since));
+    assert!(
+        triggered_at.elapsed() < Duration::from_secs(1),
+        "resize notification should wake Sync well before its 5s timeout"
+    );
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_times_out_with_the_current_unchanged_frame() {
+    let runtime = scratch_dir("sync-timeout");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let current = wait_for_quiet_output_version(&socket);
+    let started = Instant::now();
+    let response = client::request(
+        &socket,
+        &Request::Sync {
+            name: "versioned".into(),
+            instance_id: None,
+            since: current,
+            timeout_ms: 60,
+        },
+    )
+    .expect("sync timeout response");
+    assert!(started.elapsed() >= Duration::from_millis(40));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(matches!(response, Response::Sync { output_version, .. } if output_version == current));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_reports_bracketed_paste_mode_enabled_by_child() {
+    let runtime = unique_scratch_dir("sync-bracketed-paste");
+    let _cleanup = RemoveDirectoryOnDrop(runtime.clone());
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(
+        &socket,
+        "stty raw -echo; printf '\\033[?2004h'; printf 'bracketed-sync-ready\\n'; sleep 30",
+    );
+    wait_for(&socket, "versioned", "bracketed-sync-ready");
+    let session = listed_session(&socket);
+    let response = client::request(
+        &socket,
+        &Request::Sync {
+            name: "versioned".into(),
+            instance_id: Some(session.instance_id.expect("session instance id")),
+            since: 0,
+            timeout_ms: 0,
+        },
+    )
+    .expect("sync response after child enables bracketed paste");
+    match response {
+        Response::Sync { snapshot, .. } => assert!(snapshot.bracketed_paste),
+        other => panic!("unexpected sync response: {other:?}"),
+    }
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_waiter_wakes_when_child_exits() {
+    let runtime = scratch_dir("sync-child-exit");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let since = wait_for_quiet_output_version(&socket);
+    let request_socket = socket.clone();
+    let request = std::thread::spawn(move || {
+        client::request(
+            &request_socket,
+            &Request::Sync {
+                name: "versioned".into(),
+                instance_id: None,
+                since,
+                timeout_ms: 5_000,
+            },
+        )
+        .expect("sync response after child exit")
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        matches!(
+            client::request(
+                &socket,
+                &Request::Close {
+                    name: "versioned".into(),
+                    instance_id: None,
+                    confirm: None,
+                },
+            ),
+            Ok(Response::Ok)
+        ),
+        "closing the child must succeed while Sync is waiting"
+    );
+    let triggered_at = Instant::now();
+    let response = request.join().expect("sync worker");
+    assert!(
+        triggered_at.elapsed() < Duration::from_secs(1),
+        "child exit must wake the waiter before its Sync timeout"
+    );
+    assert!(matches!(response, Response::Error(message) if message.contains("exited")));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_rechecks_instance_after_close_and_relaunch_during_wait() {
+    let runtime = scratch_dir("sync-relaunch");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let old_instance = listed_session(&socket).instance_id.expect("instance id");
+    let since = wait_for_quiet_output_version(&socket);
+    let request_socket = socket.clone();
+    let request = std::thread::spawn(move || {
+        client::request(
+            &request_socket,
+            &Request::Sync {
+                name: "versioned".into(),
+                instance_id: Some(old_instance),
+                since,
+                timeout_ms: 5_000,
+            },
+        )
+        .expect("sync response after relaunch")
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(matches!(
+        client::request(
+            &socket,
+            &Request::Close {
+                name: "versioned".into(),
+                instance_id: None,
+                confirm: None,
+            },
+        ),
+        Ok(Response::Ok)
+    ));
+    start_shell_session(&socket, "sleep 30");
+    let triggered_at = Instant::now();
+    let response = request.join().expect("sync worker");
+    assert_eq!(response, Response::WrongInstance);
+    assert!(
+        triggered_at.elapsed() < Duration::from_secs(1),
+        "post-wait instance check should return promptly"
+    );
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_rejects_a_wrong_instance_without_waiting() {
+    let runtime = scratch_dir("sync-wrong-instance");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let started = Instant::now();
+    let response = client::request(
+        &socket,
+        &Request::Sync {
+            name: "versioned".into(),
+            instance_id: Some("old-session-instance".into()),
+            since: 0,
+            timeout_ms: 30_000,
+        },
+    )
+    .expect("wrong-instance response");
+    assert_eq!(response, Response::WrongInstance);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+fn stop_daemon(runtime: &Path, socket: &Path, running: &mut spawn::Daemon) {
+    assert_eq!(
+        socket,
+        daemon::socket_path_in(runtime, "s"),
+        "only stop the private daemon created under this test's scratch runtime"
+    );
+    let _ = client::request(
+        socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
+    assert!(
+        running.left_on_its_own(),
+        "private daemon should stop cleanly"
+    );
+}
+
+fn wait_for_output_version(socket: &Path, original: u64) {
+    let deadline = Instant::now() + PATIENCE;
+    while capture_version(socket) <= original {
+        assert!(Instant::now() < deadline, "output version did not increase");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_quiet_output_version(socket: &Path) -> u64 {
+    let deadline = Instant::now() + PATIENCE;
+    let mut version = capture_version(socket);
+    let mut quiet_since = Instant::now();
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "output version did not become quiet"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        let next = capture_version(socket);
+        if next != version {
+            version = next;
+            quiet_since = Instant::now();
+        } else if quiet_since.elapsed() >= Duration::from_millis(400) {
+            return version;
+        }
+    }
+}
+
+fn shell_test_path(path: &Path) -> String {
+    #[cfg(windows)]
+    let value = {
+        let value = path.to_string_lossy().replace('\\', "/");
+        if let Some((drive, rest)) = value.split_once(':') {
+            format!(
+                "/{}/{}",
+                drive.to_ascii_lowercase(),
+                rest.trim_start_matches('/')
+            )
+        } else {
+            value
+        }
+    };
+    #[cfg(not(windows))]
+    let value = path.to_string_lossy().into_owned();
+    format!("\"{}\"", value.replace('"', "\\\""))
+}
+
+#[test]
+fn old_json_shapes_parse_with_defaults_for_additive_session_fields() {
+    let summary = remuda_core::SessionSummary {
+        id: "".into(),
+        name: "old-client".into(),
+        instance_id: Some("new-field".into()),
+        output_version: Some(7),
+        alive: true,
+        idle: Duration::ZERO,
+        output_idle: None,
+        size: Size::new(80, 24),
+        attached: false,
+        human_idle: None,
+        mouse_tracking: false,
+    };
+    let mut old_summary = serde_json::to_value(summary).expect("serialize summary");
+    let fields = old_summary.as_object_mut().expect("summary object");
+    fields.remove("id");
+    fields.remove("instance_id");
+    fields.remove("output_version");
+    let decoded: remuda_core::SessionSummary =
+        serde_json::from_value(old_summary).expect("parse old session summary");
+    assert_eq!(decoded.instance_id, None);
+    assert_eq!(decoded.output_version, None);
+
+    let response = Response::StyledScreen {
+        rows: vec![],
+        instance_id: Some("new-field".into()),
+        output_version: Some(7),
+        wrapped: vec![],
+        scrollback_len: 0,
+        scrollback_total: 0,
+        cursor: remuda_core::agent::Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        },
+    };
+    let mut old_response = serde_json::to_value(response).expect("serialize response");
+    let fields = old_response
+        .as_object_mut()
+        .and_then(|variant| variant.get_mut("StyledScreen"))
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("styled response object");
+    fields.remove("instance_id");
+    fields.remove("output_version");
+    let decoded: Response = serde_json::from_value(old_response).expect("parse old response");
+    assert!(matches!(
+        decoded,
+        Response::StyledScreen {
+            instance_id: None,
+            output_version: None,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn resizing_without_child_output_advances_the_output_version() {
+    let runtime = scratch_dir("resize-ver");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut daemon = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let before = capture_version(&socket);
+    let response = client::request(
+        &socket,
+        &Request::Resize {
+            name: "versioned".into(),
+            size: Size::new(81, 24),
+        },
+    )
+    .expect("resize session");
+    assert_eq!(response, Response::Ok);
+    assert!(capture_version(&socket) > before);
+    client::request(
+        &socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("stop daemon");
+    assert!(daemon.left_on_its_own(), "daemon should stop cleanly");
 }
 
 /// Connect using the original attach wire shape and leave the connection in
@@ -314,19 +3072,96 @@ fn capture_styled(path: &Path, name: &str, scrollback: usize) -> String {
     }
 }
 
+fn capture_styled_snapshot(path: &Path, name: &str, scrollback: usize) -> (String, usize, usize) {
+    match client::request(
+        path,
+        &Request::CaptureStyled {
+            name: name.to_string(),
+            scrollback,
+        },
+    ) {
+        Ok(Response::StyledScreen {
+            rows,
+            scrollback_len,
+            scrollback_total,
+            ..
+        }) => (
+            rows.into_iter()
+                .map(|row| row.into_iter().map(|run| run.text).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            scrollback_len,
+            scrollback_total,
+        ),
+        other => panic!("styled capture failed: {other:?}"),
+    }
+}
+
 fn wait_for(path: &Path, name: &str, needle: &str) -> String {
-    let deadline = Instant::now() + PATIENCE;
+    let started_at = Instant::now();
+    let mut deadline = Instant::now() + EMPTY_SCREEN_STARTUP_PATIENCE;
+    let mut saw_output = false;
     loop {
         let screen = capture(path, name);
         if screen.contains(needle) {
             return screen;
         }
+        if !saw_output && !screen.trim().is_empty() {
+            saw_output = true;
+            deadline = Instant::now() + PATIENCE;
+        }
         assert!(
             Instant::now() < deadline,
-            "{needle:?} never appeared in {name}. screen:\n{screen}"
+            "{needle:?} never appeared in {name}. screen:\n{screen}\n{}",
+            wait_for_diagnostics(path, name, started_at.elapsed())
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn wait_for_diagnostics(path: &Path, name: &str, elapsed: Duration) -> String {
+    let sessions = match client::request(path, &Request::List) {
+        Ok(Response::Sessions(sessions)) => format!(
+            "List sessions (name, alive, output_version, output_idle, size): {:?}",
+            sessions
+                .into_iter()
+                .map(|session| (
+                    session.name,
+                    session.alive,
+                    session.output_version,
+                    session.output_idle,
+                    session.size,
+                ))
+                .collect::<Vec<_>>()
+        ),
+        other => format!("List request failed: {other:?}"),
+    };
+    let capture = match client::request(
+        path,
+        &Request::CaptureStyled {
+            name: name.to_string(),
+            scrollback: 0,
+        },
+    ) {
+        Ok(Response::StyledScreen {
+            rows,
+            scrollback_len,
+            scrollback_total,
+            cursor,
+            ..
+        }) => {
+            let viewport = rows
+                .into_iter()
+                .map(|row| row.into_iter().map(|run| run.text).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "CaptureStyled viewport (scrollback_len/total={scrollback_len}/{scrollback_total}, cursor={cursor:?}):\n{viewport}"
+            )
+        }
+        other => format!("CaptureStyled request failed: {other:?}"),
+    };
+    format!("elapsed since wait_for start: {elapsed:?}\n{sessions}\n{capture}")
 }
 
 fn wait_for_session_screen(session: &Session, needle: &str) {
@@ -472,14 +3307,17 @@ fn sessions_are_listed_and_kept_apart() {
 
     // Instructions must land in the session they name and nowhere else — the
     // property a shared pty would break.
-    client::request(
+    let send = client::request(
         &path,
         &Request::SendLine {
             name: "alpha".into(),
             text: "echo $((6*7))-alpha".into(),
         },
-    )
-    .expect("send");
+    );
+    assert!(
+        matches!(&send, Ok(Response::Ok)),
+        "SendLine response: {send:?}"
+    );
 
     wait_for(&path, "alpha", "42-alpha");
     let bravo = capture(&path, "bravo");
@@ -731,6 +3569,7 @@ fn wait_for_target_attach(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     // The binary derives its socket as $REMUDA_RUNTIME_DIR/remuda/default.sock,
     // so the daemon must listen exactly there. Pointing the test somewhere else
@@ -740,6 +3579,14 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
     new_session(&path, "target");
+    let target_instance = match client::request(&path, &Request::List).expect("list target") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "target")
+            .and_then(|session| session.instance_id)
+            .expect("target instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
 
     // Put something on screen BEFORE attaching, so the repaint has something to
     // prove. A viewer that only streams would show a blank terminal here.
@@ -805,6 +3652,8 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
             &path,
             &Request::Close {
                 name: "target".into(),
+                instance_id: Some(target_instance.clone()),
+                confirm: Some(true),
             },
         )
     };
@@ -1339,13 +4188,353 @@ fn direct_attach_mouse_scrolls_the_full_history_and_returns_to_live_output() {
 
 #[cfg(unix)]
 #[test]
+fn direct_attach_keeps_scrolled_content_anchored_as_output_arrives() {
+    let dir = scratch_dir("attach-scroll-anchor");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    client::request(
+        &path,
+        &Request::SendLine {
+            name: "target".into(),
+            text: "i=0; while [ $i -lt 40 ]; do printf 'seed-%03d\\n' \"$i\"; i=$((i+1)); done; sleep 2; i=0; while [ $i -lt 4 ]; do printf 'burst-%03d\\n' \"$i\"; i=$((i+1)); sleep 0.15; done; sleep 2".into(),
+        },
+    )
+    .expect("start output stream");
+    wait_for(&path, "target", "seed-039");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "seed-039");
+
+    held.write_raw(b"\x1b[<64;10;10M").expect("wheel up");
+    let _ = collect_until_bytes(&output, b"[scrollback: 3 rows");
+    let anchor_line = viewer
+        .screen_text()
+        .expect("viewer screen")
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("seed-"))
+        .expect("visible seed row")
+        .to_string();
+    let (anchor_view, _, anchor_total) = capture_styled_snapshot(&path, "target", 3);
+
+    wait_for(&path, "target", "burst-003");
+    let (_, history_rows, latest_total) = capture_styled_snapshot(&path, "target", 0);
+    assert!(latest_total > anchor_total, "history did not advance");
+    let expected_offset = 3usize
+        .saturating_add(latest_total.saturating_sub(anchor_total))
+        .min(history_rows);
+    let expected_indicator = format!("[scrollback: {expected_offset} rows");
+    let _ = collect_until_bytes(&output, expected_indicator.as_bytes());
+
+    let (anchored_view, _, _) = capture_styled_snapshot(&path, "target", expected_offset);
+    assert_eq!(
+        anchored_view, anchor_view,
+        "the captured history anchor moved"
+    );
+    let visible_screen = viewer.screen_text().expect("viewer screen after output");
+    let visible_line = visible_screen
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("seed-"))
+        .expect("visible anchored seed row")
+        .to_string();
+    assert_eq!(
+        visible_line, anchor_line,
+        "direct attach moved the visible row"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_clears_stale_scrollback_indicator_when_history_is_clamped_to_zero() {
+    let dir = scratch_dir("a-clamp");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    client::request(
+        &path,
+        &Request::SendLine {
+            name: "target".into(),
+            text: "i=0; while [ $i -lt 40 ]; do printf 'clearseed-%03d\\n' \"$i\"; i=$((i+1)); done; sleep 2; printf '\\033[?1049h'; sleep 2".into(),
+        },
+    )
+    .expect("start history then enter alternate screen");
+    wait_for(&path, "target", "clearseed-039");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "clearseed-039");
+    held.write_raw(b"\x1b[<64;10;10M").expect("wheel up");
+    collect_until_bytes(&output, b"[scrollback: 3 rows");
+    let (_, before_rows, before_total) = capture_styled_snapshot(&path, "target", 0);
+    assert!(before_rows > 0, "test requires retained history");
+
+    // The running child enters the alternate screen without adding any
+    // history rows, clamping retained history to zero while total stays fixed.
+    std::thread::sleep(Duration::from_millis(2200));
+    let alternate_screen = capture(&path, "target");
+    let (_, after_rows, after_total) = capture_styled_snapshot(&path, "target", 0);
+    assert_eq!(
+        after_total, before_total,
+        "alternate screen adds no history"
+    );
+    assert_eq!(
+        after_rows, 0,
+        "alternate screen should clamp history to zero"
+    );
+    assert!(before_rows > after_rows);
+    let screen = viewer
+        .screen_text()
+        .expect("viewer screen after history clear");
+    assert!(
+        !screen.contains("[scrollback:"),
+        "the stale scrollback indicator should be repainted away: {screen:?}; target={alternate_screen:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_wheel_up_with_no_history_does_not_enter_scrollback() {
+    let dir = scratch_dir("a-empty");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    collect_until_bytes(&output, b"$ ");
+    held.write_raw(b"\x1b[<64;10;10M")
+        .expect("wheel up with no history");
+    std::thread::sleep(Duration::from_millis(200));
+    let screen = viewer.screen_text().expect("viewer screen");
+    assert!(
+        !screen.contains("[scrollback:"),
+        "empty history must not enter a scrollback frame: {screen:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_forwards_pagedown_at_live_bottom_to_the_child() {
+    let dir = scratch_dir("a-pgdn-live");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let created = client::request(
+        &path,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty raw -echo; printf 'pgdn-ready\\n'; dd bs=1 count=4 2>/dev/null | od -An -tx1; printf '\\npgdn-forwarded\\n'; sleep 1".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start raw child");
+    assert_eq!(created, Response::Value("target".into()));
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "pgdn-ready");
+    held.write_raw(b"\x1b[6~").expect("PageDown at live bottom");
+    let received = collect_until_bytes(&output, b"pgdn-forwarded");
+    let received_hex: String = String::from_utf8_lossy(&received)
+        .split_whitespace()
+        .collect();
+    assert!(
+        received_hex.contains("1b5b367e"),
+        "the live PageDown bytes did not reach the child: {received:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_forwards_paging_keys_when_the_child_tracks_mouse() {
+    use remuda_core::agent::{MouseEncoding, MouseMode, MouseState};
+
+    let dir = scratch_dir("a-pg-mouse");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let created = client::request(
+        &path,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty raw -echo; printf '\\033[?1000h\\033[?1006h'; printf 'mouse-page-ready\\n'; dd bs=1 count=4 2>/dev/null | od -An -tx1; printf '\\nmouse-page-forwarded\\n'; sleep 1".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start mouse-reporting child");
+    assert_eq!(created, Response::Value("target".into()));
+    wait_for(&path, "target", "mouse-page-ready");
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        match client::request(
+            &path,
+            &Request::MouseState {
+                name: "target".into(),
+            },
+        ) {
+            Ok(Response::MouseState(MouseState {
+                mode: MouseMode::PressRelease,
+                encoding: MouseEncoding::Sgr,
+                ..
+            })) => break,
+            other => {
+                assert!(
+                    Instant::now() < deadline,
+                    "child mouse mode not observed: {other:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "mouse-page-ready");
+    held.write_raw(b"\x1b[5~")
+        .expect("PageUp with child mouse mode");
+    let received = collect_until_bytes(&output, b"mouse-page-forwarded");
+    let received_hex: String = String::from_utf8_lossy(&received)
+        .split_whitespace()
+        .collect();
+    assert!(
+        received_hex.contains("1b5b357e"),
+        "the child did not receive PageUp: {received:?}"
+    );
+    assert!(!viewer.screen_text().unwrap().contains("[scrollback:"));
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_history_exit_keys_are_swallowed_and_other_keys_pass_through() {
+    let dir = scratch_dir("a-history-keys");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let created = client::request(
+        &path,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "i=0; while [ $i -lt 80 ]; do printf 'keyhistory-%03d\\n' \"$i\"; i=$((i+1)); done; stty raw -echo; printf 'history-key-ready\\n'; dd bs=1 count=1 2>/dev/null | od -An -tx1; printf '\\nforwarded-key\\n'; sleep 1".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start history child");
+    assert_eq!(created, Response::Value("target".into()));
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(40, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "history-key-ready");
+    let _ = collect_until_bytes(&output, b"history-key-ready");
+    let expected_history = capture_styled_snapshot(&path, "target", 24).0;
+    let expected_top = expected_history.lines().next().unwrap().trim().to_string();
+
+    held.write_raw(b"\x1b[5~").expect("PageUp into history");
+    let _ = collect_until_bytes(&output, b"[scrollback: 24 rows");
+    let indicator = viewer.screen_text().expect("history indicator");
+    assert!(
+        indicator.contains("q/Esc exit · keys go live"),
+        "short indicator must explain exit and key routing: {indicator:?}"
+    );
+    assert_eq!(
+        indicator.lines().next().unwrap().trim(),
+        expected_top,
+        "the indicator must not wrap and scroll history off the top"
+    );
+
+    held.write_raw(b"q").expect("exit history with q");
+    let _ = collect_until_bytes(&output, b"history-key-ready");
+    assert!(!viewer.screen_text().unwrap().contains("[scrollback:"));
+    held.write_raw(b"\x1b[5~")
+        .expect("PageUp into history again");
+    let _ = collect_until_bytes(&output, b"[scrollback: 24 rows");
+    held.write_raw(b"\x1b").expect("exit history with Escape");
+    let _ = collect_until_bytes(&output, b"history-key-ready");
+    assert!(!viewer.screen_text().unwrap().contains("[scrollback:"));
+
+    held.write_raw(b"x")
+        .expect("send ordinary key after exiting history");
+    let received = collect_until_bytes(&output, b"forwarded-key");
+    assert!(
+        received.windows(b"78".len()).any(|w| w == b"78"),
+        "ordinary key was not passed to the child: {received:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
     use remuda_core::agent::{MouseEncoding, MouseMode, MouseState};
 
     let dir = scratch_dir("attach-mouse-forward");
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
-    let script = "stty raw -echo; printf '\\033[?1000h\\033[?1006h'; dd bs=1 count=12 2>/dev/null | od -An -tx1; printf '\\nmouse-forwarded\\n'";
+    let script = "stty raw -echo; printf '\\033[?1000h\\033[?1006h\\033[?2004h'; dd bs=1 count=12 2>/dev/null | od -An -tx1; printf '\\nmouse-forwarded\\n'";
     let created = client::request(
         &path,
         &Request::New {
@@ -1370,6 +4559,7 @@ fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
             Ok(Response::MouseState(MouseState {
                 mode: MouseMode::PressRelease,
                 encoding: MouseEncoding::Sgr,
+                bracketed_paste: true,
             })) => break,
             other => {
                 assert!(
@@ -1525,6 +4715,313 @@ fn a_registered_schedule_actually_fires_through_a_real_daemon() {
     }
 }
 
+#[test]
+fn lua_timers_are_available_cancelable_and_run_after_the_current_turn() {
+    let path = scratch("lua-timer-api");
+    let _daemon = daemon_at(&path);
+
+    let scheduled = client::request(
+        &path,
+        &Request::Eval {
+            code: r#"
+                remuda._timer_fired = false
+                local handle = remuda.after(0.03, function()
+                  remuda._timer_fired = true
+                end)
+                assert(type(handle.cancel) == "function")
+                collectgarbage("collect")
+                return "scheduled"
+            "#
+            .to_string(),
+            name: None,
+        },
+    )
+    .expect("schedule a timer");
+    assert_eq!(scheduled, Response::Value("scheduled".into()));
+    assert_eq!(eval(&path, "return remuda._timer_fired"), "false");
+
+    // Real time passes in Rust; the image stays available to service another
+    // request while the timer waits.
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(eval(&path, "return remuda._timer_fired"), "true");
+
+    let canceled = client::request(
+        &path,
+        &Request::Eval {
+            code: r#"
+                remuda._canceled_timer_fired = false
+                local handle = remuda.after(0.03, function()
+                  remuda._canceled_timer_fired = true
+                end)
+                handle:cancel()
+                return "canceled"
+            "#
+            .to_string(),
+            name: None,
+        },
+    )
+    .expect("cancel a timer");
+    assert_eq!(canceled, Response::Value("canceled".into()));
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(eval(&path, "return remuda._canceled_timer_fired"), "false");
+}
+
+#[test]
+fn another_client_eval_returns_while_a_one_second_timer_is_pending() {
+    let path = scratch("lua-timer-nonblocking");
+    let _daemon = daemon_at(&path);
+    assert_eq!(
+        eval(&path, "remuda.after(1, function() end); return 'scheduled'",),
+        "scheduled"
+    );
+
+    let started = Instant::now();
+    assert_eq!(eval(&path, "return 'responsive'"), "responsive");
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "client eval waited for a pending timer"
+    );
+}
+
+#[test]
+fn queued_eval_is_serviced_between_due_timer_callbacks() {
+    let runtime = unique_scratch_dir("timer-batch");
+    let _cleanup = RemoveDirectoryOnDrop(runtime.clone());
+    let path = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            for _ = 1, 10 do
+              remuda.after(0.01, function()
+                local total = 0
+                for i = 1, 300000 do total = total + i end
+                remuda._timer_test_total = total
+              end)
+            end
+            return 'scheduled'
+        "#,
+    );
+
+    // Let the first callback start and the remaining timers become overdue,
+    // then queue ordinary work while the image is draining that due batch.
+    std::thread::sleep(Duration::from_millis(40));
+    let started = Instant::now();
+    assert_eq!(eval(&path, "return 'responsive'"), "responsive");
+    assert!(
+        started.elapsed() < Duration::from_millis(750),
+        "queued eval was not serviced between due timer callbacks"
+    );
+}
+
+#[test]
+fn repeating_timer_keeps_firing_during_client_eval_traffic() {
+    let path = scratch("lua-timer-client-traffic");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        "remuda._traffic_timer_fires = 0; remuda.every(0.04, function() remuda._traffic_timer_fires = remuda._traffic_timer_fires + 1 end); return 'scheduled'",
+    );
+
+    let deadline = Instant::now() + Duration::from_millis(400);
+    while Instant::now() < deadline {
+        assert_eq!(eval(&path, "return 'responsive'"), "responsive");
+    }
+    let count = read_count(&path, "return remuda._traffic_timer_fires");
+    assert!(
+        count >= 5,
+        "interval was starved by eval traffic: {count} fires"
+    );
+}
+
+#[test]
+fn user_lua_cannot_cancel_another_owners_timer_and_reload_cancels_it() {
+    let runtime = unique_scratch_dir("lua-timer-owner");
+    let _cleanup = RemoveDirectoryOnDrop(runtime.clone());
+    let data = runtime.join("data");
+    let package = data.join("remuda/mods/timer_mod");
+    let entry = package.join("packages/timer_mod/init.lua");
+    std::fs::create_dir_all(entry.parent().unwrap()).expect("create installed mod tree");
+    std::fs::write(
+        package.join("extension.toml"),
+        "name = \"timer_mod\"\nentry = \"packages/timer_mod/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .expect("write lifecycle manifest");
+    std::fs::write(
+        &entry,
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function()
+            remuda.every(0.05, function()
+              remuda._timer_test.fires = remuda._timer_test.fires + 1
+            end)
+          end,
+        }"#,
+    )
+    .expect("write lifecycle mod");
+
+    let mut command = spawn::base_command(&runtime);
+    command.env("XDG_DATA_HOME", &data);
+    let _daemon = spawn::spawn_and_wait(command, &runtime);
+    let path = daemon::socket_path_in(&runtime, "s");
+    eval(&path, "remuda._timer_test = { fires = 0 }; return 'ready'");
+    eval(&path, "remuda.exec('timer_mod'); return 'loaded'");
+    let before_deadline = Instant::now() + Duration::from_secs(3);
+    let before_reload = loop {
+        let count = read_count(&path, "return remuda._timer_test.fires");
+        if count >= 1 {
+            break count;
+        }
+        assert!(
+            Instant::now() < before_deadline,
+            "owner interval did not fire before reload"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    assert_eq!(
+        eval(
+            &path,
+            "local ok = pcall(function() remuda._timer_cancel_owner('timer_mod') end); return tostring(ok)",
+        ),
+        "false",
+        "user Lua must not be able to invoke owner-wide timer cancellation"
+    );
+    let attack_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let fires = read_count(&path, "return remuda._timer_test.fires");
+        if fires > before_reload {
+            break;
+        }
+        assert!(
+            Instant::now() < attack_deadline,
+            "the other owner's interval stopped after the cancellation attempt"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    std::fs::write(
+        &entry,
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function() end,
+        }"#,
+    )
+    .expect("write replacement lifecycle mod without timer");
+    eval(&path, "remuda.reload('timer_mod'); return 'reloaded'");
+    let after_reload = read_count(&path, "return remuda._timer_test.fires");
+    std::thread::sleep(Duration::from_millis(300));
+    let settled = read_count(&path, "return remuda._timer_test.fires");
+    assert!(
+        settled == after_reload && after_reload >= before_reload,
+        "reload should cancel the old interval without losing prior fires: before={before_reload}, immediately after={after_reload}, settled={settled}"
+    );
+}
+
+#[test]
+fn lua_timers_have_bounded_inputs_and_live_timer_count() {
+    let path = scratch("lua-timer-caps");
+    let _daemon = daemon_at(&path);
+    let result = eval(
+        &path,
+        r#"
+            local callback = function() end
+            local ok, err = pcall(remuda.after, 0.009, callback)
+            local message = tostring(err)
+            assert(not ok and message:find("0.01 and 86400", 1, true), message)
+            ok, err = pcall(remuda.every, 0.009, callback)
+            message = tostring(err)
+            assert(not ok and message:find("0.01 and 86400", 1, true), message)
+            ok, err = pcall(remuda.after, 86401, callback)
+            message = tostring(err)
+            assert(not ok and message:find("0.01 and 86400", 1, true), message)
+            ok, err = pcall(remuda.every, 86401, callback)
+            message = tostring(err)
+            assert(not ok and message:find("0.01 and 86400", 1, true), message)
+            local handles = {}
+            for index = 1, 1024 do
+              handles[index] = remuda.after(86400, callback)
+            end
+            ok, err = pcall(remuda.after, 86400, callback)
+            message = tostring(err)
+            assert(not ok and message:find("1024 live timers", 1, true), message)
+            for _, handle in ipairs(handles) do handle:cancel() end
+            return "caps-ok"
+        "#,
+    );
+    assert_eq!(result, "caps-ok");
+
+    eval(
+        &path,
+        "remuda._clock_before = remuda.clock(); remuda.after(0.02, function() remuda._clock_after = remuda.clock() end); return 'clock-set'",
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    let elapsed = eval(&path, "return remuda._clock_after - remuda._clock_before")
+        .parse::<u64>()
+        .expect("monotonic millisecond delta");
+    assert!(
+        elapsed >= 10,
+        "clock did not advance in milliseconds: {elapsed}"
+    );
+}
+
+#[test]
+fn interval_skips_missed_ticks_and_callback_errors_do_not_stop_timers() {
+    let path = scratch("lua-timer-interval");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            remuda._timer_marks = {}
+            local handle
+            handle = remuda.every(0.02, function()
+              local marks = remuda._timer_marks
+              marks[#marks + 1] = remuda.clock()
+              if #marks == 1 then
+                local until_time = os.clock() + 0.06
+                while os.clock() < until_time do end
+              end
+              if #marks == 5 then handle:cancel() end
+            end)
+            remuda.after(0.01, function() error("expected timer callback failure") end)
+            remuda.after(0.02, function() remuda._timer_after_error = true end)
+            return "scheduled"
+        "#,
+    );
+    let minimum_marks_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let marks = read_count(&path, "return #remuda._timer_marks");
+        if marks >= 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < minimum_marks_deadline,
+            "interval did not continue before the deadline: {marks} fires"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let result = eval(
+        &path,
+        r#"
+            local marks = remuda._timer_marks
+            assert(remuda._timer_after_error, "a callback error stopped later timers")
+            assert(#marks >= 3,
+              "interval did not continue: " .. #marks .. " [" .. table.concat(marks, ",") .. "]")
+            for index = 2, #marks do
+              assert(marks[index] - marks[index - 1] >= 15,
+                "interval burst-fired: " .. table.concat(marks, ","))
+            end
+            return #marks
+        "#,
+    );
+    assert!(
+        result.parse::<usize>().unwrap() <= 5,
+        "missed interval ticks were not skipped"
+    );
+}
+
 fn eval(path: &Path, code: &str) -> String {
     match client::request(
         path,
@@ -1630,6 +5127,8 @@ fn a_session_exited_hook_fires_once_when_a_session_is_closed() {
         &path,
         &Request::Close {
             name: "closed".into(),
+            instance_id: None,
+            confirm: None,
         },
     )
     .expect("close");
@@ -1651,6 +5150,148 @@ fn a_session_exited_hook_fires_once_when_a_session_is_closed() {
         1,
         "a closed session must fire exactly once"
     );
+}
+
+#[test]
+fn a_late_session_exited_event_carries_the_closed_instance_id() {
+    let path = scratch("session-exited-reused-name");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            remuda._closed_instance_ids = {}
+            remuda.on("session_exited", function(name, details)
+                if name == "reused" then
+                    table.insert(remuda._closed_instance_ids, details.instance_id or "")
+                end
+            end)
+        "#,
+    );
+    new_session(&path, "reused");
+    let old_instance_id = match client::request(&path, &Request::List).expect("list old session") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "reused")
+            .and_then(|session| session.instance_id)
+            .expect("old instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
+    let closed = client::request(
+        &path,
+        &Request::Close {
+            name: "reused".into(),
+            instance_id: Some(old_instance_id.clone()),
+            confirm: Some(true),
+        },
+    )
+    .expect("close old instance");
+    assert_eq!(closed, Response::Ok);
+    new_session(&path, "reused");
+
+    let event_id = "return remuda._closed_instance_ids[1] or ''";
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let observed = eval(&path, event_id);
+        if !observed.is_empty() {
+            assert_eq!(observed, old_instance_id);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "late session_exited event did not include the closed instance id"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn confirmed_close_refuses_a_mismatched_instance_and_keeps_the_session() {
+    let path = scratch("close-wrong-instance");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    let instance_id = match client::request(&path, &Request::List).expect("list") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "target")
+            .and_then(|session| session.instance_id)
+            .expect("session instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
+    let response = client::request(
+        &path,
+        &Request::Close {
+            name: "target".into(),
+            instance_id: Some(format!("wrong-{instance_id}")),
+            confirm: Some(true),
+        },
+    )
+    .expect("close response");
+    assert!(matches!(response, Response::Error(_)), "{response:?}");
+    assert!(matches!(
+        client::request(&path, &Request::List),
+        Ok(Response::Sessions(sessions)) if sessions.iter().any(|session| session.name == "target")
+    ));
+}
+
+#[test]
+fn confirmed_close_requires_true_confirmation_and_keeps_the_session() {
+    let path = scratch("close-unconfirmed-instance");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    let instance_id = match client::request(&path, &Request::List).expect("list") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "target")
+            .and_then(|session| session.instance_id)
+            .expect("session instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
+
+    for confirm in [Some(false), None] {
+        let response = client::request(
+            &path,
+            &Request::Close {
+                name: "target".into(),
+                instance_id: Some(instance_id.clone()),
+                confirm,
+            },
+        )
+        .expect("close response");
+        assert!(matches!(response, Response::Error(_)), "{response:?}");
+        assert!(matches!(
+            client::request(&path, &Request::List),
+            Ok(Response::Sessions(sessions)) if sessions.iter().any(|session| session.name == "target")
+        ));
+    }
+}
+
+#[test]
+fn confirmed_close_ends_the_matching_instance() {
+    let path = scratch("close-confirmed-instance");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    let instance_id = match client::request(&path, &Request::List).expect("list") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "target")
+            .and_then(|session| session.instance_id)
+            .expect("session instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
+    let response = client::request(
+        &path,
+        &Request::Close {
+            name: "target".into(),
+            instance_id: Some(instance_id),
+            confirm: Some(true),
+        },
+    )
+    .expect("confirmed close");
+    assert_eq!(response, Response::Ok);
+    assert!(matches!(
+        client::request(&path, &Request::List),
+        Ok(Response::Sessions(sessions)) if sessions.iter().all(|session| session.name != "target")
+    ));
 }
 
 #[test]
@@ -2079,6 +5720,30 @@ fn the_daemon_names_the_build_it_was_started_from() {
         Response::Value(said) => assert_eq!(said, remuda_native::dist::BUILD_VERSION),
         other => panic!("unexpected: {other:?}"),
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn idle_daemon_version_requests_do_not_wait_for_a_poll_interval() {
+    let dir = scratch_dir("version-latency");
+    let path = daemon::socket_path_in(&dir, "s");
+    let daemon = Daemon::spawn(&dir);
+    let mut samples = Vec::with_capacity(50);
+
+    for _ in 0..50 {
+        let started = Instant::now();
+        match client::request(&path, &Request::Version).expect("version") {
+            Response::Value(said) => assert_eq!(said, remuda_native::dist::BUILD_VERSION),
+            other => panic!("unexpected: {other:?}"),
+        }
+        samples.push(started.elapsed());
+    }
+
+    samples.sort_unstable();
+    let p50 = samples[samples.len() / 2];
+    assert!(p50 < Duration::from_millis(5), "Version p50 was {p50:?}");
+    drop(daemon);
+    std::fs::remove_dir_all(dir).expect("remove isolated runtime directory");
 }
 
 // Unix only: the regression is SIGPIPE, and `true` is not a Windows command.
@@ -2838,7 +6503,9 @@ fn a_sigkilled_daemon_reaps_a_codex_app_server_in_its_session() {
     let deadline = Instant::now() + PATIENCE;
     let app_server_pid = loop {
         if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-            break pid.trim().parse::<i32>().unwrap();
+            if let Ok(pid) = pid.trim().parse::<i32>() {
+                break pid;
+            }
         }
         assert!(Instant::now() < deadline, "stub app-server never started");
         std::thread::sleep(Duration::from_millis(20));

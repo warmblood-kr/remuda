@@ -50,13 +50,42 @@ check_nightly_succeeds() {
 	export REMUDA_CHANNEL=nightly
 	mkdir -p "$HOME" "$XDG_DATA_HOME" "$REMUDA_INSTALL_DIR"
 
-	sh "$ROOT/docs/install.sh"
-	if [ ! -x "$REMUDA_INSTALL_DIR/remuda" ]; then
+	# The install dir is a fresh temp dir, so it is not on PATH: the installer
+	# must print the command that fixes that (#395).
+	set +e
+	out=$(sh "$ROOT/docs/install.sh" 2>&1)
+	status=$?
+	set -e
+	if [ "$status" -ne 0 ] || [ ! -x "$REMUDA_INSTALL_DIR/remuda" ]; then
 		rm -rf "$tmp"
-		echo "check-cold-install: REMUDA_CHANNEL=nightly did not produce $REMUDA_INSTALL_DIR/remuda" >&2
+		echo "check-cold-install: REMUDA_CHANNEL=nightly did not produce $REMUDA_INSTALL_DIR/remuda: $out" >&2
 		exit 1
 	fi
+	case "$out" in
+	*"Next: export PATH='$REMUDA_INSTALL_DIR':\"\$PATH\""*) ;;
+	*)
+		rm -rf "$tmp"
+		echo "check-cold-install: an install dir that is not on PATH got no 'Next: export PATH=...' line: $out" >&2
+		exit 1
+		;;
+	esac
+
+	# With the dir on PATH there is nothing to fix and nothing to say.
+	set +e
+	out=$(PATH="$REMUDA_INSTALL_DIR:$PATH" sh "$ROOT/docs/install.sh" 2>&1)
+	status=$?
+	set -e
 	rm -rf "$tmp"
+	if [ "$status" -ne 0 ]; then
+		echo "check-cold-install: the second nightly install failed: $out" >&2
+		exit 1
+	fi
+	case "$out" in
+	*"export PATH"* | *"not on your PATH"*)
+		echo "check-cold-install: an install dir already on PATH still got a PATH line: $out" >&2
+		exit 1
+		;;
+	esac
 }
 
 check_stable_fails

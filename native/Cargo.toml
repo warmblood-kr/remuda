@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "input_unit_fake_agent"
+path = "tests/daemon_support/input_unit_fake_agent.rs"
+test = false
+bench = false
+
 # Everything that touches the operating system lives here: the real clock now,
 # the pty backend and terminal emulation next. This crate may depend on
 # `remuda-core`; the reverse is rejected by cargo, and that one-way arrow is the
@@ -23,11 +29,24 @@ publish.workspace = true
 # `nix` survives for exactly one call, `shutdown(2)`, and is now gated to unix
 # so it cannot creep back onto the shared path.
 
+[features]
+http-test-support = []
+
 [dependencies]
+clap = { version = "4.6", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions", "string"] }
 crossterm = "0.29.0"
 interprocess = "2.4.4"
 portable-pty = "0.9.0"
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = { version = "0.7", default-features = false }
+sha2 = "0.10"
+base64 = "0.22"
+url = "2.5"
 serde_json = "1.0.140"
+serde = { version = "=1.0.229", features = ["derive"] }
+getrandom = "=0.3.4"
+snow = { version = "=0.10.0", default-features = false, features = ["default-resolver", "use-chacha20poly1305", "use-curve25519", "use-getrandom", "use-sha2"] }
+zeroize = "=1.9.0"
 remuda-core = { path = "../core" }
 vt100 = "0.16.2"
 mlua = { version = "0.12.1", features = ["lua54", "vendored"] }
@@ -45,8 +64,14 @@ nix = { version = "0.28.0", features = ["socket"] }
 # the graph transitively via several other deps (mio, parking_lot_core, ...).
 libc = "0.2"
 
+# `remuda.system.credential`: the login Keychain, generic passwords. Already in
+# the graph via `rustls-platform-verifier`; every other OS answers
+# `unavailable` without it.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "=3.7.0"
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [lints]
 workspace = true

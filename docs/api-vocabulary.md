@@ -4,7 +4,7 @@
 
 Remuda already has the right atoms: protocol `Request` variants, Rust-bound Lua operations, pure Lua tools, and Butler workflows. Their names currently sit together on `remuda`, while reusable mod interfaces are often hidden behind `_`. Make the vocabulary visible in layers: atomic session operations under `remuda.session`, higher-level terminal interactions under `remuda.input` and `remuda.screen`, reusable framework words under `remuda.hook`, `remuda.schedule`, `remuda.process`, `remuda.module`, and `remuda.tool`, and Butler's supported interface under `remuda.butler`. Keep implementation state and dispatch machinery private. For each promotion, add the new name first, retain the old spelling as a deprecated alias with a notice, then remove only in a later breaking API version.
 
-The proposal does not change behavior. Owner approval #206 fixes the first implementation scope: the `remuda.session` table remains callable through `__call`, its established nested words join `list/new/close/attach`, and only the named Butler vocabulary in the approved list below becomes public this round.
+Owner approval #206 fixes the first implementation scope: the `remuda.session` table remains callable through `__call`, its established nested words join `list/new/close/attach`, and only the named Butler vocabulary in the approved list below becomes public this round. The resize operation is added as another `remuda.session` primitive, with bounded dimensions.
 
 ## Inventory and classification
 
@@ -12,22 +12,24 @@ The proposal does not change behavior. Owner approval #206 fixes the first imple
 
 ### Core Lua surface
 
-The inventory below covers every name in `native/src/script.rs` `BINDINGS` (69 names), including the names added by `native/src/tools.lua`. Purely local Lua functions are implementation details and are outside the public `remuda.*` surface. The public table and registry should eventually be derived from these classifications.
+The inventory below covers every name in `native/src/script.rs` `BINDINGS` (79 names), including the names added by `native/src/tools.lua`. Purely local Lua functions are implementation details and are outside the public `remuda.*` surface. The public table and registry should eventually be derived from these classifications.
 
 | Current name(s) | Class | What it does / proposal |
 |---|---|---|
 | `ls`, `new`, `close` | Primitive | List, create, and end sessions. Promote to `remuda.session.list/new/close`; keep `ls` as a short deprecated alias if the owner values shell-like convenience. |
 | `send`, `insert`, `key`, `click`, `feed` | Primitive | Deliver line, bytes, key, pointer, or timed input steps. Promote to `remuda.input.line/insert/key/click/feed`; `send` remains a deprecated alias for `input.line`. |
+| `caller` | Primitive/query | Return `{kind = "session"|"outside"|"unknown", session = name?}` from the daemon's socket peer PID and managed-session ancestry. `session` means positive ancestry evidence; `outside` is unauthenticated and does not imply operator identity; missing, unreadable, or exited peers are `unknown`. This is ADVISORY only: same-UID Lua callers can invoke `remuda -e` or otherwise spoof Lua state, and Windows parent PIDs have the same limitation. Butler policy must not treat this as an authentication boundary. |
 | `capture`, `capture_styled` | Primitive | Read plain or styled terminal content. Promote to `remuda.screen.capture/styled`; styled capture includes cursor and style runs. |
 | `attach` | Primitive | Give a human the terminal connection. Promote to `remuda.session.attach`. |
-| `list_dir`, `mkdir`, `remove_dir_all` | Primitive | List, create, and recursively remove filesystem directories. Promote to `remuda.fs.list_dir/mkdir/remove_tree`; retain `remove_dir_all` alias to preserve its explicit destructive meaning. |
+| `list_dir`, `mkdir`, `remove_dir_all`, `fs.write_atomic`, `fs.mkdir_new` | Primitive | List, create, remove filesystem directories, and atomically replace a file. `fs.mkdir_new` creates one directory only when the target does not exist and does not create parents. Promote to `remuda.fs.list_dir/mkdir/mkdir_new/remove_tree/write_atomic`; retain `remove_dir_all` alias to preserve its explicit destructive meaning. |
 | `sleep`, `fail` | Primitive | Pause the Lua image or deliberately fail its caller. Promote to `remuda.runtime.sleep/fail`. |
 | `exec`, `reload` | Composite | Load or lifecycle-reload an installed mod. Promote to `remuda.module.exec/reload`. |
-| `type_text` | Composite | Type a string and optionally wait for settling; built on `feed`/input primitives. Promote to `remuda.input.type_text`. |
+| `input.text`, `input.submit` | Primitive | Deliver one text burst (bracketed paste when mode 2004 is enabled) and submit visible composer text with a separate Return and one bounded retry. |
+| `type_text` | Composite | Type text, wait for the minimum settle pause, and submit it through `input.text` and `input.submit`. |
 | `expect`, `expect_option` | Composite | Observe a screen, select and perform a matching branch/action; `expect_option` selects from a screen and match set. Promote under `remuda.screen.expect` and `remuda.screen.expect_option`. |
 | `buffer`, `buffers` | Existing namespace + registry | `remuda.buffer` is already a namespace table with `new`, `set`, and `list`; `remuda.buffers` is its registry. Preserve these nested words and use them as the in-repo precedent for the proposed namespace tables. |
 | `window`, `windows` | Existing namespace + registry | `remuda.window` is already a namespace table with `current`; `remuda.windows` is its registry. Preserve these nested words and use them as the in-repo precedent for the proposed namespace tables. |
-| `session` (Lua helper) | Composite | `remuda.session(name)` returns a handle by name, with `buffer` and `is_busy` properties. It does not return Butler session detail; `session_detail` is a separate Butler hook. The approved `remuda.session` namespace is a callable table (`__call` preserves `remuda.session(name)`) with nested `list`, `new`, `close`, `attach`, and the existing session-handle words. |
+| `session` (Lua helper) | Composite | `remuda.session(name)` returns a handle by name, with `buffer` and `is_busy` properties. It does not return Butler session detail; `session_detail` is a separate Butler hook. The approved `remuda.session` namespace is a callable table (`__call` preserves `remuda.session(name)`) with nested `list`, `new`, `close`, `attach`, `resize`, and the existing session-handle words. |
 | `schedule`, `cancel`, `schedules` | Composite + registry | Register repeating work, cancel a handle, and inspect schedules. Promote to `remuda.schedule.every/cancel/registry`; `schedule` remains an alias during migration. |
 | `tool`, `tools` | Composite + registry | Register an MCP tool word and inspect tool definitions. Promote to `remuda.tool.define/registry`. |
 | `on`, `emit`, `emit_until_success`, `emit_until_failure`, `emit_filter` | Composite | Register event handlers and dispatch/broadcast/filter values. Promote to `remuda.hook.on/emit/emit_until_success/emit_until_failure/emit_filter`. |
@@ -119,9 +121,9 @@ The protocol is deliberately lower than the Lua word set: Lua `send` uses `SendL
 | Namespace | Words | Rationale |
 |---|---|---|
 | `remuda.session` | `list`, `new`, `close`, `attach`; callable table for `session(name)` | Session identity and lifecycle; `__call` preserves the existing handle constructor. |
-| `remuda.input` | `line`, `insert`, `key`, `click`, `feed`, `type_text` | Distinguishes input kinds and composes type-text behavior from atomic input. |
+| `remuda.input` | `text`, `submit`, `type_text` | Names text delivery and submission as units, with type-text retained as their composite. |
 | `remuda.screen` | `capture`, `styled`, `expect`, `expect_option` | Reading and acting on screen observations. |
-| `remuda.fs` | `list_dir`, `mkdir`, `remove_tree` | Filesystem primitives named by intent. |
+| `remuda.fs` | `list_dir`, `mkdir`, `mkdir_new`, `remove_tree`, `write_atomic` | Filesystem primitives named by intent; `mkdir_new` creates exactly one new directory from an absolute path without a trailing separator, and `write_atomic` replaces one target without following a target symlink. |
 | `remuda.runtime` | `sleep`, `fail`, `registry` (read-only) | Runtime controls and supported introspection. |
 | `remuda.module` | `exec`, `reload` | Module loading and lifecycle. |
 | `remuda.hook` | `on`, `emit*`, `list`, `clear`, `counts` | Event registration and dispatch vocabulary. |
@@ -145,8 +147,9 @@ Rust Request / host boundary
 ├── List, New, Close, Attach, Resize
 │   └── remuda.session.list / new / close / attach
 ├── SendLine, Send, Feed
-│   └── remuda.input.line / insert / feed
-│       └── remuda.input.type_text = insert/feed + optional settle pause
+│   ├── remuda.input.text = one burst, bracketed when mode 2004 is enabled
+│   ├── remuda.input.submit = visible composer + separate Return + one retry
+│   └── remuda.input.type_text = text + optional settle pause + submit
 ├── Capture, CaptureStyled
 │   └── remuda.screen.capture / styled
 │       └── remuda.screen.expect = capture + match + selected action

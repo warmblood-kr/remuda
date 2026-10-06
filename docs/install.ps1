@@ -1,38 +1,52 @@
 # remuda installer for Windows — also the upgrader. `remuda upgrade` re-runs
 # this exact script, so there is one download-and-verify path rather than two.
 #
-#   irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
+#   $env:REMUDA_CHANNEL='nightly'; $env:REMUDA_INSTALL_BUTLER='1'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
 #
 #   $env:REMUDA_CHANNEL     stable|nightly  default: the channel already installed, else stable
-#   $env:REMUDA_INSTALL_DIR <dir>           default: ~\.local\bin
+#   $env:REMUDA_INSTALL_DIR <dir>           default: %LOCALAPPDATA%\Programs\remuda\bin
+#   $env:REMUDA_INSTALL_BUTLER=1            also install warmblood-kr/remuda-butler
+#   $env:REMUDA_NO_MODIFY_PATH=1            leave PATH alone; say so if the install dir is not on it
 #
-# This mirrors docs/install.sh line for line, INCLUDING its two bugs-found-by-
-# installing: the checksum name is compared as a string (a `./` prefix from
-# sha256sum is stripped first, never pattern-matched), and the download is
-# landed on disk and checked before anything runs it.
+# This mirrors docs/install.sh: resolve the channel version first, then verify
+# its checksum before installing the binary.
 
 $ErrorActionPreference = 'Stop'
 
 $Repo  = 'warmblood-kr/remuda'
 $Index = 'https://warmblood-kr.github.io/remuda/latest.json'
 
+# Not `exit`: piped to iex, this script IS the user's session, and exit closes
+# their window with the message in it. An uncaught throw stops the script,
+# leaves the error on screen, and still exits 1 when run as a file - which is
+# how `remuda upgrade` runs it.
 function Die($message) {
-    Write-Host "install.ps1: $message" -ForegroundColor Red
-    exit 1
+    throw "install.ps1: $message"
 }
 
 # `-UseBasicParsing` for Windows PowerShell 5.1, which is what a fresh machine
 # has. With $ErrorActionPreference = 'Stop' a 404 raises rather than writing an
 # error page to the output file — the shell script's `curl | sh` bug, avoided.
-function Fetch($url, $outFile) {
+function TryFetch($url, $outFile) {
     try {
         Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $outFile
+        return $true
     } catch {
-        Die "cannot download $url — $($_.Exception.Message)"
+        return $false
     }
 }
 
-$dataDir = if ($env:XDG_DATA_HOME) { $env:XDG_DATA_HOME } else { Join-Path $HOME '.local\share' }
+function Fetch($url, $outFile) {
+    if (-not (TryFetch $url $outFile)) {
+        Die "cannot download $url"
+    }
+}
+
+# Per-user app data, where the remuda binary itself looks for the channel file
+# (dist.rs): XDG_DATA_HOME, else %LOCALAPPDATA%, else <profile>\AppData\Local.
+$profileDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+$localAppData = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $profileDir 'AppData\Local' }
+$dataDir = if ($env:XDG_DATA_HOME) { $env:XDG_DATA_HOME } else { $localAppData }
 $dataDir = Join-Path $dataDir 'remuda'
 $channelFile = Join-Path $dataDir 'channel'
 
@@ -83,21 +97,21 @@ try {
         Die "no '$channel' version published at $Index"
     }
 
-    $tag = if ($channel -eq 'stable') { "v$version" } else { 'nightly' }
+    $tag = if ($channel -eq 'stable') { "v$version" } else { $version }
     $base = "https://github.com/$Repo/releases/download/$tag"
 
-    Fetch "$base/SHA256SUMS" (Join-Path $tmp 'SHA256SUMS')
-
-    if ($channel -eq 'nightly') {
-        # nightly's tag is fixed and every release replaces its assets, so a
-        # version read from latest.json's cached copy (cache-control:
-        # max-age=600) can already name a build whose assets no longer exist
-        # under that name - for up to ten minutes after every push to main.
-        # SHA256SUMS lives on the tag itself and lists exactly what is
-        # published right now, so derive the asset name (and the version to
-        # report) from that instead of constructing it from the index.
+    $manifestPath = Join-Path $tmp 'SHA256SUMS'
+    if (TryFetch "$base/SHA256SUMS" $manifestPath) {
+        $asset = "remuda-$version-$target.tar.gz"
+    } elseif ($channel -eq 'nightly') {
+        # Migration bridge for indexes published before nightly releases became
+        # immutable version tags. New indexes resolve above; old ones keep
+        # working through the rolling compatibility alias.
+        $tag = 'nightly'
+        $base = "https://github.com/$Repo/releases/download/$tag"
+        Fetch "$base/SHA256SUMS" $manifestPath
         $asset = $null
-        foreach ($line in Get-Content (Join-Path $tmp 'SHA256SUMS')) {
+        foreach ($line in Get-Content $manifestPath) {
             $fields = $line -split '\s+', 2
             if ($fields.Count -lt 2) { continue }
             $name = $fields[1].Trim() -replace '^\./', ''
@@ -106,7 +120,7 @@ try {
         if (-not $asset) { Die "no nightly build published for $target" }
         $version = $asset -replace "^remuda-(.*)-$target\.tar\.gz$", '$1'
     } else {
-        $asset = "remuda-$version-$target.tar.gz"
+        Die "cannot download $base/SHA256SUMS"
     }
 
     Write-Host "install.ps1: fetching remuda $version ($channel, $target)"
@@ -125,7 +139,16 @@ try {
     }
     if (-not $expected) { Die "$asset is not listed in SHA256SUMS" }
 
-    $actual = (Get-FileHash -Algorithm SHA256 (Join-Path $tmp $asset)).Hash
+    # Not Get-FileHash: Windows PowerShell started underneath PowerShell 7 -
+    # `remuda upgrade` typed into pwsh - does not find it. .NET is always there.
+    $download = [IO.File]::OpenRead((Join-Path $tmp $asset))
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $actual = [BitConverter]::ToString($sha256.ComputeHash($download)) -replace '-', ''
+    } finally {
+        $download.Dispose()
+        $sha256.Dispose()
+    }
     if ($actual -ine $expected) {
         Die "checksum mismatch on $asset - refusing to install"
     }
@@ -141,8 +164,11 @@ try {
     $unpacked = Join-Path $tmp 'remuda.exe'
     if (-not (Test-Path $unpacked)) { Die "$asset does not contain remuda.exe" }
 
-    $installDir = if ($env:REMUDA_INSTALL_DIR) { $env:REMUDA_INSTALL_DIR } else { Join-Path $HOME '.local\bin' }
+    $installDir = if ($env:REMUDA_INSTALL_DIR) { $env:REMUDA_INSTALL_DIR } else { Join-Path $localAppData 'Programs\remuda\bin' }
     New-Item -ItemType Directory -Force -Path $installDir, $dataDir | Out-Null
+    # Absolute, because it is about to be written to PATH, where a relative
+    # entry means a different directory in every shell.
+    $installDir = (Get-Item -Force -LiteralPath $installDir).FullName
     $installed = Join-Path $installDir 'remuda.exe'
 
     # Windows refuses to overwrite a RUNNING executable but allows renaming it,
@@ -162,10 +188,52 @@ try {
     Set-Content -Path $channelFile -Value $channel -NoNewline
 
     Write-Host "install.ps1: remuda $version -> $installed ($channel channel)"
+    # Nothing on a stock Windows has %LOCALAPPDATA%\Programs\remuda\bin on PATH, and a hint to add it
+    # is one more step between the one-liner and `remuda` being a command. So
+    # persist it for the user, and add it to this session for the next step.
+    # The session's PATH is not asked whether to persist: a launcher can put
+    # the dir there for one shell only. REMUDA_NO_MODIFY_PATH opts out, and
+    # `remuda upgrade` runs this too - set it for the user to opt out for good.
     $onPath = ($env:PATH -split ';') -contains $installDir
-    if (-not $onPath) {
-        Write-Host "install.ps1: $installDir is not on your PATH - add it, e.g."
-        Write-Host ('  [Environment]::SetEnvironmentVariable(''PATH'', "$env:PATH;' + $installDir + '", ''User'')')
+    if ($env:REMUDA_NO_MODIFY_PATH) {
+        if (-not $onPath) {
+            Write-Host "install.ps1: $installDir is not on your PATH - add it, or run this again without REMUDA_NO_MODIFY_PATH to have it added"
+        }
+    } else {
+        # Read from the registry unexpanded and written back as the kind it
+        # was, so the user's own entries survive as-is; only the User PATH is
+        # touched.
+        $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+        $userPath = $envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+        $pathKind = if ($envKey.GetValueNames() -contains 'Path') { $envKey.GetValueKind('Path') } else { 'ExpandString' }
+        if (($userPath -split ';') -notcontains $installDir) {
+            $newUserPath = if ($userPath) { $userPath.TrimEnd(';') + ';' + $installDir } else { $installDir }
+            $envKey.SetValue('Path', $newUserPath, $pathKind)
+            # A registry write alone reaches nobody. Explorer re-reads the
+            # environment on WM_SETTINGCHANGE, which .NET broadcasts when it
+            # sets a User variable - so set and clear a throwaway one.
+            $nudge = 'REMUDA_PATH_' + [guid]::NewGuid().ToString('N')
+            [Environment]::SetEnvironmentVariable($nudge, '1', 'User')
+            [Environment]::SetEnvironmentVariable($nudge, [NullString]::Value, 'User')
+            Write-Host "install.ps1: added $installDir to your user PATH - a terminal app that is already open may need a restart to see it"
+        }
+        $envKey.Close()
+        if (-not $onPath) { $env:PATH = $env:PATH.TrimEnd(';') + ';' + $installDir }
+    }
+
+    if ($env:REMUDA_INSTALL_BUTLER -eq '1') {
+        # `remuda mod install` clones with git, and a stock Windows has none.
+        # Remuda itself is installed by now, so say what is missing and how to
+        # finish, rather than fail the install on git's behalf.
+        # git.exe as an application, because that is all `remuda` will look
+        # for: a `git` function, alias or .cmd shim would not help it.
+        if (-not (Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue)) {
+            Write-Host 'install.ps1: the Butler mod needs git, which is not installed - install it (winget install --id Git.Git -e, or https://git-scm.com/download/win), open a new PowerShell, then: remuda mod install warmblood-kr/remuda-butler --force'
+        } else {
+            & $installed mod install warmblood-kr/remuda-butler --force
+            if ($LASTEXITCODE -ne 0) { Die 'could not install the Butler mod (Next: remuda mod install warmblood-kr/remuda-butler --force)' }
+            Write-Output 'Next: remuda butler doctor'
+        }
     }
 } finally {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmp

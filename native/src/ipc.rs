@@ -19,24 +19,73 @@ use std::path::Path;
 pub use interprocess::local_socket::{Listener, Stream};
 pub use interprocess::TryClone;
 
+#[derive(Clone, Copy)]
+pub(crate) enum WakeHandle {
+    #[cfg(unix)]
+    Unix(std::os::fd::RawFd),
+    #[cfg(windows)]
+    Windows(usize),
+}
+
+/// Keep the stream alive for as long as the returned handle may be used.
+pub(crate) fn wake_handle(stream: &Stream) -> WakeHandle {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsFd, AsRawFd};
+        let Stream::UdSocket(socket) = stream;
+        WakeHandle::Unix(socket.as_fd().as_raw_fd())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsHandle, AsRawHandle};
+        let Stream::NamedPipe(pipe) = stream;
+        WakeHandle::Windows(pipe.as_handle().as_raw_handle() as usize)
+    }
+}
+
+pub(crate) fn wake_captured(handle: WakeHandle) {
+    #[cfg(unix)]
+    {
+        let WakeHandle::Unix(fd) = handle;
+        let _ = nix::sys::socket::shutdown(fd, nix::sys::socket::Shutdown::Both);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::RawHandle;
+        let WakeHandle::Windows(handle) = handle;
+        use windows_sys::Win32::System::IO::CancelIoEx;
+        unsafe {
+            CancelIoEx(handle as RawHandle, std::ptr::null());
+        }
+    }
+}
+
 fn name(path: &Path) -> io::Result<Name<'_>> {
     #[cfg(unix)]
     {
-        // sun_path capacity, NUL included; the transport's error blamed nothing.
-        const LIMIT: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
-        let len = path.as_os_str().len();
-        if len >= LIMIT {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "socket path is {len} bytes, over the platform limit of {}; \
-                     use a shorter REMUDA_RUNTIME_DIR",
-                    LIMIT - 1
-                ),
-            ));
-        }
+        // sun_path has room for a trailing NUL, so these are usable bytes.
+        const LIMIT: usize = if cfg!(any(target_os = "linux", target_os = "android")) {
+            107
+        } else {
+            103
+        };
+        check_socket_path_len(path.as_os_str().len(), LIMIT)?;
     }
     path.to_fs_name::<GenericFilePath>()
+}
+
+#[cfg(unix)]
+fn check_socket_path_len(len: usize, limit: usize) -> io::Result<()> {
+    if len > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "socket path too long ({len} bytes, limit {limit})\n\
+                 Next: set a shorter REMUDA_RUNTIME_DIR"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Connect to a daemon. The error is the transport's own, so "nothing is
@@ -103,13 +152,41 @@ pub fn wake(stream: &Stream) {
         let Stream::NamedPipe(pipe) = stream;
         // `interprocess` opens pipes FILE_FLAG_OVERLAPPED and drives them with
         // synchronous waits, so the blocked read *is* a pending overlapped
-        // operation and this is the API that cancels one.
+        // operation and this is the API that cancels one. A null OVERLAPPED
+        // cancels every pending operation for this pipe handle, so callers use
+        // wake only with the stream dedicated to the blocked reader.
         unsafe {
             windows_sys::Win32::System::IO::CancelIoEx(
                 pipe.as_handle().as_raw_handle(),
                 std::ptr::null(),
             )
         };
+    }
+}
+
+/// Check whether the connected Windows named-pipe peer has closed without
+/// changing the stream's read mode; `set_nonblocking` is unsupported there.
+#[cfg(windows)]
+pub fn peer_disconnected(stream: &Stream) -> io::Result<bool> {
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let Stream::NamedPipe(pipe) = stream;
+    let mut available = 0u32;
+    let result = unsafe {
+        PeekNamedPipe(
+            pipe.as_handle().as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if result != 0 {
+        Ok(false)
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -134,6 +211,22 @@ pub fn stop_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_path_length_reports_both_unix_platform_limits() {
+        for limit in [103, 107] {
+            check_socket_path_len(limit, limit).expect("the limit itself fits");
+            let error = check_socket_path_len(limit + 1, limit).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "socket path too long ({} bytes, limit {limit})\nNext: set a shorter REMUDA_RUNTIME_DIR",
+                    limit + 1
+                )
+            );
+        }
+    }
 
     #[test]
     fn only_absence_or_a_refused_existing_unix_socket_allows_autostart() {

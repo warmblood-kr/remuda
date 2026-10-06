@@ -1,0 +1,3 @@
+remuda: cluster call: missing --addr HOST:PORT
+usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] (default port 7441) [--json]
+example: remuda cluster call <NODE> list --addr 192.0.2.1
