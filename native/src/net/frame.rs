@@ -265,11 +265,27 @@ pub const MAX_RECORDS: usize = MAX_RESPONSE_TOTAL.div_ceil(MAX_RECORD_PLAINTEXT)
 // ponytail: PR1 is pure functions; wired into client/listener in later PRs.
 /// Seal `plaintext` as a sequence of `[u16 BE len][AEAD record]`; the counter nonce orders records.
 #[allow(dead_code)]
-pub fn seal_records(
-    _transport: &mut snow::TransportState,
-    _plaintext: &[u8],
-) -> io::Result<Vec<u8>> {
-    unimplemented!()
+pub fn seal_records(transport: &mut snow::TransportState, plaintext: &[u8]) -> io::Result<Vec<u8>> {
+    if plaintext.len() > MAX_RESPONSE_TOTAL {
+        return Err(too_large());
+    }
+    let mut out = Vec::new();
+    let mut buf = vec![0; MAX_FRAME_SIZE];
+    for chunk in plaintext.chunks(MAX_RECORD_PLAINTEXT) {
+        let n = transport
+            .write_message(chunk, &mut buf)
+            .map_err(frame_error)?;
+        out.extend_from_slice(&(n as u16).to_be_bytes());
+        out.extend_from_slice(&buf[..n]);
+    }
+    Ok(out)
+}
+
+fn too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "chunked response exceeds the size cap",
+    )
 }
 
 /// Incremental reassembler for records produced by `seal_records`.
