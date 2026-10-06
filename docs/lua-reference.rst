@@ -309,7 +309,7 @@ pending
 process
 -------
 
-``process{argv, on_line?, on_exit?, cwd?, env?, clear_env?} -> id; process.run(spec) -> {code, stdout, stderr, timed_out}`` — Spawn an asynchronous plain-pipe child; process.run executes argv synchronously with bounded timeout and output. `env`, when given, sets string variables on top of the daemon's environment. `clear_env=true` starts with an empty environment before applying `env`; callers must pass every variable the child needs, including SystemRoot and PATH on Windows. Names cannot be empty or contain '=' or NUL; names and values must be strings, and values cannot contain NUL. On Windows, environment names are case-insensitive: names differing only by case refer to the same variable, and which value wins is undefined; do not pass both. `cwd`, when given, is an absolute path to an existing directory where the child starts. With `cwd`, a bare argv[1] is searched in the daemon's absolute PATH entries; without `cwd`, lookup uses the child's PATH. With `cwd`, `argv[1]` must be an absolute path or a bare command name, and a bare name is never searched in `cwd`. Use this word, not process.run, for a command that can take longer than 30 seconds.
+``process{argv, on_line?, on_exit?, cwd?, env?, clear_env?} -> id; process.run(spec) -> {code, stdout, stderr, timed_out}; process.exec(spec, on_done) -> id`` — Spawn an asynchronous plain-pipe child; process.run executes argv synchronously with bounded timeout and output; process.exec captures output asynchronously. `env`, when given, sets string variables on top of the daemon's environment. `clear_env=true` starts with an empty environment before applying `env`; callers must pass every variable the child needs, including SystemRoot and PATH on Windows. Names cannot be empty or contain '=' or NUL; names and values must be strings, and values cannot contain NUL. On Windows, environment names are case-insensitive: names differing only by case refer to the same variable, and which value wins is undefined; do not pass both. `cwd`, when given, is an absolute path to an existing directory where the child starts. With `cwd`, a bare argv[1] is searched in the daemon's absolute PATH entries; without `cwd`, lookup uses the child's PATH. With `cwd`, `argv[1]` must be an absolute path or a bare command name, and a bare name is never searched in `cwd`.
 
 process.run
 -----------
@@ -318,6 +318,11 @@ process.run
 
 processes
 ---------
+
+process.exec
+------------
+
+``process.exec(spec, on_done) -> id`` — Start argv directly without a shell and return immediately. `on_done` must be a Lua function; the image event loop calls it later with `{code, stdout, stderr, timed_out, signal?}`. It accepts the same `stdin`, `timeout` (default 5s, maximum 30s), `cwd`, `stdin_hold_until_lines`, `env` and `clear_env` fields as `process.run`. Each output stream is capped at 1 MiB. Timeout kills the child process group.
 
 ``processes() -> {id...}`` — List the ids of every process started with `remuda.process` that is still running.
 

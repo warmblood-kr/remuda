@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-06
+
+- `remuda.process.exec(spec, on_done)` runs a bounded process without blocking its Lua image and delivers captured output to a Lua callback on the image event loop.
+
 ## 2026-10-02
 
 - `remuda cluster init` warns when the cluster directory is missing but a saved fingerprint shows this machine had an identity before. The new identity does not restore peers; ask an admitted machine for a new invite and join again.
