@@ -605,6 +605,129 @@ fn client_total_deadline_wins_over_a_slow_drip_below_the_read_timeout() {
     );
 }
 
+/// Fake peer: reads the request (returned for header checks), then streams `respond(opened)` in small pieces.
+fn streaming_server(
+    pace: Duration,
+    respond: impl FnOnce(remuda_native::net::frame::OpenedRequest) -> Vec<u8> + Send + 'static,
+) -> (SocketAddr, snow::Keypair, std::thread::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+        .generate_keypair()
+        .unwrap();
+    let private = responder.private.clone();
+    let task = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut raw = Vec::new();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut head = String::new();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = v.trim().parse().unwrap();
+            }
+            head.push_str(&line);
+        }
+        raw.resize(length, 0);
+        reader.read_exact(&mut raw).unwrap();
+        let opened = remuda_native::net::frame::open_request(&private, &raw).unwrap();
+        let body = respond(opened);
+        let _ = stream.write_all(&http_response_head(body.len()));
+        for piece in body.chunks(7_000) {
+            if stream.write_all(piece).is_err() {
+                break;
+            }
+            if !pace.is_zero() {
+                std::thread::sleep(pace);
+            }
+        }
+        head
+    });
+    (address, responder, task)
+}
+
+fn http_response_head(length: usize) -> Vec<u8> {
+    format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").into_bytes()
+}
+
+fn call(
+    client: &ClusterClient,
+    address: SocketAddr,
+    responder: &snow::Keypair,
+) -> Result<Response, ClientError> {
+    let initiator = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+        .generate_keypair()
+        .unwrap();
+    client.request(
+        address,
+        &responder.public,
+        &initiator.private,
+        &Request::List,
+    )
+}
+
+fn big_sessions_json(min_len: usize) -> Vec<u8> {
+    let mut json = br#"{"Error":""#.to_vec();
+    json.resize(min_len, b'a');
+    json.extend_from_slice(b"\"}");
+    json
+}
+
+#[test]
+fn client_sends_chunked_header_and_decodes_v1_reply() {
+    let (address, responder, task) = streaming_server(Duration::ZERO, |opened| {
+        remuda_native::net::frame::seal_response(opened, br#"{"Sessions":[]}"#).unwrap()
+    });
+    let result = call(&response_test_client(), address, &responder);
+    let head = task.join().unwrap();
+    assert!(head.contains("X-Remuda-Chunked: 1\r\n"), "{head}");
+    assert!(matches!(result, Ok(Response::Sessions(_))), "{result:?}");
+}
+
+#[test]
+fn client_reads_v2_replies_of_1mib_and_4mib_streamed_in_pieces() {
+    for len in [1 << 20, 4 << 20] {
+        let (address, responder, task) = streaming_server(Duration::ZERO, move |opened| {
+            remuda_native::net::frame::seal_response_chunked(opened, &big_sessions_json(len - 2))
+                .unwrap()
+        });
+        let result = call(&response_test_client(), address, &responder);
+        task.join().unwrap();
+        assert!(
+            matches!(&result, Ok(Response::Error(e)) if e.len() == len - 2 - 10),
+            "len {len}: {:?}",
+            result.as_ref().map(|_| ())
+        );
+    }
+}
+
+#[test]
+fn client_v2_slow_loris_body_hits_the_total_deadline() {
+    let (address, responder, task) = streaming_server(Duration::from_millis(100), |opened| {
+        remuda_native::net::frame::seal_response_chunked(opened, &big_sessions_json(1 << 20))
+            .unwrap()
+    });
+    let client = ClusterClient::with_timeouts(
+        std::sync::Arc::new(ManualWallClock::new(1_800_000_000)),
+        ClientTimeouts {
+            connect: Duration::from_millis(200),
+            read: Duration::from_millis(300),
+            total: Duration::from_millis(700),
+        },
+    );
+    let started = Instant::now();
+    let result = call(&client, address, &responder);
+    let elapsed = started.elapsed();
+    task.join().unwrap();
+    assert!(matches!(result, Err(ClientError::Timeout)), "{result:?}");
+    assert!(elapsed < Duration::from_millis(1_200), "{elapsed:?}");
+}
+
 #[test]
 fn client_input_is_refused_by_listener() {
     let (client_node, server) = pair();
