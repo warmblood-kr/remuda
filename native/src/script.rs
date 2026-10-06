@@ -495,46 +495,26 @@ fn cli_parse_bindings(lua: &Lua) -> mlua::Result<Table> {
                 spec_table.raw_get::<Value>("report_version")?,
                 Value::Integer(2)
             );
-            let strict = crate::cli_spec_check::check(&spec_table);
-            let spec = match &strict {
-                Ok(true) => {
-                    cli_spec_from_lua(spec_table).map_err(|_| crate::cli_spec_check::combination())
-                }
-                _ => cli_spec_from_lua(spec_table).map_err(|e| ("", e.to_string())),
-            };
-            let argv = cli_argv_from_lua(argv_table)?;
-            let words = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let (spec, report) = match (strict, spec) {
-                (Err((kind, text)), _) | (Ok(true), Err((kind, text))) => (
-                    crate::cli_parse::Spec {
+            let strict = match crate::cli_spec_check::check(&spec_table) {
+                Ok(strict) => strict,
+                Err((kind, text)) => {
+                    let spec = crate::cli_parse::Spec {
                         name: String::new(),
                         options: vec![],
                         verbs: vec![],
-                    },
-                    crate::cli_parse::Report::failure(kind, text, 2),
-                ),
-                (_, Err((_, text))) => return Err(mlua::Error::runtime(text)),
-                (_, Ok(spec)) => {
-                    let report = crate::cli_parse::parse(&spec, &words);
-                    (spec, report)
+                    };
+                    let report = crate::cli_parse::Report::failure(kind, text, 2);
+                    return cli_report_to_lua(lua, &spec, &report, spec_table_wants_v2);
                 }
             };
-            if spec_table_wants_v2 {
-                return json_value_to_lua(lua, &crate::cli_parse::report_v2(&spec, &report));
-            }
-
-            let result = lua.create_table()?;
-            result.set("ok", report.ok)?;
-            result.set("verb", report.verb)?;
-            result.set("kind", report.kind)?;
-            result.set("text", report.text)?;
-            result.set("code", report.code)?;
-            let values = lua.create_table()?;
-            for (key, value) in &report.values {
-                values.set(key.as_str(), json_value_to_lua(lua, value)?)?;
-            }
-            result.set("values", values)?;
-            Ok(Value::Table(result))
+            let spec = match strict {
+                Some(spec) => spec,
+                None => cli_spec_from_lua(spec_table)?,
+            };
+            let argv = cli_argv_from_lua(argv_table)?;
+            let words = argv.iter().map(String::as_str).collect::<Vec<_>>();
+            let report = crate::cli_parse::parse(&spec, &words);
+            cli_report_to_lua(lua, &spec, &report, spec_table_wants_v2)
         })?,
     )?;
     cli.set(
@@ -549,6 +529,29 @@ fn cli_parse_bindings(lua: &Lua) -> mlua::Result<Table> {
         })?,
     )?;
     Ok(cli)
+}
+
+fn cli_report_to_lua(
+    lua: &Lua,
+    spec: &crate::cli_parse::Spec,
+    report: &crate::cli_parse::Report,
+    v2: bool,
+) -> mlua::Result<Value> {
+    if v2 {
+        return json_value_to_lua(lua, &crate::cli_parse::report_v2(spec, report));
+    }
+    let result = lua.create_table()?;
+    result.set("ok", report.ok)?;
+    result.set("verb", report.verb.clone())?;
+    result.set("kind", report.kind.clone())?;
+    result.set("text", report.text.clone())?;
+    result.set("code", report.code)?;
+    let values = lua.create_table()?;
+    for (key, value) in &report.values {
+        values.set(key.as_str(), json_value_to_lua(lua, value)?)?;
+    }
+    result.set("values", values)?;
+    Ok(Value::Table(result))
 }
 
 fn cli_spec_from_lua(table: Table) -> mlua::Result<crate::cli_parse::Spec> {
@@ -685,7 +688,7 @@ fn validate_cli_options(
     Ok(())
 }
 
-fn validate_cli_spec(spec: &crate::cli_parse::Spec) -> mlua::Result<()> {
+pub(crate) fn validate_cli_spec(spec: &crate::cli_parse::Spec) -> mlua::Result<()> {
     use std::collections::HashSet;
 
     let mut verb_names = HashSet::new();
@@ -2593,16 +2596,119 @@ mod binding_tests {
     }
 
     #[test]
-    fn cli_strict_v2_report_version_alone_opts_in_and_uses_the_envelope() {
+    fn cli_report_version_alone_keeps_g8a_behavior() {
         let out = dump_of(
             r#"remuda.cli.parse((function() spec.report_version = 2 spec.oops = 1 return spec end)(), {"send", "a"})"#,
         );
         assert!(
-            out.contains(r#"kind="spec""#) && out.contains("origins={}"),
+            out.contains(r#"kind="success""#) && out.contains("origins={}"),
             "{out}"
+        );
+        let both = dump_of(
+            r#"remuda.cli.parse((function() spec.version = 2 spec.report_version = 2 spec.oops = 1 return spec end)(), {"send", "a"})"#,
+        );
+        assert!(
+            both.contains(r#"kind="spec""#) && both.contains("origins={}"),
+            "{both}"
         );
         let legacy_shape = strict("spec.oops = 1");
         assert!(!legacy_shape.contains("origins"), "{legacy_shape}");
+    }
+
+    #[test]
+    fn cli_future_versions_are_unsupported_in_the_integer_domain() {
+        for v in [
+            "4294967297",
+            "4294967298",
+            "8589934593",
+            "math.maxinteger",
+            "3",
+        ] {
+            for call in [
+                format!(
+                    r#"remuda.cli.parse((function() spec.version = {v} return spec end)(), {{"send", "a"}})"#
+                ),
+                strict(&format!("spec.report_version = {v}")),
+            ] {
+                let out = if call.starts_with("remuda") {
+                    dump_of(&call)
+                } else {
+                    call
+                };
+                assert!(
+                    out.contains(r#"kind="unsupported""#) && out.contains("Next:"),
+                    "{v}: {out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cli_strict_v2_never_runs_metamethods() {
+        let call = r#"(function()
+            local hits = 0
+            local s = {version=2, report_version=2, name="remuda",
+              verbs={go={next="remuda", args={{name="X", help="x", required=false}}}}}
+            setmetatable(s, {__index=function(t, k)
+                hits = hits + 1
+                if k == "options" then t.verbs.go.args[1].name = 5 end
+            end})
+            local r = remuda.cli.parse(s, {"go", "value"})
+            r.hits = hits
+            return r
+        end)()"#;
+        let out = dump_of(call);
+        assert!(
+            out.contains("hits=0") && out.contains(r#"X="value""#),
+            "{out}"
+        );
+        let bad = call.replace("version=2, report", "version=2, oops=1, report");
+        let out = dump_of(&bad);
+        assert!(
+            out.contains("hits=0") && out.contains(r#"kind="spec""#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn cli_strict_v2_first_problem_is_deterministic() {
+        for _ in 0..40 {
+            let out = strict("spec.zzz = true spec.aaa = true");
+            assert!(out.contains("aaa") && !out.contains("zzz"), "{out}");
+        }
+    }
+
+    // First lines captured from unmodified origin/main (c1bcaf4).
+    #[test]
+    fn cli_legacy_exceptions_and_precedence_match_main() {
+        for (call, want) in [
+            (
+                r#"{name={}, verbs={go={next="remuda"}}}, {"go"}"#,
+                "error converting Lua table to String (expected string or number)",
+            ),
+            (
+                r#"{name="remuda", verbs={help={next="remuda"}}}, {"go"}"#,
+                "runtime error: remuda.cli.parse verb name 'help' is reserved",
+            ),
+            (
+                r#"{name="remuda", verbs={help={next="remuda"}}}, {1}"#,
+                "runtime error: remuda.cli.parse verb name 'help' is reserved",
+            ),
+            (
+                r#"{name="remuda", verbs={go={next="remuda"}}}, {1}"#,
+                "runtime error: remuda.cli.parse argv[1] must be a string",
+            ),
+        ] {
+            let lua = Lua::new();
+            install_cli_binding(&lua);
+            let got: String = lua
+                .load(format!(
+                    "local ok, e = pcall(remuda.cli.parse, {call}) return (tostring(e):match('^[^\\n]*'))"
+                ))
+                .eval()
+                .unwrap();
+            assert_eq!(got, want, "{call}");
+        }
     }
 
     #[test]

@@ -9,6 +9,8 @@ local function has(list, want)
 end
 assert(has(caps.features, "strict_v2") and has(caps.features, "stable_report"), "features")
 assert(has(caps.spec_versions, 1) and has(caps.spec_versions, 2), "spec versions")
+assert(has(caps.report_versions, 1) and has(caps.report_versions, 2), "report versions")
+assert(remuda._registry["cli.capabilities"] ~= nil, "cli.capabilities needs a registry entry")
 
 local function spec()
   return { name = "remuda v7", version = 2, report_version = 2,
@@ -36,5 +38,10 @@ assert(remuda.cli.parse(need, { "go", "a" }).kind == "unsupported", "missing cap
 local legacy = spec(); legacy.version = nil; legacy.report_version = nil; legacy.vrbs = {}
 local l = remuda.cli.parse(legacy, { "go", "a" })
 assert(l.ok and l.kind == nil and l.path == nil, "legacy spec unchanged")
+
+-- report_version = 2 alone keeps the envelope-only behavior: unknown keys are ignored
+local only = spec(); only.version = nil; only.vrbs = {}
+local o = remuda.cli.parse(only, { "go", "a" })
+assert(o.ok and o.kind == "success" and type(o.path) == "table", "report_version alone unchanged")
 
 print("v7 ok")

@@ -1,7 +1,7 @@
 //! Strict validation of opt-in v2 Lua specs, before any clap command is built.
 //! All reads are raw (no `__index`/`__pairs`) and messages never echo values.
 
-use crate::cli_parse::{FEATURES, REPORT_VERSIONS, SPEC_VERSIONS};
+use crate::cli_parse::{ArgSpec, OptionSpec, Spec, VerbSpec, FEATURES};
 use mlua::{Table, Value};
 use std::collections::BTreeMap;
 
@@ -55,15 +55,22 @@ fn join(path: &str, key: &str) -> String {
 
 fn fields(t: &Table, path: &str, allowed: &[&str]) -> Result<BTreeMap<String, Value>, Rejection> {
     let mut out = BTreeMap::new();
+    let mut odd_key = false;
     for pair in t.pairs::<Value, Value>() {
-        let Ok((Value::String(key), value)) = pair else {
-            return Err(spec_err(&shown(path), "field names must be strings"));
+        match pair {
+            Ok((Value::String(key), value)) => out.insert(key.to_string_lossy(), value),
+            _ => {
+                odd_key = true;
+                None
+            }
         };
-        let key = key.to_string_lossy();
-        if !allowed.contains(&key.as_str()) {
-            return Err(spec_err(&join(path, &key), "unknown field"));
-        }
-        out.insert(key, value);
+    }
+    // Classify after collecting so the first problem does not depend on hash order.
+    if let Some(key) = out.keys().find(|k| !allowed.contains(&k.as_str())) {
+        return Err(spec_err(&join(path, key), "unknown field"));
+    }
+    if odd_key {
+        return Err(spec_err(&shown(path), "field names must be strings"));
     }
     Ok(out)
 }
@@ -119,33 +126,28 @@ fn tables(t: &Table, path: &str) -> Result<Vec<(String, Table)>, Rejection> {
         .collect()
 }
 
-/// Version gate: `Ok(true)` means the spec opted into strict v2 validation.
+/// Version gate: `Ok(true)` only for an explicit integer `version = 2`.
+/// `report_version = 2` alone never selects strict validation (G8a behavior).
 fn gate(t: &Table) -> Result<bool, Rejection> {
     let version = t
         .raw_get::<Value>("version")
         .map_err(|_| spec_err("version", "unreadable"))?;
-    let report = t
-        .raw_get::<Value>("report_version")
-        .map_err(|_| spec_err("report_version", "unreadable"))?;
-    let strict = matches!(version, Value::Integer(2)) || matches!(report, Value::Integer(2));
-    match version {
-        Value::Nil => {}
-        Value::Integer(n) if SPEC_VERSIONS.contains(&(n as u32)) && n > 0 && !strict => {}
-        Value::Integer(2) => {}
+    let strict = match version {
+        Value::Nil | Value::Integer(1) => false,
+        Value::Integer(2) => true,
         Value::Integer(n) if n > 2 => {
             return Err(unsupported("spec version is newer than this core supports"))
         }
-        Value::Integer(_) if strict => {
-            return Err(spec_err("version", "conflicts with report_version = 2"))
-        }
         _ => return Err(spec_err("version", "must be an integer 1 or 2")),
-    }
+    };
     if !strict {
         return Ok(false);
     }
-    match report {
-        Value::Nil => {}
-        Value::Integer(n) if (1..=2).contains(&n) && REPORT_VERSIONS.contains(&(n as u32)) => {}
+    match t
+        .raw_get::<Value>("report_version")
+        .map_err(|_| spec_err("report_version", "unreadable"))?
+    {
+        Value::Nil | Value::Integer(1) | Value::Integer(2) => {}
         Value::Integer(n) if n > 2 => {
             return Err(unsupported(
                 "report version is newer than this core supports",
@@ -156,53 +158,90 @@ fn gate(t: &Table) -> Result<bool, Rejection> {
     Ok(true)
 }
 
-fn options(v: Option<&Value>, path: &str) -> Result<(), Rejection> {
+fn text(v: &Value, at: &str) -> Result<String, Rejection> {
+    match v {
+        Value::String(s) => s
+            .to_str()
+            .map(|s| s.to_string())
+            .map_err(|_| spec_err(at, "must be valid text")),
+        _ => Err(spec_err(at, "has the wrong type")),
+    }
+}
+
+fn str_of(
+    m: &BTreeMap<String, Value>,
+    key: &str,
+    at: &str,
+    required: bool,
+) -> Result<Option<String>, Rejection> {
+    typed(m, key, at, Ty::Str, required)?
+        .map(|v| text(v, &join(at, key)))
+        .transpose()
+}
+
+fn flag(m: &BTreeMap<String, Value>, key: &str, at: &str) -> Result<Option<bool>, Rejection> {
+    Ok(typed(m, key, at, Ty::Bool, false)?.map(|v| matches!(v, Value::Boolean(true))))
+}
+
+fn options(v: Option<&Value>, path: &str) -> Result<Vec<OptionSpec>, Rejection> {
     let Some(Value::Table(t)) = v else {
-        return Ok(());
+        return Ok(Vec::new());
     };
+    let mut out = Vec::new();
     for (at, item) in tables(t, path)? {
         let m = fields(&item, &at, &["long", "short", "value", "help", "global"])?;
-        for (key, ty, required) in [
-            ("long", Ty::Str, true),
-            ("short", Ty::Str, false),
-            ("value", Ty::Str, false),
-            ("help", Ty::Str, true),
-            ("global", Ty::Bool, false),
-        ] {
-            typed(&m, key, &at, ty, required)?;
-        }
-    }
-    Ok(())
-}
-
-fn verb(t: &Table, path: &str) -> Result<(), Rejection> {
-    let m = fields(t, path, &["about", "next", "args", "options"])?;
-    typed(&m, "about", path, Ty::Str, false)?;
-    typed(&m, "next", path, Ty::Str, true)?;
-    if let Some(Value::Table(args)) = typed(&m, "args", path, Ty::Table, false)? {
-        let args_path = join(path, "args");
-        for (at, item) in tables(args, &args_path)? {
-            let a = fields(&item, &at, &["name", "help", "multiple", "required"])?;
-            for (key, ty, required) in [
-                ("name", Ty::Str, true),
-                ("help", Ty::Str, true),
-                ("multiple", Ty::Bool, false),
-                ("required", Ty::Bool, false),
-            ] {
-                typed(&a, key, &at, ty, required)?;
+        let short = match str_of(&m, "short", &at, false)? {
+            None => None,
+            Some(s) => {
+                let mut chars = s.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => Some(c),
+                    _ => return Err(spec_err(&join(&at, "short"), "must be one character")),
+                }
             }
-        }
+        };
+        out.push(OptionSpec {
+            long: str_of(&m, "long", &at, true)?.unwrap_or_default(),
+            short,
+            value: str_of(&m, "value", &at, false)?,
+            help: str_of(&m, "help", &at, true)?.unwrap_or_default(),
+            global: flag(&m, "global", &at)?.unwrap_or(false),
+        });
     }
-    options(
-        typed(&m, "options", path, Ty::Table, false)?,
-        &join(path, "options"),
-    )
+    Ok(out)
 }
 
-/// Check a spec table. `Ok(false)` is a legacy spec: nothing was validated.
-pub fn check(t: &Table) -> Result<bool, Rejection> {
+fn verb(name: &str, t: &Table, path: &str) -> Result<VerbSpec, Rejection> {
+    let m = fields(t, path, &["about", "next", "args", "options"])?;
+    let mut args = Vec::new();
+    if let Some(Value::Table(list)) = typed(&m, "args", path, Ty::Table, false)? {
+        for (at, item) in tables(list, &join(path, "args"))? {
+            let a = fields(&item, &at, &["name", "help", "multiple", "required"])?;
+            args.push(ArgSpec {
+                name: str_of(&a, "name", &at, true)?.unwrap_or_default(),
+                help: str_of(&a, "help", &at, true)?.unwrap_or_default(),
+                multiple: flag(&a, "multiple", &at)?.unwrap_or(false),
+                required: flag(&a, "required", &at)?.unwrap_or(true),
+            });
+        }
+    }
+    Ok(VerbSpec {
+        name: name.to_owned(),
+        about: str_of(&m, "about", path, false)?.unwrap_or_default(),
+        next: str_of(&m, "next", path, true)?.unwrap_or_default(),
+        args,
+        options: options(
+            typed(&m, "options", path, Ty::Table, false)?,
+            &join(path, "options"),
+        )?,
+    })
+}
+
+/// Validate a spec table and decode it from raw reads only (no metamethods run).
+/// `Ok(None)` means a legacy spec: nothing was read beyond the version gate.
+pub fn check(t: &Table) -> Result<Option<Spec>, Rejection> {
     if !gate(t)? {
-        return Ok(false);
+        return Ok(None);
     }
     let m = fields(
         t,
@@ -232,19 +271,25 @@ pub fn check(t: &Table) -> Result<bool, Rejection> {
             }
         }
     }
-    typed(&m, "name", "", Ty::Str, true)?;
-    options(typed(&m, "options", "", Ty::Table, false)?, "options")?;
-    let Some(Value::Table(verbs)) = typed(&m, "verbs", "", Ty::Table, true)? else {
-        return Ok(true);
-    };
-    for (key, value) in fields_any(verbs)? {
-        let at = join("verbs", &key);
-        match value {
-            Value::Table(t) => verb(&t, &at)?,
-            _ => return Err(spec_err(&at, "must be a table")),
+    let name = str_of(&m, "name", "", true)?.unwrap_or_default();
+    let options = options(typed(&m, "options", "", Ty::Table, false)?, "options")?;
+    let mut verbs = Vec::new();
+    if let Some(Value::Table(list)) = typed(&m, "verbs", "", Ty::Table, true)? {
+        for (key, value) in fields_any(list)? {
+            let at = join("verbs", &key);
+            match value {
+                Value::Table(vt) => verbs.push(verb(&key, &vt, &at)?),
+                _ => return Err(spec_err(&at, "must be a table")),
+            }
         }
     }
-    Ok(true)
+    let spec = Spec {
+        name,
+        options,
+        verbs,
+    };
+    crate::script::validate_cli_spec(&spec).map_err(|_| combination())?;
+    Ok(Some(spec))
 }
 
 fn fields_any(t: &Table) -> Result<BTreeMap<String, Value>, Rejection> {
@@ -259,7 +304,7 @@ fn fields_any(t: &Table) -> Result<BTreeMap<String, Value>, Rejection> {
 }
 
 /// Generic text for combination errors found by the shared semantic checks.
-pub fn combination() -> Rejection {
+fn combination() -> Rejection {
     spec_err(
         "spec",
         "invalid combination: reserved name, duplicate id or short, bad token, or positional order",
