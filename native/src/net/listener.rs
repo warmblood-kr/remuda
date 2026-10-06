@@ -4138,6 +4138,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn watchdog_unblocks_a_write_that_never_checks_the_deadline() {
+        let (mut server, _client) = tiny_buffer_pair();
+        // Backstop only so a missing watchdog fails the assertion instead of hanging.
+        server
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let started = Instant::now();
+        let watchdog = Watchdog::start(&server, started + Duration::from_millis(200)).unwrap();
+        // One huge blocking write, no userspace deadline checks, reader never reads.
+        let result = server.write_all(&vec![1u8; 4 * 1024 * 1024]);
+        assert!(watchdog.finish(), "watchdog must have fired");
+        assert!(result.is_err());
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn one_byte_per_20ms_reader_is_cut_within_deadline_plus_300ms() {
         for deadline_ms in [100u64, 400] {
             let (server, mut client) = tiny_buffer_pair();
