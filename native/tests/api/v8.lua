@@ -10,7 +10,7 @@ assert(require_caps({ features = { "strict_v2", "stable_report" }, spec_version 
 assert(require_caps({}) == true, "empty requirement is satisfied")
 
 local ok, text = require_caps({ features = { "strict_v2", "no_such_feature" } })
-assert(ok == false and text == "remuda: this core is too old: missing no_such_feature." .. NEXT, text)
+assert(ok == false and text == "remuda: this core is too old: missing <feature>." .. NEXT, text)
 ok, text = require_caps({ spec_version = 3, report_version = 9 })
 assert(not ok and text == "remuda: this core is too old: missing spec_version 3, report_version 9." .. NEXT, text)
 ok, text = require_caps({ spec_version = 2.5 })
@@ -25,6 +25,33 @@ for _, bad in ipairs({ 5, "x", true, { features = "strict_v2" }, { features = { 
 end
 assert(select(2, require_caps({ features = { "SENTINEL SECRET" } })) == "remuda: this core is too old: missing <feature>." .. NEXT)
 assert(select(2, require_caps(nil)) == "remuda: invalid requirement." .. "\nNext: remuda doc")
+
+-- fail closed: oversized, sparse or named-key lists are malformed, never truncated
+local BAD = "remuda: invalid requirement.\nNext: remuda doc"
+local big = {}
+for i = 1, 1025 do big[i] = "strict_v2" end
+big[1025] = "missing_future_capability"
+assert(select(2, require_caps({ features = big })) == BAD, "1025 entries rejected")
+assert(select(2, require_caps({ features = { [4096] = "missing_future_capability" } })) == BAD, "sparse")
+assert(select(2, require_caps({ features = { missing_future_capability = true } })) == BAD, "named key")
+assert(select(2, require_caps({ features = { "strict_v2", x = "strict_v2" } })) == BAD, "mixed key")
+local full = {}
+for i = 1, 1024 do full[i] = "strict_v2" end
+assert(require_caps({ features = full }) == true, "1024 satisfied")
+full[1024] = "missing_future_capability"
+assert(select(2, require_caps({ features = full })) == "remuda: this core is too old: missing <feature>." .. NEXT, "1024 with a missing one")
+
+-- caller strings are never echoed; only the reviewed public names are
+assert(select(2, require_caps({ features = { "secret_api_key_123" } })) == "remuda: this core is too old: missing <feature>." .. NEXT)
+assert(select(2, require_caps({ features = { "repeat_policy" } })) == "remuda: this core is too old: missing repeat_policy." .. NEXT)
+
+-- string work is bounded: 1024 references to one 1 MiB string
+local huge = string.rep("a", 1 << 20)
+local refs = {}
+for i = 1, 1024 do refs[i] = huge end
+local t0 = os.clock()
+assert(select(2, require_caps({ features = refs })):find("<feature>", 1, true))
+assert(os.clock() - t0 < 1, "huge feature strings must not be scanned")
 
 -- metatables never run: raw reads only
 local hits = 0

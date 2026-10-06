@@ -2308,8 +2308,11 @@ register("_registry_dump", "Render the live word registry as documentation.", "_
 
 -- Boot/upgrade gate: new Lua checks this before sending a v2 spec, because an
 -- old core silently ignores unknown spec fields. Pure: raw reads only (no
--- metamethods), no I/O, and the text never echoes caller values beyond a
--- short [a-z0-9_] feature token.
+-- metamethods), no I/O, and the text never echoes caller strings beyond the
+-- reviewed public feature names below.
+-- The only caller strings ever echoed. Reviewed list: adding a public feature
+-- to cli_parse.rs FEATURES is a conscious edit here too.
+local public_features = { stable_report = true, strict_v2 = true, repeat_policy = true }
 local function cap_list_has(caps, key, want)
   local list = rawget(caps, key)
   if type(list) ~= "table" then return false end
@@ -2333,8 +2336,15 @@ function remuda.cli.require(need)
   local features = rawget(need, "features")
   if not (ok1 and ok2) or (features ~= nil and type(features) ~= "table") then return false, bad end
   features = features or {}
-  for i = 1, math.min(rawlen(features), 1024) do
+  -- Fail closed: a dense array of at most 1024 strings, no other keys.
+  local n, keys = rawlen(features), 0
+  if n > 1024 then return false, bad end
+  for i = 1, n do
     if type(rawget(features, i)) ~= "string" then return false, bad end
+  end
+  for _ in next, features do
+    keys = keys + 1
+    if keys > n then return false, bad end
   end
   local cli = rawget(remuda, "cli")
   local getter = type(cli) == "table" and rawget(cli, "capabilities") or nil
@@ -2350,10 +2360,10 @@ function remuda.cli.require(need)
   if report_v and not cap_list_has(caps, "report_versions", report_v) then
     missing[#missing + 1] = "report_version " .. report_v
   end
-  for i = 1, math.min(rawlen(features), 1024) do
+  for i = 1, n do
     local name = rawget(features, i)
     if not cap_list_has(caps, "features", name) then
-      missing[#missing + 1] = name:match("^[a-z0-9_]+$") and #name <= 32 and name or "<feature>"
+      missing[#missing + 1] = public_features[name] and name or "<feature>"
     end
   end
   if #missing == 0 then return true end
