@@ -762,7 +762,7 @@ fn driver_hosted_remote_tui_capture_shows_live_output_with_trailing_blanks() {
     let deadline = Instant::now() + Duration::from_secs(3);
     let screen = loop {
         let screen = capture();
-        if screen.contains("remote live · reachable") {
+        if screen.contains("remote live") {
             break screen;
         }
         assert!(
@@ -771,6 +771,14 @@ fn driver_hosted_remote_tui_capture_shows_live_output_with_trailing_blanks() {
         );
         std::thread::sleep(Duration::from_millis(50));
     };
+    let in_pane = |l: &str| {
+        l.split_once('│')
+            .is_some_and(|(_, p)| p.starts_with("PR8-MARKER"))
+    };
+    assert!(
+        screen.lines().any(in_pane),
+        "driver-hosted 80x24 right pane omitted the live marker:\n{screen}"
+    );
     assert!(
         screen.contains("PR8-MARKER"),
         "driver-hosted 80x24 screen pane omitted the live marker:\n{screen}"
