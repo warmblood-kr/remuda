@@ -3541,7 +3541,6 @@ mod tests {
         .unwrap();
         assert!(raw.len() > frame::MAX_RESPONSE_PAYLOAD, "raw {}", raw.len());
         let fitted = bounded_response_payload(&raw);
-        eprintln!("MEASURE raw={} fitted={}", raw.len(), fitted.len());
         let Response::StyledScreen { rows, .. } = serde_json::from_slice(&fitted).unwrap() else {
             panic!("expected a screen, got an error payload");
         };
