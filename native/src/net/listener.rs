@@ -24,6 +24,13 @@ pub const MAX_BODY_BYTES: usize = 65_535;
 pub const MAX_GLOBAL_REQUESTS: usize = 64;
 pub const MAX_PREAUTH_REQUESTS: usize = 64;
 pub const MAX_PEER_REQUESTS: usize = 8;
+/// Large-response pool (v2): bounds the sealed copy and write time only, not the
+/// payload built before it (old pool) nor seal's >8 MiB extra peak heap each.
+const MAX_LARGE_GLOBAL: usize = 4;
+const MAX_LARGE_PER_PEER: usize = 1;
+/// Absolute deadline for writing one large response (mirrors the client total).
+const WRITE_SLICE: usize = 1024;
+const LARGE_WRITE_TOTAL: Duration = Duration::from_secs(30);
 pub const MAX_PREAUTH_PER_IP: usize = 4;
 pub const MAX_PREAUTH_PER_IPV6_48: usize = 16;
 pub const MAX_JOIN_ATTEMPTS_PER_IP: usize = 10;
@@ -232,6 +239,7 @@ struct RequestLimiter {
     next_preauth_id: AtomicUsize,
     preauth_limit_override: AtomicUsize,
     active_peers: Mutex<HashMap<String, usize>>,
+    large: Mutex<HashMap<String, usize>>,
     join_attempts: Mutex<HashMap<std::net::IpAddr, VecDeque<Instant>>>,
     registry_requests: Mutex<HashMap<String, RegistryTokenBucket>>,
     remote_inputs: Mutex<RemoteInputRateLimiter>,
@@ -290,6 +298,12 @@ struct RegistryTokenBucket {
 
 struct GlobalPermit(Arc<RequestLimiter>);
 
+/// RAII slot in the large-response pool (releases on drop, error or panic).
+struct LargePermit {
+    limiter: Arc<RequestLimiter>,
+    fingerprint: String,
+}
+
 struct PreauthPermit {
     limiter: Arc<RequestLimiter>,
     id: usize,
@@ -315,6 +329,8 @@ struct IpPermit {
 
 struct InboundRequest {
     body: Vec<u8>,
+    /// Exactly one `X-Remuda-Chunked: 1` header (auth and parsing ignore it).
+    chunked: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -719,6 +735,25 @@ impl RequestLimiter {
         active.retain(|entry| entry.id != id);
     }
 
+    fn acquire_large(self: &Arc<Self>, fingerprint: &str) -> Option<LargePermit> {
+        let mut large = self.large.lock().unwrap_or_else(|p| p.into_inner());
+        if large.values().sum::<usize>() >= MAX_LARGE_GLOBAL
+            || large.get(fingerprint).copied().unwrap_or(0) >= MAX_LARGE_PER_PEER
+        {
+            return None;
+        }
+        *large.entry(fingerprint.to_owned()).or_default() += 1;
+        Some(LargePermit {
+            limiter: self.clone(),
+            fingerprint: fingerprint.to_owned(),
+        })
+    }
+
+    #[cfg(test)]
+    fn large_active(&self) -> usize {
+        self.large.lock().unwrap().values().sum()
+    }
+
     fn acquire_peer(self: &Arc<Self>, fingerprint: &str) -> Option<Arc<PeerPermit>> {
         let mut peers = self
             .active_peers
@@ -817,6 +852,18 @@ impl Drop for GlobalPermit {
     }
 }
 
+impl Drop for LargePermit {
+    fn drop(&mut self) {
+        let mut large = self.limiter.large.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(active) = large.get_mut(&self.fingerprint) {
+            *active -= 1;
+            if *active == 0 {
+                large.remove(&self.fingerprint);
+            }
+        }
+    }
+}
+
 impl Drop for PreauthPermit {
     fn drop(&mut self) {
         self.limiter.release_preauth(self.id);
@@ -887,6 +934,7 @@ fn parse_http_request<R: BufRead>(mut reader: R) -> io::Result<InboundRequest> {
     }
 
     let mut content_length = None;
+    let mut chunked_headers = Vec::new();
     let mut header_count = 0usize;
     loop {
         let line = read_header_line(&mut reader, MAX_REQUEST_LINE_BYTES)?;
@@ -904,6 +952,9 @@ fn parse_http_request<R: BufRead>(mut reader: R) -> io::Result<InboundRequest> {
         let (name, value) = parse_header(&line)?;
         if name.eq_ignore_ascii_case("transfer-encoding") {
             return Err(invalid_http("Transfer-Encoding is not supported"));
+        }
+        if name.eq_ignore_ascii_case("x-remuda-chunked") {
+            chunked_headers.push(value == "1");
         }
         if name.eq_ignore_ascii_case("content-length") {
             if content_length.is_some()
@@ -924,7 +975,8 @@ fn parse_http_request<R: BufRead>(mut reader: R) -> io::Result<InboundRequest> {
     let length = content_length.ok_or_else(|| invalid_http("Content-Length is required"))?;
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
-    Ok(InboundRequest { body })
+    let chunked = chunked_headers == [true];
+    Ok(InboundRequest { body, chunked })
 }
 
 fn parse_socket_request_with_timeout(
@@ -1283,7 +1335,10 @@ fn handle_connection_with(stream: TcpStream, context: ConnectionHandlerContext) 
         Err(_) => return ignore_response_error(write_http_response(stream, 400, b"bad request")),
     };
     let opened = match frame::open_request(&state.responder_private, &inbound.body) {
-        Ok(request) => request,
+        Ok(mut request) => {
+            request.chunked = inbound.chunked;
+            request
+        }
         Err(_) => return ignore_response_error(write_http_response(stream, 400, b"bad frame")),
     };
     let peer_fp = cluster::encoding::fingerprint(&opened.peer_static);
@@ -1514,7 +1569,30 @@ fn handle_admitted_request(
         let refused = encode_error("remote node was revoked while the request was held");
         return send_encrypted_response(stream, opened, &refused);
     }
-    send_encrypted_response(stream, opened, &response)
+    send_dispatched_response(stream, opened, &response, &state.limiter, &peer_fp)
+}
+
+/// A v2 response over one frame takes a large-pool permit after the payload is
+/// built (size unknown earlier) and before sealing; exhausted replies "busy".
+fn send_dispatched_response(
+    stream: TcpStream,
+    opened: frame::OpenedRequest,
+    payload: &[u8],
+    limiter: &Arc<RequestLimiter>,
+    peer_fp: &str,
+) {
+    if !opened.chunked || payload.len() <= frame::MAX_RESPONSE_PAYLOAD {
+        return send_encrypted_response(stream, opened, payload);
+    }
+    match limiter.acquire_large(peer_fp) {
+        Some(_permit) => {
+            send_encrypted_response_within(stream, opened, payload, Some(LARGE_WRITE_TOTAL))
+        }
+        None => {
+            let busy = encode_error("cluster busy: too many large responses in flight; retry");
+            send_encrypted_response(stream, opened, &busy)
+        }
+    }
 }
 
 fn acquire_member_permit(
@@ -1583,19 +1661,45 @@ fn decode_cluster_request(payload: &[u8]) -> Result<Request, String> {
 }
 
 fn send_encrypted_response(stream: TcpStream, opened: frame::OpenedRequest, payload: &[u8]) {
-    let payload = bounded_response_payload(payload);
-    let result = frame::seal_response(opened, &payload)
-        .and_then(|body| write_http_response(stream, 200, &body));
-    ignore_response_error(result);
+    send_encrypted_response_within(stream, opened, payload, None)
 }
 
-fn bounded_response_payload(payload: &[u8]) -> Vec<u8> {
-    if payload.len() <= frame::MAX_RESPONSE_PAYLOAD {
-        return payload.to_vec();
+fn send_encrypted_response_within(
+    stream: TcpStream,
+    opened: frame::OpenedRequest,
+    payload: &[u8],
+    write_limit: Option<Duration>,
+) {
+    let chunked = opened.chunked;
+    let payload = bounded_response_payload(payload, chunked);
+    let sealed = if chunked {
+        frame::seal_response_chunked(opened, &payload)
+    } else {
+        frame::seal_response(opened, &payload)
+    };
+    let deadline = write_limit.map(|limit| Instant::now() + limit);
+    ignore_response_error(
+        sealed.and_then(|body| write_http_response_until(stream, 200, &body, deadline)),
+    );
+}
+
+/// Fit `payload` under the cap of the peer's format (v1 one frame, v2 4 MiB).
+fn bounded_response_payload(payload: &[u8], chunked: bool) -> std::borrow::Cow<'_, [u8]> {
+    let cap = if chunked {
+        frame::MAX_RESPONSE_TOTAL
+    } else {
+        frame::MAX_RESPONSE_PAYLOAD
+    };
+    if payload.len() <= cap {
+        return payload.into();
     }
     match trim_blank_screen_tails(payload) {
-        Some(trimmed) if trimmed.len() <= frame::MAX_RESPONSE_PAYLOAD => trimmed,
-        _ => encode_error("cluster response exceeds the Noise frame limit"),
+        Some(trimmed) if trimmed.len() <= cap => trimmed.into(),
+        _ if chunked => encode_error(&format!("cluster response exceeds {cap} bytes")).into(),
+        _ => encode_error(
+            "cluster response exceeds the Noise frame limit; upgrade the requesting node to read it",
+        )
+        .into(),
     }
 }
 
@@ -1631,7 +1735,18 @@ fn trim_blank_screen_tails(payload: &[u8]) -> Option<Vec<u8>> {
     serde_json::to_vec(&response).ok()
 }
 
-fn write_http_response(mut stream: TcpStream, status: u16, body: &[u8]) -> io::Result<()> {
+fn write_http_response(stream: TcpStream, status: u16, body: &[u8]) -> io::Result<()> {
+    write_http_response_until(stream, status, body, None)
+}
+
+/// With a deadline, the whole body write is bounded (not just each write):
+/// on expiry the connection is shut down so a trickling reader is cut.
+fn write_http_response_until(
+    mut stream: TcpStream,
+    status: u16,
+    body: &[u8],
+    deadline: Option<Instant>,
+) -> io::Result<()> {
     let label = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -1641,13 +1756,118 @@ fn write_http_response(mut stream: TcpStream, status: u16, body: &[u8]) -> io::R
         503 => "Service Unavailable",
         _ => "Error",
     };
-    write!(
-        stream,
+    let head = format!(
         "HTTP/1.1 {status} {label}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
-    )?;
-    stream.write_all(body)?;
-    stream.flush()
+    );
+    let Some(deadline) = deadline else {
+        stream.write_all(head.as_bytes())?;
+        stream.write_all(body)?;
+        return stream.flush();
+    };
+    // Headers and body share one absolute deadline; every path shuts down on failure.
+    // SO_SNDTIMEO is only relative per wait (XNU restarts it), so a watchdog
+    // enforces the absolute bound by shutting the socket down at the deadline.
+    let watchdog = Watchdog::start(&stream, deadline)?;
+    let result = write_parts_until(&mut stream, head.as_bytes(), body, deadline);
+    let result = if watchdog.finish() {
+        Err(io::ErrorKind::TimedOut.into())
+    } else {
+        result
+    };
+    if result.is_err() {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+    result
+}
+
+/// Shuts a cloned socket down at `deadline` unless cancelled by `finish`.
+struct Watchdog {
+    cancel: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<bool>,
+}
+
+impl Watchdog {
+    fn start(stream: &TcpStream, deadline: Instant) -> io::Result<Self> {
+        let socket = stream.try_clone()?;
+        let (cancel, cancelled) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("remuda-cluster-write-deadline".into())
+            .spawn(move || {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                let fired =
+                    cancelled.recv_timeout(wait) == Err(std::sync::mpsc::RecvTimeoutError::Timeout);
+                if fired {
+                    let _ = socket.shutdown(Shutdown::Both);
+                }
+                fired
+            })?;
+        Ok(Self { cancel, thread })
+    }
+
+    /// Cancel and join (never leaks the thread); true if the deadline fired.
+    fn finish(self) -> bool {
+        let _ = self.cancel.send(());
+        self.thread.join().unwrap_or(false)
+    }
+}
+
+/// A writer whose blocking time per call can be capped (SO_SNDTIMEO for TCP).
+trait DeadlineWrite: Write {
+    fn cap_write_time(&mut self, limit: Duration) -> io::Result<()>;
+}
+
+impl DeadlineWrite for TcpStream {
+    fn cap_write_time(&mut self, limit: Duration) -> io::Result<()> {
+        self.set_write_timeout(Some(limit.min(Duration::from_secs(5))))
+    }
+}
+
+/// Headers, body, flush: completing exactly at the deadline is fine, after it
+/// is TimedOut.
+fn write_parts_until(
+    writer: &mut impl DeadlineWrite,
+    head: &[u8],
+    body: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    write_all_until(writer, head, deadline)?;
+    write_all_until(writer, body, deadline)?;
+    writer.flush()?;
+    if Instant::now() > deadline {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    Ok(())
+}
+
+/// `write` loop: re-checks the deadline and re-caps the write time to what
+/// remains before EVERY write, so partial writes cannot stretch it.
+fn write_all_until(
+    writer: &mut impl DeadlineWrite,
+    mut buf: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    while !buf.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        writer.cap_write_time(remaining)?;
+        // Small slices: one blocking write can otherwise outlive the timeout while
+        // a reader keeps making partial progress (SO_SNDTIMEO resets on progress).
+        let slice = &buf[..buf.len().min(WRITE_SLICE)];
+        match writer.write(slice) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => buf = &buf[n..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) if Instant::now() >= deadline => {
+                // The per-write timeout raced the deadline.
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn ignore_response_error(result: io::Result<()>) {
@@ -1960,8 +2180,17 @@ mod tests {
         }
 
         fn send_raw(&self, body: &[u8], headers: &[u8]) -> io::Result<(u16, Vec<u8>)> {
+            self.send_raw_with_timeout(body, headers, Duration::from_secs(2))
+        }
+
+        fn send_raw_with_timeout(
+            &self,
+            body: &[u8],
+            headers: &[u8],
+            timeout: Duration,
+        ) -> io::Result<(u16, Vec<u8>)> {
             let mut stream = TcpStream::connect(self.address)?;
-            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            stream.set_read_timeout(Some(timeout))?;
             write!(stream, "POST /cluster HTTP/1.1\r\nHost: test\r\n")?;
             stream.write_all(headers)?;
             stream.write_all(b"\r\n")?;
@@ -3540,7 +3769,7 @@ mod tests {
         })
         .unwrap();
         assert!(raw.len() > frame::MAX_RESPONSE_PAYLOAD, "raw {}", raw.len());
-        let fitted = bounded_response_payload(&raw);
+        let fitted = bounded_response_payload(&raw, false);
         let Response::StyledScreen { rows, .. } = serde_json::from_slice(&fitted).unwrap() else {
             panic!("expected a screen, got an error payload");
         };
@@ -3550,10 +3779,453 @@ mod tests {
 
     #[test]
     fn oversized_result_becomes_a_clear_encrypted_error_payload() {
-        let payload = bounded_response_payload(&vec![b'x'; frame::MAX_RESPONSE_PAYLOAD + 1]);
+        let big = vec![b'x'; frame::MAX_RESPONSE_PAYLOAD + 1];
+        let payload = bounded_response_payload(&big, false);
         assert!(payload.len() < frame::MAX_RESPONSE_PAYLOAD);
         let response: Response = serde_json::from_slice(&payload).unwrap();
         assert!(matches!(response, Response::Error(message) if message.contains("frame limit")));
+    }
+
+    #[cfg(unix)]
+    fn big_payload_server(size: Arc<AtomicUsize>) -> (SocketTestServer, snow::Keypair) {
+        let dispatch = move |_: &[u8], _: &[u8]| {
+            let text = "x".repeat(size.load(Ordering::SeqCst));
+            Ok(serde_json::to_vec(&Response::Error(text)).unwrap())
+        };
+        let t = Duration::from_secs(10);
+        let (server, peer, _) = socket_server(dispatch, t, t, t, t);
+        (server, peer)
+    }
+
+    /// Raw request with arbitrary extra header lines; returns (status, body).
+    #[cfg(unix)]
+    fn raw_with_headers(
+        server: &SocketTestServer,
+        peer: &snow::Keypair,
+        extra: &str,
+    ) -> (frame::SealedRequest, u16, Vec<u8>) {
+        let sealed = sealed_list_request(peer, server);
+        let headers = format!("Content-Length: {}\r\n{extra}", sealed.message.len());
+        let (status, body) = server
+            .send_raw_with_timeout(&sealed.message, headers.as_bytes(), Duration::from_secs(30))
+            .unwrap();
+        (sealed, status, body)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chunked_header_round_trips_big_responses_through_the_real_client() {
+        let size = Arc::new(AtomicUsize::new(0));
+        let (server, peer) = big_payload_server(size.clone());
+        let client = super::super::cluster_client::ClusterClient::system();
+        for n in [1 << 20, 4 * 1024 * 1024 - 1024] {
+            size.store(n, Ordering::SeqCst);
+            let response = client
+                .request(
+                    server.address,
+                    &server.responder_public,
+                    &peer.private,
+                    &Request::List,
+                )
+                .unwrap();
+            assert_eq!(response, Response::Error("x".repeat(n)));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_header_big_response_is_the_v1_upgrade_error_and_small_is_v1() {
+        let size = Arc::new(AtomicUsize::new(100_000));
+        let (server, peer) = big_payload_server(size.clone());
+        let (sealed, status, body) = raw_with_headers(&server, &peer, "");
+        assert_eq!(status, 200);
+        assert!(body.len() <= 65_535);
+        let reply: Response =
+            serde_json::from_slice(&frame::open_response(sealed, &body).unwrap()).unwrap();
+        assert!(matches!(reply, Response::Error(m) if m
+            == "cluster response exceeds the Noise frame limit; upgrade the requesting node to read it"));
+        size.store(100, Ordering::SeqCst);
+        let (sealed, _, body) = raw_with_headers(&server, &peer, "");
+        let reply: Response =
+            serde_json::from_slice(&frame::open_response(sealed, &body).unwrap()).unwrap();
+        assert_eq!(reply, Response::Error("x".repeat(100)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chunked_header_is_exact_name_case_insensitive_value_exactly_one() {
+        let size = Arc::new(AtomicUsize::new(100_000));
+        let (server, peer) = big_payload_server(size);
+        let cases = [
+            ("X-Remuda-Chunked: 1\r\n", true),
+            ("x-remuda-chunked: 1\r\n", true),
+            ("X-REMUDA-CHUNKED:\t1 \r\n", true),
+            ("X-Remuda-Chunked: 2\r\n", false),
+            ("X-Remuda-Chunked: 01\r\n", false),
+            ("X-Remuda-Chunked: \r\n", false),
+            ("X-Remuda-Chunked: 1\r\nX-Remuda-Chunked: 1\r\n", false),
+            ("X-Remuda-Chunked: 1\r\nx-remuda-chunked: 2\r\n", false),
+        ];
+        for (extra, v2) in cases {
+            let (sealed, status, body) = raw_with_headers(&server, &peer, extra);
+            assert_eq!(status, 200, "{extra:?}");
+            let payload = frame::open_response_any(sealed, &body).unwrap();
+            let reply: Response = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(
+                matches!(reply, Response::Error(m) if m.len() == 100_000),
+                v2,
+                "{extra:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn over_cap_v2_response_is_the_cap_error_and_content_length_matches_body() {
+        let size = Arc::new(AtomicUsize::new(frame::MAX_RESPONSE_TOTAL + 1));
+        let (server, peer) = big_payload_server(size);
+        let (sealed, status, body) = raw_with_headers(&server, &peer, "X-Remuda-Chunked: 1\r\n");
+        assert_eq!(status, 200);
+        let reply: Response =
+            serde_json::from_slice(&frame::open_response_any(sealed, &body).unwrap()).unwrap();
+        assert_eq!(
+            reply,
+            Response::Error("cluster response exceeds 4194304 bytes".into())
+        );
+
+        // Content-Length equals the real body length (nothing trails it).
+        let sealed = sealed_list_request(&peer, &server);
+        let mut stream = TcpStream::connect(server.address).unwrap();
+        write!(
+            stream,
+            "POST /cluster HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\nX-Remuda-Chunked: 1\r\n\r\n",
+            sealed.message.len()
+        )
+        .unwrap();
+        stream.write_all(&sealed.message).unwrap();
+        let mut all = Vec::new();
+        stream.read_to_end(&mut all).unwrap();
+        let split = all.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let head = std::str::from_utf8(&all[..split]).unwrap();
+        let length: usize = head
+            .split("Content-Length: ")
+            .nth(1)
+            .unwrap()
+            .split("\r\n")
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(length, all.len() - split);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chunked_header_does_not_relax_the_request_body_cap() {
+        let (server, peer) = big_payload_server(Arc::new(AtomicUsize::new(1)));
+        let _ = peer;
+        let headers = format!(
+            "Content-Length: {}\r\nX-Remuda-Chunked: 1\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        let (status, _) = server.send_raw(&[], headers.as_bytes()).unwrap();
+        assert_eq!(status, 400);
+    }
+
+    #[cfg(unix)]
+    fn big_request(
+        server: &SocketTestServer,
+        peer: &snow::Keypair,
+    ) -> Result<Response, super::super::cluster_client::ClientError> {
+        super::super::cluster_client::ClusterClient::system().request(
+            server.address,
+            &server.responder_public,
+            &peer.private,
+            &Request::List,
+        )
+    }
+
+    fn is_busy(response: &Response) -> bool {
+        matches!(response, Response::Error(m) if m.contains("busy"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn large_responses_are_busy_when_the_per_peer_or_global_pool_is_exhausted() {
+        let size = Arc::new(AtomicUsize::new(100_000));
+        let (server, peer) = big_payload_server(size.clone());
+        let limiter = server.state.limiter.clone();
+        let peer_fp = cluster::encoding::fingerprint(&peer.public);
+        let held = limiter.acquire_large(&peer_fp).unwrap();
+        assert!(limiter.acquire_large(&peer_fp).is_none());
+        assert!(is_busy(&big_request(&server, &peer).unwrap()));
+        // Small traffic keeps its own pool while the large one is exhausted.
+        size.store(100, Ordering::SeqCst);
+        assert_eq!(
+            big_request(&server, &peer).unwrap(),
+            Response::Error("x".repeat(100))
+        );
+        // Released after the guard drops: the next big response goes through.
+        drop(held);
+        size.store(100_000, Ordering::SeqCst);
+        assert_eq!(
+            big_request(&server, &peer).unwrap(),
+            Response::Error("x".repeat(100_000))
+        );
+        assert_eq!(limiter.large_active(), 0);
+        // Global pool: other peers fill every slot.
+        let others: Vec<_> = (0..MAX_LARGE_GLOBAL)
+            .map(|i| limiter.acquire_large(&format!("other-{i}")).unwrap())
+            .collect();
+        assert!(limiter.acquire_large("one-more").is_none());
+        assert!(is_busy(&big_request(&server, &peer).unwrap()));
+        size.store(100, Ordering::SeqCst);
+        assert!(!is_busy(&big_request(&server, &peer).unwrap()));
+        drop(others);
+        assert_eq!(limiter.large_active(), 0);
+    }
+
+    #[test]
+    fn large_permit_is_released_on_panic() {
+        let limiter = Arc::new(RequestLimiter::default());
+        let l = limiter.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _permit = l.acquire_large("p").unwrap();
+            panic!("boom");
+        });
+        assert!(result.is_err());
+        assert_eq!(limiter.large_active(), 0);
+        assert!(limiter.acquire_large("p").is_some());
+    }
+
+    /// (server-side stream with a tiny send buffer, client-side stream with a tiny window)
+    #[cfg(unix)]
+    fn tiny_buffer_pair() -> (TcpStream, TcpStream) {
+        use nix::sys::socket::{setsockopt, sockopt};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        setsockopt(&client, sockopt::RcvBuf, &4096).unwrap();
+        setsockopt(&server, sockopt::SndBuf, &4096).unwrap();
+        (server, client)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_trickle_reader_is_cut_at_the_total_write_deadline() {
+        let (server, mut client) = tiny_buffer_pair();
+        let body = vec![7u8; 4 * 1024 * 1024];
+        let started = Instant::now();
+        let writer = std::thread::spawn(move || {
+            let deadline = Some(Instant::now() + Duration::from_millis(400));
+            write_http_response_until(server, 200, &body, deadline)
+        });
+        // A few hundred bytes per 20 ms: partial writes inside a single piece.
+        let mut buf = [0u8; 300];
+        while !writer.is_finished() {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = client.read(&mut buf);
+        }
+        let error = writer.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
+    }
+
+    /// Scripted writer: `n` bytes accepted per call after `delay`; `stall` sleeps
+    /// the capped time, then WouldBlock, instead of accepting anything.
+    struct Scripted {
+        n: usize,
+        delay: Duration,
+        stall: bool,
+        cap: Duration,
+    }
+
+    impl Write for Scripted {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.stall {
+                std::thread::sleep(self.cap);
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            std::thread::sleep(self.delay);
+            Ok(self.n.min(buf.len()))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl DeadlineWrite for Scripted {
+        fn cap_write_time(&mut self, limit: Duration) -> io::Result<()> {
+            self.cap = limit;
+            Ok(())
+        }
+    }
+
+    fn scripted(n: usize, delay_ms: u64, stall: bool) -> Scripted {
+        Scripted {
+            n,
+            delay: Duration::from_millis(delay_ms),
+            stall,
+            cap: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn scripted_partial_writes_hit_the_deadline_not_the_end_of_the_body() {
+        // 2 bytes per 5 ms would need ~460 ms for 200 bytes; deadline is 40 ms.
+        let mut writer = scripted(2, 5, false);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(40);
+        let error = write_parts_until(&mut writer, b"HEAD", &[1; 200], deadline).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_millis(120),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn writer_stalled_in_the_headers_times_out_at_the_deadline() {
+        let mut writer = scripted(0, 0, true);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(60);
+        let error = write_parts_until(&mut writer, b"HEAD", b"body", deadline).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn final_piece_completing_after_the_deadline_is_timed_out() {
+        // One call takes 60 ms and accepts everything, past a 20 ms deadline.
+        let mut writer = scripted(usize::MAX, 60, false);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let error = write_parts_until(&mut writer, b"H", b"b", deadline).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let mut ok = scripted(usize::MAX, 0, false);
+        write_parts_until(&mut ok, b"H", b"b", Instant::now() + Duration::from_secs(5)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_is_cancelled_on_fast_completion_without_touching_the_socket() {
+        let (server, mut client) = tiny_buffer_pair();
+        let started = Instant::now();
+        let watchdog = Watchdog::start(&server, Instant::now() + Duration::from_secs(30)).unwrap();
+        assert!(!watchdog.finish(), "must not fire");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "joined promptly"
+        );
+        // The socket still works: not shut down by the cancelled watchdog.
+        (&server).write_all(b"ok").unwrap();
+        let mut got = [0u8; 2];
+        client.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_unblocks_a_write_that_never_checks_the_deadline() {
+        let (mut server, _client) = tiny_buffer_pair();
+        // Backstop only so a missing watchdog fails the assertion instead of hanging.
+        server
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let started = Instant::now();
+        let watchdog = Watchdog::start(&server, started + Duration::from_millis(200)).unwrap();
+        // One huge blocking write, no userspace deadline checks, reader never reads.
+        let result = server.write_all(&vec![1u8; 4 * 1024 * 1024]);
+        assert!(watchdog.finish(), "watchdog must have fired");
+        assert!(result.is_err());
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_byte_per_20ms_reader_is_cut_within_deadline_plus_300ms() {
+        for deadline_ms in [100u64, 400] {
+            let (server, mut client) = tiny_buffer_pair();
+            let started = Instant::now();
+            let writer = std::thread::spawn(move || {
+                let deadline = Some(Instant::now() + Duration::from_millis(deadline_ms));
+                write_http_response_until(server, 200, &vec![7u8; 4 * 1024 * 1024], deadline)
+            });
+            let mut buf = [0u8; 1];
+            while !writer.is_finished() {
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = client.read(&mut buf);
+            }
+            assert_eq!(
+                writer.join().unwrap().unwrap_err().kind(),
+                io::ErrorKind::TimedOut
+            );
+            let elapsed = started.elapsed();
+            assert!(elapsed >= Duration::from_millis(deadline_ms), "{elapsed:?}");
+            assert!(
+                elapsed < Duration::from_millis(deadline_ms + 300),
+                "{elapsed:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cut_connection_is_shut_down_and_frees_the_large_pool_for_another_peer() {
+        let limiter = Arc::new(RequestLimiter::default());
+        let permit = limiter.acquire_large("peer-a").unwrap();
+        let (server, mut client) = tiny_buffer_pair();
+        let started = Instant::now();
+        let writer = std::thread::spawn(move || {
+            let _permit = permit; // released when the write path ends
+            let deadline = Some(Instant::now() + Duration::from_millis(400));
+            write_http_response_until(server, 200, &vec![7u8; 4 * 1024 * 1024], deadline)
+        });
+        let mut buf = [0u8; 300];
+        while !writer.is_finished() {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = client.read(&mut buf);
+        }
+        assert_eq!(
+            writer.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
+        assert_eq!(limiter.large_active(), 0);
+        assert!(limiter.acquire_large("peer-b").is_some());
+        // Shut down: draining what was buffered ends in EOF, not a hang.
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fast_reader_finishes_a_deadline_bounded_write() {
+        // Default buffers: tiny Linux windows make 4 MiB crawl (fixture, not the writer).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let body = vec![7u8; 4 * 1024 * 1024];
+        let len = body.len();
+        let writer = std::thread::spawn(move || {
+            let deadline = Some(Instant::now() + Duration::from_secs(20));
+            write_http_response_until(server, 200, &body, deadline)
+        });
+        let mut all = Vec::new();
+        client.read_to_end(&mut all).unwrap();
+        writer.join().unwrap().unwrap();
+        assert!(all.len() > len);
     }
 
     #[test]
