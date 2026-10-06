@@ -67,9 +67,10 @@ under `${XDG_DATA_HOME:-$HOME/.local/share}/remuda/mods`. The package contains
 Lua files and may include inert regular files listed in `assets`, an array of
 checkout-relative paths inside the package root (for example,
 `assets = ["packages/butler/matrix_relay.py"]`). Assets must not be symlinks
-or directories and are limited to 1 MiB each. Remuda copies their bytes and
-file mode but never loads or executes them. Other non-Lua package files remain
-rejected. Add
+or directories and are limited to 64 assets, 1 MiB each and 8 MiB in total. An
+asset with a setuid, setgid or sticky mode bit is rejected. Remuda copies their
+bytes and file mode (group and other write bits are cleared) but never loads or
+executes them. Other non-Lua package files remain rejected. Add
 `--ref REF` to select a branch, tag, or commit. Installation never changes a
 live Lua image by default. Add `--reload` to ask the running daemon to replace
 the installed lifecycle-managed mod in its existing Lua image. `remuda mod
