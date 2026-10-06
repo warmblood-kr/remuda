@@ -1743,6 +1743,11 @@ fn visible_remote_pane_lines(
         .collect()
 }
 
+/// Raw mode clears OPOST, so a bare `\n` only moves down and every row staircases right.
+fn terminal_frame(frame: &str) -> String {
+    frame.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
 fn age_seconds(now: Duration, since: Duration) -> u64 {
     now.saturating_sub(since).as_secs()
 }
@@ -2183,7 +2188,7 @@ fn run_loop(
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
             crossterm::cursor::MoveTo(0, 0)
         )?;
-        write!(io::stdout(), "{frame}")?;
+        write!(io::stdout(), "{}", terminal_frame(&frame))?;
         io::stdout().flush()?;
         ui.send_close_pending(path, remote_input, clock.now());
         ui.send_pending(path, clock.now(), remote_input);
@@ -2230,7 +2235,8 @@ mod tests {
     use super::queue::{QueueEvent, QueueState, MAX_IO_RETRIES};
     use super::{
         is_attention, remote_state_label, render_badge, select_target_with_remote_wait,
-        AttentionSignals, Badge, ClusterUi, RemoteInputTransport, RemoteSelection, RemoteSource,
+        terminal_frame, AttentionSignals, Badge, ClusterUi, RemoteInputTransport, RemoteSelection,
+        RemoteSource,
     };
     use crate::cluster_remote::{
         RemoteNodeSnapshot, RemoteSessionSnapshot, RemoteSnapshot, RemoteState,
@@ -2383,6 +2389,11 @@ mod tests {
         now: Duration,
     ) {
         ui.key_event(crossterm::event::KeyEvent::new(code, modifiers), now);
+    }
+
+    #[test]
+    fn raw_mode_frames_use_carriage_return_line_feed() {
+        assert_eq!(terminal_frame("a\nb\r\nc"), "a\r\nb\r\nc");
     }
 
     #[test]
