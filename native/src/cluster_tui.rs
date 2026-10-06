@@ -24,6 +24,8 @@ use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub mod close_request;
+/// Below this many columns there is no room for two panes: the tree stacks above the pane.
+const SPLIT_MIN_COLS: usize = 60;
 const UI_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 const REMOTE_KEYS_COALESCE_INTERVAL: Duration = Duration::from_millis(40);
 const REMOTE_PASTE_FAILURE_NOTICE: &str =
@@ -569,56 +571,11 @@ impl ClusterUi {
             return self.render_remote_keys_mode(width, height);
         }
         let now = clock.now();
-        let mut frame = Vec::new();
-        let reachable = 1 + self
-            .remote_snapshot
-            .nodes
-            .iter()
-            .filter(|node| node.state == RemoteState::Reachable)
-            .count();
-        frame.push(format!(
-            "remuda · cluster ({reachable}/{} reachable)",
-            self.remote_snapshot.nodes.len() + 1
-        ));
-        frame.push(format!(
-            "{} {}       {} · {} · sync {}s",
-            if self.expanded { "▼" } else { "▶" },
-            self.node,
-            render_badge(Badge::Local),
-            render_badge(Badge::Reachable),
-            age_seconds(now, self.synced_at)
-        ));
-        let tree_start = frame.len();
-        if self.expanded {
-            let visible = self.visible_sessions();
-            for index in visible.iter().copied() {
-                let session = &self.sessions[index];
-                let prefix = format!("{}    ", if index == self.selected { ">" } else { " " },);
-                let status = session_status(
-                    render_badge(if session.alive {
-                        Badge::Live
-                    } else {
-                        Badge::Ended
-                    }),
-                    self.pending_count(session),
-                );
-                frame.push(tree_label_line(&prefix, &session.name, &status, 12, width));
-            }
-            if visible.is_empty() {
-                frame.push(if self.attention_only {
-                    "    no sessions need attention".into()
-                } else {
-                    "    no matching sessions".into()
-                });
-                if !cluster_tree_has_sessions(&self.sessions, &self.remote_snapshot) {
-                    frame.push(
-                        "    No sessions yet. Start one on any machine: remuda run -n NAME COMMAND"
-                            .into(),
-                    );
-                }
-            }
+        if width >= SPLIT_MIN_COLS {
+            return self.render_split(width, height, screen, now);
         }
-        self.append_remote_tree(&mut frame, width);
+        let mut frame = self.tree_lines(width, now);
+        let tree_start = 2;
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
         let divider = "─".repeat(width);
         let queue_rows: Vec<&PendingBatch> = self.input_queue.items().rev().take(3).collect();
@@ -646,6 +603,112 @@ impl ClusterUi {
         );
         frame.extend(notice_lines);
         frame.extend(queue_rows.into_iter().rev().map(queue_line));
+        self.append_footer(&mut frame, width);
+        frame
+            .into_iter()
+            .map(|line| truncate(&line, width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Cluster header, local node and remote nodes as one virtual tree (first 2 rows are the header).
+    fn tree_lines(&self, width: usize, now: Duration) -> Vec<String> {
+        let mut frame = Vec::new();
+        let reachable = 1 + self
+            .remote_snapshot
+            .nodes
+            .iter()
+            .filter(|node| node.state == RemoteState::Reachable)
+            .count();
+        frame.push(format!(
+            "remuda · cluster ({reachable}/{} reachable)",
+            self.remote_snapshot.nodes.len() + 1
+        ));
+        frame.push(format!(
+            "{} {}  {} · {} · sync {}s",
+            if self.expanded { "▼" } else { "▶" },
+            self.node,
+            render_badge(Badge::Local),
+            render_badge(Badge::Reachable),
+            age_seconds(now, self.synced_at)
+        ));
+        if self.expanded {
+            let visible = self.visible_sessions();
+            for index in visible.iter().copied() {
+                let session = &self.sessions[index];
+                let prefix = format!("{}    ", if index == self.selected { ">" } else { " " },);
+                let status = session_status(
+                    render_badge(if session.alive {
+                        Badge::Live
+                    } else {
+                        Badge::Ended
+                    }),
+                    self.pending_count(session),
+                );
+                frame.push(tree_label_line(&prefix, &session.name, &status, 12, width));
+            }
+            if visible.is_empty() {
+                frame.push(if self.attention_only {
+                    "    no sessions need attention".into()
+                } else {
+                    "    no matching sessions".into()
+                });
+                if !cluster_tree_has_sessions(&self.sessions, &self.remote_snapshot) {
+                    frame.push("    No sessions yet. Start one on any machine:".into());
+                    frame.push("    remuda run -n NAME COMMAND".into());
+                }
+            }
+        }
+        self.append_remote_tree(&mut frame, width);
+        frame
+    }
+
+    /// Wide layout: tree in a left column, selected pane on the right, footer full width.
+    fn render_split(&self, width: usize, height: usize, screen: &str, now: Duration) -> String {
+        let wanted = self
+            .tree_lines(48, now)
+            .iter()
+            .map(|l| UnicodeWidthStr::width(l.as_str()))
+            .max()
+            .unwrap_or(0);
+        let left_w = (wanted + 1).clamp(24, (width / 2).min(48));
+        let right_w = width - left_w - 1;
+        let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
+        let notices = self.active_notice_lines(now, width);
+        let queue: Vec<String> = self
+            .input_queue
+            .items()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(queue_line)
+            .collect();
+        let body_rows = height
+            .saturating_sub(self.footer_row_count(width) + notices.len() + queue.len())
+            .max(1);
+        let screen_rows = body_rows.saturating_sub(1);
+        let mut right = vec![pane_header];
+        right.extend(
+            visible_remote_pane_lines(&pane_body, self.remote_active.is_some(), screen_rows)
+                .into_iter()
+                .map(str::to_string),
+        );
+        let mut left = self.tree_lines(left_w, now);
+        if left.len() > body_rows {
+            left.truncate(body_rows - 1);
+            left.push("… more".into());
+        }
+        let mut frame: Vec<String> = (0..body_rows)
+            .map(|row| {
+                let l = truncate(left.get(row).map_or("", String::as_str), left_w);
+                let r = truncate(right.get(row).map_or("", String::as_str), right_w);
+                format!("{}│{r}", pad_to(&l, left_w))
+            })
+            .collect();
+        frame.extend(notices);
+        frame.extend(queue);
         self.append_footer(&mut frame, width);
         frame
             .into_iter()
@@ -1832,6 +1895,11 @@ fn truncate(text: &str, width: usize) -> String {
     text.chars().take(width).collect()
 }
 
+fn pad_to(text: &str, width: usize) -> String {
+    let w = UnicodeWidthStr::width(text);
+    format!("{text}{}", " ".repeat(width.saturating_sub(w)))
+}
+
 fn tree_label_line(prefix: &str, label: &str, status: &str, pad_to: usize, width: usize) -> String {
     let available =
         width.saturating_sub(UnicodeWidthStr::width(prefix) + 1 + UnicodeWidthStr::width(status));
@@ -2993,7 +3061,7 @@ mod tests {
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
         ui.capture_completed(clock.now());
         let frame = ui.render(80, 24, "snapshot", &clock);
-        assert!(frame.contains("▼ studio       local"));
+        assert!(frame.contains("▼ studio  local"));
         assert!(frame.contains("    dev          live"));
         assert!(frame.contains("studio / dev · live · snapshot 0s ago"));
     }
@@ -3451,9 +3519,8 @@ mod tests {
 
         let frame = empty_ui.render(100, 24, "", &clock);
 
-        assert!(
-            frame.contains("No sessions yet. Start one on any machine: remuda run -n NAME COMMAND")
-        );
+        assert!(frame.contains("No sessions yet. Start one on any machine:"));
+        assert!(frame.contains("remuda run -n NAME COMMAND"));
 
         let mut stale_ui = ClusterUi::new("studio", vec![], clock.now());
         let stale_remote = FakeRemoteSource(Mutex::new(remote_snapshot(
@@ -3520,7 +3587,7 @@ mod tests {
             let one_line = ui.render(cols, rows, &screen, &clock);
             let one_line_body_rows = one_line
                 .lines()
-                .filter(|line| line.starts_with("body-"))
+                .filter(|line| line.contains("body-"))
                 .count();
             ui.notice = Some((
                 "a human is attached to this session, so remote input is paused; wait for them to detach, then retry"
@@ -3532,10 +3599,7 @@ mod tests {
                 .lines()
                 .filter(|line| line.contains("a human") || line.contains("then retry"))
                 .count();
-            let long_notice_body_rows = frame
-                .lines()
-                .filter(|line| line.starts_with("body-"))
-                .count();
+            let long_notice_body_rows = frame.lines().filter(|line| line.contains("body-")).count();
             assert!(
                 frame.contains("then retry"),
                 "notice lost its next step at {cols}x{rows}: {frame}"
@@ -4147,6 +4211,31 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Enter);
         assert_eq!(ui.query.as_deref(), Some("dev"));
         assert_eq!(ui.active, 1);
+    }
+
+    #[test]
+    fn wide_terminal_puts_tree_left_and_pane_right() {
+        let clock = ManualClock::new();
+        let ui = selected_remote_ui(&clock, remote_screen("remote-body"));
+        let frame = ui.render(100, 24, "", &clock);
+        let lines: Vec<&str> = frame.lines().collect();
+        let first = lines[0];
+        assert!(first.starts_with("remuda · cluster"), "{first}");
+        let (left, right) = first.split_once('│').expect("divider on header row");
+        assert!(left.chars().count() <= 48);
+        assert!(right.contains("laptop / build"), "{first}");
+        assert!(lines
+            .iter()
+            .any(|l| l.contains('│') && l.contains("remote-body")));
+        assert!(lines.iter().all(|l| l.chars().count() <= 100));
+    }
+
+    #[test]
+    fn narrow_terminal_keeps_stacked_layout() {
+        let clock = ManualClock::new();
+        let ui = selected_remote_ui(&clock, remote_screen("remote-body"));
+        let frame = ui.render(40, 24, "", &clock);
+        assert!(!frame.lines().next().unwrap().contains('│'));
     }
 
     #[test]
