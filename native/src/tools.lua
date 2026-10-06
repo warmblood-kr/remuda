@@ -2327,49 +2327,52 @@ local function cap_int(need, key)
   if math.type(v) ~= "integer" then return nil, false end
   return v, true
 end
-function remuda.cli.require(need)
-  local next_line = "\nNext: remuda upgrade"
-  local bad = "remuda: invalid requirement.\nNext: remuda doc"
-  if type(need) ~= "table" then return false, bad end
-  local spec_v, ok1 = cap_int(need, "spec_version")
-  local report_v, ok2 = cap_int(need, "report_version")
-  local features = rawget(need, "features")
-  if not (ok1 and ok2) or (features ~= nil and type(features) ~= "table") then return false, bad end
-  features = features or {}
-  -- Fail closed: a dense array of at most 1024 strings, no other keys.
-  local n, keys = rawlen(features), 0
-  if n > 1024 then return false, bad end
-  for i = 1, n do
-    if type(rawget(features, i)) ~= "string" then return false, bad end
-  end
-  for _ in next, features do
-    keys = keys + 1
-    if keys > n then return false, bad end
-  end
-  local cli = rawget(remuda, "cli")
-  local getter = type(cli) == "table" and rawget(cli, "capabilities") or nil
-  local called, caps = false, nil
-  if type(getter) == "function" then called, caps = pcall(getter) end
-  if not called or type(caps) ~= "table" then
-    return false, "remuda: this core predates CLI capabilities; upgrade it." .. next_line
-  end
-  local missing = {}
-  if spec_v and not cap_list_has(caps, "spec_versions", spec_v) then
-    missing[#missing + 1] = "spec_version " .. spec_v
-  end
-  if report_v and not cap_list_has(caps, "report_versions", report_v) then
-    missing[#missing + 1] = "report_version " .. report_v
-  end
-  for i = 1, n do
-    local name = rawget(features, i)
-    if not cap_list_has(caps, "features", name) then
-      missing[#missing + 1] = public_features[name] and name or "<feature>"
+-- Unit-test images load this file without the native cli binding.
+if remuda.cli then
+  function remuda.cli.require(need)
+    local next_line = "\nNext: remuda upgrade"
+    local bad = "remuda: invalid requirement.\nNext: remuda doc"
+    if type(need) ~= "table" then return false, bad end
+    local spec_v, ok1 = cap_int(need, "spec_version")
+    local report_v, ok2 = cap_int(need, "report_version")
+    local features = rawget(need, "features")
+    if not (ok1 and ok2) or (features ~= nil and type(features) ~= "table") then return false, bad end
+    features = features or {}
+    -- Fail closed: a dense array of at most 1024 strings, no other keys.
+    local n, keys = rawlen(features), 0
+    if n > 1024 then return false, bad end
+    for i = 1, n do
+      if type(rawget(features, i)) ~= "string" then return false, bad end
     end
+    for _ in next, features do
+      keys = keys + 1
+      if keys > n then return false, bad end
+    end
+    local cli = rawget(remuda, "cli")
+    local getter = type(cli) == "table" and rawget(cli, "capabilities") or nil
+    local called, caps = false, nil
+    if type(getter) == "function" then called, caps = pcall(getter) end
+    if not called or type(caps) ~= "table" then
+      return false, "remuda: this core predates CLI capabilities; upgrade it." .. next_line
+    end
+    local missing = {}
+    if spec_v and not cap_list_has(caps, "spec_versions", spec_v) then
+      missing[#missing + 1] = "spec_version " .. spec_v
+    end
+    if report_v and not cap_list_has(caps, "report_versions", report_v) then
+      missing[#missing + 1] = "report_version " .. report_v
+    end
+    for i = 1, n do
+      local name = rawget(features, i)
+      if not cap_list_has(caps, "features", name) then
+        missing[#missing + 1] = public_features[name] and name or "<feature>"
+      end
+    end
+    if #missing == 0 then return true end
+    return false, "remuda: this core is too old: missing " .. table.concat(missing, ", ") .. "." .. next_line
   end
-  if #missing == 0 then return true end
-  return false, "remuda: this core is too old: missing " .. table.concat(missing, ", ") .. "." .. next_line
+  register("cli.require", "Check remuda.cli.capabilities() before sending a v2 spec: need = {features?, spec_version?, report_version?}. Returns true, or false and a diagnostic ending in 'Next: remuda upgrade'; a core without capabilities counts as old.", "cli.require(need) -> true | false, text")
 end
-register("cli.require", "Check remuda.cli.capabilities() before sending a v2 spec: need = {features?, spec_version?, report_version?}. Returns true, or false and a diagnostic ending in 'Next: remuda upgrade'; a core without capabilities counts as old.", "cli.require(need) -> true | false, text")
 
 -- The first word, and the one `steps/008` found missing: readiness. Driving an
 -- agent means waiting for it, and every caller so far has written this loop
