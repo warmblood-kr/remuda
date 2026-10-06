@@ -59,7 +59,7 @@ impl Report {
         }
     }
 
-    fn failure(kind: &str, text: String, code: i32) -> Self {
+    pub fn failure(kind: &str, text: String, code: i32) -> Self {
         Self {
             ok: false,
             verb: None,
@@ -72,9 +72,9 @@ impl Report {
 }
 
 /// Versions and features this parser supports, for `remuda.cli.capabilities()`.
-pub const SPEC_VERSIONS: &[u32] = &[1];
+pub const SPEC_VERSIONS: &[u32] = &[1, 2];
 pub const REPORT_VERSIONS: &[u32] = &[1, 2];
-pub const FEATURES: &[&str] = &["stable_report"];
+pub const FEATURES: &[&str] = &["stable_report", "strict_v2"];
 
 /// Shape a report as the v2 envelope; vectors are always arrays.
 /// Error text is the legacy diagnostic and may quote input until G7b safe_errors;
