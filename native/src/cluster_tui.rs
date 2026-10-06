@@ -1892,7 +1892,13 @@ impl RemoteSource for EmptyRemoteSource {
 }
 
 fn truncate(text: &str, width: usize) -> String {
-    text.chars().take(width).collect()
+    let mut used = 0;
+    text.chars()
+        .take_while(|ch| {
+            used += UnicodeWidthChar::width(*ch).unwrap_or(0);
+            used <= width
+        })
+        .collect()
 }
 
 fn pad_to(text: &str, width: usize) -> String {
@@ -4236,6 +4242,62 @@ mod tests {
         let ui = selected_remote_ui(&clock, remote_screen("remote-body"));
         let frame = ui.render(40, 24, "", &clock);
         assert!(!frame.lines().next().unwrap().contains('│'));
+    }
+
+    fn cell_width(s: &str) -> usize {
+        unicode_width::UnicodeWidthStr::width(s)
+    }
+
+    #[test]
+    fn split_cells_are_width_aware_for_wide_text() {
+        let clock = ManualClock::new();
+        let ui = selected_remote_ui(&clock, remote_screen("한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글"));
+        let frame = ui.render(60, 24, "", &clock);
+        let cols: Vec<usize> = frame
+            .lines()
+            .filter(|l| l.contains('│'))
+            .map(|l| cell_width(l.split('│').next().unwrap()))
+            .collect();
+        assert!(cols.len() > 3);
+        assert!(cols.iter().all(|c| *c == cols[0]), "{cols:?}\n{frame}");
+        assert!(frame.lines().all(|l| cell_width(l) <= 60), "{frame}");
+        assert!(frame.contains('한'));
+    }
+
+    #[test]
+    fn layout_switches_exactly_at_sixty_columns() {
+        let clock = ManualClock::new();
+        let ui = selected_remote_ui(&clock, remote_screen("remote-body"));
+        assert!(!ui
+            .render(59, 24, "", &clock)
+            .lines()
+            .next()
+            .unwrap()
+            .contains('│'));
+        assert!(ui
+            .render(60, 24, "", &clock)
+            .lines()
+            .next()
+            .unwrap()
+            .contains('│'));
+    }
+
+    #[test]
+    fn split_mode_notice_footer_and_keys_mode() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote-body"));
+        ui.notice = Some(("heads up".into(), clock.now()));
+        let frame = ui.render(100, 24, "", &clock);
+        let lines: Vec<&str> = frame.lines().collect();
+        assert!(lines.last().unwrap().contains("type") || lines.last().unwrap().contains("Enter"));
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("heads up") && !l.contains('│')));
+        assert!(lines.iter().all(|l| cell_width(l) <= 100));
+        ui.remote_keys_mode = ui.remote_active.clone();
+        let keys = ui.render(100, 24, "", &clock);
+        assert!(keys.starts_with("KEYS laptop/build"));
+        assert!(!keys.contains('│'));
     }
 
     #[test]
