@@ -400,6 +400,117 @@ impl RecordOpener {
     }
 }
 
+const RESPONSE_V2: u8 = 0x01;
+const MSG2_HEADER: usize = 1 + 4;
+/// Largest chunk0 that fits msg2: frame cap - tag - ephemeral key - header.
+pub const MAX_CHUNK0: usize = MAX_FRAME_SIZE - AEAD_TAG_SIZE - 32 - MSG2_HEADER;
+
+/// v2 response body: `[u16 len][msg2]` then records. msg2 plaintext is `[ver][u32 BE total][chunk0]`.
+#[allow(dead_code)]
+pub fn seal_response_chunked(mut request: OpenedRequest, payload: &[u8]) -> io::Result<Vec<u8>> {
+    if payload.len() > MAX_RESPONSE_TOTAL {
+        return Err(too_large());
+    }
+    let (chunk0, rest) = payload.split_at(payload.len().min(MAX_CHUNK0));
+    let mut plain = Vec::with_capacity(MSG2_HEADER + chunk0.len());
+    plain.push(RESPONSE_V2);
+    plain.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    plain.extend_from_slice(chunk0);
+    let mut msg = vec![0; MAX_FRAME_SIZE];
+    let n = request
+        .handshake
+        .write_message(&plain, &mut msg)
+        .map_err(frame_error)?;
+    let mut out = (n as u16).to_be_bytes().to_vec();
+    out.extend_from_slice(&msg[..n]);
+    let mut transport = request
+        .handshake
+        .into_transport_mode()
+        .map_err(frame_error)?;
+    out.extend_from_slice(&seal_records(&mut transport, rest)?);
+    Ok(out)
+}
+
+/// Open a v2 body from a slice.
+#[allow(dead_code)]
+pub fn open_response_chunked(request: SealedRequest, body: &[u8]) -> io::Result<Vec<u8>> {
+    open_response_chunked_from(request, &mut &*body)
+}
+
+/// Open a v2 body from a reader; nothing past msg2 is read until its total_len passes the cap.
+#[allow(dead_code)]
+pub fn open_response_chunked_from(
+    mut request: SealedRequest,
+    reader: &mut impl io::Read,
+) -> io::Result<Vec<u8>> {
+    let mut len = [0; 2];
+    reader.read_exact(&mut len)?;
+    let mut msg = vec![0; u16::from_be_bytes(len) as usize];
+    reader.read_exact(&mut msg)?;
+    let plain = decrypt_msg2(&mut request, &msg)?;
+    if plain.first() != Some(&RESPONSE_V2) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "peer uses newer cluster response format",
+        ));
+    }
+    let header: [u8; 4] = plain
+        .get(1..MSG2_HEADER)
+        .and_then(|h| h.try_into().ok())
+        .ok_or_else(invalid_frame)?;
+    let total = u32::from_be_bytes(header) as usize;
+    if total > MAX_RESPONSE_TOTAL {
+        return Err(too_large());
+    }
+    let chunk0 = &plain[MSG2_HEADER..];
+    let expected = total.checked_sub(chunk0.len()).ok_or_else(invalid_frame)?;
+    let transport = request
+        .handshake
+        .into_transport_mode()
+        .map_err(frame_error)?;
+    let mut opener = RecordOpener::new(transport, expected)?;
+    // Bound the read; the opener rejects any byte after the final record anyway.
+    let mut limited = io::Read::take(
+        &mut *reader,
+        (MAX_RECORDS * (2 + MAX_FRAME_SIZE) + 1) as u64,
+    );
+    let mut buf = vec![0; 64 * 1024];
+    loop {
+        let n = io::Read::read(&mut limited, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        opener.push(&buf[..n])?;
+    }
+    let mut out = chunk0.to_vec();
+    out.extend_from_slice(&opener.finish()?);
+    Ok(out)
+}
+
+/// Open either format: a bare msg2 is v1 (returned untouched), a length-prefixed msg2 is v2.
+#[allow(dead_code)]
+pub fn open_response_any(mut request: SealedRequest, body: &[u8]) -> io::Result<Vec<u8>> {
+    // A failed read_message restores the handshake state, so trying v1 first is safe.
+    if let Ok(payload) = decrypt_msg2(&mut request, body) {
+        return Ok(payload);
+    }
+    open_response_chunked(request, body)
+}
+
+fn decrypt_msg2(request: &mut SealedRequest, message: &[u8]) -> io::Result<Vec<u8>> {
+    if message.len() < 32 || message.len() > MAX_FRAME_SIZE {
+        return Err(invalid_frame());
+    }
+    reject_low_order_dh(&request.initiator_private, &message[..32])?;
+    let mut payload = vec![0; MAX_FRAME_SIZE];
+    let n = request
+        .handshake
+        .read_message(message, &mut payload)
+        .map_err(frame_error)?;
+    payload.truncate(n);
+    Ok(payload)
+}
+
 fn parse_pattern() -> io::Result<snow::params::NoiseParams> {
     NOISE_PATTERN.parse().map_err(frame_error)
 }
@@ -703,5 +814,165 @@ mod tests {
         opener.push(&wire).unwrap();
         assert_eq!(opener.pending_len(), 1002);
         assert!(opener.finish().is_err());
+    }
+
+    // ---- v2 wrappers ----
+    fn pair() -> (OpenedRequest, SealedRequest) {
+        let (i, r) = (keypair(), keypair());
+        let sealed = seal_request(&i.private, &r.public, 1000, b"req").unwrap();
+        (open_request(&r.private, &sealed.message).unwrap(), sealed)
+    }
+
+    /// Hand-built v2 body: arbitrary header fields, chunk0 and records payload.
+    fn forge(mut o: OpenedRequest, ver: u8, total: u32, chunk0: &[u8], rest: &[u8]) -> Vec<u8> {
+        let mut plain = vec![ver];
+        plain.extend_from_slice(&total.to_be_bytes());
+        plain.extend_from_slice(chunk0);
+        let mut msg = vec![0; MAX_FRAME_SIZE];
+        let n = o.handshake.write_message(&plain, &mut msg).unwrap();
+        let mut out = (n as u16).to_be_bytes().to_vec();
+        out.extend_from_slice(&msg[..n]);
+        let mut t = o.handshake.into_transport_mode().unwrap();
+        out.extend_from_slice(&seal_records(&mut t, rest).unwrap());
+        out
+    }
+
+    fn v2_roundtrip(n: usize) {
+        let (o, s) = pair();
+        let plain = data(n);
+        let body = seal_response_chunked(o, &plain).unwrap();
+        assert_eq!(open_response_chunked(s, &body).unwrap(), plain);
+    }
+
+    #[test]
+    fn v2_roundtrips_edges() {
+        for n in [
+            0,
+            1,
+            100,
+            MAX_CHUNK0 - 1,
+            MAX_CHUNK0,
+            MAX_CHUNK0 + 1,
+            1 << 20,
+            MAX_RESPONSE_TOTAL,
+        ] {
+            v2_roundtrip(n);
+        }
+    }
+
+    #[test]
+    fn v2_small_response_is_msg2_only() {
+        let (o, _s) = pair();
+        let body = seal_response_chunked(o, &data(10)).unwrap();
+        let msg_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+        assert_eq!(body.len(), 2 + msg_len);
+    }
+
+    #[test]
+    fn v2_cap_plus_one_rejected_at_seal_and_open() {
+        let (o, _s) = pair();
+        assert!(seal_response_chunked(o, &data(MAX_RESPONSE_TOTAL + 1)).is_err());
+        let (o, s) = pair();
+        let body = forge(o, 1, MAX_RESPONSE_TOTAL as u32 + 1, b"x", b"");
+        assert!(open_response_chunked(s, &body).is_err());
+    }
+
+    #[test]
+    fn v2_over_cap_total_is_rejected_before_reading_records() {
+        struct Tripwire<'a>(&'a [u8]);
+        impl io::Read for Tripwire<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                assert!(!self.0.is_empty(), "read past msg2");
+                let n = self.0.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.0[..n]);
+                self.0 = &self.0[n..];
+                Ok(n)
+            }
+        }
+        let (o, s) = pair();
+        let body = forge(o, 1, u32::MAX, b"x", b"");
+        let msg_end = 2 + u16::from_be_bytes([body[0], body[1]]) as usize;
+        assert!(open_response_chunked_from(s, &mut Tripwire(&body[..msg_end])).is_err());
+    }
+
+    #[test]
+    fn v2_unknown_version_has_exact_message() {
+        let (o, s) = pair();
+        let body = forge(o, 2, 1, b"x", b"");
+        let err = open_response_chunked(s, &body).unwrap_err();
+        assert_eq!(err.to_string(), "peer uses newer cluster response format");
+    }
+
+    #[test]
+    fn v2_lying_totals_are_rejected() {
+        for total in [5, 200] {
+            let (o, s) = pair();
+            let body = forge(o, 1, total, &data(10), &data(MAX_RECORD_PLAINTEXT));
+            assert!(open_response_chunked(s, &body).is_err(), "total {total}");
+        }
+        let (o, s) = pair();
+        let body = forge(o, 1, 5, &data(10), b"");
+        assert!(open_response_chunked(s, &body).is_err());
+    }
+
+    #[test]
+    fn v2_oversized_chunk0_is_rejected() {
+        let (o, _s) = pair();
+        let mut o = o;
+        let mut msg = vec![0; MAX_FRAME_SIZE + 100];
+        let plain = vec![1; MAX_CHUNK0 + MSG2_HEADER + 1];
+        assert!(o.handshake.write_message(&plain, &mut msg).is_err());
+    }
+
+    #[test]
+    fn v2_truncation_trailing_dup_swap_splice_are_rejected() {
+        let plain = data(3 * MAX_RECORD_PLAINTEXT);
+        let (o, s) = pair();
+        let body = seal_response_chunked(o, &plain).unwrap();
+        let rec = 2 + MAX_RECORD_PLAINTEXT + AEAD_TAG_SIZE;
+        let msg_end = 2 + u16::from_be_bytes([body[0], body[1]]) as usize;
+        assert!(open_response_chunked(s, &body[..body.len() - rec]).is_err());
+        let (o, s) = pair();
+        let mut long = seal_response_chunked(o, &plain).unwrap();
+        long.push(0);
+        assert!(open_response_chunked(s, &long).is_err());
+        let recs: Vec<&[u8]> = body[msg_end..].chunks(rec).collect();
+        for order in [[0, 0, 2], [1, 0, 2]] {
+            let (o, s) = pair();
+            let b = seal_response_chunked(o, &plain).unwrap();
+            let mut tampered = b[..msg_end].to_vec();
+            for i in order {
+                tampered.extend_from_slice(recs_of(&b, msg_end, rec)[i]);
+            }
+            assert!(open_response_chunked(s, &tampered).is_err());
+        }
+        // record from another exchange
+        let (o2, _s2) = pair();
+        let other = seal_response_chunked(o2, &plain).unwrap();
+        let other_end = 2 + u16::from_be_bytes([other[0], other[1]]) as usize;
+        let (o, s) = pair();
+        let mut b = seal_response_chunked(o, &plain).unwrap();
+        b.truncate(msg_end);
+        b.extend_from_slice(&other[other_end..]);
+        assert!(open_response_chunked(s, &b).is_err());
+        let _ = recs;
+    }
+
+    fn recs_of(b: &[u8], msg_end: usize, rec: usize) -> Vec<&[u8]> {
+        b[msg_end..].chunks(rec).collect()
+    }
+
+    #[test]
+    fn open_response_any_handles_v1_and_v2() {
+        let (o, s) = pair();
+        let v1 = seal_response(o, b"{\"ok\":true}").unwrap();
+        assert_eq!(open_response_any(s, &v1).unwrap(), b"{\"ok\":true}");
+        let (o, s) = pair();
+        let plain = data(200_000);
+        let v2 = seal_response_chunked(o, &plain).unwrap();
+        assert_eq!(open_response_any(s, &v2).unwrap(), plain);
+        let (o, s) = pair();
+        let v2 = seal_response_chunked(o, b"").unwrap();
+        assert!(open_response_any(s, &v2).unwrap().is_empty());
     }
 }
