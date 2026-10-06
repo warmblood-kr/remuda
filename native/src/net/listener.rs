@@ -3556,6 +3556,152 @@ mod tests {
         assert!(matches!(response, Response::Error(message) if message.contains("frame limit")));
     }
 
+    #[cfg(unix)]
+    fn big_payload_server(size: Arc<AtomicUsize>) -> (SocketTestServer, snow::Keypair) {
+        let dispatch = move |_: &[u8], _: &[u8]| {
+            let text = "x".repeat(size.load(Ordering::SeqCst));
+            Ok(serde_json::to_vec(&Response::Error(text)).unwrap())
+        };
+        let t = Duration::from_secs(10);
+        let (server, peer, _) = socket_server(dispatch, t, t, t, t);
+        (server, peer)
+    }
+
+    /// Raw request with arbitrary extra header lines; returns (status, body).
+    #[cfg(unix)]
+    fn raw_with_headers(
+        server: &SocketTestServer,
+        peer: &snow::Keypair,
+        extra: &str,
+    ) -> (frame::SealedRequest, u16, Vec<u8>) {
+        let sealed = sealed_list_request(peer, server);
+        let headers = format!("Content-Length: {}\r\n{extra}", sealed.message.len());
+        let (status, body) = server
+            .send_raw(&sealed.message, headers.as_bytes())
+            .unwrap();
+        (sealed, status, body)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chunked_header_round_trips_big_responses_through_the_real_client() {
+        let size = Arc::new(AtomicUsize::new(0));
+        let (server, peer) = big_payload_server(size.clone());
+        let client = super::super::cluster_client::ClusterClient::system();
+        for n in [1 << 20, 4 * 1024 * 1024 - 1024] {
+            size.store(n, Ordering::SeqCst);
+            let response = client
+                .request(
+                    server.address,
+                    &server.responder_public,
+                    &peer.private,
+                    &Request::List,
+                )
+                .unwrap();
+            assert_eq!(response, Response::Error("x".repeat(n)));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_header_big_response_is_the_v1_upgrade_error_and_small_is_v1() {
+        let size = Arc::new(AtomicUsize::new(100_000));
+        let (server, peer) = big_payload_server(size.clone());
+        let (sealed, status, body) = raw_with_headers(&server, &peer, "");
+        assert_eq!(status, 200);
+        assert!(body.len() <= 65_535);
+        let reply: Response =
+            serde_json::from_slice(&frame::open_response(sealed, &body).unwrap()).unwrap();
+        assert!(matches!(reply, Response::Error(m) if m
+            == "cluster response exceeds the Noise frame limit; upgrade the requesting node to read it"));
+        size.store(100, Ordering::SeqCst);
+        let (sealed, _, body) = raw_with_headers(&server, &peer, "");
+        let reply: Response =
+            serde_json::from_slice(&frame::open_response(sealed, &body).unwrap()).unwrap();
+        assert_eq!(reply, Response::Error("x".repeat(100)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chunked_header_is_exact_name_case_insensitive_value_exactly_one() {
+        let size = Arc::new(AtomicUsize::new(100_000));
+        let (server, peer) = big_payload_server(size);
+        let cases = [
+            ("X-Remuda-Chunked: 1\r\n", true),
+            ("x-remuda-chunked: 1\r\n", true),
+            ("X-REMUDA-CHUNKED:\t1 \r\n", true),
+            ("X-Remuda-Chunked: 2\r\n", false),
+            ("X-Remuda-Chunked: 01\r\n", false),
+            ("X-Remuda-Chunked: \r\n", false),
+            ("X-Remuda-Chunked: 1\r\nX-Remuda-Chunked: 1\r\n", false),
+            ("X-Remuda-Chunked: 1\r\nx-remuda-chunked: 2\r\n", false),
+        ];
+        for (extra, v2) in cases {
+            let (sealed, status, body) = raw_with_headers(&server, &peer, extra);
+            assert_eq!(status, 200, "{extra:?}");
+            let payload = frame::open_response_any(sealed, &body).unwrap();
+            let reply: Response = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(
+                matches!(reply, Response::Error(m) if m.len() == 100_000),
+                v2,
+                "{extra:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn over_cap_v2_response_is_the_cap_error_and_content_length_matches_body() {
+        let size = Arc::new(AtomicUsize::new(frame::MAX_RESPONSE_TOTAL + 1));
+        let (server, peer) = big_payload_server(size);
+        let (sealed, status, body) = raw_with_headers(&server, &peer, "X-Remuda-Chunked: 1\r\n");
+        assert_eq!(status, 200);
+        let reply: Response =
+            serde_json::from_slice(&frame::open_response_any(sealed, &body).unwrap()).unwrap();
+        assert_eq!(
+            reply,
+            Response::Error("cluster response exceeds 4194304 bytes".into())
+        );
+
+        // Content-Length equals the real body length (nothing trails it).
+        let sealed = sealed_list_request(&peer, &server);
+        let mut stream = TcpStream::connect(server.address).unwrap();
+        write!(
+            stream,
+            "POST /cluster HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\nX-Remuda-Chunked: 1\r\n\r\n",
+            sealed.message.len()
+        )
+        .unwrap();
+        stream.write_all(&sealed.message).unwrap();
+        let mut all = Vec::new();
+        stream.read_to_end(&mut all).unwrap();
+        let split = all.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let head = std::str::from_utf8(&all[..split]).unwrap();
+        let length: usize = head
+            .split("Content-Length: ")
+            .nth(1)
+            .unwrap()
+            .split("\r\n")
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(length, all.len() - split);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chunked_header_does_not_relax_the_request_body_cap() {
+        let (server, peer) = big_payload_server(Arc::new(AtomicUsize::new(1)));
+        let _ = peer;
+        let headers = format!(
+            "Content-Length: {}\r\nX-Remuda-Chunked: 1\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        let (status, _) = server.send_raw(&[], headers.as_bytes()).unwrap();
+        assert_eq!(status, 400);
+    }
+
     #[test]
     fn request_limiter_caps_global_and_per_peer_work() {
         let limiter = Arc::new(RequestLimiter::default());
