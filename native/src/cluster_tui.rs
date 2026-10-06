@@ -689,7 +689,7 @@ impl ClusterUi {
             .saturating_sub(self.footer_row_count(width) + notices.len() + queue.len())
             .max(1);
         let screen_rows = body_rows.saturating_sub(1);
-        let mut right = vec![pane_header];
+        let mut right = vec![ellipsize(&pane_header, right_w)];
         right.extend(
             visible_remote_pane_lines(&pane_body, self.remote_active.is_some(), screen_rows)
                 .into_iter()
@@ -871,17 +871,19 @@ impl ClusterUi {
         match &self.remote_active {
             Some(active) => match self.remote_session(active) {
                 Some((node, session)) => (
+                    // State first: a narrow pane clips the tail, never the reachability.
                     format!(
-                        "{} / {} · remote {} · {}",
-                        node.name,
-                        session.name,
+                        "remote {} · {}{} · {} / {}",
                         if session.alive { "live" } else { "ended" },
                         remote_state_label(
                             node.state,
                             node.last_sync_age,
                             node.last_error.as_deref()
-                        )
-                    ) + &session_error_suffix(session.last_error.as_deref()),
+                        ),
+                        session_error_suffix(session.last_error.as_deref()),
+                        node.name,
+                        session.name
+                    ),
                     session
                         .screen
                         .as_ref()
@@ -4276,6 +4278,25 @@ mod tests {
     }
 
     #[test]
+    fn split_header_keeps_reachability_with_long_names() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote-body"));
+        ui.remote_snapshot.nodes[0].name = "a-very-long-remote-node-label".into();
+        ui.remote_snapshot.nodes[0].sessions[0].name = "a-very-long-session-name".into();
+        ui.remote_active = Some(RemoteSelection::Session {
+            node: "fp-laptop".into(),
+            name: "a-very-long-session-name".into(),
+            instance_id: "remote-instance".into(),
+        });
+        for cols in [60, 80] {
+            let first = ui.render(cols, 24, "", &clock);
+            let first = first.lines().next().unwrap();
+            assert!(first.contains("remote live · reachable"), "{cols}: {first}");
+            assert!(first.contains('…'), "{first}");
+        }
+    }
+
+    #[test]
     fn layout_switches_exactly_at_sixty_columns() {
         let clock = ManualClock::new();
         let ui = selected_remote_ui(&clock, remote_screen("remote-body"));
@@ -4300,7 +4321,10 @@ mod tests {
         ui.notice = Some(("heads up".into(), clock.now()));
         let frame = ui.render(100, 24, "", &clock);
         let lines: Vec<&str> = frame.lines().collect();
-        assert!(lines.last().unwrap().contains("type") || lines.last().unwrap().contains("Enter"));
+        assert!(lines
+            .last()
+            .unwrap()
+            .starts_with("Enter type · k keys · x close · q detach"));
         assert!(lines
             .iter()
             .any(|l| l.starts_with("heads up") && !l.contains('│')));

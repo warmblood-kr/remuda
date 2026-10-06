@@ -762,7 +762,7 @@ fn driver_hosted_remote_tui_capture_shows_live_output_with_trailing_blanks() {
     let deadline = Instant::now() + Duration::from_secs(3);
     let screen = loop {
         let screen = capture();
-        if screen.contains("remote live") {
+        if screen.contains("remote live · reachable") {
             break screen;
         }
         assert!(
