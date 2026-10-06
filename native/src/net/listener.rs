@@ -24,6 +24,10 @@ pub const MAX_BODY_BYTES: usize = 65_535;
 pub const MAX_GLOBAL_REQUESTS: usize = 64;
 pub const MAX_PREAUTH_REQUESTS: usize = 64;
 pub const MAX_PEER_REQUESTS: usize = 8;
+/// Separate pool for responses above one Noise frame (v2 only): worst case
+/// MAX_LARGE_GLOBAL x 4 MiB sealed copies in flight, on top of the old pool.
+const MAX_LARGE_GLOBAL: usize = 4;
+const MAX_LARGE_PER_PEER: usize = 1;
 pub const MAX_PREAUTH_PER_IP: usize = 4;
 pub const MAX_PREAUTH_PER_IPV6_48: usize = 16;
 pub const MAX_JOIN_ATTEMPTS_PER_IP: usize = 10;
@@ -232,6 +236,7 @@ struct RequestLimiter {
     next_preauth_id: AtomicUsize,
     preauth_limit_override: AtomicUsize,
     active_peers: Mutex<HashMap<String, usize>>,
+    large: Mutex<HashMap<String, usize>>,
     join_attempts: Mutex<HashMap<std::net::IpAddr, VecDeque<Instant>>>,
     registry_requests: Mutex<HashMap<String, RegistryTokenBucket>>,
     remote_inputs: Mutex<RemoteInputRateLimiter>,
@@ -289,6 +294,12 @@ struct RegistryTokenBucket {
 }
 
 struct GlobalPermit(Arc<RequestLimiter>);
+
+/// RAII slot in the large-response pool (releases on drop, error or panic).
+struct LargePermit {
+    limiter: Arc<RequestLimiter>,
+    fingerprint: String,
+}
 
 struct PreauthPermit {
     limiter: Arc<RequestLimiter>,
@@ -721,6 +732,25 @@ impl RequestLimiter {
         active.retain(|entry| entry.id != id);
     }
 
+    fn acquire_large(self: &Arc<Self>, fingerprint: &str) -> Option<LargePermit> {
+        let mut large = self.large.lock().unwrap_or_else(|p| p.into_inner());
+        if large.values().sum::<usize>() >= MAX_LARGE_GLOBAL
+            || large.get(fingerprint).copied().unwrap_or(0) >= MAX_LARGE_PER_PEER
+        {
+            return None;
+        }
+        *large.entry(fingerprint.to_owned()).or_default() += 1;
+        Some(LargePermit {
+            limiter: self.clone(),
+            fingerprint: fingerprint.to_owned(),
+        })
+    }
+
+    #[cfg(test)]
+    fn large_active(&self) -> usize {
+        self.large.lock().unwrap().values().sum()
+    }
+
     fn acquire_peer(self: &Arc<Self>, fingerprint: &str) -> Option<Arc<PeerPermit>> {
         let mut peers = self
             .active_peers
@@ -816,6 +846,18 @@ fn preauth_victim_index(
 impl Drop for GlobalPermit {
     fn drop(&mut self) {
         self.0.active_global.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for LargePermit {
+    fn drop(&mut self) {
+        let mut large = self.limiter.large.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(active) = large.get_mut(&self.fingerprint) {
+            *active -= 1;
+            if *active == 0 {
+                large.remove(&self.fingerprint);
+            }
+        }
     }
 }
 
@@ -1524,7 +1566,31 @@ fn handle_admitted_request(
         let refused = encode_error("remote node was revoked while the request was held");
         return send_encrypted_response(stream, opened, &refused);
     }
-    send_encrypted_response(stream, opened, &response)
+    send_dispatched_response(stream, opened, &response, &state.limiter, &peer_fp)
+}
+
+/// A v2 response above one frame needs a large-pool permit, acquired AFTER the
+/// payload exists (its size is unknown before dispatch) and BEFORE sealing.
+/// The pool bounds the sealed copy plus the socket write time (<= 4 x 4 MiB);
+/// it cannot bound the already-built payload, which the old 64-slot pool
+/// still caps at 64 x 4 MiB. Exhausted: reply "busy" instead of waiting.
+fn send_dispatched_response(
+    stream: TcpStream,
+    opened: frame::OpenedRequest,
+    payload: &[u8],
+    limiter: &Arc<RequestLimiter>,
+    peer_fp: &str,
+) {
+    if !opened.chunked || payload.len() <= frame::MAX_RESPONSE_PAYLOAD {
+        return send_encrypted_response(stream, opened, payload);
+    }
+    match limiter.acquire_large(peer_fp) {
+        Some(_permit) => send_encrypted_response(stream, opened, payload),
+        None => {
+            let busy = encode_error("cluster busy: too many large responses in flight; retry");
+            send_encrypted_response(stream, opened, &busy)
+        }
+    }
 }
 
 fn acquire_member_permit(
@@ -3734,6 +3800,72 @@ mod tests {
         );
         let (status, _) = server.send_raw(&[], headers.as_bytes()).unwrap();
         assert_eq!(status, 400);
+    }
+
+    #[cfg(unix)]
+    fn big_request(
+        server: &SocketTestServer,
+        peer: &snow::Keypair,
+    ) -> Result<Response, super::super::cluster_client::ClientError> {
+        super::super::cluster_client::ClusterClient::system().request(
+            server.address,
+            &server.responder_public,
+            &peer.private,
+            &Request::List,
+        )
+    }
+
+    fn is_busy(response: &Response) -> bool {
+        matches!(response, Response::Error(m) if m.contains("busy"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn large_responses_are_busy_when_the_per_peer_or_global_pool_is_exhausted() {
+        let size = Arc::new(AtomicUsize::new(100_000));
+        let (server, peer) = big_payload_server(size.clone());
+        let limiter = server.state.limiter.clone();
+        let peer_fp = cluster::encoding::fingerprint(&peer.public);
+        let held = limiter.acquire_large(&peer_fp).unwrap();
+        assert!(limiter.acquire_large(&peer_fp).is_none());
+        assert!(is_busy(&big_request(&server, &peer).unwrap()));
+        // Small traffic keeps its own pool while the large one is exhausted.
+        size.store(100, Ordering::SeqCst);
+        assert_eq!(
+            big_request(&server, &peer).unwrap(),
+            Response::Error("x".repeat(100))
+        );
+        // Released after the guard drops: the next big response goes through.
+        drop(held);
+        size.store(100_000, Ordering::SeqCst);
+        assert_eq!(
+            big_request(&server, &peer).unwrap(),
+            Response::Error("x".repeat(100_000))
+        );
+        assert_eq!(limiter.large_active(), 0);
+        // Global pool: other peers fill every slot.
+        let others: Vec<_> = (0..MAX_LARGE_GLOBAL)
+            .map(|i| limiter.acquire_large(&format!("other-{i}")).unwrap())
+            .collect();
+        assert!(limiter.acquire_large("one-more").is_none());
+        assert!(is_busy(&big_request(&server, &peer).unwrap()));
+        size.store(100, Ordering::SeqCst);
+        assert!(!is_busy(&big_request(&server, &peer).unwrap()));
+        drop(others);
+        assert_eq!(limiter.large_active(), 0);
+    }
+
+    #[test]
+    fn large_permit_is_released_on_panic() {
+        let limiter = Arc::new(RequestLimiter::default());
+        let l = limiter.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _permit = l.acquire_large("p").unwrap();
+            panic!("boom");
+        });
+        assert!(result.is_err());
+        assert_eq!(limiter.large_active(), 0);
+        assert!(limiter.acquire_large("p").is_some());
     }
 
     #[test]
