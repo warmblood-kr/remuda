@@ -2457,10 +2457,46 @@ local function process_run(spec)
   if result == nil then error(refused, 2) end
   return result
 end
-remuda.process = setmetatable({ run = process_run }, {
+local function process_exec(spec, on_done)
+  if type(spec) ~= "table" then error("process.exec needs a spec table", 2) end
+  if type(on_done) ~= "function" then error("process.exec needs an on_done function", 2) end
+  if type(spec.argv) ~= "table" or #spec.argv == 0 then
+    error("process.exec needs a non-empty `argv`", 2)
+  end
+  for i, arg in ipairs(spec.argv) do
+    if type(arg) ~= "string" or (i == 1 and arg == "") then
+      error("process.exec argv must contain strings and a non-empty executable", 2)
+    end
+  end
+  if spec.stdin ~= nil and type(spec.stdin) ~= "string" then
+    error("process.exec stdin must be a string", 2)
+  end
+  local timeout = spec.timeout
+  if timeout == nil then timeout = 5 end
+  if type(timeout) ~= "number" or timeout ~= timeout or timeout <= 0 or timeout > 30 then
+    error("process.exec timeout must be positive and at most 30 seconds", 2)
+  end
+  local stdin_hold_until_lines = spec.stdin_hold_until_lines
+  if stdin_hold_until_lines ~= nil and (type(stdin_hold_until_lines) ~= "number"
+      or stdin_hold_until_lines ~= stdin_hold_until_lines
+      or stdin_hold_until_lines % 1 ~= 0
+      or stdin_hold_until_lines < 1 or stdin_hold_until_lines > 1000) then
+    error("process.exec stdin_hold_until_lines must be an integer from 1 through 1000. Next: pass a whole number in that range.", 2)
+  end
+  if spec.cwd ~= nil and (type(spec.cwd) ~= "string" or not utf8.len(spec.cwd)) then
+    error("process.exec cwd must be an absolute path to an existing directory. Next: pass the directory's full path.", 2)
+  end
+  local id, refused = remuda._process_exec(
+    spec.argv, spec.stdin, timeout, spec.cwd, stdin_hold_until_lines,
+    spec.env, spec.clear_env, on_done
+  )
+  if id == nil then error(refused, 2) end
+  return id
+end
+remuda.process = setmetatable({ run = process_run, exec = process_exec }, {
   __call = function(_, spec) return process_start(spec) end,
 })
-register("process", "Spawn an asynchronous plain-pipe child; process.run executes argv synchronously with bounded timeout and output. `env`, when given, sets string variables on top of the daemon's environment. `clear_env=true` starts with an empty environment before applying `env`; callers must pass every variable the child needs, including SystemRoot and PATH on Windows. Names cannot be empty or contain '=' or NUL; names and values must be strings, and values cannot contain NUL. On Windows, environment names are case-insensitive: names differing only by case refer to the same variable, and which value wins is undefined; do not pass both. `cwd`, when given, is an absolute path to an existing directory where the child starts. With `cwd`, a bare argv[1] is searched in the daemon's absolute PATH entries; without `cwd`, lookup uses the child's PATH. With `cwd`, `argv[1]` must be an absolute path or a bare command name, and a bare name is never searched in `cwd`. Use this word, not process.run, for a command that can take longer than 30 seconds.", "process{argv, on_line?, on_exit?, cwd?, env?, clear_env?} -> id; process.run(spec) -> {code, stdout, stderr, timed_out}")
+register("process", "Spawn an asynchronous plain-pipe child; process.run executes argv synchronously with bounded timeout and output; process.exec runs bounded jobs asynchronously and calls a Lua callback on the image event loop. `env`, when given, sets string variables on top of the daemon's environment. `clear_env=true` starts with an empty environment before applying `env`; callers must pass every variable the child needs, including SystemRoot and PATH on Windows. Names cannot be empty or contain '=' or NUL; names and values must be strings, and values cannot contain NUL. On Windows, environment names are case-insensitive: names differing only by case refer to the same variable, and which value wins is undefined; do not pass both. `cwd`, when given, is an absolute path to an existing directory where the child starts. With `cwd`, a bare argv[1] is searched in the daemon's absolute PATH entries; without `cwd`, lookup uses the child's PATH. With `cwd`, `argv[1]` must be an absolute path or a bare command name, and a bare name is never searched in `cwd`.", "process{argv, on_line?, on_exit?, cwd?, env?, clear_env?} -> id; process.run(spec) -> {code, stdout, stderr, timed_out}; process.exec(spec, on_done) -> id")
 register("process.run", "Run argv directly without a shell; inherits the daemon's environment unless `clear_env=true`, then applies `env` string variables. Callers using a cleared environment must pass every variable the child needs, including SystemRoot and PATH on Windows. Names cannot be empty or contain '=' or NUL; names and values must be strings, and values cannot contain NUL. On Windows, environment names are case-insensitive: names differing only by case refer to the same variable, and which value wins is undefined; do not pass both. Unless `cwd` is given, the child inherits the daemon's working directory. `cwd` is an absolute path to an existing directory where the child starts. With `cwd`, a bare argv[1] is searched in the daemon's absolute PATH entries; without `cwd`, lookup uses the child's PATH. With `cwd`, `argv[1]` must be an absolute path or a bare command name, and a bare name is never searched in `cwd`. Blocks the Lua image until exit or timeout (default 5s, max 30s; longer commands use remuda.process), captures each stream up to 1 MiB. `stdin_hold_until_lines`, when set to an integer from 1 through 1000, keeps stdin open until stdout has that many newlines, the child exits, or timeout. Surviving descendants can keep pipes open; at most 16 background output readers are allowed.", "process.run{argv, stdin?, timeout?, cwd?, stdin_hold_until_lines?, env?, clear_env?} -> {code, stdout, stderr, timed_out, signal?}")
 
 -- Everything defined so far is core's; a mod may not replace it (#145).

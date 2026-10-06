@@ -22,14 +22,17 @@ use remuda_core::keys;
 use remuda_core::protocol::{Request, Response, Step};
 use remuda_core::{InputSubmitOutcome, DEFAULT_INPUT_SETTLE};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 97] = [
+pub const BINDINGS: [&str; 99] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -48,6 +51,8 @@ pub const BINDINGS: [&str; 97] = [
     "_pending_line_events",
     "_pending_secret_events",
     "_process_drain",
+    "_process_exec",
+    "_process_exec_done",
     "_process_killpg",
     "_process_run",
     "_process_spawn",
@@ -421,6 +426,16 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_registry",
         "The word registry itself: name, about and signature for every bound word.",
         "table",
+    ),
+    (
+        "_process_exec",
+        "Run a bounded process asynchronously; internal, wrapped by `remuda.process.exec`.",
+        "_process_exec(argv, stdin?, timeout, cwd?, stdin_hold_until_lines?, env?, clear_env?, on_done) -> id | nil, refusal",
+    ),
+    (
+        "_process_exec_done",
+        "Deliver completed process.exec output and invoke its Lua callback; internal, an Image job only.",
+        "_process_exec_done(id) -> nil",
     ),
     (
         "_process_run",
@@ -916,7 +931,7 @@ pub(crate) fn bindings(
     let input_registry = registry.clone();
     fail_binding(lua, &table, image.clone())?;
     pending_bindings(lua, &table, image.pending_replies(), Rc::clone(&caller))?;
-    timer_bindings(lua, &table, timers)?;
+    timer_bindings(lua, &table, Rc::clone(&timers))?;
     caller_binding(lua, &table, caller)?;
     random_bytes_binding(lua, &table)?;
     hostname_binding(lua, &table)?;
@@ -1042,7 +1057,7 @@ pub(crate) fn bindings(
     request_count_bindings(lua, &table, counters)?;
     registry_bindings(lua, &table)?;
     fs_lock_binding(lua, &table, socket)?;
-    process_bindings(lua, &table, image)?;
+    process_bindings(lua, &table, image, timers)?;
 
     removed_sleep_error(lua, &table)?;
 
@@ -1931,13 +1946,31 @@ fn parse_process_environment(
 // `remuda.process` itself (the validated, Lua-facing spec-table word) lives
 // in `tools.lua` and calls `_process_spawn` here; `kill` and `processes` are
 // plain Rust words with nothing to validate.
-fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlua::Result<()> {
+fn process_bindings(
+    lua: &Lua,
+    table: &Table,
+    image: crate::image::Image,
+    timers: crate::image::timers::SharedTimerService,
+) -> mlua::Result<()> {
     let processes = crate::process::Processes::new();
+    let execs = Rc::new(RefCell::new(HashMap::<u64, ProcessExecCallback>::new()));
     table.set(
         "_process_spawn",
         process_spawn_binding(lua, processes.clone(), image.clone())?,
     )?;
     table.set("_process_run", process_run_binding(lua)?)?;
+    table.set(
+        "_process_exec",
+        process_exec_binding(lua, execs.clone(), image.clone(), timers.clone())?,
+    )?;
+    let completed_execs = execs.clone();
+    let exec_timers = timers;
+    table.set(
+        "_process_exec_done",
+        lua.create_function(move |lua, id: u64| {
+            process_exec_done(lua, id, &completed_execs, &exec_timers)
+        })?,
+    )?;
 
     let drainer = processes.clone();
     let drain_image = image;
@@ -2006,6 +2039,134 @@ fn process_spawn_binding(
             Ok((Some(id), None))
         },
     )
+}
+
+struct ProcessExecCallback {
+    callback: mlua::RegistryKey,
+    timer_id: u64,
+    result: Arc<Mutex<Option<Result<crate::process::RunOutput, String>>>>,
+}
+
+static NEXT_PROCESS_EXEC_ID: AtomicU64 = AtomicU64::new(1);
+type ProcessExecArgs = (
+    Vec<String>,
+    Option<mlua::LuaString>,
+    f64,
+    Option<String>,
+    Value,
+    Value,
+    Value,
+    mlua::Function,
+);
+
+fn process_exec_binding(
+    lua: &Lua,
+    execs: Rc<RefCell<HashMap<u64, ProcessExecCallback>>>,
+    image: crate::image::Image,
+    timers: crate::image::timers::SharedTimerService,
+) -> mlua::Result<mlua::Function> {
+    lua.create_function(
+        move |lua,
+              (mut argv, stdin, timeout, cwd, stdin_hold_until_lines, env, clear_env, callback): ProcessExecArgs| {
+            let child_environment = match parse_process_environment(env, clear_env, "process.exec") {
+                Ok(environment) => environment,
+                Err(refused) => return Ok((Value::Nil, Some(refused))),
+            };
+            let stdin_hold_until_lines = match parse_stdin_hold_until_lines(stdin_hold_until_lines)
+            {
+                Ok(lines) => lines,
+                Err(refused) => return Ok((Value::Nil, Some(refused))),
+            };
+            let cwd = match crate::process::checked_cwd("process.exec", cwd.as_deref(), &mut argv) {
+                Ok(cwd) => cwd,
+                Err(refused) => return Ok((Value::Nil, Some(refused))),
+            };
+            let id = NEXT_PROCESS_EXEC_ID.fetch_add(1, Ordering::Relaxed);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let timer_cancelled = cancelled.clone();
+            let timer_callback = lua.create_function(move |_, ()| {
+                timer_cancelled.store(true, Ordering::Release);
+                Ok(())
+            })?;
+            // The runner also checks its exact deadline, so sub-10ms timeouts
+            // retain process.run's range even though image timers have a floor.
+            let timer_id = timers.borrow_mut().schedule(
+                lua,
+                timeout.max(crate::image::timers::MIN_DELAY.as_secs_f64()),
+                timer_callback,
+                None,
+                false,
+            )?;
+            let result = Arc::new(Mutex::new(None));
+            let callback_key = lua.create_registry_value(callback)?;
+            execs.borrow_mut().insert(
+                id,
+                ProcessExecCallback {
+                    callback: callback_key,
+                    timer_id,
+                    result: result.clone(),
+                },
+            );
+            let completed = result;
+            let done_image = image.clone();
+            let started = crate::process::run_async_with_env(
+                crate::process::RunConfig {
+                    word: "process.exec",
+                    argv,
+                    stdin: stdin.map(|value| value.as_bytes().to_vec()),
+                    timeout_seconds: timeout,
+                    cwd,
+                    stdin_hold_until_lines,
+                    child_environment,
+                },
+                cancelled,
+                move |output| {
+                    *completed.lock().unwrap() = Some(output);
+                    if let Err(error) = done_image.submit(&format!("remuda._process_exec_done({id})"), None) {
+                        eprintln!("remuda process.exec completion delivery failed: {error}");
+                    }
+                },
+            );
+            if let Err(refused) = started {
+                if let Some(entry) = execs.borrow_mut().remove(&id) {
+                    timers.borrow_mut().cancel(lua, entry.timer_id);
+                    lua.remove_registry_value(entry.callback)?;
+                }
+                return Ok((Value::Nil, Some(refused)));
+            }
+            Ok((Value::Integer(id as i64), None))
+        },
+    )
+}
+
+fn process_exec_done(
+    lua: &Lua,
+    id: u64,
+    execs: &Rc<RefCell<HashMap<u64, ProcessExecCallback>>>,
+    timers: &crate::image::timers::SharedTimerService,
+) -> mlua::Result<()> {
+    let Some(entry) = execs.borrow_mut().remove(&id) else {
+        return Ok(());
+    };
+    timers.borrow_mut().cancel(lua, entry.timer_id);
+    let callback: mlua::Function = lua.registry_value(&entry.callback)?;
+    lua.remove_registry_value(entry.callback)?;
+    let result = entry.result.lock().unwrap().take();
+    match result {
+        Some(Ok(output)) => {
+            let result = lua.create_table()?;
+            result.set("code", output.code)?;
+            result.set("stdout", lua.create_string(&output.stdout)?)?;
+            result.set("stderr", lua.create_string(&output.stderr)?)?;
+            result.set("timed_out", output.timed_out)?;
+            if let Some(signal) = output.signal {
+                result.set("signal", signal)?;
+            }
+            callback.call::<()>((result,))
+        }
+        Some(Err(error)) => callback.call::<()>((Value::Nil, error)),
+        None => Ok(()),
+    }
 }
 
 fn process_run_binding(lua: &Lua) -> mlua::Result<mlua::Function> {
