@@ -1,4 +1,4 @@
--- v7 adds strict validation for specs that opt in with version = 2 (or report_version = 2),
+-- v7 adds strict validation for specs that opt in with an explicit version = 2,
 -- the "spec" and "unsupported" report kinds, and the strict_v2 capability.
 -- Like earlier versions, this file becomes frozen once merged.
 
