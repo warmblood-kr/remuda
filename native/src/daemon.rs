@@ -2698,12 +2698,9 @@ fn pty_program(builder: &CommandBuilder, program: &str) -> Option<std::path::Pat
     None
 }
 
-/// Windows runs a `.cmd` or `.bat` program with cmd.exe, so its arguments
-/// must be ones cmd.exe reads as text. The program is pinned to the file the
-/// check looked at, batch file or not. Pinning an absolute path removes
-/// relative-PATH ambiguity; it is not a defence against the file changing
-/// afterwards (the pty still searches, and may try PATHEXT names if the pinned
-/// file disappears).
+/// A `.cmd` or `.bat` program runs under cmd.exe, so its arguments must be text it reads as text.
+/// The program is pinned to an absolute path: no relative-PATH ambiguity, but no defence against
+/// the file changing (the pty still searches and may try PATHEXT names if it disappears).
 #[cfg(windows)]
 fn refuse_unsafe_batch_arguments(
     builder: &mut CommandBuilder,
