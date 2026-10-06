@@ -82,6 +82,16 @@ pub struct RunOutput {
     pub signal: Option<i32>,
 }
 
+pub(crate) struct RunConfig {
+    pub(crate) word: &'static str,
+    pub(crate) argv: Vec<String>,
+    pub(crate) stdin: Option<Vec<u8>>,
+    pub(crate) timeout_seconds: f64,
+    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) stdin_hold_until_lines: Option<usize>,
+    pub(crate) child_environment: ChildEnvironment,
+}
+
 /// Run one child with argv directly (never through a shell). This is a
 /// deliberately synchronous exception: its enforced deadline bounds how long
 /// it can hold the daemon's single Lua image.
@@ -110,9 +120,78 @@ pub fn run_sync_with_env(
     stdin_hold_until_lines: Option<usize>,
     child_environment: ChildEnvironment,
 ) -> Result<RunOutput, String> {
+    run_controlled_with_env(
+        RunConfig {
+            word: "process.run",
+            argv,
+            stdin,
+            timeout_seconds,
+            cwd,
+            stdin_hold_until_lines,
+            child_environment,
+        },
+        None,
+        None,
+    )
+}
+
+/// Start a bounded run on a worker thread. The child is spawned before this
+/// returns, so launch failures remain synchronous; its completion is delivered
+/// by `on_done` on that worker's caller-provided dispatch path.
+pub(crate) fn run_async_with_env(
+    config: RunConfig,
+    timed_out: Arc<AtomicBool>,
+    on_done: impl FnOnce(Result<RunOutput, String>) + Send + 'static,
+) -> Result<(), String> {
+    validate_run(&config.argv, config.timeout_seconds)?;
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("remuda-process-exec".into())
+        .spawn(move || {
+            let result = run_controlled_with_env(config, Some(timed_out), Some(started_tx));
+            on_done(result);
+        })
+        .map_err(|error| format!("start process.exec worker: {error}"))?;
+    started_rx
+        .recv()
+        .map_err(|_| "process.exec worker stopped before starting".to_string())?
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_controlled_with_env(
+    config: RunConfig,
+    cancellation: Option<Arc<AtomicBool>>,
+    mut started: Option<std::sync::mpsc::SyncSender<Result<(), String>>>,
+) -> Result<RunOutput, String> {
+    let RunConfig {
+        word,
+        argv,
+        stdin,
+        timeout_seconds,
+        cwd,
+        stdin_hold_until_lines,
+        child_environment,
+    } = config;
     validate_run(&argv, timeout_seconds)?;
-    let (stdout_permit, stderr_permit) = reserve_run_reader_workers()?;
-    let process_tree = ProcessTree::new().map_err(|error| error.to_string())?;
+    let (stdout_permit, stderr_permit) = match reserve_run_reader_workers() {
+        Ok(permits) => permits,
+        Err(error) => {
+            if let Some(sender) = started.take() {
+                let _ = sender.send(Err(error.clone()));
+            }
+            return Err(error);
+        }
+    };
+    let process_tree = match ProcessTree::new() {
+        Ok(tree) => tree,
+        Err(error) => {
+            let error = error.to_string();
+            if let Some(sender) = started.take() {
+                let _ = sender.send(Err(error.clone()));
+            }
+            return Err(error);
+        }
+    };
 
     let deadline = Instant::now() + Duration::from_secs_f64(timeout_seconds);
     let (program, args) = argv.split_first().expect("argv checked above");
@@ -133,13 +212,27 @@ pub fn run_sync_with_env(
         use std::os::windows::process::CommandExt;
         command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("start process.run program {program:?}: {error}"))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let error = format!("start {word} program {program:?}: {error}");
+            if let Some(sender) = started.take() {
+                let _ = sender.send(Err(error.clone()));
+            }
+            return Err(error);
+        }
+    };
     if let Err(error) = process_tree.assign(&child) {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(error.to_string());
+        let error = error.to_string();
+        if let Some(sender) = started.take() {
+            let _ = sender.send(Err(error.clone()));
+        }
+        return Err(error);
+    }
+    if let Some(sender) = started.take() {
+        let _ = sender.send(Ok(()));
     }
 
     let stdout = child.stdout.take().expect("stdout was piped");
@@ -185,12 +278,15 @@ pub fn run_sync_with_env(
 
     let process_io = wait_for_process_io(
         &mut child,
-        deadline,
-        &process_tree,
-        &stdout_reader,
-        &stderr_reader,
-        &stdin_done,
-        &child_exited,
+        ProcessWait {
+            deadline,
+            process_tree: &process_tree,
+            stdout_reader: &stdout_reader,
+            stderr_reader: &stderr_reader,
+            stdin_done: &stdin_done,
+            child_exited: &child_exited,
+            cancellation: cancellation.as_deref(),
+        },
     );
     stdin_release.store(true, Ordering::Release);
     let (child_status, timed_out, tree_terminated) = process_io?;
@@ -366,47 +462,59 @@ fn reserve_run_reader_workers() -> Result<(RunReaderPermit, RunReaderPermit), St
     }
 }
 
+struct ProcessWait<'a> {
+    deadline: Instant,
+    process_tree: &'a ProcessTree,
+    stdout_reader: &'a ReaderState,
+    stderr_reader: &'a ReaderState,
+    stdin_done: &'a AtomicBool,
+    child_exited: &'a AtomicBool,
+    cancellation: Option<&'a AtomicBool>,
+}
+
 fn wait_for_process_io(
     child: &mut Child,
-    deadline: Instant,
-    process_tree: &ProcessTree,
-    stdout_reader: &ReaderState,
-    stderr_reader: &ReaderState,
-    stdin_done: &AtomicBool,
-    child_exited: &AtomicBool,
+    wait: ProcessWait<'_>,
 ) -> Result<(std::process::ExitStatus, bool, bool), String> {
     let mut child_status = None;
     let mut tree_terminated = false;
     loop {
         if child_status.is_none() {
-            let pipes_open = !stdout_reader.done() || !stderr_reader.done();
-            let (status, terminated) = observe_child_status(child, process_tree, pipes_open)?;
+            let pipes_open = !wait.stdout_reader.done() || !wait.stderr_reader.done();
+            let (status, terminated) = observe_child_status(child, wait.process_tree, pipes_open)?;
             child_status = status;
             tree_terminated |= terminated;
         }
         if child_status.is_some() {
-            child_exited.store(true, Ordering::Release);
+            wait.child_exited.store(true, Ordering::Release);
         }
-        if let Some(error) = stdout_reader.error() {
-            terminate_child(child, process_tree, child_status.is_none());
+        if let Some(error) = wait.stdout_reader.error() {
+            terminate_child(child, wait.process_tree, child_status.is_none());
             return Err(format!("read process.run stdout: {error}"));
         }
-        if let Some(error) = stderr_reader.error() {
-            terminate_child(child, process_tree, child_status.is_none());
+        if let Some(error) = wait.stderr_reader.error() {
+            terminate_child(child, wait.process_tree, child_status.is_none());
 
             return Err(format!("read process.run stderr: {error}"));
         }
-        if stdout_reader.done() && stderr_reader.done() && stdin_done.load(Ordering::Acquire) {
+        if wait.stdout_reader.done()
+            && wait.stderr_reader.done()
+            && wait.stdin_done.load(Ordering::Acquire)
+        {
             if let Some(status) = child_status.take() {
                 return Ok((status, false, tree_terminated));
             }
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= wait.deadline
+            || wait
+                .cancellation
+                .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+        {
             return expire_process_run(
                 child,
-                process_tree,
+                wait.process_tree,
                 child_status.take(),
-                !stdout_reader.done() || !stderr_reader.done(),
+                !wait.stdout_reader.done() || !wait.stderr_reader.done(),
                 tree_terminated,
             );
         }
