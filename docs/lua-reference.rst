@@ -316,13 +316,13 @@ process.run
 
 ``process.run{argv, stdin?, timeout?, cwd?, stdin_hold_until_lines?, env?, clear_env?} -> {code, stdout, stderr, timed_out, signal?}`` — Run argv directly without a shell; inherits the daemon's environment unless `clear_env=true`, then applies `env` string variables. Callers using a cleared environment must pass every variable the child needs, including SystemRoot and PATH on Windows. Names cannot be empty or contain '=' or NUL; names and values must be strings, and values cannot contain NUL. On Windows, environment names are case-insensitive: names differing only by case refer to the same variable, and which value wins is undefined; do not pass both. Unless `cwd` is given, the child inherits the daemon's working directory. `cwd` is an absolute path to an existing directory where the child starts. With `cwd`, a bare argv[1] is searched in the daemon's absolute PATH entries; without `cwd`, lookup uses the child's PATH. With `cwd`, `argv[1]` must be an absolute path or a bare command name, and a bare name is never searched in `cwd`. Blocks the Lua image until exit or timeout (default 5s, max 30s; longer commands use remuda.process), captures each stream up to 1 MiB. `stdin_hold_until_lines`, when set to an integer from 1 through 1000, keeps stdin open until stdout has that many newlines, the child exits, or timeout. Surviving descendants can keep pipes open; at most 16 background output readers are allowed.
 
-processes
----------
-
 process.exec
 ------------
 
-``process.exec(spec, on_done) -> id`` — Start argv directly without a shell and return immediately. `on_done` must be a Lua function; the image event loop calls it later with `{code, stdout, stderr, timed_out, signal?}`. It accepts the same `stdin`, `timeout` (default 5s, maximum 30s), `cwd`, `stdin_hold_until_lines`, `env` and `clear_env` fields as `process.run`. Each output stream is capped at 1 MiB. Timeout kills the child process group.
+``process.exec(spec, on_done) -> id`` — Start argv directly without a shell and return immediately. `on_done` must be a Lua function; the image event loop calls it later with `{code, stdout, stderr, timed_out, signal?}`. It accepts the same `stdin`, `timeout` (default 5s, maximum 30s), `cwd`, `stdin_hold_until_lines`, `env` and `clear_env` fields as `process.run`. Each output stream is capped at 1 MiB. Timeout kills the child process group. If an I/O error occurs after launch, `on_done` receives `nil, error`.
+
+processes
+---------
 
 ``processes() -> {id...}`` — List the ids of every process started with `remuda.process` that is still running.
 
