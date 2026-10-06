@@ -66,6 +66,11 @@ cli
 
 ``table`` — Declarative command-line parsing for extension handlers.
 
+cli.capabilities
+----------------
+
+``cli.capabilities() -> {spec_versions, report_versions, features}`` — Report the spec versions, report versions and features this core supports; set report_version = 2 on a spec for the stable report envelope.
+
 cli.parse
 ---------
 
@@ -184,7 +189,7 @@ fs.realpath
 fs.write_atomic
 ---------------
 
-``fs.write_atomic(path, bytes, options?) -> true, nil | nil, error`` — Write bytes through a same-directory temporary file and atomically replace the target; private mode uses owner-only permissions on Unix.
+``fs.write_atomic(path, bytes, options?) -> true, nil | nil, error`` — Write bytes through a same-directory temporary file and atomically replace the target; private mode makes the file owner-only (mode 0600 on Unix, owner-only ACL on Windows).
 
 hook_list
 ---------

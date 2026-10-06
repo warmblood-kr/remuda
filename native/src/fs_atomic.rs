@@ -18,10 +18,16 @@ pub(crate) fn write_atomic_exact_mode(path: &Path, bytes: &[u8], mode: u32) -> i
     write_atomic_inner(path, bytes, mode, false)
 }
 
-/// Write an owner-only Lua state file on Unix. Windows uses its normal
-/// inherited ACL for this public Lua option.
+/// Write an owner-only Lua state file: mode 0600 on Unix, an owner-only ACL
+/// on Windows.
+#[cfg(not(windows))]
 pub(crate) fn write_atomic_lua_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_atomic_inner(path, bytes, 0o600, false)
+}
+
+#[cfg(windows)]
+pub(crate) fn write_atomic_lua_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_private(path, bytes)
 }
 
 fn write_atomic_inner(

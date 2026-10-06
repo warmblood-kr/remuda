@@ -101,11 +101,11 @@ that path is not followed. The parent directory must already exist.
 On success the function returns `true, nil`; on an I/O error it returns
 `nil, error`. By default, new files use mode `0644` filtered through the
 process umask, and existing regular-file permissions are preserved. Pass
-`{ private = true }` to create a file with mode `0600` on Unix, including when
-replacing an existing file; the mode is applied at temporary-file creation.
+`{ private = true }` to make the file owner-only (mode `0600` on Unix, an
+owner-only ACL on Windows), including when replacing an existing file; it is
+applied at temporary-file creation.
 The options table accepts only the boolean `private` key; unknown keys or a
-non-boolean value raise a Lua argument error. On Windows, `private` is ignored
-and the file uses the normal inherited ACL.
+non-boolean value raise a Lua argument error.
 This word does not restrict paths: the Lua runtime already provides trusted
 scripts with `io.open` and `os.rename`.
 On Windows 10 version 1903 and later those C-library words (`os.getenv`,
