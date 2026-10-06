@@ -290,23 +290,97 @@ fn too_large() -> io::Error {
 
 /// Incremental reassembler for records produced by `seal_records`.
 #[allow(dead_code)]
-pub struct RecordOpener {}
+pub struct RecordOpener {
+    transport: snow::TransportState,
+    expected: usize,
+    pending: Vec<u8>,
+    plaintext: Vec<u8>,
+    records: usize,
+}
 
 #[allow(dead_code)]
 impl RecordOpener {
     /// `expected_total` is the authenticated total plaintext length (checked against the cap).
-    pub fn new(_transport: snow::TransportState, _expected_total: usize) -> io::Result<Self> {
-        unimplemented!()
+    pub fn new(transport: snow::TransportState, expected_total: usize) -> io::Result<Self> {
+        if expected_total > MAX_RESPONSE_TOTAL {
+            return Err(too_large());
+        }
+        Ok(Self {
+            transport,
+            expected: expected_total,
+            pending: Vec::new(),
+            plaintext: Vec::new(),
+            records: 0,
+        })
     }
-    pub fn push(&mut self, _bytes: &[u8]) -> io::Result<()> {
-        unimplemented!()
+
+    /// Feed bytes as they arrive. Memory only grows with bytes actually received.
+    pub fn push(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        while !bytes.is_empty() {
+            if self.plaintext.len() == self.expected {
+                return Err(invalid_frame());
+            }
+            let need = match self.record_len()? {
+                None => 2 - self.pending.len(),
+                Some(len) => 2 + len - self.pending.len(),
+            };
+            let take = need.min(bytes.len());
+            self.pending.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self
+                .record_len()?
+                .is_some_and(|len| self.pending.len() == 2 + len)
+            {
+                self.open_record()?;
+            }
+        }
+        Ok(())
     }
+
+    /// Length prefix of the record being read, once its two bytes are in and valid.
+    fn record_len(&self) -> io::Result<Option<usize>> {
+        if self.pending.len() < 2 {
+            return Ok(None);
+        }
+        let len = u16::from_be_bytes([self.pending[0], self.pending[1]]) as usize;
+        if len <= AEAD_TAG_SIZE {
+            return Err(invalid_frame());
+        }
+        Ok(Some(len))
+    }
+
+    fn open_record(&mut self) -> io::Result<()> {
+        self.records += 1;
+        if self.records > MAX_RECORDS {
+            return Err(too_large());
+        }
+        let mut out = vec![0; self.pending.len() - 2];
+        let n = self
+            .transport
+            .read_message(&self.pending[2..], &mut out)
+            .map_err(frame_error)?;
+        if self.plaintext.len() + n > self.expected {
+            return Err(invalid_frame());
+        }
+        self.plaintext.extend_from_slice(&out[..n]);
+        self.pending.clear();
+        Ok(())
+    }
+
     /// Bytes currently buffered for an unfinished record.
     pub fn pending_len(&self) -> usize {
-        unimplemented!()
+        self.pending.len()
     }
+
+    /// Succeeds only when exactly `expected_total` plaintext bytes arrived in whole records.
     pub fn finish(self) -> io::Result<Vec<u8>> {
-        unimplemented!()
+        if !self.pending.is_empty() || self.plaintext.len() != self.expected {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated chunked response",
+            ));
+        }
+        Ok(self.plaintext)
     }
 }
 
