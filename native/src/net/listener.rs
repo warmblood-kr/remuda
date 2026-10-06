@@ -1772,11 +1772,50 @@ fn write_http_response_until(
         return stream.flush();
     };
     // Headers and body share one absolute deadline; every path shuts down on failure.
+    // SO_SNDTIMEO is only relative per wait (XNU restarts it), so a watchdog
+    // enforces the absolute bound by shutting the socket down at the deadline.
+    let watchdog = Watchdog::start(&stream, deadline)?;
     let result = write_parts_until(&mut stream, head.as_bytes(), body, deadline);
+    let result = if watchdog.finish() {
+        Err(io::ErrorKind::TimedOut.into())
+    } else {
+        result
+    };
     if result.is_err() {
         let _ = stream.shutdown(Shutdown::Both);
     }
     result
+}
+
+/// Shuts a cloned socket down at `deadline` unless cancelled by `finish`.
+struct Watchdog {
+    cancel: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<bool>,
+}
+
+impl Watchdog {
+    fn start(stream: &TcpStream, deadline: Instant) -> io::Result<Self> {
+        let socket = stream.try_clone()?;
+        let (cancel, cancelled) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("remuda-cluster-write-deadline".into())
+            .spawn(move || {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                let fired =
+                    cancelled.recv_timeout(wait) == Err(std::sync::mpsc::RecvTimeoutError::Timeout);
+                if fired {
+                    let _ = socket.shutdown(Shutdown::Both);
+                }
+                fired
+            })?;
+        Ok(Self { cancel, thread })
+    }
+
+    /// Cancel and join (never leaks the thread); true if the deadline fired.
+    fn finish(self) -> bool {
+        let _ = self.cancel.send(());
+        self.thread.join().unwrap_or(false)
+    }
 }
 
 /// A writer whose blocking time per call can be capped (SO_SNDTIMEO for TCP).
@@ -4077,6 +4116,52 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         let mut ok = scripted(usize::MAX, 0, false);
         write_parts_until(&mut ok, b"H", b"b", Instant::now() + Duration::from_secs(5)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_is_cancelled_on_fast_completion_without_touching_the_socket() {
+        let (server, mut client) = tiny_buffer_pair();
+        let started = Instant::now();
+        let watchdog = Watchdog::start(&server, Instant::now() + Duration::from_secs(30)).unwrap();
+        assert!(!watchdog.finish(), "must not fire");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "joined promptly"
+        );
+        // The socket still works: not shut down by the cancelled watchdog.
+        (&server).write_all(b"ok").unwrap();
+        let mut got = [0u8; 2];
+        client.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_byte_per_20ms_reader_is_cut_within_deadline_plus_300ms() {
+        for deadline_ms in [100u64, 400] {
+            let (server, mut client) = tiny_buffer_pair();
+            let started = Instant::now();
+            let writer = std::thread::spawn(move || {
+                let deadline = Some(Instant::now() + Duration::from_millis(deadline_ms));
+                write_http_response_until(server, 200, &vec![7u8; 4 * 1024 * 1024], deadline)
+            });
+            let mut buf = [0u8; 1];
+            while !writer.is_finished() {
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = client.read(&mut buf);
+            }
+            assert_eq!(
+                writer.join().unwrap().unwrap_err().kind(),
+                io::ErrorKind::TimedOut
+            );
+            let elapsed = started.elapsed();
+            assert!(elapsed >= Duration::from_millis(deadline_ms), "{elapsed:?}");
+            assert!(
+                elapsed < Duration::from_millis(deadline_ms + 300),
+                "{elapsed:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
