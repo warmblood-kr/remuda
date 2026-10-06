@@ -77,6 +77,8 @@ pub const REPORT_VERSIONS: &[u32] = &[1, 2];
 pub const FEATURES: &[&str] = &["stable_report"];
 
 /// Shape a report as the v2 envelope; vectors are always arrays.
+/// Error text is the legacy diagnostic and may quote input until G7b safe_errors;
+/// no sensitive-command consumer may migrate to report v2 before then.
 pub fn report_v2(spec: &Spec, report: &Report) -> Value {
     let verb = report
         .verb

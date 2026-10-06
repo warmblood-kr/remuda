@@ -490,7 +490,11 @@ fn cli_parse_bindings(lua: &Lua) -> mlua::Result<Table> {
     cli.set(
         "parse",
         lua.create_function(|lua, (spec_table, argv_table): (Table, Table)| {
-            let spec_table_wants_v2 = spec_table.get::<Option<i64>>("report_version")? == Some(2);
+            // Raw lookup: no __index, no coercion; only an exact integer 2 opts in.
+            let spec_table_wants_v2 = matches!(
+                spec_table.raw_get::<Value>("report_version")?,
+                Value::Integer(2)
+            );
             let spec = cli_spec_from_lua(spec_table)?;
             let argv = cli_argv_from_lua(argv_table)?;
             let words = argv.iter().map(String::as_str).collect::<Vec<_>>();
@@ -2471,11 +2475,37 @@ mod binding_tests {
     #[test]
     fn cli_parse_other_report_versions_stay_v1() {
         let v1 = dump_of(r#"remuda.cli.parse(spec, {"send", "a"})"#);
-        let v1_explicit = dump_of(
-            r#"remuda.cli.parse((function() spec.report_version = 1 return spec end)(), {"send", "a"})"#,
-        );
-        assert_eq!(v1, v1_explicit);
+        for odd in [
+            "1",
+            "false",
+            "{}",
+            "function() end",
+            "2.5",
+            "'2'",
+            "0",
+            "-2",
+        ] {
+            let call = format!(
+                r#"remuda.cli.parse((function() spec.report_version = {odd} return spec end)(), {{"send", "a"}})"#
+            );
+            assert_eq!(v1, dump_of(&call), "report_version={odd}");
+        }
         assert!(!v1.contains("path="));
+    }
+
+    #[test]
+    fn cli_parse_report_version_ignores_metatables() {
+        let call = r#"(function()
+            hits = {}
+            local raw = {name=spec.name, options=spec.options, verbs=spec.verbs}
+            setmetatable(raw, {__index=function(_, k) hits[#hits + 1] = k; if k == "report_version" then return 2 end end})
+            local r = remuda.cli.parse(raw, {"send", "a"})
+            r.hit_report_version = #hits > 0 and (hits[1] == "report_version" or hits[2] == "report_version")
+            return r
+        end)()"#;
+        let out = dump_of(call);
+        assert!(out.contains("hit_report_version=false"), "{out}");
+        assert!(out.contains("verb=") && !out.contains("path="), "{out}");
     }
 
     #[test]
