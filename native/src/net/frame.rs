@@ -652,6 +652,7 @@ mod tests {
         let mut opener = RecordOpener::new(rx, 2 * MAX_RECORD_PLAINTEXT).unwrap();
         assert!(opener.push(&bad).is_err());
         assert!(opener.push(&r[1]).is_err());
+        assert!(opener.push(&[]).is_err());
         assert!(opener.finish().is_err());
     }
 
