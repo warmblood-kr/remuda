@@ -63,25 +63,29 @@ pub(crate) fn wake_captured(handle: WakeHandle) {
 fn name(path: &Path) -> io::Result<Name<'_>> {
     #[cfg(unix)]
     {
-        // sun_path capacity, NUL included; the transport's error blamed nothing.
+        // sun_path has room for a trailing NUL, so these are usable bytes.
         const LIMIT: usize = if cfg!(any(target_os = "linux", target_os = "android")) {
-            108
+            107
         } else {
-            104
+            103
         };
-        let len = path.as_os_str().len();
-        if len >= LIMIT {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "socket path is {len} bytes, over the platform limit of {}; \
-                     use a shorter REMUDA_RUNTIME_DIR",
-                    LIMIT - 1
-                ),
-            ));
-        }
+        check_socket_path_len(path.as_os_str().len(), LIMIT)?;
     }
     path.to_fs_name::<GenericFilePath>()
+}
+
+#[cfg(unix)]
+fn check_socket_path_len(len: usize, limit: usize) -> io::Result<()> {
+    if len > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "socket path too long ({len} bytes, limit {limit})\n\
+                 Next: set a shorter REMUDA_RUNTIME_DIR"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Connect to a daemon. The error is the transport's own, so "nothing is
@@ -207,6 +211,22 @@ pub fn stop_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_path_length_reports_both_unix_platform_limits() {
+        for limit in [103, 107] {
+            check_socket_path_len(limit, limit).expect("the limit itself fits");
+            let error = check_socket_path_len(limit + 1, limit).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "socket path too long ({} bytes, limit {limit})\nNext: set a shorter REMUDA_RUNTIME_DIR",
+                    limit + 1
+                )
+            );
+        }
+    }
 
     #[test]
     fn only_absence_or_a_refused_existing_unix_socket_allows_autostart() {

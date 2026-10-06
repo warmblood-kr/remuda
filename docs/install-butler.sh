@@ -94,7 +94,11 @@ Linux | Darwin) ;;
 *) die "no persistence layer for $os yet (only Linux/systemd and macOS/launchd are wired up) -- run 'remuda exec butler' by hand after every restart" ;;
 esac
 
-config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+config_home="${XDG_CONFIG_HOME:-}"
+case "$config_home" in
+	/*) ;;
+	*) config_home="$HOME/.config" ;;
+esac
 token_file="${REMUDA_BUTLER_TOKEN_FILE:-$config_home/remuda/butler/token}"
 config_file="${REMUDA_BUTLER_CONFIG_FILE:-$config_home/remuda/butler/config}"
 

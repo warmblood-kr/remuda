@@ -84,7 +84,7 @@ struct SyncPermit;
 impl SyncPermit {
     fn acquire() -> Option<Self> {
         ACTIVE_SYNCS
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
                 (active < MAX_CONCURRENT_SYNCS).then_some(active + 1)
             })
             .ok()
@@ -217,17 +217,17 @@ pub(crate) fn keep_exited() -> bool {
 }
 
 /// Where a user's own auto-loaded config lives (XDG `$XDG_CONFIG_HOME`,
-/// else `$HOME/.config`) — mirrors `remuda.rs`'s `history_path` shape, not
-/// `dist.rs`'s `base_dir` (see steps/035 for why).
+/// else the platform's config directory).
 fn user_config_path() -> Option<PathBuf> {
-    let config_home = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
-    };
-    Some(config_home.join("remuda").join("init.lua"))
+    crate::storage::user_file_path_for(
+        crate::storage::Kind::Config,
+        "init.lua",
+        cfg!(windows),
+        &|name| std::env::var_os(name),
+    )
 }
 
-/// Evaluate the user's `~/.config/remuda/init.lua`, once, at daemon boot.
+/// Evaluate the user's config `init.lua`, once, at daemon boot.
 /// Absence is silent; a broken file is reported but never poisons the
 /// image the way an `Err` in `Image::spawn`'s `ready` chain would (steps/035).
 fn load_user_config(image: &Image) {
@@ -1023,6 +1023,15 @@ pub fn prepare_socket_path(_socket: &Path, _runtime: Option<&Path>) -> std::io::
     Ok(())
 }
 
+/// Give a daemon about to be spawned a console of its own, with no window.
+/// Left on the caller's console it is ended when that window is closed, and
+/// every session with it. A console it keeps, so its children open no windows.
+#[cfg(windows)]
+pub fn own_console(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+}
+
 #[cfg(unix)]
 fn socket_lock_holder(lock_path: &Path) -> Option<u32> {
     std::fs::read_to_string(lock_path).ok()?.trim().parse().ok()
@@ -1729,8 +1738,31 @@ fn handle_eval(
         },
         // Lua's own message, which already carries the line and a traceback —
         // the same treatment `remuda run` gives a script file.
-        Err(error) => reply(&stream, &Response::error(error)),
+        Err(error) => {
+            if name == Some("=remuda mod command") {
+                eprintln!(
+                    "remuda daemon: mod command failed: {}",
+                    escaped_mod_command_error(&error)
+                );
+            }
+            reply(&stream, &Response::error(error))
+        }
     }
+}
+
+const MAX_LOGGED_MOD_COMMAND_ERROR: usize = 4096;
+
+fn escaped_mod_command_error(error: &str) -> String {
+    let mut escaped = format!("{error:?}");
+    if escaped.len() > MAX_LOGGED_MOD_COMMAND_ERROR {
+        let mut end = MAX_LOGGED_MOD_COMMAND_ERROR - 3;
+        while !escaped.is_char_boundary(end) {
+            end -= 1;
+        }
+        escaped.truncate(end);
+        escaped.push_str("...");
+    }
+    escaped
 }
 
 fn caller_context(
@@ -2405,6 +2437,9 @@ fn handle_new(
         )),
     };
     let mut session_env = env.unwrap_or_default();
+    session_env
+        .entry("REMUDA_RUNTIME_DIR".into())
+        .or_insert_with(|| runtime_dir().to_string_lossy().into_owned());
     let session_id = Session::new_id();
     session_env.insert("REMUDA_DAEMON_ID".into(), std::process::id().to_string());
     session_env.insert("REMUDA_SESSION_ID".into(), session_id.clone());
@@ -2646,6 +2681,8 @@ fn spawn(
             builder.env(k, v);
         }
     }
+    #[cfg(windows)]
+    refuse_unsafe_batch_arguments(&mut builder, &argv)?;
 
     let agent = PtyAgent::spawn(builder, size).map_err(crate::session_job::spawn_error_line)?;
     Ok(Session::new_with_id(
@@ -2656,11 +2693,74 @@ fn spawn(
     ))
 }
 
+/// The file portable-pty will find for `program` (portable-pty 0.9.0,
+/// `cmdbuilder.rs:581-607`): in each PATH directory the name as given, then
+/// with each PATHEXT extension in place of its own. `None`: the name as given.
+#[cfg(windows)]
+fn pty_program(builder: &CommandBuilder, program: &str) -> Option<std::path::PathBuf> {
+    use std::ffi::OsStr;
+    if let Some(path) = builder.get_env("PATH") {
+        let extensions = builder.get_env("PATHEXT").unwrap_or(OsStr::new(".EXE"));
+        for dir in std::env::split_paths(path) {
+            let exact = dir.join(program);
+            if exact.exists() {
+                return Some(exact);
+            }
+            for entry in std::env::split_paths(extensions) {
+                // An entry portable-pty would panic on is skipped here.
+                let candidate = entry
+                    .to_str()
+                    .and_then(|entry| crate::cmd_arguments::pty_candidate(&exact, entry));
+                if candidate
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.exists())
+                {
+                    return candidate;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A `.cmd` or `.bat` program runs under cmd.exe, so its arguments must be text it reads as text.
+/// The program is pinned to an absolute path: no relative-PATH ambiguity, but no defence against
+/// the file changing (the pty still searches and may try PATHEXT names if it disappears).
+#[cfg(windows)]
+fn refuse_unsafe_batch_arguments(
+    builder: &mut CommandBuilder,
+    argv: &[String],
+) -> Result<(), String> {
+    use crate::cmd_arguments::{batch_arguments_refusal, is_batch_file};
+    let program = match pty_program(builder, &argv[0]) {
+        // A hit through a relative PATH entry is relative to the daemon's own
+        // directory, where `exists` looked. Pinned as it is, the pty would
+        // join it onto every PATH directory again and another file could win.
+        Some(found) => std::path::absolute(&found)
+            .map_err(|error| {
+                format!(
+                    "the program path could not be made absolute: {error}. \
+                     Next: pass the full path of the program."
+                )
+            })?
+            .into_os_string(),
+        None => argv[0].clone().into(),
+    };
+    let shown = program.to_string_lossy().into_owned();
+    builder.get_argv_mut()[0] = program;
+    if !is_batch_file(&shown) {
+        return Ok(());
+    }
+    let mut words = argv.to_vec();
+    words[0] = shown;
+    batch_arguments_refusal(&words).map_or(Ok(()), Err)
+}
+
 /// Hand this connection over to a human. A later attach displaces this one;
 /// the old connection receives a printable notice before it is closed.
 fn attach(
     stream: Stream,
-    mut reader: BufReader<Stream>,
+    reader: BufReader<Stream>,
     registry: &Registry,
     name: &str,
     tracked: bool,
@@ -2701,48 +2801,20 @@ fn attach(
     // the loop. See steps/029.
     let stop = std::sync::atomic::AtomicBool::new(false);
     let stop = &stop;
+    let dropped_input = std::sync::atomic::AtomicUsize::new(0);
+    let dropped_input = &dropped_input;
 
     std::thread::scope(|scope| {
-        let (keys_tx, keys_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
-        let key_thread = scope.spawn(move || {
-            let mut buf = [0u8; 4096];
-            'keys: while !stop.load(std::sync::atomic::Ordering::SeqCst)
-                && !done.load(std::sync::atomic::Ordering::SeqCst)
-            {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => {
-                        reader_eof.store(true, std::sync::atomic::Ordering::SeqCst);
-                        break;
-                    }
-                    Ok(n) => {
-                        let mut bytes = buf[..n].to_vec();
-                        loop {
-                            if stop.load(std::sync::atomic::Ordering::SeqCst)
-                                || done.load(std::sync::atomic::Ordering::SeqCst)
-                            {
-                                break 'keys;
-                            }
-                            match keys_tx.try_send(bytes) {
-                                Ok(()) => break,
-                                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
-                                    bytes = returned;
-                                    std::thread::sleep(std::time::Duration::from_millis(10));
-                                }
-                                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                                    break 'keys;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        // One writer preserves read-buffer order. A failed write ends the pump:
-        // only Busy means no write was submitted and is safe to retry.
-        let held = &held;
-        let write_thread = scope
-            .spawn(move || pump_attach_input(keys_rx, held, done, stop, reader_eof, input_failed));
+        let context = AttachInputContext {
+            held: &held,
+            done,
+            stop,
+            reader_eof,
+            input_failed,
+            dropped_input,
+            session_name: name.to_owned(),
+        };
+        let (key_thread, write_thread) = spawn_attach_input_pumps(scope, reader, context);
 
         let mut process_gone = false;
         if let Some(rx) = held.subscribe() {
@@ -2782,7 +2854,11 @@ fn attach(
         // sending keys. Let the socket reader observe EOF and the PTY pump
         // drain its queue before stopping it. Takeover and process exit still
         // cancel input immediately because there is nowhere safe to deliver it.
-        if held.is_displaced() || process_gone || !held.session().is_alive() {
+        if input_failed.load(std::sync::atomic::Ordering::SeqCst)
+            || held.is_displaced()
+            || process_gone
+            || !held.session().is_alive()
+        {
             stop.store(true, std::sync::atomic::Ordering::SeqCst);
             ipc::stop_reader(&stream, stop, || key_thread.is_finished());
         }
@@ -2790,8 +2866,78 @@ fn attach(
         done.store(true, std::sync::atomic::Ordering::SeqCst);
         // Unblocks the key thread if the input pump ended without socket EOF.
         ipc::stop_reader(&stream, stop, || key_thread.is_finished());
+        let _ = key_thread.join();
     });
     Ok(())
+}
+
+struct AttachInputContext<'a, 'session> {
+    held: &'a remuda_core::session::Attached<'session>,
+    done: &'a std::sync::atomic::AtomicBool,
+    stop: &'a std::sync::atomic::AtomicBool,
+    reader_eof: &'a std::sync::atomic::AtomicBool,
+    input_failed: &'a std::sync::atomic::AtomicBool,
+    dropped_input: &'a std::sync::atomic::AtomicUsize,
+    session_name: String,
+}
+
+fn spawn_attach_input_pumps<'scope, 'env, 'session>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    mut reader: BufReader<Stream>,
+    context: AttachInputContext<'env, 'session>,
+) -> (
+    std::thread::ScopedJoinHandle<'scope, ()>,
+    std::thread::ScopedJoinHandle<'scope, ()>,
+) {
+    let (keys_tx, keys_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+    let key_thread = scope.spawn(move || {
+        let mut buf = [0u8; 4096];
+        'keys: while !context.stop.load(std::sync::atomic::Ordering::SeqCst)
+            && !context.done.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => {
+                    context
+                        .reader_eof
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                Ok(n) => {
+                    let mut bytes = buf[..n].to_vec();
+                    let bytes_len = bytes.len();
+                    loop {
+                        if context.stop.load(std::sync::atomic::Ordering::SeqCst)
+                            || context.done.load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            context
+                                .dropped_input
+                                .fetch_add(bytes_len, std::sync::atomic::Ordering::SeqCst);
+                            break 'keys;
+                        }
+                        match keys_tx.try_send(bytes) {
+                            Ok(()) => break,
+                            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                                bytes = returned;
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                context
+                                    .dropped_input
+                                    .fetch_add(bytes_len, std::sync::atomic::Ordering::SeqCst);
+                                break 'keys;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let writer_context = context;
+    let write_thread = scope.spawn(move || {
+        pump_attach_input(keys_rx, writer_context);
+    });
+    (key_thread, write_thread)
 }
 
 /// Start the output side before the input pumps. A failed write must not drop
@@ -2819,14 +2965,108 @@ fn attach_output(
 const ATTACH_INPUT_FAILURE_NOTICE: &str =
     "\r\n[remuda] input stopped because the PTY writer failed or stalled; some bytes may have been delivered partially or lost\r\n";
 
-fn pump_attach_input(
+const PASTE_OPEN: &[u8] = b"\x1b[200~";
+const PASTE_CLOSE: &[u8] = b"\x1b[201~";
+const PASTE_CLEANUP_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct PasteCleanupState {
+    open: bool,
+    pending: Vec<u8>,
+}
+
+impl PasteCleanupState {
+    fn observe_attempt(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.pending.push(*byte);
+            loop {
+                if self.pending.ends_with(PASTE_OPEN) {
+                    self.open = true;
+                    self.pending.clear();
+                    break;
+                }
+                if self.pending.ends_with(PASTE_CLOSE) {
+                    self.open = false;
+                    self.pending.clear();
+                    break;
+                }
+                if PASTE_OPEN.starts_with(&self.pending) || PASTE_CLOSE.starts_with(&self.pending) {
+                    break;
+                }
+                self.pending.remove(0);
+            }
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.open
+    }
+}
+
+fn attempt_paste_cleanup(
+    state: &mut PasteCleanupState,
+    mut write: impl FnMut(&[u8], &dyn Fn() -> bool) -> AgentResult<()>,
+) -> bool {
+    if !state.is_open() {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + PASTE_CLEANUP_TIMEOUT;
+    let cancelled = || std::time::Instant::now() >= deadline;
+    // The deadline bounds this wait, not an already queued PTY write: a
+    // cancelled cleanup can still land late. A cleanup observed as successful
+    // follows the ordinary completion path, which clears late-submit state.
+    if write(PASTE_CLOSE, &cancelled).is_ok() {
+        state.observe_attempt(PASTE_CLOSE);
+        true
+    } else {
+        false
+    }
+}
+
+fn paste_cleanup_trace(
+    session: &str,
+    reason: &str,
+    bytes_dropped: usize,
+    delivered: bool,
+) -> String {
+    format!(
+        "session={session} reason={reason} bytes_dropped={bytes_dropped} {}",
+        if delivered {
+            "cleanup delivered"
+        } else {
+            "cleanup not delivered"
+        }
+    )
+}
+
+fn paste_write_started_callback(
+    state: Arc<Mutex<PasteCleanupState>>,
+    bytes: &[u8],
+) -> Arc<dyn Fn() + Send + Sync> {
+    let bytes = Arc::new(bytes.to_vec());
+    Arc::new(move || {
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe_attempt(&bytes);
+    })
+}
+
+fn pump_attach_input<'a, 'session>(
     keys: std::sync::mpsc::Receiver<Vec<u8>>,
-    held: &remuda_core::session::Attached<'_>,
-    done: &std::sync::atomic::AtomicBool,
-    stop: &std::sync::atomic::AtomicBool,
-    reader_eof: &std::sync::atomic::AtomicBool,
-    input_failed: &std::sync::atomic::AtomicBool,
+    context: AttachInputContext<'a, 'session>,
 ) {
+    let AttachInputContext {
+        held,
+        done,
+        stop,
+        reader_eof,
+        input_failed,
+        dropped_input,
+        session_name,
+    } = context;
+    let paste_state = Arc::new(Mutex::new(PasteCleanupState::default()));
+    let mut cleanup_reason = None;
     while let Ok(bytes) = keys.recv() {
         let stopping = || {
             stop.load(std::sync::atomic::Ordering::SeqCst)
@@ -2834,23 +3074,60 @@ fn pump_attach_input(
                 || (reader_eof.load(std::sync::atomic::Ordering::SeqCst)
                     && held.is_writer_timed_out())
         };
-        match forward_attach_input(|| held.write_raw_while(&bytes, &stopping), &stopping) {
+        let on_start = paste_write_started_callback(Arc::clone(&paste_state), &bytes);
+        match forward_attach_input(
+            || held.write_raw_while_started(&bytes, &stopping, Arc::clone(&on_start)),
+            &stopping,
+        ) {
             Ok(()) => {}
             Err(remuda_core::AgentError::Exited) => break,
-            Err(remuda_core::AgentError::Attached) if stopping() => break,
+            Err(remuda_core::AgentError::Attached) if stopping() => {
+                if reader_eof.load(std::sync::atomic::Ordering::SeqCst)
+                    && held.is_writer_timed_out()
+                {
+                    cleanup_reason = Some("client EOF during timed-out PTY write");
+                }
+                break;
+            }
             Err(_) => {
                 input_failed.store(true, std::sync::atomic::Ordering::SeqCst);
                 done.store(true, std::sync::atomic::Ordering::SeqCst);
+                cleanup_reason = Some("PTY write failed or timed out");
                 break;
             }
         }
     }
     done.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(reason) = cleanup_reason {
+        let bytes_dropped = drain_queued_attach_input(&keys, dropped_input);
+        let mut state = paste_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.is_open() {
+            let delivered = attempt_paste_cleanup(&mut state, |bytes, cancelled| {
+                held.write_raw_while(bytes, cancelled)
+            });
+            eprintln!(
+                "{}",
+                paste_cleanup_trace(&session_name, reason, bytes_dropped, delivered)
+            );
+        }
+    }
 }
 
 fn report_attach_input_failure(output: &mut impl Write) -> std::io::Result<()> {
     output.write_all(ATTACH_INPUT_FAILURE_NOTICE.as_bytes())?;
     output.flush()
+}
+
+fn drain_queued_attach_input(
+    keys: &std::sync::mpsc::Receiver<Vec<u8>>,
+    dropped_input: &std::sync::atomic::AtomicUsize,
+) -> usize {
+    keys.try_iter()
+        .map(|bytes| bytes.len())
+        .fold(0usize, usize::saturating_add)
+        .saturating_add(dropped_input.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 fn forward_attach_input(
@@ -2920,9 +3197,11 @@ fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_sync_permit, auto_listener_addresses, auto_listener_ip_changed,
-        forward_attach_input, report_attach_input_failure, runtime_base_for, shell_or_default,
-        SyncPermit, ATTACH_INPUT_FAILURE_NOTICE, MAX_CONCURRENT_SYNCS,
+        acquire_sync_permit, attempt_paste_cleanup, auto_listener_addresses,
+        auto_listener_ip_changed, drain_queued_attach_input, forward_attach_input,
+        paste_cleanup_trace, paste_write_started_callback, report_attach_input_failure,
+        runtime_base_for, shell_or_default, PasteCleanupState, SyncPermit,
+        ATTACH_INPUT_FAILURE_NOTICE, MAX_CONCURRENT_SYNCS,
     };
     #[cfg(not(windows))]
     use super::{AutoAddressDetector, ListenerStatus, ListenerTask};
@@ -2938,6 +3217,81 @@ mod tests {
     use std::time::Duration;
 
     static SYNC_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn queued_input_drain_returns_while_the_key_sender_is_still_open() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(b"queued".to_vec()).unwrap();
+        let dropped = std::sync::atomic::AtomicUsize::new(3);
+        let started = std::time::Instant::now();
+
+        assert_eq!(drain_queued_attach_input(&receiver, &dropped), 9);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(sender.send(b"later".to_vec()).is_ok());
+    }
+
+    #[test]
+    fn paste_cleanup_ignores_queued_bytes_until_the_write_starts() {
+        let state = Arc::new(Mutex::new(PasteCleanupState::default()));
+        let on_start = paste_write_started_callback(Arc::clone(&state), b"\x1b[200~paste");
+        assert!(!state.lock().unwrap().is_open());
+        on_start();
+        assert!(state.lock().unwrap().is_open());
+    }
+
+    #[test]
+    fn paste_cleanup_closes_only_an_unmatched_attempted_opener() {
+        let mut state = PasteCleanupState::default();
+        state.observe_attempt(b"before\x1b[200~paste");
+        let mut sent = Vec::new();
+        assert!(attempt_paste_cleanup(&mut state, |bytes, _| {
+            sent.extend_from_slice(bytes);
+            Ok(())
+        }));
+        assert_eq!(sent, b"\x1b[201~");
+
+        state.observe_attempt(b"\x1b[200~paste\x1b[201~");
+        sent.clear();
+        assert!(!attempt_paste_cleanup(&mut state, |bytes, _| {
+            sent.extend_from_slice(bytes);
+            Ok(())
+        }));
+        assert!(sent.is_empty());
+
+        let mut empty = PasteCleanupState::default();
+        assert!(!attempt_paste_cleanup(&mut empty, |bytes, _| {
+            sent.extend_from_slice(bytes);
+            Ok(())
+        }));
+    }
+
+    #[test]
+    fn paste_cleanup_tracks_markers_split_across_attempts() {
+        let mut state = PasteCleanupState::default();
+        state.observe_attempt(b"\x1b[20");
+        state.observe_attempt(b"0~body\x1b[201");
+        assert!(state.is_open());
+        state.observe_attempt(b"~");
+        assert!(!state.is_open());
+    }
+
+    #[test]
+    fn stalled_paste_cleanup_is_bounded_and_traced_as_undelivered() {
+        let mut state = PasteCleanupState::default();
+        state.observe_attempt(b"\x1b[200~");
+        let started = std::time::Instant::now();
+        assert!(!attempt_paste_cleanup(&mut state, |_, cancelled| {
+            while !cancelled() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(AgentError::Attached)
+        }));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(
+            paste_cleanup_trace("alpha", "write timeout", 12, false),
+            "session=alpha reason=write timeout bytes_dropped=12 cleanup not delivered"
+        );
+    }
 
     #[test]
     fn auto_listener_uses_detected_address_for_bind_and_advertisement() {

@@ -515,8 +515,8 @@ fn serve_line_prompt(
         });
 }
 
-pub const PREFACE_MAX_LINES: usize = 32;
-pub const PREFACE_MAX_LINE_CHARS: usize = 256;
+pub(crate) const PREFACE_MAX_LINES: usize = 32;
+pub(crate) const PREFACE_MAX_LINE_CHARS: usize = 256;
 
 /// Split a prompt preface into terminal-safe lines: the label's sanitizer per
 /// line, so only the newline survives, as the separator. Over a cap is an

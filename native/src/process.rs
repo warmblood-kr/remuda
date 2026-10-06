@@ -17,7 +17,7 @@ use crate::image::Image;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -40,6 +40,38 @@ pub const RUN_DEFAULT_TIMEOUT: f64 = 5.0;
 pub const RUN_MAX_TIMEOUT: f64 = 30.0;
 pub const RUN_TIMEOUT_EXIT_CODE: i32 = 124;
 
+/// Environment policy applied to a process child. With `clear` false, the
+/// child inherits the daemon's environment and `vars` overrides entries.
+#[derive(Clone, Default)]
+pub struct ChildEnvironment {
+    clear: bool,
+    vars: Vec<(String, String)>,
+}
+
+impl ChildEnvironment {
+    pub fn new(word: &str, clear: bool, vars: Vec<(String, String)>) -> Result<Self, String> {
+        for (name, value) in &vars {
+            if name.is_empty() {
+                return Err(format!("{word} env names must not be empty"));
+            }
+            if name.contains('=') || name.contains('\0') {
+                return Err(format!("{word} env names must not contain '=' or NUL"));
+            }
+            if value.contains('\0') {
+                return Err(format!("{word} env values must not contain NUL"));
+            }
+        }
+        Ok(Self { clear, vars })
+    }
+
+    fn apply(&self, command: &mut Command) {
+        if self.clear {
+            command.env_clear();
+        }
+        command.envs(self.vars.iter().map(|(name, value)| (name, value)));
+    }
+}
+
 /// Result from the bounded synchronous `remuda.process.run` word. Output is
 /// raw bytes (Lua strings are byte strings); each stream is capped separately.
 pub struct RunOutput {
@@ -58,6 +90,25 @@ pub fn run_sync(
     stdin: Option<Vec<u8>>,
     timeout_seconds: f64,
     cwd: Option<PathBuf>,
+    stdin_hold_until_lines: Option<usize>,
+) -> Result<RunOutput, String> {
+    run_sync_with_env(
+        argv,
+        stdin,
+        timeout_seconds,
+        cwd,
+        stdin_hold_until_lines,
+        ChildEnvironment::default(),
+    )
+}
+
+pub fn run_sync_with_env(
+    argv: Vec<String>,
+    stdin: Option<Vec<u8>>,
+    timeout_seconds: f64,
+    cwd: Option<PathBuf>,
+    stdin_hold_until_lines: Option<usize>,
+    child_environment: ChildEnvironment,
 ) -> Result<RunOutput, String> {
     validate_run(&argv, timeout_seconds)?;
     let (stdout_permit, stderr_permit) = reserve_run_reader_workers()?;
@@ -74,6 +125,7 @@ pub fn run_sync(
     if let Some(dir) = &cwd {
         command.current_dir(dir);
     }
+    child_environment.apply(&mut command);
     child_guard::harden(&mut command);
 
     #[cfg(windows)]
@@ -96,14 +148,16 @@ pub fn run_sync(
 
     let stdout_capture = Arc::new(Mutex::new(BoundedCapture::default()));
     let stderr_capture = Arc::new(Mutex::new(BoundedCapture::default()));
+    let stdout_newlines = Arc::new(AtomicUsize::new(0));
     let stdout_reader = ReaderState::new();
     let stderr_reader = ReaderState::new();
     let stdout_reader_thread = {
         let capture = stdout_capture.clone();
         let state = stdout_reader.clone();
+        let newlines = stdout_newlines.clone();
         std::thread::spawn(move || {
             let _permit = stdout_permit;
-            capture_bounded(stdout, capture, state)
+            capture_bounded(stdout, capture, state, Some(newlines))
         })
     };
     let stderr_reader_thread = {
@@ -111,30 +165,35 @@ pub fn run_sync(
         let state = stderr_reader.clone();
         std::thread::spawn(move || {
             let _permit = stderr_permit;
-            capture_bounded(stderr, capture, state)
+            capture_bounded(stderr, capture, state, None)
         })
     };
     let stdin_done = Arc::new(AtomicBool::new(false));
+    let child_exited = Arc::new(AtomicBool::new(false));
+    let stdin_release = Arc::new(AtomicBool::new(false));
     let stdin_writer = {
         let done = stdin_done.clone();
+        let exited = child_exited.clone();
+        let release = stdin_release.clone();
+        let newlines = stdout_newlines.clone();
+        let state =
+            StdinWriterState::new(stdin_hold_until_lines, deadline, newlines, exited, release);
         std::thread::spawn(move || {
-            if let Some(input) = stdin {
-                let mut child_stdin = child_stdin;
-                let _ = child_stdin.write_all(&input);
-            }
-            // Dropping stdin signals EOF to children which read until end.
-            done.store(true, Ordering::Release);
+            finish_stdin_write(child_stdin, stdin, state, done);
         })
     };
 
-    let (child_status, timed_out, tree_terminated) = wait_for_process_io(
+    let process_io = wait_for_process_io(
         &mut child,
         deadline,
         &process_tree,
         &stdout_reader,
         &stderr_reader,
         &stdin_done,
-    )?;
+        &child_exited,
+    );
+    stdin_release.store(true, Ordering::Release);
+    let (child_status, timed_out, tree_terminated) = process_io?;
 
     if tree_terminated {
         // Terminating the Windows Job closes descendant-held pipe handles.
@@ -162,6 +221,59 @@ pub fn run_sync(
         timed_out,
         signal: exit_signal(&child_status),
     })
+}
+
+struct StdinWriterState {
+    hold_until_lines: Option<usize>,
+    deadline: Instant,
+    newlines: Arc<AtomicUsize>,
+    child_exited: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+}
+
+impl StdinWriterState {
+    fn new(
+        hold_until_lines: Option<usize>,
+        deadline: Instant,
+        newlines: Arc<AtomicUsize>,
+        child_exited: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            hold_until_lines,
+            deadline,
+            newlines,
+            child_exited,
+            release,
+        }
+    }
+}
+
+fn finish_stdin_write(
+    mut child_stdin: ChildStdin,
+    input: Option<Vec<u8>>,
+    state: StdinWriterState,
+    done: Arc<AtomicBool>,
+) {
+    if let Some(input) = input {
+        let _ = child_stdin.write_all(&input);
+    }
+    if let Some(target) = state.hold_until_lines {
+        while state.newlines.load(Ordering::Acquire) < target
+            && !state.child_exited.load(Ordering::Acquire)
+            && Instant::now() < state.deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if Instant::now() >= state.deadline && !state.child_exited.load(Ordering::Acquire) {
+            while !state.release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    // Dropping stdin signals EOF to children which read until end.
+    drop(child_stdin);
+    done.store(true, Ordering::Release);
 }
 
 /// Check the optional `cwd` of `process.run` and `process`: an absolute path
@@ -261,6 +373,7 @@ fn wait_for_process_io(
     stdout_reader: &ReaderState,
     stderr_reader: &ReaderState,
     stdin_done: &AtomicBool,
+    child_exited: &AtomicBool,
 ) -> Result<(std::process::ExitStatus, bool, bool), String> {
     let mut child_status = None;
     let mut tree_terminated = false;
@@ -270,6 +383,9 @@ fn wait_for_process_io(
             let (status, terminated) = observe_child_status(child, process_tree, pipes_open)?;
             child_status = status;
             tree_terminated |= terminated;
+        }
+        if child_status.is_some() {
+            child_exited.store(true, Ordering::Release);
         }
         if let Some(error) = stdout_reader.error() {
             terminate_child(child, process_tree, child_status.is_none());
@@ -494,12 +610,23 @@ impl ReaderState {
     }
 }
 
-fn capture_bounded(mut reader: impl Read, capture: Arc<Mutex<BoundedCapture>>, state: ReaderState) {
+fn capture_bounded(
+    mut reader: impl Read,
+    capture: Arc<Mutex<BoundedCapture>>,
+    state: ReaderState,
+    newline_counter: Option<Arc<AtomicUsize>>,
+) {
     let mut buffer = [0u8; 8192];
     let result = loop {
         match reader.read(&mut buffer) {
             Ok(0) => break Ok(()),
-            Ok(read) => capture.lock().unwrap().push(&buffer[..read]),
+            Ok(read) => {
+                if let Some(counter) = &newline_counter {
+                    let newlines = buffer[..read].iter().filter(|&&byte| byte == b'\n').count();
+                    counter.fetch_add(newlines, Ordering::Release);
+                }
+                capture.lock().unwrap().push(&buffer[..read]);
+            }
             Err(error) => break Err(error.to_string()),
         }
     };
@@ -540,6 +667,7 @@ mod run_tests {
             Cursor::new(vec![b'x'; RUN_OUTPUT_LIMIT + 1]),
             capture.clone(),
             super::ReaderState::new(),
+            None,
         );
         let output = capture.lock().unwrap().snapshot();
         assert_eq!(output.len(), RUN_OUTPUT_LIMIT + RUN_OUTPUT_MARKER.len());
@@ -588,6 +716,7 @@ mod run_tests {
             None,
             2.0,
             None,
+            None,
         )
         .expect("the child should start and exit before its deadline");
 
@@ -631,6 +760,7 @@ mod run_tests {
             ],
             Some(paths.into_bytes()),
             3.0,
+            None,
             None,
         )
         .expect("process.run should return after the leader exits");
@@ -762,6 +892,7 @@ mod run_tests {
             ],
             None,
             1.0,
+            None,
             None,
         )
         .expect("process.run should return after the leader exits");
@@ -1049,6 +1180,25 @@ impl Processes {
         on_exit: Option<String>,
         cwd: Option<PathBuf>,
     ) -> Result<u64, String> {
+        self.spawn_with_env(
+            image,
+            argv,
+            on_line,
+            on_exit,
+            cwd,
+            ChildEnvironment::default(),
+        )
+    }
+
+    pub fn spawn_with_env(
+        &self,
+        image: Image,
+        argv: Vec<String>,
+        on_line: Option<String>,
+        on_exit: Option<String>,
+        cwd: Option<PathBuf>,
+        child_environment: ChildEnvironment,
+    ) -> Result<u64, String> {
         let (program, args) = argv
             .split_first()
             .ok_or_else(|| "a process needs a non-empty argv".to_string())?;
@@ -1061,6 +1211,7 @@ impl Processes {
         if let Some(dir) = &cwd {
             command.current_dir(dir);
         }
+        child_environment.apply(&mut command);
         // Every plain-pipe child funnels through the one seam that keeps it
         // from outliving this daemon — see child_guard.rs.
         child_guard::harden(&mut command);

@@ -67,3 +67,22 @@ fn read_only_verbs_without_a_daemon_fail_without_starting_one() {
         );
     }
 }
+
+// A daemon that died takes its sessions with it, and the next command quietly
+// starts a new one. The notice is the only place that says so.
+#[test]
+fn a_command_that_starts_a_daemon_says_none_was_running() {
+    let dir = scratch("n");
+    let output = run(&dir, &["-e", "return 1"]);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let _ = run(&dir, &["stop", "-f"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        stderr.contains(
+            "remuda: started a daemon for \"s\": none was running (sessions of an earlier daemon, if any, are gone)"
+        ),
+        "{stderr:?}"
+    );
+}

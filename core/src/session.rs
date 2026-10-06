@@ -136,6 +136,17 @@ pub struct Session {
     input_rate: Mutex<InputRateLimiter>,
 }
 
+fn configure_writer_clock(
+    agent: &mut dyn AgentProcess,
+    clock: &Arc<dyn Clock>,
+) -> (Duration, Arc<Mutex<Duration>>) {
+    if let Some(writer) = agent.input_writer() {
+        writer.set_clock(Arc::clone(clock));
+    }
+    let started = clock.now();
+    (started, Arc::new(Mutex::new(started)))
+}
+
 /// Generate a unique session-start identity from host entropy and a process counter.
 pub fn generate_instance_id(seed: u128) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -181,9 +192,8 @@ impl Session {
         clock: Arc<dyn Clock>,
     ) -> Self {
         let instance_id = generate_instance_id(clock.instance_id_seed());
+        let (started, last_output_at) = configure_writer_clock(agent.as_mut(), &clock);
         let size = agent.size();
-        let started = clock.now();
-        let last_output_at = Arc::new(Mutex::new(started));
         let output_changed = Arc::new((Mutex::new(0_u64), Condvar::new()));
         if let Some(output) = agent.subscribe_output_wakeup() {
             let last_output_at = Arc::clone(&last_output_at);
@@ -358,7 +368,13 @@ impl Session {
             .filter(|pending| pending.tail == tail)
             .map(|pending| pending.baseline_occurrences)
             .unwrap_or_else(|| self.tail_occurrences(&tail).saturating_sub(1));
-        self.submit_locked(&tail, baseline)
+        match self.submit_locked(&tail, baseline) {
+            // The first Return write was refused without writing bytes. The
+            // body came from an earlier input_text call, so keep the result
+            // cautious and report submission as unconfirmed.
+            Err(AgentError::Busy) => Err(AgentError::SubmitUncertain),
+            result => result,
+        }
     }
 
     /// Deliver TEXT and submit it as one act. This is the composite used by
@@ -416,7 +432,10 @@ impl Session {
         if !settle.is_zero() {
             self.clock.sleep(settle);
         }
-        self.submit_locked(&tail, baseline)
+        match self.submit_locked(&tail, baseline) {
+            Err(AgentError::Busy) => Err(AgentError::SubmitUncertain),
+            result => result,
+        }
     }
 
     fn submit_locked(&self, tail: &str, baseline_occurrences: usize) -> Result<InputSubmitOutcome> {
@@ -639,7 +658,7 @@ impl Session {
                 }
                 Ok(InputOutcome::Ack { duplicate: false })
             }
-            Err(AgentError::Busy) => {
+            Err(AgentError::Busy | AgentError::LateSubmitAbandoned { .. }) => {
                 if let Ok(mut deduplicator) = self.input_dedup.lock() {
                     deduplicator.release(batch.client_id, batch.seq);
                 }
@@ -709,15 +728,16 @@ impl Session {
     /// The one place that touches the backend. PTY handles wait without the
     /// process mutex; callers hold `input_lock` except an attachment writer.
     fn write_one_burst(&self, bytes: &[u8]) -> Result<()> {
-        self.write_one_burst_with(bytes, false, &|| false)
+        self.write_one_burst_with(bytes, false, &|| false, None)
     }
 
-    fn write_one_burst_to_completion_while(
+    fn write_one_burst_to_completion_while_started(
         &self,
         bytes: &[u8],
         cancelled: &dyn Fn() -> bool,
+        on_start: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<()> {
-        self.write_one_burst_with(bytes, true, cancelled)
+        self.write_one_burst_with(bytes, true, cancelled, Some(on_start))
     }
 
     fn write_one_burst_with(
@@ -725,6 +745,7 @@ impl Session {
         bytes: &[u8],
         wait_to_completion: bool,
         cancelled: &dyn Fn() -> bool,
+        on_start: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<()> {
         let writer = {
             let mut agent = self
@@ -738,7 +759,11 @@ impl Session {
         };
         let result = if let Some(writer) = writer {
             if wait_to_completion {
-                writer.write_to_completion_while(bytes, cancelled)
+                if let Some(on_start) = on_start {
+                    writer.write_to_completion_while_started(bytes, cancelled, on_start)
+                } else {
+                    writer.write_to_completion_while(bytes, cancelled)
+                }
             } else {
                 writer.write_bounded(bytes)
             }
@@ -747,6 +772,9 @@ impl Session {
                 .agent
                 .lock()
                 .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+            if let Some(on_start) = on_start {
+                on_start();
+            }
             agent.write(bytes)
         };
         if let Err(error) = result {
@@ -1118,6 +1146,16 @@ impl Attached<'_> {
     /// A takeover may still let one pending buffer land after `attach()` returns.
     /// Single-flight writes do not interleave, and the buffer is never replayed.
     pub fn write_raw_while(&self, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
+        self.write_raw_while_started(bytes, cancelled, Arc::new(|| {}))
+    }
+
+    /// Write bytes while notifying when the backend starts the PTY write.
+    pub fn write_raw_while_started(
+        &self,
+        bytes: &[u8],
+        cancelled: &dyn Fn() -> bool,
+        on_start: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<()> {
         {
             let slot = self
                 .session
@@ -1132,8 +1170,11 @@ impl Attached<'_> {
                 return Err(AgentError::Attached);
             }
         }
-        self.session
-            .write_one_burst_to_completion_while(bytes, &|| self.is_displaced() || cancelled())?;
+        self.session.write_one_burst_to_completion_while_started(
+            bytes,
+            &|| self.is_displaced() || cancelled(),
+            on_start,
+        )?;
         // Only after the write lands, as `last_input_at` is.
         if let Ok(mut at) = self.session.last_human_input_at.lock() {
             *at = Some(self.session.clock.now());

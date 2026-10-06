@@ -6,10 +6,14 @@
 //! depend on this crate and cannot be made to.
 
 pub mod child_guard;
+pub mod cli_parse;
+pub mod cli_spec_check;
 pub mod client;
 pub mod cluster;
 pub mod cluster_remote;
 pub mod cluster_tui;
+pub mod cmd_arguments;
+pub(crate) mod credential;
 pub mod daemon;
 pub mod dist;
 pub mod find_command;
@@ -32,12 +36,28 @@ pub mod remote_front;
 pub mod reply_limit;
 pub mod script;
 pub mod session_job;
+pub(crate) mod storage;
 pub mod text;
 pub mod tick;
 pub mod tui;
+pub(crate) mod windows_security;
+
+/// Path used to persist command history for the REPL binary.
+#[doc(hidden)]
+pub fn repl_history_path() -> Option<std::path::PathBuf> {
+    storage::user_file_path_for(
+        storage::Kind::State,
+        "repl-history",
+        cfg!(windows),
+        &|name| std::env::var_os(name),
+    )
+}
 
 pub use portable_pty::CommandBuilder;
 pub use pty::PtyAgent;
+
+/// Shared guidance for input writes refused because the session is busy.
+pub const BUSY_RETRY_MESSAGE: &str = "session input is busy; nothing was written, retry\nNext: wait for the previous write to finish (see it with remuda capture NAME), then run the command again.";
 
 use remuda_core::{Clock, Size, WallClock};
 use std::time::{Duration, Instant};

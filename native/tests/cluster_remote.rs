@@ -771,6 +771,14 @@ fn driver_hosted_remote_tui_capture_shows_live_output_with_trailing_blanks() {
         );
         std::thread::sleep(Duration::from_millis(50));
     };
+    let in_pane = |l: &str| {
+        l.split_once('│')
+            .is_some_and(|(_, p)| p.starts_with("PR8-MARKER"))
+    };
+    assert!(
+        screen.lines().any(in_pane),
+        "driver-hosted 80x24 right pane omitted the live marker:\n{screen}"
+    );
     assert!(
         screen.contains("PR8-MARKER"),
         "driver-hosted 80x24 screen pane omitted the live marker:\n{screen}"
@@ -927,4 +935,68 @@ fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_res
             })
         },
     );
+}
+
+#[test]
+fn selected_remote_session_with_hangul_text_syncs_within_the_frame_limit() {
+    const HANGUL: &str = "안녕하세요 한글 패널 내용";
+    let client_node = Node::start("hangul-client");
+    let server_node = Node::start("hangul-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    server_node.start_session(&format!("printf '{HANGUL}\\n'; sleep 600"));
+    // A wide pane: blank cells alone used to overflow the Noise frame.
+    let out = server_node
+        .command()
+        .args(["resize", "proof", "500", "150"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let server_public = server_node.public.clone();
+    let address = listener.address;
+    let transport = Arc::new(ClusterRemoteTransport::with_client(
+        Zeroizing::new(client_node.private.clone()),
+        ClusterClient::with_timeouts(
+            Arc::new(SystemWallClock::new()),
+            ClientTimeouts {
+                connect: Duration::from_secs(2),
+                read: Duration::from_secs(25),
+                total: Duration::from_secs(25),
+            },
+        ),
+        move |_target| {
+            Ok(ResolvedTarget {
+                address,
+                pinned_static_key: server_public.clone(),
+            })
+        },
+    ));
+    let target = RemoteTarget {
+        name: remuda_native::cluster::node_label(&server_node.fingerprint()),
+        registry_key: server_node.fingerprint(),
+        addr_override: Some(address),
+    };
+    let poller = RemotePoller::new(vec![target.clone()], transport);
+    let source = poller.source();
+    poller
+        .selection()
+        .select(target.registry_key.clone(), "proof");
+    poller.start().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let session = proof_session(source.as_ref());
+        if session
+            .as_ref()
+            .is_some_and(|s| session_text(s).contains("안녕하세요"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no Hangul screen; last_error = {:?}",
+            session.map(|s| s.last_error)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

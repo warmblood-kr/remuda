@@ -300,19 +300,26 @@ fn exercise_session_exit_payload(path: &std::path::Path) {
 }
 
 #[test]
-fn frozen_api_fixtures_v1_through_v4_and_new_v5_surface_run() {
+fn frozen_api_fixtures_v1_through_v7_and_new_v8_surface_run() {
     for (version, source) in [
         ("v1", include_str!("api/v1.lua")),
         ("v2", include_str!("api/v2.lua")),
         ("v3", include_str!("api/v3.lua")),
         ("v4", include_str!("api/v4.lua")),
         ("v5", include_str!("api/v5.lua")),
+        ("v6", include_str!("api/v6.lua")),
+        ("v7", include_str!("api/v7.lua")),
+        ("v8", include_str!("api/v8.lua")),
     ] {
         let dir = scratch(version);
         let path = daemon::socket_path_in(&dir, "s");
         let mut private_daemon = spawn::Daemon::spawn(&dir);
         let fixture = dir.join(format!("{version}.lua"));
         if version == "v5" {
+            eval(
+                &path,
+                &format!("remuda._api_v5_test_pid = {}", std::process::id()),
+            );
             let private_path = dir.join("private-atomic-write");
             std::fs::write(&private_path, b"old contents").unwrap();
             #[cfg(unix)]
