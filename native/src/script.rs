@@ -781,6 +781,7 @@ fn cli_options_from_lua(table: Option<Table>) -> mlua::Result<Vec<crate::cli_par
                 value: item.get("value")?,
                 help: item.get("help")?,
                 global: item.get::<Option<bool>>("global")?.unwrap_or(false),
+                repeat_policy: Default::default(),
             });
         }
     }
@@ -2437,7 +2438,7 @@ mod binding_tests {
         let out = dump_of("remuda.cli.capabilities()");
         assert_eq!(
             out,
-            r#"{features={1="stable_report",2="strict_v2"},report_versions={1=1,2=2},spec_versions={1=1,2=2}}"#
+            r#"{features={1="stable_report",2="strict_v2",3="repeat_policy"},report_versions={1=1,2=2},spec_versions={1=1,2=2}}"#
         );
     }
 
@@ -2722,6 +2723,123 @@ mod binding_tests {
         ] {
             let out = strict(mutate);
             assert!(out.contains(r#"kind="spec""#), "{mutate}: {out}");
+        }
+    }
+
+    fn policy(options: &str, argv: &str) -> String {
+        dump_of(&format!(
+            r#"remuda.cli.parse({{version=2, name="remuda", requires={{"repeat_policy"}},
+            verbs={{go={{next="n", options={{{options}}}}}}}}}, {{"go"{argv}}})"#
+        ))
+    }
+
+    const APPEND: &str = r#"{long="w",short="w",value="D",help="h",repeat_policy="append"}"#;
+    const LAST: &str = r#"{long="m",short="m",value="M",help="h",repeat_policy="last"}"#;
+    const COALESCE: &str = r#"{long="j",short="j",help="h",repeat_policy="coalesce"}"#;
+
+    #[test]
+    fn cli_repeat_policy_append_is_an_array_for_zero_one_many() {
+        for (argv, want) in [
+            ("", "w={}"),
+            (r#","--w","a""#, r#"w={1="a"}"#),
+            (
+                r#","--w","a","-w","b","--w=c","-wd""#,
+                r#"w={1="a",2="b",3="c",4="d"}"#,
+            ),
+        ] {
+            let out = policy(APPEND, argv);
+            assert!(
+                out.contains(want) && out.contains("ok=true"),
+                "{argv}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_repeat_policy_last_wins_in_every_spelling() {
+        let out = policy(LAST, r#","--m","a","-m","b","--m=c","-md""#);
+        assert!(out.contains(r#"m="d""#), "{out}");
+        assert!(
+            !policy(LAST, "").contains("m="),
+            "absent scalar stays absent"
+        );
+        assert!(policy(LAST, r#","-m","x""#).contains(r#"m="x""#));
+    }
+
+    #[test]
+    fn cli_repeat_policy_coalesce_is_a_bool() {
+        assert!(policy(COALESCE, "").contains("j=false"));
+        assert!(policy(COALESCE, r#","-j""#).contains("j=true"));
+        let out = policy(COALESCE, r#","--j","-j","-jj""#);
+        assert!(out.contains("j=true") && out.contains("ok=true"), "{out}");
+    }
+
+    #[test]
+    fn cli_repeat_policy_reject_is_the_default_and_errors_on_duplicates() {
+        for opt in [
+            r#"{long="m",short="m",value="M",help="h"}"#,
+            r#"{long="m",short="m",value="M",help="h",repeat_policy="reject"}"#,
+        ] {
+            assert!(policy(opt, r#","-m","a""#).contains("ok=true"));
+            let out = policy(opt, r#","-m","a","--m=b""#);
+            assert!(
+                out.contains("kind=\"error\"") && out.contains("code=2"),
+                "{out}"
+            );
+        }
+        let flag = policy(
+            r#"{long="j",help="h",repeat_policy="reject"}"#,
+            r#","--j","--j""#,
+        );
+        assert!(flag.contains("ok=false"), "{flag}");
+    }
+
+    #[test]
+    fn cli_repeat_policy_rejects_bad_combinations_safely() {
+        for opt in [
+            r#"{long="a",help="h",repeat_policy="append"}"#,
+            r#"{long="a",help="h",repeat_policy="last"}"#,
+            r#"{long="a",value="V",help="h",repeat_policy="coalesce"}"#,
+            r#"{long="a",value="V",help="h",repeat_policy="SENTINEL SECRET"}"#,
+            r#"{long="a",value="V",help="h",repeat_policy=5}"#,
+            r#"{long="a",value="V",help="h",global=true,repeat_policy="append"}"#,
+        ] {
+            let out = policy(opt, "");
+            assert!(
+                out.contains(r#"kind="spec""#)
+                    && out.contains("code=2")
+                    && !out.contains("SENTINEL"),
+                "{opt}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_repeat_policy_is_strict_only_and_v1_ignores_it() {
+        let legacy = r#"remuda.cli.parse({name="remuda", verbs={go={next="n",
+            options={{long="m",value="M",help="h",repeat_policy="append"}}}}}, {"go","--m","a"})"#;
+        assert_eq!(
+            dump_of(legacy),
+            dump_of(&legacy.replace(r#",repeat_policy="append""#, ""))
+        );
+        assert!(dump_of(legacy).contains(r#"m="a""#));
+        let dup = legacy.replace(r#""--m","a""#, r#""--m","a","--m","b""#);
+        assert!(
+            dump_of(&dup).contains("ok=false"),
+            "v1 duplicates still error"
+        );
+    }
+
+    #[test]
+    fn cli_repeat_policy_hostile_tables_reject_without_panic() {
+        for opt in [
+            r#"{long="a",value="V",help="h",repeat_policy={}}"#,
+            r#"{long="a",value="V",help="h",repeat_policy=true}"#,
+            r#"{long="a",value="V",help="h",repeat_policy="APPEND"}"#,
+            r#"{long="a",value="V",help="h",repeat_policy=""}"#,
+            r#"{long="a",value="V",help="h",repeat_policy="append",[1]="x"}"#,
+        ] {
+            assert!(policy(opt, "").contains(r#"kind="spec""#), "{opt}");
         }
     }
 
