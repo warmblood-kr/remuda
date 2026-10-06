@@ -255,11 +255,15 @@ pub fn open_response(mut request: SealedRequest, message: &[u8]) -> io::Result<V
     Ok(payload)
 }
 
+// Deviation from the design note: no flags byte and no FINAL flag. The authenticated total length
+// (msg2 in PR2) is mandatory and proves completeness, so FINAL is redundant; empty input is zero
+// records with total 0.
 /// Largest plaintext carried by a single transport record (Noise message cap minus the AEAD tag).
 pub const MAX_RECORD_PLAINTEXT: usize = MAX_FRAME_SIZE - AEAD_TAG_SIZE;
 /// Hard cap on the total plaintext of a chunked response.
 pub const MAX_RESPONSE_TOTAL: usize = 4 * 1024 * 1024;
-/// Hard cap on the number of records in one chunked response.
+/// Hard cap on the number of records: ceil(MAX_RESPONSE_TOTAL / MAX_RECORD_PLAINTEXT) = 65.
+/// Enough because msg2 (PR2) carries chunk0 outside these records, so records hold at most the cap.
 pub const MAX_RECORDS: usize = MAX_RESPONSE_TOTAL.div_ceil(MAX_RECORD_PLAINTEXT);
 
 // ponytail: PR1 is pure functions; wired into client/listener in later PRs.
@@ -294,8 +298,9 @@ pub struct RecordOpener {
     transport: snow::TransportState,
     expected: usize,
     pending: Vec<u8>,
-    plaintext: Vec<u8>,
+    plaintext: Zeroizing<Vec<u8>>,
     records: usize,
+    failed: bool,
 }
 
 #[allow(dead_code)]
@@ -309,13 +314,24 @@ impl RecordOpener {
             transport,
             expected: expected_total,
             pending: Vec::new(),
-            plaintext: Vec::new(),
+            plaintext: Zeroizing::new(Vec::new()),
             records: 0,
+            failed: false,
         })
     }
 
     /// Feed bytes as they arrive. Memory only grows with bytes actually received.
-    pub fn push(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+    /// Any error is terminal: later `push`/`finish` calls fail without touching state.
+    pub fn push(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.failed {
+            return Err(invalid_frame());
+        }
+        let result = self.push_inner(bytes);
+        self.failed = result.is_err();
+        result
+    }
+
+    fn push_inner(&mut self, mut bytes: &[u8]) -> io::Result<()> {
         while !bytes.is_empty() {
             if self.plaintext.len() == self.expected {
                 return Err(invalid_frame());
@@ -373,14 +389,14 @@ impl RecordOpener {
     }
 
     /// Succeeds only when exactly `expected_total` plaintext bytes arrived in whole records.
-    pub fn finish(self) -> io::Result<Vec<u8>> {
-        if !self.pending.is_empty() || self.plaintext.len() != self.expected {
+    pub fn finish(mut self) -> io::Result<Vec<u8>> {
+        if self.failed || !self.pending.is_empty() || self.plaintext.len() != self.expected {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "truncated chunked response",
             ));
         }
-        Ok(self.plaintext)
+        Ok(std::mem::take(&mut *self.plaintext))
     }
 }
 
@@ -613,9 +629,78 @@ mod tests {
         let mut opener = RecordOpener::new(rx, n).unwrap();
         for byte in &wire {
             opener.push(std::slice::from_ref(byte)).unwrap();
-            assert!(opener.pending_len() <= 2 + MAX_FRAME_SIZE);
+            assert!(opener.pending_len() <= 2 + MAX_RECORD_PLAINTEXT + AEAD_TAG_SIZE);
         }
         assert_eq!(opener.pending_len(), 0);
         assert_eq!(opener.finish().unwrap(), data(n));
+    }
+
+    #[test]
+    fn empty_input_is_zero_records_and_zero_total() {
+        let (mut tx, rx) = transport_pair();
+        assert!(seal_records(&mut tx, b"").unwrap().is_empty());
+        assert!(open_all(rx, 0, &[]).unwrap().is_empty());
+        let (_, rx) = transport_pair();
+        assert!(open_all(rx, 1, &[]).is_err());
+    }
+
+    #[test]
+    fn opener_stays_failed_after_a_corrupt_record() {
+        let (rx, _, r) = two_records();
+        let mut bad = r[0].clone();
+        bad[10] ^= 1;
+        let mut opener = RecordOpener::new(rx, 2 * MAX_RECORD_PLAINTEXT).unwrap();
+        assert!(opener.push(&bad).is_err());
+        assert!(opener.push(&r[1]).is_err());
+        assert!(opener.finish().is_err());
+    }
+
+    #[test]
+    fn more_than_max_records_is_refused_by_the_count_cap() {
+        let (mut tx, rx) = transport_pair();
+        let mut opener = RecordOpener::new(rx, MAX_RESPONSE_TOTAL).unwrap();
+        let mut buf = vec![0; 64];
+        for i in 0..=MAX_RECORDS {
+            let n = tx.write_message(&[1], &mut buf).unwrap();
+            let mut rec = (n as u16).to_be_bytes().to_vec();
+            rec.extend_from_slice(&buf[..n]);
+            let result = opener.push(&rec);
+            if i < MAX_RECORDS {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().to_string(), too_large().to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn plaintext_beyond_expected_total_is_refused_after_authentication() {
+        let (mut tx, rx) = transport_pair();
+        let wire = seal_records(&mut tx, &data(20)).unwrap();
+        let mut opener = RecordOpener::new(rx, 10).unwrap();
+        let error = opener.push(&wire).unwrap_err();
+        assert_eq!(error.to_string(), invalid_frame().to_string());
+    }
+
+    #[test]
+    fn max_prefix_with_full_body_fails_authentication() {
+        let (_, rx) = transport_pair();
+        let mut opener = RecordOpener::new(rx, 100).unwrap();
+        let mut wire = u16::MAX.to_be_bytes().to_vec();
+        wire.extend(data(MAX_FRAME_SIZE));
+        let error = opener.push(&wire).unwrap_err();
+        assert_ne!(error.to_string(), invalid_frame().to_string());
+        assert_ne!(error.to_string(), too_large().to_string());
+    }
+
+    #[test]
+    fn claimed_length_without_data_buffers_only_what_arrived() {
+        let (_, rx) = transport_pair();
+        let mut opener = RecordOpener::new(rx, 100).unwrap();
+        let mut wire = u16::MAX.to_be_bytes().to_vec();
+        wire.extend(data(1000));
+        opener.push(&wire).unwrap();
+        assert_eq!(opener.pending_len(), 1002);
+        assert!(opener.finish().is_err());
     }
 }
