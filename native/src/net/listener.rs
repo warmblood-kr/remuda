@@ -3,6 +3,7 @@
 
 use super::{frame, replay};
 use crate::cluster::{self, identity, join_token::JoinTokenStore, NodeState};
+use remuda_core::agent::Color;
 use remuda_core::protocol::{Request, Response};
 use remuda_core::WallClock;
 use std::collections::{HashMap, VecDeque};
@@ -1589,11 +1590,45 @@ fn send_encrypted_response(stream: TcpStream, opened: frame::OpenedRequest, payl
 }
 
 fn bounded_response_payload(payload: &[u8]) -> Vec<u8> {
-    if payload.len() > frame::MAX_RESPONSE_PAYLOAD {
-        encode_error("cluster response exceeds the Noise frame limit")
-    } else {
-        payload.to_vec()
+    if payload.len() <= frame::MAX_RESPONSE_PAYLOAD {
+        return payload.to_vec();
     }
+    match trim_blank_screen_tails(payload) {
+        Some(trimmed) if trimmed.len() <= frame::MAX_RESPONSE_PAYLOAD => trimmed,
+        _ => encode_error("cluster response exceeds the Noise frame limit"),
+    }
+}
+
+/// Only for an oversized screen (#589): a wide pane's trailing default-style
+/// blanks alone can overflow the frame. Short rows read as blank-padded, as a
+/// wide glyph's dropped continuation already does.
+fn trim_blank_screen_tails(payload: &[u8]) -> Option<Vec<u8>> {
+    let mut response: Response = serde_json::from_slice(payload).ok()?;
+    let rows = match &mut response {
+        Response::StyledScreen { rows, .. } => rows,
+        Response::Sync { snapshot, .. } => &mut snapshot.rows,
+        _ => return None,
+    };
+    for row in rows {
+        while let Some(run) = row.last_mut() {
+            let plain = run.fg == Color::Default
+                && run.bg == Color::Default
+                && !run.inverse
+                && !run.underline;
+            let kept = if plain {
+                run.text.trim_end_matches(' ').len()
+            } else {
+                run.text.len()
+            };
+            run.text.truncate(kept);
+            if run.text.is_empty() {
+                row.pop();
+            } else {
+                break;
+            }
+        }
+    }
+    serde_json::to_vec(&response).ok()
 }
 
 fn write_http_response(mut stream: TcpStream, status: u16, body: &[u8]) -> io::Result<()> {
@@ -3465,6 +3500,52 @@ mod tests {
             effective_hold_timeout(std::time::Duration::from_secs(5)),
             std::time::Duration::from_secs(5)
         );
+    }
+
+    #[test]
+    fn wide_blank_screen_is_trimmed_to_fit_the_frame() {
+        let run = |text: &str, wide| remuda_core::protocol::StyledRun {
+            text: text.into(),
+            fg: Color::Default,
+            bg: Color::Default,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+            wide,
+        };
+        // 500x150 pane: one Hangul line, every other cell a plain blank.
+        let rows = (0..150)
+            .map(|i| match i {
+                0 => vec![
+                    run("안녕하세요 한글 패널 내용", true),
+                    run(&" ".repeat(470), false),
+                ],
+                _ => vec![run(&" ".repeat(500), false)],
+            })
+            .collect();
+        let raw = serde_json::to_vec(&Response::StyledScreen {
+            rows,
+            instance_id: None,
+            output_version: None,
+            wrapped: vec![],
+            scrollback_len: 0,
+            scrollback_total: 0,
+            cursor: remuda_core::agent::Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            },
+        })
+        .unwrap();
+        assert!(raw.len() > frame::MAX_RESPONSE_PAYLOAD, "raw {}", raw.len());
+        let fitted = bounded_response_payload(&raw);
+        let Response::StyledScreen { rows, .. } = serde_json::from_slice(&fitted).unwrap() else {
+            panic!("expected a screen, got an error payload");
+        };
+        assert_eq!(rows[0][0].text, "안녕하세요 한글 패널 내용");
+        assert!(rows[1].is_empty());
     }
 
     #[test]

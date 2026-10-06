@@ -512,7 +512,9 @@ pub fn collapse_runs(row: &[StyledCell]) -> Vec<StyledRun> {
                 && r.italic == cell.italic
                 && r.underline == cell.underline
                 && r.inverse == cell.inverse
-                && r.wide == cell.wide
+                // A wide glyph's empty continuation joins its run, so a
+                // CJK row stays one run, not two per glyph (#589).
+                && (r.wide == cell.wide || (r.wide && cell.text.is_empty()))
         });
         if extends_last {
             runs.last_mut().unwrap().text.push_str(&cell.text);
@@ -635,9 +637,8 @@ mod tests {
         let runs = collapse_runs(&row);
         assert_eq!(
             runs.len(),
-            3,
-            "the continuation's differing `wide` must start its own run, \
-             not merge into the wide cell despite sharing a colour: {runs:?}"
+            2,
+            "the continuation merges into the wide cell it belongs to: {runs:?}"
         );
 
         let back = expand_runs(&runs);
@@ -646,5 +647,18 @@ mod tests {
             vec![wide, cell("!", Color::Default)],
             "the continuation must not reappear: {back:?}"
         );
+    }
+
+    /// #589: a Hangul row must not cost two runs per glyph on the wire.
+    #[test]
+    fn a_hangul_row_collapses_to_one_run() {
+        let mut row = Vec::new();
+        for _ in 0..60 {
+            let mut wide = cell("한", Color::Default);
+            wide.wide = true;
+            row.push(wide);
+            row.push(cell("", Color::Default));
+        }
+        assert_eq!(collapse_runs(&row).len(), 1);
     }
 }
