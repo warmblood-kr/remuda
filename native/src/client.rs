@@ -493,7 +493,7 @@ fn client_timeout_from(default: Duration, value: Option<&str>) -> Duration {
 pub fn request_with_secret_prompts(path: &Path, request: &Request) -> std::io::Result<Response> {
     let stream = ipc::connect(path)?;
     send(&stream, request)?;
-    let timeout = Duration::from_secs(305);
+    let timeout = client_timeout(Duration::from_secs(305));
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
