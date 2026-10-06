@@ -6,6 +6,7 @@ use zeroize::Zeroizing;
 const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 const MAX_FRAME_SIZE: usize = 65_535;
 pub const MAX_RESPONSE_PAYLOAD: usize = MAX_FRAME_SIZE - 16;
+const AEAD_TAG_SIZE: usize = 16;
 const TIMESTAMP_SIZE: usize = std::mem::size_of::<i64>();
 const NOISE_PROLOGUE: &[u8] = b"remuda-cluster-v1";
 
@@ -254,6 +255,151 @@ pub fn open_response(mut request: SealedRequest, message: &[u8]) -> io::Result<V
     Ok(payload)
 }
 
+// Deviation from the design note: no flags byte and no FINAL flag. The authenticated total length
+// (msg2 in PR2) is mandatory and proves completeness, so FINAL is redundant; empty input is zero
+// records with total 0.
+/// Largest plaintext carried by a single transport record (Noise message cap minus the AEAD tag).
+pub const MAX_RECORD_PLAINTEXT: usize = MAX_FRAME_SIZE - AEAD_TAG_SIZE;
+/// Hard cap on the total plaintext of a chunked response.
+pub const MAX_RESPONSE_TOTAL: usize = 4 * 1024 * 1024;
+/// Hard cap on the number of records: ceil(MAX_RESPONSE_TOTAL / MAX_RECORD_PLAINTEXT) = 65.
+/// Enough because msg2 (PR2) carries chunk0 outside these records, so records hold at most the cap.
+pub const MAX_RECORDS: usize = MAX_RESPONSE_TOTAL.div_ceil(MAX_RECORD_PLAINTEXT);
+
+// ponytail: PR1 is pure functions; wired into client/listener in later PRs.
+/// Seal `plaintext` as a sequence of `[u16 BE len][AEAD record]`; the counter nonce orders records.
+#[allow(dead_code)]
+pub fn seal_records(transport: &mut snow::TransportState, plaintext: &[u8]) -> io::Result<Vec<u8>> {
+    if plaintext.len() > MAX_RESPONSE_TOTAL {
+        return Err(too_large());
+    }
+    let mut out = Vec::new();
+    let mut buf = vec![0; MAX_FRAME_SIZE];
+    for chunk in plaintext.chunks(MAX_RECORD_PLAINTEXT) {
+        let n = transport
+            .write_message(chunk, &mut buf)
+            .map_err(frame_error)?;
+        out.extend_from_slice(&(n as u16).to_be_bytes());
+        out.extend_from_slice(&buf[..n]);
+    }
+    Ok(out)
+}
+
+fn too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "chunked response exceeds the size cap",
+    )
+}
+
+/// Incremental reassembler for records produced by `seal_records`.
+#[allow(dead_code)]
+pub struct RecordOpener {
+    transport: snow::TransportState,
+    expected: usize,
+    pending: Vec<u8>,
+    plaintext: Zeroizing<Vec<u8>>,
+    records: usize,
+    failed: bool,
+}
+
+#[allow(dead_code)]
+impl RecordOpener {
+    /// `expected_total` is the authenticated total plaintext length (checked against the cap).
+    pub fn new(transport: snow::TransportState, expected_total: usize) -> io::Result<Self> {
+        if expected_total > MAX_RESPONSE_TOTAL {
+            return Err(too_large());
+        }
+        Ok(Self {
+            transport,
+            expected: expected_total,
+            pending: Vec::new(),
+            plaintext: Zeroizing::new(Vec::new()),
+            records: 0,
+            failed: false,
+        })
+    }
+
+    /// Feed bytes as they arrive. Memory only grows with bytes actually received.
+    /// Any error is terminal: later `push`/`finish` calls fail without touching state.
+    pub fn push(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.failed {
+            return Err(invalid_frame());
+        }
+        let result = self.push_inner(bytes);
+        self.failed = result.is_err();
+        result
+    }
+
+    fn push_inner(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        while !bytes.is_empty() {
+            if self.plaintext.len() == self.expected {
+                return Err(invalid_frame());
+            }
+            let need = match self.record_len()? {
+                None => 2 - self.pending.len(),
+                Some(len) => 2 + len - self.pending.len(),
+            };
+            let take = need.min(bytes.len());
+            self.pending.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self
+                .record_len()?
+                .is_some_and(|len| self.pending.len() == 2 + len)
+            {
+                self.open_record()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Length prefix of the record being read, once its two bytes are in and valid.
+    fn record_len(&self) -> io::Result<Option<usize>> {
+        if self.pending.len() < 2 {
+            return Ok(None);
+        }
+        let len = u16::from_be_bytes([self.pending[0], self.pending[1]]) as usize;
+        if len <= AEAD_TAG_SIZE {
+            return Err(invalid_frame());
+        }
+        Ok(Some(len))
+    }
+
+    fn open_record(&mut self) -> io::Result<()> {
+        self.records += 1;
+        if self.records > MAX_RECORDS {
+            return Err(too_large());
+        }
+        let mut out = vec![0; self.pending.len() - 2];
+        let n = self
+            .transport
+            .read_message(&self.pending[2..], &mut out)
+            .map_err(frame_error)?;
+        if self.plaintext.len() + n > self.expected {
+            return Err(invalid_frame());
+        }
+        self.plaintext.extend_from_slice(&out[..n]);
+        self.pending.clear();
+        Ok(())
+    }
+
+    /// Bytes currently buffered for an unfinished record.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Succeeds only when exactly `expected_total` plaintext bytes arrived in whole records.
+    pub fn finish(mut self) -> io::Result<Vec<u8>> {
+        if self.failed || !self.pending.is_empty() || self.plaintext.len() != self.expected {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated chunked response",
+            ));
+        }
+        Ok(std::mem::take(&mut *self.plaintext))
+    }
+}
+
 fn parse_pattern() -> io::Result<snow::params::NoiseParams> {
     NOISE_PATTERN.parse().map_err(frame_error)
 }
@@ -334,5 +480,228 @@ mod tests {
             .write_message(&plaintext[..15], &mut message)
             .unwrap();
         assert!(open_request(&responder.private, &message[..len]).is_err());
+    }
+
+    fn keypair() -> snow::Keypair {
+        snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .generate_keypair()
+            .unwrap()
+    }
+
+    /// (responder/sender, initiator/receiver) transport states of one handshake.
+    fn transport_pair() -> (snow::TransportState, snow::TransportState) {
+        let (i, r) = (keypair(), keypair());
+        let sealed = seal_request(&i.private, &r.public, 1000, b"req").unwrap();
+        let mut opened = open_request(&r.private, &sealed.message).unwrap();
+        let (mut msg, mut out) = (vec![0; MAX_FRAME_SIZE], vec![0; MAX_FRAME_SIZE]);
+        let n = opened.handshake.write_message(b"", &mut msg).unwrap();
+        let mut init = sealed.handshake;
+        init.read_message(&msg[..n], &mut out).unwrap();
+        (
+            opened.handshake.into_transport_mode().unwrap(),
+            init.into_transport_mode().unwrap(),
+        )
+    }
+
+    fn data(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    fn open_all(rx: snow::TransportState, total: usize, wire: &[u8]) -> io::Result<Vec<u8>> {
+        let mut opener = RecordOpener::new(rx, total)?;
+        opener.push(wire)?;
+        opener.finish()
+    }
+
+    fn roundtrip(n: usize) {
+        let (tx, rx) = transport_pair();
+        let (mut tx, plain) = (tx, data(n));
+        let wire = seal_records(&mut tx, &plain).unwrap();
+        assert_eq!(open_all(rx, n, &wire).unwrap(), plain);
+    }
+
+    #[test]
+    fn roundtrips_1_mib() {
+        roundtrip(1 << 20);
+    }
+
+    #[test]
+    fn roundtrips_exactly_the_cap_and_record_edges() {
+        for n in [
+            0,
+            1,
+            MAX_RECORD_PLAINTEXT,
+            MAX_RECORD_PLAINTEXT + 1,
+            MAX_RESPONSE_TOTAL,
+        ] {
+            roundtrip(n);
+        }
+        assert_eq!(MAX_RECORDS, 65);
+    }
+
+    #[test]
+    fn cap_plus_one_is_rejected_at_seal_and_open() {
+        let (mut tx, rx) = transport_pair();
+        assert!(seal_records(&mut tx, &data(MAX_RESPONSE_TOTAL + 1)).is_err());
+        assert!(RecordOpener::new(rx, MAX_RESPONSE_TOTAL + 1).is_err());
+    }
+
+    #[test]
+    fn truncated_stream_never_completes() {
+        let n = 3 * MAX_RECORD_PLAINTEXT + 10;
+        let (mut tx, _) = transport_pair();
+        let wire = seal_records(&mut tx, &data(n)).unwrap();
+        let mut cuts = vec![0, 1, 2, 3, wire.len() - 1];
+        let mut at = 0;
+        while at < wire.len() {
+            let len = u16::from_be_bytes([wire[at], wire[at + 1]]) as usize;
+            at += 2 + len;
+            cuts.extend([at - len, at - 1, at, at + 1]);
+        }
+        for cut in cuts.into_iter().filter(|c| *c < wire.len()) {
+            let (mut tx, rx) = transport_pair();
+            let wire = seal_records(&mut tx, &data(n)).unwrap();
+            let mut opener = RecordOpener::new(rx, n).unwrap();
+            assert!(opener.push(&wire[..cut]).is_ok(), "cut {cut}");
+            assert!(opener.finish().is_err(), "cut {cut} completed");
+        }
+    }
+
+    fn two_records() -> (snow::TransportState, Vec<u8>, Vec<Vec<u8>>) {
+        let (mut tx, rx) = transport_pair();
+        let wire = seal_records(&mut tx, &data(2 * MAX_RECORD_PLAINTEXT)).unwrap();
+        let split = 2 + u16::from_be_bytes([wire[0], wire[1]]) as usize;
+        (
+            rx,
+            Vec::new(),
+            vec![wire[..split].to_vec(), wire[split..].to_vec()],
+        )
+    }
+
+    #[test]
+    fn duplicate_record_is_rejected() {
+        let (rx, _, r) = two_records();
+        let wire = [r[0].clone(), r[0].clone()].concat();
+        assert!(open_all(rx, 2 * MAX_RECORD_PLAINTEXT, &wire).is_err());
+    }
+
+    #[test]
+    fn reordered_records_are_rejected() {
+        let (rx, _, r) = two_records();
+        let wire = [r[1].clone(), r[0].clone()].concat();
+        assert!(open_all(rx, 2 * MAX_RECORD_PLAINTEXT, &wire).is_err());
+    }
+
+    #[test]
+    fn record_spliced_from_another_session_is_rejected() {
+        let (rx, _, r) = two_records();
+        let (mut other_tx, _) = transport_pair();
+        let other = seal_records(&mut other_tx, &data(2 * MAX_RECORD_PLAINTEXT)).unwrap();
+        let split = 2 + u16::from_be_bytes([other[0], other[1]]) as usize;
+        let wire = [r[0].clone(), other[split..].to_vec()].concat();
+        assert!(open_all(rx, 2 * MAX_RECORD_PLAINTEXT, &wire).is_err());
+    }
+
+    #[test]
+    fn trailing_garbage_is_rejected() {
+        let (mut tx, rx) = transport_pair();
+        let mut wire = seal_records(&mut tx, &data(100)).unwrap();
+        wire.push(0);
+        assert!(open_all(rx, 100, &wire).is_err());
+    }
+
+    #[test]
+    fn bad_length_prefixes_are_rejected() {
+        for prefix in [0u16, 1, 16, u16::MAX] {
+            let (_, rx) = transport_pair();
+            let mut opener = RecordOpener::new(rx, 100).unwrap();
+            let mut wire = prefix.to_be_bytes().to_vec();
+            wire.extend(data(70_000));
+            assert!(opener.push(&wire).is_err(), "prefix {prefix}");
+        }
+    }
+
+    #[test]
+    fn one_byte_at_a_time_keeps_buffering_bounded() {
+        let n = 2 * MAX_RECORD_PLAINTEXT + 5;
+        let (mut tx, rx) = transport_pair();
+        let wire = seal_records(&mut tx, &data(n)).unwrap();
+        let mut opener = RecordOpener::new(rx, n).unwrap();
+        for byte in &wire {
+            opener.push(std::slice::from_ref(byte)).unwrap();
+            assert!(opener.pending_len() <= 2 + MAX_RECORD_PLAINTEXT + AEAD_TAG_SIZE);
+        }
+        assert_eq!(opener.pending_len(), 0);
+        assert_eq!(opener.finish().unwrap(), data(n));
+    }
+
+    #[test]
+    fn empty_input_is_zero_records_and_zero_total() {
+        let (mut tx, rx) = transport_pair();
+        assert!(seal_records(&mut tx, b"").unwrap().is_empty());
+        assert!(open_all(rx, 0, &[]).unwrap().is_empty());
+        let (_, rx) = transport_pair();
+        assert!(open_all(rx, 1, &[]).is_err());
+    }
+
+    #[test]
+    fn opener_stays_failed_after_a_corrupt_record() {
+        let (rx, _, r) = two_records();
+        let mut bad = r[0].clone();
+        bad[10] ^= 1;
+        let mut opener = RecordOpener::new(rx, 2 * MAX_RECORD_PLAINTEXT).unwrap();
+        assert!(opener.push(&bad).is_err());
+        assert!(opener.push(&r[1]).is_err());
+        assert!(opener.push(&[]).is_err());
+        assert!(opener.finish().is_err());
+    }
+
+    #[test]
+    fn more_than_max_records_is_refused_by_the_count_cap() {
+        let (mut tx, rx) = transport_pair();
+        let mut opener = RecordOpener::new(rx, MAX_RESPONSE_TOTAL).unwrap();
+        let mut buf = vec![0; 64];
+        for i in 0..=MAX_RECORDS {
+            let n = tx.write_message(&[1], &mut buf).unwrap();
+            let mut rec = (n as u16).to_be_bytes().to_vec();
+            rec.extend_from_slice(&buf[..n]);
+            let result = opener.push(&rec);
+            if i < MAX_RECORDS {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().to_string(), too_large().to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn plaintext_beyond_expected_total_is_refused_after_authentication() {
+        let (mut tx, rx) = transport_pair();
+        let wire = seal_records(&mut tx, &data(20)).unwrap();
+        let mut opener = RecordOpener::new(rx, 10).unwrap();
+        let error = opener.push(&wire).unwrap_err();
+        assert_eq!(error.to_string(), invalid_frame().to_string());
+    }
+
+    #[test]
+    fn max_prefix_with_full_body_fails_authentication() {
+        let (_, rx) = transport_pair();
+        let mut opener = RecordOpener::new(rx, 100).unwrap();
+        let mut wire = u16::MAX.to_be_bytes().to_vec();
+        wire.extend(data(MAX_FRAME_SIZE));
+        let error = opener.push(&wire).unwrap_err();
+        assert_ne!(error.to_string(), invalid_frame().to_string());
+        assert_ne!(error.to_string(), too_large().to_string());
+    }
+
+    #[test]
+    fn claimed_length_without_data_buffers_only_what_arrived() {
+        let (_, rx) = transport_pair();
+        let mut opener = RecordOpener::new(rx, 100).unwrap();
+        let mut wire = u16::MAX.to_be_bytes().to_vec();
+        wire.extend(data(1000));
+        opener.push(&wire).unwrap();
+        assert_eq!(opener.pending_len(), 1002);
+        assert!(opener.finish().is_err());
     }
 }
