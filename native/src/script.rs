@@ -224,7 +224,7 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "fs.write_atomic",
-        "Write bytes through a same-directory temporary file and atomically replace the target; private mode uses owner-only permissions on Unix.",
+        "Write bytes through a same-directory temporary file and atomically replace the target; private mode makes the file owner-only (mode 0600 on Unix, owner-only ACL on Windows).",
         "fs.write_atomic(path, bytes, options?) -> true, nil | nil, error",
     ),
     (

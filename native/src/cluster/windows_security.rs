@@ -922,6 +922,10 @@ mod tests {
         let path = dir.join("password");
         crate::fs_atomic::write_atomic_lua_private(&path, b"x\n").unwrap();
         assert!(is_owner_only(&path, false));
+        let seeded = dir.join("seeded");
+        std::fs::write(&seeded, b"loose\n").unwrap();
+        crate::fs_atomic::write_atomic_lua_private(&seeded, b"z\n").unwrap();
+        assert!(is_owner_only(&seeded, false));
         crate::fs_atomic::write_atomic_lua_private(&path, b"y\n").unwrap();
         assert!(is_owner_only(&path, false));
         assert_eq!(std::fs::read(&path).unwrap(), b"y\n");
