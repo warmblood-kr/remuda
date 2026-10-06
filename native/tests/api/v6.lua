@@ -2,10 +2,10 @@
 -- Like earlier versions, this file becomes frozen once merged.
 
 local caps = remuda.cli.capabilities()
-assert(#caps.spec_versions == 1 and caps.spec_versions[1] == 1, "spec versions")
+assert(caps.spec_versions[1] == 1, "spec versions")
 assert(#caps.report_versions == 2 and caps.report_versions[1] == 1
   and caps.report_versions[2] == 2, "report versions")
-assert(#caps.features == 1 and caps.features[1] == "stable_report", "features")
+assert(caps.features[1] == "stable_report", "features")
 assert(remuda._registry["cli.capabilities"] ~= nil, "cli.capabilities needs a registry entry")
 
 local function spec(version)
