@@ -24,10 +24,8 @@ pub const MAX_BODY_BYTES: usize = 65_535;
 pub const MAX_GLOBAL_REQUESTS: usize = 64;
 pub const MAX_PREAUTH_REQUESTS: usize = 64;
 pub const MAX_PEER_REQUESTS: usize = 8;
-/// Separate pool for responses above one Noise frame (v2 only). It bounds only
-/// the sealed copy and the socket write time of large responses; the payload
-/// is built BEFORE the permit (old 64-slot pool), and seal/open need more than
-/// 8 MiB of extra peak heap per 4 MiB response, so budget ~3 copies each.
+/// Large-response pool (v2): bounds the sealed copy and write time only, not the
+/// payload built before it (old pool) nor seal's >8 MiB extra peak heap each.
 const MAX_LARGE_GLOBAL: usize = 4;
 const MAX_LARGE_PER_PEER: usize = 1;
 /// Absolute deadline for writing one large response (mirrors the client total).
@@ -1574,12 +1572,8 @@ fn handle_admitted_request(
     send_dispatched_response(stream, opened, &response, &state.limiter, &peer_fp)
 }
 
-/// A v2 response above one frame needs a large-pool permit, acquired AFTER the
-/// payload exists (its size is unknown before dispatch) and BEFORE sealing.
-/// The pool bounds only the sealed copy plus the write time (now capped by an
-/// absolute deadline); it cannot bound the already-built payload (old pool:
-/// 64 x 4 MiB) or the seal-time working copies (>8 MiB extra peak heap per
-/// 4 MiB response). Exhausted: reply "busy" instead of waiting.
+/// A v2 response over one frame takes a large-pool permit after the payload is
+/// built (size unknown earlier) and before sealing; exhausted replies "busy".
 fn send_dispatched_response(
     stream: TcpStream,
     opened: frame::OpenedRequest,
@@ -4218,7 +4212,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fast_reader_finishes_a_deadline_bounded_write() {
-        let (server, mut client) = tiny_buffer_pair();
+        // Default buffers: tiny Linux windows make 4 MiB crawl (fixture, not the writer).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
         let body = vec![7u8; 4 * 1024 * 1024];
         let len = body.len();
         let writer = std::thread::spawn(move || {
