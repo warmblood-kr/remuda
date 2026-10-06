@@ -315,6 +315,8 @@ struct IpPermit {
 
 struct InboundRequest {
     body: Vec<u8>,
+    /// Exactly one `X-Remuda-Chunked: 1` header (auth and parsing ignore it).
+    chunked: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -887,6 +889,7 @@ fn parse_http_request<R: BufRead>(mut reader: R) -> io::Result<InboundRequest> {
     }
 
     let mut content_length = None;
+    let mut chunked_headers = Vec::new();
     let mut header_count = 0usize;
     loop {
         let line = read_header_line(&mut reader, MAX_REQUEST_LINE_BYTES)?;
@@ -904,6 +907,9 @@ fn parse_http_request<R: BufRead>(mut reader: R) -> io::Result<InboundRequest> {
         let (name, value) = parse_header(&line)?;
         if name.eq_ignore_ascii_case("transfer-encoding") {
             return Err(invalid_http("Transfer-Encoding is not supported"));
+        }
+        if name.eq_ignore_ascii_case("x-remuda-chunked") {
+            chunked_headers.push(value == "1");
         }
         if name.eq_ignore_ascii_case("content-length") {
             if content_length.is_some()
@@ -924,7 +930,8 @@ fn parse_http_request<R: BufRead>(mut reader: R) -> io::Result<InboundRequest> {
     let length = content_length.ok_or_else(|| invalid_http("Content-Length is required"))?;
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
-    Ok(InboundRequest { body })
+    let chunked = chunked_headers == [true];
+    Ok(InboundRequest { body, chunked })
 }
 
 fn parse_socket_request_with_timeout(
@@ -1283,7 +1290,10 @@ fn handle_connection_with(stream: TcpStream, context: ConnectionHandlerContext) 
         Err(_) => return ignore_response_error(write_http_response(stream, 400, b"bad request")),
     };
     let opened = match frame::open_request(&state.responder_private, &inbound.body) {
-        Ok(request) => request,
+        Ok(mut request) => {
+            request.chunked = inbound.chunked;
+            request
+        }
         Err(_) => return ignore_response_error(write_http_response(stream, 400, b"bad frame")),
     };
     let peer_fp = cluster::encoding::fingerprint(&opened.peer_static);
@@ -1583,19 +1593,33 @@ fn decode_cluster_request(payload: &[u8]) -> Result<Request, String> {
 }
 
 fn send_encrypted_response(stream: TcpStream, opened: frame::OpenedRequest, payload: &[u8]) {
-    let payload = bounded_response_payload(payload);
-    let result = frame::seal_response(opened, &payload)
-        .and_then(|body| write_http_response(stream, 200, &body));
-    ignore_response_error(result);
+    let chunked = opened.chunked;
+    let payload = bounded_response_payload(payload, chunked);
+    let sealed = if chunked {
+        frame::seal_response_chunked(opened, &payload)
+    } else {
+        frame::seal_response(opened, &payload)
+    };
+    ignore_response_error(sealed.and_then(|body| write_http_response(stream, 200, &body)));
 }
 
-fn bounded_response_payload(payload: &[u8]) -> Vec<u8> {
-    if payload.len() <= frame::MAX_RESPONSE_PAYLOAD {
-        return payload.to_vec();
+/// Fit `payload` under the cap of the peer's format (v1 one frame, v2 4 MiB).
+fn bounded_response_payload(payload: &[u8], chunked: bool) -> std::borrow::Cow<'_, [u8]> {
+    let cap = if chunked {
+        frame::MAX_RESPONSE_TOTAL
+    } else {
+        frame::MAX_RESPONSE_PAYLOAD
+    };
+    if payload.len() <= cap {
+        return payload.into();
     }
     match trim_blank_screen_tails(payload) {
-        Some(trimmed) if trimmed.len() <= frame::MAX_RESPONSE_PAYLOAD => trimmed,
-        _ => encode_error("cluster response exceeds the Noise frame limit"),
+        Some(trimmed) if trimmed.len() <= cap => trimmed.into(),
+        _ if chunked => encode_error(&format!("cluster response exceeds {cap} bytes")).into(),
+        _ => encode_error(
+            "cluster response exceeds the Noise frame limit; upgrade the requesting node to read it",
+        )
+        .into(),
     }
 }
 
@@ -3540,7 +3564,7 @@ mod tests {
         })
         .unwrap();
         assert!(raw.len() > frame::MAX_RESPONSE_PAYLOAD, "raw {}", raw.len());
-        let fitted = bounded_response_payload(&raw);
+        let fitted = bounded_response_payload(&raw, false);
         let Response::StyledScreen { rows, .. } = serde_json::from_slice(&fitted).unwrap() else {
             panic!("expected a screen, got an error payload");
         };
@@ -3550,7 +3574,8 @@ mod tests {
 
     #[test]
     fn oversized_result_becomes_a_clear_encrypted_error_payload() {
-        let payload = bounded_response_payload(&vec![b'x'; frame::MAX_RESPONSE_PAYLOAD + 1]);
+        let big = vec![b'x'; frame::MAX_RESPONSE_PAYLOAD + 1];
+        let payload = bounded_response_payload(&big, false);
         assert!(payload.len() < frame::MAX_RESPONSE_PAYLOAD);
         let response: Response = serde_json::from_slice(&payload).unwrap();
         assert!(matches!(response, Response::Error(message) if message.contains("frame limit")));

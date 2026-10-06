@@ -23,6 +23,9 @@ pub struct OpenedRequest {
     pub ephemeral: [u8; 32],
     pub timestamp_seconds: i64,
     pub payload: Vec<u8>,
+    /// Set by the listener when the peer asked for the chunked (v2) response.
+    #[allow(dead_code)] // frame.rs is also compiled into tests that never read it
+    pub chunked: bool,
     handshake: snow::HandshakeState,
 }
 
@@ -95,6 +98,7 @@ pub fn open_request(responder_private: &[u8], message: &[u8]) -> io::Result<Open
         ephemeral,
         timestamp_seconds,
         payload: plaintext[TIMESTAMP_SIZE..length].to_vec(),
+        chunked: false,
         handshake,
     })
 }
