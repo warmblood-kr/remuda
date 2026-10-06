@@ -188,6 +188,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "cli.parse(spec, argv) -> report",
     ),
     (
+        "cli.capabilities",
+        "Report the spec versions, report versions and features this core supports; set report_version = 2 on a spec for the stable report envelope.",
+        "cli.capabilities() -> {spec_versions, report_versions, features}",
+    ),
+    (
         "_pending_create",
         "Create a private bounded reply handle for remuda.pending.",
         "_pending_create(timeout?) -> id, handle",
@@ -485,10 +490,14 @@ fn cli_parse_bindings(lua: &Lua) -> mlua::Result<Table> {
     cli.set(
         "parse",
         lua.create_function(|lua, (spec_table, argv_table): (Table, Table)| {
+            let spec_table_wants_v2 = spec_table.get::<Option<i64>>("report_version")? == Some(2);
             let spec = cli_spec_from_lua(spec_table)?;
             let argv = cli_argv_from_lua(argv_table)?;
             let words = argv.iter().map(String::as_str).collect::<Vec<_>>();
             let report = crate::cli_parse::parse(&spec, &words);
+            if spec_table_wants_v2 {
+                return json_value_to_lua(lua, &crate::cli_parse::report_v2(&spec, &report));
+            }
 
             let result = lua.create_table()?;
             result.set("ok", report.ok)?;
@@ -501,7 +510,18 @@ fn cli_parse_bindings(lua: &Lua) -> mlua::Result<Table> {
                 values.set(key.as_str(), json_value_to_lua(lua, value)?)?;
             }
             result.set("values", values)?;
-            Ok(result)
+            Ok(Value::Table(result))
+        })?,
+    )?;
+    cli.set(
+        "capabilities",
+        lua.create_function(|lua, ()| {
+            let caps = serde_json::json!({
+                "spec_versions": crate::cli_parse::SPEC_VERSIONS,
+                "report_versions": crate::cli_parse::REPORT_VERSIONS,
+                "features": crate::cli_parse::FEATURES,
+            });
+            json_value_to_lua(lua, &caps)
         })?,
     )?;
     Ok(cli)
@@ -2335,6 +2355,127 @@ mod binding_tests {
         )
         .exec()
         .unwrap();
+    }
+
+    const DUMP: &str = r#"
+        function dump(v)
+            if type(v) ~= "table" then return type(v) == "string" and '"' .. v:gsub("\n", "\\n") .. '"' or tostring(v) end
+            local keys = {}
+            for k in pairs(v) do keys[#keys + 1] = k end
+            table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+            local out = {}
+            for _, k in ipairs(keys) do out[#out + 1] = tostring(k) .. "=" .. dump(v[k]) end
+            return "{" .. table.concat(out, ",") .. "}"
+        end
+        spec = {
+            name="remuda",
+            options={{long="json",help="j",global=true},{long="room",value="R",help="r"}},
+            verbs={
+                send={next="remuda send --help",args={{name="TO",help="to"},{name="BODY",help="b",multiple=true,required=false}},
+                    options={{long="loud",help="l"},{long="tag",value="T",help="t"}}},
+            },
+        }
+    "#;
+
+    fn dump_of(call: &str) -> String {
+        let lua = Lua::new();
+        install_cli_binding(&lua);
+        lua.load(DUMP).exec().unwrap();
+        lua.load(format!("return dump({call})")).eval().unwrap()
+    }
+
+    // Goldens captured from the pre-v2 parser; v1 output must never change.
+    #[test]
+    fn cli_parse_v1_reports_are_unchanged() {
+        assert_eq!(
+            dump_of(r#"remuda.cli.parse(spec, {"--json", "send", "a", "x", "y"})"#),
+            r#"{code=0,ok=true,text="",values={BODY={1="x",2="y"},TO="a",json=true,loud=false},verb="send"}"#
+        );
+        assert_eq!(
+            dump_of(r#"remuda.cli.parse(spec, {"send", "a", "x"})"#),
+            r#"{code=0,ok=true,text="",values={BODY="x",TO="a",json=false,loud=false},verb="send"}"#
+        );
+        assert_eq!(
+            dump_of(r#"remuda.cli.parse(spec, {"send", "--help"})"#),
+            r#"{code=0,kind="help",ok=false,text="\nUsage: remuda send [OPTIONS] TO [BODY]\n\nArguments:\n  <TO>       to\n  [BODY]...  b\n\nOptions:\n  -h, --help     Print help\n      --json     j\n      --loud     l\n      --tag <T>  t\n\nNext: remuda send --help\n",values={}}"#
+        );
+        assert_eq!(
+            dump_of(r#"remuda.cli.parse(spec, {"send", "--nope"})"#),
+            r#"{code=2,kind="error",ok=false,text="remuda: remuda send: unknown option '--nope'. put the text after --\nUsage: remuda send [OPTIONS] TO [BODY]\nNext: remuda send --help",values={}}"#
+        );
+    }
+
+    #[test]
+    fn cli_capabilities_advertise_only_what_exists() {
+        let out = dump_of("remuda.cli.capabilities()");
+        assert_eq!(
+            out,
+            r#"{features={1="stable_report"},report_versions={1=1,2=2},spec_versions={1=1}}"#
+        );
+    }
+
+    #[test]
+    fn cli_parse_v2_success_envelope_and_vectors() {
+        let many = dump_of(
+            r#"remuda.cli.parse((function() spec.report_version = 2 return spec end)(), {"send", "a", "x", "y"})"#,
+        );
+        assert_eq!(
+            many,
+            r#"{bodies={},boundaries={},code=0,handler="",kind="success",ok=true,origins={},path={},shape="",text="",values={BODY={1="x",2="y"},TO="a",json=false,loud=false},verb="send"}"#
+        );
+        let spec2 = "(function() spec.report_version = 2 return spec end)()";
+        let one = dump_of(&format!(
+            r#"remuda.cli.parse({spec2}, {{"send", "a", "x"}})"#
+        ));
+        assert!(one.contains(r#"BODY={1="x"}"#), "{one}");
+        let zero = dump_of(&format!(r#"remuda.cli.parse({spec2}, {{"send", "a"}})"#));
+        assert!(
+            zero.contains("BODY={}") && zero.contains(r#"TO="a""#),
+            "{zero}"
+        );
+        assert!(
+            !zero.contains("room="),
+            "absent scalar stays absent: {zero}"
+        );
+        assert!(zero.contains("json=false"), "absent flag is false: {zero}");
+    }
+
+    #[test]
+    fn cli_parse_v2_help_and_error_clear_values() {
+        let spec2 = "(function() spec.report_version = 2 return spec end)()";
+        let help = dump_of(&format!(
+            r#"remuda.cli.parse({spec2}, {{"send", "--help"}})"#
+        ));
+        assert!(
+            help.contains(r#"kind="help""#)
+                && help.contains("values={}")
+                && help.contains("bodies={}"),
+            "{help}"
+        );
+        let err = dump_of(&format!(
+            r#"remuda.cli.parse({spec2}, {{"send", "--nope"}})"#
+        ));
+        assert!(
+            err.contains(r#"kind="error""#)
+                && err.contains("values={}")
+                && err.contains(r#"handler="""#),
+            "{err}"
+        );
+        let unknown = dump_of(&format!(r#"remuda.cli.parse({spec2}, {{"zzz"}})"#));
+        assert!(
+            unknown.contains(r#"kind="error""#) && unknown.contains("path={}"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
+    fn cli_parse_other_report_versions_stay_v1() {
+        let v1 = dump_of(r#"remuda.cli.parse(spec, {"send", "a"})"#);
+        let v1_explicit = dump_of(
+            r#"remuda.cli.parse((function() spec.report_version = 1 return spec end)(), {"send", "a"})"#,
+        );
+        assert_eq!(v1, v1_explicit);
+        assert!(!v1.contains("path="));
     }
 
     #[test]
