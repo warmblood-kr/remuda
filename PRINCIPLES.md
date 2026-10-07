@@ -236,6 +236,10 @@ Every version of the Lua surface has a script written against it in
 `native/tests/api/`, and CI runs all of them on every commit. Widening the API
 means adding `v2.lua`; it never means editing `v1.lua`.
 
+Capability metadata lists (spec/report versions, features) are extensible:
+fixtures assert membership, not cardinality. v6's exact counts froze extensible
+metadata, so its two count checks were relaxed in the open to membership.
+
 **Why.** 정수님, 2026-09-10: *"그 언어 API 에 대고 사용자들이 자기 함수를 얹어서
 설정하거나 플러그인, 워크플로 등을 만들면, 하위호환을 엄격하게 지켜야 합니다."*
 The incident is this repo's own step 004, the change that introduced the rule:

@@ -656,7 +656,7 @@ fn process_output(
         } else {
             probe_end.saturating_sub(probe_start)
         };
-        let _ = scrollback_total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+        let _ = scrollback_total.try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
             Some(total.saturating_add(scrolled))
         });
     }

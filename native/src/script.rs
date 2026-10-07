@@ -188,6 +188,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "cli.parse(spec, argv) -> report",
     ),
     (
+        "cli.capabilities",
+        "Report the spec versions, report versions and features this core supports; set report_version = 2 on a spec for the stable report envelope.",
+        "cli.capabilities() -> {spec_versions, report_versions, features}",
+    ),
+    (
         "_pending_create",
         "Create a private bounded reply handle for remuda.pending.",
         "_pending_create(timeout?) -> id, handle",
@@ -224,7 +229,7 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "fs.write_atomic",
-        "Write bytes through a same-directory temporary file and atomically replace the target; private mode uses owner-only permissions on Unix.",
+        "Write bytes through a same-directory temporary file and atomically replace the target; private mode makes the file owner-only (mode 0600 on Unix, owner-only ACL on Windows).",
         "fs.write_atomic(path, bytes, options?) -> true, nil | nil, error",
     ),
     (
@@ -485,26 +490,68 @@ fn cli_parse_bindings(lua: &Lua) -> mlua::Result<Table> {
     cli.set(
         "parse",
         lua.create_function(|lua, (spec_table, argv_table): (Table, Table)| {
-            let spec = cli_spec_from_lua(spec_table)?;
+            // Raw lookup: no __index, no coercion; only an exact integer 2 opts in.
+            let spec_table_wants_v2 = matches!(
+                spec_table.raw_get::<Value>("report_version")?,
+                Value::Integer(2)
+            );
+            let strict = match crate::cli_spec_check::check(&spec_table) {
+                Ok(strict) => strict,
+                Err((kind, text)) => {
+                    let spec = crate::cli_parse::Spec {
+                        name: String::new(),
+                        options: vec![],
+                        verbs: vec![],
+                    };
+                    let report = crate::cli_parse::Report::failure(kind, text, 2);
+                    return cli_report_to_lua(lua, &spec, &report, spec_table_wants_v2);
+                }
+            };
+            let spec = match strict {
+                Some(spec) => spec,
+                None => cli_spec_from_lua(spec_table)?,
+            };
             let argv = cli_argv_from_lua(argv_table)?;
             let words = argv.iter().map(String::as_str).collect::<Vec<_>>();
             let report = crate::cli_parse::parse(&spec, &words);
-
-            let result = lua.create_table()?;
-            result.set("ok", report.ok)?;
-            result.set("verb", report.verb)?;
-            result.set("kind", report.kind)?;
-            result.set("text", report.text)?;
-            result.set("code", report.code)?;
-            let values = lua.create_table()?;
-            for (key, value) in &report.values {
-                values.set(key.as_str(), json_value_to_lua(lua, value)?)?;
-            }
-            result.set("values", values)?;
-            Ok(result)
+            cli_report_to_lua(lua, &spec, &report, spec_table_wants_v2)
+        })?,
+    )?;
+    cli.set(
+        "capabilities",
+        lua.create_function(|lua, ()| {
+            let caps = serde_json::json!({
+                "spec_versions": crate::cli_parse::SPEC_VERSIONS,
+                "report_versions": crate::cli_parse::REPORT_VERSIONS,
+                "features": crate::cli_parse::FEATURES,
+            });
+            json_value_to_lua(lua, &caps)
         })?,
     )?;
     Ok(cli)
+}
+
+fn cli_report_to_lua(
+    lua: &Lua,
+    spec: &crate::cli_parse::Spec,
+    report: &crate::cli_parse::Report,
+    v2: bool,
+) -> mlua::Result<Value> {
+    if v2 {
+        return json_value_to_lua(lua, &crate::cli_parse::report_v2(spec, report));
+    }
+    let result = lua.create_table()?;
+    result.set("ok", report.ok)?;
+    result.set("verb", report.verb.clone())?;
+    result.set("kind", report.kind.clone())?;
+    result.set("text", report.text.clone())?;
+    result.set("code", report.code)?;
+    let values = lua.create_table()?;
+    for (key, value) in &report.values {
+        values.set(key.as_str(), json_value_to_lua(lua, value)?)?;
+    }
+    result.set("values", values)?;
+    Ok(Value::Table(result))
 }
 
 fn cli_spec_from_lua(table: Table) -> mlua::Result<crate::cli_parse::Spec> {
@@ -641,7 +688,7 @@ fn validate_cli_options(
     Ok(())
 }
 
-fn validate_cli_spec(spec: &crate::cli_parse::Spec) -> mlua::Result<()> {
+pub(crate) fn validate_cli_spec(spec: &crate::cli_parse::Spec) -> mlua::Result<()> {
     use std::collections::HashSet;
 
     let mut verb_names = HashSet::new();
@@ -2335,6 +2382,389 @@ mod binding_tests {
         )
         .exec()
         .unwrap();
+    }
+
+    const DUMP: &str = r#"
+        function dump(v)
+            if type(v) ~= "table" then return type(v) == "string" and '"' .. v:gsub("\n", "\\n") .. '"' or tostring(v) end
+            local keys = {}
+            for k in pairs(v) do keys[#keys + 1] = k end
+            table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+            local out = {}
+            for _, k in ipairs(keys) do out[#out + 1] = tostring(k) .. "=" .. dump(v[k]) end
+            return "{" .. table.concat(out, ",") .. "}"
+        end
+        spec = {
+            name="remuda",
+            options={{long="json",help="j",global=true},{long="room",value="R",help="r"}},
+            verbs={
+                send={next="remuda send --help",args={{name="TO",help="to"},{name="BODY",help="b",multiple=true,required=false}},
+                    options={{long="loud",help="l"},{long="tag",value="T",help="t"}}},
+            },
+        }
+    "#;
+
+    fn dump_of(call: &str) -> String {
+        let lua = Lua::new();
+        install_cli_binding(&lua);
+        lua.load(DUMP).exec().unwrap();
+        lua.load(format!("return dump({call})")).eval().unwrap()
+    }
+
+    // Goldens captured from the pre-v2 parser; v1 output must never change.
+    #[test]
+    fn cli_parse_v1_reports_are_unchanged() {
+        assert_eq!(
+            dump_of(r#"remuda.cli.parse(spec, {"--json", "send", "a", "x", "y"})"#),
+            r#"{code=0,ok=true,text="",values={BODY={1="x",2="y"},TO="a",json=true,loud=false},verb="send"}"#
+        );
+        assert_eq!(
+            dump_of(r#"remuda.cli.parse(spec, {"send", "a", "x"})"#),
+            r#"{code=0,ok=true,text="",values={BODY="x",TO="a",json=false,loud=false},verb="send"}"#
+        );
+        assert_eq!(
+            dump_of(r#"remuda.cli.parse(spec, {"send", "--help"})"#),
+            r#"{code=0,kind="help",ok=false,text="\nUsage: remuda send [OPTIONS] TO [BODY]\n\nArguments:\n  <TO>       to\n  [BODY]...  b\n\nOptions:\n  -h, --help     Print help\n      --json     j\n      --loud     l\n      --tag <T>  t\n\nNext: remuda send --help\n",values={}}"#
+        );
+        assert_eq!(
+            dump_of(r#"remuda.cli.parse(spec, {"send", "--nope"})"#),
+            r#"{code=2,kind="error",ok=false,text="remuda: remuda send: unknown option '--nope'. put the text after --\nUsage: remuda send [OPTIONS] TO [BODY]\nNext: remuda send --help",values={}}"#
+        );
+    }
+
+    #[test]
+    fn cli_capabilities_advertise_only_what_exists() {
+        let out = dump_of("remuda.cli.capabilities()");
+        assert_eq!(
+            out,
+            r#"{features={1="stable_report",2="strict_v2"},report_versions={1=1,2=2},spec_versions={1=1,2=2}}"#
+        );
+    }
+
+    #[test]
+    fn cli_parse_v2_success_envelope_and_vectors() {
+        let many = dump_of(
+            r#"remuda.cli.parse((function() spec.report_version = 2 return spec end)(), {"send", "a", "x", "y"})"#,
+        );
+        assert_eq!(
+            many,
+            r#"{bodies={},boundaries={},code=0,handler="",kind="success",ok=true,origins={},path={},shape="",text="",values={BODY={1="x",2="y"},TO="a",json=false,loud=false},verb="send"}"#
+        );
+        let spec2 = "(function() spec.report_version = 2 return spec end)()";
+        let one = dump_of(&format!(
+            r#"remuda.cli.parse({spec2}, {{"send", "a", "x"}})"#
+        ));
+        assert!(one.contains(r#"BODY={1="x"}"#), "{one}");
+        let zero = dump_of(&format!(r#"remuda.cli.parse({spec2}, {{"send", "a"}})"#));
+        assert!(
+            zero.contains("BODY={}") && zero.contains(r#"TO="a""#),
+            "{zero}"
+        );
+        assert!(
+            !zero.contains("room="),
+            "absent scalar stays absent: {zero}"
+        );
+        assert!(zero.contains("json=false"), "absent flag is false: {zero}");
+    }
+
+    #[test]
+    fn cli_parse_v2_help_and_error_clear_values() {
+        let spec2 = "(function() spec.report_version = 2 return spec end)()";
+        let help = dump_of(&format!(
+            r#"remuda.cli.parse({spec2}, {{"send", "--help"}})"#
+        ));
+        assert!(
+            help.contains(r#"kind="help""#)
+                && help.contains("values={}")
+                && help.contains("bodies={}"),
+            "{help}"
+        );
+        let err = dump_of(&format!(
+            r#"remuda.cli.parse({spec2}, {{"send", "--nope"}})"#
+        ));
+        assert!(
+            err.contains(r#"kind="error""#)
+                && err.contains("values={}")
+                && err.contains(r#"handler="""#),
+            "{err}"
+        );
+        let unknown = dump_of(&format!(r#"remuda.cli.parse({spec2}, {{"zzz"}})"#));
+        assert!(
+            unknown.contains(r#"kind="error""#) && unknown.contains("path={}"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
+    fn cli_parse_other_report_versions_stay_v1() {
+        let v1 = dump_of(r#"remuda.cli.parse(spec, {"send", "a"})"#);
+        for odd in [
+            "1",
+            "false",
+            "{}",
+            "function() end",
+            "2.5",
+            "'2'",
+            "0",
+            "-2",
+        ] {
+            let call = format!(
+                r#"remuda.cli.parse((function() spec.report_version = {odd} return spec end)(), {{"send", "a"}})"#
+            );
+            assert_eq!(v1, dump_of(&call), "report_version={odd}");
+        }
+        assert!(!v1.contains("path="));
+    }
+
+    const V2: &str = "(function() spec.version = 2 return spec end)()";
+
+    fn strict(mutate: &str) -> String {
+        dump_of(&format!(
+            r#"remuda.cli.parse((function() spec.version = 2 {mutate} return spec end)(), {{"send", "a"}})"#
+        ))
+    }
+
+    #[test]
+    fn cli_strict_v2_accepts_a_clean_spec_and_keeps_the_legacy_report() {
+        let out = dump_of(&format!(r#"remuda.cli.parse({V2}, {{"send", "a", "x"}})"#));
+        assert_eq!(
+            out,
+            dump_of(r#"remuda.cli.parse(spec, {"send", "a", "x"})"#)
+        );
+        let both = strict("spec.report_version = 2 spec.requires = {'stable_report', 'strict_v2'}");
+        assert!(both.contains(r#"kind="success""#), "{both}");
+    }
+
+    #[test]
+    fn cli_strict_v2_rejects_bad_specs_with_safe_paths() {
+        for (mutate, path) in [
+            ("spec.vrbs = {}", "vrbs"),
+            ("spec.name = 5", "name"),
+            ("spec.verbs.send.next = {}", "verbs.send.next"),
+            (
+                "spec.verbs.send.args[1].mutliple = true",
+                "verbs.send.args[1].mutliple",
+            ),
+            ("spec.options[1].global = 'yes'", "options[1].global"),
+            (
+                "spec.verbs.send.args[4] = {name='Z', help='z'}",
+                "verbs.send.args",
+            ),
+            ("spec.requires = {5}", "requires[1]"),
+            ("spec.report_version = 2.5", "report_version"),
+            ("spec.version = '2'", "version"),
+            ("spec.verbs.send.options[1].long = 'help'", "combination"),
+        ] {
+            let out = strict(mutate);
+            assert!(
+                out.contains(r#"kind="spec""#) && out.contains("ok=false") && out.contains(path),
+                "{mutate}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_strict_v2_unsupported_has_upgrade_and_next() {
+        for mutate in [
+            "spec.version = 3",
+            "spec.report_version = 3",
+            "spec.requires = {'nope'}",
+        ] {
+            let out = strict(mutate);
+            assert!(out.contains(r#"kind="unsupported""#), "{mutate}: {out}");
+            assert!(
+                out.contains("remuda upgrade") && out.contains("Next:"),
+                "{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_strict_v2_never_echoes_supplied_values() {
+        for mutate in [
+            "spec.verbs.send.options[1].long = 'SENTINEL_SECRET'",
+            "spec.verbs.send.options[1].short = 'SENTINEL_SECRET'",
+            "spec.requires = {'SENTINEL_SECRET'}",
+            "spec.SENTINEL_SECRET_KEY_THAT_IS_LONG_AND_ODD_NAME_XYZ = 1",
+            "spec.verbs['SENTINEL SECRET'] = {next='n'}",
+            "spec.name = {SENTINEL_SECRET=1}",
+        ] {
+            let out = strict(mutate);
+            assert!(!out.contains("SENTINEL"), "{mutate}: {out}");
+            assert!(out.contains("ok=false"), "{mutate}: {out}");
+        }
+    }
+
+    #[test]
+    fn cli_report_version_alone_keeps_g8a_behavior() {
+        let out = dump_of(
+            r#"remuda.cli.parse((function() spec.report_version = 2 spec.oops = 1 return spec end)(), {"send", "a"})"#,
+        );
+        assert!(
+            out.contains(r#"kind="success""#) && out.contains("origins={}"),
+            "{out}"
+        );
+        let both = dump_of(
+            r#"remuda.cli.parse((function() spec.version = 2 spec.report_version = 2 spec.oops = 1 return spec end)(), {"send", "a"})"#,
+        );
+        assert!(
+            both.contains(r#"kind="spec""#) && both.contains("origins={}"),
+            "{both}"
+        );
+        let legacy_shape = strict("spec.oops = 1");
+        assert!(!legacy_shape.contains("origins"), "{legacy_shape}");
+    }
+
+    #[test]
+    fn cli_future_versions_are_unsupported_in_the_integer_domain() {
+        for v in [
+            "4294967297",
+            "4294967298",
+            "8589934593",
+            "math.maxinteger",
+            "3",
+        ] {
+            for call in [
+                format!(
+                    r#"remuda.cli.parse((function() spec.version = {v} return spec end)(), {{"send", "a"}})"#
+                ),
+                strict(&format!("spec.report_version = {v}")),
+            ] {
+                let out = if call.starts_with("remuda") {
+                    dump_of(&call)
+                } else {
+                    call
+                };
+                assert!(
+                    out.contains(r#"kind="unsupported""#) && out.contains("Next:"),
+                    "{v}: {out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cli_strict_v2_never_runs_metamethods() {
+        let call = r#"(function()
+            local hits = 0
+            local s = {version=2, report_version=2, name="remuda",
+              verbs={go={next="remuda", args={{name="X", help="x", required=false}}}}}
+            setmetatable(s, {__index=function(t, k)
+                hits = hits + 1
+                if k == "options" then t.verbs.go.args[1].name = 5 end
+            end})
+            local r = remuda.cli.parse(s, {"go", "value"})
+            r.hits = hits
+            return r
+        end)()"#;
+        let out = dump_of(call);
+        assert!(
+            out.contains("hits=0") && out.contains(r#"X="value""#),
+            "{out}"
+        );
+        let bad = call.replace("version=2, report", "version=2, oops=1, report");
+        let out = dump_of(&bad);
+        assert!(
+            out.contains("hits=0") && out.contains(r#"kind="spec""#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn cli_strict_v2_first_problem_is_deterministic() {
+        for _ in 0..40 {
+            let out = strict("spec.zzz = true spec.aaa = true");
+            assert!(out.contains("aaa") && !out.contains("zzz"), "{out}");
+        }
+    }
+
+    // First lines captured from unmodified origin/main (c1bcaf4).
+    #[test]
+    fn cli_legacy_exceptions_and_precedence_match_main() {
+        for (call, want) in [
+            (
+                r#"{name={}, verbs={go={next="remuda"}}}, {"go"}"#,
+                "error converting Lua table to String (expected string or number)",
+            ),
+            (
+                r#"{name="remuda", verbs={help={next="remuda"}}}, {"go"}"#,
+                "runtime error: remuda.cli.parse verb name 'help' is reserved",
+            ),
+            (
+                r#"{name="remuda", verbs={help={next="remuda"}}}, {1}"#,
+                "runtime error: remuda.cli.parse verb name 'help' is reserved",
+            ),
+            (
+                r#"{name="remuda", verbs={go={next="remuda"}}}, {1}"#,
+                "runtime error: remuda.cli.parse argv[1] must be a string",
+            ),
+        ] {
+            let lua = Lua::new();
+            install_cli_binding(&lua);
+            let got: String = lua
+                .load(format!(
+                    "local ok, e = pcall(remuda.cli.parse, {call}) return (tostring(e):match('^[^\\n]*'))"
+                ))
+                .eval()
+                .unwrap();
+            assert_eq!(got, want, "{call}");
+        }
+    }
+
+    #[test]
+    fn cli_strict_v2_survives_hostile_tables() {
+        for mutate in [
+            "spec.verbs.send = spec",
+            "spec[1.5] = 1 spec[spec] = 2",
+            "spec.verbs[1] = {}",
+            "spec.options = {[1]=spec.options[1], [3]=spec.options[1]}",
+            "spec.verbs.send.args = {[math.maxinteger]={}}",
+        ] {
+            let out = strict(mutate);
+            assert!(out.contains(r#"kind="spec""#), "{mutate}: {out}");
+        }
+    }
+
+    #[test]
+    fn cli_v1_ignores_unknown_keys_and_never_touches_metatables() {
+        let call = r#"(function()
+            local raw = {name=spec.name, options=spec.options, verbs=spec.verbs, typo=1, version=1}
+            local seen = {}
+            setmetatable(raw, {__index=function(_, k)
+                if k == "version" or k == "report_version" or k == "requires" then seen[#seen + 1] = k end
+            end})
+            raw.version = nil
+            local r = remuda.cli.parse(raw, {"send", "a", "x"})
+            r.touched = #seen
+            return r
+        end)()"#;
+        let out = dump_of(call);
+        assert!(
+            out.contains("touched=0") && out.contains(r#"verb="send""#),
+            "{out}"
+        );
+        let one = dump_of(
+            r#"remuda.cli.parse((function() spec.version = 1 spec.typo = 1 return spec end)(), {"send", "a", "x"})"#,
+        );
+        assert_eq!(
+            one,
+            dump_of(r#"remuda.cli.parse(spec, {"send", "a", "x"})"#)
+        );
+    }
+
+    #[test]
+    fn cli_parse_report_version_ignores_metatables() {
+        let call = r#"(function()
+            hits = {}
+            local raw = {name=spec.name, options=spec.options, verbs=spec.verbs}
+            setmetatable(raw, {__index=function(_, k) hits[#hits + 1] = k; if k == "report_version" then return 2 end end})
+            local r = remuda.cli.parse(raw, {"send", "a"})
+            r.hit_report_version = #hits > 0 and (hits[1] == "report_version" or hits[2] == "report_version")
+            return r
+        end)()"#;
+        let out = dump_of(call);
+        assert!(out.contains("hit_report_version=false"), "{out}");
+        assert!(out.contains("verb=") && !out.contains("path="), "{out}");
     }
 
     #[test]
