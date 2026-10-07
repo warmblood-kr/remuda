@@ -504,9 +504,10 @@ fn cli_parse_bindings(lua: &Lua) -> mlua::Result<Table> {
                         verbs: vec![],
                     };
                     let report = crate::cli_parse::Report::failure(kind, text, 2);
-                    return cli_report_to_lua(lua, &spec, &report, spec_table_wants_v2);
+                    return cli_report_to_lua(lua, &spec, &report, spec_table_wants_v2, false);
                 }
             };
+            let strict_v2 = strict.is_some();
             let spec = match strict {
                 Some(spec) => spec,
                 None => cli_spec_from_lua(spec_table)?,
@@ -514,7 +515,7 @@ fn cli_parse_bindings(lua: &Lua) -> mlua::Result<Table> {
             let argv = cli_argv_from_lua(argv_table)?;
             let words = argv.iter().map(String::as_str).collect::<Vec<_>>();
             let report = crate::cli_parse::parse(&spec, &words);
-            cli_report_to_lua(lua, &spec, &report, spec_table_wants_v2)
+            cli_report_to_lua(lua, &spec, &report, spec_table_wants_v2, strict_v2)
         })?,
     )?;
     cli.set(
@@ -536,9 +537,15 @@ fn cli_report_to_lua(
     spec: &crate::cli_parse::Spec,
     report: &crate::cli_parse::Report,
     v2: bool,
+    strict_v2: bool,
 ) -> mlua::Result<Value> {
     if v2 {
-        return json_value_to_lua(lua, &crate::cli_parse::report_v2(spec, report));
+        let mut value = crate::cli_parse::report_v2(spec, report);
+        if !strict_v2 {
+            value["origins"] = serde_json::json!({});
+            value["boundaries"] = serde_json::json!([]);
+        }
+        return json_value_to_lua(lua, &value);
     }
     let result = lua.create_table()?;
     result.set("ok", report.ok)?;
@@ -2434,11 +2441,19 @@ mod binding_tests {
     }
 
     #[test]
-    fn cli_capabilities_advertise_only_what_exists() {
-        let out = dump_of("remuda.cli.capabilities()");
+    fn cli_capabilities_keep_extensible_features() {
+        let out = dump_of(
+            r#"(function() local c = remuda.cli.capabilities(); local found = {}
+              for _, f in ipairs(c.features) do found[f] = true end
+              return {stable=found.stable_report, strict=found.strict_v2,
+                repeat_policy=found.repeat_policy, token_origins=found.token_origins,
+                spec1=c.spec_versions[1], spec2=c.spec_versions[2],
+                report1=c.report_versions[1], report2=c.report_versions[2]}
+            end)()"#,
+        );
         assert_eq!(
             out,
-            r#"{features={1="stable_report",2="strict_v2",3="repeat_policy"},report_versions={1=1,2=2},spec_versions={1=1,2=2}}"#
+            r#"{repeat_policy=true,report1=1,report2=2,spec1=1,spec2=2,stable=true,strict=true,token_origins=true}"#
         );
     }
 

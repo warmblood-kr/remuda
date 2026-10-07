@@ -56,6 +56,8 @@ pub struct Report {
     pub kind: Option<String>,
     pub text: String,
     pub code: i32,
+    pub origins: Map<String, Value>,
+    pub boundaries: Vec<Value>,
 }
 
 impl Report {
@@ -67,6 +69,8 @@ impl Report {
             kind: None,
             text: String::new(),
             code: 0,
+            origins: Map::new(),
+            boundaries: Vec::new(),
         }
     }
 
@@ -78,6 +82,8 @@ impl Report {
             kind: Some(kind.to_owned()),
             text,
             code,
+            origins: Map::new(),
+            boundaries: Vec::new(),
         }
     }
 }
@@ -85,7 +91,12 @@ impl Report {
 /// Versions and features this parser supports, for `remuda.cli.capabilities()`.
 pub const SPEC_VERSIONS: &[u32] = &[1, 2];
 pub const REPORT_VERSIONS: &[u32] = &[1, 2];
-pub const FEATURES: &[&str] = &["stable_report", "strict_v2", "repeat_policy"];
+pub const FEATURES: &[&str] = &[
+    "stable_report",
+    "strict_v2",
+    "repeat_policy",
+    "token_origins",
+];
 
 /// Shape a report as the v2 envelope; vectors are always arrays.
 /// Error text is the legacy diagnostic and may quote input until G7b safe_errors;
@@ -113,7 +124,7 @@ pub fn report_v2(spec: &Spec, report: &Report) -> Value {
     let mut out = serde_json::json!({
         "ok": report.ok, "kind": kind, "code": report.code, "text": report.text,
         "values": values, "path": [], "handler": "", "shape": "",
-        "origins": {}, "boundaries": {}, "bodies": {},
+        "origins": report.origins, "boundaries": report.boundaries, "bodies": {},
     });
     if let Some(name) = &report.verb {
         out["verb"] = Value::String(name.clone());
@@ -136,7 +147,12 @@ pub fn parse(spec: &Spec, argv: &[&str]) -> Report {
     match command.try_get_matches_from(input) {
         Ok(matches) => {
             let submatches = matches.subcommand().map(|(_, matches)| matches);
-            Report::success(verb_name, collect_values(spec, verb, &matches, submatches))
+            let mut report =
+                Report::success(verb_name, collect_values(spec, verb, &matches, submatches));
+            let (origins, boundaries) = token_origins(spec, verb, verb_index, argv);
+            report.origins = origins;
+            report.boundaries = boundaries;
+            report
         }
         Err(error) if error.kind() == ErrorKind::DisplayHelp => {
             let mut text = error.to_string();
@@ -144,6 +160,175 @@ pub fn parse(spec: &Spec, argv: &[&str]) -> Report {
             Report::failure("help", text, 0)
         }
         Err(error) => error_report(spec, Some(verb), Some(&error)),
+    }
+}
+
+/// Keep provenance tied to token positions and byte spans. This scanner only
+/// records syntax already accepted by clap; it never decides whether argv is valid.
+fn token_origins(
+    spec: &Spec,
+    verb: &VerbSpec,
+    verb_index: usize,
+    argv: &[&str],
+) -> (Map<String, Value>, Vec<Value>) {
+    let options: Vec<&OptionSpec> = spec.options.iter().chain(&verb.options).collect();
+    let mut origins: Map<String, Value> = Map::new();
+    let mut boundaries = Vec::new();
+    let mut positionals = 0usize;
+    let mut after_separator = false;
+    let mut i = 0usize;
+    while i < argv.len() {
+        let word = argv[i];
+        let index = i + 1;
+        if i == verb_index {
+            i += 1;
+            continue;
+        }
+        if word == "--" {
+            after_separator = true;
+            boundaries.push(serde_json::json!({"argv_index": index, "role": "separator"}));
+            i += 1;
+            continue;
+        }
+        if word == "-" {
+            boundaries.push(serde_json::json!({"argv_index": index, "role": if after_separator { "escaped_dash" } else { "dash_value" }}));
+        }
+        let (recognized, consumed_next) = scan_option_origin(
+            &options,
+            word,
+            argv.get(i + 1).copied(),
+            index,
+            after_separator,
+            &mut origins,
+        );
+        if !recognized && (after_separator || !word.starts_with('-') || word == "-") {
+            if let Some(arg) = verb
+                .args
+                .get(positionals.min(verb.args.len().saturating_sub(1)))
+            {
+                push_origin(
+                    &mut origins,
+                    &arg.name,
+                    index,
+                    0..word.len(),
+                    after_separator,
+                );
+                if !arg.multiple {
+                    positionals += 1;
+                }
+            }
+        }
+        i += 1 + usize::from(consumed_next);
+    }
+    for option in options
+        .iter()
+        .filter(|option| option.repeat_policy == RepeatPolicy::Last)
+    {
+        if let Some(Value::Array(items)) = origins.get_mut(&option.long) {
+            if let Some(last) = items.pop() {
+                items.clear();
+                items.push(last);
+            }
+        }
+    }
+    (origins, boundaries)
+}
+
+fn scan_option_origin(
+    options: &[&OptionSpec],
+    word: &str,
+    next: Option<&str>,
+    index: usize,
+    after_separator: bool,
+    origins: &mut Map<String, Value>,
+) -> (bool, bool) {
+    if after_separator {
+        return (false, false);
+    }
+    if let Some(body) = word.strip_prefix("--").filter(|_| word.len() > 2) {
+        let (name, inline) = body
+            .split_once('=')
+            .map_or((body, None), |(name, value)| (name, Some(value)));
+        let Some(option) = options.iter().find(|option| option.long == name) else {
+            return (false, false);
+        };
+        if option.value.is_some() {
+            let (value_index, range, consumed_next) = match inline {
+                Some(value) => (index, word.len() - value.len()..word.len(), false),
+                None if next.is_some() => {
+                    let value = next.unwrap_or_default();
+                    (index + 1, 0..value.len(), true)
+                }
+                None => (index, 0..0, false),
+            };
+            push_origin(origins, &option.long, value_index, range, after_separator);
+            return (true, consumed_next);
+        }
+        push_origin(origins, &option.long, index, 0..word.len(), after_separator);
+        return (true, false);
+    }
+    if !word.starts_with('-') || word.len() == 1 {
+        return (false, false);
+    }
+    let chars: Vec<(usize, char)> = word.char_indices().skip(1).collect();
+    let mut found = false;
+    for (n, (start, short)) in chars.iter().enumerate() {
+        let Some(option) = options.iter().find(|option| option.short == Some(*short)) else {
+            continue;
+        };
+        found = true;
+        let next_start = chars.get(n + 1).map(|(at, _)| *at).unwrap_or(word.len());
+        if option.value.is_some() {
+            if next_start < word.len() {
+                push_origin(
+                    origins,
+                    &option.long,
+                    index,
+                    next_start..word.len(),
+                    after_separator,
+                );
+                return (true, false);
+            }
+            if let Some(value) = next {
+                push_origin(
+                    origins,
+                    &option.long,
+                    index + 1,
+                    0..value.len(),
+                    after_separator,
+                );
+                return (true, true);
+            }
+            return (true, false);
+        }
+        push_origin(
+            origins,
+            &option.long,
+            index,
+            *start..start + short.len_utf8(),
+            after_separator,
+        );
+    }
+    (found, false)
+}
+
+fn push_origin(
+    origins: &mut Map<String, Value>,
+    id: &str,
+    argv_index: usize,
+    span: std::ops::Range<usize>,
+    after_separator: bool,
+) {
+    let list = origins
+        .entry(id.to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Value::Array(items) = list {
+        items.push(serde_json::json!({
+            "argv_index": argv_index,
+            "byte_range": [span.start, span.end],
+            "after_separator": after_separator,
+            "synthetic": false,
+        }));
     }
 }
 
@@ -527,8 +712,35 @@ fn append_next(text: &mut String, next: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, ArgSpec, OptionSpec, Spec, VerbSpec};
+    use super::{parse, Arg, ArgAction, ArgSpec, Command, OptionSpec, Spec, VerbSpec};
     use serde_json::Value;
+
+    #[test]
+    fn token_adapter_grammar_matches_locked_clap_cases() {
+        let command = Command::new("go")
+            .disable_help_flag(true)
+            .arg(Arg::new("x").long("x").short('x').num_args(1))
+            .arg(Arg::new("a").short('a').action(ArgAction::SetTrue))
+            .arg(Arg::new("b").short('b').action(ArgAction::SetTrue))
+            .arg(Arg::new("c").short('c').action(ArgAction::SetTrue))
+            .arg(Arg::new("flag").long("flag").action(ArgAction::SetTrue))
+            .arg(Arg::new("ITEM").num_args(0..).trailing_var_arg(true));
+        let cases: &[(&[&str], bool, &str)] = &[
+            (&["-"], true, "dash value"),
+            (&["--", "-"], true, "escaped dash"),
+            (&["--x=-"], true, "inline dash value"),
+            (&["-abc"], true, "short cluster"),
+            (&["--flag", "--flag"], false, "repeated flag"),
+            (&["same", "same"], true, "repeated identical words"),
+        ];
+        for (argv, expected, label) in cases {
+            let actual = command
+                .clone()
+                .try_get_matches_from(std::iter::once("go").chain(argv.iter().copied()))
+                .is_ok();
+            assert_eq!(actual, *expected, "locked clap case: {label}");
+        }
+    }
 
     fn spec() -> Spec {
         Spec {
