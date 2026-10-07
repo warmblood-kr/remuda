@@ -4471,6 +4471,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
                     value: None,
                     help: "Stop without asking for confirmation".into(),
                     global: false,
+                    repeat_policy: Default::default(),
                 },
                 OptionSpec {
                     long: "yes".into(),
@@ -4478,6 +4479,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
                     value: None,
                     help: "Confirm stopping all sessions".into(),
                     global: false,
+                    repeat_policy: Default::default(),
                 },
                 OptionSpec {
                     long: "i-am-inside".into(),
@@ -4485,6 +4487,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
                     value: None,
                     help: "Allow a hosted session to stop its daemon".into(),
                     global: false,
+                    repeat_policy: Default::default(),
                 },
             ],
         }],
@@ -4656,12 +4659,13 @@ fn skew_notice(response: std::io::Result<Response>) -> Option<String> {
 /// is the client's only diagnostic when start-up fails — and on `mcp`, whose
 /// streams belong to whatever spawned it.
 fn announce_update(argv: &[&str]) {
-    if matches!(argv, ["daemon"] | ["mcp"]) || UPDATE_NOTICE_EMITTED.load(Ordering::Relaxed) {
+    if UPDATE_NOTICE_EMITTED.load(Ordering::Relaxed) {
         return;
     }
     let now = std::time::SystemTime::now();
     let no_update_check = std::env::var_os("REMUDA_NO_UPDATE_CHECK").is_some();
-    if !dist::should_show_update_notice(
+    if !should_announce_update(
+        argv,
         std::io::stderr().is_terminal(),
         std::env::var_os("REMUDA_BUTLER_AGENT_ID").is_some(),
         no_update_check,
@@ -4675,6 +4679,26 @@ fn announce_update(argv: &[&str]) {
         UPDATE_NOTICE_EMITTED.store(true, Ordering::Relaxed);
         dist::record_update_notice_shown(now);
     }
+}
+
+fn should_announce_update(
+    argv: &[&str],
+    stderr_is_terminal: bool,
+    agent_id_set: bool,
+    no_update_check_env: bool,
+    last_shown: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> bool {
+    if matches!(argv, ["daemon"] | ["mcp"]) {
+        return false;
+    }
+    dist::should_show_update_notice(
+        stderr_is_terminal,
+        agent_id_set,
+        no_update_check_env,
+        last_shown,
+        now,
+    )
 }
 
 fn prepare_command(argv: &[&str], path: &Path) -> Result<Option<String>, String> {
@@ -4725,6 +4749,7 @@ fn upgrade_cli_spec() -> remuda_native::cli_parse::Spec {
                 value: Some("CHANNEL".into()),
                 help: "Release channel: stable or nightly".into(),
                 global: false,
+                repeat_policy: Default::default(),
             }],
         }],
     }
@@ -4924,6 +4949,16 @@ fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> Exit
     }
 }
 
+/// Installed extension commands may opt out of starting a daemon. This is
+/// useful for periodic, best-effort integrations such as editor status lines.
+fn with_extension_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> ExitCode {
+    if std::env::var_os("REMUDA_NO_AUTOSTART").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        with_existing_daemon(server, path, f)
+    } else {
+        with_daemon(server, path, f)
+    }
+}
+
 /// Run a read-only command only against a daemon that already exists.
 fn with_existing_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> ExitCode {
     match remuda_native::ipc::connect(path) {
@@ -5091,7 +5126,7 @@ fn extension_command(
         return fail("--stdin requires a mod command handler, not a mod launch");
     }
     if let Some((headless, agent)) = launch {
-        return with_daemon(server, path, |path| {
+        return with_extension_daemon(server, path, |path| {
             if let Some(agent) = agent {
                 let code = format!(
                     "remuda._mod_launch_options = remuda._mod_launch_options or {{}}; remuda._mod_launch_options[{}] = {{agent = {}}}",
@@ -5150,7 +5185,7 @@ fn extension_command(
         "return remuda._dispatch_extension_command({}, {{{arguments}}}, {{env = {{{env}}}{stdin_field}}})",
         serde_json::to_string(command).expect("command serializes")
     );
-    with_daemon(server, path, |path| {
+    with_extension_daemon(server, path, |path| {
         match load_extension_command(path, command, &package) {
             Ok(()) => eval_mod_command_once(path, &code),
             Err(failed) => failed,
@@ -5689,6 +5724,7 @@ fn doc_cli_spec() -> remuda_native::cli_parse::Spec {
                 value: Some("FORMAT".into()),
                 help: "Output format: rst, markdown, or json".into(),
                 global: false,
+                repeat_policy: Default::default(),
             }],
         }],
     }
@@ -5750,6 +5786,7 @@ fn mod_cli_spec() -> remuda_native::cli_parse::Spec {
         value: value.map(str::to_owned),
         help: help.into(),
         global: false,
+        repeat_policy: Default::default(),
     };
     let arg = |name: &str, help: &str, required| ArgSpec {
         name: name.into(),
@@ -6786,6 +6823,23 @@ fn print_lines(n: &str, delay_ms: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_agent_suppresses_update_notice_for_butler_and_any_verb() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(2 * 24 * 60 * 60);
+        for argv in [
+            &["butler"][..],
+            &["butler", "inbox"][..],
+            &["butler", "sessions"][..],
+            &["ls"][..],
+            &["upgrade"][..],
+        ] {
+            assert!(
+                !should_announce_update(argv, true, true, false, None, now),
+                "update notice should be suppressed for {argv:?}"
+            );
+        }
+    }
 
     #[test]
     fn stdout_broken_pipe_panic_match_is_narrow() {

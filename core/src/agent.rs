@@ -402,6 +402,13 @@ pub trait AgentProcess: Send {
         None
     }
 
+    /// Whether `pid` is a process this agent's backend holds as its own, by a
+    /// marker the process cannot shed (a Windows job object). Unlike
+    /// [`Self::process_id`] it can be true after the agent's own child exited.
+    fn owns_process(&self, _pid: u32) -> bool {
+        false
+    }
+
     /// The visible screen as styled cells, for a croppable colour pane.
     /// Default: every cell plain, from the same text `screen_text` gives —
     /// a backend that hasn't implemented styling degrades to colourless.
@@ -524,6 +531,8 @@ pub struct ScriptedAgent {
     /// rather than one buffer so a test can see whether two writers
     /// interleaved, which a concatenated buffer would hide.
     pub writes: Vec<Vec<u8>>,
+    /// Process IDs this double claims through `owns_process`.
+    owned: Vec<u32>,
 }
 
 impl ScriptedAgent {
@@ -539,7 +548,13 @@ impl ScriptedAgent {
             alive: true,
             size: Size::default(),
             writes: Vec::new(),
+            owned: Vec::new(),
         }
+    }
+
+    pub fn owning(mut self, pid: u32) -> Self {
+        self.owned.push(pid);
+        self
     }
 
     pub fn with_size(mut self, size: Size) -> Self {
@@ -586,6 +601,10 @@ impl AgentProcess for ScriptedAgent {
 
     fn is_alive(&mut self) -> bool {
         self.alive
+    }
+
+    fn owns_process(&self, pid: u32) -> bool {
+        self.owned.contains(&pid)
     }
 
     fn terminate(&mut self) -> Result<()> {

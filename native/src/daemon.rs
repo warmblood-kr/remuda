@@ -84,7 +84,7 @@ struct SyncPermit;
 impl SyncPermit {
     fn acquire() -> Option<Self> {
         ACTIVE_SYNCS
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
                 (active < MAX_CONCURRENT_SYNCS).then_some(active + 1)
             })
             .ok()
@@ -320,6 +320,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
+            let accepted = std::time::SystemTime::now();
             let registry = Arc::clone(&registry);
             let image = image.clone();
             let counters = Arc::clone(&counters);
@@ -335,6 +336,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
                     socket_owner,
                     anti_entropy,
                     listener_task,
+                    accepted,
                 );
             });
         }
@@ -1319,6 +1321,7 @@ fn serve_unix(
         if watched[0].revents & libc::POLLIN != 0 {
             match listener.accept() {
                 Ok(stream) => {
+                    let accepted = std::time::SystemTime::now();
                     if let Err(error) = stream.set_nonblocking(false) {
                         eprintln!("remuda daemon: could not restore blocking client mode: {error}");
                         continue;
@@ -1338,6 +1341,7 @@ fn serve_unix(
                             socket_owner,
                             anti_entropy,
                             listener_task,
+                            accepted,
                         );
                     });
                 }
@@ -1484,6 +1488,7 @@ fn capture_styled(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle(
     stream: Stream,
     registry: &Registry,
@@ -1492,6 +1497,7 @@ fn handle(
     socket_owner: Arc<SocketOwnership>,
     anti_entropy: Arc<AntiEntropyTask>,
     listener_task: Arc<DaemonListenerControl>,
+    accepted: std::time::SystemTime,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let Some(request) = read_request(&stream, &mut reader)? else {
@@ -1508,6 +1514,7 @@ fn handle(
         anti_entropy,
         listener_task,
         request,
+        accepted,
     )
 }
 
@@ -1521,6 +1528,7 @@ fn handle_request(
     anti_entropy: Arc<AntiEntropyTask>,
     listener_task: Arc<DaemonListenerControl>,
     request: Request,
+    accepted: std::time::SystemTime,
 ) -> std::io::Result<()> {
     match request {
         Request::List => {
@@ -1645,7 +1653,7 @@ fn handle_request(
         Request::RemoveDirAll { path: dir } => reply(&stream, &remove_dir_all(&dir)),
 
         Request::Eval { code, name } => {
-            let caller = caller_context(&stream, registry);
+            let caller = caller_context(&stream, registry, accepted);
             handle_eval(stream, reader, image, &code, name.as_deref(), caller)
         }
 
@@ -1761,11 +1769,36 @@ fn escaped_mod_command_error(error: &str) -> String {
     escaped
 }
 
-fn caller_context(stream: &Stream, registry: &Registry) -> crate::image::CallerContext {
-    match process_ancestry::resolve_caller(
-        process_ancestry::peer_pid(stream),
-        &registry.live_processes(),
-    ) {
+fn caller_context(
+    stream: &Stream,
+    registry: &Registry,
+    accepted: std::time::SystemTime,
+) -> crate::image::CallerContext {
+    // Windows: a session's job decides first. It still holds a process whose
+    // parent has exited, which the parent walk below cannot see. A session
+    // child's own PID stays sound there: the daemon holds that process open.
+    #[cfg(windows)]
+    let (peer_pid, held) = {
+        let Some((pid, held)) = process_ancestry::current_peer(stream, accepted) else {
+            return crate::image::CallerContext::default();
+        };
+        if let Some(name) = registry.session_owning(pid) {
+            return crate::image::CallerContext {
+                kind: crate::image::CallerKind::Session,
+                session: Some(name),
+            };
+        }
+        (Ok(Some(pid)), held)
+    };
+    #[cfg(not(windows))]
+    let peer_pid = {
+        let _ = accepted;
+        process_ancestry::peer_pid(stream)
+    };
+    let origin = process_ancestry::resolve_caller(peer_pid, &registry.live_processes());
+    #[cfg(windows)]
+    drop(held);
+    match origin {
         process_ancestry::CallerOrigin::Session(name) => crate::image::CallerContext {
             kind: crate::image::CallerKind::Session,
             session: Some(name),
@@ -2656,14 +2689,79 @@ fn spawn(
             builder.env(k, v);
         }
     }
+    #[cfg(windows)]
+    refuse_unsafe_batch_arguments(&mut builder, &argv)?;
 
-    let agent = PtyAgent::spawn(builder, size).map_err(|e| e.to_string())?;
+    let agent = PtyAgent::spawn(builder, size).map_err(crate::session_job::spawn_error_line)?;
     Ok(Session::new_with_id(
         name,
         session_id,
         Box::new(agent),
         Arc::new(SystemClock::new()),
     ))
+}
+
+/// The file portable-pty will find for `program` (portable-pty 0.9.0,
+/// `cmdbuilder.rs:581-607`): in each PATH directory the name as given, then
+/// with each PATHEXT extension in place of its own. `None`: the name as given.
+#[cfg(windows)]
+fn pty_program(builder: &CommandBuilder, program: &str) -> Option<std::path::PathBuf> {
+    use std::ffi::OsStr;
+    if let Some(path) = builder.get_env("PATH") {
+        let extensions = builder.get_env("PATHEXT").unwrap_or(OsStr::new(".EXE"));
+        for dir in std::env::split_paths(path) {
+            let exact = dir.join(program);
+            if exact.exists() {
+                return Some(exact);
+            }
+            for entry in std::env::split_paths(extensions) {
+                // An entry portable-pty would panic on is skipped here.
+                let candidate = entry
+                    .to_str()
+                    .and_then(|entry| crate::cmd_arguments::pty_candidate(&exact, entry));
+                if candidate
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.exists())
+                {
+                    return candidate;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A `.cmd` or `.bat` program runs under cmd.exe, so its arguments must be text it reads as text.
+/// The program is pinned to an absolute path: no relative-PATH ambiguity, but no defence against
+/// the file changing (the pty still searches and may try PATHEXT names if it disappears).
+#[cfg(windows)]
+fn refuse_unsafe_batch_arguments(
+    builder: &mut CommandBuilder,
+    argv: &[String],
+) -> Result<(), String> {
+    use crate::cmd_arguments::{batch_arguments_refusal, is_batch_file};
+    let program = match pty_program(builder, &argv[0]) {
+        // A hit through a relative PATH entry is relative to the daemon's own
+        // directory, where `exists` looked. Pinned as it is, the pty would
+        // join it onto every PATH directory again and another file could win.
+        Some(found) => std::path::absolute(&found)
+            .map_err(|error| {
+                format!(
+                    "the program path could not be made absolute: {error}. \
+                     Next: pass the full path of the program."
+                )
+            })?
+            .into_os_string(),
+        None => argv[0].clone().into(),
+    };
+    let shown = program.to_string_lossy().into_owned();
+    builder.get_argv_mut()[0] = program;
+    if !is_batch_file(&shown) {
+        return Ok(());
+    }
+    let mut words = argv.to_vec();
+    words[0] = shown;
+    batch_arguments_refusal(&words).map_or(Ok(()), Err)
 }
 
 /// Hand this connection over to a human. A later attach displaces this one;

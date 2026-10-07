@@ -686,7 +686,7 @@ impl RequestLimiter {
     fn acquire_global(self: &Arc<Self>) -> Option<Arc<GlobalPermit>> {
         let limit = configured_limit(&self.global_limit_override, MAX_GLOBAL_REQUESTS);
         self.active_global
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < limit).then_some(count + 1)
             })
             .ok()

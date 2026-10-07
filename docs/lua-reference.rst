@@ -76,6 +76,11 @@ cli.parse
 
 ``cli.parse(spec, argv) -> report`` — Parse a word list against a runtime command declaration without printing or exiting. Returns {ok, verb?, values, kind?, text, code}; set required = false on an optional positional (positionals are required by default), and set multiple = true on the final positional argument to collect message body words.
 
+cli.require
+-----------
+
+``cli.require(need) -> true | false, text`` — Check remuda.cli.capabilities() before sending a v2 spec: need = {features?, spec_version?, report_version?}. Returns true, or false and a diagnostic ending in 'Next: remuda upgrade'; a core without capabilities counts as old.
+
 click
 -----
 
