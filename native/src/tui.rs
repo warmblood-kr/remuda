@@ -2907,11 +2907,11 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 Err(error) => ui.notice = Some(error),
             },
             Action::Type(bytes) => {
-                if let Some((name, hold)) = &held {
-                    if let Err(e) = hold.keys(&bytes) {
-                        ui.notice = Some(format!("{name}: {e}"));
-                        ui.focus = Focus::List;
-                    }
+                let failure = held.as_ref().and_then(|(name, hold)| {
+                    hold.keys(&bytes).err().map(|error| (name.clone(), error))
+                });
+                if let Some((name, error)) = failure {
+                    input_write_failed(&mut ui, &name, &error, &mut held);
                 }
             }
             Action::Start(command) => {
@@ -2929,7 +2929,9 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
             }
             Action::Copy(name) => copy_screen(path, &mut ui, &name),
             Action::CopySelection(name) => copy_selection(path, &mut ui, &name),
-            Action::Paste => paste(path, &mut ui, &held),
+            Action::Paste => {
+                paste(path, &mut ui, &mut held);
+            }
         }
         // Not `painted.clear()`: the frame-vs-`painted` compare in `refresh`
         // already skips the write when a key changed nothing visible — see
@@ -3002,6 +3004,8 @@ fn restart_daemon(path: &Path, server: &str) -> Result<(), String> {
             });
         }
     }
+    #[cfg(windows)]
+    crate::daemon::own_console(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| format!("cannot restart daemon: {error}"))?;
@@ -3110,12 +3114,24 @@ fn capture_preview(path: &Path, ui: &mut Ui, name: &str) -> Result<PreviewCaptur
     Ok((cells, wrapped, cursor))
 }
 
-fn paste(path: &Path, ui: &mut Ui, held: &Option<(String, Hold)>) {
+fn input_write_failed<T>(ui: &mut Ui, name: &str, error: &std::io::Error, held: &mut Option<T>) {
+    let message = if error.kind() == std::io::ErrorKind::BrokenPipe {
+        format!("{name}: input pipe closed ({error})")
+    } else {
+        format!("{name}: input stuck; this key batch may not have been delivered (a large paste may be cut mid-way; check the session) ({error})")
+    };
+    ui.notice = Some(message);
+    ui.focus = Focus::List;
+    *held = None;
+}
+
+fn paste(path: &Path, ui: &mut Ui, held: &mut Option<(String, Hold)>) {
     if ui.yank.is_empty() {
         ui.notice = Some("kill ring is empty".into());
-    } else if let Some((name, hold)) = &held {
+    } else if let Some((name, hold)) = &*held {
         if let Err(e) = hold.keys(ui.yank.as_bytes()) {
-            ui.notice = Some(format!("{name}: {e}"));
+            let name = name.clone();
+            input_write_failed(ui, &name, &e, held);
         }
     } else if let Some(name) = ui.selected().map(|session| session.name.clone()) {
         match client::request(

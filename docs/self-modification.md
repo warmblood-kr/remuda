@@ -118,8 +118,16 @@ The core writes none of your ad-hoc definitions to disk. To keep one, put it
 in a mod or in the config file:
 
 - **`init.lua`** is `$XDG_CONFIG_HOME/remuda/init.lua`, else
-  `~/.config/remuda/init.lua`. It is read once, at boot. Editing it changes
-  nothing in a running daemon; evaluate the new lines through a door as well.
+  `~/.config/remuda/init.lua` (Windows: `%XDG_CONFIG_HOME%\remuda\config\init.lua`,
+  else `%LOCALAPPDATA%\remuda\config\init.lua`; with only `USERPROFILE`,
+  `%USERPROFILE%\AppData\Local\remuda\config\init.lua`). It is read once, at
+  boot. Editing it changes nothing in a running daemon; evaluate the new lines
+  through a door as well.
+- **REPL history** is `$XDG_STATE_HOME/remuda/repl-history`, else
+  `~/.local/state/remuda/repl-history` (Windows:
+  `%XDG_STATE_HOME%\remuda\state\repl-history`, else
+  `%LOCALAPPDATA%\remuda\state\repl-history`; with only `USERPROFILE`,
+  `%USERPROFILE%\AppData\Local\remuda\state\repl-history`).
 - **A mod** is the place for anything that should be reloadable. Tools and
   advice a lifecycle mod declares in its returned table are owned by that mod
   and replaced on reload. Advice added from its `start` is owned the same

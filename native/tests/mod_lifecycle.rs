@@ -331,7 +331,7 @@ fn lifecycle_stop_runs_before_the_next_activation_starts() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn failed_reload_stops_candidate_restarts_previous_and_stops_each_activation_once() {
+fn failed_reload_stops_candidate_after_start_attempt_and_restarts_previous() {
     let home = DataHome::new();
     let manifest = home.root.join("remuda/mods/sample/extension.toml");
     fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
@@ -605,6 +605,344 @@ fn mod_command_handler_receives_caller_env() {
              return remuda._dispatch_extension_command('bare', {})"
         ),
         "table"
+    );
+}
+
+#[test]
+fn mod_command_loads_commands_without_start_then_bare_exec_starts_once() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    write_entry(
+        &home.entry(),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return { starts = 0, commands = 0 } end,
+          commands = function(state)
+            state.commands = state.commands + 1
+            remuda.extension_command("sample-cmd", function()
+              return state.commands .. ":" .. state.starts
+            end)
+          end,
+          start = function(state)
+            assert(state.commands == 1, "commands must run before start")
+            state.starts = state.starts + 1
+          end,
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-commands-only.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+
+    assert_eq!(
+        read_value(
+            &image,
+            "return tostring(remuda._load_extension_command('sample-cmd', 'sample'))",
+        ),
+        "true"
+    );
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample-cmd')"
+        ),
+        "1:0"
+    );
+
+    read_value(&image, "remuda.exec('sample')");
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample-cmd')"
+        ),
+        "1:1"
+    );
+    read_value(&image, "remuda.exec('sample')");
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample-cmd')"
+        ),
+        "1:1"
+    );
+}
+
+#[test]
+fn stop_only_module_stops_on_reload_and_shutdown() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    write_entry(
+        &home.entry(),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          stop = function() remuda.emit("stop_probe") end,
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-stop-only.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(
+        &image,
+        "stop_calls = 0; remuda.on('stop_probe', function() stop_calls = stop_calls + 1 end); remuda.exec('sample')",
+    );
+    read_value(&image, "remuda.reload('sample')");
+    assert_eq!(read_value(&image, "return stop_calls"), "1");
+    image.stop_modules_bounded();
+    assert_eq!(read_value(&image, "return stop_calls"), "2");
+}
+
+#[test]
+fn failed_deferred_start_rolls_back_commands_hooks_and_schedules_before_retry() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    write_entry(
+        &home.entry(),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          commands = function()
+            remuda.extension_command("sample-cmd", function() return "ready" end)
+          end,
+          start = function()
+            remuda.on("start_probe", function() end)
+            remuda.schedule({ every = 60, run = function() end })
+            if remuda._sample_test_fail_start then
+              remuda._sample_test_fail_start = false
+              error("deferred start failed")
+            end
+          end,
+          stop = function()
+            remuda.emit("stop_probe")
+          end,
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-deferred-start-rollback.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(
+        &image,
+        "remuda._sample_test_fail_start = true; stop_calls = 0; remuda.on('stop_probe', function() stop_calls = stop_calls + 1 end)",
+    );
+    read_value(
+        &image,
+        "remuda._load_extension_command('sample-cmd', 'sample')",
+    );
+    image.stop_modules_bounded();
+    assert_eq!(read_value(&image, "return tostring(stop_calls)"), "0");
+
+    assert!(image.eval("remuda.exec('sample')", None).is_err());
+    assert_eq!(
+        read_value(
+            &image,
+            "local hooks = 0 for _, h in ipairs(remuda.hooks.start_probe or {}) do if h.owner == 'sample' then hooks = hooks + 1 end end; local timers = 0 for _, s in pairs(remuda.schedules) do if s.owner == 'sample' then timers = timers + 1 end end; return tostring(remuda._extension_commands['sample-cmd'] == nil) .. ':' .. hooks .. ':' .. timers .. ':' .. stop_calls",
+        ),
+        "true:0:0:1"
+    );
+
+    read_value(&image, "remuda.exec('sample')");
+    assert_eq!(
+        read_value(
+            &image,
+            "local hooks = 0 for _, h in ipairs(remuda.hooks.start_probe or {}) do if h.owner == 'sample' then hooks = hooks + 1 end end; local timers = 0 for _, s in pairs(remuda.schedules) do if s.owner == 'sample' then timers = timers + 1 end end; return tostring(remuda._extension_commands['sample-cmd'] ~= nil) .. ':' .. hooks .. ':' .. timers .. ':' .. stop_calls",
+        ),
+        "true:1:1:1"
+    );
+    image.stop_modules_bounded();
+    assert_eq!(read_value(&image, "return tostring(stop_calls)"), "2");
+}
+
+#[test]
+fn command_hook_propagates_errors_from_emitted_hooks() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    write_entry(
+        &home.entry(),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          hooks = {{ event = "commands_probe", run = function() error("command hook failure") end }},
+          commands = function()
+            remuda.extension_command("sample-cmd", function() return "ready" end)
+            remuda.emit("commands_probe")
+          end,
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-commands-hook-error.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+
+    let error = image
+        .eval(
+            "remuda._load_extension_command('sample-cmd', 'sample')",
+            None,
+        )
+        .expect_err("the command hook's emitted hook error must fail activation");
+    assert!(
+        error.to_string().contains("command hook failure"),
+        "{error}"
+    );
+    assert_eq!(
+        read_value(
+            &image,
+            "return tostring(remuda._extension_commands['sample-cmd'] == nil)",
+        ),
+        "true"
+    );
+}
+
+#[test]
+fn legacy_start_only_mod_still_starts_when_command_is_loaded() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    write_entry(
+        &home.entry(),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return { starts = 0 } end,
+          start = function(state)
+            state.starts = state.starts + 1
+            remuda.extension_command("sample-cmd", function() return tostring(state.starts) end)
+          end,
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-legacy-command.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+
+    assert_eq!(
+        read_value(
+            &image,
+            "return tostring(remuda._load_extension_command('sample-cmd', 'sample'))",
+        ),
+        "true"
+    );
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample-cmd')"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn command_hook_reload_replaces_handler_and_failed_reload_restores_it() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    let entry = home.entry();
+    let source = |version: &str, fails: bool| {
+        format!(
+            r#"return {{
+              api = "remuda-module-v1", state_version = 1,
+              initialize = function() return {{}} end,
+              commands = function()
+                remuda.extension_command("sample-cmd", function() return "{version}" end)
+                {failure}
+              end,
+            }}"#,
+            failure = if fails {
+                "error('commands failed')"
+            } else {
+                ""
+            }
+        )
+    };
+    write_entry(&entry, &source("v1", false));
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-commands-reload.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(
+        &image,
+        "remuda._load_extension_command('sample-cmd', 'sample')",
+    );
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample-cmd')"
+        ),
+        "v1"
+    );
+
+    write_entry(&entry, &source("v2", false));
+    read_value(&image, "remuda.reload('sample')");
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample-cmd')"
+        ),
+        "v2"
+    );
+    assert_eq!(
+        read_value(&image, "local n = 0 for _ in pairs(remuda._extension_commands) do n = n + 1 end return tostring(n)"),
+        "1"
+    );
+
+    write_entry(&entry, &source("v3", true));
+    assert!(image.eval("remuda.reload('sample')", None).is_err());
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample-cmd')"
+        ),
+        "v2"
+    );
+    assert_eq!(
+        read_value(&image, "local n = 0 for _ in pairs(remuda._extension_commands) do n = n + 1 end return tostring(n)"),
+        "1"
     );
 }
 

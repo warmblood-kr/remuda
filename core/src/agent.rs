@@ -9,6 +9,7 @@
 //! Drill the hole once and both are satisfied: a scripted double for tests,
 //! and a second vendor later, are the same substitution.
 
+use crate::clock::Clock;
 use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -224,6 +225,9 @@ pub enum AgentError {
     },
     /// Text is still being written; its Return will follow if it lands in time.
     SubmitPending,
+    /// The body landed, but a Return write was refused while busy, whether
+    /// that Return was meant to submit or add a composer newline.
+    SubmitUncertain,
     /// A `feed` act's `Pause`s summed past the caller's cap — refused before
     /// anything is written, not clamped, so a seconds/millis mixup errors
     /// instead of silently running a shorter pause than asked for.
@@ -259,6 +263,10 @@ impl fmt::Display for AgentError {
                 f,
                 "text is still being written to a slow pane; Return follows when it lands or is dropped after the bound; check the pane before resending"
             ),
+            AgentError::SubmitUncertain => write!(
+                f,
+                "text may be in the pane, but submission is unconfirmed.\nNext: inspect it with `remuda capture NAME` before resending."
+            ),
             AgentError::PauseTooLong { total, cap } => {
                 write!(f, "feed's pauses total {total:?}, over the {cap:?} cap")
             }
@@ -278,6 +286,9 @@ pub enum ChainOutcome {
 
 /// A backend writer that can wait independently of the locked process object.
 pub trait AgentWriter: Send + Sync {
+    /// Give the writer the session's clock for policy deadlines. Backends that
+    /// do not keep time-based writer state can ignore it.
+    fn set_clock(&self, _clock: Arc<dyn Clock>) {}
     fn write_bounded(&self, bytes: &[u8]) -> Result<()>;
     /// Ask the write that timed out to be followed by FOLLOW_UP once it lands.
     /// `Landed` means the timed-out write is no longer the active write; `Unsupported` means it cannot chain.
@@ -302,6 +313,20 @@ pub trait AgentWriter: Send + Sync {
             return Err(AgentError::Attached);
         }
         self.write_to_completion(bytes)
+    }
+    /// As `write_to_completion_while`, notifying when the backend begins its
+    /// actual write attempt.
+    fn write_to_completion_while_started(
+        &self,
+        bytes: &[u8],
+        cancelled: &dyn Fn() -> bool,
+        on_start: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<()> {
+        if cancelled() {
+            return Err(AgentError::Attached);
+        }
+        on_start();
+        self.write_to_completion_while(bytes, cancelled)
     }
     fn is_busy(&self) -> bool;
     /// Whether an active write has exceeded its backend's bounded-write deadline.
@@ -375,6 +400,13 @@ pub trait AgentProcess: Send {
     /// Non-process implementations return `None`.
     fn process_id(&self) -> Option<u32> {
         None
+    }
+
+    /// Whether `pid` is a process this agent's backend holds as its own, by a
+    /// marker the process cannot shed (a Windows job object). Unlike
+    /// [`Self::process_id`] it can be true after the agent's own child exited.
+    fn owns_process(&self, _pid: u32) -> bool {
+        false
     }
 
     /// The visible screen as styled cells, for a croppable colour pane.
@@ -499,6 +531,8 @@ pub struct ScriptedAgent {
     /// rather than one buffer so a test can see whether two writers
     /// interleaved, which a concatenated buffer would hide.
     pub writes: Vec<Vec<u8>>,
+    /// Process IDs this double claims through `owns_process`.
+    owned: Vec<u32>,
 }
 
 impl ScriptedAgent {
@@ -514,7 +548,13 @@ impl ScriptedAgent {
             alive: true,
             size: Size::default(),
             writes: Vec::new(),
+            owned: Vec::new(),
         }
+    }
+
+    pub fn owning(mut self, pid: u32) -> Self {
+        self.owned.push(pid);
+        self
     }
 
     pub fn with_size(mut self, size: Size) -> Self {
@@ -561,6 +601,10 @@ impl AgentProcess for ScriptedAgent {
 
     fn is_alive(&mut self) -> bool {
         self.alive
+    }
+
+    fn owns_process(&self, pid: u32) -> bool {
+        self.owned.contains(&pid)
     }
 
     fn terminate(&mut self) -> Result<()> {

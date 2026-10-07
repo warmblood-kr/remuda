@@ -1,0 +1,8 @@
+Starting the listener for cluster nodes (port 7441 by default). Peers can reach the port, but an unadmitted peer cannot join without a valid invitation; admitted nodes authenticate with their registered key. To skip opening a port, use remuda cluster init --no-listen; to stop it later, run remuda cluster listen --off; to limit its address, run remuda cluster listen --bind IP[:PORT] (<ADDR> for local-only).
+Cluster initialized
+Node: <NODE>
+Fingerprint: <FINGERPRINT>
+Listening for cluster nodes on <LISTEN_ADDR> (loopback only)
+Peers can reach the port, but an unadmitted peer cannot join without a valid invitation; admitted nodes authenticate with their registered key.
+To skip opening a port on init, use `remuda cluster init --no-listen`; to stop it later, run `remuda cluster listen --off`; to limit the address, run `remuda cluster listen --bind IP[:PORT]` (use `<ADDR>` for local-only).
+Next: run `remuda cluster invite` here, then run its printed `remuda cluster join ...` command on the other node.

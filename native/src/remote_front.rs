@@ -30,7 +30,7 @@ struct RemoteSyncPermit;
 impl RemoteSyncPermit {
     fn acquire() -> Option<Self> {
         ACTIVE_REMOTE_SYNCS
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |active| (active < MAX_REMOTE_SYNCS).then_some(active + 1),
@@ -153,7 +153,7 @@ struct ConnectionSlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 impl ConnectionSlot {
     fn acquire(active: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
         active
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |count| (count < MAX_CONNECTIONS).then_some(count + 1),

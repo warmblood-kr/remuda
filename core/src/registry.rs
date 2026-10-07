@@ -170,6 +170,15 @@ impl Registry {
             .collect()
     }
 
+    /// The session whose backend holds `pid` as its own. Every listed session
+    /// is asked, also one whose child has exited: its descendants may live on.
+    pub fn session_owning(&self, pid: u32) -> Option<String> {
+        self.lock()
+            .values()
+            .find(|session| session.owns_process(pid))
+            .map(|session| session.name().to_string())
+    }
+
     /// A snapshot of every session, sorted by name so callers can diff two
     /// listings without sorting first.
     pub fn list(&self) -> Vec<SessionSummary> {
@@ -237,6 +246,9 @@ impl Registry {
         drop(sessions);
         dead.into_iter()
             .map(|(name, id, instance_id, reason, session)| {
+                if let Err(error) = session.terminate_for_reap() {
+                    eprintln!("remuda core: failed to terminate reaped session {name}: {error}");
+                }
                 (name, id, instance_id, reason, session.exit_info())
             })
             .collect()

@@ -542,6 +542,257 @@ fn random_bytes_returns_csprng_bytes_and_rejects_invalid_lengths() {
 }
 
 #[test]
+fn remuda_cli_parse_handles_declared_arguments() {
+    run_lua(
+        "cli-parse",
+        r#"
+        local spec = {
+          name = "remuda butler matrix",
+          options = {
+            { long = "room", value = "ROOM", help = "Room ID", global = true },
+            { long = "json", help = "Print JSON", global = true },
+          },
+          verbs = {
+            thread = {
+              about = "Show every reply in a Matrix thread",
+              args = { { name = "EVENT_ID", help = "Event that starts the thread" } },
+              next = "remuda butler matrix reply EVENT_ID TEXT",
+            },
+          },
+        }
+        local result = remuda.cli.parse(spec, { "--room", "!r", "thread", "$abc", "--json" })
+        assert(result.ok == true, "expected parse success")
+        assert(result.verb == "thread", "expected selected verb")
+        assert(result.values.room == "!r", "expected room option")
+        assert(result.values.EVENT_ID == "$abc", "expected positional value")
+        assert(result.values.json == true, "expected boolean option")
+
+        local help = remuda.cli.parse(spec, { "thread", "--help" })
+        assert(help.ok == false and help.kind == "help" and help.code == 0, "expected help result")
+        assert(help.text:find("Usage:", 1, true), "help should include Usage")
+        assert(help.text:find("Next: remuda butler matrix reply EVENT_ID TEXT", 1, true), "help should include Next")
+
+        local error = remuda.cli.parse(spec, { "thread", "--jsno", "x" })
+        assert(error.ok == false and error.kind == "error" and error.code == 2, "expected error result")
+        assert(error.text:find("Did you mean '--json'", 1, true), "error should suggest --json")
+        "#,
+    );
+}
+
+// Off Windows, none of the credential tests below reach a real OS store: every
+// call either fails validation first or runs where no backend exists, and the
+// round trip that writes to the login Keychain is `#[ignore]`. The Windows
+// tests do write to Credential Manager: the CI runner is their only run.
+const CREDENTIAL_PRELUDE: &str = r#"
+    assert(type(remuda.system) == "table", "remuda.system is missing")
+    local credential = remuda.system.credential
+    assert(type(credential) == "table", "remuda.system.credential is missing")
+    local MARKER = "s3cret-MARKER-do-not-leak"
+"#;
+
+#[test]
+fn credential_surface_is_exactly_put_get_delete_backend() {
+    let backend = if cfg!(target_os = "macos") {
+        r#""keychain""#
+    } else if cfg!(windows) {
+        r#""wincred""#
+    } else {
+        "nil"
+    };
+    run_lua(
+        "credential-surface",
+        &format!(
+            r#"{CREDENTIAL_PRELUDE}
+            local words = {{}}
+            for key in pairs(credential) do words[#words + 1] = key end
+            table.sort(words)
+            assert(table.concat(words, ",") == "backend,delete,get,put", table.concat(words, ","))
+            local system_words = {{}}
+            for key in pairs(remuda.system) do system_words[#system_words + 1] = key end
+            assert(table.concat(system_words, ",") == "credential", table.concat(system_words, ","))
+            assert(credential.backend() == {backend}, "backend is " .. tostring(credential.backend()))
+            "#
+        ),
+    );
+}
+
+#[test]
+fn credential_rejects_invalid_names_and_secret_lengths() {
+    run_lua(
+        "credential-validation",
+        &format!(
+            r#"{CREDENTIAL_PRELUDE}
+            local bad_names = {{
+              "", string.rep("a", 256), "tab\there", "line\nbreak", "nul\0byte",
+              "del\127", "caf\195\169", "has space", {{}}, true,
+            }}
+            for index, name in ipairs(bad_names) do
+              for _, word in ipairs({{ "put", "get", "delete" }}) do
+                local ok, err = pcall(credential[word], name, MARKER)
+                assert(not ok, word .. " should reject bad name #" .. index)
+                err = tostring(err)
+                assert(err:find("name", 1, true), word .. " error should mention name: " .. err)
+                assert(not err:find(MARKER, 1, true), word .. " error leaked the secret")
+              end
+            end
+            assert(not pcall(credential.get), "get needs a name")
+            assert(not pcall(credential.delete), "delete needs a name")
+
+            for _, secret in ipairs({{ "", MARKER .. string.rep("x", 2049 - #MARKER) }}) do
+              local ok, err = pcall(credential.put, "remuda-test/never-stored", secret)
+              assert(not ok, "put should reject a secret of " .. #secret .. " bytes")
+              err = tostring(err)
+              assert(err:find("secret", 1, true), "put error should mention secret: " .. err)
+              assert(not err:find(MARKER, 1, true), "put error leaked the secret")
+            end
+            for _, secret in ipairs({{ {{}}, true }}) do
+              assert(not pcall(credential.put, "remuda-test/never-stored", secret),
+                "put should reject a non-string secret")
+            end
+            assert(not pcall(credential.put, "remuda-test/never-stored"), "put needs a secret")
+            "#
+        ),
+    );
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+#[test]
+fn credential_is_unavailable_where_no_backend_exists() {
+    run_lua(
+        "credential-unavailable",
+        &format!(
+            r#"{CREDENTIAL_PRELUDE}
+            local want = "unavailable: no credential store on this OS"
+            local name = string.rep("n", 255)
+            local secret = MARKER .. string.rep("x", 2048 - #MARKER)
+            assert(credential.backend() == nil, "no backend on this OS")
+            for _, call in ipairs({{
+              function() return credential.put(name, secret) end,
+              function() return credential.put("a", "b") end,
+              function() return credential.get(name) end,
+              function() return credential.delete(name) end,
+            }}) do
+              local value, reason = call()
+              assert(value == nil, "expected nil, got " .. tostring(value))
+              assert(reason == want, "reason is " .. tostring(reason))
+            end
+            "#
+        ),
+    );
+}
+
+// Writes to the real login Keychain, so it never runs by default: run it by
+// hand with `--ignored`. It removes its own item even when an assertion fails.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "writes to the real login Keychain"]
+fn credential_round_trip_in_the_login_keychain() {
+    let pid = std::process::id();
+    run_lua(
+        "credential-round-trip",
+        &format!(
+            r#"{CREDENTIAL_PRELUDE}
+            local hex = remuda.random_bytes(8):gsub(".", function(byte)
+              return string.format("%02x", byte:byte())
+            end)
+            local name = "remuda-test/{pid}-" .. hex
+            local secret = "round\0trip\255-" .. hex
+            local ok, err = pcall(function()
+              local value, reason = credential.get(name)
+              assert(value == nil and reason == "not_found", "get before put: " .. tostring(reason))
+              assert(credential.put(name, secret) == true, "put")
+              assert(credential.get(name) == secret, "get returns the stored bytes")
+              assert(credential.put(name, "replaced") == true, "put replaces")
+              assert(credential.get(name) == "replaced", "get returns the replacement")
+              assert(credential.delete(name) == true, "delete")
+              value, reason = credential.get(name)
+              assert(value == nil and reason == "not_found", "get after delete: " .. tostring(reason))
+              value, reason = credential.delete(name)
+              assert(value == nil and reason == "not_found", "second delete: " .. tostring(reason))
+            end)
+            credential.delete(name)
+            assert(ok, err)
+            "#
+        ),
+    );
+}
+
+// Nobody here has a Windows machine, so the CI log is the evidence: a failure
+// prints its reason as a FACT line before the test fails with it.
+#[cfg(windows)]
+fn run_lua_reporting(tag: &str, source: &str) {
+    let dir = scratch(tag);
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path, &dir);
+    if let Err(reason) = script::run(&path, &write(&dir, &format!("{tag}.lua"), source)) {
+        eprintln!("FACT: {tag} failed on this runner: {reason}");
+        panic!("{tag}: {reason}");
+    }
+}
+
+// A unique item name per test run, and `expect`, which fails with the store's
+// own reason. No message here ever carries a secret.
+#[cfg(windows)]
+fn wincred_prelude() -> String {
+    let pid = std::process::id();
+    format!(
+        r#"{CREDENTIAL_PRELUDE}
+        assert(credential.backend() == "wincred", "backend is " .. tostring(credential.backend()))
+        local hex = remuda.random_bytes(8):gsub(".", function(byte)
+          return string.format("%02x", byte:byte())
+        end)
+        local name = "remuda-test/{pid}-" .. hex
+        local function expect(what, want, value, reason)
+          assert(value == want and (want ~= nil or reason == "not_found"),
+            what .. ": " .. type(value) .. ", " .. tostring(reason))
+        end
+        "#
+    )
+}
+
+// Writes to the real Credential Manager of the CI runner, which has a logon
+// session. It removes its own item even when an assertion fails.
+#[cfg(windows)]
+#[test]
+fn credential_round_trip_in_windows_credential_manager() {
+    let prelude = wincred_prelude();
+    run_lua_reporting(
+        "credential-wincred-round-trip",
+        &format!(
+            r#"{prelude}
+            local secret = "round\0trip\255-" .. hex
+            local longest = string.rep("\0\255", 1024)
+            local ok, err = pcall(function()
+              expect("put", true, credential.put(name, secret))
+              assert(credential.get(name) == secret, "get did not return the stored bytes")
+              expect("put replaces", true, credential.put(name, longest))
+              assert(credential.get(name) == longest, "get did not return the 2048-byte replacement")
+              expect("delete", true, credential.delete(name))
+              expect("get after delete", nil, credential.get(name))
+            end)
+            credential.delete(name)
+            assert(ok, err)
+            "#
+        ),
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn credential_missing_item_is_not_found_on_windows() {
+    let prelude = wincred_prelude();
+    run_lua_reporting(
+        "credential-wincred-missing",
+        &format!(
+            r#"{prelude}
+            expect("get of a missing item", nil, credential.get(name))
+            expect("delete of a missing item", nil, credential.delete(name))
+            "#
+        ),
+    );
+}
+
+#[test]
 fn hostname_returns_the_os_host_name() {
     let dir = scratch("hostname");
     let path = daemon::socket_path_in(&dir, "s");
@@ -580,6 +831,24 @@ fn hostname_returns_the_os_host_name() {
         let end = buffer.iter().position(|byte| *byte == 0).unwrap();
         assert_eq!(name.as_bytes(), &buffer[..end]);
     }
+}
+
+fn documented_function<'a>(document: &'a Value, name: &str) -> &'a Value {
+    let functions = document["runtime"]["functions"].as_array().unwrap();
+    let found = functions.iter().find(|entry| entry["name"] == name);
+    found.unwrap_or_else(|| panic!("{name} is not documented"))
+}
+
+fn assert_cli_parse_documented(document: &Value) {
+    let cli_parse = documented_function(document, "cli.parse");
+    assert!(cli_parse["signature"]
+        .as_str()
+        .unwrap()
+        .contains("cli.parse(spec, argv)"));
+    assert!(cli_parse["description"]
+        .as_str()
+        .unwrap()
+        .contains("without printing or exiting"));
 }
 
 #[test]
@@ -644,6 +913,21 @@ fn registry_documentation_formats_are_live_and_structured() {
         .as_str()
         .unwrap()
         .contains("65536"));
+    assert_cli_parse_documented(&document);
+    let credential_get = document["runtime"]["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "system.credential.get")
+        .expect("system.credential.get is documented");
+    assert!(credential_get["description"]
+        .as_str()
+        .unwrap()
+        .contains("waits until the user answers"));
+    let backend = documented_function(&document, "system.credential.backend");
+    for field in ["description", "signature"] {
+        assert!(backend[field].as_str().unwrap().contains("'wincred'"));
+    }
     let hostname = document["runtime"]["functions"]
         .as_array()
         .unwrap()
@@ -816,7 +1100,7 @@ fn remuda_new_can_set_cwd_and_env_on_the_launched_process() {
         .replace('"', "\\\"");
     let source = format!(
         r#"
-        remuda.new("probed", {{"sh", "-c", "pwd && echo $PROBE_VAR && echo path-has:$PATH"}}, "{cwd_literal}", {{PROBE_VAR = "remuda-env-probe-7f3a"}})
+        remuda.new("probed", {{"sh", "-c", "pwd && echo $PROBE_VAR && echo path-has:${{PATH%%:*}} && sleep 30"}}, "{cwd_literal}", {{PROBE_VAR = "remuda-env-probe-7f3a"}})
         "#
     );
     script::run(&path, &write(&dir, "cwd-env.lua", &source)).expect("script");
@@ -1024,4 +1308,329 @@ fn capture_styled_marks_dim_spans_and_reports_the_cursor() {
     "#;
     let got = script::eval_source(&path, "=styled-capture", code).expect("capture styled screen");
     assert_eq!(got, "ghost=true -plain=false cursor=number,number,boolean");
+}
+
+#[test]
+fn input_line_empty_uses_styled_prompt_snapshots_and_returns_unknown_safely() {
+    run_lua(
+        "input-line-empty",
+        r#"
+        local original_capture = remuda.capture_styled
+        local current
+        remuda.capture_styled = function(name)
+          assert(name == "fixture")
+          if current == "capture-error" then error("capture failed") end
+          return current
+        end
+        local function span(text, dim) return { text = text, dim = dim or false } end
+        local function row(...)
+          local spans = {}
+          for _, text in ipairs({...}) do spans[#spans + 1] = type(text) == "table" and text or span(text) end
+          return spans
+        end
+        local function screen(rows, cursor_row)
+          cursor_row = cursor_row or 1
+          local parts = {}
+          for _, span in ipairs(rows[cursor_row] or {}) do parts[#parts + 1] = span.text or "" end
+          local raw = table.concat(parts):gsub("\194\160", " ")
+          local col = raw:sub(1, 3) == "│" and 5 or 3
+          return { rows = rows, cursor = { row = cursor_row, col = col, visible = true } }
+        end
+        local function answer(opts)
+          return remuda.input_line_empty("fixture", opts)
+        end
+        local function both(snapshot, kind, expected)
+          current = snapshot
+          local generic, generic_reason = answer()
+          assert(generic == expected, "generic result: " .. tostring(generic) .. " / " .. tostring(generic_reason))
+          local specific, specific_reason = answer({ kind = kind })
+          assert(specific == expected, kind .. " result: " .. tostring(specific) .. " / " .. tostring(specific_reason))
+        end
+
+        -- Empty prompt forms for each kind are checked both with an explicit
+        -- kind and through the generic parser on the exact same snapshot.
+        both(screen({ row("❯ ") }), "shell", true)
+        both(screen({ row("│ ❯ │") }), "claude", true) -- U+00A0 is Claude's empty prompt.
+        both(screen({ row("> ") }), "codex", true)
+
+        both(screen({ row("❯ typed command") }), "shell", nil)
+        both(screen({ row("│ ❯ draft│"), row("│ continuation│"), row("╰ footer") }), "claude", nil)
+        both(screen({ row("> draft"), row("3.2k tokens · context left") }), "codex", nil)
+
+        current = screen({ row("❯ ", span("suggested text", true)) })
+        assert(answer({ kind = "shell" }) == true)
+
+        -- The visible Codex empty placeholder is recognized without opts.kind
+        -- for any caller; explicit non-Codex policy retains Butler's behavior.
+        current = screen({ row("> Ask Codex to do anything") })
+        assert(answer() == true)
+        assert(answer({ kind = "codex" }) == true)
+        assert(answer({ kind = "shell" }) == nil)
+
+        -- Codex status/trace rows below the cursor are footer area. A visible
+        -- paste placeholder in the cursor composer is still content.
+        both(screen({ row("> "), row("3.2k tokens · context left") }), "codex", true)
+        current = screen({ row("> my draft · notes") })
+        local footer_draft, footer_reason = answer({ kind = "codex" })
+        assert(footer_draft == nil and footer_reason:find("visible text", 1, true))
+        current = screen({ row("> "), row("gpt 5 · 40%") })
+        -- known limit, see docs: rows below the cursor do not affect the result.
+        assert(answer() == true)
+        assert(answer({ kind = "codex" }) == true)
+        assert(answer({ kind = "shell" }) == true)
+        current = screen({ row("❯ "), row("? for shortcuts") })
+        assert(answer({ kind = "shell" }) == true)
+        assert(answer({ kind = "claude" }) == true)
+        both(screen({ row("> "), row("2026-10-03T12:00:00Z INFO codex: startup trace") }), "codex", true)
+        both(screen({ row("❯ [Pasted text #1 +5 lines]") }), "shell", nil)
+
+        current = screen({ row("ordinary terminal output") })
+        local unknown, reason = answer()
+        assert(unknown == nil and type(reason) == "string" and reason:find("prompt glyph", 1, true))
+
+        current = screen({ row("❯ ") })
+        current.cursor.visible = false
+        unknown, reason = answer()
+        assert(unknown == nil and type(reason) == "string" and reason:find("hidden", 1, true))
+
+        current = screen({ row("❯ ") })
+        unknown, reason = answer({ kind = "gemini" })
+        assert(unknown == nil and type(reason) == "string" and reason:find("opts.kind", 1, true))
+
+        current = screen({ row("❯ ") })
+        current.cursor.row = 2
+        unknown, reason = answer()
+        assert(unknown == nil and type(reason) == "string" and reason:find("outside", 1, true))
+
+        current = "capture-error"
+        unknown, reason = answer()
+        assert(unknown == nil and type(reason) == "string" and reason:find("capture failed", 1, true))
+
+        remuda.capture_styled = original_capture
+        unknown, reason = remuda.input_line_empty("missing-session")
+        assert(unknown == nil and type(reason) == "string" and reason:find("no such session", 1, true))
+
+        local word = remuda._registry.input_line_empty
+        assert(word and word.signature == "input_line_empty(session, opts?) -> true | nil, reason")
+        assert(word.about:find("opts.kind", 1, true) and word.about:find("contiguous composer block", 1, true))
+        assert(word.about:find("true means only that the cursor row matches the empty-prompt shape; callers must add per-kind checks", 1, true))
+        assert(word.about:find("'? for shortcuts' for every kind", 1, true))
+        assert(word.about:find("Unlike Butler's helper", 1, true))
+        assert(word.about:find("continuation prompt after a blank row", 1, true))
+        assert(word.about:find("rows below the cursor are not inspected", 1, true))
+        "#,
+    );
+}
+
+#[test]
+fn input_line_empty_rejects_draft_content_above_the_cursor() {
+    run_lua(
+        "input-line-empty-ambiguous-rows",
+        r#"
+        local current
+        remuda.capture_styled = function() return current end
+        local function row(text) return { { text = text, dim = false } } end
+        local function screen(rows, cursor_row)
+          local raw = rows[cursor_row][1].text:gsub("\194\160", " ")
+          local col = raw:sub(1, 3) == "│" and 5 or 3
+          return { rows = rows, cursor = { row = cursor_row, col = col, visible = true } }
+        end
+        local function expect_unknown(snapshot, kind)
+          current = snapshot
+          local answer, reason = remuda.input_line_empty("fixture", { kind = kind })
+          assert(answer == nil and type(reason) == "string", tostring(answer) .. " / " .. tostring(reason))
+        end
+        local function expect_empty(snapshot, kind)
+          current = snapshot
+          local answer, reason = remuda.input_line_empty("fixture", { kind = kind })
+          assert(answer == true, tostring(answer) .. " / " .. tostring(reason))
+        end
+
+        local after_glyph = screen({ row("❯ ") }, 1)
+        after_glyph.cursor.col = 2 -- the valid position before its optional space
+        expect_empty(after_glyph, "shell")
+        local plain_col_four = screen({ row("❯ ") }, 1)
+        plain_col_four.cursor.col = 4
+        expect_unknown(plain_col_four, "shell")
+        local wrong_col = screen({ row("❯ ") }, 1)
+        wrong_col.cursor.col = 1
+        expect_unknown(wrong_col, "shell")
+
+        local framed_col_four = screen({ row("│ ❯ │") }, 1)
+        framed_col_four.cursor.col = 4
+        expect_empty(framed_col_four, "claude")
+        local framed_col_six = screen({ row("│ ❯ │") }, 1)
+        framed_col_six.cursor.col = 6
+        expect_unknown(framed_col_six, "claude")
+
+        -- Column math uses text after dim spans are discarded, so an earlier
+        -- dim prefix shifts the physical cursor beyond the accepted prompt columns.
+        local dim_prefix = { rows = {{
+          { text = "ghost ", dim = true }, { text = "❯ ", dim = false }
+        }}, cursor = { row = 1, col = 9, visible = true } }
+        expect_unknown(dim_prefix, "shell")
+        -- Tabs are not stripped as prompt indentation; only ASCII spaces are.
+        expect_unknown(screen({ row("\t❯ ") }, 1), "shell")
+        -- A CJK glyph is not treated as whitespace before a supported prompt.
+        expect_unknown(screen({ row("界❯ ") }, 1), "shell")
+        -- NBSP is folded to one ASCII space before prompt and column checks.
+        local nbsp_prefix = screen({ row(" ❯ ") }, 1)
+        nbsp_prefix.cursor.col = 4
+        expect_empty(nbsp_prefix, "shell")
+        -- Frame recognition requires │ in the first screen column.
+        expect_unknown(screen({ row("  │ ❯ ") }, 1), "claude")
+
+        current = screen({ row("│ transcript"), row("╭ unrelated history"), row("❯ ") }, 3)
+        local generic, generic_reason = remuda.input_line_empty("fixture")
+        assert(generic == nil and generic_reason:find("non-blank rows", 1, true), "a stray │ must not enable Claude frame mode")
+
+        expect_empty(screen({ row("ls output"), row(""), row("❯ ") }, 3), "shell")
+        expect_empty(screen({
+          row("history"), row(""), row("╭──────╮"), row("│ ❯  │"), row("╰──────╯"), row("? for shortcuts")
+        }, 4), "claude")
+        expect_empty(screen({ row("transcript line"), row(""), row("> Ask Codex to do anything"), row("gpt 5 · 40%") }, 3), "codex")
+        -- known limit, see docs: a blank row inside a composer block hides prior draft text,
+        -- so a later continuation prompt can still be reported as empty.
+        expect_empty(screen({ row("text"), row(""), row("> ") }, 3), "codex")
+
+        expect_unknown(screen({ row("❯ draft"), row("❯ ") }, 2), "shell")
+        expect_unknown(screen({ row("❯ draft"), row("> "), row("❯ ") }, 3), "shell")
+        -- A glyph-less PS1 above a PS2 row is still ambiguous.
+        expect_unknown(screen({ row("user@host$ python"), row("> ") }, 2), "shell")
+        expect_unknown(screen({ row("❯ "), row("continued draft"), row("ordinary row") }, 3), "shell")
+        -- In a Claude frame the first prompt row anchors the composer.
+        expect_unknown(screen({ row("│ ❯ draft│"), row("│ ❯ │"), row("╰ footer") }, 2), "claude")
+        -- Codex's placeholder does not hide text on a later composer row.
+        expect_unknown(screen({ row("> Ask Codex to do anything"), row("continued draft") }, 2), "codex")
+        "#,
+    );
+}
+
+/// A Lua long string: a Windows path keeps its backslashes.
+fn lua_path(path: &Path) -> String {
+    format!("[==[{}]==]", path.display())
+}
+
+const FS_PRELUDE: &str = r#"
+    assert(type(remuda.fs.realpath) == "function", "remuda.fs.realpath is missing")
+    assert(type(remuda.fs.is_symlink) == "function", "remuda.fs.is_symlink is missing")
+    local function expect(what, want, got, reason)
+      assert(got == want, what .. ": want " .. tostring(want) .. ", got " .. tostring(got) .. " (" .. tostring(reason) .. ")")
+    end
+"#;
+
+#[test]
+fn fs_realpath_resolves_dot_dot_and_reports_a_missing_path() {
+    let dir = scratch("fs-realpath");
+    std::fs::create_dir_all(dir.join("sub")).expect("make sub");
+    std::fs::write(dir.join("file.txt"), "x").expect("write file");
+    let real = std::fs::canonicalize(dir.join("file.txt")).expect("canonical file");
+    let manifest = std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+        .expect("canonical manifest");
+    run_lua(
+        "fs-realpath",
+        &format!(
+            r#"{FS_PRELUDE}
+            expect("an absolute path with '..'", {real}, remuda.fs.realpath({dotted}))
+            -- A relative path is resolved against the daemon's working directory.
+            expect("a relative path with '..'", {manifest}, remuda.fs.realpath("src/../Cargo.toml"))
+            local got, reason = remuda.fs.realpath({missing})
+            expect("a missing path", nil, got)
+            expect("a missing path's reason", "not_found", reason)
+            got, reason = remuda.fs.is_symlink({missing})
+            expect("is_symlink of a missing path", nil, got)
+            expect("is_symlink of a missing path's reason", "not_found", reason)
+            expect("a plain file is not a link", false, remuda.fs.is_symlink({file}))
+            expect("a directory is not a link", false, remuda.fs.is_symlink({sub}))
+            for _, bad in ipairs({{ "", {{}}, true }}) do
+              assert(not pcall(remuda.fs.realpath, bad), "realpath should raise for " .. tostring(bad))
+              assert(not pcall(remuda.fs.is_symlink, bad), "is_symlink should raise for " .. tostring(bad))
+            end
+            assert(not pcall(remuda.fs.realpath), "realpath with no argument should raise")
+            "#,
+            real = lua_path(&real),
+            manifest = lua_path(&manifest),
+            dotted = lua_path(&dir.join("sub").join("..").join("file.txt")),
+            missing = lua_path(&dir.join("missing.txt")),
+            file = lua_path(&dir.join("file.txt")),
+            sub = lua_path(&dir.join("sub")),
+        ),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_realpath_follows_a_symlink_and_is_symlink_does_not() {
+    let dir = scratch("fs-symlink");
+    std::fs::write(dir.join("target.txt"), "x").expect("write target");
+    let _ = std::fs::remove_file(dir.join("link"));
+    let _ = std::fs::remove_file(dir.join("dangling"));
+    std::os::unix::fs::symlink(dir.join("target.txt"), dir.join("link")).expect("make link");
+    std::os::unix::fs::symlink(dir.join("gone"), dir.join("dangling")).expect("make dangling link");
+    let real = std::fs::canonicalize(dir.join("target.txt")).expect("canonical target");
+    run_lua(
+        "fs-symlink",
+        &format!(
+            r#"{FS_PRELUDE}
+            expect("realpath of a link is its target", {real}, remuda.fs.realpath({link}))
+            expect("a link is a link", true, remuda.fs.is_symlink({link}))
+            expect("its target is not", false, remuda.fs.is_symlink({target}))
+            -- The link itself is asked about, so a dangling one is still a link.
+            expect("a dangling link is a link", true, remuda.fs.is_symlink({dangling}))
+            local got, reason = remuda.fs.realpath({dangling})
+            expect("realpath of a dangling link", nil, got)
+            expect("realpath of a dangling link's reason", "not_found", reason)
+            "#,
+            real = lua_path(&real),
+            link = lua_path(&dir.join("link")),
+            target = lua_path(&dir.join("target.txt")),
+            dangling = lua_path(&dir.join("dangling")),
+        ),
+    );
+}
+
+// The CI log is the evidence for Windows: the FACT lines say what a resolved
+// path looks like there and whether a junction counts as a link.
+#[cfg(windows)]
+#[test]
+fn fs_realpath_and_is_symlink_on_windows() {
+    let dir = scratch("fs-windows");
+    std::fs::create_dir_all(dir.join("target")).expect("make target");
+    std::fs::write(dir.join("target").join("file.txt"), "x").expect("write file");
+    let junction = dir.join("junction");
+    let _ = std::fs::remove_dir(&junction);
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&junction)
+        .arg(dir.join("target"))
+        .output()
+        .expect("run mklink");
+    assert!(made.status.success(), "mklink /J failed: {made:?}");
+    let real = std::fs::canonicalize(dir.join("target").join("file.txt")).expect("canonical file");
+    eprintln!("FACT: std canonicalize returns {}", real.display());
+    eprintln!(
+        "FACT: std is_symlink of a junction is {}",
+        std::fs::symlink_metadata(&junction)
+            .expect("junction metadata")
+            .file_type()
+            .is_symlink()
+    );
+    run_lua_reporting(
+        "fs-windows",
+        &format!(
+            r#"{FS_PRELUDE}
+            local real = remuda.fs.realpath({through})
+            expect("realpath through a junction", {real}, real)
+            expect("the resolved path keeps the verbatim prefix", [[\\?\]], real:sub(1, 4))
+            local slashed = ({through}):gsub("\\", "/")
+            expect("a forward-slash path resolves the same", {real}, remuda.fs.realpath(slashed))
+            expect("a junction is a link", true, remuda.fs.is_symlink({junction}))
+            expect("its target is not", false, remuda.fs.is_symlink({target}))
+            "#,
+            real = lua_path(&real),
+            through = lua_path(&junction.join("file.txt")),
+            junction = lua_path(&junction),
+            target = lua_path(&dir.join("target")),
+        ),
+    );
 }

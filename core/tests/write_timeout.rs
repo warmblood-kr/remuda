@@ -1,4 +1,6 @@
-use remuda_core::agent::{AgentError, AgentProcess, AgentWriter, Cursor, Result, Size};
+use remuda_core::agent::{
+    AgentError, AgentProcess, AgentWriter, ChainOutcome, Cursor, Result, Size,
+};
 use remuda_core::input::{InputBatch, InputError, InputOutcome};
 use remuda_core::{Clock, ManualClock, Session};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -136,6 +138,94 @@ fn interactive_send_returns_busy_only_after_the_writer_deadline() {
     first.join().unwrap().unwrap();
     second.join().unwrap();
     assert_eq!(writer.writes.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn send_line_reports_uncertain_when_enter_is_busy_after_body_lands() {
+    let (body_tx, body_rx) = mpsc::channel();
+    let (attached_started_tx, attached_started_rx) = mpsc::channel();
+    let (attached_release_tx, attached_release_rx) = mpsc::channel();
+    let writer = Arc::new(SendLineBusyWriter {
+        body: Mutex::new(String::new()),
+        body_landed: AtomicBool::new(false),
+        attached_busy: AtomicBool::new(false),
+        body_written: Mutex::new(Some(body_tx)),
+        attached_started: Mutex::new(Some(attached_started_tx)),
+        attached_release: Mutex::new(attached_release_rx),
+    });
+    let clock = Arc::new(ManualClock::new());
+    let session = Arc::new(Session::new(
+        "send-line-enter-busy",
+        Box::new(SendLineBusyAgent {
+            writer: Arc::clone(&writer),
+            output_version: Some(0),
+        }),
+        Arc::clone(&clock) as Arc<dyn Clock>,
+    ));
+
+    let send_session = Arc::clone(&session);
+    let (result_tx, result_rx) = mpsc::channel();
+    let send = thread::spawn(move || {
+        result_tx
+            .send(send_session.send_line("draft body"))
+            .unwrap();
+    });
+    body_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("send_line body landed");
+
+    let attach_session = Arc::clone(&session);
+    let human_write = thread::spawn(move || attach_session.attach().write_raw(b"human key"));
+    attached_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("attached writer stalled before Enter");
+    clock.advance(Duration::from_millis(300));
+
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("send_line returned after Enter was refused");
+    attached_release_tx.send(()).unwrap();
+    assert!(human_write.join().unwrap().is_ok());
+    send.join().unwrap();
+
+    assert!(
+        matches!(&result, Err(AgentError::SubmitUncertain)),
+        "the body landed but the refused Enter was reported as {result:?}"
+    );
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "text may be in the pane, but submission is unconfirmed.\nNext: inspect it with `remuda capture NAME` before resending."
+    );
+}
+
+#[test]
+fn submit_reports_uncertain_when_enter_is_busy_after_input_text_lands() {
+    let (_attached_release_tx, attached_release_rx) = mpsc::channel();
+    let writer = Arc::new(SendLineBusyWriter {
+        body: Mutex::new(String::new()),
+        body_landed: AtomicBool::new(false),
+        attached_busy: AtomicBool::new(false),
+        body_written: Mutex::new(None),
+        attached_started: Mutex::new(None),
+        attached_release: Mutex::new(attached_release_rx),
+    });
+    let session = Session::new(
+        "submit-enter-busy",
+        Box::new(SendLineBusyAgent {
+            writer: Arc::clone(&writer),
+            output_version: None,
+        }),
+        Arc::new(ManualClock::new()),
+    );
+
+    session.input_text("draft body").unwrap();
+    assert_eq!(writer.body.lock().unwrap().as_str(), "draft body");
+    writer.attached_busy.store(true, Ordering::Release);
+
+    assert!(matches!(
+        session.submit("draft body"),
+        Err(AgentError::SubmitUncertain)
+    ));
 }
 
 #[test]
@@ -385,6 +475,57 @@ fn batch_rejected_before_submit_is_busy_and_refunds_rate_for_retry() {
 }
 
 #[test]
+fn abandoned_late_submit_batch_is_busy_and_can_be_retried() {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let writer = Arc::new(BlockingWriter {
+        started: Mutex::new(Some(started_tx)),
+        release: Mutex::new(release_rx),
+        busy: AtomicBool::new(false),
+        timed_out: AtomicBool::new(false),
+        fail: false,
+        refusal_once: AtomicUsize::new(4),
+        writes: AtomicUsize::new(0),
+    });
+    let session = Arc::new(Session::new(
+        "abandoned-late-submit-batch",
+        Box::new(BlockingAgent {
+            writer: Arc::clone(&writer),
+        }),
+        Arc::new(ManualClock::new()),
+    ));
+    let instance_id = session.instance_id().to_owned();
+    let batch = InputBatch {
+        instance_id: &instance_id,
+        client_id: [17; 16],
+        seq: 1,
+        bytes: b"never written",
+    };
+
+    assert_eq!(session.apply_input_batch(batch), Err(InputError::Busy));
+
+    let retry_session = Arc::clone(&session);
+    let retry_instance_id = instance_id.clone();
+    let retry = thread::spawn(move || {
+        retry_session.apply_input_batch(InputBatch {
+            instance_id: &retry_instance_id,
+            client_id: [17; 16],
+            seq: 1,
+            bytes: b"never written",
+        })
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("retry write started");
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        retry.join().unwrap(),
+        Ok(InputOutcome::Ack { duplicate: false })
+    );
+    assert_eq!(writer.writes.load(Ordering::Acquire), 1);
+}
+
+#[test]
 fn late_success_after_timeout_does_not_turn_a_batch_retry_into_an_ack() {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -600,6 +741,111 @@ fn input_waiting_during_feed_pause_queues_behind_healthy_feed_write() {
     assert_eq!(writer.writes.load(Ordering::Acquire), 2);
 }
 
+struct SendLineBusyWriter {
+    body: Mutex<String>,
+    body_landed: AtomicBool,
+    attached_busy: AtomicBool,
+    body_written: Mutex<Option<Sender<()>>>,
+    attached_started: Mutex<Option<Sender<()>>>,
+    attached_release: Mutex<Receiver<()>>,
+}
+
+impl AgentWriter for SendLineBusyWriter {
+    fn write_bounded(&self, bytes: &[u8]) -> Result<()> {
+        if self.body_landed.load(Ordering::Acquire) {
+            return if self.attached_busy.load(Ordering::Acquire) {
+                Err(AgentError::Busy)
+            } else {
+                Err(AgentError::Io("unexpected bounded write after body".into()))
+            };
+        }
+        *self.body.lock().unwrap() = String::from_utf8_lossy(bytes).into_owned();
+        self.body_landed.store(true, Ordering::Release);
+        if let Some(written) = self.body_written.lock().unwrap().take() {
+            written.send(()).unwrap();
+        }
+        Ok(())
+    }
+
+    fn write_to_completion_while(&self, _bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
+        self.attached_busy.store(true, Ordering::Release);
+        if let Some(started) = self.attached_started.lock().unwrap().take() {
+            started.send(()).unwrap();
+        }
+        loop {
+            if cancelled() {
+                self.attached_busy.store(false, Ordering::Release);
+                return Err(AgentError::Attached);
+            }
+            match self
+                .attached_release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_millis(5))
+            {
+                Ok(()) => {
+                    self.attached_busy.store(false, Ordering::Release);
+                    return Ok(());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.attached_busy.store(false, Ordering::Release);
+                    return Err(AgentError::Io(
+                        "attached writer released without signal".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn is_busy(&self) -> bool {
+        self.attached_busy.load(Ordering::Acquire)
+    }
+}
+
+struct SendLineBusyAgent {
+    writer: Arc<SendLineBusyWriter>,
+    output_version: Option<u64>,
+}
+
+impl AgentProcess for SendLineBusyAgent {
+    fn write(&mut self, _bytes: &[u8]) -> Result<()> {
+        Err(AgentError::Io("unexpected direct write".into()))
+    }
+
+    fn input_writer(&mut self) -> Option<Arc<dyn AgentWriter>> {
+        Some(Arc::clone(&self.writer) as Arc<dyn AgentWriter>)
+    }
+
+    fn screen_text(&mut self) -> Result<String> {
+        Ok(self.writer.body.lock().unwrap().clone())
+    }
+
+    fn output_version(&mut self) -> Option<u64> {
+        self.output_version
+    }
+
+    fn cursor(&mut self) -> Result<Cursor> {
+        Ok(Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        })
+    }
+
+    fn is_alive(&mut self) -> bool {
+        true
+    }
+
+    fn terminate(&mut self) -> Result<()> {
+        Err(AgentError::Io("not used".into()))
+    }
+
+    fn size(&self) -> Size {
+        Size::default()
+    }
+}
+
 struct BlockingAgent {
     writer: Arc<BlockingWriter>,
 }
@@ -611,7 +857,8 @@ struct BlockingWriter {
     timed_out: AtomicBool,
     fail: bool,
     /// Test-only refusals returned before a write is accepted: 1 = Busy,
-    /// 2 = Exited, 3 = an in-flight write timed out during submission.
+    /// 2 = Exited, 3 = an in-flight write timed out during submission,
+    /// 4 = an abandoned late submit (the bytes were not written).
     refusal_once: AtomicUsize,
     writes: AtomicUsize,
 }
@@ -624,6 +871,11 @@ impl AgentWriter for BlockingWriter {
             3 if self.busy.load(Ordering::Acquire) => {
                 self.timed_out.store(true, Ordering::Release);
                 return Err(AgentError::Busy);
+            }
+            4 => {
+                return Err(AgentError::LateSubmitAbandoned {
+                    bound: Duration::from_secs(30),
+                });
             }
             _ => {}
         }
@@ -785,6 +1037,93 @@ impl AgentProcess for LateCompletionAgent {
 
     fn screen_text(&mut self) -> Result<String> {
         Ok(String::new())
+    }
+
+    fn cursor(&mut self) -> Result<Cursor> {
+        Ok(Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        })
+    }
+
+    fn is_alive(&mut self) -> bool {
+        true
+    }
+
+    fn terminate(&mut self) -> Result<()> {
+        Err(AgentError::Io("not used".into()))
+    }
+
+    fn size(&self) -> Size {
+        Size::default()
+    }
+}
+
+#[test]
+fn type_text_preserves_write_timeout_when_return_chaining_is_unsupported() {
+    let writer = Arc::new(UnsupportedChainWriter {
+        writes: Mutex::new(Vec::new()),
+        timeout: Duration::from_millis(17),
+    });
+    let session = Session::new(
+        "unsupported-return-chain",
+        Box::new(UnsupportedChainAgent {
+            writer: Arc::clone(&writer),
+        }),
+        Arc::new(ManualClock::new()),
+    );
+
+    let result = session.type_text("text", Duration::ZERO);
+
+    assert!(matches!(
+        result,
+        Err(AgentError::WriteTimeout { timeout }) if timeout == Duration::from_millis(17)
+    ));
+    assert_eq!(*writer.writes.lock().unwrap(), [b"text".to_vec()]);
+}
+
+struct UnsupportedChainWriter {
+    writes: Mutex<Vec<Vec<u8>>>,
+    timeout: Duration,
+}
+
+impl AgentWriter for UnsupportedChainWriter {
+    fn write_bounded(&self, bytes: &[u8]) -> Result<()> {
+        self.writes.lock().unwrap().push(bytes.to_vec());
+        Err(AgentError::WriteTimeout {
+            timeout: self.timeout,
+        })
+    }
+
+    fn chain_after_stalled(&self, _follow_up: &[u8], _settle: Duration) -> ChainOutcome {
+        ChainOutcome::Unsupported
+    }
+
+    fn is_busy(&self) -> bool {
+        true
+    }
+}
+
+struct UnsupportedChainAgent {
+    writer: Arc<UnsupportedChainWriter>,
+}
+
+impl AgentProcess for UnsupportedChainAgent {
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.writer.write_bounded(bytes)
+    }
+
+    fn input_writer(&mut self) -> Option<Arc<dyn AgentWriter>> {
+        Some(Arc::clone(&self.writer) as Arc<dyn AgentWriter>)
+    }
+
+    fn screen_text(&mut self) -> Result<String> {
+        Ok("ready".into())
+    }
+
+    fn output_version(&mut self) -> Option<u64> {
+        Some(0)
     }
 
     fn cursor(&mut self) -> Result<Cursor> {

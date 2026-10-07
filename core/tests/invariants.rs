@@ -369,6 +369,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// An agent whose liveness the test still controls after the session owns it.
 struct FlagAgent {
     alive: Arc<AtomicBool>,
+    terminate_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl AgentProcess for FlagAgent {
@@ -390,6 +391,9 @@ impl AgentProcess for FlagAgent {
     }
     fn terminate(&mut self) -> Result<()> {
         self.alive.store(false, Ordering::SeqCst);
+        if let Some(calls) = &self.terminate_calls {
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
     }
     fn size(&self) -> Size {
@@ -509,6 +513,7 @@ fn reap_drops_the_dead_and_keeps_the_living() {
             "doomed",
             Box::new(FlagAgent {
                 alive: doomed.clone(),
+                terminate_calls: None,
             }),
         ))
         .expect("registration");
@@ -517,6 +522,7 @@ fn reap_drops_the_dead_and_keeps_the_living() {
             "healthy",
             Box::new(FlagAgent {
                 alive: Arc::new(AtomicBool::new(true)),
+                terminate_calls: None,
             }),
         ))
         .expect("registration");
@@ -532,6 +538,27 @@ fn reap_drops_the_dead_and_keeps_the_living() {
     assert!(registry.get("healthy").is_some());
 }
 
+#[test]
+fn reap_terminates_a_dead_agent_even_when_a_session_arc_is_retained() {
+    let registry = Registry::new();
+    let alive = Arc::new(AtomicBool::new(false));
+    let terminate_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    registry
+        .register(named(
+            "doomed",
+            Box::new(FlagAgent {
+                alive,
+                terminate_calls: Some(Arc::clone(&terminate_calls)),
+            }),
+        ))
+        .expect("registration");
+    let retained = registry.get("doomed").expect("retained session");
+
+    assert_eq!(registry.reap(), ["doomed"]);
+    assert_eq!(terminate_calls.load(Ordering::SeqCst), 1);
+    assert!(retained.exit_info().is_none());
+}
+
 // ---------------------------------------------------------------------------
 // Step 006 — ending a session.
 //
@@ -545,20 +572,25 @@ fn reap_drops_the_dead_and_keeps_the_living() {
 fn close_terminates_a_live_session_and_stops_tracking_it() {
     let registry = Registry::new();
     let alive = Arc::new(AtomicBool::new(true));
+    let terminate_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     registry
         .register(named(
             "worker",
             Box::new(FlagAgent {
                 alive: alive.clone(),
+                terminate_calls: Some(Arc::clone(&terminate_calls)),
             }),
         ))
         .expect("registration");
+    let retained = registry.get("worker").expect("retained session");
 
     assert!(matches!(registry.close("worker"), Some(Ok(true))));
     assert!(
         !alive.load(Ordering::SeqCst),
         "the process must actually end"
     );
+    assert_eq!(terminate_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(retained.name(), "worker");
     assert!(registry.get("worker").is_none(), "and stop being tracked");
 }
 
@@ -574,6 +606,7 @@ fn close_on_an_already_dead_session_is_not_an_error() {
             "worker",
             Box::new(FlagAgent {
                 alive: Arc::new(AtomicBool::new(false)),
+                terminate_calls: None,
             }),
         ))
         .expect("registration");
@@ -597,6 +630,7 @@ fn close_is_refused_while_attached_and_the_session_survives() {
             "worker",
             Box::new(FlagAgent {
                 alive: alive.clone(),
+                terminate_calls: None,
             }),
         ))
         .expect("registration");
@@ -635,6 +669,7 @@ fn confirmed_close_clears_its_closing_marker_when_attachment_refuses_it() {
             "worker",
             Box::new(FlagAgent {
                 alive: alive.clone(),
+                terminate_calls: None,
             }),
         ))
         .expect("registration");

@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::io::{BufRead, Read, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -187,7 +187,11 @@ fn normalize(input: &str, root: &Path) -> String {
 }
 
 fn replace_listener_addresses(input: &str) -> String {
-    let prefixes = ["Listening on ", "Listener: on "];
+    let prefixes = [
+        "Listening on ",
+        "Listening for cluster nodes on ",
+        "Listener: on ",
+    ];
     let mut text = input.to_owned();
     for prefix in prefixes {
         let mut out = String::new();
@@ -462,12 +466,12 @@ fn normalizer_self_test_removes_token_shaped_material() {
     assert!(!normalized.contains(token));
     assert!(!has_token_shaped_text(&normalized));
     let listener = normalize(
-        "Listening on 192.168.100.100:7441 (only admitted machines can connect)\nListener: on [fd00::1]:7441 (auto)",
+        "Listening for cluster nodes on 192.168.100.100:7441 (reachable from your LAN)\nListener: on [fd00::1]:7441 (auto)",
         root,
     );
     assert_eq!(
         listener,
-        "Listening on <LISTEN_ADDR> (only admitted machines can connect)\nListener: on <LISTEN_ADDR> (auto)"
+        "Listening for cluster nodes on <LISTEN_ADDR> (reachable from your LAN)\nListener: on <LISTEN_ADDR> (auto)"
     );
 }
 
@@ -480,6 +484,126 @@ fn cluster_cli_output_matches_goldens() {
     golden_invite_join_cases(&scratch);
     golden_revoke_cancel_case(&scratch);
     golden_remaining_verb_errors(&scratch);
+}
+
+#[test]
+fn cluster_help_output_is_routed_and_discloses_listener_controls() {
+    let scratch = Scratch::new();
+    let cases = [
+        (
+            &["cluster", "--help"][..],
+            "usage: remuda cluster <command>\n  init\n    creates identity; opens listener for cluster nodes on private LAN port 7441 by default\n    --no-listen skips opening it; listen --off stops it; listen --bind IP[:PORT] limits its address\n  invite\n  join\n  nodes\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n",
+        ),
+        (
+            &["cluster", "init", "--help"][..],
+            "usage: remuda cluster init [--no-listen | --new-identity [--yes]]\nCreates this node's identity and opens a listener for cluster nodes on a private LAN address (port 7441) by default.\nUse --no-listen to skip opening a port; run `remuda cluster listen --off` to stop it later; use `remuda cluster listen --bind IP[:PORT]` to limit the address (127.0.0.1:7441 for local-only).\nexample: remuda cluster init --no-listen\n",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (args, expected_stdout) in cases {
+        let output = scratch.run(args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() || stdout != expected_stdout || !stderr.is_empty() {
+            failures.push(format!(
+                "{args:?}: exit={:?}\nexpected stdout: {expected_stdout:?}\nstdout: {stdout}\nstderr: {stderr}",
+                output.status.code()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn cluster_init_discloses_listener_before_it_binds() {
+    use remuda_native::cluster::listener_config::{self, ListenerBind, ListenerConfig};
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = Scratch::new();
+    let _daemon = start_daemon(&scratch);
+    let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port");
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    let cluster_dir = scratch.root.join("state/remuda/cluster");
+    fs::create_dir_all(&cluster_dir).unwrap();
+    fs::set_permissions(&cluster_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    listener_config::write_at(
+        &cluster_dir,
+        &ListenerConfig {
+            enabled: false,
+            bind: ListenerBind::Explicit(address),
+            allow_public: false,
+        },
+    )
+    .unwrap();
+    assert!(!cluster_dir.join("identity.key").exists());
+
+    let mut child = scratch
+        .command(&["cluster", "init"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start init command");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout pipe"));
+    let mut first_line = String::new();
+    stdout.read_line(&mut first_line).expect("read init notice");
+    assert_eq!(
+        first_line.trim_end(),
+        "Starting the listener for cluster nodes (port 7441 by default). Peers can reach the port, but an unadmitted peer cannot join without a valid invitation; admitted nodes authenticate with their registered key. To skip opening a port, use remuda cluster init --no-listen; to stop it later, run remuda cluster listen --off; to limit its address, run remuda cluster listen --bind IP[:PORT] (127.0.0.1:7441 for local-only)."
+    );
+    assert!(
+        TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err(),
+        "listener bound before the disclosure was printed"
+    );
+    let mut remaining_stdout = String::new();
+    stdout
+        .read_to_string(&mut remaining_stdout)
+        .expect("read remaining init output");
+    let output = child.wait_with_output().expect("wait for init command");
+    assert!(
+        output.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(remaining_stdout.contains(&format!(
+        "Listening for cluster nodes on {address} (loopback only)"
+    )));
+    assert!(remaining_stdout.contains(
+        "Peers can reach the port, but an unadmitted peer cannot join without a valid invitation; admitted nodes authenticate with their registered key."
+    ));
+    assert!(remaining_stdout.contains("remuda cluster init --no-listen"));
+    assert!(remaining_stdout.contains("remuda cluster listen --off"));
+    assert!(remaining_stdout.contains("remuda cluster listen --bind IP[:PORT]"));
+    assert!(remaining_stdout.contains("127.0.0.1:7441` for local-only"));
+    assert!(remaining_stdout.contains("Next: run `remuda cluster invite` here"));
+    assert!(remaining_stdout.contains("`remuda cluster join ...` command on the other node."));
+    let mut init_stdout = first_line.into_bytes();
+    init_stdout.extend_from_slice(remaining_stdout.as_bytes());
+    golden(
+        "init_listener",
+        &Output {
+            status: output.status,
+            stdout: init_stdout,
+            stderr: output.stderr,
+        },
+        &scratch.root,
+    );
+}
+
+#[test]
+fn already_initialized_no_listen_does_not_say_listener_is_starting() {
+    let scratch = Scratch::new();
+    let _daemon = start_daemon(&scratch);
+    let first = scratch.run(&["cluster", "init", "--no-listen"]);
+    assert!(first.status.success(), "init failed: {first:?}");
+    let rerun = scratch.run(&["cluster", "init", "--no-listen"]);
+    let stdout = String::from_utf8_lossy(&rerun.stdout);
+    assert!(rerun.status.success(), "init rerun failed: {rerun:?}");
+    assert!(stdout.contains("Already initialized"), "{stdout}");
+    assert!(
+        !stdout.contains("Starting the cluster listener"),
+        "no-listen rerun does not start a listener: {stdout}"
+    );
 }
 
 #[test]

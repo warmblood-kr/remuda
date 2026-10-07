@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-02
+
+- `remuda cluster init` warns when the cluster directory is missing but a saved fingerprint shows this machine had an identity before. The new identity does not restore peers; ask an admitted machine for a new invite and join again.
+
 ## 2026-10-01
 
 - `reply:prompt_line` accepts an optional `preface`: text shown above the prompt on stderr, each line indented by two spaces and untagged, at most 32 lines of 256 characters (over a limit is an error). The label is unchanged: one line, cut at 256 characters. See `docs/deferred-reply.md`.

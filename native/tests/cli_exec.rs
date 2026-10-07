@@ -3,15 +3,27 @@
 //! chunk and discard the declaration. #98 item 3.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "daemon_support/autostart_guard.rs"]
+mod autostart_daemon_guard;
+use autostart_daemon_guard::AutostartDaemonGuard;
+
 static NEXT_STDIN_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+fn guarded_temp_dir(tag: &str) -> (PathBuf, AutostartDaemonGuard) {
+    let dir = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
+    let guard = AutostartDaemonGuard::new(&dir);
+    let _ = fs::remove_dir_all(&dir);
+    (dir, guard)
+}
 
 #[test]
 fn cli_exec_activates_a_lifecycle_mod() {
     let dir = std::env::temp_dir().join(format!("rcx-{}", std::process::id()));
+    let _daemon_guard = AutostartDaemonGuard::new(&dir);
     let _ = fs::remove_dir_all(&dir);
     let mod_dir = dir.join("data/remuda/mods/sample");
     fs::create_dir_all(mod_dir.join("packages/sample")).unwrap();
@@ -61,8 +73,7 @@ fn cli_exec_activates_a_lifecycle_mod() {
 fn cli_exec_waits_for_lifecycle_readiness_and_reports_failures() {
     use std::time::{Duration, Instant};
 
-    let dir = std::env::temp_dir().join(format!("rc-ready-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
+    let (dir, _daemon_guard) = guarded_temp_dir("rc-ready");
     let write_mod = |name: &str, source: &str| {
         let mod_dir = dir.join(format!("data/remuda/mods/{name}"));
         fs::create_dir_all(mod_dir.join(format!("packages/{name}"))).unwrap();
@@ -172,6 +183,7 @@ fn cli_exec_waits_for_lifecycle_readiness_and_reports_failures() {
 #[test]
 fn cli_exec_reports_timeout_declaration_errors_cleanly() {
     let dir = std::env::temp_dir().join(format!("rc-ready-timeout-{}", std::process::id()));
+    let _daemon_guard = AutostartDaemonGuard::new(&dir);
     let _ = fs::remove_dir_all(&dir);
     for (name, fields) in [
         (
@@ -242,6 +254,7 @@ fn cli_exec_reports_timeout_declaration_errors_cleanly() {
 #[test]
 fn cli_exec_error_names_the_wrapper_not_the_mod_entry() {
     let dir = std::env::temp_dir().join(format!("rcy-{}", std::process::id()));
+    let _daemon_guard = AutostartDaemonGuard::new(&dir);
     let _ = fs::remove_dir_all(&dir);
     let mod_dir = dir.join("data/remuda/mods/broken");
     fs::create_dir_all(mod_dir.join("packages/broken")).unwrap();
@@ -294,6 +307,7 @@ fn cli_exec_error_names_the_wrapper_not_the_mod_entry() {
 #[test]
 fn cli_exec_fails_when_a_start_hook_errors() {
     let dir = std::env::temp_dir().join(format!("rcz-{}", std::process::id()));
+    let _daemon_guard = AutostartDaemonGuard::new(&dir);
     let _ = fs::remove_dir_all(&dir);
     let mod_dir = dir.join("data/remuda/mods/hookbroken");
     fs::create_dir_all(mod_dir.join("packages/hookbroken")).unwrap();
@@ -338,6 +352,7 @@ fn cli_exec_fails_when_a_start_hook_errors() {
 #[test]
 fn typed_failures_print_only_the_message_and_use_the_requested_exit_code() {
     let dir = std::env::temp_dir().join(format!("rc-typed-failure-{}", std::process::id()));
+    let _daemon_guard = AutostartDaemonGuard::new(&dir);
     let _ = fs::remove_dir_all(&dir);
     let mod_dir = dir.join("data/remuda/mods/sample");
     fs::create_dir_all(mod_dir.join("packages/sample")).unwrap();
@@ -421,12 +436,13 @@ fn stdin_cli(dir: &Path, args: &[&str]) -> Command {
     command
 }
 
-fn setup_stdin_fixture() -> std::path::PathBuf {
+fn setup_stdin_fixture() -> (std::path::PathBuf, AutostartDaemonGuard) {
     // These tests run in parallel in the same integration-test process. Give
     // each fixture its own runtime directory so one test cannot remove the
     // other's loaded mod or daemon data.
     let fixture_id = NEXT_STDIN_FIXTURE.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("rc-stdin-{}-{fixture_id}", std::process::id()));
+    let daemon_guard = AutostartDaemonGuard::new(&dir);
     let _ = fs::remove_dir_all(&dir);
     let mod_dir = dir.join("data/remuda/mods/sample");
     fs::create_dir_all(mod_dir.join("packages/sample")).unwrap();
@@ -460,12 +476,7 @@ fn setup_stdin_fixture() -> std::path::PathBuf {
         .output()
         .expect("load mod");
     assert!(loaded.status.success(), "mod load failed: {loaded:?}");
-    dir
-}
-
-fn cleanup_stdin_fixture(dir: &Path) {
-    let _ = stdin_cli(dir, &["stop", "-f"]).output();
-    let _ = fs::remove_dir_all(dir);
+    (dir, daemon_guard)
 }
 
 #[test]
@@ -473,7 +484,7 @@ fn extension_commands_receive_stdin_with_dash_and_enforce_limit() {
     use std::io::Write;
 
     const MAX_STDIN: usize = 1024 * 1024;
-    let dir = setup_stdin_fixture();
+    let (dir, _daemon_guard) = setup_stdin_fixture();
 
     let payload = b"message from pipe\nwith \"quotes\" and backslash \\";
     let mut command = stdin_cli(&dir, &["sample", "-"])
@@ -516,15 +527,13 @@ fn extension_commands_receive_stdin_with_dash_and_enforce_limit() {
         String::from_utf8_lossy(&output.stderr).contains("stdin exceeds 1 MiB limit"),
         "unexpected oversized stdin error: {output:?}"
     );
-
-    cleanup_stdin_fixture(&dir);
 }
 
 #[test]
 fn extension_commands_accept_binary_stdin_only_when_requested() {
     use std::io::Write;
 
-    let dir = setup_stdin_fixture();
+    let (dir, _daemon_guard) = setup_stdin_fixture();
     let bytes = [0, 0xff, b'A'];
     let mut command = stdin_cli(&dir, &["--stdin", "sample", "bytes"])
         .stdin(std::process::Stdio::piped())
@@ -566,12 +575,11 @@ fn extension_commands_accept_binary_stdin_only_when_requested() {
     assert!(status.success(), "no-stdin extension failed: {status:?}");
     let output = command.wait_with_output().expect("no-stdin command result");
     assert_eq!(output.stdout, b"<nil>\n");
-    cleanup_stdin_fixture(&dir);
 }
 
 #[test]
 fn extension_command_rejects_trailing_stdin_flag_with_usage_hint() {
-    let dir = setup_stdin_fixture();
+    let (dir, _daemon_guard) = setup_stdin_fixture();
     let output = stdin_cli(&dir, &["sample", "--stdin"])
         .output()
         .expect("run extension command with misplaced stdin flag");
@@ -585,12 +593,11 @@ fn extension_command_rejects_trailing_stdin_flag_with_usage_hint() {
             && stderr.contains("put --stdin before the mod command"),
         "misplaced --stdin should show a usage hint: {output:?}"
     );
-    cleanup_stdin_fixture(&dir);
 }
 
 #[test]
 fn extension_command_separator_passes_stdin_flag_as_a_literal_argument() {
-    let dir = setup_stdin_fixture();
+    let (dir, _daemon_guard) = setup_stdin_fixture();
     let output = stdin_cli(&dir, &["sample", "y", "--", "--stdin"])
         .output()
         .expect("run extension command with literal stdin flag");
@@ -599,27 +606,29 @@ fn extension_command_separator_passes_stdin_flag_as_a_literal_argument() {
         "literal --stdin failed: {output:?}"
     );
     assert_eq!(output.stdout, b"y|--|--stdin|no-stdin\n");
-    cleanup_stdin_fixture(&dir);
 }
 
 #[test]
 fn extension_command_separator_passes_dash_as_a_literal_argument() {
-    let dir = setup_stdin_fixture();
+    let (dir, _daemon_guard) = setup_stdin_fixture();
     let output = stdin_cli(&dir, &["sample", "y", "--", "-"])
         .output()
         .expect("run extension command with literal dash argument");
     assert!(output.status.success(), "literal dash failed: {output:?}");
     assert_eq!(output.stdout, b"y|--|-|no-stdin\n");
-    cleanup_stdin_fixture(&dir);
 }
 
 /// #394: a fresh isolated home whose FIRST command is the mod subcommand under
 /// test. Dropping it stops its private daemon, also when an assert panics.
-struct FreshHome(std::path::PathBuf);
+struct FreshHome {
+    dir: std::path::PathBuf,
+    _daemon_guard: AutostartDaemonGuard,
+}
 
 impl FreshHome {
     fn new(label: &str, manifest_extra: &str, entry: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("rc-first-{label}-{}", std::process::id()));
+        let daemon_guard = AutostartDaemonGuard::new(&dir);
         let _ = fs::remove_dir_all(&dir);
         let mod_dir = dir.join("data/remuda/mods/sample");
         fs::create_dir_all(mod_dir.join("packages/sample")).unwrap();
@@ -631,21 +640,17 @@ impl FreshHome {
         )
         .unwrap();
         fs::write(mod_dir.join("packages/sample/init.lua"), entry).unwrap();
-        Self(dir)
+        Self {
+            dir,
+            _daemon_guard: daemon_guard,
+        }
     }
 
     fn remuda(&self, args: &[&str]) -> Output {
-        stdin_cli(&self.0, args)
+        stdin_cli(&self.dir, args)
             .env("REMUDA_NO_UPDATE_CHECK", "1")
             .output()
             .expect("run remuda")
-    }
-}
-
-impl Drop for FreshHome {
-    fn drop(&mut self) {
-        let _ = self.remuda(&["stop", "-f"]);
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

@@ -16,6 +16,37 @@ notices, set `REMUDA_SUPPRESS_DEPRECATIONS=1` in the daemon's environment when
 the daemon starts; setting it only on a CLI process cannot change the
 environment of a running daemon.
 
+On Windows, everything the session's program starts after it is put in its
+job ends when the session is reaped or closed, or when the daemon stops. A
+session that cannot be put in a job is not started. The one gap is the instant
+between program creation and job assignment; issue #614 tracks closing it with
+atomic job-list process creation (`CreateProcessW` with
+`PROC_THREAD_ATTRIBUTE_JOB_LIST`). A process that must outlive the session has to start outside remuda. While
+listed, processes in the job are `session` callers for `remuda.caller()`,
+including ones whose parent has exited.
+
+## Screen capture
+
+`remuda.capture(name)` returns the current screen as plain text.
+`remuda.capture_styled(name)` returns screen rows as arrays of `{text, dim}`
+spans, plus a `cursor` table with `row`, `col`, and `visible` fields:
+
+```lua
+local screen = remuda.capture_styled("work")
+local cursor = screen.cursor
+-- row and col are 1-based; visible says whether the terminal displays the cursor.
+print(cursor.row, cursor.col, cursor.visible)
+for _, row in ipairs(screen.rows) do
+  for _, span in ipairs(row) do
+    print(span.text, span.dim)
+  end
+end
+```
+
+The `dim` field preserves terminal dim styling, which can identify placeholder
+or suggestion text. Cursor position and styled spans are observations only;
+mods interpret them according to the prompt or terminal application they know.
+
 ## Generate the reference
 
 ```sh
@@ -40,8 +71,15 @@ entry, lifecycle API, source, and installation status. `remuda mod info NAME`
 shows one manifest. Both use the same RST/Markdown/JSON format selector.
 
 `remuda mod install OWNER/REPO` accepts a GitHub shorthand or HTTPS URL,
-validates the repository's `extension.toml`, and atomically stores its Lua
-package under `${XDG_DATA_HOME:-$HOME/.local/share}/remuda/mods`. Add
+validates the repository's `extension.toml`, and atomically stores its package
+under `${XDG_DATA_HOME:-$HOME/.local/share}/remuda/mods`. The package contains
+Lua files and may include inert regular files listed in `assets`, an array of
+checkout-relative paths inside the package root (for example,
+`assets = ["packages/butler/matrix_relay.py"]`). Assets must not be symlinks
+or directories and are limited to 64 assets, 1 MiB each and 8 MiB in total. An
+asset with a setuid, setgid or sticky mode bit is rejected. Remuda copies their
+bytes and file mode (group and other write bits are cleared) but never loads or
+executes them. Other non-Lua package files remain rejected. Add
 `--ref REF` to select a branch, tag, or commit. Installation never changes a
 live Lua image by default. Add `--reload` to ask the running daemon to replace
 the installed lifecycle-managed mod in its existing Lua image. `remuda mod
@@ -55,7 +93,9 @@ When a manifest declares `command = "NAME"`, `remuda NAME` loads that
 mod explicitly and opens the regular Remuda screen when attached to a terminal.
 Use `remuda NAME --headless` to load it without opening the screen. Further
 words (`remuda NAME ...`) are dispatched to the already-loaded mod's Lua
-command handler; the core does not embed a mod-specific parser.
+command handler; the core does not embed a mod-specific parser. A mod may hand
+its declaration to `remuda.cli.parse`; the handler still receives the raw word
+list.
 
 `remuda mod update NAME` and `remuda mod update --all` reuse each installed
 mod's recorded GitHub source and ref, validate the new checkout, and replace
@@ -77,11 +117,11 @@ that path is not followed. The parent directory must already exist.
 On success the function returns `true, nil`; on an I/O error it returns
 `nil, error`. By default, new files use mode `0644` filtered through the
 process umask, and existing regular-file permissions are preserved. Pass
-`{ private = true }` to create a file with mode `0600` on Unix, including when
-replacing an existing file; the mode is applied at temporary-file creation.
+`{ private = true }` to make the file owner-only (mode `0600` on Unix, an
+owner-only ACL on Windows), including when replacing an existing file; it is
+applied at temporary-file creation.
 The options table accepts only the boolean `private` key; unknown keys or a
-non-boolean value raise a Lua argument error. On Windows, `private` is ignored
-and the file uses the normal inherited ACL.
+non-boolean value raise a Lua argument error.
 This word does not restrict paths: the Lua runtime already provides trusted
 scripts with `io.open` and `os.rename`.
 On Windows 10 version 1903 and later those C-library words (`os.getenv`,
@@ -141,8 +181,8 @@ A manifest can declare the mods it needs: `requires = { butler = ">=0.4, <0.5" }
 
 An extension repository declares `api = "remuda-lua-v1"` in its
 `extension.toml`. `remuda mod test PATH` is the deterministic local check: it
-validates the manifest, package paths, symlinks, Lua-only contents, and Lua
-syntax without installing or mutating a daemon. Integration tests should run
+validates the manifest, package paths, symlinks, Lua contents and syntax, and
+declared assets without installing or mutating a daemon. Integration tests should run
 the same mod in an isolated `XDG_DATA_HOME`, then use the real Remuda daemon
 and host bindings; unit tests can use fixture implementations of the small
 `remuda` API surface. Keep the API string pinned until a deliberate host
@@ -230,9 +270,18 @@ mod's own no-argument command) on an already-active mod does nothing, so
 opening a mod's screen does not restart it. The mod owns its declared hooks,
 tools and schedules, and also every `remuda.on` hook and
 `remuda.extension_command` registered while its own code runs (`initialize`,
-`start`, or one of its declared hooks, tools or schedules). `hook_list` shows
-that `owner`. A mod may also create new top-level `remuda.*` fields (for
-example `function remuda._sample_notify(...) end` in `start`); they are its own.
+`commands`, `start`, or one of its declared hooks, tools or schedules).
+`hook_list` shows the owner of event hooks.
+
+An optional `commands(state)` hook lets a lifecycle mod register its CLI
+handlers without launching its background work. When Remuda loads a mod to
+serve one of its subcommands, it runs `commands` and skips `start`; running
+`remuda MOD` with no subcommand runs `commands` and then `start` once. A later
+bare invocation starts a mod that was previously loaded only for commands.
+Mods without `commands` keep the old behavior: loading their subcommand runs
+`start` as before. Keep `commands` limited to registration; put launch work in
+`start`. A mod may also create new top-level `remuda.*` fields (for example
+`function remuda._sample_notify(...) end` in `start`); they are its own.
 Assigning a field core defines, or one another mod owns, is an error. A field
 left by a legacy script is taken over only in the mod's own namespace,
 `remuda._NAME_*` or `remuda.NAME_*`; any other existing field is an error. Reload replaces everything the mod owns,

@@ -7,6 +7,9 @@ A terminal orchestrator with a programmable layer. You keep a herd of agent
 sessions running, attach to one and ride it, swap to another. The herd outlives
 any single ride.
 
+New here? [Getting started](getting-started.md) takes you from install to a
+Butler you can reach from your phone, on three machines.
+
 ### Cascading spawn
 
 ![A terminal session tree: butler has spawned a lead session, which has in
