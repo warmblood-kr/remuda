@@ -246,7 +246,9 @@ impl Registry {
         drop(sessions);
         dead.into_iter()
             .map(|(name, id, instance_id, reason, session)| {
-                let _ = session.terminate_for_reap();
+                if let Err(error) = session.terminate_for_reap() {
+                    eprintln!("remuda core: failed to terminate reaped session {name}: {error}");
+                }
                 (name, id, instance_id, reason, session.exit_info())
             })
             .collect()
