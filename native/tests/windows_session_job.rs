@@ -206,6 +206,59 @@ fn what_a_session_started_ends_when_the_session_is_closed() {
     });
 }
 
+/// Reaping ends the job even while a blocked Sync handler still owns an Arc
+/// to the session. This is Windows CI coverage; the target is not available
+/// for local compilation on this machine.
+#[test]
+fn reaping_ends_the_job_while_sync_retains_the_session() {
+    let scratch = Scratch::new("reap-held");
+    let _daemon = spawn::Daemon::spawn(&scratch.0);
+    let out = scratch.0.join("kind.txt");
+    let session = session_with_a_lingering_process(&scratch.0, &out, 4, 12);
+    start(
+        &scratch.0,
+        format!(
+            "return remuda.new('linger', {{ 'cmd.exe', '/c', {} }})",
+            lua(&session)
+        ),
+    );
+    let began = Instant::now();
+    while !scratch.0.join("started.txt").exists() {
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "child never started"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let socket = daemon::socket_path_in(&scratch.0, "s");
+    let sync = std::thread::spawn(move || {
+        client::request(
+            &socket,
+            &Request::Sync {
+                name: "linger".into(),
+                instance_id: None,
+                since: u64::MAX,
+                timeout_ms: 15_000,
+            },
+        )
+    });
+    std::thread::sleep(Duration::from_millis(200));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut after = lingering(&scratch.0);
+    while !after.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        after = lingering(&scratch.0);
+    }
+    fact(format_args!(
+        "lingering processes after reap with Sync retaining session: {after:?}"
+    ));
+    assert!(after.is_empty(), "job survived reaping: {after:?}");
+    assert!(!sync.is_finished(), "Sync did not retain the session");
+    let _ = sync.join();
+}
+
 #[test]
 fn what_a_session_started_ends_when_the_daemon_stops() {
     the_lingering_process_ends_with("daemon", 120, |_, daemon| drop(daemon));

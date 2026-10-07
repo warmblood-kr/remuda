@@ -478,28 +478,23 @@ pub struct PtyAgent {
     output_version: Arc<AtomicU64>,
     exit_info: Option<ExitInfo>,
     master: Option<Box<dyn MasterPty + Send>>,
-    /// Windows: what makes a process this session's own after its parent
-    /// has exited. Held for as long as the session is listed.
-    #[cfg(windows)]
-    job: crate::session_job::SessionJob,
+    end_job: Box<dyn Fn() -> Result<()> + Send + Sync>,
+    job_ended: bool,
 }
 
-/// Windows: the session's job, holding the child and what it has already
-/// started. If that cannot be done the child is killed and the session is
-/// refused: its orphans could not be told from outside processes.
+/// Windows: the session's job, holding the child. If the child cannot be
+/// assigned, it is killed and the session is refused.
 #[cfg(windows)]
 fn session_job_for(
     child: &mut (dyn Child + Send + Sync),
 ) -> Result<crate::session_job::SessionJob> {
     use crate::session_job::{set_up, SessionJob};
     let handle = child.as_raw_handle();
-    let pid = child.process_id();
     let assign = |job: &SessionJob| {
-        let (Some(handle), Some(pid)) = (handle, pid) else {
+        let Some(handle) = handle else {
             return Err(std::io::Error::other("the child has no process handle"));
         };
-        job.assign(handle)?;
-        job.sweep(pid, handle)
+        job.assign(handle)
     };
     let kill = || {
         let _ = child.kill();
@@ -522,7 +517,12 @@ impl PtyAgent {
         #[cfg_attr(not(windows), allow(unused_mut))]
         let mut child = pair.slave.spawn_command(command).map_err(io)?;
         #[cfg(windows)]
-        let job = session_job_for(child.as_mut())?;
+        let end_job: Box<dyn Fn() -> Result<()> + Send + Sync> = {
+            let job = session_job_for(child.as_mut())?;
+            Box::new(move || job.end().map_err(io))
+        };
+        #[cfg(not(windows))]
+        let end_job: Box<dyn Fn() -> Result<()> + Send + Sync> = Box::new(|| Ok(()));
         // No child_guard here on purpose — this child already dies with the
         // daemon by kernel accident (the master fd closes on any daemon
         // exit, SIGHUP-ing this session leader). See child_guard.rs and
@@ -573,8 +573,8 @@ impl PtyAgent {
             output_version,
             exit_info: None,
             master: Some(pair.master),
-            #[cfg(windows)]
-            job,
+            end_job,
+            job_ended: false,
         })
     }
 }
@@ -796,6 +796,17 @@ pub(crate) fn styled_cells(screen: &vt100::Screen, size: Size) -> Vec<Vec<Styled
         .collect()
 }
 
+impl PtyAgent {
+    fn end_job(&mut self) -> Result<()> {
+        if self.job_ended {
+            return Ok(());
+        }
+        (self.end_job)()?;
+        self.job_ended = true;
+        Ok(())
+    }
+}
+
 impl AgentProcess for PtyAgent {
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         if !self.is_alive() {
@@ -962,7 +973,7 @@ impl AgentProcess for PtyAgent {
     /// therefore explicit here — an already-gone process is nothing to signal.
     fn terminate(&mut self) -> Result<()> {
         if !self.is_alive() {
-            return Ok(());
+            return self.end_job();
         }
         self.child.kill().map_err(io)?;
         let status = self.child.wait().map_err(io)?;
@@ -971,7 +982,7 @@ impl AgentProcess for PtyAgent {
         // ClosePseudoConsole runs. Close the master here so output monitors
         // can flush before the caller waits for their final notification.
         self.master.take();
-        Ok(())
+        self.end_job()
     }
 
     fn resize(&mut self, size: Size) -> Result<()> {
@@ -1810,6 +1821,25 @@ fn capture_snapshot(
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_ends_its_job_once_even_when_the_session_is_already_dead() {
+        let mut command = CommandBuilder::new("printf");
+        command.arg("done");
+        let mut agent = PtyAgent::spawn(command, Size::new(80, 24)).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ended = Arc::clone(&calls);
+        agent.end_job = Box::new(move || {
+            ended.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        agent.terminate().unwrap();
+        agent.terminate().unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     #[cfg(unix)]
     #[test]

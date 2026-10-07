@@ -2,13 +2,13 @@
 
 ## Unreleased
 
-- Windows: everything a session started now ends with the session or the
-  daemon, including a background server an agent started. A session ends when
-  its own program exits, when it is closed, or when the daemon stops. A process
-  that must outlive the session has to be started outside remuda. Each session
-  is held in a Windows job object; a session that cannot be put in one is not
-  started. While a session is listed, every process it started is a `session`
-  caller for `remuda.caller()`, also one whose parent has exited.
+- Windows: everything the session's program starts after it is put in its job
+  ends when the session is reaped or closed, or when the daemon stops. A
+  session that cannot be put in a job is not started. The one gap is the
+  instant between program creation and job assignment; a follow-up issue tracks
+  closing it. A process that must outlive the session has to start outside
+  remuda. While listed, processes in the job are `session` callers for
+  `remuda.caller()`, including ones whose parent has exited.
 
 - Windows: a session whose program is a `.cmd` or `.bat` file (for example an
   npm-installed agent) now refuses an argument that cmd.exe would act on

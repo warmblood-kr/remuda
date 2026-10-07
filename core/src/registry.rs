@@ -246,6 +246,7 @@ impl Registry {
         drop(sessions);
         dead.into_iter()
             .map(|(name, id, instance_id, reason, session)| {
+                let _ = session.terminate_for_reap();
                 (name, id, instance_id, reason, session.exit_info())
             })
             .collect()

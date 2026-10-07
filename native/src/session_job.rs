@@ -1,19 +1,8 @@
-//! A session's processes on Windows, held together by a job object. A parent
-//! PID stops naming a session once the parent has exited; a job does not: a
-//! process a member starts is in the job, stays in it when its parent exits,
-//! and cannot leave it (the job sets no breakaway limit). The job is closed
-//! with its session, and that ends every process still in it. The decisions
-//! are plain functions, tested on every platform; the Windows calls are below.
+//! Windows job objects keep assigned processes together and end them when the
+//! session closes. The platform-independent setup decisions are tested on all
+//! platforms; the Windows calls are below.
 
 use std::io;
-
-/// One row of the system's process list. Times are Windows file times.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Listed {
-    pub pid: u32,
-    pub parent: u32,
-    pub created: u64,
-}
 
 /// The one line for a session that could not be put in its job. Such a
 /// session is not started: without the job its orphans could not be told
@@ -55,24 +44,6 @@ pub fn set_up<J>(
     attempt
 }
 
-/// The processes `root` may have started before it was in the job: its
-/// children that are not older than it, and theirs. A listed child that is
-/// older than its parent has a reused parent PID and is someone else's.
-pub fn early_descendants(list: &[Listed], root: u32, root_created: u64) -> Vec<u32> {
-    let mut found = Vec::new();
-    let mut parents = vec![(root, root_created)];
-    while let Some((parent, parent_created)) = parents.pop() {
-        for row in list {
-            let is_child = row.parent == parent && row.pid != parent;
-            if is_child && row.created >= parent_created && !found.contains(&row.pid) {
-                found.push(row.pid);
-                parents.push((row.pid, row.created));
-            }
-        }
-    }
-    found
-}
-
 /// Whether the process the daemon opened is the client that connected: it
 /// existed before the connection was accepted (else its PID was reused since)
 /// and the pipe still names the same PID.
@@ -95,17 +66,16 @@ pub use self::windows::SessionJob;
 
 #[cfg(windows)]
 mod windows {
-    use super::{early_descendants, Listed};
     use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
-        JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
-        PROCESS_TERMINATE,
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     /// When the process behind `process` was created, as a file time.
@@ -152,7 +122,10 @@ mod windows {
     /// One session's job. Its one limit is kill-on-close: when this handle,
     /// the only one, closes, every process in the job ends. No breakaway is
     /// allowed (neither JOB_OBJECT_LIMIT_BREAKAWAY_OK nor the silent form).
-    pub struct SessionJob(HANDLE);
+    pub struct SessionJob {
+        handle: HANDLE,
+        ended: AtomicBool,
+    }
 
     // SAFETY: a job handle names a kernel object; the calls made on it here
     // are safe from any thread, and the handle is closed once, in Drop.
@@ -168,14 +141,17 @@ mod windows {
                 return Err(io::Error::last_os_error());
             }
             // From here Drop closes the handle, on the error path too.
-            let job = Self(handle);
+            let job = Self {
+                handle,
+                ended: AtomicBool::new(false),
+            };
             let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             // SAFETY: `limits` is the structure this information class takes,
             // and the pointer and length are valid for the call.
             let set = unsafe {
                 SetInformationJobObject(
-                    job.0,
+                    job.handle,
                     JobObjectExtendedLimitInformation,
                     (&raw const limits).cast(),
                     std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
@@ -189,7 +165,7 @@ mod windows {
 
         pub(crate) fn assign(&self, process: HANDLE) -> io::Result<()> {
             // SAFETY: both handles are live for the call.
-            if unsafe { AssignProcessToJobObject(self.0, process) } == 0 {
+            if unsafe { AssignProcessToJobObject(self.handle, process) } == 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -198,7 +174,7 @@ mod windows {
         fn holds(&self, process: HANDLE) -> io::Result<bool> {
             let mut inside = 0;
             // SAFETY: both handles are live and `inside` is a valid BOOL.
-            if unsafe { IsProcessInJob(process, self.0, &mut inside) } == 0 {
+            if unsafe { IsProcessInJob(process, self.handle, &mut inside) } == 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(inside != 0)
@@ -210,39 +186,16 @@ mod windows {
             Opened::query(pid).is_ok_and(|process| self.holds(process.0).unwrap_or(false))
         }
 
-        /// Puts what `child` started before it was assigned into the job too.
-        /// One level is certain; a deeper process whose parent has already
-        /// exited is not found (a suspended start would close that).
-        pub(crate) fn sweep(&self, child_pid: u32, child: HANDLE) -> io::Result<()> {
-            let root_created = created(child)?;
-            let parents = crate::process_ancestry::process_parents()?;
-            // A process that cannot be opened is another user's, not a child
-            // this session started a moment ago.
-            let list: Vec<Listed> = parents
-                .iter()
-                .filter_map(|(&pid, &parent)| {
-                    let created = Opened::query(pid).ok()?.created().ok()?;
-                    Some(Listed {
-                        pid,
-                        parent,
-                        created,
-                    })
-                })
-                .collect();
-            let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE;
-            for pid in early_descendants(&list, child_pid, root_created) {
-                // Gone already, or its PID now names another process: skip.
-                let Ok(process) = Opened::open(pid, access) else {
-                    continue;
-                };
-                let listed = list
-                    .iter()
-                    .find(|row| row.pid == pid)
-                    .map(|row| row.created);
-                if process.created().ok() != listed || self.holds(process.0)? {
-                    continue;
-                }
-                self.assign(process.0)?;
+        /// Ends every process in the job. Repeated calls succeed without
+        /// sending another termination request.
+        pub fn end(&self) -> io::Result<()> {
+            if self.ended.swap(true, Ordering::AcqRel) {
+                return Ok(());
+            }
+            // SAFETY: this is the live job handle and zero requests termination.
+            if unsafe { TerminateJobObject(self.handle, 0) } == 0 {
+                self.ended.store(false, Ordering::Release);
+                return Err(io::Error::last_os_error());
             }
             Ok(())
         }
@@ -251,7 +204,7 @@ mod windows {
     impl Drop for SessionJob {
         fn drop(&mut self) {
             // SAFETY: the handle came from CreateJobObjectW and is closed once.
-            unsafe { CloseHandle(self.0) };
+            unsafe { CloseHandle(self.handle) };
         }
     }
 }
@@ -317,45 +270,6 @@ mod tests {
         let killed = Cell::new(false);
         assert_eq!(set_up(Ok(7), |_| Ok(()), || killed.set(true)), Ok(7));
         assert!(!killed.get());
-    }
-
-    #[test]
-    fn early_descendants_are_the_younger_children_and_theirs() {
-        let row = |pid, parent, created| Listed {
-            pid,
-            parent,
-            created,
-        };
-        let list = [
-            row(10, 1, 100),  // the session child itself
-            row(11, 10, 105), // its child
-            row(12, 11, 110), // its grandchild
-            row(13, 10, 100), // a child from the same clock tick
-            row(20, 10, 50),  // older than its "parent": a reused PID
-            row(21, 20, 120), // so its children are not ours either
-            row(30, 2, 130),  // unrelated
-        ];
-        let mut found = early_descendants(&list, 10, 100);
-        found.sort_unstable();
-        assert_eq!(found, [11, 12, 13]);
-        assert!(early_descendants(&list, 99, 0).is_empty());
-    }
-
-    #[test]
-    fn early_descendants_end_on_a_parent_cycle() {
-        let list = [
-            Listed {
-                pid: 10,
-                parent: 11,
-                created: 100,
-            },
-            Listed {
-                pid: 11,
-                parent: 10,
-                created: 100,
-            },
-        ];
-        assert_eq!(early_descendants(&list, 10, 100), [11, 10]);
     }
 
     #[test]

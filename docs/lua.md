@@ -16,12 +16,13 @@ notices, set `REMUDA_SUPPRESS_DEPRECATIONS=1` in the daemon's environment when
 the daemon starts; setting it only on a CLI process cannot change the
 environment of a running daemon.
 
-On Windows a session ends when its own program exits (the daemon reaps it),
-when it is closed, or when the daemon stops, and everything the session
-started ends with it, including a background server an agent started. A
-process that must outlive the session has to be started outside remuda. While
-a session is listed, every process it started is a `session` caller for
-`remuda.caller()`, also one whose parent has exited.
+On Windows, everything the session's program starts after it is put in its
+job ends when the session is reaped or closed, or when the daemon stops. A
+session that cannot be put in a job is not started. The one gap is the instant
+between program creation and job assignment; a follow-up issue tracks closing
+it. A process that must outlive the session has to start outside remuda. While
+listed, processes in the job are `session` callers for `remuda.caller()`,
+including ones whose parent has exited.
 
 ## Screen capture
 
