@@ -184,7 +184,15 @@ fn write_locked(dir: &Path, config: &ListenerConfig) -> io::Result<()> {
     })
     .map_err(io::Error::other)?;
     bytes.push(b'\n');
-    super::storage::atomic_write(&path, &bytes)
+    super::storage::atomic_write(&path, &bytes).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot write cluster listener config at {}: {error}",
+                path.display()
+            ),
+        )
+    })
 }
 
 fn remove_locked(dir: &Path) -> io::Result<()> {

@@ -1320,6 +1320,8 @@ fn render_cluster_init_lines(
 fn listener_failure_next_step(reason: &str) -> &'static str {
     if reason.contains("no private LAN address found") {
         "Next: remuda cluster listen --bind IP"
+    } else if reason.contains("cluster identity") && reason.contains("identity.key") {
+        "Next: remuda cluster init, then run the join command again"
     } else {
         "Next: remuda cluster listen"
     }
@@ -1676,10 +1678,38 @@ fn cluster_join_command(
                 Err(_) => {}
             }
         }
+        if registry.authorized_nodes.iter().any(|entry| {
+            entry.node_fp != identity.node_fp
+                && entry.node_fp != invitation.issuer_fingerprint
+                && entry.state == remuda_native::cluster::NodeState::Admitted
+        }) {
+            return fail(
+                "cluster join: this identity already belongs to a different cluster\nNext: run `remuda cluster init --new-identity`, then join with a new invite",
+            );
+        }
     }
-    with_daemon(server, path, |daemon_path| {
-        cluster_join_with_listener(daemon_path, fingerprint, invitation, bind_addr)
-    })
+    match with_prepared_join_identity(|| {
+        with_daemon(server, path, |daemon_path| {
+            cluster_join_with_listener(daemon_path, fingerprint, invitation, bind_addr)
+        })
+    }) {
+        Ok(exit_code) => exit_code,
+        Err(error) => fail(render_join_identity_prepare_error(&error)),
+    }
+}
+
+fn render_join_identity_prepare_error(error: &std::io::Error) -> String {
+    let next = if error.to_string().contains("cluster registry exists but") {
+        "Next: restore the missing identity.key backup before joining"
+    } else {
+        "Next: remuda cluster init, then run the join command again"
+    };
+    format!("cluster join: could not prepare the local identity: {error}\n{next}")
+}
+
+fn with_prepared_join_identity<T>(operation: impl FnOnce() -> T) -> std::io::Result<T> {
+    remuda_native::cluster::ensure_join_identity()?;
+    Ok(operation())
 }
 
 fn cluster_join_with_listener(
@@ -2812,16 +2842,16 @@ mod cluster_cli_tests {
         next_step_join, next_step_listen, next_step_status, parse_addr_default_port,
         parse_cluster_command, remote_control_status_lines, render_cluster_init_lines,
         render_init_listener_lines, render_invite_listener_refusal, render_join_failure,
-        render_join_listener_restore_error, render_join_listener_unexpected_on,
-        revoke_confirmation, write_nodes_table, write_revocation_notice, ClusterCommand,
-        NEW_IDENTITY_WARNING,
+        render_join_listener_restore_error, render_join_listener_start_error,
+        render_join_listener_unexpected_on, revoke_confirmation, write_nodes_table,
+        write_revocation_notice, ClusterCommand, NEW_IDENTITY_WARNING,
     };
     #[cfg(unix)]
     use super::{
         finish_join_listener_start, finish_join_listener_start_with_reporter,
-        restore_join_listener, start_join_listener_with_config, wait_for_join, ExitCode,
-        JoinInterruptHandler, JoinListenerRestoreGuard, JoinListenerStartOutcome, JoinRun,
-        JOIN_INTERRUPTED, JOIN_INTERRUPT_SIGNAL,
+        restore_join_listener, start_join_listener_with_config, wait_for_join,
+        with_prepared_join_identity, ExitCode, JoinInterruptHandler, JoinListenerRestoreGuard,
+        JoinListenerStartOutcome, JoinRun, JOIN_INTERRUPTED, JOIN_INTERRUPT_SIGNAL,
     };
     #[cfg(unix)]
     use remuda_native::cluster::join_line::JoinLine;
@@ -3148,6 +3178,60 @@ mod cluster_cli_tests {
             remuda_native::cluster::listener_config::read().unwrap(),
             Some(snapshot)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_listener_missing_identity_names_path_and_recommends_init() {
+        let _environment = ForegroundListenerLockEnvironment::new();
+        let cluster_dir = _environment.root.join("state/remuda/cluster");
+        std::fs::remove_file(cluster_dir.join("identity.key")).unwrap();
+        let daemon_path = std::path::Path::new("missing.sock");
+        let mut restore_guard = JoinListenerRestoreGuard::new(daemon_path, None);
+        let config = ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit("127.0.0.1:7441".parse().unwrap()),
+            allow_public: false,
+        };
+
+        let start = start_join_listener_with_config(daemon_path, &mut restore_guard, config);
+        let JoinListenerStartOutcome::Started(Err(error)) = start else {
+            panic!("missing identity should prevent listener start");
+        };
+
+        let rendered = render_join_listener_start_error(&error);
+        assert!(rendered.contains("identity.key"), "{rendered}");
+        assert!(rendered.contains("Next: remuda cluster init"), "{rendered}");
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_creates_identity_before_starting_listener_or_network_work() {
+        let _environment = ForegroundListenerLockEnvironment::new();
+        let key_path = _environment.root.join("state/remuda/cluster/identity.key");
+        std::fs::remove_file(&key_path).unwrap();
+        std::fs::remove_file(
+            _environment
+                .root
+                .join("state/remuda/cluster/authorized_nodes.json"),
+        )
+        .unwrap();
+        let mut started = false;
+
+        with_prepared_join_identity(|| {
+            assert!(
+                key_path.is_file(),
+                "listener/network work began before identity"
+            );
+            started = true;
+        })
+        .unwrap();
+
+        assert!(started);
     }
 
     #[cfg(unix)]
