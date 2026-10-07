@@ -1813,6 +1813,24 @@ fn terminal_frame(frame: &str) -> String {
     frame.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
+fn present(prev: Option<&vt100::Screen>, next: &vt100::Screen) -> Vec<u8> {
+    match prev {
+        Some(prev) if prev.size() == next.size() => {
+            let mut output = next.contents_diff(prev);
+            if prev.cursor_position() != next.cursor_position() {
+                let (row, col) = next.cursor_position();
+                output.extend_from_slice(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+            }
+            output
+        }
+        _ => {
+            let mut output = b"\x1b[2J\x1b[H".to_vec();
+            output.extend(next.contents_formatted());
+            output
+        }
+    }
+}
+
 fn age_seconds(now: Duration, since: Duration) -> u64 {
     now.saturating_sub(since).as_secs()
 }
@@ -2220,6 +2238,7 @@ fn run_loop(
             ui.composer_focused = true;
         }
     }
+    let mut previous = None;
     loop {
         if let Ok(current) = list(path) {
             ui.sessions_synced(current, clock.now());
@@ -2259,13 +2278,14 @@ fn run_loop(
         let body = captured.unwrap_or_default();
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let frame = ui.render(cols, rows, &body, clock);
-        crossterm::execute!(
-            io::stdout(),
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-            crossterm::cursor::MoveTo(0, 0)
-        )?;
-        write!(io::stdout(), "{}", terminal_frame(&frame))?;
-        io::stdout().flush()?;
+        let mut next = vt100::Parser::new(rows, cols, 0);
+        next.process(format!("\x1b[H\x1b[2J{}", terminal_frame(&frame)).as_bytes());
+        let output = present(previous.as_ref().map(vt100::Parser::screen), next.screen());
+        if !output.is_empty() {
+            io::stdout().write_all(&output)?;
+            io::stdout().flush()?;
+        }
+        previous = Some(next);
         ui.send_close_pending(path, remote_input, clock.now());
         ui.send_pending(path, clock.now(), remote_input);
         ui.start_pending(clock.now());
@@ -2310,7 +2330,7 @@ fn select_target_with_remote_wait(
 mod tests {
     use super::queue::{QueueEvent, QueueState, MAX_IO_RETRIES};
     use super::{
-        is_attention, remote_state_label, render_badge, select_target_with_remote_wait,
+        is_attention, present, remote_state_label, render_badge, select_target_with_remote_wait,
         terminal_frame, AttentionSignals, Badge, ClusterUi, RemoteInputTransport, RemoteSelection,
         RemoteSource,
     };
@@ -2323,6 +2343,52 @@ mod tests {
     use remuda_core::{SessionSummary, Size};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    fn parsed_frame(frame: &str, cols: u16, rows: u16) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(format!("\x1b[H\x1b[2J{}", terminal_frame(frame)).as_bytes());
+        parser
+    }
+
+    #[test]
+    fn presenter_emits_nothing_for_an_unchanged_frame() {
+        let parser = parsed_frame("hello", 80, 24);
+
+        assert!(present(Some(parser.screen()), parser.screen()).is_empty());
+    }
+
+    #[test]
+    fn presenter_emits_only_the_changed_cell() {
+        let previous = parsed_frame("hello", 80, 24);
+        let next = parsed_frame("hallo", 80, 24);
+        let diff = present(Some(previous.screen()), next.screen());
+
+        assert!(!diff.is_empty());
+        assert!(diff.len() < 20, "unexpectedly large diff: {diff:?}");
+    }
+
+    #[test]
+    fn presenter_diff_round_trips_hangul_wide_cells() {
+        let previous = parsed_frame("hello", 80, 24);
+        let next = parsed_frame("안녕하세요", 80, 24);
+        let mut terminal = vt100::Parser::new(24, 80, 0);
+        terminal.process(&present(None, previous.screen()));
+        terminal.process(&present(Some(previous.screen()), next.screen()));
+
+        assert_eq!(terminal.screen().contents(), next.screen().contents());
+    }
+
+    #[test]
+    fn presenter_forces_full_repaint_after_resize() {
+        let previous = parsed_frame("before", 80, 24);
+        let next = parsed_frame("after", 40, 24);
+        let repaint = present(Some(previous.screen()), next.screen());
+
+        assert!(repaint.starts_with(b"\x1b[2J\x1b[H"));
+        let mut terminal = vt100::Parser::new(24, 40, 0);
+        terminal.process(&repaint);
+        assert_eq!(terminal.screen().contents(), next.screen().contents());
+    }
 
     struct FakeRemoteSource(Mutex<RemoteSnapshot>);
 
