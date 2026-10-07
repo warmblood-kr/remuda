@@ -264,10 +264,14 @@ struct RemoteTui {
 
 impl RemoteTui {
     fn start(node: &Node, target: Option<&str>) -> Self {
+        Self::start_at_size(node, target, 100, 24)
+    }
+
+    fn start_at_size(node: &Node, target: Option<&str>, cols: u16, rows: u16) -> Self {
         let pty = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize {
-                rows: 24,
-                cols: 100,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -416,6 +420,126 @@ fn real_remote_tui_paints_the_selected_remote_session_screen() {
     tui.wait_for("remote live · reachable", Duration::from_secs(10));
     tui.wait_for(&format!("$ {server_label}/proof>"), Duration::from_secs(3));
     tui.wait_for("PR8-MARKER", Duration::from_secs(10));
+}
+
+fn assert_remote_screen_columns(tui: &RemoteTui, cols: u16, server_label: &str) {
+    let mut parser = vt100::Parser::new(24, cols, 0);
+    parser.process(&tui.output.lock().unwrap());
+    let screen_cells = (0..24)
+        .map(|row| {
+            (0..cols)
+                .map(|col| {
+                    parser
+                        .screen()
+                        .cell(row, col)
+                        .map_or(" ", |cell| cell.contents())
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let screen = screen_cells
+        .iter()
+        .map(|row| row.concat())
+        .collect::<Vec<_>>();
+    let column_of = |needle: &str| {
+        screen_cells
+            .iter()
+            .find_map(|row| {
+                let text = row.concat();
+                text.find(needle)
+                    .map(|byte_column| text[..byte_column].chars().count())
+            })
+            .unwrap_or_else(|| panic!("{needle:?} missing from screen:\n{}", screen.join("\n")))
+    };
+
+    assert_eq!(
+        column_of("remuda · cluster"),
+        0,
+        "{cols} columns:\n{}",
+        screen.join("\n")
+    );
+    assert_eq!(
+        column_of(server_label),
+        3,
+        "{cols} columns:\n{}",
+        screen.join("\n")
+    );
+    let expected_marker_column = if cols >= 60 {
+        usize::from(cols / 2 + 1)
+    } else {
+        0
+    };
+    assert_eq!(
+        column_of("CRLF-MARKER"),
+        expected_marker_column,
+        "{cols} columns; remote pane must begin at its layout column:\n{}",
+        screen.join("\n")
+    );
+
+    let separator = if cols >= 60 { "│" } else { "─" };
+    let separator_column = if cols >= 60 { usize::from(cols / 2) } else { 0 };
+    let separator_rows = screen_cells
+        .iter()
+        .filter_map(|row| {
+            row.iter()
+                .position(|cell| cell == separator)
+                .map(|column| (row, column))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !separator_rows.is_empty(),
+        "{cols} columns: no pane divider"
+    );
+    for (row, column) in separator_rows {
+        assert_eq!(
+            column,
+            separator_column,
+            "{cols} columns: pane divider shifted from its frame column: {}",
+            row.concat()
+        );
+    }
+}
+
+#[test]
+fn real_remote_tui_frames_start_each_row_at_column_zero_at_wide_and_narrow_sizes() {
+    let client_node = Node::start("crlf-client");
+    let server_node = Node::start("crlf-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    server_node.start_session(
+        "for i in $(seq 1 22); do printf 'FILLER\\n'; done; while true; do printf 'CRLF-MARKER'; sleep 1; done",
+    );
+
+    let registry_path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry =
+        serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server_node.fingerprint())
+        .unwrap()
+        .endpoint = Some(listener.address.to_string());
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    let server_label = remuda_native::cluster::node_label(&server_node.fingerprint());
+    for cols in [80, 40] {
+        let mut tui = RemoteTui::start_at_size(&client_node, None, cols, 24);
+        tui.wait_for(&server_label, Duration::from_secs(10));
+        tui.wait_for("reachable", Duration::from_secs(10));
+        tui.writer.write_all(b"\x1b[B\x1b[C").unwrap();
+        tui.wait_for("proof", Duration::from_secs(10));
+        tui.writer.write_all(b"\x1b[B\r").unwrap();
+        tui.wait_for("remote live · reachable", Duration::from_secs(10));
+        tui.wait_for("CRLF-MARKER", Duration::from_secs(10));
+        assert_remote_screen_columns(&tui, cols, &server_label);
+    }
 }
 
 #[test]
