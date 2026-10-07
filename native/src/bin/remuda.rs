@@ -4471,6 +4471,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
                     value: None,
                     help: "Stop without asking for confirmation".into(),
                     global: false,
+                    repeat_policy: Default::default(),
                 },
                 OptionSpec {
                     long: "yes".into(),
@@ -4478,6 +4479,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
                     value: None,
                     help: "Confirm stopping all sessions".into(),
                     global: false,
+                    repeat_policy: Default::default(),
                 },
                 OptionSpec {
                     long: "i-am-inside".into(),
@@ -4485,6 +4487,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
                     value: None,
                     help: "Allow a hosted session to stop its daemon".into(),
                     global: false,
+                    repeat_policy: Default::default(),
                 },
             ],
         }],
@@ -4725,6 +4728,7 @@ fn upgrade_cli_spec() -> remuda_native::cli_parse::Spec {
                 value: Some("CHANNEL".into()),
                 help: "Release channel: stable or nightly".into(),
                 global: false,
+                repeat_policy: Default::default(),
             }],
         }],
     }
@@ -5699,6 +5703,7 @@ fn doc_cli_spec() -> remuda_native::cli_parse::Spec {
                 value: Some("FORMAT".into()),
                 help: "Output format: rst, markdown, or json".into(),
                 global: false,
+                repeat_policy: Default::default(),
             }],
         }],
     }
@@ -5760,6 +5765,7 @@ fn mod_cli_spec() -> remuda_native::cli_parse::Spec {
         value: value.map(str::to_owned),
         help: help.into(),
         global: false,
+        repeat_policy: Default::default(),
     };
     let arg = |name: &str, help: &str, required| ArgSpec {
         name: name.into(),

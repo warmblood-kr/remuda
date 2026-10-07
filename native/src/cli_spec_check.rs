@@ -1,7 +1,7 @@
 //! Strict validation of opt-in v2 Lua specs, before any clap command is built.
 //! All reads are raw (no `__index`/`__pairs`) and messages never echo values.
 
-use crate::cli_parse::{ArgSpec, OptionSpec, Spec, VerbSpec, FEATURES};
+use crate::cli_parse::{ArgSpec, OptionSpec, RepeatPolicy, Spec, VerbSpec, FEATURES};
 use mlua::{Table, Value};
 use std::collections::BTreeMap;
 
@@ -183,13 +183,33 @@ fn flag(m: &BTreeMap<String, Value>, key: &str, at: &str) -> Result<Option<bool>
     Ok(typed(m, key, at, Ty::Bool, false)?.map(|v| matches!(v, Value::Boolean(true))))
 }
 
+fn repeat_policy(m: &BTreeMap<String, Value>, at: &str) -> Result<RepeatPolicy, Rejection> {
+    let Some(v) = typed(m, "repeat_policy", at, Ty::Str, false)? else {
+        return Ok(RepeatPolicy::Reject);
+    };
+    match text(v, &join(at, "repeat_policy"))?.as_str() {
+        "reject" => Ok(RepeatPolicy::Reject),
+        "append" => Ok(RepeatPolicy::Append),
+        "last" => Ok(RepeatPolicy::Last),
+        "coalesce" => Ok(RepeatPolicy::Coalesce),
+        _ => Err(spec_err(
+            &join(at, "repeat_policy"),
+            "must be reject, append, last or coalesce",
+        )),
+    }
+}
+
 fn options(v: Option<&Value>, path: &str) -> Result<Vec<OptionSpec>, Rejection> {
     let Some(Value::Table(t)) = v else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
     for (at, item) in tables(t, path)? {
-        let m = fields(&item, &at, &["long", "short", "value", "help", "global"])?;
+        let m = fields(
+            &item,
+            &at,
+            &["long", "short", "value", "help", "global", "repeat_policy"],
+        )?;
         let short = match str_of(&m, "short", &at, false)? {
             None => None,
             Some(s) => {
@@ -200,13 +220,27 @@ fn options(v: Option<&Value>, path: &str) -> Result<Vec<OptionSpec>, Rejection> 
                 }
             }
         };
-        out.push(OptionSpec {
+        let option = OptionSpec {
             long: str_of(&m, "long", &at, true)?.unwrap_or_default(),
             short,
             value: str_of(&m, "value", &at, false)?,
             help: str_of(&m, "help", &at, true)?.unwrap_or_default(),
             global: flag(&m, "global", &at)?.unwrap_or(false),
-        });
+            repeat_policy: repeat_policy(&m, &at)?,
+        };
+        // Cross-scope repeats are not specified yet, so global options keep Reject.
+        let fits = match option.repeat_policy {
+            RepeatPolicy::Reject => true,
+            RepeatPolicy::Append | RepeatPolicy::Last => option.value.is_some() && !option.global,
+            RepeatPolicy::Coalesce => option.value.is_none() && !option.global,
+        };
+        if !fits {
+            return Err(spec_err(
+                &join(&at, "repeat_policy"),
+                "does not fit this option (append/last need a value, coalesce a flag, none on global)",
+            ));
+        }
+        out.push(option);
     }
     Ok(out)
 }
