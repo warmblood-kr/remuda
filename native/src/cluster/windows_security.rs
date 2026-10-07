@@ -912,6 +912,27 @@ mod tests {
     }
 
     #[test]
+    fn lua_private_write_gets_owner_only_acl() {
+        let dir = std::env::temp_dir().join(format!(
+            "remuda-lua-private-acl-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("password");
+        crate::fs_atomic::write_atomic_lua_private(&path, b"x\n").unwrap();
+        assert!(is_owner_only(&path, false));
+        let seeded = dir.join("seeded");
+        std::fs::write(&seeded, b"loose\n").unwrap();
+        crate::fs_atomic::write_atomic_lua_private(&seeded, b"z\n").unwrap();
+        assert!(is_owner_only(&seeded, false));
+        crate::fs_atomic::write_atomic_lua_private(&path, b"y\n").unwrap();
+        assert!(is_owner_only(&path, false));
+        assert_eq!(std::fs::read(&path).unwrap(), b"y\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn refuses_an_object_owned_by_an_unrelated_sid() {
         let path = std::env::temp_dir().join(format!(
             "remuda-cluster-other-owner-{}-{}.key",

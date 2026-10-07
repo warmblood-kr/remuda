@@ -66,10 +66,20 @@ cli
 
 ``table`` — Declarative command-line parsing for extension handlers.
 
+cli.capabilities
+----------------
+
+``cli.capabilities() -> {spec_versions, report_versions, features}`` — Report the spec versions, report versions and features this core supports; set report_version = 2 on a spec for the stable report envelope.
+
 cli.parse
 ---------
 
 ``cli.parse(spec, argv) -> report`` — Parse a word list against a runtime command declaration without printing or exiting. Returns {ok, verb?, values, kind?, text, code}; set required = false on an optional positional (positionals are required by default), and set multiple = true on the final positional argument to collect message body words.
+
+cli.require
+-----------
+
+``cli.require(need) -> true | false, text`` — Check remuda.cli.capabilities() before sending a v2 spec: need = {features?, spec_version?, report_version?}. Returns true, or false and a diagnostic ending in 'Next: remuda upgrade'; a core without capabilities counts as old.
 
 click
 -----
@@ -184,7 +194,7 @@ fs.realpath
 fs.write_atomic
 ---------------
 
-``fs.write_atomic(path, bytes, options?) -> true, nil | nil, error`` — Write bytes through a same-directory temporary file and atomically replace the target; private mode uses owner-only permissions on Unix.
+``fs.write_atomic(path, bytes, options?) -> true, nil | nil, error`` — Write bytes through a same-directory temporary file and atomically replace the target; private mode makes the file owner-only (mode 0600 on Unix, owner-only ACL on Windows).
 
 hook_list
 ---------

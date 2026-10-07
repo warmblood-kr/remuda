@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Windows: a session whose program is a `.cmd` or `.bat` file (for example an
+  npm-installed agent) now refuses an argument that cmd.exe would act on
+  instead of passing it as text: a line break, NUL, `%`, or `& | < > ^ ( )` outside
+  double quotes. Before, such an argument could be cut, expanded, or run as a
+  second command. The refusal is one line that names the argument's position
+  and ends with `Next: start the .exe, or pass this text in a file.` Other
+  arguments, and `.exe` programs, are unchanged. Limits: the guarantee ends at
+  the batch file's own lines and holds for a file that forwards its arguments
+  intact as `%*`, as npm shims do; rebuilding single parameters (`%~1`, `%~2`,
+  `shift`) is not covered; the machine's cmd.exe settings still
+  apply (AutoRun commands, and delayed expansion, where an argument with `!`
+  may arrive changed).
 - The storage file backend opens files through no-follow directory handles, refuses symlinked namespace and file components, and writes directories 0700 and files 0600 on Unix.
 - Storage listings cap results at 1,024 valid names and eight path parts, filter names through API validation, and reject case-folded directory-part collisions.
 - `remuda.storage.set_default("xdg")` selects a file backend for config, data, state and cache blobs under `REMUDA_STORAGE_ROOT` or the platform storage directories; secrets stay unavailable there.

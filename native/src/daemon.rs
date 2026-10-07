@@ -84,7 +84,7 @@ struct SyncPermit;
 impl SyncPermit {
     fn acquire() -> Option<Self> {
         ACTIVE_SYNCS
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
                 (active < MAX_CONCURRENT_SYNCS).then_some(active + 1)
             })
             .ok()
@@ -2656,6 +2656,8 @@ fn spawn(
             builder.env(k, v);
         }
     }
+    #[cfg(windows)]
+    refuse_unsafe_batch_arguments(&mut builder, &argv)?;
 
     let agent = PtyAgent::spawn(builder, size).map_err(|e| e.to_string())?;
     Ok(Session::new_with_id(
@@ -2664,6 +2666,69 @@ fn spawn(
         Box::new(agent),
         Arc::new(SystemClock::new()),
     ))
+}
+
+/// The file portable-pty will find for `program` (portable-pty 0.9.0,
+/// `cmdbuilder.rs:581-607`): in each PATH directory the name as given, then
+/// with each PATHEXT extension in place of its own. `None`: the name as given.
+#[cfg(windows)]
+fn pty_program(builder: &CommandBuilder, program: &str) -> Option<std::path::PathBuf> {
+    use std::ffi::OsStr;
+    if let Some(path) = builder.get_env("PATH") {
+        let extensions = builder.get_env("PATHEXT").unwrap_or(OsStr::new(".EXE"));
+        for dir in std::env::split_paths(path) {
+            let exact = dir.join(program);
+            if exact.exists() {
+                return Some(exact);
+            }
+            for entry in std::env::split_paths(extensions) {
+                // An entry portable-pty would panic on is skipped here.
+                let candidate = entry
+                    .to_str()
+                    .and_then(|entry| crate::cmd_arguments::pty_candidate(&exact, entry));
+                if candidate
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.exists())
+                {
+                    return candidate;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A `.cmd` or `.bat` program runs under cmd.exe, so its arguments must be text it reads as text.
+/// The program is pinned to an absolute path: no relative-PATH ambiguity, but no defence against
+/// the file changing (the pty still searches and may try PATHEXT names if it disappears).
+#[cfg(windows)]
+fn refuse_unsafe_batch_arguments(
+    builder: &mut CommandBuilder,
+    argv: &[String],
+) -> Result<(), String> {
+    use crate::cmd_arguments::{batch_arguments_refusal, is_batch_file};
+    let program = match pty_program(builder, &argv[0]) {
+        // A hit through a relative PATH entry is relative to the daemon's own
+        // directory, where `exists` looked. Pinned as it is, the pty would
+        // join it onto every PATH directory again and another file could win.
+        Some(found) => std::path::absolute(&found)
+            .map_err(|error| {
+                format!(
+                    "the program path could not be made absolute: {error}. \
+                     Next: pass the full path of the program."
+                )
+            })?
+            .into_os_string(),
+        None => argv[0].clone().into(),
+    };
+    let shown = program.to_string_lossy().into_owned();
+    builder.get_argv_mut()[0] = program;
+    if !is_batch_file(&shown) {
+        return Ok(());
+    }
+    let mut words = argv.to_vec();
+    words[0] = shown;
+    batch_arguments_refusal(&words).map_or(Ok(()), Err)
 }
 
 /// Hand this connection over to a human. A later attach displaces this one;
