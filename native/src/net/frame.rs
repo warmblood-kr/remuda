@@ -5,7 +5,8 @@ use zeroize::Zeroizing;
 
 const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 const MAX_FRAME_SIZE: usize = 65_535;
-pub const MAX_RESPONSE_PAYLOAD: usize = MAX_FRAME_SIZE - 16;
+/// Largest v1 payload after msg2's ephemeral key and authentication tag.
+pub const MAX_RESPONSE_PAYLOAD: usize = MAX_FRAME_SIZE - 32 - 16;
 const AEAD_TAG_SIZE: usize = 16;
 const TIMESTAMP_SIZE: usize = std::mem::size_of::<i64>();
 const NOISE_PROLOGUE: &[u8] = b"remuda-cluster-v1";
@@ -274,10 +275,19 @@ pub const MAX_RECORDS: usize = MAX_RESPONSE_TOTAL.div_ceil(MAX_RECORD_PLAINTEXT)
 /// Seal `plaintext` as a sequence of `[u16 BE len][AEAD record]`; the counter nonce orders records.
 #[allow(dead_code)]
 pub fn seal_records(transport: &mut snow::TransportState, plaintext: &[u8]) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    seal_records_into(transport, plaintext, &mut out)?;
+    Ok(out)
+}
+
+fn seal_records_into(
+    transport: &mut snow::TransportState,
+    plaintext: &[u8],
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
     if plaintext.len() > MAX_RESPONSE_TOTAL {
         return Err(too_large());
     }
-    let mut out = Vec::new();
     let mut buf = vec![0; MAX_FRAME_SIZE];
     for chunk in plaintext.chunks(MAX_RECORD_PLAINTEXT) {
         let n = transport
@@ -286,7 +296,7 @@ pub fn seal_records(transport: &mut snow::TransportState, plaintext: &[u8]) -> i
         out.extend_from_slice(&(n as u16).to_be_bytes());
         out.extend_from_slice(&buf[..n]);
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Marker for PR3: the peer sent a response version we do not understand (`ErrorKind::Unsupported`).
@@ -318,14 +328,27 @@ pub struct RecordOpener {
 impl RecordOpener {
     /// `expected_total` is the authenticated total plaintext length (checked against the cap).
     pub fn new(transport: snow::TransportState, expected_total: usize) -> io::Result<Self> {
+        Self::with_prefix(transport, expected_total, &[])
+    }
+
+    fn with_prefix(
+        transport: snow::TransportState,
+        expected_total: usize,
+        prefix: &[u8],
+    ) -> io::Result<Self> {
         if expected_total > MAX_RESPONSE_TOTAL {
             return Err(too_large());
         }
+        if prefix.len() > expected_total {
+            return Err(invalid_frame());
+        }
+        let mut plaintext = Zeroizing::new(Vec::with_capacity(expected_total));
+        plaintext.extend_from_slice(prefix);
         Ok(Self {
             transport,
             expected: expected_total,
             pending: Vec::new(),
-            plaintext: Zeroizing::new(Vec::new()),
+            plaintext,
             records: 0,
             failed: false,
         })
@@ -423,22 +446,25 @@ pub fn seal_response_chunked(mut request: OpenedRequest, payload: &[u8]) -> io::
         return Err(too_large());
     }
     let (chunk0, rest) = payload.split_at(payload.len().min(MAX_CHUNK0));
-    let mut plain = Vec::with_capacity(MSG2_HEADER + chunk0.len());
-    plain.push(RESPONSE_V2);
-    plain.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    plain.extend_from_slice(chunk0);
-    let mut msg = vec![0; MAX_FRAME_SIZE];
-    let n = request
-        .handshake
-        .write_message(&plain, &mut msg)
-        .map_err(frame_error)?;
-    let mut out = (n as u16).to_be_bytes().to_vec();
-    out.extend_from_slice(&msg[..n]);
+    let mut out = {
+        let mut plain = Vec::with_capacity(MSG2_HEADER + chunk0.len());
+        plain.push(RESPONSE_V2);
+        plain.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        plain.extend_from_slice(chunk0);
+        let mut msg = vec![0; MAX_FRAME_SIZE];
+        let n = request
+            .handshake
+            .write_message(&plain, &mut msg)
+            .map_err(frame_error)?;
+        let mut out = (n as u16).to_be_bytes().to_vec();
+        out.extend_from_slice(&msg[..n]);
+        out
+    };
     let mut transport = request
         .handshake
         .into_transport_mode()
         .map_err(frame_error)?;
-    out.extend_from_slice(&seal_records(&mut transport, rest)?);
+    seal_records_into(&mut transport, rest, &mut out)?;
     Ok(out)
 }
 
@@ -476,12 +502,14 @@ pub fn open_response_chunked_from(
         ));
     }
     let chunk0 = &plain[MSG2_HEADER..];
-    let expected = total.checked_sub(chunk0.len()).ok_or_else(invalid_frame)?;
+    if chunk0.len() > total {
+        return Err(invalid_frame());
+    }
     let transport = request
         .handshake
         .into_transport_mode()
         .map_err(frame_error)?;
-    let mut opener = RecordOpener::new(transport, expected)?;
+    let mut opener = RecordOpener::with_prefix(transport, total, chunk0)?;
     // Bound the read; the opener rejects any byte after the final record anyway.
     let mut limited = io::Read::take(
         &mut *reader,
@@ -495,9 +523,7 @@ pub fn open_response_chunked_from(
         }
         opener.push(&buf[..n])?;
     }
-    let mut out = chunk0.to_vec();
-    out.extend_from_slice(&opener.finish()?);
-    Ok(out)
+    opener.finish()
 }
 
 /// Open either format: a bare msg2 is v1 (returned untouched), a length-prefixed msg2 is v2.
@@ -543,6 +569,26 @@ fn invalid_frame() -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v1_response_payload_limit_includes_the_msg2_ephemeral_key() {
+        let initiator = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let responder = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        for (size, accepted) in [(65_486, true), (65_487, true), (65_488, false)] {
+            let sealed =
+                seal_request(&initiator.private, &responder.public, 1000, b"request").unwrap();
+            let opened = open_request(&responder.private, &sealed.message).unwrap();
+            assert_eq!(
+                seal_response(opened, &vec![0; size]).is_ok(),
+                accepted,
+                "payload size {size}"
+            );
+        }
+    }
 
     #[test]
     fn rejects_low_order_dh_result() {
