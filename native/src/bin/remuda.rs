@@ -4659,12 +4659,13 @@ fn skew_notice(response: std::io::Result<Response>) -> Option<String> {
 /// is the client's only diagnostic when start-up fails — and on `mcp`, whose
 /// streams belong to whatever spawned it.
 fn announce_update(argv: &[&str]) {
-    if matches!(argv, ["daemon"] | ["mcp"]) || UPDATE_NOTICE_EMITTED.load(Ordering::Relaxed) {
+    if UPDATE_NOTICE_EMITTED.load(Ordering::Relaxed) {
         return;
     }
     let now = std::time::SystemTime::now();
     let no_update_check = std::env::var_os("REMUDA_NO_UPDATE_CHECK").is_some();
-    if !dist::should_show_update_notice(
+    if !should_announce_update(
+        argv,
         std::io::stderr().is_terminal(),
         std::env::var_os("REMUDA_BUTLER_AGENT_ID").is_some(),
         no_update_check,
@@ -4678,6 +4679,26 @@ fn announce_update(argv: &[&str]) {
         UPDATE_NOTICE_EMITTED.store(true, Ordering::Relaxed);
         dist::record_update_notice_shown(now);
     }
+}
+
+fn should_announce_update(
+    argv: &[&str],
+    stderr_is_terminal: bool,
+    agent_id_set: bool,
+    no_update_check_env: bool,
+    last_shown: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> bool {
+    if matches!(argv, ["daemon"] | ["mcp"]) {
+        return false;
+    }
+    dist::should_show_update_notice(
+        stderr_is_terminal,
+        agent_id_set,
+        no_update_check_env,
+        last_shown,
+        now,
+    )
 }
 
 fn prepare_command(argv: &[&str], path: &Path) -> Result<Option<String>, String> {
@@ -6802,6 +6823,23 @@ fn print_lines(n: &str, delay_ms: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_agent_suppresses_update_notice_for_butler_and_any_verb() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(2 * 24 * 60 * 60);
+        for argv in [
+            &["butler"][..],
+            &["butler", "inbox"][..],
+            &["butler", "sessions"][..],
+            &["ls"][..],
+            &["upgrade"][..],
+        ] {
+            assert!(
+                !should_announce_update(argv, true, true, false, None, now),
+                "update notice should be suppressed for {argv:?}"
+            );
+        }
+    }
 
     #[test]
     fn stdout_broken_pipe_panic_match_is_narrow() {
