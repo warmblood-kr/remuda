@@ -480,6 +480,8 @@ pub struct PtyAgent {
     master: Option<Box<dyn MasterPty + Send>>,
     end_job: Box<dyn Fn() -> Result<()> + Send + Sync>,
     job_ended: bool,
+    #[cfg(windows)]
+    job: Arc<crate::session_job::SessionJob>,
 }
 
 /// Windows: the session's job, holding the child. If the child cannot be
@@ -517,9 +519,14 @@ impl PtyAgent {
         #[cfg_attr(not(windows), allow(unused_mut))]
         let mut child = pair.slave.spawn_command(command).map_err(io)?;
         #[cfg(windows)]
-        let end_job: Box<dyn Fn() -> Result<()> + Send + Sync> = {
-            let job = session_job_for(child.as_mut())?;
-            Box::new(move || job.end().map_err(io))
+        let (job, end_job): (
+            Arc<crate::session_job::SessionJob>,
+            Box<dyn Fn() -> Result<()> + Send + Sync>,
+        ) = {
+            let job = Arc::new(session_job_for(child.as_mut())?);
+            let ending = Arc::clone(&job);
+            let end_job = Box::new(move || ending.end().map_err(io));
+            (job, end_job)
         };
         #[cfg(not(windows))]
         let end_job: Box<dyn Fn() -> Result<()> + Send + Sync> = Box::new(|| Ok(()));
@@ -575,6 +582,8 @@ impl PtyAgent {
             master: Some(pair.master),
             end_job,
             job_ended: false,
+            #[cfg(windows)]
+            job,
         })
     }
 }
