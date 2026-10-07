@@ -10,9 +10,9 @@
 //! path calls `documented_pty_hangup_accident()` at its spawn site so the
 //! decision not to add a guard there is visible, not merely absent, and is
 //! pinned by a real test: native/tests/pty_survives_daemon_death.rs.
-//! On Windows a pty child and everything it started end with the session or
-//! the daemon through the session's job object (`session_job.rs`, kill on
-//! close); `harden()` there is still unimplemented for plain-pipe children.
+//! On Windows the assigned pty child and descendants it starts after
+//! assignment end with the session or daemon through the session's job object
+//! (`session_job.rs`, kill on close); plain-pipe children remain unguarded.
 
 use std::process::Command;
 

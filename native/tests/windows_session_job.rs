@@ -1,8 +1,7 @@
-//! A session's processes on Windows. While the session is listed they are
-//! `session` callers, also one whose parent has exited or that asks to leave
-//! the job. When the session ends (its program exits, it is closed, or the
-//! daemon stops) everything it started ends with it. A command in an ordinary
-//! terminal still reads `unknown` here.
+//! Assigned session processes and descendants started after assignment are
+//! `session` callers, even when a parent has exited or asks to leave the job.
+//! They end with the session or daemon. A command in an ordinary terminal
+//! still reads `unknown` here.
 #![cfg(windows)]
 
 use remuda_core::protocol::{Request, Response};
@@ -185,8 +184,8 @@ fn the_lingering_process_ends_with(tag: &str, life: u32, end: impl FnOnce(&Path,
     );
 }
 
-/// A session ends when its own program exits: the daemon reaps it. What the
-/// session started ends with it.
+/// A session ends when its own program exits: the daemon reaps it. Its assigned
+/// child and descendants started after assignment end with it.
 #[test]
 fn what_a_session_started_ends_when_its_program_exits() {
     the_lingering_process_ends_with("exit", 4, |_, daemon| {
