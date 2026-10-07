@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Windows: everything the session's program starts after it is put in its job
+  ends when the session is reaped or closed, or when the daemon stops. A
+  session that cannot be put in a job is not started. The one gap is the
+  instant between program creation and job assignment; issue #614 tracks
+  closing it with atomic job-list process creation (`CreateProcessW` with
+  `PROC_THREAD_ATTRIBUTE_JOB_LIST`). A process that must outlive the session has to start outside
+  remuda. While listed, processes in the job are `session` callers for
+  `remuda.caller()`, including ones whose parent has exited.
+
 - Windows: a session whose program is a `.cmd` or `.bat` file (for example an
   npm-installed agent) now refuses an argument that cmd.exe would act on
   instead of passing it as text: a line break, NUL, `%`, or `& | < > ^ ( )` outside

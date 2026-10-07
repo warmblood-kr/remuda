@@ -320,6 +320,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
+            let accepted = std::time::SystemTime::now();
             let registry = Arc::clone(&registry);
             let image = image.clone();
             let counters = Arc::clone(&counters);
@@ -335,6 +336,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
                     socket_owner,
                     anti_entropy,
                     listener_task,
+                    accepted,
                 );
             });
         }
@@ -1319,6 +1321,7 @@ fn serve_unix(
         if watched[0].revents & libc::POLLIN != 0 {
             match listener.accept() {
                 Ok(stream) => {
+                    let accepted = std::time::SystemTime::now();
                     if let Err(error) = stream.set_nonblocking(false) {
                         eprintln!("remuda daemon: could not restore blocking client mode: {error}");
                         continue;
@@ -1338,6 +1341,7 @@ fn serve_unix(
                             socket_owner,
                             anti_entropy,
                             listener_task,
+                            accepted,
                         );
                     });
                 }
@@ -1484,6 +1488,7 @@ fn capture_styled(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle(
     stream: Stream,
     registry: &Registry,
@@ -1492,6 +1497,7 @@ fn handle(
     socket_owner: Arc<SocketOwnership>,
     anti_entropy: Arc<AntiEntropyTask>,
     listener_task: Arc<DaemonListenerControl>,
+    accepted: std::time::SystemTime,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let Some(request) = read_request(&stream, &mut reader)? else {
@@ -1508,6 +1514,7 @@ fn handle(
         anti_entropy,
         listener_task,
         request,
+        accepted,
     )
 }
 
@@ -1521,6 +1528,7 @@ fn handle_request(
     anti_entropy: Arc<AntiEntropyTask>,
     listener_task: Arc<DaemonListenerControl>,
     request: Request,
+    accepted: std::time::SystemTime,
 ) -> std::io::Result<()> {
     match request {
         Request::List => {
@@ -1645,7 +1653,7 @@ fn handle_request(
         Request::RemoveDirAll { path: dir } => reply(&stream, &remove_dir_all(&dir)),
 
         Request::Eval { code, name } => {
-            let caller = caller_context(&stream, registry);
+            let caller = caller_context(&stream, registry, accepted);
             handle_eval(stream, reader, image, &code, name.as_deref(), caller)
         }
 
@@ -1761,11 +1769,36 @@ fn escaped_mod_command_error(error: &str) -> String {
     escaped
 }
 
-fn caller_context(stream: &Stream, registry: &Registry) -> crate::image::CallerContext {
-    match process_ancestry::resolve_caller(
-        process_ancestry::peer_pid(stream),
-        &registry.live_processes(),
-    ) {
+fn caller_context(
+    stream: &Stream,
+    registry: &Registry,
+    accepted: std::time::SystemTime,
+) -> crate::image::CallerContext {
+    // Windows: a session's job decides first. It still holds a process whose
+    // parent has exited, which the parent walk below cannot see. A session
+    // child's own PID stays sound there: the daemon holds that process open.
+    #[cfg(windows)]
+    let (peer_pid, held) = {
+        let Some((pid, held)) = process_ancestry::current_peer(stream, accepted) else {
+            return crate::image::CallerContext::default();
+        };
+        if let Some(name) = registry.session_owning(pid) {
+            return crate::image::CallerContext {
+                kind: crate::image::CallerKind::Session,
+                session: Some(name),
+            };
+        }
+        (Ok(Some(pid)), held)
+    };
+    #[cfg(not(windows))]
+    let peer_pid = {
+        let _ = accepted;
+        process_ancestry::peer_pid(stream)
+    };
+    let origin = process_ancestry::resolve_caller(peer_pid, &registry.live_processes());
+    #[cfg(windows)]
+    drop(held);
+    match origin {
         process_ancestry::CallerOrigin::Session(name) => crate::image::CallerContext {
             kind: crate::image::CallerKind::Session,
             session: Some(name),
@@ -2659,7 +2692,7 @@ fn spawn(
     #[cfg(windows)]
     refuse_unsafe_batch_arguments(&mut builder, &argv)?;
 
-    let agent = PtyAgent::spawn(builder, size).map_err(|e| e.to_string())?;
+    let agent = PtyAgent::spawn(builder, size).map_err(crate::session_job::spawn_error_line)?;
     Ok(Session::new_with_id(
         name,
         session_id,

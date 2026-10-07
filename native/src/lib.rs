@@ -35,6 +35,7 @@ pub mod pty;
 pub mod remote_front;
 pub mod reply_limit;
 pub mod script;
+pub mod session_job;
 pub(crate) mod storage;
 pub mod text;
 pub mod tick;
