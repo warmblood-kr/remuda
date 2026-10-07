@@ -11,7 +11,7 @@ use crate::clock::Clock;
 use crate::input::{InputBatch, InputDeduplicator, InputError, InputOutcome, InputRateLimiter};
 use crate::protocol::Step;
 use core::time::Duration;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -61,6 +61,166 @@ mod input_text_tests {
         assert_eq!(occurrence_count("old: abc / new: abc", "abc"), 2);
         assert_eq!(occurrence_count("old: abc", "missing"), 0);
         assert_eq!(occurrence_count("anything", ""), 0);
+    }
+}
+
+#[cfg(test)]
+mod clear_input_tests {
+    use super::*;
+    use crate::agent::{AgentError, AgentProcess, AgentWriter, Cursor, Size};
+    use crate::clock::ManualClock;
+    use std::sync::mpsc::{self, Receiver, Sender};
+
+    struct TestWriter {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        started: Sender<()>,
+        blocking: bool,
+        blocked_once: AtomicBool,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl AgentWriter for TestWriter {
+        fn write_bounded(&self, bytes: &[u8]) -> Result<()> {
+            self.write_to_completion(bytes)
+        }
+        fn write_to_completion(&self, bytes: &[u8]) -> Result<()> {
+            let should_block = self.blocking && !self.blocked_once.swap(true, Ordering::SeqCst);
+            if !self.blocked_once.load(Ordering::SeqCst) || should_block {
+                let _ = self.started.send(());
+            }
+            if should_block {
+                let (ready, changed) = &*self.release;
+                let mut ready = ready.lock().unwrap();
+                while !*ready {
+                    ready = changed.wait(ready).unwrap();
+                }
+            }
+            self.writes.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        }
+        fn is_busy(&self) -> bool {
+            let (ready, _) = &*self.release;
+            self.blocking && !*ready.lock().unwrap()
+        }
+    }
+
+    struct TestAgent(Arc<TestWriter>);
+    impl AgentProcess for TestAgent {
+        fn write(&mut self, bytes: &[u8]) -> Result<()> {
+            self.0.write_bounded(bytes)
+        }
+        fn input_writer(&mut self) -> Option<Arc<dyn AgentWriter>> {
+            Some(self.0.clone())
+        }
+        fn screen_text(&mut self) -> Result<String> {
+            Ok(String::new())
+        }
+        fn cursor(&mut self) -> Result<Cursor> {
+            Ok(Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            })
+        }
+        fn is_alive(&mut self) -> bool {
+            true
+        }
+        fn terminate(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> Size {
+            Size::default()
+        }
+    }
+
+    type SessionFixture = (
+        Arc<Session>,
+        Arc<ManualClock>,
+        Arc<Mutex<Vec<Vec<u8>>>>,
+        Receiver<()>,
+        Arc<(Mutex<bool>, Condvar)>,
+    );
+
+    fn session(blocking: bool) -> SessionFixture {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let release = Arc::new((Mutex::new(!blocking), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let writer = Arc::new(TestWriter {
+            writes: Arc::clone(&writes),
+            started: started_tx,
+            blocking,
+            blocked_once: AtomicBool::new(false),
+            release: Arc::clone(&release),
+        });
+        let clock = Arc::new(ManualClock::new());
+        let session = Arc::new(Session::new(
+            "test",
+            Box::new(TestAgent(writer)),
+            clock.clone(),
+        ));
+        (session, clock, writes, started_rx, release)
+    }
+
+    #[test]
+    fn attach_write_waiting_after_clear_guard_lands_after_clear() {
+        let (session, clock, writes, _started, _release) = session(false);
+        let attached = session.attach();
+        clock.advance(Duration::from_secs(10));
+        let (spawned_tx, spawned_rx) = mpsc::channel();
+        let (handle_tx, handle_rx) = mpsc::channel();
+        let session_for_hook = Arc::clone(&session);
+        *session.clear_hook.lock().unwrap() = Some(Box::new(move || {
+            let session = Arc::clone(&session_for_hook);
+            let handle = std::thread::spawn(move || {
+                let attached = session.attach();
+                let _ = spawned_tx.send(());
+                attached.write_raw(b"x").unwrap();
+            });
+            handle_tx.send(handle).unwrap();
+            spawned_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }));
+        session.clear_input(b"\x15").unwrap();
+        drop(attached);
+        handle_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![b"\x15".to_vec(), b"x".to_vec()]
+        );
+    }
+
+    #[test]
+    fn clear_refuses_while_attach_write_is_in_flight_even_after_idle_window() {
+        let (session, clock, _writes, started, release) = session(true);
+        let worker_session = Arc::clone(&session);
+        let worker = std::thread::spawn(move || worker_session.attach().write_raw(b"x"));
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        clock.advance(Duration::from_secs(3));
+        assert!(matches!(
+            session.clear_input(b"\x15"),
+            Err(AgentError::HumanInputRecent)
+        ));
+        let (ready, changed) = &*release;
+        *ready.lock().unwrap() = true;
+        changed.notify_all();
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn idle_clear_still_works_and_clear_keys_cannot_submit_lines() {
+        let (session, clock, writes, _started, _release) = session(false);
+        clock.advance(Duration::from_secs(3));
+        session.clear_input(b"\x1b[D").unwrap();
+        assert_eq!(*writes.lock().unwrap(), vec![b"\x1b[D".to_vec()]);
+        for key in [b"\r".as_slice(), b"\n".as_slice(), b"\x15\r".as_slice()] {
+            assert!(
+                matches!(session.clear_input(key), Err(AgentError::Io(message)) if message.contains("Return or newline"))
+            );
+        }
+        assert_eq!(*writes.lock().unwrap(), vec![b"\x1b[D".to_vec()]);
     }
 }
 
@@ -118,6 +278,12 @@ pub struct Session {
     /// [`Clock::now`] at the last keystroke through an [`Attached`] guard —
     /// a human's, never a script's. `None` until one arrives (#136).
     last_human_input_at: Mutex<Option<Duration>>,
+    /// Orders attached writes with destructive clear operations.
+    human_gate: Mutex<()>,
+    /// Attached writes which have started but have not completed.
+    human_inflight: AtomicUsize,
+    #[cfg(test)]
+    clear_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Set while the current [`Attached`] guard is alive.
     attached: AtomicBool,
     /// Set under the registry lock before a close request terminates the child.
@@ -187,6 +353,7 @@ impl Session {
     }
 
     /// Construct a session with the identity injected into its child process.
+    #[allow(clippy::too_many_lines)]
     pub fn new_with_id(
         name: impl Into<String>,
         id: impl Into<String>,
@@ -246,6 +413,10 @@ impl Session {
             output_changed,
             instance_id,
             last_human_input_at: Mutex::new(None),
+            human_gate: Mutex::new(()),
+            human_inflight: AtomicUsize::new(0),
+            #[cfg(test)]
+            clear_hook: Mutex::new(None),
             attached: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             attach_slot: Mutex::new(None),
@@ -555,15 +726,29 @@ impl Session {
     /// Refuses a timed-out writer or human keystroke from the last two seconds;
     /// cleared text is `None` when this session cannot identify its composer.
     pub fn clear_input(&self, key: &[u8]) -> Result<Option<String>> {
+        if key.contains(&b'\r') || key.contains(&b'\n') {
+            return Err(AgentError::Io(
+                "clear key must not contain Return or newline bytes".into(),
+            ));
+        }
         let _held = self.acquire_input_lock()?;
         if self.input_writer_timed_out()? {
             return Err(AgentError::Busy);
         }
+        let _human_gate = self
+            .human_gate
+            .lock()
+            .map_err(|_| AgentError::Io("session human input gate poisoned".into()))?;
         if self
             .human_idle_for()
             .is_some_and(|idle| idle < HUMAN_INPUT_GUARD)
+            || self.human_inflight.load(Ordering::SeqCst) > 0
         {
             return Err(AgentError::HumanInputRecent);
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.clear_hook.lock().unwrap().take() {
+            hook();
         }
         self.write_one_burst(key)?;
         Ok(None)
@@ -1194,6 +1379,24 @@ impl Attached<'_> {
                 return Err(AgentError::Attached);
             }
         }
+        let _human_gate = loop {
+            match self.session.human_gate.try_lock() {
+                Ok(gate) => break gate,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if self.is_displaced() || cancelled() {
+                        return Err(AgentError::Attached);
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        };
+        if let Ok(mut at) = self.session.last_human_input_at.lock() {
+            *at = Some(self.session.clock.now());
+        }
+        self.session.human_inflight.fetch_add(1, Ordering::SeqCst);
+        drop(_human_gate);
+        let _inflight = HumanInflightGuard(&self.session.human_inflight);
         self.session.write_one_burst_to_completion_while_started(
             bytes,
             &|| self.is_displaced() || cancelled(),
@@ -1226,6 +1429,14 @@ impl Attached<'_> {
 
     pub fn session(&self) -> &Session {
         self.session
+    }
+}
+
+struct HumanInflightGuard<'a>(&'a AtomicUsize);
+
+impl Drop for HumanInflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
