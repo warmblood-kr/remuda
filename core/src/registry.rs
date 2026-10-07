@@ -275,6 +275,10 @@ impl Registry {
         self.get(name).map(|s| s.send(bytes))
     }
 
+    pub fn clear_input(&self, name: &str, key: &[u8]) -> Option<Result<Option<String>>> {
+        self.get(name).map(|session| session.clear_input(key))
+    }
+
     pub fn feed(&self, name: &str, steps: &[Step]) -> Option<Result<()>> {
         self.get(name).map(|s| s.feed(steps))
     }

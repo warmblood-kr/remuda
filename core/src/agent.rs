@@ -215,6 +215,8 @@ pub enum AgentError {
     Attached,
     /// A previous PTY write is still active; no second write was queued.
     Busy,
+    /// A human typed recently, so scripted input must not clear that draft.
+    HumanInputRecent,
     /// The bounded write deadline elapsed; bytes may still finish later.
     WriteTimeout {
         timeout: core::time::Duration,
@@ -247,6 +249,9 @@ impl fmt::Display for AgentError {
                 "a human is attached to this session; detach it first (Ctrl-\\ in that terminal), then retry"
             ),
             AgentError::Busy => write!(f, "a session input write is already in flight"),
+            AgentError::HumanInputRecent => {
+                write!(f, "a human typed recently; refusing to clear the input line")
+            }
             AgentError::WriteTimeout { timeout } => {
                 write!(
                     f,
