@@ -203,6 +203,8 @@ pub enum Request {
     /// Deliver one instruction as an indivisible act. An attached terminal is
     /// a viewer, not a delivery lock.
     SendLine { name: String, text: String },
+    /// Write one caller-supplied clear-line key as an indivisible act.
+    ClearInput { name: String, key: Vec<u8> },
     /// Submit an idempotent input batch. Client IDs are 32 hex digits and
     /// sequence numbers start at one and increase for each batch.
     Input {
@@ -343,6 +345,11 @@ pub enum Step {
 pub enum Response {
     Sessions(Vec<SessionSummary>),
     Screen(String),
+    /// The session-level clear-line key was written; cleared text is optional
+    /// because terminal screens do not generally identify composer contents.
+    ClearInput {
+        cleared: Option<String>,
+    },
     /// An input batch was applied, or was already applied.
     Ack {
         duplicate: bool,

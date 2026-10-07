@@ -89,6 +89,8 @@ pub enum InputSubmitOutcome {
 
 /// Pause between pasted text and its Return when the caller gives none.
 pub const DEFAULT_INPUT_SETTLE: Duration = Duration::from_millis(100);
+/// A clear is refused while the most recent human keystroke is this recent.
+const HUMAN_INPUT_GUARD: Duration = Duration::from_secs(2);
 
 struct PendingInput {
     tail: String,
@@ -547,6 +549,24 @@ impl Session {
     pub fn send(&self, bytes: &[u8]) -> Result<()> {
         let _held = self.acquire_input_lock()?;
         self.write_one_burst(bytes)
+    }
+
+    /// Write the caller's agent-specific clear-line key as one atomic burst.
+    /// Refuses a timed-out writer or human keystroke from the last two seconds;
+    /// cleared text is `None` when this session cannot identify its composer.
+    pub fn clear_input(&self, key: &[u8]) -> Result<Option<String>> {
+        let _held = self.acquire_input_lock()?;
+        if self.input_writer_timed_out()? {
+            return Err(AgentError::Busy);
+        }
+        if self
+            .human_idle_for()
+            .is_some_and(|idle| idle < HUMAN_INPUT_GUARD)
+        {
+            return Err(AgentError::HumanInputRecent);
+        }
+        self.write_one_burst(key)?;
+        Ok(None)
     }
 
     /// Check the shared per-session remote-input byte budget.

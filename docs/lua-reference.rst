@@ -61,6 +61,11 @@ clear_hooks
 
 ``clear_hooks(opts) -> nil`` — Remove every hook registered under a group.
 
+clear_input
+-----------
+
+``clear_input(name, key) -> {cleared = string|nil}`` — Write the agent-specific clear-line key to a session as one atomic input act. Refuses while a human typed in the last 2 seconds or a PTY writer is busy. OpenAI's Codex TUI binds Ctrl+U (byte 0x15) to kill text from the cursor to the line start; at the end of the composer line this clears it ([Codex issue #20698](https://github.com/openai/codex/issues/20698)). Terminal screens do not generally identify composer contents, so `cleared` is nil when unknown.
+
 cli
 ---
 
