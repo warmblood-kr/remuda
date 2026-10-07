@@ -982,17 +982,21 @@ impl AgentProcess for PtyAgent {
     /// `kill()` afterwards fails with ESRCH. The trait's idempotence is
     /// therefore explicit here — an already-gone process is nothing to signal.
     fn terminate(&mut self) -> Result<()> {
-        if !self.is_alive() {
-            return self.end_job();
-        }
-        self.child.kill().map_err(io)?;
-        let status = self.child.wait().map_err(io)?;
-        self.record_exit_status(status);
-        // ConPTY can keep the output reader alive after the child exits until
-        // ClosePseudoConsole runs. Close the master here so output monitors
-        // can flush before the caller waits for their final notification.
-        self.master.take();
-        self.end_job()
+        let child_result = if self.is_alive() {
+            self.child.kill().map_err(io).and_then(|()| {
+                self.child.wait().map_err(io).map(|status| {
+                    self.record_exit_status(status);
+                    // ConPTY can keep the output reader alive after the child
+                    // exits until ClosePseudoConsole runs. Close the master
+                    // so output monitors can flush before final notification.
+                    self.master.take();
+                })
+            })
+        } else {
+            Ok(())
+        };
+        let job_result = self.end_job();
+        child_result.and(job_result)
     }
 
     fn resize(&mut self, size: Size) -> Result<()> {
@@ -1832,6 +1836,38 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    #[derive(Debug)]
+    struct WaitErrorChild;
+
+    impl portable_pty::ChildKiller for WaitErrorChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(Self)
+        }
+    }
+
+    impl portable_pty::Child for WaitErrorChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Err(std::io::Error::other("wait failed"))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn terminate_ends_its_job_once_even_when_the_session_is_already_dead() {
@@ -1848,6 +1884,26 @@ mod tests {
         agent.terminate().unwrap();
         agent.terminate().unwrap();
 
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_ends_its_job_when_wait_fails() {
+        let mut command = CommandBuilder::new("sh");
+        command.args(["-c", "exit 0"]);
+        let mut agent = PtyAgent::spawn(command, Size::new(80, 24)).unwrap();
+        agent.child.kill().unwrap();
+        let _ = agent.child.wait();
+        agent.child = Box::new(WaitErrorChild);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ended = Arc::clone(&calls);
+        agent.end_job = Box::new(move || {
+            ended.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        assert!(agent.terminate().is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
