@@ -320,6 +320,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
+            let accepted = std::time::SystemTime::now();
             let registry = Arc::clone(&registry);
             let image = image.clone();
             let counters = Arc::clone(&counters);
@@ -335,6 +336,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
                     socket_owner,
                     anti_entropy,
                     listener_task,
+                    accepted,
                 );
             });
         }
@@ -1319,6 +1321,7 @@ fn serve_unix(
         if watched[0].revents & libc::POLLIN != 0 {
             match listener.accept() {
                 Ok(stream) => {
+                    let accepted = std::time::SystemTime::now();
                     if let Err(error) = stream.set_nonblocking(false) {
                         eprintln!("remuda daemon: could not restore blocking client mode: {error}");
                         continue;
@@ -1338,6 +1341,7 @@ fn serve_unix(
                             socket_owner,
                             anti_entropy,
                             listener_task,
+                            accepted,
                         );
                     });
                 }
@@ -1492,9 +1496,8 @@ fn handle(
     socket_owner: Arc<SocketOwnership>,
     anti_entropy: Arc<AntiEntropyTask>,
     listener_task: Arc<DaemonListenerControl>,
+    accepted: std::time::SystemTime,
 ) -> std::io::Result<()> {
-    // Before the request is read: a caller must be older than this moment.
-    let accepted = std::time::SystemTime::now();
     let mut reader = BufReader::new(stream.try_clone()?);
     let Some(request) = read_request(&stream, &mut reader)? else {
         return Ok(());
@@ -1774,8 +1777,8 @@ fn caller_context(
     // parent has exited, which the parent walk below cannot see. A session
     // child's own PID stays sound there: the daemon holds that process open.
     #[cfg(windows)]
-    {
-        let Some((pid, _held)) = process_ancestry::current_peer(stream, accepted) else {
+    let (peer_pid, held) = {
+        let Some((pid, held)) = process_ancestry::current_peer(stream, accepted) else {
             return crate::image::CallerContext::default();
         };
         if let Some(name) = registry.session_owning(pid) {
@@ -1784,13 +1787,17 @@ fn caller_context(
                 session: Some(name),
             };
         }
-    }
+        (Ok(Some(pid)), held)
+    };
     #[cfg(not(windows))]
-    let _ = accepted;
-    match process_ancestry::resolve_caller(
-        process_ancestry::peer_pid(stream),
-        &registry.live_processes(),
-    ) {
+    let peer_pid = {
+        let _ = accepted;
+        process_ancestry::peer_pid(stream)
+    };
+    let origin = process_ancestry::resolve_caller(peer_pid, &registry.live_processes());
+    #[cfg(windows)]
+    drop(held);
+    match origin {
         process_ancestry::CallerOrigin::Session(name) => crate::image::CallerContext {
             kind: crate::image::CallerKind::Session,
             session: Some(name),
