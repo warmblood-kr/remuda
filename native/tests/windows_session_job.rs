@@ -5,11 +5,13 @@
 #![cfg(windows)]
 
 use remuda_core::protocol::{Request, Response};
-use remuda_native::{client, daemon};
+use remuda_core::{Registry, Session, Size};
+use remuda_native::{client, daemon, CommandBuilder, PtyAgent, SystemClock};
 use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[path = "daemon_support/spawn.rs"]
@@ -205,22 +207,26 @@ fn what_a_session_started_ends_when_the_session_is_closed() {
     });
 }
 
-/// Reaping ends the job even while a blocked Sync handler still owns an Arc
-/// to the session. This is Windows CI coverage; the target is not available
-/// for local compilation on this machine.
+/// Reaping ends the job while a Registry::get handle keeps the Session alive.
+/// This is Windows CI coverage; the target is unavailable locally.
 #[test]
-fn reaping_ends_the_job_while_sync_retains_the_session() {
+fn reaping_ends_the_job_while_registry_get_retains_the_session() {
     let scratch = Scratch::new("reap-held");
-    let _daemon = spawn::Daemon::spawn(&scratch.0);
     let out = scratch.0.join("kind.txt");
-    let session = session_with_a_lingering_process(&scratch.0, &out, 4, 12);
-    start(
-        &scratch.0,
-        format!(
-            "return remuda.new('linger', {{ 'cmd.exe', '/c', {} }})",
-            lua(&session)
-        ),
-    );
+    let session_script = session_with_a_lingering_process(&scratch.0, &out, 4, 12);
+    let mut command = CommandBuilder::new("cmd.exe");
+    command.args(["/c", session_script.to_str().expect("utf-8 scratch path")]);
+    let agent = PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn session pty");
+    let registry = Registry::new();
+    registry
+        .register(Session::new(
+            "linger",
+            Box::new(agent),
+            Arc::new(SystemClock::new()),
+        ))
+        .expect("register session");
+    let held = registry.get("linger").expect("hold session from registry");
+
     let began = Instant::now();
     while !scratch.0.join("started.txt").exists() {
         assert!(
@@ -230,32 +236,32 @@ fn reaping_ends_the_job_while_sync_retains_the_session() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let socket = daemon::socket_path_in(&scratch.0, "s");
-    let sync = std::thread::spawn(move || {
-        client::request(
-            &socket,
-            &Request::Sync {
-                name: "linger".into(),
-                instance_id: None,
-                since: u64::MAX,
-                timeout_ms: 15_000,
-            },
-        )
-    });
-    std::thread::sleep(Duration::from_millis(200));
+    let before = lingering(&scratch.0);
+    fact(format_args!("lingering processes before reap: {before:?}"));
+    assert!(!before.is_empty(), "the lingering process never ran");
 
     let deadline = Instant::now() + Duration::from_secs(10);
+    while held.is_alive() {
+        assert!(Instant::now() < deadline, "session process never exited");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(registry.reap(), vec![String::from("linger")]);
+    assert!(registry.get("linger").is_none(), "session was not reaped");
+    assert_eq!(
+        Arc::strong_count(&held),
+        1,
+        "held Arc was unexpectedly dropped"
+    );
+
     let mut after = lingering(&scratch.0);
     while !after.is_empty() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
         after = lingering(&scratch.0);
     }
     fact(format_args!(
-        "lingering processes after reap with Sync retaining session: {after:?}"
+        "lingering processes after reap with Registry::get Arc held: {after:?}"
     ));
     assert!(after.is_empty(), "job survived reaping: {after:?}");
-    assert!(!sync.is_finished(), "Sync did not retain the session");
-    let _ = sync.join();
 }
 
 #[test]
