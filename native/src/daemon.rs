@@ -1488,6 +1488,7 @@ fn capture_styled(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle(
     stream: Stream,
     registry: &Registry,
