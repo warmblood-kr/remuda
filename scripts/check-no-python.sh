@@ -1,9 +1,16 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Fail when Python enters the core tree outside the temporary, owned port list.
-set -eu
+set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
+export LC_ALL=C
+inventory=$(mktemp)
+trap 'rm -f "$inventory"' EXIT HUP INT TERM
+git ls-files --cached --others --exclude-standard -z >"$inventory" || {
+	echo 'check-no-python: cannot enumerate repository files' >&2
+	exit 1
+}
 
 # Keep one row per exception. The six CI checkers are assigned to core CI.
 ALLOWLIST=$(cat <<'EOF'
@@ -41,13 +48,23 @@ is_allowed_py() {
 	done
 }
 
+# Split policy tokens so the guard scans its own source without an exemption.
+python_token='py''thon'
+pip_token='pi''p'
+uv_token='u''v'
+setup_token='setup-py''thon'
 failed=0
-while IFS= read -r file; do
-	[ -f "$file" ] || continue
-	case "$file" in
-		scripts/check-no-python.sh|scripts/test-no-python.sh) continue ;;
-	esac
+while IFS= read -r -d '' file; do
+	if [ -L "$file" ] || [ ! -f "$file" ]; then
+		echo "check-no-python: cannot inspect regular repository file: $file" >&2
+		failed=1
+		continue
+	fi
 	if is_allowed_py "$file"; then continue; fi
+	first_line=$(head -n 1 -- "$file" | tr -d '\000') || {
+		echo "check-no-python: cannot read repository file: $file" >&2
+		exit 1
+	}
 	# Extensions in any case, packaging files, and Python shebangs anywhere.
 	if printf '%s\n' "$file" | grep -qiE '\.pyw?$'; then
 		echo "check-no-python: unexpected Python file: $file" >&2
@@ -55,13 +72,11 @@ while IFS= read -r file; do
 	elif printf '%s\n' "${file##*/}" | grep -qiE '^requirements.*\.(txt|in)$'; then
 		echo "check-no-python: unexpected Python requirements file: $file" >&2
 		failed=1
-	elif head -n 1 "$file" 2>/dev/null | grep -qE '^#!.*python'; then
+	elif grep -qE '^#!.*py''thon' <<<"$first_line"; then
 		echo "check-no-python: unexpected Python shebang: $file" >&2
 		failed=1
 	fi
-done <<EOF
-$(git -c core.quotePath=false ls-files --cached --others --exclude-standard)
-EOF
+done <"$inventory"
 
 while IFS='|' read -r file owner todo; do
 	[ -n "$file" ] || continue
@@ -88,21 +103,26 @@ done <<EOF
 $ALLOWLIST
 EOF
 
-# Check tracked and untracked source in the two directories where build scripts
-# and workflow commands live. Comments are ignored; Python shebangs are not.
-source_files=$(git ls-files --cached --others --exclude-standard -- .github/workflows scripts)
-for file in $source_files; do
-	[ -f "$file" ] || continue
+# Text guard limit: a name built at run time (p=py""thon3; "$p") is not seen.
+invocation_re="(^|[^[:alnum:]_-])(${python_token}[0-9.]*|${pip_token}[0-9.]*|${uv_token})([^[:alnum:]_-]|$)|${setup_token}|requirements[^[:space:]]*\\.(txt|in)|^#!.*${python_token}"
+while IFS= read -r -d '' file; do
+	[ ! -L "$file" ] && [ -f "$file" ] || continue
 	case "$file" in
-		scripts/check-no-python.sh|scripts/test-no-python.sh) continue ;;
-		scripts/*.py)
-			if is_allowed_py "$file"; then continue; fi
-			;;
+		.github/*|scripts/*|*.sh|*.bash|*.ps1|*.rs|*.lua|*.js|*.ts|*.toml|*.yml|*.yaml|Dockerfile*|*/Dockerfile*|*Makefile*) ;;
+		*) [ -x "$file" ] || continue ;;
 	esac
+	if is_allowed_py "$file"; then continue; fi
+	matches=$(grep -anE -- "$invocation_re" "$file") || {
+		status=$?
+		if [ "$status" -ne 1 ]; then
+			echo "check-no-python: cannot scan repository file: $file" >&2
+			exit 1
+		fi
+	}
 	while IFS=: read -r line_no line; do
 		[ -n "$line_no" ] || continue
 		case "$line" in
-			'#!'*python*) ;;
+			'#!'*"$python_token"*) ;;
 			*)
 				trimmed=$(printf '%s' "$line" | sed 's/^[[:space:]]*//')
 				case "$trimmed" in \#*) continue ;; esac
@@ -118,7 +138,7 @@ for file in $source_files; do
 		esac
 		allowed=0
 		if [ -n "$checker" ] && printf '%s\n' "$line" | grep -qxE \
-			"[[:space:]]*(- run: |if )?python3 scripts/check-($checker)\.py( 2>/tmp/out; then| \\\\)?"; then
+			"[[:space:]]*(- run: |if )?${python_token}3 scripts/check-($checker)\.py( 2>/tmp/out; then| \\\\)?"; then
 			allowed=1
 		fi
 		if [ "$allowed" -ne 1 ]; then
@@ -126,9 +146,9 @@ for file in $source_files; do
 			failed=1
 		fi
 	done <<EOF
-$(grep -nE '(^|[/[:space:]|;&(])(python[0-9.]*|pip[0-9.]*|uv)([[:space:]]|$)|setup-python|requirements[^[:space:]]*\.(txt|in)|^#!.*python' "$file" || true)
+$matches
 EOF
-done
+done <"$inventory"
 
 [ "$failed" -eq 0 ] || exit 1
 echo "ok — Python files and invocations match the documented temporary allowlist"
