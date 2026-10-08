@@ -110,6 +110,10 @@ mod windows {
         pub(crate) fn created(&self) -> io::Result<u64> {
             created(self.0)
         }
+
+        pub(crate) fn raw_handle(&self) -> usize {
+            self.0 as usize
+        }
     }
 
     impl Drop for Opened {
@@ -171,7 +175,7 @@ mod windows {
             Ok(())
         }
 
-        fn holds(&self, process: HANDLE) -> io::Result<bool> {
+        pub(crate) fn holds(&self, process: HANDLE) -> io::Result<bool> {
             let mut inside = 0;
             // SAFETY: both handles are live and `inside` is a valid BOOL.
             if unsafe { IsProcessInJob(process, self.handle, &mut inside) } == 0 {
@@ -180,10 +184,10 @@ mod windows {
             Ok(inside != 0)
         }
 
-        /// Whether `pid` is in this job. A process that cannot be opened or
-        /// asked about is not counted as ours.
-        pub fn contains(&self, pid: u32) -> bool {
-            Opened::query(pid).is_ok_and(|process| self.holds(process.0).unwrap_or(false))
+        /// Whether `pid` is in this job, preserving query failures.
+        pub fn contains(&self, pid: u32) -> io::Result<bool> {
+            let process = Opened::query(pid)?;
+            self.holds(process.0)
         }
 
         /// Ends every process in the job. Repeated calls succeed without
