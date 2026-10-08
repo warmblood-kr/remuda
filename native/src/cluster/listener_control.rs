@@ -43,6 +43,18 @@ pub fn start_with_config_written(
     request(daemon_path, ListenerOp::Reload)
 }
 
+/// Atomically decide whether a no-bind join may enable the listener, then
+/// reload the daemon after releasing the state lock.
+pub fn start_for_join(
+    daemon_path: &Path,
+    config_observed: impl FnOnce(Option<ListenerConfig>, Option<ListenerConfig>),
+) -> io::Result<ListenerStatus> {
+    match listener_config::enable_for_join(config_observed)? {
+        Some(_) => request(daemon_path, ListenerOp::Reload),
+        None => Ok(ListenerStatus::Off),
+    }
+}
+
 /// Disable the listener and ask the selected daemon to reload its task.
 pub fn stop(daemon_path: &Path) -> io::Result<ListenerStatus> {
     let mut config = listener_config::read()?.unwrap_or(ListenerConfig {

@@ -123,6 +123,31 @@ pub fn write_at(dir: &Path, config: &ListenerConfig) -> io::Result<()> {
     write_locked(dir, config)
 }
 
+/// Enable the join listener only if the config current under the state lock
+/// permits it. The callback runs after the decision, while the lock is held,
+/// so callers can record the rollback expectation before another writer acts.
+pub fn enable_for_join(
+    config_observed: impl FnOnce(Option<ListenerConfig>, Option<ListenerConfig>),
+) -> io::Result<Option<ListenerConfig>> {
+    let dir = super::storage::cluster_state_dir()?.join("cluster");
+    super::identity::load_identity_at(&dir)?;
+    super::storage::verify_directory(&dir)?;
+    let _guard = super::storage::StateLock::acquire(&dir)?;
+    let current = read_at(&dir)?;
+    if current.as_ref().is_some_and(|config| !config.enabled) {
+        config_observed(current.clone(), current);
+        return Ok(None);
+    }
+    let config = current.clone().unwrap_or(ListenerConfig {
+        enabled: true,
+        bind: ListenerBind::Auto,
+        allow_public: false,
+    });
+    write_locked(&dir, &config)?;
+    config_observed(current, Some(config.clone()));
+    Ok(Some(config))
+}
+
 /// Restore a listener snapshot only while the current config matches `expected`.
 pub fn restore_if_current(
     expected: Option<&ListenerConfig>,

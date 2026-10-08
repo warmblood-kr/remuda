@@ -1844,6 +1844,16 @@ impl JoinListenerRestoreGuard {
         self.expected = expected;
     }
 
+    fn set_join_configs(
+        &mut self,
+        snapshot: Option<ListenerConfig>,
+        expected: Option<ListenerConfig>,
+    ) {
+        self.expected_off = snapshot.as_ref().is_none_or(|config| !config.enabled);
+        self.snapshot = snapshot;
+        self.expected = expected;
+    }
+
     fn restore(
         &mut self,
     ) -> std::io::Result<remuda_native::cluster::listener_control::RestoreOutcome> {
@@ -1895,7 +1905,7 @@ enum JoinListenerStartOutcome {
 fn start_join_listener(
     daemon_path: &Path,
     restore_guard: &mut JoinListenerRestoreGuard,
-    listener_snapshot: Option<&ListenerConfig>,
+    _listener_snapshot: Option<&ListenerConfig>,
     bind_addr: Option<std::net::SocketAddr>,
 ) -> JoinListenerStartOutcome {
     match bind_addr {
@@ -1908,26 +1918,12 @@ fn start_join_listener(
                 allow_public: false,
             },
         ),
-        None if listener_snapshot.is_some_and(|config| !config.enabled) => {
-            JoinListenerStartOutcome::Started(Ok(remuda_core::protocol::ListenerStatus::Off))
-        }
-        None => {
-            let initial_status = remuda_native::cluster::listener_control::status(daemon_path);
-            match initial_status {
-                remuda_core::protocol::ListenerStatus::On { .. } => {
-                    JoinListenerStartOutcome::Started(Ok(initial_status))
-                }
-                _ => {
-                    let mut config = listener_snapshot.cloned().unwrap_or(ListenerConfig {
-                        enabled: true,
-                        bind: ListenerBind::Auto,
-                        allow_public: false,
-                    });
-                    config.enabled = true;
-                    start_join_listener_with_config(daemon_path, restore_guard, config)
-                }
-            }
-        }
+        None => finish_join_listener_start(restore_guard, |restore_guard| {
+            remuda_native::cluster::listener_control::start_for_join(
+                daemon_path,
+                |snapshot, expected| restore_guard.set_join_configs(snapshot, expected),
+            )
+        }),
     }
 }
 
@@ -3152,6 +3148,63 @@ mod cluster_cli_tests {
 
     #[cfg(unix)]
     #[test]
+    fn join_honors_no_listen_written_after_snapshot() {
+        let _environment = ForegroundListenerLockEnvironment::new();
+        let snapshot = ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Auto,
+            allow_public: false,
+        };
+        let disabled = ListenerConfig {
+            enabled: false,
+            ..snapshot.clone()
+        };
+        remuda_native::cluster::listener_config::write(&snapshot).unwrap();
+        let daemon_path = _environment.root.join("missing-daemon.sock");
+        let mut restore_guard = JoinListenerRestoreGuard::new(&daemon_path, Some(snapshot.clone()));
+
+        // A completed `cluster listen --off` after join's initial snapshot.
+        remuda_native::cluster::listener_config::write(&disabled).unwrap();
+        let outcome = start_join_listener(&daemon_path, &mut restore_guard, Some(&snapshot), None);
+
+        assert!(matches!(
+            outcome,
+            JoinListenerStartOutcome::Started(Ok(remuda_core::protocol::ListenerStatus::Off))
+        ));
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            Some(disabled.clone())
+        );
+
+        // Rollback after the interleaving must retain the newer disabled setting.
+        restore_join_listener(&mut restore_guard);
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            Some(ListenerConfig {
+                enabled: false,
+                bind: ListenerBind::Auto,
+                allow_public: false,
+            })
+        );
+
+        remuda_native::cluster::listener_config::remove().unwrap();
+        let empty_snapshot = None;
+        let mut restore_guard = JoinListenerRestoreGuard::new(&daemon_path, empty_snapshot);
+        remuda_native::cluster::listener_config::write(&disabled).unwrap();
+        let outcome = start_join_listener(&daemon_path, &mut restore_guard, None, None);
+        assert!(matches!(
+            outcome,
+            JoinListenerStartOutcome::Started(Ok(remuda_core::protocol::ListenerStatus::Off))
+        ));
+        restore_join_listener(&mut restore_guard);
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            Some(disabled)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn join_without_saved_no_listen_still_enables_listener() {
         let _serial = JOIN_SIGNAL_TEST
             .lock()
@@ -3421,6 +3474,14 @@ mod cluster_cli_tests {
         let _serial = JOIN_SIGNAL_TEST
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct ResetInterruptState;
+        impl Drop for ResetInterruptState {
+            fn drop(&mut self) {
+                JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
+                JOIN_INTERRUPT_SIGNAL.store(0, Ordering::Relaxed);
+            }
+        }
+        let _reset = ResetInterruptState;
         let _handler = JoinInterruptHandler::install().unwrap();
         assert!(!JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
@@ -3443,6 +3504,15 @@ mod cluster_cli_tests {
             }
         }
 
+        struct ResetInterruptState;
+        impl Drop for ResetInterruptState {
+            fn drop(&mut self) {
+                JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
+                JOIN_INTERRUPT_SIGNAL.store(0, Ordering::Relaxed);
+            }
+        }
+        let _reset = ResetInterruptState;
+
         let prior = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
         assert_ne!(prior, libc::SIG_ERR, "set SIGHUP to ignored");
         let _restore = RestoreSignal(libc::SIGHUP, prior);
@@ -3460,6 +3530,14 @@ mod cluster_cli_tests {
         let _serial = JOIN_SIGNAL_TEST
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct ResetInterruptState;
+        impl Drop for ResetInterruptState {
+            fn drop(&mut self) {
+                JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
+                JOIN_INTERRUPT_SIGNAL.store(0, Ordering::Relaxed);
+            }
+        }
+        let _reset = ResetInterruptState;
         let signals = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
         let before: Vec<_> = signals
             .iter()
