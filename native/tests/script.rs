@@ -1496,7 +1496,7 @@ fn input_line_empty_rejects_draft_content_above_the_cursor() {
         expect_unknown(screen({ row("❯ draft"), row("❯ ") }, 2), "shell")
         expect_unknown(screen({ row("❯ draft"), row("> "), row("❯ ") }, 3), "shell")
         -- A glyph-less PS1 above a PS2 row is still ambiguous.
-        expect_unknown(screen({ row("user@host$ python"), row("> ") }, 2), "shell")
+        expect_unknown(screen({ row("user@host$ node"), row("> ") }, 2), "shell")
         expect_unknown(screen({ row("❯ "), row("continued draft"), row("ordinary row") }, 3), "shell")
         -- In a Claude frame the first prompt row anchors the composer.
         expect_unknown(screen({ row("│ ❯ draft│"), row("│ ❯ │"), row("╰ footer") }, 2), "claude")
