@@ -155,7 +155,8 @@ fn children_of_a_detached_daemon_keep_the_default_sighup() {
     let dir = daemon.socket.parent().unwrap().to_path_buf();
     let probe = |file: &Path| {
         format!(
-            "{{'python3', '-c', 'import signal, sys, time; open(sys.argv[1], \"w\").write(str(int(signal.getsignal(signal.SIGHUP)))); time.sleep(30)', '{}'}}",
+            "{{'{}', '{}'}}",
+            env!("CARGO_BIN_EXE_sighup_disposition_probe"),
             file.display()
         )
     };
