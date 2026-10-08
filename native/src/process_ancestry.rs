@@ -85,6 +85,20 @@ pub(crate) enum CallerOrigin {
     Unknown,
 }
 
+#[cfg(any(windows, test))]
+pub(crate) fn resolve_job_first<J, A>(job: J, ancestry: A) -> CallerOrigin
+where
+    J: FnOnce() -> io::Result<Option<String>>,
+    A: FnOnce() -> CallerOrigin,
+{
+    match job() {
+        Ok(Some(name)) => CallerOrigin::Session(name),
+        Ok(None) => ancestry(),
+        Err(_) => CallerOrigin::Unknown,
+    }
+}
+
+#[cfg(any(not(windows), test))]
 pub(crate) fn resolve_caller(
     peer_pid: io::Result<Option<u32>>,
     sessions: &[(String, u32)],
@@ -92,17 +106,7 @@ pub(crate) fn resolve_caller(
     #[cfg(windows)]
     {
         return match peer_pid {
-            Ok(Some(pid)) if pid > 1 => match process_parents() {
-                Ok(parents) => resolve_caller_with(pid, sessions, std::process::id(), |pid| {
-                    parents.get(&pid).copied().map(Some).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::NotFound,
-                            format!("process {pid} is not in the process snapshot"),
-                        )
-                    })
-                }),
-                Err(_) => CallerOrigin::Unknown,
-            },
+            Ok(Some(pid)) if pid > 1 => resolve_caller_windows(pid, sessions, None),
             Ok(Some(_)) | Ok(None) | Err(_) => CallerOrigin::Unknown,
         };
     }
@@ -115,6 +119,111 @@ pub(crate) fn resolve_caller(
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn resolve_caller_opened(
+    pid: u32,
+    peer: &crate::session_job::Opened,
+    sessions: &[(String, u32)],
+) -> CallerOrigin {
+    resolve_caller_windows(pid, sessions, Some(peer))
+}
+
+#[cfg(windows)]
+fn resolve_caller_windows(
+    pid: u32,
+    sessions: &[(String, u32)],
+    peer: Option<&crate::session_job::Opened>,
+) -> CallerOrigin {
+    use crate::session_job::Opened;
+    let parents = match process_parents() {
+        Ok(parents) => parents,
+        Err(_) => return CallerOrigin::Unknown,
+    };
+    chain_end(pid, sessions, |process_pid| {
+        let Some(&parent_pid) = parents.get(&process_pid) else {
+            return Ok(None);
+        };
+        let opened;
+        let process = if process_pid == pid {
+            match peer {
+                Some(peer) => peer,
+                None => {
+                    opened = match Opened::query(process_pid) {
+                        Ok(opened) => opened,
+                        Err(error) if process_missing(&error) => {
+                            return Ok(None);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    &opened
+                }
+            }
+        } else {
+            opened = match Opened::query(process_pid) {
+                Ok(opened) => opened,
+                Err(error) if process_missing(&error) => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            &opened
+        };
+        process.created().map(|created| Some((parent_pid, created)))
+    })
+}
+
+#[cfg(any(windows, test))]
+fn process_missing(error: &io::Error) -> bool {
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    error.raw_os_error() == Some(ERROR_INVALID_PARAMETER)
+}
+
+#[cfg(any(windows, test))]
+fn chain_end<F>(mut pid: u32, sessions: &[(String, u32)], mut process: F) -> CallerOrigin
+where
+    F: FnMut(u32) -> io::Result<Option<(u32, u64)>>,
+{
+    const MAX_HOPS: usize = 64;
+    let mut visited = std::collections::HashSet::new();
+    let mut child_created = None;
+    let mut hops = 0;
+    loop {
+        let session = sessions.iter().find(|(_, session_pid)| *session_pid == pid);
+        if child_created.is_none() {
+            if let Some((name, _)) = session {
+                return CallerOrigin::Session(name.clone());
+            }
+        }
+        if pid <= 1 {
+            return CallerOrigin::Outside;
+        }
+        if !visited.insert(pid) {
+            return CallerOrigin::Unknown;
+        }
+        let (parent_pid, created) = match process(pid) {
+            Ok(Some(info)) => info,
+            Ok(None) if hops > 0 => return CallerOrigin::Outside,
+            Ok(None) | Err(_) => return CallerOrigin::Unknown,
+        };
+        if child_created.is_some_and(|child| created > child) {
+            return CallerOrigin::Outside;
+        }
+        if let Some((name, _)) = session {
+            return CallerOrigin::Session(name.clone());
+        }
+        if parent_pid <= 1 {
+            return CallerOrigin::Outside;
+        }
+        if hops == MAX_HOPS {
+            return CallerOrigin::Unknown;
+        }
+        child_created = Some(created);
+        pid = parent_pid;
+        hops += 1;
+    }
+}
+
+#[cfg(any(not(windows), test))]
 fn resolve_caller_with<F>(
     mut pid: u32,
     sessions: &[(String, u32)],
@@ -292,6 +401,167 @@ pub(crate) fn process_parents() -> io::Result<std::collections::HashMap<u32, u32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chain_end<F>(pid: u32, sessions: &[(String, u32)], process: F) -> CallerOrigin
+    where
+        F: FnMut(u32) -> io::Result<Option<(u32, u64)>>,
+    {
+        super::chain_end(pid, sessions, process)
+    }
+
+    #[test]
+    fn a_missing_parent_ends_a_caller_chain_outside() {
+        let process = |pid| match pid {
+            40 => Ok(Some((30, 100))),
+            30 => Ok(None),
+            _ => unreachable!(),
+        };
+        assert_eq!(chain_end(40, &[], process), CallerOrigin::Outside);
+    }
+
+    #[test]
+    fn a_strictly_younger_parent_ends_a_caller_chain_outside() {
+        let process = |pid| match pid {
+            40 => Ok(Some((30, 100))),
+            30 => Ok(Some((20, 200))),
+            _ => unreachable!(),
+        };
+        assert_eq!(chain_end(40, &[], process), CallerOrigin::Outside);
+    }
+
+    #[test]
+    fn an_equal_creation_time_parent_is_not_a_reused_pid() {
+        let process = |pid| match pid {
+            40 => Ok(Some((30, 100))),
+            30 => Ok(Some((20, 100))),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            chain_end(40, &[("work".into(), 30)], process),
+            CallerOrigin::Session("work".into())
+        );
+    }
+
+    #[test]
+    fn a_missing_peer_at_the_first_hop_is_unknown() {
+        assert_eq!(chain_end(40, &[], |_| Ok(None)), CallerOrigin::Unknown);
+    }
+
+    #[test]
+    fn a_caller_chain_can_reach_a_session_at_the_64_hop_boundary() {
+        let process = |pid| Ok(Some((pid - 1, u64::from(pid))));
+        assert_eq!(
+            chain_end(100, &[("work".into(), 36)], process),
+            CallerOrigin::Session("work".into())
+        );
+    }
+
+    #[test]
+    fn a_session_beyond_the_64_hop_boundary_is_unknown() {
+        let process = |pid| Ok(Some((pid - 1, u64::from(pid))));
+        assert_eq!(
+            chain_end(100, &[("work".into(), 35)], process),
+            CallerOrigin::Unknown
+        );
+    }
+
+    #[test]
+    fn root_pids_end_the_chain_outside() {
+        for pid in [0, 1] {
+            assert_eq!(
+                chain_end(pid, &[], |_| unreachable!()),
+                CallerOrigin::Outside
+            );
+        }
+    }
+
+    #[test]
+    fn only_invalid_parameter_maps_to_a_missing_process() {
+        assert!(process_missing(&io::Error::from_raw_os_error(87)));
+        assert!(!process_missing(&io::Error::from_raw_os_error(5)));
+    }
+
+    #[test]
+    fn a_membership_error_stays_unknown_even_if_the_parent_is_missing() {
+        let held_peer = Some(40);
+        let origin = resolve_job_first(
+            || {
+                assert_eq!(held_peer, Some(40));
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+            },
+            || {
+                chain_end(40, &[], |pid| match pid {
+                    40 => Ok(Some((30, 100))),
+                    30 => Ok(None),
+                    _ => unreachable!(),
+                })
+            },
+        );
+        assert_eq!(origin, CallerOrigin::Unknown);
+    }
+
+    #[test]
+    fn unreadable_parent_information_keeps_the_caller_unknown() {
+        let process = |pid| match pid {
+            40 => Ok(Some((30, 100))),
+            30 => Err(io::Error::new(io::ErrorKind::PermissionDenied, "hidden")),
+            _ => unreachable!(),
+        };
+        assert_eq!(chain_end(40, &[], process), CallerOrigin::Unknown);
+
+        let unreadable_creation = |_| {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "creation time unavailable",
+            ))
+        };
+        assert_eq!(
+            chain_end(40, &[], unreadable_creation),
+            CallerOrigin::Unknown
+        );
+    }
+
+    #[test]
+    fn an_overlong_caller_chain_is_unknown() {
+        let process = |pid| Ok(Some((pid - 1, u64::from(pid))));
+        assert_eq!(chain_end(100, &[], process), CallerOrigin::Unknown);
+    }
+
+    #[test]
+    fn a_cyclic_caller_chain_is_unknown() {
+        let process = |pid| match pid {
+            40 => Ok(Some((30, 100))),
+            30 => Ok(Some((40, 90))),
+            _ => unreachable!(),
+        };
+        assert_eq!(chain_end(40, &[], process), CallerOrigin::Unknown);
+    }
+
+    #[test]
+    fn a_session_pid_ends_the_caller_chain_before_its_parent_is_read() {
+        let process = |pid| match pid {
+            40 => Ok(Some((30, 100))),
+            30 => Ok(Some((20, 90))),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            chain_end(40, &[("work".into(), 30)], process),
+            CallerOrigin::Session("work".into())
+        );
+    }
+
+    #[test]
+    fn a_reused_session_pid_is_outside_when_the_parent_is_younger() {
+        let process = |pid| match pid {
+            40 => Ok(Some((30, 100))),
+            30 => Ok(Some((20, 200))),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            chain_end(40, &[("work".into(), 30)], process),
+            CallerOrigin::Outside
+        );
+    }
 
     #[test]
     fn current_process_is_its_own_ancestor() {
