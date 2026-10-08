@@ -3373,6 +3373,7 @@ mod cluster_cli_tests {
         }
 
         let _reset = ResetInterruptState;
+        let _default = DefaultSignals::set(&[libc::SIGTERM]);
         let _environment = ForegroundListenerLockEnvironment::new();
         let join_config = ListenerConfig {
             enabled: true,
@@ -3488,6 +3489,7 @@ mod cluster_cli_tests {
             }
         }
         let _reset = ResetInterruptState;
+        let _default = DefaultSignals::set(&[libc::SIGINT]);
         let _handler = JoinInterruptHandler::install().unwrap();
         assert!(!JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
@@ -3544,6 +3546,7 @@ mod cluster_cli_tests {
             }
         }
         let _reset = ResetInterruptState;
+        let _default = DefaultSignals::set(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
         let signals = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
         let before: Vec<_> = signals
             .iter()
@@ -3560,6 +3563,36 @@ mod cluster_cli_tests {
         drop(handler);
         for (signal, expected) in signals.into_iter().zip(before) {
             assert_eq!(current_signal_handler(signal), expected);
+        }
+    }
+
+    /// A background test run (`cargo test &`) inherits SIGINT ignored, and
+    /// `install` keeps ignored signals; tests that raise one restore the default.
+    #[cfg(unix)]
+    struct DefaultSignals(Vec<(libc::c_int, libc::sighandler_t)>);
+
+    #[cfg(unix)]
+    impl DefaultSignals {
+        fn set(signals: &[libc::c_int]) -> Self {
+            let mut ignored = Vec::new();
+            for &signal in signals {
+                if current_signal_handler(signal) == libc::SIG_IGN {
+                    // SAFETY: SIG_DFL is a valid disposition; Drop restores SIG_IGN.
+                    unsafe { libc::signal(signal, libc::SIG_DFL) };
+                    ignored.push((signal, libc::SIG_IGN));
+                }
+            }
+            Self(ignored)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DefaultSignals {
+        fn drop(&mut self) {
+            for &(signal, previous) in &self.0 {
+                // SAFETY: restore the inherited disposition recorded by `set`.
+                unsafe { libc::signal(signal, previous) };
+            }
         }
     }
 
