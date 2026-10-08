@@ -866,6 +866,39 @@ fn cluster_join_and_peer_call_outputs_match_goldens() {
 }
 
 #[test]
+fn fresh_state_cli_join_creates_identity_at_the_command_callsite() {
+    let inviter = Scratch::new();
+    let _inviter_daemon = start_daemon(&inviter);
+    let initialized = inviter.run(&["cluster", "init", "--no-listen"]);
+    assert!(
+        initialized.status.success(),
+        "inviter init failed: {initialized:?}"
+    );
+    let invite = inviter.run(&["cluster", "invite", "--bind", "127.0.0.1:0"]);
+    assert!(invite.status.success(), "invite failed: {invite:?}");
+    let (fingerprint, join_line) = invitation_command_args(&invite);
+
+    let joiner = Scratch::new();
+    let _joiner_daemon = start_daemon(&joiner);
+    let identity_path = joiner.root.join("state/remuda/cluster/identity.key");
+    assert!(
+        !identity_path.exists(),
+        "fresh joiner unexpectedly has an identity"
+    );
+    let joined = joiner.run(&["cluster", "join", &fingerprint, &join_line]);
+
+    assert!(
+        joined.status.success(),
+        "fresh-state CLI join failed: {}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    assert!(
+        identity_path.is_file(),
+        "join did not create the local identity"
+    );
+}
+
+#[test]
 fn rerunning_a_join_line_on_a_member_says_already_a_member_without_network() {
     let inviter = Scratch::new();
     let inviter_daemon = initialized_node(&inviter);

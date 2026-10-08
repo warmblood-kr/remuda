@@ -168,7 +168,12 @@ pub(super) struct StateLock(File);
 impl StateLock {
     pub(super) fn acquire(dir: &Path) -> io::Result<Self> {
         let path = dir.join("identity.lock");
-        let file = super::windows_security::create_or_open_lock(&path)?;
+        let file = super::windows_security::create_or_open_lock(&path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot open cluster lock at {}: {error}", path.display()),
+            )
+        })?;
         check_private_file(&file, "cluster lock", &path)?;
         file.lock()?;
         Ok(Self(file))
@@ -176,7 +181,12 @@ impl StateLock {
 
     pub(super) fn lock_with_deadline(dir: &Path, timeout: Duration) -> io::Result<Self> {
         let path = dir.join("identity.lock");
-        let file = super::windows_security::create_or_open_lock(&path)?;
+        let file = super::windows_security::create_or_open_lock(&path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot open cluster lock at {}: {error}", path.display()),
+            )
+        })?;
         check_private_file(&file, "cluster lock", &path)?;
         lock_file_with_deadline(file, timeout)
     }
@@ -376,7 +386,12 @@ impl StateLock {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
-        let file = options.open(&path)?;
+        let file = options.open(&path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot open cluster lock at {}: {error}", path.display()),
+            )
+        })?;
         check_private_file(&file, "cluster lock", &path)?;
         file.lock()?;
         Ok(Self(file))
@@ -391,7 +406,12 @@ impl StateLock {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
-        let file = options.open(&path)?;
+        let file = options.open(&path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot open cluster lock at {}: {error}", path.display()),
+            )
+        })?;
         check_private_file(&file, "cluster lock", &path)?;
         lock_file_with_deadline(file, timeout)
     }
