@@ -33,7 +33,14 @@ struct Node {
 impl Node {
     fn start(label: &str) -> Self {
         let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("rp-{}-{serial}", std::process::id()));
+        // The default macOS TMPDIR (/var/folders/...) leaves too little of the
+        // 104-byte sun_path for runtime/remuda/<node>.sock.
+        let temp_root = if cfg!(target_os = "macos") {
+            PathBuf::from("/private/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let root = temp_root.join(format!("rp-{}-{serial}", std::process::id()));
         let runtime = root.join("runtime");
         let state = root.join("state");
         let home = root.join("home");
