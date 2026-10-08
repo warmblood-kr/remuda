@@ -593,10 +593,13 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
     if matches!(args, ["help"] | ["-h"] | ["--help"]) {
         return ClusterCommand::Help(None);
     }
-    if let [verb, "--help"] = args {
+    if let [verb, "--help"] | ["help", verb] = args {
         if cluster_verb_known(verb) {
             return ClusterCommand::Help(Some((*verb).to_owned()));
         }
+    }
+    if let ["help", verb] = args {
+        return ClusterCommand::UnknownVerb((*verb).to_owned());
     }
     let (verb, rest) = args.split_first().expect("non-empty cluster args");
     if !cluster_verb_known(verb) {
@@ -3764,6 +3767,23 @@ mod cluster_cli_tests {
         assert_eq!(
             parse_cluster_command(&["node"]),
             ClusterCommand::UnknownVerb("node".into())
+        );
+    }
+
+    #[test]
+    fn cluster_help_verb_shows_that_verbs_usage() {
+        for verb in [
+            "init", "invite", "join", "nodes", "control", "revoke", "remote", "listen", "call",
+        ] {
+            assert_eq!(
+                parse_cluster_command(&["help", verb]),
+                ClusterCommand::Help(Some(verb.into())),
+                "cluster help {verb}"
+            );
+        }
+        assert_eq!(
+            parse_cluster_command(&["help", "wat"]),
+            ClusterCommand::UnknownVerb("wat".into())
         );
     }
 
