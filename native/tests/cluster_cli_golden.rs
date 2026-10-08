@@ -540,6 +540,25 @@ fn cluster_help_verb_matches_verb_help_for_every_verb() {
 }
 
 #[test]
+fn cluster_help_about_help_matches_cluster_help() {
+    let scratch = Scratch::new();
+    let expected = scratch.run(&["cluster", "--help"]);
+    let mut failures = Vec::new();
+    for topic in ["help", "-h", "--help"] {
+        let output = scratch.run(&["cluster", "help", topic]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() || output.stdout != expected.stdout || !stderr.is_empty() {
+            failures.push(format!(
+                "cluster help {topic}: exit={:?}\nstdout: {stdout}\nstderr: {stderr}",
+                output.status.code()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
 fn cluster_init_discloses_listener_before_it_binds() {
     use remuda_native::cluster::listener_config::{self, ListenerBind, ListenerConfig};
     use std::os::unix::fs::PermissionsExt;
@@ -1941,6 +1960,10 @@ fn assert_join_signal_restores_listener_config(signal: libc::c_int, expected_exi
         let _ = release_rx.recv_timeout(Duration::from_secs(5));
         drop(stream);
     });
+    // A background test run (`cargo test &`) inherits SIGINT ignored, and the
+    // child would keep it; spawn it with the default action instead.
+    // SAFETY: SIG_DFL is a valid disposition; the inherited one is restored below.
+    let inherited = unsafe { libc::signal(signal, libc::SIG_DFL) };
     let child = scratch
         .command(&[
             "cluster",
@@ -1954,6 +1977,8 @@ fn assert_join_signal_restores_listener_config(signal: libc::c_int, expected_exi
         .stderr(Stdio::piped())
         .spawn()
         .expect("start isolated join command");
+    // SAFETY: restore the disposition this test process inherited.
+    unsafe { libc::signal(signal, inherited) };
     let mut child = ChildGuard(Some(child));
     connected_rx
         .recv_timeout(Duration::from_secs(5))

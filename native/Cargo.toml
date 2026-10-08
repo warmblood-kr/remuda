@@ -4,10 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "input_unit_fake_agent"
 path = "tests/daemon_support/input_unit_fake_agent.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "sighup_disposition_probe"
+path = "tests/daemon_support/sighup_disposition_probe.rs"
 test = false
 bench = false
 

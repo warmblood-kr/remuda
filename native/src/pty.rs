@@ -1044,8 +1044,11 @@ impl AgentProcess for PtyAgent {
     }
 
     #[cfg(windows)]
-    fn owns_process(&self, pid: u32) -> bool {
-        self.job.contains(pid)
+    fn owns_process(&self, pid: u32, process_handle: Option<usize>) -> std::io::Result<bool> {
+        match process_handle {
+            Some(handle) => self.job.holds(handle as _),
+            None => self.job.contains(pid),
+        }
     }
 }
 

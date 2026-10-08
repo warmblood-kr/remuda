@@ -1326,10 +1326,13 @@ impl Session {
         agent.is_alive().then(|| agent.process_id()).flatten()
     }
 
-    /// Whether the backend holds `pid` as this session's own; it can be true
-    /// after the session's child has exited.
-    pub fn owns_process(&self, pid: u32) -> bool {
-        self.agent.lock().is_ok_and(|agent| agent.owns_process(pid))
+    /// Whether the backend holds `pid` as this session's own, even after its
+    /// child exits. A query error leaves ownership unknown.
+    pub fn owns_process(&self, pid: u32, process_handle: Option<usize>) -> std::io::Result<bool> {
+        self.agent
+            .lock()
+            .map_err(|_| std::io::Error::other("session lock poisoned"))?
+            .owns_process(pid, process_handle)
     }
 
     /// End the child. Refused while attached, and idempotent on an

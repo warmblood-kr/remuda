@@ -417,11 +417,10 @@ pub trait AgentProcess: Send {
         None
     }
 
-    /// Whether `pid` is a process this agent's backend holds as its own, by a
-    /// marker the process cannot shed (a Windows job object). Unlike
-    /// [`Self::process_id`] it can be true after the agent's own child exited.
-    fn owns_process(&self, _pid: u32) -> bool {
-        false
+    /// Whether the backend holds `pid` as its own (for example, in a job).
+    /// The held process handle avoids reopening by PID; errors mean unknown.
+    fn owns_process(&self, _pid: u32, _process_handle: Option<usize>) -> std::io::Result<bool> {
+        Ok(false)
     }
 
     /// The visible screen as styled cells, for a croppable colour pane.
@@ -618,8 +617,8 @@ impl AgentProcess for ScriptedAgent {
         self.alive
     }
 
-    fn owns_process(&self, pid: u32) -> bool {
-        self.owned.contains(&pid)
+    fn owns_process(&self, pid: u32, _process_handle: Option<usize>) -> std::io::Result<bool> {
+        Ok(self.owned.contains(&pid))
     }
 
     fn terminate(&mut self) -> Result<()> {
