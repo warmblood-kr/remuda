@@ -515,6 +515,31 @@ fn cluster_help_output_is_routed_and_discloses_listener_controls() {
 }
 
 #[test]
+fn cluster_help_verb_matches_verb_help_for_every_verb() {
+    let scratch = Scratch::new();
+    let mut failures = Vec::new();
+    for verb in [
+        "init", "invite", "join", "nodes", "control", "revoke", "remote", "listen", "call",
+    ] {
+        let expected = scratch.run(&["cluster", verb, "--help"]);
+        let output = scratch.run(&["cluster", "help", verb]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success()
+            || output.stdout != expected.stdout
+            || !stdout.starts_with(&format!("usage: remuda cluster {verb}"))
+            || !stderr.is_empty()
+        {
+            failures.push(format!(
+                "cluster help {verb}: exit={:?}\nstdout: {stdout}\nstderr: {stderr}",
+                output.status.code()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
 fn cluster_init_discloses_listener_before_it_binds() {
     use remuda_native::cluster::listener_config::{self, ListenerBind, ListenerConfig};
     use std::os::unix::fs::PermissionsExt;
