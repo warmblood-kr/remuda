@@ -98,6 +98,7 @@ where
     }
 }
 
+#[cfg(any(not(windows), test))]
 pub(crate) fn resolve_caller(
     peer_pid: io::Result<Option<u32>>,
     sessions: &[(String, u32)],
@@ -464,7 +465,12 @@ mod tests {
 
     #[test]
     fn root_pids_end_the_chain_outside() {
-        assert_eq!(chain_end(1, &[], |_| unreachable!()), CallerOrigin::Outside);
+        for pid in [0, 1] {
+            assert_eq!(
+                chain_end(pid, &[], |_| unreachable!()),
+                CallerOrigin::Outside
+            );
+        }
     }
 
     #[test]

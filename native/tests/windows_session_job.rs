@@ -1,7 +1,6 @@
 //! Assigned session processes and descendants started after assignment are
 //! `session` callers, even when a parent has exited or asks to leave the job.
-//! They end with the session or daemon. A command in an ordinary terminal
-//! still reads `unknown` here.
+//! They end with the session or daemon.
 #![cfg(windows)]
 
 use remuda_core::protocol::{Request, Response};
