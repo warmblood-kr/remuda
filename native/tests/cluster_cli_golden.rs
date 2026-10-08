@@ -1960,6 +1960,10 @@ fn assert_join_signal_restores_listener_config(signal: libc::c_int, expected_exi
         let _ = release_rx.recv_timeout(Duration::from_secs(5));
         drop(stream);
     });
+    // A background test run (`cargo test &`) inherits SIGINT ignored, and the
+    // child would keep it; spawn it with the default action instead.
+    // SAFETY: SIG_DFL is a valid disposition; the inherited one is restored below.
+    let inherited = unsafe { libc::signal(signal, libc::SIG_DFL) };
     let child = scratch
         .command(&[
             "cluster",
@@ -1973,6 +1977,8 @@ fn assert_join_signal_restores_listener_config(signal: libc::c_int, expected_exi
         .stderr(Stdio::piped())
         .spawn()
         .expect("start isolated join command");
+    // SAFETY: restore the disposition this test process inherited.
+    unsafe { libc::signal(signal, inherited) };
     let mut child = ChildGuard(Some(child));
     connected_rx
         .recv_timeout(Duration::from_secs(5))

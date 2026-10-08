@@ -28,6 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: scripts/check-no-python.sh
+      - run: sh scripts/test-no-python.sh
 
   test:
     runs-on: ubuntu-latest

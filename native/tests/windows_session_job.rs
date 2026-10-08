@@ -1,7 +1,6 @@
 //! Assigned session processes and descendants started after assignment are
 //! `session` callers, even when a parent has exited or asks to leave the job.
-//! They end with the session or daemon. A command in an ordinary terminal
-//! still reads `unknown` here.
+//! They end with the session or daemon.
 #![cfg(windows)]
 
 use remuda_core::protocol::{Request, Response};
@@ -317,10 +316,9 @@ fn a_child_that_asks_to_leave_the_job_is_still_a_session_caller() {
     );
 }
 
-/// The order of the two changes, pinned: until the chain end is decided in
-/// its own change, a command outside every session is not yet `outside`.
+/// A plain command outside every live session has a confirmed outside chain.
 #[test]
-fn a_command_outside_every_session_still_reads_unknown() {
+fn a_command_outside_every_session_reads_outside() {
     let scratch = Scratch::new("plain");
     let _daemon = spawn::Daemon::spawn(&scratch.0);
     let output = Command::new(env!("CARGO_BIN_EXE_remuda"))
@@ -333,7 +331,7 @@ fn a_command_outside_every_session_still_reads_unknown() {
         .expect("run remuda");
     let kind = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     fact(format_args!("plain command: kind {kind:?}"));
-    assert_eq!(kind, "unknown");
+    assert_eq!(kind, "outside");
 }
 
 /// The same grandchild while its session is still LISTED (the daemon is told
