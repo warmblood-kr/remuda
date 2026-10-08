@@ -1,3 +1,4 @@
 Joined <NODE> (fingerprint <FINGERPRINT>).
+Joined as a client; cluster listener remains off (--no-listen).
 Registry push reached peer <FINGERPRINT>.
 Next: remuda cluster remote

@@ -1726,6 +1726,15 @@ fn cluster_join_with_listener(
             ))
         }
     };
+    if bind_addr.is_some()
+        && listener_snapshot
+            .as_ref()
+            .is_some_and(|config| !config.enabled)
+    {
+        eprintln!(
+            "cluster join: --bind explicitly enables the listener despite the saved --no-listen setting."
+        );
+    }
     let mut restore_guard = JoinListenerRestoreGuard::new(daemon_path, listener_snapshot.clone());
     // Install before listener start: finish_join_listener_start checks signals after reload
     // and restores the config, so moving this below start could leave an interrupted join unobserved.
@@ -1765,7 +1774,8 @@ fn cluster_join_with_listener(
             addr,
             advertise_addr,
             ..
-        } => advertise_addr.unwrap_or(addr),
+        } => Some(advertise_addr.unwrap_or(addr)),
+        remuda_core::protocol::ListenerStatus::Off => None,
         status => {
             let message = render_join_listener_refusal(&status);
             let rollback_error = restore_join_listener(&mut restore_guard);
@@ -1775,7 +1785,7 @@ fn cluster_join_with_listener(
 
     let join_fingerprint = fingerprint.to_owned();
     let join_invitation = invitation.clone();
-    let join = move || cluster_join(&join_fingerprint, &join_invitation, Some(bound_addr));
+    let join = move || cluster_join(&join_fingerprint, &join_invitation, bound_addr);
     #[cfg(unix)]
     let join_session = run_join_interruptible(signal_handler, join);
     #[cfg(not(unix))]
@@ -1792,6 +1802,9 @@ fn cluster_join_with_listener(
         JoinRun::Finished(Ok(())) => {
             restore_guard.disarm();
             println!("{}", join_success_message(invitation, fingerprint));
+            if bound_addr.is_none() {
+                println!("Joined as a client; cluster listener remains off (--no-listen).");
+            }
             report_cluster_pushes();
             println!("{}", next_step_join());
             ExitCode::SUCCESS
@@ -1885,7 +1898,6 @@ fn start_join_listener(
     listener_snapshot: Option<&ListenerConfig>,
     bind_addr: Option<std::net::SocketAddr>,
 ) -> JoinListenerStartOutcome {
-    let initial_status = remuda_native::cluster::listener_control::status(daemon_path);
     match bind_addr {
         Some(address) => start_join_listener_with_config(
             daemon_path,
@@ -1896,20 +1908,26 @@ fn start_join_listener(
                 allow_public: false,
             },
         ),
-        None => match initial_status {
-            remuda_core::protocol::ListenerStatus::On { .. } => {
-                JoinListenerStartOutcome::Started(Ok(initial_status))
+        None if listener_snapshot.is_some_and(|config| !config.enabled) => {
+            JoinListenerStartOutcome::Started(Ok(remuda_core::protocol::ListenerStatus::Off))
+        }
+        None => {
+            let initial_status = remuda_native::cluster::listener_control::status(daemon_path);
+            match initial_status {
+                remuda_core::protocol::ListenerStatus::On { .. } => {
+                    JoinListenerStartOutcome::Started(Ok(initial_status))
+                }
+                _ => {
+                    let mut config = listener_snapshot.cloned().unwrap_or(ListenerConfig {
+                        enabled: true,
+                        bind: ListenerBind::Auto,
+                        allow_public: false,
+                    });
+                    config.enabled = true;
+                    start_join_listener_with_config(daemon_path, restore_guard, config)
+                }
             }
-            _ => {
-                let mut config = listener_snapshot.cloned().unwrap_or(ListenerConfig {
-                    enabled: true,
-                    bind: ListenerBind::Auto,
-                    allow_public: false,
-                });
-                config.enabled = true;
-                start_join_listener_with_config(daemon_path, restore_guard, config)
-            }
-        },
+        }
     }
 }
 
@@ -2849,7 +2867,7 @@ mod cluster_cli_tests {
     #[cfg(unix)]
     use super::{
         finish_join_listener_start, finish_join_listener_start_with_reporter,
-        restore_join_listener, start_join_listener_with_config, wait_for_join,
+        restore_join_listener, start_join_listener, start_join_listener_with_config, wait_for_join,
         with_prepared_join_identity, ExitCode, JoinInterruptHandler, JoinListenerRestoreGuard,
         JoinListenerStartOutcome, JoinRun, JOIN_INTERRUPTED, JOIN_INTERRUPT_SIGNAL,
     };
@@ -3104,6 +3122,51 @@ mod cluster_cli_tests {
         let warning = render_join_listener_unexpected_on("127.0.0.1:7441".parse().unwrap());
         assert!(warning.contains("listener remains on at 127.0.0.1:7441"));
         assert!(warning.contains("Next: run `remuda cluster listen --off`"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_respects_persisted_no_listen_config() {
+        let environment = ForegroundListenerLockEnvironment::new();
+        let ClusterCommand::Init { no_listen } = parse_cluster_command(&["init", "--no-listen"])
+        else {
+            panic!("expected init --no-listen");
+        };
+        let off = super::cluster_init_listener_config(None, !no_listen);
+        remuda_native::cluster::listener_config::write(&off).unwrap();
+        let daemon_path = environment.root.join("missing-daemon.sock");
+        let mut restore_guard = JoinListenerRestoreGuard::new(&daemon_path, Some(off.clone()));
+
+        let outcome = start_join_listener(&daemon_path, &mut restore_guard, Some(&off), None);
+
+        assert!(matches!(
+            outcome,
+            JoinListenerStartOutcome::Started(Ok(remuda_core::protocol::ListenerStatus::Off))
+        ));
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            Some(off)
+        );
+        assert!(!daemon_path.exists(), "join unexpectedly started a daemon");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_without_saved_no_listen_still_enables_listener() {
+        let _serial = JOIN_SIGNAL_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let environment = ForegroundListenerLockEnvironment::new();
+        let daemon_path = environment.root.join("missing-daemon.sock");
+        let mut restore_guard = JoinListenerRestoreGuard::new(&daemon_path, None);
+
+        let outcome = start_join_listener(&daemon_path, &mut restore_guard, None, None);
+
+        assert!(matches!(outcome, JoinListenerStartOutcome::Started(Err(_))));
+        assert!(remuda_native::cluster::listener_config::read()
+            .unwrap()
+            .is_some_and(|config| config.enabled));
+        assert!(!daemon_path.exists(), "test unexpectedly started a daemon");
     }
 
     #[cfg(unix)]
