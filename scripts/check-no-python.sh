@@ -53,6 +53,17 @@ python_token='py''thon'
 pip_token='pi''p'
 uv_token='u''v'
 setup_token='setup-py''thon'
+policy_matches() {
+	local status=0
+	grep "$@" || status=$?
+	case "$status" in
+		0|1) return "$status" ;;
+		*)
+			echo "check-no-python: cannot match repository policy for: $file" >&2
+			exit 1
+			;;
+	esac
+}
 failed=0
 while IFS= read -r -d '' file; do
 	if [ -L "$file" ] || [ ! -f "$file" ]; then
@@ -66,13 +77,13 @@ while IFS= read -r -d '' file; do
 		exit 1
 	}
 	# Extensions in any case, packaging files, and Python shebangs anywhere.
-	if printf '%s\n' "$file" | grep -qiE '\.pyw?$'; then
+	if policy_matches -qiE '\.pyw?$' <<<"$file"; then
 		echo "check-no-python: unexpected Python file: $file" >&2
 		failed=1
-	elif printf '%s\n' "${file##*/}" | grep -qiE '^requirements.*\.(txt|in)$'; then
+	elif policy_matches -qiE '^requirements.*\.(txt|in)$' <<<"${file##*/}"; then
 		echo "check-no-python: unexpected Python requirements file: $file" >&2
 		failed=1
-	elif grep -qE '^#!.*py''thon' <<<"$first_line"; then
+	elif policy_matches -qE '^#!.*py''thon' <<<"$first_line"; then
 		echo "check-no-python: unexpected Python shebang: $file" >&2
 		failed=1
 	fi
