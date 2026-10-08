@@ -261,14 +261,13 @@ mod tests {
         }
     }
 
+    #[cfg(unix)] // Windows rejects a filesystem path as a pipe name before connecting.
     #[test]
     fn missing_daemon_connection_names_endpoint_path() {
         let path = std::env::temp_dir()
             .join(format!("remuda-ipc-missing-{}", std::process::id()))
             .join("daemon.sock");
         let error = connect(&path).unwrap_err();
-        // Windows named pipes report Unsupported for a missing path.
-        #[cfg(unix)]
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(error.to_string().contains(&path.display().to_string()));
         assert!(error.to_string().contains("cannot connect to daemon at"));
