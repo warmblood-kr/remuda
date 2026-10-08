@@ -295,6 +295,16 @@ pub trait AgentWriter: Send + Sync {
     /// do not keep time-based writer state can ignore it.
     fn set_clock(&self, _clock: Arc<dyn Clock>) {}
     fn write_bounded(&self, bytes: &[u8]) -> Result<()>;
+    /// Attempt one bounded write without waiting behind an active write.
+    /// Asynchronous backends must override this and reserve their single-flight
+    /// slot atomically; the default is for synchronous implementations.
+    fn write_bounded_if_idle(&self, bytes: &[u8]) -> Result<()> {
+        if self.is_busy() {
+            Err(AgentError::Busy)
+        } else {
+            self.write_bounded(bytes)
+        }
+    }
     /// Ask the write that timed out to be followed by FOLLOW_UP once it lands.
     /// `Landed` means the timed-out write is no longer the active write; `Unsupported` means it cannot chain.
     fn chain_after_stalled(

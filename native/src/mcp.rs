@@ -367,12 +367,12 @@ fn frame() -> Vec<Value> {
         }),
         json!({
             "name": "clear_input",
-            "description": "Write the agent-specific clear-line key to a session as one atomic input act. Refused if a human typed in the last 2 seconds or a PTY writer is busy. For Codex, the current TUI binds Ctrl+U (byte 0x15) to kill to the start of the line; at the end of its composer this clears the input.",
+            "description": "Write one trusted clear-line key as an atomic input act. The core currently allows only exact Ctrl+U (byte 0x15), verified for Codex; use it only when the target agent's configured binding clears to the start of its input. Other keys are refused. Keys are limited to 1–16 bytes and four calls per session per second. Refused during recent human typing or while a PTY writer is busy.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session": {"type": "string"},
-                    "key": {"type": "string", "description": "Raw key bytes as a string; Codex's Ctrl+U key is the U+0015 control byte."},
+                    "key": {"type": "string", "minLength": 1, "maxLength": 16, "description": "The exact allowlisted key as a string; currently only Codex Ctrl+U (U+0015) is accepted."},
                 },
                 "required": ["session", "key"],
             },

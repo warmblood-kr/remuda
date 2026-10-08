@@ -241,6 +241,28 @@ fn clear_input_requires_a_key_string_over_mcp() {
 }
 
 #[test]
+fn clear_input_mcp_schema_documents_the_core_key_limit() {
+    let dir = scratch("clear-input-schema");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+    let reply = ask(
+        &path,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let tools = reply["result"]["tools"].as_array().expect("tools list");
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "clear_input")
+        .expect("clear_input tool");
+    let key = &tool["inputSchema"]["properties"]["key"];
+    assert_eq!(key["minLength"], 1);
+    assert_eq!(key["maxLength"], 16);
+    assert!(tool["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("four calls per session per second")));
+}
+
+#[test]
 fn a_tool_defined_in_lua_is_listed_and_dispatched() {
     // Ruling ③, 정수님 2026-09-10: the MCP server is a frame and tools get added
     // as needed. The claim under test is that a Lua function marked exported

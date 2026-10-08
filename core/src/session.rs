@@ -8,7 +8,10 @@ use crate::agent::{
     ScreenSnapshot, Size, StyledCell, VersionedSnapshot,
 };
 use crate::clock::Clock;
-use crate::input::{InputBatch, InputDeduplicator, InputError, InputOutcome, InputRateLimiter};
+use crate::input::{
+    ClearInputRateLimiter, InputBatch, InputDeduplicator, InputError, InputOutcome,
+    InputRateLimiter,
+};
 use crate::protocol::Step;
 use core::time::Duration;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -230,17 +233,80 @@ mod clear_input_tests {
     }
 
     #[test]
+    fn clear_rejects_untrusted_keys() {
+        let (session, clock, writes, _started, _release) = session(false);
+        clock.advance(Duration::from_secs(3));
+        for key in [
+            b"\x0f".as_slice(),
+            b"\x1bOM",
+            b"x",
+            b"\x15\x15",
+            b"\r",
+            b"\n",
+        ] {
+            assert!(session.clear_input(key).is_err(), "accepted {key:?}");
+        }
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_key_length_is_limited_before_writer_activity() {
+        let (session, clock, writes, _started, _release) = session(false);
+        clock.advance(Duration::from_secs(3));
+        for key in [Vec::new(), vec![b'x'; 17], vec![b'x'; 1_048_576]] {
+            assert!(
+                session.clear_input(&key).is_err(),
+                "accepted {} bytes",
+                key.len()
+            );
+        }
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_calls_have_a_per_session_rate_budget() {
+        let (session, clock, writes, _started, _release) = session(false);
+        clock.advance(Duration::from_secs(3));
+        for _ in 0..4 {
+            session.clear_input(b"\x15").unwrap();
+        }
+        assert!(session.clear_input(b"\x15").is_err());
+        assert_eq!(writes.lock().unwrap().len(), 4);
+        clock.advance(Duration::from_secs(1));
+        session.clear_input(b"\x15").unwrap();
+        assert_eq!(writes.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn clear_refuses_an_active_writer_without_queuing_behind_it() {
+        let (session, clock, writes, started, release) = session(true);
+        let writer = session.agent.lock().unwrap().input_writer().unwrap();
+        let active = std::thread::spawn(move || writer.write_bounded(b"prior"));
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        clock.advance(Duration::from_secs(3));
+        assert!(matches!(
+            session.clear_input(b"\x15"),
+            Err(AgentError::Busy)
+        ));
+        assert!(writes.lock().unwrap().is_empty());
+        let (ready, changed) = &*release;
+        *ready.lock().unwrap() = true;
+        changed.notify_all();
+        active.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn idle_clear_still_works_and_clear_keys_cannot_submit_lines() {
         let (session, clock, writes, _started, _release) = session(false);
         clock.advance(Duration::from_secs(3));
-        session.clear_input(b"\x1b[D").unwrap();
-        assert_eq!(*writes.lock().unwrap(), vec![b"\x1b[D".to_vec()]);
+        session.clear_input(b"\x15").unwrap();
+        assert_eq!(*writes.lock().unwrap(), vec![b"\x15".to_vec()]);
         for key in [b"\r".as_slice(), b"\n".as_slice(), b"\x15\r".as_slice()] {
             assert!(
-                matches!(session.clear_input(key), Err(AgentError::Io(message)) if message.contains("Return or newline"))
+                matches!(session.clear_input(key), Err(AgentError::Io(message)) if message.contains("allowlisted"))
             );
         }
-        assert_eq!(*writes.lock().unwrap(), vec![b"\x1b[D".to_vec()]);
+        assert_eq!(*writes.lock().unwrap(), vec![b"\x15".to_vec()]);
     }
 }
 
@@ -271,10 +337,20 @@ pub enum InputSubmitOutcome {
 pub const DEFAULT_INPUT_SETTLE: Duration = Duration::from_millis(100);
 /// A clear is refused while the most recent human keystroke is this recent.
 const HUMAN_INPUT_GUARD: Duration = Duration::from_secs(2);
+const MAX_CLEAR_INPUT_KEY_BYTES: usize = 16;
+/// Core-owned allowlist: only the verified Ctrl+U clear-line binding is enabled.
+const CLEAR_INPUT_KEYS: &[&[u8]] = &[b"\x15"];
 
 struct PendingInput {
     tail: String,
     baseline_occurrences: usize,
+}
+
+#[derive(Clone, Copy)]
+enum BurstWriteMode {
+    Bounded,
+    IfIdle,
+    ToCompletion,
 }
 
 /// A running agent, addressable by name.
@@ -322,6 +398,8 @@ pub struct Session {
     input_dedup: Mutex<InputDeduplicator>,
     /// Per-session byte budget, checked before taking `input_lock`.
     input_rate: Mutex<InputRateLimiter>,
+    /// Per-session operation budget for destructive clear-key writes.
+    clear_input_rate: Mutex<ClearInputRateLimiter>,
 }
 
 fn configure_writer_clock(
@@ -446,6 +524,7 @@ impl Session {
             pending_input: Mutex::new(None),
             input_dedup: Mutex::new(InputDeduplicator::new()),
             input_rate: Mutex::new(InputRateLimiter::default()),
+            clear_input_rate: Mutex::new(ClearInputRateLimiter::default()),
         }
     }
 
@@ -742,19 +821,21 @@ impl Session {
         self.write_one_burst(bytes)
     }
 
-    /// Write the caller's agent-specific clear-line key as one atomic burst.
-    /// Refuses a timed-out writer or human keystroke from the last two seconds;
-    /// cleared text is `None` when this session cannot identify its composer.
+    /// Write the core-allowlisted clear-line key as one atomic burst. Refuses
+    /// untrusted keys, a busy writer, recent human input, or excess clear calls.
+    /// Cleared text is `None` when this session cannot identify its composer.
     pub fn clear_input(&self, key: &[u8]) -> Result<Option<String>> {
-        if key.contains(&b'\r') || key.contains(&b'\n') {
+        if key.is_empty() || key.len() > MAX_CLEAR_INPUT_KEY_BYTES {
             return Err(AgentError::Io(
-                "clear key must not contain Return or newline bytes".into(),
+                "clear key must contain 1 to 16 bytes".into(),
+            ));
+        }
+        if !CLEAR_INPUT_KEYS.contains(&key) {
+            return Err(AgentError::Io(
+                "clear key is not allowlisted; only Ctrl+U (byte 0x15) is supported".into(),
             ));
         }
         let _held = self.acquire_input_lock()?;
-        if self.input_writer_timed_out()? {
-            return Err(AgentError::Busy);
-        }
         let _human_gate = self
             .human_gate
             .lock()
@@ -766,11 +847,18 @@ impl Session {
         {
             return Err(AgentError::HumanInputRecent);
         }
+        self.clear_input_rate
+            .lock()
+            .map_err(|_| AgentError::Io("session clear input rate limit poisoned".into()))?
+            .check_rate(self.clock.now())
+            .map_err(|_| {
+                AgentError::Io("clear input rate limit exceeded (4 calls per second)".into())
+            })?;
         #[cfg(test)]
         if let Some(hook) = self.clear_hook.lock().unwrap().take() {
             hook();
         }
-        self.write_one_burst(key)?;
+        self.write_one_burst_if_idle(key)?;
         Ok(None)
     }
 
@@ -953,7 +1041,11 @@ impl Session {
     /// The one place that touches the backend. PTY handles wait without the
     /// process mutex; callers hold `input_lock` except an attachment writer.
     fn write_one_burst(&self, bytes: &[u8]) -> Result<()> {
-        self.write_one_burst_with(bytes, false, &|| false, None)
+        self.write_one_burst_with(bytes, BurstWriteMode::Bounded, &|| false, None)
+    }
+
+    fn write_one_burst_if_idle(&self, bytes: &[u8]) -> Result<()> {
+        self.write_one_burst_with(bytes, BurstWriteMode::IfIdle, &|| false, None)
     }
 
     fn write_one_burst_to_completion_while_started(
@@ -962,13 +1054,18 @@ impl Session {
         cancelled: &dyn Fn() -> bool,
         on_start: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<()> {
-        self.write_one_burst_with(bytes, true, cancelled, Some(on_start))
+        self.write_one_burst_with(
+            bytes,
+            BurstWriteMode::ToCompletion,
+            cancelled,
+            Some(on_start),
+        )
     }
 
     fn write_one_burst_with(
         &self,
         bytes: &[u8],
-        wait_to_completion: bool,
+        mode: BurstWriteMode,
         cancelled: &dyn Fn() -> bool,
         on_start: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<()> {
@@ -983,14 +1080,16 @@ impl Session {
             agent.input_writer()
         };
         let result = if let Some(writer) = writer {
-            if wait_to_completion {
-                if let Some(on_start) = on_start {
-                    writer.write_to_completion_while_started(bytes, cancelled, on_start)
-                } else {
-                    writer.write_to_completion_while(bytes, cancelled)
+            match mode {
+                BurstWriteMode::ToCompletion => {
+                    if let Some(on_start) = on_start {
+                        writer.write_to_completion_while_started(bytes, cancelled, on_start)
+                    } else {
+                        writer.write_to_completion_while(bytes, cancelled)
+                    }
                 }
-            } else {
-                writer.write_bounded(bytes)
+                BurstWriteMode::IfIdle => writer.write_bounded_if_idle(bytes),
+                BurstWriteMode::Bounded => writer.write_bounded(bytes),
             }
         } else {
             let mut agent = self

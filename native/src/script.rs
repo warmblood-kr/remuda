@@ -155,7 +155,7 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "clear_input",
-        "Write the agent-specific clear-line key to a session as one atomic input act. Refuses while a human typed in the last 2 seconds or a PTY writer is busy. OpenAI's Codex TUI binds Ctrl+U (byte 0x15) to kill text from the cursor to the line start; at the end of the composer line this clears it ([Codex issue #20698](https://github.com/openai/codex/issues/20698)). Terminal screens do not generally identify composer contents, so `cleared` is nil when unknown.",
+        "Write one trusted clear-line key to a session as an atomic input act. The core currently allows only exact Ctrl+U (byte 0x15), verified for Codex; use it only when the target agent's configured binding clears to the start of its input. Other keys are refused. Keys are limited to 1–16 bytes and four calls per session per second. Refuses during recent human typing or while a PTY writer is busy. Terminal screens do not generally identify composer contents, so `cleared` is nil when unknown ([Codex issue #20698](https://github.com/openai/codex/issues/20698)).",
         "clear_input(name, key) -> {cleared = string|nil}",
     ),
     (
