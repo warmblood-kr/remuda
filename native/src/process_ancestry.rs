@@ -332,12 +332,14 @@ fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
 fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
     let pid = i32::try_from(pid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process PID out of range"))?;
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    // The short form also answers for another user's process (the root-owned
+    // /usr/bin/login above every terminal shell); PROC_PIDTBSDINFO gets EPERM.
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdshortinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>();
     let result = unsafe {
         libc::proc_pidinfo(
             pid,
-            libc::PROC_PIDTBSDINFO,
+            libc::PROC_PIDT_SHORTBSDINFO,
             0,
             info.as_mut_ptr().cast(),
             size as i32,
@@ -350,7 +352,7 @@ fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
         )));
     }
     let info = unsafe { info.assume_init() };
-    Ok(Some(info.pbi_ppid))
+    Ok(Some(info.pbsi_ppid))
 }
 
 #[cfg(windows)]
@@ -604,6 +606,14 @@ mod tests {
     fn missing_peer_pid_refuses_only_with_self_reported_identity() {
         assert!(missing_peer_requires_refusal(true));
         assert!(!missing_peer_requires_refusal(false));
+    }
+
+    // Terminal apps start shells through the root-owned /usr/bin/login, so
+    // the parent walk must read processes owned by another user (#632).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_parent_of_a_root_owned_process_is_readable() {
+        assert_eq!(parent_pid(1).expect("read launchd's parent"), Some(0));
     }
 
     #[test]

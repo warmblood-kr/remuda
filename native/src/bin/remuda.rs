@@ -590,7 +590,10 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
     if args.is_empty() {
         return ClusterCommand::Status;
     }
-    if matches!(args, ["help"] | ["-h"] | ["--help"]) {
+    if matches!(
+        args,
+        ["help"] | ["-h"] | ["--help"] | ["help", "help" | "-h" | "--help"]
+    ) {
         return ClusterCommand::Help(None);
     }
     if let [verb, "--help"] | ["help", verb] = args {
@@ -3785,6 +3788,17 @@ mod cluster_cli_tests {
             parse_cluster_command(&["help", "wat"]),
             ClusterCommand::UnknownVerb("wat".into())
         );
+    }
+
+    #[test]
+    fn cluster_help_about_help_shows_cluster_usage() {
+        for topic in ["help", "-h", "--help"] {
+            assert_eq!(
+                parse_cluster_command(&["help", topic]),
+                ClusterCommand::Help(None),
+                "cluster help {topic}"
+            );
+        }
     }
 
     #[test]
