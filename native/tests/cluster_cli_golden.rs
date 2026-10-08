@@ -540,6 +540,25 @@ fn cluster_help_verb_matches_verb_help_for_every_verb() {
 }
 
 #[test]
+fn cluster_help_about_help_matches_cluster_help() {
+    let scratch = Scratch::new();
+    let expected = scratch.run(&["cluster", "--help"]);
+    let mut failures = Vec::new();
+    for topic in ["help", "-h", "--help"] {
+        let output = scratch.run(&["cluster", "help", topic]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() || output.stdout != expected.stdout || !stderr.is_empty() {
+            failures.push(format!(
+                "cluster help {topic}: exit={:?}\nstdout: {stdout}\nstderr: {stderr}",
+                output.status.code()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
 fn cluster_init_discloses_listener_before_it_binds() {
     use remuda_native::cluster::listener_config::{self, ListenerBind, ListenerConfig};
     use std::os::unix::fs::PermissionsExt;
