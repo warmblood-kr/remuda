@@ -39,7 +39,7 @@ buffers
 caller
 ------
 
-``caller() -> {kind: 'session'|'outside'|'unknown', session?: string}`` — ADVISORY only: peer ancestry identifies a managed session, outside, or unknown; outside does not prove operator identity. Same-UID Lua can run ``remuda -e`` and wrap ``_dispatch_extension_command``; Windows parent PIDs may be stale or chosen, so this is not an authentication boundary.
+``caller() -> {kind: 'session'|'outside'|'unknown', session?: string, instance_id?: string}`` — ADVISORY only: peer ancestry identifies a managed session, outside, or unknown; outside does not prove operator identity. Same-UID Lua can run ``remuda -e`` and wrap ``_dispatch_extension_command``; Windows parent PIDs may be stale or chosen, so this is not an authentication boundary.
 
 cancel
 ------
@@ -154,7 +154,7 @@ expect_option
 extension_command
 -----------------
 
-``extension_command(name, handler(args, caller)) -> nil`` — Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind and session fields, plus forwarded env/stdin values; kind outside does not establish operator identity.
+``extension_command(name, handler(args, caller)) -> nil`` — Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind, session and instance_id fields, plus forwarded env/stdin values; kind outside does not establish operator identity.
 
 fail
 ----
