@@ -1966,7 +1966,7 @@ function remuda._call(name, arguments, caller)
   end
   return tostring(answer)
 end
-register("_call", "Dispatch one MCP tools/call by name.", "_call(name, arguments, caller) -> string")
+register("_call", "Dispatch one MCP tools/call by name. Always supplies a fresh caller table; only the incoming capability is retained. instance_id identifies the launch captured for this request, is not secret or proof of liveness, and may be stale after exit until runtime validation is added.", "_call(name, arguments, caller) -> string")
 
 -- Input is expressed as two words: one contiguous text burst, then a
 -- separately-timed submit key after the composer shows the text.

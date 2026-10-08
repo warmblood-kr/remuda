@@ -99,7 +99,7 @@ where
     }
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(test)]
 pub(crate) fn resolve_caller(
     peer_pid: io::Result<Option<u32>>,
     sessions: &[LiveSessionProcess],
@@ -225,7 +225,7 @@ where
 }
 
 #[cfg(any(not(windows), test))]
-fn resolve_caller_with<F>(
+pub(crate) fn resolve_caller_with<F>(
     mut pid: u32,
     sessions: &[LiveSessionProcess],
     daemon_pid: u32,
@@ -314,7 +314,7 @@ where
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
+pub(crate) fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let close = stat.rfind(')').ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "malformed /proc process stat")
@@ -330,7 +330,7 @@ fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
 }
 
 #[cfg(target_os = "macos")]
-fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
+pub(crate) fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
     let pid = i32::try_from(pid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process PID out of range"))?;
     // The short form also answers for another user's process (the root-owned
