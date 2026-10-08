@@ -1778,26 +1778,23 @@ fn caller_context(
     // parent has exited, which the parent walk below cannot see. A session
     // child's own PID stays sound there: the daemon holds that process open.
     #[cfg(windows)]
-    let (peer_pid, held) = {
+    let origin = {
         let Some((pid, held)) = process_ancestry::current_peer(stream, accepted) else {
             return crate::image::CallerContext::default();
         };
-        if let Some(name) = registry.session_owning(pid) {
-            return crate::image::CallerContext {
-                kind: crate::image::CallerKind::Session,
-                session: Some(name),
-            };
-        }
-        (Ok(Some(pid)), held)
+        process_ancestry::resolve_job_first(
+            || registry.session_owning(pid, Some(held.raw_handle())),
+            || process_ancestry::resolve_caller_opened(pid, &held, &registry.live_processes()),
+        )
     };
     #[cfg(not(windows))]
-    let peer_pid = {
+    let origin = {
         let _ = accepted;
-        process_ancestry::peer_pid(stream)
+        process_ancestry::resolve_caller(
+            process_ancestry::peer_pid(stream),
+            &registry.live_processes(),
+        )
     };
-    let origin = process_ancestry::resolve_caller(peer_pid, &registry.live_processes());
-    #[cfg(windows)]
-    drop(held);
     match origin {
         process_ancestry::CallerOrigin::Session(name) => crate::image::CallerContext {
             kind: crate::image::CallerKind::Session,

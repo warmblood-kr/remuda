@@ -20,8 +20,11 @@ fn the_session_whose_backend_holds_a_process_is_found_by_its_pid() {
     let owner = ScriptedAgent::new(vec![]).owning(40).owning(41);
     registry.register(session("owner", owner)).expect("owner");
 
-    assert_eq!(registry.session_owning(41).as_deref(), Some("owner"));
-    assert_eq!(registry.session_owning(42), None);
+    assert_eq!(
+        registry.session_owning(41, None).unwrap().as_deref(),
+        Some("owner")
+    );
+    assert_eq!(registry.session_owning(42, None).unwrap(), None);
 }
 
 #[test]
@@ -32,7 +35,10 @@ fn a_session_whose_child_exited_still_owns_its_other_processes() {
     registry.register(session("gone", agent)).expect("gone");
 
     assert!(registry.live_processes().is_empty());
-    assert_eq!(registry.session_owning(40).as_deref(), Some("gone"));
+    assert_eq!(
+        registry.session_owning(40, None).unwrap().as_deref(),
+        Some("gone")
+    );
 }
 
 #[test]
@@ -40,5 +46,5 @@ fn a_backend_that_holds_no_marker_owns_nothing() {
     let registry = Registry::new();
     let plain = ScriptedAgent::new(vec![]);
     registry.register(session("plain", plain)).expect("plain");
-    assert_eq!(registry.session_owning(1), None);
+    assert_eq!(registry.session_owning(1, None).unwrap(), None);
 }
