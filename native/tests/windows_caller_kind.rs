@@ -154,18 +154,26 @@ fn a_session_grandchild_that_outlives_its_parent_is_not_outside() {
     let _daemon = spawn::Daemon::spawn(&scratch.0);
     let out = scratch.0.join("escape.txt");
     let script = scratch.0.join("escape.cmd");
+    let marker = scratch.0.join("escape.started");
     let body = format!(
-        "@echo off\r\nping -n 4 127.0.0.1 >nul\r\n\"{}\" -s s -e \"{ASK}\" >\"{}\" 2>&1\r\n",
+        "@echo off\r\necho up >\"{}\"\r\nping -n 4 127.0.0.1 >nul\r\n\"{}\" -s s -e \"{ASK}\" >\"{}\" 2>&1\r\n",
+        marker.display(),
         env!("CARGO_BIN_EXE_remuda"),
         out.display()
     );
     std::fs::write(&script, body).expect("write escape.cmd");
 
-    // `start` without /b gives the new process its own console, so it is not
-    // closed with the session's pty when the session's child exits at once.
+    // The session's program starts the script in its own console, then stays
+    // alive: the session's job ends with the session, so it must outlive the read.
+    let keep = scratch.0.join("keep.cmd");
+    let keep_body = format!(
+        "@echo off\r\nstart \"\" /min cmd.exe /c \"{}\"\r\nping -n 90 127.0.0.1 >nul\r\n",
+        script.display()
+    );
+    std::fs::write(&keep, keep_body).expect("write keep.cmd");
     let code = format!(
-        "return remuda.new('escape', {{ 'cmd.exe', '/c', 'start', '', '/min', 'cmd.exe', '/c', {:?} }})",
-        script.to_str().expect("utf-8 scratch path")
+        "return remuda.new('escape', {{ 'cmd.exe', '/c', {:?} }})",
+        keep.to_str().expect("utf-8 scratch path")
     );
     let request = Request::Eval { code, name: None };
     let socket = daemon::socket_path_in(&scratch.0, "s");
@@ -186,6 +194,7 @@ fn a_session_grandchild_that_outlives_its_parent_is_not_outside() {
     ));
     assert!(
         matches!(kind.as_str(), "session" | "unknown"),
-        "a session's descendant reported {kind:?}, not session or unknown"
+        "a session's descendant reported {kind:?}, not session or unknown (script started: {})",
+        marker.exists()
     );
 }
