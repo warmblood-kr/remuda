@@ -1783,8 +1783,14 @@ fn caller_context(
             return crate::image::CallerContext::default();
         };
         process_ancestry::resolve_job_first(
-            || registry.session_owning(pid, Some(held.raw_handle())),
-            || process_ancestry::resolve_caller_opened(pid, &held, &registry.live_processes()),
+            || registry.session_attribution_owning(pid, Some(held.raw_handle())),
+            || {
+                process_ancestry::resolve_caller_opened(
+                    pid,
+                    &held,
+                    &registry.live_processes_with_identity(),
+                )
+            },
         )
     };
     #[cfg(not(windows))]
@@ -1792,17 +1798,19 @@ fn caller_context(
         let _ = accepted;
         process_ancestry::resolve_caller(
             process_ancestry::peer_pid(stream),
-            &registry.live_processes(),
+            &registry.live_processes_with_identity(),
         )
     };
     match origin {
-        process_ancestry::CallerOrigin::Session(name) => crate::image::CallerContext {
+        process_ancestry::CallerOrigin::Session(attribution) => crate::image::CallerContext {
             kind: crate::image::CallerKind::Session,
-            session: Some(name),
+            session: Some(attribution.name),
+            instance_id: Some(attribution.instance_id),
         },
         process_ancestry::CallerOrigin::Outside => crate::image::CallerContext {
             kind: crate::image::CallerKind::Outside,
             session: None,
+            instance_id: None,
         },
         process_ancestry::CallerOrigin::Unknown => crate::image::CallerContext::default(),
     }

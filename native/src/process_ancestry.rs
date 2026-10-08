@@ -8,6 +8,7 @@
 
 #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
 use interprocess::local_socket::traits::StreamCommon as _;
+use remuda_core::registry::{LiveSessionProcess, SessionAttribution};
 use std::io;
 
 pub(crate) fn peer_pid(stream: &crate::ipc::Stream) -> io::Result<Option<u32>> {
@@ -80,7 +81,7 @@ pub(crate) enum Ancestry {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CallerOrigin {
-    Session(String),
+    Session(SessionAttribution),
     Outside,
     Unknown,
 }
@@ -88,11 +89,11 @@ pub(crate) enum CallerOrigin {
 #[cfg(any(windows, test))]
 pub(crate) fn resolve_job_first<J, A>(job: J, ancestry: A) -> CallerOrigin
 where
-    J: FnOnce() -> io::Result<Option<String>>,
+    J: FnOnce() -> io::Result<Option<SessionAttribution>>,
     A: FnOnce() -> CallerOrigin,
 {
     match job() {
-        Ok(Some(name)) => CallerOrigin::Session(name),
+        Ok(Some(attribution)) => CallerOrigin::Session(attribution),
         Ok(None) => ancestry(),
         Err(_) => CallerOrigin::Unknown,
     }
@@ -101,7 +102,7 @@ where
 #[cfg(any(not(windows), test))]
 pub(crate) fn resolve_caller(
     peer_pid: io::Result<Option<u32>>,
-    sessions: &[(String, u32)],
+    sessions: &[LiveSessionProcess],
 ) -> CallerOrigin {
     #[cfg(windows)]
     {
@@ -123,7 +124,7 @@ pub(crate) fn resolve_caller(
 pub(crate) fn resolve_caller_opened(
     pid: u32,
     peer: &crate::session_job::Opened,
-    sessions: &[(String, u32)],
+    sessions: &[LiveSessionProcess],
 ) -> CallerOrigin {
     resolve_caller_windows(pid, sessions, Some(peer))
 }
@@ -131,7 +132,7 @@ pub(crate) fn resolve_caller_opened(
 #[cfg(windows)]
 fn resolve_caller_windows(
     pid: u32,
-    sessions: &[(String, u32)],
+    sessions: &[LiveSessionProcess],
     peer: Option<&crate::session_job::Opened>,
 ) -> CallerOrigin {
     use crate::session_job::Opened;
@@ -179,7 +180,7 @@ fn process_missing(error: &io::Error) -> bool {
 }
 
 #[cfg(any(windows, test))]
-fn chain_end<F>(mut pid: u32, sessions: &[(String, u32)], mut process: F) -> CallerOrigin
+fn chain_end<F>(mut pid: u32, sessions: &[LiveSessionProcess], mut process: F) -> CallerOrigin
 where
     F: FnMut(u32) -> io::Result<Option<(u32, u64)>>,
 {
@@ -188,10 +189,10 @@ where
     let mut child_created = None;
     let mut hops = 0;
     loop {
-        let session = sessions.iter().find(|(_, session_pid)| *session_pid == pid);
+        let session = sessions.iter().find(|session| session.pid == pid);
         if child_created.is_none() {
-            if let Some((name, _)) = session {
-                return CallerOrigin::Session(name.clone());
+            if let Some(session) = session {
+                return CallerOrigin::Session(session.attribution.clone());
             }
         }
         if pid <= 1 {
@@ -208,8 +209,8 @@ where
         if child_created.is_some_and(|child| created > child) {
             return CallerOrigin::Outside;
         }
-        if let Some((name, _)) = session {
-            return CallerOrigin::Session(name.clone());
+        if let Some(session) = session {
+            return CallerOrigin::Session(session.attribution.clone());
         }
         if parent_pid <= 1 {
             return CallerOrigin::Outside;
@@ -226,7 +227,7 @@ where
 #[cfg(any(not(windows), test))]
 fn resolve_caller_with<F>(
     mut pid: u32,
-    sessions: &[(String, u32)],
+    sessions: &[LiveSessionProcess],
     daemon_pid: u32,
     mut parent: F,
 ) -> CallerOrigin
@@ -237,8 +238,8 @@ where
     loop {
         // The first matching session while walking upward is the innermost
         // one, even when registry iteration order is different.
-        if let Some((name, _)) = sessions.iter().find(|(_, session_pid)| *session_pid == pid) {
-            return CallerOrigin::Session(name.clone());
+        if let Some(session) = sessions.iter().find(|session| session.pid == pid) {
+            return CallerOrigin::Session(session.attribution.clone());
         }
         // A process reparented to launchd/init has left every session tree.
         // This says nothing about whether its owner is an operator.
@@ -402,7 +403,24 @@ pub(crate) fn process_parents() -> io::Result<std::collections::HashMap<u32, u32
 mod tests {
     use super::*;
 
-    fn chain_end<F>(pid: u32, sessions: &[(String, u32)], process: F) -> CallerOrigin
+    fn candidate(name: &str, pid: u32) -> LiveSessionProcess {
+        LiveSessionProcess {
+            attribution: SessionAttribution {
+                name: name.to_string(),
+                instance_id: format!("{name}-instance"),
+            },
+            pid,
+        }
+    }
+
+    fn session_origin(name: &str) -> CallerOrigin {
+        CallerOrigin::Session(SessionAttribution {
+            name: name.to_string(),
+            instance_id: format!("{name}-instance"),
+        })
+    }
+
+    fn chain_end<F>(pid: u32, sessions: &[LiveSessionProcess], process: F) -> CallerOrigin
     where
         F: FnMut(u32) -> io::Result<Option<(u32, u64)>>,
     {
@@ -437,8 +455,8 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(
-            chain_end(40, &[("work".into(), 30)], process),
-            CallerOrigin::Session("work".into())
+            chain_end(40, &[candidate("work", 30)], process),
+            session_origin("work")
         );
     }
 
@@ -451,8 +469,8 @@ mod tests {
     fn a_caller_chain_can_reach_a_session_at_the_64_hop_boundary() {
         let process = |pid| Ok(Some((pid - 1, u64::from(pid))));
         assert_eq!(
-            chain_end(100, &[("work".into(), 36)], process),
-            CallerOrigin::Session("work".into())
+            chain_end(100, &[candidate("work", 36)], process),
+            session_origin("work")
         );
     }
 
@@ -460,7 +478,7 @@ mod tests {
     fn a_session_beyond_the_64_hop_boundary_is_unknown() {
         let process = |pid| Ok(Some((pid - 1, u64::from(pid))));
         assert_eq!(
-            chain_end(100, &[("work".into(), 35)], process),
+            chain_end(100, &[candidate("work", 35)], process),
             CallerOrigin::Unknown
         );
     }
@@ -545,8 +563,8 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(
-            chain_end(40, &[("work".into(), 30)], process),
-            CallerOrigin::Session("work".into())
+            chain_end(40, &[candidate("work", 30)], process),
+            session_origin("work")
         );
     }
 
@@ -558,7 +576,7 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(
-            chain_end(40, &[("work".into(), 30)], process),
+            chain_end(40, &[candidate("work", 30)], process),
             CallerOrigin::Outside
         );
     }
@@ -650,10 +668,65 @@ mod tests {
             30 => Ok(Some(1)),
             _ => unreachable!(),
         };
-        let sessions = vec![("outer".into(), 30), ("inner".into(), 40)];
+        let sessions = vec![candidate("outer", 30), candidate("inner", 40)];
         assert_eq!(
             resolve_caller_with(50, &sessions, 99, parent),
-            CallerOrigin::Session("inner".into())
+            session_origin("inner")
         );
+    }
+
+    #[test]
+    fn replacement_after_candidate_capture_keeps_the_matched_instance() {
+        let captured = candidate("work", 30);
+        let captured_candidates = vec![captured.clone()];
+        // Model a same-name registry replacement after the immutable candidate
+        // snapshot, but before the resolver constructs its final origin.
+        let replacement = LiveSessionProcess {
+            attribution: SessionAttribution {
+                name: "work".into(),
+                instance_id: "replacement-instance".into(),
+            },
+            pid: 31,
+        };
+        let mut current_registry = std::collections::HashMap::from([(
+            captured.attribution.name.clone(),
+            captured.attribution.clone(),
+        )]);
+        current_registry.insert(
+            replacement.attribution.name.clone(),
+            replacement.attribution.clone(),
+        );
+        let process = |pid| match pid {
+            40 => Ok(Some(30)),
+            _ => unreachable!(),
+        };
+        let origin = resolve_caller_with(40, &captured_candidates, 99, process);
+        assert_eq!(
+            current_registry.get("work"),
+            Some(&replacement.attribution),
+            "the registered same-name launch was replaced"
+        );
+        assert_eq!(
+            origin,
+            CallerOrigin::Session(SessionAttribution {
+                name: "work".into(),
+                instance_id: "work-instance".into(),
+            })
+        );
+        assert_ne!(
+            origin,
+            CallerOrigin::Session(replacement.attribution),
+            "a name-only relookup must not rebind the match to a replacement"
+        );
+    }
+
+    #[test]
+    fn windows_job_match_preserves_the_captured_instance() {
+        let matched = SessionAttribution {
+            name: "work".into(),
+            instance_id: "launch-a".into(),
+        };
+        let origin = resolve_job_first(|| Ok(Some(matched.clone())), || CallerOrigin::Outside);
+        assert_eq!(origin, CallerOrigin::Session(matched));
     }
 }

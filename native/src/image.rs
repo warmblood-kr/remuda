@@ -249,6 +249,7 @@ enum JobKind {
 pub(crate) struct CallerContext {
     pub kind: CallerKind,
     pub session: Option<String>,
+    pub instance_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -263,6 +264,7 @@ impl Default for CallerContext {
         Self {
             kind: CallerKind::Unknown,
             session: None,
+            instance_id: None,
         }
     }
 }
@@ -1266,7 +1268,7 @@ fn key(k: &mlua::Value, depth: usize, seen: &mut Vec<*const c_void>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_print, eval, render};
+    use super::{capture_print, eval, render, CallerContext, CallerKind, Image};
     use mlua::Lua;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1339,6 +1341,72 @@ mod tests {
         assert!(!error.contains("runtime error:"));
         assert!(!error.contains("stack traceback:"));
         assert_eq!(printed.borrow().len(), MAX_REPLY_BYTES);
+    }
+
+    #[test]
+    fn caller_instance_is_cleared_after_errors_and_internal_callbacks() {
+        let socket = std::env::temp_dir().join(format!(
+            "remuda-caller-reset-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let image = Image::spawn(
+            &socket,
+            std::sync::Arc::new(remuda_core::Registry::new()),
+            std::sync::Arc::new(crate::tick::Counters::default()),
+        );
+        let attributed = || CallerContext {
+            kind: CallerKind::Session,
+            session: Some("caller-reset".into()),
+            instance_id: Some("caller-reset-instance".into()),
+        };
+
+        assert!(image
+            .eval_request("error('expected')", None, attributed())
+            .is_err());
+        assert_eq!(
+            image
+                .eval(
+                    "return remuda.caller().kind .. ':' .. tostring(remuda.caller().instance_id)",
+                    None
+                )
+                .unwrap(),
+            "unknown:nil"
+        );
+
+        image
+            .eval_request(
+                "remuda.schedule({every=1, run=function() scheduled_caller = remuda.caller().kind .. ':' .. tostring(remuda.caller().instance_id) end}); remuda.after(0.01, function() timer_caller = remuda.caller().kind .. ':' .. tostring(remuda.caller().instance_id) end)",
+                None,
+                attributed(),
+            )
+            .unwrap();
+        image
+            .eval("remuda._run_due_schedules(10.0)", None)
+            .expect("run schedule from an internal Eval");
+        assert_eq!(
+            image.eval("return scheduled_caller", None).unwrap(),
+            "unknown:nil"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let result = image
+                .eval("return timer_caller or 'waiting'", None)
+                .unwrap();
+            if result != "waiting" {
+                assert_eq!(result, "unknown:nil");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timer callback did not run"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]

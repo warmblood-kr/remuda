@@ -28,6 +28,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Immutable process attribution captured from one registered session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionAttribution {
+    pub name: String,
+    pub instance_id: String,
+}
+
+/// One live session process and the identity of the launch that owns it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveSessionProcess {
+    pub attribution: SessionAttribution,
+    pub pid: u32,
+}
+
 /// One session's state, copied out. Owned data, never a borrow into the
 /// registry — the caller may be a viewer on another machine.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -170,6 +184,24 @@ impl Registry {
             .collect()
     }
 
+    /// Live process candidates with their launch identity captured together
+    /// under the registry lock. Carry this value through ancestry resolution
+    /// instead of looking the session name up again afterwards.
+    pub fn live_processes_with_identity(&self) -> Vec<LiveSessionProcess> {
+        self.lock()
+            .values()
+            .filter_map(|session| {
+                session.process_id_if_alive().map(|pid| LiveSessionProcess {
+                    attribution: SessionAttribution {
+                        name: session.name().to_string(),
+                        instance_id: session.instance_id().to_string(),
+                    },
+                    pid,
+                })
+            })
+            .collect()
+    }
+
     /// The session whose backend holds `pid` as its own. Every listed session
     /// is asked, also one whose child has exited: its descendants may live on.
     pub fn session_owning(
@@ -181,6 +213,36 @@ impl Registry {
         for session in self.lock().values() {
             match session.owns_process(pid, process_handle) {
                 Ok(true) => return Ok(Some(session.name().to_string())),
+                Ok(false) => {}
+                Err(_) => unknown = true,
+            }
+        }
+        if unknown {
+            Err(std::io::Error::other(
+                "session process membership unavailable",
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The immutable launch identity whose backend owns `pid`, resolved while
+    /// the registry entry is locked. This includes dead owners because Windows
+    /// job membership can outlive the session's primary process.
+    pub fn session_attribution_owning(
+        &self,
+        pid: u32,
+        process_handle: Option<usize>,
+    ) -> std::io::Result<Option<SessionAttribution>> {
+        let mut unknown = false;
+        for session in self.lock().values() {
+            match session.owns_process(pid, process_handle) {
+                Ok(true) => {
+                    return Ok(Some(SessionAttribution {
+                        name: session.name().to_string(),
+                        instance_id: session.instance_id().to_string(),
+                    }));
+                }
                 Ok(false) => {}
                 Err(_) => unknown = true,
             }
