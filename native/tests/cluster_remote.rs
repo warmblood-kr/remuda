@@ -258,16 +258,22 @@ struct RemoteTui {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     pid: u32,
     writer: Box<dyn Write + Send>,
+    cols: u16,
+    rows: u16,
     output: Arc<std::sync::Mutex<Vec<u8>>>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RemoteTui {
     fn start(node: &Node, target: Option<&str>) -> Self {
+        Self::start_at_size(node, target, 100, 24)
+    }
+
+    fn start_at_size(node: &Node, target: Option<&str>, cols: u16, rows: u16) -> Self {
         let pty = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize {
-                rows: 24,
-                cols: 100,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -307,28 +313,65 @@ impl RemoteTui {
             child,
             pid,
             writer,
+            cols,
+            rows,
             output,
             reader: Some(reader),
         }
     }
 
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+    fn screen_text(&self) -> String {
+        let output = self.output.lock().unwrap();
+        let mut parser = vt100::Parser::new(self.rows, self.cols, 0);
+        parser.process(&output);
+        parser.screen().contents()
     }
 
     fn output_len(&self) -> usize {
         self.output.lock().unwrap().len()
     }
 
-    fn text_from(&self, offset: usize) -> String {
+    fn raw_text_from(&self, offset: usize) -> String {
         let output = self.output.lock().unwrap();
         String::from_utf8_lossy(&output[offset.min(output.len())..]).into_owned()
+    }
+
+    fn screens_from(&self, offset: usize) -> (String, String) {
+        let output = self.output.lock().unwrap();
+        let offset = offset.min(output.len());
+        let mut parser = vt100::Parser::new(self.rows, self.cols, 0);
+        parser.process(&output[..offset]);
+        let before = parser.screen().contents();
+        parser.process(&output[offset..]);
+        let after = parser.screen().contents();
+        (before, after)
+    }
+
+    fn any_screen_contains_from(&self, offset: usize, needles: &[&str]) -> bool {
+        let output = self.output.lock().unwrap();
+        let offset = offset.min(output.len());
+        let mut parser = vt100::Parser::new(self.rows, self.cols, 0);
+        parser.process(&output[..offset]);
+        if needles
+            .iter()
+            .any(|needle| parser.screen().contents().contains(needle))
+        {
+            return true;
+        }
+        for byte in &output[offset..] {
+            parser.process(std::slice::from_ref(byte));
+            let screen = parser.screen().contents();
+            if needles.iter().any(|needle| screen.contains(needle)) {
+                return true;
+            }
+        }
+        false
     }
 
     fn wait_for(&self, needle: &str, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
-            let text = self.text();
+            let text = self.screen_text();
             if text.contains(needle) {
                 return;
             }
@@ -343,13 +386,13 @@ impl RemoteTui {
     fn wait_for_from(&self, offset: usize, needle: &str, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
-            let text = self.text_from(offset);
-            if text.contains(needle) {
+            let (before, after) = self.screens_from(offset);
+            if after.contains(needle) && !before.contains(needle) {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "TUI did not render {needle:?} after input: {text}"
+                "TUI did not render {needle:?} after input; screen at offset:\n{before}\ncurrent screen:\n{after}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -416,6 +459,126 @@ fn real_remote_tui_paints_the_selected_remote_session_screen() {
     tui.wait_for("remote live · reachable", Duration::from_secs(10));
     tui.wait_for(&format!("$ {server_label}/proof>"), Duration::from_secs(3));
     tui.wait_for("PR8-MARKER", Duration::from_secs(10));
+}
+
+fn assert_remote_screen_columns(tui: &RemoteTui, cols: u16, server_label: &str) {
+    let mut parser = vt100::Parser::new(24, cols, 0);
+    parser.process(&tui.output.lock().unwrap());
+    let screen_cells = (0..24)
+        .map(|row| {
+            (0..cols)
+                .map(|col| {
+                    parser
+                        .screen()
+                        .cell(row, col)
+                        .map_or(" ", |cell| cell.contents())
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let screen = screen_cells
+        .iter()
+        .map(|row| row.concat())
+        .collect::<Vec<_>>();
+    let column_of = |needle: &str| {
+        screen_cells
+            .iter()
+            .find_map(|row| {
+                let text = row.concat();
+                text.find(needle)
+                    .map(|byte_column| text[..byte_column].chars().count())
+            })
+            .unwrap_or_else(|| panic!("{needle:?} missing from screen:\n{}", screen.join("\n")))
+    };
+
+    assert_eq!(
+        column_of("remuda · cluster"),
+        0,
+        "{cols} columns:\n{}",
+        screen.join("\n")
+    );
+    assert_eq!(
+        column_of(server_label),
+        3,
+        "{cols} columns:\n{}",
+        screen.join("\n")
+    );
+    let expected_marker_column = if cols >= 60 {
+        usize::from(cols / 2 + 1)
+    } else {
+        0
+    };
+    assert_eq!(
+        column_of("CRLF-MARKER"),
+        expected_marker_column,
+        "{cols} columns; remote pane must begin at its layout column:\n{}",
+        screen.join("\n")
+    );
+
+    let separator = if cols >= 60 { "│" } else { "─" };
+    let separator_column = if cols >= 60 { usize::from(cols / 2) } else { 0 };
+    let separator_rows = screen_cells
+        .iter()
+        .filter_map(|row| {
+            row.iter()
+                .position(|cell| cell == separator)
+                .map(|column| (row, column))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !separator_rows.is_empty(),
+        "{cols} columns: no pane divider"
+    );
+    for (row, column) in separator_rows {
+        assert_eq!(
+            column,
+            separator_column,
+            "{cols} columns: pane divider shifted from its frame column: {}",
+            row.concat()
+        );
+    }
+}
+
+#[test]
+fn real_remote_tui_frames_start_each_row_at_column_zero_at_wide_and_narrow_sizes() {
+    let client_node = Node::start("crlf-client");
+    let server_node = Node::start("crlf-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    server_node.start_session(
+        "for i in $(seq 1 22); do printf 'FILLER\\n'; done; while true; do printf 'CRLF-MARKER'; sleep 1; done",
+    );
+
+    let registry_path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry =
+        serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server_node.fingerprint())
+        .unwrap()
+        .endpoint = Some(listener.address.to_string());
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    let server_label = remuda_native::cluster::node_label(&server_node.fingerprint());
+    for cols in [80, 40] {
+        let mut tui = RemoteTui::start_at_size(&client_node, None, cols, 24);
+        tui.wait_for(&server_label, Duration::from_secs(10));
+        tui.wait_for("reachable", Duration::from_secs(10));
+        tui.writer.write_all(b"\x1b[B\x1b[C").unwrap();
+        tui.wait_for("proof", Duration::from_secs(10));
+        tui.writer.write_all(b"\x1b[B\r").unwrap();
+        tui.wait_for("remote live · reachable", Duration::from_secs(10));
+        tui.wait_for("CRLF-MARKER", Duration::from_secs(10));
+        assert_remote_screen_columns(&tui, cols, &server_label);
+    }
 }
 
 #[test]
@@ -580,19 +743,16 @@ fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
         Duration::from_secs(3),
     );
     assert!(
-        tui.text_from(keys_start).contains("\x1b[?2004h"),
+        tui.raw_text_from(keys_start).contains("\x1b[?2004h"),
         "keys mode must enable bracketed paste capture"
     );
 
     let output_start = tui.output_len();
     tui.writer.write_all(b"\x1b[200~line1\rline2").unwrap();
     std::thread::sleep(Duration::from_millis(250));
-    let before_end = tui.text_from(output_start);
     assert!(
-        !before_end.contains("got=payload")
-            && !before_end.contains("got=enter")
-            && !before_end.contains("Input sent"),
-        "remote received input before paste terminator: {before_end}"
+        !tui.any_screen_contains_from(output_start, &["got=payload", "got=enter", "Input sent"],),
+        "remote received input on an intermediate screen before paste terminator"
     );
 
     tui.writer.write_all(b"\x1b[201~").unwrap();
@@ -673,10 +833,9 @@ fn real_remote_keys_mode_respects_cluster_control_off() {
     let input_start = tui.output_len();
     tui.writer.write_all(b"y").unwrap();
     std::thread::sleep(Duration::from_secs(2));
-    let output = tui.text_from(input_start);
     assert!(
-        !output.contains("got=y"),
-        "server accepted input while cluster control was disabled: {output}"
+        !tui.any_screen_contains_from(input_start, &["got=y"]),
+        "server accepted input while cluster control was disabled on an intermediate screen"
     );
 }
 
