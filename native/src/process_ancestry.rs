@@ -92,17 +92,7 @@ pub(crate) fn resolve_caller(
     #[cfg(windows)]
     {
         return match peer_pid {
-            Ok(Some(pid)) if pid > 1 => match process_parents() {
-                Ok(parents) => resolve_caller_with(pid, sessions, std::process::id(), |pid| {
-                    parents.get(&pid).copied().map(Some).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::NotFound,
-                            format!("process {pid} is not in the process snapshot"),
-                        )
-                    })
-                }),
-                Err(_) => CallerOrigin::Unknown,
-            },
+            Ok(Some(pid)) if pid > 1 => resolve_caller_windows(pid, sessions, None),
             Ok(Some(_)) | Ok(None) | Err(_) => CallerOrigin::Unknown,
         };
     }
@@ -112,6 +102,106 @@ pub(crate) fn resolve_caller(
             resolve_caller_with(pid, sessions, std::process::id(), parent_pid)
         }
         Ok(Some(_)) | Ok(None) | Err(_) => CallerOrigin::Unknown,
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn resolve_caller_opened(
+    pid: u32,
+    peer: &crate::session_job::Opened,
+    sessions: &[(String, u32)],
+) -> CallerOrigin {
+    resolve_caller_windows(pid, sessions, Some(peer))
+}
+
+#[cfg(windows)]
+fn resolve_caller_windows(
+    pid: u32,
+    sessions: &[(String, u32)],
+    peer: Option<&crate::session_job::Opened>,
+) -> CallerOrigin {
+    use crate::session_job::Opened;
+    use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+    let parents = match process_parents() {
+        Ok(parents) => parents,
+        Err(_) => return CallerOrigin::Unknown,
+    };
+    chain_end(pid, sessions, |process_pid| {
+        let Some(&parent_pid) = parents.get(&process_pid) else {
+            return Ok(None);
+        };
+        let opened;
+        let process = if process_pid == pid {
+            match peer {
+                Some(peer) => peer,
+                None => {
+                    opened = match Opened::query(process_pid) {
+                        Ok(opened) => opened,
+                        Err(error)
+                            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) =>
+                        {
+                            return Ok(None);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    &opened
+                }
+            }
+        } else {
+            opened = match Opened::query(process_pid) {
+                Ok(opened) => opened,
+                Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            &opened
+        };
+        process.created().map(|created| Some((parent_pid, created)))
+    })
+}
+
+fn chain_end<F>(mut pid: u32, sessions: &[(String, u32)], mut process: F) -> CallerOrigin
+where
+    F: FnMut(u32) -> io::Result<Option<(u32, u64)>>,
+{
+    const MAX_HOPS: usize = 64;
+    let mut visited = std::collections::HashSet::new();
+    let mut child_created = None;
+    let mut hops = 0;
+    loop {
+        let session = sessions.iter().find(|(_, session_pid)| *session_pid == pid);
+        if child_created.is_none() {
+            if let Some((name, _)) = session {
+                return CallerOrigin::Session(name.clone());
+            }
+        }
+        if pid <= 1 {
+            return CallerOrigin::Outside;
+        }
+        if !visited.insert(pid) {
+            return CallerOrigin::Unknown;
+        }
+        let (parent_pid, created) = match process(pid) {
+            Ok(Some(info)) => info,
+            Ok(None) if hops > 0 => return CallerOrigin::Outside,
+            Ok(None) | Err(_) => return CallerOrigin::Unknown,
+        };
+        if child_created.is_some_and(|child| created > child) {
+            return CallerOrigin::Outside;
+        }
+        if let Some((name, _)) = session {
+            return CallerOrigin::Session(name.clone());
+        }
+        if parent_pid <= 1 {
+            return CallerOrigin::Outside;
+        }
+        if hops == MAX_HOPS {
+            return CallerOrigin::Unknown;
+        }
+        child_created = Some(created);
+        pid = parent_pid;
+        hops += 1;
     }
 }
 
@@ -326,6 +416,17 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(chain_end(40, &[], process), CallerOrigin::Unknown);
+
+        let unreadable_creation = |_| {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "creation time unavailable",
+            ))
+        };
+        assert_eq!(
+            chain_end(40, &[], unreadable_creation),
+            CallerOrigin::Unknown
+        );
     }
 
     #[test]
@@ -348,11 +449,25 @@ mod tests {
     fn a_session_pid_ends_the_caller_chain_before_its_parent_is_read() {
         let process = |pid| match pid {
             40 => Ok(Some((30, 100))),
+            30 => Ok(Some((20, 90))),
             _ => unreachable!(),
         };
         assert_eq!(
             chain_end(40, &[("work".into(), 30)], process),
             CallerOrigin::Session("work".into())
+        );
+    }
+
+    #[test]
+    fn a_reused_session_pid_is_outside_when_the_parent_is_younger() {
+        let process = |pid| match pid {
+            40 => Ok(Some((30, 100))),
+            30 => Ok(Some((20, 200))),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            chain_end(40, &[("work".into(), 30)], process),
+            CallerOrigin::Outside
         );
     }
 

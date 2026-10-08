@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Windows: `remuda.caller().kind` is `outside` when the caller is in no
+  session's job and its parent chain ends at a missing or reused PID. An
+  unreadable or incomplete chain stays `unknown`; `outside` means only that
+  the caller was not started inside a live session's tree.
+
 - Windows: everything the session's program starts after it is put in its job
   ends when the session is reaped or closed, or when the daemon stops. A
   session that cannot be put in a job is not started. The one gap is the
