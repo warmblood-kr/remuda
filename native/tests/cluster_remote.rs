@@ -336,10 +336,6 @@ impl RemoteTui {
         String::from_utf8_lossy(&output[offset.min(output.len())..]).into_owned()
     }
 
-    fn text_from(&self, offset: usize) -> String {
-        self.screens_from(offset).1
-    }
-
     fn screens_from(&self, offset: usize) -> (String, String) {
         let output = self.output.lock().unwrap();
         let offset = offset.min(output.len());
@@ -349,6 +345,27 @@ impl RemoteTui {
         parser.process(&output[offset..]);
         let after = parser.screen().contents();
         (before, after)
+    }
+
+    fn any_screen_contains_from(&self, offset: usize, needles: &[&str]) -> bool {
+        let output = self.output.lock().unwrap();
+        let offset = offset.min(output.len());
+        let mut parser = vt100::Parser::new(self.rows, self.cols, 0);
+        parser.process(&output[..offset]);
+        if needles
+            .iter()
+            .any(|needle| parser.screen().contents().contains(needle))
+        {
+            return true;
+        }
+        for byte in &output[offset..] {
+            parser.process(std::slice::from_ref(byte));
+            let screen = parser.screen().contents();
+            if needles.iter().any(|needle| screen.contains(needle)) {
+                return true;
+            }
+        }
+        false
     }
 
     fn wait_for(&self, needle: &str, timeout: Duration) {
@@ -733,12 +750,9 @@ fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
     let output_start = tui.output_len();
     tui.writer.write_all(b"\x1b[200~line1\rline2").unwrap();
     std::thread::sleep(Duration::from_millis(250));
-    let before_end = tui.text_from(output_start);
     assert!(
-        !before_end.contains("got=payload")
-            && !before_end.contains("got=enter")
-            && !before_end.contains("Input sent"),
-        "remote received input before paste terminator: {before_end}"
+        !tui.any_screen_contains_from(output_start, &["got=payload", "got=enter", "Input sent"],),
+        "remote received input on an intermediate screen before paste terminator"
     );
 
     tui.writer.write_all(b"\x1b[201~").unwrap();
@@ -819,10 +833,9 @@ fn real_remote_keys_mode_respects_cluster_control_off() {
     let input_start = tui.output_len();
     tui.writer.write_all(b"y").unwrap();
     std::thread::sleep(Duration::from_secs(2));
-    let output = tui.text_from(input_start);
     assert!(
-        !output.contains("got=y"),
-        "server accepted input while cluster control was disabled: {output}"
+        !tui.any_screen_contains_from(input_start, &["got=y"]),
+        "server accepted input while cluster control was disabled on an intermediate screen"
     );
 }
 

@@ -261,13 +261,32 @@ fn stopped_daemon_keeps_cluster_tui_ticking_and_recovers_input() {
     tui.wait_for("sending input to tui-session", Duration::from_secs(3));
     let started = Instant::now();
     let uncertain_bound = Duration::from_secs(8);
-    tui.wait_for("delivery uncertain", uncertain_bound);
-    let (screen_before, screen_after) = tui.screens_from(redraw_start);
+    let deadline = started + uncertain_bound;
+    let mut progress_screens = std::collections::HashSet::new();
+    let screen_after = loop {
+        let screen = tui.screen_text();
+        if screen.contains("delivery uncertain") {
+            break screen;
+        }
+        if screen.contains("sending input") {
+            progress_screens.insert(screen.clone());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "uncertain state was not rendered within 8s while daemon was SIGSTOPped; screen:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    let (screen_before, _) = tui.screens_from(redraw_start);
     assert!(
-        started.elapsed() <= uncertain_bound
-            && screen_after.contains("delivery uncertain")
-            && !screen_before.contains("delivery uncertain"),
-        "uncertain state was not rendered within 8s while daemon was SIGSTOPped; screen at offset:\n{screen_before}\ncurrent screen:\n{screen_after}"
+        started.elapsed() <= uncertain_bound && !screen_before.contains("delivery uncertain"),
+        "uncertain state was already visible before the retry: screen at offset:\n{screen_before}\ncurrent screen:\n{screen_after}"
+    );
+    assert!(
+        progress_screens.len() >= 3,
+        "TUI did not keep rendering changing progress while daemon was SIGSTOPped; saw {} progress snapshots:\n{}",
+        progress_screens.len(),
+        progress_screens.into_iter().collect::<Vec<_>>().join("\n---\n")
     );
 
     daemon.resume();
