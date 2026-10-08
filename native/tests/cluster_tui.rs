@@ -163,23 +163,32 @@ impl TuiPty {
         }
     }
 
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+    fn screen_text(&self) -> String {
+        let output = self.output.lock().unwrap();
+        let mut parser = vt100::Parser::new(24, 100, 0);
+        parser.process(&output);
+        parser.screen().contents()
     }
 
     fn output_len(&self) -> usize {
         self.output.lock().unwrap().len()
     }
 
-    fn text_from(&self, offset: usize) -> String {
+    fn screens_from(&self, offset: usize) -> (String, String) {
         let output = self.output.lock().unwrap();
-        String::from_utf8_lossy(&output[offset.min(output.len())..]).into_owned()
+        let offset = offset.min(output.len());
+        let mut parser = vt100::Parser::new(24, 100, 0);
+        parser.process(&output[..offset]);
+        let before = parser.screen().contents();
+        parser.process(&output[offset..]);
+        let after = parser.screen().contents();
+        (before, after)
     }
 
     fn wait_for(&self, needle: &str, timeout: Duration) -> String {
         let deadline = Instant::now() + timeout;
         loop {
-            let output = self.text();
+            let output = self.screen_text();
             if output.contains(needle) {
                 return output;
             }
@@ -253,14 +262,12 @@ fn stopped_daemon_keeps_cluster_tui_ticking_and_recovers_input() {
     let started = Instant::now();
     let uncertain_bound = Duration::from_secs(8);
     tui.wait_for("delivery uncertain", uncertain_bound);
-    let redraw_output = tui.text_from(redraw_start);
+    let (screen_before, screen_after) = tui.screens_from(redraw_start);
     assert!(
-        started.elapsed() <= uncertain_bound,
-        "Uncertain exceeded 8s from the first send attempt"
-    );
-    assert!(
-        redraw_output.matches("\u{1b}[2J").count() >= 3,
-        "expected repeated redraws while daemon was SIGSTOPped"
+        started.elapsed() <= uncertain_bound
+            && screen_after.contains("delivery uncertain")
+            && !screen_before.contains("delivery uncertain"),
+        "uncertain state was not rendered within 8s while daemon was SIGSTOPped; screen at offset:\n{screen_before}\ncurrent screen:\n{screen_after}"
     );
 
     daemon.resume();

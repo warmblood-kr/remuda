@@ -258,6 +258,8 @@ struct RemoteTui {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     pid: u32,
     writer: Box<dyn Write + Send>,
+    cols: u16,
+    rows: u16,
     output: Arc<std::sync::Mutex<Vec<u8>>>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
@@ -311,28 +313,48 @@ impl RemoteTui {
             child,
             pid,
             writer,
+            cols,
+            rows,
             output,
             reader: Some(reader),
         }
     }
 
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+    fn screen_text(&self) -> String {
+        let output = self.output.lock().unwrap();
+        let mut parser = vt100::Parser::new(self.rows, self.cols, 0);
+        parser.process(&output);
+        parser.screen().contents()
     }
 
     fn output_len(&self) -> usize {
         self.output.lock().unwrap().len()
     }
 
-    fn text_from(&self, offset: usize) -> String {
+    fn raw_text_from(&self, offset: usize) -> String {
         let output = self.output.lock().unwrap();
         String::from_utf8_lossy(&output[offset.min(output.len())..]).into_owned()
+    }
+
+    fn text_from(&self, offset: usize) -> String {
+        self.screens_from(offset).1
+    }
+
+    fn screens_from(&self, offset: usize) -> (String, String) {
+        let output = self.output.lock().unwrap();
+        let offset = offset.min(output.len());
+        let mut parser = vt100::Parser::new(self.rows, self.cols, 0);
+        parser.process(&output[..offset]);
+        let before = parser.screen().contents();
+        parser.process(&output[offset..]);
+        let after = parser.screen().contents();
+        (before, after)
     }
 
     fn wait_for(&self, needle: &str, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
-            let text = self.text();
+            let text = self.screen_text();
             if text.contains(needle) {
                 return;
             }
@@ -347,13 +369,13 @@ impl RemoteTui {
     fn wait_for_from(&self, offset: usize, needle: &str, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
-            let text = self.text_from(offset);
-            if text.contains(needle) {
+            let (before, after) = self.screens_from(offset);
+            if after.contains(needle) && !before.contains(needle) {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "TUI did not render {needle:?} after input: {text}"
+                "TUI did not render {needle:?} after input; screen at offset:\n{before}\ncurrent screen:\n{after}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -704,7 +726,7 @@ fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
         Duration::from_secs(3),
     );
     assert!(
-        tui.text_from(keys_start).contains("\x1b[?2004h"),
+        tui.raw_text_from(keys_start).contains("\x1b[?2004h"),
         "keys mode must enable bracketed paste capture"
     );
 
