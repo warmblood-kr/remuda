@@ -267,6 +267,8 @@ mod tests {
             .join(format!("remuda-ipc-missing-{}", std::process::id()))
             .join("daemon.sock");
         let error = connect(&path).unwrap_err();
+        // Windows named pipes report Unsupported for a missing path.
+        #[cfg(unix)]
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(error.to_string().contains(&path.display().to_string()));
         assert!(error.to_string().contains("cannot connect to daemon at"));
