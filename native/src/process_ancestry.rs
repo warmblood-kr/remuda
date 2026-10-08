@@ -85,6 +85,19 @@ pub(crate) enum CallerOrigin {
     Unknown,
 }
 
+#[cfg(any(windows, test))]
+pub(crate) fn resolve_job_first<J, A>(job: J, ancestry: A) -> CallerOrigin
+where
+    J: FnOnce() -> io::Result<Option<String>>,
+    A: FnOnce() -> CallerOrigin,
+{
+    match job() {
+        Ok(Some(name)) => CallerOrigin::Session(name),
+        Ok(None) => ancestry(),
+        Err(_) => CallerOrigin::Unknown,
+    }
+}
+
 pub(crate) fn resolve_caller(
     peer_pid: io::Result<Option<u32>>,
     sessions: &[(String, u32)],
@@ -121,7 +134,6 @@ fn resolve_caller_windows(
     peer: Option<&crate::session_job::Opened>,
 ) -> CallerOrigin {
     use crate::session_job::Opened;
-    use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
     let parents = match process_parents() {
         Ok(parents) => parents,
         Err(_) => return CallerOrigin::Unknown,
@@ -137,9 +149,7 @@ fn resolve_caller_windows(
                 None => {
                     opened = match Opened::query(process_pid) {
                         Ok(opened) => opened,
-                        Err(error)
-                            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) =>
-                        {
+                        Err(error) if process_missing(&error) => {
                             return Ok(None);
                         }
                         Err(error) => return Err(error),
@@ -150,7 +160,7 @@ fn resolve_caller_windows(
         } else {
             opened = match Opened::query(process_pid) {
                 Ok(opened) => opened,
-                Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) => {
+                Err(error) if process_missing(&error) => {
                     return Ok(None);
                 }
                 Err(error) => return Err(error),
@@ -161,6 +171,13 @@ fn resolve_caller_windows(
     })
 }
 
+#[cfg(any(windows, test))]
+fn process_missing(error: &io::Error) -> bool {
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    error.raw_os_error() == Some(ERROR_INVALID_PARAMETER)
+}
+
+#[cfg(any(windows, test))]
 fn chain_end<F>(mut pid: u32, sessions: &[(String, u32)], mut process: F) -> CallerOrigin
 where
     F: FnMut(u32) -> io::Result<Option<(u32, u64)>>,
@@ -205,6 +222,7 @@ where
     }
 }
 
+#[cfg(any(not(windows), test))]
 fn resolve_caller_with<F>(
     mut pid: u32,
     sessions: &[(String, u32)],
@@ -406,6 +424,72 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(chain_end(40, &[], process), CallerOrigin::Outside);
+    }
+
+    #[test]
+    fn an_equal_creation_time_parent_is_not_a_reused_pid() {
+        let process = |pid| match pid {
+            40 => Ok(Some((30, 100))),
+            30 => Ok(Some((20, 100))),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            chain_end(40, &[("work".into(), 30)], process),
+            CallerOrigin::Session("work".into())
+        );
+    }
+
+    #[test]
+    fn a_missing_peer_at_the_first_hop_is_unknown() {
+        assert_eq!(chain_end(40, &[], |_| Ok(None)), CallerOrigin::Unknown);
+    }
+
+    #[test]
+    fn a_caller_chain_can_reach_a_session_at_the_64_hop_boundary() {
+        let process = |pid| Ok(Some((pid - 1, u64::from(pid))));
+        assert_eq!(
+            chain_end(100, &[("work".into(), 36)], process),
+            CallerOrigin::Session("work".into())
+        );
+    }
+
+    #[test]
+    fn a_session_beyond_the_64_hop_boundary_is_unknown() {
+        let process = |pid| Ok(Some((pid - 1, u64::from(pid))));
+        assert_eq!(
+            chain_end(100, &[("work".into(), 35)], process),
+            CallerOrigin::Unknown
+        );
+    }
+
+    #[test]
+    fn root_pids_end_the_chain_outside() {
+        assert_eq!(chain_end(1, &[], |_| unreachable!()), CallerOrigin::Outside);
+    }
+
+    #[test]
+    fn only_invalid_parameter_maps_to_a_missing_process() {
+        assert!(process_missing(&io::Error::from_raw_os_error(87)));
+        assert!(!process_missing(&io::Error::from_raw_os_error(5)));
+    }
+
+    #[test]
+    fn a_membership_error_stays_unknown_even_if_the_parent_is_missing() {
+        let held_peer = Some(40);
+        let origin = resolve_job_first(
+            || {
+                assert_eq!(held_peer, Some(40));
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+            },
+            || {
+                chain_end(40, &[], |pid| match pid {
+                    40 => Ok(Some((30, 100))),
+                    30 => Ok(None),
+                    _ => unreachable!(),
+                })
+            },
+        );
+        assert_eq!(origin, CallerOrigin::Unknown);
     }
 
     #[test]

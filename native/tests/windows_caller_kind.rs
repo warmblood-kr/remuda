@@ -132,7 +132,6 @@ fn a_command_outside_every_session_is_an_outside_caller() {
         &format!("& '{exe}' -s s -e '{ASK}'"),
     ]);
 
-    let mut wrong = Vec::new();
     for (route, command) in [
         ("plain", plain),
         ("cmd", through_cmd),
@@ -140,11 +139,11 @@ fn a_command_outside_every_session_is_an_outside_caller() {
     ] {
         let kind = said(command);
         fact(format_args!("{route}: kind {kind:?}"));
-        if kind != "outside" {
-            wrong.push(format!("{route}: {kind}"));
-        }
+        assert_eq!(
+            kind, "outside",
+            "{route} did not return the exact caller kind"
+        );
     }
-    assert!(wrong.is_empty(), "want outside, got {}", wrong.join("; "));
 }
 
 /// A process that a session's child starts in a new console, and that

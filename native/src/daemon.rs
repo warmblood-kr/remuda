@@ -1782,13 +1782,10 @@ fn caller_context(
         let Some((pid, held)) = process_ancestry::current_peer(stream, accepted) else {
             return crate::image::CallerContext::default();
         };
-        if let Some(name) = registry.session_owning(pid) {
-            return crate::image::CallerContext {
-                kind: crate::image::CallerKind::Session,
-                session: Some(name),
-            };
-        }
-        process_ancestry::resolve_caller_opened(pid, &held, &registry.live_processes())
+        process_ancestry::resolve_job_first(
+            || registry.session_owning(pid, Some(held.raw_handle())),
+            || process_ancestry::resolve_caller_opened(pid, &held, &registry.live_processes()),
+        )
     };
     #[cfg(not(windows))]
     let origin = {
