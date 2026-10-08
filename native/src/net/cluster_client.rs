@@ -204,42 +204,72 @@ fn read_response<R: Read>(
     if status != 200 {
         return Err(ClientError::Refused(status));
     }
-    let mut body = reader.take(length as u64);
-    let opened = if length <= MAX_BODY_BYTES {
-        let mut bytes = Vec::new();
-        body.read_to_end(&mut bytes).map_err(map_io)?;
-        frame::open_response_any(sealed, &bytes)
-    } else {
-        frame::open_response_chunked_from(sealed, &mut body)
+    let plaintext = {
+        let mut body = reader.take(length as u64);
+        let opened = if length <= MAX_BODY_BYTES {
+            let mut bytes = Vec::new();
+            body.read_to_end(&mut bytes).map_err(map_io)?;
+            frame::open_response_any(sealed, &bytes)
+        } else {
+            frame::open_response_chunked_from(sealed, &mut body)
+        };
+        // The peer ended early, or sent more than it declared: HTTP framing is broken.
+        let short = body.limit() > 0;
+        match opened {
+            Ok(_) if short => return Err(ClientError::BadResponse),
+            Ok(plaintext) => plaintext,
+            Err(error) if is_transport_io(&error) => return Err(map_io(error)),
+            Err(_) if short => return Err(ClientError::BadResponse),
+            Err(error) => return Err(map_frame_error(&error)),
+        }
     };
-    // The peer ended early, or sent more than it declared: HTTP framing is broken.
-    let short = body.limit() > 0;
-    match opened {
-        Ok(_) if short => Err(ClientError::BadResponse),
-        Ok(plaintext) => Ok(plaintext),
-        Err(_) if short => Err(ClientError::BadResponse),
-        Err(error) => Err(map_frame_error(&error)),
+    let mut trailing = [0; 1];
+    match reader.read(&mut trailing).map_err(map_io)? {
+        0 => Ok(plaintext),
+        _ => Err(ClientError::BadResponse),
     }
 }
 
 fn map_frame_error(error: &io::Error) -> ClientError {
     match error.kind() {
         io::ErrorKind::Unsupported => ClientError::BadResponse,
-        _ => ClientError::Crypto,
+        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => ClientError::Crypto,
+        _ => map_io(io::Error::from(error.kind())),
     }
+}
+
+fn is_transport_io(error: &io::Error) -> bool {
+    !matches!(
+        error.kind(),
+        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof | io::ErrorKind::Unsupported
+    )
 }
 
 fn read_http_head<R: Read>(reader: &mut BufReader<R>) -> Result<(u16, usize), ClientError> {
     let status_line = read_line(reader)?;
-    let status_text = std::str::from_utf8(&status_line).map_err(|_| ClientError::BadResponse)?;
-    let mut status_parts = status_text.split_ascii_whitespace();
-    if status_parts.next() != Some("HTTP/1.1") {
+    let first_space = status_line
+        .iter()
+        .position(|byte| *byte == b' ')
+        .ok_or(ClientError::BadResponse)?;
+    let rest = &status_line[first_space + 1..];
+    let second_space = rest
+        .iter()
+        .position(|byte| *byte == b' ')
+        .ok_or(ClientError::BadResponse)?;
+    let version = &status_line[..first_space];
+    let code = &rest[..second_space];
+    let reason = &rest[second_space + 1..];
+    if version != b"HTTP/1.1"
+        || code.len() != 3
+        || !code.iter().all(u8::is_ascii_digit)
+        || !valid_field_value(reason)
+    {
         return Err(ClientError::BadResponse);
     }
-    let status = status_parts
-        .next()
-        .and_then(|value| value.parse::<u16>().ok())
-        .ok_or(ClientError::BadResponse)?;
+    let status = std::str::from_utf8(code)
+        .map_err(|_| ClientError::BadResponse)?
+        .parse::<u16>()
+        .map_err(|_| ClientError::BadResponse)?;
     if !(100..600).contains(&status) {
         return Err(ClientError::BadResponse);
     }
@@ -259,21 +289,27 @@ fn read_http_head<R: Read>(reader: &mut BufReader<R>) -> Result<(u16, usize), Cl
         if header_count > MAX_HEADER_COUNT {
             return Err(ClientError::BadResponse);
         }
-        let text = std::str::from_utf8(&line).map_err(|_| ClientError::BadResponse)?;
-        let (name, value) = text.split_once(':').ok_or(ClientError::BadResponse)?;
-        if name.eq_ignore_ascii_case("transfer-encoding") {
+        let colon = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or(ClientError::BadResponse)?;
+        let name = &line[..colon];
+        let value = &line[colon + 1..];
+        if !valid_field_name(name) || !valid_field_value(value) {
             return Err(ClientError::BadResponse);
         }
-        if name.eq_ignore_ascii_case("content-length") {
-            if content_length.is_some()
-                || value.trim().is_empty()
-                || !value.trim().bytes().all(|byte| byte.is_ascii_digit())
+        if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            return Err(ClientError::BadResponse);
+        }
+        if name.eq_ignore_ascii_case(b"content-length") {
+            let value = trim_ows(value);
+            if content_length.is_some() || value.is_empty() || !value.iter().all(u8::is_ascii_digit)
             {
                 return Err(ClientError::BadResponse);
             }
             content_length = Some(
-                value
-                    .trim()
+                std::str::from_utf8(value)
+                    .map_err(|_| ClientError::BadResponse)?
                     .parse::<usize>()
                     .map_err(|_| ClientError::BadResponse)?,
             );
@@ -289,14 +325,51 @@ fn read_line<R: Read>(reader: &mut BufReader<R>) -> Result<Vec<u8>, ClientError>
         .take((MAX_REQUEST_LINE_BYTES + 1) as u64)
         .read_until(b'\n', &mut line)
         .map_err(map_io)?;
-    if count == 0 || line.len() > MAX_REQUEST_LINE_BYTES || line.last() != Some(&b'\n') {
+    if count == 0 || line.len() > MAX_REQUEST_LINE_BYTES || !line.ends_with(b"\r\n") {
         return Err(ClientError::BadResponse);
     }
-    line.pop();
-    if line.last() == Some(&b'\r') {
-        line.pop();
-    }
+    line.truncate(line.len() - 2);
     Ok(line)
+}
+
+fn valid_field_name(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.iter().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn valid_field_value(value: &[u8]) -> bool {
+    value
+        .iter()
+        .all(|byte| *byte == b'\t' || (b' '..=b'~').contains(byte) || *byte >= 0x80)
+}
+
+fn trim_ows(mut value: &[u8]) -> &[u8] {
+    while matches!(value.first(), Some(b' ' | b'\t')) {
+        value = &value[1..];
+    }
+    while matches!(value.last(), Some(b' ' | b'\t')) {
+        value = &value[..value.len() - 1];
+    }
+    value
 }
 
 fn remaining(deadline: Instant) -> Result<Duration, ClientError> {
@@ -321,7 +394,7 @@ fn map_io(error: io::Error) -> ClientError {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_io, read_response, ClientError, V2_BODY_BOUND};
+    use super::{map_io, read_http_head, read_response, ClientError, V2_BODY_BOUND};
     use crate::net::frame;
     use std::io::{BufReader, Cursor, Read};
 
@@ -443,6 +516,87 @@ mod tests {
         let (sealed, _, body) = v2(200_000);
         let (result, _) = run(sealed, http(&body, body.len() - 10));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn complete_response_followed_by_bytes_outside_content_length_is_rejected() {
+        let mut rejected = Vec::new();
+        for version in [1, 2] {
+            let (sealed, body) = if version == 1 {
+                let (sealed, opened) = pair();
+                (sealed, frame::seal_response(opened, b"{}").unwrap())
+            } else {
+                let (sealed, _, body) = v2(200_000);
+                (sealed, body)
+            };
+            let mut raw = http(&body, body.len());
+            raw.extend_from_slice(b"tail");
+            let (result, _) = run(sealed, raw);
+            rejected.push((version, result == Err(ClientError::BadResponse)));
+        }
+        assert_eq!(rejected, [(1, true), (2, true)]);
+    }
+
+    #[test]
+    fn v2_idle_read_timeout_after_msg2_remains_a_timeout() {
+        struct TimeoutAfter(Vec<u8>);
+
+        impl Read for TimeoutAfter {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                if self.0.is_empty() {
+                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                }
+                let count = output.len().min(self.0.len());
+                output[..count].copy_from_slice(&self.0[..count]);
+                self.0.drain(..count);
+                Ok(count)
+            }
+        }
+
+        let (sealed, _, body) = v2(200_000);
+        let msg2_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+        let msg2_end = 2 + msg2_len;
+        let mut raw = http(&body[..msg2_end], body.len());
+        let body_start = raw.len() - msg2_end;
+        raw.truncate(body_start + msg2_end);
+        let mut reader = BufReader::new(TimeoutAfter(raw));
+        assert_eq!(
+            read_response(&mut reader, sealed),
+            Err(ClientError::Timeout)
+        );
+    }
+
+    #[test]
+    fn response_headers_reject_invalid_names_folding_and_control_bytes() {
+        for head in [
+            b"HTTP/1.1 200 OK\r\nBad Name: value\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding : chunked\r\nContent-Length: 0\r\n\r\n"
+                .as_slice(),
+            b"HTTP/1.1 200 OK\r\n Content-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nX-Test: bad\x01value\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 bad\x01reason\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nX-Test: bare\nlf\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nX-Test: bare\rcr\r\nContent-Length: 0\r\n\r\n".as_slice(),
+        ] {
+            assert_eq!(
+                read_http_head(&mut BufReader::new(Cursor::new(head))),
+                Err(ClientError::BadResponse),
+                "{head:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_v1_response_accepts_obs_text_in_reason_and_values() {
+        let (sealed, opened) = pair();
+        let body = frame::seal_response(opened, b"{\"ok\":1}").unwrap();
+        let mut raw =
+            b"HTTP/1.1 200 Succ\xc3\xa8s\r\nX-Label: caf\xc3\xa9\r\nContent-Length: ".to_vec();
+        raw.extend_from_slice(body.len().to_string().as_bytes());
+        raw.extend_from_slice(b"\r\n\r\n");
+        raw.extend_from_slice(&body);
+        let (result, _) = run(sealed, raw);
+        assert_eq!(result.unwrap(), b"{\"ok\":1}");
     }
 
     #[test]

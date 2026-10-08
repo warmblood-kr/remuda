@@ -565,6 +565,7 @@ impl ClusterUi {
     }
 
     pub fn render(&self, cols: u16, rows: u16, screen: &str, clock: &dyn Clock) -> String {
+        let (cols, rows) = normalized_terminal_size(cols, rows);
         let width = usize::from(cols.max(1));
         let height = usize::from(rows.max(1));
         if self.remote_keys_mode.is_some() {
@@ -759,8 +760,18 @@ impl ClusterUi {
     fn active_notice_lines(&self, now: Duration, width: usize) -> Vec<String> {
         self.notice
             .as_ref()
-            .filter(|(_, at)| now.saturating_sub(*at) < Duration::from_secs(5))
-            .map_or_else(Vec::new, |(notice, _)| wrap_to_two_lines(notice, width))
+            .filter(|(notice, at)| {
+                notice.starts_with("sending input to ")
+                    || now.saturating_sub(*at) < Duration::from_secs(5)
+            })
+            .map_or_else(Vec::new, |(notice, at)| {
+                let notice = if notice.starts_with("sending input to ") {
+                    format!("{notice} · {}s", age_seconds(now, *at))
+                } else {
+                    notice.clone()
+                };
+                wrap_to_two_lines(&notice, width)
+            })
     }
 
     fn append_footer(&self, frame: &mut Vec<String>, width: usize) {
@@ -1511,7 +1522,14 @@ impl ClusterUi {
                     .as_ref()
                     .is_some_and(|(notice, _)| notice == REMOTE_PASTE_FAILURE_NOTICE)
             {
-                self.notice = Some((format!("sending input to {}", batch.name), now));
+                let notice = format!("sending input to {}", batch.name);
+                if !self
+                    .notice
+                    .as_ref()
+                    .is_some_and(|(current, _)| current == &notice)
+                {
+                    self.notice = Some((notice, now));
+                }
             }
         }
     }
@@ -1811,6 +1829,35 @@ fn visible_remote_pane_lines(
 /// Raw mode clears OPOST, so a bare `\n` only moves down and every row staircases right.
 fn terminal_frame(frame: &str) -> String {
     frame.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+// vt100 stores one base scalar plus combining marks in each cell; diffs inherit that cell limit.
+fn present(prev: Option<&vt100::Screen>, next: &vt100::Screen) -> Vec<u8> {
+    match prev {
+        Some(prev) if prev.size() == next.size() => next.contents_diff(prev),
+        _ => {
+            let mut output = b"\x1b[2J\x1b[H".to_vec();
+            output.extend(next.contents_formatted());
+            output
+        }
+    }
+}
+
+const MAX_TERMINAL_COLS: u16 = 512;
+const MAX_TERMINAL_ROWS: u16 = 256;
+const MAX_TERMINAL_CELLS: u32 = 131_072;
+
+fn normalized_terminal_size(cols: u16, rows: u16) -> (u16, u16) {
+    let cols = cols.clamp(1, MAX_TERMINAL_COLS);
+    let max_rows =
+        u16::try_from((MAX_TERMINAL_CELLS / u32::from(cols)).min(u32::from(MAX_TERMINAL_ROWS)))
+            .expect("maximum terminal rows fit in u16");
+    let rows = rows.clamp(1, max_rows);
+    (cols, rows)
+}
+
+fn resize_requires_full_repaint(event: &crossterm::event::Event) -> bool {
+    matches!(event, crossterm::event::Event::Resize(_, _))
 }
 
 fn age_seconds(now: Duration, since: Duration) -> u64 {
@@ -2220,6 +2267,7 @@ fn run_loop(
             ui.composer_focused = true;
         }
     }
+    let mut previous = None;
     loop {
         if let Ok(current) = list(path) {
             ui.sessions_synced(current, clock.now());
@@ -2257,20 +2305,26 @@ fn run_loop(
                 }
             });
         let body = captured.unwrap_or_default();
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
+        let (cols, rows) = normalized_terminal_size(terminal_size.0, terminal_size.1);
         let frame = ui.render(cols, rows, &body, clock);
-        crossterm::execute!(
-            io::stdout(),
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-            crossterm::cursor::MoveTo(0, 0)
-        )?;
-        write!(io::stdout(), "{}", terminal_frame(&frame))?;
-        io::stdout().flush()?;
+        let mut next = vt100::Parser::new(rows, cols, 0);
+        next.process(format!("\x1b[H\x1b[2J{}", terminal_frame(&frame)).as_bytes());
+        let output = present(previous.as_ref().map(vt100::Parser::screen), next.screen());
+        if !output.is_empty() {
+            io::stdout().write_all(&output)?;
+            io::stdout().flush()?;
+        }
+        previous = Some(next);
         ui.send_close_pending(path, remote_input, clock.now());
         ui.send_pending(path, clock.now(), remote_input);
         ui.start_pending(clock.now());
         if crossterm::event::poll(Duration::from_millis(250))? {
-            if ui.handle_event(crossterm::event::read()?, clock.now()) {
+            let event = crossterm::event::read()?;
+            if resize_requires_full_repaint(&event) {
+                previous = None;
+            }
+            if ui.handle_event(event, clock.now()) {
                 return Ok(());
             }
             ui.send_close_pending(path, remote_input, clock.now());
@@ -2310,9 +2364,9 @@ fn select_target_with_remote_wait(
 mod tests {
     use super::queue::{QueueEvent, QueueState, MAX_IO_RETRIES};
     use super::{
-        is_attention, remote_state_label, render_badge, select_target_with_remote_wait,
-        terminal_frame, AttentionSignals, Badge, ClusterUi, RemoteInputTransport, RemoteSelection,
-        RemoteSource,
+        is_attention, normalized_terminal_size, present, remote_state_label, render_badge,
+        resize_requires_full_repaint, select_target_with_remote_wait, terminal_frame,
+        AttentionSignals, Badge, ClusterUi, RemoteInputTransport, RemoteSelection, RemoteSource,
     };
     use crate::cluster_remote::{
         RemoteNodeSnapshot, RemoteSessionSnapshot, RemoteSnapshot, RemoteState,
@@ -2323,6 +2377,109 @@ mod tests {
     use remuda_core::{SessionSummary, Size};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    fn parsed_frame(frame: &str, cols: u16, rows: u16) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(format!("\x1b[H\x1b[2J{}", terminal_frame(frame)).as_bytes());
+        parser
+    }
+
+    #[test]
+    fn presenter_emits_nothing_for_an_unchanged_frame() {
+        let parser = parsed_frame("hello", 80, 24);
+
+        assert!(present(Some(parser.screen()), parser.screen()).is_empty());
+    }
+
+    #[test]
+    fn presenter_emits_only_the_changed_cell() {
+        let previous = parsed_frame("hello", 80, 24);
+        let next = parsed_frame("hallo", 80, 24);
+        let diff = present(Some(previous.screen()), next.screen());
+
+        assert!(!diff.is_empty());
+        assert!(diff.len() < 20, "unexpectedly large diff: {diff:?}");
+    }
+
+    #[test]
+    fn presenter_diff_round_trips_hangul_wide_cells() {
+        let previous = parsed_frame("hello", 80, 24);
+        let next = parsed_frame("안녕하세요", 80, 24);
+        let mut terminal = vt100::Parser::new(24, 80, 0);
+        terminal.process(&present(None, previous.screen()));
+        terminal.process(&present(Some(previous.screen()), next.screen()));
+
+        assert_eq!(terminal.screen().contents(), next.screen().contents());
+    }
+
+    #[test]
+    fn presenter_forces_full_repaint_after_resize() {
+        let previous = parsed_frame("before", 80, 24);
+        let next = parsed_frame("after", 40, 24);
+        let repaint = present(Some(previous.screen()), next.screen());
+
+        assert!(repaint.starts_with(b"\x1b[2J\x1b[H"));
+        let mut terminal = vt100::Parser::new(24, 40, 0);
+        terminal.process(&repaint);
+        assert_eq!(terminal.screen().contents(), next.screen().contents());
+    }
+
+    #[test]
+    fn zero_and_extreme_terminal_dimensions_are_bounded() {
+        assert_eq!(normalized_terminal_size(0, 0), (1, 1));
+        let (cols, rows) = normalized_terminal_size(u16::MAX, u16::MAX);
+        assert_eq!(cols, 512);
+        assert_eq!(rows, 256);
+        assert!(u32::from(cols) * u32::from(rows) <= 131_072);
+        let (cols, rows) = normalized_terminal_size(512, 1000);
+        assert_eq!(cols, 512);
+        assert_eq!(rows, 256);
+    }
+
+    #[test]
+    fn presenter_preserves_wrap_pending_cursor_state() {
+        let previous = parsed_frame("abc", 4, 2);
+        let next = parsed_frame("abcd", 4, 2);
+        let diff = present(Some(previous.screen()), next.screen());
+        let mut terminal = vt100::Parser::new(2, 4, 0);
+        terminal.process(&present(None, previous.screen()));
+        terminal.process(&diff);
+        terminal.process(b"X");
+        let expected = parsed_frame("abcdX", 4, 2);
+
+        assert_eq!(terminal.screen().contents(), expected.screen().contents());
+        assert_eq!(
+            terminal.screen().cursor_position(),
+            expected.screen().cursor_position()
+        );
+    }
+
+    #[test]
+    fn resize_invalidates_the_frame_cache_even_when_dimensions_return() {
+        let original = parsed_frame("preserved beyond narrow width", 16, 3);
+        let next = parsed_frame("preserved beyond narrow width", 16, 3);
+        let mut terminal = vt100::Parser::new(3, 16, 0);
+        terminal.process(&present(None, original.screen()));
+        terminal.screen_mut().set_size(3, 8);
+        terminal.screen_mut().set_size(3, 16);
+        assert!(!terminal.screen().contents().contains("beyond narrow"));
+
+        let resize = crossterm::event::Event::Resize(8, 3);
+        assert!(resize_requires_full_repaint(&resize));
+        let repaint = present(None, next.screen());
+        terminal.process(&repaint);
+        assert_eq!(terminal.screen().contents(), next.screen().contents());
+    }
+
+    #[test]
+    fn presenter_keeps_combining_marks_in_their_cell() {
+        let text = "e\u{301}";
+        let next = parsed_frame(text, 8, 2);
+        assert_eq!(next.screen().cell(0, 0).unwrap().contents(), text);
+        let mut terminal = vt100::Parser::new(2, 8, 0);
+        terminal.process(&present(None, next.screen()));
+        assert_eq!(terminal.screen().cell(0, 0).unwrap().contents(), text);
+    }
 
     struct FakeRemoteSource(Mutex<RemoteSnapshot>);
 
@@ -3244,6 +3401,21 @@ mod tests {
             Duration::ZERO,
         );
         assert!(ui.notice.is_none());
+    }
+
+    #[test]
+    fn sending_notice_shows_elapsed_time_while_pending() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], clock.now());
+        ui.notice = Some(("sending input to dev".into(), clock.now()));
+
+        assert!(ui
+            .render(80, 24, "", &clock)
+            .contains("sending input to dev · 0s"));
+        clock.advance(Duration::from_secs(2));
+        assert!(ui
+            .render(80, 24, "", &clock)
+            .contains("sending input to dev · 2s"));
     }
 
     #[test]
