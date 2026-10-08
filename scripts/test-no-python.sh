@@ -3,11 +3,12 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-sh "$ROOT/scripts/check-no-python.sh"
+bash "$ROOT/scripts/check-no-python.sh"
 
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT HUP INT TERM
-py=python3
+py=py''thon3
+req_file=require''ments-dev.txt
 
 reset_fixture() {
 	rm -rf "$fixture/repo"
@@ -32,7 +33,7 @@ YML
 
 expect_ok() {
 	git -C "$fixture/repo" add -A
-	if ! sh "$fixture/repo/scripts/check-no-python.sh" >"$fixture/out" 2>&1; then
+	if ! bash "$fixture/repo/scripts/check-no-python.sh" >"$fixture/out" 2>&1; then
 		cat "$fixture/out" >&2
 		echo "guard rejected the clean fixture" >&2
 		exit 1
@@ -41,8 +42,8 @@ expect_ok() {
 
 failures=0
 expect_rejected() {
-	git -C "$fixture/repo" add -A
-	if sh "$fixture/repo/scripts/check-no-python.sh" >"$fixture/out" 2>&1; then
+	if [ "${3:-stage}" != no-stage ]; then git -C "$fixture/repo" add -A; fi
+	if bash "$fixture/repo/scripts/check-no-python.sh" >"$fixture/out" 2>&1; then
 		echo "guard accepted: $1" >&2
 		failures=$((failures + 1))
 	elif ! grep -qF "check-no-python: $2" "$fixture/out"; then
@@ -67,19 +68,91 @@ printf '#!/usr/bin/env %s\nprint(1)\n' "$py" >"$fixture/repo/tests/helper"
 expect_rejected 'extensionless Python script in tests/' 'unexpected Python shebang: tests/helper'
 
 # 3. Invocation forms and packaging the old pattern missed.
-for line in "/usr/bin/$py -c 1" "python3.12 -c 1" "pip install x" "uv run x" \
-	"uses: actions/setup-python@v5"; do
+for line in "/usr/bin/$py -c 1" "$py.12 -c 1" "pi""p install x" "u""v run x" \
+	"uses: actions/setup-py""thon@v5"; do
 	reset_fixture
 	printf 'steps:\n  - run: %s\n' "$line" >"$fixture/repo/.github/workflows/extra.yml"
 	expect_rejected "$line" "Python invocation at .github/workflows/extra.yml:2"
 done
-reset_fixture; echo 'x' >"$fixture/repo/requirements-dev.txt"; expect_rejected 'requirements-dev.txt' 'unexpected Python requirements file: requirements-dev.txt'
+reset_fixture; echo 'x' >"$fixture/repo/$req_file"; expect_rejected "$req_file" "unexpected Python requirements file: $req_file"
 
 # 4. A second command chained onto an allowlisted line.
 reset_fixture
 printf '      - run: %s scripts/check-steps.py && %s -c 1\n' "$py" "$py" \
 	>>"$fixture/repo/.github/workflows/ci.yml"
 expect_rejected 'chained command after an allowlisted invocation' 'Python invocation at .github/workflows/ci.yml:8'
+
+# Preserve complete Git filenames in both scans.
+for file in 'scripts/my tool.sh' 'scripts/도구.sh'; do
+	reset_fixture
+	printf '%s -c 1\n' "$py" >"$fixture/repo/$file"
+	expect_rejected "$file" "Python invocation at $file:1"
+done
+for file in "$(printf 'tool\t.py')" "$(printf 'tool\n.py')" 'tool".py'; do
+	reset_fixture
+	printf 'print(1)\n' >"$fixture/repo/$file"
+	expect_rejected 'quoted Git filename' 'unexpected Python file:'
+done
+
+# Cover command quoting and source outside scripts/workflows.
+for line in "\"$py\" -c 1" "$(printf 'echo `%s -c 1`' "$py")" "pi""p.exe install x"; do
+	reset_fixture
+	printf '%s\n' "$line" >"$fixture/repo/.github/workflows/extra.yml"
+	expect_rejected 'quoted command' 'Python invocation at .github/workflows/extra.yml:1'
+done
+for file in Makefile Dockerfile docs/install.sh native/src/probe.rs .github/actions/probe/action.yml; do
+	reset_fixture
+	mkdir -p "$(dirname "$fixture/repo/$file")"
+	printf '%s -c 1\n' "$py" >"$fixture/repo/$file"
+	expect_rejected "$file" "Python invocation at $file:1"
+done
+
+# Neither checker is exempt from its own policy. The function is never called.
+reset_fixture
+printf '\nunused_probe() { %s -c 1; }\n' "$py" >>"$fixture/repo/scripts/check-no-python.sh"
+expect_rejected 'guard source' 'Python invocation at scripts/check-no-python.sh:'
+reset_fixture
+printf '#!/bin/sh\n%s -c 1\n' "$py" >"$fixture/repo/scripts/test-no-python.sh"
+expect_rejected 'test source' 'Python invocation at scripts/test-no-python.sh:2'
+
+# Missing files, symlinks, and submodule directories must not disappear.
+reset_fixture
+ln -s missing "$fixture/repo/tool.py"
+expect_rejected 'dangling symlink' 'cannot inspect regular repository file: tool.py'
+reset_fixture
+git -C "$fixture/repo" update-index --add --cacheinfo 160000,1111111111111111111111111111111111111111,embedded
+expect_rejected 'unpopulated submodule' 'cannot inspect regular repository file: embedded' no-stage
+reset_fixture
+printf 'print(1)\n' >"$fixture/repo/tool.py"
+git -C "$fixture/repo" add tool.py
+rm "$fixture/repo/tool.py"
+expect_rejected 'missing indexed file' 'cannot inspect regular repository file: tool.py' no-stage
+
+# Tool failures are not empty, successful scans.
+reset_fixture
+mkdir -p "$fixture/bin"
+cat >"$fixture/bin/git" <<'SH'
+#!/bin/sh
+case "$1" in ls-files|-c) exit 71 ;; esac
+exec /usr/bin/git "$@"
+SH
+chmod +x "$fixture/bin/git"
+PATH="$fixture/bin:$PATH" expect_rejected 'Git enumeration error' 'cannot enumerate repository files'
+rm -f "$fixture/bin/git"
+reset_fixture
+cat >"$fixture/bin/grep" <<'SH'
+#!/bin/sh
+case "$1" in -nE|-anE) exit 2 ;; esac
+exec /usr/bin/grep "$@"
+SH
+chmod +x "$fixture/bin/grep"
+PATH="$fixture/bin:$PATH" expect_rejected 'content scan error' 'cannot scan repository file:'
+rm -f "$fixture/bin/grep"
+reset_fixture
+printf '#!/bin/sh\nexit 2\n' >"$fixture/bin/head"
+chmod +x "$fixture/bin/head"
+PATH="$fixture/bin:$PATH" expect_rejected 'first-line read error' 'cannot read repository file:'
+rm -f "$fixture/bin/head"
 
 [ "$failures" -eq 0 ] || {
 	echo "check-no-python accepted $failures planted bypass(es)" >&2
