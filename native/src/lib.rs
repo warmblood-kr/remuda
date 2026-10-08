@@ -139,6 +139,11 @@ impl Clock for SystemClock {
     }
 }
 
+/// Held by every lib test that swaps process-global env (HOME, XDG_STATE_HOME):
+/// one lock, or tests guarded by different ones see each other's directories.
+#[cfg(all(test, unix))]
+pub(crate) static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;

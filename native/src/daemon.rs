@@ -3472,10 +3472,6 @@ mod tests {
         }
     }
 
-    // Windows test-windows is blocked by identity storage hardening tracked in #348.
-    #[cfg(not(windows))]
-    static LISTENER_TASK_TEST_LOCK: Mutex<()> = Mutex::new(());
-
     // D2 ListenerTask socket tests are skipped on Windows until identity storage #348 lands.
     #[cfg(not(windows))]
     struct ListenerTaskEnvironment {
@@ -3491,7 +3487,7 @@ mod tests {
     impl ListenerTaskEnvironment {
         fn new(config: Option<crate::cluster::listener_config::ListenerConfig>) -> Self {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-            let lock = LISTENER_TASK_TEST_LOCK
+            let lock = crate::PROCESS_ENV_TEST_LOCK
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             let root = std::env::temp_dir().join(format!(
