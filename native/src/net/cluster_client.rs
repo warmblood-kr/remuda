@@ -247,19 +247,29 @@ fn is_transport_io(error: &io::Error) -> bool {
 
 fn read_http_head<R: Read>(reader: &mut BufReader<R>) -> Result<(u16, usize), ClientError> {
     let status_line = read_line(reader)?;
-    let status_text = std::str::from_utf8(&status_line).map_err(|_| ClientError::BadResponse)?;
-    let (version, rest) = status_text
-        .split_once(' ')
+    let first_space = status_line
+        .iter()
+        .position(|byte| *byte == b' ')
         .ok_or(ClientError::BadResponse)?;
-    let (code, reason) = rest.split_once(' ').ok_or(ClientError::BadResponse)?;
-    if version != "HTTP/1.1"
+    let rest = &status_line[first_space + 1..];
+    let second_space = rest
+        .iter()
+        .position(|byte| *byte == b' ')
+        .ok_or(ClientError::BadResponse)?;
+    let version = &status_line[..first_space];
+    let code = &rest[..second_space];
+    let reason = &rest[second_space + 1..];
+    if version != b"HTTP/1.1"
         || code.len() != 3
-        || !code.bytes().all(|byte| byte.is_ascii_digit())
-        || !valid_field_value(reason.as_bytes())
+        || !code.iter().all(u8::is_ascii_digit)
+        || !valid_field_value(reason)
     {
         return Err(ClientError::BadResponse);
     }
-    let status = code.parse::<u16>().map_err(|_| ClientError::BadResponse)?;
+    let status = std::str::from_utf8(code)
+        .map_err(|_| ClientError::BadResponse)?
+        .parse::<u16>()
+        .map_err(|_| ClientError::BadResponse)?;
     if !(100..600).contains(&status) {
         return Err(ClientError::BadResponse);
     }
@@ -279,24 +289,27 @@ fn read_http_head<R: Read>(reader: &mut BufReader<R>) -> Result<(u16, usize), Cl
         if header_count > MAX_HEADER_COUNT {
             return Err(ClientError::BadResponse);
         }
-        let text = std::str::from_utf8(&line).map_err(|_| ClientError::BadResponse)?;
-        let (name, value) = text.split_once(':').ok_or(ClientError::BadResponse)?;
-        if !valid_field_name(name.as_bytes()) || !valid_field_value(value.as_bytes()) {
+        let colon = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or(ClientError::BadResponse)?;
+        let name = &line[..colon];
+        let value = &line[colon + 1..];
+        if !valid_field_name(name) || !valid_field_value(value) {
             return Err(ClientError::BadResponse);
         }
-        if name.eq_ignore_ascii_case("transfer-encoding") {
+        if name.eq_ignore_ascii_case(b"transfer-encoding") {
             return Err(ClientError::BadResponse);
         }
-        if name.eq_ignore_ascii_case("content-length") {
-            if content_length.is_some()
-                || value.trim().is_empty()
-                || !value.trim().bytes().all(|byte| byte.is_ascii_digit())
+        if name.eq_ignore_ascii_case(b"content-length") {
+            let value = trim_ows(value);
+            if content_length.is_some() || value.is_empty() || !value.iter().all(u8::is_ascii_digit)
             {
                 return Err(ClientError::BadResponse);
             }
             content_length = Some(
-                value
-                    .trim()
+                std::str::from_utf8(value)
+                    .map_err(|_| ClientError::BadResponse)?
                     .parse::<usize>()
                     .map_err(|_| ClientError::BadResponse)?,
             );
@@ -346,7 +359,17 @@ fn valid_field_name(name: &[u8]) -> bool {
 fn valid_field_value(value: &[u8]) -> bool {
     value
         .iter()
-        .all(|byte| *byte == b'\t' || (b' '..=b'~').contains(byte))
+        .all(|byte| *byte == b'\t' || (b' '..=b'~').contains(byte) || *byte >= 0x80)
+}
+
+fn trim_ows(mut value: &[u8]) -> &[u8] {
+    while matches!(value.first(), Some(b' ' | b'\t')) {
+        value = &value[1..];
+    }
+    while matches!(value.last(), Some(b' ' | b'\t')) {
+        value = &value[..value.len() - 1];
+    }
+    value
 }
 
 fn remaining(deadline: Instant) -> Result<Duration, ClientError> {
@@ -551,6 +574,9 @@ mod tests {
                 .as_slice(),
             b"HTTP/1.1 200 OK\r\n Content-Length: 0\r\n\r\n".as_slice(),
             b"HTTP/1.1 200 OK\r\nX-Test: bad\x01value\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 bad\x01reason\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nX-Test: bare\nlf\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nX-Test: bare\rcr\r\nContent-Length: 0\r\n\r\n".as_slice(),
         ] {
             assert_eq!(
                 read_http_head(&mut BufReader::new(Cursor::new(head))),
@@ -558,6 +584,19 @@ mod tests {
                 "{head:?}"
             );
         }
+    }
+
+    #[test]
+    fn authenticated_v1_response_accepts_obs_text_in_reason_and_values() {
+        let (sealed, opened) = pair();
+        let body = frame::seal_response(opened, b"{\"ok\":1}").unwrap();
+        let mut raw =
+            b"HTTP/1.1 200 Succ\xc3\xa8s\r\nX-Label: caf\xc3\xa9\r\nContent-Length: ".to_vec();
+        raw.extend_from_slice(body.len().to_string().as_bytes());
+        raw.extend_from_slice(b"\r\n\r\n");
+        raw.extend_from_slice(&body);
+        let (result, _) = run(sealed, raw);
+        assert_eq!(result.unwrap(), b"{\"ok\":1}");
     }
 
     #[test]

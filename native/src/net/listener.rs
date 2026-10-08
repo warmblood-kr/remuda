@@ -1580,7 +1580,7 @@ fn send_dispatched_response(
     limiter: &Arc<RequestLimiter>,
     peer_fp: &str,
 ) {
-    if !opened.chunked || payload.len() <= frame::MAX_RESPONSE_PAYLOAD {
+    if !opened.chunked || payload.len() <= frame::MAX_RECORD_PLAINTEXT {
         return send_encrypted_response(stream, opened, payload);
     }
     match limiter.acquire_large(peer_fp) {
@@ -3849,6 +3849,42 @@ mod tests {
                 .unwrap();
             assert_eq!(response, Response::Error("x".repeat(n)));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_reply_below_one_record_limit_succeeds_with_peer_permit_occupied() {
+        let target_len = 65_488;
+        let empty = serde_json::to_vec(&Response::Error(String::new())).unwrap();
+        let message = "x".repeat(target_len - empty.len());
+        let response = serde_json::to_vec(&Response::Error(message)).unwrap();
+        assert_eq!(response.len(), target_len);
+        let dispatch_response = response.clone();
+        let t = Duration::from_secs(10);
+        let (server, peer, _) =
+            socket_server(move |_, _| Ok(dispatch_response.clone()), t, t, t, t);
+        let peer_fp = crate::cluster::encoding::fingerprint(&peer.public);
+        let held = server.state.limiter.acquire_large(&peer_fp).unwrap();
+        let client = super::super::cluster_client::ClusterClient::with_timeouts(
+            Arc::new(crate::SystemWallClock::new()),
+            super::super::cluster_client::ClientTimeouts {
+                connect: Duration::from_secs(5),
+                read: Duration::from_secs(10),
+                total: Duration::from_secs(10),
+            },
+        );
+        assert_eq!(
+            client
+                .request(
+                    server.address,
+                    &server.responder_public,
+                    &peer.private,
+                    &Request::List,
+                )
+                .unwrap(),
+            Response::Error("x".repeat(target_len - empty.len()))
+        );
+        drop(held);
     }
 
     #[cfg(unix)]

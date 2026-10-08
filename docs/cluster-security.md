@@ -157,11 +157,12 @@ record plaintext = data
   `cluster busy` error and retries. Large writes have an absolute 30 s
   deadline, enforced by a watchdog that shuts the socket down, since a
   per-wait send timeout alone can restart on every partial write.
-- Memory: the server appends records into the final wire buffer with one
-  65,535-byte scratch buffer. Its permit is acquired after dispatch builds the
-  serialized payload, so it does not bound payload construction (#595). The
-  client reassembles into one capped 4 MiB plaintext buffer, plus one record
-  scratch buffer; JSON deserialization can add its own allocations. Neither
+- Memory: the server reserves the calculated final wire size and appends
+  records with one 65,535-byte scratch buffer. Its permit is acquired after
+  dispatch builds the serialized payload, so it does not bound payload
+  construction (#595). The client can hold its HTTP read buffer, pending
+  ciphertext, a decrypted-record buffer, and the capped 4 MiB msg2 plaintext
+  buffer at once; JSON deserialization can add its own allocations. Neither
   side promises a process-wide memory budget for concurrent callers.
 - Requests are not chunked: the listener still caps a request body at 65,535
   bytes (the request-cap inconsistency is tracked in #592).

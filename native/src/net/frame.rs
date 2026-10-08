@@ -299,6 +299,13 @@ fn seal_records_into(
     Ok(())
 }
 
+fn response_wire_size(payload_len: usize) -> usize {
+    let chunk0 = payload_len.min(MAX_CHUNK0);
+    let remaining = payload_len - chunk0;
+    let record_count = remaining.div_ceil(MAX_RECORD_PLAINTEXT);
+    2 + 32 + 16 + MSG2_HEADER + payload_len + record_count * (2 + AEAD_TAG_SIZE)
+}
+
 /// Marker for PR3: the peer sent a response version we do not understand (`ErrorKind::Unsupported`).
 pub const NEWER_FORMAT_MSG: &str = "peer uses newer cluster response format";
 
@@ -446,7 +453,8 @@ pub fn seal_response_chunked(mut request: OpenedRequest, payload: &[u8]) -> io::
         return Err(too_large());
     }
     let (chunk0, rest) = payload.split_at(payload.len().min(MAX_CHUNK0));
-    let mut out = {
+    let mut out = Vec::with_capacity(response_wire_size(payload.len()));
+    {
         let mut plain = Vec::with_capacity(MSG2_HEADER + chunk0.len());
         plain.push(RESPONSE_V2);
         plain.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -456,10 +464,9 @@ pub fn seal_response_chunked(mut request: OpenedRequest, payload: &[u8]) -> io::
             .handshake
             .write_message(&plain, &mut msg)
             .map_err(frame_error)?;
-        let mut out = (n as u16).to_be_bytes().to_vec();
+        out.extend_from_slice(&(n as u16).to_be_bytes());
         out.extend_from_slice(&msg[..n]);
-        out
-    };
+    }
     let mut transport = request
         .handshake
         .into_transport_mode()
@@ -711,6 +718,16 @@ mod tests {
             roundtrip(n);
         }
         assert_eq!(MAX_RECORDS, 65);
+    }
+
+    #[test]
+    fn maximum_response_wire_buffer_reserves_only_its_wire_size() {
+        let initiator = keypair();
+        let responder = keypair();
+        let sealed = seal_request(&initiator.private, &responder.public, 1000, b"req").unwrap();
+        let opened = open_request(&responder.private, &sealed.message).unwrap();
+        let wire = seal_response_chunked(opened, &data(MAX_RESPONSE_TOTAL)).unwrap();
+        assert_eq!(wire.capacity(), wire.len());
     }
 
     #[test]
