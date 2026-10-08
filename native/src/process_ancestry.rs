@@ -86,6 +86,14 @@ pub(crate) enum CallerOrigin {
 }
 
 #[cfg(any(windows, test))]
+#[derive(Debug)]
+enum ChainEnd {
+    Session(String),
+    Outside,
+    Unknown { pid: u32, error: io::Error },
+}
+
+#[cfg(any(windows, test))]
 pub(crate) fn resolve_job_first<J, A>(job: J, ancestry: A) -> CallerOrigin
 where
     J: FnOnce() -> io::Result<Option<String>>,
@@ -179,7 +187,19 @@ fn process_missing(error: &io::Error) -> bool {
 }
 
 #[cfg(any(windows, test))]
-fn chain_end<F>(mut pid: u32, sessions: &[(String, u32)], mut process: F) -> CallerOrigin
+fn chain_end<F>(pid: u32, sessions: &[(String, u32)], mut process: F) -> CallerOrigin
+where
+    F: FnMut(u32) -> io::Result<Option<(u32, u64)>>,
+{
+    match chain_end_detailed(pid, sessions, &mut process) {
+        ChainEnd::Session(name) => CallerOrigin::Session(name),
+        ChainEnd::Outside => CallerOrigin::Outside,
+        ChainEnd::Unknown { .. } => CallerOrigin::Unknown,
+    }
+}
+
+#[cfg(any(windows, test))]
+fn chain_end_detailed<F>(mut pid: u32, sessions: &[(String, u32)], mut process: F) -> ChainEnd
 where
     F: FnMut(u32) -> io::Result<Option<(u32, u64)>>,
 {
@@ -191,35 +211,66 @@ where
         let session = sessions.iter().find(|(_, session_pid)| *session_pid == pid);
         if child_created.is_none() {
             if let Some((name, _)) = session {
-                return CallerOrigin::Session(name.clone());
+                return ChainEnd::Session(name.clone());
             }
         }
         if pid <= 1 {
-            return CallerOrigin::Outside;
+            return ChainEnd::Outside;
         }
         if !visited.insert(pid) {
-            return CallerOrigin::Unknown;
+            return ChainEnd::Unknown {
+                pid,
+                error: io::Error::new(io::ErrorKind::InvalidData, "cycle in process parent chain"),
+            };
         }
         let (parent_pid, created) = match process(pid) {
             Ok(Some(info)) => info,
-            Ok(None) if hops > 0 => return CallerOrigin::Outside,
-            Ok(None) | Err(_) => return CallerOrigin::Unknown,
+            Ok(None) if hops > 0 => return ChainEnd::Outside,
+            Ok(None) => {
+                return ChainEnd::Unknown {
+                    pid,
+                    error: io::Error::new(io::ErrorKind::NotFound, "process is unavailable"),
+                };
+            }
+            Err(error) => return ChainEnd::Unknown { pid, error },
         };
         if child_created.is_some_and(|child| created > child) {
-            return CallerOrigin::Outside;
+            return ChainEnd::Outside;
         }
         if let Some((name, _)) = session {
-            return CallerOrigin::Session(name.clone());
+            return ChainEnd::Session(name.clone());
         }
         if parent_pid <= 1 {
-            return CallerOrigin::Outside;
+            return ChainEnd::Outside;
         }
         if hops == MAX_HOPS {
-            return CallerOrigin::Unknown;
+            return ChainEnd::Unknown {
+                pid,
+                error: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "process ancestry exceeded the hop limit",
+                ),
+            };
         }
         child_created = Some(created);
         pid = parent_pid;
         hops += 1;
+    }
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn ancestry_from_parent_table<F>(pid: u32, ancestors: &[u32], process: F) -> Ancestry
+where
+    F: FnMut(u32) -> io::Result<Option<(u32, u64)>>,
+{
+    let sessions: Vec<_> = ancestors
+        .iter()
+        .map(|ancestor| (ancestor.to_string(), *ancestor))
+        .collect();
+    match chain_end_detailed(pid, &sessions, process) {
+        ChainEnd::Session(_) => Ancestry::Inside,
+        ChainEnd::Outside => Ancestry::Outside,
+        ChainEnd::Unknown { pid, error } => Ancestry::Unreadable { pid, error },
     }
 }
 
@@ -259,13 +310,16 @@ pub(crate) fn is_self_or_descendant(pid: u32, ancestors: &[u32]) -> Ancestry {
     #[cfg(windows)]
     {
         return match process_parents() {
-            Ok(parents) => walk_ancestry(pid, ancestors, std::process::id(), |pid| {
-                parents.get(&pid).copied().map(Some).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("process {pid} is not in the process snapshot"),
-                    )
-                })
+            Ok(parents) => ancestry_from_parent_table(pid, ancestors, |process_pid| {
+                let Some(&parent_pid) = parents.get(&process_pid) else {
+                    return Ok(None);
+                };
+                let process = match crate::session_job::Opened::query(process_pid) {
+                    Ok(process) => process,
+                    Err(error) if process_missing(&error) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                process.created().map(|created| Some((parent_pid, created)))
             }),
             Err(error) => Ancestry::Unreadable { pid, error },
         };
@@ -274,6 +328,7 @@ pub(crate) fn is_self_or_descendant(pid: u32, ancestors: &[u32]) -> Ancestry {
     walk_ancestry(pid, ancestors, std::process::id(), parent_pid)
 }
 
+#[cfg(any(not(windows), test))]
 fn walk_ancestry<F>(mut pid: u32, ancestors: &[u32], daemon_pid: u32, mut parent: F) -> Ancestry
 where
     F: FnMut(u32) -> io::Result<Option<u32>>,
@@ -531,6 +586,62 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(chain_end(40, &[], process), CallerOrigin::Unknown);
+    }
+
+    #[test]
+    fn shutdown_ancestry_uses_caller_chain_end_semantics() {
+        assert!(matches!(
+            ancestry_from_parent_table(40, &[], |pid| match pid {
+                40 => Ok(Some((30, 100))),
+                30 => Ok(None),
+                _ => unreachable!(),
+            }),
+            Ancestry::Outside
+        ));
+
+        assert!(matches!(
+            ancestry_from_parent_table(40, &[30], |pid| match pid {
+                40 => Ok(Some((30, 100))),
+                30 => Ok(Some((20, 200))),
+                _ => unreachable!(),
+            }),
+            Ancestry::Outside
+        ));
+
+        assert!(matches!(
+            ancestry_from_parent_table(40, &[], |pid| match pid {
+                40 => Ok(Some((30, 100))),
+                30 => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "enumeration denied"
+                )),
+                _ => unreachable!(),
+            }),
+            Ancestry::Unreadable { pid: 30, .. }
+        ));
+
+        assert!(matches!(
+            ancestry_from_parent_table(40, &[], |pid| match pid {
+                40 => Ok(Some((30, 100))),
+                30 => Ok(Some((40, 90))),
+                _ => unreachable!(),
+            }),
+            Ancestry::Unreadable { .. }
+        ));
+
+        assert!(matches!(
+            ancestry_from_parent_table(100, &[], |pid| Ok(Some((pid - 1, u64::from(pid)))),),
+            Ancestry::Unreadable { .. }
+        ));
+
+        assert!(matches!(
+            ancestry_from_parent_table(40, &[30], |pid| match pid {
+                40 => Ok(Some((30, 100))),
+                30 => Ok(Some((20, 90))),
+                _ => unreachable!(),
+            }),
+            Ancestry::Inside
+        ));
     }
 
     #[test]

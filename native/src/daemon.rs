@@ -2524,10 +2524,12 @@ fn refuse_hosted_shutdown(stream: &Stream, identity: &str) -> std::io::Result<()
 fn refuse_unverifiable_shutdown(stream: &Stream, details: &str) -> std::io::Result<()> {
     reply(
         stream,
-        &Response::error(format!(
-            "cannot stop this daemon: {details}; pass --i-am-inside to override"
-        )),
+        &Response::error(unverifiable_shutdown_message(details)),
     )
+}
+
+fn unverifiable_shutdown_message(details: &str) -> String {
+    format!("cannot stop this daemon: {details}; pass --i-am-inside to override")
 }
 
 fn refuse_shutdown(stream: &Stream, reason: &ShutdownRefusal) -> std::io::Result<()> {
@@ -3562,6 +3564,38 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn failed_process_enumeration_refuses_with_the_override_hint() {
+        let ancestry =
+            crate::process_ancestry::ancestry_from_parent_table(40, &[], |pid| match pid {
+                40 => Ok(Some((30, 100))),
+                30 => Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "process enumeration denied",
+                )),
+                _ => unreachable!(),
+            });
+        let Ancestry::Unreadable { pid, error } = ancestry else {
+            panic!("a process enumeration error must remain unreadable");
+        };
+        assert_eq!(pid, 30);
+
+        let verdict = shutdown_verdict(shutdown_input(
+            shutdown_claims(None, None, None, None),
+            ShutdownPeer::Ancestry(Ancestry::Unreadable { pid, error }),
+            false,
+        ));
+        let ShutdownVerdict::Refuse(ShutdownRefusal::Unverifiable(details)) = verdict else {
+            panic!("an unreadable process chain must refuse shutdown");
+        };
+        let message = super::unverifiable_shutdown_message(&details);
+        assert!(message.contains("process enumeration denied"), "{message}");
+        assert!(
+            message.contains("pass --i-am-inside to override"),
+            "{message}"
+        );
     }
 
     #[test]
