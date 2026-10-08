@@ -172,11 +172,26 @@ impl Registry {
 
     /// The session whose backend holds `pid` as its own. Every listed session
     /// is asked, also one whose child has exited: its descendants may live on.
-    pub fn session_owning(&self, pid: u32) -> Option<String> {
-        self.lock()
-            .values()
-            .find(|session| session.owns_process(pid))
-            .map(|session| session.name().to_string())
+    pub fn session_owning(
+        &self,
+        pid: u32,
+        process_handle: Option<usize>,
+    ) -> std::io::Result<Option<String>> {
+        let mut unknown = false;
+        for session in self.lock().values() {
+            match session.owns_process(pid, process_handle) {
+                Ok(true) => return Ok(Some(session.name().to_string())),
+                Ok(false) => {}
+                Err(_) => unknown = true,
+            }
+        }
+        if unknown {
+            Err(std::io::Error::other(
+                "session process membership unavailable",
+            ))
+        } else {
+            Ok(None)
+        }
     }
 
     /// A snapshot of every session, sorted by name so callers can diff two
