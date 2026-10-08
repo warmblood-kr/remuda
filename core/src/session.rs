@@ -75,6 +75,7 @@ mod clear_input_tests {
         writes: Arc<Mutex<Vec<Vec<u8>>>>,
         started: Sender<()>,
         blocking: bool,
+        timed_out: bool,
         blocked_once: AtomicBool,
         release: Arc<(Mutex<bool>, Condvar)>,
     }
@@ -100,7 +101,10 @@ mod clear_input_tests {
         }
         fn is_busy(&self) -> bool {
             let (ready, _) = &*self.release;
-            self.blocking && !*ready.lock().unwrap()
+            self.timed_out || (self.blocking && !*ready.lock().unwrap())
+        }
+        fn is_timed_out(&self) -> bool {
+            self.timed_out
         }
     }
 
@@ -142,6 +146,10 @@ mod clear_input_tests {
     );
 
     fn session(blocking: bool) -> SessionFixture {
+        session_with_timeout(blocking, false)
+    }
+
+    fn session_with_timeout(blocking: bool, timed_out: bool) -> SessionFixture {
         let writes = Arc::new(Mutex::new(Vec::new()));
         let release = Arc::new((Mutex::new(!blocking), Condvar::new()));
         let (started_tx, started_rx) = mpsc::channel();
@@ -149,6 +157,7 @@ mod clear_input_tests {
             writes: Arc::clone(&writes),
             started: started_tx,
             blocking,
+            timed_out,
             blocked_once: AtomicBool::new(false),
             release: Arc::clone(&release),
         });
@@ -207,6 +216,17 @@ mod clear_input_tests {
         *ready.lock().unwrap() = true;
         changed.notify_all();
         worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn clear_refuses_a_timed_out_writer_without_writing() {
+        let (session, clock, writes, _started, _release) = session_with_timeout(false, true);
+        clock.advance(Duration::from_secs(3));
+        assert!(matches!(
+            session.clear_input(b"\x15"),
+            Err(AgentError::Busy)
+        ));
+        assert!(writes.lock().unwrap().is_empty());
     }
 
     #[test]
