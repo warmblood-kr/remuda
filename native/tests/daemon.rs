@@ -5895,6 +5895,48 @@ fn stop_stops_a_daemon_and_leaves_the_next_command_free_to_start_one() {
     assert!(daemon.left_on_its_own(), "it did not exit 0 on its own");
 }
 
+#[cfg(unix)]
+#[test]
+fn terminal_origin_outside_stop_succeeds_with_readable_ancestry() {
+    let dir = scratch_dir("terminal-stop-outside");
+    let path = daemon::socket_path_in(&dir, "s");
+    let mut daemon = Daemon::spawn(&dir);
+    let pty = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open shell terminal");
+    let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    command.args(["-s", "s", "stop", "-f", "--yes"]);
+    command.env("REMUDA_RUNTIME_DIR", &dir);
+    command.env("REMUDA_NO_UPDATE_CHECK", "1");
+    let mut child = pty
+        .slave
+        .spawn_command(command)
+        .expect("spawn terminal stop");
+    drop(pty.slave);
+    let deadline = Instant::now() + PATIENCE;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll terminal-origin stop") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "terminal-origin stop did not exit within PATIENCE"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "terminal-origin stop failed: {status}");
+    assert!(
+        ipc::connect(&path).is_err(),
+        "terminal-origin stop left the daemon answering"
+    );
+    assert!(daemon.left_on_its_own(), "daemon did not stop cleanly");
+}
+
 #[test]
 fn stop_with_no_daemon_running_is_not_an_error() {
     let dir = scratch_dir("stop-empty");
@@ -6169,6 +6211,60 @@ fn raw_shutdown_descendant_helper() {
     assert!(
         matches!(&response, Response::Error(reason) if reason.contains("one of its own sessions")),
         "raw descendant Shutdown was not refused: {response:?}"
+    );
+}
+
+#[test]
+fn raw_shutdown_override_helper() {
+    let Ok(path) = std::env::var("REMUDA_TEST_RAW_SHUTDOWN_OVERRIDE_SOCKET") else {
+        return;
+    };
+    let response = client::request(
+        Path::new(&path),
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: true,
+        },
+    )
+    .expect("raw hosted override shutdown response");
+    assert_eq!(response, Response::Ok);
+}
+
+#[test]
+fn raw_shutdown_override_from_a_hosted_session_stops_the_daemon() {
+    let dir = scratch_dir("raw-stop-override");
+    let path = daemon::socket_path_in(&dir, "s");
+    let mut daemon = Daemon::spawn(&dir);
+    let env = std::collections::HashMap::from([(
+        "REMUDA_TEST_RAW_SHUTDOWN_OVERRIDE_SOCKET".to_string(),
+        path.to_string_lossy().into_owned(),
+    )]);
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("raw-override".into()),
+            command: vec![
+                std::env::current_exe()
+                    .expect("current daemon test binary")
+                    .to_string_lossy()
+                    .into_owned(),
+                "--exact".into(),
+                "raw_shutdown_override_helper".into(),
+                "--nocapture".into(),
+            ],
+            size: Size::new(100, 30),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("create raw override session");
+    assert!(matches!(response, Response::Value(_)));
+    assert!(daemon.left_on_its_own(), "raw override did not stop daemon");
+    assert!(
+        ipc::connect(&path).is_err(),
+        "daemon still answers after override"
     );
 }
 

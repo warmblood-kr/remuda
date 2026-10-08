@@ -255,10 +255,6 @@ where
     }
 }
 
-pub(crate) fn missing_peer_requires_refusal(self_reported_identity: bool) -> bool {
-    self_reported_identity
-}
-
 pub(crate) fn is_self_or_descendant(pid: u32, ancestors: &[u32]) -> Ancestry {
     #[cfg(windows)]
     {
@@ -600,12 +596,6 @@ mod tests {
             walk_ancestry(40, &[25], 1, parent),
             Ancestry::Inside
         ));
-    }
-
-    #[test]
-    fn missing_peer_pid_refuses_only_with_self_reported_identity() {
-        assert!(missing_peer_requires_refusal(true));
-        assert!(!missing_peer_requires_refusal(false));
     }
 
     // Terminal apps start shells through the root-owned /usr/bin/login, so
