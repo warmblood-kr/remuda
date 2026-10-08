@@ -123,7 +123,7 @@ the listener, while the daemon deduplicates them to prevent repeated writes.
 ## Response chunking (v2)
 
 A Noise message is capped at 65,535 bytes, so a v1 response (one handshake
-message, 65,519 B payload) cannot carry a large screen snapshot. A requester
+message, 65,487 B payload) cannot carry a large screen snapshot. A requester
 that sends exactly one `X-Remuda-Chunked: 1` header (any other value, or a
 repeated header, means v1) gets a v2 body in the same HTTP response:
 
@@ -143,7 +143,8 @@ record plaintext = data
   trailing bytes, is an error.
 - Limits: 4 MiB total, 65,519 B per record plaintext, 65 records. The client
   checks `total_len` against the cap before reading further records and bounds
-  the HTTP body accordingly; v1 stays at 65,535.
+  the HTTP body accordingly; a v1 HTTP body is capped at 65,535 B and its
+  Noise plaintext at 65,487 B.
 - Compatibility: no header gets v1. An oversized v1 reply is the error
   "cluster response exceeds the Noise frame limit; upgrade the requesting node
   to read it", so a mixed-version pair fails with a clear message, not a wrong
@@ -156,12 +157,19 @@ record plaintext = data
   `cluster busy` error and retries. Large writes have an absolute 30 s
   deadline, enforced by a watchdog that shuts the socket down, since a
   per-wait send timeout alone can restart on every partial write.
+- Memory: the server reserves the calculated final wire size and appends
+  records with one 65,535-byte scratch buffer. Its permit is acquired after
+  dispatch builds the serialized payload, so it does not bound payload
+  construction (#595). The client can hold its HTTP read buffer, pending
+  ciphertext, a decrypted-record buffer, and the capped 4 MiB msg2 plaintext
+  buffer at once; JSON deserialization can add its own allocations. Neither
+  side promises a process-wide memory budget for concurrent callers.
 - Requests are not chunked: the listener still caps a request body at 65,535
   bytes (the request-cap inconsistency is tracked in #592).
 - Known limits: the built payload is bounded only after it is serialized,
   about 256 MiB worst case (#595); remaining low-severity hardening is in #596.
 - The blank-tail trim (#591) stays as a size reducer: v1 peers still hit the
-  65,519 B cap, and v2 responses over 4 MiB are trimmed before being refused.
+  65,487 B payload cap, and v2 responses over 4 MiB are trimmed before being refused.
 
 ## Threat model
 
