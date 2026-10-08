@@ -2352,56 +2352,165 @@ fn handle_shutdown(
     else {
         unreachable!("handle_shutdown only accepts Shutdown requests");
     };
-    let own_daemon_id = std::process::id().to_string();
-    let known_session_name = requester_session_id
-        .as_deref()
-        .and_then(|id| registry.name_for_id(id));
-    let caller_claims_this_daemon = requester_daemon_id.as_deref() == Some(own_daemon_id.as_str())
-        && (requester_session_id.is_some() || requester_session_name.is_some());
-    if !override_hosted && (known_session_name.is_some() || caller_claims_this_daemon) {
-        let identity = known_session_name
-            .or(requester_session_name)
-            .or(requester_session_id)
-            .unwrap_or_else(|| "unknown".into());
-        return refuse_hosted_shutdown(&stream, &identity);
-    }
-    if !override_hosted {
-        match process_ancestry::peer_pid(&stream) {
-            Ok(Some(peer_pid)) => match process_ancestry::is_self_or_descendant(
-                peer_pid,
-                &registry.live_process_ids(),
-            ) {
-                process_ancestry::Ancestry::Inside => {
-                    return refuse_hosted_shutdown(&stream, "session process ancestry")
+    let verdict = if override_hosted {
+        // Keep the override ahead of all identity reads, including the registry lookup.
+        ShutdownVerdict::Allow
+    } else {
+        let claims = ShutdownClaims {
+            own_daemon_id: std::process::id().to_string(),
+            known_session_name: requester_session_id
+                .as_deref()
+                .and_then(|id| registry.name_for_id(id)),
+            requester_daemon_id,
+            requester_session_id,
+            requester_session_name,
+        };
+        shutdown_verdict_with_classifier(false, claims, || {
+            match process_ancestry::peer_pid(&stream) {
+                Ok(Some(peer_pid)) => {
+                    let ancestry = process_ancestry::is_self_or_descendant(
+                        peer_pid,
+                        &registry.live_process_ids(),
+                    );
+                    if let process_ancestry::Ancestry::Unreadable { pid, ref error } = ancestry {
+                        eprintln!(
+                            "remuda: shutdown ancestry stopped at unreadable pid {pid} ({error}); treating requester as outside"
+                        );
+                    }
+                    ShutdownPeer::Ancestry(ancestry)
                 }
-                process_ancestry::Ancestry::Outside => {}
-                process_ancestry::Ancestry::Unreadable { pid, error } => eprintln!(
-                    "remuda: shutdown ancestry stopped at unreadable pid {pid} ({error}); treating requester as outside"
-                ),
-            },
-            Ok(None) | Err(_)
-                if process_ancestry::missing_peer_requires_refusal(caller_claims_this_daemon) =>
-            {
-                return refuse_hosted_shutdown(&stream, "self-reported session identity")
+                Ok(None) => {
+                    eprintln!("remuda: shutdown peer process ID unavailable; treating requester as outside");
+                    ShutdownPeer::Unavailable
+                }
+                Err(error) => {
+                    eprintln!("remuda: shutdown peer process ID unavailable ({error}); treating requester as outside");
+                    ShutdownPeer::Error
+                }
             }
-            Ok(None) => eprintln!(
-                "remuda: shutdown peer process ID unavailable; treating requester as outside"
-            ),
-            Err(error) => eprintln!(
-                "remuda: shutdown peer process ID unavailable ({error}); treating requester as outside"
-            ),
+        })
+    };
+    finish_shutdown_verdict(
+        verdict,
+        |identity| refuse_hosted_shutdown(&stream, identity),
+        || {
+            image.shutdown_pending_replies();
+            reply(&stream, &Response::Ok)?;
+            // A session can request this shutdown as soon as its process starts. Let
+            // every already-running New handler flush its response before the daemon exits.
+            wait_for_new_requests();
+            reap_processes_before_exit(image);
+            anti_entropy.stop_and_join();
+            socket_owner.cleanup();
+            std::process::exit(0);
+        },
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ShutdownVerdict {
+    Allow,
+    Refuse(String),
+}
+
+#[derive(Debug)]
+struct ShutdownClaims {
+    own_daemon_id: String,
+    requester_daemon_id: Option<String>,
+    requester_session_id: Option<String>,
+    requester_session_name: Option<String>,
+    known_session_name: Option<String>,
+}
+
+#[derive(Debug)]
+enum ShutdownPeer {
+    Ancestry(process_ancestry::Ancestry),
+    Unavailable,
+    Error,
+}
+
+struct ShutdownInputs {
+    override_hosted: bool,
+    claims: ShutdownClaims,
+    peer: ShutdownPeer,
+}
+
+fn claim_refusal(claims: &ShutdownClaims) -> Option<String> {
+    if claims.known_session_name.is_some()
+        || (claims.requester_daemon_id.as_deref() == Some(claims.own_daemon_id.as_str())
+            && (claims.requester_session_id.is_some() || claims.requester_session_name.is_some()))
+    {
+        Some(
+            claims
+                .known_session_name
+                .as_deref()
+                .or(claims.requester_session_name.as_deref())
+                .or(claims.requester_session_id.as_deref())
+                .unwrap_or("unknown")
+                .to_owned(),
+        )
+    } else {
+        None
+    }
+}
+
+fn shutdown_verdict(inputs: ShutdownInputs) -> ShutdownVerdict {
+    if inputs.override_hosted {
+        return ShutdownVerdict::Allow;
+    }
+    if let Some(identity) = claim_refusal(&inputs.claims) {
+        return ShutdownVerdict::Refuse(identity);
+    }
+    let caller_claims_this_daemon = inputs.claims.requester_daemon_id.as_deref()
+        == Some(inputs.claims.own_daemon_id.as_str())
+        && (inputs.claims.requester_session_id.is_some()
+            || inputs.claims.requester_session_name.is_some());
+    match inputs.peer {
+        ShutdownPeer::Ancestry(process_ancestry::Ancestry::Inside) => {
+            ShutdownVerdict::Refuse("session process ancestry".into())
+        }
+        ShutdownPeer::Ancestry(process_ancestry::Ancestry::Outside) => ShutdownVerdict::Allow,
+        ShutdownPeer::Ancestry(process_ancestry::Ancestry::Unreadable { error, .. }) => {
+            drop(error);
+            ShutdownVerdict::Allow
+        }
+        ShutdownPeer::Unavailable | ShutdownPeer::Error => {
+            if process_ancestry::missing_peer_requires_refusal(caller_claims_this_daemon) {
+                ShutdownVerdict::Refuse("self-reported session identity".into())
+            } else {
+                ShutdownVerdict::Allow
+            }
         }
     }
-    image.shutdown_pending_replies();
-    reply(&stream, &Response::Ok)?;
-    // A session can request this shutdown as soon as its process starts. Let
-    // every already-running New handler flush its response before the daemon
-    // exits and tears down their client connections.
-    wait_for_new_requests();
-    reap_processes_before_exit(image);
-    anti_entropy.stop_and_join();
-    socket_owner.cleanup();
-    std::process::exit(0);
+}
+
+fn shutdown_verdict_with_classifier(
+    override_hosted: bool,
+    claims: ShutdownClaims,
+    classify_peer: impl FnOnce() -> ShutdownPeer,
+) -> ShutdownVerdict {
+    if override_hosted {
+        return ShutdownVerdict::Allow;
+    }
+    if let Some(identity) = claim_refusal(&claims) {
+        return ShutdownVerdict::Refuse(identity);
+    }
+    shutdown_verdict(ShutdownInputs {
+        override_hosted,
+        claims,
+        peer: classify_peer(),
+    })
+}
+
+fn finish_shutdown_verdict(
+    verdict: ShutdownVerdict,
+    on_refuse: impl FnOnce(&str) -> std::io::Result<()>,
+    on_allow: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match verdict {
+        ShutdownVerdict::Allow => on_allow(),
+        ShutdownVerdict::Refuse(identity) => on_refuse(&identity),
+    }
 }
 
 fn refuse_hosted_shutdown(stream: &Stream, identity: &str) -> std::io::Result<()> {
@@ -3206,13 +3315,16 @@ fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
 mod tests {
     use super::{
         acquire_sync_permit, attempt_paste_cleanup, auto_listener_addresses,
-        auto_listener_ip_changed, drain_queued_attach_input, forward_attach_input,
-        paste_cleanup_trace, paste_write_started_callback, report_attach_input_failure,
-        runtime_base_for, shell_or_default, PasteCleanupState, SyncPermit,
-        ATTACH_INPUT_FAILURE_NOTICE, MAX_CONCURRENT_SYNCS,
+        auto_listener_ip_changed, drain_queued_attach_input, finish_shutdown_verdict,
+        forward_attach_input, paste_cleanup_trace, paste_write_started_callback,
+        report_attach_input_failure, runtime_base_for, shell_or_default, shutdown_verdict,
+        shutdown_verdict_with_classifier, PasteCleanupState, ShutdownClaims, ShutdownInputs,
+        ShutdownPeer, ShutdownVerdict, SyncPermit, ATTACH_INPUT_FAILURE_NOTICE,
+        MAX_CONCURRENT_SYNCS,
     };
     #[cfg(not(windows))]
     use super::{AutoAddressDetector, ListenerStatus, ListenerTask};
+    use crate::process_ancestry::Ancestry;
     use remuda_core::agent::{AgentError, Color, StyledCell};
     use remuda_core::protocol::collapse_runs;
     use remuda_core::protocol::Response;
@@ -3225,6 +3337,241 @@ mod tests {
     use std::time::Duration;
 
     static SYNC_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn shutdown_claims(
+        requester_daemon_id: Option<&str>,
+        requester_session_id: Option<&str>,
+        requester_session_name: Option<&str>,
+        known_session_name: Option<&str>,
+    ) -> ShutdownClaims {
+        ShutdownClaims {
+            own_daemon_id: "42".into(),
+            requester_daemon_id: requester_daemon_id.map(str::to_owned),
+            requester_session_id: requester_session_id.map(str::to_owned),
+            requester_session_name: requester_session_name.map(str::to_owned),
+            known_session_name: known_session_name.map(str::to_owned),
+        }
+    }
+
+    fn shutdown_input(
+        claims: ShutdownClaims,
+        peer: ShutdownPeer,
+        override_hosted: bool,
+    ) -> ShutdownInputs {
+        ShutdownInputs {
+            override_hosted,
+            claims,
+            peer,
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn shutdown_verdict_preserves_claim_and_peer_precedence() {
+        let cases = [
+            (
+                "known session id without daemon id",
+                shutdown_claims(None, Some("sid"), None, Some("known")),
+                ShutdownPeer::Ancestry(Ancestry::Outside),
+                false,
+                ShutdownVerdict::Refuse("known".into()),
+            ),
+            (
+                "matching daemon plus stale session id",
+                shutdown_claims(Some("42"), Some("stale"), None, None),
+                ShutdownPeer::Ancestry(Ancestry::Outside),
+                false,
+                ShutdownVerdict::Refuse("stale".into()),
+            ),
+            (
+                "matching daemon plus present session name",
+                shutdown_claims(Some("42"), None, Some("claimed"), None),
+                ShutdownPeer::Ancestry(Ancestry::Outside),
+                false,
+                ShutdownVerdict::Refuse("claimed".into()),
+            ),
+            (
+                "daemon id alone",
+                shutdown_claims(Some("42"), None, None, None),
+                ShutdownPeer::Ancestry(Ancestry::Outside),
+                false,
+                ShutdownVerdict::Allow,
+            ),
+            (
+                "foreign daemon identity",
+                shutdown_claims(Some("other"), Some("sid"), None, None),
+                ShutdownPeer::Ancestry(Ancestry::Outside),
+                false,
+                ShutdownVerdict::Allow,
+            ),
+            (
+                "no claims and inside ancestry",
+                shutdown_claims(None, None, None, None),
+                ShutdownPeer::Ancestry(Ancestry::Inside),
+                false,
+                ShutdownVerdict::Refuse("session process ancestry".into()),
+            ),
+            (
+                "no claims and outside ancestry",
+                shutdown_claims(None, None, None, None),
+                ShutdownPeer::Ancestry(Ancestry::Outside),
+                false,
+                ShutdownVerdict::Allow,
+            ),
+            (
+                "no claims and unreadable ancestry",
+                shutdown_claims(None, None, None, None),
+                ShutdownPeer::Ancestry(Ancestry::Unreadable {
+                    pid: 7,
+                    error: std::io::Error::other("denied"),
+                }),
+                false,
+                ShutdownVerdict::Allow,
+            ),
+            (
+                "no claims and unavailable peer id",
+                shutdown_claims(None, None, None, None),
+                ShutdownPeer::Unavailable,
+                false,
+                ShutdownVerdict::Allow,
+            ),
+            (
+                "no claims and peer error",
+                shutdown_claims(None, None, None, None),
+                ShutdownPeer::Error,
+                false,
+                ShutdownVerdict::Allow,
+            ),
+            (
+                "override bypasses claim refusal",
+                shutdown_claims(Some("42"), Some("sid"), None, Some("known")),
+                ShutdownPeer::Ancestry(Ancestry::Outside),
+                true,
+                ShutdownVerdict::Allow,
+            ),
+            (
+                "override bypasses daemon claim refusal",
+                shutdown_claims(Some("42"), None, Some("claimed"), None),
+                ShutdownPeer::Ancestry(Ancestry::Outside),
+                true,
+                ShutdownVerdict::Allow,
+            ),
+            (
+                "override bypasses inside ancestry",
+                shutdown_claims(None, None, None, None),
+                ShutdownPeer::Ancestry(Ancestry::Inside),
+                true,
+                ShutdownVerdict::Allow,
+            ),
+            (
+                "override bypasses unreadable ancestry",
+                shutdown_claims(None, None, None, None),
+                ShutdownPeer::Ancestry(Ancestry::Unreadable {
+                    pid: 7,
+                    error: std::io::Error::other("denied"),
+                }),
+                true,
+                ShutdownVerdict::Allow,
+            ),
+            (
+                "override bypasses unavailable peer id",
+                shutdown_claims(None, None, None, None),
+                ShutdownPeer::Unavailable,
+                true,
+                ShutdownVerdict::Allow,
+            ),
+            (
+                "override bypasses peer error",
+                shutdown_claims(None, None, None, None),
+                ShutdownPeer::Error,
+                true,
+                ShutdownVerdict::Allow,
+            ),
+        ];
+
+        for (name, claims, peer, override_hosted, expected) in cases {
+            assert_eq!(
+                shutdown_verdict(shutdown_input(claims, peer, override_hosted)),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn shutdown_handler_seam_skips_identity_reads_and_routes_verdict() {
+        let mut classifier_calls = 0;
+        let verdict = shutdown_verdict_with_classifier(
+            true,
+            shutdown_claims(Some("42"), Some("sid"), None, Some("known")),
+            || {
+                classifier_calls += 1;
+                ShutdownPeer::Ancestry(Ancestry::Inside)
+            },
+        );
+        assert_eq!(verdict, ShutdownVerdict::Allow);
+        assert_eq!(classifier_calls, 0);
+
+        let claim_refusal = shutdown_verdict_with_classifier(
+            false,
+            shutdown_claims(Some("42"), Some("sid"), None, Some("known")),
+            || panic!("known-session refusal must precede peer reads"),
+        );
+        assert_eq!(claim_refusal, ShutdownVerdict::Refuse("known".into()));
+
+        let inside_refusal = shutdown_verdict_with_classifier(
+            false,
+            shutdown_claims(None, None, None, None),
+            || ShutdownPeer::Ancestry(Ancestry::Inside),
+        );
+        let mut response = None;
+        let mut shutdown_called = false;
+        finish_shutdown_verdict(
+            inside_refusal,
+            |identity| {
+                response = Some(Response::error(format!(
+                    "cannot stop this daemon from one of its own sessions ({identity}); pass --i-am-inside to override"
+                )));
+                Ok(())
+            },
+            || {
+                shutdown_called = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(response, Some(Response::Error(reason)) if reason == "cannot stop this daemon from one of its own sessions (session process ancestry); pass --i-am-inside to override")
+        );
+        assert!(!shutdown_called);
+
+        let fail_open_peers = [
+            ShutdownPeer::Ancestry(Ancestry::Unreadable {
+                pid: 7,
+                error: std::io::Error::other("denied"),
+            }),
+            ShutdownPeer::Unavailable,
+            ShutdownPeer::Error,
+        ];
+        for peer in fail_open_peers {
+            let verdict = shutdown_verdict_with_classifier(
+                false,
+                shutdown_claims(None, None, None, None),
+                || peer,
+            );
+            assert_eq!(verdict, ShutdownVerdict::Allow);
+            finish_shutdown_verdict(
+                verdict,
+                |_| panic!("allow must not send a refusal"),
+                || {
+                    shutdown_called = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert!(shutdown_called);
+    }
 
     #[test]
     fn queued_input_drain_returns_while_the_key_sender_is_still_open() {
