@@ -291,6 +291,71 @@ pub(crate) fn process_parents() -> io::Result<std::collections::HashMap<u32, u32
 mod tests {
     use super::*;
 
+    fn chain_end<F>(pid: u32, sessions: &[(String, u32)], process: F) -> CallerOrigin
+    where
+        F: FnMut(u32) -> io::Result<Option<(u32, u64)>>,
+    {
+        super::chain_end(pid, sessions, process)
+    }
+
+    #[test]
+    fn a_missing_parent_ends_a_caller_chain_outside() {
+        let process = |pid| match pid {
+            40 => Ok(Some((30, 100))),
+            30 => Ok(None),
+            _ => unreachable!(),
+        };
+        assert_eq!(chain_end(40, &[], process), CallerOrigin::Outside);
+    }
+
+    #[test]
+    fn a_strictly_younger_parent_ends_a_caller_chain_outside() {
+        let process = |pid| match pid {
+            40 => Ok(Some((30, 100))),
+            30 => Ok(Some((20, 200))),
+            _ => unreachable!(),
+        };
+        assert_eq!(chain_end(40, &[], process), CallerOrigin::Outside);
+    }
+
+    #[test]
+    fn unreadable_parent_information_keeps_the_caller_unknown() {
+        let process = |pid| match pid {
+            40 => Ok(Some((30, 100))),
+            30 => Err(io::Error::new(io::ErrorKind::PermissionDenied, "hidden")),
+            _ => unreachable!(),
+        };
+        assert_eq!(chain_end(40, &[], process), CallerOrigin::Unknown);
+    }
+
+    #[test]
+    fn an_overlong_caller_chain_is_unknown() {
+        let process = |pid| Ok(Some((pid - 1, u64::from(pid))));
+        assert_eq!(chain_end(100, &[], process), CallerOrigin::Unknown);
+    }
+
+    #[test]
+    fn a_cyclic_caller_chain_is_unknown() {
+        let process = |pid| match pid {
+            40 => Ok(Some((30, 100))),
+            30 => Ok(Some((40, 90))),
+            _ => unreachable!(),
+        };
+        assert_eq!(chain_end(40, &[], process), CallerOrigin::Unknown);
+    }
+
+    #[test]
+    fn a_session_pid_ends_the_caller_chain_before_its_parent_is_read() {
+        let process = |pid| match pid {
+            40 => Ok(Some((30, 100))),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            chain_end(40, &[("work".into(), 30)], process),
+            CallerOrigin::Session("work".into())
+        );
+    }
+
     #[test]
     fn current_process_is_its_own_ancestor() {
         assert!(matches!(
