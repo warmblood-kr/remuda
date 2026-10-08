@@ -42,13 +42,26 @@ is_allowed_py() {
 }
 
 failed=0
-py_files=$(git ls-files --cached --others --exclude-standard -- '*.py')
-for file in $py_files; do
-	if ! is_allowed_py "$file"; then
+while IFS= read -r file; do
+	[ -f "$file" ] || continue
+	case "$file" in
+		scripts/check-no-python.sh|scripts/test-no-python.sh) continue ;;
+	esac
+	if is_allowed_py "$file"; then continue; fi
+	# Extensions in any case, packaging files, and Python shebangs anywhere.
+	if printf '%s\n' "$file" | grep -qiE '\.pyw?$'; then
 		echo "check-no-python: unexpected Python file: $file" >&2
 		failed=1
+	elif printf '%s\n' "${file##*/}" | grep -qiE '^requirements.*\.(txt|in)$'; then
+		echo "check-no-python: unexpected Python requirements file: $file" >&2
+		failed=1
+	elif head -n 1 "$file" 2>/dev/null | grep -qE '^#!.*python'; then
+		echo "check-no-python: unexpected Python shebang: $file" >&2
+		failed=1
 	fi
-done
+done <<EOF
+$(git -c core.quotePath=false ls-files --cached --others --exclude-standard)
+EOF
 
 while IFS='|' read -r file owner todo; do
 	[ -n "$file" ] || continue
@@ -81,6 +94,7 @@ source_files=$(git ls-files --cached --others --exclude-standard -- .github/work
 for file in $source_files; do
 	[ -f "$file" ] || continue
 	case "$file" in
+		scripts/check-no-python.sh|scripts/test-no-python.sh) continue ;;
 		scripts/*.py)
 			if is_allowed_py "$file"; then continue; fi
 			;;
@@ -94,24 +108,25 @@ for file in $source_files; do
 				case "$trimmed" in \#*) continue ;; esac
 				;;
 		esac
-		allowed=0
-		case "$file:$line" in
-			.github/workflows/ci.yml:*python3\ scripts/check-principles.py*|\
-			.github/workflows/ci.yml:*python3\ scripts/check-steps.py*|\
-			.github/workflows/ci.yml:*python3\ scripts/check-comments.py*|\
-			.github/workflows/ci.yml:*python3\ scripts/check-install.py*|\
-			.github/workflows/ci.yml:*python3\ scripts/check-butler-path-convention.py*|\
-			.github/workflows/ci.yml:*python3\ scripts/check-workflows.py*|\
-			.github/workflows/workflow-guard.yml:*python3\ scripts/check-workflows.py*)
-				allowed=1
+		# The whole line must be one allowlisted command, so nothing rides along.
+		case "$file" in
+			.github/workflows/ci.yml)
+				checker='principles|steps|comments|install|butler-path-convention|workflows'
 				;;
+			.github/workflows/workflow-guard.yml) checker='workflows' ;;
+			*) checker='' ;;
 		esac
+		allowed=0
+		if [ -n "$checker" ] && printf '%s\n' "$line" | grep -qxE \
+			"[[:space:]]*(- run: |if )?python3 scripts/check-($checker)\.py( 2>/tmp/out; then| \\\\)?"; then
+			allowed=1
+		fi
 		if [ "$allowed" -ne 1 ]; then
 			echo "check-no-python: Python invocation at $file:$line_no: $line" >&2
 			failed=1
 		fi
 	done <<EOF
-$(grep -nE '(^|[[:space:]|;&(])python(3)?([[:space:]]|$)|^#!.*python' "$file" || true)
+$(grep -nE '(^|[/[:space:]|;&(])(python[0-9.]*|pip[0-9.]*|uv)([[:space:]]|$)|setup-python|requirements[^[:space:]]*\.(txt|in)|^#!.*python' "$file" || true)
 EOF
 done
 
