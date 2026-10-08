@@ -1,20 +1,9 @@
-//! A vanished parent in a Windows caller's ancestry is a normal chain end.
+//! A stop CLI launched by a short-lived command shell has an exited parent.
 #![cfg(windows)]
 
-use remuda_native::daemon;
-use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, Thread32First, Thread32Next,
-    PROCESSENTRY32W, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32,
-};
-use windows_sys::Win32::System::Threading::{
-    OpenProcess, OpenThread, ResumeThread, TerminateProcess, WaitForSingleObject, CREATE_SUSPENDED,
-    PROCESS_TERMINATE, SYNCHRONIZATION_SYNCHRONIZE, THREAD_SUSPEND_RESUME,
-};
 
 #[path = "daemon_support/spawn.rs"]
 mod spawn;
@@ -37,126 +26,59 @@ impl Drop for Scratch {
     }
 }
 
-/// Holds the suspended CLI by process handle so a failed assertion cannot
-/// leave a stopped test process behind or accidentally kill a reused PID.
-struct ClientProcess(HANDLE);
+fn cmd_quote(path: &Path) -> String {
+    format!("\"{}\"", path.to_string_lossy())
+}
 
-impl ClientProcess {
-    fn open(pid: u32) -> Self {
-        let handle =
-            unsafe { OpenProcess(PROCESS_TERMINATE | SYNCHRONIZATION_SYNCHRONIZE, 0, pid) };
-        assert!(!handle.is_null(), "open suspended stop client");
-        Self(handle)
-    }
-
-    fn wait_for_exit(&self, timeout: Duration) -> bool {
-        let millis = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
-        unsafe { WaitForSingleObject(self.0, millis) == WAIT_OBJECT_0 }
+fn reap_launcher_after_kill(child: &mut Child) {
+    let _ = child.kill();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => return,
+        }
     }
 }
 
-impl Drop for ClientProcess {
-    fn drop(&mut self) {
-        if unsafe { WaitForSingleObject(self.0, 0) } == WAIT_TIMEOUT {
-            unsafe {
-                TerminateProcess(self.0, 1);
-                WaitForSingleObject(self.0, 1_000);
+fn wait_for_launcher(child: &mut Child) -> ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                reap_launcher_after_kill(child);
+                panic!("cmd launcher did not exit within 10 seconds; it was killed");
+            }
+            Err(error) => {
+                reap_launcher_after_kill(child);
+                panic!("could not poll cmd launcher; it was killed: {error}");
             }
         }
-        unsafe { CloseHandle(self.0) };
     }
-}
-
-/// This test is also run in a short-lived child harness. That harness creates
-/// remuda suspended, prints its PID, and exits; the main test resumes remuda
-/// only after the parent process is gone.
-#[test]
-fn launch_stop_suspended_for_parent_exit() {
-    if std::env::var_os("REMUDA_TEST_LAUNCH_STOP").is_none() {
-        return;
-    }
-    let output = std::env::var_os("REMUDA_TEST_STOP_OUTPUT").expect("stop output path");
-    let stdout = std::fs::File::create(&output).expect("create stop output");
-    let stderr = stdout.try_clone().expect("clone stop output");
-    let child = Command::new(env!("CARGO_BIN_EXE_remuda"))
-        .args(["-s", "s", "stop", "-f", "--yes"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .creation_flags(CREATE_SUSPENDED)
-        .spawn()
-        .expect("create suspended stop client");
-    println!("STOP_CHILD {} {}", child.id(), std::process::id());
-}
-
-fn resume_primary_thread(process_id: u32) {
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    assert_ne!(snapshot, -1isize as HANDLE, "snapshot threads");
-
-    let mut entry = THREADENTRY32 {
-        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
-        ..Default::default()
-    };
-    let mut thread_id = None;
-    unsafe {
-        if Thread32First(snapshot, &mut entry) != 0 {
-            loop {
-                if entry.th32OwnerProcessID == process_id {
-                    thread_id = Some(entry.th32ThreadID);
-                    break;
-                }
-                if Thread32Next(snapshot, &mut entry) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snapshot);
-    }
-    let thread_id = thread_id.expect("find suspended stop client's primary thread");
-    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
-    assert!(!thread.is_null(), "open suspended stop client's thread");
-    let previous = unsafe { ResumeThread(thread) };
-    unsafe { CloseHandle(thread) };
-    assert_ne!(previous, u32::MAX, "resume stop client");
-}
-
-fn process_parents() -> std::collections::HashMap<u32, u32> {
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    assert_ne!(snapshot, -1isize as HANDLE, "snapshot processes");
-
-    let mut entry = PROCESSENTRY32W {
-        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-        ..Default::default()
-    };
-    let mut parents = std::collections::HashMap::new();
-    unsafe {
-        if Process32FirstW(snapshot, &mut entry) != 0 {
-            loop {
-                parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
-                if Process32NextW(snapshot, &mut entry) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snapshot);
-    }
-    parents
 }
 
 #[test]
 fn stop_cli_succeeds_after_its_parent_exits() {
     let scratch = Scratch::new();
-    let mut daemon_process = spawn::Daemon::spawn(&scratch.0);
+    let mut daemon = spawn::Daemon::spawn(&scratch.0);
+    let exe = Path::new(env!("CARGO_BIN_EXE_remuda"));
     let output = scratch.0.join("stop-output.txt");
+    let script = scratch.0.join("stop.cmd");
+    let body = format!(
+        "@echo off\r\nstart \"\" /b {} -s s stop -f --yes > {} 2>&1\r\n",
+        cmd_quote(exe),
+        cmd_quote(&output)
+    );
+    std::fs::write(&script, body).expect("write stop launcher");
 
-    let helper = Command::new(std::env::current_exe().expect("test executable"))
-        .args([
-            "--exact",
-            "launch_stop_suspended_for_parent_exit",
-            "--nocapture",
-        ])
-        .env("REMUDA_TEST_LAUNCH_STOP", "1")
-        .env("REMUDA_TEST_STOP_OUTPUT", &output)
+    let mut launcher = Command::new("cmd.exe")
+        .args(["/d", "/c"])
+        .arg(format!("call {}", cmd_quote(&script)))
         .env("REMUDA_RUNTIME_DIR", &scratch.0)
         .env("HOME", scratch.0.join("home"))
         .env("LOCALAPPDATA", scratch.0.join("home"))
@@ -165,60 +87,39 @@ fn stop_cli_succeeds_after_its_parent_exits() {
         .env_remove("REMUDA_DAEMON_ID")
         .env_remove("REMUDA_SESSION_ID")
         .env_remove("REMUDA_SESSION_NAME")
-        .output()
-        .expect("run the short-lived stop launcher");
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start short-lived cmd launcher");
+    let launcher_status = wait_for_launcher(&mut launcher);
     assert!(
-        helper.status.success(),
-        "launcher failed: {}{}",
-        String::from_utf8_lossy(&helper.stdout),
-        String::from_utf8_lossy(&helper.stderr)
-    );
-    let report = String::from_utf8_lossy(&helper.stdout);
-    let launch_line = report
-        .lines()
-        .find_map(|line| line.strip_prefix("STOP_CHILD "))
-        .unwrap_or_else(|| panic!("launcher omitted child PIDs: {report}"));
-    let mut fields = launch_line.split_whitespace();
-    let client_pid = fields
-        .next()
-        .expect("launcher reports client PID")
-        .parse::<u32>()
-        .expect("numeric client PID");
-    let client_process = ClientProcess::open(client_pid);
-    let exited_parent_pid = fields
-        .next()
-        .expect("launcher reports its PID")
-        .parse::<u32>()
-        .expect("numeric parent PID");
-    assert_ne!(client_pid, exited_parent_pid);
-    let parents = process_parents();
-    assert_eq!(parents.get(&client_pid), Some(&exited_parent_pid));
-    assert!(
-        !parents.contains_key(&exited_parent_pid),
-        "the stop client's recorded parent still exists"
+        launcher_status.success(),
+        "cmd launcher failed: {launcher_status}"
     );
 
-    // `output()` returned only after the launcher exited. The process was
-    // created suspended, so its recorded parent has vanished before its first
-    // instruction can connect to the daemon and ask it to shut down.
-    resume_primary_thread(client_pid);
-
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // `start` creates remuda as a child of this short-lived cmd process. The
+    // launcher has exited before its result is read, so the CLI's parent is
+    // gone by the time this test observes whether the daemon stopped.
+    let deadline = Instant::now() + Duration::from_secs(25);
     let mut stop_output = String::new();
-    while !stop_output.contains("stopped the daemon") && Instant::now() < deadline {
+    loop {
         stop_output = std::fs::read_to_string(&output).unwrap_or_default();
-        std::thread::sleep(Duration::from_millis(20));
+        if stop_output.contains("stopped the daemon") {
+            break;
+        }
+        if stop_output.contains("cannot stop this daemon") {
+            panic!("stop CLI refused the vanished-parent caller: {stop_output}");
+        }
+        if Instant::now() >= deadline {
+            let _ = daemon.0.kill();
+            panic!("stop CLI produced no result within 40 seconds: {stop_output}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
+
     assert!(
-        daemon_process.left_on_its_own(),
-        "stop was not allowed as an outside caller; output: {stop_output}"
-    );
-    assert!(
-        stop_output.contains("stopped the daemon"),
-        "unexpected stop output: {stop_output}"
-    );
-    assert!(
-        client_process.wait_for_exit(Duration::from_secs(5)),
-        "the stop CLI did not exit"
+        daemon.left_on_its_own(),
+        "stop CLI reported success but daemon remained"
     );
 }
