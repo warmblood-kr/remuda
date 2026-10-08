@@ -154,6 +154,29 @@ chmod +x "$fixture/bin/head"
 PATH="$fixture/bin:$PATH" expect_rejected 'first-line read error' 'cannot read repository file:'
 rm -f "$fixture/bin/head"
 
+# Policy predicates must distinguish no match from a tool failure too.
+for probe in extension packaging shebang; do
+	reset_fixture
+	selector=-qiE
+	case "$probe" in
+		extension) printf '\n' >"$fixture/repo/tool.py" ;;
+		packaging) printf '\n' >"$fixture/repo/$req_file" ;;
+		shebang)
+			mkdir -p "$fixture/repo/tests"
+			printf '#!/usr/bin/env %s\n' "$py" >"$fixture/repo/tests/helper"
+			selector=-qE
+			;;
+	esac
+	cat >"$fixture/bin/grep" <<SH
+#!/bin/sh
+case "\$1" in $selector) exit 2 ;; esac
+exec /usr/bin/grep "\$@"
+SH
+	chmod +x "$fixture/bin/grep"
+	PATH="$fixture/bin:$PATH" expect_rejected "$probe predicate error" 'cannot match repository policy for:'
+	rm -f "$fixture/bin/grep"
+done
+
 [ "$failures" -eq 0 ] || {
 	echo "check-no-python accepted $failures planted bypass(es)" >&2
 	exit 1
