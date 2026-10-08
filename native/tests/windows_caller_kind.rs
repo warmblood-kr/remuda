@@ -185,8 +185,7 @@ fn a_session_grandchild_that_outlives_its_parent_is_not_outside() {
         "session grandchild after its parent exited: kind {kind:?}"
     ));
     assert!(
-        !kind.is_empty(),
-        "the session grandchild reported no caller kind"
+        matches!(kind.as_str(), "session" | "unknown"),
+        "a session's descendant reported {kind:?}, not session or unknown"
     );
-    assert_ne!(kind, "outside", "a session's descendant reads as outside");
 }
