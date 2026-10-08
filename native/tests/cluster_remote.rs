@@ -756,9 +756,10 @@ fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
     );
 
     tui.writer.write_all(b"\x1b[201~").unwrap();
+    let back_start = tui.output_len();
     tui.writer.write_all(b"\x1c").unwrap();
     tui.wait_for_from(
-        keys_start,
+        back_start,
         "Enter type · k keys · x close · q detach",
         Duration::from_secs(3),
     );
