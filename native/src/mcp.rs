@@ -28,7 +28,7 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 /// The tools the frame itself serves. Not the whole list — `tools/list` adds
 /// the image's registry to these. A constant so a test can assert both ways:
 /// an undecided addition here and an unserved name each fail.
-pub const TOOLS: [&str; 5] = ["capture", "ls", "new", "run_script", "send"];
+pub const TOOLS: [&str; 6] = ["capture", "clear_input", "ls", "new", "run_script", "send"];
 
 /// Serve MCP over stdin/stdout until the client closes the stream.
 pub fn serve(socket: &Path) -> std::io::Result<()> {
@@ -153,6 +153,15 @@ fn call(socket: &Path, id: Value, params: &Value, capability: Option<&str>) -> S
             name: text("session"),
             text: text("text"),
         },
+        "clear_input" => {
+            let Some(key) = args.get("key").and_then(Value::as_str) else {
+                return ok_reply(id, tool_error("clear_input needs `key` as a string"));
+            };
+            Request::ClearInput {
+                name: text("session"),
+                key: key.as_bytes().to_vec(),
+            }
+        }
         "capture" => Request::Capture {
             name: text("session"),
         },
@@ -198,6 +207,9 @@ fn call_response(id: Value, response: Response) -> String {
             ok_reply(id, tool_error(&reason))
         }
         Response::Screen(screen) => ok_reply(id, tool_text(&screen)),
+        Response::ClearInput { cleared } => {
+            ok_reply(id, tool_text(cleared.as_deref().unwrap_or("ok")))
+        }
         // No MCP tool asks for `CaptureStyled`, so this never arrives — spelled
         // out rather than a wildcard for the same reason as `Response::Value`
         // below: a real caller appearing later is a compile error to notice.
@@ -220,6 +232,10 @@ fn call_response(id: Value, response: Response) -> String {
         // the arm the old comment called unreachable is now the common one, and
         // the decision it left open was made rather than dropped. `steps/013`.
         Response::Value(value) => ok_reply(id, tool_text(&value)),
+        Response::SessionStarted { .. } => ok_reply(
+            id,
+            tool_error("session identity responses are not exposed over MCP"),
+        ),
         Response::CommandResult {
             exit_code,
             stdout_base64,
@@ -352,6 +368,18 @@ fn frame() -> Vec<Value> {
             "description": "Read a session's screen as text. Does not take the session over, \
                             so it works while a human is attached.",
             "inputSchema": session_arg("read"),
+        }),
+        json!({
+            "name": "clear_input",
+            "description": "Write one trusted clear-line key as an atomic input act. The core currently allows only exact Ctrl+U (byte 0x15), verified for Codex; use it only when the target agent's configured binding clears to the start of its input. Other keys are refused. Keys are limited to 1–16 bytes and four calls per session per second. Refused during recent human typing or while a PTY writer is busy.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": {"type": "string"},
+                    "key": {"type": "string", "minLength": 1, "maxLength": 16, "description": "The exact allowlisted key as a string; currently only Codex Ctrl+U (U+0015) is accepted."},
+                },
+                "required": ["session", "key"],
+            },
         }),
         json!({
             "name": "ls",

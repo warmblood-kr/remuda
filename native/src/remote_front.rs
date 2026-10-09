@@ -253,7 +253,9 @@ pub fn authorize(request: &Request) -> Result<(), String> {
             validate_batch(client_id, *seq, bytes).map(|_| ())
         }
         Request::New { .. } => Err(refusal("New")),
+        Request::NewWithInstance { .. } => Err(refusal("NewWithInstance")),
         Request::SendLine { .. } => Err(refusal("SendLine")),
+        Request::ClearInput { .. } => Err(refusal("ClearInput")),
         Request::Send { .. } => Err(refusal("Send")),
         Request::Feed { .. } => Err(refusal("Feed")),
         Request::Resize { .. } => Err(refusal("Resize")),
@@ -415,6 +417,10 @@ mod tests {
             Request::SendLine {
                 name: "dev".into(),
                 text: "hello".into(),
+            },
+            Request::ClearInput {
+                name: "dev".into(),
+                key: b"\x15".to_vec(),
             },
             Request::Resize {
                 name: "dev".into(),

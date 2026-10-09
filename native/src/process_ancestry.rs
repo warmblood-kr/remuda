@@ -8,6 +8,7 @@
 
 #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
 use interprocess::local_socket::traits::StreamCommon as _;
+use remuda_core::registry::{LiveSessionProcess, SessionAttribution};
 use std::io;
 
 pub(crate) fn peer_pid(stream: &crate::ipc::Stream) -> io::Result<Option<u32>> {
@@ -80,28 +81,36 @@ pub(crate) enum Ancestry {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CallerOrigin {
-    Session(String),
+    Session(SessionAttribution),
     Outside,
     Unknown,
 }
 
 #[cfg(any(windows, test))]
+#[derive(Debug)]
+enum ChainEnd {
+    Session(SessionAttribution),
+    Outside,
+    Unknown { pid: u32, error: io::Error },
+}
+
+#[cfg(any(windows, test))]
 pub(crate) fn resolve_job_first<J, A>(job: J, ancestry: A) -> CallerOrigin
 where
-    J: FnOnce() -> io::Result<Option<String>>,
+    J: FnOnce() -> io::Result<Option<SessionAttribution>>,
     A: FnOnce() -> CallerOrigin,
 {
     match job() {
-        Ok(Some(name)) => CallerOrigin::Session(name),
+        Ok(Some(attribution)) => CallerOrigin::Session(attribution),
         Ok(None) => ancestry(),
         Err(_) => CallerOrigin::Unknown,
     }
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(test)]
 pub(crate) fn resolve_caller(
     peer_pid: io::Result<Option<u32>>,
-    sessions: &[(String, u32)],
+    sessions: &[LiveSessionProcess],
 ) -> CallerOrigin {
     #[cfg(windows)]
     {
@@ -123,7 +132,7 @@ pub(crate) fn resolve_caller(
 pub(crate) fn resolve_caller_opened(
     pid: u32,
     peer: &crate::session_job::Opened,
-    sessions: &[(String, u32)],
+    sessions: &[LiveSessionProcess],
 ) -> CallerOrigin {
     resolve_caller_windows(pid, sessions, Some(peer))
 }
@@ -131,7 +140,7 @@ pub(crate) fn resolve_caller_opened(
 #[cfg(windows)]
 fn resolve_caller_windows(
     pid: u32,
-    sessions: &[(String, u32)],
+    sessions: &[LiveSessionProcess],
     peer: Option<&crate::session_job::Opened>,
 ) -> CallerOrigin {
     use crate::session_job::Opened;
@@ -179,7 +188,19 @@ fn process_missing(error: &io::Error) -> bool {
 }
 
 #[cfg(any(windows, test))]
-fn chain_end<F>(mut pid: u32, sessions: &[(String, u32)], mut process: F) -> CallerOrigin
+fn chain_end<F>(pid: u32, sessions: &[LiveSessionProcess], mut process: F) -> CallerOrigin
+where
+    F: FnMut(u32) -> io::Result<Option<(u32, u64)>>,
+{
+    match chain_end_detailed(pid, sessions, &mut process) {
+        ChainEnd::Session(name) => CallerOrigin::Session(name),
+        ChainEnd::Outside => CallerOrigin::Outside,
+        ChainEnd::Unknown { .. } => CallerOrigin::Unknown,
+    }
+}
+
+#[cfg(any(windows, test))]
+fn chain_end_detailed<F>(mut pid: u32, sessions: &[LiveSessionProcess], mut process: F) -> ChainEnd
 where
     F: FnMut(u32) -> io::Result<Option<(u32, u64)>>,
 {
@@ -188,34 +209,49 @@ where
     let mut child_created = None;
     let mut hops = 0;
     loop {
-        let session = sessions.iter().find(|(_, session_pid)| *session_pid == pid);
+        let session = sessions.iter().find(|session| session.pid == pid);
         if child_created.is_none() {
-            if let Some((name, _)) = session {
-                return CallerOrigin::Session(name.clone());
+            if let Some(session) = session {
+                return ChainEnd::Session(session.attribution.clone());
             }
         }
         if pid <= 1 {
-            return CallerOrigin::Outside;
+            return ChainEnd::Outside;
         }
         if !visited.insert(pid) {
-            return CallerOrigin::Unknown;
+            return ChainEnd::Unknown {
+                pid,
+                error: io::Error::new(io::ErrorKind::InvalidData, "cycle in process parent chain"),
+            };
         }
         let (parent_pid, created) = match process(pid) {
             Ok(Some(info)) => info,
-            Ok(None) if hops > 0 => return CallerOrigin::Outside,
-            Ok(None) | Err(_) => return CallerOrigin::Unknown,
+            Ok(None) if hops > 0 => return ChainEnd::Outside,
+            Ok(None) => {
+                return ChainEnd::Unknown {
+                    pid,
+                    error: io::Error::new(io::ErrorKind::NotFound, "process is unavailable"),
+                };
+            }
+            Err(error) => return ChainEnd::Unknown { pid, error },
         };
         if child_created.is_some_and(|child| created > child) {
-            return CallerOrigin::Outside;
+            return ChainEnd::Outside;
         }
-        if let Some((name, _)) = session {
-            return CallerOrigin::Session(name.clone());
+        if let Some(session) = session {
+            return ChainEnd::Session(session.attribution.clone());
         }
         if parent_pid <= 1 {
-            return CallerOrigin::Outside;
+            return ChainEnd::Outside;
         }
         if hops == MAX_HOPS {
-            return CallerOrigin::Unknown;
+            return ChainEnd::Unknown {
+                pid,
+                error: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "process ancestry exceeded the hop limit",
+                ),
+            };
         }
         child_created = Some(created);
         pid = parent_pid;
@@ -223,10 +259,32 @@ where
     }
 }
 
+#[cfg(any(windows, test))]
+pub(crate) fn ancestry_from_parent_table<F>(pid: u32, ancestors: &[u32], process: F) -> Ancestry
+where
+    F: FnMut(u32) -> io::Result<Option<(u32, u64)>>,
+{
+    let sessions: Vec<_> = ancestors
+        .iter()
+        .map(|ancestor| LiveSessionProcess {
+            attribution: SessionAttribution {
+                name: ancestor.to_string(),
+                instance_id: String::new(),
+            },
+            pid: *ancestor,
+        })
+        .collect();
+    match chain_end_detailed(pid, &sessions, process) {
+        ChainEnd::Session(_) => Ancestry::Inside,
+        ChainEnd::Outside => Ancestry::Outside,
+        ChainEnd::Unknown { pid, error } => Ancestry::Unreadable { pid, error },
+    }
+}
+
 #[cfg(any(not(windows), test))]
-fn resolve_caller_with<F>(
+pub(crate) fn resolve_caller_with<F>(
     mut pid: u32,
-    sessions: &[(String, u32)],
+    sessions: &[LiveSessionProcess],
     daemon_pid: u32,
     mut parent: F,
 ) -> CallerOrigin
@@ -237,8 +295,8 @@ where
     loop {
         // The first matching session while walking upward is the innermost
         // one, even when registry iteration order is different.
-        if let Some((name, _)) = sessions.iter().find(|(_, session_pid)| *session_pid == pid) {
-            return CallerOrigin::Session(name.clone());
+        if let Some(session) = sessions.iter().find(|session| session.pid == pid) {
+            return CallerOrigin::Session(session.attribution.clone());
         }
         // A process reparented to launchd/init has left every session tree.
         // This says nothing about whether its owner is an operator.
@@ -255,21 +313,20 @@ where
     }
 }
 
-pub(crate) fn missing_peer_requires_refusal(self_reported_identity: bool) -> bool {
-    self_reported_identity
-}
-
 pub(crate) fn is_self_or_descendant(pid: u32, ancestors: &[u32]) -> Ancestry {
     #[cfg(windows)]
     {
         return match process_parents() {
-            Ok(parents) => walk_ancestry(pid, ancestors, std::process::id(), |pid| {
-                parents.get(&pid).copied().map(Some).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("process {pid} is not in the process snapshot"),
-                    )
-                })
+            Ok(parents) => ancestry_from_parent_table(pid, ancestors, |process_pid| {
+                let Some(&parent_pid) = parents.get(&process_pid) else {
+                    return Ok(None);
+                };
+                let process = match crate::session_job::Opened::query(process_pid) {
+                    Ok(process) => process,
+                    Err(error) if process_missing(&error) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                process.created().map(|created| Some((parent_pid, created)))
             }),
             Err(error) => Ancestry::Unreadable { pid, error },
         };
@@ -278,6 +335,7 @@ pub(crate) fn is_self_or_descendant(pid: u32, ancestors: &[u32]) -> Ancestry {
     walk_ancestry(pid, ancestors, std::process::id(), parent_pid)
 }
 
+#[cfg(any(not(windows), test))]
 fn walk_ancestry<F>(mut pid: u32, ancestors: &[u32], daemon_pid: u32, mut parent: F) -> Ancestry
 where
     F: FnMut(u32) -> io::Result<Option<u32>>,
@@ -313,7 +371,7 @@ where
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
+pub(crate) fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let close = stat.rfind(')').ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "malformed /proc process stat")
@@ -329,7 +387,7 @@ fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
 }
 
 #[cfg(target_os = "macos")]
-fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
+pub(crate) fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
     let pid = i32::try_from(pid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process PID out of range"))?;
     // The short form also answers for another user's process (the root-owned
@@ -402,7 +460,24 @@ pub(crate) fn process_parents() -> io::Result<std::collections::HashMap<u32, u32
 mod tests {
     use super::*;
 
-    fn chain_end<F>(pid: u32, sessions: &[(String, u32)], process: F) -> CallerOrigin
+    fn candidate(name: &str, pid: u32) -> LiveSessionProcess {
+        LiveSessionProcess {
+            attribution: SessionAttribution {
+                name: name.to_string(),
+                instance_id: format!("{name}-instance"),
+            },
+            pid,
+        }
+    }
+
+    fn session_origin(name: &str) -> CallerOrigin {
+        CallerOrigin::Session(SessionAttribution {
+            name: name.to_string(),
+            instance_id: format!("{name}-instance"),
+        })
+    }
+
+    fn chain_end<F>(pid: u32, sessions: &[LiveSessionProcess], process: F) -> CallerOrigin
     where
         F: FnMut(u32) -> io::Result<Option<(u32, u64)>>,
     {
@@ -437,8 +512,8 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(
-            chain_end(40, &[("work".into(), 30)], process),
-            CallerOrigin::Session("work".into())
+            chain_end(40, &[candidate("work", 30)], process),
+            session_origin("work")
         );
     }
 
@@ -451,8 +526,8 @@ mod tests {
     fn a_caller_chain_can_reach_a_session_at_the_64_hop_boundary() {
         let process = |pid| Ok(Some((pid - 1, u64::from(pid))));
         assert_eq!(
-            chain_end(100, &[("work".into(), 36)], process),
-            CallerOrigin::Session("work".into())
+            chain_end(100, &[candidate("work", 36)], process),
+            session_origin("work")
         );
     }
 
@@ -460,7 +535,7 @@ mod tests {
     fn a_session_beyond_the_64_hop_boundary_is_unknown() {
         let process = |pid| Ok(Some((pid - 1, u64::from(pid))));
         assert_eq!(
-            chain_end(100, &[("work".into(), 35)], process),
+            chain_end(100, &[candidate("work", 35)], process),
             CallerOrigin::Unknown
         );
     }
@@ -538,6 +613,62 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_ancestry_uses_caller_chain_end_semantics() {
+        assert!(matches!(
+            ancestry_from_parent_table(40, &[], |pid| match pid {
+                40 => Ok(Some((30, 100))),
+                30 => Ok(None),
+                _ => unreachable!(),
+            }),
+            Ancestry::Outside
+        ));
+
+        assert!(matches!(
+            ancestry_from_parent_table(40, &[30], |pid| match pid {
+                40 => Ok(Some((30, 100))),
+                30 => Ok(Some((20, 200))),
+                _ => unreachable!(),
+            }),
+            Ancestry::Outside
+        ));
+
+        assert!(matches!(
+            ancestry_from_parent_table(40, &[], |pid| match pid {
+                40 => Ok(Some((30, 100))),
+                30 => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "enumeration denied"
+                )),
+                _ => unreachable!(),
+            }),
+            Ancestry::Unreadable { pid: 30, .. }
+        ));
+
+        assert!(matches!(
+            ancestry_from_parent_table(40, &[], |pid| match pid {
+                40 => Ok(Some((30, 100))),
+                30 => Ok(Some((40, 90))),
+                _ => unreachable!(),
+            }),
+            Ancestry::Unreadable { .. }
+        ));
+
+        assert!(matches!(
+            ancestry_from_parent_table(100, &[], |pid| Ok(Some((pid - 1, u64::from(pid)))),),
+            Ancestry::Unreadable { .. }
+        ));
+
+        assert!(matches!(
+            ancestry_from_parent_table(40, &[30], |pid| match pid {
+                40 => Ok(Some((30, 100))),
+                30 => Ok(Some((20, 90))),
+                _ => unreachable!(),
+            }),
+            Ancestry::Inside
+        ));
+    }
+
+    #[test]
     fn a_session_pid_ends_the_caller_chain_before_its_parent_is_read() {
         let process = |pid| match pid {
             40 => Ok(Some((30, 100))),
@@ -545,8 +676,8 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(
-            chain_end(40, &[("work".into(), 30)], process),
-            CallerOrigin::Session("work".into())
+            chain_end(40, &[candidate("work", 30)], process),
+            session_origin("work")
         );
     }
 
@@ -558,7 +689,7 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(
-            chain_end(40, &[("work".into(), 30)], process),
+            chain_end(40, &[candidate("work", 30)], process),
             CallerOrigin::Outside
         );
     }
@@ -600,12 +731,6 @@ mod tests {
             walk_ancestry(40, &[25], 1, parent),
             Ancestry::Inside
         ));
-    }
-
-    #[test]
-    fn missing_peer_pid_refuses_only_with_self_reported_identity() {
-        assert!(missing_peer_requires_refusal(true));
-        assert!(!missing_peer_requires_refusal(false));
     }
 
     // Terminal apps start shells through the root-owned /usr/bin/login, so
@@ -650,10 +775,65 @@ mod tests {
             30 => Ok(Some(1)),
             _ => unreachable!(),
         };
-        let sessions = vec![("outer".into(), 30), ("inner".into(), 40)];
+        let sessions = vec![candidate("outer", 30), candidate("inner", 40)];
         assert_eq!(
             resolve_caller_with(50, &sessions, 99, parent),
-            CallerOrigin::Session("inner".into())
+            session_origin("inner")
         );
+    }
+
+    #[test]
+    fn replacement_after_candidate_capture_keeps_the_matched_instance() {
+        let captured = candidate("work", 30);
+        let captured_candidates = vec![captured.clone()];
+        // Model a same-name registry replacement after the immutable candidate
+        // snapshot, but before the resolver constructs its final origin.
+        let replacement = LiveSessionProcess {
+            attribution: SessionAttribution {
+                name: "work".into(),
+                instance_id: "replacement-instance".into(),
+            },
+            pid: 31,
+        };
+        let mut current_registry = std::collections::HashMap::from([(
+            captured.attribution.name.clone(),
+            captured.attribution.clone(),
+        )]);
+        current_registry.insert(
+            replacement.attribution.name.clone(),
+            replacement.attribution.clone(),
+        );
+        let process = |pid| match pid {
+            40 => Ok(Some(30)),
+            _ => unreachable!(),
+        };
+        let origin = resolve_caller_with(40, &captured_candidates, 99, process);
+        assert_eq!(
+            current_registry.get("work"),
+            Some(&replacement.attribution),
+            "the registered same-name launch was replaced"
+        );
+        assert_eq!(
+            origin,
+            CallerOrigin::Session(SessionAttribution {
+                name: "work".into(),
+                instance_id: "work-instance".into(),
+            })
+        );
+        assert_ne!(
+            origin,
+            CallerOrigin::Session(replacement.attribution),
+            "a name-only relookup must not rebind the match to a replacement"
+        );
+    }
+
+    #[test]
+    fn windows_job_match_preserves_the_captured_instance() {
+        let matched = SessionAttribution {
+            name: "work".into(),
+            instance_id: "launch-a".into(),
+        };
+        let origin = resolve_job_first(|| Ok(Some(matched.clone())), || CallerOrigin::Outside);
+        assert_eq!(origin, CallerOrigin::Session(matched));
     }
 }

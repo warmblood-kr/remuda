@@ -116,6 +116,47 @@ fn send_line_writes_the_body_and_its_enter_as_one_burst() {
 }
 
 #[test]
+fn clear_input_writes_one_atomic_agent_key_and_is_safe_to_repeat() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (session, _clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
+
+    session.input_text("draft").unwrap();
+    session.clear_input(b"\x15").unwrap();
+    session.clear_input(b"\x15").unwrap();
+
+    assert_eq!(
+        writes.lock().unwrap().clone(),
+        vec![b"draft".to_vec(), b"\x15".to_vec(), b"\x15".to_vec()],
+        "each explicit clear is one indivisible write of the caller's key"
+    );
+}
+
+#[test]
+fn clear_input_refuses_recent_human_input_without_writing() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (session, _clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
+    let attached = session.attach();
+    attached.write_raw(b"human draft").unwrap();
+    writes.lock().unwrap().clear();
+
+    assert!(session.clear_input(b"\x15").is_err());
+    assert!(writes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn clear_input_only_writes_to_its_own_session() {
+    let first_writes = Arc::new(Mutex::new(Vec::new()));
+    let second_writes = Arc::new(Mutex::new(Vec::new()));
+    let (first, _clock) = session_with(Box::new(RecordingAgent::new(first_writes.clone())));
+    let (_second, _clock) = session_with(Box::new(RecordingAgent::new(second_writes.clone())));
+
+    first.clear_input(b"\x15").unwrap();
+
+    assert_eq!(first_writes.lock().unwrap().as_slice(), [b"\x15".to_vec()]);
+    assert!(second_writes.lock().unwrap().is_empty());
+}
+
+#[test]
 fn send_appends_nothing_so_a_line_can_be_left_un_submitted() {
     // The capability 004 adds, and the footgun it admits to: a script may type
     // into a prompt and stop. Nothing invents the CR that would run it.
@@ -643,6 +684,7 @@ fn close_is_refused_while_attached_and_the_session_survives() {
         "tearing the pty out from under an attached human is worse than \
          making them detach first"
     );
+    let instance_id = session.instance_id().to_owned();
     assert_eq!(
         AgentError::Attached.to_string(),
         "a human is attached to this session; detach it first (Ctrl-\\ in that terminal), then retry"
@@ -651,6 +693,13 @@ fn close_is_refused_while_attached_and_the_session_survives() {
         alive.load(Ordering::SeqCst),
         "a refused close must not have touched the process"
     );
+    assert!(
+        session.is_alive(),
+        "a refused close must preserve authority"
+    );
+    assert!(registry
+        .validate_live_instance("worker", &instance_id)
+        .is_ok());
     assert!(registry.get("worker").is_some(), "and the entry survives");
 
     drop(held);

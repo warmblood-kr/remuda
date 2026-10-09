@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Lua: `remuda.session.new` and `remuda.new` now return `name, instance_id`, the
+  ID of the launch that call started, taken from the same registry insertion
+  (never a later lookup by name). Single-value assignments still get the name.
+  Behavior change: `return new(...)` now passes both values, so `run_script`
+  over MCP returns `name<TAB>instance_id`; write `return (new(...))` to keep the
+  name alone. The ID identifies a launch; it is not a secret or proof of
+  liveness. The daemon socket gains an additive request for this
+  (same-user, mode 0600, same limits as `New`; remuda-butler issue #471).
+
+- Shutdown: `remuda stop` now refuses when the daemon cannot verify who is
+  asking (unreadable process ancestry, no peer PID, or a peer lookup error),
+  as it already did for a caller inside one of its sessions (issue #639). To
+  stop the intended daemon anyway, use the same server and runtime selection
+  with `remuda -s NAME stop -f --yes --i-am-inside`. A caller whose parent has
+  already exited still reads as outside and is allowed. The guard is advisory,
+  not authentication: same-user access is not an authorization boundary and it
+  makes no isolation claim.
+
 - Windows: `remuda.caller().kind` is `outside` when the caller is in no
   session's job and its parent chain ends at a missing or reused PID. An
   unreadable or incomplete chain stays `unknown`; `outside` means only that
