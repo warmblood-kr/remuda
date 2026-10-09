@@ -23,6 +23,13 @@ The ID comes from the same registry insertion that starts the session, so it
 continues to identify that launch if another session later reuses its name. A
 failed launch raises an error and returns no ID.
 
+Compatibility: `return new(...)` as a final function result, or `new(...)` as the last
+argument of a call, now passes both values. Over MCP, `run_script` joins
+multiple return values with a tab, so a script that returned `new(...)` now
+yields `name<TAB>instance_id` instead of `name`. To keep the old text, wrap the
+call: `return (new(...))`, or assign `local name = new(...)` first. The ID is
+not a secret and proves the launch, not that the session is still running.
+
 On Windows, everything the session's program starts after it is put in its
 job ends when the session is reaped or closed, or when the daemon stops. A
 session that cannot be put in a job is not started. The one gap is the instant
