@@ -49,7 +49,9 @@ pub fn spawn_and_wait(mut cmd: std::process::Command, dir: &Path) -> Daemon {
     let mut child = cmd.spawn().expect("spawn daemon");
     let path = daemon::socket_path_in(dir, "s");
     let deadline = Instant::now() + PATIENCE;
-    while remuda_native::ipc::connect(&path).is_err() {
+    // Served, not just connectable: the socket accepts before the daemon records
+    // its inode, so a test that swaps the path in that gap misleads it (#603).
+    while remuda_native::client::request(&path, &remuda_core::protocol::Request::List).is_err() {
         if let Ok(Some(status)) = child.try_wait() {
             panic!("daemon exited before binding {path:?}: {status}");
         }
