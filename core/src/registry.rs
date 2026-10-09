@@ -28,6 +28,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Immutable process attribution captured from one registered session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionAttribution {
+    pub name: String,
+    pub instance_id: String,
+}
+
+/// One live session process and the identity of the launch that owns it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveSessionProcess {
+    pub attribution: SessionAttribution,
+    pub pid: u32,
+}
+
 /// One session's state, copied out. Owned data, never a borrow into the
 /// registry — the caller may be a viewer on another machine.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -170,6 +184,24 @@ impl Registry {
             .collect()
     }
 
+    /// Live process candidates with their launch identity captured together
+    /// under the registry lock. Carry this value through ancestry resolution
+    /// instead of looking the session name up again afterwards.
+    pub fn live_processes_with_identity(&self) -> Vec<LiveSessionProcess> {
+        self.lock()
+            .values()
+            .filter_map(|session| {
+                session.process_id_if_alive().map(|pid| LiveSessionProcess {
+                    attribution: SessionAttribution {
+                        name: session.name().to_string(),
+                        instance_id: session.instance_id().to_string(),
+                    },
+                    pid,
+                })
+            })
+            .collect()
+    }
+
     /// The session whose backend holds `pid` as its own. Every listed session
     /// is asked, also one whose child has exited: its descendants may live on.
     pub fn session_owning(
@@ -181,6 +213,36 @@ impl Registry {
         for session in self.lock().values() {
             match session.owns_process(pid, process_handle) {
                 Ok(true) => return Ok(Some(session.name().to_string())),
+                Ok(false) => {}
+                Err(_) => unknown = true,
+            }
+        }
+        if unknown {
+            Err(std::io::Error::other(
+                "session process membership unavailable",
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The immutable launch identity whose backend owns `pid`, resolved while
+    /// the registry entry is locked. This includes dead owners because Windows
+    /// job membership can outlive the session's primary process.
+    pub fn session_attribution_owning(
+        &self,
+        pid: u32,
+        process_handle: Option<usize>,
+    ) -> std::io::Result<Option<SessionAttribution>> {
+        let mut unknown = false;
+        for session in self.lock().values() {
+            match session.owns_process(pid, process_handle) {
+                Ok(true) => {
+                    return Ok(Some(SessionAttribution {
+                        name: session.name().to_string(),
+                        instance_id: session.instance_id().to_string(),
+                    }));
+                }
                 Ok(false) => {}
                 Err(_) => unknown = true,
             }
@@ -290,6 +352,10 @@ impl Registry {
         self.get(name).map(|s| s.send(bytes))
     }
 
+    pub fn clear_input(&self, name: &str, key: &[u8]) -> Option<Result<Option<String>>> {
+        self.get(name).map(|session| session.clear_input(key))
+    }
+
     pub fn feed(&self, name: &str, steps: &[Step]) -> Option<Result<()>> {
         self.get(name).map(|s| s.feed(steps))
     }
@@ -387,5 +453,165 @@ impl Registry {
             return Some(Err(error));
         }
         Some(Ok(sessions.remove(name).is_some()))
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+    use crate::agent::{AgentProcess, Cursor, ScriptedAgent, Size};
+    use crate::clock::ManualClock;
+    use crate::session::Session;
+    use std::sync::Arc;
+
+    struct OwnershipAgent {
+        owned: std::io::Result<bool>,
+        alive: bool,
+        pid: u32,
+    }
+
+    impl AgentProcess for OwnershipAgent {
+        fn write(&mut self, _: &[u8]) -> crate::agent::Result<()> {
+            Ok(())
+        }
+        fn screen_text(&mut self) -> crate::agent::Result<String> {
+            Ok(String::new())
+        }
+        fn cursor(&mut self) -> crate::agent::Result<Cursor> {
+            Ok(Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            })
+        }
+        fn is_alive(&mut self) -> bool {
+            self.alive
+        }
+        fn terminate(&mut self) -> crate::agent::Result<()> {
+            self.alive = false;
+            Ok(())
+        }
+        fn size(&self) -> Size {
+            Size::default()
+        }
+        fn process_id(&self) -> Option<u32> {
+            self.alive.then_some(self.pid)
+        }
+        fn owns_process(&self, _: u32, _: Option<usize>) -> std::io::Result<bool> {
+            match &self.owned {
+                Ok(value) => Ok(*value),
+                Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+            }
+        }
+    }
+
+    fn registry_with(name: &str, agent: impl AgentProcess + 'static) -> (Registry, Arc<Session>) {
+        let registry = Registry::new();
+        let session = Session::new_with_id(
+            name,
+            format!("id-{name}"),
+            Box::new(agent),
+            Arc::new(ManualClock::new()),
+        );
+        let handle = registry.register(session).expect("register session");
+        (registry, handle)
+    }
+
+    #[test]
+    fn session_attribution_owning_returns_the_live_matched_launch() {
+        let (registry, session) = registry_with(
+            "work",
+            OwnershipAgent {
+                owned: Ok(true),
+                alive: true,
+                pid: 30,
+            },
+        );
+        assert_eq!(
+            registry.session_attribution_owning(40, Some(7)).unwrap(),
+            Some(SessionAttribution {
+                name: "work".into(),
+                instance_id: session.instance_id().into(),
+            })
+        );
+    }
+
+    #[test]
+    fn session_attribution_owning_retains_dead_owner_provenance() {
+        let (registry, session) = registry_with(
+            "work",
+            OwnershipAgent {
+                owned: Ok(true),
+                alive: false,
+                pid: 30,
+            },
+        );
+        assert_eq!(
+            registry.session_attribution_owning(40, Some(7)).unwrap(),
+            Some(SessionAttribution {
+                name: "work".into(),
+                instance_id: session.instance_id().into(),
+            })
+        );
+    }
+
+    #[test]
+    fn session_attribution_owning_propagates_query_errors() {
+        let (registry, _) = registry_with(
+            "work",
+            OwnershipAgent {
+                owned: Err(std::io::Error::other("ownership unavailable")),
+                alive: true,
+                pid: 30,
+            },
+        );
+        assert!(registry.session_attribution_owning(40, Some(7)).is_err());
+    }
+
+    #[test]
+    fn session_attribution_owning_returns_none_when_no_session_matches() {
+        let (registry, _) = registry_with(
+            "work",
+            OwnershipAgent {
+                owned: Ok(false),
+                alive: true,
+                pid: 30,
+            },
+        );
+        assert_eq!(
+            registry.session_attribution_owning(40, Some(7)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn session_attribution_owning_uses_the_matched_sessions_instance() {
+        let registry = Registry::new();
+        let first = Session::new_with_id(
+            "first",
+            "id-first",
+            Box::new(OwnershipAgent {
+                owned: Ok(false),
+                alive: true,
+                pid: 30,
+            }),
+            Arc::new(ManualClock::new()),
+        );
+        let second = Session::new_with_id(
+            "second",
+            "id-second",
+            Box::new(ScriptedAgent::new(vec![]).owning(40)),
+            Arc::new(ManualClock::new()),
+        );
+        registry.register(first).unwrap();
+        let second = registry.register(second).unwrap();
+        assert_eq!(
+            registry
+                .session_attribution_owning(40, None)
+                .unwrap()
+                .unwrap()
+                .instance_id,
+            second.instance_id()
+        );
     }
 }

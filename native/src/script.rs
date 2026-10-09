@@ -29,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 97] = [
+pub const BINDINGS: [&str; 98] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -72,6 +72,7 @@ pub const BINDINGS: [&str; 97] = [
     "capture",
     "capture_styled",
     "clear_hooks",
+    "clear_input",
     "cli",
     "click",
     "clock",
@@ -150,7 +151,12 @@ const WORDS: &[(&str, &str, &str)] = &[
     (
         "caller",
         "ADVISORY only: peer ancestry identifies a managed session, outside, or unknown; outside does not prove operator identity. Same-UID Lua can run ``remuda -e`` and wrap ``_dispatch_extension_command``; Windows parent PIDs may be stale or chosen, so this is not an authentication boundary.",
-        "caller() -> {kind: 'session'|'outside'|'unknown', session?: string}",
+        "caller() -> {kind: 'session'|'outside'|'unknown', session?: string, instance_id?: string}",
+    ),
+    (
+        "clear_input",
+        "Write one trusted clear-line key to a session as an atomic input act. The core currently allows only exact Ctrl+U (byte 0x15), verified for Codex; use it only when the target agent's configured binding clears to the start of its input. Other keys are refused. Keys are limited to 1–16 bytes and four calls per session per second. Refuses during recent human typing or while a PTY writer is busy. Terminal screens do not generally identify composer contents, so `cleared` is nil when unknown ([Codex issue #20698](https://github.com/openai/codex/issues/20698)).",
+        "clear_input(name, key) -> {cleared = string|nil}",
     ),
     (
         "_module_readiness",
@@ -882,6 +888,7 @@ fn caller_binding(
             };
             value.set("kind", kind)?;
             value.set("session", caller.session)?;
+            value.set("instance_id", caller.instance_id)?;
             Ok(value)
         })?,
     )
@@ -995,6 +1002,8 @@ pub(crate) fn bindings(
             value(lua, ask(&path, Request::SendLine { name, text })?)
         })?,
     )?;
+
+    clear_input_binding(lua, &table, at())?;
 
     // The `insert-char` analogue: exactly these bytes, nothing appended. An
     // `mlua::String` rather than a Rust `String` so a script can hand over any
@@ -1118,6 +1127,24 @@ fn removed_sleep_error(lua: &Lua, table: &Table) -> mlua::Result<()> {
         })?,
     )?;
     table.set_metatable(Some(metatable))
+}
+
+fn clear_input_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
+    table.set(
+        "clear_input",
+        lua.create_function(move |lua, (name, key): (String, mlua::LuaString)| {
+            value(
+                lua,
+                ask(
+                    &path,
+                    Request::ClearInput {
+                        name,
+                        key: key.as_bytes().to_vec(),
+                    },
+                )?,
+            )
+        })?,
+    )
 }
 
 fn session_resize_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
@@ -2157,6 +2184,13 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
             mlua::Error::runtime("attach responses are not exposed to scripts"),
         ),
         Response::Screen(text) => Ok(Value::String(lua.create_string(&text)?)),
+        Response::ClearInput { cleared } => {
+            let result = lua.create_table()?;
+            if let Some(cleared) = cleared {
+                result.set("cleared", cleared)?;
+            }
+            Ok(Value::Table(result))
+        }
         // No binding here asks for an `Eval`, so this arm is unreachable in
         // practice — spelled out rather than folded into a wildcard so that
         // adding one later is a compile error to think about, not a silent

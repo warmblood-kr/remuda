@@ -222,6 +222,47 @@ fn a_refusal_is_an_error_not_an_empty_success() {
 }
 
 #[test]
+fn clear_input_requires_a_key_string_over_mcp() {
+    let path = scratch("clear-input-argument").join("missing.sock");
+    for arguments in [
+        json!({"session": "agent"}),
+        json!({"session": "agent", "key": 21}),
+    ] {
+        let seen = call(&path, "clear_input", arguments);
+        assert_eq!(seen["result"]["isError"], true, "{seen}");
+        assert!(
+            seen["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("clear_input needs `key` as a string"),
+            "{seen}"
+        );
+    }
+}
+
+#[test]
+fn clear_input_mcp_schema_documents_the_core_key_limit() {
+    let dir = scratch("clear-input-schema");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+    let reply = ask(
+        &path,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let tools = reply["result"]["tools"].as_array().expect("tools list");
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "clear_input")
+        .expect("clear_input tool");
+    let key = &tool["inputSchema"]["properties"]["key"];
+    assert_eq!(key["minLength"], 1);
+    assert_eq!(key["maxLength"], 16);
+    assert!(tool["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("four calls per session per second")));
+}
+
+#[test]
 fn a_tool_defined_in_lua_is_listed_and_dispatched() {
     // Ruling ③, 정수님 2026-09-10: the MCP server is a frame and tools get added
     // as needed. The claim under test is that a Lua function marked exported
@@ -316,9 +357,9 @@ fn dynamic_tools_receive_only_daemon_issued_caller_context() {
         json!({"code": r#"
             remuda.tool{
               name = "who_called",
-              about = "Return the MCP caller capability supplied by the daemon.",
+              about = "Return merged caller data.",
               run = function(_, caller)
-                return caller and caller.capability or "anonymous"
+                return table.concat({tostring(caller and caller.capability), tostring(caller and caller.kind), tostring(caller and caller.session), tostring(caller and caller.instance_id)}, ":")
               end,
             }
             return "defined"
@@ -326,20 +367,34 @@ fn dynamic_tools_receive_only_daemon_issued_caller_context() {
     );
     assert_eq!(defined["result"]["isError"], false, "define: {defined}");
 
-    // The request tries to spoof a capability in its own arguments. It is not
-    // the caller context and cannot replace the daemon-issued one.
+    // The bridge capability is retained, while args cannot override native
+    // fields and an explicit caller table cannot replace their source.
     let identified = call_as(
         &path,
         Some("capability-issued-by-butler"),
         "who_called",
-        json!({"capability": "spoofed-by-mcp-client"}),
+        json!({"capability": "spoofed-by-mcp-client", "kind": "session", "session": "spoofed", "instance_id": "spoofed"}),
     );
     assert_eq!(identified["result"]["isError"], false, "{identified}");
-    assert_eq!(text_of(&identified), "capability-issued-by-butler");
+    assert_eq!(
+        text_of(&identified),
+        "capability-issued-by-butler:outside:nil:nil"
+    );
 
     let anonymous = call_as(&path, None, "who_called", json!({}));
     assert_eq!(anonymous["result"]["isError"], false, "{anonymous}");
-    assert_eq!(text_of(&anonymous), "anonymous");
+    assert_eq!(text_of(&anonymous), "nil:outside:nil:nil");
+
+    let explicit = call(
+        &path,
+        "run_script",
+        json!({"code": r#"
+            remuda.caller = function() return {kind='session', session='forged', instance_id='forged'} end
+            return remuda._call('who_called', {kind='spoofed', session='spoofed', instance_id='spoofed'}, {capability='direct-capability', kind='spoofed', session='spoofed', instance_id='spoofed'})
+        "#}),
+    );
+    assert_eq!(explicit["result"]["isError"], false, "{explicit}");
+    assert_eq!(text_of(&explicit), "direct-capability:outside:nil:nil");
 }
 
 #[test]

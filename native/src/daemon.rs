@@ -1582,6 +1582,13 @@ fn handle_request(
             })
         }
 
+        Request::ClearInput { name, key } => respond(
+            &stream,
+            &name,
+            registry.clear_input(&name, &key),
+            |cleared| Response::ClearInput { cleared },
+        ),
+
         Request::Input {
             name,
             instance_id,
@@ -1778,33 +1785,183 @@ fn caller_context(
     // parent has exited, which the parent walk below cannot see. A session
     // child's own PID stays sound there: the daemon holds that process open.
     #[cfg(windows)]
-    let origin = {
+    {
         let Some((pid, held)) = process_ancestry::current_peer(stream, accepted) else {
             return crate::image::CallerContext::default();
         };
-        process_ancestry::resolve_job_first(
-            || registry.session_owning(pid, Some(held.raw_handle())),
-            || process_ancestry::resolve_caller_opened(pid, &held, &registry.live_processes()),
-        )
-    };
+        let origin = process_ancestry::resolve_job_first(
+            || registry.session_attribution_owning(pid, Some(held.raw_handle())),
+            || {
+                process_ancestry::resolve_caller_opened(
+                    pid,
+                    &held,
+                    &registry.live_processes_with_identity(),
+                )
+            },
+        );
+        caller_context_from_origin(origin, registry)
+    }
     #[cfg(not(windows))]
-    let origin = {
+    {
         let _ = accepted;
-        process_ancestry::resolve_caller(
+        let candidates = registry.live_processes_with_identity();
+        caller_context_from_ancestry(
             process_ancestry::peer_pid(stream),
-            &registry.live_processes(),
+            &candidates,
+            std::process::id(),
+            process_ancestry::parent_pid,
+            registry,
         )
+    }
+}
+
+#[cfg(not(windows))]
+fn caller_context_from_ancestry<F>(
+    peer_pid: std::io::Result<Option<u32>>,
+    candidates: &[remuda_core::registry::LiveSessionProcess],
+    daemon_pid: u32,
+    parent: F,
+    registry: &Registry,
+) -> crate::image::CallerContext
+where
+    F: FnMut(u32) -> std::io::Result<Option<u32>>,
+{
+    let origin = match peer_pid {
+        Ok(Some(pid)) if pid > 1 => {
+            process_ancestry::resolve_caller_with(pid, candidates, daemon_pid, parent)
+        }
+        Ok(Some(_)) | Ok(None) | Err(_) => process_ancestry::CallerOrigin::Unknown,
     };
+    caller_context_from_origin(origin, registry)
+}
+
+fn caller_context_from_origin(
+    origin: process_ancestry::CallerOrigin,
+    _registry: &Registry,
+) -> crate::image::CallerContext {
     match origin {
-        process_ancestry::CallerOrigin::Session(name) => crate::image::CallerContext {
+        process_ancestry::CallerOrigin::Session(attribution) => crate::image::CallerContext {
             kind: crate::image::CallerKind::Session,
-            session: Some(name),
+            session: Some(attribution.name),
+            instance_id: Some(attribution.instance_id),
         },
         process_ancestry::CallerOrigin::Outside => crate::image::CallerContext {
             kind: crate::image::CallerKind::Outside,
             session: None,
+            instance_id: None,
         },
         process_ancestry::CallerOrigin::Unknown => crate::image::CallerContext::default(),
+    }
+}
+
+#[cfg(test)]
+mod caller_context_tests {
+    use super::*;
+    use remuda_core::agent::{AgentProcess, Cursor, Result as AgentResult};
+    use remuda_core::Size;
+
+    struct ProcessAgent {
+        pid: u32,
+        owns: bool,
+    }
+    impl AgentProcess for ProcessAgent {
+        fn write(&mut self, _: &[u8]) -> AgentResult<()> {
+            Ok(())
+        }
+        fn screen_text(&mut self) -> AgentResult<String> {
+            Ok(String::new())
+        }
+        fn cursor(&mut self) -> AgentResult<remuda_core::agent::Cursor> {
+            Ok(Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            })
+        }
+        fn is_alive(&mut self) -> bool {
+            true
+        }
+        fn terminate(&mut self) -> AgentResult<()> {
+            Ok(())
+        }
+        fn size(&self) -> Size {
+            Size::default()
+        }
+        fn process_id(&self) -> Option<u32> {
+            Some(self.pid)
+        }
+        fn owns_process(&self, _: u32, _: Option<usize>) -> std::io::Result<bool> {
+            Ok(self.owns)
+        }
+    }
+
+    fn register(registry: &Registry, pid: u32) -> Arc<Session> {
+        registry
+            .register(Session::new(
+                "work",
+                Box::new(ProcessAgent { pid, owns: false }),
+                Arc::new(SystemClock::new()),
+            ))
+            .expect("register session")
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn replacement_between_registry_capture_and_daemon_context_keeps_launch_a() {
+        let registry = Registry::new();
+        let launch_a = register(&registry, 30);
+        let candidates = registry.live_processes_with_identity();
+        assert_eq!(
+            candidates[0].attribution.instance_id,
+            launch_a.instance_id()
+        );
+
+        // A same-name launch replaces A after Registry captured its candidate.
+        drop(registry.remove("work").expect("remove A"));
+        let launch_b = register(&registry, 31);
+        assert_ne!(launch_a.instance_id(), launch_b.instance_id());
+
+        let parent = |pid| match pid {
+            40 => Ok(Some(30)),
+            _ => unreachable!("unexpected ancestry query for {pid}"),
+        };
+        let context =
+            caller_context_from_ancestry(Ok(Some(40)), &candidates, 99, parent, &registry);
+        assert!(matches!(context.kind, crate::image::CallerKind::Session));
+        assert_eq!(context.session.as_deref(), Some("work"));
+        assert_eq!(context.instance_id.as_deref(), Some(launch_a.instance_id()));
+        assert_ne!(context.instance_id.as_deref(), Some(launch_b.instance_id()));
+    }
+
+    #[test]
+    fn windows_ownership_capture_keeps_launch_a_after_same_name_replacement() {
+        let registry = Registry::new();
+        let launch_a = registry
+            .register(Session::new(
+                "work",
+                Box::new(ProcessAgent {
+                    pid: 30,
+                    owns: true,
+                }),
+                Arc::new(SystemClock::new()),
+            ))
+            .expect("register launch A");
+        let captured = registry
+            .session_attribution_owning(40, Some(7))
+            .unwrap()
+            .unwrap();
+        assert_eq!(captured.instance_id, launch_a.instance_id());
+
+        drop(registry.remove("work").expect("remove launch A"));
+        let launch_b = register(&registry, 31);
+        let origin = process_ancestry::resolve_job_first(
+            || Ok(Some(captured)),
+            || process_ancestry::CallerOrigin::Outside,
+        );
+        let context = caller_context_from_origin(origin, &registry);
+        assert_eq!(context.session.as_deref(), Some("work"));
+        assert_eq!(context.instance_id.as_deref(), Some(launch_a.instance_id()));
+        assert_ne!(context.instance_id.as_deref(), Some(launch_b.instance_id()));
     }
 }
 
