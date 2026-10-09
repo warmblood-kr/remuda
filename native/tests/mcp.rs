@@ -423,7 +423,12 @@ fn run_script_reaches_the_one_shared_image() {
         "run_script",
         json!({"code": r#"return remuda.new("by-script", {"sh"})"#}),
     );
-    assert_eq!(text_of(&made), "by-script", "{made}");
+    let made_text = text_of(&made);
+    let (made_name, made_instance_id) = made_text
+        .split_once('\t')
+        .expect("run_script returns name and instance_id");
+    assert_eq!(made_name, "by-script", "{made}");
+    assert!(!made_instance_id.is_empty(), "{made}");
     assert!(
         text_of(&call(&path, "ls", json!({}))).contains("by-script"),
         "the script's session is not in the herd `ls` shows"

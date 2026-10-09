@@ -122,7 +122,7 @@
 <h2 id="mkdir">mkdir</h2>
 <p><code>mkdir(dir) -&gt; nil</code> — Create a directory, including its parents.</p>
 <h2 id="new">new</h2>
-<p><code>new(name?, argv?, cwd?, env?) -&gt; string</code> — Deprecated alias for <span class="title-ref">remuda.session.new</span>.</p>
+<p><code>new(name?, argv?, cwd?, env?) -&gt; name, instance_id</code> — Deprecated alias for <span class="title-ref">remuda.session.new</span>; returns name and registered instance_id.</p>
 <h2 id="on">on</h2>
 <p><code>on(event, fn, opts?) -&gt; nil</code> — Register a callback to run when an event fires. `opts`: <span class="title-ref">group</span>, <span class="title-ref">id</span> (same group+id replaces), <span class="title-ref">depth</span> (-100..100, lower first).</p>
 <h2 id="pending">pending</h2>
@@ -160,7 +160,7 @@
 <h2 id="session.list">session.list</h2>
 <p><code>session.list() -&gt; {session...}</code> — List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.</p>
 <h2 id="session.new">session.new</h2>
-<p><code>session.new(name?, argv?, cwd?, env?) -&gt; string</code> — Start a session, defaulting the command to the user's shell.</p>
+<p><code>session.new(name?, argv?, cwd?, env?) -&gt; name, instance_id</code> — Start a session and return its name and registered instance_id.</p>
 <h2 id="session.resize">session.resize</h2>
 <p><code>session.resize(name, cols, rows) -&gt; true | nil, err</code> — Resize a session's terminal (cols 20..1000, rows 24..500).</p>
 <h2 id="storage">storage</h2>
