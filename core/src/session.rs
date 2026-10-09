@@ -384,6 +384,8 @@ pub struct Session {
     attached: AtomicBool,
     /// Set under the registry lock before a close request terminates the child.
     closing: AtomicBool,
+    /// Once any liveness probe observes exit, this launch can never become live again.
+    alive: AtomicBool,
     /// Current attachment generation and its takeover signal. The generation
     /// keeps an old guard's drop from clearing a newer attachment.
     attach_slot: Mutex<Option<(u64, Arc<AtomicBool>)>>,
@@ -517,6 +519,7 @@ impl Session {
             clear_hook: Mutex::new(None),
             attached: AtomicBool::new(false),
             closing: AtomicBool::new(false),
+            alive: AtomicBool::new(true),
             attach_slot: Mutex::new(None),
             next_attach_generation: AtomicU64::new(1),
             input_lock: Mutex::new(false),
@@ -1074,7 +1077,7 @@ impl Session {
                 .agent
                 .lock()
                 .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
-            if !agent.is_alive() {
+            if !self.alive.load(Ordering::SeqCst) || !self.observe_alive(agent.is_alive()) {
                 return Err(AgentError::Exited);
             }
             agent.input_writer()
@@ -1282,17 +1285,33 @@ impl Session {
     }
 
     pub fn is_alive(&self) -> bool {
+        if !self.alive.load(Ordering::SeqCst) {
+            Self::notify_output_changed(&self.output_changed);
+            return false;
+        }
         let alive = match self.agent.lock() {
-            Ok(mut agent) => agent.is_alive(),
+            Ok(mut agent) => {
+                self.alive.load(Ordering::SeqCst) && self.observe_alive(agent.is_alive())
+            }
             // A poisoned lock means a writer panicked mid-session. Reporting
             // "alive" would invite more writes into a session whose state is
             // unknown.
-            Err(_) => false,
+            Err(_) => {
+                self.alive.store(false, Ordering::SeqCst);
+                false
+            }
         };
         if !alive {
             Self::notify_output_changed(&self.output_changed);
         }
         alive
+    }
+
+    fn observe_alive(&self, alive: bool) -> bool {
+        if !alive {
+            self.alive.store(false, Ordering::SeqCst);
+        }
+        self.alive.load(Ordering::SeqCst)
     }
 
     fn notify_output_changed(output_changed: &Arc<(Mutex<u64>, Condvar)>) {
@@ -1322,8 +1341,19 @@ impl Session {
 
     /// The child PID if this process-backed session is still running.
     pub fn process_id_if_alive(&self) -> Option<u32> {
-        let mut agent = self.agent.lock().ok()?;
-        agent.is_alive().then(|| agent.process_id()).flatten()
+        if !self.alive.load(Ordering::SeqCst) {
+            return None;
+        }
+        let mut agent = match self.agent.lock() {
+            Ok(agent) => agent,
+            Err(_) => {
+                self.alive.store(false, Ordering::SeqCst);
+                return None;
+            }
+        };
+        (self.alive.load(Ordering::SeqCst) && self.observe_alive(agent.is_alive()))
+            .then(|| agent.process_id())
+            .flatten()
     }
 
     /// Whether the backend holds `pid` as this session's own, even after its
@@ -1358,7 +1388,17 @@ impl Session {
             .agent
             .lock()
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        if self.alive.load(Ordering::SeqCst) {
+            self.observe_alive(agent.is_alive());
+        }
         let result = agent.terminate();
+        if result.is_ok() {
+            self.alive.store(false, Ordering::SeqCst);
+        } else {
+            if self.alive.load(Ordering::SeqCst) {
+                self.observe_alive(agent.is_alive());
+            }
+        }
         drop(agent);
         if result.is_ok() && wake_waiters {
             Self::notify_output_changed(&self.output_changed);

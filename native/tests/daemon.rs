@@ -5330,7 +5330,11 @@ fn a_session_exited_hook_still_fires_once_when_ls_reaps_before_the_tick() {
     // Well inside TICK_PERIOD (1s) — this reaps the session before the
     // ticker's own tick has a chance to.
     std::thread::sleep(Duration::from_millis(80));
-    client::request(&path, &Request::List).expect("list");
+    let listed = client::request(&path, &Request::List).expect("list");
+    assert!(
+        matches!(&listed, Response::Sessions(sessions) if sessions.iter().all(|session| session.name != "race-short-lived")),
+        "List reaps the already-exited session before returning summaries: {listed:?}"
+    );
 
     // Give the ticker a full period too, so a double-emit (both paths firing)
     // would have every chance to show up if the funnel were not idempotent.

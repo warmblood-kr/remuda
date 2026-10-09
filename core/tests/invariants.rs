@@ -692,6 +692,10 @@ fn close_is_refused_while_attached_and_the_session_survives() {
         alive.load(Ordering::SeqCst),
         "a refused close must not have touched the process"
     );
+    assert!(
+        session.is_alive(),
+        "a refused close must preserve authority"
+    );
     assert!(registry.get("worker").is_some(), "and the entry survives");
 
     drop(held);
