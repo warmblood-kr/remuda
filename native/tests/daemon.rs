@@ -5327,10 +5327,22 @@ fn a_session_exited_hook_still_fires_once_when_ls_reaps_before_the_tick() {
     .expect("new");
     assert_eq!(response, Response::Value("race-short-lived".into()));
 
-    // Well inside TICK_PERIOD (1s) — this reaps the session before the
-    // ticker's own tick has a chance to.
-    std::thread::sleep(Duration::from_millis(80));
-    client::request(&path, &Request::List).expect("list");
+    // Poll until the daemon has observed process exit and reaped the session.
+    // A fixed delay races process startup/exit on Windows, where the first
+    // query can still correctly report a short-lived child as alive.
+    let reap_deadline = Instant::now() + PATIENCE;
+    loop {
+        let listed = client::request(&path, &Request::List).expect("list");
+        if matches!(&listed, Response::Sessions(sessions) if sessions.iter().all(|session| session.name != "race-short-lived"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < reap_deadline,
+            "List never observed the short-lived session exit: {listed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     // Give the ticker a full period too, so a double-emit (both paths firing)
     // would have every chance to show up if the funnel were not idempotent.

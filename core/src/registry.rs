@@ -35,6 +35,24 @@ pub struct SessionAttribution {
     pub instance_id: String,
 }
 
+/// Why a captured caller identity no longer names a live registry entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveInstanceError {
+    NotRegistered,
+    InstanceChanged,
+    NotLive,
+}
+
+impl LiveInstanceError {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NotRegistered => "session is no longer registered",
+            Self::InstanceChanged => "session instance changed",
+            Self::NotLive => "session is no longer live",
+        }
+    }
+}
+
 /// One live session process and the identity of the launch that owns it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveSessionProcess {
@@ -153,6 +171,23 @@ impl Registry {
     /// what lets a viewer attach while the core keeps driving.
     pub fn get(&self, name: &str) -> Option<Arc<Session>> {
         self.lock().get(name).map(Arc::clone)
+    }
+
+    /// Validate one caller launch atomically with removal and replacement.
+    pub fn validate_live_instance(
+        &self,
+        name: &str,
+        instance_id: &str,
+    ) -> std::result::Result<(), LiveInstanceError> {
+        let sessions = self.lock();
+        let session = sessions.get(name).ok_or(LiveInstanceError::NotRegistered)?;
+        if session.instance_id() != instance_id {
+            return Err(LiveInstanceError::InstanceChanged);
+        }
+        if !session.is_alive() {
+            return Err(LiveInstanceError::NotLive);
+        }
+        Ok(())
     }
 
     /// Look up a tracked session identity without reaping exited sessions.

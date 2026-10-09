@@ -24,14 +24,16 @@ use remuda_core::{InputSubmitOutcome, DEFAULT_INPUT_SETTLE};
 use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 98] = [
+pub const BINDINGS: [&str; 99] = [
     "_advice_reattach",
     "_call",
+    "_caller_live",
     "_descriptors",
     "_dispatch_extension_command",
     "_event_counts",
@@ -894,6 +896,35 @@ fn caller_binding(
     )
 }
 
+fn caller_live_binding(
+    lua: &Lua,
+    table: &Table,
+    registry: Arc<remuda_core::Registry>,
+) -> mlua::Result<()> {
+    table.set(
+        "_caller_live",
+        lua.create_function(
+            move |_, (name, instance_id): (Option<String>, Option<String>)| {
+                let name = name.filter(|name| !name.is_empty()).ok_or_else(|| {
+                    mlua::Error::runtime("caller session name is missing; refusing authorization")
+                })?;
+                let instance_id = instance_id.filter(|id| !id.is_empty()).ok_or_else(|| {
+                    mlua::Error::runtime("caller instance_id is missing; refusing authorization")
+                })?;
+                registry
+                    .validate_live_instance(&name, &instance_id)
+                    .map_err(|error| {
+                        mlua::Error::runtime(format!(
+                            "caller {}; refusing authorization",
+                            error.message()
+                        ))
+                    })?;
+                Ok(true)
+            },
+        )?,
+    )
+}
+
 fn input_bindings(
     lua: &Lua,
     table: &Table,
@@ -973,6 +1004,7 @@ pub(crate) fn bindings(
     pending_bindings(lua, &table, image.pending_replies(), Rc::clone(&caller))?;
     timer_bindings(lua, &table, timers)?;
     caller_binding(lua, &table, caller)?;
+    caller_live_binding(lua, &table, registry.clone())?;
     random_bytes_binding(lua, &table)?;
     hostname_binding(lua, &table)?;
 
