@@ -320,6 +320,13 @@ jobs:
             cargo llvm-cov --workspace --all-targets --summary-only
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Profile diagnostics (#624)
+        # Print-only evidence when Coverage failed; it always exits 0, so it
+        # never changes this job's result.
+        if: failure()
+        timeout-minutes: 5
+        continue-on-error: true
+        run: bash scripts/diagnose-profraw.sh || true
       - name: Lines of code
         run: |
           cargo install tokei --locked

@@ -1573,6 +1573,27 @@ fn handle_request(
                 size,
                 cwd,
                 env,
+                return_instance_id: false,
+            },
+        ),
+
+        Request::NewWithInstance {
+            name,
+            command,
+            size,
+            cwd,
+            env,
+        } => handle_new(
+            stream,
+            registry,
+            image,
+            NewSessionRequest {
+                name,
+                command,
+                size,
+                cwd,
+                env,
+                return_instance_id: true,
             },
         ),
 
@@ -1581,6 +1602,13 @@ fn handle_request(
                 Response::Ok
             })
         }
+
+        Request::ClearInput { name, key } => respond(
+            &stream,
+            &name,
+            registry.clear_input(&name, &key),
+            |cleared| Response::ClearInput { cleared },
+        ),
 
         Request::Input {
             name,
@@ -1778,33 +1806,183 @@ fn caller_context(
     // parent has exited, which the parent walk below cannot see. A session
     // child's own PID stays sound there: the daemon holds that process open.
     #[cfg(windows)]
-    let origin = {
+    {
         let Some((pid, held)) = process_ancestry::current_peer(stream, accepted) else {
             return crate::image::CallerContext::default();
         };
-        process_ancestry::resolve_job_first(
-            || registry.session_owning(pid, Some(held.raw_handle())),
-            || process_ancestry::resolve_caller_opened(pid, &held, &registry.live_processes()),
-        )
-    };
+        let origin = process_ancestry::resolve_job_first(
+            || registry.session_attribution_owning(pid, Some(held.raw_handle())),
+            || {
+                process_ancestry::resolve_caller_opened(
+                    pid,
+                    &held,
+                    &registry.live_processes_with_identity(),
+                )
+            },
+        );
+        caller_context_from_origin(origin, registry)
+    }
     #[cfg(not(windows))]
-    let origin = {
+    {
         let _ = accepted;
-        process_ancestry::resolve_caller(
+        let candidates = registry.live_processes_with_identity();
+        caller_context_from_ancestry(
             process_ancestry::peer_pid(stream),
-            &registry.live_processes(),
+            &candidates,
+            std::process::id(),
+            process_ancestry::parent_pid,
+            registry,
         )
+    }
+}
+
+#[cfg(not(windows))]
+fn caller_context_from_ancestry<F>(
+    peer_pid: std::io::Result<Option<u32>>,
+    candidates: &[remuda_core::registry::LiveSessionProcess],
+    daemon_pid: u32,
+    parent: F,
+    registry: &Registry,
+) -> crate::image::CallerContext
+where
+    F: FnMut(u32) -> std::io::Result<Option<u32>>,
+{
+    let origin = match peer_pid {
+        Ok(Some(pid)) if pid > 1 => {
+            process_ancestry::resolve_caller_with(pid, candidates, daemon_pid, parent)
+        }
+        Ok(Some(_)) | Ok(None) | Err(_) => process_ancestry::CallerOrigin::Unknown,
     };
+    caller_context_from_origin(origin, registry)
+}
+
+fn caller_context_from_origin(
+    origin: process_ancestry::CallerOrigin,
+    _registry: &Registry,
+) -> crate::image::CallerContext {
     match origin {
-        process_ancestry::CallerOrigin::Session(name) => crate::image::CallerContext {
+        process_ancestry::CallerOrigin::Session(attribution) => crate::image::CallerContext {
             kind: crate::image::CallerKind::Session,
-            session: Some(name),
+            session: Some(attribution.name),
+            instance_id: Some(attribution.instance_id),
         },
         process_ancestry::CallerOrigin::Outside => crate::image::CallerContext {
             kind: crate::image::CallerKind::Outside,
             session: None,
+            instance_id: None,
         },
         process_ancestry::CallerOrigin::Unknown => crate::image::CallerContext::default(),
+    }
+}
+
+#[cfg(test)]
+mod caller_context_tests {
+    use super::*;
+    use remuda_core::agent::{AgentProcess, Cursor, Result as AgentResult};
+    use remuda_core::Size;
+
+    struct ProcessAgent {
+        pid: u32,
+        owns: bool,
+    }
+    impl AgentProcess for ProcessAgent {
+        fn write(&mut self, _: &[u8]) -> AgentResult<()> {
+            Ok(())
+        }
+        fn screen_text(&mut self) -> AgentResult<String> {
+            Ok(String::new())
+        }
+        fn cursor(&mut self) -> AgentResult<remuda_core::agent::Cursor> {
+            Ok(Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            })
+        }
+        fn is_alive(&mut self) -> bool {
+            true
+        }
+        fn terminate(&mut self) -> AgentResult<()> {
+            Ok(())
+        }
+        fn size(&self) -> Size {
+            Size::default()
+        }
+        fn process_id(&self) -> Option<u32> {
+            Some(self.pid)
+        }
+        fn owns_process(&self, _: u32, _: Option<usize>) -> std::io::Result<bool> {
+            Ok(self.owns)
+        }
+    }
+
+    fn register(registry: &Registry, pid: u32) -> Arc<Session> {
+        registry
+            .register(Session::new(
+                "work",
+                Box::new(ProcessAgent { pid, owns: false }),
+                Arc::new(SystemClock::new()),
+            ))
+            .expect("register session")
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn replacement_between_registry_capture_and_daemon_context_keeps_launch_a() {
+        let registry = Registry::new();
+        let launch_a = register(&registry, 30);
+        let candidates = registry.live_processes_with_identity();
+        assert_eq!(
+            candidates[0].attribution.instance_id,
+            launch_a.instance_id()
+        );
+
+        // A same-name launch replaces A after Registry captured its candidate.
+        drop(registry.remove("work").expect("remove A"));
+        let launch_b = register(&registry, 31);
+        assert_ne!(launch_a.instance_id(), launch_b.instance_id());
+
+        let parent = |pid| match pid {
+            40 => Ok(Some(30)),
+            _ => unreachable!("unexpected ancestry query for {pid}"),
+        };
+        let context =
+            caller_context_from_ancestry(Ok(Some(40)), &candidates, 99, parent, &registry);
+        assert!(matches!(context.kind, crate::image::CallerKind::Session));
+        assert_eq!(context.session.as_deref(), Some("work"));
+        assert_eq!(context.instance_id.as_deref(), Some(launch_a.instance_id()));
+        assert_ne!(context.instance_id.as_deref(), Some(launch_b.instance_id()));
+    }
+
+    #[test]
+    fn windows_ownership_capture_keeps_launch_a_after_same_name_replacement() {
+        let registry = Registry::new();
+        let launch_a = registry
+            .register(Session::new(
+                "work",
+                Box::new(ProcessAgent {
+                    pid: 30,
+                    owns: true,
+                }),
+                Arc::new(SystemClock::new()),
+            ))
+            .expect("register launch A");
+        let captured = registry
+            .session_attribution_owning(40, Some(7))
+            .unwrap()
+            .unwrap();
+        assert_eq!(captured.instance_id, launch_a.instance_id());
+
+        drop(registry.remove("work").expect("remove launch A"));
+        let launch_b = register(&registry, 31);
+        let origin = process_ancestry::resolve_job_first(
+            || Ok(Some(captured)),
+            || process_ancestry::CallerOrigin::Outside,
+        );
+        let context = caller_context_from_origin(origin, &registry);
+        assert_eq!(context.session.as_deref(), Some("work"));
+        assert_eq!(context.instance_id.as_deref(), Some(launch_a.instance_id()));
+        assert_ne!(context.instance_id.as_deref(), Some(launch_b.instance_id()));
     }
 }
 
@@ -2371,25 +2549,25 @@ fn handle_shutdown(
                     );
                     if let process_ancestry::Ancestry::Unreadable { pid, ref error } = ancestry {
                         eprintln!(
-                            "remuda: shutdown ancestry stopped at unreadable pid {pid} ({error}); treating requester as outside"
+                            "remuda: shutdown ancestry stopped at unreadable pid {pid} ({error}); refusing unverifiable requester"
                         );
                     }
                     ShutdownPeer::Ancestry(ancestry)
                 }
                 Ok(None) => {
-                    eprintln!("remuda: shutdown peer process ID unavailable; treating requester as outside");
+                    eprintln!("remuda: shutdown peer process ID unavailable; refusing unverifiable requester");
                     ShutdownPeer::Unavailable
                 }
                 Err(error) => {
-                    eprintln!("remuda: shutdown peer process ID unavailable ({error}); treating requester as outside");
-                    ShutdownPeer::Error
+                    eprintln!("remuda: shutdown peer process ID unavailable ({error}); refusing unverifiable requester");
+                    ShutdownPeer::Error(error.to_string())
                 }
             }
         })
     };
     finish_shutdown_verdict(
         verdict,
-        |identity| refuse_hosted_shutdown(&stream, identity),
+        |reason| refuse_shutdown(&stream, reason),
         || {
             image.shutdown_pending_replies();
             reply(&stream, &Response::Ok)?;
@@ -2407,7 +2585,13 @@ fn handle_shutdown(
 #[derive(Debug, PartialEq, Eq)]
 enum ShutdownVerdict {
     Allow,
-    Refuse(String),
+    Refuse(ShutdownRefusal),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ShutdownRefusal {
+    Hosted(String),
+    Unverifiable(String),
 }
 
 #[derive(Debug)]
@@ -2423,7 +2607,7 @@ struct ShutdownClaims {
 enum ShutdownPeer {
     Ancestry(process_ancestry::Ancestry),
     Unavailable,
-    Error,
+    Error(String),
 }
 
 struct ShutdownInputs {
@@ -2432,12 +2616,12 @@ struct ShutdownInputs {
     peer: ShutdownPeer,
 }
 
-fn claim_refusal(claims: &ShutdownClaims) -> Option<String> {
+fn claim_refusal(claims: &ShutdownClaims) -> Option<ShutdownRefusal> {
     if claims.known_session_name.is_some()
         || (claims.requester_daemon_id.as_deref() == Some(claims.own_daemon_id.as_str())
             && (claims.requester_session_id.is_some() || claims.requester_session_name.is_some()))
     {
-        Some(
+        Some(ShutdownRefusal::Hosted(
             claims
                 .known_session_name
                 .as_deref()
@@ -2445,7 +2629,7 @@ fn claim_refusal(claims: &ShutdownClaims) -> Option<String> {
                 .or(claims.requester_session_id.as_deref())
                 .unwrap_or("unknown")
                 .to_owned(),
-        )
+        ))
     } else {
         None
     }
@@ -2458,26 +2642,22 @@ fn shutdown_verdict(inputs: ShutdownInputs) -> ShutdownVerdict {
     if let Some(identity) = claim_refusal(&inputs.claims) {
         return ShutdownVerdict::Refuse(identity);
     }
-    let caller_claims_this_daemon = inputs.claims.requester_daemon_id.as_deref()
-        == Some(inputs.claims.own_daemon_id.as_str())
-        && (inputs.claims.requester_session_id.is_some()
-            || inputs.claims.requester_session_name.is_some());
     match inputs.peer {
         ShutdownPeer::Ancestry(process_ancestry::Ancestry::Inside) => {
-            ShutdownVerdict::Refuse("session process ancestry".into())
+            ShutdownVerdict::Refuse(ShutdownRefusal::Hosted("session process ancestry".into()))
         }
         ShutdownPeer::Ancestry(process_ancestry::Ancestry::Outside) => ShutdownVerdict::Allow,
-        ShutdownPeer::Ancestry(process_ancestry::Ancestry::Unreadable { error, .. }) => {
-            drop(error);
-            ShutdownVerdict::Allow
+        ShutdownPeer::Ancestry(process_ancestry::Ancestry::Unreadable { pid, error }) => {
+            ShutdownVerdict::Refuse(ShutdownRefusal::Unverifiable(format!(
+                "cannot verify requester (pid {pid}: {error})"
+            )))
         }
-        ShutdownPeer::Unavailable | ShutdownPeer::Error => {
-            if process_ancestry::missing_peer_requires_refusal(caller_claims_this_daemon) {
-                ShutdownVerdict::Refuse("self-reported session identity".into())
-            } else {
-                ShutdownVerdict::Allow
-            }
-        }
+        ShutdownPeer::Unavailable => ShutdownVerdict::Refuse(ShutdownRefusal::Unverifiable(
+            "cannot read requester identity (peer process ID unavailable)".into(),
+        )),
+        ShutdownPeer::Error(error) => ShutdownVerdict::Refuse(ShutdownRefusal::Unverifiable(
+            format!("cannot read requester identity ({error})"),
+        )),
     }
 }
 
@@ -2501,12 +2681,12 @@ fn shutdown_verdict_with_classifier(
 
 fn finish_shutdown_verdict(
     verdict: ShutdownVerdict,
-    on_refuse: impl FnOnce(&str) -> std::io::Result<()>,
+    on_refuse: impl FnOnce(&ShutdownRefusal) -> std::io::Result<()>,
     on_allow: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     match verdict {
         ShutdownVerdict::Allow => on_allow(),
-        ShutdownVerdict::Refuse(identity) => on_refuse(&identity),
+        ShutdownVerdict::Refuse(reason) => on_refuse(&reason),
     }
 }
 
@@ -2519,12 +2699,31 @@ fn refuse_hosted_shutdown(stream: &Stream, identity: &str) -> std::io::Result<()
     )
 }
 
+fn refuse_unverifiable_shutdown(stream: &Stream, details: &str) -> std::io::Result<()> {
+    reply(
+        stream,
+        &Response::error(unverifiable_shutdown_message(details)),
+    )
+}
+
+fn unverifiable_shutdown_message(details: &str) -> String {
+    format!("cannot stop this daemon: {details}; pass --i-am-inside to override")
+}
+
+fn refuse_shutdown(stream: &Stream, reason: &ShutdownRefusal) -> std::io::Result<()> {
+    match reason {
+        ShutdownRefusal::Hosted(identity) => refuse_hosted_shutdown(stream, identity),
+        ShutdownRefusal::Unverifiable(details) => refuse_unverifiable_shutdown(stream, details),
+    }
+}
+
 struct NewSessionRequest {
     name: Option<String>,
     command: Vec<String>,
     size: Size,
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
+    return_instance_id: bool,
 }
 
 fn handle_new(
@@ -2540,6 +2739,7 @@ fn handle_new(
         size,
         cwd,
         env,
+        return_instance_id,
     } = request;
     let name = match name {
         Some(given) => given,
@@ -2572,13 +2772,21 @@ fn handle_new(
             let notifier = image.session_output_notifier(&name, &session_id);
             match registry.register(session) {
                 Ok(session) => {
+                    let response = if return_instance_id {
+                        Response::SessionStarted {
+                            name,
+                            instance_id: session.instance_id().to_owned(),
+                        }
+                    } else {
+                        Response::Value(name)
+                    };
                     if let Some(output) = session.subscribe_output_wakeup() {
                         monitor_session_output(output, notifier);
                     } else {
                         notifier.flush(session.output_version().unwrap_or(0));
                         notifier.finish_monitor();
                     }
-                    reply(&stream, &Response::Value(name))
+                    reply(&stream, &response)
                 }
                 Err(_) => {
                     image.discard_session_output_monitor(&session_id, &notifier);
@@ -3316,12 +3524,13 @@ mod tests {
         forward_attach_input, paste_cleanup_trace, paste_write_started_callback,
         report_attach_input_failure, runtime_base_for, shell_or_default, shutdown_verdict,
         shutdown_verdict_with_classifier, PasteCleanupState, ShutdownClaims, ShutdownInputs,
-        ShutdownPeer, ShutdownVerdict, SyncPermit, ATTACH_INPUT_FAILURE_NOTICE,
+        ShutdownPeer, ShutdownRefusal, ShutdownVerdict, SyncPermit, ATTACH_INPUT_FAILURE_NOTICE,
         MAX_CONCURRENT_SYNCS,
     };
     #[cfg(not(windows))]
     use super::{AutoAddressDetector, ListenerStatus, ListenerTask};
     use crate::process_ancestry::Ancestry;
+    use interprocess::local_socket::traits::Listener as _;
     use remuda_core::agent::{AgentError, Color, StyledCell};
     use remuda_core::protocol::collapse_runs;
     use remuda_core::protocol::Response;
@@ -3362,6 +3571,17 @@ mod tests {
         }
     }
 
+    fn read_adapter_response(path: &Path) -> Response {
+        use std::io::BufRead as _;
+        let stream = crate::ipc::connect(path).expect("connect to shutdown adapter");
+        let mut reader = std::io::BufReader::new(stream);
+        let mut line = Vec::new();
+        reader
+            .read_until(b'\n', &mut line)
+            .expect("read shutdown adapter response");
+        serde_json::from_slice(&line).expect("decode shutdown adapter response")
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn shutdown_verdict_preserves_claim_and_peer_precedence() {
@@ -3371,21 +3591,54 @@ mod tests {
                 shutdown_claims(None, Some("sid"), None, Some("known")),
                 ShutdownPeer::Ancestry(Ancestry::Outside),
                 false,
-                ShutdownVerdict::Refuse("known".into()),
+                ShutdownVerdict::Refuse(ShutdownRefusal::Hosted("known".into())),
+            ),
+            (
+                "known session id with foreign daemon identity",
+                shutdown_claims(
+                    Some("other"),
+                    Some("sid"),
+                    Some("claimed-name"),
+                    Some("known"),
+                ),
+                ShutdownPeer::Ancestry(Ancestry::Outside),
+                false,
+                ShutdownVerdict::Refuse(ShutdownRefusal::Hosted("known".into())),
             ),
             (
                 "matching daemon plus stale session id",
                 shutdown_claims(Some("42"), Some("stale"), None, None),
                 ShutdownPeer::Ancestry(Ancestry::Outside),
                 false,
-                ShutdownVerdict::Refuse("stale".into()),
+                ShutdownVerdict::Refuse(ShutdownRefusal::Hosted("stale".into())),
             ),
             (
                 "matching daemon plus present session name",
                 shutdown_claims(Some("42"), None, Some("claimed"), None),
                 ShutdownPeer::Ancestry(Ancestry::Outside),
                 false,
-                ShutdownVerdict::Refuse("claimed".into()),
+                ShutdownVerdict::Refuse(ShutdownRefusal::Hosted("claimed".into())),
+            ),
+            (
+                "empty session id still counts as present",
+                shutdown_claims(Some("42"), Some(""), None, None),
+                ShutdownPeer::Ancestry(Ancestry::Outside),
+                false,
+                ShutdownVerdict::Refuse(ShutdownRefusal::Hosted("".into())),
+            ),
+            (
+                "empty session name still counts as present",
+                shutdown_claims(Some("42"), None, Some(""), None),
+                ShutdownPeer::Ancestry(Ancestry::Outside),
+                false,
+                ShutdownVerdict::Refuse(ShutdownRefusal::Hosted("".into())),
+            ),
+            (
+                "session name takes diagnostic priority over id",
+                shutdown_claims(Some("42"), Some("session-id"), Some("session-name"), None),
+                ShutdownPeer::Ancestry(Ancestry::Outside),
+                false,
+                ShutdownVerdict::Refuse(ShutdownRefusal::Hosted("session-name".into())),
             ),
             (
                 "daemon id alone",
@@ -3406,7 +3659,7 @@ mod tests {
                 shutdown_claims(None, None, None, None),
                 ShutdownPeer::Ancestry(Ancestry::Inside),
                 false,
-                ShutdownVerdict::Refuse("session process ancestry".into()),
+                ShutdownVerdict::Refuse(ShutdownRefusal::Hosted("session process ancestry".into())),
             ),
             (
                 "no claims and outside ancestry",
@@ -3423,21 +3676,27 @@ mod tests {
                     error: std::io::Error::other("denied"),
                 }),
                 false,
-                ShutdownVerdict::Allow,
+                ShutdownVerdict::Refuse(ShutdownRefusal::Unverifiable(
+                    "cannot verify requester (pid 7: denied)".into(),
+                )),
             ),
             (
                 "no claims and unavailable peer id",
                 shutdown_claims(None, None, None, None),
                 ShutdownPeer::Unavailable,
                 false,
-                ShutdownVerdict::Allow,
+                ShutdownVerdict::Refuse(ShutdownRefusal::Unverifiable(
+                    "cannot read requester identity (peer process ID unavailable)".into(),
+                )),
             ),
             (
                 "no claims and peer error",
                 shutdown_claims(None, None, None, None),
-                ShutdownPeer::Error,
+                ShutdownPeer::Error("operation failed".into()),
                 false,
-                ShutdownVerdict::Allow,
+                ShutdownVerdict::Refuse(ShutdownRefusal::Unverifiable(
+                    "cannot read requester identity (operation failed)".into(),
+                )),
             ),
             (
                 "override bypasses claim refusal",
@@ -3480,7 +3739,7 @@ mod tests {
             (
                 "override bypasses peer error",
                 shutdown_claims(None, None, None, None),
-                ShutdownPeer::Error,
+                ShutdownPeer::Error("operation failed".into()),
                 true,
                 ShutdownVerdict::Allow,
             ),
@@ -3493,6 +3752,38 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn failed_process_enumeration_refuses_with_the_override_hint() {
+        let ancestry =
+            crate::process_ancestry::ancestry_from_parent_table(40, &[], |pid| match pid {
+                40 => Ok(Some((30, 100))),
+                30 => Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "process enumeration denied",
+                )),
+                _ => unreachable!(),
+            });
+        let Ancestry::Unreadable { pid, error } = ancestry else {
+            panic!("a process enumeration error must remain unreadable");
+        };
+        assert_eq!(pid, 30);
+
+        let verdict = shutdown_verdict(shutdown_input(
+            shutdown_claims(None, None, None, None),
+            ShutdownPeer::Ancestry(Ancestry::Unreadable { pid, error }),
+            false,
+        ));
+        let ShutdownVerdict::Refuse(ShutdownRefusal::Unverifiable(details)) = verdict else {
+            panic!("an unreadable process chain must refuse shutdown");
+        };
+        let message = super::unverifiable_shutdown_message(&details);
+        assert!(message.contains("process enumeration denied"), "{message}");
+        assert!(
+            message.contains("pass --i-am-inside to override"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -3514,60 +3805,126 @@ mod tests {
             shutdown_claims(Some("42"), Some("sid"), None, Some("known")),
             || panic!("known-session refusal must precede peer reads"),
         );
-        assert_eq!(claim_refusal, ShutdownVerdict::Refuse("known".into()));
+        assert_eq!(
+            claim_refusal,
+            ShutdownVerdict::Refuse(ShutdownRefusal::Hosted("known".into()))
+        );
 
-        let inside_refusal = shutdown_verdict_with_classifier(
+        let daemon_claim_refusal = shutdown_verdict_with_classifier(
             false,
-            shutdown_claims(None, None, None, None),
-            || ShutdownPeer::Ancestry(Ancestry::Inside),
+            shutdown_claims(Some("42"), Some("stale"), None, None),
+            || panic!("daemon-id plus stale session id must precede peer reads"),
         );
-        let mut response = None;
-        let mut shutdown_called = false;
-        finish_shutdown_verdict(
-            inside_refusal,
-            |identity| {
-                response = Some(Response::error(format!(
-                    "cannot stop this daemon from one of its own sessions ({identity}); pass --i-am-inside to override"
-                )));
-                Ok(())
-            },
-            || {
-                shutdown_called = true;
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(
-            matches!(response, Some(Response::Error(reason)) if reason == "cannot stop this daemon from one of its own sessions (session process ancestry); pass --i-am-inside to override")
+        assert_eq!(
+            daemon_claim_refusal,
+            ShutdownVerdict::Refuse(ShutdownRefusal::Hosted("stale".into()))
         );
-        assert!(!shutdown_called);
+    }
 
-        let fail_open_peers = [
-            ShutdownPeer::Ancestry(Ancestry::Unreadable {
-                pid: 7,
-                error: std::io::Error::other("denied"),
-            }),
-            ShutdownPeer::Unavailable,
-            ShutdownPeer::Error,
+    #[test]
+    fn shutdown_handler_refuses_unverifiable_peers_without_side_effects() {
+        let scratch_dir = std::env::temp_dir().join(format!(
+            "r{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&scratch_dir).expect("create shutdown refusal test runtime");
+        let socket_path = super::socket_path_in(&scratch_dir, "x");
+        let listener = crate::ipc::listen(&socket_path).expect("listen for shutdown refusal test");
+        let shutdown_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_calls = Arc::clone(&shutdown_calls);
+        let server = std::thread::spawn(move || {
+            let peers = [
+                ShutdownPeer::Ancestry(Ancestry::Unreadable {
+                    pid: 7,
+                    error: std::io::Error::other("denied"),
+                }),
+                ShutdownPeer::Unavailable,
+                ShutdownPeer::Error("credential lookup failed".into()),
+            ];
+            for peer in peers {
+                let stream = listener.accept().expect("accept shutdown refusal client");
+                let verdict = shutdown_verdict_with_classifier(
+                    false,
+                    shutdown_claims(None, None, None, None),
+                    || peer,
+                );
+                finish_shutdown_verdict(
+                    verdict,
+                    |reason| super::refuse_shutdown(&stream, reason),
+                    || {
+                        server_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        super::reply(&stream, &Response::Ok)
+                    },
+                )
+                .expect("respond to shutdown refusal client");
+            }
+        });
+
+        let expected = [
+            "cannot stop this daemon: cannot verify requester (pid 7: denied); pass --i-am-inside to override",
+            "cannot stop this daemon: cannot read requester identity (peer process ID unavailable); pass --i-am-inside to override",
+            "cannot stop this daemon: cannot read requester identity (credential lookup failed); pass --i-am-inside to override",
         ];
-        for peer in fail_open_peers {
-            let verdict = shutdown_verdict_with_classifier(
-                false,
-                shutdown_claims(None, None, None, None),
-                || peer,
-            );
-            assert_eq!(verdict, ShutdownVerdict::Allow);
+        for message in expected {
+            let response = read_adapter_response(&socket_path);
+            assert_eq!(response, Response::error(message));
+        }
+        server.join().expect("join shutdown refusal server");
+        assert_eq!(shutdown_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_dir_all(scratch_dir);
+    }
+
+    #[test]
+    fn refuse_hosted_shutdown_is_the_response_adapter() {
+        let scratch_dir = std::env::temp_dir().join(format!(
+            "r{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&scratch_dir).expect("create refusal adapter test runtime");
+        let socket_path = super::socket_path_in(&scratch_dir, "x");
+        let listener = crate::ipc::listen(&socket_path).expect("listen for refusal adapter test");
+        let server = std::thread::spawn(move || {
+            let stream = listener.accept().expect("accept refusal adapter client");
+            let mut shutdown_called = false;
             finish_shutdown_verdict(
-                verdict,
-                |_| panic!("allow must not send a refusal"),
+                ShutdownVerdict::Refuse(ShutdownRefusal::Hosted("session process ancestry".into())),
+                |reason| match reason {
+                    ShutdownRefusal::Hosted(identity) => {
+                        super::refuse_hosted_shutdown(&stream, identity)
+                    }
+                    ShutdownRefusal::Unverifiable(_) => {
+                        panic!("hosted refusal test received an unverifiable refusal")
+                    }
+                },
                 || {
                     shutdown_called = true;
                     Ok(())
                 },
             )
-            .unwrap();
-        }
-        assert!(shutdown_called);
+            .expect("send refusal through the production adapter");
+            assert!(!shutdown_called);
+        });
+        let response = read_adapter_response(&socket_path);
+        assert_eq!(
+            response,
+            Response::error(
+                "cannot stop this daemon from one of its own sessions (session process ancestry); pass --i-am-inside to override"
+            )
+        );
+        server.join().expect("join refusal adapter server");
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_dir_all(scratch_dir);
     }
 
     #[test]
