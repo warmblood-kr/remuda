@@ -2411,19 +2411,38 @@ mod binding_tests {
         })
     }
 
+    fn new_test_socket_path() -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            % 100_000_000;
+        let base = std::env::temp_dir().join(format!("rni-{}-{stamp:08}", std::process::id()));
+        crate::daemon::socket_path_in(&base, "script-test")
+    }
+
+    fn cleanup_new_test_socket(_path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            let _ = std::fs::remove_file(_path);
+            if let Some(parent) = _path.parent() {
+                let _ = std::fs::remove_dir(parent);
+                if let Some(base) = parent.parent() {
+                    let _ = std::fs::remove_dir(base);
+                }
+            }
+        }
+    }
+
     #[test]
     fn new_returns_the_spawned_identity_across_same_name_replacement() {
         use interprocess::local_socket::traits::Listener as _;
         use interprocess::local_socket::ListenerNonblockingMode;
 
-        let path = std::env::temp_dir().join(format!(
-            "remuda-new-instance-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = new_test_socket_path();
+        #[cfg(unix)]
+        std::fs::create_dir_all(path.parent().expect("Unix socket parent"))
+            .expect("create Unix socket parent");
         let listener = crate::ipc::listen(&path).expect("test IPC listener");
         listener
             .set_nonblocking(ListenerNonblockingMode::Accept)
@@ -2460,7 +2479,7 @@ mod binding_tests {
         let actual = lua.join().expect("Lua binding thread");
         stop_tx.send(()).expect("stop fake daemon");
         server.join().expect("fake daemon thread");
-        let _ = std::fs::remove_file(path);
+        cleanup_new_test_socket(&path);
 
         assert_eq!(
             actual.expect("new binding returned"),
