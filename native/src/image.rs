@@ -31,6 +31,9 @@ use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
+#[cfg(test)]
+use std::sync::mpsc::Receiver;
+
 #[path = "timers.rs"]
 pub(crate) mod timers;
 
@@ -248,6 +251,11 @@ enum JobKind {
     ReadCaller,
     #[cfg(test)]
     FireTimers,
+    #[cfg(test)]
+    InstallTestBarrier {
+        entered: Sender<()>,
+        release: Arc<Mutex<Receiver<()>>>,
+    },
 }
 
 /// How much the daemon can say about the process that submitted this Eval.
@@ -582,6 +590,24 @@ impl Image {
             .unwrap();
     }
 
+    #[cfg(test)]
+    fn install_test_barrier(&self) -> (Receiver<()>, Sender<()>) {
+        let (entered, entered_rx) = channel();
+        let (release_tx, release) = channel();
+        let (reply, answer) = channel();
+        self.jobs
+            .send(Job {
+                kind: JobKind::InstallTestBarrier {
+                    entered,
+                    release: Arc::new(Mutex::new(release)),
+                },
+                reply: Some(reply),
+            })
+            .unwrap();
+        answer.recv().unwrap().unwrap();
+        (entered_rx, release_tx)
+    }
+
     pub fn session_output_notifier(&self, name: &str, id: &str) -> SessionOutputNotifier {
         let notifier = SessionOutputNotifier {
             jobs: self.jobs.clone(),
@@ -848,6 +874,26 @@ fn process_job(
             }
             #[cfg(test)]
             JobKind::FireTimers => Ok(String::new()),
+            #[cfg(test)]
+            JobKind::InstallTestBarrier { entered, release } => {
+                *caller.borrow_mut() = CallerContext::default();
+                let entered = entered.clone();
+                let release = Arc::clone(release);
+                let barrier = lua
+                    .create_function(move |_, ()| {
+                        entered.send(()).map_err(mlua::Error::external)?;
+                        let release = release
+                            .lock()
+                            .map_err(|_| mlua::Error::runtime("test barrier mutex poisoned"))?;
+                        release.recv().map_err(mlua::Error::external)?;
+                        Ok(())
+                    })
+                    .map_err(|error| error.to_string())?;
+                lua.globals()
+                    .set("__remuda_test_barrier", barrier)
+                    .map_err(|error| error.to_string())?;
+                Ok(String::new())
+            }
         },
     }
 }
@@ -1621,7 +1667,6 @@ mod tests {
         use super::{Job, JobKind};
         use remuda_core::{ManualClock, Registry, ScriptedAgent, Session};
         use std::sync::Arc;
-        use std::time::{Duration, Instant};
 
         let socket = std::env::temp_dir().join(format!(
             "remuda-caller-queued-{}-{}.sock",
@@ -1631,8 +1676,6 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let marker = socket.with_extension("started");
-        let marker_lua = marker.to_string_lossy().replace('\\', "/");
         let registry = Arc::new(Registry::new());
         registry
             .register(Session::new(
@@ -1655,20 +1698,12 @@ mod tests {
             )
             .unwrap();
 
+        let (entered, release) = image.install_test_barrier();
         let blocking_image = image.clone();
         let blocker = std::thread::spawn(move || {
-            blocking_image.eval(
-                &format!(
-                    "local f=assert(io.open('{marker_lua}','w')); f:write('ready'); f:close(); local until_time=os.clock()+0.5; while os.clock()<until_time do end; return 'released'"
-                ),
-                None,
-            )
+            blocking_image.eval("__remuda_test_barrier(); return 'released'", None)
         });
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !marker.exists() {
-            assert!(Instant::now() < deadline, "image did not enter its barrier");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        entered.recv().unwrap();
 
         let caller = CallerContext {
             kind: CallerKind::Session,
@@ -1689,6 +1724,7 @@ mod tests {
             })
             .unwrap();
         session.terminate().unwrap();
+        release.send(()).unwrap();
 
         assert_eq!(blocker.join().unwrap().unwrap(), "released");
         let error = answer.recv().unwrap().unwrap_err();
@@ -1700,7 +1736,6 @@ mod tests {
     fn mcp_dispatch_admitted_before_liveness_commit_finishes() {
         use remuda_core::{ManualClock, Registry, ScriptedAgent, Session};
         use std::sync::Arc;
-        use std::time::{Duration, Instant};
 
         let socket = std::env::temp_dir().join(format!(
             "remuda-caller-admitted-{}-{}.sock",
@@ -1710,8 +1745,6 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let marker = socket.with_extension("started");
-        let marker_lua = marker.to_string_lossy().replace('\\', "/");
         let registry = Arc::new(Registry::new());
         registry
             .register(Session::new(
@@ -1731,11 +1764,10 @@ mod tests {
             Arc::clone(&registry),
             Arc::new(crate::tick::Counters::default()),
         );
+        let (entered, release) = image.install_test_barrier();
         image
             .eval(
-                &format!(
-                    "probe_effects = 0; remuda.tool{{ name='probe', about='A protected side-effect probe for caller liveness validation.', run=function() probe_effects = probe_effects + 1; local f=assert(io.open('{marker_lua}','w')); f:write('admitted'); f:close(); local until_time=os.clock()+0.3; while os.clock()<until_time do end; return 'admitted' end }}"
-                ),
+                "probe_effects = 0; remuda.tool{ name='probe', about='A protected side-effect probe for caller liveness validation.', run=function() probe_effects = probe_effects + 1; if probe_effects == 1 then __remuda_test_barrier() end; return 'admitted' end }",
                 None,
             )
             .unwrap();
@@ -1748,15 +1780,259 @@ mod tests {
                 caller,
             )
         });
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !marker.exists() {
-            assert!(Instant::now() < deadline, "handler did not pass validation");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        entered.recv().unwrap();
         session.terminate().unwrap();
+        release.send(()).unwrap();
 
         assert_eq!(dispatch.join().unwrap().unwrap(), "admitted:false:1");
         assert_eq!(image.eval("return probe_effects", None).unwrap(), "1");
+    }
+
+    #[test]
+    fn mod_command_dispatch_rejects_dead_and_replaced_callers() {
+        use remuda_core::{ManualClock, Registry, ScriptedAgent, Session};
+        use std::sync::Arc;
+
+        let socket = std::env::temp_dir().join(format!(
+            "remuda-command-live-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let registry = Arc::new(Registry::new());
+        registry
+            .register(Session::new(
+                "command-caller",
+                Box::new(ScriptedAgent::new(vec![])),
+                Arc::new(ManualClock::new()),
+            ))
+            .unwrap();
+        let session = registry.get("command-caller").unwrap();
+        let caller = || CallerContext {
+            kind: CallerKind::Session,
+            session: Some("command-caller".into()),
+            instance_id: Some(session.instance_id().to_owned()),
+        };
+        let image = Image::spawn(
+            &socket,
+            Arc::clone(&registry),
+            Arc::new(crate::tick::Counters::default()),
+        );
+        image
+            .eval(
+                "command_effects=0; remuda.extension_command('probe', function() command_effects=command_effects+1; return 'ran' end)",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            image
+                .eval_request(
+                    "return remuda._dispatch_extension_command('probe', {}, {})",
+                    None,
+                    caller(),
+                )
+                .unwrap(),
+            "ran"
+        );
+
+        session.terminate().unwrap();
+        let error = image
+            .eval_request(
+                "remuda._caller_live=function() return true end; return remuda._dispatch_extension_command('probe', {}, {})",
+                None,
+                caller(),
+            )
+            .unwrap_err();
+        assert!(error.contains("no longer live"), "{error}");
+
+        registry.remove("command-caller").unwrap();
+        registry
+            .register(Session::new(
+                "command-caller",
+                Box::new(ScriptedAgent::new(vec![])),
+                Arc::new(ManualClock::new()),
+            ))
+            .unwrap();
+        let error = image
+            .eval_request(
+                "return remuda._dispatch_extension_command('probe', {}, {})",
+                None,
+                caller(),
+            )
+            .unwrap_err();
+        assert!(error.contains("instance changed"), "{error}");
+        assert_eq!(image.eval("return command_effects", None).unwrap(), "1");
+    }
+
+    #[test]
+    fn caller_live_refuses_missing_identity_and_unreadable_session() {
+        use remuda_core::agent::{AgentProcess, Cursor, Result, ScriptedAgent, Size};
+        use remuda_core::{ManualClock, Registry, Session};
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::sync::Arc;
+
+        struct PanicOutputAgent(ScriptedAgent);
+        impl AgentProcess for PanicOutputAgent {
+            fn write(&mut self, bytes: &[u8]) -> Result<()> {
+                self.0.write(bytes)
+            }
+            fn screen_text(&mut self) -> Result<String> {
+                self.0.screen_text()
+            }
+            fn cursor(&mut self) -> Result<Cursor> {
+                self.0.cursor()
+            }
+            fn is_alive(&mut self) -> bool {
+                self.0.is_alive()
+            }
+            fn output_version(&mut self) -> Option<u64> {
+                panic!("simulated unreadable session lock")
+            }
+            fn terminate(&mut self) -> Result<()> {
+                self.0.terminate()
+            }
+            fn size(&self) -> Size {
+                self.0.size()
+            }
+        }
+
+        let socket = std::env::temp_dir().join(format!(
+            "remuda-caller-unreadable-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let registry = Arc::new(Registry::new());
+        let session = registry
+            .register(Session::new(
+                "unreadable",
+                Box::new(PanicOutputAgent(ScriptedAgent::new(vec![]))),
+                Arc::new(ManualClock::new()),
+            ))
+            .unwrap();
+        let instance_id = session.instance_id().to_owned();
+        let _ = catch_unwind(AssertUnwindSafe(|| session.output_version()));
+        let image = Image::spawn(
+            &socket,
+            Arc::clone(&registry),
+            Arc::new(crate::tick::Counters::default()),
+        );
+        image
+            .eval("protected_effects=0; remuda.tool{ name='probe', about='A protected side-effect probe for caller liveness validation.', run=function() protected_effects=protected_effects+1; return 'ran' end }", None)
+            .unwrap();
+
+        for (name, id, expected) in [
+            (None, Some(instance_id.clone()), "session name is missing"),
+            (Some("unreadable".into()), None, "instance_id is missing"),
+        ] {
+            let error = image
+                .eval_request(
+                    "return remuda._call('probe', {}, {})",
+                    None,
+                    CallerContext {
+                        kind: CallerKind::Session,
+                        session: name,
+                        instance_id: id,
+                    },
+                )
+                .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+        let error = image
+            .eval_request(
+                "return remuda._call('probe', {}, {})",
+                None,
+                CallerContext {
+                    kind: CallerKind::Session,
+                    session: Some("unreadable".into()),
+                    instance_id: Some(instance_id),
+                },
+            )
+            .unwrap_err();
+        assert!(error.contains("no longer live"), "{error}");
+        assert_eq!(image.eval("return protected_effects", None).unwrap(), "0");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_owner_checks_dead_refusal_and_live_descendant_admission() {
+        use remuda_core::{ManualClock, Registry, ScriptedAgent, Session};
+        use std::sync::Arc;
+
+        let socket = std::env::temp_dir().join(format!(
+            "remuda-windows-caller-live-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let registry = Arc::new(Registry::new());
+        let mut dead_owner = ScriptedAgent::new(vec![]).owning(80);
+        dead_owner.kill();
+        let dead = registry
+            .register(Session::new(
+                "dead-job-owner",
+                Box::new(dead_owner),
+                Arc::new(ManualClock::new()),
+            ))
+            .unwrap();
+        let live = registry
+            .register(Session::new(
+                "live-job-owner",
+                Box::new(ScriptedAgent::new(vec![]).owning(81)),
+                Arc::new(ManualClock::new()),
+            ))
+            .unwrap();
+        assert_eq!(
+            registry.session_owning(80, None).unwrap().as_deref(),
+            Some("dead-job-owner")
+        );
+        assert_eq!(
+            registry.session_owning(81, None).unwrap().as_deref(),
+            Some("live-job-owner")
+        );
+
+        let image = Image::spawn(
+            &socket,
+            Arc::clone(&registry),
+            Arc::new(crate::tick::Counters::default()),
+        );
+        image
+            .eval("windows_effects=0; remuda.tool{ name='probe', about='A protected side-effect probe for caller liveness validation.', run=function() windows_effects=windows_effects+1; return 'ran' end }", None)
+            .unwrap();
+        let error = image
+            .eval_request(
+                "return remuda._call('probe', {}, {})",
+                None,
+                CallerContext {
+                    kind: CallerKind::Session,
+                    session: Some("dead-job-owner".into()),
+                    instance_id: Some(dead.instance_id().to_owned()),
+                },
+            )
+            .unwrap_err();
+        assert!(error.contains("no longer live"), "{error}");
+        assert_eq!(image.eval("return windows_effects", None).unwrap(), "0");
+        assert_eq!(
+            image
+                .eval_request(
+                    "return remuda._call('probe', {}, {})",
+                    None,
+                    CallerContext {
+                        kind: CallerKind::Session,
+                        session: Some("live-job-owner".into()),
+                        instance_id: Some(live.instance_id().to_owned()),
+                    },
+                )
+                .unwrap(),
+            "ran"
+        );
+        assert_eq!(image.eval("return windows_effects", None).unwrap(), "1");
     }
 
     #[test]

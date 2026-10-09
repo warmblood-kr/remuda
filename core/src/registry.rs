@@ -173,10 +173,7 @@ impl Registry {
         self.lock().get(name).map(Arc::clone)
     }
 
-    /// Validate a caller identity while holding the same registry lock used by
-    /// removal and replacement. The successful check is the authorization
-    /// linearization point; a later removal does not revoke an already admitted
-    /// operation, while a removal that wins first is observed here.
+    /// Validate one caller launch atomically with removal and replacement.
     pub fn validate_live_instance(
         &self,
         name: &str,

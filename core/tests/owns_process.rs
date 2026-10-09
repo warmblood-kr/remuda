@@ -49,8 +49,13 @@ fn first_observed_dead_session_never_revives_in_list_or_live_processes() {
             Arc::new(ManualClock::new()),
         ))
         .unwrap();
+    let instance_id = registry.get("flap").unwrap().instance_id().to_owned();
 
     assert!(!registry.list()[0].alive);
+    assert_eq!(
+        registry.validate_live_instance("flap", &instance_id),
+        Err(remuda_core::registry::LiveInstanceError::NotLive)
+    );
     assert!(registry.live_processes().is_empty());
     assert!(!registry.list()[0].alive);
     assert_eq!(
@@ -107,7 +112,52 @@ fn failed_terminate_does_not_latch_session_dead() {
     assert!(registry.close("refuses").unwrap().is_err());
     assert!(alive.load(Ordering::SeqCst));
     assert!(session.is_alive());
+    assert!(registry
+        .validate_live_instance("refuses", session.instance_id())
+        .is_ok());
     assert_eq!(registry.live_processes().len(), 1);
+}
+
+#[test]
+fn a_live_owner_with_a_descendant_process_passes_runtime_validation() {
+    let registry = Registry::new();
+    let checks = Arc::new(AtomicUsize::new(1));
+    let session = registry
+        .register(Session::new(
+            "live-owner",
+            Box::new(FlappingAgent(checks)),
+            Arc::new(ManualClock::new()),
+        ))
+        .unwrap();
+    assert_eq!(
+        registry.session_owning(80, None).unwrap().as_deref(),
+        Some("live-owner")
+    );
+    assert!(registry
+        .validate_live_instance("live-owner", session.instance_id())
+        .is_ok());
+}
+
+#[test]
+fn a_dead_owner_keeps_descendant_provenance_but_fails_runtime_validation() {
+    let registry = Registry::new();
+    let mut agent = ScriptedAgent::new(vec![]).owning(82);
+    agent.kill();
+    let session = registry
+        .register(Session::new(
+            "dead-owner",
+            Box::new(agent),
+            Arc::new(ManualClock::new()),
+        ))
+        .unwrap();
+    assert_eq!(
+        registry.session_owning(82, None).unwrap().as_deref(),
+        Some("dead-owner")
+    );
+    assert_eq!(
+        registry.validate_live_instance("dead-owner", session.instance_id()),
+        Err(remuda_core::registry::LiveInstanceError::NotLive)
+    );
 }
 
 #[test]
