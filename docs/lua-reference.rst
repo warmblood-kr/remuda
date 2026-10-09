@@ -39,7 +39,7 @@ buffers
 caller
 ------
 
-``caller() -> {kind: 'session'|'outside'|'unknown', session?: string}`` — ADVISORY only: peer ancestry identifies a managed session, outside, or unknown; outside does not prove operator identity. Same-UID Lua can run ``remuda -e`` and wrap ``_dispatch_extension_command``; Windows parent PIDs may be stale or chosen, so this is not an authentication boundary.
+``caller() -> {kind: 'session'|'outside'|'unknown', session?: string, instance_id?: string}`` — ADVISORY only: peer ancestry identifies a managed session, outside, or unknown; outside does not prove operator identity. Same-UID Lua can run ``remuda -e`` and wrap ``_dispatch_extension_command``; Windows parent PIDs may be stale or chosen, so this is not an authentication boundary.
 
 cancel
 ------
@@ -60,6 +60,11 @@ clear_hooks
 -----------
 
 ``clear_hooks(opts) -> nil`` — Remove every hook registered under a group.
+
+clear_input
+-----------
+
+``clear_input(name, key) -> {cleared = string|nil}`` — Write one trusted clear-line key to a session as an atomic input act. The core currently allows only exact Ctrl+U (byte 0x15), verified for Codex; use it only when the target agent's configured binding clears to the start of its input. Other keys are refused. Keys are limited to 1–16 bytes and four calls per session per second. Refuses during recent human typing or while a PTY writer is busy. Terminal screens do not generally identify composer contents, so `cleared` is nil when unknown ([Codex issue #20698](https://github.com/openai/codex/issues/20698)).
 
 cli
 ---
@@ -154,7 +159,7 @@ expect_option
 extension_command
 -----------------
 
-``extension_command(name, handler(args, caller)) -> nil`` — Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind and session fields, plus forwarded env/stdin values; kind outside does not establish operator identity.
+``extension_command(name, handler(args, caller)) -> nil`` — Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind, session and instance_id fields, plus forwarded env/stdin values; kind outside does not establish operator identity.
 
 fail
 ----
@@ -304,7 +309,7 @@ mkdir
 new
 ---
 
-``new(name?, argv?, cwd?, env?) -> string`` — Deprecated alias for `remuda.session.new`.
+``new(name?, argv?, cwd?, env?) -> name, instance_id`` — Deprecated alias for `remuda.session.new`; returns name and registered instance_id.
 
 on
 --
@@ -399,7 +404,7 @@ session.list
 session.new
 -----------
 
-``session.new(name?, argv?, cwd?, env?) -> string`` — Start a session, defaulting the command to the user's shell.
+``session.new(name?, argv?, cwd?, env?) -> name, instance_id`` — Start a session and return its name and registered instance_id.
 
 session.resize
 --------------

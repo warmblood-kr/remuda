@@ -67,15 +67,20 @@ end
 -- not be used for authorization. Capture the native word before user Lua can
 -- replace remuda.caller; its result is merged into the handler's caller data.
 local native_caller = remuda.caller
+local native_caller_live = remuda._caller_live
 function remuda._dispatch_extension_command(name, args, caller)
   local handler = remuda._extension_commands[name]
   if not handler then
     error("mod command " .. tostring(name) .. " is not loaded; run `remuda " .. tostring(name) .. "` first", 2)
   end
   local context = native_caller()
+  if context.kind == "session" then
+    native_caller_live(context.session, context.instance_id)
+  end
   local caller_data = type(caller) == "table" and caller or {}
   caller_data.kind = context.kind
   caller_data.session = context.session
+  caller_data.instance_id = context.instance_id
   return handler(args or {}, caller_data)
 end
 
@@ -88,7 +93,7 @@ register("after", "Run a callback once after a delay without blocking the Lua im
 register("every", "Run a callback periodically without blocking the Lua image; cancel with handle:cancel(). If a callback finishes late, the next tick comes one interval after it ends, so the phase shifts and ticks do not burst to catch up.", "every(seconds, fn) -> handle")
 register("tools", "The `remuda.tool` registry table, keyed by tool name.", "table")
 register("_extension_commands", "Handlers registered for installed mod commands.", "table")
-register("extension_command", "Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind and session fields, plus forwarded env/stdin values; kind outside does not establish operator identity.", "extension_command(name, handler(args, caller)) -> nil")
+register("extension_command", "Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind, session and instance_id fields, plus forwarded env/stdin values; kind outside does not establish operator identity.", "extension_command(name, handler(args, caller)) -> nil")
 register("_dispatch_extension_command", "Dispatch arguments and caller context to a loaded mod command handler.", "_dispatch_extension_command(name, args, caller) -> value")
 register("_exec_commands", "Load a mod and run its optional commands hook without starting it; legacy mods keep their existing start behavior.", "_exec_commands(name) -> nil")
 
@@ -1808,8 +1813,8 @@ setmetatable(remuda.session, {
 register("session", "Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach and resize.",
   "session(name) -> handle; table {list, new, close, attach, resize}")
 register("session.list", "List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.", "session.list() -> {session...}")
-register("session.new", "Start a session, defaulting the command to the user's shell.",
-  "session.new(name?, argv?, cwd?, env?) -> string")
+register("session.new", "Start a session and return its name and registered instance_id.",
+  "session.new(name?, argv?, cwd?, env?) -> name, instance_id")
 register("session.close", "End a session, live or already self-exited.", "session.close(name) -> nil")
 register("session.attach", "Enter raw mode on a session.", "session.attach(name) -> nil")
 register("session.resize", "Resize a session's terminal (cols 20..1000, rows 24..500).", "session.resize(name, cols, rows) -> true | nil, err")
@@ -1819,7 +1824,7 @@ remuda.new = deprecated_alias("new", "new", flat_session_words.new)
 remuda.close = deprecated_alias("close", "close", flat_session_words.close)
 remuda.attach = deprecated_alias("attach", "attach", flat_session_words.attach)
 register("ls", "Deprecated alias for `remuda.session.list`.", "ls() -> {session...}")
-register("new", "Deprecated alias for `remuda.session.new`.", "new(name?, argv?, cwd?, env?) -> string")
+register("new", "Deprecated alias for `remuda.session.new`; returns name and registered instance_id.", "new(name?, argv?, cwd?, env?) -> name, instance_id")
 register("close", "Deprecated alias for `remuda.session.close`.", "close(name) -> nil")
 register("attach", "Deprecated alias for `remuda.session.attach`.", "attach(name) -> nil")
 
@@ -1947,9 +1952,19 @@ function remuda._call(name, arguments, caller)
       error(name .. " needs `" .. key .. "`", 0)
     end
   end
-  -- `caller` is daemon-issued process context, never MCP input.  Existing
-  -- tools keep working because Lua ignores the optional second argument.
-  local answer = word(arguments, caller)
+  -- Preserve only the bridge capability. Native identity is captured before
+  -- extensions load and always replaces any supplied caller fields.
+  local context = native_caller()
+  if context.kind == "session" then
+    native_caller_live(context.session, context.instance_id)
+  end
+  local caller_data = {
+    capability = type(caller) == "table" and caller.capability or nil,
+    kind = context.kind,
+    session = context.session,
+    instance_id = context.instance_id,
+  }
+  local answer = word(arguments, caller_data)
   if answer == nil then
     return ""
   end
@@ -1958,7 +1973,8 @@ function remuda._call(name, arguments, caller)
   end
   return tostring(answer)
 end
-register("_call", "Dispatch one MCP tools/call by name.", "_call(name, arguments, caller) -> string")
+register("_caller_live", "Check that the captured caller session name and instance_id still identify the same live registered launch. Missing, changed, exited, or unreadable sessions raise an error.", "_caller_live(session, instance_id) -> true")
+register("_call", "Dispatch one MCP tools/call by name. Always supplies a fresh caller table; only the incoming capability is retained. A captured session caller is revalidated immediately before dispatch.", "_call(name, arguments, caller) -> string")
 
 -- Input is expressed as two words: one contiguous text burst, then a
 -- separately-timed submit key after the composer shows the text.

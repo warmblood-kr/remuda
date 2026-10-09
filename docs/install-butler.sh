@@ -204,7 +204,10 @@ status "wrote $init_lua"
 # butler` a second time. If butler does not come back on its own, the
 # loader did not do its job.
 status "restarting the daemon to verify the new loader actually re-registers butler..."
-env -u PWD remuda stop -f >&2
+if ! env -u PWD remuda stop -f >&2; then
+	status "restart check failed: the daemon did not stop; it may still be running, and the new loader was not verified. Resolve the stop error or stop the intended daemon explicitly, then rerun this installer."
+	exit 1
+fi
 
 # `ls` is read-only and must not create the daemon it is checking for. Use
 # eval (which may create state) as the explicit startup path; the boot loader

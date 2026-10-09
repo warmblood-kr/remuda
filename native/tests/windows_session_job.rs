@@ -358,3 +358,147 @@ fn a_grandchild_of_a_listed_session_is_a_session_caller() {
     ));
     assert_eq!(kind, "session");
 }
+
+#[test]
+fn a_dead_windows_job_owner_is_refused_before_a_mcp_tool_can_run() {
+    let scratch = Scratch::new("dead-owner-call");
+    let mut command = spawn::base_command(&scratch.0);
+    command.env("REMUDA_KEEP_EXITED", "1");
+    let _daemon = spawn::spawn_and_wait(command, &scratch.0);
+    let socket = daemon::socket_path_in(&scratch.0, "s");
+    assert!(matches!(
+        client::request(
+            &socket,
+            &Request::Eval {
+                code: "mcp_effects=0; remuda.tool{ name='probe', about='A protected Windows job caller probe.', run=function() mcp_effects=mcp_effects+1; return 'ran' end }".into(),
+                name: None,
+            },
+        )
+        .expect("register test tool"),
+        Response::Value(_)
+    ));
+
+    let parent_release = scratch.0.join("parent.release");
+    let descendant_release = scratch.0.join("descendant.release");
+    let started = scratch.0.join("descendant.started");
+    let live_reply = scratch.0.join("live-mcp.json");
+    let dead_reply = scratch.0.join("dead-mcp.json");
+    let child_script = scratch.0.join("mcp-child.cmd");
+    let remuda = env!("CARGO_BIN_EXE_remuda");
+    let live_request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "probe", "arguments": {}}
+    })
+    .to_string();
+    let dead_request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "probe", "arguments": {}}
+    })
+    .to_string();
+    let live_call = format!(
+        "(echo {live_request}) | \"{remuda}\" -s s mcp >\"{}\"\r\n",
+        live_reply.display()
+    );
+    let dead_call = format!(
+        "(echo {dead_request}) | \"{remuda}\" -s s mcp >\"{}\"\r\n",
+        dead_reply.display()
+    );
+    let child_body = format!(
+        "@echo off\r\n>\"{}\" echo started\r\n{}:wait\r\nif exist \"{}\" goto ready\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n:ready\r\n{}",
+        started.display(),
+        live_call,
+        descendant_release.display(),
+        dead_call,
+    );
+    std::fs::write(&child_script, child_body).expect("write descendant MCP script");
+    let session_script = scratch.0.join("session.cmd");
+    let session_body = format!(
+        "@echo off\r\nstart \"\" /min cmd.exe /c \"{}\"\r\n:wait\r\nif exist \"{}\" goto done\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n:done\r\n",
+        child_script.display(),
+        parent_release.display(),
+    );
+    std::fs::write(&session_script, session_body).expect("write session script");
+
+    assert!(matches!(
+        client::request(
+            &socket,
+            &Request::New {
+                name: Some("windows-owner".into()),
+                command: vec![
+                    "cmd.exe".into(),
+                    "/c".into(),
+                    session_script.to_string_lossy().into_owned()
+                ],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: None,
+            },
+        )
+        .expect("start Windows session"),
+        Response::Value(_)
+    ));
+    assert_eq!(answer(&started), "started");
+    let live = wait_json(&live_reply);
+    assert_eq!(live["result"]["isError"], false, "{live}");
+    assert_eq!(
+        client::request(
+            &socket,
+            &Request::Eval {
+                code: "return mcp_effects".into(),
+                name: None,
+            },
+        )
+        .expect("read live effect count"),
+        Response::Value("1".into())
+    );
+
+    std::fs::write(&parent_release, "exit").expect("release session parent");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let response = client::request(&socket, &Request::List).expect("list retained owner");
+        let dead = matches!(
+            &response,
+            Response::Sessions(sessions)
+                if sessions.iter().any(|session| session.name == "windows-owner" && !session.alive)
+        );
+        if dead {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session did not commit death: {response:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    std::fs::write(&descendant_release, "call").expect("release descendant call");
+    let dead = wait_json(&dead_reply);
+    assert_eq!(dead["result"]["isError"], true, "{dead}");
+    assert_eq!(
+        client::request(
+            &socket,
+            &Request::Eval {
+                code: "return mcp_effects".into(),
+                name: None,
+            },
+        )
+        .expect("verify refused call had no handler effect"),
+        Response::Value("1".into())
+    );
+}
+
+fn wait_json(path: &Path) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if let Ok(value) = serde_json::from_str(&contents) {
+                return value;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no MCP JSON response at {path:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
