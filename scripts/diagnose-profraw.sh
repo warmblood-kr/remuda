@@ -14,7 +14,7 @@ profdata=${2:-$(t 30 find "$(t 30 rustc --print sysroot)" -name llvm-profdata -t
 profdata_name=${profdata:-not found}
 echo "llvm-profdata: ${profdata_name##*/}"
 
-target=$(cd "$dir" 2>/dev/null && pwd -P || true)
+target=$(cd -- "$dir" 2>/dev/null && pwd -P || true)
 
 profile_signature() {
   name=$1
@@ -38,7 +38,7 @@ print_target_processes() {
     ppid=$(awk '/^PPid:/ {print $2; exit}' "$proc/status" 2>/dev/null)
     cmd=$(tr '\000' ' ' < "$proc/cmdline" 2>/dev/null | cut -c1-240)
     [ -n "$cmd" ] || cmd='[exited or unavailable]'
-    if [ -n "${HOME:-}" ]; then cmd=$(printf '%s' "$cmd" | sed "s|$HOME|~|g"); fi
+    if [ -n "${HOME:-}" ]; then cmd=${cmd//"$HOME"/"~"}; fi
     printf '  %s %s %s\n' "$pid" "${ppid:-?}" "$cmd"
   done
 }
@@ -48,6 +48,10 @@ listing=$(for f in "$dir"/*.profraw; do
 done)
 echo "== $(printf '%s\n' "$listing" | grep -c .) profiles; newest (size, mtime)"
 printf '%s\n' "$listing" | sort -k2,2 -rn | head -n 15
+# %b needs an ELF build-id; without one every process writes default.profraw.
+no_id=$(printf '%s\n' "$listing" | grep -c " default\.profraw\$")
+echo "== profiles named default.profraw (missing build-id for %b): ${no_id:-0}"
+[ "${no_id:-0}" -eq 0 ] || echo "   WARNING: %b fell back to default.profraw; revert LLVM_PROFILE_FILE_NAME in ci.yml (#624)"
 
 # The trailing %m value identifies the instrumented binary.
 echo "== profiles whose size differs from the most common size for their signature"
