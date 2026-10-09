@@ -67,12 +67,16 @@ end
 -- not be used for authorization. Capture the native word before user Lua can
 -- replace remuda.caller; its result is merged into the handler's caller data.
 local native_caller = remuda.caller
+local native_caller_live = remuda._caller_live
 function remuda._dispatch_extension_command(name, args, caller)
   local handler = remuda._extension_commands[name]
   if not handler then
     error("mod command " .. tostring(name) .. " is not loaded; run `remuda " .. tostring(name) .. "` first", 2)
   end
   local context = native_caller()
+  if context.kind == "session" then
+    native_caller_live(context.session, context.instance_id)
+  end
   local caller_data = type(caller) == "table" and caller or {}
   caller_data.kind = context.kind
   caller_data.session = context.session
@@ -1951,6 +1955,9 @@ function remuda._call(name, arguments, caller)
   -- Preserve only the bridge capability. Native identity is captured before
   -- extensions load and always replaces any supplied caller fields.
   local context = native_caller()
+  if context.kind == "session" then
+    native_caller_live(context.session, context.instance_id)
+  end
   local caller_data = {
     capability = type(caller) == "table" and caller.capability or nil,
     kind = context.kind,
@@ -1966,7 +1973,8 @@ function remuda._call(name, arguments, caller)
   end
   return tostring(answer)
 end
-register("_call", "Dispatch one MCP tools/call by name. Always supplies a fresh caller table; only the incoming capability is retained. instance_id identifies the launch captured for this request, is not secret or proof of liveness, and may be stale after exit until runtime validation is added.", "_call(name, arguments, caller) -> string")
+register("_caller_live", "Check that the captured caller session name and instance_id still identify the same live registered launch. Missing, changed, exited, or unreadable sessions raise an error.", "_caller_live(session, instance_id) -> true")
+register("_call", "Dispatch one MCP tools/call by name. Always supplies a fresh caller table; only the incoming capability is retained. A captured session caller is revalidated immediately before dispatch.", "_call(name, arguments, caller) -> string")
 
 -- Input is expressed as two words: one contiguous text burst, then a
 -- separately-timed submit key after the composer shows the text.
