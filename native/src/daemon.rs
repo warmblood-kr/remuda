@@ -1582,6 +1582,13 @@ fn handle_request(
             })
         }
 
+        Request::ClearInput { name, key } => respond(
+            &stream,
+            &name,
+            registry.clear_input(&name, &key),
+            |cleared| Response::ClearInput { cleared },
+        ),
+
         Request::Input {
             name,
             instance_id,

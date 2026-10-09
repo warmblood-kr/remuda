@@ -357,6 +357,24 @@ impl AgentWriter for PtyInputWriter {
         }
     }
 
+    fn write_bounded_if_idle(&self, bytes: &[u8]) -> Result<()> {
+        // `submit_bounded` reserves the worker's single-flight slot under its
+        // state lock and refuses an active write without waiting or queuing.
+        let (sequence, receiver) = self.submit_bounded(bytes)?;
+        match receiver.recv_timeout(self.timeout) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.record_stalled_sequence(sequence);
+                Err(AgentError::WriteTimeout {
+                    timeout: self.timeout,
+                })
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(AgentError::Io("pty writer worker stopped".into()))
+            }
+        }
+    }
+
     fn write_to_completion(&self, bytes: &[u8]) -> Result<()> {
         self.write_to_completion_while(bytes, &|| false)
     }
@@ -1306,6 +1324,10 @@ mod input_writer_tests {
         assert!(writer.is_busy());
         assert!(matches!(
             writer.write_bounded(b"not submitted"),
+            Err(AgentError::Busy)
+        ));
+        assert!(matches!(
+            writer.write_bounded_if_idle(b"clear must not queue"),
             Err(AgentError::Busy)
         ));
 
