@@ -33,6 +33,38 @@ fn daemon_at(path: &Path, dir: &Path) -> spawn::Daemon {
 }
 
 #[test]
+fn new_returns_name_then_instance_through_the_session_wrapper() {
+    let dir = scratch("new-instance-return");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path, &dir);
+    let missing_command = format!("remuda-no-such-command-{}", std::process::id());
+    let source = format!(
+        r#"
+        local legacy_name = remuda.new("legacy-return", {{}})
+        assert(legacy_name == "legacy-return", "single assignment must still receive the name")
+
+        local name, instance_id = remuda.session.new("session-return", {{}})
+        assert(name == "session-return", "session.new must return the name first")
+        assert(type(instance_id) == "string" and #instance_id > 0,
+          "session.new must return the spawned instance id second")
+        local found = false
+        for _, row in ipairs(remuda.session.list()) do
+          if row.name == name and row.instance_id == instance_id then found = true end
+        end
+        assert(found, "returned identity must match the created session")
+
+        local ok, failure, leaked_id = pcall(function()
+          return remuda.session.new("failed-return", {{{missing_command:?}}})
+        end)
+        assert(not ok,
+          "a failed launch must remain an error: " .. tostring(failure))
+        assert(leaked_id == nil, "a failed launch must not return an instance id")
+        "#
+    );
+    script::run_source(&path, "=new-instance-return", &source).expect("new return contract");
+}
+
+#[test]
 fn deprecated_flat_session_alias_warns_once_per_process() {
     let dir = scratch("deprecation-once");
     let path = daemon::socket_path_in(&dir, "s");

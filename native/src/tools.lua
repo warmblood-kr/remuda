@@ -1813,8 +1813,8 @@ setmetatable(remuda.session, {
 register("session", "Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach and resize.",
   "session(name) -> handle; table {list, new, close, attach, resize}")
 register("session.list", "List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.", "session.list() -> {session...}")
-register("session.new", "Start a session, defaulting the command to the user's shell.",
-  "session.new(name?, argv?, cwd?, env?) -> string")
+register("session.new", "Start a session and return its name and registered instance_id.",
+  "session.new(name?, argv?, cwd?, env?) -> name, instance_id")
 register("session.close", "End a session, live or already self-exited.", "session.close(name) -> nil")
 register("session.attach", "Enter raw mode on a session.", "session.attach(name) -> nil")
 register("session.resize", "Resize a session's terminal (cols 20..1000, rows 24..500).", "session.resize(name, cols, rows) -> true | nil, err")
@@ -1824,7 +1824,7 @@ remuda.new = deprecated_alias("new", "new", flat_session_words.new)
 remuda.close = deprecated_alias("close", "close", flat_session_words.close)
 remuda.attach = deprecated_alias("attach", "attach", flat_session_words.attach)
 register("ls", "Deprecated alias for `remuda.session.list`.", "ls() -> {session...}")
-register("new", "Deprecated alias for `remuda.session.new`.", "new(name?, argv?, cwd?, env?) -> string")
+register("new", "Deprecated alias for `remuda.session.new`; returns name and registered instance_id.", "new(name?, argv?, cwd?, env?) -> name, instance_id")
 register("close", "Deprecated alias for `remuda.session.close`.", "close(name) -> nil")
 register("attach", "Deprecated alias for `remuda.session.attach`.", "attach(name) -> nil")
 

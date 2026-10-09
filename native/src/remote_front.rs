@@ -253,6 +253,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
             validate_batch(client_id, *seq, bytes).map(|_| ())
         }
         Request::New { .. } => Err(refusal("New")),
+        Request::NewWithInstance { .. } => Err(refusal("NewWithInstance")),
         Request::SendLine { .. } => Err(refusal("SendLine")),
         Request::ClearInput { .. } => Err(refusal("ClearInput")),
         Request::Send { .. } => Err(refusal("Send")),

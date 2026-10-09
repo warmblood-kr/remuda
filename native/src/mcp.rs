@@ -232,6 +232,10 @@ fn call_response(id: Value, response: Response) -> String {
         // the arm the old comment called unreachable is now the common one, and
         // the decision it left open was made rather than dropped. `steps/013`.
         Response::Value(value) => ok_reply(id, tool_text(&value)),
+        Response::SessionStarted { .. } => ok_reply(
+            id,
+            tool_error("session identity responses are not exposed over MCP"),
+        ),
         Response::CommandResult {
             exit_code,
             stdout_base64,

@@ -309,7 +309,7 @@ mkdir
 new
 ---
 
-``new(name?, argv?, cwd?, env?) -> string`` — Deprecated alias for `remuda.session.new`.
+``new(name?, argv?, cwd?, env?) -> name, instance_id`` — Deprecated alias for `remuda.session.new`; returns name and registered instance_id.
 
 on
 --
@@ -404,7 +404,7 @@ session.list
 session.new
 -----------
 
-``session.new(name?, argv?, cwd?, env?) -> string`` — Start a session, defaulting the command to the user's shell.
+``session.new(name?, argv?, cwd?, env?) -> name, instance_id`` — Start a session and return its name and registered instance_id.
 
 session.resize
 --------------

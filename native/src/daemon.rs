@@ -1573,6 +1573,27 @@ fn handle_request(
                 size,
                 cwd,
                 env,
+                return_instance_id: false,
+            },
+        ),
+
+        Request::NewWithInstance {
+            name,
+            command,
+            size,
+            cwd,
+            env,
+        } => handle_new(
+            stream,
+            registry,
+            image,
+            NewSessionRequest {
+                name,
+                command,
+                size,
+                cwd,
+                env,
+                return_instance_id: true,
             },
         ),
 
@@ -2702,6 +2723,7 @@ struct NewSessionRequest {
     size: Size,
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
+    return_instance_id: bool,
 }
 
 fn handle_new(
@@ -2717,6 +2739,7 @@ fn handle_new(
         size,
         cwd,
         env,
+        return_instance_id,
     } = request;
     let name = match name {
         Some(given) => given,
@@ -2749,13 +2772,21 @@ fn handle_new(
             let notifier = image.session_output_notifier(&name, &session_id);
             match registry.register(session) {
                 Ok(session) => {
+                    let response = if return_instance_id {
+                        Response::SessionStarted {
+                            name,
+                            instance_id: session.instance_id().to_owned(),
+                        }
+                    } else {
+                        Response::Value(name)
+                    };
                     if let Some(output) = session.subscribe_output_wakeup() {
                         monitor_session_output(output, notifier);
                     } else {
                         notifier.flush(session.output_version().unwrap_or(0));
                         notifier.finish_monitor();
                     }
-                    reply(&stream, &Response::Value(name))
+                    reply(&stream, &response)
                 }
                 Err(_) => {
                     image.discard_session_output_monitor(&session_id, &notifier);

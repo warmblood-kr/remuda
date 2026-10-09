@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Lua: `remuda.session.new` and `remuda.new` now return `name, instance_id`, the
+  ID of the launch that call started, taken from the same registry insertion
+  (never a later lookup by name). Single-value assignments still get the name.
+  Behavior change: `return new(...)` now passes both values, so `run_script`
+  over MCP returns `name<TAB>instance_id`; write `return (new(...))` to keep the
+  name alone. The ID identifies a launch; it is not a secret or proof of
+  liveness. The daemon socket gains an additive request for this
+  (same-user, mode 0600, same limits as `New`; remuda-butler issue #471).
+
 - Shutdown: `remuda stop` now refuses when the daemon cannot verify who is
   asking (unreadable process ancestry, no peer PID, or a peer lookup error),
   as it already did for a caller inside one of its sessions (issue #639). To
