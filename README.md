@@ -175,6 +175,26 @@ the herd with it:
 remuda stop           # names any live session and asks first; -f skips the ask
 ```
 
+The shutdown guard refuses a stop from one of this daemon's sessions and refuses
+when it cannot verify the caller's ancestry. `-f` and `--yes` only skip the
+confirmation prompt. If this is the intended daemon, use the same server and
+runtime selection with `remuda -s NAME stop -f --yes --i-am-inside`; this
+intentionally ends its sessions. The guard is advisory, not authentication:
+it does not authenticate the caller or make same-user access an authorization
+boundary.
+
+If the daemon is responsive, use that override rather than killing it. For a
+stuck Unix daemon, verify its PID first, then `kill -CONT PID` if it is stopped
+or `kill PID` to request graceful termination; `kill -KILL PID` is a last resort
+that can skip cleanup. On Windows, identify the process in Task Manager or
+`Get-Process` before terminating it; forced process termination can skip
+cleanup there too. The override only works when the request reaches the
+responsive intended daemon. It cannot fix a wrong runtime path, socket access
+failure, or a hung daemon. "No daemon running" means the selected endpoint is
+unavailable, not proof that no process remains. Do not unlink a socket that
+may belong to a live daemon. An installed Butler poller may start the daemon
+again after it stops.
+
 [`steps/013`](steps/013-a-daemon-that-says-which-build-it-is.md) has the incident,
 and what each half does and does not cover.
 

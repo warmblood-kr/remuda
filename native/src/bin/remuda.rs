@@ -309,11 +309,9 @@ remuda — a pty manager you can attach to
   remuda repl                   the same image, a line at a time
   remuda mcp                    serve the image as an MCP tool on stdin/stdout
   remuda upgrade [--channel C]  re-run the installer on stable or nightly
-  remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon; the next command
-                                  starts a fresh one. A hosted session needs the
-                                  explicit --i-am-inside override.
-                                  Its sessions and Lua image die with it,
-                                  so a live herd is named and confirmed first.
+  remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon; its sessions and
+                                  Lua image end with it. Unverifiable callers
+                                  are refused; --i-am-inside overrides the guard.
   remuda --version              the version this binary was built with
 
 Four verbs, not ten. A verb is here only if it needs a terminal, must survive
@@ -375,6 +373,7 @@ remuda — terminal orchestration for coding agents
   remuda resize NAME COLS ROWS   resize a session (cols 20..1000, rows 24..500)
   remuda upgrade [--channel stable|nightly]  replace the CLI binary
   remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon (sessions are lost)
+                                  --i-am-inside overrides hosted or unverifiable identity checks.
 
   remuda mod install OWNER/REPO  install a mod from GitHub
   remuda mod list | info NAME    inspect installed mods
@@ -4742,6 +4741,9 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+        Err(e) if e.starts_with("cannot stop this daemon") => fail(format!(
+            "{e}\nNext: to stop it intentionally, run `remuda -s {server} stop -f --yes --i-am-inside` using the same runtime directory. This intentionally ends its sessions."
+        )),
         Err(e) => fail(e),
     }
 }
@@ -4753,7 +4755,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
         options: vec![],
         verbs: vec![VerbSpec {
             name: "stop".into(),
-            about: "Stop the daemon".into(),
+            about: "Stop this server's daemon and end its sessions".into(),
             args: vec![],
             next: "remuda stop --help".into(),
             options: vec![
@@ -4761,7 +4763,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
                     long: "force".into(),
                     short: Some('f'),
                     value: None,
-                    help: "Stop without asking for confirmation".into(),
+                    help: "Skip confirmation; identity checks still apply".into(),
                     global: false,
                     repeat_policy: Default::default(),
                 },
@@ -4769,7 +4771,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
                     long: "yes".into(),
                     short: None,
                     value: None,
-                    help: "Confirm stopping all sessions".into(),
+                    help: "Confirm ending all sessions; identity checks still apply".into(),
                     global: false,
                     repeat_policy: Default::default(),
                 },
@@ -4777,7 +4779,8 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
                     long: "i-am-inside".into(),
                     short: None,
                     value: None,
-                    help: "Allow a hosted session to stop its daemon".into(),
+                    help: "Override hosted or unverifiable identity checks; ends all sessions"
+                        .into(),
                     global: false,
                     repeat_policy: Default::default(),
                 },
