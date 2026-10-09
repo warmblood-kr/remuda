@@ -357,9 +357,9 @@ fn dynamic_tools_receive_only_daemon_issued_caller_context() {
         json!({"code": r#"
             remuda.tool{
               name = "who_called",
-              about = "Return the MCP caller capability supplied by the daemon.",
+              about = "Return merged caller data.",
               run = function(_, caller)
-                return caller and caller.capability or "anonymous"
+                return table.concat({tostring(caller and caller.capability), tostring(caller and caller.kind), tostring(caller and caller.session), tostring(caller and caller.instance_id)}, ":")
               end,
             }
             return "defined"
@@ -367,20 +367,34 @@ fn dynamic_tools_receive_only_daemon_issued_caller_context() {
     );
     assert_eq!(defined["result"]["isError"], false, "define: {defined}");
 
-    // The request tries to spoof a capability in its own arguments. It is not
-    // the caller context and cannot replace the daemon-issued one.
+    // The bridge capability is retained, while args cannot override native
+    // fields and an explicit caller table cannot replace their source.
     let identified = call_as(
         &path,
         Some("capability-issued-by-butler"),
         "who_called",
-        json!({"capability": "spoofed-by-mcp-client"}),
+        json!({"capability": "spoofed-by-mcp-client", "kind": "session", "session": "spoofed", "instance_id": "spoofed"}),
     );
     assert_eq!(identified["result"]["isError"], false, "{identified}");
-    assert_eq!(text_of(&identified), "capability-issued-by-butler");
+    assert_eq!(
+        text_of(&identified),
+        "capability-issued-by-butler:outside:nil:nil"
+    );
 
     let anonymous = call_as(&path, None, "who_called", json!({}));
     assert_eq!(anonymous["result"]["isError"], false, "{anonymous}");
-    assert_eq!(text_of(&anonymous), "anonymous");
+    assert_eq!(text_of(&anonymous), "nil:outside:nil:nil");
+
+    let explicit = call(
+        &path,
+        "run_script",
+        json!({"code": r#"
+            remuda.caller = function() return {kind='session', session='forged', instance_id='forged'} end
+            return remuda._call('who_called', {kind='spoofed', session='spoofed', instance_id='spoofed'}, {capability='direct-capability', kind='spoofed', session='spoofed', instance_id='spoofed'})
+        "#}),
+    );
+    assert_eq!(explicit["result"]["isError"], false, "{explicit}");
+    assert_eq!(text_of(&explicit), "direct-capability:outside:nil:nil");
 }
 
 #[test]

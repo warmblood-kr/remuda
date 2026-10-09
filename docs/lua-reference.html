@@ -14,7 +14,7 @@
 <h2 id="buffers">buffers</h2>
 <p><code>table</code> — The <span class="title-ref">remuda.buffer</span> registry table, keyed by buffer name.</p>
 <h2 id="caller">caller</h2>
-<p><code>caller() -&gt; {kind: 'session'|'outside'|'unknown', session?: string}</code> — ADVISORY only: peer ancestry identifies a managed session, outside, or unknown; outside does not prove operator identity. Same-UID Lua can run <code>remuda -e</code> and wrap <code>_dispatch_extension_command</code>; Windows parent PIDs may be stale or chosen, so this is not an authentication boundary.</p>
+<p><code>caller() -&gt; {kind: 'session'|'outside'|'unknown', session?: string, instance_id?: string}</code> — ADVISORY only: peer ancestry identifies a managed session, outside, or unknown; outside does not prove operator identity. Same-UID Lua can run <code>remuda -e</code> and wrap <code>_dispatch_extension_command</code>; Windows parent PIDs may be stale or chosen, so this is not an authentication boundary.</p>
 <h2 id="cancel">cancel</h2>
 <p><code>cancel(handle) -&gt; nil</code> — Cancel a schedule by the handle <span class="title-ref">schedule()</span> returned.</p>
 <h2 id="capture">capture</h2>
@@ -62,7 +62,7 @@
 <h2 id="expect_option">expect_option</h2>
 <p><code>expect_option(screen, label_predicate) -&gt; number|nil</code> — Pick a unique numbered menu option by its label.</p>
 <h2 id="extension_command">extension_command</h2>
-<p><code>extension_command(name, handler(args, caller)) -&gt; nil</code> — Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind and session fields, plus forwarded env/stdin values; kind outside does not establish operator identity.</p>
+<p><code>extension_command(name, handler(args, caller)) -&gt; nil</code> — Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind, session and instance_id fields, plus forwarded env/stdin values; kind outside does not establish operator identity.</p>
 <h2 id="fail">fail</h2>
 <p><code>fail(message, code?) -&gt; never (default code 1; valid codes are 1..255)</code> — Raise a deliberate CLI failure with a message and exit code.</p>
 <h2 id="feed">feed</h2>

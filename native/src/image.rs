@@ -242,6 +242,12 @@ enum JobKind {
     SessionOutputFlush(SessionOutputNotifier),
     #[cfg(test)]
     StopImage,
+    #[cfg(test)]
+    SeedCaller(CallerContext),
+    #[cfg(test)]
+    ReadCaller,
+    #[cfg(test)]
+    FireTimers,
 }
 
 /// How much the daemon can say about the process that submitted this Eval.
@@ -249,6 +255,7 @@ enum JobKind {
 pub(crate) struct CallerContext {
     pub kind: CallerKind,
     pub session: Option<String>,
+    pub instance_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -263,6 +270,7 @@ impl Default for CallerContext {
         Self {
             kind: CallerKind::Unknown,
             session: None,
+            instance_id: None,
         }
     }
 }
@@ -471,6 +479,18 @@ impl Image {
                             let _ = reply.send(answer);
                         }
                         if !stop_image {
+                            #[cfg(test)]
+                            if matches!(job.kind, JobKind::FireTimers) {
+                                run_due_timers_at(
+                                    &lua,
+                                    &budget,
+                                    &timers,
+                                    Instant::now() + std::time::Duration::from_secs(86_401),
+                                );
+                            } else {
+                                run_due_timers(&lua, &budget, &timers);
+                            }
+                            #[cfg(not(test))]
                             run_due_timers(&lua, &budget, &timers);
                         }
                         if stop_image {
@@ -528,6 +548,38 @@ impl Image {
 
     pub fn pending_replies(&self) -> crate::pending::PendingReplies {
         self.pending.clone()
+    }
+
+    #[cfg(test)]
+    fn seed_caller_for_test(&self, caller: CallerContext) {
+        self.jobs
+            .send(Job {
+                kind: JobKind::SeedCaller(caller),
+                reply: None,
+            })
+            .unwrap();
+    }
+
+    #[cfg(test)]
+    fn read_caller_for_test(&self) -> String {
+        let (reply, answer) = channel();
+        self.jobs
+            .send(Job {
+                kind: JobKind::ReadCaller,
+                reply: Some(reply),
+            })
+            .unwrap();
+        answer.recv().unwrap().unwrap()
+    }
+
+    #[cfg(test)]
+    fn fire_timers_for_test(&self) {
+        self.jobs
+            .send(Job {
+                kind: JobKind::FireTimers,
+                reply: None,
+            })
+            .unwrap();
     }
 
     pub fn session_output_notifier(&self, name: &str, id: &str) -> SessionOutputNotifier {
@@ -679,6 +731,10 @@ impl Image {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "test-only caller probes exercise reset order at each internal callback boundary"
+)]
 fn process_job(
     lua: &Lua,
     budget: &LuaExecutionBudget,
@@ -771,6 +827,27 @@ fn process_job(
                 *caller.borrow_mut() = CallerContext::default();
                 Ok(String::new())
             }
+            #[cfg(test)]
+            JobKind::SeedCaller(seed) => {
+                *caller.borrow_mut() = seed.clone();
+                Ok(String::new())
+            }
+            #[cfg(test)]
+            JobKind::ReadCaller => {
+                let caller = caller.borrow();
+                let kind = match &caller.kind {
+                    CallerKind::Session => "session",
+                    CallerKind::Outside => "outside",
+                    CallerKind::Unknown => "unknown",
+                };
+                Ok(format!(
+                    "{kind}:{}:{}",
+                    caller.session.as_deref().unwrap_or("nil"),
+                    caller.instance_id.as_deref().unwrap_or("nil")
+                ))
+            }
+            #[cfg(test)]
+            JobKind::FireTimers => Ok(String::new()),
         },
     }
 }
@@ -798,10 +875,19 @@ fn run_due_schedules(lua: &Lua, budget: &LuaExecutionBudget, now: f64) -> Result
 }
 
 fn run_due_timers(lua: &Lua, budget: &LuaExecutionBudget, timers: &timers::SharedTimerService) {
+    run_due_timers_at(lua, budget, timers, Instant::now());
+}
+
+fn run_due_timers_at(
+    lua: &Lua,
+    budget: &LuaExecutionBudget,
+    timers: &timers::SharedTimerService,
+    now: Instant,
+) {
     // Return to the image inbox between callbacks so an overdue timer batch
     // cannot keep ordinary work queued behind every due callback.
     for _ in 0..MAX_TIMER_CALLBACKS_PER_TURN {
-        let fire = match timers.borrow_mut().take_due(lua, Instant::now()) {
+        let fire = match timers.borrow_mut().take_due(lua, now) {
             Ok(Some(fire)) => fire,
             Ok(None) => return,
             Err(error) => {
@@ -1266,7 +1352,7 @@ fn key(k: &mlua::Value, depth: usize, seen: &mut Vec<*const c_void>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_print, eval, render};
+    use super::{capture_print, eval, render, CallerContext, CallerKind, Image};
     use mlua::Lua;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1339,6 +1425,131 @@ mod tests {
         assert!(!error.contains("runtime error:"));
         assert!(!error.contains("stack traceback:"));
         assert_eq!(printed.borrow().len(), MAX_REPLY_BYTES);
+    }
+
+    #[test]
+    fn repeating_timer_waits_a_full_interval_after_callback_completion() {
+        use std::time::{Duration, Instant};
+
+        let lua = Lua::new();
+        let timers = Rc::new(RefCell::new(super::timers::TimerService::new()));
+        let callback = lua
+            .create_function(|_, ()| {
+                std::thread::sleep(Duration::from_millis(60));
+                Ok(())
+            })
+            .unwrap();
+        timers
+            .borrow_mut()
+            .schedule(&lua, 0.02, callback, None, true)
+            .unwrap();
+
+        let delay = timers
+            .borrow_mut()
+            .wait_timeout()
+            .expect("repeating timer deadline");
+        std::thread::sleep(delay + Duration::from_millis(2));
+        let dequeue_time = Instant::now();
+        super::run_due_timers_at(
+            &lua,
+            &super::LuaExecutionBudget::default(),
+            &timers,
+            dequeue_time,
+        );
+
+        let next = timers.borrow_mut().take_due(&lua, Instant::now()).unwrap();
+        assert!(
+            next.is_none(),
+            "next repeating tick must wait a full interval after callback completion"
+        );
+    }
+
+    #[test]
+    fn attributed_caller_is_cleared_before_errors_and_internal_callbacks() {
+        let socket = std::env::temp_dir().join(format!(
+            "remuda-caller-reset-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let image = Image::spawn(
+            &socket,
+            std::sync::Arc::new(remuda_core::Registry::new()),
+            std::sync::Arc::new(crate::tick::Counters::default()),
+        );
+        let attributed = || CallerContext {
+            kind: CallerKind::Session,
+            session: Some("caller-reset".into()),
+            instance_id: Some("caller-reset-instance".into()),
+        };
+
+        assert_eq!(
+            image
+                .eval_request(
+                    "return remuda.caller().session .. ':' .. remuda.caller().instance_id",
+                    None,
+                    attributed(),
+                )
+                .unwrap(),
+            "caller-reset:caller-reset-instance",
+            "the attributed caller precondition must be observable before reset"
+        );
+        assert!(image
+            .eval_request("error('expected')", None, attributed())
+            .is_err());
+        assert_eq!(image.read_caller_for_test(), "unknown:nil:nil");
+
+        image
+            .eval_request(
+                "assert(remuda.caller().session == 'caller-reset' and remuda.caller().instance_id == 'caller-reset-instance'); remuda.after(0.01, function() timer_caller = remuda.caller().kind .. ':' .. tostring(remuda.caller().instance_id) end)",
+                None,
+                attributed(),
+            )
+            .unwrap();
+        image.fire_timers_for_test();
+        assert_eq!(
+            image.eval("return timer_caller", None).unwrap(),
+            "unknown:nil"
+        );
+
+        image.eval("remuda.schedule({every=1, run=function() scheduled_caller = remuda.caller().kind .. ':' .. tostring(remuda.caller().instance_id) end})", None).unwrap();
+        image.seed_caller_for_test(attributed());
+        image
+            .submit_due_schedules(10.0)
+            .unwrap()
+            .recv()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            image.eval("return scheduled_caller", None).unwrap(),
+            "unknown:nil"
+        );
+
+        let pending = image
+            .eval_request(
+                "assert(remuda.caller().session == 'caller-reset' and remuda.caller().instance_id == 'caller-reset-instance'); return remuda.pending({timeout=10, on_cancel=function() pending_caller = remuda.caller().kind .. ':' .. tostring(remuda.caller().instance_id) end})",
+                None,
+                attributed(),
+            )
+            .unwrap();
+        let pending_id = image
+            .pending_replies()
+            .pending_id(&pending)
+            .expect("pending ID");
+        image.seed_caller_for_test(attributed());
+        image.pending_replies().abandon(pending_id);
+        image
+            .submit_due_schedules(20.0)
+            .unwrap()
+            .recv()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            image.eval("return pending_caller", None).unwrap(),
+            "unknown:nil"
+        );
     }
 
     #[test]

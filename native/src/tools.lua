@@ -76,6 +76,7 @@ function remuda._dispatch_extension_command(name, args, caller)
   local caller_data = type(caller) == "table" and caller or {}
   caller_data.kind = context.kind
   caller_data.session = context.session
+  caller_data.instance_id = context.instance_id
   return handler(args or {}, caller_data)
 end
 
@@ -88,7 +89,7 @@ register("after", "Run a callback once after a delay without blocking the Lua im
 register("every", "Run a callback periodically without blocking the Lua image; cancel with handle:cancel(). If a callback finishes late, the next tick comes one interval after it ends, so the phase shifts and ticks do not burst to catch up.", "every(seconds, fn) -> handle")
 register("tools", "The `remuda.tool` registry table, keyed by tool name.", "table")
 register("_extension_commands", "Handlers registered for installed mod commands.", "table")
-register("extension_command", "Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind and session fields, plus forwarded env/stdin values; kind outside does not establish operator identity.", "extension_command(name, handler(args, caller)) -> nil")
+register("extension_command", "Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind, session and instance_id fields, plus forwarded env/stdin values; kind outside does not establish operator identity.", "extension_command(name, handler(args, caller)) -> nil")
 register("_dispatch_extension_command", "Dispatch arguments and caller context to a loaded mod command handler.", "_dispatch_extension_command(name, args, caller) -> value")
 register("_exec_commands", "Load a mod and run its optional commands hook without starting it; legacy mods keep their existing start behavior.", "_exec_commands(name) -> nil")
 
@@ -1947,9 +1948,16 @@ function remuda._call(name, arguments, caller)
       error(name .. " needs `" .. key .. "`", 0)
     end
   end
-  -- `caller` is daemon-issued process context, never MCP input.  Existing
-  -- tools keep working because Lua ignores the optional second argument.
-  local answer = word(arguments, caller)
+  -- Preserve only the bridge capability. Native identity is captured before
+  -- extensions load and always replaces any supplied caller fields.
+  local context = native_caller()
+  local caller_data = {
+    capability = type(caller) == "table" and caller.capability or nil,
+    kind = context.kind,
+    session = context.session,
+    instance_id = context.instance_id,
+  }
+  local answer = word(arguments, caller_data)
   if answer == nil then
     return ""
   end
@@ -1958,7 +1966,7 @@ function remuda._call(name, arguments, caller)
   end
   return tostring(answer)
 end
-register("_call", "Dispatch one MCP tools/call by name.", "_call(name, arguments, caller) -> string")
+register("_call", "Dispatch one MCP tools/call by name. Always supplies a fresh caller table; only the incoming capability is retained. instance_id identifies the launch captured for this request, is not secret or proof of liveness, and may be stale after exit until runtime validation is added.", "_call(name, arguments, caller) -> string")
 
 -- Input is expressed as two words: one contiguous text burst, then a
 -- separately-timed submit key after the composer shows the text.
