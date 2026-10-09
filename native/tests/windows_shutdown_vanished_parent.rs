@@ -69,16 +69,17 @@ fn stop_cli_succeeds_after_its_parent_exits() {
     let exe = Path::new(env!("CARGO_BIN_EXE_remuda"));
     let output = scratch.0.join("stop-output.txt");
     let script = scratch.0.join("stop.cmd");
+    let launcher_stderr = scratch.0.join("launcher-stderr.txt");
     let body = format!(
         "@echo off\r\nstart \"\" /b {} -s s stop -f --yes > {} 2>&1\r\n",
         cmd_quote(exe),
         cmd_quote(&output)
     );
-    std::fs::write(&script, body).expect("write stop launcher");
+    std::fs::write(&script, &body).expect("write stop launcher");
 
     let mut launcher = Command::new("cmd.exe")
-        .args(["/d", "/c"])
-        .arg(format!("call {}", cmd_quote(&script)))
+        .arg("/c")
+        .arg(&script)
         .env("REMUDA_RUNTIME_DIR", &scratch.0)
         .env("HOME", scratch.0.join("home"))
         .env("LOCALAPPDATA", scratch.0.join("home"))
@@ -89,34 +90,36 @@ fn stop_cli_succeeds_after_its_parent_exits() {
         .env_remove("REMUDA_SESSION_NAME")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(&launcher_stderr).expect("create launcher stderr file"),
+        ))
         .spawn()
         .expect("start short-lived cmd launcher");
     let launcher_status = wait_for_launcher(&mut launcher);
     assert!(
         launcher_status.success(),
-        "cmd launcher failed: {launcher_status}"
+        "cmd launcher failed: {launcher_status}; stderr: {}; script:\n{body}",
+        std::fs::read_to_string(&launcher_stderr).unwrap_or_default()
     );
 
     // `start` creates remuda as a child of this short-lived cmd process. The
     // launcher has exited before its result is read, so the CLI's parent is
     // gone by the time this test observes whether the daemon stopped.
     let deadline = Instant::now() + Duration::from_secs(25);
-    let mut stop_output = String::new();
-    loop {
-        stop_output = std::fs::read_to_string(&output).unwrap_or_default();
-        if stop_output.contains("stopped the daemon") {
-            break;
+    let stop_output = loop {
+        let output_so_far = std::fs::read_to_string(&output).unwrap_or_default();
+        if output_so_far.contains("stopped the daemon") {
+            break output_so_far;
         }
-        if stop_output.contains("cannot stop this daemon") {
-            panic!("stop CLI refused the vanished-parent caller: {stop_output}");
+        if output_so_far.contains("cannot stop this daemon") {
+            panic!("stop CLI refused the vanished-parent caller: {output_so_far}");
         }
         if Instant::now() >= deadline {
             let _ = daemon.0.kill();
-            panic!("stop CLI produced no result within 40 seconds: {stop_output}");
+            panic!("stop CLI produced no result within 25 seconds: {output_so_far}");
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
 
     assert!(
         daemon.left_on_its_own(),
