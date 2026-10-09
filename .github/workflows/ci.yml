@@ -313,6 +313,9 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - name: Coverage
+        # Revert this line to undo #624; %p separates processes and %b identifies the binary.
+        env:
+          LLVM_PROFILE_FILE_NAME: "%p-%b.profraw"
         run: |
           {
             echo "## Coverage"
