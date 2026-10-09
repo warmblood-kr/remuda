@@ -181,7 +181,9 @@ confirmation prompt. If this is the intended daemon, use the same server and
 runtime selection with `remuda -s NAME stop -f --yes --i-am-inside`; this
 intentionally ends its sessions. The guard is advisory, not authentication:
 it does not authenticate the caller or make same-user access an authorization
-boundary.
+boundary, and it claims no isolation. A caller whose parent has already exited
+reads as outside, so that loss of ancestry is accepted and the stop proceeds;
+a caller whose ancestry cannot be read is unverifiable and is refused.
 
 If the daemon is responsive, use that override rather than killing it. For a
 stuck Unix daemon, verify its PID first, then `kill -CONT PID` if it is stopped

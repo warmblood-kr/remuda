@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Shutdown: `remuda stop` now refuses when the daemon cannot verify who is
+  asking (unreadable process ancestry, no peer PID, or a peer lookup error),
+  as it already did for a caller inside one of its sessions (issue #639). To
+  stop the intended daemon anyway, use the same server and runtime selection
+  with `remuda -s NAME stop -f --yes --i-am-inside`. A caller whose parent has
+  already exited still reads as outside and is allowed. The guard is advisory,
+  not authentication: same-user access is not an authorization boundary and it
+  makes no isolation claim.
+
 - Windows: `remuda.caller().kind` is `outside` when the caller is in no
   session's job and its parent chain ends at a missing or reused PID. An
   unreadable or incomplete chain stays `unknown`; `outside` means only that
