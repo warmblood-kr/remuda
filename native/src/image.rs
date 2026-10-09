@@ -900,7 +900,7 @@ fn run_due_timers_at(
             eprintln!("remuda timer callback error: {error}");
         }
         if fire.repeating {
-            timers.borrow_mut().finish_fire(fire.id, now);
+            timers.borrow_mut().finish_fire(fire.id, Instant::now());
         }
     }
 }
@@ -1425,6 +1425,43 @@ mod tests {
         assert!(!error.contains("runtime error:"));
         assert!(!error.contains("stack traceback:"));
         assert_eq!(printed.borrow().len(), MAX_REPLY_BYTES);
+    }
+
+    #[test]
+    fn repeating_timer_waits_a_full_interval_after_callback_completion() {
+        use std::time::{Duration, Instant};
+
+        let lua = Lua::new();
+        let timers = Rc::new(RefCell::new(super::timers::TimerService::new()));
+        let callback = lua
+            .create_function(|_, ()| {
+                std::thread::sleep(Duration::from_millis(60));
+                Ok(())
+            })
+            .unwrap();
+        timers
+            .borrow_mut()
+            .schedule(&lua, 0.02, callback, None, true)
+            .unwrap();
+
+        let delay = timers
+            .borrow_mut()
+            .wait_timeout()
+            .expect("repeating timer deadline");
+        std::thread::sleep(delay + Duration::from_millis(2));
+        let dequeue_time = Instant::now();
+        super::run_due_timers_at(
+            &lua,
+            &super::LuaExecutionBudget::default(),
+            &timers,
+            dequeue_time,
+        );
+
+        let next = timers.borrow_mut().take_due(&lua, Instant::now()).unwrap();
+        assert!(
+            next.is_none(),
+            "next repeating tick must wait a full interval after callback completion"
+        );
     }
 
     #[test]
