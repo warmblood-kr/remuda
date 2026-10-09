@@ -218,12 +218,6 @@ where
         if pid <= 1 {
             return ChainEnd::Outside;
         }
-        if !visited.insert(pid) {
-            return ChainEnd::Unknown {
-                pid,
-                error: io::Error::new(io::ErrorKind::InvalidData, "cycle in process parent chain"),
-            };
-        }
         let (parent_pid, created) = match process(pid) {
             Ok(Some(info)) => info,
             Ok(None) if hops > 0 => return ChainEnd::Outside,
@@ -237,6 +231,12 @@ where
         };
         if child_created.is_some_and(|child| created > child) {
             return ChainEnd::Outside;
+        }
+        if !visited.insert(pid) {
+            return ChainEnd::Unknown {
+                pid,
+                error: io::Error::new(io::ErrorKind::InvalidData, "cycle in process parent chain"),
+            };
         }
         if let Some(session) = session {
             return ChainEnd::Session(session.attribution.clone());
@@ -505,6 +505,45 @@ mod tests {
     }
 
     #[test]
+    fn a_reused_pid_revisited_as_a_younger_process_ends_the_chain_outside() {
+        let mut process_pid_calls = 0;
+        let result = super::chain_end_detailed(748, &[], |pid| match pid {
+            748 => {
+                process_pid_calls += 1;
+                Ok(Some((700, 500)))
+            }
+            700 => Ok(Some((600, 400))),
+            600 => Ok(Some((748, 300))),
+            _ => unreachable!(),
+        });
+        assert!(matches!(result, ChainEnd::Outside));
+        assert_eq!(process_pid_calls, 2);
+    }
+
+    #[test]
+    fn an_equal_time_revisited_pid_is_still_a_cycle() {
+        let result = super::chain_end_detailed(40, &[], |pid| match pid {
+            40 => Ok(Some((30, 100))),
+            30 => Ok(Some((40, 100))),
+            _ => unreachable!(),
+        });
+        assert!(matches!(
+            result,
+            ChainEnd::Unknown { error, .. } if error.to_string() == "cycle in process parent chain"
+        ));
+    }
+
+    #[test]
+    fn a_chain_beyond_the_hop_limit_is_unknown() {
+        let result =
+            super::chain_end_detailed(1_000, &[], |pid| Ok(Some((pid - 1, u64::from(pid)))));
+        assert!(matches!(
+            result,
+            ChainEnd::Unknown { error, .. } if error.to_string() == "process ancestry exceeded the hop limit"
+        ));
+    }
+
+    #[test]
     fn an_equal_creation_time_parent_is_not_a_reused_pid() {
         let process = |pid| match pid {
             40 => Ok(Some((30, 100))),
@@ -606,7 +645,7 @@ mod tests {
     fn a_cyclic_caller_chain_is_unknown() {
         let process = |pid| match pid {
             40 => Ok(Some((30, 100))),
-            30 => Ok(Some((40, 90))),
+            30 => Ok(Some((40, 100))),
             _ => unreachable!(),
         };
         assert_eq!(chain_end(40, &[], process), CallerOrigin::Unknown);
@@ -647,7 +686,7 @@ mod tests {
         assert!(matches!(
             ancestry_from_parent_table(40, &[], |pid| match pid {
                 40 => Ok(Some((30, 100))),
-                30 => Ok(Some((40, 90))),
+                30 => Ok(Some((40, 100))),
                 _ => unreachable!(),
             }),
             Ancestry::Unreadable { .. }
