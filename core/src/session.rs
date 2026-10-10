@@ -8,10 +8,13 @@ use crate::agent::{
     ScreenSnapshot, Size, StyledCell, VersionedSnapshot,
 };
 use crate::clock::Clock;
-use crate::input::{InputBatch, InputDeduplicator, InputError, InputOutcome, InputRateLimiter};
+use crate::input::{
+    ClearInputRateLimiter, InputBatch, InputDeduplicator, InputError, InputOutcome,
+    InputRateLimiter,
+};
 use crate::protocol::Step;
 use core::time::Duration;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -64,6 +67,249 @@ mod input_text_tests {
     }
 }
 
+#[cfg(test)]
+mod clear_input_tests {
+    use super::*;
+    use crate::agent::{AgentError, AgentProcess, AgentWriter, Cursor, Size};
+    use crate::clock::ManualClock;
+    use std::sync::mpsc::{self, Receiver, Sender};
+
+    struct TestWriter {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        started: Sender<()>,
+        blocking: bool,
+        timed_out: bool,
+        blocked_once: AtomicBool,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl AgentWriter for TestWriter {
+        fn write_bounded(&self, bytes: &[u8]) -> Result<()> {
+            self.write_to_completion(bytes)
+        }
+        fn write_to_completion(&self, bytes: &[u8]) -> Result<()> {
+            let should_block = self.blocking && !self.blocked_once.swap(true, Ordering::SeqCst);
+            if !self.blocked_once.load(Ordering::SeqCst) || should_block {
+                let _ = self.started.send(());
+            }
+            if should_block {
+                let (ready, changed) = &*self.release;
+                let mut ready = ready.lock().unwrap();
+                while !*ready {
+                    ready = changed.wait(ready).unwrap();
+                }
+            }
+            self.writes.lock().unwrap().push(bytes.to_vec());
+            Ok(())
+        }
+        fn is_busy(&self) -> bool {
+            let (ready, _) = &*self.release;
+            self.timed_out || (self.blocking && !*ready.lock().unwrap())
+        }
+        fn is_timed_out(&self) -> bool {
+            self.timed_out
+        }
+    }
+
+    struct TestAgent(Arc<TestWriter>);
+    impl AgentProcess for TestAgent {
+        fn write(&mut self, bytes: &[u8]) -> Result<()> {
+            self.0.write_bounded(bytes)
+        }
+        fn input_writer(&mut self) -> Option<Arc<dyn AgentWriter>> {
+            Some(self.0.clone())
+        }
+        fn screen_text(&mut self) -> Result<String> {
+            Ok(String::new())
+        }
+        fn cursor(&mut self) -> Result<Cursor> {
+            Ok(Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            })
+        }
+        fn is_alive(&mut self) -> bool {
+            true
+        }
+        fn terminate(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> Size {
+            Size::default()
+        }
+    }
+
+    type SessionFixture = (
+        Arc<Session>,
+        Arc<ManualClock>,
+        Arc<Mutex<Vec<Vec<u8>>>>,
+        Receiver<()>,
+        Arc<(Mutex<bool>, Condvar)>,
+    );
+
+    fn session(blocking: bool) -> SessionFixture {
+        session_with_timeout(blocking, false)
+    }
+
+    fn session_with_timeout(blocking: bool, timed_out: bool) -> SessionFixture {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let release = Arc::new((Mutex::new(!blocking), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let writer = Arc::new(TestWriter {
+            writes: Arc::clone(&writes),
+            started: started_tx,
+            blocking,
+            timed_out,
+            blocked_once: AtomicBool::new(false),
+            release: Arc::clone(&release),
+        });
+        let clock = Arc::new(ManualClock::new());
+        let session = Arc::new(Session::new(
+            "test",
+            Box::new(TestAgent(writer)),
+            clock.clone(),
+        ));
+        (session, clock, writes, started_rx, release)
+    }
+
+    #[test]
+    fn attach_write_waiting_after_clear_guard_lands_after_clear() {
+        let (session, clock, writes, _started, _release) = session(false);
+        let attached = session.attach();
+        clock.advance(Duration::from_secs(10));
+        let (spawned_tx, spawned_rx) = mpsc::channel();
+        let (handle_tx, handle_rx) = mpsc::channel();
+        let session_for_hook = Arc::clone(&session);
+        *session.clear_hook.lock().unwrap() = Some(Box::new(move || {
+            let session = Arc::clone(&session_for_hook);
+            let handle = std::thread::spawn(move || {
+                let attached = session.attach();
+                let _ = spawned_tx.send(());
+                attached.write_raw(b"x").unwrap();
+            });
+            handle_tx.send(handle).unwrap();
+            spawned_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }));
+        session.clear_input(b"\x15").unwrap();
+        drop(attached);
+        handle_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![b"\x15".to_vec(), b"x".to_vec()]
+        );
+    }
+
+    #[test]
+    fn clear_refuses_while_attach_write_is_in_flight_even_after_idle_window() {
+        let (session, clock, _writes, started, release) = session(true);
+        let worker_session = Arc::clone(&session);
+        let worker = std::thread::spawn(move || worker_session.attach().write_raw(b"x"));
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        clock.advance(Duration::from_secs(3));
+        assert!(matches!(
+            session.clear_input(b"\x15"),
+            Err(AgentError::HumanInputRecent)
+        ));
+        let (ready, changed) = &*release;
+        *ready.lock().unwrap() = true;
+        changed.notify_all();
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn clear_refuses_a_timed_out_writer_without_writing() {
+        let (session, clock, writes, _started, _release) = session_with_timeout(false, true);
+        clock.advance(Duration::from_secs(3));
+        assert!(matches!(
+            session.clear_input(b"\x15"),
+            Err(AgentError::Busy)
+        ));
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_rejects_untrusted_keys() {
+        let (session, clock, writes, _started, _release) = session(false);
+        clock.advance(Duration::from_secs(3));
+        for key in [
+            b"\x0f".as_slice(),
+            b"\x1bOM",
+            b"x",
+            b"\x15\x15",
+            b"\r",
+            b"\n",
+        ] {
+            assert!(session.clear_input(key).is_err(), "accepted {key:?}");
+        }
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_key_length_is_limited_before_writer_activity() {
+        let (session, clock, writes, _started, _release) = session(false);
+        clock.advance(Duration::from_secs(3));
+        for key in [Vec::new(), vec![b'x'; 17], vec![b'x'; 1_048_576]] {
+            assert!(
+                session.clear_input(&key).is_err(),
+                "accepted {} bytes",
+                key.len()
+            );
+        }
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_calls_have_a_per_session_rate_budget() {
+        let (session, clock, writes, _started, _release) = session(false);
+        clock.advance(Duration::from_secs(3));
+        for _ in 0..4 {
+            session.clear_input(b"\x15").unwrap();
+        }
+        assert!(session.clear_input(b"\x15").is_err());
+        assert_eq!(writes.lock().unwrap().len(), 4);
+        clock.advance(Duration::from_secs(1));
+        session.clear_input(b"\x15").unwrap();
+        assert_eq!(writes.lock().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn clear_refuses_an_active_writer_without_queuing_behind_it() {
+        let (session, clock, writes, started, release) = session(true);
+        let writer = session.agent.lock().unwrap().input_writer().unwrap();
+        let active = std::thread::spawn(move || writer.write_bounded(b"prior"));
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        clock.advance(Duration::from_secs(3));
+        assert!(matches!(
+            session.clear_input(b"\x15"),
+            Err(AgentError::Busy)
+        ));
+        assert!(writes.lock().unwrap().is_empty());
+        let (ready, changed) = &*release;
+        *ready.lock().unwrap() = true;
+        changed.notify_all();
+        active.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn idle_clear_still_works_and_clear_keys_cannot_submit_lines() {
+        let (session, clock, writes, _started, _release) = session(false);
+        clock.advance(Duration::from_secs(3));
+        session.clear_input(b"\x15").unwrap();
+        assert_eq!(*writes.lock().unwrap(), vec![b"\x15".to_vec()]);
+        for key in [b"\r".as_slice(), b"\n".as_slice(), b"\x15\r".as_slice()] {
+            assert!(
+                matches!(session.clear_input(key), Err(AgentError::Io(message)) if message.contains("allowlisted"))
+            );
+        }
+        assert_eq!(*writes.lock().unwrap(), vec![b"\x15".to_vec()]);
+    }
+}
+
 fn occurrence_count(screen: &str, tail: &str) -> usize {
     if tail.is_empty() {
         0
@@ -89,10 +335,22 @@ pub enum InputSubmitOutcome {
 
 /// Pause between pasted text and its Return when the caller gives none.
 pub const DEFAULT_INPUT_SETTLE: Duration = Duration::from_millis(100);
+/// A clear is refused while the most recent human keystroke is this recent.
+const HUMAN_INPUT_GUARD: Duration = Duration::from_secs(2);
+const MAX_CLEAR_INPUT_KEY_BYTES: usize = 16;
+/// Core-owned allowlist: only the verified Ctrl+U clear-line binding is enabled.
+const CLEAR_INPUT_KEYS: &[&[u8]] = &[b"\x15"];
 
 struct PendingInput {
     tail: String,
     baseline_occurrences: usize,
+}
+
+#[derive(Clone, Copy)]
+enum BurstWriteMode {
+    Bounded,
+    IfIdle,
+    ToCompletion,
 }
 
 /// A running agent, addressable by name.
@@ -116,10 +374,18 @@ pub struct Session {
     /// [`Clock::now`] at the last keystroke through an [`Attached`] guard —
     /// a human's, never a script's. `None` until one arrives (#136).
     last_human_input_at: Mutex<Option<Duration>>,
+    /// Orders attached writes with destructive clear operations.
+    human_gate: Mutex<()>,
+    /// Attached writes which have started but have not completed.
+    human_inflight: AtomicUsize,
+    #[cfg(test)]
+    clear_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Set while the current [`Attached`] guard is alive.
     attached: AtomicBool,
     /// Set under the registry lock before a close request terminates the child.
     closing: AtomicBool,
+    /// Once any liveness probe observes exit, this launch can never become live again.
+    alive: AtomicBool,
     /// Current attachment generation and its takeover signal. The generation
     /// keeps an old guard's drop from clearing a newer attachment.
     attach_slot: Mutex<Option<(u64, Arc<AtomicBool>)>>,
@@ -134,6 +400,8 @@ pub struct Session {
     input_dedup: Mutex<InputDeduplicator>,
     /// Per-session byte budget, checked before taking `input_lock`.
     input_rate: Mutex<InputRateLimiter>,
+    /// Per-session operation budget for destructive clear-key writes.
+    clear_input_rate: Mutex<ClearInputRateLimiter>,
 }
 
 fn configure_writer_clock(
@@ -185,6 +453,7 @@ impl Session {
     }
 
     /// Construct a session with the identity injected into its child process.
+    #[allow(clippy::too_many_lines)]
     pub fn new_with_id(
         name: impl Into<String>,
         id: impl Into<String>,
@@ -244,8 +513,13 @@ impl Session {
             output_changed,
             instance_id,
             last_human_input_at: Mutex::new(None),
+            human_gate: Mutex::new(()),
+            human_inflight: AtomicUsize::new(0),
+            #[cfg(test)]
+            clear_hook: Mutex::new(None),
             attached: AtomicBool::new(false),
             closing: AtomicBool::new(false),
+            alive: AtomicBool::new(true),
             attach_slot: Mutex::new(None),
             next_attach_generation: AtomicU64::new(1),
             input_lock: Mutex::new(false),
@@ -253,6 +527,7 @@ impl Session {
             pending_input: Mutex::new(None),
             input_dedup: Mutex::new(InputDeduplicator::new()),
             input_rate: Mutex::new(InputRateLimiter::default()),
+            clear_input_rate: Mutex::new(ClearInputRateLimiter::default()),
         }
     }
 
@@ -549,6 +824,47 @@ impl Session {
         self.write_one_burst(bytes)
     }
 
+    /// Write the core-allowlisted clear-line key as one atomic burst. Refuses
+    /// untrusted keys, a busy writer, recent human input, or excess clear calls.
+    /// Cleared text is `None` when this session cannot identify its composer.
+    pub fn clear_input(&self, key: &[u8]) -> Result<Option<String>> {
+        if key.is_empty() || key.len() > MAX_CLEAR_INPUT_KEY_BYTES {
+            return Err(AgentError::Io(
+                "clear key must contain 1 to 16 bytes".into(),
+            ));
+        }
+        if !CLEAR_INPUT_KEYS.contains(&key) {
+            return Err(AgentError::Io(
+                "clear key is not allowlisted; only Ctrl+U (byte 0x15) is supported".into(),
+            ));
+        }
+        let _held = self.acquire_input_lock()?;
+        let _human_gate = self
+            .human_gate
+            .lock()
+            .map_err(|_| AgentError::Io("session human input gate poisoned".into()))?;
+        if self
+            .human_idle_for()
+            .is_some_and(|idle| idle < HUMAN_INPUT_GUARD)
+            || self.human_inflight.load(Ordering::SeqCst) > 0
+        {
+            return Err(AgentError::HumanInputRecent);
+        }
+        self.clear_input_rate
+            .lock()
+            .map_err(|_| AgentError::Io("session clear input rate limit poisoned".into()))?
+            .check_rate(self.clock.now())
+            .map_err(|_| {
+                AgentError::Io("clear input rate limit exceeded (4 calls per second)".into())
+            })?;
+        #[cfg(test)]
+        if let Some(hook) = self.clear_hook.lock().unwrap().take() {
+            hook();
+        }
+        self.write_one_burst_if_idle(key)?;
+        Ok(None)
+    }
+
     /// Check the shared per-session remote-input byte budget.
     pub fn check_rate(&self, bytes: usize) -> core::result::Result<(), InputError> {
         let mut rate = self
@@ -728,7 +1044,11 @@ impl Session {
     /// The one place that touches the backend. PTY handles wait without the
     /// process mutex; callers hold `input_lock` except an attachment writer.
     fn write_one_burst(&self, bytes: &[u8]) -> Result<()> {
-        self.write_one_burst_with(bytes, false, &|| false, None)
+        self.write_one_burst_with(bytes, BurstWriteMode::Bounded, &|| false, None)
+    }
+
+    fn write_one_burst_if_idle(&self, bytes: &[u8]) -> Result<()> {
+        self.write_one_burst_with(bytes, BurstWriteMode::IfIdle, &|| false, None)
     }
 
     fn write_one_burst_to_completion_while_started(
@@ -737,13 +1057,18 @@ impl Session {
         cancelled: &dyn Fn() -> bool,
         on_start: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<()> {
-        self.write_one_burst_with(bytes, true, cancelled, Some(on_start))
+        self.write_one_burst_with(
+            bytes,
+            BurstWriteMode::ToCompletion,
+            cancelled,
+            Some(on_start),
+        )
     }
 
     fn write_one_burst_with(
         &self,
         bytes: &[u8],
-        wait_to_completion: bool,
+        mode: BurstWriteMode,
         cancelled: &dyn Fn() -> bool,
         on_start: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<()> {
@@ -752,20 +1077,22 @@ impl Session {
                 .agent
                 .lock()
                 .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
-            if !agent.is_alive() {
+            if !self.alive.load(Ordering::SeqCst) || !self.observe_alive(agent.is_alive()) {
                 return Err(AgentError::Exited);
             }
             agent.input_writer()
         };
         let result = if let Some(writer) = writer {
-            if wait_to_completion {
-                if let Some(on_start) = on_start {
-                    writer.write_to_completion_while_started(bytes, cancelled, on_start)
-                } else {
-                    writer.write_to_completion_while(bytes, cancelled)
+            match mode {
+                BurstWriteMode::ToCompletion => {
+                    if let Some(on_start) = on_start {
+                        writer.write_to_completion_while_started(bytes, cancelled, on_start)
+                    } else {
+                        writer.write_to_completion_while(bytes, cancelled)
+                    }
                 }
-            } else {
-                writer.write_bounded(bytes)
+                BurstWriteMode::IfIdle => writer.write_bounded_if_idle(bytes),
+                BurstWriteMode::Bounded => writer.write_bounded(bytes),
             }
         } else {
             let mut agent = self
@@ -958,17 +1285,33 @@ impl Session {
     }
 
     pub fn is_alive(&self) -> bool {
+        if !self.alive.load(Ordering::SeqCst) {
+            Self::notify_output_changed(&self.output_changed);
+            return false;
+        }
         let alive = match self.agent.lock() {
-            Ok(mut agent) => agent.is_alive(),
+            Ok(mut agent) => {
+                self.alive.load(Ordering::SeqCst) && self.observe_alive(agent.is_alive())
+            }
             // A poisoned lock means a writer panicked mid-session. Reporting
             // "alive" would invite more writes into a session whose state is
             // unknown.
-            Err(_) => false,
+            Err(_) => {
+                self.alive.store(false, Ordering::SeqCst);
+                false
+            }
         };
         if !alive {
             Self::notify_output_changed(&self.output_changed);
         }
         alive
+    }
+
+    fn observe_alive(&self, alive: bool) -> bool {
+        if !alive {
+            self.alive.store(false, Ordering::SeqCst);
+        }
+        self.alive.load(Ordering::SeqCst)
     }
 
     fn notify_output_changed(output_changed: &Arc<(Mutex<u64>, Condvar)>) {
@@ -998,30 +1341,64 @@ impl Session {
 
     /// The child PID if this process-backed session is still running.
     pub fn process_id_if_alive(&self) -> Option<u32> {
-        let mut agent = self.agent.lock().ok()?;
-        agent.is_alive().then(|| agent.process_id()).flatten()
+        if !self.alive.load(Ordering::SeqCst) {
+            return None;
+        }
+        let mut agent = match self.agent.lock() {
+            Ok(agent) => agent,
+            Err(_) => {
+                self.alive.store(false, Ordering::SeqCst);
+                return None;
+            }
+        };
+        (self.alive.load(Ordering::SeqCst) && self.observe_alive(agent.is_alive()))
+            .then(|| agent.process_id())
+            .flatten()
+    }
+
+    /// Whether the backend holds `pid` as this session's own, even after its
+    /// child exits. A query error leaves ownership unknown.
+    pub fn owns_process(&self, pid: u32, process_handle: Option<usize>) -> std::io::Result<bool> {
+        self.agent
+            .lock()
+            .map_err(|_| std::io::Error::other("session lock poisoned"))?
+            .owns_process(pid, process_handle)
     }
 
     /// End the child. Refused while attached, and idempotent on an
     /// already-dead agent. Does not remove the session from a registry — the
     /// last screen survives; [`crate::Registry::close`] does both.
     pub fn terminate(&self) -> Result<()> {
-        self.terminate_inner(true)
+        self.terminate_inner(true, true)
     }
 
     pub(crate) fn terminate_for_close(&self) -> Result<()> {
-        self.terminate_inner(false)
+        self.terminate_inner(false, true)
     }
 
-    fn terminate_inner(&self, wake_waiters: bool) -> Result<()> {
-        if self.attached.load(Ordering::SeqCst) {
+    pub(crate) fn terminate_for_reap(&self) -> Result<()> {
+        self.terminate_inner(false, false)
+    }
+
+    fn terminate_inner(&self, wake_waiters: bool, refuse_attached: bool) -> Result<()> {
+        if refuse_attached && self.attached.load(Ordering::SeqCst) {
             return Err(AgentError::Attached);
         }
         let mut agent = self
             .agent
             .lock()
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        if self.alive.load(Ordering::SeqCst) {
+            self.observe_alive(agent.is_alive());
+        }
         let result = agent.terminate();
+        if result.is_ok() {
+            self.alive.store(false, Ordering::SeqCst);
+        } else {
+            if self.alive.load(Ordering::SeqCst) {
+                self.observe_alive(agent.is_alive());
+            }
+        }
         drop(agent);
         if result.is_ok() && wake_waiters {
             Self::notify_output_changed(&self.output_changed);
@@ -1164,6 +1541,24 @@ impl Attached<'_> {
                 return Err(AgentError::Attached);
             }
         }
+        let _human_gate = loop {
+            match self.session.human_gate.try_lock() {
+                Ok(gate) => break gate,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if self.is_displaced() || cancelled() {
+                        return Err(AgentError::Attached);
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        };
+        if let Ok(mut at) = self.session.last_human_input_at.lock() {
+            *at = Some(self.session.clock.now());
+        }
+        self.session.human_inflight.fetch_add(1, Ordering::SeqCst);
+        drop(_human_gate);
+        let _inflight = HumanInflightGuard(&self.session.human_inflight);
         self.session.write_one_burst_to_completion_while_started(
             bytes,
             &|| self.is_displaced() || cancelled(),
@@ -1196,6 +1591,14 @@ impl Attached<'_> {
 
     pub fn session(&self) -> &Session {
         self.session
+    }
+}
+
+struct HumanInflightGuard<'a>(&'a AtomicUsize);
+
+impl Drop for HumanInflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

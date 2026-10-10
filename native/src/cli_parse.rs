@@ -11,6 +11,16 @@ pub struct Spec {
     pub verbs: Vec<VerbSpec>,
 }
 
+/// How repeats of one option within a scope are handled (strict specs only).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum RepeatPolicy {
+    #[default]
+    Reject,
+    Append,
+    Last,
+    Coalesce,
+}
+
 #[derive(Clone, Debug)]
 pub struct OptionSpec {
     pub long: String,
@@ -18,6 +28,7 @@ pub struct OptionSpec {
     pub value: Option<String>,
     pub help: String,
     pub global: bool,
+    pub repeat_policy: RepeatPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -74,7 +85,7 @@ impl Report {
 /// Versions and features this parser supports, for `remuda.cli.capabilities()`.
 pub const SPEC_VERSIONS: &[u32] = &[1, 2];
 pub const REPORT_VERSIONS: &[u32] = &[1, 2];
-pub const FEATURES: &[&str] = &["stable_report", "strict_v2"];
+pub const FEATURES: &[&str] = &["stable_report", "strict_v2", "repeat_policy"];
 
 /// Shape a report as the v2 envelope; vectors are always arrays.
 /// Error text is the legacy diagnostic and may quote input until G7b safe_errors;
@@ -212,9 +223,19 @@ fn make_option(option: &OptionSpec) -> Arg {
         arg = arg.short(short);
     }
     if let Some(value) = &option.value {
-        arg = arg.value_name(value.clone()).action(ArgAction::Set);
+        let action = match option.repeat_policy {
+            RepeatPolicy::Append => ArgAction::Append,
+            _ => ArgAction::Set,
+        };
+        arg = arg.value_name(value.clone()).action(action);
     } else {
         arg = arg.action(ArgAction::SetTrue);
+    }
+    if matches!(
+        option.repeat_policy,
+        RepeatPolicy::Last | RepeatPolicy::Coalesce
+    ) {
+        arg = arg.overrides_with(option.long.clone());
     }
     arg
 }
@@ -383,7 +404,17 @@ fn collect_option(
     option: &OptionSpec,
     matches: Option<&clap::ArgMatches>,
 ) {
-    let value = if option.value.is_some() {
+    let value = if option.repeat_policy == RepeatPolicy::Append {
+        let items = matches.and_then(|m| m.get_many::<String>(&option.long));
+        Some(Value::Array(
+            items
+                .into_iter()
+                .flatten()
+                .cloned()
+                .map(Value::String)
+                .collect(),
+        ))
+    } else if option.value.is_some() {
         matches
             .and_then(|m| m.get_one::<String>(&option.long))
             .cloned()
@@ -509,6 +540,7 @@ mod tests {
                     value: Some("ROOM".into()),
                     help: "Room ID".into(),
                     global: true,
+                    repeat_policy: Default::default(),
                 },
                 OptionSpec {
                     long: "json".into(),
@@ -516,6 +548,7 @@ mod tests {
                     value: None,
                     help: "Print JSON".into(),
                     global: true,
+                    repeat_policy: Default::default(),
                 },
             ],
             verbs: vec![
@@ -557,6 +590,7 @@ mod tests {
                     value: Some("ROOM".into()),
                     help: "Room ID".into(),
                     global: true,
+                    repeat_policy: Default::default(),
                 },
                 OptionSpec {
                     long: "verbose".into(),
@@ -564,6 +598,7 @@ mod tests {
                     value: Some("LEVEL".into()),
                     help: "Verbosity".into(),
                     global: true,
+                    repeat_policy: Default::default(),
                 },
                 OptionSpec {
                     long: "json".into(),
@@ -571,6 +606,7 @@ mod tests {
                     value: None,
                     help: "Print JSON".into(),
                     global: true,
+                    repeat_policy: Default::default(),
                 },
             ],
             verbs: vec![VerbSpec {

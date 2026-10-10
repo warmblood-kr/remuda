@@ -28,6 +28,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
+rust-version = "1.95"
 
 [workspace.lints.clippy]
 # R15's actual subject: keep any one unit from growing without bound. These are

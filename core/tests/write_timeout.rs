@@ -179,10 +179,14 @@ fn send_line_reports_uncertain_when_enter_is_busy_after_body_lands() {
     attached_started_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("attached writer stalled before Enter");
-    clock.advance(Duration::from_millis(300));
-
-    let result = result_rx
-        .recv_timeout(Duration::from_secs(1))
+    // Keep driving time until send_line returns: one advance can land before
+    // send_line takes its quiet-screen deadline, which then never expires (#627).
+    // ~10 s of real patience: 500 rounds of a 20 ms receive.
+    let result = (0..500)
+        .find_map(|_| {
+            clock.advance(Duration::from_millis(100));
+            result_rx.recv_timeout(Duration::from_millis(20)).ok()
+        })
         .expect("send_line returned after Enter was refused");
     attached_release_tx.send(()).unwrap();
     assert!(human_write.join().unwrap().is_ok());

@@ -155,7 +155,16 @@ fn read_identity_material_at(dir: &Path) -> io::Result<Zeroizing<[u8; 64]>> {
     let path = dir.join(IDENTITY_FILE);
     #[cfg(windows)]
     let mut file = {
-        let file = super::windows_security::open_for_read(&path)?;
+        let file = super::windows_security::open_for_read(&path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                io::Error::new(
+                    error.kind(),
+                    format!("cluster identity {} not found", path.display()),
+                )
+            } else {
+                error
+            }
+        })?;
         storage::check_private_file(&file, "cluster identity", &path)?;
         file
     };
@@ -178,6 +187,12 @@ fn read_identity_material_at(dir: &Path) -> io::Result<Zeroizing<[u8; 64]>> {
                         "{} is a symlink; refusing (remove it to re-initialize)",
                         path.display()
                     ),
+                );
+            }
+            if error.kind() == io::ErrorKind::NotFound {
+                return io::Error::new(
+                    error.kind(),
+                    format!("cluster identity {} not found", path.display()),
                 );
             }
             error

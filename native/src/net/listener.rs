@@ -24,8 +24,7 @@ pub const MAX_BODY_BYTES: usize = 65_535;
 pub const MAX_GLOBAL_REQUESTS: usize = 64;
 pub const MAX_PREAUTH_REQUESTS: usize = 64;
 pub const MAX_PEER_REQUESTS: usize = 8;
-/// Large-response pool (v2): bounds the sealed copy and write time only, not the
-/// payload built before it (old pool) nor seal's >8 MiB extra peak heap each.
+/// Large-response pool (v2): bounds ciphertext assembly and write time, after dispatch builds payload.
 const MAX_LARGE_GLOBAL: usize = 4;
 const MAX_LARGE_PER_PEER: usize = 1;
 /// Absolute deadline for writing one large response (mirrors the client total).
@@ -1581,7 +1580,7 @@ fn send_dispatched_response(
     limiter: &Arc<RequestLimiter>,
     peer_fp: &str,
 ) {
-    if !opened.chunked || payload.len() <= frame::MAX_RESPONSE_PAYLOAD {
+    if !opened.chunked || payload.len() <= frame::MAX_RECORD_PLAINTEXT {
         return send_encrypted_response(stream, opened, payload);
     }
     match limiter.acquire_large(peer_fp) {
@@ -1763,7 +1762,8 @@ fn write_http_response_until(
     let Some(deadline) = deadline else {
         stream.write_all(head.as_bytes())?;
         stream.write_all(body)?;
-        return stream.flush();
+        stream.flush()?;
+        return stream.shutdown(Shutdown::Write);
     };
     // Headers and body share one absolute deadline; every path shuts down on failure.
     // SO_SNDTIMEO is only relative per wait (XNU restarts it), so a watchdog
@@ -1777,6 +1777,8 @@ fn write_http_response_until(
     };
     if result.is_err() {
         let _ = stream.shutdown(Shutdown::Both);
+    } else {
+        let _ = stream.shutdown(Shutdown::Write);
     }
     result
 }
@@ -3786,6 +3788,16 @@ mod tests {
         assert!(matches!(response, Response::Error(message) if message.contains("frame limit")));
     }
 
+    #[test]
+    fn v1_response_bound_matches_the_noise_msg2_limit() {
+        for (size, accepted) in [(65_486, true), (65_487, true), (65_488, false)] {
+            let raw = vec![b'x'; size];
+            let payload = bounded_response_payload(&raw, false);
+            assert_eq!(payload[0] == b'x', accepted, "payload size {size}");
+            assert!(payload.len() <= frame::MAX_RESPONSE_PAYLOAD);
+        }
+    }
+
     #[cfg(unix)]
     fn big_payload_server(size: Arc<AtomicUsize>) -> (SocketTestServer, snow::Keypair) {
         let dispatch = move |_: &[u8], _: &[u8]| {
@@ -3817,7 +3829,14 @@ mod tests {
     fn chunked_header_round_trips_big_responses_through_the_real_client() {
         let size = Arc::new(AtomicUsize::new(0));
         let (server, peer) = big_payload_server(size.clone());
-        let client = super::super::cluster_client::ClusterClient::system();
+        let client = super::super::cluster_client::ClusterClient::with_timeouts(
+            Arc::new(crate::SystemWallClock::new()),
+            super::super::cluster_client::ClientTimeouts {
+                connect: Duration::from_secs(5),
+                read: Duration::from_secs(30),
+                total: Duration::from_secs(30),
+            },
+        );
         for n in [1 << 20, 4 * 1024 * 1024 - 1024] {
             size.store(n, Ordering::SeqCst);
             let response = client
@@ -3830,6 +3849,42 @@ mod tests {
                 .unwrap();
             assert_eq!(response, Response::Error("x".repeat(n)));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_reply_below_one_record_limit_succeeds_with_peer_permit_occupied() {
+        let target_len = 65_488;
+        let empty = serde_json::to_vec(&Response::Error(String::new())).unwrap();
+        let message = "x".repeat(target_len - empty.len());
+        let response = serde_json::to_vec(&Response::Error(message)).unwrap();
+        assert_eq!(response.len(), target_len);
+        let dispatch_response = response.clone();
+        let t = Duration::from_secs(10);
+        let (server, peer, _) =
+            socket_server(move |_, _| Ok(dispatch_response.clone()), t, t, t, t);
+        let peer_fp = crate::cluster::encoding::fingerprint(&peer.public);
+        let held = server.state.limiter.acquire_large(&peer_fp).unwrap();
+        let client = super::super::cluster_client::ClusterClient::with_timeouts(
+            Arc::new(crate::SystemWallClock::new()),
+            super::super::cluster_client::ClientTimeouts {
+                connect: Duration::from_secs(5),
+                read: Duration::from_secs(10),
+                total: Duration::from_secs(10),
+            },
+        );
+        assert_eq!(
+            client
+                .request(
+                    server.address,
+                    &server.responder_public,
+                    &peer.private,
+                    &Request::List,
+                )
+                .unwrap(),
+            Response::Error("x".repeat(target_len - empty.len()))
+        );
+        drop(held);
     }
 
     #[cfg(unix)]
@@ -3849,6 +3904,41 @@ mod tests {
         let reply: Response =
             serde_json::from_slice(&frame::open_response(sealed, &body).unwrap()).unwrap();
         assert_eq!(reply, Response::Error("x".repeat(100)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v1_payload_boundary_uses_an_encrypted_error_above_the_cap() {
+        let size = Arc::new(AtomicUsize::new(0));
+        let (server, peer) = big_payload_server(size.clone());
+        let empty_len = serde_json::to_vec(&Response::Error(String::new()))
+            .unwrap()
+            .len();
+        for (wire_len, accepted) in [(65_486, true), (65_487, true), (65_488, false)] {
+            let content_len = wire_len - empty_len;
+            assert_eq!(
+                serde_json::to_vec(&Response::Error("x".repeat(content_len)))
+                    .unwrap()
+                    .len(),
+                wire_len
+            );
+            size.store(content_len, Ordering::SeqCst);
+            let (sealed, status, body) = raw_with_headers(&server, &peer, "");
+            assert_eq!(status, 200);
+            let reply: Response =
+                serde_json::from_slice(&frame::open_response(sealed, &body).unwrap()).unwrap();
+            if accepted {
+                assert_eq!(reply, Response::Error("x".repeat(content_len)));
+            } else {
+                assert_eq!(
+                    reply,
+                    Response::Error(
+                        "cluster response exceeds the Noise frame limit; upgrade the requesting node to read it"
+                            .into()
+                    )
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

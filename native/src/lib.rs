@@ -35,6 +35,7 @@ pub mod pty;
 pub mod remote_front;
 pub mod reply_limit;
 pub mod script;
+pub mod session_job;
 pub(crate) mod storage;
 pub mod text;
 pub mod tick;
@@ -137,6 +138,11 @@ impl Clock for SystemClock {
         self.instance_id_seed
     }
 }
+
+/// Held by every lib test that swaps process-global env (HOME, XDG_STATE_HOME):
+/// one lock, or tests guarded by different ones see each other's directories.
+#[cfg(all(test, unix))]
+pub(crate) static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {

@@ -2,12 +2,19 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("remuda-broken-pipe-{}", std::process::id()));
+        // One directory per Scratch: a shared one let a second Scratch delete a live daemon's socket.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "remuda-broken-pipe-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("make private test directory");
         Self(dir)
@@ -129,6 +136,11 @@ fn listing_commands_allow_the_reader_to_stop_after_one_line() {
     }
 
     let empty_home = Scratch::new();
+    let socket = scratch.0.join("remuda/s.sock");
+    assert!(
+        socket.exists(),
+        "a second Scratch removed the first daemon's socket {socket:?}"
+    );
     let failed_batch = empty_home.remuda(&["mod", "update", "--all", "--reload"]);
     assert_eq!(
         failed_batch.status.code(),
@@ -146,5 +158,10 @@ fn listing_commands_allow_the_reader_to_stop_after_one_line() {
         stderr(&failed_batch)
     );
 
-    let _ = scratch.remuda(&["-s", "s", "stop", "-f"]);
+    let stop = scratch.remuda(&["-s", "s", "stop", "-f"]);
+    assert!(
+        stop.status.success(),
+        "the listing daemon could not be stopped, so it leaks: {}",
+        stderr(&stop)
+    );
 }

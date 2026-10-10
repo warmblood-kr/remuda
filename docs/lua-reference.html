@@ -14,7 +14,7 @@
 <h2 id="buffers">buffers</h2>
 <p><code>table</code> — The <span class="title-ref">remuda.buffer</span> registry table, keyed by buffer name.</p>
 <h2 id="caller">caller</h2>
-<p><code>caller() -&gt; {kind: 'session'|'outside'|'unknown', session?: string}</code> — ADVISORY only: peer ancestry identifies a managed session, outside, or unknown; outside does not prove operator identity. Same-UID Lua can run <code>remuda -e</code> and wrap <code>_dispatch_extension_command</code>; Windows parent PIDs may be stale or chosen, so this is not an authentication boundary.</p>
+<p><code>caller() -&gt; {kind: 'session'|'outside'|'unknown', session?: string, instance_id?: string}</code> — ADVISORY only: peer ancestry identifies a managed session, outside, or unknown; outside does not prove operator identity. Same-UID Lua can run <code>remuda -e</code> and wrap <code>_dispatch_extension_command</code>; Windows parent PIDs may be stale or chosen, so this is not an authentication boundary.</p>
 <h2 id="cancel">cancel</h2>
 <p><code>cancel(handle) -&gt; nil</code> — Cancel a schedule by the handle <span class="title-ref">schedule()</span> returned.</p>
 <h2 id="capture">capture</h2>
@@ -23,6 +23,8 @@
 <p><code>capture_styled(name) -&gt; {rows, cursor = {row, col, visible}}</code> — Read a session's screen as rows of {text, dim} spans, plus its cursor.</p>
 <h2 id="clear_hooks">clear_hooks</h2>
 <p><code>clear_hooks(opts) -&gt; nil</code> — Remove every hook registered under a group.</p>
+<h2 id="clear_input">clear_input</h2>
+<p><code>clear_input(name, key) -&gt; {cleared = string|nil}</code> — Write one trusted clear-line key to a session as an atomic input act. The core currently allows only exact Ctrl+U (byte 0x15), verified for Codex; use it only when the target agent's configured binding clears to the start of its input. Other keys are refused. Keys are limited to 1–16 bytes and four calls per session per second. Refuses during recent human typing or while a PTY writer is busy. Terminal screens do not generally identify composer contents, so <span class="title-ref">cleared</span> is nil when unknown ([Codex issue #20698](<a href="https://github.com/openai/codex/issues/20698">https://github.com/openai/codex/issues/20698</a>)).</p>
 <h2 id="cli">cli</h2>
 <p><code>table</code> — Declarative command-line parsing for extension handlers.</p>
 <h2 id="cli.capabilities">cli.capabilities</h2>
@@ -60,7 +62,7 @@
 <h2 id="expect_option">expect_option</h2>
 <p><code>expect_option(screen, label_predicate) -&gt; number|nil</code> — Pick a unique numbered menu option by its label.</p>
 <h2 id="extension_command">extension_command</h2>
-<p><code>extension_command(name, handler(args, caller)) -&gt; nil</code> — Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind and session fields, plus forwarded env/stdin values; kind outside does not establish operator identity.</p>
+<p><code>extension_command(name, handler(args, caller)) -&gt; nil</code> — Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind, session and instance_id fields, plus forwarded env/stdin values; kind outside does not establish operator identity.</p>
 <h2 id="fail">fail</h2>
 <p><code>fail(message, code?) -&gt; never (default code 1; valid codes are 1..255)</code> — Raise a deliberate CLI failure with a message and exit code.</p>
 <h2 id="feed">feed</h2>
@@ -120,7 +122,7 @@
 <h2 id="mkdir">mkdir</h2>
 <p><code>mkdir(dir) -&gt; nil</code> — Create a directory, including its parents.</p>
 <h2 id="new">new</h2>
-<p><code>new(name?, argv?, cwd?, env?) -&gt; string</code> — Deprecated alias for <span class="title-ref">remuda.session.new</span>.</p>
+<p><code>new(name?, argv?, cwd?, env?) -&gt; name, instance_id</code> — Deprecated alias for <span class="title-ref">remuda.session.new</span>; returns name and registered instance_id.</p>
 <h2 id="on">on</h2>
 <p><code>on(event, fn, opts?) -&gt; nil</code> — Register a callback to run when an event fires. `opts`: <span class="title-ref">group</span>, <span class="title-ref">id</span> (same group+id replaces), <span class="title-ref">depth</span> (-100..100, lower first).</p>
 <h2 id="pending">pending</h2>
@@ -158,7 +160,7 @@
 <h2 id="session.list">session.list</h2>
 <p><code>session.list() -&gt; {session...}</code> — List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.</p>
 <h2 id="session.new">session.new</h2>
-<p><code>session.new(name?, argv?, cwd?, env?) -&gt; string</code> — Start a session, defaulting the command to the user's shell.</p>
+<p><code>session.new(name?, argv?, cwd?, env?) -&gt; name, instance_id</code> — Start a session and return its name and registered instance_id.</p>
 <h2 id="session.resize">session.resize</h2>
 <p><code>session.resize(name, cols, rows) -&gt; true | nil, err</code> — Resize a session's terminal (cols 20..1000, rows 24..500).</p>
 <h2 id="storage">storage</h2>

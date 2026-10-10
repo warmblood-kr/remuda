@@ -155,7 +155,8 @@ fn children_of_a_detached_daemon_keep_the_default_sighup() {
     let dir = daemon.socket.parent().unwrap().to_path_buf();
     let probe = |file: &Path| {
         format!(
-            "{{'python3', '-c', 'import signal, sys, time; open(sys.argv[1], \"w\").write(str(int(signal.getsignal(signal.SIGHUP)))); time.sleep(30)', '{}'}}",
+            "{{'{}', '{}'}}",
+            env!("CARGO_BIN_EXE_sighup_disposition_probe"),
             file.display()
         )
     };
@@ -193,4 +194,19 @@ fn children_of_a_detached_daemon_keep_the_default_sighup() {
         "0",
         "process child's SIGHUP is not SIG_DFL"
     );
+
+    // A probe that outlives its daemon writes its coverage profile late (#624).
+    let pids = [&pty_file, &process_file].map(|file| {
+        let pid = read(&file.with_extension("pid"));
+        pid.parse::<libc::pid_t>().expect("probe pid")
+    });
+    drop(daemon);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for pid in pids {
+        // SAFETY: signal 0 only checks that the pid exists.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(Instant::now() < deadline, "probe {pid} outlived its daemon");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }

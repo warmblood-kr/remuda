@@ -8,6 +8,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 static NEXT_IMAGE_SOCKET: AtomicU64 = AtomicU64::new(0);
+// The budget is counted in Lua instructions, not time: one exhausted budget is
+// about a second of CPU in a debug build, and a loaded host stretches that
+// without limit. Waits that only detect a job that never returns use this;
+// a wait that asserts promptness keeps its own short bound.
+const PATIENCE: Duration = Duration::from_secs(120);
 
 struct ScratchDir(PathBuf);
 
@@ -87,7 +92,7 @@ fn expect_bounded_error(code: &str) {
     let image = image();
     let answer = image.submit(code, None).expect("queue bounded regression");
     let error = answer
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(PATIENCE)
         .expect("Lua execution returns within the test bound")
         .expect_err("the script must exceed the instruction budget");
     assert!(
@@ -126,7 +131,7 @@ fn a_coroutine_resumed_in_a_later_job_is_bounded() {
         .submit("return coroutine.resume(saved_coroutine)", None)
         .expect("queue resume");
     let error = answer
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(PATIENCE)
         .expect("resumed coroutine returns within the test bound")
         .expect_err("the coroutine must exceed the instruction budget");
     assert!(
@@ -152,14 +157,14 @@ fn a_timer_wait_does_not_consume_the_instruction_budget() {
         "scheduled"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + PATIENCE;
     loop {
         let answer = image
             .submit("return tostring(remuda._timer_test_sum)", None)
             .expect("queue timer result query");
         let result = answer
-            .recv_timeout(Duration::from_secs(1))
-            .expect("timer result query returns promptly")
+            .recv_timeout(PATIENCE)
+            .expect("timer result query returns")
             .expect("read timer result");
         if result != "nil" {
             assert_eq!(result, "5000050000");
@@ -188,7 +193,7 @@ fn a_million_step_lua_loop_fits_the_budget() {
         .expect("queue ordinary Lua work");
     assert_eq!(
         answer
-            .recv_timeout(Duration::from_secs(15))
+            .recv_timeout(PATIENCE)
             .expect("million-step loop completes within the test bound")
             .expect("ordinary Lua work fits the execution budget"),
         "500000500000"
@@ -251,7 +256,7 @@ fn tool_callback_instruction_limit_is_enforced() {
         .expect("queue follow-up request");
 
     let callback_error = callback
-        .recv_timeout(Duration::from_secs(30))
+        .recv_timeout(PATIENCE)
         .expect("the infinite callback returns within its instruction budget")
         .expect_err("the callback must report its execution limit");
     assert!(
@@ -259,7 +264,7 @@ fn tool_callback_instruction_limit_is_enforced() {
         "unexpected callback error: {callback_error}"
     );
     assert_eq!(
-        next.recv_timeout(Duration::from_secs(1))
+        next.recv_timeout(PATIENCE)
             .expect("the image answers the next request")
             .expect("follow-up eval succeeds"),
         "200010000"

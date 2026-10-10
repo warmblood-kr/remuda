@@ -357,6 +357,24 @@ impl AgentWriter for PtyInputWriter {
         }
     }
 
+    fn write_bounded_if_idle(&self, bytes: &[u8]) -> Result<()> {
+        // `submit_bounded` reserves the worker's single-flight slot under its
+        // state lock and refuses an active write without waiting or queuing.
+        let (sequence, receiver) = self.submit_bounded(bytes)?;
+        match receiver.recv_timeout(self.timeout) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.record_stalled_sequence(sequence);
+                Err(AgentError::WriteTimeout {
+                    timeout: self.timeout,
+                })
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(AgentError::Io("pty writer worker stopped".into()))
+            }
+        }
+    }
+
     fn write_to_completion(&self, bytes: &[u8]) -> Result<()> {
         self.write_to_completion_while(bytes, &|| false)
     }
@@ -478,6 +496,30 @@ pub struct PtyAgent {
     output_version: Arc<AtomicU64>,
     exit_info: Option<ExitInfo>,
     master: Option<Box<dyn MasterPty + Send>>,
+    end_job: Box<dyn Fn() -> Result<()> + Send + Sync>,
+    job_ended: bool,
+    #[cfg(windows)]
+    job: Arc<crate::session_job::SessionJob>,
+}
+
+/// Windows: the session's job, holding the child. If the child cannot be
+/// assigned, it is killed and the session is refused.
+#[cfg(windows)]
+fn session_job_for(
+    child: &mut (dyn Child + Send + Sync),
+) -> Result<crate::session_job::SessionJob> {
+    use crate::session_job::{set_up, SessionJob};
+    let handle = child.as_raw_handle();
+    let assign = |job: &SessionJob| {
+        let Some(handle) = handle else {
+            return Err(std::io::Error::other("the child has no process handle"));
+        };
+        job.assign(handle)
+    };
+    let kill = || {
+        let _ = child.kill();
+    };
+    set_up(SessionJob::new(), assign, kill).map_err(AgentError::Io)
 }
 
 impl PtyAgent {
@@ -492,11 +534,26 @@ impl PtyAgent {
             })
             .map_err(io)?;
 
-        let child = pair.slave.spawn_command(command).map_err(io)?;
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut child = pair.slave.spawn_command(command).map_err(io)?;
+        #[cfg(windows)]
+        let (job, end_job): (
+            Arc<crate::session_job::SessionJob>,
+            Box<dyn Fn() -> Result<()> + Send + Sync>,
+        ) = {
+            let job = Arc::new(session_job_for(child.as_mut())?);
+            let ending = Arc::clone(&job);
+            let end_job = Box::new(move || ending.end().map_err(io));
+            (job, end_job)
+        };
+        #[cfg(not(windows))]
+        let end_job: Box<dyn Fn() -> Result<()> + Send + Sync> = Box::new(|| Ok(()));
         // No child_guard here on purpose — this child already dies with the
         // daemon by kernel accident (the master fd closes on any daemon
         // exit, SIGHUP-ing this session leader). See child_guard.rs and
-        // native/tests/pty_survives_daemon_death.rs, which pins it.
+        // native/tests/pty_survives_daemon_death.rs, which pins it. On Windows
+        // the session's job ends its assigned child and descendants started
+        // after assignment.
         crate::child_guard::documented_pty_hangup_accident();
         drop(pair.slave); // Or the master never sees EOF when the child exits.
 
@@ -542,6 +599,10 @@ impl PtyAgent {
             output_version,
             exit_info: None,
             master: Some(pair.master),
+            end_job,
+            job_ended: false,
+            #[cfg(windows)]
+            job,
         })
     }
 }
@@ -763,6 +824,17 @@ pub(crate) fn styled_cells(screen: &vt100::Screen, size: Size) -> Vec<Vec<Styled
         .collect()
 }
 
+impl PtyAgent {
+    fn end_job(&mut self) -> Result<()> {
+        if self.job_ended {
+            return Ok(());
+        }
+        (self.end_job)()?;
+        self.job_ended = true;
+        Ok(())
+    }
+}
+
 impl AgentProcess for PtyAgent {
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         if !self.is_alive() {
@@ -928,17 +1000,21 @@ impl AgentProcess for PtyAgent {
     /// `kill()` afterwards fails with ESRCH. The trait's idempotence is
     /// therefore explicit here — an already-gone process is nothing to signal.
     fn terminate(&mut self) -> Result<()> {
-        if !self.is_alive() {
-            return Ok(());
-        }
-        self.child.kill().map_err(io)?;
-        let status = self.child.wait().map_err(io)?;
-        self.record_exit_status(status);
-        // ConPTY can keep the output reader alive after the child exits until
-        // ClosePseudoConsole runs. Close the master here so output monitors
-        // can flush before the caller waits for their final notification.
-        self.master.take();
-        Ok(())
+        let child_result = if self.is_alive() {
+            self.child.kill().map_err(io).and_then(|()| {
+                self.child.wait().map_err(io).map(|status| {
+                    self.record_exit_status(status);
+                    // ConPTY can keep the output reader alive after the child
+                    // exits until ClosePseudoConsole runs. Close the master
+                    // so output monitors can flush before final notification.
+                    self.master.take();
+                })
+            })
+        } else {
+            Ok(())
+        };
+        let job_result = self.end_job();
+        child_result.and(job_result)
     }
 
     fn resize(&mut self, size: Size) -> Result<()> {
@@ -965,6 +1041,14 @@ impl AgentProcess for PtyAgent {
 
     fn process_id(&self) -> Option<u32> {
         self.child.process_id()
+    }
+
+    #[cfg(windows)]
+    fn owns_process(&self, pid: u32, process_handle: Option<usize>) -> std::io::Result<bool> {
+        match process_handle {
+            Some(handle) => self.job.holds(handle as _),
+            None => self.job.contains(pid),
+        }
     }
 }
 
@@ -1240,6 +1324,10 @@ mod input_writer_tests {
         assert!(writer.is_busy());
         assert!(matches!(
             writer.write_bounded(b"not submitted"),
+            Err(AgentError::Busy)
+        ));
+        assert!(matches!(
+            writer.write_bounded_if_idle(b"clear must not queue"),
             Err(AgentError::Busy)
         ));
 
@@ -1772,6 +1860,77 @@ fn capture_snapshot(
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[derive(Debug)]
+    struct WaitErrorChild;
+
+    impl portable_pty::ChildKiller for WaitErrorChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(Self)
+        }
+    }
+
+    impl portable_pty::Child for WaitErrorChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Err(std::io::Error::other("wait failed"))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_ends_its_job_once_even_when_the_session_is_already_dead() {
+        let mut command = CommandBuilder::new("printf");
+        command.arg("done");
+        let mut agent = PtyAgent::spawn(command, Size::new(80, 24)).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ended = Arc::clone(&calls);
+        agent.end_job = Box::new(move || {
+            ended.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        agent.terminate().unwrap();
+        agent.terminate().unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_ends_its_job_when_wait_fails() {
+        let mut command = CommandBuilder::new("sh");
+        command.args(["-c", "exit 0"]);
+        let mut agent = PtyAgent::spawn(command, Size::new(80, 24)).unwrap();
+        agent.child.kill().unwrap();
+        let _ = agent.child.wait();
+        agent.child = Box::new(WaitErrorChild);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ended = Arc::clone(&calls);
+        agent.end_job = Box::new(move || {
+            ended.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        assert!(agent.terminate().is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     #[cfg(unix)]
     #[test]
