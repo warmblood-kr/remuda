@@ -163,6 +163,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 scripts/check-install.py
+      - run: sh scripts/check-landing-a11y.sh
       - run: sh -n docs/install.sh
       - run: pwsh -NoProfile -File scripts/check-powershell.ps1
 
