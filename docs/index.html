@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#111315">
+  <title>Remuda — A terminal for working with agents</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111315;
+      --surface: #17191b;
+      --surface-2: #1b1e20;
+      --ink: #f3f2ee;
+      --muted: #b4b3ae;
+      --quiet: #858680;
+      --line: #3b3d3d;
+      --accent: #e6a33b;
+      --accent-ink: #21180c;
+      --max: 1440px;
+      --pad: clamp(24px, 6vw, 88px);
+      --section-pad: clamp(48px, 4vw, 64px);
+      --chapter-pad: clamp(42px, 3.6vw, 54px);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      font-synthesis: none;
+      text-rendering: optimizeLegibility;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; background: var(--bg); }
+    body { margin: 0; min-width: 320px; background: var(--bg); color: var(--ink); line-height: 1.55; }
+    a { color: inherit; text-decoration: none; }
+    a:hover { color: var(--accent); }
+    a:focus-visible, .button:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+    .wrap { width: min(100%, var(--max)); margin-inline: auto; padding-inline: var(--pad); }
+    .nav { min-height: 76px; border-bottom: 1px solid var(--line); display: flex; align-items: center; }
+    .nav-inner { display: flex; align-items: center; justify-content: space-between; gap: 28px; }
+    .wordmark { color: var(--accent); font-size: 20px; font-weight: 750; letter-spacing: -.04em; }
+    .nav-links { display: flex; align-items: center; gap: clamp(18px, 3vw, 46px); font-size: 14px; color: var(--muted); }
+    .nav-links a:last-child { color: var(--ink); }
+    .button { display: inline-flex; align-items: center; justify-content: center; min-height: 48px; padding: 0 22px; border: 1px solid var(--line); border-radius: 5px; font-size: 14px; font-weight: 650; }
+    .button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+    .button.secondary { background: transparent; color: var(--ink); }
+    .button:hover { border-color: var(--accent); color: var(--accent); }
+    .button.primary:hover { color: var(--accent-ink); background: #f0b255; }
+    .band { border-bottom: 1px solid var(--line); display: flex; align-items: center; padding-block: var(--section-pad); }
+    .band-inner { width: min(100%, var(--max)); }
+    .hero { min-height: 620px; padding-block: clamp(58px, 5vw, 76px); flex-direction: column; align-items: stretch; }
+    .hero-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: center; gap: clamp(40px, 5vw, 72px); }
+    .hero-grid > * { min-width: 0; }
+    .eyebrow { color: var(--accent); text-transform: uppercase; letter-spacing: .15em; font-size: 11px; font-weight: 700; margin: 0 0 22px; }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { font-size: clamp(44px, 5.2vw, 72px); line-height: .99; letter-spacing: -.065em; font-weight: 660; max-width: 620px; margin-bottom: 28px; }
+    .tagline { font-size: clamp(17px, 1.7vw, 22px); color: var(--ink); margin-bottom: 8px; }
+    .subline { color: var(--muted); font-size: 16px; max-width: 620px; margin-bottom: 30px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; }
+    .tui-placeholder { background: #0e1011; border: 1px solid #68665f; border-radius: 8px; min-height: 410px; padding: 14px; box-shadow: 0 18px 50px #0004; }
+    .windowbar { height: 34px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid #333; color: var(--quiet); font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .windowbar span:first-child { color: var(--accent); }
+    .placeholder-content { min-height: 344px; border: 1px dashed #575750; border-radius: 4px; margin-top: 10px; display: grid; place-content: center; text-align: center; padding: 32px; color: var(--muted); }
+    .placeholder-content strong { display: block; color: var(--ink); font-size: 17px; font-weight: 580; margin-bottom: 10px; }
+    .placeholder-content small { max-width: 330px; color: var(--quiet); font-size: 12px; }
+    .flow-strip { display: grid; width: min(calc(100% - var(--pad) - var(--pad)), calc(var(--max) - var(--pad) - var(--pad))); min-width: 0; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: center; gap: 12px; margin: 34px auto 0; padding: 16px 18px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); }
+    .flow-node { text-align: center; font-size: 12px; font-weight: 620; }
+    .flow-node small { display: block; color: var(--quiet); font-size: 10px; font-weight: 450; }
+    .flow-arrow { color: var(--accent); font-size: 10px; text-align: center; white-space: nowrap; }
+    .flow-arrow span { display: block; color: var(--muted); font-size: 9px; }
+    .band-title { display: grid; grid-template-columns: .75fr 1fr; align-items: start; gap: clamp(28px, 3vw, 42px); margin-bottom: 34px; }
+    h2 { font-size: clamp(34px, 4vw, 54px); line-height: 1.05; letter-spacing: -.055em; font-weight: 620; margin-bottom: 16px; }
+    .lede { color: var(--muted); font-size: 16px; max-width: 560px; margin: 0; }
+    .layers { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 28px 40px; align-items: center; }
+    .layers > * { min-width: 0; }
+    .stack { display: grid; gap: 10px; }
+    .layer { min-height: 66px; padding: 15px 20px; border: 1px solid var(--line); border-radius: 5px; display: flex; align-items: center; justify-content: space-between; gap: 18px; background: var(--surface); }
+    .layer small { color: var(--quiet); font-size: 11px; }
+    .layer strong { font-size: 15px; font-weight: 560; }
+    .layer .highlight { color: var(--accent); }
+    .stack-note { color: var(--muted); font-size: 13px; margin-top: 14px; }
+    .story { min-height: 480px; padding-block: var(--chapter-pad); }
+    .story-grid { display: grid; grid-template-columns: minmax(0, .78fr) minmax(0, 1.22fr); gap: clamp(32px, 5vw, 72px); align-items: center; }
+    .story-grid > * { min-width: 0; }
+    .story-copy h2 { max-width: 520px; }
+    .story-copy .lede { margin-bottom: 24px; }
+    .diagram { min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: clamp(18px, 3vw, 34px); }
+    .diagram svg { width: 100%; height: auto; display: block; overflow: visible; }
+    svg text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--ink); }
+    svg .box { fill: #17191b; stroke: #66665e; stroke-width: 1.5; }
+    svg .machine-box { fill: #141618; stroke: #77766e; stroke-width: 1.5; }
+    svg .accent-box { fill: #211d17; stroke: var(--accent); stroke-width: 1.5; }
+    svg .line { stroke: #d7d5cd; stroke-width: 1.6; fill: none; marker-end: url(#arrow); }
+    svg .dash { stroke: #aaa89e; stroke-width: 1.5; stroke-dasharray: 5 5; fill: none; marker-end: url(#arrow); }
+        svg .caption { fill: var(--muted); font-size: 12px; }
+    svg .tiny { fill: var(--quiet); font-size: 10px; }
+    svg .amber { fill: var(--accent); }
+    .multi-links { display: grid; gap: 12px; margin-top: 14px; grid-template-columns: 1fr 1fr; }
+    .link-label { border: 1px solid var(--line); border-radius: 4px; padding: 11px 13px; display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 12px; color: var(--muted); text-align: center; }
+    .link-label strong { color: var(--ink); font-weight: 620; }
+    .link-swatch { width: 30px; height: 0; border-top: 2px solid var(--ink); flex: 0 0 auto; }
+    .link-swatch.dashed { border-top-style: dashed; }
+    .flow { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 30px; }
+    .flow-step { padding: 18px 14px; border: 1px solid var(--line); border-radius: 5px; text-align: center; background: var(--surface); }
+    .flow-step strong { display: block; font-size: 14px; margin-bottom: 5px; }
+    .flow-step span { color: var(--quiet); font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .lua-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .lua-card { border: 1px solid var(--line); border-radius: 6px; background: var(--surface); padding: 22px; min-height: 160px; }
+    .lua-card .label { display: block; color: var(--accent); text-transform: uppercase; letter-spacing: .12em; font-size: 10px; font-weight: 700; margin-bottom: 14px; }
+    .lua-card p { color: var(--muted); font-size: 13px; margin-bottom: 0; }
+    .placeholder-code { min-height: 62px; border: 1px dashed #605e56; border-radius: 4px; display: flex; align-items: center; padding: 12px; color: var(--quiet); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .capture-player { min-width: 0; overflow: hidden; border: 1px solid #68665f; border-radius: 8px; background: #0d0f10; box-shadow: 0 18px 50px #0004; }
+    .capture-top { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 15px; border-bottom: 1px solid #333; color: var(--muted); font: 11px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .capture-title { color: var(--accent); font-weight: 700; letter-spacing: .04em; }
+    .capture-screen { min-height: 240px; max-height: 280px; overflow: auto; padding: 18px; background: #0b0d0e; }
+    .capture-screen pre { min-height: 204px; margin: 0; color: #e9e8e2; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .capture-screen pre::selection { background: #57401e; }
+    .capture-controls { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-top: 1px solid #333; }
+    .capture-controls button { min-height: 34px; padding: 0 12px; border: 1px solid #454641; border-radius: 4px; background: #17191b; color: var(--ink); font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace; cursor: pointer; }
+    .capture-controls button:hover { border-color: var(--accent); color: var(--accent); }
+    .capture-progress { flex: 1; min-width: 28px; height: 3px; background: #343633; overflow: hidden; }
+    .capture-progress span { display: block; width: 0; height: 100%; background: var(--accent); transition: width .15s linear; }
+    .capture-step { min-width: 74px; color: var(--quiet); text-align: right; font: 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .capture-note { margin: 0; padding: 0 14px 12px; color: var(--quiet); font-size: 10px; }
+    .capture-story { display: grid; grid-template-columns: minmax(0,.8fr) minmax(0,1.2fr); align-items: center; gap: clamp(28px,4vw,56px); }
+    .capture-story > * { min-width: 0; }
+    .capture-points { display: grid; gap: 8px; margin: 20px 0 0; padding: 0; list-style: none; color: var(--muted); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .capture-points li::before { content: "→"; margin-right: 9px; color: var(--accent); }
+    .demo-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    .demo-card { min-height: 250px; border: 1px solid var(--line); border-radius: 6px; padding: 18px; display: flex; flex-direction: column; background: var(--surface); }
+    .demo-card h3 { font-size: 16px; line-height: 1.25; margin: 0 0 13px; }
+    .demo-placeholder { flex: 1; min-height: 90px; border: 1px dashed #5b5b55; border-radius: 4px; display: grid; place-content: center; text-align: center; padding: 12px; color: var(--quiet); font-size: 11px; }
+    .demo-link { margin-top: 15px; color: var(--accent); font-size: 12px; font-weight: 650; }
+    .install-instructions h3 { margin: 18px 0 8px; font-size: 14px; }
+    .install-command { margin: 0; padding: 13px; overflow-x: auto; border: 1px solid var(--line); border-radius: 4px; background: #0d0f10; color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .install-grid { display: grid; grid-template-columns: .7fr 1.3fr; gap: 50px; align-items: center; }
+    .install-bar { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 15px; border: 1px solid var(--line); background: #0d0f10; padding: 10px; border-radius: 5px; }
+    .install-placeholder { min-height: 42px; display: flex; align-items: center; padding: 8px 12px; color: var(--quiet); border: 1px dashed #56564f; border-radius: 3px; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .foot { padding-block: 34px; color: var(--quiet); font-size: 12px; }
+    .foot-inner { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+    .wide-diagram { overflow-x: auto; }
+    .wide-diagram svg { min-width: 600px; }
+    .system-diagram svg { min-width: 680px; }
+    .foot-links { display: flex; flex-wrap: wrap; gap: 24px; }
+    .checklist-note { margin-top: 14px; font-size: 11px; color: var(--quiet); }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    @media (max-width: 1100px) {
+      .hero-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 900px) {
+      .hero-grid, .story-grid, .layers, .install-grid { grid-template-columns: 1fr; }
+      .hero { min-height: 0; }
+      .capture-screen { min-height: 220px; }
+      .capture-story { grid-template-columns: 1fr; }
+      .placeholder-content { min-height: 275px; }
+      .band-title { grid-template-columns: 1fr; gap: 8px; }
+      .story { min-height: 0; }
+      .demo-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 600px) {
+      :root { --pad: 22px; }
+      .nav { min-height: 64px; }
+      .nav-inner { gap: 14px; }
+      .nav-links { gap: 12px; font-size: 11px; }
+      .nav-links a:nth-child(4) { display: none; }
+      .nav .button { min-height: 38px; padding-inline: 12px; font-size: 11px; }
+      .wordmark { font-size: 18px; }
+      :root { --section-pad: 50px; --chapter-pad: 46px; }
+      .band { padding-block: var(--section-pad); }
+      .hero { padding-block: 56px; }
+      h1 { font-size: clamp(42px, 12vw, 58px); }
+      h2 { font-size: 34px; }
+      .subline { font-size: 14px; }
+      .actions { width: 100%; }
+      .actions .button { flex: 1; }
+      .capture-screen { min-height: 190px; max-height: 250px; padding: 14px; }
+      .capture-screen pre { min-height: 160px; font-size: 11px; }
+      .capture-controls { gap: 7px; padding: 10px; }
+      .capture-controls button { padding-inline: 9px; }
+      .capture-step { min-width: 58px; }
+      .layers { gap: 24px; }
+      .band-title { margin-bottom: 28px; }
+      .diagram { padding: 14px; overflow-x: auto; }
+      .story-grid .diagram:not(.wide-diagram) svg { min-width: 520px; }
+      .diagram.wide-diagram { overflow-x: auto; }
+      .multi-links { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: repeat(2, 1fr); }
+      .flow-strip { grid-template-columns: 1fr; gap: 8px; text-align: center; }
+      .flow-arrow { transform: none; min-height: 25px; }
+      .flow-arrow::after { content: "↓"; display: block; color: var(--accent); font-size: 16px; line-height: 1; }
+      .lua-grid { grid-template-columns: 1fr; }
+      .demo-grid { grid-template-columns: 1fr; }
+      .demo-card { min-height: 215px; }
+      .install-grid { gap: 24px; }
+      .install-bar { grid-template-columns: 1fr; }
+      .install-bar .button { width: 100%; }
+      .foot-inner { align-items: flex-start; flex-direction: column; }
+      .foot-links { gap: 16px; }
+    }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+      .flow-arrow { white-space: normal; }
+  </style>
+</head>
+<body>
+  <header class="nav">
+    <div class="wrap nav-inner">
+      <a class="wordmark" href="#top" aria-label="Remuda home">Remuda</a>
+      <nav class="nav-links" aria-label="Main navigation">
+        <a href="#product">Product</a><a href="#demos">Demos</a><a href="getting-started.html">Docs</a><a href="https://github.com/warmblood-kr/remuda">GitHub</a>
+      </nav>
+      <a class="button primary" href="#install">Get started</a>
+    </div>
+  </header>
+
+  <main id="top">
+    <section class="band hero" id="product">
+      <div class="wrap band-inner hero-grid">
+        <div>
+          <p class="eyebrow">Persistent terminal sessions for agents</p>
+          <h1>A terminal for working with agents.</h1>
+          <p class="tagline">The terminal for working with agents.</p>
+          <p class="subline">Keep agent terminal sessions visible and interact with them through Remuda. Remuda includes a Lua runtime for extensions.</p>
+          <div class="actions"><a class="button primary" href="#install">Get started</a><a class="button secondary" href="#demos">See demo status</a></div>
+        </div>
+        <div class="capture-player" data-recording="remuda" aria-label="Offline text replay of a scrubbed Remuda terminal session">
+          <div class="capture-top"><span class="capture-title">REMUDA · SESSION REPLAY</span><span>offline text replay · scrubbed</span></div>
+          <div class="capture-screen"><pre class="capture-output" aria-live="polite"></pre></div>
+          <div class="capture-controls"><button type="button" data-action="play" aria-label="Play terminal replay">Play</button><button type="button" data-action="replay">Replay</button><button type="button" data-action="next">Next</button><div class="capture-progress" aria-hidden="true"><span></span></div><output class="capture-step">01 / 03</output></div>
+          <p class="capture-note">Offline text replay from a disposable local session. Names and content are synthetic; displayed dimensions and idle times are illustrative.</p>
+        </div>
+      </div>
+      <div class="wrap flow-strip" aria-label="Agent process, PTY, and Remuda session flow">
+        <div class="flow-node">Agent process<small>interactive CLI</small></div>
+        <div class="flow-arrow">input · output<span>through PTY</span></div>
+        <div class="flow-node">PTY<small>terminal boundary</small></div>
+        <div class="flow-arrow">terminal events<span>session I/O</span></div>
+        <div class="flow-node">Remuda<small>persistent terminal session</small></div>
+      </div>
+    </section>
+
+    <section class="band" aria-labelledby="layers-title">
+      <div class="wrap band-inner layers">
+        <div><p class="eyebrow">One system, clear boundaries</p><h2 id="layers-title">Four layers.<br>Each does one job.</h2><p class="lede">Start with a Remuda terminal session, then add Butler to coordinate agent work.</p></div>
+        <div>
+          <div class="stack" aria-label="Product layers, from machines to agent sessions">
+            <div class="layer"><strong>Claude Code and Codex</strong><small>separate sessions</small></div>
+            <div class="layer"><strong><span class="highlight">Butler:</span> a task coordinator</strong><small>Lua extension for Remuda</small></div>
+            <div class="layer"><strong><span class="highlight">Remuda:</span> a terminal with persistent sessions</strong><small>session and Lua runtime</small></div>
+            <div class="layer"><strong>Your machine</strong><small>foundation</small></div>
+          </div>
+          <p class="stack-note">Remuda manages terminal sessions. Butler uses Remuda to coordinate agent tasks.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="band story" aria-labelledby="chapter-one">
+      <div class="wrap band-inner story-grid">
+        <div class="story-copy"><p class="eyebrow">01 / Delegate</p><h2 id="chapter-one">Tired of opening every session by hand?</h2><p class="lede">Butler is a Lua extension that coordinates agent sessions through Remuda. Its CLI supports task delegation and session management.</p></div>
+        <div class="diagram">
+          <svg viewBox="0 0 620 320" role="img" aria-labelledby="delegation-title delegation-desc"><title id="delegation-title">One Butler delegates work to agent sessions</title><desc id="delegation-desc">A single machine contains Remuda, one Butler and three agent sessions connected by labeled delegation arrows.</desc><defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="none" stroke="#d7d5cd" stroke-width="1.4"/></marker></defs>
+            <rect class="machine-box" x="18" y="18" width="584" height="284" rx="8"/><text x="38" y="48" font-size="14" font-weight="650">One machine</text><rect class="box" x="44" y="70" width="532" height="205" rx="6"/><text x="64" y="96" class="caption">Remuda sessions</text><rect class="accent-box" x="225" y="108" width="170" height="54" rx="5"/><text x="310" y="141" text-anchor="middle" font-size="16" font-weight="650" class="amber">Butler</text>
+            <rect class="box" x="65" y="218" width="142" height="40" rx="4"/><text x="136" y="243" text-anchor="middle" font-size="13">Agent session 1</text><rect class="box" x="239" y="218" width="142" height="40" rx="4"/><text x="310" y="243" text-anchor="middle" font-size="13">Agent session 2</text><rect class="box" x="413" y="218" width="142" height="40" rx="4"/><text x="484" y="243" text-anchor="middle" font-size="13">Agent session 3</text>
+            <path class="line" d="M260 163 L142 212"/><path class="line" d="M310 164 L310 210"/><path class="line" d="M360 163 L478 212"/><text x="310" y="270" text-anchor="middle" class="caption">Butler delegates work to each session</text>
+          </svg>
+        </div>
+      </div>
+    </section>
+
+    <section class="band story" aria-labelledby="chapter-two">
+      <div class="wrap band-inner story-grid">
+        <div class="story-copy"><p class="eyebrow">02 / Choose the right tool</p><h2 id="chapter-two">Stuck with one kind of agent?</h2><p class="lede">Run Claude Code and Codex in separate named terminal sessions.</p></div>
+        <div class="diagram">
+          <svg viewBox="0 0 620 320" role="img" aria-labelledby="agents-title agents-desc"><title id="agents-title">Claude Code and Codex in separate sessions</title><desc id="agents-desc">Claude Code and Codex each run in a separate named terminal session.</desc><defs><marker id="arrow2" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="none" stroke="#d7d5cd" stroke-width="1.4"/></marker></defs>
+            <rect class="machine-box" x="18" y="18" width="584" height="284" rx="8"/><text x="38" y="48" font-size="14" font-weight="650">One machine · separate sessions</text><rect class="accent-box" x="222" y="76" width="176" height="54" rx="5"/><text x="310" y="109" text-anchor="middle" font-size="16" font-weight="650" class="amber">Butler</text>
+            <rect class="box" x="45" y="226" width="154" height="46" rx="4"/><text x="122" y="254" text-anchor="middle" font-size="14">Claude Code session</text><rect class="box" x="233" y="226" width="154" height="46" rx="4"/><text x="310" y="254" text-anchor="middle" font-size="14">Codex session</text><rect class="box" x="421" y="226" width="154" height="46" rx="4"/><text x="498" y="254" text-anchor="middle" font-size="14">Codex session</text>
+            <path d="M264 132 L128 218" stroke="#d7d5cd" stroke-width="1.6" fill="none" marker-end="url(#arrow2)"/><path d="M310 132 L310 218" stroke="#d7d5cd" stroke-width="1.6" fill="none" marker-end="url(#arrow2)"/><path d="M356 132 L492 218" stroke="#d7d5cd" stroke-width="1.6" fill="none" marker-end="url(#arrow2)"/><text x="310" y="292" text-anchor="middle" class="caption">One named session per agent</text>
+          </svg>
+        </div>
+      </div>
+    </section>
+
+    
+
+    
+
+    
+
+    <section class="band" id="butler-capture" aria-labelledby="butler-capture-title">
+      <div class="wrap band-inner capture-story">
+        <div><p class="eyebrow">A manager for each machine</p><h2 id="butler-capture-title">Delegate the work. Keep the sessions visible.</h2><p class="lede">Butler starts a bounded task, tracks the agent session, and keeps a message inbox for the handoff.</p><ul class="capture-points"><li>Delegate a small task</li><li>Check the session roster</li><li>Read the reply in the inbox</li></ul></div>
+        <div class="capture-player" data-recording="butler" aria-label="Offline replay of scrubbed Butler status, delegation, sessions, and inbox output">
+          <div class="capture-top"><span class="capture-title">BUTLER · SESSION MANAGER</span><span>offline text replay · names scrubbed</span></div>
+          <div class="capture-screen"><pre class="capture-output" aria-live="polite"></pre></div>
+          <div class="capture-controls"><button type="button" data-action="play" aria-label="Play Butler replay">Play</button><button type="button" data-action="replay">Replay</button><button type="button" data-action="next">Next</button><div class="capture-progress" aria-hidden="true"><span></span></div><output class="capture-step">01 / 05</output></div>
+          <p class="capture-note">Illustrative offline text replay. Sample statuses are examples; names, private message bodies, and identifiers are scrubbed.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" id="demos" aria-labelledby="demos-title">
+      <div class="wrap band-inner">
+        <div class="band-title"><div><p class="eyebrow">Product recordings</p><h2 id="demos-title">Demo videos coming soon.</h2></div><p class="lede">The replays above are offline text examples. Video recordings will be added after each workflow is verified and privacy-reviewed.</p></div>
+        <div class="demo-grid">
+          <article class="demo-card"><h3>Remuda terminal sessions</h3><div class="demo-placeholder">Coming soon<br>Verified video recording</div></article>
+          <article class="demo-card"><h3>Butler task delegation</h3><div class="demo-placeholder">Coming soon<br>Verified video recording</div></article>
+          <article class="demo-card"><h3>Butler session management</h3><div class="demo-placeholder">Coming soon<br>Verified video recording</div></article>
+          <article class="demo-card"><h3>Butler inbox</h3><div class="demo-placeholder">Coming soon<br>Verified video recording</div></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" id="install" aria-labelledby="install-title">
+      <div class="wrap band-inner install-grid">
+        <div><p class="eyebrow">Nightly channel</p><h2 id="install-title">Install Remuda.</h2><p class="lede">The local Remuda README says a stable release has not been published; the commands below explicitly select nightly.</p><p class="checklist-note">Before installing Butler, check the Remuda runtime version with <code>remuda --version</code>. Butler recommends <code>0.1.0-nightly.20261001000710.0a5f090</code> or later; older cores boot Butler through a fallback (see the Butler README).</p></div>
+        <div class="install-instructions">
+          <h3>Linux and macOS</h3>
+          <pre class="install-command"><code>curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly sh</code></pre>
+          <h3>Windows · PowerShell</h3>
+          <pre class="install-command"><code>$env:REMUDA_CHANNEL='nightly'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex</code></pre>
+          <h3>Then install Butler</h3>
+          <pre class="install-command"><code>remuda mod install warmblood-kr/remuda-butler
+remuda butler --agent codex</code></pre>
+          <p class="checklist-note">For Claude, use <code>remuda butler --agent claude</code>. Check the <a href="https://github.com/warmblood-kr/remuda#install">Remuda README</a> and <a href="https://github.com/warmblood-kr/remuda-butler#install">Butler README</a> for current install and compatibility guidance.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot" id="footer"><div class="wrap"><div class="foot-inner"><a class="wordmark" href="#top">Remuda</a><nav class="foot-links" aria-label="Footer navigation"><a href="getting-started.html">Docs</a><a href="#demos">Demos</a><a href="https://github.com/warmblood-kr/remuda">GitHub</a></nav></div><p class="checklist-note">Static site draft. Demo recordings are coming soon; review the linked READMEs for current details.</p></div></footer>
+  <script type="application/json" id="replay-data">
+  {
+    "remuda": [
+      {"label":"Session list","command":"remuda ls","output":"site-demo              80x24   live  idle 1804s\nsite-shell             80x24   live  idle 1120s"},
+      {"label":"Attach · site-shell","command":"remuda attach site-shell","output":"sh-3.2$ printf 'Remuda session ready\\n'\nRemuda session ready\nsh-3.2$"},
+      {"label":"Send · live PTY","command":"remuda send site-shell · command sent","output":"sh-3.2$ printf 'Send reached the live PTY\\n'\nSend reached the live PTY\nsh-3.2$"}
+    ],
+    "butler": [
+      {"label":"Delegate","command":"remuda butler topic delegate demo-task --agent codex · bounded task","output":"launching demo-task"},
+      {"label":"Task result","command":"demo-task · illustrative session output","output":"Demo delegation complete"},
+      {"label":"Status","command":"remuda butler status","output":"status: up"},
+      {"label":"Sessions · names scrubbed","command":"remuda butler sessions","output":"Agent 01 · ready\nAgent 02 · failed\nAgent 03 · ready"},
+      {"label":"Inbox","command":"remuda butler inbox","output":"inbox empty"}
+    ]
+  }
+  </script>
+  <script>
+    (() => {
+      const recordings = JSON.parse(document.getElementById('replay-data').textContent);
+      document.querySelectorAll('.capture-player').forEach(player => {
+        const frames = recordings[player.dataset.recording];
+        if (!frames || !frames.length) return;
+        const screen = player.querySelector('.capture-output');
+        const step = player.querySelector('.capture-step');
+        const progress = player.querySelector('.capture-progress span');
+        const playButton = player.querySelector('[data-action="play"]');
+        let index = 0, cursor = 0, timer = null, advance = null;
+        const content = () => `$ ${frames[index].command}\n${frames[index].output}`;
+        const stop = () => { clearInterval(timer); clearTimeout(advance); timer = advance = null; playButton.textContent = 'Play'; };
+        const paint = full => {
+          const text = content();
+          cursor = full ? text.length : 0;
+          screen.textContent = text.slice(0, cursor);
+          step.value = `${String(index + 1).padStart(2, '0')} / ${String(frames.length).padStart(2, '0')} · ${frames[index].label}`;
+          step.textContent = step.value;
+          progress.style.width = `${text.length ? Math.round(cursor / text.length * 100) : 0}%`;
+        };
+        const next = autoplay => {
+          index = (index + 1) % frames.length;
+          paint(false);
+          if (autoplay) play();
+        };
+        const play = () => {
+          if (timer) { clearInterval(timer); timer = null; playButton.textContent = 'Play'; return; }
+          if (cursor >= content().length) { index = (index + 1) % frames.length; paint(false); }
+          playButton.textContent = 'Pause';
+          timer = setInterval(() => {
+            const text = content();
+            cursor = Math.min(text.length, cursor + 2);
+            screen.textContent = text.slice(0, cursor);
+            progress.style.width = `${Math.round(cursor / text.length * 100)}%`;
+            if (cursor >= text.length) {
+              clearInterval(timer); timer = null; playButton.textContent = 'Play';
+              if (index < frames.length - 1) advance = setTimeout(() => next(true), 1000);
+            }
+          }, 22);
+        };
+        player.querySelector('[data-action="play"]').addEventListener('click', play);
+        player.querySelector('[data-action="replay"]').addEventListener('click', () => { stop(); index = 0; paint(false); play(); });
+        player.querySelector('[data-action="next"]').addEventListener('click', () => { stop(); next(false); paint(true); });
+        paint(true);
+      });
+    })();
+  </script>
+</body>
+</html>
