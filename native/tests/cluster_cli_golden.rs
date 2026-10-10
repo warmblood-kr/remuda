@@ -515,6 +515,50 @@ fn cluster_help_output_is_routed_and_discloses_listener_controls() {
 }
 
 #[test]
+fn cluster_help_verb_matches_verb_help_for_every_verb() {
+    let scratch = Scratch::new();
+    let mut failures = Vec::new();
+    for verb in [
+        "init", "invite", "join", "nodes", "control", "revoke", "remote", "listen", "call",
+    ] {
+        let expected = scratch.run(&["cluster", verb, "--help"]);
+        let output = scratch.run(&["cluster", "help", verb]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success()
+            || output.stdout != expected.stdout
+            || !stdout.starts_with(&format!("usage: remuda cluster {verb}"))
+            || !stderr.is_empty()
+        {
+            failures.push(format!(
+                "cluster help {verb}: exit={:?}\nstdout: {stdout}\nstderr: {stderr}",
+                output.status.code()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn cluster_help_about_help_matches_cluster_help() {
+    let scratch = Scratch::new();
+    let expected = scratch.run(&["cluster", "--help"]);
+    let mut failures = Vec::new();
+    for topic in ["help", "-h", "--help"] {
+        let output = scratch.run(&["cluster", "help", topic]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() || output.stdout != expected.stdout || !stderr.is_empty() {
+            failures.push(format!(
+                "cluster help {topic}: exit={:?}\nstdout: {stdout}\nstderr: {stderr}",
+                output.status.code()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
 fn cluster_init_discloses_listener_before_it_binds() {
     use remuda_native::cluster::listener_config::{self, ListenerBind, ListenerConfig};
     use std::os::unix::fs::PermissionsExt;
@@ -863,6 +907,39 @@ fn cluster_join_and_peer_call_outputs_match_goldens() {
     .expect("write modified registry");
     let bad_auth = joiner.run(&["cluster", "call", &label, "list", "--addr", &address_text]);
     golden("call_error_5", &bad_auth, &joiner.root);
+}
+
+#[test]
+fn fresh_state_cli_join_creates_identity_at_the_command_callsite() {
+    let inviter = Scratch::new();
+    let _inviter_daemon = start_daemon(&inviter);
+    let initialized = inviter.run(&["cluster", "init", "--no-listen"]);
+    assert!(
+        initialized.status.success(),
+        "inviter init failed: {initialized:?}"
+    );
+    let invite = inviter.run(&["cluster", "invite", "--bind", "127.0.0.1:0"]);
+    assert!(invite.status.success(), "invite failed: {invite:?}");
+    let (fingerprint, join_line) = invitation_command_args(&invite);
+
+    let joiner = Scratch::new();
+    let _joiner_daemon = start_daemon(&joiner);
+    let identity_path = joiner.root.join("state/remuda/cluster/identity.key");
+    assert!(
+        !identity_path.exists(),
+        "fresh joiner unexpectedly has an identity"
+    );
+    let joined = joiner.run(&["cluster", "join", &fingerprint, &join_line]);
+
+    assert!(
+        joined.status.success(),
+        "fresh-state CLI join failed: {}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    assert!(
+        identity_path.is_file(),
+        "join did not create the local identity"
+    );
 }
 
 #[test]
@@ -1883,6 +1960,10 @@ fn assert_join_signal_restores_listener_config(signal: libc::c_int, expected_exi
         let _ = release_rx.recv_timeout(Duration::from_secs(5));
         drop(stream);
     });
+    // A background test run (`cargo test &`) inherits SIGINT ignored, and the
+    // child would keep it; spawn it with the default action instead.
+    // SAFETY: SIG_DFL is a valid disposition; the inherited one is restored below.
+    let inherited = unsafe { libc::signal(signal, libc::SIG_DFL) };
     let child = scratch
         .command(&[
             "cluster",
@@ -1896,6 +1977,8 @@ fn assert_join_signal_restores_listener_config(signal: libc::c_int, expected_exi
         .stderr(Stdio::piped())
         .spawn()
         .expect("start isolated join command");
+    // SAFETY: restore the disposition this test process inherited.
+    unsafe { libc::signal(signal, inherited) };
     let mut child = ChildGuard(Some(child));
     connected_rx
         .recv_timeout(Duration::from_secs(5))

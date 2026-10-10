@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- Lua: `remuda.session.new` and `remuda.new` now return `name, instance_id`, the
+  ID of the launch that call started, taken from the same registry insertion
+  (never a later lookup by name). Single-value assignments still get the name.
+  Behavior change: `return new(...)` now passes both values, so `run_script`
+  over MCP returns `name<TAB>instance_id`; write `return (new(...))` to keep the
+  name alone. The ID identifies a launch; it is not a secret or proof of
+  liveness. The daemon socket gains an additive request for this
+  (same-user, mode 0600, same limits as `New`; remuda-butler issue #471).
+
+- Shutdown: `remuda stop` now refuses when the daemon cannot verify who is
+  asking (unreadable process ancestry, no peer PID, or a peer lookup error),
+  as it already did for a caller inside one of its sessions (issue #639). To
+  stop the intended daemon anyway, use the same server and runtime selection
+  with `remuda -s NAME stop -f --yes --i-am-inside`. A caller whose parent has
+  already exited still reads as outside and is allowed. The guard is advisory,
+  not authentication: same-user access is not an authorization boundary and it
+  makes no isolation claim.
+
+- Windows: `remuda.caller().kind` is `outside` when the caller is in no
+  session's job and its parent chain ends at a missing or reused PID. An
+  unreadable or incomplete chain stays `unknown`; `outside` means only that
+  the caller was not started inside a live session's tree. A process started
+  in the instant before job assignment (issue #614) is not in the job, so
+  `outside` is not an authorization or isolation claim.
+
+- Windows: everything the session's program starts after it is put in its job
+  ends when the session is reaped or closed, or when the daemon stops. A
+  session that cannot be put in a job is not started. The one gap is the
+  instant between program creation and job assignment; issue #614 tracks
+  closing it with atomic job-list process creation (`CreateProcessW` with
+  `PROC_THREAD_ATTRIBUTE_JOB_LIST`). A process that must outlive the session has to start outside
+  remuda. While listed, processes in the job are `session` callers for
+  `remuda.caller()`, including ones whose parent has exited.
+
 - Windows: a session whose program is a `.cmd` or `.bat` file (for example an
   npm-installed agent) now refuses an argument that cmd.exe would act on
   instead of passing it as text: a line break, NUL, `%`, or `& | < > ^ ( )` outside

@@ -123,6 +123,31 @@ pub fn write_at(dir: &Path, config: &ListenerConfig) -> io::Result<()> {
     write_locked(dir, config)
 }
 
+/// Enable the join listener only if the config current under the state lock
+/// permits it. The callback runs after the decision, while the lock is held,
+/// so callers can record the rollback expectation before another writer acts.
+pub fn enable_for_join(
+    config_observed: impl FnOnce(Option<ListenerConfig>, Option<ListenerConfig>),
+) -> io::Result<Option<ListenerConfig>> {
+    let dir = super::storage::cluster_state_dir()?.join("cluster");
+    super::identity::load_identity_at(&dir)?;
+    super::storage::verify_directory(&dir)?;
+    let _guard = super::storage::StateLock::acquire(&dir)?;
+    let current = read_at(&dir)?;
+    if current.as_ref().is_some_and(|config| !config.enabled) {
+        config_observed(current.clone(), current);
+        return Ok(None);
+    }
+    let config = current.clone().unwrap_or(ListenerConfig {
+        enabled: true,
+        bind: ListenerBind::Auto,
+        allow_public: false,
+    });
+    write_locked(&dir, &config)?;
+    config_observed(current, Some(config.clone()));
+    Ok(Some(config))
+}
+
 /// Restore a listener snapshot only while the current config matches `expected`.
 pub fn restore_if_current(
     expected: Option<&ListenerConfig>,
@@ -184,7 +209,15 @@ fn write_locked(dir: &Path, config: &ListenerConfig) -> io::Result<()> {
     })
     .map_err(io::Error::other)?;
     bytes.push(b'\n');
-    super::storage::atomic_write(&path, &bytes)
+    super::storage::atomic_write(&path, &bytes).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot write cluster listener config at {}: {error}",
+                path.display()
+            ),
+        )
+    })
 }
 
 fn remove_locked(dir: &Path) -> io::Result<()> {
@@ -232,10 +265,8 @@ mod tests {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
 
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn cluster_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -292,7 +323,9 @@ mod tests {
 
     #[test]
     fn listener_config_write_requires_existing_identity() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state_home = cluster_dir();
         let old = std::env::var_os("XDG_STATE_HOME");
         std::env::set_var("XDG_STATE_HOME", &state_home);

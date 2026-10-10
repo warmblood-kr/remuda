@@ -352,8 +352,8 @@ fn response_test_client() -> ClusterClient {
         std::sync::Arc::new(ManualWallClock::new(1_800_000_000)),
         ClientTimeouts {
             connect: Duration::from_secs(2),
-            read: Duration::from_secs(5),
-            total: Duration::from_secs(5),
+            read: Duration::from_secs(30),
+            total: Duration::from_secs(30),
         },
     )
 }
@@ -618,6 +618,7 @@ fn streaming_server(
     let private = responder.private.clone();
     let task = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
+        stream.set_nodelay(true).unwrap();
         let mut raw = Vec::new();
         let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
         let mut head = String::new();

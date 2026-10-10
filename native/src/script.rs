@@ -24,14 +24,16 @@ use remuda_core::{InputSubmitOutcome, DEFAULT_INPUT_SETTLE};
 use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 97] = [
+pub const BINDINGS: [&str; 99] = [
     "_advice_reattach",
     "_call",
+    "_caller_live",
     "_descriptors",
     "_dispatch_extension_command",
     "_event_counts",
@@ -72,6 +74,7 @@ pub const BINDINGS: [&str; 97] = [
     "capture",
     "capture_styled",
     "clear_hooks",
+    "clear_input",
     "cli",
     "click",
     "clock",
@@ -150,7 +153,12 @@ const WORDS: &[(&str, &str, &str)] = &[
     (
         "caller",
         "ADVISORY only: peer ancestry identifies a managed session, outside, or unknown; outside does not prove operator identity. Same-UID Lua can run ``remuda -e`` and wrap ``_dispatch_extension_command``; Windows parent PIDs may be stale or chosen, so this is not an authentication boundary.",
-        "caller() -> {kind: 'session'|'outside'|'unknown', session?: string}",
+        "caller() -> {kind: 'session'|'outside'|'unknown', session?: string, instance_id?: string}",
+    ),
+    (
+        "clear_input",
+        "Write one trusted clear-line key to a session as an atomic input act. The core currently allows only exact Ctrl+U (byte 0x15), verified for Codex; use it only when the target agent's configured binding clears to the start of its input. Other keys are refused. Keys are limited to 1–16 bytes and four calls per session per second. Refuses during recent human typing or while a PTY writer is busy. Terminal screens do not generally identify composer contents, so `cleared` is nil when unknown ([Codex issue #20698](https://github.com/openai/codex/issues/20698)).",
+        "clear_input(name, key) -> {cleared = string|nil}",
     ),
     (
         "_module_readiness",
@@ -259,8 +267,8 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "new",
-        "Start a new session, defaulting the command to the user's shell.",
-        "new(name?, argv?, cwd?, env?) -> string",
+        "Start a new session, defaulting the command to the user's shell; return its name and registered instance_id.",
+        "new(name?, argv?, cwd?, env?) -> name, instance_id",
     ),
     (
         "send",
@@ -781,6 +789,7 @@ fn cli_options_from_lua(table: Option<Table>) -> mlua::Result<Vec<crate::cli_par
                 value: item.get("value")?,
                 help: item.get("help")?,
                 global: item.get::<Option<bool>>("global")?.unwrap_or(false),
+                repeat_policy: Default::default(),
             });
         }
     }
@@ -847,15 +856,15 @@ pub fn run(socket: &Path, script: &Path) -> Result<(), String> {
     run_source(socket, &script.display().to_string(), &source)
 }
 
-/// `new`'s wire shape, from the four positional Lua arguments `bindings`
-/// hands it. `env` is a Lua table, already converted by the caller.
+/// `new`'s request, from the four positional Lua arguments `bindings` hands it.
+/// The private response carries the identity from the registry insertion.
 fn new_request(
     name: Option<String>,
     argv: Option<Vec<String>>,
     cwd: Option<String>,
     env: Option<std::collections::HashMap<String, String>>,
 ) -> Request {
-    Request::New {
+    Request::NewWithInstance {
         name,
         command: argv.unwrap_or_default(),
         size: crate::terminal_size(),
@@ -881,8 +890,38 @@ fn caller_binding(
             };
             value.set("kind", kind)?;
             value.set("session", caller.session)?;
+            value.set("instance_id", caller.instance_id)?;
             Ok(value)
         })?,
+    )
+}
+
+fn caller_live_binding(
+    lua: &Lua,
+    table: &Table,
+    registry: Arc<remuda_core::Registry>,
+) -> mlua::Result<()> {
+    table.set(
+        "_caller_live",
+        lua.create_function(
+            move |_, (name, instance_id): (Option<String>, Option<String>)| {
+                let name = name.filter(|name| !name.is_empty()).ok_or_else(|| {
+                    mlua::Error::runtime("caller session name is missing; refusing authorization")
+                })?;
+                let instance_id = instance_id.filter(|id| !id.is_empty()).ok_or_else(|| {
+                    mlua::Error::runtime("caller instance_id is missing; refusing authorization")
+                })?;
+                registry
+                    .validate_live_instance(&name, &instance_id)
+                    .map_err(|error| {
+                        mlua::Error::runtime(format!(
+                            "caller {}; refusing authorization",
+                            error.message()
+                        ))
+                    })?;
+                Ok(true)
+            },
+        )?,
     )
 }
 
@@ -965,6 +1004,7 @@ pub(crate) fn bindings(
     pending_bindings(lua, &table, image.pending_replies(), Rc::clone(&caller))?;
     timer_bindings(lua, &table, timers)?;
     caller_binding(lua, &table, caller)?;
+    caller_live_binding(lua, &table, registry.clone())?;
     random_bytes_binding(lua, &table)?;
     hostname_binding(lua, &table)?;
 
@@ -994,6 +1034,8 @@ pub(crate) fn bindings(
             value(lua, ask(&path, Request::SendLine { name, text })?)
         })?,
     )?;
+
+    clear_input_binding(lua, &table, at())?;
 
     // The `insert-char` analogue: exactly these bytes, nothing appended. An
     // `mlua::String` rather than a Rust `String` so a script can hand over any
@@ -1117,6 +1159,24 @@ fn removed_sleep_error(lua: &Lua, table: &Table) -> mlua::Result<()> {
         })?,
     )?;
     table.set_metatable(Some(metatable))
+}
+
+fn clear_input_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
+    table.set(
+        "clear_input",
+        lua.create_function(move |lua, (name, key): (String, mlua::LuaString)| {
+            value(
+                lua,
+                ask(
+                    &path,
+                    Request::ClearInput {
+                        name,
+                        key: key.as_bytes().to_vec(),
+                    },
+                )?,
+            )
+        })?,
+    )
 }
 
 fn session_resize_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
@@ -1373,9 +1433,8 @@ fn pending_bindings(
     Ok(())
 }
 
-/// `remuda.new(name, argv, cwd, env)` — split out of `bindings` to stay under
-/// its line cap. The last two arguments are trailing and optional, so every
-/// existing 2-argument call site keeps working unchanged.
+/// `remuda.new(name, argv, cwd, env)` — returns name then launch identity.
+/// The last two arguments remain trailing and optional.
 fn new_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
     table.set(
         "new",
@@ -1388,7 +1447,13 @@ fn new_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Resu
                 Option<Table>,
             )| {
                 let env = env.map(lua_env_to_wire).transpose()?;
-                value(lua, ask(&path, new_request(name, argv, cwd, env))?)
+                match ask(&path, new_request(name, argv, cwd, env))? {
+                    Response::SessionStarted { name, instance_id } => Ok((
+                        Value::String(lua.create_string(&name)?),
+                        Value::String(lua.create_string(&instance_id)?),
+                    )),
+                    other => Ok((value(lua, other)?, Value::Nil)),
+                }
             },
         )?,
     )
@@ -2156,11 +2221,21 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
             mlua::Error::runtime("attach responses are not exposed to scripts"),
         ),
         Response::Screen(text) => Ok(Value::String(lua.create_string(&text)?)),
+        Response::ClearInput { cleared } => {
+            let result = lua.create_table()?;
+            if let Some(cleared) = cleared {
+                result.set("cleared", cleared)?;
+            }
+            Ok(Value::Table(result))
+        }
         // No binding here asks for an `Eval`, so this arm is unreachable in
         // practice — spelled out rather than folded into a wildcard so that
         // adding one later is a compile error to think about, not a silent
         // fall-through that returns the wrong shape.
         Response::Value(text) => Ok(Value::String(lua.create_string(&text)?)),
+        Response::SessionStarted { .. } => Err(mlua::Error::runtime(
+            "session launch response must be handled by remuda.new",
+        )),
         Response::CommandResult { .. } => Err(mlua::Error::runtime(
             "deferred command replies cannot be consumed as a Lua value",
         )),
@@ -2239,10 +2314,16 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
 #[cfg(test)]
 mod binding_tests {
     use super::{
-        cli_parse_bindings, cli_spec_from_lua, fs_bindings, lua_steps_to_wire, value, BINDINGS,
+        cli_parse_bindings, cli_spec_from_lua, fs_bindings, lua_steps_to_wire, new_binding, value,
+        BINDINGS,
     };
     use mlua::{Lua, Table};
-    use remuda_core::protocol::{Response, Step};
+    use remuda_core::agent::Size;
+    use remuda_core::protocol::{Request, Response, Step};
+    use remuda_core::registry::SessionSummary;
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
 
     #[test]
     fn lua_busy_error_has_the_cli_retry_guidance() {
@@ -2259,6 +2340,151 @@ mod binding_tests {
     #[test]
     fn binding_names_are_sorted_and_unique() {
         assert!(BINDINGS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    fn spawn_fake_new_daemon(
+        listener: crate::ipc::Listener,
+        new_seen_tx: mpsc::Sender<()>,
+        release_rx: mpsc::Receiver<()>,
+        stop_rx: mpsc::Receiver<()>,
+        server_id: Arc<Mutex<String>>,
+    ) -> std::thread::JoinHandle<()> {
+        use interprocess::local_socket::traits::{Listener as _, Stream as _};
+        use interprocess::TryClone as _;
+
+        std::thread::spawn(move || loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+            let mut stream = match listener.accept() {
+                Ok(stream) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::yield_now();
+                    continue;
+                }
+                Err(error) => panic!("test IPC accept failed: {error}"),
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("set accepted test stream blocking");
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().expect("clone test stream"))
+                .read_line(&mut line)
+                .expect("read test request");
+            let request: Request = serde_json::from_str(&line).expect("decode test request");
+            let response = match request {
+                Request::New { name, .. } => {
+                    new_seen_tx.send(()).expect("notify new request");
+                    release_rx.recv().expect("release new request");
+                    Response::Value(name.unwrap_or_else(|| "worker".into()))
+                }
+                Request::NewWithInstance { name, .. } => {
+                    new_seen_tx.send(()).expect("notify new request");
+                    release_rx.recv().expect("release new request");
+                    Response::SessionStarted {
+                        name: name.unwrap_or_else(|| "worker".into()),
+                        instance_id: "spawned-instance".into(),
+                    }
+                }
+                Request::List => Response::Sessions(vec![SessionSummary {
+                    id: "replacement-session".into(),
+                    name: "worker".into(),
+                    instance_id: Some(
+                        server_id
+                            .lock()
+                            .expect("replacement identity mutex")
+                            .clone(),
+                    ),
+                    output_version: None,
+                    alive: true,
+                    idle: Duration::ZERO,
+                    output_idle: None,
+                    size: Size::new(80, 24),
+                    attached: false,
+                    human_idle: None,
+                    mouse_tracking: false,
+                }]),
+                other => panic!("unexpected test request: {other:?}"),
+            };
+            serde_json::to_writer(&mut stream, &response).expect("write test response");
+            stream.write_all(b"\n").expect("terminate test response");
+        })
+    }
+
+    fn new_test_socket_path() -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            % 100_000_000;
+        let base = std::env::temp_dir().join(format!("rni-{}-{stamp:08}", std::process::id()));
+        crate::daemon::socket_path_in(&base, "script-test")
+    }
+
+    fn cleanup_new_test_socket(_path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            let _ = std::fs::remove_file(_path);
+            if let Some(parent) = _path.parent() {
+                let _ = std::fs::remove_dir(parent);
+                if let Some(base) = parent.parent() {
+                    let _ = std::fs::remove_dir(base);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn new_returns_the_spawned_identity_across_same_name_replacement() {
+        use interprocess::local_socket::traits::Listener as _;
+        use interprocess::local_socket::ListenerNonblockingMode;
+
+        let path = new_test_socket_path();
+        #[cfg(unix)]
+        std::fs::create_dir_all(path.parent().expect("Unix socket parent"))
+            .expect("create Unix socket parent");
+        let listener = crate::ipc::listen(&path).expect("test IPC listener");
+        listener
+            .set_nonblocking(ListenerNonblockingMode::Accept)
+            .expect("nonblocking test listener");
+        let (new_seen_tx, new_seen_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let current_id = Arc::new(Mutex::new(String::from("spawned-instance")));
+        let server_id = Arc::clone(&current_id);
+        let server = spawn_fake_new_daemon(listener, new_seen_tx, release_rx, stop_rx, server_id);
+
+        let lua_path = path.clone();
+        let lua = std::thread::spawn(move || {
+            let lua = Lua::new();
+            let remuda = lua.create_table().map_err(|error| error.to_string())?;
+            new_binding(&lua, &remuda, lua_path).map_err(|error| error.to_string())?;
+            lua.globals()
+                .set("remuda", remuda)
+                .map_err(|error| error.to_string())?;
+            lua.load(
+                "local name, id = remuda.new('worker', {'sh'}); return name .. ':' .. tostring(id)",
+            )
+            .eval::<String>()
+            .map_err(|error| error.to_string())
+        });
+
+        new_seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("spawn request reached the daemon");
+        *current_id.lock().expect("replacement identity mutex") = "replacement-instance".into();
+        release_tx
+            .send(())
+            .expect("release spawned launch response");
+        let actual = lua.join().expect("Lua binding thread");
+        stop_tx.send(()).expect("stop fake daemon");
+        server.join().expect("fake daemon thread");
+        cleanup_new_test_socket(&path);
+
+        assert_eq!(
+            actual.expect("new binding returned"),
+            "worker:spawned-instance"
+        );
     }
 
     fn rejects_cli_spec(spec: &str) {
@@ -2437,7 +2663,7 @@ mod binding_tests {
         let out = dump_of("remuda.cli.capabilities()");
         assert_eq!(
             out,
-            r#"{features={1="stable_report",2="strict_v2"},report_versions={1=1,2=2},spec_versions={1=1,2=2}}"#
+            r#"{features={1="stable_report",2="strict_v2",3="repeat_policy"},report_versions={1=1,2=2},spec_versions={1=1,2=2}}"#
         );
     }
 
@@ -2722,6 +2948,123 @@ mod binding_tests {
         ] {
             let out = strict(mutate);
             assert!(out.contains(r#"kind="spec""#), "{mutate}: {out}");
+        }
+    }
+
+    fn policy(options: &str, argv: &str) -> String {
+        dump_of(&format!(
+            r#"remuda.cli.parse({{version=2, name="remuda", requires={{"repeat_policy"}},
+            verbs={{go={{next="n", options={{{options}}}}}}}}}, {{"go"{argv}}})"#
+        ))
+    }
+
+    const APPEND: &str = r#"{long="w",short="w",value="D",help="h",repeat_policy="append"}"#;
+    const LAST: &str = r#"{long="m",short="m",value="M",help="h",repeat_policy="last"}"#;
+    const COALESCE: &str = r#"{long="j",short="j",help="h",repeat_policy="coalesce"}"#;
+
+    #[test]
+    fn cli_repeat_policy_append_is_an_array_for_zero_one_many() {
+        for (argv, want) in [
+            ("", "w={}"),
+            (r#","--w","a""#, r#"w={1="a"}"#),
+            (
+                r#","--w","a","-w","b","--w=c","-wd""#,
+                r#"w={1="a",2="b",3="c",4="d"}"#,
+            ),
+        ] {
+            let out = policy(APPEND, argv);
+            assert!(
+                out.contains(want) && out.contains("ok=true"),
+                "{argv}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_repeat_policy_last_wins_in_every_spelling() {
+        let out = policy(LAST, r#","--m","a","-m","b","--m=c","-md""#);
+        assert!(out.contains(r#"m="d""#), "{out}");
+        assert!(
+            !policy(LAST, "").contains("m="),
+            "absent scalar stays absent"
+        );
+        assert!(policy(LAST, r#","-m","x""#).contains(r#"m="x""#));
+    }
+
+    #[test]
+    fn cli_repeat_policy_coalesce_is_a_bool() {
+        assert!(policy(COALESCE, "").contains("j=false"));
+        assert!(policy(COALESCE, r#","-j""#).contains("j=true"));
+        let out = policy(COALESCE, r#","--j","-j","-jj""#);
+        assert!(out.contains("j=true") && out.contains("ok=true"), "{out}");
+    }
+
+    #[test]
+    fn cli_repeat_policy_reject_is_the_default_and_errors_on_duplicates() {
+        for opt in [
+            r#"{long="m",short="m",value="M",help="h"}"#,
+            r#"{long="m",short="m",value="M",help="h",repeat_policy="reject"}"#,
+        ] {
+            assert!(policy(opt, r#","-m","a""#).contains("ok=true"));
+            let out = policy(opt, r#","-m","a","--m=b""#);
+            assert!(
+                out.contains("kind=\"error\"") && out.contains("code=2"),
+                "{out}"
+            );
+        }
+        let flag = policy(
+            r#"{long="j",help="h",repeat_policy="reject"}"#,
+            r#","--j","--j""#,
+        );
+        assert!(flag.contains("ok=false"), "{flag}");
+    }
+
+    #[test]
+    fn cli_repeat_policy_rejects_bad_combinations_safely() {
+        for opt in [
+            r#"{long="a",help="h",repeat_policy="append"}"#,
+            r#"{long="a",help="h",repeat_policy="last"}"#,
+            r#"{long="a",value="V",help="h",repeat_policy="coalesce"}"#,
+            r#"{long="a",value="V",help="h",repeat_policy="SENTINEL SECRET"}"#,
+            r#"{long="a",value="V",help="h",repeat_policy=5}"#,
+            r#"{long="a",value="V",help="h",global=true,repeat_policy="append"}"#,
+        ] {
+            let out = policy(opt, "");
+            assert!(
+                out.contains(r#"kind="spec""#)
+                    && out.contains("code=2")
+                    && !out.contains("SENTINEL"),
+                "{opt}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_repeat_policy_is_strict_only_and_v1_ignores_it() {
+        let legacy = r#"remuda.cli.parse({name="remuda", verbs={go={next="n",
+            options={{long="m",value="M",help="h",repeat_policy="append"}}}}}, {"go","--m","a"})"#;
+        assert_eq!(
+            dump_of(legacy),
+            dump_of(&legacy.replace(r#",repeat_policy="append""#, ""))
+        );
+        assert!(dump_of(legacy).contains(r#"m="a""#));
+        let dup = legacy.replace(r#""--m","a""#, r#""--m","a","--m","b""#);
+        assert!(
+            dump_of(&dup).contains("ok=false"),
+            "v1 duplicates still error"
+        );
+    }
+
+    #[test]
+    fn cli_repeat_policy_hostile_tables_reject_without_panic() {
+        for opt in [
+            r#"{long="a",value="V",help="h",repeat_policy={}}"#,
+            r#"{long="a",value="V",help="h",repeat_policy=true}"#,
+            r#"{long="a",value="V",help="h",repeat_policy="APPEND"}"#,
+            r#"{long="a",value="V",help="h",repeat_policy=""}"#,
+            r#"{long="a",value="V",help="h",repeat_policy="append",[1]="x"}"#,
+        ] {
+            assert!(policy(opt, "").contains(r#"kind="spec""#), "{opt}");
         }
     }
 

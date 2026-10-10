@@ -16,6 +16,29 @@ notices, set `REMUDA_SUPPRESS_DEPRECATIONS=1` in the daemon's environment when
 the daemon starts; setting it only on a CLI process cannot change the
 environment of a running daemon.
 
+`remuda.session.new(name?, argv?, cwd?, env?)` and its `remuda.new` alias
+return two values: the chosen session name first, then that launch's
+`instance_id`. Existing single-value assignments still receive the name.
+The ID comes from the same registry insertion that starts the session, so it
+continues to identify that launch if another session later reuses its name. A
+failed launch raises an error and returns no ID.
+
+Compatibility: `return new(...)` as a final function result, or `new(...)` as the last
+argument of a call, now passes both values. Over MCP, `run_script` joins
+multiple return values with a tab, so a script that returned `new(...)` now
+yields `name<TAB>instance_id` instead of `name`. To keep the old text, wrap the
+call: `return (new(...))`, or assign `local name = new(...)` first. The ID is
+not a secret and proves the launch, not that the session is still running.
+
+On Windows, everything the session's program starts after it is put in its
+job ends when the session is reaped or closed, or when the daemon stops. A
+session that cannot be put in a job is not started. The one gap is the instant
+between program creation and job assignment; issue #614 tracks closing it with
+atomic job-list process creation (`CreateProcessW` with
+`PROC_THREAD_ATTRIBUTE_JOB_LIST`). A process that must outlive the session has to start outside remuda. While
+listed, processes in the job are `session` callers for `remuda.caller()`,
+including ones whose parent has exited.
+
 ## Screen capture
 
 `remuda.capture(name)` returns the current screen as plain text.
@@ -62,8 +85,15 @@ entry, lifecycle API, source, and installation status. `remuda mod info NAME`
 shows one manifest. Both use the same RST/Markdown/JSON format selector.
 
 `remuda mod install OWNER/REPO` accepts a GitHub shorthand or HTTPS URL,
-validates the repository's `extension.toml`, and atomically stores its Lua
-package under `${XDG_DATA_HOME:-$HOME/.local/share}/remuda/mods`. Add
+validates the repository's `extension.toml`, and atomically stores its package
+under `${XDG_DATA_HOME:-$HOME/.local/share}/remuda/mods`. The package contains
+Lua files and may include inert regular files listed in `assets`, an array of
+checkout-relative paths inside the package root (for example,
+`assets = ["packages/butler/matrix_relay.py"]`). Assets must not be symlinks
+or directories and are limited to 64 assets, 1 MiB each and 8 MiB in total. An
+asset with a setuid, setgid or sticky mode bit is rejected. Remuda copies their
+bytes and file mode (group and other write bits are cleared) but never loads or
+executes them. Other non-Lua package files remain rejected. Add
 `--ref REF` to select a branch, tag, or commit. Installation never changes a
 live Lua image by default. Add `--reload` to ask the running daemon to replace
 the installed lifecycle-managed mod in its existing Lua image. `remuda mod
@@ -165,8 +195,8 @@ A manifest can declare the mods it needs: `requires = { butler = ">=0.4, <0.5" }
 
 An extension repository declares `api = "remuda-lua-v1"` in its
 `extension.toml`. `remuda mod test PATH` is the deterministic local check: it
-validates the manifest, package paths, symlinks, Lua-only contents, and Lua
-syntax without installing or mutating a daemon. Integration tests should run
+validates the manifest, package paths, symlinks, Lua contents and syntax, and
+declared assets without installing or mutating a daemon. Integration tests should run
 the same mod in an isolated `XDG_DATA_HOME`, then use the real Remuda daemon
 and host bindings; unit tests can use fixture implementations of the small
 `remuda` API surface. Keep the API string pinned until a deliberate host

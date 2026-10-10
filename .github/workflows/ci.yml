@@ -28,6 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: scripts/check-no-python.sh
+      - run: sh scripts/test-no-python.sh
 
   test:
     runs-on: ubuntu-latest
@@ -312,6 +313,9 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - name: Coverage
+        # Revert this line to undo #624; %p separates processes and %b identifies the binary.
+        env:
+          LLVM_PROFILE_FILE_NAME: "%p-%b.profraw"
         run: |
           {
             echo "## Coverage"
@@ -319,6 +323,13 @@ jobs:
             cargo llvm-cov --workspace --all-targets --summary-only
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Profile diagnostics (#624)
+        # Print-only evidence when Coverage failed; it always exits 0, so it
+        # never changes this job's result.
+        if: failure()
+        timeout-minutes: 5
+        continue-on-error: true
+        run: bash scripts/diagnose-profraw.sh || true
       - name: Lines of code
         run: |
           cargo install tokei --locked

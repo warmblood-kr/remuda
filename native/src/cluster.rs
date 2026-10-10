@@ -80,6 +80,38 @@ pub fn init_with_notice() -> io::Result<(NodeIdentity, bool, Option<String>)> {
     init_at(&storage::cluster_state_dir()?)
 }
 
+/// Ensure this node has a local identity for a join, without resetting existing
+/// membership or writing the init recovery marker.
+pub fn ensure_join_identity() -> io::Result<(NodeIdentity, bool)> {
+    ensure_join_identity_at(&storage::cluster_state_dir()?)
+}
+
+fn ensure_join_identity_at(state_dir: &Path) -> io::Result<(NodeIdentity, bool)> {
+    let dir = identity::prepare_cluster_dir_at(state_dir)?;
+    let _guard = storage::StateLock::acquire(&dir)?;
+    match identity::load_identity_at(&dir) {
+        Ok(node) => Ok((node, false)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let registry = registry::load_registry_at(&dir)?;
+            if !registry.authorized_nodes.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "cluster registry exists but {} is missing; restore the identity before joining",
+                        dir.join("identity.key").display()
+                    ),
+                ));
+            }
+            let (node, created) = identity::init_identity_locked(&dir)?;
+            if created {
+                add_self_to_registry_at(&dir, &node)?;
+            }
+            Ok((node, created))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn init_at(state_dir: &Path) -> io::Result<(NodeIdentity, bool, Option<String>)> {
     let cluster_dir = state_dir.join("cluster");
     let previous_fingerprint = match fs::symlink_metadata(&cluster_dir) {
@@ -100,7 +132,22 @@ fn init_at(state_dir: &Path) -> io::Result<(NodeIdentity, bool, Option<String>)>
     let dir = identity::prepare_cluster_dir_at(state_dir)?;
     let _guard = storage::StateLock::acquire(&dir)?;
     let (node, created) = identity::init_identity_locked(&dir)?;
-    let mut registry = registry::load_registry_at(&dir)?;
+    add_self_to_registry_at(&dir, &node)?;
+    if let Err(error) = storage::write_cluster_init_marker(state_dir, &node.node_fp) {
+        eprintln!(
+            "warning: cluster identity initialized, but marker {} could not be written: {error}",
+            state_dir.join("cluster-initialized").display()
+        );
+    }
+    Ok((
+        node,
+        created,
+        if created { previous_fingerprint } else { None },
+    ))
+}
+
+fn add_self_to_registry_at(dir: &Path, node: &NodeIdentity) -> io::Result<()> {
+    let mut registry = registry::load_registry_at(dir)?;
     registry.merge(&Registry {
         authorized_nodes: vec![AuthorizedNode {
             node_fp: node.node_fp.clone(),
@@ -115,18 +162,7 @@ fn init_at(state_dir: &Path) -> io::Result<(NodeIdentity, bool, Option<String>)>
             by: node.node_fp.clone(),
         }],
     })?;
-    registry::save_registry_at(&dir, &registry)?;
-    if let Err(error) = storage::write_cluster_init_marker(state_dir, &node.node_fp) {
-        eprintln!(
-            "warning: cluster identity initialized, but marker {} could not be written: {error}",
-            state_dir.join("cluster-initialized").display()
-        );
-    }
-    Ok((
-        node,
-        created,
-        if created { previous_fingerprint } else { None },
-    ))
+    registry::save_registry_at(dir, &registry)
 }
 
 /// Replace the local identity and reset membership to the new local node only.
@@ -685,6 +721,54 @@ mod init_marker_tests {
         assert!(message.contains(&marker.display().to_string()), "{message}");
         assert!(message.contains("delete"), "{message}");
         assert!(message.contains("new-identity notice"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_join_identity_creates_once_without_init_marker() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let state_dir = TempStateDir::new();
+        fs::create_dir_all(&state_dir.0).unwrap();
+        let cluster_dir = state_dir.0.join("cluster");
+
+        let (first, created) = ensure_join_identity_at(&state_dir.0).unwrap();
+        assert!(created);
+        let key_path = cluster_dir.join("identity.key");
+        let first_bytes = fs::read(&key_path).unwrap();
+        let first_metadata = fs::metadata(&key_path).unwrap();
+        assert_eq!(first_bytes.len(), 64);
+        assert_eq!(first_metadata.permissions().mode() & 0o777, 0o600);
+        let registry = registry::load_registry_at(&cluster_dir).unwrap();
+        assert_eq!(registry.authorized_nodes.len(), 1);
+        assert_eq!(registry.authorized_nodes[0].node_fp, first.node_fp);
+        assert!(!state_dir.0.join("cluster-initialized").exists());
+
+        let (second, created_again) = ensure_join_identity_at(&state_dir.0).unwrap();
+        let second_metadata = fs::metadata(&key_path).unwrap();
+        assert!(!created_again);
+        assert_eq!(first, second);
+        assert_eq!(fs::read(&key_path).unwrap(), first_bytes);
+        assert_eq!(first_metadata.ino(), second_metadata.ino());
+        assert_eq!(first_metadata.mtime(), second_metadata.mtime());
+        assert_eq!(first_metadata.mtime_nsec(), second_metadata.mtime_nsec());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_cluster_directory_lock_error_names_path() {
+        let state_dir = TempStateDir::new();
+        fs::create_dir_all(&state_dir.0).unwrap();
+        let missing_cluster_dir = state_dir.0.join("missing-cluster");
+        let error = storage::StateLock::acquire(&missing_cluster_dir)
+            .err()
+            .expect("the lock cannot be created without its parent directory");
+        assert!(error.to_string().contains(
+            &missing_cluster_dir
+                .join("identity.lock")
+                .display()
+                .to_string()
+        ));
     }
 
     #[test]

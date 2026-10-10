@@ -9,6 +9,7 @@ pub const INPUT_RING_CAPACITY: usize = 256;
 pub const MAX_INPUT_CLIENTS: usize = 16;
 pub const MAX_INPUT_BYTES: usize = 64 * 1024;
 pub const INPUT_RATE_BYTES_PER_SECOND: usize = 256 * 1024;
+pub const CLEAR_INPUT_CALLS_PER_SECOND: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InputError {
@@ -59,6 +60,28 @@ impl InputRateLimiter {
         if self.window_second == Some(now.as_secs()) {
             self.bytes_in_window = self.bytes_in_window.saturating_sub(bytes);
         }
+    }
+}
+
+/// Per-session budget for explicit destructive clear-key operations.
+#[derive(Default)]
+pub struct ClearInputRateLimiter {
+    window_second: Option<u64>,
+    calls_in_window: usize,
+}
+
+impl ClearInputRateLimiter {
+    pub fn check_rate(&mut self, now: Duration) -> Result<(), InputError> {
+        let second = now.as_secs();
+        if self.window_second != Some(second) {
+            self.window_second = Some(second);
+            self.calls_in_window = 0;
+        }
+        if self.calls_in_window >= CLEAR_INPUT_CALLS_PER_SECOND {
+            return Err(InputError::RateLimited);
+        }
+        self.calls_in_window += 1;
+        Ok(())
     }
 }
 

@@ -309,11 +309,9 @@ remuda — a pty manager you can attach to
   remuda repl                   the same image, a line at a time
   remuda mcp                    serve the image as an MCP tool on stdin/stdout
   remuda upgrade [--channel C]  re-run the installer on stable or nightly
-  remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon; the next command
-                                  starts a fresh one. A hosted session needs the
-                                  explicit --i-am-inside override.
-                                  Its sessions and Lua image die with it,
-                                  so a live herd is named and confirmed first.
+  remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon; its sessions and
+                                  Lua image end with it. Unverifiable callers
+                                  are refused; --i-am-inside overrides the guard.
   remuda --version              the version this binary was built with
 
 Four verbs, not ten. A verb is here only if it needs a terminal, must survive
@@ -375,6 +373,7 @@ remuda — terminal orchestration for coding agents
   remuda resize NAME COLS ROWS   resize a session (cols 20..1000, rows 24..500)
   remuda upgrade [--channel stable|nightly]  replace the CLI binary
   remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon (sessions are lost)
+                                  --i-am-inside overrides hosted or unverifiable identity checks.
 
   remuda mod install OWNER/REPO  install a mod from GitHub
   remuda mod list | info NAME    inspect installed mods
@@ -590,13 +589,19 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
     if args.is_empty() {
         return ClusterCommand::Status;
     }
-    if matches!(args, ["help"] | ["-h"] | ["--help"]) {
+    if matches!(
+        args,
+        ["help"] | ["-h"] | ["--help"] | ["help", "help" | "-h" | "--help"]
+    ) {
         return ClusterCommand::Help(None);
     }
-    if let [verb, "--help"] = args {
+    if let [verb, "--help"] | ["help", verb] = args {
         if cluster_verb_known(verb) {
             return ClusterCommand::Help(Some((*verb).to_owned()));
         }
+    }
+    if let ["help", verb] = args {
+        return ClusterCommand::UnknownVerb((*verb).to_owned());
     }
     let (verb, rest) = args.split_first().expect("non-empty cluster args");
     if !cluster_verb_known(verb) {
@@ -1320,6 +1325,8 @@ fn render_cluster_init_lines(
 fn listener_failure_next_step(reason: &str) -> &'static str {
     if reason.contains("no private LAN address found") {
         "Next: remuda cluster listen --bind IP"
+    } else if reason.contains("cluster identity") && reason.contains("identity.key") {
+        "Next: remuda cluster init, then run the join command again"
     } else {
         "Next: remuda cluster listen"
     }
@@ -1676,10 +1683,38 @@ fn cluster_join_command(
                 Err(_) => {}
             }
         }
+        if registry.authorized_nodes.iter().any(|entry| {
+            entry.node_fp != identity.node_fp
+                && entry.node_fp != invitation.issuer_fingerprint
+                && entry.state == remuda_native::cluster::NodeState::Admitted
+        }) {
+            return fail(
+                "cluster join: this identity already belongs to a different cluster\nNext: run `remuda cluster init --new-identity`, then join with a new invite",
+            );
+        }
     }
-    with_daemon(server, path, |daemon_path| {
-        cluster_join_with_listener(daemon_path, fingerprint, invitation, bind_addr)
-    })
+    match with_prepared_join_identity(|| {
+        with_daemon(server, path, |daemon_path| {
+            cluster_join_with_listener(daemon_path, fingerprint, invitation, bind_addr)
+        })
+    }) {
+        Ok(exit_code) => exit_code,
+        Err(error) => fail(render_join_identity_prepare_error(&error)),
+    }
+}
+
+fn render_join_identity_prepare_error(error: &std::io::Error) -> String {
+    let next = if error.to_string().contains("cluster registry exists but") {
+        "Next: restore the missing identity.key backup before joining"
+    } else {
+        "Next: remuda cluster init, then run the join command again"
+    };
+    format!("cluster join: could not prepare the local identity: {error}\n{next}")
+}
+
+fn with_prepared_join_identity<T>(operation: impl FnOnce() -> T) -> std::io::Result<T> {
+    remuda_native::cluster::ensure_join_identity()?;
+    Ok(operation())
 }
 
 fn cluster_join_with_listener(
@@ -1696,6 +1731,15 @@ fn cluster_join_with_listener(
             ))
         }
     };
+    if bind_addr.is_some()
+        && listener_snapshot
+            .as_ref()
+            .is_some_and(|config| !config.enabled)
+    {
+        eprintln!(
+            "cluster join: --bind explicitly enables the listener despite the saved --no-listen setting."
+        );
+    }
     let mut restore_guard = JoinListenerRestoreGuard::new(daemon_path, listener_snapshot.clone());
     // Install before listener start: finish_join_listener_start checks signals after reload
     // and restores the config, so moving this below start could leave an interrupted join unobserved.
@@ -1735,7 +1779,8 @@ fn cluster_join_with_listener(
             addr,
             advertise_addr,
             ..
-        } => advertise_addr.unwrap_or(addr),
+        } => Some(advertise_addr.unwrap_or(addr)),
+        remuda_core::protocol::ListenerStatus::Off => None,
         status => {
             let message = render_join_listener_refusal(&status);
             let rollback_error = restore_join_listener(&mut restore_guard);
@@ -1745,7 +1790,7 @@ fn cluster_join_with_listener(
 
     let join_fingerprint = fingerprint.to_owned();
     let join_invitation = invitation.clone();
-    let join = move || cluster_join(&join_fingerprint, &join_invitation, Some(bound_addr));
+    let join = move || cluster_join(&join_fingerprint, &join_invitation, bound_addr);
     #[cfg(unix)]
     let join_session = run_join_interruptible(signal_handler, join);
     #[cfg(not(unix))]
@@ -1762,6 +1807,9 @@ fn cluster_join_with_listener(
         JoinRun::Finished(Ok(())) => {
             restore_guard.disarm();
             println!("{}", join_success_message(invitation, fingerprint));
+            if bound_addr.is_none() {
+                println!("Joined as a client; cluster listener remains off (--no-listen).");
+            }
             report_cluster_pushes();
             println!("{}", next_step_join());
             ExitCode::SUCCESS
@@ -1798,6 +1846,16 @@ impl JoinListenerRestoreGuard {
     }
 
     fn set_expected(&mut self, expected: Option<ListenerConfig>) {
+        self.expected = expected;
+    }
+
+    fn set_join_configs(
+        &mut self,
+        snapshot: Option<ListenerConfig>,
+        expected: Option<ListenerConfig>,
+    ) {
+        self.expected_off = snapshot.as_ref().is_none_or(|config| !config.enabled);
+        self.snapshot = snapshot;
         self.expected = expected;
     }
 
@@ -1852,10 +1910,9 @@ enum JoinListenerStartOutcome {
 fn start_join_listener(
     daemon_path: &Path,
     restore_guard: &mut JoinListenerRestoreGuard,
-    listener_snapshot: Option<&ListenerConfig>,
+    _listener_snapshot: Option<&ListenerConfig>,
     bind_addr: Option<std::net::SocketAddr>,
 ) -> JoinListenerStartOutcome {
-    let initial_status = remuda_native::cluster::listener_control::status(daemon_path);
     match bind_addr {
         Some(address) => start_join_listener_with_config(
             daemon_path,
@@ -1866,20 +1923,12 @@ fn start_join_listener(
                 allow_public: false,
             },
         ),
-        None => match initial_status {
-            remuda_core::protocol::ListenerStatus::On { .. } => {
-                JoinListenerStartOutcome::Started(Ok(initial_status))
-            }
-            _ => {
-                let mut config = listener_snapshot.cloned().unwrap_or(ListenerConfig {
-                    enabled: true,
-                    bind: ListenerBind::Auto,
-                    allow_public: false,
-                });
-                config.enabled = true;
-                start_join_listener_with_config(daemon_path, restore_guard, config)
-            }
-        },
+        None => finish_join_listener_start(restore_guard, |restore_guard| {
+            remuda_native::cluster::listener_control::start_for_join(
+                daemon_path,
+                |snapshot, expected| restore_guard.set_join_configs(snapshot, expected),
+            )
+        }),
     }
 }
 
@@ -2812,16 +2861,16 @@ mod cluster_cli_tests {
         next_step_join, next_step_listen, next_step_status, parse_addr_default_port,
         parse_cluster_command, remote_control_status_lines, render_cluster_init_lines,
         render_init_listener_lines, render_invite_listener_refusal, render_join_failure,
-        render_join_listener_restore_error, render_join_listener_unexpected_on,
-        revoke_confirmation, write_nodes_table, write_revocation_notice, ClusterCommand,
-        NEW_IDENTITY_WARNING,
+        render_join_listener_restore_error, render_join_listener_start_error,
+        render_join_listener_unexpected_on, revoke_confirmation, write_nodes_table,
+        write_revocation_notice, ClusterCommand, NEW_IDENTITY_WARNING,
     };
     #[cfg(unix)]
     use super::{
         finish_join_listener_start, finish_join_listener_start_with_reporter,
-        restore_join_listener, start_join_listener_with_config, wait_for_join, ExitCode,
-        JoinInterruptHandler, JoinListenerRestoreGuard, JoinListenerStartOutcome, JoinRun,
-        JOIN_INTERRUPTED, JOIN_INTERRUPT_SIGNAL,
+        restore_join_listener, start_join_listener, start_join_listener_with_config, wait_for_join,
+        with_prepared_join_identity, ExitCode, JoinInterruptHandler, JoinListenerRestoreGuard,
+        JoinListenerStartOutcome, JoinRun, JOIN_INTERRUPTED, JOIN_INTERRUPT_SIGNAL,
     };
     #[cfg(unix)]
     use remuda_native::cluster::join_line::JoinLine;
@@ -3078,6 +3127,108 @@ mod cluster_cli_tests {
 
     #[cfg(unix)]
     #[test]
+    fn join_respects_persisted_no_listen_config() {
+        let environment = ForegroundListenerLockEnvironment::new();
+        let ClusterCommand::Init { no_listen } = parse_cluster_command(&["init", "--no-listen"])
+        else {
+            panic!("expected init --no-listen");
+        };
+        let off = super::cluster_init_listener_config(None, !no_listen);
+        remuda_native::cluster::listener_config::write(&off).unwrap();
+        let daemon_path = environment.root.join("missing-daemon.sock");
+        let mut restore_guard = JoinListenerRestoreGuard::new(&daemon_path, Some(off.clone()));
+
+        let outcome = start_join_listener(&daemon_path, &mut restore_guard, Some(&off), None);
+
+        assert!(matches!(
+            outcome,
+            JoinListenerStartOutcome::Started(Ok(remuda_core::protocol::ListenerStatus::Off))
+        ));
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            Some(off)
+        );
+        assert!(!daemon_path.exists(), "join unexpectedly started a daemon");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_honors_no_listen_written_after_snapshot() {
+        let _environment = ForegroundListenerLockEnvironment::new();
+        let snapshot = ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Auto,
+            allow_public: false,
+        };
+        let disabled = ListenerConfig {
+            enabled: false,
+            ..snapshot.clone()
+        };
+        remuda_native::cluster::listener_config::write(&snapshot).unwrap();
+        let daemon_path = _environment.root.join("missing-daemon.sock");
+        let mut restore_guard = JoinListenerRestoreGuard::new(&daemon_path, Some(snapshot.clone()));
+
+        // A completed `cluster listen --off` after join's initial snapshot.
+        remuda_native::cluster::listener_config::write(&disabled).unwrap();
+        let outcome = start_join_listener(&daemon_path, &mut restore_guard, Some(&snapshot), None);
+
+        assert!(matches!(
+            outcome,
+            JoinListenerStartOutcome::Started(Ok(remuda_core::protocol::ListenerStatus::Off))
+        ));
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            Some(disabled.clone())
+        );
+
+        // Rollback after the interleaving must retain the newer disabled setting.
+        restore_join_listener(&mut restore_guard);
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            Some(ListenerConfig {
+                enabled: false,
+                bind: ListenerBind::Auto,
+                allow_public: false,
+            })
+        );
+
+        remuda_native::cluster::listener_config::remove().unwrap();
+        let empty_snapshot = None;
+        let mut restore_guard = JoinListenerRestoreGuard::new(&daemon_path, empty_snapshot);
+        remuda_native::cluster::listener_config::write(&disabled).unwrap();
+        let outcome = start_join_listener(&daemon_path, &mut restore_guard, None, None);
+        assert!(matches!(
+            outcome,
+            JoinListenerStartOutcome::Started(Ok(remuda_core::protocol::ListenerStatus::Off))
+        ));
+        restore_join_listener(&mut restore_guard);
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            Some(disabled)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_without_saved_no_listen_still_enables_listener() {
+        let _serial = JOIN_SIGNAL_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let environment = ForegroundListenerLockEnvironment::new();
+        let daemon_path = environment.root.join("missing-daemon.sock");
+        let mut restore_guard = JoinListenerRestoreGuard::new(&daemon_path, None);
+
+        let outcome = start_join_listener(&daemon_path, &mut restore_guard, None, None);
+
+        assert!(matches!(outcome, JoinListenerStartOutcome::Started(Err(_))));
+        assert!(remuda_native::cluster::listener_config::read()
+            .unwrap()
+            .is_some_and(|config| config.enabled));
+        assert!(!daemon_path.exists(), "test unexpectedly started a daemon");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn join_listener_drop_guard_restores_during_unwind() {
         let environment = ForegroundListenerLockEnvironment::new();
         let join_config = ListenerConfig {
@@ -3152,6 +3303,60 @@ mod cluster_cli_tests {
 
     #[cfg(unix)]
     #[test]
+    fn join_listener_missing_identity_names_path_and_recommends_init() {
+        let _environment = ForegroundListenerLockEnvironment::new();
+        let cluster_dir = _environment.root.join("state/remuda/cluster");
+        std::fs::remove_file(cluster_dir.join("identity.key")).unwrap();
+        let daemon_path = std::path::Path::new("missing.sock");
+        let mut restore_guard = JoinListenerRestoreGuard::new(daemon_path, None);
+        let config = ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit("127.0.0.1:7441".parse().unwrap()),
+            allow_public: false,
+        };
+
+        let start = start_join_listener_with_config(daemon_path, &mut restore_guard, config);
+        let JoinListenerStartOutcome::Started(Err(error)) = start else {
+            panic!("missing identity should prevent listener start");
+        };
+
+        let rendered = render_join_listener_start_error(&error);
+        assert!(rendered.contains("identity.key"), "{rendered}");
+        assert!(rendered.contains("Next: remuda cluster init"), "{rendered}");
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_creates_identity_before_starting_listener_or_network_work() {
+        let _environment = ForegroundListenerLockEnvironment::new();
+        let key_path = _environment.root.join("state/remuda/cluster/identity.key");
+        std::fs::remove_file(&key_path).unwrap();
+        std::fs::remove_file(
+            _environment
+                .root
+                .join("state/remuda/cluster/authorized_nodes.json"),
+        )
+        .unwrap();
+        let mut started = false;
+
+        with_prepared_join_identity(|| {
+            assert!(
+                key_path.is_file(),
+                "listener/network work began before identity"
+            );
+            started = true;
+        })
+        .unwrap();
+
+        assert!(started);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn join_signal_during_listener_start_restores_listener_config() {
         use remuda_core::protocol::ListenerStatus;
 
@@ -3167,6 +3372,7 @@ mod cluster_cli_tests {
         }
 
         let _reset = ResetInterruptState;
+        let _default = DefaultSignals::set(&[libc::SIGTERM]);
         let _environment = ForegroundListenerLockEnvironment::new();
         let join_config = ListenerConfig {
             enabled: true,
@@ -3274,6 +3480,15 @@ mod cluster_cli_tests {
         let _serial = JOIN_SIGNAL_TEST
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct ResetInterruptState;
+        impl Drop for ResetInterruptState {
+            fn drop(&mut self) {
+                JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
+                JOIN_INTERRUPT_SIGNAL.store(0, Ordering::Relaxed);
+            }
+        }
+        let _reset = ResetInterruptState;
+        let _default = DefaultSignals::set(&[libc::SIGINT]);
         let _handler = JoinInterruptHandler::install().unwrap();
         assert!(!JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
@@ -3296,6 +3511,15 @@ mod cluster_cli_tests {
             }
         }
 
+        struct ResetInterruptState;
+        impl Drop for ResetInterruptState {
+            fn drop(&mut self) {
+                JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
+                JOIN_INTERRUPT_SIGNAL.store(0, Ordering::Relaxed);
+            }
+        }
+        let _reset = ResetInterruptState;
+
         let prior = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
         assert_ne!(prior, libc::SIG_ERR, "set SIGHUP to ignored");
         let _restore = RestoreSignal(libc::SIGHUP, prior);
@@ -3313,6 +3537,15 @@ mod cluster_cli_tests {
         let _serial = JOIN_SIGNAL_TEST
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct ResetInterruptState;
+        impl Drop for ResetInterruptState {
+            fn drop(&mut self) {
+                JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
+                JOIN_INTERRUPT_SIGNAL.store(0, Ordering::Relaxed);
+            }
+        }
+        let _reset = ResetInterruptState;
+        let _default = DefaultSignals::set(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
         let signals = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
         let before: Vec<_> = signals
             .iter()
@@ -3329,6 +3562,36 @@ mod cluster_cli_tests {
         drop(handler);
         for (signal, expected) in signals.into_iter().zip(before) {
             assert_eq!(current_signal_handler(signal), expected);
+        }
+    }
+
+    /// A background test run (`cargo test &`) inherits SIGINT ignored, and
+    /// `install` keeps ignored signals; tests that raise one restore the default.
+    #[cfg(unix)]
+    struct DefaultSignals(Vec<(libc::c_int, libc::sighandler_t)>);
+
+    #[cfg(unix)]
+    impl DefaultSignals {
+        fn set(signals: &[libc::c_int]) -> Self {
+            let mut ignored = Vec::new();
+            for &signal in signals {
+                if current_signal_handler(signal) == libc::SIG_IGN {
+                    // SAFETY: SIG_DFL is a valid disposition; Drop restores SIG_IGN.
+                    unsafe { libc::signal(signal, libc::SIG_DFL) };
+                    ignored.push((signal, libc::SIG_IGN));
+                }
+            }
+            Self(ignored)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DefaultSignals {
+        fn drop(&mut self) {
+            for &(signal, previous) in &self.0 {
+                // SAFETY: restore the inherited disposition recorded by `set`.
+                unsafe { libc::signal(signal, previous) };
+            }
         }
     }
 
@@ -3540,6 +3803,34 @@ mod cluster_cli_tests {
             parse_cluster_command(&["node"]),
             ClusterCommand::UnknownVerb("node".into())
         );
+    }
+
+    #[test]
+    fn cluster_help_verb_shows_that_verbs_usage() {
+        for verb in [
+            "init", "invite", "join", "nodes", "control", "revoke", "remote", "listen", "call",
+        ] {
+            assert_eq!(
+                parse_cluster_command(&["help", verb]),
+                ClusterCommand::Help(Some(verb.into())),
+                "cluster help {verb}"
+            );
+        }
+        assert_eq!(
+            parse_cluster_command(&["help", "wat"]),
+            ClusterCommand::UnknownVerb("wat".into())
+        );
+    }
+
+    #[test]
+    fn cluster_help_about_help_shows_cluster_usage() {
+        for topic in ["help", "-h", "--help"] {
+            assert_eq!(
+                parse_cluster_command(&["help", topic]),
+                ClusterCommand::Help(None),
+                "cluster help {topic}"
+            );
+        }
     }
 
     #[test]
@@ -4450,6 +4741,9 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+        Err(e) if e.starts_with("cannot stop this daemon") => fail(format!(
+            "{e}\nNext: to stop it intentionally, run `remuda -s {server} stop -f --yes --i-am-inside` using the same runtime directory. This intentionally ends its sessions."
+        )),
         Err(e) => fail(e),
     }
 }
@@ -4461,7 +4755,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
         options: vec![],
         verbs: vec![VerbSpec {
             name: "stop".into(),
-            about: "Stop the daemon".into(),
+            about: "Stop this server's daemon and end its sessions".into(),
             args: vec![],
             next: "remuda stop --help".into(),
             options: vec![
@@ -4469,22 +4763,26 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
                     long: "force".into(),
                     short: Some('f'),
                     value: None,
-                    help: "Stop without asking for confirmation".into(),
+                    help: "Skip confirmation; identity checks still apply".into(),
                     global: false,
+                    repeat_policy: Default::default(),
                 },
                 OptionSpec {
                     long: "yes".into(),
                     short: None,
                     value: None,
-                    help: "Confirm stopping all sessions".into(),
+                    help: "Confirm ending all sessions; identity checks still apply".into(),
                     global: false,
+                    repeat_policy: Default::default(),
                 },
                 OptionSpec {
                     long: "i-am-inside".into(),
                     short: None,
                     value: None,
-                    help: "Allow a hosted session to stop its daemon".into(),
+                    help: "Override hosted or unverifiable identity checks; ends all sessions"
+                        .into(),
                     global: false,
+                    repeat_policy: Default::default(),
                 },
             ],
         }],
@@ -4656,12 +4954,13 @@ fn skew_notice(response: std::io::Result<Response>) -> Option<String> {
 /// is the client's only diagnostic when start-up fails — and on `mcp`, whose
 /// streams belong to whatever spawned it.
 fn announce_update(argv: &[&str]) {
-    if matches!(argv, ["daemon"] | ["mcp"]) || UPDATE_NOTICE_EMITTED.load(Ordering::Relaxed) {
+    if UPDATE_NOTICE_EMITTED.load(Ordering::Relaxed) {
         return;
     }
     let now = std::time::SystemTime::now();
     let no_update_check = std::env::var_os("REMUDA_NO_UPDATE_CHECK").is_some();
-    if !dist::should_show_update_notice(
+    if !should_announce_update(
+        argv,
         std::io::stderr().is_terminal(),
         std::env::var_os("REMUDA_BUTLER_AGENT_ID").is_some(),
         no_update_check,
@@ -4675,6 +4974,26 @@ fn announce_update(argv: &[&str]) {
         UPDATE_NOTICE_EMITTED.store(true, Ordering::Relaxed);
         dist::record_update_notice_shown(now);
     }
+}
+
+fn should_announce_update(
+    argv: &[&str],
+    stderr_is_terminal: bool,
+    agent_id_set: bool,
+    no_update_check_env: bool,
+    last_shown: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> bool {
+    if matches!(argv, ["daemon"] | ["mcp"]) {
+        return false;
+    }
+    dist::should_show_update_notice(
+        stderr_is_terminal,
+        agent_id_set,
+        no_update_check_env,
+        last_shown,
+        now,
+    )
 }
 
 fn prepare_command(argv: &[&str], path: &Path) -> Result<Option<String>, String> {
@@ -4725,6 +5044,7 @@ fn upgrade_cli_spec() -> remuda_native::cli_parse::Spec {
                 value: Some("CHANNEL".into()),
                 help: "Release channel: stable or nightly".into(),
                 global: false,
+                repeat_policy: Default::default(),
             }],
         }],
     }
@@ -5699,6 +6019,7 @@ fn doc_cli_spec() -> remuda_native::cli_parse::Spec {
                 value: Some("FORMAT".into()),
                 help: "Output format: rst, markdown, or json".into(),
                 global: false,
+                repeat_policy: Default::default(),
             }],
         }],
     }
@@ -5760,6 +6081,7 @@ fn mod_cli_spec() -> remuda_native::cli_parse::Spec {
         value: value.map(str::to_owned),
         help: help.into(),
         global: false,
+        repeat_policy: Default::default(),
     };
     let arg = |name: &str, help: &str, required| ArgSpec {
         name: name.into(),
@@ -6796,6 +7118,23 @@ fn print_lines(n: &str, delay_ms: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_agent_suppresses_update_notice_for_butler_and_any_verb() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(2 * 24 * 60 * 60);
+        for argv in [
+            &["butler"][..],
+            &["butler", "inbox"][..],
+            &["butler", "sessions"][..],
+            &["ls"][..],
+            &["upgrade"][..],
+        ] {
+            assert!(
+                !should_announce_update(argv, true, true, false, None, now),
+                "update notice should be suppressed for {argv:?}"
+            );
+        }
+    }
 
     #[test]
     fn stdout_broken_pipe_panic_match_is_narrow() {

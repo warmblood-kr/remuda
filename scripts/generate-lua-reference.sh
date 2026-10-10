@@ -5,13 +5,27 @@ output=${1:-docs/lua-reference.rst}
 html_output=${2:-docs/lua-reference.html}
 runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/remuda-doc.XXXXXX")
 cleanup() {
+  result=$?
+  trap - EXIT HUP INT TERM
   if [ -x target/debug/remuda ]; then
-    REMUDA_RUNTIME_DIR="$runtime_dir" REMUDA_NO_UPDATE_CHECK=1 \
-      target/debug/remuda stop -f >/dev/null 2>&1 || true
+    # This script started the daemon in a fresh private runtime, so the
+    # override is an intentional cleanup of only that daemon and its sessions.
+    if ! REMUDA_RUNTIME_DIR="$runtime_dir" REMUDA_NO_UPDATE_CHECK=1 \
+      target/debug/remuda stop -f --yes --i-am-inside >&2; then
+      echo "could not stop the private documentation daemon; kept its runtime at $runtime_dir" >&2
+      result=1
+    else
+      rm -rf "$runtime_dir" || result=1
+    fi
+  else
+    rm -rf "$runtime_dir" || result=1
   fi
-  rm -rf "$runtime_dir"
+  exit "$result"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 command -v pandoc >/dev/null 2>&1 || {
   echo "pandoc is required to render the generated RST reference as HTML" >&2

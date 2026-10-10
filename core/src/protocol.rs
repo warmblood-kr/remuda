@@ -200,9 +200,23 @@ pub enum Request {
         #[serde(default)]
         env: Option<std::collections::HashMap<String, String>>,
     },
+    /// Start a session for the Lua API and return its registered identity.
+    /// Ordinary callers keep using [`Request::New`] and receive only the name.
+    NewWithInstance {
+        #[serde(default)]
+        name: Option<String>,
+        command: Vec<String>,
+        size: Size,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        env: Option<std::collections::HashMap<String, String>>,
+    },
     /// Deliver one instruction as an indivisible act. An attached terminal is
     /// a viewer, not a delivery lock.
     SendLine { name: String, text: String },
+    /// Write one caller-supplied clear-line key as an indivisible act.
+    ClearInput { name: String, key: Vec<u8> },
     /// Submit an idempotent input batch. Client IDs are 32 hex digits and
     /// sequence numbers start at one and increase for each batch.
     Input {
@@ -343,6 +357,11 @@ pub enum Step {
 pub enum Response {
     Sessions(Vec<SessionSummary>),
     Screen(String),
+    /// The session-level clear-line key was written; cleared text is optional
+    /// because terminal screens do not generally identify composer contents.
+    ClearInput {
+        cleared: Option<String>,
+    },
     /// An input batch was applied, or was already applied.
     Ack {
         duplicate: bool,
@@ -394,6 +413,11 @@ pub enum Response {
     /// distinct from `Screen` so a client can tell "the session printed
     /// nothing" from "the expression returned nothing".
     Value(String),
+    /// A newly spawned session and the identity returned by its registry insertion.
+    SessionStarted {
+        name: String,
+        instance_id: String,
+    },
     /// A command result completed through a bounded pending reply handle.
     CommandResult {
         exit_code: u8,

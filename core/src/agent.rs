@@ -215,6 +215,8 @@ pub enum AgentError {
     Attached,
     /// A previous PTY write is still active; no second write was queued.
     Busy,
+    /// A human typed recently, so scripted input must not clear that draft.
+    HumanInputRecent,
     /// The bounded write deadline elapsed; bytes may still finish later.
     WriteTimeout {
         timeout: core::time::Duration,
@@ -247,6 +249,9 @@ impl fmt::Display for AgentError {
                 "a human is attached to this session; detach it first (Ctrl-\\ in that terminal), then retry"
             ),
             AgentError::Busy => write!(f, "a session input write is already in flight"),
+            AgentError::HumanInputRecent => {
+                write!(f, "a human typed recently; refusing to clear the input line")
+            }
             AgentError::WriteTimeout { timeout } => {
                 write!(
                     f,
@@ -290,6 +295,16 @@ pub trait AgentWriter: Send + Sync {
     /// do not keep time-based writer state can ignore it.
     fn set_clock(&self, _clock: Arc<dyn Clock>) {}
     fn write_bounded(&self, bytes: &[u8]) -> Result<()>;
+    /// Attempt one bounded write without waiting behind an active write.
+    /// Asynchronous backends must override this and reserve their single-flight
+    /// slot atomically; the default is for synchronous implementations.
+    fn write_bounded_if_idle(&self, bytes: &[u8]) -> Result<()> {
+        if self.is_busy() {
+            Err(AgentError::Busy)
+        } else {
+            self.write_bounded(bytes)
+        }
+    }
     /// Ask the write that timed out to be followed by FOLLOW_UP once it lands.
     /// `Landed` means the timed-out write is no longer the active write; `Unsupported` means it cannot chain.
     fn chain_after_stalled(
@@ -400,6 +415,12 @@ pub trait AgentProcess: Send {
     /// Non-process implementations return `None`.
     fn process_id(&self) -> Option<u32> {
         None
+    }
+
+    /// Whether the backend holds `pid` as its own (for example, in a job).
+    /// The held process handle avoids reopening by PID; errors mean unknown.
+    fn owns_process(&self, _pid: u32, _process_handle: Option<usize>) -> std::io::Result<bool> {
+        Ok(false)
     }
 
     /// The visible screen as styled cells, for a croppable colour pane.
@@ -524,6 +545,8 @@ pub struct ScriptedAgent {
     /// rather than one buffer so a test can see whether two writers
     /// interleaved, which a concatenated buffer would hide.
     pub writes: Vec<Vec<u8>>,
+    /// Process IDs this double claims through `owns_process`.
+    owned: Vec<u32>,
 }
 
 impl ScriptedAgent {
@@ -539,7 +562,13 @@ impl ScriptedAgent {
             alive: true,
             size: Size::default(),
             writes: Vec::new(),
+            owned: Vec::new(),
         }
+    }
+
+    pub fn owning(mut self, pid: u32) -> Self {
+        self.owned.push(pid);
+        self
     }
 
     pub fn with_size(mut self, size: Size) -> Self {
@@ -586,6 +615,10 @@ impl AgentProcess for ScriptedAgent {
 
     fn is_alive(&mut self) -> bool {
         self.alive
+    }
+
+    fn owns_process(&self, pid: u32, _process_handle: Option<usize>) -> std::io::Result<bool> {
+        Ok(self.owned.contains(&pid))
     }
 
     fn terminate(&mut self) -> Result<()> {
