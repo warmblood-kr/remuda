@@ -1408,6 +1408,7 @@ fn the_preview_claims_what_the_widest_session_needs() {
 #[test]
 fn a_shown_list_fits_its_content_without_overriding_a_manual_width() {
     let mut ui = make_ui(vec![row("short", true, false)]);
+    ui.set_keymap(crate::keybindings::Snapshot::from_json(r#"{"generation":1,"ready":true,"rows":[{"context":"session.list.browse","key":"l","action":"session.toggle_list","help":"list"}]}"#).unwrap());
     ui.sessions_text = vec![
         "\x1b[1mshort\x1b[0m".into(),
         "a rendered detail row that is longer".into(),

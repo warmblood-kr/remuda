@@ -4,7 +4,7 @@ use remuda_native::tui::{pane_size, render, Action, Ui};
 use std::time::Duration;
 
 fn ui_with_mouse_tracking(mouse_tracking: bool) -> Ui {
-    Ui::new(
+    let mut ui = Ui::new(
         vec![SessionSummary {
             id: String::new(),
             name: "agent".into(),
@@ -20,7 +20,9 @@ fn ui_with_mouse_tracking(mouse_tracking: bool) -> Ui {
         }],
         "sh",
         None,
-    )
+    );
+    ui.set_keymap(remuda_native::keybindings::Snapshot::from_json(r#"{"generation":1,"ready":true,"rows":[{"context":"session.list.browse","key":"l","action":"session.toggle_list","help":"list"}]}"#).unwrap());
+    ui
 }
 
 fn ui() -> Ui {

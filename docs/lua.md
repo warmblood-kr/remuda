@@ -505,3 +505,53 @@ other site or tooling integrations.
 See [the design notes](design.md#one-registry-for-every-word) for the registry
 model and [the project source](https://github.com/warmblood-kr/remuda) for the
 current implementation.
+
+### UI key bindings (first adopter: session list)
+
+The Lua image owns UI declarations and help metadata. The native UI takes one
+validated snapshot after user configuration finishes, then resolves keys and
+renders help from that same snapshot. Reopen the UI to pick up later changes.
+The session-list browse toggle is the first adopter; other UI commands still
+use their existing handlers, pending migration (see #704).
+
+In `$XDG_CONFIG_HOME/remuda/init.lua` (otherwise `~/.config/remuda/init.lua`):
+
+```lua
+remuda.rebind("session.list.browse", "session.toggle_list", "M-l")
+```
+
+This replaces the default `l` binding, and help shows `M-l list`. Plain `l`
+still moves right in visual mode and goes to the child in session focus.
+`remuda.unbind(context, key)` removes an effective binding. An unbound action
+can be declared again, with its help, using:
+
+```lua
+remuda.define_key{
+  context = "session.list.browse",
+  key = "z",
+  action = "session.toggle_list",
+  help = "list",
+}
+```
+
+`remuda.keymap_snapshot()` returns `{generation, ready, diagnostic?, rows}`;
+each row contains `context`, `key`, `action`, and `help`. Rows are copies, not
+a mutable registry. This slice supports one binding per action. Unknown
+contexts/actions/key spellings, duplicate keys/actions and conflicts with
+legacy browse commands raise errors before changing the map. Use the existing
+Emacs-style spelling with `C-` and `M-` modifiers, single characters and named
+keys such as `<left>`. Multi-key chords and explicit Shift modifiers are not
+supported. Ctrl-4 normalizes to Ctrl-backslash, as the terminal decoder does.
+
+Lifecycle mod registrations carry the current mod owner, are removed when
+replaced, and are restored on failed activation rollback. A mod cannot replace
+another mod's effective binding; user `rebind` is explicit replacement. The
+user layer takes precedence over mod layers, which take precedence over
+defaults. Removing a mod's layer exposes an earlier declaration. Defaults remain in Lua rather than being mirrored in
+Rust.
+
+The UI waits up to three seconds for config readiness. A missing registry,
+transport failure or readiness timeout produces a visible startup error and
+never falls back to a hidden native key table. A failed `init.lua` is recorded
+in the snapshot and displayed in the footer; each completed binding operation
+remains valid, while a rejected operation leaves its prior map intact.

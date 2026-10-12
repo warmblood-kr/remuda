@@ -25,6 +25,14 @@ remuda._extension_commands = {}
 -- it registers imperatively is tagged with its name, so reload and rollback
 -- can replace it like the declared registrations.
 local current_owner = nil
+local keymaps = nil
+if remuda._keymap_factory then
+  local api
+  api, keymaps = remuda._keymap_factory(function() return current_owner end,
+    remuda._keymap_validate, remuda._keymap_config_status)
+  for name, fn in pairs(api) do remuda[name] = fn end
+  remuda._keymap_factory, remuda._keymap_validate, remuda._keymap_config_status = nil, nil, nil
+end
 local module_tool_owners = {}
 local function with_owner(owner, fn, ...)
   local outer = current_owner
@@ -88,6 +96,12 @@ end
 -- populates this table before this file loads) — `remuda doc` reads it.
 local function register(name, about, signature)
   remuda._registry[name] = { name = name, about = about, signature = signature }
+end
+if keymaps then
+  register("define_key", "Declare a contextual UI key, native action and generated help.", "define_key(spec) -> nil")
+  register("rebind", "Atomically replace an action's key in its context.", "rebind(context, action, key) -> nil")
+  register("unbind", "Remove an effective contextual UI binding.", "unbind(context, key) -> nil")
+  register("keymap_snapshot", "Effective UI bindings and startup readiness; refresh by reopening the UI.", "keymap_snapshot() -> table")
 end
 register("after", "Run a callback once after a delay without blocking the Lua image; cancel with handle:cancel().", "after(seconds, fn) -> handle")
 register("every", "Run a callback periodically without blocking the Lua image; cancel with handle:cancel(). If a callback finishes late, the next tick comes one interval after it ends, so the phase shifts and ticks do not burst to catch up.", "every(seconds, fn) -> handle")
@@ -1055,6 +1069,7 @@ local field_owners = {}
 -- created, so discard those owner-tagged effects before running it again.
 local function clear_imperative_module_registrations(name, activation)
   cancel_owner_timers(name)
+  if keymaps then keymaps.drop(name) end
   local declared_schedules, declared_tools, declared_advice, declared_contributions = {}, {}, {}, {}
   for _, handle in ipairs(activation.schedules or {}) do declared_schedules[handle] = true end
   for _, tool_name in ipairs(activation.tools or {}) do declared_tools[tool_name] = true end
@@ -1346,6 +1361,7 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
   -- Snapshot what this activation replaces, so a failing `start` can put the
   -- previous activation back (#129). State mutated by that `start` stays.
   local saved_hooks, saved_tools, saved_schedules, saved_owner_schedules, saved_commands = {}, {}, {}, {}, {}
+  local saved_keys = keymaps and keymaps.save(name)
   local saved_advice = snapshot_advice()
   local saved_fields = {}
   for key, owner in pairs(field_owners) do
@@ -1389,6 +1405,7 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
     remuda._extension_commands[command], extension_command_owners[command] = nil, nil
   end
   drop_owned_advice(name)
+  if keymaps then keymaps.drop(name) end
   -- The mod's fields go too; `start` recreates the ones it still defines,
   -- and advice on those re-attaches (a field not recreated takes its advice).
   for key in pairs(saved_fields) do
@@ -1560,6 +1577,7 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
     for key, value in pairs(saved_fields) do
       remuda[key], field_owners[key] = value, name
     end
+    if keymaps then keymaps.restore(name, saved_keys) end
     restore_advice(saved_advice)
     for point, items in pairs(contributions) do
       local restored = saved_contributions[point] or {}
@@ -1600,6 +1618,7 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
         for key, owner in pairs(field_owners) do
           if owner == name then remuda[key], field_owners[key] = nil, nil end
         end
+        if keymaps then keymaps.drop(name) end
         drop_owned_advice(name)
         for _, items in pairs(contributions) do
           for id, item in pairs(items) do

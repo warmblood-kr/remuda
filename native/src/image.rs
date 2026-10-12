@@ -402,6 +402,7 @@ fn deliver_session_output(lua: &Lua, notifier: &SessionOutputNotifier, version: 
 #[derive(Clone)]
 pub struct Image {
     jobs: Sender<Job>,
+    user_config: Arc<Mutex<Option<Result<(), String>>>>,
     pending: crate::pending::PendingReplies,
     http: crate::net::HttpClient,
     session_outputs: Arc<Mutex<HashMap<String, SessionOutputNotifier>>>,
@@ -423,6 +424,7 @@ impl Image {
         let socket: PathBuf = socket.to_path_buf();
         let image = Self {
             jobs,
+            user_config: Arc::new(Mutex::new(None)),
             pending: crate::pending::PendingReplies::default(),
             http: crate::net::HttpClient::default(),
             session_outputs: Arc::new(Mutex::new(HashMap::new())),
@@ -453,7 +455,19 @@ impl Image {
                         Rc::clone(&caller),
                         Rc::clone(&timers),
                     )
-                    .and_then(|table| lua.globals().set("remuda", table))
+                    .and_then(|table| {
+                        let config = Arc::clone(&handle.user_config);
+                        crate::keybindings::install(&lua, &table, move || {
+                            let status = config.lock().unwrap();
+                            (
+                                status.is_some(),
+                                status
+                                    .as_ref()
+                                    .and_then(|result| result.as_ref().err().cloned()),
+                            )
+                        })?;
+                        lua.globals().set("remuda", table)
+                    })
                     .and_then(|()| install_execution_guards(&lua, budget.clone()))
                     // The tool frame loads after bindings and guard helpers,
                     // before any caller can access it.
@@ -716,6 +730,12 @@ impl Image {
     /// Evaluate `code` in the image and wait for the result. State persists
     /// between calls — a `-e`, a script and a REPL line are all doors into one
     /// interpreter, and a variable set by any of them outlives the call.
+    /// Publish config completion outside the Lua queue, so an early keymap
+    /// request observes loading without blocking the interpreter or listener.
+    pub(crate) fn finish_user_config(&self, result: Result<(), String>) {
+        *self.user_config.lock().unwrap() = Some(result);
+    }
+
     pub fn eval(&self, code: &str, name: Option<&str>) -> Result<String, String> {
         self.submit(code, name)?
             .recv()
