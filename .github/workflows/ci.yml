@@ -314,6 +314,7 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - name: Coverage
+        id: coverage
         # Revert this line to undo #624; %p separates processes and %b identifies the binary.
         env:
           LLVM_PROFILE_FILE_NAME: "%p-%b.profraw"
@@ -327,7 +328,7 @@ jobs:
       - name: Profile diagnostics (#624)
         # Print-only evidence when Coverage failed; it always exits 0, so it
         # never changes this job's result.
-        if: failure()
+        if: failure() && steps.coverage.outcome == 'failure'
         timeout-minutes: 5
         continue-on-error: true
         run: bash scripts/diagnose-profraw.sh || true
