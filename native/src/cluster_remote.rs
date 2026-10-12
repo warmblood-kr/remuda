@@ -433,12 +433,13 @@ impl RemoteTreeState {
     }
 
     /// Like `with_node`, but moves the generation when what a viewer sees differs
-    /// from the last recorded view; bookkeeping, repeats or a removed node do not.
+    /// from the last recorded or current live view; bookkeeping and removed nodes do not.
     fn record<R>(&self, name: &str, f: impl FnOnce(&mut RemoteNode) -> R) -> Option<R> {
         let (result, changed) = self.with_node(name, |node| {
+            let before = node.view();
             let result = f(node);
             let view = node.view();
-            let changed = view != node.published;
+            let changed = view != node.published || view != before;
             node.published = view;
             (result, changed)
         })?;
@@ -1959,7 +1960,7 @@ mod tests {
     }
 
     #[test]
-    fn a_worker_error_backs_off_and_an_unchanged_repeat_does_not_wake_the_tui() {
+    fn a_worker_error_backs_off_and_completion_wakes_the_retry_label() {
         struct Down;
 
         impl RemoteTransport for Down {
@@ -2024,10 +2025,57 @@ mod tests {
         let (failures, backoff) = poll_once();
         assert_eq!(failures, 2);
         assert!(backoff >= 2 * BACKOFF_BASE, "{backoff:?}");
+        assert!(
+            state.generation() > failed,
+            "completion replaces the retry label"
+        );
+    }
+
+    #[test]
+    fn recording_bookkeeping_repeated_views_and_absent_nodes_does_not_wake() {
+        let state = RemoteTreeState::default();
+        let now = Instant::now();
+        state.insert_node(RemoteNode::new("laptop", now));
+        state.record("laptop", |node| {
+            node.poll_failed_with_reason(now, Some("offline".into()))
+        });
+        let seen = state.generation();
+        state.record("laptop", |node| {
+            node.poll_failed_with_reason(now, Some("offline".into()))
+        });
+        state.record("laptop", |node| node.next_poll = now);
         assert_eq!(
-            state.generation(),
-            failed,
-            "an unchanged repeat is not a wake"
+            state.record("absent", |_| panic!("absent callback ran")),
+            None::<()>
+        );
+        assert_eq!(state.generation(), seen);
+    }
+
+    #[test]
+    fn an_observed_retry_label_is_woken_by_an_identical_failure() {
+        let state = RemoteTreeState::default();
+        let start = Instant::now();
+        state.insert_node(RemoteNode::new("laptop", start));
+        state.record("laptop", |node| {
+            node.poll_failed_with_reason(start, Some("offline".into()))
+        });
+        let retry = state.with_node("laptop", |node| node.retry_at()).unwrap();
+        state.with_node("laptop", |node| assert!(node.begin_poll(retry)));
+        assert_eq!(
+            state.snapshot_at(retry).nodes[0].state,
+            RemoteState::Reconnecting
+        );
+        let seen = state.generation();
+        state.record("laptop", |node| {
+            node.poll_failed_with_reason(retry, Some("offline".into()))
+        });
+        assert_eq!(
+            state.snapshot_at(retry).nodes[0].state,
+            RemoteState::Unreachable
+        );
+        assert!(
+            state.generation() > seen,
+            "completion must wake the observed label"
         );
     }
 
