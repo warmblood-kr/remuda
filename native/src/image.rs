@@ -727,15 +727,15 @@ impl Image {
             })
     }
 
-    /// Evaluate `code` in the image and wait for the result. State persists
-    /// between calls — a `-e`, a script and a REPL line are all doors into one
-    /// interpreter, and a variable set by any of them outlives the call.
     /// Publish config completion outside the Lua queue, so an early keymap
     /// request observes loading without blocking the interpreter or listener.
     pub(crate) fn finish_user_config(&self, result: Result<(), String>) {
         *self.user_config.lock().unwrap() = Some(result);
     }
 
+    /// Evaluate `code` in the image and wait for the result. State persists
+    /// between calls — a `-e`, a script and a REPL line are all doors into one
+    /// interpreter, and a variable set by any of them outlives the call.
     pub fn eval(&self, code: &str, name: Option<&str>) -> Result<String, String> {
         self.submit(code, name)?
             .recv()
