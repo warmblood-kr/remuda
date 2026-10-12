@@ -208,13 +208,15 @@ fn wait_until_probe_exits(file: &Path, failure: &str) {
     use std::os::fd::AsRawFd;
     let mut alive = file.as_os_str().to_owned();
     alive.push(".alive");
-    let alive = std::fs::File::open(&alive).expect("open the probe's FILE.alive");
+    let lock = std::fs::File::open(&alive).expect("open the probe's FILE.alive");
     let deadline = Instant::now() + Duration::from_secs(5);
     // SAFETY: flock on a descriptor this function owns.
-    while unsafe { libc::flock(alive.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         assert!(Instant::now() < deadline, "probe for {file:?} {failure}");
         std::thread::sleep(Duration::from_millis(20));
     }
+    let _ = std::fs::remove_file(&alive);
+    let _ = std::fs::remove_file(file);
 }
 
 /// A probe whose daemon died before it started exits at once rather than
@@ -238,4 +240,5 @@ fn a_probe_whose_daemon_is_already_gone_exits_at_once() {
     }
     wait_until_probe_exits(&file, "idled after its daemon was gone");
     let _ = probe.wait();
+    let _ = std::fs::remove_dir_all(&dir);
 }
