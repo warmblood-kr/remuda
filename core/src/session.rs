@@ -414,14 +414,14 @@ mod submit_window_tests {
         }
     }
 
-    /// Types "alpha" into a scripted TUI; returns the outcome, the Return
-    /// times, and how long after the first Return `type_text` returned.
+    /// Types "alpha" into a scripted TUI; returns the outcome, the Return times,
+    /// and how long `type_text` took after the first Return and in total.
     fn type_into(
         echo_ms: u64,
         trailing_ms: Option<u64>,
         redraw_ms: u64,
         redraw: Redraw,
-    ) -> (InputSubmitOutcome, Vec<Duration>, Duration) {
+    ) -> (InputSubmitOutcome, Vec<Duration>, Duration, Duration) {
         let clock = Arc::new(ManualClock::new());
         let script = Arc::new(Mutex::new(Script {
             echo_after: Duration::from_millis(echo_ms),
@@ -437,22 +437,23 @@ mod submit_window_tests {
             script: Arc::clone(&script),
         };
         let session = Session::new("tui", Box::new(agent), clock.clone());
+        let entered = clock.now();
         let outcome = session.type_text("alpha", Duration::ZERO).unwrap();
         let returns = script.lock().unwrap().returns.clone();
         let after_return = clock.now() - returns[0];
-        (outcome, returns, after_return)
+        (outcome, returns, after_return, clock.now() - entered)
     }
 
     #[test]
     fn a_prompt_redraw_after_return_is_submitted() {
-        let (outcome, returns, _) = type_into(0, None, 200, Redraw::Submit);
+        let (outcome, returns, _, _) = type_into(0, None, 200, Redraw::Submit);
         assert_eq!(outcome, InputSubmitOutcome::Submitted);
         assert_eq!(returns.len(), 1);
     }
 
     #[test]
     fn a_silent_submit_is_unverified_within_one_second() {
-        let (outcome, returns, after_return) = type_into(0, None, 0, Redraw::Nothing);
+        let (outcome, returns, after_return, _) = type_into(0, None, 0, Redraw::Nothing);
         assert_eq!(outcome, InputSubmitOutcome::Unverified);
         assert_eq!(returns.len(), 1, "a silent submit must not be retried");
         assert!(
@@ -463,21 +464,21 @@ mod submit_window_tests {
 
     #[test]
     fn a_prompt_composer_newline_gets_one_retry() {
-        let (outcome, returns, _) = type_into(0, None, 200, Redraw::ComposerNewline);
+        let (outcome, returns, _, _) = type_into(0, None, 200, Redraw::ComposerNewline);
         assert_eq!(outcome, InputSubmitOutcome::Unverified);
         assert_eq!(returns.len(), 2);
     }
 
     #[test]
     fn a_slow_tui_redraw_after_return_is_still_submitted() {
-        let (outcome, returns, _) = type_into(600, None, 1500, Redraw::Submit);
+        let (outcome, returns, _, _) = type_into(600, None, 1500, Redraw::Submit);
         assert_eq!(outcome, InputSubmitOutcome::Submitted);
         assert_eq!(returns.len(), 1);
     }
 
     #[test]
     fn a_slow_tui_composer_newline_still_gets_its_retry() {
-        let (_, returns, _) = type_into(600, None, 1500, Redraw::ComposerNewline);
+        let (_, returns, _, _) = type_into(600, None, 1500, Redraw::ComposerNewline);
         assert_eq!(
             returns.len(),
             2,
@@ -487,24 +488,21 @@ mod submit_window_tests {
 
     #[test]
     fn a_slow_tui_late_paste_redraw_is_not_taken_for_a_submit() {
-        let (outcome, returns, _) = type_into(600, Some(500), 0, Redraw::Nothing);
+        let (outcome, returns, _, _) = type_into(600, Some(500), 0, Redraw::Nothing);
         assert_eq!(outcome, InputSubmitOutcome::Unverified);
         assert_eq!(returns.len(), 1);
     }
 
     #[test]
-    fn the_scaled_window_stays_bounded() {
-        let (outcome, _, after_return) = type_into(1900, None, 0, Redraw::Nothing);
+    fn the_whole_call_stays_within_the_submit_budget() {
+        let (outcome, _, after_return, total) = type_into(1900, None, 0, Redraw::Nothing);
         assert_eq!(outcome, InputSubmitOutcome::Unverified);
-        assert!(
-            after_return <= Duration::from_millis(6100),
-            "{after_return:?}"
-        );
+        assert!(after_return >= Duration::from_secs(1), "{after_return:?}");
+        assert!(total <= Duration::from_millis(6100), "{total:?}");
     }
 }
 
 /// A child slow to echo the paste is slow to redraw after Return too (#637).
-/// The echo wait is capped at 2s, so the window stays within 6s.
 fn submit_window(echo: Duration) -> Duration {
     SUBMIT_WINDOW.max(echo * 3)
 }
@@ -538,6 +536,9 @@ pub const DEFAULT_INPUT_SETTLE: Duration = Duration::from_millis(100);
 /// echoes the paste at once. A slower echo stretches both (`submit_window`).
 const SCREEN_QUIET: Duration = Duration::from_millis(300);
 const SUBMIT_WINDOW: Duration = Duration::from_secs(1);
+/// The echo wait, quiet wait and post-Return window share this budget; the
+/// echo wait's 2s cap leaves the window at least 2s of it.
+const SUBMIT_BUDGET: Duration = Duration::from_secs(6);
 /// A clear is refused while the most recent human keystroke is this recent.
 const HUMAN_INPUT_GUARD: Duration = Duration::from_secs(2);
 const MAX_CLEAR_INPUT_KEY_BYTES: usize = 16;
@@ -930,9 +931,11 @@ impl Session {
             return Ok(InputSubmitOutcome::Submitted);
         }
         let echo_started = self.clock.now();
+        let budget_end = echo_started + SUBMIT_BUDGET;
         let visible = self.wait_for_visible_tail(tail, baseline_occurrences, &mut version);
         let echo = self.clock.now().saturating_sub(echo_started);
-        self.wait_for_screen_quiet(&mut version, SCREEN_QUIET.max(echo));
+        let left = budget_end.saturating_sub(self.clock.now());
+        self.wait_for_screen_quiet(&mut version, SCREEN_QUIET.max(echo).min(left));
         let before_raw = self.screen_text().unwrap_or_default();
         let before_compact = compact_screen(&before_raw);
         let before_version = self.output_version().unwrap_or(version);
@@ -942,7 +945,8 @@ impl Session {
         }
 
         version = before_version;
-        let deadline = self.clock.now() + submit_window(echo);
+        let left = budget_end.saturating_sub(self.clock.now());
+        let deadline = self.clock.now() + submit_window(echo).min(left);
         let mut composer_newline = false;
         while self.clock.now() < deadline {
             if !self.is_alive() {
