@@ -123,6 +123,6 @@ fn stop_cli_succeeds_after_its_parent_exits() {
 
     assert!(
         daemon.left_on_its_own(),
-        "stop CLI reported success but daemon remained"
+        "stop CLI reported success but daemon remained: {stop_output}"
     );
 }
