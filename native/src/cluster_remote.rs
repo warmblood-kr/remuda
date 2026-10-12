@@ -14,8 +14,8 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Gap after a selected session's Sync returns before the next one (#622).
 /// Sync long-polls, so a quiet session still costs one request per timeout.
 const SELECTED_SYNC_SPACING: Duration = Duration::from_millis(150);
-/// Longest a selected session's Sync holds the node's one worker, so a new
-/// selection waits at most this for it (#684 QA).
+/// Server-side hold requested for a selected Sync (#684 QA): the peer answers
+/// by then when quiet, but the worker itself is bounded by REMOTE_SYNC_TIMEOUT.
 const SELECTED_SYNC_WAIT: Duration = POLL_INTERVAL;
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -197,6 +197,23 @@ pub fn registry_targets(
         .collect()
 }
 
+/// One full poll: the fresh List, plus the selected read's failure, which is
+/// carried even when no snapshot could keep it (#684 SEC).
+#[derive(Debug, Default)]
+pub struct RemotePoll {
+    pub sessions: Vec<RemoteSessionSnapshot>,
+    pub selected_error: Option<String>,
+}
+
+impl From<Vec<RemoteSessionSnapshot>> for RemotePoll {
+    fn from(sessions: Vec<RemoteSessionSnapshot>) -> Self {
+        Self {
+            sessions,
+            selected_error: None,
+        }
+    }
+}
+
 /// One read-only node poll. Implementations make at most one Sync call at a
 /// time for this node and preserve the previous frame when nothing changed.
 pub trait RemoteTransport: Send + Sync + 'static {
@@ -205,7 +222,7 @@ pub trait RemoteTransport: Send + Sync + 'static {
         target: &RemoteTarget,
         selected_session: Option<&str>,
         previous: &[RemoteSessionSnapshot],
-    ) -> io::Result<Vec<RemoteSessionSnapshot>>;
+    ) -> io::Result<RemotePoll>;
 
     /// Sync only the selected session against `previous`, without a List.
     /// `None` means a List must come first (no syncable prior, or a restart).
@@ -265,24 +282,24 @@ impl RemoteNode {
     }
 
     pub fn poll_succeeded(&mut self, sessions: Vec<RemoteSessionSnapshot>, now: Instant) {
-        self.poll_delivered(sessions, now, None);
+        self.poll_delivered(sessions.into(), now, None);
     }
 
     /// Record a poll whose List succeeded. A selected session synced without
     /// error is polled again after the spacing; one whose read failed backs off
     /// like a failed poll (the fresh List is kept); anything else waits the interval.
-    pub fn poll_delivered(
-        &mut self,
-        sessions: Vec<RemoteSessionSnapshot>,
-        now: Instant,
-        selected: Option<&str>,
-    ) {
+    pub fn poll_delivered(&mut self, poll: RemotePoll, now: Instant, selected: Option<&str>) {
+        let RemotePoll {
+            sessions,
+            selected_error,
+        } = poll;
         let selected_session = selected.and_then(|name| {
             sessions
                 .iter()
                 .find(|session| session.name == name && session.alive)
         });
-        let selected_error = selected_session.and_then(|session| session.last_error.clone());
+        let selected_error = selected_error
+            .or_else(|| selected_session.and_then(|session| session.last_error.clone()));
         let follow = selected_session.is_some_and(|session| should_sync(Some(session)));
         self.sessions = sessions;
         self.last_sync = Some(now);
@@ -503,68 +520,81 @@ impl ClusterRemoteTransport {
                 scrollback: 0,
             },
         };
-        match self.request(target, &request)? {
-            Response::Sync {
-                instance_id,
-                output_version,
-                snapshot,
-            } => Ok(RemoteSessionSnapshot {
+        let response = self.request(target, &request)?;
+        selected_snapshot(session, prior, &request, response)
+    }
+}
+
+/// Map the selected read's reply. A reply of the other kind than the request
+/// (Sync vs capture) is rejected as invalid.
+fn selected_snapshot(
+    session: &remuda_core::registry::SessionSummary,
+    prior: Option<&RemoteSessionSnapshot>,
+    request: &Request,
+    response: Response,
+) -> io::Result<RemoteSessionSnapshot> {
+    let synced = matches!(request, Request::Sync { .. });
+    match response {
+        Response::Sync {
+            instance_id,
+            output_version,
+            snapshot,
+        } if synced => Ok(RemoteSessionSnapshot {
+            name: display_name(&session.name),
+            wire_name: session.name.clone(),
+            instance_id,
+            alive: true,
+            output_version: Some(output_version),
+            bracketed_paste: snapshot.bracketed_paste,
+            screen: Some(to_screen_snapshot(snapshot)),
+            last_error: None,
+        }),
+        Response::StyledScreen {
+            rows,
+            instance_id,
+            output_version,
+            wrapped,
+            scrollback_len,
+            scrollback_total,
+            cursor,
+        } if !synced => {
+            let instance_id = instance_id
+                .or_else(|| listed_instance_id(session))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "remote screen has no instance")
+                })?;
+            let bracketed_paste = prior.is_some_and(|prior| prior.bracketed_paste);
+            Ok(RemoteSessionSnapshot {
                 name: display_name(&session.name),
                 wire_name: session.name.clone(),
                 instance_id,
                 alive: true,
-                output_version: Some(output_version),
-                bracketed_paste: snapshot.bracketed_paste,
-                screen: Some(to_screen_snapshot(snapshot)),
-                last_error: None,
-            }),
-            Response::StyledScreen {
-                rows,
-                instance_id,
                 output_version,
-                wrapped,
-                scrollback_len,
-                scrollback_total,
-                cursor,
-            } => {
-                let instance_id = instance_id
-                    .or_else(|| listed_instance_id(session))
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "remote screen has no instance")
-                    })?;
-                let bracketed_paste = prior.is_some_and(|prior| prior.bracketed_paste);
-                Ok(RemoteSessionSnapshot {
-                    name: display_name(&session.name),
-                    wire_name: session.name.clone(),
-                    instance_id,
-                    alive: true,
-                    output_version,
+                bracketed_paste,
+                screen: Some(to_screen_snapshot(remuda_core::protocol::StyledScreen {
+                    rows,
                     bracketed_paste,
-                    screen: Some(to_screen_snapshot(remuda_core::protocol::StyledScreen {
-                        rows,
-                        bracketed_paste,
-                        wrapped,
-                        scrollback_len,
-                        scrollback_total,
-                        cursor,
-                    })),
-                    last_error: None,
-                })
-            }
-            Response::WrongInstance => Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "remote session instance changed during poll",
-            )),
-            Response::SyncAtCapacity => Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "remote Sync is at capacity",
-            )),
-            Response::Error(error) => Err(io::Error::other(error)),
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unexpected remote screen response: {other:?}"),
-            )),
+                    wrapped,
+                    scrollback_len,
+                    scrollback_total,
+                    cursor,
+                })),
+                last_error: None,
+            })
         }
+        Response::WrongInstance => Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "remote session instance changed during poll",
+        )),
+        Response::SyncAtCapacity => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "remote Sync is at capacity",
+        )),
+        Response::Error(error) => Err(io::Error::other(error)),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected remote screen response: {other:?}"),
+        )),
     }
 }
 
@@ -574,7 +604,7 @@ impl RemoteTransport for ClusterRemoteTransport {
         target: &RemoteTarget,
         selected_session: Option<&str>,
         previous: &[RemoteSessionSnapshot],
-    ) -> io::Result<Vec<RemoteSessionSnapshot>> {
+    ) -> io::Result<RemotePoll> {
         let resolved = (self.resolve)(target)?;
         let sessions = self.list_sessions(&resolved)?;
         Ok(poll_listed_sessions(
@@ -626,7 +656,8 @@ fn poll_listed_sessions(
         &remuda_core::registry::SessionSummary,
         Option<&RemoteSessionSnapshot>,
     ) -> io::Result<RemoteSessionSnapshot>,
-) -> Vec<RemoteSessionSnapshot> {
+) -> RemotePoll {
+    let mut selected_error = None;
     let mut selected_read = false;
     let mut snapshots = Vec::with_capacity(sessions.len());
     for session in sessions {
@@ -641,10 +672,16 @@ fn poll_listed_sessions(
         selected_read = true;
         match read(&session, prior) {
             Ok(snapshot) => snapshots.push(snapshot),
-            Err(error) => snapshots.extend(session_after_poll_error(session, prior, error)),
+            Err(error) => {
+                selected_error = Some(error.to_string());
+                snapshots.extend(session_after_poll_error(session, prior, error));
+            }
         }
     }
-    snapshots
+    RemotePoll {
+        sessions: snapshots,
+        selected_error,
+    }
 }
 
 fn selected_sync_request(prior: &RemoteSessionSnapshot) -> Request {
@@ -784,7 +821,7 @@ impl RemoteTransport for UnavailableRemoteTransport {
         _target: &RemoteTarget,
         _selected_session: Option<&str>,
         _previous: &[RemoteSessionSnapshot],
-    ) -> io::Result<Vec<RemoteSessionSnapshot>> {
+    ) -> io::Result<RemotePoll> {
         Err(io::Error::other(self.0.clone()))
     }
 }
@@ -1005,14 +1042,14 @@ fn schedule_remote_poll(
         .spawn(move || {
             let _permit = permit;
             let result = match selected_session.as_deref() {
-                Some(selected) if !listed => transport.sync_selected(&target, selected, &previous),
+                Some(selected) if !listed => transport
+                    .sync_selected(&target, selected, &previous)
+                    .map(|sessions| sessions.map(RemotePoll::from)),
                 selected => transport.poll_node(&target, selected, &previous).map(Some),
             };
             let now = Instant::now();
             let _ = state.with_node(&target.registry_key, |node| match result {
-                Ok(Some(sessions)) => {
-                    node.poll_delivered(sessions, now, selected_session.as_deref())
-                }
+                Ok(Some(poll)) => node.poll_delivered(poll, now, selected_session.as_deref()),
                 Ok(None) => node.poll_needs_list(now),
                 Err(error) => node.poll_failed_with_reason(now, Some(error.to_string())),
             });
@@ -1266,13 +1303,13 @@ mod tests {
                 target: &RemoteTarget,
                 selected_session: Option<&str>,
                 _previous: &[RemoteSessionSnapshot],
-            ) -> io::Result<Vec<RemoteSessionSnapshot>> {
+            ) -> io::Result<RemotePoll> {
                 self.selected.lock().unwrap().insert(
                     target.registry_key.clone(),
                     selected_session.map(str::to_owned),
                 );
                 self.changed.notify_all();
-                Ok(Vec::new())
+                Ok(RemotePoll::default())
             }
         }
 
@@ -1448,12 +1485,12 @@ mod tests {
             _target: &RemoteTarget,
             _selected_session: Option<&str>,
             _previous: &[RemoteSessionSnapshot],
-        ) -> io::Result<Vec<RemoteSessionSnapshot>> {
+        ) -> io::Result<RemotePoll> {
             self.calls
                 .lock()
                 .unwrap()
                 .push((Call::List, Instant::now()));
-            Ok(Self::screen(*self.version.lock().unwrap()))
+            Ok(Self::screen(*self.version.lock().unwrap()).into())
         }
 
         fn sync_selected(
@@ -1608,7 +1645,7 @@ mod tests {
         let start = Instant::now();
         let mut node = RemoteNode::new("laptop", start);
         assert!(node.begin_poll(start) && node.take_list(start));
-        node.poll_delivered(vec![session("proof", "a")], start, Some("proof"));
+        node.poll_delivered(vec![session("proof", "a")].into(), start, Some("proof"));
         assert_eq!(node.retry_at(), start + SELECTED_SYNC_SPACING);
         assert!(!node.take_list(node.retry_at()));
 
@@ -1635,7 +1672,7 @@ mod tests {
         ] {
             let mut node = RemoteNode::new("tower", start);
             assert!(node.begin_poll(start));
-            node.poll_delivered(sessions, start, selected);
+            node.poll_delivered(sessions.into(), start, selected);
             assert_eq!(node.retry_at(), start + POLL_INTERVAL);
         }
     }
@@ -1673,7 +1710,7 @@ mod tests {
         for backoff in [1, 2, 4, 8] {
             assert!(node.begin_poll(now));
             node.poll_delivered(
-                vec![errored.clone(), session("other", "b")],
+                vec![errored.clone(), session("other", "b")].into(),
                 now,
                 Some("proof"),
             );
@@ -1694,8 +1731,36 @@ mod tests {
 
         // The next clean read resets the backoff.
         assert!(node.begin_poll(now));
-        node.poll_delivered(vec![session("proof", "a")], now, Some("proof"));
+        node.poll_delivered(vec![session("proof", "a")].into(), now, Some("proof"));
         assert_eq!(node.retry_at(), now + SELECTED_SYNC_SPACING);
+    }
+
+    #[test]
+    fn a_failed_selected_read_backs_off_even_without_an_identity_to_keep() {
+        // An identity-less summary cannot be kept as a snapshot after a failed
+        // capture; the failure must still back off, up to the 30 s cap.
+        let mut nameless = summary("proof", "");
+        nameless.instance_id = None;
+        let start = Instant::now();
+        let mut node = RemoteNode::new("laptop", start);
+        let mut now = start;
+        for backoff in [1, 2, 4, 8, 16, 30, 30] {
+            let poll = poll_listed_sessions(
+                vec![nameless.clone(), summary("other", "2")],
+                Some("proof"),
+                &[],
+                |_, _| Err(io::Error::other("capture failed")),
+            );
+            assert_eq!(poll.sessions.len(), 1, "only the identified session stays");
+            assert!(node.begin_poll(now));
+            node.poll_delivered(poll, now, Some("proof"));
+            assert_eq!(node.retry_at(), now + Duration::from_secs(backoff));
+            now = node.retry_at();
+        }
+        assert_eq!(
+            node.snapshot_at(now).last_error.as_deref(),
+            Some("capture failed")
+        );
     }
 
     #[test]
@@ -1714,7 +1779,7 @@ mod tests {
             Ok(session_named(&display_name(&session.name), &session.id))
         });
         assert_eq!(reads, ["1"]);
-        assert_eq!(snapshots.len(), 4);
+        assert_eq!(snapshots.sessions.len(), 4);
     }
 
     fn summary(name: &str, id: &str) -> remuda_core::registry::SessionSummary {
@@ -1761,6 +1826,49 @@ mod tests {
             .filter(|at| *at > cleared + Duration::from_millis(50))
             .count();
         assert_eq!(late_syncs, 0, "no Sync once nothing is selected");
+    }
+
+    #[test]
+    fn a_selected_reply_of_the_other_kind_is_rejected() {
+        let prior = session("proof", "a");
+        let listed = summary("proof", "instance-1");
+        let cursor = Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        };
+        let sync = Response::Sync {
+            instance_id: "instance-1".into(),
+            output_version: 9,
+            snapshot: remuda_core::protocol::StyledScreen {
+                rows: Vec::new(),
+                bracketed_paste: false,
+                wrapped: Vec::new(),
+                scrollback_len: 0,
+                scrollback_total: 0,
+                cursor,
+            },
+        };
+        let screen = Response::StyledScreen {
+            rows: Vec::new(),
+            instance_id: Some("instance-1".into()),
+            output_version: Some(9),
+            wrapped: Vec::new(),
+            scrollback_len: 0,
+            scrollback_total: 0,
+            cursor,
+        };
+        let sync_request = selected_sync_request(&prior);
+        let capture = Request::CaptureStyled {
+            name: "proof".into(),
+            scrollback: 0,
+        };
+        assert!(selected_snapshot(&listed, Some(&prior), &sync_request, sync.clone()).is_ok());
+        assert!(selected_snapshot(&listed, None, &capture, screen.clone()).is_ok());
+        for (request, response) in [(&sync_request, screen), (&capture, sync)] {
+            let error = selected_snapshot(&listed, Some(&prior), request, response).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
     }
 
     #[test]
