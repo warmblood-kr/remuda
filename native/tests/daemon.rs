@@ -2414,10 +2414,18 @@ fn session_output_wakes_coalesce_while_lua_is_busy_and_list_stays_responsive() {
     let hook_ran = {
         let path = path.clone();
         std::thread::spawn(move || {
+            let calls = Request::Eval {
+                code: "return remuda._session_output_test_calls".into(),
+                name: None,
+            };
             let deadline = Instant::now() + PATIENCE;
-            while eval(&path, "return remuda._session_output_test_calls") == "0" {
-                assert!(Instant::now() < deadline, "the output hook never ran");
-                std::thread::sleep(Duration::from_millis(20));
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "the output hook never ran");
+                match client::request_with_timeout(&path, &calls, remaining) {
+                    Ok(Response::Value(count)) if count != "0" => break,
+                    _ => std::thread::sleep(Duration::from_millis(20)),
+                }
             }
         })
     };
