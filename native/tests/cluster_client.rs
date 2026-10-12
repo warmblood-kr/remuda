@@ -746,3 +746,26 @@ fn client_input_is_refused_by_listener() {
         "unexpected result: {result:?}"
     );
 }
+
+#[test]
+fn client_oversized_request_fails_as_too_large_before_connecting() {
+    let (client_node, server) = pair();
+    // Nothing listens here: the size check must come before any connect.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = closed.local_addr().unwrap();
+    drop(closed);
+    let input = Request::Input {
+        name: "dev".into(),
+        instance_id: "instance".into(),
+        client_id: "00000000000000000000000000000001".into(),
+        seq: 1,
+        bytes: vec![0; 64 * 1024],
+    };
+    let result = request(&client_node, address, &server.public, &input);
+    assert!(
+        matches!(result, Err(ClientError::RequestTooLarge)),
+        "unexpected result: {result:?}"
+    );
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("request too large"), "{message}");
+}

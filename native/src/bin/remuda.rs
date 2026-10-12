@@ -2411,7 +2411,7 @@ fn cluster_call(
                 | ClientError::OsBlockedConnection
                 | ClientError::Timeout => 3,
                 ClientError::Refused(_) => 4,
-                ClientError::Crypto | ClientError::BadResponse => 5,
+                ClientError::Crypto | ClientError::BadResponse | ClientError::RequestTooLarge => 5,
             };
             eprintln!("cluster call: {error}");
             return ExitCode::from(code);

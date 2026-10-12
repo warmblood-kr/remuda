@@ -38,6 +38,8 @@ pub enum ClientError {
     /// Noise sealing or response authentication failed. HTTP 400 from the
     /// listener also maps here: the generated msg1 was rejected before open.
     Crypto,
+    /// The request exceeds what one Noise message carries; it was not sent.
+    RequestTooLarge,
 }
 
 impl std::fmt::Display for ClientError {
@@ -51,6 +53,11 @@ impl std::fmt::Display for ClientError {
             Self::Refused(status) => write!(formatter, "cluster peer refused request ({status})"),
             Self::BadResponse => formatter.write_str("cluster peer returned a bad response"),
             Self::Crypto => formatter.write_str("cluster Noise authentication failed"),
+            Self::RequestTooLarge => write!(
+                formatter,
+                "cluster request too large (limit {} bytes)",
+                frame::MAX_REQUEST_PAYLOAD
+            ),
         }
     }
 }
@@ -124,6 +131,9 @@ impl ClusterClient {
         frame::reject_low_order_dh(our_static_private, pinned_peer_static)
             .map_err(|_| ClientError::Crypto)?;
         let payload = serde_json::to_vec(request).map_err(|_| ClientError::BadResponse)?;
+        if payload.len() > frame::MAX_REQUEST_PAYLOAD {
+            return Err(ClientError::RequestTooLarge);
+        }
         let timestamp = self.clock.unix_seconds().min(i64::MAX as u64) as i64;
         let sealed =
             frame::seal_request(our_static_private, pinned_peer_static, timestamp, &payload)

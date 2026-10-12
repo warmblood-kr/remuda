@@ -21,6 +21,11 @@ pub const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_HEADER_COUNT: usize = 64;
 pub const MAX_BODY_BYTES: usize = 65_535;
+/// Cluster requests are one Noise message, so they stay below the HTTP body cap
+/// and the local front's frame cap (#592).
+pub const MAX_CLUSTER_REQUEST_BYTES: usize = frame::MAX_REQUEST_PAYLOAD;
+const _: () = assert!(MAX_CLUSTER_REQUEST_BYTES < MAX_BODY_BYTES);
+const _: () = assert!(MAX_CLUSTER_REQUEST_BYTES < crate::remote_front::MAX_FRAME_BYTES);
 pub const MAX_GLOBAL_REQUESTS: usize = 64;
 pub const MAX_PREAUTH_REQUESTS: usize = 64;
 pub const MAX_PEER_REQUESTS: usize = 8;
@@ -1650,10 +1655,9 @@ fn encode_error(reason: &str) -> Vec<u8> {
 }
 
 fn decode_cluster_request(payload: &[u8]) -> Result<Request, String> {
-    if payload.len() > crate::remote_front::MAX_FRAME_BYTES {
+    if payload.len() > MAX_CLUSTER_REQUEST_BYTES {
         return Err(format!(
-            "remote frame exceeds {} bytes",
-            crate::remote_front::MAX_FRAME_BYTES
+            "cluster request exceeds {MAX_CLUSTER_REQUEST_BYTES} bytes"
         ));
     }
     serde_json::from_slice(payload).map_err(|_| "invalid remote request".to_owned())

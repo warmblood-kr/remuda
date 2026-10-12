@@ -10,6 +10,10 @@ pub const MAX_RESPONSE_PAYLOAD: usize = MAX_FRAME_SIZE - 32 - 16;
 const AEAD_TAG_SIZE: usize = 16;
 const TIMESTAMP_SIZE: usize = std::mem::size_of::<i64>();
 const NOISE_PROLOGUE: &[u8] = b"remuda-cluster-v1";
+/// Largest request payload (#592): msg1 is one Noise message holding e, the
+/// sealed s, the timestamp and the payload tag. Requests are not chunked.
+pub const MAX_REQUEST_PAYLOAD: usize =
+    MAX_FRAME_SIZE - 32 - (32 + AEAD_TAG_SIZE) - TIMESTAMP_SIZE - AEAD_TAG_SIZE;
 
 /// An encrypted request plus the initiator state needed to open its response.
 pub struct SealedRequest {
@@ -576,6 +580,23 @@ fn invalid_frame() -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_payload_limit_is_exactly_what_msg1_can_carry() {
+        let initiator = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let responder = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        for (size, accepted) in [
+            (MAX_REQUEST_PAYLOAD, true),
+            (MAX_REQUEST_PAYLOAD + 1, false),
+        ] {
+            let sealed = seal_request(&initiator.private, &responder.public, 1000, &vec![0; size]);
+            assert_eq!(sealed.is_ok(), accepted, "payload size {size}");
+        }
+    }
 
     #[test]
     fn v1_response_payload_limit_includes_the_msg2_ephemeral_key() {
