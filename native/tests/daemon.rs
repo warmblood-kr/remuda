@@ -7119,17 +7119,26 @@ fn a_broken_user_config_is_reported_but_never_bricks_the_daemon() {
 #[test]
 fn spawn_wait_gives_up_on_an_unserved_socket_within_its_patience() {
     use std::os::unix::net::UnixListener;
+    use std::sync::atomic::AtomicBool;
 
-    let path = scratch("unserved");
-    let _ = std::fs::create_dir_all(path.parent().expect("socket has a parent"));
-    let _ = std::fs::remove_file(&path);
+    let dir = unique_scratch_dir("unserved");
+    let path = daemon::socket_path_in(&dir, "s");
+    std::fs::create_dir_all(path.parent().expect("socket has a parent")).expect("socket dir");
     let listener = UnixListener::bind(&path).expect("bind unserved socket");
-    std::thread::spawn(move || {
-        let mut held = Vec::new();
-        for stream in listener.incoming().flatten() {
-            held.push(stream);
-        }
-    });
+    listener.set_nonblocking(true).expect("nonblocking accept");
+    let stop = Arc::new(AtomicBool::new(false));
+    let accepting = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        })
+    };
     let mut child = std::process::Command::new("sleep")
         .arg("60")
         .spawn()
@@ -7142,6 +7151,9 @@ fn spawn_wait_gives_up_on_an_unserved_socket_within_its_patience() {
     let elapsed = started.elapsed();
     let _ = child.kill();
     let _ = child.wait();
+    stop.store(true, Ordering::Relaxed);
+    accepting.join().expect("accept loop stops");
+    let _ = std::fs::remove_dir_all(&dir);
     assert!(waited.is_err(), "an unserved socket was taken as served");
     assert!(
         elapsed < patience + Duration::from_secs(3),
