@@ -831,16 +831,22 @@ fn reconcile_registry_targets(
         .nodes
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.changed();
+    let before = nodes.len();
     nodes.retain(|key, _| refreshed_keys.contains(key));
+    let mut changed = nodes.len() != before;
     for target in &refreshed {
         nodes.entry(target.registry_key.clone()).or_insert_with(|| {
+            changed = true;
             RemoteNode::with_key(
                 target.registry_key.clone(),
                 target.name.clone(),
                 Instant::now(),
             )
         });
+    }
+    // The scheduler reconciles every second; only a real change wakes viewers.
+    if changed {
+        state.changed();
     }
     *current = refreshed;
 }
@@ -1299,6 +1305,31 @@ mod tests {
         // The scheduler ticks every 100ms; the next poll is 2s away.
         std::thread::sleep(Duration::from_millis(500));
         assert_eq!(source.generation(), landed);
+    }
+
+    #[test]
+    fn registry_reconcile_moves_the_generation_only_when_nodes_change() {
+        let target = |key: &str| RemoteTarget {
+            name: "laptop".into(),
+            registry_key: key.into(),
+            addr_override: None,
+        };
+        let state = RemoteTreeState::default();
+        let mut targets = Vec::new();
+        reconcile_registry_targets(&state, &mut targets, vec![target("fp-a")]);
+        let added = state.generation();
+        assert!(added > 0);
+        reconcile_registry_targets(&state, &mut targets, vec![target("fp-a")]);
+        assert_eq!(
+            state.generation(),
+            added,
+            "an unchanged registry is not a change"
+        );
+        reconcile_registry_targets(&state, &mut targets, vec![target("fp-a"), target("fp-b")]);
+        let grown = state.generation();
+        assert!(grown > added);
+        reconcile_registry_targets(&state, &mut targets, vec![target("fp-b")]);
+        assert!(state.generation() > grown, "a revoked node is a change");
     }
 
     #[test]

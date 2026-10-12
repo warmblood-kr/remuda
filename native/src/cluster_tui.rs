@@ -1860,24 +1860,24 @@ const INPUT_WAIT: Duration = Duration::from_millis(250);
 const REMOTE_CHECK: Duration = Duration::from_millis(25);
 
 /// Wait up to INPUT_WAIT for terminal input, returning early (false) once the
-/// remote snapshot generation moves, so a remote update is painted at once (#622).
+/// remote generation differs from `seen`, read before this frame's sync (#622).
 fn wait_for_input_or_remote(
     clock: &dyn Clock,
     mut poll: impl FnMut(Duration) -> io::Result<bool>,
     generation: impl Fn() -> u64,
+    seen: u64,
 ) -> io::Result<bool> {
-    let seen = generation();
     let deadline = clock.now() + INPUT_WAIT;
     loop {
+        if generation() != seen {
+            return Ok(false);
+        }
         let left = deadline.saturating_sub(clock.now());
         if left.is_zero() {
             return Ok(false);
         }
         if poll(left.min(REMOTE_CHECK))? {
             return Ok(true);
-        }
-        if generation() != seen {
-            return Ok(false);
         }
     }
 }
@@ -2298,6 +2298,8 @@ fn run_loop(
         if let Ok(current) = list(path) {
             ui.sessions_synced(current, clock.now());
         }
+        // Read before syncing: an update landing during sync/render wakes the wait.
+        let seen = remote_source.generation();
         ui.remote_synced(remote_source);
         runtime.paste_capture.set(ui.remote_keys_mode.is_some())?;
         if let Some(RemoteSelection::Session { node, name, .. }) = &ui.remote_active {
@@ -2345,7 +2347,12 @@ fn run_loop(
         ui.send_close_pending(path, remote_input, clock.now());
         ui.send_pending(path, clock.now(), remote_input);
         ui.start_pending(clock.now());
-        if wait_for_input_or_remote(clock, crossterm::event::poll, || remote_source.generation())? {
+        if wait_for_input_or_remote(
+            clock,
+            crossterm::event::poll,
+            || remote_source.generation(),
+            seen,
+        )? {
             let event = crossterm::event::read()?;
             if resize_requires_full_repaint(&event) {
                 previous = None;
@@ -2426,6 +2433,7 @@ mod tests {
                 Ok(false)
             },
             || generation.get(),
+            7,
         )
         .unwrap();
         assert!(!ready);
@@ -2446,6 +2454,7 @@ mod tests {
                 Ok(false)
             },
             || 7,
+            7,
         )
         .unwrap();
         assert!(!ready);
@@ -2456,7 +2465,27 @@ mod tests {
         );
 
         let clock = ManualClock::new();
-        assert!(super::wait_for_input_or_remote(&clock, |_| Ok(true), || 7).unwrap());
+        assert!(super::wait_for_input_or_remote(&clock, |_| Ok(true), || 7, 7).unwrap());
+    }
+
+    #[test]
+    fn an_update_that_landed_before_the_wait_ends_it_at_once() {
+        // The baseline is read before sync/render; the update landed during them.
+        let clock = ManualClock::new();
+        let mut polls = 0;
+        let ready = super::wait_for_input_or_remote(
+            &clock,
+            |slice| {
+                polls += 1;
+                clock.advance(slice);
+                Ok(false)
+            },
+            || 8,
+            7,
+        )
+        .unwrap();
+        assert!(!ready);
+        assert_eq!(polls, 0, "no input wait once the snapshot already moved");
     }
 
     #[test]
