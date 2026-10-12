@@ -1994,7 +1994,7 @@ fn push_color(out: &mut String, color: Color, fg: bool) {
 
 /// One row of styled cells as text plus minimal SGR — see steps/020 for the
 /// shape this has to satisfy (byte-identity when plain; minimal when not).
-fn render_styled_row(cells: &[StyledCell]) -> String {
+pub(crate) fn render_styled_row(cells: &[StyledCell]) -> String {
     let mut out = String::new();
     let mut current: Option<&StyledCell> = None;
     let mut styled_at_all = false;
@@ -2136,7 +2136,7 @@ fn char_width(c: char) -> usize {
 /// A styled row's display width, ignoring the SGR bytes riding along with
 /// it, and counting a wide (CJK) character as the 2 columns it actually
 /// draws — `fit`'s plain char count would under-count it by 1. See steps/023.
-fn visible_width(s: &str) -> usize {
+pub(crate) fn visible_width(s: &str) -> usize {
     let mut width = 0;
     let mut chars = s.chars();
     while let Some(c) = chars.next() {

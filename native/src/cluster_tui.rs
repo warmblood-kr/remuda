@@ -83,6 +83,7 @@ pub fn cluster_tree_has_sessions(
 
 pub struct ClusterUi {
     node: String,
+    local_targets: Vec<String>,
     sessions: Vec<SessionSummary>,
     selected: usize,
     active: usize,
@@ -175,6 +176,7 @@ impl ClusterUi {
     ) -> Self {
         Self {
             node: node.into(),
+            local_targets: vec![node.into()],
             sessions,
             selected: 0,
             active: 0,
@@ -579,7 +581,7 @@ impl ClusterUi {
         let tree_start = 2;
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
         let divider = "─".repeat(width);
-        let queue_rows: Vec<&PendingBatch> = self.input_queue.items().rev().take(3).collect();
+        let queue_rows: Vec<&PendingBatch> = self.visible_queue().rev().take(3).collect();
         let notice_lines = self.active_notice_lines(now, width);
         let footer_rows = self.footer_row_count(width);
         let tree_capacity = height.saturating_sub(
@@ -669,7 +671,7 @@ impl ClusterUi {
         let wanted = self
             .tree_lines(48, now)
             .iter()
-            .map(|l| UnicodeWidthStr::width(l.as_str()))
+            .map(|l| crate::tui::visible_width(l))
             .max()
             .unwrap_or(0);
         let left_w = (wanted + 1).clamp(24, (width / 2).min(48));
@@ -677,8 +679,7 @@ impl ClusterUi {
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
         let notices = self.active_notice_lines(now, width);
         let queue: Vec<String> = self
-            .input_queue
-            .items()
+            .visible_queue()
             .rev()
             .take(3)
             .collect::<Vec<_>>()
@@ -1569,7 +1570,14 @@ impl ClusterUi {
 
     fn handle_send_event(&mut self, event: Option<QueueEvent>, now: Duration) {
         match event {
-            Some(QueueEvent::Sent { .. } | QueueEvent::Uncertain { .. }) => {
+            Some(QueueEvent::Sent { .. }) => {
+                if self.notice.as_ref().is_none_or(|(notice, _)| {
+                    notice.starts_with("sending input to ") || notice == "Input sent"
+                }) {
+                    self.notice = Some(("Input sent".into(), now));
+                }
+            }
+            Some(QueueEvent::Uncertain { .. }) => {
                 self.clear_sending_notice();
             }
             Some(QueueEvent::PasteAborted { .. }) => {
@@ -1605,6 +1613,12 @@ impl ClusterUi {
             }
             Some(QueueEvent::RetryScheduled { .. }) | None => {}
         }
+    }
+
+    fn visible_queue(&self) -> impl DoubleEndedIterator<Item = &PendingBatch> {
+        self.input_queue
+            .items()
+            .filter(|batch| batch.state != QueueState::Sent)
     }
 
     fn clear_sending_notice(&mut self) {
@@ -1741,15 +1755,15 @@ impl ClusterUi {
             },
             |(name, _)| format!("{name}> "),
         );
-        format!("$ {target}{before}▏{after}")
+        crate::text::strip_terminal_controls(&format!("$ {target}{before}▏{after}")).into_owned()
     }
 
     fn select_target(&mut self, target: Option<&str>) -> io::Result<()> {
         let Some(target) = target else { return Ok(()) };
-        let Some((node, session)) = target.split_once('/') else {
+        let Some((node, session)) = self.split_target(target) else {
             return Err(io::Error::other("target must be node/session"));
         };
-        if node != self.node {
+        if !self.local_targets.iter().any(|identity| identity == node) {
             let exact = self
                 .remote_snapshot
                 .nodes
@@ -1758,11 +1772,10 @@ impl ClusterUi {
             let remote = if let Some(exact) = exact {
                 exact
             } else {
-                let mut matches = self
-                    .remote_snapshot
-                    .nodes
-                    .iter()
-                    .filter(|snapshot| snapshot.name == node);
+                let mut matches =
+                    self.remote_snapshot.nodes.iter().filter(|snapshot| {
+                        crate::cluster::node_label(&snapshot.registry_key) == node
+                    });
                 let remote = matches
                     .next()
                     .ok_or_else(|| io::Error::other(format!("node {node} was not found")))?;
@@ -1801,6 +1814,50 @@ impl ClusterUi {
         self.active = self.selected;
         Ok(())
     }
+
+    fn split_target<'a>(&self, target: &'a str) -> Option<(&'a str, &'a str)> {
+        // Fingerprints can contain '/'; prefer a known identity before the
+        // legacy first-slash split, preserving slashes in session names too.
+        let identity = self
+            .local_targets
+            .iter()
+            .chain(
+                self.remote_snapshot
+                    .nodes
+                    .iter()
+                    .map(|node| &node.registry_key),
+            )
+            .filter(|identity| {
+                target
+                    .strip_prefix(identity.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .max_by_key(|identity| identity.len());
+        identity
+            .map(|identity| {
+                let (node, session) = target.split_at(identity.len());
+                (node, &session[1..])
+            })
+            .or_else(|| target.split_once('/'))
+    }
+
+    fn set_local_identity(
+        &mut self,
+        fingerprint: &str,
+        aliases: &std::collections::BTreeMap<String, String>,
+    ) {
+        let hostname = self.local_targets[0].clone();
+        self.local_targets = vec![
+            hostname.clone(),
+            crate::cluster::node_label(fingerprint),
+            fingerprint.into(),
+        ];
+        self.node = if aliases.contains_key(fingerprint) {
+            crate::cluster::display_node_label(fingerprint, aliases)
+        } else {
+            hostname
+        };
+    }
 }
 
 fn visible_remote_pane_lines(
@@ -1810,7 +1867,10 @@ fn visible_remote_pane_lines(
 ) -> Vec<&str> {
     let mut pane_lines = pane_body.lines().collect::<Vec<_>>();
     if remote_active {
-        while pane_lines.last().is_some_and(|line| line.trim().is_empty()) {
+        while pane_lines
+            .last()
+            .is_some_and(|line| visually_blank_line(line))
+        {
             pane_lines.pop();
         }
     }
@@ -1825,6 +1885,46 @@ fn visible_remote_pane_lines(
         .take(screen_rows)
         .copied()
         .collect()
+}
+
+fn visually_blank_line(line: &str) -> bool {
+    if !line.contains('\x1b') {
+        return line.trim().is_empty();
+    }
+    let mut chars = line.chars();
+    let mut parser = vt100::Parser::new(2, 2, 0);
+    let mut decorated = false;
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Only generated SGR is expected here. Unknown controls keep the row.
+            let mut sgr = String::from("\x1b[H\x1b");
+            if chars.next() != Some('[') {
+                return false;
+            }
+            sgr.push('[');
+            loop {
+                let Some(code) = chars.next() else {
+                    return false;
+                };
+                sgr.push(code);
+                if code == 'm' {
+                    break;
+                }
+                if !code.is_ascii_digit() && code != ';' {
+                    return false;
+                }
+            }
+            // Probe the current attributes in one cell without allocating a full row.
+            sgr.push(' ');
+            parser.process(sgr.as_bytes());
+            let cell = parser.screen().cell(0, 0).expect("one-cell style probe");
+            decorated =
+                cell.bgcolor() != vt100::Color::Default || cell.inverse() || cell.underline();
+        } else if !ch.is_whitespace() || decorated {
+            return false;
+        }
+    }
+    true
 }
 
 /// Raw mode clears OPOST, so a bare `\n` only moves down and every row staircases right.
@@ -1842,6 +1942,22 @@ fn present(prev: Option<&vt100::Screen>, next: &vt100::Screen) -> Vec<u8> {
             output
         }
     }
+}
+
+const FULL_REPAINT_INTERVAL: Duration = Duration::from_secs(5);
+
+fn present_with_recovery(
+    prev: Option<&vt100::Screen>,
+    next: &vt100::Screen,
+    now: Duration,
+    last_full: &mut Duration,
+) -> Vec<u8> {
+    let full = prev.is_none_or(|screen| screen.size() != next.size())
+        || now.saturating_sub(*last_full) >= FULL_REPAINT_INTERVAL;
+    if full {
+        *last_full = now;
+    }
+    present(if full { None } else { prev }, next)
 }
 
 const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
@@ -1999,13 +2115,21 @@ fn remote_screen_text(screen: &remuda_core::agent::ScreenSnapshot) -> String {
     screen
         .cells
         .iter()
-        .map(|row| {
-            row.iter()
-                .map(|cell| crate::text::strip_terminal_controls(&cell.text).into_owned())
-                .collect::<String>()
-        })
+        .map(|row| styled_screen_row(row))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn styled_screen_row(row: &[StyledCell]) -> String {
+    let safe: Vec<_> = row
+        .iter()
+        .map(|cell| {
+            let mut cell = cell.clone();
+            cell.text = crate::text::strip_terminal_controls(&cell.text).into_owned();
+            cell
+        })
+        .collect();
+    crate::tui::render_styled_row(&safe)
 }
 
 struct EmptyRemoteSource;
@@ -2018,28 +2142,63 @@ impl RemoteSource for EmptyRemoteSource {
 
 fn truncate(text: &str, width: usize) -> String {
     let mut used = 0;
-    text.chars()
-        .take_while(|ch| {
-            used += UnicodeWidthChar::width(*ch).unwrap_or(0);
-            used <= width
-        })
-        .collect()
+    let mut out = String::new();
+    let mut chars = text.chars();
+    let mut styled = false;
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            styled = true;
+            out.push(ch);
+            for code in chars.by_ref() {
+                out.push(code);
+                if code == 'm' {
+                    break;
+                }
+            }
+        } else {
+            used += UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used > width {
+                break;
+            }
+            out.push(ch);
+        }
+    }
+    if styled {
+        out.push_str("\x1b[0m");
+    }
+    out
 }
 
 fn pad_to(text: &str, width: usize) -> String {
-    let w = UnicodeWidthStr::width(text);
+    let w = crate::tui::visible_width(text);
     format!("{text}{}", " ".repeat(width.saturating_sub(w)))
 }
 
 fn tree_label_line(prefix: &str, label: &str, status: &str, pad_to: usize, width: usize) -> String {
-    let available =
-        width.saturating_sub(UnicodeWidthStr::width(prefix) + 1 + UnicodeWidthStr::width(status));
+    let available = width
+        .saturating_sub(UnicodeWidthStr::width(prefix) + 1 + crate::tui::visible_width(status));
     let label = ellipsize(label, available);
     let label_width = UnicodeWidthStr::width(label.as_str());
     let padding = pad_to
         .saturating_sub(label_width)
         .min(available.saturating_sub(label_width));
-    format!("{prefix}{label}{}{status}", " ".repeat(padding + 1))
+    let label = crate::text::strip_terminal_controls(&label);
+    let label_style = if prefix.starts_with('>') {
+        "\x1b[1;7;36m"
+    } else {
+        "\x1b[1m"
+    };
+    let status = if status.starts_with("live") {
+        format!("\x1b[32m{status}\x1b[0m")
+    } else if status.starts_with("ended") {
+        format!("\x1b[31m{status}\x1b[0m")
+    } else {
+        status.into()
+    };
+    format!(
+        "{prefix}{label_style}{label}\x1b[0m{}{status}",
+        " ".repeat(padding + 1)
+    )
 }
 
 fn remote_keys_hint(node: &str, session: &str, width: usize) -> String {
@@ -2119,6 +2278,7 @@ fn wrap_to_two_lines(text: &str, width: usize) -> Vec<String> {
 fn queue_line(batch: &PendingBatch) -> String {
     let bytes = batch.bytes.strip_suffix(b"\r").unwrap_or(&batch.bytes);
     let text = String::from_utf8_lossy(bytes);
+    let text = crate::text::strip_terminal_controls(&text);
     let status = crate::text::strip_terminal_controls(&batch.status);
     format!("Input {status} · {text}")
 }
@@ -2165,10 +2325,7 @@ fn screen(
             rows.iter()
                 .map(|row| {
                     let cells = expand_runs(row);
-                    cells
-                        .iter()
-                        .map(|cell: &StyledCell| cell.text.as_str())
-                        .collect::<String>()
+                    styled_screen_row(&cells)
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -2305,6 +2462,28 @@ struct ClusterTuiRuntime<'a> {
     paste_capture: &'a mut crate::tui::BracketedPasteCapture<io::Stdout>,
 }
 
+fn capture_local_pane(ui: &mut ClusterUi, path: &Path, clock: &dyn Clock) -> Option<String> {
+    if let Some(ended) = &ui.ended {
+        return Some(ended.screen.clone());
+    }
+    if ui.remote_active.is_some() {
+        return None;
+    }
+    let session = ui.sessions.get(ui.active)?.clone();
+    let (captured, captured_at, instance_id) = screen(path, &session.name, clock).ok()?;
+    if instance_id == session.instance_id
+        && ui.record_capture(&session, captured.clone(), captured_at)
+    {
+        Some(captured)
+    } else {
+        ui.notice = Some((
+            format!("{} restarted; screen was not refreshed", session.name),
+            clock.now(),
+        ));
+        None
+    }
+}
+
 fn run_loop(
     path: &Path,
     node: &str,
@@ -2316,6 +2495,9 @@ fn run_loop(
 ) -> io::Result<()> {
     let clock = runtime.clock;
     let mut ui = ClusterUi::with_sender(node, list(path)?, clock.now(), InputSender::random()?);
+    if let Some((identity, _)) = crate::cluster::nodes()? {
+        ui.set_local_identity(&identity.node_fp, &crate::cluster::control::node_aliases()?);
+    }
     ui.remote_input_enabled = remote_input.is_some();
     ui.remote_synced(remote_source);
     select_target_with_remote_wait(&mut ui, target, remote_source, Duration::from_secs(5))?;
@@ -2342,6 +2524,7 @@ fn run_loop(
         }
     }
     let mut previous = None;
+    let mut last_full_repaint = clock.now();
     let mut frames = frame_writer()?;
     loop {
         if let Ok(current) = list(path) {
@@ -2358,36 +2541,19 @@ fn run_loop(
         }
         ui.selected = ui.selected.min(ui.sessions.len().saturating_sub(1));
         ui.active = ui.active.min(ui.sessions.len().saturating_sub(1));
-        let captured = ui
-            .ended
-            .as_ref()
-            .map(|ended| ended.screen.clone())
-            .or_else(|| {
-                if ui.remote_active.is_some() {
-                    return None;
-                }
-                let session = ui.sessions.get(ui.active)?.clone();
-                let (captured, captured_at, instance_id) =
-                    screen(path, &session.name, clock).ok()?;
-                if instance_id == session.instance_id
-                    && ui.record_capture(&session, captured.clone(), captured_at)
-                {
-                    Some(captured)
-                } else {
-                    ui.notice = Some((
-                        format!("{} restarted; screen was not refreshed", session.name),
-                        clock.now(),
-                    ));
-                    None
-                }
-            });
+        let captured = capture_local_pane(&mut ui, path, clock);
         let body = captured.unwrap_or_default();
         let terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
         let (cols, rows) = normalized_terminal_size(terminal_size.0, terminal_size.1);
         let frame = ui.render(cols, rows, &body, clock);
         let mut next = vt100::Parser::new(rows, cols, 0);
         next.process(format!("\x1b[H\x1b[2J{}", terminal_frame(&frame)).as_bytes());
-        let output = present(previous.as_ref().map(vt100::Parser::screen), next.screen());
+        let output = present_with_recovery(
+            previous.as_ref().map(vt100::Parser::screen),
+            next.screen(),
+            clock.now(),
+            &mut last_full_repaint,
+        );
         if !output.is_empty() {
             // Anything another writer left in stdout's buffer goes first.
             io::stdout().flush()?;
@@ -2404,8 +2570,20 @@ fn run_loop(
             seen,
         )? {
             let event = crossterm::event::read()?;
-            if resize_requires_full_repaint(&event) {
+            let redraw = ui.remote_keys_mode.is_none()
+                && matches!(
+                    event,
+                    crossterm::event::Event::Key(crossterm::event::KeyEvent {
+                        code: crossterm::event::KeyCode::Char('l'),
+                        modifiers: crossterm::event::KeyModifiers::CONTROL,
+                        ..
+                    })
+                );
+            if resize_requires_full_repaint(&event) || redraw {
                 previous = None;
+            }
+            if redraw {
+                continue;
             }
             if ui.handle_event(event, clock.now()) {
                 return Ok(());
@@ -2422,13 +2600,13 @@ fn select_target_with_remote_wait(
     timeout: Duration,
 ) -> io::Result<()> {
     let Some(target) = target else { return Ok(()) };
-    let Some((node, _)) = target.split_once('/') else {
+    let Some((node, _)) = ui.split_target(target) else {
         return ui.select_target(Some(target));
     };
     match ui.select_target(Some(target)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::InvalidInput => Err(error),
-        Err(error) if node != ui.node => {
+        Err(error) if !ui.local_targets.iter().any(|identity| identity == node) => {
             let deadline = Instant::now() + timeout;
             while Instant::now() < deadline {
                 ui.remote_synced(source);
@@ -2465,6 +2643,34 @@ mod tests {
         let mut parser = vt100::Parser::new(rows, cols, 0);
         parser.process(format!("\x1b[H\x1b[2J{}", terminal_frame(frame)).as_bytes());
         parser
+    }
+
+    impl ClusterUi {
+        // Content/layout assertions ignore generated SGR, while rejecting any
+        // other escape sequence. Color assertions inspect the original frame.
+        fn render_text(&self, cols: u16, rows: u16, screen: &str, clock: &dyn Clock) -> String {
+            let frame = self.render(cols, rows, screen, clock);
+            let mut text = String::new();
+            let mut chars = frame.chars();
+            while let Some(ch) = chars.next() {
+                if ch != '\x1b' {
+                    text.push(ch);
+                    continue;
+                }
+                assert_eq!(chars.next(), Some('['), "unexpected terminal control");
+                loop {
+                    let code = chars.next().expect("unterminated SGR");
+                    if code == 'm' {
+                        break;
+                    }
+                    assert!(
+                        code.is_ascii_digit() || code == ';',
+                        "unexpected terminal control"
+                    );
+                }
+            }
+            text
+        }
     }
 
     fn assert_remote_text_is_safe(frame: &str) {
@@ -2737,6 +2943,36 @@ mod tests {
     }
 
     #[test]
+    fn an_unchanged_frame_recovers_terminal_damage_after_the_repaint_interval() {
+        let next = parsed_frame("tree\nselected pane\nfooter", 40, 8);
+        let mut terminal = parsed_frame("tree\nselected pane\nfooter", 40, 8);
+        terminal.process(b"\x1b[Hafterimage\x1b[7;1Hstale input");
+        let mut last_full = Duration::ZERO;
+        assert!(super::present_with_recovery(
+            Some(next.screen()),
+            next.screen(),
+            Duration::from_secs(4),
+            &mut last_full
+        )
+        .is_empty());
+        terminal.process(&super::present_with_recovery(
+            Some(next.screen()),
+            next.screen(),
+            Duration::from_secs(5),
+            &mut last_full,
+        ));
+        assert_eq!(terminal.screen().contents(), next.screen().contents());
+        assert_eq!(last_full, Duration::from_secs(5));
+        assert!(super::present_with_recovery(
+            Some(next.screen()),
+            next.screen(),
+            Duration::from_secs(6),
+            &mut last_full
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn presenter_emits_only_the_changed_cell() {
         let previous = parsed_frame("hello", 80, 24);
         let next = parsed_frame("hallo", 80, 24);
@@ -2888,6 +3124,108 @@ mod tests {
         }
     }
 
+    #[test]
+    fn colored_remote_cells_survive_both_layouts_without_style_bleed() {
+        let clock = ManualClock::new();
+        let mut screen = remote_screen("red");
+        screen.cells[0][0].fg = Color::Idx(1);
+        let source = FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(screen),
+        )));
+        let mut ui = ClusterUi::new("local", vec![session("local", true)], Duration::ZERO);
+        ui.remote_synced(&source);
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        for cols in [40, 100] {
+            let rendered = ui.render(cols, 20, "", &clock);
+            let parsed = parsed_frame(&rendered, cols, 20);
+            let mut found = false;
+            for row in 0..20 {
+                for col in 0..cols {
+                    let cell = parsed.screen().cell(row, col).unwrap();
+                    if cell.contents() == "r" && cell.fgcolor() == vt100::Color::Idx(1) {
+                        found = true;
+                    }
+                    if cell.contents() == "│" {
+                        assert_eq!(cell.fgcolor(), vt100::Color::Default);
+                    }
+                }
+            }
+            assert!(found, "red cell lost at {cols} columns: {rendered:?}");
+        }
+    }
+
+    #[test]
+    fn foreground_only_blank_tails_do_not_hide_remote_output() {
+        let clock = ManualClock::new();
+        for foreground in [Color::Default, Color::Idx(1)] {
+            let mut screen = remote_screen("important output");
+            screen.cells.extend(vec![
+                vec![StyledCell {
+                    text: "   ".into(),
+                    fg: foreground,
+                    ..StyledCell::default()
+                }];
+                3
+            ]);
+            screen.wrapped.extend([false; 3]);
+            let ui = selected_remote_ui(&clock, screen);
+            let frame = parsed_frame(&ui.render(100, 4, "", &clock), 100, 4);
+            assert!(
+                frame.screen().contents().contains("important output"),
+                "foreground-only blanks hid output: {foreground:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn meaningful_blank_backgrounds_inverse_and_underlines_remain_in_the_pane() {
+        for cell in [
+            StyledCell {
+                text: "   ".into(),
+                bg: Color::Idx(2),
+                ..StyledCell::default()
+            },
+            StyledCell {
+                text: "   ".into(),
+                inverse: true,
+                ..StyledCell::default()
+            },
+            StyledCell {
+                text: "   ".into(),
+                underline: true,
+                ..StyledCell::default()
+            },
+        ] {
+            let mut screen = remote_screen("important output");
+            screen.cells.extend(vec![vec![cell.clone()]; 3]);
+            screen.wrapped.extend([false; 3]);
+            let body = super::remote_screen_text(&screen);
+            let visible = super::visible_remote_pane_lines(&body, true, 2);
+            assert_eq!(visible.len(), 2);
+            assert!(
+                !visible.iter().any(|line| line.contains("important output")),
+                "meaningful styled blanks were removed: {cell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_tree_uses_the_local_list_live_and_ended_colors() {
+        let ui = ClusterUi::new(
+            "local",
+            vec![session("live", true), session("dead", false)],
+            Duration::ZERO,
+        );
+        let parsed = parsed_frame(&ui.render(80, 20, "", &ManualClock::new()), 80, 20);
+        for (row, color) in [(2, 2), (3, 1)] {
+            assert!((0..40)
+                .any(|col| parsed.screen().cell(row, col).unwrap().fgcolor()
+                    == vt100::Color::Idx(color)));
+        }
+    }
+
     fn remote_snapshot(
         state: RemoteState,
         age: Duration,
@@ -2946,6 +3284,61 @@ mod tests {
         selected_remote_ui_with_bracketed_paste(clock, screen, true)
     }
 
+    #[test]
+    fn aliased_remote_node_still_accepts_its_original_id_and_fingerprint() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("body"));
+        let node_id = crate::cluster::node_label("fp-laptop");
+        ui.remote_snapshot.nodes[0].name = format!("macbook ({node_id})");
+        ui.select_target(Some(&format!("{node_id}/build"))).unwrap();
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        assert!(ui.render(80, 24, "", &clock).contains("macbook"));
+        let label = ui.remote_snapshot.nodes[0].name.clone();
+        assert!(
+            ui.select_target(Some(&format!("{label}/build"))).is_err(),
+            "display alias became a command target"
+        );
+    }
+
+    #[test]
+    fn local_targets_stay_stable_when_the_display_alias_changes_or_clears() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let fingerprint = "SHA256:local/identity";
+        let node_id = crate::cluster::node_label(fingerprint);
+        for alias in [Some("macbook"), Some("renamed"), None] {
+            let aliases = alias
+                .map(|label| std::collections::BTreeMap::from([(fingerprint.into(), label.into())]))
+                .unwrap_or_default();
+            ui.set_local_identity(fingerprint, &aliases);
+            for target in ["studio", node_id.as_str(), fingerprint] {
+                ui.select_target(Some(&format!("{target}/dev"))).unwrap();
+                assert!(ui.remote_active.is_none());
+            }
+            if let Some(alias) = alias {
+                assert!(ui.select_target(Some(&format!("{alias}/dev"))).is_err());
+                let decorated = format!("{alias} ({node_id})/dev");
+                assert!(ui.select_target(Some(&decorated)).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn remote_fingerprint_with_slashes_preserves_the_session_name() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("body"));
+        let node = &mut ui.remote_snapshot.nodes[0];
+        node.registry_key = "SHA256:peer/key".into();
+        node.name = "friendly (node-peerkey)".into();
+        node.sessions[0].name = "build/task".into();
+        ui.select_target(Some("SHA256:peer/key/build/task"))
+            .unwrap();
+        ui.select_target(Some("node-peerkey/build/task")).unwrap();
+        assert!(ui
+            .select_target(Some("friendly (node-peerkey)/build/task"))
+            .is_err());
+    }
+
     fn selected_remote_ui_with_bracketed_paste(
         clock: &ManualClock,
         screen: ScreenSnapshot,
@@ -2975,6 +3368,58 @@ mod tests {
     }
 
     #[test]
+    fn input_key_controls_cannot_move_the_tree_or_add_status_rows() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.input_queue.enqueue(
+            "dev".into(),
+            "instance-dev".into(),
+            "client".into(),
+            1,
+            b"command\r\nextra\x1b[HOVERWRITE\x1b[2J".to_vec(),
+            Instant::now(),
+        );
+        let frame = ui.render(80, 24, "pane", &clock);
+        assert!(
+            !frame.contains("\x1b[H") && !frame.contains("\x1b[2J"),
+            "queued input leaked cursor/clear escapes: {frame:?}"
+        );
+        assert!(!frame.contains('\r'), "queued input leaked carriage return");
+        assert_eq!(frame.lines().count(), 24, "queued input added a status row");
+        let parsed = parsed_frame(&frame, 80, 24);
+        assert!(parsed.screen().contents().starts_with("remuda · cluster"));
+    }
+
+    #[test]
+    fn acknowledged_input_does_not_keep_three_command_rows_on_screen() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let now = Instant::now();
+        for seq in 1..=3 {
+            ui.input_queue.enqueue(
+                "dev".into(),
+                "instance-dev".into(),
+                "client".into(),
+                seq,
+                format!("long command {seq}\r").into_bytes(),
+                now,
+            );
+            let batch = ui.input_queue.begin_due(now).unwrap();
+            ui.input_queue.finish(
+                batch.seq,
+                super::queue::SendOutcome::Ack { duplicate: false },
+                now,
+            );
+        }
+        let frame = ui.render(80, 24, "pane", &clock);
+        assert!(
+            !frame.contains("Input sent"),
+            "finished rows remain: {frame}"
+        );
+        assert!(!frame.contains("long command"));
+    }
+
+    #[test]
     fn remote_close_error_text_is_safe_in_the_rendered_frame() {
         let clock = ManualClock::new();
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
@@ -2989,7 +3434,7 @@ mod tests {
             Ok(Response::Error(hostile.into())),
             clock.now(),
         );
-        let frame = ui.render(80, 24, "", &clock);
+        let frame = ui.render_text(80, 24, "", &clock);
 
         assert_remote_text_is_safe(&frame);
         assert!(frame.contains("tailtext"), "{frame:?}");
@@ -3019,7 +3464,7 @@ mod tests {
         ui.input_queue
             .finish(batch.seq, SendOutcome::IoFailure(hostile.into()), now);
 
-        let frame = ui.render(80, 24, "", &clock);
+        let frame = ui.render_text(80, 24, "", &clock);
 
         assert_remote_text_is_safe(&frame);
         assert!(frame.contains("tailtext"), "{frame:?}");
@@ -3035,7 +3480,7 @@ mod tests {
                 .into();
         let ui = selected_remote_ui(&clock, screen);
 
-        let rendered = ui.render(80, 24, "", &clock);
+        let rendered = ui.render_text(80, 24, "", &clock);
         let terminal_input = terminal_frame(&rendered);
         assert!(terminal_input.contains("tailtext ordinary"));
         assert!(rendered.contains("tailtext"), "{rendered:?}");
@@ -3109,7 +3554,7 @@ mod tests {
         let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
         key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
         assert!(ui
-            .render(80, 24, "", &clock)
+            .render_text(80, 24, "", &clock)
             .contains("KEYS laptop/build · Ctrl-\\ back"));
 
         key_event(
@@ -3119,7 +3564,9 @@ mod tests {
             clock.now(),
         );
 
-        assert!(!ui.render(80, 24, "", &clock).contains("KEYS laptop/build"));
+        assert!(!ui
+            .render_text(80, 24, "", &clock)
+            .contains("KEYS laptop/build"));
         assert_eq!(ui.input_queue.items().count(), 0);
     }
 
@@ -3140,7 +3587,7 @@ mod tests {
         ui.select_target(Some("fp-laptop/build")).unwrap();
         key_event(&mut ui, KeyCode::Char('x'), KeyModifiers::NONE, clock.now());
 
-        let frame = ui.render(40, 24, "", &clock);
+        let frame = ui.render_text(40, 24, "", &clock);
         let prompt = frame.lines().last().expect("close prompt is rendered");
         assert!(prompt.ends_with("y / n"), "prompt lost choices: {prompt:?}");
         assert!(
@@ -3167,7 +3614,7 @@ mod tests {
         ui.select_target(Some("fp-laptop/build")).unwrap();
         key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
 
-        let frame = ui.render(40, 24, "", &clock);
+        let frame = ui.render_text(40, 24, "", &clock);
         let hint = frame.lines().next().expect("keys hint is rendered");
         assert!(
             hint.contains("Ctrl-\\ back"),
@@ -3181,7 +3628,7 @@ mod tests {
     fn default_footer_keeps_action_keys_at_40_columns() {
         let clock = ManualClock::new();
         let ui = ClusterUi::new("studio", sessions(), clock.now());
-        let frame = ui.render(40, 24, "", &clock);
+        let frame = ui.render_text(40, 24, "", &clock);
         let footer = frame.lines().rev().take(2).collect::<Vec<_>>().join(" ");
         for binding in ["↑", "←", "Enter", "k", "x", "/", "!", "q"] {
             assert!(
@@ -3201,7 +3648,7 @@ mod tests {
         ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
         ui.remote_expanded.insert("fp-laptop".into());
 
-        let frame = ui.render(40, 24, "", &clock);
+        let frame = ui.render_text(40, 24, "", &clock);
         let node = frame
             .lines()
             .find(|line| line.contains("laptop"))
@@ -3231,7 +3678,7 @@ mod tests {
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
         ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
 
-        let frame = ui.render(40, 24, "", &clock);
+        let frame = ui.render_text(40, 24, "", &clock);
         assert!(frame.lines().count() <= 24, "tree overflowed viewport");
         assert!(frame
             .lines()
@@ -3325,7 +3772,7 @@ mod tests {
         for (cols, rows) in [(80, 24), (40, 12)] {
             let mut ui = selected_remote_ui(&clock, remote_screen_rows(40));
             key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
-            let frame = ui.render(cols, rows, "", &clock);
+            let frame = ui.render_text(cols, rows, "", &clock);
             let lines = frame.lines().collect::<Vec<_>>();
 
             assert_eq!(lines.len(), usize::from(rows), "{cols}x{rows}: {frame}");
@@ -3667,7 +4114,7 @@ mod tests {
         let clock = ManualClock::new();
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
         ui.capture_completed(clock.now());
-        let frame = ui.render(80, 24, "snapshot", &clock);
+        let frame = ui.render_text(80, 24, "snapshot", &clock);
         assert!(frame.contains("▼ studio  local"));
         assert!(frame.contains("    dev          live"));
         assert!(frame.contains("studio / dev · live · snapshot 0s ago"));
@@ -3693,11 +4140,11 @@ mod tests {
         let mut ui = ClusterUi::new("studio", sessions, clock.now());
         ui.key(crossterm::event::KeyCode::Down);
         assert!(ui
-            .render(80, 24, "", &clock)
+            .render_text(80, 24, "", &clock)
             .contains("studio / dev · live"));
         ui.key(crossterm::event::KeyCode::Enter);
         assert!(ui
-            .render(80, 24, "", &clock)
+            .render_text(80, 24, "", &clock)
             .contains("studio / shell · live"));
     }
 
@@ -3708,7 +4155,7 @@ mod tests {
         ui.capture_completed(clock.now());
         ui.sync_completed(clock.now());
         clock.advance(Duration::from_secs(5));
-        let frame = ui.render(80, 24, "snapshot", &clock);
+        let frame = ui.render_text(80, 24, "snapshot", &clock);
         assert!(frame.contains("local · reachable · sync 5s"));
         assert!(frame.contains("studio / dev · live · snapshot 5s ago"));
     }
@@ -3724,7 +4171,7 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('/'));
         ui.key(crossterm::event::KeyCode::Char('s'));
         ui.key(crossterm::event::KeyCode::Char('h'));
-        let frame = ui.render(80, 24, "", &clock);
+        let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("shell"));
         assert!(!frame.contains("    dev"));
         assert!(frame.contains("search: sh"));
@@ -3736,7 +4183,7 @@ mod tests {
         );
         node_search.key(crossterm::event::KeyCode::Char('/'));
         node_search.key(crossterm::event::KeyCode::Char('S'));
-        let node_frame = node_search.render(80, 24, "", &clock);
+        let node_frame = node_search.render_text(80, 24, "", &clock);
         assert!(node_frame.contains("    dev"));
         assert!(node_frame.contains("    shell"));
     }
@@ -3754,7 +4201,7 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('h'));
         ui.key(crossterm::event::KeyCode::Enter);
         assert!(ui
-            .render(80, 24, "", &clock)
+            .render_text(80, 24, "", &clock)
             .contains("studio / shell · live"));
         ui.key_event(
             crossterm::event::KeyEvent::new(
@@ -3766,13 +4213,13 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('/'));
         ui.key(crossterm::event::KeyCode::Char('d'));
         ui.key(crossterm::event::KeyCode::Backspace);
-        let edited = ui.render(80, 24, "", &clock);
+        let edited = ui.render_text(80, 24, "", &clock);
         assert!(edited.contains("    dev"));
         assert!(edited.contains("    shell"));
         assert!(edited.contains("search:  ·"));
         ui.key(crossterm::event::KeyCode::Char('z'));
         ui.key(crossterm::event::KeyCode::Esc);
-        let frame = ui.render(80, 24, "", &clock);
+        let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("    dev"));
         assert!(frame.contains("    shell"));
         assert!(!frame.contains("search:"));
@@ -3787,7 +4234,7 @@ mod tests {
             clock.now(),
         );
         ui.key(crossterm::event::KeyCode::Char('!'));
-        let frame = ui.render(80, 24, "", &clock);
+        let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("ended"));
         assert!(!frame.contains("    dev"));
         assert!(frame.contains("attention: on"));
@@ -3811,12 +4258,12 @@ mod tests {
         ui.input_sender.attempt_due(&mut ui.input_queue, now, |_| {
             Ok(remuda_core::protocol::Response::Uncertain)
         });
-        let frame = ui.render(80, 24, "", &clock);
+        let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("Input delivery uncertain"));
         assert!(!frame.contains("pending input 1"));
         ui.key(crossterm::event::KeyCode::Char('!'));
         assert!(ui
-            .render(80, 24, "", &clock)
+            .render_text(80, 24, "", &clock)
             .contains("no sessions need attention"));
     }
 
@@ -3831,7 +4278,17 @@ mod tests {
             }),
             Duration::ZERO,
         );
-        assert!(ui.notice.is_none());
+        assert_eq!(
+            ui.notice.as_ref().map(|(notice, _)| notice.as_str()),
+            Some("Input sent")
+        );
+        assert!(ui
+            .active_notice_lines(Duration::from_secs(4), 80)
+            .iter()
+            .any(|line| line == "Input sent"));
+        assert!(ui
+            .active_notice_lines(Duration::from_secs(5), 80)
+            .is_empty());
     }
 
     #[test]
@@ -3841,11 +4298,11 @@ mod tests {
         ui.notice = Some(("sending input to dev".into(), clock.now()));
 
         assert!(ui
-            .render(80, 24, "", &clock)
+            .render_text(80, 24, "", &clock)
             .contains("sending input to dev · 0s"));
         clock.advance(Duration::from_secs(2));
         assert!(ui
-            .render(80, 24, "", &clock)
+            .render_text(80, 24, "", &clock)
             .contains("sending input to dev · 2s"));
     }
 
@@ -3910,7 +4367,7 @@ mod tests {
         let failure_notice = ui.notice.as_ref().map(|(notice, _)| notice.as_str());
         assert!(failure_notice.is_some());
         assert_eq!(
-            ui.render(100, 24, "", &clock)
+            ui.render_text(100, 24, "", &clock)
                 .matches(failure_notice.unwrap())
                 .count(),
             1
@@ -4121,7 +4578,7 @@ mod tests {
         let clock = ManualClock::new();
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
         ui.key(crossterm::event::KeyCode::Char('!'));
-        let frame = ui.render(80, 24, "", &clock);
+        let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("no sessions need attention"));
         assert!(frame.contains("local · reachable"));
         assert!(frame.contains("attention: on"));
@@ -4139,7 +4596,7 @@ mod tests {
         empty_remote.0.lock().unwrap().nodes[0].sessions.clear();
         empty_ui.remote_synced(&empty_remote);
 
-        let frame = empty_ui.render(100, 24, "", &clock);
+        let frame = empty_ui.render_text(100, 24, "", &clock);
 
         assert!(frame.contains("No sessions yet. Start one on any machine:"));
         assert!(frame.contains("remuda run -n NAME COMMAND"));
@@ -4153,7 +4610,7 @@ mod tests {
         stale_ui.remote_synced(&stale_remote);
         stale_ui.remote_expanded.insert("fp-laptop".into());
 
-        let frame = stale_ui.render(100, 24, "", &clock);
+        let frame = stale_ui.render_text(100, 24, "", &clock);
 
         assert!(frame.contains("build"));
         assert!(!frame.contains("No sessions yet."));
@@ -4167,7 +4624,7 @@ mod tests {
             vec![session("dev", true), session("ended", false)],
             clock.now(),
         );
-        let frame = ui.render(80, 24, "", &clock);
+        let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("local · reachable"));
         assert!(frame.contains("dev          live"));
         assert!(frame.contains("ended        ended"));
@@ -4186,7 +4643,7 @@ mod tests {
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
         ui.remote_synced(&source);
 
-        let frame = ui.render(100, 24, "", &clock);
+        let frame = ui.render_text(100, 24, "", &clock);
 
         assert!(
             frame.contains("▶ laptop · stale · sync 17s ago"),
@@ -4206,7 +4663,7 @@ mod tests {
         ui.notice = Some(("short notice".into(), clock.now()));
 
         for (cols, rows) in [(80, 24), (40, 12)] {
-            let one_line = ui.render(cols, rows, &screen, &clock);
+            let one_line = ui.render_text(cols, rows, &screen, &clock);
             let one_line_body_rows = one_line
                 .lines()
                 .filter(|line| line.contains("body-"))
@@ -4216,7 +4673,7 @@ mod tests {
                     .into(),
                 clock.now(),
             ));
-            let frame = ui.render(cols, rows, &screen, &clock);
+            let frame = ui.render_text(cols, rows, &screen, &clock);
             let notice_lines = frame
                 .lines()
                 .filter(|line| line.contains("a human") || line.contains("then retry"))
@@ -4249,7 +4706,7 @@ mod tests {
             instance_id: "remote-instance".into(),
         });
 
-        let frame = ui.render(40, 12, "", &clock);
+        let frame = ui.render_text(40, 12, "", &clock);
         let status_lines = frame.lines().take(2).collect::<Vec<_>>();
         assert!(
             status_lines[0].ends_with("Ctrl-\\ back"),
@@ -4276,7 +4733,7 @@ mod tests {
             ui.select_target(Some("fp-laptop/build")).unwrap();
             ui.enter_selected(clock.now());
             assert!(ui.composer_focused);
-            let focused = ui.render(100, 24, "", &clock);
+            let focused = ui.render_text(100, 24, "", &clock);
             ui.key_event(
                 crossterm::event::KeyEvent::new(
                     crossterm::event::KeyCode::Esc,
@@ -4292,7 +4749,7 @@ mod tests {
         assert!(focused.contains("Enter send · Ctrl-C clear · Esc list"));
 
         let (ui, _, _) = make_ui();
-        let footer = ui.render(100, 24, "", &clock);
+        let footer = ui.render_text(100, 24, "", &clock);
         assert!(footer.contains("Enter type · k keys · x close · q detach"));
 
         let (mut ui, _, _) = make_ui();
@@ -4332,7 +4789,9 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Down);
         ui.key(crossterm::event::KeyCode::Enter);
         assert!(!ui.composer_focused);
-        assert!(ui.render(100, 24, "", &clock).contains("last good screen"));
+        assert!(ui
+            .render_text(100, 24, "", &clock)
+            .contains("last good screen"));
 
         source.replace(remote_snapshot(
             RemoteState::Unreachable,
@@ -4342,13 +4801,13 @@ mod tests {
         ui.remote_synced(&source);
         ui.key(crossterm::event::KeyCode::Char('x'));
 
-        let frame = ui.render(100, 24, "", &clock);
+        let frame = ui.render_text(100, 24, "", &clock);
         assert!(frame.contains("laptop · unreachable"));
         assert!(frame.contains("last good screen"));
         assert!(frame.contains("kill laptop(fp-lap)/build? it is running — y / n"));
         ui.key(crossterm::event::KeyCode::Char('n'));
         assert!(!ui
-            .render(100, 24, "", &clock)
+            .render_text(100, 24, "", &clock)
             .contains("kill laptop(fp-lap)/build?"));
     }
 
@@ -4368,7 +4827,7 @@ mod tests {
         ui.remote_synced(source.as_ref());
         select_target_with_remote_wait(
             &mut ui,
-            Some("laptop/build"),
+            Some("fp-laptop/build"),
             source.as_ref(),
             Duration::from_millis(250),
         )
@@ -4380,7 +4839,7 @@ mod tests {
     }
 
     #[test]
-    fn user_target_with_an_ambiguous_remote_label_is_refused() {
+    fn user_target_with_an_ambiguous_original_node_id_is_refused() {
         let mut ui = ClusterUi::new("studio", Vec::new(), Duration::ZERO);
         let mut snapshot = remote_snapshot(
             RemoteState::Reachable,
@@ -4388,11 +4847,12 @@ mod tests {
             Some(remote_screen("ready")),
         );
         let mut colliding = snapshot.nodes[0].clone();
-        colliding.registry_key = "fp-other".into();
+        snapshot.nodes[0].registry_key = "SHA256:abcdefghfirst".into();
+        colliding.registry_key = "SHA256:abcdefghsecond".into();
         snapshot.nodes.push(colliding);
         ui.remote_snapshot = snapshot;
 
-        let error = ui.select_target(Some("laptop/build")).unwrap_err();
+        let error = ui.select_target(Some("node-abcdefgh/build")).unwrap_err();
         assert!(error.to_string().contains("ambiguous"));
     }
 
@@ -4417,7 +4877,7 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('x'));
 
         assert!(ui
-            .render(100, 24, "", &clock)
+            .render_text(100, 24, "", &clock)
             .contains("kill laptop(RL+gta)/build? it is running — y / n"));
 
         ui.key(crossterm::event::KeyCode::Char('y'));
@@ -4622,18 +5082,18 @@ mod tests {
             )
             .unwrap();
 
-        let frame = ui.render(100, 24, "", &clock);
+        let frame = ui.render_text(100, 24, "", &clock);
         assert!(
             frame.contains("live · pending input 1"),
             "remote pending marker missing from frame:\n{frame}"
         );
 
         ui.start_pending(clock.now());
-        let sending_frame = ui.render(100, 24, "", &clock);
+        let sending_frame = ui.render_text(100, 24, "", &clock);
         assert!(sending_frame.contains("live · pending input 1"));
 
         ui.key(crossterm::event::KeyCode::Char('!'));
-        let attention_frame = ui.render(100, 24, "", &clock);
+        let attention_frame = ui.render_text(100, 24, "", &clock);
         assert!(attention_frame.contains("build"));
         assert!(attention_frame.contains("pending input 1"));
     }
@@ -4756,7 +5216,7 @@ mod tests {
         }
         let notice = ui.notice.as_ref().map(|(notice, _)| notice.as_str());
         assert!(notice.is_some_and(|notice| notice.contains("remaining lines dropped")));
-        let frame = ui.render(100, 24, "", &clock);
+        let frame = ui.render_text(100, 24, "", &clock);
         assert_eq!(frame.matches(notice.unwrap()).count(), 1);
         let requests = transport.requests.lock().unwrap();
         assert!(!requests.iter().any(|(node, request)| {
@@ -4800,7 +5260,7 @@ mod tests {
             Duration::ZERO,
         );
         assert_eq!(ui.query.as_deref(), Some("q"));
-        let frame = ui.render(80, 24, "", &clock);
+        let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("search: q"));
         assert!(!frame.contains("attention:"));
     }
@@ -4812,7 +5272,7 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('/'));
         ui.key(crossterm::event::KeyCode::Char('z'));
         ui.key(crossterm::event::KeyCode::Enter);
-        let frame = ui.render(80, 24, "", &clock);
+        let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("search: z"));
         assert!(frame.contains("no matching sessions"));
         assert_eq!(ui.query.as_deref(), Some("z"));
@@ -4839,7 +5299,7 @@ mod tests {
     fn wide_terminal_puts_tree_left_and_pane_right() {
         let clock = ManualClock::new();
         let ui = selected_remote_ui(&clock, remote_screen("remote-body"));
-        let frame = ui.render(100, 24, "", &clock);
+        let frame = ui.render_text(100, 24, "", &clock);
         let lines: Vec<&str> = frame.lines().collect();
         let first = lines[0];
         assert!(first.starts_with("remuda · cluster"), "{first}");
@@ -4856,7 +5316,7 @@ mod tests {
     fn narrow_terminal_keeps_stacked_layout() {
         let clock = ManualClock::new();
         let ui = selected_remote_ui(&clock, remote_screen("remote-body"));
-        let frame = ui.render(40, 24, "", &clock);
+        let frame = ui.render_text(40, 24, "", &clock);
         assert!(!frame.lines().next().unwrap().contains('│'));
     }
 
@@ -4868,7 +5328,7 @@ mod tests {
     fn split_cells_are_width_aware_for_wide_text() {
         let clock = ManualClock::new();
         let ui = selected_remote_ui(&clock, remote_screen("한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글한글"));
-        let frame = ui.render(60, 24, "", &clock);
+        let frame = ui.render_text(60, 24, "", &clock);
         let cols: Vec<usize> = frame
             .lines()
             .filter(|l| l.contains('│'))
@@ -4892,7 +5352,7 @@ mod tests {
             instance_id: "remote-instance".into(),
         });
         for cols in [60, 80] {
-            let first = ui.render(cols, 24, "", &clock);
+            let first = ui.render_text(cols, 24, "", &clock);
             let first = first.lines().next().unwrap();
             assert!(first.contains("remote live · reachable"), "{cols}: {first}");
             assert!(first.contains('…'), "{first}");
@@ -4904,13 +5364,13 @@ mod tests {
         let clock = ManualClock::new();
         let ui = selected_remote_ui(&clock, remote_screen("remote-body"));
         assert!(!ui
-            .render(59, 24, "", &clock)
+            .render_text(59, 24, "", &clock)
             .lines()
             .next()
             .unwrap()
             .contains('│'));
         assert!(ui
-            .render(60, 24, "", &clock)
+            .render_text(60, 24, "", &clock)
             .lines()
             .next()
             .unwrap()
@@ -4922,7 +5382,7 @@ mod tests {
         let clock = ManualClock::new();
         let mut ui = selected_remote_ui(&clock, remote_screen("remote-body"));
         ui.notice = Some(("heads up".into(), clock.now()));
-        let frame = ui.render(100, 24, "", &clock);
+        let frame = ui.render_text(100, 24, "", &clock);
         let lines: Vec<&str> = frame.lines().collect();
         assert!(lines
             .last()
@@ -4933,7 +5393,7 @@ mod tests {
             .any(|l| l.starts_with("heads up") && !l.contains('│')));
         assert!(lines.iter().all(|l| cell_width(l) <= 100));
         ui.remote_keys_mode = ui.remote_active.clone();
-        let keys = ui.render(100, 24, "", &clock);
+        let keys = ui.render_text(100, 24, "", &clock);
         assert!(keys.starts_with("KEYS laptop/build"));
         assert!(!keys.contains('│'));
     }
@@ -4944,7 +5404,7 @@ mod tests {
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
         ui.key(crossterm::event::KeyCode::Char('!'));
         ui.key(crossterm::event::KeyCode::Enter);
-        let frame = ui.render(80, 24, "", &clock);
+        let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("attention: on"));
         assert!(frame.contains("no sessions need attention"));
         assert_eq!(ui.active, 0);
@@ -4962,7 +5422,45 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('!'));
         ui.key(crossterm::event::KeyCode::Char('!'));
         assert_eq!(ui.selected, 1);
-        assert!(ui.render(80, 24, "", &clock).contains(">    shell"));
+        assert!(ui.render_text(80, 24, "", &clock).contains(">    shell"));
+    }
+
+    #[test]
+    fn restored_composer_preview_is_safe_without_changing_delivery_bytes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], clock.now());
+        ui.composer_focused = true;
+        ui.bind_composer_target();
+        let draft = "before\u{009b}2J\u{202e}after\x1b[H\r\n";
+        ui.restore_draft(format!("{draft}\r").as_bytes());
+        // Put the cursor inside the restored draft, exercising both halves.
+        ui.composer
+            .handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        for _ in 0..8 {
+            ui.composer
+                .handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        }
+        let frame = ui.render(80, 24, "pane", &clock);
+        assert_remote_text_is_safe(&ui.composer_line());
+        assert!(
+            !frame.contains('\u{009b}')
+                && !frame.contains('\u{202e}')
+                && !frame.contains("\x1b[H")
+                && !frame.contains('\r')
+        );
+        assert!(frame.contains("before2▏Jafter[H"), "{frame:?}");
+        assert_eq!(ui.composer.text(), draft);
+        ui.key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            clock.now(),
+        );
+        let queued = ui
+            .input_queue
+            .items()
+            .next()
+            .expect("restored draft queued");
+        assert_eq!(queued.bytes, format!("{draft}\r").as_bytes());
     }
 
     #[test]
@@ -4999,7 +5497,7 @@ mod tests {
             clock.now(),
         );
         ui.key(crossterm::event::KeyCode::Char('!'));
-        let frame = ui.render(80, 24, "", &clock);
+        let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("dev          live · pending input 1"));
     }
 
@@ -5009,11 +5507,11 @@ mod tests {
         let mut ui = ClusterUi::new("studio", vec![session("dev", true)], clock.now());
         ui.key(crossterm::event::KeyCode::Char('x'));
         assert!(ui
-            .render(80, 24, "", &clock)
+            .render_text(80, 24, "", &clock)
             .contains("kill dev? it is running — y / n"));
         ui.key(crossterm::event::KeyCode::Char('n'));
         assert!(!ui
-            .render(80, 24, "", &clock)
+            .render_text(80, 24, "", &clock)
             .contains("kill dev? it is running — y / n"));
     }
 
@@ -5025,7 +5523,7 @@ mod tests {
         assert!(ui.record_capture(&summary, "final output".into(), clock.now()));
         ui.key(crossterm::event::KeyCode::Char('x'));
         ui.key(crossterm::event::KeyCode::Char('y'));
-        assert!(ui.render(80, 24, "", &clock).contains("closing dev"));
+        assert!(ui.render_text(80, 24, "", &clock).contains("closing dev"));
         let pending = ui.pending_close.take().unwrap();
         assert_eq!(
             (pending.name.clone(), pending.instance_id.clone()),
@@ -5041,7 +5539,7 @@ mod tests {
             clock.now(),
         );
         let final_frame = ui.ended.as_ref().unwrap().screen.clone();
-        let frame = ui.render(80, 24, &final_frame, &clock);
+        let frame = ui.render_text(80, 24, &final_frame, &clock);
         assert!(frame.contains("studio / dev · ended · final snapshot"));
         assert!(frame.contains("final output"));
         assert!(frame.contains("Input is disabled"));
@@ -5077,7 +5575,7 @@ mod tests {
 
         ui.key(crossterm::event::KeyCode::Char('x'));
 
-        let frame = ui.render(80, 24, "", &clock);
+        let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("dev has already ended."));
         assert!(!frame.contains("kill dev?"));
     }
@@ -5089,12 +5587,12 @@ mod tests {
         let summary = ui.sessions[0].clone();
         assert!(ui.record_capture(&summary, "final output".into(), clock.now()));
         ui.sessions_synced(vec![], Duration::from_secs(2));
-        let frame = ui.render(80, 24, &ui.ended.as_ref().unwrap().screen, &clock);
+        let frame = ui.render_text(80, 24, &ui.ended.as_ref().unwrap().screen, &clock);
         assert!(frame.contains("studio / dev · ended · final snapshot"));
         assert!(frame.contains("final output"));
         assert!(frame.contains("Input is disabled · x clears ended session"));
         ui.key(crossterm::event::KeyCode::Char('x'));
-        let frame = ui.render(80, 24, "", &clock);
+        let frame = ui.render_text(80, 24, "", &clock);
         assert!(!frame.contains("studio / dev · ended"));
         assert!(frame.contains("studio · no sessions"));
     }
