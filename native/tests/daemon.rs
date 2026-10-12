@@ -5315,12 +5315,11 @@ fn confirmed_close_ends_the_matching_instance() {
 }
 
 #[test]
-fn a_session_exited_hook_still_fires_once_when_ls_reaps_before_the_tick() {
+fn a_session_exited_hook_still_fires_once_when_ls_and_the_ticker_both_reap() {
     // `Registry::reap()` removes what it finds and hands it only to whoever
-    // calls first. A `List` that reaps well inside TICK_PERIOD must not make
-    // the ticker's own later reap silently find nothing to emit for — and it
-    // must not double-emit either, once every reap site funnels through one
-    // notifying path.
+    // calls first. Whichever of `List` and the ticker reaps the exit, the hook
+    // must fire exactly once. The `List` loop below polls until the exit is
+    // observed; it does not prove `List` reaped before the tick (#651).
     let path = scratch("session-exited-race");
     let _daemon = daemon_at(&path);
 

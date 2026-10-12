@@ -33,6 +33,9 @@ use std::time::Instant;
 
 #[cfg(test)]
 use std::sync::mpsc::Receiver;
+/// Bounds every test barrier wait, so a regression fails instead of hanging (#651).
+#[cfg(test)]
+const TEST_BARRIER_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[path = "timers.rs"]
 pub(crate) mod timers;
@@ -604,7 +607,10 @@ impl Image {
                 reply: Some(reply),
             })
             .unwrap();
-        answer.recv().unwrap().unwrap();
+        answer
+            .recv_timeout(TEST_BARRIER_PATIENCE)
+            .expect("test barrier installed")
+            .unwrap();
         (entered_rx, release_tx)
     }
 
@@ -885,7 +891,9 @@ fn process_job(
                         let release = release
                             .lock()
                             .map_err(|_| mlua::Error::runtime("test barrier mutex poisoned"))?;
-                        release.recv().map_err(mlua::Error::external)?;
+                        release
+                            .recv_timeout(TEST_BARRIER_PATIENCE)
+                            .map_err(mlua::Error::external)?;
                         Ok(())
                     })
                     .map_err(|error| error.to_string())?;
@@ -1703,7 +1711,9 @@ mod tests {
         let blocker = std::thread::spawn(move || {
             blocking_image.eval("__remuda_test_barrier(); return 'released'", None)
         });
-        entered.recv().unwrap();
+        entered
+            .recv_timeout(super::TEST_BARRIER_PATIENCE)
+            .expect("test barrier entered");
 
         let caller = CallerContext {
             kind: CallerKind::Session,
@@ -1727,7 +1737,10 @@ mod tests {
         release.send(()).unwrap();
 
         assert_eq!(blocker.join().unwrap().unwrap(), "released");
-        let error = answer.recv().unwrap().unwrap_err();
+        let error = answer
+            .recv_timeout(super::TEST_BARRIER_PATIENCE)
+            .expect("queued call answered")
+            .unwrap_err();
         assert!(error.contains("no longer live"), "{error}");
         assert_eq!(image.eval("return probe_effects", None).unwrap(), "0");
     }
@@ -1780,7 +1793,9 @@ mod tests {
                 caller,
             )
         });
-        entered.recv().unwrap();
+        entered
+            .recv_timeout(super::TEST_BARRIER_PATIENCE)
+            .expect("test barrier entered");
         session.terminate().unwrap();
         release.send(()).unwrap();
 
