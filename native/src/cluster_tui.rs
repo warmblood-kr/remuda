@@ -2465,6 +2465,21 @@ mod tests {
         parser
     }
 
+    fn assert_remote_text_is_safe(frame: &str) {
+        assert!(
+            !frame
+                .chars()
+                .any(|character| character.is_control() && !matches!(character, '\n' | '\r')),
+            "{frame:?}"
+        );
+        assert!(
+            frame
+                .match_indices('\r')
+                .all(|(index, _)| { frame.as_bytes().get(index + 1) == Some(&b'\n') }),
+            "rendered frame contains a lone carriage return: {frame:?}"
+        );
+    }
+
     #[test]
     fn the_input_wait_ends_early_when_the_remote_snapshot_changes() {
         let clock = ManualClock::new();
@@ -2955,6 +2970,28 @@ mod tests {
     #[test]
     fn raw_mode_frames_use_carriage_return_line_feed() {
         assert_eq!(terminal_frame("a\nb\r\nc"), "a\r\nb\r\nc");
+    }
+
+    #[test]
+    fn remote_close_error_text_is_safe_in_the_rendered_frame() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let hostile =
+            "close \u{1b}[31mred\u{1b}[0m \u{1b}]0;title\u{7} \u{1b}]2;title\u{1b}\\ tail\rtext";
+
+        ui.close_completed(
+            Some("fp-laptop"),
+            "build".into(),
+            "build".into(),
+            "remote-instance".into(),
+            Ok(Response::Error(hostile.into())),
+            clock.now(),
+        );
+        let frame = ui.render(80, 24, "", &clock);
+
+        assert_remote_text_is_safe(&frame);
+        assert!(frame.contains("tailtext"), "{frame:?}");
+        assert!(!frame.contains("tail\rtext"), "{frame:?}");
     }
 
     #[test]
