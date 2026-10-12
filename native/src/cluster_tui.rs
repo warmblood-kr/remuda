@@ -1741,7 +1741,7 @@ impl ClusterUi {
             },
             |(name, _)| format!("{name}> "),
         );
-        format!("$ {target}{before}▏{after}")
+        crate::text::strip_terminal_controls(&format!("$ {target}{before}▏{after}")).into_owned()
     }
 
     fn select_target(&mut self, target: Option<&str>) -> io::Result<()> {
@@ -4963,6 +4963,44 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('!'));
         assert_eq!(ui.selected, 1);
         assert!(ui.render(80, 24, "", &clock).contains(">    shell"));
+    }
+
+    #[test]
+    fn restored_composer_preview_is_safe_without_changing_delivery_bytes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], clock.now());
+        ui.composer_focused = true;
+        ui.bind_composer_target();
+        let draft = "before\u{009b}2J\u{202e}after\x1b[H\r\n";
+        ui.restore_draft(format!("{draft}\r").as_bytes());
+        // Put the cursor inside the restored draft, exercising both halves.
+        ui.composer
+            .handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        for _ in 0..8 {
+            ui.composer
+                .handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        }
+        let frame = ui.render(80, 24, "pane", &clock);
+        assert_remote_text_is_safe(&ui.composer_line());
+        assert!(
+            !frame.contains('\u{009b}')
+                && !frame.contains('\u{202e}')
+                && !frame.contains("\x1b[H")
+                && !frame.contains('\r')
+        );
+        assert!(frame.contains("before2▏Jafter[H"), "{frame:?}");
+        assert_eq!(ui.composer.text(), draft);
+        ui.key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            clock.now(),
+        );
+        let queued = ui
+            .input_queue
+            .items()
+            .next()
+            .expect("restored draft queued");
+        assert_eq!(queued.bytes, format!("{draft}\r").as_bytes());
     }
 
     #[test]
