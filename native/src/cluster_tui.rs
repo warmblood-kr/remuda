@@ -1748,7 +1748,7 @@ impl ClusterUi {
 
     fn select_target(&mut self, target: Option<&str>) -> io::Result<()> {
         let Some(target) = target else { return Ok(()) };
-        let Some((node, session)) = target.split_once('/') else {
+        let Some((node, session)) = self.split_target(target) else {
             return Err(io::Error::other("target must be node/session"));
         };
         if !self.local_targets.iter().any(|identity| identity == node) {
@@ -1801,6 +1801,32 @@ impl ClusterUi {
             })?;
         self.active = self.selected;
         Ok(())
+    }
+
+    fn split_target<'a>(&self, target: &'a str) -> Option<(&'a str, &'a str)> {
+        // Fingerprints can contain '/'; prefer a known identity before the
+        // legacy first-slash split, preserving slashes in session names too.
+        let identity = self
+            .local_targets
+            .iter()
+            .chain(
+                self.remote_snapshot
+                    .nodes
+                    .iter()
+                    .map(|node| &node.registry_key),
+            )
+            .filter(|identity| {
+                target
+                    .strip_prefix(identity.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .max_by_key(|identity| identity.len());
+        identity
+            .map(|identity| {
+                let (node, session) = target.split_at(identity.len());
+                (node, &session[1..])
+            })
+            .or_else(|| target.split_once('/'))
     }
 
     fn set_local_identity(
@@ -2444,7 +2470,7 @@ fn select_target_with_remote_wait(
     timeout: Duration,
 ) -> io::Result<()> {
     let Some(target) = target else { return Ok(()) };
-    let Some((node, _)) = target.split_once('/') else {
+    let Some((node, _)) = ui.split_target(target) else {
         return ui.select_target(Some(target));
     };
     match ui.select_target(Some(target)) {
@@ -2988,7 +3014,7 @@ mod tests {
     fn local_targets_stay_stable_when_the_display_alias_changes_or_clears() {
         let clock = ManualClock::new();
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
-        let fingerprint = "SHA256:localidentity";
+        let fingerprint = "SHA256:local/identity";
         let node_id = crate::cluster::node_label(fingerprint);
         for alias in [Some("macbook"), Some("renamed"), None] {
             let aliases = alias
@@ -3005,6 +3031,22 @@ mod tests {
                 assert!(ui.select_target(Some(&decorated)).is_err());
             }
         }
+    }
+
+    #[test]
+    fn remote_fingerprint_with_slashes_preserves_the_session_name() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("body"));
+        let node = &mut ui.remote_snapshot.nodes[0];
+        node.registry_key = "SHA256:peer/key".into();
+        node.name = "friendly (node-peerkey)".into();
+        node.sessions[0].name = "build/task".into();
+        ui.select_target(Some("SHA256:peer/key/build/task"))
+            .unwrap();
+        ui.select_target(Some("node-peerkey/build/task")).unwrap();
+        assert!(ui
+            .select_target(Some("friendly (node-peerkey)/build/task"))
+            .is_err());
     }
 
     fn selected_remote_ui_with_bracketed_paste(
