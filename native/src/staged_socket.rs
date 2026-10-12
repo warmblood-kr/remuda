@@ -161,6 +161,13 @@ fn size_of<T>() -> libc::socklen_t {
     std::mem::size_of::<T>() as libc::socklen_t
 }
 
+fn listen_and_validate(fd: &OwnedFd) -> io::Result<ListenerIdentity> {
+    if unsafe { libc::listen(fd.as_raw_fd(), 128) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    ListenerIdentity::validate(fd, true)
+}
+
 fn create_stream_socket() -> io::Result<OwnedFd> {
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
     if fd < 0 {
@@ -474,6 +481,14 @@ mod tests {
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
         assert!(ListenerIdentity::validate(&fd, false).is_ok());
         assert!(ListenerIdentity::validate(&fd, true).is_err());
+    }
+
+    #[test]
+    fn listening_socket_has_a_valid_listener_receipt() {
+        let scratch = Scratch::new();
+        let listener = UnixListener::bind(scratch.0.join("listening")).unwrap();
+        let fd: OwnedFd = listener.into();
+        assert!(listen_and_validate(&fd).is_ok());
     }
 
     #[test]
