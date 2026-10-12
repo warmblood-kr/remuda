@@ -765,10 +765,11 @@ impl ClusterUi {
                     || now.saturating_sub(*at) < Duration::from_secs(5)
             })
             .map_or_else(Vec::new, |(notice, at)| {
-                let notice = if notice.starts_with("sending input to ") {
-                    format!("{notice} · {}s", age_seconds(now, *at))
+                let safe = crate::text::strip_terminal_controls(notice);
+                let notice = if safe.starts_with("sending input to ") {
+                    format!("{safe} · {}s", age_seconds(now, *at))
                 } else {
-                    notice.clone()
+                    safe.into_owned()
                 };
                 wrap_to_two_lines(&notice, width)
             })
@@ -2000,7 +2001,7 @@ fn remote_screen_text(screen: &remuda_core::agent::ScreenSnapshot) -> String {
         .iter()
         .map(|row| {
             row.iter()
-                .map(|cell| cell.text.as_str())
+                .map(|cell| crate::text::strip_terminal_controls(&cell.text).into_owned())
                 .collect::<String>()
         })
         .collect::<Vec<_>>()
@@ -2118,7 +2119,8 @@ fn wrap_to_two_lines(text: &str, width: usize) -> Vec<String> {
 fn queue_line(batch: &PendingBatch) -> String {
     let bytes = batch.bytes.strip_suffix(b"\r").unwrap_or(&batch.bytes);
     let text = String::from_utf8_lossy(bytes);
-    format!("Input {} · {text}", batch.status)
+    let status = crate::text::strip_terminal_controls(&batch.status);
+    format!("Input {status} · {text}")
 }
 
 fn session_status(status: &str, pending_count: usize) -> String {
@@ -2443,7 +2445,7 @@ fn select_target_with_remote_wait(
 
 #[cfg(test)]
 mod tests {
-    use super::queue::{QueueEvent, QueueState, MAX_IO_RETRIES};
+    use super::queue::{InputTarget, QueueEvent, QueueState, SendOutcome, MAX_IO_RETRIES};
     use super::{
         is_attention, normalized_terminal_size, present, remote_state_label, render_badge,
         resize_requires_full_repaint, select_target_with_remote_wait, terminal_frame,
@@ -2463,6 +2465,21 @@ mod tests {
         let mut parser = vt100::Parser::new(rows, cols, 0);
         parser.process(format!("\x1b[H\x1b[2J{}", terminal_frame(frame)).as_bytes());
         parser
+    }
+
+    fn assert_remote_text_is_safe(frame: &str) {
+        assert!(
+            !frame
+                .chars()
+                .any(|character| character.is_control() && !matches!(character, '\n' | '\r')),
+            "{frame:?}"
+        );
+        assert!(
+            frame
+                .match_indices('\r')
+                .all(|(index, _)| { frame.as_bytes().get(index + 1) == Some(&b'\n') }),
+            "rendered frame contains a lone carriage return: {frame:?}"
+        );
     }
 
     #[test]
@@ -2955,6 +2972,92 @@ mod tests {
     #[test]
     fn raw_mode_frames_use_carriage_return_line_feed() {
         assert_eq!(terminal_frame("a\nb\r\nc"), "a\r\nb\r\nc");
+    }
+
+    #[test]
+    fn remote_close_error_text_is_safe_in_the_rendered_frame() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let hostile =
+            "close \u{1b}[31mred\u{1b}[0m \u{1b}]0;title\u{7} \u{1b}]2;title\u{1b}\\ tail\rtext";
+
+        ui.close_completed(
+            Some("fp-laptop"),
+            "build".into(),
+            "build".into(),
+            "remote-instance".into(),
+            Ok(Response::Error(hostile.into())),
+            clock.now(),
+        );
+        let frame = ui.render(80, 24, "", &clock);
+
+        assert_remote_text_is_safe(&frame);
+        assert!(frame.contains("tailtext"), "{frame:?}");
+        assert!(!frame.contains("tail\rtext"), "{frame:?}");
+    }
+
+    #[test]
+    fn remote_input_error_status_is_safe_in_the_rendered_frame() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let now = Instant::now();
+        let hostile =
+            "tail\rtext \u{1b}[31mred\u{1b}[0m \u{1b}]0;title\u{7} \u{1b}]2;title\u{1b}\\";
+        assert!(ui.input_queue.enqueue_target(
+            InputTarget {
+                remote_node: Some("fp-laptop".into()),
+                name: "build".into(),
+                instance_id: "remote-instance".into(),
+            },
+            None,
+            "client".into(),
+            1,
+            b"input".to_vec(),
+            now,
+        ));
+        let batch = ui.input_queue.begin_due(now).unwrap();
+        ui.input_queue
+            .finish(batch.seq, SendOutcome::IoFailure(hostile.into()), now);
+
+        let frame = ui.render(80, 24, "", &clock);
+
+        assert_remote_text_is_safe(&frame);
+        assert!(frame.contains("tailtext"), "{frame:?}");
+        assert!(!frame.contains("tail\rtext"), "{frame:?}");
+    }
+
+    #[test]
+    fn remote_cell_text_cannot_inject_terminal_controls_into_the_frame() {
+        let clock = ManualClock::new();
+        let mut screen = remote_screen_rows(1);
+        screen.cells[0][0].text =
+            "tail\rtext ordinary \u{1b}[31mred\u{1b}[0m \u{1b}]0;pwn\u{7} \u{1b}]2;title\u{1b}\\"
+                .into();
+        let ui = selected_remote_ui(&clock, screen);
+
+        let rendered = ui.render(80, 24, "", &clock);
+        let terminal_input = terminal_frame(&rendered);
+        assert!(terminal_input.contains("tailtext ordinary"));
+        assert!(rendered.contains("tailtext"), "{rendered:?}");
+        assert!(!rendered.contains("tail\rtext"), "{rendered:?}");
+        assert!(
+            terminal_input
+                .match_indices('\r')
+                .all(|(index, _)| { terminal_input.as_bytes().get(index + 1) == Some(&b'\n') }),
+            "terminal frame contains a lone carriage return: {terminal_input:?}"
+        );
+        assert!(
+            !terminal_input
+                .chars()
+                .any(|character| character.is_control() && !matches!(character, '\r' | '\n')),
+            "{terminal_input:?}"
+        );
+
+        let output = present(None, parsed_frame(&rendered, 80, 24).screen());
+        assert!(
+            output.windows(2).any(|bytes| bytes == b"\x1b["),
+            "TUI styling is retained"
+        );
     }
 
     #[test]
