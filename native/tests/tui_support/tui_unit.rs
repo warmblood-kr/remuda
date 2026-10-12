@@ -203,8 +203,14 @@ fn row(name: &str, alive: bool, attached: bool) -> SessionSummary {
     }
 }
 
-fn make_ui(rows: Vec<SessionSummary>) -> Ui {
+fn make_keymap_ui(rows: Vec<SessionSummary>) -> Ui {
     let mut ui = Ui::new(rows, "/bin/sh", None);
+    ui.set_keymap(crate::keybindings::Snapshot::from_json(r#"{"generation":1,"ready":true,"rows":[{"context":"session.list.browse","key":"l","action":"session.toggle_list","help":"list"}]}"#).unwrap());
+    ui
+}
+
+fn make_ui(rows: Vec<SessionSummary>) -> Ui {
+    let mut ui = make_keymap_ui(rows);
     // Unit fixtures use the same row contract the Lua renderer publishes.
     ui.session_rows = 3;
     ui.preview_rows = 23;
@@ -1408,7 +1414,6 @@ fn the_preview_claims_what_the_widest_session_needs() {
 #[test]
 fn a_shown_list_fits_its_content_without_overriding_a_manual_width() {
     let mut ui = make_ui(vec![row("short", true, false)]);
-    ui.set_keymap(crate::keybindings::Snapshot::from_json(r#"{"generation":1,"ready":true,"rows":[{"context":"session.list.browse","key":"l","action":"session.toggle_list","help":"list"}]}"#).unwrap());
     ui.sessions_text = vec![
         "\x1b[1mshort\x1b[0m".into(),
         "a rendered detail row that is longer".into(),
@@ -3265,7 +3270,7 @@ fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_sessio
 
     // No sessions buffer yet: `list_row` falls back to the bare name, which
     // keeps this oracle about the right pane rather than Lua's list styling.
-    let ui = Ui::new(vec![row("alpha", true, false)], "/bin/sh", None);
+    let ui = make_keymap_ui(vec![row("alpha", true, false)]);
     // rows=25, not 24: the pty is a real 24-row screen (`Size::MIN_ROWS`
     // floors it there), and `body = rows - 1` is what the bottom-anchored
     // crop keeps — 24 would drop row 0, exactly where "hello" printed.

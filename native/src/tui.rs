@@ -2469,7 +2469,7 @@ fn footer(ui: &Ui, server: &str, cut: bool, preview_w: u16, cols: u16) -> String
         }
         Mode::Browse => match &ui.notice {
             Some(notice) => format!("remuda: {notice}"),
-            None if ui.sessions.is_empty() => format!("n new   {binding_help}   q quit"),
+            None if ui.sessions.is_empty() => "n new   q quit".into(),
             None if cut => {
                 format!("↑↓/jk ⏎ enter n new {binding_help} q quit · showing {preview_w}")
             }
@@ -3662,7 +3662,20 @@ mod keybindings_adopter_tests {
     use super::*;
 
     fn remapped() -> Ui {
-        let mut ui = Ui::new(Vec::new(), "sh", None);
+        let sessions = vec![SessionSummary {
+            id: "synthetic".into(),
+            name: "test".into(),
+            instance_id: Some("synthetic-instance".into()),
+            output_version: Some(0),
+            alive: true,
+            idle: Duration::ZERO,
+            output_idle: Some(Duration::ZERO),
+            size: Size::new(80, 24),
+            attached: false,
+            human_idle: None,
+            mouse_tracking: false,
+        }];
+        let mut ui = Ui::new(sessions, "sh", None);
         ui.set_keymap(crate::keybindings::Snapshot::from_json(r#"{"generation":2,"ready":true,"rows":[{"context":"session.list.browse","key":"M-l","action":"session.toggle_list","help":"list"}]}"#).unwrap());
         ui
     }
@@ -3692,9 +3705,10 @@ mod keybindings_adopter_tests {
     #[test]
     fn keybindings_adopter_help_uses_the_dispatch_snapshot() {
         let mut ui = remapped();
-        // Empty-list help still comes from the effective declaration.
+        // A populated browse list uses the effective help in both layouts.
         ui.notice = None;
         assert!(footer(&ui, "test", false, 80, 180).contains("M-l list"));
+        assert!(footer(&ui, "test", true, 63, 180).contains("M-l list"));
         assert_eq!(ui.keymap.help(crate::keybindings::LIST_CONTEXT), "M-l list");
         ui.keymap.diagnostic = Some("bad init.lua".into());
         assert!(footer(&ui, "test", false, 80, 180).contains("bad init.lua"));
