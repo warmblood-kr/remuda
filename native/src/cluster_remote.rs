@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 pub const MAX_REMOTE_WORKERS: usize = 8;
 pub const REMOTE_SYNC_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Gap after a selected session's Sync returns before the next one (#622).
+/// Sync long-polls, so a quiet session still costs one request per timeout.
+const SELECTED_SYNC_SPACING: Duration = Duration::from_millis(150);
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
@@ -200,6 +203,16 @@ pub trait RemoteTransport: Send + Sync + 'static {
         selected_session: Option<&str>,
         previous: &[RemoteSessionSnapshot],
     ) -> io::Result<Vec<RemoteSessionSnapshot>>;
+
+    /// Sync only the selected session against `previous`, without a List.
+    fn sync_selected(
+        &self,
+        target: &RemoteTarget,
+        selected_session: &str,
+        previous: &[RemoteSessionSnapshot],
+    ) -> io::Result<Vec<RemoteSessionSnapshot>> {
+        self.poll_node(target, Some(selected_session), previous)
+    }
 }
 
 pub struct RemoteNode {
@@ -211,6 +224,7 @@ pub struct RemoteNode {
     failure_count: u32,
     last_error: Option<String>,
     next_poll: Instant,
+    next_list: Instant,
     polling: bool,
 }
 
@@ -230,6 +244,7 @@ impl RemoteNode {
             failure_count: 0,
             last_error: None,
             next_poll: now,
+            next_list: now,
             polling: false,
         }
     }
@@ -246,13 +261,43 @@ impl RemoteNode {
     }
 
     pub fn poll_succeeded(&mut self, sessions: Vec<RemoteSessionSnapshot>, now: Instant) {
+        self.poll_delivered(sessions, now, true, None);
+    }
+
+    /// Record a successful poll. A selected session that can be synced is
+    /// polled again after the spacing; List and other nodes keep the interval.
+    pub fn poll_delivered(
+        &mut self,
+        sessions: Vec<RemoteSessionSnapshot>,
+        now: Instant,
+        listed: bool,
+        selected: Option<&str>,
+    ) {
+        if listed {
+            self.next_list = now + POLL_INTERVAL;
+        }
+        let follow = selected.is_some_and(|name| {
+            sessions
+                .iter()
+                .any(|session| session.name == name && session.alive && should_sync(Some(session)))
+        });
         self.sessions = sessions;
         self.last_sync = Some(now);
         self.failure_count = 0;
         self.last_error = None;
-        self.next_poll = now + POLL_INTERVAL;
+        self.next_poll = now
+            + if follow {
+                SELECTED_SYNC_SPACING
+            } else {
+                POLL_INTERVAL
+            };
         self.polling = false;
         self.state = RemoteState::Reachable;
+    }
+
+    /// Whether the next poll must List again rather than only Sync.
+    pub fn list_due(&self, now: Instant) -> bool {
+        now >= self.next_list
     }
 
     pub fn poll_failed(&mut self, now: Instant) {
@@ -551,6 +596,75 @@ impl RemoteTransport for ClusterRemoteTransport {
         }
         Ok(snapshots)
     }
+
+    fn sync_selected(
+        &self,
+        target: &RemoteTarget,
+        selected_session: &str,
+        previous: &[RemoteSessionSnapshot],
+    ) -> io::Result<Vec<RemoteSessionSnapshot>> {
+        match self.sync_prior(target, selected_session, previous)? {
+            Some(sessions) => Ok(sessions),
+            // No syncable prior, a restart, or another reply: a full poll sorts it out.
+            None => self.poll_node(target, Some(selected_session), previous),
+        }
+    }
+}
+
+impl ClusterRemoteTransport {
+    fn sync_prior(
+        &self,
+        target: &RemoteTarget,
+        selected_session: &str,
+        previous: &[RemoteSessionSnapshot],
+    ) -> io::Result<Option<Vec<RemoteSessionSnapshot>>> {
+        let Some(prior) = previous
+            .iter()
+            .find(|old| old.alive && old.name == selected_session && should_sync(Some(old)))
+        else {
+            return Ok(None);
+        };
+        let resolved = (self.resolve)(target)?;
+        let response = self.request(
+            &resolved,
+            &Request::Sync {
+                name: prior.wire_name.clone(),
+                instance_id: Some(prior.instance_id.clone()),
+                since: prior.output_version.unwrap_or_default(),
+                timeout_ms: REMOTE_SYNC_TIMEOUT.as_millis() as u64,
+            },
+        )?;
+        let Response::Sync {
+            instance_id,
+            output_version,
+            snapshot,
+        } = response
+        else {
+            return Ok(None);
+        };
+        if instance_id != prior.instance_id {
+            return Ok(None);
+        }
+        let updated = RemoteSessionSnapshot {
+            output_version: Some(output_version),
+            bracketed_paste: snapshot.bracketed_paste,
+            screen: Some(to_screen_snapshot(snapshot)),
+            last_error: None,
+            ..prior.clone()
+        };
+        Ok(Some(
+            previous
+                .iter()
+                .map(|old| {
+                    if old == prior {
+                        updated.clone()
+                    } else {
+                        old.clone()
+                    }
+                })
+                .collect(),
+        ))
+    }
 }
 
 fn listed_instance_id(session: &remuda_core::registry::SessionSummary) -> Option<String> {
@@ -844,9 +958,11 @@ fn schedule_remote_poll(
     let Some(permit) = workers.acquire(target.registry_key.clone()) else {
         return Ok(false);
     };
-    let Some(previous) = state
+    let Some((previous, listed)) = state
         .with_node(&target.registry_key, |node| {
-            node.begin_poll(Instant::now()).then(|| node.sessions())
+            let now = Instant::now();
+            node.begin_poll(now)
+                .then(|| (node.sessions(), node.list_due(now)))
         })
         .flatten()
     else {
@@ -861,10 +977,15 @@ fn schedule_remote_poll(
         .name(format!("remote-sync-{}", target.name))
         .spawn(move || {
             let _permit = permit;
-            let result = transport.poll_node(&target, selected_session.as_deref(), &previous);
+            let result = match selected_session.as_deref() {
+                Some(selected) if !listed => transport.sync_selected(&target, selected, &previous),
+                selected => transport.poll_node(&target, selected, &previous),
+            };
             let now = Instant::now();
             let _ = state.with_node(&target.registry_key, |node| match result {
-                Ok(sessions) => node.poll_succeeded(sessions, now),
+                Ok(sessions) => {
+                    node.poll_delivered(sessions, now, listed, selected_session.as_deref())
+                }
                 Err(error) => node.poll_failed_with_reason(now, Some(error.to_string())),
             });
         });
@@ -1235,6 +1356,200 @@ mod tests {
         assert!(!node.begin_poll(start + Duration::from_millis(999)));
         assert!(node.begin_poll(start + BACKOFF_BASE));
         assert_eq!(node.snapshot_at(start).state, RemoteState::Reconnecting);
+    }
+
+    /// Long-poll fake: a poll with a prior screen waits for a newer version.
+    struct LongPollTransport {
+        version: Mutex<u64>,
+        changed: Condvar,
+        /// Every poll bumps the version itself, as continuous output would.
+        busy: bool,
+        polls: Mutex<Vec<Instant>>,
+    }
+
+    impl LongPollTransport {
+        fn new(busy: bool) -> Arc<Self> {
+            Arc::new(Self {
+                version: Mutex::new(0),
+                changed: Condvar::new(),
+                busy,
+                polls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn bump(&self) {
+            *self.version.lock().unwrap() += 1;
+            self.changed.notify_all();
+        }
+    }
+
+    impl RemoteTransport for LongPollTransport {
+        fn poll_node(
+            &self,
+            _target: &RemoteTarget,
+            selected_session: Option<&str>,
+            previous: &[RemoteSessionSnapshot],
+        ) -> io::Result<Vec<RemoteSessionSnapshot>> {
+            self.polls.lock().unwrap().push(Instant::now());
+            let mut version = self.version.lock().unwrap();
+            if self.busy {
+                *version += 1;
+            }
+            let prior = previous.iter().find_map(|old| old.output_version);
+            if let (Some(_), Some(prior)) = (selected_session, prior) {
+                version = self
+                    .changed
+                    .wait_timeout_while(version, Duration::from_secs(5), |now| *now <= prior)
+                    .unwrap()
+                    .0;
+            }
+            let mut snapshot = session("proof", &format!("v{}", *version));
+            snapshot.output_version = Some(*version);
+            Ok(vec![snapshot])
+        }
+    }
+
+    fn start_selected(transport: Arc<LongPollTransport>) -> RemotePoller {
+        let target = RemoteTarget {
+            name: "laptop".into(),
+            registry_key: "fp-a".into(),
+            addr_override: None,
+        };
+        let poller = RemotePoller::new(vec![target], transport);
+        poller.selection().select("fp-a", "proof");
+        poller.start().unwrap();
+        poller
+    }
+
+    fn shown_version(poller: &RemotePoller) -> Option<u64> {
+        poller
+            .source()
+            .snapshot()
+            .nodes
+            .first()?
+            .sessions
+            .first()?
+            .output_version
+    }
+
+    fn wait_for_version(poller: &RemotePoller, at_least: u64, limit: Duration) -> Duration {
+        let start = Instant::now();
+        while shown_version(poller).is_none_or(|version| version < at_least) {
+            assert!(
+                start.elapsed() < limit,
+                "version {at_least} not shown in {limit:?}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        start.elapsed()
+    }
+
+    #[test]
+    fn a_change_soon_after_a_delivery_reaches_the_selected_session_at_once() {
+        let transport = LongPollTransport::new(false);
+        let poller = start_selected(Arc::clone(&transport));
+        wait_for_version(&poller, 0, Duration::from_secs(5));
+        // Today the next poll waits out POLL_INTERVAL: a change 0.5s later took ~1.5s.
+        std::thread::sleep(Duration::from_millis(500));
+        transport.bump();
+        let latency = wait_for_version(&poller, 1, Duration::from_secs(5));
+        assert!(
+            latency < Duration::from_millis(400),
+            "delivered after {latency:?}"
+        );
+    }
+
+    #[test]
+    fn continuous_output_keeps_selected_syncs_at_least_the_spacing_apart() {
+        let transport = LongPollTransport::new(true);
+        let poller = start_selected(Arc::clone(&transport));
+        wait_for_version(&poller, 1, Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(1500));
+        drop(poller);
+        let polls = transport.polls.lock().unwrap().clone();
+        let gaps: Vec<_> = polls.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert!(
+            gaps.iter().all(|gap| *gap >= Duration::from_millis(150)),
+            "gaps {gaps:?}"
+        );
+        // 1.5s at >= 150ms apart is at most ~11 polls; today's 2s interval gives 1.
+        assert!(
+            (4..=12).contains(&polls.len()),
+            "{} polls: {gaps:?}",
+            polls.len()
+        );
+    }
+
+    #[test]
+    fn selected_session_follows_the_spacing_while_list_and_other_nodes_keep_the_interval() {
+        let start = Instant::now();
+        let mut selected = RemoteNode::new("laptop", start);
+        assert!(selected.begin_poll(start) && selected.list_due(start));
+        selected.poll_delivered(vec![session("proof", "a")], start, true, Some("proof"));
+        assert_eq!(selected.retry_at(), start + SELECTED_SYNC_SPACING);
+        assert!(!selected.list_due(selected.retry_at()));
+        assert!(selected.list_due(start + POLL_INTERVAL));
+
+        let mut other = RemoteNode::new("desk", start);
+        assert!(other.begin_poll(start));
+        other.poll_delivered(vec![session("proof", "a")], start, true, None);
+        assert_eq!(other.retry_at(), start + POLL_INTERVAL);
+
+        let mut uncaptured = RemoteNode::new("tower", start);
+        assert!(uncaptured.begin_poll(start));
+        let mut listed_only = session("proof", "a");
+        listed_only.screen = None;
+        uncaptured.poll_delivered(vec![listed_only], start, true, Some("proof"));
+        assert_eq!(uncaptured.retry_at(), start + POLL_INTERVAL);
+    }
+
+    #[test]
+    fn busy_selected_session_syncs_often_but_lists_only_each_interval() {
+        #[derive(Default)]
+        struct Counting {
+            lists: Mutex<usize>,
+            syncs: Mutex<usize>,
+        }
+
+        impl RemoteTransport for Counting {
+            fn poll_node(
+                &self,
+                _target: &RemoteTarget,
+                _selected_session: Option<&str>,
+                _previous: &[RemoteSessionSnapshot],
+            ) -> io::Result<Vec<RemoteSessionSnapshot>> {
+                *self.lists.lock().unwrap() += 1;
+                Ok(vec![session("proof", "listed")])
+            }
+
+            fn sync_selected(
+                &self,
+                _target: &RemoteTarget,
+                _selected_session: &str,
+                _previous: &[RemoteSessionSnapshot],
+            ) -> io::Result<Vec<RemoteSessionSnapshot>> {
+                *self.syncs.lock().unwrap() += 1;
+                Ok(vec![session("proof", "synced")])
+            }
+        }
+
+        let transport = Arc::new(Counting::default());
+        let target = RemoteTarget {
+            name: "laptop".into(),
+            registry_key: "fp-a".into(),
+            addr_override: None,
+        };
+        let poller = RemotePoller::new(vec![target], transport.clone());
+        poller.selection().select("fp-a", "proof");
+        poller.start().unwrap();
+        std::thread::sleep(Duration::from_millis(2500));
+        drop(poller);
+        let (lists, syncs) = (
+            *transport.lists.lock().unwrap(),
+            *transport.syncs.lock().unwrap(),
+        );
+        assert!((1..=2).contains(&lists), "{lists} lists in 2.5s");
+        assert!(syncs >= 4, "{syncs} syncs in 2.5s");
     }
 
     #[test]
