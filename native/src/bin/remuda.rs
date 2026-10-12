@@ -553,6 +553,10 @@ enum ClusterCommand {
         bind_addr: Option<std::net::SocketAddr>,
     },
     Nodes,
+    Alias {
+        target: String,
+        alias: Option<String>,
+    },
     Control(bool),
     Revoke {
         target: String,
@@ -612,6 +616,17 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
         "invite" => parse_cluster_invite(rest),
         "join" => parse_cluster_join(rest),
         "nodes" => parse_cluster_nodes(rest),
+        "alias" => match rest {
+            [target, "--clear"] => Ok(ClusterCommand::Alias {
+                target: (*target).into(),
+                alias: None,
+            }),
+            [target, alias] if !alias.starts_with('-') => Ok(ClusterCommand::Alias {
+                target: (*target).into(),
+                alias: Some((*alias).into()),
+            }),
+            _ => Err("expected NODE|FINGERPRINT ALIAS or NODE|FINGERPRINT --clear".into()),
+        },
         "control" => parse_cluster_control(rest),
         "revoke" => parse_cluster_revoke(rest),
         "remote" => parse_cluster_remote(rest),
@@ -625,7 +640,16 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
 fn cluster_verb_known(verb: &str) -> bool {
     matches!(
         verb,
-        "init" | "invite" | "join" | "nodes" | "control" | "revoke" | "remote" | "listen" | "call"
+        "init"
+            | "invite"
+            | "join"
+            | "nodes"
+            | "alias"
+            | "control"
+            | "revoke"
+            | "remote"
+            | "listen"
+            | "call"
     )
 }
 
@@ -893,12 +917,13 @@ pub fn cluster_usage(verb: &str) -> String {
         "invite" => format!("usage: remuda cluster invite [--bind IP[:PORT]] [--addr IP[:PORT]] (default port {CLUSTER_DEFAULT_PORT})\nexample: remuda cluster invite\n"),
         "join" => format!("usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' (FINGERPRINT required when not on a terminal) [--bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})]\nexample: remuda cluster join 'remuda-join-v1 …'\n"),
         "nodes" => "usage: remuda cluster nodes\nexample: remuda cluster nodes\n".into(),
+        "alias" => "usage: remuda cluster alias NODE|FINGERPRINT ALIAS|--clear\nAliases are local display labels; use the node id or fingerprint for commands.\nexample: remuda cluster alias node-abcd1234 macbook\n".into(),
         "revoke" => "usage: remuda cluster revoke NODE|FINGERPRINT [--yes]\nexample: remuda cluster revoke node-abcd1234\n".into(),
         "control" => "usage: remuda cluster control on|off\nexample: remuda cluster control off\n".into(),
         "remote" => "usage: remuda cluster remote [NODE/SESSION]\nexample: remuda cluster remote\n".into(),
         "listen" => format!("usage: remuda cluster listen [--bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})] [--allow-public] [--foreground]\nusage: remuda cluster listen --off\nexample: remuda cluster listen\n"),
         "call" => format!("usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--json]\nexample: remuda cluster call node-abcd1234 list --addr 192.0.2.1\n"),
-        _ => "usage: remuda cluster <command>\n  init\n    creates identity; opens listener for cluster nodes on private LAN port 7441 by default\n    --no-listen skips opening it; listen --off stops it; listen --bind IP[:PORT] limits its address\n  invite\n  join\n  nodes\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n".into(),
+        _ => "usage: remuda cluster <command>\n  init\n    creates identity; opens listener for cluster nodes on private LAN port 7441 by default\n    --no-listen skips opening it; listen --off stops it; listen --bind IP[:PORT] limits its address\n  invite\n  join\n  nodes\n  alias\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n".into(),
     }
 }
 
@@ -928,6 +953,15 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             Err(error) => fail(format!("cluster nodes: {error}")),
         },
         ClusterCommand::Revoke { target, yes } => cluster_revoke(&target, yes),
+        ClusterCommand::Alias { target, alias } => {
+            match remuda_native::cluster::control::set_node_alias(&target, alias.as_deref()) {
+                Ok(()) => {
+                    println!("Local node alias updated.");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => fail(format!("cluster alias: {error}")),
+            }
+        }
         ClusterCommand::Control(enabled) => {
             match remuda_native::cluster::control::set_enabled(enabled) {
                 Ok(()) => {
@@ -938,7 +972,18 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             }
         }
         ClusterCommand::Remote(target) => {
-            let node = remote_node_label(remuda_native::hostname::hostname);
+            let node = match (
+                remuda_native::cluster::nodes(),
+                remuda_native::cluster::control::node_aliases(),
+            ) {
+                (Ok(Some((identity, _))), Ok(aliases))
+                    if aliases.contains_key(&identity.node_fp) =>
+                {
+                    remuda_native::cluster::display_node_label(&identity.node_fp, &aliases)
+                }
+                (_, Err(error)) => return fail(format!("cluster remote: {error}")),
+                _ => remote_node_label(remuda_native::hostname::hostname),
+            };
             cluster_remote(server, path, &node, target.as_deref())
         }
         ClusterCommand::ListenOff => cluster_listen_off(server, path),
@@ -2707,7 +2752,9 @@ fn write_nodes_table<W: Write>(
     identity: &remuda_native::cluster::NodeIdentity,
     registry: &remuda_native::cluster::Registry,
 ) -> std::io::Result<()> {
-    let table = remuda_native::cluster::format_nodes_table(identity, registry);
+    let aliases = remuda_native::cluster::control::node_aliases()?;
+    let table =
+        remuda_native::cluster::format_nodes_table_with_aliases(identity, registry, &aliases);
     match writer.write_all(table.as_bytes()) {
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         Err(error) => Err(error),
@@ -4260,6 +4307,18 @@ mod cluster_cli_tests {
     fn remote_node_label_uses_injected_os_hostname() {
         let label = super::remote_node_label(|| Ok("from-os".into()));
         assert_eq!(label, "from-os");
+    }
+
+    #[test]
+    fn node_alias_command_is_recognized_and_requires_a_value() {
+        assert!(matches!(
+            parse_cluster_command(&["alias", "node-abcd", "macbook"]),
+            ClusterCommand::Alias { .. }
+        ));
+        assert!(matches!(
+            parse_cluster_command(&["alias", "node-abcd"]),
+            ClusterCommand::Invalid { .. }
+        ));
     }
 
     #[test]

@@ -188,6 +188,14 @@ pub fn registry_targets(
     registry: &crate::cluster::Registry,
     local_fingerprint: &str,
 ) -> Vec<RemoteTarget> {
+    registry_targets_with_aliases(registry, local_fingerprint, &BTreeMap::new())
+}
+
+fn registry_targets_with_aliases(
+    registry: &crate::cluster::Registry,
+    local_fingerprint: &str,
+    aliases: &BTreeMap<String, String>,
+) -> Vec<RemoteTarget> {
     registry
         .authorized_nodes
         .iter()
@@ -195,7 +203,7 @@ pub fn registry_targets(
             entry.state == crate::cluster::NodeState::Admitted && entry.node_fp != local_fingerprint
         })
         .map(|entry| RemoteTarget {
-            name: crate::cluster::node_label(&entry.node_fp),
+            name: crate::cluster::display_node_label(&entry.node_fp, aliases),
             registry_key: entry.node_fp.clone(),
             addr_override: None,
         })
@@ -890,7 +898,8 @@ impl RemotePoller {
         registry: &crate::cluster::Registry,
         local_fingerprint: &str,
     ) -> io::Result<Self> {
-        let targets = registry_targets(registry, local_fingerprint);
+        let aliases = crate::cluster::control::node_aliases()?;
+        let targets = registry_targets_with_aliases(registry, local_fingerprint, &aliases);
         let transport: Arc<dyn RemoteTransport> = match ClusterRemoteTransport::system() {
             Ok(transport) => Arc::new(transport),
             Err(error) => Arc::new(UnavailableRemoteTransport(format!(
@@ -938,11 +947,18 @@ impl RemotePoller {
                     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                         if let Some(local_fingerprint) = &registry_fingerprint {
                             if last_registry_refresh.elapsed() >= Duration::from_secs(1) {
-                                if let Ok(Some((_, registry))) = crate::cluster::nodes() {
+                                if let (Ok(Some((_, registry))), Ok(aliases)) = (
+                                    crate::cluster::nodes(),
+                                    crate::cluster::control::node_aliases(),
+                                ) {
                                     reconcile_registry_targets(
                                         &state,
                                         &mut targets,
-                                        registry_targets(&registry, local_fingerprint),
+                                        registry_targets_with_aliases(
+                                            &registry,
+                                            local_fingerprint,
+                                            &aliases,
+                                        ),
                                     );
                                     cursor = cursor.min(targets.len().saturating_sub(1));
                                 }
@@ -1023,7 +1039,7 @@ fn reconcile_registry_targets(
     nodes.retain(|key, _| refreshed_keys.contains(key));
     let mut changed = nodes.len() != before;
     for target in &refreshed {
-        nodes.entry(target.registry_key.clone()).or_insert_with(|| {
+        let node = nodes.entry(target.registry_key.clone()).or_insert_with(|| {
             changed = true;
             RemoteNode::with_key(
                 target.registry_key.clone(),
@@ -1031,6 +1047,10 @@ fn reconcile_registry_targets(
                 Instant::now(),
             )
         });
+        if node.name != target.name {
+            node.name = target.name.clone();
+            changed = true;
+        }
     }
     // The scheduler reconciles every second; only a real change wakes viewers.
     if changed {
@@ -1335,8 +1355,33 @@ mod tests {
             ],
         };
         let targets = registry_targets(&registry, "local");
+        let aliases = BTreeMap::from([("admitted-fingerprint".into(), "macbook".into())]);
+        let aliased = super::registry_targets_with_aliases(&registry, "local", &aliases);
+        assert_eq!(aliased[0].registry_key, targets[0].registry_key);
+        assert_eq!(aliased[0].name, format!("macbook ({})", targets[0].name));
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].registry_key, "admitted-fingerprint");
+    }
+
+    #[test]
+    fn alias_refresh_updates_display_without_replacing_the_node() {
+        let state = RemoteTreeState::default();
+        let mut targets = Vec::new();
+        let mut target = RemoteTarget {
+            registry_key: "peer-fp".into(),
+            name: "old".into(),
+            addr_override: None,
+        };
+        super::reconcile_registry_targets(&state, &mut targets, vec![target.clone()]);
+        state.with_node("peer-fp", |node| node.last_error = Some("retained".into()));
+        let before = state.generation();
+        target.name = "macbook (old)".into();
+        super::reconcile_registry_targets(&state, &mut targets, vec![target]);
+        assert!(state.generation() > before);
+        state.with_node("peer-fp", |node| {
+            assert_eq!(node.name, "macbook (old)");
+            assert_eq!(node.last_error.as_deref(), Some("retained"));
+        });
     }
 
     #[test]

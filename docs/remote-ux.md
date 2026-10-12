@@ -2,7 +2,9 @@
 
 Remote mode continues the existing Remuda TUI: the list stays on the left and the selected session stays on the right. The difference is that the left side becomes a virtual tree of nodes and their sessions, addressed as `node/session`. The selected remote screen keeps refreshing over short requests and survives network loss. There is no separate remote-client look. The name `control tower` remains reserved for a later composed multi-node control experience.
 
-The command tree is `remuda cluster init`, `remuda cluster join [FINGERPRINT] <line>`, `remuda cluster nodes`, `remuda cluster revoke <node>`, and `remuda cluster remote [node/session]`. A terminal join may omit `FINGERPRINT`; outside a terminal, provide a fingerprint checked independently with the inviting machine. Example addresses, fingerprints, tokens, and output are illustrative.
+The command tree is `remuda cluster init`, `remuda cluster join [FINGERPRINT] <line>`, `remuda cluster nodes`, `remuda cluster alias NODE|FINGERPRINT ALIAS|--clear`, `remuda cluster revoke <node>`, and `remuda cluster remote [node/session]`. A terminal join may omit `FINGERPRINT`; outside a terminal, provide a fingerprint checked independently with the inviting machine. Example addresses, fingerprints, tokens, and output are illustrative.
+
+Assign a friendly label with `remuda cluster alias node-abcd1234 macbook`, or remove it with `remuda cluster alias node-abcd1234 --clear`. Aliases persist only on the machine where assigned, and appear beside the original node id in `cluster nodes` and `cluster remote`. The remote tree refreshes peer aliases while open; reopen it to refresh the local label. Use the original node id or full fingerprint for commands. Aliases do not change membership, routing, or authentication, and duplicate aliases are allowed. Labels accept 1–64 UTF-8 bytes without terminal controls, slash, or surrounding whitespace; all local settings together retain their 4 KiB limit.
 
 ## Journey 0: form a cluster
 

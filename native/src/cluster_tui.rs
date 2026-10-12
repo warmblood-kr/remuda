@@ -1749,7 +1749,7 @@ impl ClusterUi {
         let Some((node, session)) = target.split_once('/') else {
             return Err(io::Error::other("target must be node/session"));
         };
-        if node != self.node {
+        if node != self.node && !self.node.ends_with(&format!("({node})")) {
             let exact = self
                 .remote_snapshot
                 .nodes
@@ -1758,11 +1758,10 @@ impl ClusterUi {
             let remote = if let Some(exact) = exact {
                 exact
             } else {
-                let mut matches = self
-                    .remote_snapshot
-                    .nodes
-                    .iter()
-                    .filter(|snapshot| snapshot.name == node);
+                let mut matches = self.remote_snapshot.nodes.iter().filter(|snapshot| {
+                    snapshot.name == node
+                        || crate::cluster::node_label(&snapshot.registry_key) == node
+                });
                 let remote = matches
                     .next()
                     .ok_or_else(|| io::Error::other(format!("node {node} was not found")))?;
@@ -2944,6 +2943,17 @@ mod tests {
 
     fn selected_remote_ui(clock: &ManualClock, screen: ScreenSnapshot) -> ClusterUi {
         selected_remote_ui_with_bracketed_paste(clock, screen, true)
+    }
+
+    #[test]
+    fn aliased_remote_node_still_accepts_its_original_id_and_fingerprint() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("body"));
+        let node_id = crate::cluster::node_label("fp-laptop");
+        ui.remote_snapshot.nodes[0].name = format!("macbook ({node_id})");
+        ui.select_target(Some(&format!("{node_id}/build"))).unwrap();
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        assert!(ui.render(80, 24, "", &clock).contains("macbook"));
     }
 
     fn selected_remote_ui_with_bracketed_paste(
