@@ -2443,7 +2443,7 @@ fn select_target_with_remote_wait(
 
 #[cfg(test)]
 mod tests {
-    use super::queue::{QueueEvent, QueueState, MAX_IO_RETRIES};
+    use super::queue::{InputTarget, QueueEvent, QueueState, SendOutcome, MAX_IO_RETRIES};
     use super::{
         is_attention, normalized_terminal_size, present, remote_state_label, render_badge,
         resize_requires_full_repaint, select_target_with_remote_wait, terminal_frame,
@@ -2987,6 +2987,36 @@ mod tests {
             Ok(Response::Error(hostile.into())),
             clock.now(),
         );
+        let frame = ui.render(80, 24, "", &clock);
+
+        assert_remote_text_is_safe(&frame);
+        assert!(frame.contains("tailtext"), "{frame:?}");
+        assert!(!frame.contains("tail\rtext"), "{frame:?}");
+    }
+
+    #[test]
+    fn remote_input_error_status_is_safe_in_the_rendered_frame() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let now = Instant::now();
+        let hostile =
+            "tail\rtext \u{1b}[31mred\u{1b}[0m \u{1b}]0;title\u{7} \u{1b}]2;title\u{1b}\\";
+        assert!(ui.input_queue.enqueue_target(
+            InputTarget {
+                remote_node: Some("fp-laptop".into()),
+                name: "build".into(),
+                instance_id: "remote-instance".into(),
+            },
+            None,
+            "client".into(),
+            1,
+            b"input".to_vec(),
+            now,
+        ));
+        let batch = ui.input_queue.begin_due(now).unwrap();
+        ui.input_queue
+            .finish(batch.seq, SendOutcome::IoFailure(hostile.into()), now);
+
         let frame = ui.render(80, 24, "", &clock);
 
         assert_remote_text_is_safe(&frame);
