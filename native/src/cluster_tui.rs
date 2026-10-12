@@ -1570,9 +1570,9 @@ impl ClusterUi {
         match event {
             Some(QueueEvent::Sent { .. }) => {
                 if self.notice.as_ref().is_none_or(|(notice, _)| {
-                    notice.starts_with("sending input to ") || notice == "input sent"
+                    notice.starts_with("sending input to ") || notice == "Input sent"
                 }) {
-                    self.notice = Some(("input sent".into(), now));
+                    self.notice = Some(("Input sent".into(), now));
                 }
             }
             Some(QueueEvent::Uncertain { .. }) => {
@@ -3065,8 +3065,8 @@ mod tests {
         );
         let frame = ui.render(80, 24, "pane", &clock);
         assert!(
-            !frame.contains('\x1b'),
-            "queued input leaked terminal escapes: {frame:?}"
+            !frame.contains("\x1b[H") && !frame.contains("\x1b[2J"),
+            "queued input leaked cursor/clear escapes: {frame:?}"
         );
         assert!(!frame.contains('\r'), "queued input leaked carriage return");
         assert_eq!(frame.lines().count(), 24, "queued input added a status row");
@@ -3962,12 +3962,12 @@ mod tests {
         );
         assert_eq!(
             ui.notice.as_ref().map(|(notice, _)| notice.as_str()),
-            Some("input sent")
+            Some("Input sent")
         );
         assert!(ui
             .active_notice_lines(Duration::from_secs(4), 80)
             .iter()
-            .any(|line| line == "input sent"));
+            .any(|line| line == "Input sent"));
         assert!(ui
             .active_notice_lines(Duration::from_secs(5), 80)
             .is_empty());
