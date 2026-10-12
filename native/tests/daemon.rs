@@ -7123,19 +7123,36 @@ fn a_socket_replaced_during_startup_survives_the_daemon_shutdown() {
 
     let dir = unique_scratch_dir("startup-swap");
     let socket = daemon::socket_path_in(&dir, "s");
+    let pause = Duration::from_secs(2);
     let mut command = spawn::base_command(&dir);
-    command.env("REMUDA_TEST_STARTUP_PAUSE_MS", "2000");
+    command.env(
+        "REMUDA_TEST_STARTUP_PAUSE_MS",
+        pause.as_millis().to_string(),
+    );
     let mut daemon = Daemon(command.spawn().expect("spawn daemon"));
     let deadline = Instant::now() + PATIENCE;
-    while std::fs::symlink_metadata(&socket).is_err() {
+    let original_ino = loop {
+        if let Ok(metadata) = std::fs::symlink_metadata(&socket) {
+            break metadata.ino();
+        }
         assert!(Instant::now() < deadline, "daemon never bound {socket:?}");
         std::thread::sleep(Duration::from_millis(5));
-    }
+    };
+    let bound_at = Instant::now();
     std::fs::remove_file(&socket).expect("remove the daemon's socket");
     let replacement = UnixListener::bind(&socket).expect("bind replacement");
     let replacement_ino = std::fs::symlink_metadata(&socket)
         .expect("replacement")
         .ino();
+    // Otherwise the swap missed the window and the verdict below means nothing.
+    assert!(
+        bound_at.elapsed() < pause,
+        "swap landed after the startup pause"
+    );
+    assert_ne!(
+        replacement_ino, original_ino,
+        "replacement reused the inode"
+    );
 
     // Handled only once startup is done, so after the daemon records its owner.
     let signalled = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
