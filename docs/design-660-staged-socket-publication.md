@@ -1,7 +1,8 @@
 # Staged daemon socket publication (#660)
 
-Design proposal; no implementation or runtime validation. Code references are
-at `aeed1a881994b19e00cf22f0a521a12dc18e90c0`, not PR #674's head.
+Historical design-review scope (docs-only revision): this was a proposal with
+no implementation or runtime validation at that time. Code references are at
+`aeed1a881994b19e00cf22f0a521a12dc18e90c0`, not PR #674's head.
 **Fact** means inspected source/documentation; **proposal** and **inference**
 describe intended behavior and its assumptions. The review input was the SEC
 review of #674 (head 0334208d). This revision incorporates the three MUSTs and
@@ -361,6 +362,7 @@ retain response-or-clean-close for old queued clients and bounded signal exit
 also hold publication under lifecycle synchronization to prove cleanup cannot
 observe an intermediate generation.
 
-No runtime tests or Cargo jobs were run for this docs-only revision. Static
-whitespace/link checks do not certify the platform matrix, RED/GREEN behavior,
-or the outstanding Butler/owner scope acceptance.
+Historical design-review scope: no runtime tests or Cargo jobs were run for
+that docs-only revision. Static whitespace/link checks did not certify the
+platform matrix, RED/GREEN behavior, or the outstanding Butler/owner scope
+acceptance.

@@ -373,10 +373,10 @@ struct StagedTransaction {
 
 impl StagedTransaction {
     fn new(parent: File, source: OsString, receipt: NodeReceipt) -> io::Result<Self> {
-        if !receipt.matches(&parent, &source) {
+        if receipt.kind != NodeKind::Socket || !receipt.matches(&parent, &source) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "staging receipt does not match",
+                "staging receipt is not a matching socket",
             ));
         }
         Ok(Self {
@@ -388,10 +388,12 @@ impl StagedTransaction {
     }
 
     fn publish(mut self, destination: &OsStr) -> io::Result<NodeReceipt> {
-        if !self.receipt.matches(&self.parent, &self.source) {
+        if self.receipt.kind != NodeKind::Socket
+            || !self.receipt.matches(&self.parent, &self.source)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "staging receipt changed before rename",
+                "staging receipt is not a matching socket before rename",
             ));
         }
         rename_noreplace(&self.parent, &self.source, destination)?;
@@ -402,7 +404,7 @@ impl StagedTransaction {
 
 impl Drop for StagedTransaction {
     fn drop(&mut self) {
-        if !self.committed {
+        if !self.committed && self.receipt.kind == NodeKind::Socket {
             let _ = unlink_if_matches(&self.parent, &self.source, self.receipt);
         }
     }
