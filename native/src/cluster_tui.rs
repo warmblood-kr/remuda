@@ -1843,6 +1843,49 @@ fn present(prev: Option<&vt100::Screen>, next: &vt100::Screen) -> Vec<u8> {
     }
 }
 
+const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+const SYNC_END: &[u8] = b"\x1b[?2026l";
+
+/// Hand one frame to the terminal inside synchronized output (#621), attempting
+/// a single write call; a short write is continued. On failure, END is resent.
+fn write_frame(out: &mut impl Write, frame: &[u8]) -> io::Result<()> {
+    let mut bytes = Vec::with_capacity(SYNC_BEGIN.len() + frame.len() + SYNC_END.len());
+    bytes.extend_from_slice(SYNC_BEGIN);
+    bytes.extend_from_slice(frame);
+    bytes.extend_from_slice(SYNC_END);
+    let result = out.write_all(&bytes).and_then(|()| out.flush());
+    if result.is_err() {
+        let _ = out.write_all(SYNC_END);
+        let _ = out.flush();
+    }
+    result
+}
+
+/// Ends synchronized output when the TUI returns or unwinds, whatever the
+/// last frame write did.
+struct SyncReset<W: Write>(W);
+
+impl<W: Write> Drop for SyncReset<W> {
+    fn drop(&mut self) {
+        let _ = self.0.write_all(SYNC_END);
+        let _ = self.0.flush();
+    }
+}
+
+/// Stdout for frames. On Unix a duplicate of fd 1, bypassing the LineWriter
+/// that would split a frame at its last line feed; elsewhere buffered stdout.
+#[cfg(unix)]
+fn frame_writer() -> io::Result<Box<dyn Write>> {
+    use std::os::fd::AsFd as _;
+    let fd = io::stdout().as_fd().try_clone_to_owned()?;
+    Ok(Box::new(std::fs::File::from(fd)))
+}
+
+#[cfg(not(unix))]
+fn frame_writer() -> io::Result<Box<dyn Write>> {
+    Ok(Box::new(io::stdout()))
+}
+
 const MAX_TERMINAL_COLS: u16 = 512;
 const MAX_TERMINAL_ROWS: u16 = 256;
 const MAX_TERMINAL_CELLS: u32 = 131_072;
@@ -2208,6 +2251,7 @@ pub fn run_with_remote_selection_and_input(
     remote_input: Option<&dyn RemoteInputTransport>,
 ) -> io::Result<()> {
     let terminal_mode = RawMode::enable()?;
+    let sync_reset = SyncReset(io::stdout());
     let mut paste_capture = crate::tui::BracketedPasteCapture::new(io::stdout());
     let clock = crate::SystemClock::new();
     let result = {
@@ -2226,6 +2270,7 @@ pub fn run_with_remote_selection_and_input(
         )
     };
     drop(paste_capture);
+    drop(sync_reset);
     drop(terminal_mode);
     result
 }
@@ -2294,6 +2339,7 @@ fn run_loop(
         }
     }
     let mut previous = None;
+    let mut frames = frame_writer()?;
     loop {
         if let Ok(current) = list(path) {
             ui.sessions_synced(current, clock.now());
@@ -2340,8 +2386,9 @@ fn run_loop(
         next.process(format!("\x1b[H\x1b[2J{}", terminal_frame(&frame)).as_bytes());
         let output = present(previous.as_ref().map(vt100::Parser::screen), next.screen());
         if !output.is_empty() {
-            io::stdout().write_all(&output)?;
+            // Anything another writer left in stdout's buffer goes first.
             io::stdout().flush()?;
+            write_frame(&mut frames, &output)?;
         }
         previous = Some(next);
         ui.send_close_pending(path, remote_input, clock.now());
@@ -2486,6 +2533,138 @@ mod tests {
         .unwrap();
         assert!(!ready);
         assert_eq!(polls, 0, "no input wait once the snapshot already moved");
+    }
+
+    #[test]
+    fn a_frame_reaches_the_terminal_as_one_synchronized_write() {
+        #[derive(Default)]
+        struct Writes(Vec<Vec<u8>>);
+        impl std::io::Write for Writes {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.push(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let frame = present(None, parsed_frame("one\r\ntwo\r\nthree", 20, 4).screen());
+        assert!(frame.contains(&b'\n'), "a full repaint has line feeds");
+        let mut terminal = Writes::default();
+        super::write_frame(&mut terminal, &frame).unwrap();
+
+        assert_eq!(terminal.0.len(), 1, "one write call per frame");
+        let written = &terminal.0[0];
+        assert!(written.starts_with(b"\x1b[?2026h"), "{written:?}");
+        assert!(written.ends_with(b"\x1b[?2026l"), "{written:?}");
+        assert_eq!(&written[8..written.len() - 8], frame.as_slice());
+    }
+
+    /// Fails once in the chosen way, then records every later write.
+    struct FailingTerminal {
+        failure: Failure,
+        failed: bool,
+        written: Vec<Vec<u8>>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Failure {
+        AfterBegin,
+        WriteZero,
+        WouldBlock,
+        Flush,
+    }
+
+    impl std::io::Write for FailingTerminal {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.failed {
+                match self.failure {
+                    Failure::AfterBegin if bytes.starts_with(super::SYNC_BEGIN) => {
+                        self.written.push(super::SYNC_BEGIN.to_vec());
+                        return Ok(super::SYNC_BEGIN.len());
+                    }
+                    Failure::AfterBegin => {
+                        self.failed = true;
+                        return Err(std::io::Error::other("terminal went away"));
+                    }
+                    Failure::WriteZero => {
+                        self.failed = true;
+                        return Ok(0);
+                    }
+                    Failure::WouldBlock => {
+                        self.failed = true;
+                        return Err(std::io::ErrorKind::WouldBlock.into());
+                    }
+                    Failure::Flush => {}
+                }
+            }
+            self.written.push(bytes.to_vec());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if matches!(self.failure, Failure::Flush) && !self.failed {
+                self.failed = true;
+                return Err(std::io::Error::other("flush failed"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_frame_write_still_ends_synchronized_output() {
+        let frame = present(None, parsed_frame("one\r\ntwo", 20, 4).screen());
+        for failure in [
+            Failure::AfterBegin,
+            Failure::WriteZero,
+            Failure::WouldBlock,
+            Failure::Flush,
+        ] {
+            let mut terminal = FailingTerminal {
+                failure,
+                failed: false,
+                written: Vec::new(),
+            };
+            assert!(
+                super::write_frame(&mut terminal, &frame).is_err(),
+                "{failure:?}"
+            );
+            assert_eq!(
+                terminal.written.last().map(Vec::as_slice),
+                Some(super::SYNC_END),
+                "{failure:?}: {:?}",
+                terminal.written
+            );
+        }
+    }
+
+    #[test]
+    fn leaving_the_tui_ends_synchronized_output_on_return_and_on_panic() {
+        #[derive(Clone, Default)]
+        struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Shared {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let returned = Shared::default();
+        drop(super::SyncReset(returned.clone()));
+        assert_eq!(returned.0.lock().unwrap().as_slice(), super::SYNC_END);
+
+        let panicked = Shared::default();
+        let guard_output = panicked.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _reset = super::SyncReset(guard_output);
+            panic!("render failed");
+        });
+        assert!(result.is_err());
+        assert_eq!(panicked.0.lock().unwrap().as_slice(), super::SYNC_END);
     }
 
     #[test]
