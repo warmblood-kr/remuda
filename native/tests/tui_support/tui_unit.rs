@@ -2891,21 +2891,10 @@ fn scratch_socket(tag: &str) -> std::path::PathBuf {
     crate::daemon::socket_path_in(&dir, "s")
 }
 
-/// Starts a real daemon and returns once it actually answers — the same
-/// shape as `native/tests/daemon.rs`'s helper, kept local since a unit
-/// test needs `list`/`capture_styled` themselves, which are private.
+/// Starts a real daemon and returns once it answers, in scratch cluster state
+/// under the env lock like every in-process test daemon (#672).
 fn daemon_at(path: &std::path::Path) {
-    let serving = path.to_path_buf();
-    std::thread::spawn(move || {
-        if let Err(error) = crate::daemon::serve(&serving) {
-            panic!("test daemon failed to serve {serving:?}: {error}");
-        }
-    });
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while crate::ipc::connect(path).is_err() {
-        assert!(Instant::now() < deadline, "daemon never bound {path:?}");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    super::serve_in_scratch(path.parent().expect("socket has a parent"), path);
 }
 
 /// [MEASURED] `list` (the pane's own function, not a stand-in) must say a
