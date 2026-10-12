@@ -1202,6 +1202,55 @@ mod tests {
     }
 
     #[test]
+    fn insert_and_remove_advance_generation_after_mutating_the_node_set() {
+        let state = RemoteTreeState::default();
+        let now = Instant::now();
+        let inserted_generation = state.generation();
+        let nodes = state.nodes.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let insert_state = &state;
+        let insert = std::thread::scope(|scope| {
+            let insert = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                insert_state.insert_node(RemoteNode::new("laptop", now));
+            });
+            started_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            assert_eq!(state.generation(), inserted_generation);
+            drop(nodes);
+            insert.join().unwrap();
+        });
+        let _ = insert;
+        assert_eq!(state.generation(), inserted_generation + 1);
+        assert_eq!(state.snapshot().nodes.len(), 1);
+
+        let removed_generation = state.generation();
+        let nodes = state.nodes.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let remove = scope.spawn(|| {
+                started_tx.send(()).unwrap();
+                assert!(state.remove_node("laptop").is_some());
+            });
+            started_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            assert_eq!(state.generation(), removed_generation);
+            drop(nodes);
+            remove.join().unwrap();
+        });
+        assert_eq!(state.generation(), removed_generation + 1);
+        assert!(state.snapshot().nodes.is_empty());
+    }
+
+    #[test]
+    fn record_of_missing_node_does_not_advance_generation() {
+        let state = RemoteTreeState::default();
+        let generation = state.generation();
+        assert_eq!(state.record("missing", |_| ()), None);
+        assert_eq!(state.generation(), generation);
+    }
+
+    #[test]
     fn remote_names_and_screen_cells_strip_terminal_injection_controls() {
         let hostile_name = "x\u{1b}]0;pwn\u{7}\u{202e}";
         assert_eq!(display_name(hostile_name), "x]0;pwn");
