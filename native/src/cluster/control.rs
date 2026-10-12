@@ -1,5 +1,6 @@
 //! Local, nonreplicated cluster control settings.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
@@ -20,6 +21,59 @@ pub struct RevokedNotice {
 #[serde(deny_unknown_fields)]
 struct Settings {
     allow_remote_control: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    node_aliases: BTreeMap<String, String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            allow_remote_control: true,
+            node_aliases: BTreeMap::new(),
+        }
+    }
+}
+
+/// Read receiver-local display aliases; fingerprints remain routing identities.
+pub fn node_aliases() -> io::Result<BTreeMap<String, String>> {
+    Ok(settings_at(&super::storage::cluster_state_dir()?.join("cluster"))?.node_aliases)
+}
+
+/// Assign or clear a local display alias using a node id or full fingerprint.
+pub fn set_node_alias(target: &str, alias: Option<&str>) -> io::Result<()> {
+    let dir = super::storage::cluster_state_dir()?.join("cluster");
+    super::identity::load_identity_at(&dir)?;
+    super::storage::verify_directory(&dir)?;
+    let _guard = super::storage::StateLock::acquire(&dir)?;
+    let registry = super::registry::load_registry_at(&dir)?;
+    let node = super::resolve_node(&registry.authorized_nodes, target)?;
+    set_node_alias_at(&dir, &node.node_fp, alias)
+}
+
+fn valid_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.len() <= 64
+        && alias == alias.trim()
+        && !alias.contains('/')
+        && super::super::text::strip_terminal_controls(alias) == alias
+}
+
+fn set_node_alias_at(dir: &Path, fingerprint: &str, alias: Option<&str>) -> io::Result<()> {
+    let mut settings = settings_at(dir)?;
+    if let Some(alias) = alias {
+        if !valid_alias(alias) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "alias must be 1–64 bytes, without controls, slash or surrounding whitespace",
+            ));
+        }
+        settings
+            .node_aliases
+            .insert(fingerprint.into(), alias.into());
+    } else {
+        settings.node_aliases.remove(fingerprint);
+    }
+    save_settings_at(dir, &settings)
 }
 
 /// Return whether this node accepts remote control requests. Missing settings
@@ -137,6 +191,10 @@ pub(super) fn clear_revoked_notice_at(dir: &Path) -> io::Result<()> {
 
 /// Read the setting from one cluster state directory.
 pub fn enabled_at(dir: &Path) -> io::Result<bool> {
+    Ok(settings_at(dir)?.allow_remote_control)
+}
+
+fn settings_at(dir: &Path) -> io::Result<Settings> {
     use std::fs;
     #[cfg(not(windows))]
     use std::fs::OpenOptions;
@@ -144,7 +202,7 @@ pub fn enabled_at(dir: &Path) -> io::Result<bool> {
 
     match fs::symlink_metadata(dir) {
         Ok(_) => super::storage::verify_directory(dir)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Settings::default()),
         Err(error) => return Err(error),
     }
     let path = dir.join(SETTINGS_FILE);
@@ -159,14 +217,14 @@ pub fn enabled_at(dir: &Path) -> io::Result<bool> {
         }
         match options.open(&path) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Settings::default()),
             Err(error) => return Err(error),
         }
     };
     #[cfg(windows)]
     let file = match super::windows_security::open_for_read(&path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Settings::default()),
         Err(error) => return Err(error),
     };
     super::storage::check_private_file(&file, "cluster settings", &path)?;
@@ -184,17 +242,34 @@ pub fn enabled_at(dir: &Path) -> io::Result<bool> {
             "cluster settings exceed byte cap",
         ));
     }
-    serde_json::from_slice::<Settings>(&bytes)
-        .map(|settings| settings.allow_remote_control)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    let settings: Settings = serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if settings
+        .node_aliases
+        .values()
+        .any(|alias| !valid_alias(alias))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid node alias in cluster settings",
+        ));
+    }
+    Ok(settings)
 }
 
 /// Persist the setting in one cluster state directory.
 pub fn set_enabled_at(dir: &Path, value: bool) -> io::Result<()> {
+    super::storage::verify_directory(dir)?;
+    let _guard = super::storage::StateLock::acquire(dir)?;
+    let mut settings = settings_at(dir)?;
+    settings.allow_remote_control = value;
+    save_settings_at(dir, &settings)
+}
+
+fn save_settings_at(dir: &Path, settings: &Settings) -> io::Result<()> {
     use std::fs;
 
     super::storage::verify_directory(dir)?;
-    let _guard = super::storage::StateLock::acquire(dir)?;
     let path = dir.join(SETTINGS_FILE);
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -207,11 +282,14 @@ pub fn set_enabled_at(dir: &Path, value: bool) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let mut bytes = serde_json::to_vec(&Settings {
-        allow_remote_control: value,
-    })
-    .map_err(io::Error::other)?;
+    let mut bytes = serde_json::to_vec(settings).map_err(io::Error::other)?;
     bytes.push(b'\n');
+    if bytes.len() as u64 > SETTINGS_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cluster settings exceed byte cap",
+        ));
+    }
     super::storage::atomic_write(&path, &bytes)
 }
 
@@ -243,6 +321,49 @@ mod tests {
         let dir = cluster_dir();
         assert!(enabled_at(&dir).unwrap());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn node_alias_settings_preserve_remote_control_preference() {
+        let dir = cluster_dir();
+        super::super::storage::atomic_write(
+            &dir.join("settings.json"),
+            br#"{"allow_remote_control":false,"node_aliases":{"SHA256:peer":"macbook"}}"#,
+        )
+        .unwrap();
+        assert!(!enabled_at(&dir).unwrap());
+        set_enabled_at(&dir, true).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(saved["node_aliases"]["SHA256:peer"], "macbook");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn aliases_persist_clear_and_reject_terminal_controls_without_changing_settings() {
+        let dir = cluster_dir();
+        set_enabled_at(&dir, false).unwrap();
+        super::set_node_alias_at(&dir, "SHA256:peer", Some("맥북")).unwrap();
+        assert_eq!(
+            super::settings_at(&dir).unwrap().node_aliases["SHA256:peer"],
+            "맥북"
+        );
+        let before = std::fs::read(dir.join("settings.json")).unwrap();
+        for invalid in [
+            "",
+            " x",
+            "x/guest",
+            "x\x1b[31m",
+            "x\u{202e}",
+            &"a".repeat(65),
+        ] {
+            assert!(super::set_node_alias_at(&dir, "SHA256:peer", Some(invalid)).is_err());
+            assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), before);
+        }
+        super::set_node_alias_at(&dir, "SHA256:peer", None).unwrap();
+        assert!(super::settings_at(&dir).unwrap().node_aliases.is_empty());
+        assert!(!enabled_at(&dir).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

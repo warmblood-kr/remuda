@@ -714,7 +714,7 @@ fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
     );
     server_node.start_named_session(
         "proof",
-        "stty raw -echo; printf 'READY\\r\\n'; seen=0; while :; do byte=$(dd bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d ' '); case \"$byte\" in 13) printf '\\r\\ngot=enter\\r\\n' ;; 108) if [ \"$seen\" = 0 ]; then seen=1; printf '\\r\\ngot=payload\\r\\n'; fi ;; esac; done",
+        "stty raw -echo; printf 'READY\\r\\n'; seen=0; count=0; received=''; while :; do byte=$(dd bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d ' '); received=\"$received$byte,\"; count=$((count+1)); if [ \"$count\" = 11 ]; then printf '\\r\\nreceived=%s\\r\\n' \"$received\"; count=0; received=''; fi; case \"$byte\" in 13) printf '\\r\\ngot=enter\\r\\n' ;; 108) if [ \"$seen\" = 0 ]; then seen=1; printf '\\r\\ngot=payload\\r\\n'; fi ;; esac; done",
     );
 
     let registry_path = client_node
@@ -770,18 +770,21 @@ fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
         "Enter type · k keys · x close · q detach",
         Duration::from_secs(3),
     );
-    tui.wait_for_from(output_start, "sent ·", Duration::from_secs(10));
+    tui.wait_for_from(output_start, "Input sent", Duration::from_secs(10));
+    let payload = "received=108,105,110,101,49,13,108,105,110,101,50,";
+    tui.wait_for_from(output_start, payload, Duration::from_secs(10));
     let output = tui.output.lock().unwrap();
     let mut parser = vt100::Parser::new(24, 100, 0);
     parser.process(&output);
     let screen = parser.screen().contents();
-    let complete_paste_inputs = screen
-        .lines()
-        .filter(|line| line.contains("line1") && line.contains("line2"))
-        .count();
+    let complete_paste_inputs = screen.lines().filter(|line| line.contains(payload)).count();
     assert_eq!(
         complete_paste_inputs, 1,
-        "the completed paste should be one Input batch; screen:\n{screen}"
+        "the completed paste should arrive exactly once with all bytes intact; screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Input sent ·"),
+        "acknowledgement must omit command contents"
     );
 }
 

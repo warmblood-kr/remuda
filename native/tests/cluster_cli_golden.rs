@@ -492,7 +492,7 @@ fn cluster_help_output_is_routed_and_discloses_listener_controls() {
     let cases = [
         (
             &["cluster", "--help"][..],
-            "usage: remuda cluster <command>\n  init\n    creates identity; opens listener for cluster nodes on private LAN port 7441 by default\n    --no-listen skips opening it; listen --off stops it; listen --bind IP[:PORT] limits its address\n  invite\n  join\n  nodes\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n",
+            "usage: remuda cluster <command>\n  init\n    creates identity; opens listener for cluster nodes on private LAN port 7441 by default\n    --no-listen skips opening it; listen --off stops it; listen --bind IP[:PORT] limits its address\n  invite\n  join\n  nodes\n  alias\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n",
         ),
         (
             &["cluster", "init", "--help"][..],
@@ -519,7 +519,7 @@ fn cluster_help_verb_matches_verb_help_for_every_verb() {
     let scratch = Scratch::new();
     let mut failures = Vec::new();
     for verb in [
-        "init", "invite", "join", "nodes", "control", "revoke", "remote", "listen", "call",
+        "init", "invite", "join", "nodes", "alias", "control", "revoke", "remote", "listen", "call",
     ] {
         let expected = scratch.run(&["cluster", verb, "--help"]);
         let output = scratch.run(&["cluster", "help", verb]);

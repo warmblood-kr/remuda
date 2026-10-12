@@ -188,6 +188,14 @@ pub fn registry_targets(
     registry: &crate::cluster::Registry,
     local_fingerprint: &str,
 ) -> Vec<RemoteTarget> {
+    registry_targets_with_aliases(registry, local_fingerprint, &BTreeMap::new())
+}
+
+fn registry_targets_with_aliases(
+    registry: &crate::cluster::Registry,
+    local_fingerprint: &str,
+    aliases: &BTreeMap<String, String>,
+) -> Vec<RemoteTarget> {
     registry
         .authorized_nodes
         .iter()
@@ -195,7 +203,7 @@ pub fn registry_targets(
             entry.state == crate::cluster::NodeState::Admitted && entry.node_fp != local_fingerprint
         })
         .map(|entry| RemoteTarget {
-            name: crate::cluster::node_label(&entry.node_fp),
+            name: crate::cluster::display_node_label(&entry.node_fp, aliases),
             registry_key: entry.node_fp.clone(),
             addr_override: None,
         })
@@ -433,12 +441,13 @@ impl RemoteTreeState {
     }
 
     /// Like `with_node`, but moves the generation when what a viewer sees differs
-    /// from the last recorded view; bookkeeping, repeats or a removed node do not.
+    /// from the last recorded or current live view; bookkeeping and removed nodes do not.
     fn record<R>(&self, name: &str, f: impl FnOnce(&mut RemoteNode) -> R) -> Option<R> {
         let (result, changed) = self.with_node(name, |node| {
+            let before = node.view();
             let result = f(node);
             let view = node.view();
-            let changed = view != node.published;
+            let changed = view != node.published || view != before;
             node.published = view;
             (result, changed)
         })?;
@@ -892,7 +901,8 @@ impl RemotePoller {
         registry: &crate::cluster::Registry,
         local_fingerprint: &str,
     ) -> io::Result<Self> {
-        let targets = registry_targets(registry, local_fingerprint);
+        let aliases = crate::cluster::control::node_aliases()?;
+        let targets = registry_targets_with_aliases(registry, local_fingerprint, &aliases);
         let transport: Arc<dyn RemoteTransport> = match ClusterRemoteTransport::system() {
             Ok(transport) => Arc::new(transport),
             Err(error) => Arc::new(UnavailableRemoteTransport(format!(
@@ -940,11 +950,18 @@ impl RemotePoller {
                     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                         if let Some(local_fingerprint) = &registry_fingerprint {
                             if last_registry_refresh.elapsed() >= Duration::from_secs(1) {
-                                if let Ok(Some((_, registry))) = crate::cluster::nodes() {
+                                if let (Ok(Some((_, registry))), Ok(aliases)) = (
+                                    crate::cluster::nodes(),
+                                    crate::cluster::control::node_aliases(),
+                                ) {
                                     reconcile_registry_targets(
                                         &state,
                                         &mut targets,
-                                        registry_targets(&registry, local_fingerprint),
+                                        registry_targets_with_aliases(
+                                            &registry,
+                                            local_fingerprint,
+                                            &aliases,
+                                        ),
                                     );
                                     cursor = cursor.min(targets.len().saturating_sub(1));
                                 }
@@ -1025,7 +1042,7 @@ fn reconcile_registry_targets(
     nodes.retain(|key, _| refreshed_keys.contains(key));
     let mut changed = nodes.len() != before;
     for target in &refreshed {
-        nodes.entry(target.registry_key.clone()).or_insert_with(|| {
+        let node = nodes.entry(target.registry_key.clone()).or_insert_with(|| {
             changed = true;
             RemoteNode::with_key(
                 target.registry_key.clone(),
@@ -1033,6 +1050,10 @@ fn reconcile_registry_targets(
                 Instant::now(),
             )
         });
+        if node.name != target.name {
+            node.name = target.name.clone();
+            changed = true;
+        }
     }
     // The scheduler reconciles every second; only a real change wakes viewers.
     if changed {
@@ -1395,8 +1416,33 @@ mod tests {
             ],
         };
         let targets = registry_targets(&registry, "local");
+        let aliases = BTreeMap::from([("admitted-fingerprint".into(), "macbook".into())]);
+        let aliased = super::registry_targets_with_aliases(&registry, "local", &aliases);
+        assert_eq!(aliased[0].registry_key, targets[0].registry_key);
+        assert_eq!(aliased[0].name, format!("macbook ({})", targets[0].name));
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].registry_key, "admitted-fingerprint");
+    }
+
+    #[test]
+    fn alias_refresh_updates_display_without_replacing_the_node() {
+        let state = RemoteTreeState::default();
+        let mut targets = Vec::new();
+        let mut target = RemoteTarget {
+            registry_key: "peer-fp".into(),
+            name: "old".into(),
+            addr_override: None,
+        };
+        super::reconcile_registry_targets(&state, &mut targets, vec![target.clone()]);
+        state.with_node("peer-fp", |node| node.last_error = Some("retained".into()));
+        let before = state.generation();
+        target.name = "macbook (old)".into();
+        super::reconcile_registry_targets(&state, &mut targets, vec![target]);
+        assert!(state.generation() > before);
+        state.with_node("peer-fp", |node| {
+            assert_eq!(node.name, "macbook (old)");
+            assert_eq!(node.last_error.as_deref(), Some("retained"));
+        });
     }
 
     #[test]
@@ -2017,7 +2063,7 @@ mod tests {
     }
 
     #[test]
-    fn a_worker_error_backs_off_and_an_unchanged_repeat_does_not_wake_the_tui() {
+    fn a_worker_error_backs_off_and_completion_wakes_the_retry_label() {
         struct Down;
 
         impl RemoteTransport for Down {
@@ -2082,11 +2128,89 @@ mod tests {
         let (failures, backoff) = poll_once();
         assert_eq!(failures, 2);
         assert!(backoff >= 2 * BACKOFF_BASE, "{backoff:?}");
-        assert_eq!(
-            state.generation(),
-            failed,
-            "an unchanged repeat is not a wake"
+        assert!(
+            state.generation() > failed,
+            "completion replaces the retry label"
         );
+    }
+
+    #[test]
+    fn recording_bookkeeping_repeated_views_and_absent_nodes_does_not_wake() {
+        let state = RemoteTreeState::default();
+        let now = Instant::now();
+        state.insert_node(RemoteNode::new("laptop", now));
+        state.record("laptop", |node| {
+            node.poll_failed_with_reason(now, Some("offline".into()))
+        });
+        let seen = state.generation();
+        state.record("laptop", |node| {
+            node.poll_failed_with_reason(now, Some("offline".into()))
+        });
+        state.record("laptop", |node| node.next_poll = now);
+        assert_eq!(
+            state.record("absent", |_| panic!("absent callback ran")),
+            None::<()>
+        );
+        assert_eq!(state.generation(), seen);
+    }
+
+    #[test]
+    fn an_observed_retry_label_is_woken_by_an_identical_failure() {
+        let state = RemoteTreeState::default();
+        let start = Instant::now();
+        state.insert_node(RemoteNode::new("laptop", start));
+        state.record("laptop", |node| {
+            node.poll_failed_with_reason(start, Some("offline".into()))
+        });
+        let retry = state.with_node("laptop", |node| node.retry_at()).unwrap();
+        state.with_node("laptop", |node| assert!(node.begin_poll(retry)));
+        assert_eq!(
+            state.snapshot_at(retry).nodes[0].state,
+            RemoteState::Reconnecting
+        );
+        let seen = state.generation();
+        state.record("laptop", |node| {
+            node.poll_failed_with_reason(retry, Some("offline".into()))
+        });
+        assert_eq!(
+            state.snapshot_at(retry).nodes[0].state,
+            RemoteState::Unreachable
+        );
+        assert!(
+            state.generation() > seen,
+            "completion must wake the observed label"
+        );
+    }
+
+    #[test]
+    fn node_mutations_publish_only_after_obtaining_the_map_lock() {
+        for remove in [false, true] {
+            let state = Arc::new(RemoteTreeState::default());
+            state.insert_node(RemoteNode::new("laptop", Instant::now()));
+            let locked = state.nodes.lock().unwrap();
+            let before = state.generation();
+            let (started, ready) = std::sync::mpsc::channel();
+            let writer = Arc::clone(&state);
+            let worker = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                if remove {
+                    writer.remove_node("laptop");
+                } else {
+                    writer.insert_node(RemoteNode::new("other", Instant::now()));
+                }
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(100);
+            while state.generation() == before && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let blocked_generation = state.generation();
+            drop(locked);
+            worker.join().unwrap();
+            assert_eq!(blocked_generation, before, "published before map mutation");
+            assert!(state.generation() > before);
+            assert_eq!(state.snapshot().nodes.len(), if remove { 0 } else { 2 });
+        }
     }
 
     #[test]

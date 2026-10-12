@@ -6,6 +6,7 @@ usage: remuda cluster <command>
   invite
   join
   nodes
+  alias
   revoke
   control
   remote
