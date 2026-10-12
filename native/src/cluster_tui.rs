@@ -581,7 +581,7 @@ impl ClusterUi {
         let tree_start = 2;
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
         let divider = "─".repeat(width);
-        let queue_rows: Vec<&PendingBatch> = self.input_queue.items().rev().take(3).collect();
+        let queue_rows: Vec<&PendingBatch> = self.visible_queue().rev().take(3).collect();
         let notice_lines = self.active_notice_lines(now, width);
         let footer_rows = self.footer_row_count(width);
         let tree_capacity = height.saturating_sub(
@@ -679,8 +679,7 @@ impl ClusterUi {
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
         let notices = self.active_notice_lines(now, width);
         let queue: Vec<String> = self
-            .input_queue
-            .items()
+            .visible_queue()
             .rev()
             .take(3)
             .collect::<Vec<_>>()
@@ -1571,7 +1570,14 @@ impl ClusterUi {
 
     fn handle_send_event(&mut self, event: Option<QueueEvent>, now: Duration) {
         match event {
-            Some(QueueEvent::Sent { .. } | QueueEvent::Uncertain { .. }) => {
+            Some(QueueEvent::Sent { .. }) => {
+                if self.notice.as_ref().is_none_or(|(notice, _)| {
+                    notice.starts_with("sending input to ") || notice == "Input sent"
+                }) {
+                    self.notice = Some(("Input sent".into(), now));
+                }
+            }
+            Some(QueueEvent::Uncertain { .. }) => {
                 self.clear_sending_notice();
             }
             Some(QueueEvent::PasteAborted { .. }) => {
@@ -1607,6 +1613,12 @@ impl ClusterUi {
             }
             Some(QueueEvent::RetryScheduled { .. }) | None => {}
         }
+    }
+
+    fn visible_queue(&self) -> impl DoubleEndedIterator<Item = &PendingBatch> {
+        self.input_queue
+            .items()
+            .filter(|batch| batch.state != QueueState::Sent)
     }
 
     fn clear_sending_notice(&mut self) {
@@ -1932,6 +1944,22 @@ fn present(prev: Option<&vt100::Screen>, next: &vt100::Screen) -> Vec<u8> {
     }
 }
 
+const FULL_REPAINT_INTERVAL: Duration = Duration::from_secs(5);
+
+fn present_with_recovery(
+    prev: Option<&vt100::Screen>,
+    next: &vt100::Screen,
+    now: Duration,
+    last_full: &mut Duration,
+) -> Vec<u8> {
+    let full = prev.is_none_or(|screen| screen.size() != next.size())
+        || now.saturating_sub(*last_full) >= FULL_REPAINT_INTERVAL;
+    if full {
+        *last_full = now;
+    }
+    present(if full { None } else { prev }, next)
+}
+
 const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 const SYNC_END: &[u8] = b"\x1b[?2026l";
 
@@ -2250,6 +2278,7 @@ fn wrap_to_two_lines(text: &str, width: usize) -> Vec<String> {
 fn queue_line(batch: &PendingBatch) -> String {
     let bytes = batch.bytes.strip_suffix(b"\r").unwrap_or(&batch.bytes);
     let text = String::from_utf8_lossy(bytes);
+    let text = crate::text::strip_terminal_controls(&text);
     let status = crate::text::strip_terminal_controls(&batch.status);
     format!("Input {status} · {text}")
 }
@@ -2433,6 +2462,28 @@ struct ClusterTuiRuntime<'a> {
     paste_capture: &'a mut crate::tui::BracketedPasteCapture<io::Stdout>,
 }
 
+fn capture_local_pane(ui: &mut ClusterUi, path: &Path, clock: &dyn Clock) -> Option<String> {
+    if let Some(ended) = &ui.ended {
+        return Some(ended.screen.clone());
+    }
+    if ui.remote_active.is_some() {
+        return None;
+    }
+    let session = ui.sessions.get(ui.active)?.clone();
+    let (captured, captured_at, instance_id) = screen(path, &session.name, clock).ok()?;
+    if instance_id == session.instance_id
+        && ui.record_capture(&session, captured.clone(), captured_at)
+    {
+        Some(captured)
+    } else {
+        ui.notice = Some((
+            format!("{} restarted; screen was not refreshed", session.name),
+            clock.now(),
+        ));
+        None
+    }
+}
+
 fn run_loop(
     path: &Path,
     node: &str,
@@ -2473,6 +2524,7 @@ fn run_loop(
         }
     }
     let mut previous = None;
+    let mut last_full_repaint = clock.now();
     let mut frames = frame_writer()?;
     loop {
         if let Ok(current) = list(path) {
@@ -2489,36 +2541,19 @@ fn run_loop(
         }
         ui.selected = ui.selected.min(ui.sessions.len().saturating_sub(1));
         ui.active = ui.active.min(ui.sessions.len().saturating_sub(1));
-        let captured = ui
-            .ended
-            .as_ref()
-            .map(|ended| ended.screen.clone())
-            .or_else(|| {
-                if ui.remote_active.is_some() {
-                    return None;
-                }
-                let session = ui.sessions.get(ui.active)?.clone();
-                let (captured, captured_at, instance_id) =
-                    screen(path, &session.name, clock).ok()?;
-                if instance_id == session.instance_id
-                    && ui.record_capture(&session, captured.clone(), captured_at)
-                {
-                    Some(captured)
-                } else {
-                    ui.notice = Some((
-                        format!("{} restarted; screen was not refreshed", session.name),
-                        clock.now(),
-                    ));
-                    None
-                }
-            });
+        let captured = capture_local_pane(&mut ui, path, clock);
         let body = captured.unwrap_or_default();
         let terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
         let (cols, rows) = normalized_terminal_size(terminal_size.0, terminal_size.1);
         let frame = ui.render(cols, rows, &body, clock);
         let mut next = vt100::Parser::new(rows, cols, 0);
         next.process(format!("\x1b[H\x1b[2J{}", terminal_frame(&frame)).as_bytes());
-        let output = present(previous.as_ref().map(vt100::Parser::screen), next.screen());
+        let output = present_with_recovery(
+            previous.as_ref().map(vt100::Parser::screen),
+            next.screen(),
+            clock.now(),
+            &mut last_full_repaint,
+        );
         if !output.is_empty() {
             // Anything another writer left in stdout's buffer goes first.
             io::stdout().flush()?;
@@ -2535,8 +2570,20 @@ fn run_loop(
             seen,
         )? {
             let event = crossterm::event::read()?;
-            if resize_requires_full_repaint(&event) {
+            let redraw = ui.remote_keys_mode.is_none()
+                && matches!(
+                    event,
+                    crossterm::event::Event::Key(crossterm::event::KeyEvent {
+                        code: crossterm::event::KeyCode::Char('l'),
+                        modifiers: crossterm::event::KeyModifiers::CONTROL,
+                        ..
+                    })
+                );
+            if resize_requires_full_repaint(&event) || redraw {
                 previous = None;
+            }
+            if redraw {
+                continue;
             }
             if ui.handle_event(event, clock.now()) {
                 return Ok(());
@@ -2893,6 +2940,36 @@ mod tests {
         let parser = parsed_frame("hello", 80, 24);
 
         assert!(present(Some(parser.screen()), parser.screen()).is_empty());
+    }
+
+    #[test]
+    fn an_unchanged_frame_recovers_terminal_damage_after_the_repaint_interval() {
+        let next = parsed_frame("tree\nselected pane\nfooter", 40, 8);
+        let mut terminal = parsed_frame("tree\nselected pane\nfooter", 40, 8);
+        terminal.process(b"\x1b[Hafterimage\x1b[7;1Hstale input");
+        let mut last_full = Duration::ZERO;
+        assert!(super::present_with_recovery(
+            Some(next.screen()),
+            next.screen(),
+            Duration::from_secs(4),
+            &mut last_full
+        )
+        .is_empty());
+        terminal.process(&super::present_with_recovery(
+            Some(next.screen()),
+            next.screen(),
+            Duration::from_secs(5),
+            &mut last_full,
+        ));
+        assert_eq!(terminal.screen().contents(), next.screen().contents());
+        assert_eq!(last_full, Duration::from_secs(5));
+        assert!(super::present_with_recovery(
+            Some(next.screen()),
+            next.screen(),
+            Duration::from_secs(6),
+            &mut last_full
+        )
+        .is_empty());
     }
 
     #[test]
@@ -3288,6 +3365,58 @@ mod tests {
     #[test]
     fn raw_mode_frames_use_carriage_return_line_feed() {
         assert_eq!(terminal_frame("a\nb\r\nc"), "a\r\nb\r\nc");
+    }
+
+    #[test]
+    fn input_key_controls_cannot_move_the_tree_or_add_status_rows() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.input_queue.enqueue(
+            "dev".into(),
+            "instance-dev".into(),
+            "client".into(),
+            1,
+            b"command\r\nextra\x1b[HOVERWRITE\x1b[2J".to_vec(),
+            Instant::now(),
+        );
+        let frame = ui.render(80, 24, "pane", &clock);
+        assert!(
+            !frame.contains("\x1b[H") && !frame.contains("\x1b[2J"),
+            "queued input leaked cursor/clear escapes: {frame:?}"
+        );
+        assert!(!frame.contains('\r'), "queued input leaked carriage return");
+        assert_eq!(frame.lines().count(), 24, "queued input added a status row");
+        let parsed = parsed_frame(&frame, 80, 24);
+        assert!(parsed.screen().contents().starts_with("remuda · cluster"));
+    }
+
+    #[test]
+    fn acknowledged_input_does_not_keep_three_command_rows_on_screen() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let now = Instant::now();
+        for seq in 1..=3 {
+            ui.input_queue.enqueue(
+                "dev".into(),
+                "instance-dev".into(),
+                "client".into(),
+                seq,
+                format!("long command {seq}\r").into_bytes(),
+                now,
+            );
+            let batch = ui.input_queue.begin_due(now).unwrap();
+            ui.input_queue.finish(
+                batch.seq,
+                super::queue::SendOutcome::Ack { duplicate: false },
+                now,
+            );
+        }
+        let frame = ui.render(80, 24, "pane", &clock);
+        assert!(
+            !frame.contains("Input sent"),
+            "finished rows remain: {frame}"
+        );
+        assert!(!frame.contains("long command"));
     }
 
     #[test]
@@ -4149,7 +4278,17 @@ mod tests {
             }),
             Duration::ZERO,
         );
-        assert!(ui.notice.is_none());
+        assert_eq!(
+            ui.notice.as_ref().map(|(notice, _)| notice.as_str()),
+            Some("Input sent")
+        );
+        assert!(ui
+            .active_notice_lines(Duration::from_secs(4), 80)
+            .iter()
+            .any(|line| line == "Input sent"));
+        assert!(ui
+            .active_notice_lines(Duration::from_secs(5), 80)
+            .is_empty());
     }
 
     #[test]
