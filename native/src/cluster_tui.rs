@@ -83,6 +83,7 @@ pub fn cluster_tree_has_sessions(
 
 pub struct ClusterUi {
     node: String,
+    local_targets: Vec<String>,
     sessions: Vec<SessionSummary>,
     selected: usize,
     active: usize,
@@ -175,6 +176,7 @@ impl ClusterUi {
     ) -> Self {
         Self {
             node: node.into(),
+            local_targets: vec![node.into()],
             sessions,
             selected: 0,
             active: 0,
@@ -1749,7 +1751,7 @@ impl ClusterUi {
         let Some((node, session)) = target.split_once('/') else {
             return Err(io::Error::other("target must be node/session"));
         };
-        if node != self.node && !self.node.ends_with(&format!("({node})")) {
+        if !self.local_targets.iter().any(|identity| identity == node) {
             let exact = self
                 .remote_snapshot
                 .nodes
@@ -1758,10 +1760,10 @@ impl ClusterUi {
             let remote = if let Some(exact) = exact {
                 exact
             } else {
-                let mut matches = self.remote_snapshot.nodes.iter().filter(|snapshot| {
-                    snapshot.name == node
-                        || crate::cluster::node_label(&snapshot.registry_key) == node
-                });
+                let mut matches =
+                    self.remote_snapshot.nodes.iter().filter(|snapshot| {
+                        crate::cluster::node_label(&snapshot.registry_key) == node
+                    });
                 let remote = matches
                     .next()
                     .ok_or_else(|| io::Error::other(format!("node {node} was not found")))?;
@@ -1799,6 +1801,24 @@ impl ClusterUi {
             })?;
         self.active = self.selected;
         Ok(())
+    }
+
+    fn set_local_identity(
+        &mut self,
+        fingerprint: &str,
+        aliases: &std::collections::BTreeMap<String, String>,
+    ) {
+        let hostname = self.local_targets[0].clone();
+        self.local_targets = vec![
+            hostname.clone(),
+            crate::cluster::node_label(fingerprint),
+            fingerprint.into(),
+        ];
+        self.node = if aliases.contains_key(fingerprint) {
+            crate::cluster::display_node_label(fingerprint, aliases)
+        } else {
+            hostname
+        };
     }
 }
 
@@ -2315,6 +2335,9 @@ fn run_loop(
 ) -> io::Result<()> {
     let clock = runtime.clock;
     let mut ui = ClusterUi::with_sender(node, list(path)?, clock.now(), InputSender::random()?);
+    if let Some((identity, _)) = crate::cluster::nodes()? {
+        ui.set_local_identity(&identity.node_fp, &crate::cluster::control::node_aliases()?);
+    }
     ui.remote_input_enabled = remote_input.is_some();
     ui.remote_synced(remote_source);
     select_target_with_remote_wait(&mut ui, target, remote_source, Duration::from_secs(5))?;
@@ -2427,7 +2450,7 @@ fn select_target_with_remote_wait(
     match ui.select_target(Some(target)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::InvalidInput => Err(error),
-        Err(error) if node != ui.node => {
+        Err(error) if !ui.local_targets.iter().any(|identity| identity == node) => {
             let deadline = Instant::now() + timeout;
             while Instant::now() < deadline {
                 ui.remote_synced(source);
@@ -2954,6 +2977,34 @@ mod tests {
         ui.select_target(Some(&format!("{node_id}/build"))).unwrap();
         ui.select_target(Some("fp-laptop/build")).unwrap();
         assert!(ui.render(80, 24, "", &clock).contains("macbook"));
+        let label = ui.remote_snapshot.nodes[0].name.clone();
+        assert!(
+            ui.select_target(Some(&format!("{label}/build"))).is_err(),
+            "display alias became a command target"
+        );
+    }
+
+    #[test]
+    fn local_targets_stay_stable_when_the_display_alias_changes_or_clears() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let fingerprint = "SHA256:localidentity";
+        let node_id = crate::cluster::node_label(fingerprint);
+        for alias in [Some("macbook"), Some("renamed"), None] {
+            let aliases = alias
+                .map(|label| std::collections::BTreeMap::from([(fingerprint.into(), label.into())]))
+                .unwrap_or_default();
+            ui.set_local_identity(fingerprint, &aliases);
+            for target in ["studio", node_id.as_str(), fingerprint] {
+                ui.select_target(Some(&format!("{target}/dev"))).unwrap();
+                assert!(ui.remote_active.is_none());
+            }
+            if let Some(alias) = alias {
+                assert!(ui.select_target(Some(&format!("{alias}/dev"))).is_err());
+                let decorated = format!("{alias} ({node_id})/dev");
+                assert!(ui.select_target(Some(&decorated)).is_err());
+            }
+        }
     }
 
     fn selected_remote_ui_with_bracketed_paste(
@@ -4378,7 +4429,7 @@ mod tests {
         ui.remote_synced(source.as_ref());
         select_target_with_remote_wait(
             &mut ui,
-            Some("laptop/build"),
+            Some("fp-laptop/build"),
             source.as_ref(),
             Duration::from_millis(250),
         )
@@ -4390,7 +4441,7 @@ mod tests {
     }
 
     #[test]
-    fn user_target_with_an_ambiguous_remote_label_is_refused() {
+    fn user_target_with_an_ambiguous_original_node_id_is_refused() {
         let mut ui = ClusterUi::new("studio", Vec::new(), Duration::ZERO);
         let mut snapshot = remote_snapshot(
             RemoteState::Reachable,
@@ -4398,11 +4449,12 @@ mod tests {
             Some(remote_screen("ready")),
         );
         let mut colliding = snapshot.nodes[0].clone();
-        colliding.registry_key = "fp-other".into();
+        snapshot.nodes[0].registry_key = "SHA256:abcdefghfirst".into();
+        colliding.registry_key = "SHA256:abcdefghsecond".into();
         snapshot.nodes.push(colliding);
         ui.remote_snapshot = snapshot;
 
-        let error = ui.select_target(Some("laptop/build")).unwrap_err();
+        let error = ui.select_target(Some("node-abcdefgh/build")).unwrap_err();
         assert!(error.to_string().contains("ambiguous"));
     }
 

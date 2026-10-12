@@ -972,18 +972,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             }
         }
         ClusterCommand::Remote(target) => {
-            let node = match (
-                remuda_native::cluster::nodes(),
-                remuda_native::cluster::control::node_aliases(),
-            ) {
-                (Ok(Some((identity, _))), Ok(aliases))
-                    if aliases.contains_key(&identity.node_fp) =>
-                {
-                    remuda_native::cluster::display_node_label(&identity.node_fp, &aliases)
-                }
-                (_, Err(error)) => return fail(format!("cluster remote: {error}")),
-                _ => remote_node_label(remuda_native::hostname::hostname),
-            };
+            let node = remote_node_label(remuda_native::hostname::hostname);
             cluster_remote(server, path, &node, target.as_deref())
         }
         ClusterCommand::ListenOff => cluster_listen_off(server, path),
