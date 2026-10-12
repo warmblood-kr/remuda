@@ -1899,6 +1899,33 @@ fn normalized_terminal_size(cols: u16, rows: u16) -> (u16, u16) {
     (cols, rows)
 }
 
+const INPUT_WAIT: Duration = Duration::from_millis(250);
+const REMOTE_CHECK: Duration = Duration::from_millis(25);
+
+/// Wait up to INPUT_WAIT for terminal input, returning early (false) once the
+/// remote generation differs from `seen`, read before this frame's sync (#622).
+/// Input is polled first each slice, so a remote change never starves it.
+fn wait_for_input_or_remote(
+    clock: &dyn Clock,
+    mut poll: impl FnMut(Duration) -> io::Result<bool>,
+    generation: impl Fn() -> u64,
+    seen: u64,
+) -> io::Result<bool> {
+    let deadline = clock.now() + INPUT_WAIT;
+    loop {
+        let left = deadline.saturating_sub(clock.now());
+        if left.is_zero() {
+            return Ok(false);
+        }
+        if poll(left.min(REMOTE_CHECK))? {
+            return Ok(true);
+        }
+        if generation() != seen {
+            return Ok(false);
+        }
+    }
+}
+
 fn resize_requires_full_repaint(event: &crossterm::event::Event) -> bool {
     matches!(event, crossterm::event::Event::Resize(_, _))
 }
@@ -2318,6 +2345,8 @@ fn run_loop(
         if let Ok(current) = list(path) {
             ui.sessions_synced(current, clock.now());
         }
+        // Read before syncing: an update landing during sync/render wakes the wait.
+        let seen = remote_source.generation();
         ui.remote_synced(remote_source);
         runtime.paste_capture.set(ui.remote_keys_mode.is_some())?;
         if let Some(RemoteSelection::Session { node, name, .. }) = &ui.remote_active {
@@ -2366,7 +2395,12 @@ fn run_loop(
         ui.send_close_pending(path, remote_input, clock.now());
         ui.send_pending(path, clock.now(), remote_input);
         ui.start_pending(clock.now());
-        if crossterm::event::poll(Duration::from_millis(250))? {
+        if wait_for_input_or_remote(
+            clock,
+            crossterm::event::poll,
+            || remote_source.generation(),
+            seen,
+        )? {
             let event = crossterm::event::read()?;
             if resize_requires_full_repaint(&event) {
                 previous = None;
@@ -2429,6 +2463,121 @@ mod tests {
         let mut parser = vt100::Parser::new(rows, cols, 0);
         parser.process(format!("\x1b[H\x1b[2J{}", terminal_frame(frame)).as_bytes());
         parser
+    }
+
+    #[test]
+    fn the_input_wait_ends_early_when_the_remote_snapshot_changes() {
+        let clock = ManualClock::new();
+        let generation = std::cell::Cell::new(7);
+        let mut slices = Vec::new();
+        let ready = super::wait_for_input_or_remote(
+            &clock,
+            |slice| {
+                slices.push(slice);
+                clock.advance(slice);
+                if slices.len() == 3 {
+                    generation.set(8);
+                }
+                Ok(false)
+            },
+            || generation.get(),
+            7,
+        )
+        .unwrap();
+        assert!(!ready);
+        assert_eq!(slices.len(), 3, "{slices:?}");
+        assert!(
+            clock.now() < Duration::from_millis(100),
+            "{:?}",
+            clock.now()
+        );
+
+        let clock = ManualClock::new();
+        let mut waited = Duration::ZERO;
+        let ready = super::wait_for_input_or_remote(
+            &clock,
+            |slice| {
+                waited += slice;
+                clock.advance(slice);
+                Ok(false)
+            },
+            || 7,
+            7,
+        )
+        .unwrap();
+        assert!(!ready);
+        assert_eq!(
+            waited,
+            Duration::from_millis(250),
+            "a quiet wait keeps its budget"
+        );
+
+        let clock = ManualClock::new();
+        assert!(super::wait_for_input_or_remote(&clock, |_| Ok(true), || 7, 7).unwrap());
+    }
+
+    #[test]
+    fn an_update_that_landed_before_the_wait_ends_it_after_one_input_slice() {
+        // The baseline is read before sync/render; the update landed during them.
+        let clock = ManualClock::new();
+        let mut slices = Vec::new();
+        let ready = super::wait_for_input_or_remote(
+            &clock,
+            |slice| {
+                slices.push(slice);
+                clock.advance(slice);
+                Ok(false)
+            },
+            || 8,
+            7,
+        )
+        .unwrap();
+        assert!(!ready);
+        assert_eq!(
+            slices,
+            vec![Duration::from_millis(25)],
+            "input still gets one bounded poll before the remote redraw"
+        );
+    }
+
+    #[test]
+    fn ready_input_wins_over_a_remote_change() {
+        // Queued input with an already-moved snapshot is still read first.
+        let clock = ManualClock::new();
+        let mut slices = Vec::new();
+        let ready = super::wait_for_input_or_remote(
+            &clock,
+            |slice| {
+                slices.push(slice);
+                Ok(true)
+            },
+            || 8,
+            7,
+        )
+        .unwrap();
+        assert!(ready);
+        assert_eq!(slices, vec![Duration::from_millis(25)]);
+
+        // Remote changes on every pass never starve input that is ready.
+        let clock = ManualClock::new();
+        let generation = std::cell::Cell::new(7);
+        let mut inputs = 0;
+        for pass in 0..20 {
+            let seen = generation.get();
+            generation.set(seen + 1);
+            let ready = super::wait_for_input_or_remote(
+                &clock,
+                |_| Ok(pass % 2 == 0),
+                || generation.get(),
+                seen,
+            )
+            .unwrap();
+            if ready {
+                inputs += 1;
+            }
+            assert_eq!(ready, pass % 2 == 0, "pass {pass}");
+        }
+        assert_eq!(inputs, 10);
     }
 
     #[test]
