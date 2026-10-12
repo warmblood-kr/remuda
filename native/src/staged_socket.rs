@@ -523,6 +523,49 @@ mod tests {
     }
 
     #[test]
+    fn transaction_rejects_regular_file_receipt_in_new() {
+        let scratch = Scratch::new();
+        let parent = scratch.parent();
+        let path = scratch.0.join("source");
+        std::fs::write(&path, b"regular file").unwrap();
+        let receipt = NodeReceipt::capture(&parent, OsStr::new("source")).unwrap();
+
+        assert_eq!(receipt.kind, NodeKind::Other);
+        assert!(
+            StagedTransaction::new(parent, OsString::from("source"), receipt).is_err(),
+            "transaction accepted a regular-file receipt"
+        );
+        assert!(path.exists(), "refusing the receipt must preserve the file");
+    }
+
+    #[test]
+    fn transaction_rejects_regular_file_receipt_in_publish() {
+        let scratch = Scratch::new();
+        let parent = scratch.parent();
+        let source_path = scratch.0.join("source");
+        let destination_path = scratch.0.join("published");
+        std::fs::write(&source_path, b"regular file").unwrap();
+        let receipt = NodeReceipt::capture(&parent, OsStr::new("source")).unwrap();
+        let transaction = StagedTransaction {
+            parent,
+            source: OsString::from("source"),
+            receipt,
+            committed: false,
+        };
+
+        assert_eq!(receipt.kind, NodeKind::Other);
+        assert!(
+            transaction.publish(OsStr::new("published")).is_err(),
+            "publish accepted a regular-file receipt"
+        );
+        assert!(
+            source_path.exists(),
+            "refusing the receipt must preserve the file"
+        );
+        assert!(!destination_path.exists());
+    }
+
+    #[test]
     fn lifecycle_keeps_receipt_when_terminal_and_rejects_later_publish() {
         let scratch = Scratch::new();
         let parent = scratch.parent();
