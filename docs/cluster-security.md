@@ -150,8 +150,8 @@ record plaintext = data
   to read it", so a mixed-version pair fails with a clear message, not a wrong
   payload. A new client against an old listener gets v1 (the header is
   ignored) and detects it because v2 msg2 starts with `0x01`, never JSON. An
-  unknown version byte is `BadResponse` ("peer uses newer cluster response
-  format").
+  unknown version byte is `PeerTooNew` ("peer uses newer cluster response
+  format (upgrade remuda on this node)"); `remuda cluster call` exits 5.
 - Resources: a v2 response larger than one frame needs a large-response
   permit (4 global, 1 per peer). When none is free the peer receives a
   `cluster busy` error and retries. Large writes have an absolute 30 s

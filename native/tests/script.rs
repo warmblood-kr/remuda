@@ -64,6 +64,118 @@ fn new_returns_name_then_instance_through_the_session_wrapper() {
     script::run_source(&path, "=new-instance-return", &source).expect("new return contract");
 }
 
+fn new_with_instance(path: &Path, name: &str, command: Vec<String>) -> std::io::Result<Response> {
+    client::request(
+        path,
+        &Request::NewWithInstance {
+            name: Some(name.into()),
+            command,
+            size: remuda_core::Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+}
+
+/// `None` when `name` is not listed; otherwise the row's instance id.
+fn listed_instance(path: &Path, name: &str) -> Option<Option<String>> {
+    match client::request(path, &Request::List).expect("list") {
+        Response::Sessions(rows) => rows
+            .into_iter()
+            .find(|row| row.name == name)
+            .map(|row| row.instance_id),
+        other => panic!("list answered {other:?}"),
+    }
+}
+
+#[test]
+fn new_refuses_a_taken_name_without_an_instance_id() {
+    let dir = scratch("new-instance-taken");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path, &dir);
+    let source = r#"
+        local name, first_id = remuda.session.new("taken", {})
+        local ok, failure, leaked_id = pcall(function()
+          return remuda.session.new("taken", {})
+        end)
+        assert(not ok and tostring(failure):find("name taken", 1, true),
+          "a collision must stay an error: " .. tostring(failure))
+        assert(leaked_id == nil, "a collision must not return an instance id")
+        for _, row in ipairs(remuda.session.list()) do
+          if row.name == name then
+            assert(row.instance_id == first_id, "a collision must not replace the live session")
+          end
+        end
+    "#;
+    script::run_source(&path, "=new-instance-taken", source).expect("collision contract");
+}
+
+#[test]
+fn new_returns_its_own_launch_when_the_name_is_replaced_right_after() {
+    let dir = scratch("new-instance-swap");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path, &dir);
+    let short_lived: Vec<String> = if cfg!(windows) {
+        vec!["cmd.exe".into(), "/c".into(), "exit 0".into()]
+    } else {
+        vec!["sh".into(), "-c".into(), "exit 0".into()]
+    };
+    let first = match new_with_instance(&path, "swap", short_lived).expect("first new") {
+        Response::SessionStarted { name, instance_id } if name == "swap" => instance_id,
+        other => panic!("first new answered {other:?}"),
+    };
+    // `List` reaps the exited launch; the name is free once it is gone.
+    let deadline = Instant::now() + PATIENCE;
+    while listed_instance(&path, "swap").is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "the short-lived launch never exited"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let second = match new_with_instance(&path, "swap", Vec::new()).expect("second new") {
+        Response::SessionStarted { name, instance_id } if name == "swap" => instance_id,
+        other => panic!("second new answered {other:?}"),
+    };
+    assert_ne!(first, second, "each launch reports its own instance id");
+    assert_eq!(listed_instance(&path, "swap"), Some(Some(second)));
+}
+
+#[test]
+fn new_registers_the_launch_when_its_reply_cannot_be_delivered() {
+    use std::io::Write;
+
+    let dir = scratch("new-instance-hangup");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path, &dir);
+    {
+        let mut stream = remuda_native::ipc::connect(&path).expect("connect");
+        let mut line = serde_json::to_string(&Request::NewWithInstance {
+            name: Some("orphan".into()),
+            command: Vec::new(),
+            size: remuda_core::Size::new(80, 24),
+            cwd: None,
+            env: None,
+        })
+        .expect("encode");
+        line.push('\n');
+        stream.write_all(line.as_bytes()).expect("send");
+        stream.flush().expect("flush");
+    } // Hung up before the reply.
+    let deadline = Instant::now() + PATIENCE;
+    while listed_instance(&path, "orphan").is_none() {
+        assert!(Instant::now() < deadline, "the launch was never registered");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        matches!(
+            new_with_instance(&path, "after-orphan", Vec::new()),
+            Ok(Response::SessionStarted { .. })
+        ),
+        "the daemon keeps serving after a lost reply"
+    );
+}
+
 #[test]
 fn deprecated_flat_session_alias_warns_once_per_process() {
     let dir = scratch("deprecation-once");
