@@ -38,6 +38,8 @@ pub enum ClientError {
     /// Noise sealing or response authentication failed. HTTP 400 from the
     /// listener also maps here: the generated msg1 was rejected before open.
     Crypto,
+    /// The peer answered in a response format newer than this node understands.
+    PeerTooNew,
 }
 
 impl std::fmt::Display for ClientError {
@@ -51,6 +53,11 @@ impl std::fmt::Display for ClientError {
             Self::Refused(status) => write!(formatter, "cluster peer refused request ({status})"),
             Self::BadResponse => formatter.write_str("cluster peer returned a bad response"),
             Self::Crypto => formatter.write_str("cluster Noise authentication failed"),
+            Self::PeerTooNew => write!(
+                formatter,
+                "{} (upgrade remuda on this node)",
+                frame::NEWER_FORMAT_MSG
+            ),
         }
     }
 }
@@ -232,7 +239,7 @@ fn read_response<R: Read>(
 
 fn map_frame_error(error: &io::Error) -> ClientError {
     match error.kind() {
-        io::ErrorKind::Unsupported => ClientError::BadResponse,
+        io::ErrorKind::Unsupported => ClientError::PeerTooNew,
         io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => ClientError::Crypto,
         _ => map_io(io::Error::from(error.kind())),
     }
@@ -620,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn newer_format_version_is_bad_response() {
+    fn newer_format_version_is_peer_too_new() {
         let initiator = snow::Builder::new(PATTERN.parse().unwrap())
             .generate_keypair()
             .unwrap();
@@ -645,7 +652,11 @@ mod tests {
         let mut body = (n as u16).to_be_bytes().to_vec();
         body.extend_from_slice(&scratch[..n]);
         let (result, _) = run(sealed, http(&body, body.len()));
-        assert_eq!(result, Err(ClientError::BadResponse));
+        assert_eq!(result, Err(ClientError::PeerTooNew));
+        assert_eq!(
+            ClientError::PeerTooNew.to_string(),
+            "peer uses newer cluster response format (upgrade remuda on this node)"
+        );
     }
 
     #[test]
