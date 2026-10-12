@@ -62,6 +62,11 @@ pub struct RemoteSnapshot {
 /// Read-only view consumed by the cluster tree and replaceable by a test fake.
 pub trait RemoteSource: Send + Sync {
     fn snapshot(&self) -> RemoteSnapshot;
+
+    /// Moves whenever a poll result lands or the node set changes.
+    fn generation(&self) -> u64 {
+        0
+    }
 }
 
 /// Sends idempotent Input batches to a remote member. Callers own retry policy.
@@ -388,10 +393,12 @@ fn retry_backoff(failures: u32) -> Duration {
 #[derive(Default)]
 pub struct RemoteTreeState {
     nodes: Mutex<BTreeMap<String, RemoteNode>>,
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl RemoteTreeState {
     pub fn insert_node(&self, node: RemoteNode) {
+        self.changed();
         self.nodes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -399,6 +406,7 @@ impl RemoteTreeState {
     }
 
     pub fn remove_node(&self, name: &str) -> Option<RemoteNode> {
+        self.changed();
         self.nodes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -411,6 +419,18 @@ impl RemoteTreeState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_mut(name)
             .map(f)
+    }
+
+    /// Like `with_node`, for changes a viewer should see: moves the generation.
+    fn record<R>(&self, name: &str, f: impl FnOnce(&mut RemoteNode) -> R) -> Option<R> {
+        let result = self.with_node(name, f);
+        self.changed();
+        result
+    }
+
+    fn changed(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn snapshot_at(&self, now: Instant) -> RemoteSnapshot {
@@ -428,6 +448,10 @@ impl RemoteTreeState {
 impl RemoteSource for RemoteTreeState {
     fn snapshot(&self) -> RemoteSnapshot {
         self.snapshot_at(Instant::now())
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -977,15 +1001,22 @@ fn reconcile_registry_targets(
         .nodes
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let before = nodes.len();
     nodes.retain(|key, _| refreshed_keys.contains(key));
+    let mut changed = nodes.len() != before;
     for target in &refreshed {
         nodes.entry(target.registry_key.clone()).or_insert_with(|| {
+            changed = true;
             RemoteNode::with_key(
                 target.registry_key.clone(),
                 target.name.clone(),
                 Instant::now(),
             )
         });
+    }
+    // The scheduler reconciles every second; only a real change wakes viewers.
+    if changed {
+        state.changed();
     }
     *current = refreshed;
 }
@@ -1048,7 +1079,7 @@ fn schedule_remote_poll(
                 selected => transport.poll_node(&target, selected, &previous).map(Some),
             };
             let now = Instant::now();
-            let _ = state.with_node(&target.registry_key, |node| match result {
+            let _ = state.record(&target.registry_key, |node| match result {
                 Ok(Some(poll)) => node.poll_delivered(poll, now, selected_session.as_deref()),
                 Ok(None) => node.poll_needs_list(now),
                 Err(error) => node.poll_failed_with_reason(now, Some(error.to_string())),
@@ -1056,7 +1087,7 @@ fn schedule_remote_poll(
         });
     if let Err(error) = worker {
         let now = Instant::now();
-        let _ = failed_state.with_node(&failed_name, |node| {
+        let _ = failed_state.record(&failed_name, |node| {
             node.poll_failed_with_reason(now, Some(error.to_string()))
         });
         return Err(error);
@@ -1905,6 +1936,70 @@ mod tests {
         assert_eq!(overloaded.kind(), io::ErrorKind::WouldBlock);
         assert!(synced_snapshot(&prior, Response::Error("boom".into())).is_err());
         assert!(synced_snapshot(&prior, Response::Ok).is_err());
+    }
+
+    #[test]
+    fn generation_moves_when_a_poll_lands_and_not_while_waiting_for_the_next() {
+        struct Once;
+
+        impl RemoteTransport for Once {
+            fn poll_node(
+                &self,
+                _target: &RemoteTarget,
+                _selected_session: Option<&str>,
+                _previous: &[RemoteSessionSnapshot],
+            ) -> io::Result<RemotePoll> {
+                Ok(vec![session("proof", "a")].into())
+            }
+        }
+
+        let target = RemoteTarget {
+            name: "laptop".into(),
+            registry_key: "fp-a".into(),
+            addr_override: None,
+        };
+        let poller = RemotePoller::new(vec![target], Arc::new(Once));
+        let source = poller.source();
+        let before = source.generation();
+        poller.start().unwrap();
+        let start = Instant::now();
+        while source.snapshot().nodes[0].sessions.is_empty() {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "first poll never landed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let landed = source.generation();
+        assert!(landed > before);
+        // The scheduler ticks every 100ms; the next poll is 2s away.
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(source.generation(), landed);
+    }
+
+    #[test]
+    fn registry_reconcile_moves_the_generation_only_when_nodes_change() {
+        let target = |key: &str| RemoteTarget {
+            name: "laptop".into(),
+            registry_key: key.into(),
+            addr_override: None,
+        };
+        let state = RemoteTreeState::default();
+        let mut targets = Vec::new();
+        reconcile_registry_targets(&state, &mut targets, vec![target("fp-a")]);
+        let added = state.generation();
+        assert!(added > 0);
+        reconcile_registry_targets(&state, &mut targets, vec![target("fp-a")]);
+        assert_eq!(
+            state.generation(),
+            added,
+            "an unchanged registry is not a change"
+        );
+        reconcile_registry_targets(&state, &mut targets, vec![target("fp-a"), target("fp-b")]);
+        let grown = state.generation();
+        assert!(grown > added);
+        reconcile_registry_targets(&state, &mut targets, vec![target("fp-b")]);
+        assert!(state.generation() > grown, "a revoked node is a change");
     }
 
     #[test]

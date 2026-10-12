@@ -36,6 +36,8 @@ pub mod remote_front;
 pub mod reply_limit;
 pub mod script;
 pub mod session_job;
+#[cfg(unix)]
+mod staged_socket;
 pub(crate) mod storage;
 pub mod text;
 pub mod tick;
