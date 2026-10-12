@@ -765,10 +765,11 @@ impl ClusterUi {
                     || now.saturating_sub(*at) < Duration::from_secs(5)
             })
             .map_or_else(Vec::new, |(notice, at)| {
-                let notice = if notice.starts_with("sending input to ") {
-                    format!("{notice} · {}s", age_seconds(now, *at))
+                let safe = crate::text::strip_terminal_controls(notice);
+                let notice = if safe.starts_with("sending input to ") {
+                    format!("{safe} · {}s", age_seconds(now, *at))
                 } else {
-                    notice.clone()
+                    safe.into_owned()
                 };
                 wrap_to_two_lines(&notice, width)
             })
@@ -2118,7 +2119,8 @@ fn wrap_to_two_lines(text: &str, width: usize) -> Vec<String> {
 fn queue_line(batch: &PendingBatch) -> String {
     let bytes = batch.bytes.strip_suffix(b"\r").unwrap_or(&batch.bytes);
     let text = String::from_utf8_lossy(bytes);
-    format!("Input {} · {text}", batch.status)
+    let status = crate::text::strip_terminal_controls(&batch.status);
+    format!("Input {status} · {text}")
 }
 
 fn session_status(status: &str, pending_count: usize) -> String {
