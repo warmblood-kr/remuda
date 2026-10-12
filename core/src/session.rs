@@ -319,6 +319,8 @@ mod submit_window_tests {
     /// Each screen-version read moves the manual clock by one poll step, so a
     /// run depends only on the script, never on wall-clock luck (#637).
     const STEP: Duration = Duration::from_millis(50);
+    /// type_text's screen probes before the budget starts, two STEPs here.
+    const SETUP_PROBE_SLACK: Duration = Duration::from_millis(100);
 
     #[derive(Clone, Copy)]
     enum Redraw {
@@ -498,7 +500,10 @@ mod submit_window_tests {
         let (outcome, _, after_return, total) = type_into(1900, None, 0, Redraw::Nothing);
         assert_eq!(outcome, InputSubmitOutcome::Unverified);
         assert!(after_return >= Duration::from_secs(1), "{after_return:?}");
-        assert!(total <= Duration::from_millis(6100), "{total:?}");
+        assert!(
+            total <= SUBMIT_BUDGET + SETUP_PROBE_SLACK,
+            "{total:?} exceeds 6s after the paste plus the setup probes"
+        );
     }
 }
 
@@ -536,8 +541,8 @@ pub const DEFAULT_INPUT_SETTLE: Duration = Duration::from_millis(100);
 /// echoes the paste at once. A slower echo stretches both (`submit_window`).
 const SCREEN_QUIET: Duration = Duration::from_millis(300);
 const SUBMIT_WINDOW: Duration = Duration::from_secs(1);
-/// The echo wait, quiet wait and post-Return window share this budget; the
-/// echo wait's 2s cap leaves the window at least 2s of it.
+/// The echo wait, quiet wait and post-Return window share this budget, counted
+/// from after the paste: type_text's setup probes before it (~0.1s) come on top.
 const SUBMIT_BUDGET: Duration = Duration::from_secs(6);
 /// A clear is refused while the most recent human keystroke is this recent.
 const HUMAN_INPUT_GUARD: Duration = Duration::from_secs(2);
