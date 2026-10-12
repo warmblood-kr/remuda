@@ -272,9 +272,12 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     let listener: Listener = ipc::listen(path)?;
     #[cfg(unix)]
     let listener = prepare_unix_listener(listener, path)?;
+    // Right after the bind: startup below can take seconds, and a path replaced
+    // meanwhile is not ours to delete on shutdown (#660).
+    let socket_owner = Arc::new(SocketOwnership::capture(path)?);
+    pause_startup_for_tests();
     let anti_entropy = Arc::new(AntiEntropyTask::start()?);
     let listener_task = Arc::new(DaemonListenerControl::new(ListenerTask::start(path)));
-    let socket_owner = Arc::new(SocketOwnership::capture(path)?);
 
     let registry = Arc::new(Registry::new());
     // The image starts with the daemon and lives exactly as long (step 007).
@@ -413,6 +416,18 @@ impl AntiEntropyTask {
 impl Drop for AntiEntropyTask {
     fn drop(&mut self) {
         self.stop_and_join();
+    }
+}
+
+/// Debug builds only: holds startup between bind and the slow listener startup,
+/// so a test can act while the socket is already connectable (#660).
+fn pause_startup_for_tests() {
+    #[cfg(debug_assertions)]
+    if let Some(milliseconds) = std::env::var("REMUDA_TEST_STARTUP_PAUSE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(milliseconds));
     }
 }
 

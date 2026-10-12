@@ -7160,3 +7160,58 @@ fn spawn_wait_gives_up_on_an_unserved_socket_within_its_patience() {
         "gave up after {elapsed:?}, patience was {patience:?}"
     );
 }
+
+/// A socket swapped in while the daemon is still starting is not the daemon's:
+/// it must survive the daemon's shutdown (#660).
+#[cfg(unix)]
+#[test]
+fn a_socket_replaced_during_startup_survives_the_daemon_shutdown() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::net::UnixListener;
+
+    let dir = unique_scratch_dir("startup-swap");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let pause = Duration::from_secs(2);
+    let mut command = spawn::base_command(&dir);
+    command.env(
+        "REMUDA_TEST_STARTUP_PAUSE_MS",
+        pause.as_millis().to_string(),
+    );
+    let mut daemon = Daemon(command.spawn().expect("spawn daemon"));
+    let deadline = Instant::now() + PATIENCE;
+    let original_ino = loop {
+        if let Ok(metadata) = std::fs::symlink_metadata(&socket) {
+            break metadata.ino();
+        }
+        assert!(Instant::now() < deadline, "daemon never bound {socket:?}");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let bound_at = Instant::now();
+    std::fs::remove_file(&socket).expect("remove the daemon's socket");
+    let replacement = UnixListener::bind(&socket).expect("bind replacement");
+    let replacement_ino = std::fs::symlink_metadata(&socket)
+        .expect("replacement")
+        .ino();
+    // Otherwise the swap missed the window and the verdict below means nothing.
+    assert!(
+        bound_at.elapsed() < pause,
+        "swap landed after the startup pause"
+    );
+    assert_ne!(
+        replacement_ino, original_ino,
+        "replacement reused the inode"
+    );
+
+    // Handled only once startup is done, so after the daemon records its owner.
+    let signalled = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(signalled, 0, "send SIGTERM to daemon");
+    assert!(daemon.left_on_its_own(), "daemon handles SIGTERM cleanly");
+    let survived = std::fs::symlink_metadata(&socket).map(|metadata| metadata.ino());
+    drop(replacement);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        survived.ok(),
+        Some(replacement_ino),
+        "the daemon deleted a socket it never bound"
+    );
+}
