@@ -350,6 +350,14 @@ remuda.tool("review", "Review a session", function(name)
 end, "review(name) -> string")
 ```
 
+A tool or mod command called for a session caller (over MCP, or as a mod
+command) runs only while that caller is live: the daemon checks the caller's
+session name and `instance_id` when it dispatches the call. Admission follows
+observed death. A call whose check ran before the daemon recorded the session's
+death is admitted and may finish, even if the session dies meanwhile; a call
+checked after that is refused as no longer live. The check is advisory and
+same-user, not an isolation boundary.
+
 `remuda.fail(message, code?)` deliberately ends the current evaluation with a
 CLI failure. `message` is printed by itself to standard error; `code` defaults
 to 1 and must be between 1 and 255. The evaluation stops immediately, so this
