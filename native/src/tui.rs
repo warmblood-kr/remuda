@@ -1560,6 +1560,80 @@ mod visual_mode_tests {
         assert_eq!(at(&ui), TextPoint { row: 0, col: 0 });
     }
 
+    /// HOME and XDG_STATE_HOME pointed at one directory until dropped.
+    #[cfg(unix)]
+    struct ScratchEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: [(&'static str, Option<std::ffi::OsString>); 2],
+    }
+
+    #[cfg(unix)]
+    impl ScratchEnv {
+        fn new(dir: &std::path::Path) -> Self {
+            let lock = crate::PROCESS_ENV_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let saved = ["HOME", "XDG_STATE_HOME"].map(|key| (key, std::env::var_os(key)));
+            for (key, _) in &saved {
+                std::env::set_var(key, dir);
+            }
+            Self { _lock: lock, saved }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ScratchEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// Starts a private daemon at `path` and returns once it answers.
+    fn serve_in_scratch(dir: &std::path::Path, path: &std::path::Path) {
+        use remuda_core::protocol::{Request, Response};
+        use std::time::{Duration, Instant};
+
+        // The daemon reads cluster state under HOME/XDG_STATE_HOME while it starts:
+        // point both at scratch, under the lock every env-swapping test holds (#661).
+        #[cfg(unix)]
+        let scratch_env = ScratchEnv::new(&dir.join("home"));
+        #[cfg(not(unix))]
+        let _ = dir;
+        let serving = path.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = crate::daemon::serve(&serving);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // Served, not just connectable: the listener task reads the env after bind.
+        while crate::client::request(path, &Request::List).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "private test daemon did not start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        #[cfg(unix)]
+        drop(scratch_env);
+        #[cfg(unix)]
+        assert!(
+            matches!(
+                crate::client::request(
+                    path,
+                    &Request::ClusterListener(remuda_core::protocol::ListenerOp::Status)
+                ),
+                Ok(Response::ClusterListenerStatus(
+                    remuda_core::protocol::ListenerStatus::Off
+                ))
+            ),
+            "the test daemon read cluster state outside its scratch directory"
+        );
+    }
+
     #[test]
     fn motions_and_yank_use_real_daemon_capture_cells_for_wide_text() {
         use remuda_core::protocol::{Request, Response};
@@ -1570,18 +1644,7 @@ mod visual_mode_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch directory");
         let path = crate::daemon::socket_path_in(&dir, "visual-cells");
-        let serving = path.clone();
-        std::thread::spawn(move || {
-            let _ = crate::daemon::serve(&serving);
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while crate::ipc::connect(&path).is_err() {
-            assert!(
-                Instant::now() < deadline,
-                "private test daemon did not start"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        serve_in_scratch(&dir, &path);
         let name = "visual-cells";
         let command = vec![
             "sh".into(),
