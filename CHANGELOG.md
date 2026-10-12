@@ -20,6 +20,11 @@
   not authentication: same-user access is not an authorization boundary and it
   makes no isolation claim.
 
+- Windows: a repeated parent PID whose current process is newer than its
+  child (a reused PID) no longer causes a false cycle refusal; the parent chain
+  ends there as outside (#665). The incident mechanism is inferred, not
+  reproduced. The check stays advisory, same-user, with no isolation claim.
+
 - Windows: `remuda.caller().kind` is `outside` when the caller is in no
   session's job and its parent chain ends at a missing or reused PID. An
   unreadable or incomplete chain stays `unknown`; `outside` means only that

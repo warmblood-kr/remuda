@@ -220,6 +220,8 @@ where
         }
         let (parent_pid, created) = match process(pid) {
             Ok(Some(info)) => info,
+            // Also for a pid seen earlier in this walk: a revisited pid that has
+            // vanished since ends Outside, not a cycle (#666).
             Ok(None) if hops > 0 => return ChainEnd::Outside,
             Ok(None) => {
                 return ChainEnd::Unknown {
@@ -530,6 +532,45 @@ mod tests {
         assert!(matches!(
             result,
             ChainEnd::Unknown { error, .. } if error.to_string() == "cycle in process parent chain"
+        ));
+    }
+
+    /// Walks 748 -> 700 -> 600 -> 748; the second lookup of 748 answers `revisit`.
+    fn revisit_748(revisit: io::Result<Option<(u32, u64)>>) -> ChainEnd {
+        let mut revisit = Some(revisit);
+        let mut seen = false;
+        super::chain_end_detailed(748, &[], |pid| match pid {
+            748 if seen => revisit.take().expect("748 is looked up at most twice"),
+            748 => {
+                seen = true;
+                Ok(Some((700, 500)))
+            }
+            700 => Ok(Some((600, 400))),
+            600 => Ok(Some((748, 300))),
+            _ => unreachable!(),
+        })
+    }
+
+    #[test]
+    fn a_repeated_pid_missing_on_revisit_ends_the_chain_outside() {
+        assert!(matches!(revisit_748(Ok(None)), ChainEnd::Outside));
+    }
+
+    #[test]
+    fn a_lookup_error_on_a_repeated_pid_is_unknown_for_that_pid() {
+        let result = revisit_748(Err(io::Error::other("lookup denied")));
+        assert!(matches!(
+            result,
+            ChainEnd::Unknown { pid: 748, error } if error.to_string() == "lookup denied"
+        ));
+    }
+
+    #[test]
+    fn an_older_repeated_pid_is_still_a_cycle() {
+        let result = revisit_748(Ok(Some((700, 200))));
+        assert!(matches!(
+            result,
+            ChainEnd::Unknown { pid: 748, error } if error.to_string() == "cycle in process parent chain"
         ));
     }
 
