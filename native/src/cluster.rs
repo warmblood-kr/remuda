@@ -527,12 +527,21 @@ fn resolve_target_in_registry(
 
 /// Format the local registry with an asterisk on this node's row.
 pub fn format_nodes_table(identity: &NodeIdentity, registry: &Registry) -> String {
+    format_nodes_table_with_aliases(identity, registry, &std::collections::BTreeMap::new())
+}
+
+/// Format display aliases beside stable fingerprints in the membership listing.
+pub fn format_nodes_table_with_aliases(
+    identity: &NodeIdentity,
+    registry: &Registry,
+    aliases: &std::collections::BTreeMap<String, String>,
+) -> String {
     let rows: Vec<_> = registry
         .authorized_nodes
         .iter()
         .map(|entry| {
             (
-                escape_registry_field(&node_label(&entry.node_fp)),
+                escape_registry_field(&display_node_label(&entry.node_fp, aliases)),
                 escape_registry_field(&entry.node_fp),
                 match entry.state {
                     NodeState::Admitted => "admitted",
@@ -586,6 +595,17 @@ pub fn format_nodes_table(identity: &NodeIdentity, registry: &Registry) -> Strin
         );
     }
     output
+}
+
+/// Friendly labels are display metadata, never an authentication identity.
+pub fn display_node_label(
+    fingerprint: &str,
+    aliases: &std::collections::BTreeMap<String, String>,
+) -> String {
+    aliases.get(fingerprint).map_or_else(
+        || node_label(fingerprint),
+        |alias| format!("{alias} ({})", node_label(fingerprint)),
+    )
 }
 
 /// Revoke a member by node label or exact fingerprint under the state lock.
@@ -1203,6 +1223,11 @@ mod nodes_revoke_tests {
             }],
         };
         let table = format_nodes_table(&identity, &registry);
+        let aliases =
+            std::collections::BTreeMap::from([(identity.node_fp.clone(), "macbook".into())]);
+        let aliased = super::format_nodes_table_with_aliases(&identity, &registry, &aliases);
+        assert!(aliased.contains(&format!("*macbook ({})", identity.node_name)));
+        assert!(aliased.contains(&identity.node_fp));
         assert!(table.contains(&format!("*{}", identity.node_name)));
         assert!(table.contains("FINGERPRINT"));
         assert!(table.contains("STATE"));
