@@ -10,6 +10,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 const PATIENCE: Duration = Duration::from_secs(10);
+/// One readiness probe; `client::request` would wait its full 10 s read
+/// timeout on a socket that accepts but does not answer (#663).
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A daemon as its own PROCESS, with its streams pointed at nothing. Inheriting
 /// the harness's stdout would let a leaked daemon hold cargo's pipe open, which
@@ -47,11 +50,18 @@ pub fn base_command(dir: &Path) -> std::process::Command {
 /// duplicate.
 pub fn spawn_and_wait(mut cmd: std::process::Command, dir: &Path) -> Daemon {
     let mut child = cmd.spawn().expect("spawn daemon");
-    let path = daemon::socket_path_in(dir, "s");
-    let deadline = Instant::now() + PATIENCE;
+    wait_until_served(&mut child, &daemon::socket_path_in(dir, "s"), PATIENCE);
+    Daemon(child)
+}
+
+/// Polls until the daemon at `path` answers a request; panics, killing
+/// `child`, once it exits or `patience` runs out.
+pub fn wait_until_served(child: &mut std::process::Child, path: &Path, patience: Duration) {
+    let deadline = Instant::now() + patience;
     // Served, not just connectable: the socket accepts before the daemon records
     // its inode, so a test that swaps the path in that gap misleads it (#603).
-    while remuda_native::client::request(&path, &remuda_core::protocol::Request::List).is_err() {
+    let list = remuda_core::protocol::Request::List;
+    while remuda_native::client::request_with_timeout(path, &list, PROBE_TIMEOUT).is_err() {
         if let Ok(Some(status)) = child.try_wait() {
             panic!("daemon exited before binding {path:?}: {status}");
         }
@@ -62,7 +72,6 @@ pub fn spawn_and_wait(mut cmd: std::process::Command, dir: &Path) -> Daemon {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    Daemon(child)
 }
 
 impl Daemon {
