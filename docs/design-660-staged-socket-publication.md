@@ -111,6 +111,11 @@ the node's provenance among cooperating processes; directory-relative metadata
 does not prove fd/node equality against a hostile same-UID writer. If strict
 fd-derived filesystem identity is mandatory, implementation is gated on a
 supported per-platform primitive; this portable proposal cannot promise it.
+Receipts compare node type plus `(dev, ino)`. Filesystems may reuse an inode
+after unlink, so a replacement created after removal could theoretically reuse
+the same pair and type before the next check. The receipt is therefore an
+advisory change detector, not a generation-proof token; it does not claim to
+defeat inode reuse or a hostile same-UID writer.
 
 ## Transaction and existing lifecycle
 

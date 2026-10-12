@@ -23,6 +23,7 @@ struct NodeReceipt {
 }
 
 impl NodeReceipt {
+    #[allow(clippy::unnecessary_cast)] // libc's stat field types vary across Unix targets.
     fn capture(parent: &File, name: &OsStr) -> io::Result<Self> {
         let name = c_name(name)?;
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -78,6 +79,7 @@ struct ListenerIdentity {
 }
 
 impl ListenerIdentity {
+    #[allow(clippy::unnecessary_cast)] // libc's stat field types vary across Unix targets.
     fn validate(fd: &OwnedFd, require_listening: bool) -> io::Result<Self> {
         let raw = fd.as_raw_fd();
         let descriptor_flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
@@ -185,10 +187,19 @@ fn chmod_socket_nofollow(
         ));
     }
     let name = c_name(name)?;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "arm",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )
+    ))]
     let result = unsafe {
         libc::syscall(
-            libc::SYS_fchmodat2,
+            452 as libc::c_long,
             parent.as_raw_fd(),
             name.as_ptr(),
             mode as libc::mode_t,
@@ -204,6 +215,20 @@ fn chmod_socket_nofollow(
             libc::AT_SYMLINK_NOFOLLOW,
         )
     };
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "arm",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        ))
+    ))]
+    let result = return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "fchmodat2 syscall number is unsupported on this architecture",
+    ));
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     let result = return Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -433,10 +458,11 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let receipt = NodeReceipt::capture_socket(&parent, OsStr::new("node")).unwrap();
         assert_eq!(receipt.kind, NodeKind::Socket);
-        drop(listener);
-        std::fs::remove_file(&path).unwrap();
-        UnixListener::bind(&path).unwrap();
+        let original_path = scratch.0.join("original");
+        std::fs::rename(&path, &original_path).unwrap();
+        let replacement_listener = UnixListener::bind(&path).unwrap();
         assert!(!receipt.matches(&parent, OsStr::new("node")));
+        drop((listener, replacement_listener));
     }
 
     #[test]
