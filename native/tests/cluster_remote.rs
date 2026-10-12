@@ -1167,3 +1167,128 @@ fn selected_remote_session_with_hangul_text_syncs_within_the_frame_limit() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn selected_remote_session_shows_a_change_soon_after_the_previous_one() {
+    let client_node = Node::start("cadence-client");
+    let server_node = Node::start("cadence-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    let marks = server_node.root.join("marks");
+    fs::create_dir_all(&marks).unwrap();
+    server_node.start_session(&format!(
+        "printf READY; i=1; while true; do while [ ! -e '{}/m'$i ]; do sleep 0.01; done; printf ' <M'$i'>'; i=$((i+1)); done",
+        marks.display()
+    ));
+    let server_public = server_node.public.clone();
+    let address = listener.address;
+    let timeouts = Duration::from_secs(25);
+    let client = ClusterClient::with_timeouts(
+        Arc::new(SystemWallClock::new()),
+        ClientTimeouts {
+            connect: Duration::from_secs(2),
+            read: timeouts,
+            total: timeouts,
+        },
+    );
+    let transport = Arc::new(ClusterRemoteTransport::with_client(
+        Zeroizing::new(client_node.private.clone()),
+        client,
+        move |_target| {
+            Ok(ResolvedTarget {
+                address,
+                pinned_static_key: server_public.clone(),
+            })
+        },
+    ));
+    let target = RemoteTarget {
+        name: remuda_native::cluster::node_label(&server_node.fingerprint()),
+        registry_key: server_node.fingerprint(),
+        addr_override: Some(address),
+    };
+    let poller = RemotePoller::new(vec![target.clone()], transport);
+    let source = poller.source();
+    poller
+        .selection()
+        .select(target.registry_key.clone(), "proof");
+    poller.start().unwrap();
+    wait_for("selected session screen", Duration::from_secs(10), || {
+        proof_session(source.as_ref())
+            .is_some_and(|session| session_text(&session).contains("READY"))
+    });
+    // Before #622 the next poll waited 2s after each delivery: ~1.5s here.
+    for mark in 1..=3 {
+        std::thread::sleep(Duration::from_millis(500));
+        let needle = format!("<M{mark}>");
+        let start = Instant::now();
+        fs::write(marks.join(format!("m{mark}")), b"").unwrap();
+        wait_for(&needle, Duration::from_secs(10), || {
+            proof_session(source.as_ref())
+                .is_some_and(|session| session_text(&session).contains(&needle))
+        });
+        let latency = start.elapsed();
+        assert!(
+            latency < Duration::from_millis(1000),
+            "{needle} after {latency:?}"
+        );
+    }
+}
+
+#[test]
+fn switching_away_from_a_quiet_selected_session_does_not_wait_out_its_sync() {
+    let client_node = Node::start("switch-client");
+    let server_node = Node::start("switch-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    server_node.start_session("printf QUIET_PROOF; sleep 60");
+    server_node.start_named_session("other", "printf OTHER_SCREEN; sleep 60");
+    let server_public = server_node.public.clone();
+    let address = listener.address;
+    let timeouts = Duration::from_secs(25);
+    let client = ClusterClient::with_timeouts(
+        Arc::new(SystemWallClock::new()),
+        ClientTimeouts {
+            connect: Duration::from_secs(2),
+            read: timeouts,
+            total: timeouts,
+        },
+    );
+    let transport = Arc::new(ClusterRemoteTransport::with_client(
+        Zeroizing::new(client_node.private.clone()),
+        client,
+        move |_target| {
+            Ok(ResolvedTarget {
+                address,
+                pinned_static_key: server_public.clone(),
+            })
+        },
+    ));
+    let target = RemoteTarget {
+        name: remuda_native::cluster::node_label(&server_node.fingerprint()),
+        registry_key: server_node.fingerprint(),
+        addr_override: Some(address),
+    };
+    let poller = RemotePoller::new(vec![target.clone()], transport);
+    let source = poller.source();
+    let selection = poller.selection();
+    selection.select(target.registry_key.clone(), "proof");
+    poller.start().unwrap();
+    wait_for("quiet selected screen", Duration::from_secs(10), || {
+        proof_session(source.as_ref())
+            .is_some_and(|session| session_text(&session).contains("QUIET_PROOF"))
+    });
+    // Let the follow-up Sync on the quiet session start its long-poll.
+    std::thread::sleep(Duration::from_millis(500));
+    selection.select(target.registry_key.clone(), "other");
+    let start = Instant::now();
+    wait_for("switched screen", Duration::from_secs(30), || {
+        source.snapshot().nodes.first().is_some_and(|node| {
+            node.sessions.iter().any(|session| {
+                session.name == "other" && session_text(session).contains("OTHER_SCREEN")
+            })
+        })
+    });
+    let waited = start.elapsed();
+    // A 20s Sync hold made this take ~20s before the hold was bounded.
+    assert!(waited < Duration::from_secs(5), "switch took {waited:?}");
+}
