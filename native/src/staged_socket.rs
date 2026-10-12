@@ -8,6 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
 
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NodeKind {
     Socket,
@@ -165,7 +166,9 @@ fn listen_and_validate(fd: &OwnedFd) -> io::Result<ListenerIdentity> {
     if unsafe { libc::listen(fd.as_raw_fd(), 128) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    ListenerIdentity::validate(fd, true)
+    // macOS AF_UNIX has no SO_ACCEPTCONN kernel confirmation. The successful
+    // listen above is its weaker receipt, tied to this same descriptor.
+    ListenerIdentity::validate(fd, !cfg!(target_os = "macos"))
 }
 
 fn create_stream_socket() -> io::Result<OwnedFd> {
