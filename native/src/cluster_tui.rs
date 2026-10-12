@@ -1810,7 +1810,10 @@ fn visible_remote_pane_lines(
 ) -> Vec<&str> {
     let mut pane_lines = pane_body.lines().collect::<Vec<_>>();
     if remote_active {
-        while pane_lines.last().is_some_and(|line| line.trim().is_empty()) {
+        while pane_lines
+            .last()
+            .is_some_and(|line| visually_blank_line(line))
+        {
             pane_lines.pop();
         }
     }
@@ -1825,6 +1828,46 @@ fn visible_remote_pane_lines(
         .take(screen_rows)
         .copied()
         .collect()
+}
+
+fn visually_blank_line(line: &str) -> bool {
+    if !line.contains('\x1b') {
+        return line.trim().is_empty();
+    }
+    let mut chars = line.chars();
+    let mut parser = vt100::Parser::new(2, 2, 0);
+    let mut decorated = false;
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Only generated SGR is expected here. Unknown controls keep the row.
+            let mut sgr = String::from("\x1b[H\x1b");
+            if chars.next() != Some('[') {
+                return false;
+            }
+            sgr.push('[');
+            loop {
+                let Some(code) = chars.next() else {
+                    return false;
+                };
+                sgr.push(code);
+                if code == 'm' {
+                    break;
+                }
+                if !code.is_ascii_digit() && code != ';' {
+                    return false;
+                }
+            }
+            // Probe the current attributes in one cell without allocating a full row.
+            sgr.push(' ');
+            parser.process(sgr.as_bytes());
+            let cell = parser.screen().cell(0, 0).expect("one-cell style probe");
+            decorated =
+                cell.bgcolor() != vt100::Color::Default || cell.inverse() || cell.underline();
+        } else if !ch.is_whitespace() || decorated {
+            return false;
+        }
+    }
+    true
 }
 
 /// Raw mode clears OPOST, so a bare `\n` only moves down and every row staircases right.
@@ -2985,6 +3028,61 @@ mod tests {
                 }
             }
             assert!(found, "red cell lost at {cols} columns: {rendered:?}");
+        }
+    }
+
+    #[test]
+    fn foreground_only_blank_tails_do_not_hide_remote_output() {
+        let clock = ManualClock::new();
+        for foreground in [Color::Default, Color::Idx(1)] {
+            let mut screen = remote_screen("important output");
+            screen.cells.extend(vec![
+                vec![StyledCell {
+                    text: "   ".into(),
+                    fg: foreground,
+                    ..StyledCell::default()
+                }];
+                3
+            ]);
+            screen.wrapped.extend([false; 3]);
+            let ui = selected_remote_ui(&clock, screen);
+            let frame = parsed_frame(&ui.render(100, 4, "", &clock), 100, 4);
+            assert!(
+                frame.screen().contents().contains("important output"),
+                "foreground-only blanks hid output: {foreground:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn meaningful_blank_backgrounds_inverse_and_underlines_remain_in_the_pane() {
+        for cell in [
+            StyledCell {
+                text: "   ".into(),
+                bg: Color::Idx(2),
+                ..StyledCell::default()
+            },
+            StyledCell {
+                text: "   ".into(),
+                inverse: true,
+                ..StyledCell::default()
+            },
+            StyledCell {
+                text: "   ".into(),
+                underline: true,
+                ..StyledCell::default()
+            },
+        ] {
+            let mut screen = remote_screen("important output");
+            screen.cells.extend(vec![vec![cell.clone()]; 3]);
+            screen.wrapped.extend([false; 3]);
+            let body = super::remote_screen_text(&screen);
+            let visible = super::visible_remote_pane_lines(&body, true, 2);
+            assert_eq!(visible.len(), 2);
+            assert!(
+                !visible.iter().any(|line| line.contains("important output")),
+                "meaningful styled blanks were removed: {cell:?}"
+            );
         }
     }
 
