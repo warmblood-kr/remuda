@@ -252,7 +252,10 @@ pub struct RemoteNode {
     next_poll: Instant,
     next_list: Instant,
     polling: bool,
+    published: NodeView,
 }
+
+type NodeView = (RemoteState, Option<Instant>, Option<String>);
 
 impl RemoteNode {
     pub fn new(name: impl Into<String>, now: Instant) -> Self {
@@ -272,6 +275,7 @@ impl RemoteNode {
             next_poll: now,
             next_list: now,
             polling: false,
+            published: (RemoteState::Unreachable, None, None),
         }
     }
 
@@ -371,6 +375,11 @@ impl RemoteNode {
         self.sessions.clone()
     }
 
+    /// What a viewer sees, minus sessions: those change only with `last_sync`.
+    fn view(&self) -> NodeView {
+        (self.state, self.last_sync, self.last_error.clone())
+    }
+
     fn snapshot_at(&self, now: Instant) -> RemoteNodeSnapshot {
         RemoteNodeSnapshot {
             registry_key: self.key.clone(),
@@ -421,11 +430,20 @@ impl RemoteTreeState {
             .map(f)
     }
 
-    /// Like `with_node`, for changes a viewer should see: moves the generation.
+    /// Like `with_node`, but moves the generation when what a viewer sees differs
+    /// from the last recorded view; bookkeeping, repeats or a removed node do not.
     fn record<R>(&self, name: &str, f: impl FnOnce(&mut RemoteNode) -> R) -> Option<R> {
-        let result = self.with_node(name, f);
-        self.changed();
-        result
+        let (result, changed) = self.with_node(name, |node| {
+            let result = f(node);
+            let view = node.view();
+            let changed = view != node.published;
+            node.published = view;
+            (result, changed)
+        })?;
+        if changed {
+            self.changed();
+        }
+        Some(result)
     }
 
     fn changed(&self) {
@@ -1936,6 +1954,79 @@ mod tests {
         assert_eq!(overloaded.kind(), io::ErrorKind::WouldBlock);
         assert!(synced_snapshot(&prior, Response::Error("boom".into())).is_err());
         assert!(synced_snapshot(&prior, Response::Ok).is_err());
+    }
+
+    #[test]
+    fn a_worker_error_backs_off_and_an_unchanged_repeat_does_not_wake_the_tui() {
+        struct Down;
+
+        impl RemoteTransport for Down {
+            fn poll_node(
+                &self,
+                _target: &RemoteTarget,
+                _selected_session: Option<&str>,
+                _previous: &[RemoteSessionSnapshot],
+            ) -> io::Result<RemotePoll> {
+                Err(io::Error::other("connection refused"))
+            }
+        }
+
+        let target = RemoteTarget {
+            name: "laptop".into(),
+            registry_key: "fp-a".into(),
+            addr_override: None,
+        };
+        let state = Arc::new(RemoteTreeState::default());
+        let transport: Arc<dyn RemoteTransport> = Arc::new(Down);
+        let workers = Arc::new(RemoteWorkerCap::default());
+        state.insert_node(RemoteNode::with_key(
+            "fp-a".into(),
+            "laptop".into(),
+            Instant::now(),
+        ));
+        let poll_once = || {
+            let due = Instant::now();
+            state.with_node("fp-a", |node| {
+                node.next_poll = due;
+                node.next_list = due;
+            });
+            let started = Instant::now();
+            assert!(
+                schedule_remote_poll(&state, &transport, &workers, target.clone(), None).unwrap()
+            );
+            // The permit is released only after the worker recorded its result.
+            while workers.acquire("fp-a").is_none() {
+                assert!(started.elapsed() < Duration::from_secs(2), "worker hung");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            state
+                .with_node("fp-a", |node| {
+                    (node.failure_count, node.retry_at() - started)
+                })
+                .unwrap()
+        };
+
+        let before = state.generation();
+        let (failures, backoff) = poll_once();
+        assert_eq!(failures, 1);
+        assert!(backoff >= BACKOFF_BASE, "{backoff:?}");
+        let failed = state.generation();
+        assert!(failed > before, "the first failure is shown");
+        assert_eq!(
+            state.snapshot_at(Instant::now()).nodes[0]
+                .last_error
+                .as_deref(),
+            Some("connection refused")
+        );
+
+        let (failures, backoff) = poll_once();
+        assert_eq!(failures, 2);
+        assert!(backoff >= 2 * BACKOFF_BASE, "{backoff:?}");
+        assert_eq!(
+            state.generation(),
+            failed,
+            "an unchanged repeat is not a wake"
+        );
     }
 
     #[test]
