@@ -2958,6 +2958,32 @@ mod tests {
     }
 
     #[test]
+    fn remote_cell_text_cannot_inject_terminal_controls_into_the_frame() {
+        let clock = ManualClock::new();
+        let mut screen = remote_screen_rows(1);
+        screen.cells[0][0].text =
+            "ordinary \u{1b}[31mred\u{1b}[0m \u{1b}]0;pwn\u{7} \u{1b}]2;title\u{1b}\\ tail\rtext"
+                .into();
+        let ui = selected_remote_ui(&clock, screen);
+
+        let rendered = ui.render(80, 24, "", &clock);
+        let terminal_input = terminal_frame(&rendered);
+        assert!(terminal_input.contains("ordinary"));
+        assert!(
+            !terminal_input
+                .chars()
+                .any(|character| character.is_control() && !matches!(character, '\r' | '\n')),
+            "{terminal_input:?}"
+        );
+
+        let output = present(None, parsed_frame(&rendered, 80, 24).screen());
+        assert!(
+            output.windows(2).any(|bytes| bytes == b"\x1b["),
+            "TUI styling is retained"
+        );
+    }
+
+    #[test]
     fn remote_keys_mode_uses_terminal_bytes_and_forwards_escape_control_and_navigation_keys() {
         use crossterm::event::{KeyCode, KeyModifiers};
 
