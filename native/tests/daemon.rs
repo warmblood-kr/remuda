@@ -7112,3 +7112,41 @@ fn a_broken_user_config_is_reported_but_never_bricks_the_daemon() {
          -- the image is poisoned"
     );
 }
+
+/// A socket swapped in while the daemon is still starting is not the daemon's:
+/// it must survive the daemon's shutdown (#660).
+#[cfg(unix)]
+#[test]
+fn a_socket_replaced_during_startup_survives_the_daemon_shutdown() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::net::UnixListener;
+
+    let dir = unique_scratch_dir("startup-swap");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let mut command = spawn::base_command(&dir);
+    command.env("REMUDA_TEST_STARTUP_PAUSE_MS", "2000");
+    let mut daemon = Daemon(command.spawn().expect("spawn daemon"));
+    let deadline = Instant::now() + PATIENCE;
+    while std::fs::symlink_metadata(&socket).is_err() {
+        assert!(Instant::now() < deadline, "daemon never bound {socket:?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::fs::remove_file(&socket).expect("remove the daemon's socket");
+    let replacement = UnixListener::bind(&socket).expect("bind replacement");
+    let replacement_ino = std::fs::symlink_metadata(&socket)
+        .expect("replacement")
+        .ino();
+
+    // Handled only once startup is done, so after the daemon records its owner.
+    let signalled = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(signalled, 0, "send SIGTERM to daemon");
+    assert!(daemon.left_on_its_own(), "daemon handles SIGTERM cleanly");
+    let survived = std::fs::symlink_metadata(&socket).map(|metadata| metadata.ino());
+    drop(replacement);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        survived.ok(),
+        Some(replacement_ino),
+        "the daemon deleted a socket it never bound"
+    );
+}
