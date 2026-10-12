@@ -1904,6 +1904,7 @@ const REMOTE_CHECK: Duration = Duration::from_millis(25);
 
 /// Wait up to INPUT_WAIT for terminal input, returning early (false) once the
 /// remote generation differs from `seen`, read before this frame's sync (#622).
+/// Input is polled first each slice, so a remote change never starves it.
 fn wait_for_input_or_remote(
     clock: &dyn Clock,
     mut poll: impl FnMut(Duration) -> io::Result<bool>,
@@ -1912,15 +1913,15 @@ fn wait_for_input_or_remote(
 ) -> io::Result<bool> {
     let deadline = clock.now() + INPUT_WAIT;
     loop {
-        if generation() != seen {
-            return Ok(false);
-        }
         let left = deadline.saturating_sub(clock.now());
         if left.is_zero() {
             return Ok(false);
         }
         if poll(left.min(REMOTE_CHECK))? {
             return Ok(true);
+        }
+        if generation() != seen {
+            return Ok(false);
         }
     }
 }
@@ -2516,14 +2517,14 @@ mod tests {
     }
 
     #[test]
-    fn an_update_that_landed_before_the_wait_ends_it_at_once() {
+    fn an_update_that_landed_before_the_wait_ends_it_after_one_input_slice() {
         // The baseline is read before sync/render; the update landed during them.
         let clock = ManualClock::new();
-        let mut polls = 0;
+        let mut slices = Vec::new();
         let ready = super::wait_for_input_or_remote(
             &clock,
             |slice| {
-                polls += 1;
+                slices.push(slice);
                 clock.advance(slice);
                 Ok(false)
             },
@@ -2532,7 +2533,51 @@ mod tests {
         )
         .unwrap();
         assert!(!ready);
-        assert_eq!(polls, 0, "no input wait once the snapshot already moved");
+        assert_eq!(
+            slices,
+            vec![Duration::from_millis(25)],
+            "input still gets one bounded poll before the remote redraw"
+        );
+    }
+
+    #[test]
+    fn ready_input_wins_over_a_remote_change() {
+        // Queued input with an already-moved snapshot is still read first.
+        let clock = ManualClock::new();
+        let mut slices = Vec::new();
+        let ready = super::wait_for_input_or_remote(
+            &clock,
+            |slice| {
+                slices.push(slice);
+                Ok(true)
+            },
+            || 8,
+            7,
+        )
+        .unwrap();
+        assert!(ready);
+        assert_eq!(slices, vec![Duration::from_millis(25)]);
+
+        // Remote changes on every pass never starve input that is ready.
+        let clock = ManualClock::new();
+        let generation = std::cell::Cell::new(7);
+        let mut inputs = 0;
+        for pass in 0..20 {
+            let seen = generation.get();
+            generation.set(seen + 1);
+            let ready = super::wait_for_input_or_remote(
+                &clock,
+                |_| Ok(pass % 2 == 0),
+                || generation.get(),
+                seen,
+            )
+            .unwrap();
+            if ready {
+                inputs += 1;
+            }
+            assert_eq!(ready, pass % 2 == 0, "pass {pass}");
+        }
+        assert_eq!(inputs, 10);
     }
 
     #[test]
