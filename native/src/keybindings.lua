@@ -1,6 +1,6 @@
 -- One declaration authority; native clients consume immutable effective rows.
 -- The factory's dependencies are captured before user code can replace them.
-return function(owner, validate, config_status)
+return function(owner, validate, config_status, validate_help)
   local entries, generation = {}, 0
   local api = {}
   local initializing = true
@@ -58,9 +58,8 @@ return function(owner, validate, config_status)
     if type(spec) ~= 'table' then error('define_key needs a table', 2) end
     if type(spec.action) ~= 'string' or spec.action == '' then error('binding needs an action name', 2) end
     local key = validate(spec.context, spec.key, spec.action)
-    if type(spec.help) ~= 'string' or spec.help == '' or spec.help:find('%c') then
-      error('binding needs printable help', 2)
-    end
+    if type(spec.help) ~= 'string' then error('binding needs printable help', 2) end
+    validate_help(spec.help)
     if find(spec.context, spec.action, key) then error('conflicting key or action binding', 2) end
     commit({context=spec.context, key=key, action=spec.action, help=spec.help, owner=initializing and '__defaults' or owner()})
   end

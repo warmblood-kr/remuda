@@ -29,9 +29,9 @@ local keymaps = nil
 if remuda._keymap_factory then
   local api
   api, keymaps = remuda._keymap_factory(function() return current_owner end,
-    remuda._keymap_validate, remuda._keymap_config_status)
+    remuda._keymap_validate, remuda._keymap_config_status, remuda._keymap_validate_help)
   for name, fn in pairs(api) do remuda[name] = fn end
-  remuda._keymap_factory, remuda._keymap_validate, remuda._keymap_config_status = nil, nil, nil
+  remuda._keymap_factory, remuda._keymap_validate, remuda._keymap_config_status, remuda._keymap_validate_help = nil, nil, nil, nil
 end
 local module_tool_owners = {}
 local function with_owner(owner, fn, ...)

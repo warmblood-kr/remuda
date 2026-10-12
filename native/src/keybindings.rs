@@ -34,6 +34,17 @@ fn validate(context: &str, key: &str, action: Option<&str>) -> Result<String, St
     canonical_event(event).ok_or_else(|| format!("unsupported key: {key}"))
 }
 
+fn validate_help(help: &str) -> Result<(), String> {
+    if help.is_empty() || help.chars().any(char::is_control) {
+        return Err("binding needs printable help".into());
+    }
+    Ok(())
+}
+
+fn help_validator(lua: &mlua::Lua) -> mlua::Result<mlua::Function> {
+    lua.create_function(|_, help: String| validate_help(&help).map_err(mlua::Error::runtime))
+}
+
 fn parse_key(spec: &str) -> Result<KeyEvent, String> {
     let mut base = spec;
     let mut modifiers = KeyModifiers::NONE;
@@ -209,9 +220,7 @@ impl Snapshot {
         let mut actions = std::collections::HashSet::new();
         for row in &mut snapshot.rows {
             row.key = validate(&row.context, &row.key, Some(&row.action))?;
-            if row.help.is_empty() || row.help.chars().any(char::is_control) {
-                return Err("binding needs printable help".into());
-            }
+            validate_help(&row.help)?;
             if !keys.insert((row.context.clone(), row.key.clone()))
                 || !actions.insert((row.context.clone(), row.action.clone()))
             {
@@ -294,6 +303,7 @@ pub(crate) fn install(
             },
         )?,
     )?;
+    table.set("_keymap_validate_help", help_validator(lua)?)?;
     table.set(
         "_keymap_config_status",
         lua.create_function(move |_, ()| Ok(status()))?,
@@ -329,8 +339,32 @@ mod tests {
             .unwrap()
             .set("_keymap_factory", factory)
             .unwrap();
+        lua.globals()
+            .get::<mlua::Table>("remuda")
+            .unwrap()
+            .set(
+                "_keymap_validate_help",
+                super::help_validator(&lua).unwrap(),
+            )
+            .unwrap();
         lua.load(include_str!("tools.lua")).exec().unwrap();
         lua
+    }
+
+    #[test]
+    fn keybindings_help_controls_are_rejected_before_committing() {
+        lua().load(r#"
+            remuda.unbind('session.list.browse', 'l')
+            local before = remuda.keymap_snapshot().generation
+            for _, help in ipairs({'bad\0help', 'bad\27help', 'bad\194\128help', 'bad\194\159help'}) do
+                local ok = pcall(remuda.define_key, {context='session.list.browse', key='z', action='session.toggle_list', help=help})
+                assert(not ok, 'control character help must be refused')
+                assert(remuda.keymap_snapshot().generation == before, 'failed declaration must not commit')
+                assert(#remuda.keymap_snapshot().rows == 0)
+            end
+            remuda.define_key{context='session.list.browse', key='z', action='session.toggle_list', help='목록 …'}
+            assert(remuda.keymap_snapshot().rows[1].help == '목록 …')
+        "#).exec().unwrap();
     }
 
     #[test]
