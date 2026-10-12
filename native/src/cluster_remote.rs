@@ -1205,6 +1205,19 @@ mod tests {
 
     #[test]
     fn insert_and_remove_advance_generation_after_mutating_the_node_set() {
+        // Waits up to one deadline for the generation to move off `baseline`.
+        // The old order bumps before taking the lock, so a worker blocked on
+        // the held lock still moves it and fails here whatever the scheduling.
+        fn moved_within_deadline(state: &RemoteTreeState, baseline: u64) -> bool {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                if state.generation() != baseline {
+                    return true;
+                }
+                std::thread::yield_now();
+            }
+            state.generation() != baseline
+        }
         let state = RemoteTreeState::default();
         let now = Instant::now();
         let inserted_generation = state.generation();
@@ -1216,8 +1229,7 @@ mod tests {
                 state.insert_node(RemoteNode::new("laptop", now));
             });
             started_rx.recv().unwrap();
-            std::thread::sleep(Duration::from_millis(10));
-            assert_eq!(state.generation(), inserted_generation);
+            assert!(!moved_within_deadline(&state, inserted_generation));
             drop(nodes);
             insert.join().unwrap();
         });
@@ -1233,8 +1245,7 @@ mod tests {
                 assert!(state.remove_node("laptop").is_some());
             });
             started_rx.recv().unwrap();
-            std::thread::sleep(Duration::from_millis(10));
-            assert_eq!(state.generation(), removed_generation);
+            assert!(!moved_within_deadline(&state, removed_generation));
             drop(nodes);
             remove.join().unwrap();
         });
