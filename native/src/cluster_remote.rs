@@ -14,6 +14,9 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Gap after a selected session's Sync returns before the next one (#622).
 /// Sync long-polls, so a quiet session still costs one request per timeout.
 const SELECTED_SYNC_SPACING: Duration = Duration::from_millis(150);
+/// Longest a selected session's Sync holds the node's one worker, so a new
+/// selection waits at most this for it (#684 QA).
+const SELECTED_SYNC_WAIT: Duration = POLL_INTERVAL;
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
@@ -489,15 +492,7 @@ impl ClusterRemoteTransport {
         let listed_instance_id = listed_instance_id(&session);
         let response = if should_sync(prior) {
             let prior = prior.expect("should_sync requires a prior screen");
-            self.request(
-                target,
-                &Request::Sync {
-                    name: prior.wire_name.clone(),
-                    instance_id: Some(prior.instance_id.clone()),
-                    since: prior.output_version.unwrap_or_default(),
-                    timeout_ms: REMOTE_SYNC_TIMEOUT.as_millis() as u64,
-                },
-            )?
+            self.request(target, &selected_sync_request(prior))?
         } else {
             self.request(
                 target,
@@ -625,15 +620,7 @@ impl RemoteTransport for ClusterRemoteTransport {
             return Ok(None);
         };
         let resolved = (self.resolve)(target)?;
-        let response = self.request(
-            &resolved,
-            &Request::Sync {
-                name: prior.wire_name.clone(),
-                instance_id: Some(prior.instance_id.clone()),
-                since: prior.output_version.unwrap_or_default(),
-                timeout_ms: REMOTE_SYNC_TIMEOUT.as_millis() as u64,
-            },
-        )?;
+        let response = self.request(&resolved, &selected_sync_request(prior))?;
         Ok(synced_snapshot(prior, response)?.map(|updated| {
             previous
                 .iter()
@@ -646,6 +633,15 @@ impl RemoteTransport for ClusterRemoteTransport {
                 })
                 .collect()
         }))
+    }
+}
+
+fn selected_sync_request(prior: &RemoteSessionSnapshot) -> Request {
+    Request::Sync {
+        name: prior.wire_name.clone(),
+        instance_id: Some(prior.instance_id.clone()),
+        since: prior.output_version.unwrap_or_default(),
+        timeout_ms: SELECTED_SYNC_WAIT.as_millis() as u64,
     }
 }
 
@@ -1626,6 +1622,29 @@ mod tests {
             node.poll_delivered(sessions, start, selected);
             assert_eq!(node.retry_at(), start + POLL_INTERVAL);
         }
+    }
+
+    #[test]
+    fn a_selected_sync_holds_the_worker_no_longer_than_the_list_interval() {
+        let Request::Sync {
+            name,
+            instance_id,
+            since,
+            timeout_ms,
+        } = selected_sync_request(&session("proof", "a"))
+        else {
+            panic!("selected sessions are read with Sync");
+        };
+        assert_eq!(
+            (name.as_str(), instance_id.as_deref(), since),
+            ("proof", Some("instance-1"), 4)
+        );
+        assert!(
+            Duration::from_millis(timeout_ms) <= POLL_INTERVAL,
+            "{timeout_ms} ms"
+        );
+        // The client's read timeout must outlast the server-side hold.
+        assert!(SELECTED_SYNC_WAIT < REMOTE_SYNC_TIMEOUT);
     }
 
     #[test]
