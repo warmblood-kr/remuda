@@ -310,6 +310,205 @@ mod clear_input_tests {
     }
 }
 
+#[cfg(test)]
+mod submit_window_tests {
+    use super::*;
+    use crate::agent::{AgentProcess, Cursor, Size};
+    use crate::clock::ManualClock;
+
+    /// Each screen-version read moves the manual clock by one poll step, so a
+    /// run depends only on the script, never on wall-clock luck (#637).
+    const STEP: Duration = Duration::from_millis(50);
+
+    #[derive(Clone, Copy)]
+    enum Redraw {
+        Submit,
+        ComposerNewline,
+        Nothing,
+    }
+
+    struct Script {
+        echo_after: Duration,
+        trailing_after: Option<Duration>,
+        redraw_after: Duration,
+        redraw: Redraw,
+        typed: String,
+        typed_at: Option<Duration>,
+        returns: Vec<Duration>,
+    }
+
+    /// A TUI whose paste echo, post-echo status redraw and post-Return redraw
+    /// land at chosen offsets on the manual clock.
+    struct SlowTui {
+        clock: Arc<ManualClock>,
+        script: Arc<Mutex<Script>>,
+    }
+
+    impl SlowTui {
+        fn screen(&self) -> (String, u64) {
+            let now = self.clock.now();
+            let script = self.script.lock().unwrap();
+            let mut screen = String::from("READY\n> ");
+            let mut version = 1;
+            if let Some(typed_at) = script.typed_at {
+                let echoed = typed_at + script.echo_after;
+                if now >= echoed {
+                    screen.push_str(&script.typed);
+                    version += 1;
+                }
+                if let Some(trailing) = script.trailing_after {
+                    if now >= echoed + trailing {
+                        screen.push_str("\n[pasted]");
+                        version += 1;
+                    }
+                }
+            }
+            if let Some(first_return) = script.returns.first() {
+                if now >= *first_return + script.redraw_after {
+                    match script.redraw {
+                        Redraw::Submit => screen.push_str("\nworking on it"),
+                        Redraw::ComposerNewline => screen.push_str("\n  "),
+                        Redraw::Nothing => version -= 1,
+                    }
+                    version += 1;
+                }
+            }
+            (screen, version)
+        }
+    }
+
+    impl AgentProcess for SlowTui {
+        fn write(&mut self, bytes: &[u8]) -> Result<()> {
+            let now = self.clock.now();
+            let mut script = self.script.lock().unwrap();
+            if bytes == crate::keys::RETURN_BYTES {
+                script.returns.push(now);
+            } else {
+                script.typed = String::from_utf8_lossy(bytes).into_owned();
+                script.typed_at = Some(now);
+            }
+            Ok(())
+        }
+        fn screen_text(&mut self) -> Result<String> {
+            Ok(self.screen().0)
+        }
+        fn output_version(&mut self) -> Option<u64> {
+            self.clock.advance(STEP);
+            Some(self.screen().1)
+        }
+        fn cursor(&mut self) -> Result<Cursor> {
+            Ok(Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            })
+        }
+        fn is_alive(&mut self) -> bool {
+            true
+        }
+        fn terminate(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> Size {
+            Size::default()
+        }
+    }
+
+    /// Types "alpha" into a scripted TUI; returns the outcome, the Return
+    /// times, and how long after the first Return `type_text` returned.
+    fn type_into(
+        echo_ms: u64,
+        trailing_ms: Option<u64>,
+        redraw_ms: u64,
+        redraw: Redraw,
+    ) -> (InputSubmitOutcome, Vec<Duration>, Duration) {
+        let clock = Arc::new(ManualClock::new());
+        let script = Arc::new(Mutex::new(Script {
+            echo_after: Duration::from_millis(echo_ms),
+            trailing_after: trailing_ms.map(Duration::from_millis),
+            redraw_after: Duration::from_millis(redraw_ms),
+            redraw,
+            typed: String::new(),
+            typed_at: None,
+            returns: Vec::new(),
+        }));
+        let agent = SlowTui {
+            clock: Arc::clone(&clock),
+            script: Arc::clone(&script),
+        };
+        let session = Session::new("tui", Box::new(agent), clock.clone());
+        let outcome = session.type_text("alpha", Duration::ZERO).unwrap();
+        let returns = script.lock().unwrap().returns.clone();
+        let after_return = clock.now() - returns[0];
+        (outcome, returns, after_return)
+    }
+
+    #[test]
+    fn a_prompt_redraw_after_return_is_submitted() {
+        let (outcome, returns, _) = type_into(0, None, 200, Redraw::Submit);
+        assert_eq!(outcome, InputSubmitOutcome::Submitted);
+        assert_eq!(returns.len(), 1);
+    }
+
+    #[test]
+    fn a_silent_submit_is_unverified_within_one_second() {
+        let (outcome, returns, after_return) = type_into(0, None, 0, Redraw::Nothing);
+        assert_eq!(outcome, InputSubmitOutcome::Unverified);
+        assert_eq!(returns.len(), 1, "a silent submit must not be retried");
+        assert!(
+            after_return <= Duration::from_millis(1100),
+            "{after_return:?}"
+        );
+    }
+
+    #[test]
+    fn a_prompt_composer_newline_gets_one_retry() {
+        let (outcome, returns, _) = type_into(0, None, 200, Redraw::ComposerNewline);
+        assert_eq!(outcome, InputSubmitOutcome::Unverified);
+        assert_eq!(returns.len(), 2);
+    }
+
+    #[test]
+    fn a_slow_tui_redraw_after_return_is_still_submitted() {
+        let (outcome, returns, _) = type_into(600, None, 1500, Redraw::Submit);
+        assert_eq!(outcome, InputSubmitOutcome::Submitted);
+        assert_eq!(returns.len(), 1);
+    }
+
+    #[test]
+    fn a_slow_tui_composer_newline_still_gets_its_retry() {
+        let (_, returns, _) = type_into(600, None, 1500, Redraw::ComposerNewline);
+        assert_eq!(
+            returns.len(),
+            2,
+            "the late composer newline was not retried"
+        );
+    }
+
+    #[test]
+    fn a_slow_tui_late_paste_redraw_is_not_taken_for_a_submit() {
+        let (outcome, returns, _) = type_into(600, Some(500), 0, Redraw::Nothing);
+        assert_eq!(outcome, InputSubmitOutcome::Unverified);
+        assert_eq!(returns.len(), 1);
+    }
+
+    #[test]
+    fn the_scaled_window_stays_bounded() {
+        let (outcome, _, after_return) = type_into(1900, None, 0, Redraw::Nothing);
+        assert_eq!(outcome, InputSubmitOutcome::Unverified);
+        assert!(
+            after_return <= Duration::from_millis(6100),
+            "{after_return:?}"
+        );
+    }
+}
+
+/// A child slow to echo the paste is slow to redraw after Return too (#637).
+/// The echo wait is capped at 2s, so the window stays within 6s.
+fn submit_window(echo: Duration) -> Duration {
+    SUBMIT_WINDOW.max(echo * 3)
+}
+
 fn occurrence_count(screen: &str, tail: &str) -> usize {
     if tail.is_empty() {
         0
@@ -335,6 +534,10 @@ pub enum InputSubmitOutcome {
 
 /// Pause between pasted text and its Return when the caller gives none.
 pub const DEFAULT_INPUT_SETTLE: Duration = Duration::from_millis(100);
+/// Quiet wait before Return and observation window after it, for a child that
+/// echoes the paste at once. A slower echo stretches both (`submit_window`).
+const SCREEN_QUIET: Duration = Duration::from_millis(300);
+const SUBMIT_WINDOW: Duration = Duration::from_secs(1);
 /// A clear is refused while the most recent human keystroke is this recent.
 const HUMAN_INPUT_GUARD: Duration = Duration::from_secs(2);
 const MAX_CLEAR_INPUT_KEY_BYTES: usize = 16;
@@ -726,8 +929,10 @@ impl Session {
             self.write_one_burst(crate::keys::RETURN_BYTES)?;
             return Ok(InputSubmitOutcome::Submitted);
         }
+        let echo_started = self.clock.now();
         let visible = self.wait_for_visible_tail(tail, baseline_occurrences, &mut version);
-        self.wait_for_screen_quiet(&mut version);
+        let echo = self.clock.now().saturating_sub(echo_started);
+        self.wait_for_screen_quiet(&mut version, SCREEN_QUIET.max(echo));
         let before_raw = self.screen_text().unwrap_or_default();
         let before_compact = compact_screen(&before_raw);
         let before_version = self.output_version().unwrap_or(version);
@@ -737,7 +942,7 @@ impl Session {
         }
 
         version = before_version;
-        let deadline = self.clock.now() + Duration::from_secs(1);
+        let deadline = self.clock.now() + submit_window(echo);
         let mut composer_newline = false;
         while self.clock.now() < deadline {
             if !self.is_alive() {
@@ -798,8 +1003,8 @@ impl Session {
             .map_or(0, |screen| occurrence_count(&screen, tail))
     }
 
-    fn wait_for_screen_quiet(&self, version: &mut u64) {
-        let deadline = self.clock.now() + Duration::from_millis(300);
+    fn wait_for_screen_quiet(&self, version: &mut u64, quiet: Duration) {
+        let deadline = self.clock.now() + quiet;
         while self.clock.now() < deadline {
             let remaining = deadline.saturating_sub(self.clock.now());
             let timeout = remaining.min(Duration::from_millis(75));
