@@ -1843,6 +1843,34 @@ fn present(prev: Option<&vt100::Screen>, next: &vt100::Screen) -> Vec<u8> {
     }
 }
 
+const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+const SYNC_END: &[u8] = b"\x1b[?2026l";
+
+/// Hand one frame to the terminal in a single write inside synchronized output,
+/// so a supporting terminal never shows half a frame (#621).
+fn write_frame(out: &mut impl Write, frame: &[u8]) -> io::Result<()> {
+    let mut bytes = Vec::with_capacity(SYNC_BEGIN.len() + frame.len() + SYNC_END.len());
+    bytes.extend_from_slice(SYNC_BEGIN);
+    bytes.extend_from_slice(frame);
+    bytes.extend_from_slice(SYNC_END);
+    out.write_all(&bytes)?;
+    out.flush()
+}
+
+/// Stdout for frames. On Unix a duplicate of fd 1, bypassing the LineWriter
+/// that would split a frame at its last line feed into two writes.
+#[cfg(unix)]
+fn frame_writer() -> io::Result<Box<dyn Write>> {
+    use std::os::fd::AsFd as _;
+    let fd = io::stdout().as_fd().try_clone_to_owned()?;
+    Ok(Box::new(std::fs::File::from(fd)))
+}
+
+#[cfg(not(unix))]
+fn frame_writer() -> io::Result<Box<dyn Write>> {
+    Ok(Box::new(io::stdout()))
+}
+
 const MAX_TERMINAL_COLS: u16 = 512;
 const MAX_TERMINAL_ROWS: u16 = 256;
 const MAX_TERMINAL_CELLS: u32 = 131_072;
@@ -2268,6 +2296,7 @@ fn run_loop(
         }
     }
     let mut previous = None;
+    let mut frames = frame_writer()?;
     loop {
         if let Ok(current) = list(path) {
             ui.sessions_synced(current, clock.now());
@@ -2312,8 +2341,9 @@ fn run_loop(
         next.process(format!("\x1b[H\x1b[2J{}", terminal_frame(&frame)).as_bytes());
         let output = present(previous.as_ref().map(vt100::Parser::screen), next.screen());
         if !output.is_empty() {
-            io::stdout().write_all(&output)?;
+            // Anything another writer left in stdout's buffer goes first.
             io::stdout().flush()?;
+            write_frame(&mut frames, &output)?;
         }
         previous = Some(next);
         ui.send_close_pending(path, remote_input, clock.now());
@@ -2382,6 +2412,32 @@ mod tests {
         let mut parser = vt100::Parser::new(rows, cols, 0);
         parser.process(format!("\x1b[H\x1b[2J{}", terminal_frame(frame)).as_bytes());
         parser
+    }
+
+    #[test]
+    fn a_frame_reaches_the_terminal_as_one_synchronized_write() {
+        #[derive(Default)]
+        struct Writes(Vec<Vec<u8>>);
+        impl std::io::Write for Writes {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.push(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let frame = present(None, parsed_frame("one\r\ntwo\r\nthree", 20, 4).screen());
+        assert!(frame.contains(&b'\n'), "a full repaint has line feeds");
+        let mut terminal = Writes::default();
+        super::write_frame(&mut terminal, &frame).unwrap();
+
+        assert_eq!(terminal.0.len(), 1, "one write call per frame");
+        let written = &terminal.0[0];
+        assert!(written.starts_with(b"\x1b[?2026h"), "{written:?}");
+        assert!(written.ends_with(b"\x1b[?2026l"), "{written:?}");
+        assert_eq!(&written[8..written.len() - 8], frame.as_slice());
     }
 
     #[test]
