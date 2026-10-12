@@ -155,9 +155,10 @@ fn children_of_a_detached_daemon_keep_the_default_sighup() {
     let dir = daemon.socket.parent().unwrap().to_path_buf();
     let probe = |file: &Path| {
         format!(
-            "{{'{}', '{}'}}",
+            "{{'{}', '{}', '{}'}}",
             env!("CARGO_BIN_EXE_sighup_disposition_probe"),
-            file.display()
+            file.display(),
+            daemon.child.id()
         )
     };
     let (pty_file, process_file) = (dir.join("pty.disp"), dir.join("process.disp"));
@@ -196,17 +197,48 @@ fn children_of_a_detached_daemon_keep_the_default_sighup() {
     );
 
     // A probe that outlives its daemon writes its coverage profile late (#624).
-    let pids = [&pty_file, &process_file].map(|file| {
-        let pid = read(&file.with_extension("pid"));
-        pid.parse::<libc::pid_t>().expect("probe pid")
-    });
     drop(daemon);
+    wait_until_probe_exits(&pty_file, "outlived its daemon");
+    wait_until_probe_exits(&process_file, "outlived its daemon");
+}
+
+/// Waits for the probe that reported to `file` to exit, read from its lock on
+/// FILE.alive: `kill(pid, 0)` still succeeds on a zombie.
+fn wait_until_probe_exits(file: &Path, failure: &str) {
+    use std::os::fd::AsRawFd;
+    let mut alive = file.as_os_str().to_owned();
+    alive.push(".alive");
+    let lock = std::fs::File::open(&alive).expect("open the probe's FILE.alive");
     let deadline = Instant::now() + Duration::from_secs(5);
-    for pid in pids {
-        // SAFETY: signal 0 only checks that the pid exists.
-        while unsafe { libc::kill(pid, 0) } == 0 {
-            assert!(Instant::now() < deadline, "probe {pid} outlived its daemon");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+    // SAFETY: flock on a descriptor this function owns.
+    while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        assert!(Instant::now() < deadline, "probe for {file:?} {failure}");
+        std::thread::sleep(Duration::from_millis(20));
     }
+    let _ = std::fs::remove_file(&alive);
+    let _ = std::fs::remove_file(file);
+}
+
+/// A probe whose daemon died before it started exits at once rather than
+/// idling to its cap. Unreaped here, the exited probe stays a zombie (#659).
+#[test]
+fn a_probe_whose_daemon_is_already_gone_exits_at_once() {
+    let dir = std::env::temp_dir().join(format!("rds-{}-orphan", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("orphan.disp");
+    // Its parent is this test, never pid 1, so its named daemon is gone.
+    let mut probe = Command::new(env!("CARGO_BIN_EXE_sighup_disposition_probe"))
+        .arg(&file)
+        .arg("1")
+        .spawn()
+        .expect("spawn probe");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&file).map_or(true, |text| text.is_empty()) {
+        assert!(Instant::now() < deadline, "probe never reported {file:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    wait_until_probe_exits(&file, "idled after its daemon was gone");
+    let _ = probe.wait();
+    let _ = std::fs::remove_dir_all(&dir);
 }
