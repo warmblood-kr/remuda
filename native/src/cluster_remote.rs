@@ -407,19 +407,21 @@ pub struct RemoteTreeState {
 
 impl RemoteTreeState {
     pub fn insert_node(&self, node: RemoteNode) {
-        self.changed();
         self.nodes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(node.key.clone(), node);
+        self.changed();
     }
 
     pub fn remove_node(&self, name: &str) -> Option<RemoteNode> {
-        self.changed();
-        self.nodes
+        let removed = self
+            .nodes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(name)
+            .remove(name);
+        self.changed();
+        removed
     }
 
     pub fn with_node<R>(&self, name: &str, f: impl FnOnce(&mut RemoteNode) -> R) -> Option<R> {
@@ -2027,6 +2029,37 @@ mod tests {
             failed,
             "an unchanged repeat is not a wake"
         );
+    }
+
+    #[test]
+    fn node_mutations_publish_only_after_obtaining_the_map_lock() {
+        for remove in [false, true] {
+            let state = Arc::new(RemoteTreeState::default());
+            state.insert_node(RemoteNode::new("laptop", Instant::now()));
+            let locked = state.nodes.lock().unwrap();
+            let before = state.generation();
+            let (started, ready) = std::sync::mpsc::channel();
+            let writer = Arc::clone(&state);
+            let worker = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                if remove {
+                    writer.remove_node("laptop");
+                } else {
+                    writer.insert_node(RemoteNode::new("other", Instant::now()));
+                }
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(100);
+            while state.generation() == before && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let blocked_generation = state.generation();
+            drop(locked);
+            worker.join().unwrap();
+            assert_eq!(blocked_generation, before, "published before map mutation");
+            assert!(state.generation() > before);
+            assert_eq!(state.snapshot().nodes.len(), if remove { 0 } else { 2 });
+        }
     }
 
     #[test]
