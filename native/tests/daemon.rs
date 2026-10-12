@@ -2409,15 +2409,35 @@ fn session_output_wakes_coalesce_while_lua_is_busy_and_list_stays_responsive() {
     .expect("start chatty session");
     assert_eq!(response, Response::Value("chatty".into()));
 
-    let until = Instant::now() + Duration::from_millis(750);
+    // List until the hook has run, however late output starts under load
+    // (#645): an eval queued behind the busy hook only returns after it.
+    let hook_ran = {
+        let path = path.clone();
+        std::thread::spawn(move || {
+            let calls = Request::Eval {
+                code: "return remuda._session_output_test_calls".into(),
+                name: None,
+            };
+            let deadline = Instant::now() + PATIENCE;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "the output hook never ran");
+                match client::request_with_timeout(&path, &calls, remaining) {
+                    Ok(Response::Value(count)) if count != "0" => break,
+                    _ => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        })
+    };
     let mut max_list_latency = Duration::ZERO;
-    while Instant::now() < until {
+    while !hook_ran.is_finished() {
         let started = Instant::now();
         let response = client::request(&path, &Request::List).expect("list during output hook");
         max_list_latency = max_list_latency.max(started.elapsed());
         assert!(matches!(response, Response::Sessions(_)));
         std::thread::sleep(Duration::from_millis(5));
     }
+    hook_ran.join().expect("wait for the output hook");
     assert!(
         max_list_latency < Duration::from_millis(100),
         "session list stalled behind output hook: {max_list_latency:?}"
