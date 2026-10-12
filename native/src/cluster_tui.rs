@@ -2000,7 +2000,7 @@ fn remote_screen_text(screen: &remuda_core::agent::ScreenSnapshot) -> String {
         .iter()
         .map(|row| {
             row.iter()
-                .map(|cell| cell.text.as_str())
+                .map(|cell| crate::text::strip_terminal_controls(&cell.text).into_owned())
                 .collect::<String>()
         })
         .collect::<Vec<_>>()
