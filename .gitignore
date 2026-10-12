@@ -1,2 +1,4 @@
 target/
 __pycache__/
+# LLVM default-named profiles from instrumented test children (#624)
+native/*.profraw
