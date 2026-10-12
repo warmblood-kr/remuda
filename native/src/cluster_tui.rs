@@ -2962,13 +2962,21 @@ mod tests {
         let clock = ManualClock::new();
         let mut screen = remote_screen_rows(1);
         screen.cells[0][0].text =
-            "ordinary \u{1b}[31mred\u{1b}[0m \u{1b}]0;pwn\u{7} \u{1b}]2;title\u{1b}\\ tail\rtext"
+            "tail\rtext ordinary \u{1b}[31mred\u{1b}[0m \u{1b}]0;pwn\u{7} \u{1b}]2;title\u{1b}\\"
                 .into();
         let ui = selected_remote_ui(&clock, screen);
 
         let rendered = ui.render(80, 24, "", &clock);
         let terminal_input = terminal_frame(&rendered);
-        assert!(terminal_input.contains("ordinary"));
+        assert!(terminal_input.contains("tailtext ordinary"));
+        assert!(rendered.contains("tailtext"), "{rendered:?}");
+        assert!(!rendered.contains("tail\rtext"), "{rendered:?}");
+        assert!(
+            terminal_input
+                .match_indices('\r')
+                .all(|(index, _)| { terminal_input.as_bytes().get(index + 1) == Some(&b'\n') }),
+            "terminal frame contains a lone carriage return: {terminal_input:?}"
+        );
         assert!(
             !terminal_input
                 .chars()
