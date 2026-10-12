@@ -3011,7 +3011,7 @@ mod tests {
         )));
         let mut ui = ClusterUi::new("local", vec![session("local", true)], Duration::ZERO);
         ui.remote_synced(&source);
-        ui.select_target(Some("laptop/build")).unwrap();
+        ui.select_target(Some("fp-laptop/build")).unwrap();
         for cols in [40, 100] {
             let rendered = ui.render(cols, 20, "", &clock);
             let parsed = parsed_frame(&rendered, cols, 20);
