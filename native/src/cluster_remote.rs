@@ -407,19 +407,21 @@ pub struct RemoteTreeState {
 
 impl RemoteTreeState {
     pub fn insert_node(&self, node: RemoteNode) {
-        self.changed();
         self.nodes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(node.key.clone(), node);
+        self.changed();
     }
 
     pub fn remove_node(&self, name: &str) -> Option<RemoteNode> {
-        self.changed();
-        self.nodes
+        let removed = self
+            .nodes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(name)
+            .remove(name);
+        self.changed();
+        removed
     }
 
     pub fn with_node<R>(&self, name: &str, f: impl FnOnce(&mut RemoteNode) -> R) -> Option<R> {
@@ -1208,11 +1210,10 @@ mod tests {
         let inserted_generation = state.generation();
         let nodes = state.nodes.lock().unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let insert_state = &state;
-        let insert = std::thread::scope(|scope| {
-            let insert = scope.spawn(move || {
+        std::thread::scope(|scope| {
+            let insert = scope.spawn(|| {
                 started_tx.send(()).unwrap();
-                insert_state.insert_node(RemoteNode::new("laptop", now));
+                state.insert_node(RemoteNode::new("laptop", now));
             });
             started_rx.recv().unwrap();
             std::thread::sleep(Duration::from_millis(10));
@@ -1220,7 +1221,6 @@ mod tests {
             drop(nodes);
             insert.join().unwrap();
         });
-        let _ = insert;
         assert_eq!(state.generation(), inserted_generation + 1);
         assert_eq!(state.snapshot().nodes.len(), 1);
 
