@@ -140,10 +140,8 @@ pub(crate) fn open(public: &Path, controls: &Controls) -> io::Result<Opened> {
             return Err(error);
         }
     };
-    if let Err(error) = bind_path(&fd, &staged_path) {
-        // The constructor error never authorizes a blind unlink.
-        return Err(error);
-    }
+    // A bind error never authorizes a blind unlink: the leaf is unreceipted.
+    bind_path(&fd, &staged_path)?;
     controls.checkpoint(Boundary::Bound, &staged_path)?;
     let leaf_name = OsStr::new("s");
     let mut attempts = 0;
