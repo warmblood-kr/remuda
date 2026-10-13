@@ -5691,25 +5691,11 @@ fn checked_cli_flags(args: &[String]) -> Result<CheckedCliFlags, ExitCode> {
     if version_requested {
         args = vec!["--version".into()];
     }
-    if stdin_enabled {
-        if !args.first().is_some_and(|command| {
-            remuda_native::packages::valid_component(command)
-                && remuda_native::packages::has_subcommand(command)
-        }) {
-            return Err(fail(
-                "--stdin is only valid before an installed mod command",
-            ));
-        }
-    } else if args.first().is_some_and(|command| {
-        remuda_native::packages::valid_component(command)
-            && remuda_native::packages::has_subcommand(command)
+    if let Err(message) = validate_stdin_placement(&args, stdin_enabled, |name| {
+        remuda_native::packages::valid_component(name)
+            && remuda_native::packages::has_subcommand(name)
     }) {
-        let options = args.iter().skip(1).take_while(|arg| *arg != "--");
-        if options.into_iter().any(|arg| arg == "--stdin") {
-            return Err(fail(
-                "usage: remuda --stdin MOD [ARGS…] (put --stdin before the mod command)",
-            ));
-        }
+        return Err(fail(message));
     }
     Ok(CheckedCliFlags {
         server,
@@ -5718,6 +5704,26 @@ fn checked_cli_flags(args: &[String]) -> Result<CheckedCliFlags, ExitCode> {
         help_requested,
         args,
     })
+}
+
+fn validate_stdin_placement(
+    args: &[String],
+    stdin_enabled: bool,
+    has_subcommand: impl Fn(&str) -> bool,
+) -> Result<(), &'static str> {
+    let first_is_mod = args.first().is_some_and(|command| {
+        remuda_native::packages::valid_component(command) && has_subcommand(command)
+    });
+    if stdin_enabled && !first_is_mod {
+        return Err("--stdin is only valid before an installed mod command");
+    }
+    if !stdin_enabled && first_is_mod {
+        let options = args.iter().skip(1).take_while(|arg| *arg != "--");
+        if options.into_iter().any(|arg| arg == "--stdin") {
+            return Err("usage: remuda --stdin MOD [ARGS…] (put --stdin before the mod command)");
+        }
+    }
+    Ok(())
 }
 
 /// Run `f`, starting the named daemon first if nothing is listening yet.
@@ -7341,8 +7347,8 @@ mod cluster_call_tests {
 #[cfg(test)]
 mod declared_cli_tests {
     use super::{
-        attach_cli_spec, checked_cli_flags, cli_positional_words, parse_top_level_cli,
-        run_cli_spec, send_cli_spec,
+        attach_cli_spec, checked_cli_flags, cli_flag, cli_positional_words, dispatch_cli_spec,
+        parse_top_level_cli, run_cli_spec, send_cli_spec, validate_stdin_placement,
     };
 
     #[test]
@@ -7389,23 +7395,47 @@ mod declared_cli_tests {
 
     #[test]
     fn root_stdin_flag_is_declared_and_respects_the_separator_boundary() {
-        let valid =
-            checked_cli_flags(&["--stdin".into(), "butler".into(), "inbox".into()]).unwrap();
-        assert!(valid.stdin_enabled);
-        assert_eq!(valid.args, ["butler", "inbox"]);
+        let parse = |args: &[&str]| {
+            let words = std::iter::once("__dispatch")
+                .chain(args.iter().copied())
+                .collect::<Vec<_>>();
+            remuda_native::cli_parse::parse_passthrough(&dispatch_cli_spec(), &words)
+        };
+        let valid = parse(&["--stdin", "butler", "inbox"]);
+        assert!(valid.ok);
+        assert!(cli_flag(&valid.values, "stdin"));
+        let valid_args = cli_positional_words(&valid.values, "ARGS");
+        assert_eq!(valid_args, ["butler", "inbox"]);
+        assert!(validate_stdin_placement(
+            &valid_args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            true,
+            |name| name == "butler"
+        )
+        .is_ok());
 
-        let misplaced = checked_cli_flags(&["butler".into(), "inbox".into(), "--stdin".into()]);
-        assert!(misplaced.is_err());
+        let misplaced = parse(&["butler", "inbox", "--stdin"]);
+        assert!(misplaced.ok);
+        assert!(!cli_flag(&misplaced.values, "stdin"));
+        let misplaced_args = cli_positional_words(&misplaced.values, "ARGS")
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        assert!(validate_stdin_placement(&misplaced_args, false, |name| name == "butler").is_err());
 
-        let literal = checked_cli_flags(&[
-            "butler".into(),
-            "inbox".into(),
-            "--".into(),
-            "--stdin".into(),
-        ])
-        .unwrap();
-        assert!(!literal.stdin_enabled);
-        assert_eq!(literal.args, ["butler", "inbox", "--", "--stdin"]);
+        let literal = parse(&["butler", "inbox", "--", "--stdin"]);
+        assert!(literal.ok);
+        assert!(!cli_flag(&literal.values, "stdin"));
+        let literal_args = cli_positional_words(&literal.values, "ARGS");
+        assert_eq!(literal_args, ["butler", "inbox", "--", "--stdin"]);
+        assert!(validate_stdin_placement(
+            &literal_args
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            false,
+            |name| name == "butler"
+        )
+        .is_ok());
     }
 
     #[test]
