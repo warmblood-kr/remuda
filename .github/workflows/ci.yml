@@ -430,7 +430,8 @@ jobs:
         run: |
           cp native/src/script.rs /tmp/script.rs.bak
           sed -i 's/"insert"/"insert_bytes"/g' native/src/script.rs
-          cargo test -p remuda-native --test script 2>&1 | tee /tmp/out || true
+          CARGO_TARGET_DIR="${RUNNER_TEMP}/frozen-api-mutation-target" \
+            cargo test -p remuda-native --test script 2>&1 | tee /tmp/out || true
           cp /tmp/script.rs.bak native/src/script.rs
           grep -q "the_bound_surface_is_exactly_the_protocols ... ok" /tmp/out \
             || { echo "::error::the surface test was supposed to STAY GREEN under a clean rename"; exit 1; }

@@ -168,6 +168,14 @@ fn escape_fixture(input: &str) -> String {
 
 fn normalize(input: &str, root: &Path) -> String {
     let mut text = input.replace(&root.display().to_string(), "<TEMP>");
+    if let Some(start) = text.find("remuda: cluster remote: ") {
+        let end = text[start..]
+            .find('\n')
+            .map_or(text.len(), |offset| start + offset);
+        if text[start..end].contains("(os error ") {
+            text.replace_range(start..end, "remuda: cluster remote: <PLATFORM_ERROR>");
+        }
+    }
     if let Some(index) = text.find("Unix time ") {
         let start = index + "Unix time ".len();
         let end = text[start..]
