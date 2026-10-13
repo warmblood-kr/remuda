@@ -817,6 +817,7 @@ fn cluster_cli_spec() -> remuda_native::cli_parse::Spec {
                 vec![arg("NODE", "Remote node name or fingerprint", false, true), arg("ACTION", "list or capture", false, true), arg("SESSION", "Session to capture; required for capture", false, false)],
                 vec![option("addr", Some("IP[:PORT]"), &port, true), option("json", None, "Print list results as JSON", false)],
                 "remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] [--json]"),
+            verb("help", "Print help for a cluster command", vec![arg("COMMAND", "Cluster command name", false, false)], vec![], "remuda cluster help [COMMAND]"),
         ],
     }
 }
@@ -826,27 +827,6 @@ fn cluster_verb_known(verb: &str) -> bool {
         .verbs
         .iter()
         .any(|spec| spec.name == verb)
-}
-
-fn cluster_help_alias_spec() -> remuda_native::cli_parse::Spec {
-    use remuda_native::cli_parse::{ArgSpec, Spec, VerbSpec};
-    Spec {
-        name: "remuda cluster".into(),
-        options: vec![],
-        verbs: vec![VerbSpec {
-            name: "cluster-help".into(),
-            about: "Show cluster commands or help for one command".into(),
-            usage: Some("help [COMMAND]".into()),
-            args: vec![ArgSpec {
-                name: "TOPIC".into(),
-                help: "Cluster command name".into(),
-                multiple: false,
-                required: false,
-            }],
-            next: "remuda cluster --help".into(),
-            options: vec![],
-        }],
-    }
 }
 
 fn invalid_cluster(verb: &str, reason: impl Into<String>) -> ClusterCommand {
@@ -876,18 +856,24 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
     if args.is_empty() {
         return ClusterCommand::Status;
     }
-    if matches!(args.first(), Some(&"-h" | &"--help")) {
-        return ClusterCommand::Help(None);
-    }
+    // Preserve cluster's root help aliases, then let the declared parser handle
+    // the help verb and its optional topic like every other cluster command.
+    let help_alias = ["help"];
+    let args = if matches!(args.first(), Some(&"-h" | &"--help")) {
+        &help_alias[..]
+    } else {
+        args
+    };
     let verb = args[0];
+    if !cluster_verb_known(verb) {
+        return ClusterCommand::UnknownVerb(verb.to_owned());
+    }
+    let report = remuda_native::cli_parse::parse(&cluster_cli_spec(), args);
     if verb == "help" {
-        let mut normalized = vec!["cluster-help"];
-        normalized.extend(args.iter().skip(1).copied());
-        let report = remuda_native::cli_parse::parse(&cluster_help_alias_spec(), &normalized);
-        if !report.ok {
+        if report.kind.as_deref() == Some("help") || !report.ok {
             return ClusterCommand::Help(None);
         }
-        return match cluster_value(&report.values, "TOPIC") {
+        return match cluster_value(&report.values, "COMMAND") {
             None | Some("help") => ClusterCommand::Help(None),
             Some(topic) if cluster_verb_known(topic) => {
                 ClusterCommand::Help(Some(topic.to_owned()))
@@ -895,17 +881,9 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
             Some(topic) => ClusterCommand::UnknownVerb(topic.to_owned()),
         };
     }
-    if !cluster_verb_known(verb) {
-        return ClusterCommand::UnknownVerb(verb.to_owned());
-    }
-    let report = remuda_native::cli_parse::parse(&cluster_cli_spec(), args);
     if !report.ok {
         if report.kind.as_deref() == Some("help") {
-            return if verb == "help" {
-                ClusterCommand::Help(None)
-            } else {
-                ClusterCommand::Help(Some(verb.to_owned()))
-            };
+            return ClusterCommand::Help(Some(verb.to_owned()));
         }
         // Join lines can contain bearer credentials, so never expose parser diagnostics.
         let reason = if verb == "join" {
@@ -1088,7 +1066,6 @@ pub fn cluster_usage(verb: &str) -> String {
         for command in &spec.verbs {
             output.push_str(&format!("  {:<10} {}\n", command.name, command.about));
         }
-        output.push_str("  help       Print help for a cluster command\n");
         return output;
     }
     remuda_native::cli_parse::parse(&spec, &[verb, "--help"]).text
@@ -4006,6 +3983,10 @@ mod cluster_cli_tests {
             ClusterCommand::Help(Some("listen".into()))
         );
         assert_eq!(
+            parse_cluster_command(&["help", "--help"]),
+            ClusterCommand::Help(None)
+        );
+        assert_eq!(
             parse_cluster_command(&["node"]),
             ClusterCommand::UnknownVerb("node".into())
         );
@@ -4014,7 +3995,8 @@ mod cluster_cli_tests {
     #[test]
     fn cluster_help_verb_shows_that_verbs_usage() {
         for verb in [
-            "init", "invite", "join", "nodes", "control", "revoke", "remote", "listen", "call",
+            "init", "invite", "join", "nodes", "alias", "control", "revoke", "remote", "listen",
+            "call",
         ] {
             assert_eq!(
                 parse_cluster_command(&["help", verb]),
