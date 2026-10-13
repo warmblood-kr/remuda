@@ -200,18 +200,8 @@ fn create_stream_socket() -> io::Result<OwnedFd> {
     Ok(owned)
 }
 
-fn chmod_socket_nofollow(
-    parent: &File,
-    name: &OsStr,
-    expected: NodeReceipt,
-    mode: u32,
-) -> io::Result<()> {
-    if expected.kind != NodeKind::Socket || !expected.matches(parent, name) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "socket receipt changed before chmod",
-        ));
-    }
+/// Mode change that never follows the leaf; fails closed when unsupported.
+fn fchmodat_nofollow(parent: &File, name: &OsStr, mode: u32) -> io::Result<()> {
     let name = c_name(name)?;
     #[cfg(all(
         any(target_os = "linux", target_os = "android"),
@@ -271,13 +261,45 @@ fn chmod_socket_nofollow(
         }
         return Err(error);
     }
-    if !expected.matches(parent, OsStr::from_bytes(name.as_bytes())) {
+    Ok(())
+}
+
+/// Receipt-checked no-follow chmod of a socket or directory leaf.
+fn chmod_receipted(
+    parent: &File,
+    name: &OsStr,
+    expected: NodeReceipt,
+    mode: u32,
+) -> io::Result<()> {
+    if expected.kind == NodeKind::Other || !expected.matches(parent, name) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "socket receipt changed during chmod",
+            "receipt changed before chmod",
+        ));
+    }
+    fchmodat_nofollow(parent, name, mode)?;
+    if !expected.matches(parent, name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "receipt changed during chmod",
         ));
     }
     Ok(())
+}
+
+fn chmod_socket_nofollow(
+    parent: &File,
+    name: &OsStr,
+    expected: NodeReceipt,
+    mode: u32,
+) -> io::Result<()> {
+    if expected.kind != NodeKind::Socket {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "socket receipt changed before chmod",
+        ));
+    }
+    chmod_receipted(parent, name, expected, mode)
 }
 
 fn rename_noreplace(parent: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
@@ -469,12 +491,8 @@ fn create_staging_dir(parent: &File, name: &OsStr) -> io::Result<(File, NodeRece
     let dir = match open() {
         Ok(dir) => dir,
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            // Receipt-verified mode repair of our own empty directory.
-            if !receipt.matches(parent, name)
-                || unsafe { libc::fchmodat(parent.as_raw_fd(), c.as_ptr(), 0o700, 0) } < 0
-            {
-                return Err(error);
-            }
+            // Receipt-verified, no-follow repair of our own empty directory.
+            chmod_receipted(parent, name, receipt, 0o700).map_err(|_| error)?;
             open()?
         }
         Err(error) => return Err(error),
@@ -947,5 +965,39 @@ mod tests {
         set_nonblocking(&fd).unwrap();
         let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
         assert_ne!(flags & libc::O_NONBLOCK, 0);
+    }
+
+    #[test]
+    fn directory_repair_never_follows_a_swapped_symlink() {
+        let scratch = Scratch::new();
+        let parent = scratch.parent();
+        let target = scratch.0.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir(scratch.0.join("stage")).unwrap();
+        let receipt = NodeReceipt::capture(&parent, OsStr::new("stage")).unwrap();
+        // The receipted directory is replaced by a link to an unrelated target.
+        std::fs::remove_dir(scratch.0.join("stage")).unwrap();
+        std::os::unix::fs::symlink(&target, scratch.0.join("stage")).unwrap();
+        assert!(chmod_receipted(&parent, OsStr::new("stage"), receipt, 0o700).is_err());
+        // Even the bare adapter changes at most the link, never its target.
+        let _ = fchmodat_nofollow(&parent, OsStr::new("stage"), 0o700);
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn directory_repair_changes_a_matching_directory() {
+        let scratch = Scratch::new();
+        let parent = scratch.parent();
+        std::fs::create_dir(scratch.0.join("stage")).unwrap();
+        let receipt = NodeReceipt::capture(&parent, OsStr::new("stage")).unwrap();
+        chmod_receipted(&parent, OsStr::new("stage"), receipt, 0o500).unwrap();
+        let mode = std::fs::metadata(scratch.0.join("stage"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o500);
+        chmod_receipted(&parent, OsStr::new("stage"), receipt, 0o700).unwrap();
     }
 }
