@@ -8,6 +8,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
 
+#[cfg(test)]
+pub(crate) mod startup;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NodeKind {
@@ -68,8 +70,16 @@ impl NodeReceipt {
     }
 }
 
+/// Names passed to the `*at` helpers must be one relative path component.
 fn c_name(name: &OsStr) -> io::Result<CString> {
-    CString::new(name.as_bytes())
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a single relative component",
+        ));
+    }
+    CString::new(bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path component contains NUL"))
 }
 
@@ -172,7 +182,13 @@ fn listen_and_validate(fd: &OwnedFd) -> io::Result<ListenerIdentity> {
 }
 
 fn create_stream_socket() -> io::Result<OwnedFd> {
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    // Linux/Android set CLOEXEC atomically; elsewhere a fork/exec window
+    // between socket() and fcntl() remains (macOS has no SOCK_CLOEXEC).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let kind = libc::SOCK_STREAM;
+    let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -201,7 +217,7 @@ fn chmod_socket_nofollow(
         any(target_os = "linux", target_os = "android"),
         any(
             target_arch = "x86",
-            target_arch = "x86_64",
+            all(target_arch = "x86_64", target_pointer_width = "64"),
             target_arch = "arm",
             target_arch = "aarch64",
             target_arch = "riscv64"
@@ -229,7 +245,7 @@ fn chmod_socket_nofollow(
         any(target_os = "linux", target_os = "android"),
         not(any(
             target_arch = "x86",
-            target_arch = "x86_64",
+            all(target_arch = "x86_64", target_pointer_width = "64"),
             target_arch = "arm",
             target_arch = "aarch64",
             target_arch = "riscv64"
@@ -245,7 +261,15 @@ fn chmod_socket_nofollow(
         "no-follow socket permissions are unsupported on this platform",
     ));
     if result < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        // ENOSYS is a kernel capability gap, not a generic failure.
+        if error.raw_os_error() == Some(libc::ENOSYS) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no-follow socket permissions need fchmodat2 (Linux 6.6+)",
+            ));
+        }
+        return Err(error);
     }
     if !expected.matches(parent, OsStr::from_bytes(name.as_bytes())) {
         return Err(io::Error::new(
@@ -286,7 +310,14 @@ fn rename_noreplace(parent: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
         "exclusive rename is unsupported on this platform",
     ));
     if result < 0 {
-        Err(io::Error::last_os_error())
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOSYS) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "exclusive rename is unsupported by this kernel",
+            ));
+        }
+        Err(error)
     } else {
         Ok(())
     }
@@ -373,6 +404,100 @@ impl Lifecycle {
     }
 }
 
+// Usable sun_path bytes (excluding NUL); mirrors `ipc::name`'s limits.
+const SOCKET_PATH_LIMIT: usize = if cfg!(any(target_os = "linux", target_os = "android")) {
+    107
+} else {
+    103
+};
+
+/// Reject a bind path that cannot fit sun_path, before any mutation. Counts
+/// encoded bytes, so non-ASCII components are measured as the kernel sees them.
+fn preflight_socket_path(path: &std::path::Path) -> io::Result<()> {
+    let len = path.as_os_str().as_bytes().len();
+    if len > SOCKET_PATH_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "staged socket path too long ({len} bytes, limit {SOCKET_PATH_LIMIT})\n\
+                 Next: set a shorter REMUDA_RUNTIME_DIR"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Exclusively create a private (0700) staging directory under `parent`, and
+/// return its no-follow CLOEXEC handle with a receipt. The process umask is
+/// left alone: a restrictive umask that blocks access is repaired through the
+/// parent fd without following links, then reopened and compared.
+fn create_staging_dir(parent: &File, name: &OsStr) -> io::Result<(File, NodeReceipt)> {
+    let c = c_name(name)?;
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), c.as_ptr(), 0o700) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let receipt = NodeReceipt::capture(parent, name)?;
+    if receipt.kind != NodeKind::Directory {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "staging directory receipt is not a directory",
+        ));
+    }
+    let open = || {
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+        }
+    };
+    let dir = match open() {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            // Receipt-verified mode repair of our own empty directory.
+            if !receipt.matches(parent, name)
+                || unsafe { libc::fchmodat(parent.as_raw_fd(), c.as_ptr(), 0o700, 0) } < 0
+            {
+                return Err(error);
+            }
+            open()?
+        }
+        Err(error) => return Err(error),
+    };
+    // Opened object must be the directory we created, owned by us and private.
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(dir.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    #[allow(clippy::unnecessary_cast)]
+    let same = (stat.st_dev as u64, stat.st_ino) == (receipt.dev, receipt.ino);
+    if !same || stat.st_uid != unsafe { libc::geteuid() } || stat.st_mode & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "staging directory is not private",
+        ));
+    }
+    Ok((dir, receipt))
+}
+
+/// Nonblocking accept on the listener; accepted streams stay blocking.
+fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Owns only receipted entries until an exclusive rename transfers authority.
 struct StagedTransaction {
     parent: File,
@@ -409,6 +534,29 @@ impl StagedTransaction {
         rename_noreplace(&self.parent, &self.source, destination)?;
         self.committed = true;
         Ok(self.receipt)
+    }
+}
+
+/// What an explicit abort did with the staged leaf.
+#[derive(Debug, Eq, PartialEq)]
+enum Residue {
+    /// The receipted leaf was removed.
+    Removed,
+    /// The leaf no longer matches its receipt (or is gone): left untouched.
+    Preserved,
+}
+
+impl StagedTransaction {
+    /// Fallible cleanup: reports residue instead of hiding it in `Drop`.
+    fn abort(mut self) -> io::Result<Residue> {
+        self.committed = true; // disarm Drop; this call is the cleanup
+        Ok(
+            if unlink_if_matches(&self.parent, &self.source, self.receipt)? {
+                Residue::Removed
+            } else {
+                Residue::Preserved
+            },
+        )
     }
 }
 
@@ -645,5 +793,140 @@ mod tests {
         assert_eq!(receipt.dev, metadata.dev());
         assert_eq!(receipt.ino, metadata.ino());
         drop(listener);
+    }
+
+    fn bind_raw(path: &std::path::Path) -> OwnedFd {
+        let fd = create_stream_socket().unwrap();
+        let bytes = path.as_os_str().as_bytes();
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as _;
+        for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+            *dst = *src as _;
+        }
+        assert_eq!(
+            unsafe {
+                libc::bind(
+                    fd.as_raw_fd(),
+                    (&addr as *const libc::sockaddr_un).cast(),
+                    std::mem::size_of::<libc::sockaddr_un>() as _,
+                )
+            },
+            0
+        );
+        fd
+    }
+
+    #[test]
+    fn at_helpers_reject_non_single_components() {
+        for bad in ["", ".", "..", "a/b", "/abs", "../x"] {
+            assert!(c_name(OsStr::new(bad)).is_err(), "{bad:?}");
+        }
+        assert!(c_name(OsStr::new("ok")).is_ok());
+    }
+
+    #[test]
+    fn chmod_executes_on_a_valid_socket_and_publish_is_exclusive() {
+        let scratch = Scratch::new();
+        let parent = scratch.parent();
+        let _fd = bind_raw(&scratch.0.join("staged"));
+        let receipt = NodeReceipt::capture_socket(&parent, OsStr::new("staged")).unwrap();
+        chmod_socket_nofollow(&parent, OsStr::new("staged"), receipt, 0o600).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(scratch.0.join("staged"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let tx = StagedTransaction::new(scratch.parent(), "staged".into(), receipt).unwrap();
+        assert_eq!(tx.publish(OsStr::new("public")).unwrap(), receipt);
+        assert!(!scratch.0.join("staged").exists());
+        assert!(NodeReceipt::capture_socket(&parent, OsStr::new("public")).is_ok());
+    }
+
+    #[test]
+    fn abort_reports_removed_and_preserved_residue() {
+        let scratch = Scratch::new();
+        let parent = scratch.parent();
+        let _fd = bind_raw(&scratch.0.join("a"));
+        let receipt = NodeReceipt::capture_socket(&parent, OsStr::new("a")).unwrap();
+        let tx = StagedTransaction::new(scratch.parent(), "a".into(), receipt).unwrap();
+        assert_eq!(tx.abort().unwrap(), Residue::Removed);
+        let _fd2 = bind_raw(&scratch.0.join("b"));
+        let receipt = NodeReceipt::capture_socket(&parent, OsStr::new("b")).unwrap();
+        let tx = StagedTransaction::new(scratch.parent(), "b".into(), receipt).unwrap();
+        std::fs::remove_file(scratch.0.join("b")).unwrap();
+        std::fs::write(scratch.0.join("b"), b"other").unwrap();
+        assert_eq!(tx.abort().unwrap(), Residue::Preserved);
+        assert_eq!(std::fs::read(scratch.0.join("b")).unwrap(), b"other");
+    }
+
+    #[test]
+    fn lifecycle_rejects_generation_conflict_and_poisoned_lock() {
+        let scratch = Scratch::new();
+        let generation = |number| Generation {
+            number,
+            listener: create_stream_socket().unwrap(),
+            node: NodeReceipt {
+                kind: NodeKind::Socket,
+                dev: 0,
+                ino: 0,
+            },
+            name: OsString::from("n"),
+        };
+        let lifecycle = std::sync::Arc::new(Lifecycle::new(scratch.parent()));
+        lifecycle.install(None, generation(1)).unwrap();
+        assert!(lifecycle.install(None, generation(2)).is_err());
+        assert!(lifecycle.install(Some(7), generation(2)).is_err());
+        assert!(lifecycle.install(Some(1), generation(2)).unwrap().is_some());
+        let poisoner = lifecycle.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.state.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(lifecycle.install(Some(2), generation(3)).is_err());
+        assert!(lifecycle.begin_shutdown().is_err());
+    }
+
+    #[test]
+    fn preflight_counts_encoded_bytes_at_the_limit() {
+        let at_limit =
+            std::path::PathBuf::from("/".to_string() + &"a".repeat(SOCKET_PATH_LIMIT - 1));
+        preflight_socket_path(&at_limit).unwrap();
+        let over = std::path::PathBuf::from("/".to_string() + &"a".repeat(SOCKET_PATH_LIMIT));
+        assert!(preflight_socket_path(&over).is_err());
+        // "é" is 2 bytes: a char count under the limit still overflows in bytes.
+        let wide =
+            std::path::PathBuf::from("/".to_string() + &"é".repeat(SOCKET_PATH_LIMIT / 2 + 1));
+        assert!(preflight_socket_path(&wide).is_err());
+    }
+
+    #[test]
+    fn staging_directory_is_private_cloexec_and_exclusive() {
+        let scratch = Scratch::new();
+        let parent = scratch.parent();
+        let (dir, receipt) = create_staging_dir(&parent, OsStr::new("stage")).unwrap();
+        assert_eq!(receipt.kind, NodeKind::Directory);
+        let flags = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        assert_eq!(
+            std::fs::symlink_metadata(scratch.0.join("stage"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(create_staging_dir(&parent, OsStr::new("stage")).is_err());
+    }
+
+    #[test]
+    fn nonblocking_applies_to_listener_only() {
+        let fd = create_stream_socket().unwrap();
+        set_nonblocking(&fd).unwrap();
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
     }
 }
