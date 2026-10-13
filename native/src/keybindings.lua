@@ -108,6 +108,37 @@ return function(owner, validate, config_status, validate_help)
   end
   -- Defaults appear nowhere in Rust or footer code.
   api.define_key{context='session.list.browse', key='l', action='session.toggle_list', help='list'}
+  api.define_key{context="cluster.tree", key="<up>", action="cluster.up", help="up"}
+  api.define_key{context="cluster.tree", key="<down>", action="cluster.down", help="down"}
+  api.define_key{context="cluster.tree", key="<left>", action="cluster.left", help="collapse"}
+  api.define_key{context="cluster.tree", key="<right>", action="cluster.right", help="expand"}
+  api.define_key{context="cluster.tree", key="RET", action="cluster.select", help="select"}
+  api.define_key{context="cluster.search", key="<up>", action="cluster.up", help="up"}
+  api.define_key{context="cluster.search", key="<down>", action="cluster.down", help="down"}
+  api.define_key{context="cluster.search", key="<left>", action="cluster.left", help="collapse"}
+  api.define_key{context="cluster.search", key="<right>", action="cluster.right", help="expand"}
+  api.define_key{context="cluster.search", key="RET", action="cluster.select", help="select"}
+  api.define_key{context="cluster.tree", key="q", action="cluster.detach", help="detach"}
+  api.define_key{context="cluster.tree", key="x", action="cluster.close", help="close"}
+  api.define_key{context="cluster.tree", key="/", action="cluster.search", help="search"}
+  api.define_key{context="cluster.tree", key="!", action="cluster.attention", help="attention"}
+  api.define_key{context="cluster.tree", key="k", action="cluster.remote.keys", help="keys"}
+  api.define_key{context="cluster.search", key="ESC", action="cluster.search.clear", help="clear"}
+  api.define_key{context="cluster.search", key="DEL", action="cluster.search.delete", help="delete"}
+  api.define_key{context="cluster.composer", key="RET", action="cluster.composer.submit", help="send"}
+  api.define_key{context="cluster.composer", key="C-c", action="cluster.composer.clear", help="clear"}
+  api.define_key{context="cluster.composer", key="ESC", action="cluster.composer.back", help="list"}
+  api.define_key{context="cluster.composer", key="C-\\", action="cluster.composer.detach", help="list"}
+  api.define_key{context="cluster.composer", key="<left>", action="cluster.composer.left", help="left"}
+  api.define_key{context="cluster.composer", key="<right>", action="cluster.composer.right", help="right"}
+  api.define_key{context="cluster.composer", key="<home>", action="cluster.composer.home", help="home"}
+  api.define_key{context="cluster.composer", key="<end>", action="cluster.composer.end", help="end"}
+  api.define_key{context="cluster.composer", key="DEL", action="cluster.composer.backspace", help="erase"}
+  api.define_key{context="cluster.composer", key="<delete>", action="cluster.composer.delete", help="delete"}
+  api.define_key{context="cluster.confirm", key="y", action="cluster.confirm.accept", help="confirm"}
+  api.define_key{context="cluster.confirm", key="Y", action="cluster.confirm.accept_upper", help="confirm"}
+  api.define_key{context="cluster.remote.keys", key="C-\\", action="cluster.remote.back", help="back"}
+  api.define_key{context="cluster.runtime", key="C-l", action="cluster.redraw", help="redraw"}
   initializing = false
   return api, {drop=drop, save=save, restore=restore}
 end

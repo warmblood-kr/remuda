@@ -506,13 +506,15 @@ See [the design notes](design.md#one-registry-for-every-word) for the registry
 model and [the project source](https://github.com/warmblood-kr/remuda) for the
 current implementation.
 
-### UI key bindings (first adopter: session list)
+### UI key bindings (session list and cluster UI)
 
 The Lua image owns UI declarations and help metadata. The native UI takes one
 validated snapshot after user configuration finishes, then resolves keys and
 renders help from that same snapshot. Reopen the UI to pick up later changes.
-The session-list browse toggle is the first adopter; other UI commands still
-use their existing handlers, pending migration (see #704).
+The session-list browse toggle and cluster command controls use the registry.
+Other list/visual/attach/prompt controls still use existing handlers, pending
+migration (see #704). Cluster snapshots come from the local daemon; remote
+nodes do not supply key declarations.
 
 In `$XDG_CONFIG_HOME/remuda/init.lua` (otherwise `~/.config/remuda/init.lua`):
 
@@ -533,6 +535,50 @@ remuda.define_key{
   help = "list",
 }
 ```
+
+Cluster contexts and native actions:
+
+| Context | Actions |
+| --- | --- |
+| `cluster.tree` | `cluster.detach`, `cluster.close`, `cluster.search`, `cluster.attention`, `cluster.remote.keys`, `cluster.up`, `cluster.down`, `cluster.left`, `cluster.right`, `cluster.select` |
+| `cluster.search` | `cluster.search.clear`, `cluster.search.delete`, plus the same navigation and select actions |
+| `cluster.composer` | `cluster.composer.submit`, `.clear`, `.back`, `.detach`, `.left`, `.right`, `.home`, `.end`, `.backspace`, `.delete` (all use the `cluster.composer` prefix) |
+| `cluster.confirm` | `cluster.confirm.accept`, `cluster.confirm.accept_upper` |
+| `cluster.remote.keys` | `cluster.remote.back` |
+| `cluster.runtime` | `cluster.redraw` |
+
+For example:
+
+```lua
+remuda.rebind("cluster.remote.keys", "cluster.remote.back", "M-e")
+remuda.rebind("cluster.composer", "cluster.composer.submit", "M-s")
+```
+
+The old remote exit chord then forwards to the child like other raw keys;
+the new exit chord is intercepted and shown in the remote status row. Raw
+control bytes retain their transport identity (BS, LF, NUL and Alt prefixes);
+command canonicalization applies only to lookup, and byte encoding translates
+only the terminal numeric Ctrl-4 alias. Rebind
+composer submit also changes the second-send confirmation for possibly partial
+remote input; it retains the existing target and draft safety checks.
+
+Runtime redraw wins outside remote raw mode, then confirmation, raw input,
+composer, and search/tree controls resolve in that order. Do not assign a
+runtime key you want another context to receive. Text insertion in search and
+composer, raw terminal bytes, and paste transport remain native fallbacks.
+Cluster command matches now require exact modifiers: modified commands no
+longer trigger an unmodified binding. Unmatched Ctrl/Alt characters are ignored
+in search/composer; plain characters remain text. Only Press events dispatch,
+including redraw (Repeat/Release no longer redraw).
+
+Confirmation keeps separate lower/uppercase accept actions; rebinding one
+does not change the other. Unbind the other too if only one acceptance key is
+wanted. Every other key cancels; help says this explicitly. Composer `.back`
+and `.detach` are likewise independent actions with the same return-to-list
+behavior. Ctrl-4/Ctrl-backslash are one normalized key, so rebinding that
+single action updates both terminal aliases. Effective help wraps with Unicode
+width rather than clipping controls at narrow widths. Extra rows reduce the
+available pane area; the remote exit hint is prioritized over a long target.
 
 `remuda.keymap_snapshot()` returns `{generation, ready, diagnostic?, rows}`;
 each row contains `context`, `key`, `action`, and `help`. Rows are copies, not
