@@ -139,6 +139,14 @@ impl Size {
         }
     }
 
+    /// Explicit viewport sizing opts into both narrow and short terminals.
+    pub fn for_viewport(cols: u16, rows: u16) -> Self {
+        Self {
+            cols: cols.clamp(1, Self::MAX_RESIZE_COLS),
+            rows: rows.clamp(1, Self::MAX_RESIZE_ROWS),
+        }
+    }
+
     pub fn cols(&self) -> u16 {
         self.cols
     }

@@ -20,6 +20,7 @@ pub struct PendingBatch {
     pub client_id: String,
     pub seq: u64,
     pub bytes: Vec<u8>,
+    pub line_submit: bool,
     pub state: QueueState,
     pub status: String,
     retry_at: Instant,
@@ -112,6 +113,7 @@ impl InputQueue {
             client_id,
             seq,
             bytes,
+            line_submit: false,
             state: QueueState::Waiting,
             status: "waiting to send".into(),
             retry_at: now,
@@ -120,6 +122,12 @@ impl InputQueue {
             busy_retries: 0,
         });
         true
+    }
+
+    pub(super) fn mark_last_line(&mut self) {
+        if let Some(batch) = self.batches.back_mut() {
+            batch.line_submit = true;
+        }
     }
 
     pub fn can_enqueue(&self, count: usize) -> bool {

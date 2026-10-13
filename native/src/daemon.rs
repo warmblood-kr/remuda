@@ -1647,6 +1647,27 @@ fn handle_request(
             |cleared| Response::ClearInput { cleared },
         ),
 
+        Request::InputLine {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+        } => input_line(
+            &stream,
+            registry,
+            &name,
+            remuda_core::input::InputBatch {
+                instance_id: &instance_id,
+                client_id: match remuda_core::input::validate_batch(&client_id, seq, &bytes) {
+                    Ok(id) => id,
+                    Err(error) => return reply(&stream, &Response::error(error)),
+                },
+                seq,
+                bytes: &bytes,
+            },
+        ),
+
         Request::Input {
             name,
             instance_id,
@@ -1674,6 +1695,23 @@ fn handle_request(
                 Response::Ok
             })
         }
+
+        Request::ResizeSession {
+            name,
+            instance_id,
+            size,
+        } => respond(
+            &stream,
+            &name,
+            registry.resize_instance(&name, &instance_id, size),
+            |resized| {
+                if resized {
+                    Response::Ok
+                } else {
+                    Response::WrongInstance
+                }
+            },
+        ),
 
         Request::Resize { name, size } => {
             respond(&stream, &name, registry.resize(&name, size), |()| {
@@ -2926,6 +2964,26 @@ fn input(
             bytes,
         },
     );
+    reply_input_result(stream, name, result)
+}
+
+fn input_line(
+    stream: &Stream,
+    registry: &Registry,
+    name: &str,
+    batch: remuda_core::input::InputBatch<'_>,
+) -> std::io::Result<()> {
+    if std::str::from_utf8(batch.bytes).is_err() {
+        return reply(stream, &Response::error("input line must be UTF-8"));
+    }
+    reply_input_result(stream, name, registry.apply_input_line_batch(name, batch))
+}
+
+fn reply_input_result(
+    stream: &Stream,
+    name: &str,
+    result: Option<Result<remuda_core::input::InputOutcome, remuda_core::input::InputError>>,
+) -> std::io::Result<()> {
     match result {
         None => reply(stream, &Response::error(format!("no such session: {name}"))),
         Some(Err(remuda_core::input::InputError::RateLimited)) => {

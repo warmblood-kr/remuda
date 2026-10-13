@@ -957,6 +957,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "snow",
+ "unicode-segmentation",
  "unicode-width 0.2.2",
  "url",
  "vt100",

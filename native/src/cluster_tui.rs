@@ -114,7 +114,17 @@ pub struct ClusterUi {
     remote_composer_target: Option<(String, String, String, String)>,
     partial_input_confirm_target: Option<(String, String, String, String)>,
     remote_input_enabled: bool,
+    last_resize: Option<PaneResize>,
     remote_control_disabled: HashSet<String>,
+}
+
+struct PaneResize {
+    node: Option<String>,
+    name: String,
+    instance: String,
+    size: remuda_core::Size,
+    attempted: Duration,
+    succeeded: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,6 +217,7 @@ impl ClusterUi {
             remote_composer_target: None,
             partial_input_confirm_target: None,
             remote_input_enabled: false,
+            last_resize: None,
             remote_control_disabled: HashSet::new(),
         }
     }
@@ -679,15 +690,134 @@ impl ClusterUi {
         frame
     }
 
-    /// Wide layout: tree in a left column, selected pane on the right, footer full width.
-    fn render_split(&self, width: usize, height: usize, screen: &str, now: Duration) -> String {
+    fn tree_width(&self, width: usize, now: Duration) -> usize {
         let wanted = self
             .tree_lines(48, now)
             .iter()
             .map(|l| crate::tui::visible_width(l))
             .max()
             .unwrap_or(0);
-        let left_w = (wanted + 1).clamp(24, (width / 2).min(48));
+        (wanted + 1).clamp(24, (width / 2).min(48))
+    }
+
+    fn pane_size(&self, cols: u16, rows: u16, now: Duration) -> remuda_core::Size {
+        let (cols, rows) = normalized_terminal_size(cols, rows);
+        let width = usize::from(cols);
+        let height = usize::from(rows);
+        let footer = self.footer_row_count(width);
+        let notices = self.active_notice_lines(now, width).len();
+        let queue = self.visible_queue().rev().take(3).count();
+        let (pane_cols, pane_rows) = if self.remote_keys_mode.is_some() {
+            let Some(target @ RemoteSelection::Session { .. }) = self.remote_keys_mode.as_ref()
+            else {
+                return remuda_core::Size::for_viewport(cols, rows);
+            };
+            let label = self
+                .remote_session(target)
+                .map_or("", |(node, _)| node.name.as_str());
+            let name = match target {
+                RemoteSelection::Session { name, .. } => name.as_str(),
+                _ => "",
+            };
+            let header = remote_keys_hint(
+                label,
+                name,
+                width,
+                &self.keymap.display_help("cluster.remote.keys", &[]),
+            );
+            (width, height.saturating_sub(header.len()))
+        } else if width >= SPLIT_MIN_COLS {
+            (
+                width - self.tree_width(width, now) - 1,
+                height
+                    .saturating_sub(footer + notices + queue)
+                    .max(1)
+                    .saturating_sub(1),
+            )
+        } else {
+            let capacity = height.saturating_sub(2 + 2 + queue + notices + footer + 1);
+            let tree = self.tree_lines(width, now).len();
+            let shown_tree = if tree.saturating_sub(2) > capacity {
+                2 + capacity
+            } else {
+                tree
+            };
+            (
+                width,
+                height.saturating_sub(shown_tree + 2 + queue + notices + footer),
+            )
+        };
+        remuda_core::Size::for_viewport(pane_cols as u16, pane_rows as u16)
+    }
+
+    fn resize_pane(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        now: Duration,
+        mut send: impl FnMut(Option<&str>, &Request) -> io::Result<Response>,
+    ) {
+        let target = if let Some(active) = self.remote_active.as_ref() {
+            if !self.remote_input_enabled {
+                return;
+            }
+            self.remote_session(active)
+                .filter(|(_, session)| session.alive)
+                .map(|(node, session)| {
+                    (
+                        Some(node.registry_key.clone()),
+                        session.wire_name.clone(),
+                        session.instance_id.clone(),
+                    )
+                })
+        } else {
+            self.sessions
+                .get(self.active)
+                .filter(|session| session.alive)
+                .and_then(|session| {
+                    session
+                        .instance_id
+                        .as_ref()
+                        .map(|id| (None, session.name.clone(), id.clone()))
+                })
+        };
+        let Some((node, name, instance)) = target else {
+            self.last_resize = None;
+            return;
+        };
+        let size = self.pane_size(cols, rows, now);
+        if let Some(old) = &self.last_resize {
+            if (&old.node, &old.name, &old.instance, old.size) == (&node, &name, &instance, size)
+                && (old.succeeded || now.saturating_sub(old.attempted) < Duration::from_secs(1))
+            {
+                return;
+            }
+        }
+        let result = send(
+            node.as_deref(),
+            &Request::ResizeSession {
+                name: name.clone(),
+                instance_id: instance.clone(),
+                size,
+            },
+        );
+        let succeeded = matches!(result, Ok(Response::Ok));
+        if !succeeded {
+            self.notice = Some((format!("pane resize unavailable: {result:?}"), now));
+        }
+        self.last_resize = Some(PaneResize {
+            node,
+            name,
+            instance,
+            size,
+            attempted: now,
+            succeeded,
+        });
+    }
+
+    /// Wide layout: tree in a left column, selected pane on the right, footer full width.
+    fn render_split(&self, width: usize, height: usize, screen: &str, now: Duration) -> String {
+        let left_w = self.tree_width(width, now);
         let right_w = width - left_w - 1;
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
         let notices = self.active_notice_lines(now, width);
@@ -799,7 +929,9 @@ impl ClusterUi {
         let mut lines = if let Some(prompt) = self.confirmation.prompt(width, &confirm_help) {
             wrap_help(&prompt, width)
         } else if self.composer_focused {
-            let mut lines = vec![truncate(&self.composer_line(), width)];
+            let mut lines = self
+                .composer
+                .display_lines(&self.composer_prefix(), width, 3);
             lines.extend(wrap_help(
                 &self.keymap.display_help("cluster.composer", &[]),
                 width,
@@ -976,7 +1108,13 @@ impl ClusterUi {
                 self.key_event(key, now)
             }
             crossterm::event::Event::Paste(text) => {
-                if let Some(target) = self.remote_keys_mode.clone() {
+                if self.composer_focused && self.remote_keys_mode.is_none() {
+                    if self.composer_target.is_none() && self.remote_composer_target.is_none() {
+                        self.bind_composer_target();
+                    }
+                    self.composer.insert_text(&text);
+                    self.partial_input_confirm_target = None;
+                } else if let Some(target) = self.remote_keys_mode.clone() {
                     let mut text = text;
                     loop {
                         let stripped = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
@@ -1468,10 +1606,13 @@ impl ClusterUi {
             self.notice = Some(("input disabled: session ended".into(), now));
             return;
         }
-        match self.input_sender.enqueue(
+        match self.input_sender.enqueue_line(
             &mut self.input_queue,
-            &name,
-            &instance_id,
+            queue::InputTarget {
+                remote_node: None,
+                name: name.clone(),
+                instance_id: instance_id.clone(),
+            },
             bytes.clone(),
             Instant::now(),
         ) {
@@ -1518,11 +1659,13 @@ impl ClusterUi {
             ));
             return;
         }
-        match self.input_sender.enqueue_remote(
+        match self.input_sender.enqueue_line(
             &mut self.input_queue,
-            &node_key,
-            &wire_name,
-            &instance_id,
+            queue::InputTarget {
+                remote_node: Some(node_key),
+                name: wire_name,
+                instance_id,
+            },
             bytes.clone(),
             Instant::now(),
         ) {
@@ -1776,10 +1919,7 @@ impl ClusterUi {
         }
     }
 
-    fn composer_line(&self) -> String {
-        let cursor = self.composer.cursor();
-        let before: String = self.composer.text().chars().take(cursor).collect();
-        let after: String = self.composer.text().chars().skip(cursor).collect();
+    fn composer_prefix(&self) -> String {
         let target = self.composer_target.as_ref().map_or_else(
             || {
                 self.remote_composer_target
@@ -1790,7 +1930,18 @@ impl ClusterUi {
             },
             |(name, _)| format!("{name}> "),
         );
-        crate::text::strip_terminal_controls(&format!("$ {target}{before}▏{after}")).into_owned()
+        format!("$ {target}")
+    }
+
+    #[cfg(test)]
+    fn composer_line(&self) -> String {
+        crate::text::strip_terminal_controls(
+            &self
+                .composer
+                .display_lines(&self.composer_prefix(), usize::MAX, 1)
+                .join(""),
+        )
+        .into_owned()
     }
 
     fn select_target(&mut self, target: Option<&str>) -> io::Result<()> {
@@ -2579,6 +2730,25 @@ fn capture_local_pane(ui: &mut ClusterUi, path: &Path, clock: &dyn Clock) -> Opt
     }
 }
 
+fn resize_active_pane(
+    ui: &mut ClusterUi,
+    path: &Path,
+    remote_input: Option<&dyn RemoteInputTransport>,
+    cols: u16,
+    rows: u16,
+    now: Duration,
+) {
+    ui.resize_pane(cols, rows, now, |node, request| {
+        if let Some(node) = node {
+            remote_input
+                .ok_or_else(|| io::Error::other("remote resize unavailable"))?
+                .send_input(node, request)
+        } else {
+            client::request_with_timeout(path, request, UI_REQUEST_TIMEOUT)
+        }
+    });
+}
+
 fn run_loop(
     path: &Path,
     node: &str,
@@ -2631,7 +2801,9 @@ fn run_loop(
         // Read before syncing: an update landing during sync/render wakes the wait.
         let seen = remote_source.generation();
         ui.remote_synced(remote_source);
-        runtime.paste_capture.set(ui.remote_keys_mode.is_some())?;
+        runtime
+            .paste_capture
+            .set(ui.remote_keys_mode.is_some() || ui.composer_focused)?;
         if let Some(RemoteSelection::Session { node, name, .. }) = &ui.remote_active {
             remote_selection.select(node.clone(), name.clone());
         } else {
@@ -2639,10 +2811,11 @@ fn run_loop(
         }
         ui.selected = ui.selected.min(ui.sessions.len().saturating_sub(1));
         ui.active = ui.active.min(ui.sessions.len().saturating_sub(1));
-        let captured = capture_local_pane(&mut ui, path, clock);
-        let body = captured.unwrap_or_default();
         let terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
         let (cols, rows) = normalized_terminal_size(terminal_size.0, terminal_size.1);
+        resize_active_pane(&mut ui, path, remote_input, cols, rows, clock.now());
+        let captured = capture_local_pane(&mut ui, path, clock);
+        let body = captured.unwrap_or_default();
         let frame = ui.render(cols, rows, &body, clock);
         let mut next = vt100::Parser::new(rows, cols, 0);
         next.process(format!("\x1b[H\x1b[2J{}", terminal_frame(&frame)).as_bytes());
@@ -2782,6 +2955,137 @@ mod tests {
         let mut ui = ClusterUi::new(node, sessions, at);
         ui.set_keymap(crate::keybindings::test_snapshot(""));
         ui
+    }
+
+    #[test]
+    fn composer_paste_inserts_at_cursor_and_queues_a_line_submit() {
+        use crossterm::event::{Event, KeyCode};
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
+        ui.key(KeyCode::Enter);
+        ui.handle_event(Event::Paste("한z".into()), clock.now());
+        ui.key(KeyCode::Left);
+        ui.handle_event(Event::Paste("e\u{301}".into()), clock.now());
+        assert_eq!(ui.composer.text(), "한e\u{301}z");
+        ui.key(KeyCode::Enter);
+        let batch = ui.input_queue.items().next().unwrap();
+        assert!(batch.line_submit);
+        assert!(matches!(super::sender::input_request(batch),
+            Request::InputLine { bytes, .. } if bytes == "한e\u{301}z\r".as_bytes()));
+        ui.handle_event(Event::Paste("again".into()), clock.now());
+        ui.key(KeyCode::Enter);
+        assert_eq!(ui.input_queue.items().count(), 2);
+        assert_eq!(ui.input_queue.items().last().unwrap().bytes, b"again\r");
+    }
+
+    #[test]
+    fn composer_frame_keeps_long_draft_cursor_visible_at_forty_columns() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        ui.composer_focused = true;
+        ui.composer.restore_draft(&"한글".repeat(120));
+        let frame = ui.render(40, 24, "pane", &clock);
+        assert!(frame.lines().count() <= 24);
+        let parsed = parsed_frame(&frame, 40, 24);
+        assert!((0..24).any(|row| (0..40).any(|col| parsed
+            .screen()
+            .cell(row, col)
+            .unwrap()
+            .inverse()
+            && parsed.screen().cell(row, col).unwrap().contents() == " ")));
+        assert!(ui.composer.text().len() > 40);
+    }
+
+    #[test]
+    fn remote_line_over_cap_preserves_draft_and_queues_nothing() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("body"));
+        ui.enter_selected(clock.now());
+        let draft = "x".repeat(crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES);
+        ui.composer.restore_draft(&draft);
+        ui.key(crossterm::event::KeyCode::Enter);
+        assert_eq!(ui.composer.text(), draft);
+        assert!(ui.input_queue.items().next().is_none());
+        assert!(ui.notice.as_ref().unwrap().0.contains("line too long"));
+    }
+
+    #[test]
+    fn pane_resize_dimensions_match_rendered_screen_area_in_both_layouts() {
+        let clock = ManualClock::new();
+        let ui = selected_remote_ui(&clock, remote_screen_rows(120));
+        for (cols, rows) in [(40, 24), (59, 24), (60, 24), (100, 40)] {
+            let size = ui.pane_size(cols, rows, clock.now());
+            let frame = ui.render_text(cols, rows, "", &clock);
+            assert_eq!(
+                frame
+                    .lines()
+                    .filter(|line| line.contains("body-row-"))
+                    .count(),
+                usize::from(size.rows()),
+                "{cols}x{rows}: {frame}"
+            );
+            if cols >= 60 {
+                let (left, right) = frame.lines().next().unwrap().split_once('│').unwrap();
+                assert_eq!(
+                    usize::from(size.cols()),
+                    usize::from(cols) - unicode_width::UnicodeWidthStr::width(left) - 1
+                );
+                assert!(unicode_width::UnicodeWidthStr::width(right) <= usize::from(size.cols()));
+            } else {
+                assert_eq!(size.cols(), cols);
+            }
+        }
+    }
+
+    #[test]
+    fn pane_resize_propagates_layout_draft_and_instance_changes_once() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen_rows(120));
+        let mut sent = Vec::new();
+        let mut send = |node: Option<&str>, request: &Request| {
+            sent.push((node.map(str::to_owned), request.clone()));
+            Ok(Response::Ok)
+        };
+        ui.resize_pane(100, 24, clock.now(), &mut send);
+        ui.resize_pane(100, 24, clock.now(), &mut send);
+        ui.composer_focused = true;
+        ui.composer.restore_draft(&"한글".repeat(60));
+        ui.resize_pane(100, 24, clock.now(), &mut send);
+        ui.resize_pane(40, 30, clock.now(), &mut send);
+        ui.remote_snapshot.nodes[0].sessions[0].instance_id = "replacement".into();
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        ui.resize_pane(40, 30, clock.now(), &mut send);
+        assert_eq!(sent.len(), 4);
+        assert!(sent
+            .iter()
+            .all(|(node, request)| node.as_deref() == Some("fp-laptop")
+                && matches!(request, Request::ResizeSession { name, .. } if name == "build")));
+        assert!(
+            matches!(&sent[3].1, Request::ResizeSession { instance_id, .. } if instance_id == "replacement")
+        );
+        ui.remote_input_enabled = false;
+        ui.resize_pane(90, 30, clock.now(), |_, _| panic!("read-only resize"));
+    }
+
+    #[test]
+    fn local_pane_resize_retries_failure_with_bounded_frequency_and_skips_ended() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
+        ui.resize_pane(100, 24, clock.now(), |node, request| {
+            assert_eq!(node, None);
+            assert!(matches!(request, Request::ResizeSession { instance_id, .. } if instance_id == "instance-dev"));
+            Ok(Response::WrongInstance)
+        });
+        // A resize error notice changes the geometry once; thereafter throttle.
+        ui.resize_pane(100, 24, clock.now(), |_, _| Ok(Response::WrongInstance));
+        ui.resize_pane(100, 24, clock.now(), |_, _| panic!("unthrottled retry"));
+        clock.advance(Duration::from_secs(1));
+        ui.resize_pane(100, 24, clock.now(), |_, _| Ok(Response::Ok));
+        ui.resize_pane(100, 24, clock.now(), |_, _| {
+            panic!("successful resize repeated")
+        });
+        ui.sessions[0].alive = false;
+        ui.resize_pane(100, 24, clock.now(), |_, _| panic!("ended resize"));
     }
 
     #[test]
@@ -4642,7 +4946,6 @@ mod tests {
 
     fn ui_with_uncertain_remote_target() -> (ManualClock, ClusterUi, FakeRemoteInput) {
         let clock = ManualClock::new();
-        let limit = crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES;
         let mut snapshot = remote_snapshot(
             RemoteState::Reachable,
             Duration::ZERO,
@@ -4659,7 +4962,7 @@ mod tests {
         ui.remote_input_enabled = true;
         ui.select_target(Some("fp-laptop/build")).unwrap();
         ui.enter_selected(clock.now());
-        ui.enqueue_remote_draft(vec![b'x'; limit + 1], clock.now());
+        ui.enqueue_remote_draft(b"partial\r".to_vec(), clock.now());
         ui.start_pending(clock.now());
         let transport = FakeRemoteInput::new(Response::Uncertain);
         ui.send_pending(
@@ -5278,7 +5581,7 @@ mod tests {
         assert_eq!(sent[0].0, "fp-laptop");
         assert!(matches!(
             &sent[0].1,
-            Request::Input { name, instance_id, bytes, .. }
+            Request::InputLine { name, instance_id, bytes, .. }
                 if name == "wire-build" && instance_id == "remote-instance" && bytes == b"echo hi\r"
         ));
         assert_eq!(
@@ -5486,7 +5789,16 @@ mod tests {
         ui.remote_input_enabled = true;
         ui.select_target(Some("fp-laptop/build")).unwrap();
         ui.enter_selected(clock.now());
-        ui.enqueue_remote_draft(vec![b'x'; limit * 2 + 7], clock.now());
+        ui.input_sender
+            .enqueue_remote(
+                &mut ui.input_queue,
+                "fp-laptop",
+                "build",
+                "remote-instance",
+                vec![b'x'; limit * 2 + 7],
+                Instant::now(),
+            )
+            .unwrap();
         ui.enqueue_remote_draft(b"later\r".to_vec(), clock.now());
         ui.select_target(Some("fp-tablet/build")).unwrap();
         ui.enter_selected(clock.now());
@@ -5548,11 +5860,11 @@ mod tests {
         let requests = transport.requests.lock().unwrap();
         assert!(!requests.iter().any(|(node, request)| {
             node == "fp-laptop"
-                && matches!(request, Request::Input { bytes, .. } if bytes == b"later\r")
+                && matches!(request, Request::InputLine { bytes, .. } if bytes == b"later\r")
         }));
         assert!(requests.iter().any(|(node, request)| {
             node == "fp-tablet"
-                && matches!(request, Request::Input { bytes, .. } if bytes == b"other\r")
+                && matches!(request, Request::InputLine { bytes, .. } if bytes == b"other\r")
         }));
     }
 
@@ -5777,7 +6089,12 @@ mod tests {
                 && !frame.contains("\x1b[H")
                 && !frame.contains('\r')
         );
-        assert!(frame.contains("before2▏Jafter[H"), "{frame:?}");
+        assert!(
+            ui.render_text(80, 24, "pane", &clock)
+                .contains("before2Jafter[H"),
+            "{frame:?}"
+        );
+        assert!(frame.contains("\x1b[7mJ\x1b[27m"), "{frame:?}");
         assert_eq!(ui.composer.text(), draft);
         ui.key_event(
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),

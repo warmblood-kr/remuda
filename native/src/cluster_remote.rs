@@ -121,7 +121,14 @@ impl ClusterRemoteInput {
 impl RemoteInputTransport for ClusterRemoteInput {
     fn send_input(&self, node: &str, request: &Request) -> io::Result<Response> {
         let target = (self.resolve)(node)?;
-        self.client
+        let line_client;
+        let client = if matches!(request, Request::InputLine { .. }) {
+            line_client = self.client.with_request_timeout(Duration::from_secs(8));
+            &line_client
+        } else {
+            &self.client
+        };
+        client
             .request(
                 target.address,
                 &target.pinned_static_key,

@@ -1059,12 +1059,18 @@ fn authorize_remote_request_with_source(
     request: &Request,
     control_source: &ControlSource,
 ) -> Result<(), Response> {
-    let enabled = if matches!(request, Request::Input { .. } | Request::Close { .. }) {
+    let enabled = if matches!(
+        request,
+        Request::Input { .. }
+            | Request::InputLine { .. }
+            | Request::ResizeSession { .. }
+            | Request::Close { .. }
+    ) {
         control_source.enabled().map_err(|_| {
-            let operation = if matches!(request, Request::Input { .. }) {
-                "Input"
-            } else {
-                "Close"
+            let operation = match request {
+                Request::Input { .. } | Request::InputLine { .. } => "Input",
+                Request::ResizeSession { .. } => "ResizeSession",
+                _ => "Close",
             };
             Response::error(format!(
                 "remote control setting unavailable; refusing {operation}"
@@ -1081,7 +1087,10 @@ fn authorize_remote_request_with_control(
     allow_remote_control: bool,
 ) -> Result<(), Response> {
     match request {
-        Request::Input { .. } if !allow_remote_control => {
+        Request::Input { .. } | Request::InputLine { .. } if !allow_remote_control => {
+            return Err(Response::RemoteControlDisabled);
+        }
+        Request::ResizeSession { .. } if !allow_remote_control => {
             return Err(Response::RemoteControlDisabled);
         }
         Request::Close { .. } if !allow_remote_control => {
@@ -1523,7 +1532,7 @@ fn handle_admitted_request(
         let response = serde_json::to_vec(&response).unwrap_or_else(|_| b"null".to_vec());
         return send_encrypted_response(stream, opened, &response);
     }
-    if let Request::Input { bytes, .. } = &request {
+    if let Request::Input { bytes, .. } | Request::InputLine { bytes, .. } = &request {
         if !state.limiter.allow_remote_input(&peer_fp, bytes.len()) {
             let response =
                 serde_json::to_vec(&Response::RateLimited).unwrap_or_else(|_| b"null".to_vec());
@@ -2873,6 +2882,36 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn resize_session_obeys_remote_control_setting() {
+        let request = Request::ResizeSession {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            size: remuda_core::Size::for_viewport(31, 9),
+        };
+        assert_eq!(
+            authorize_remote_request_with_control(&request, false),
+            Err(Response::RemoteControlDisabled)
+        );
+        assert!(authorize_remote_request_with_control(&request, true).is_ok());
+    }
+
+    #[test]
+    fn input_line_obeys_remote_control_setting() {
+        let request = Request::InputLine {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000000".into(),
+            seq: 1,
+            bytes: b"hello\r".to_vec(),
+        };
+        assert_eq!(
+            authorize_remote_request_with_control(&request, false),
+            Err(Response::RemoteControlDisabled)
+        );
+        assert!(authorize_remote_request_with_control(&request, true).is_ok());
+    }
+
     #[test]
     fn remote_input_obeys_local_control_setting_and_close_stays_refused() {
         let settings = TestControlSettings::new(br#"{"allow_remote_control":true}"#);

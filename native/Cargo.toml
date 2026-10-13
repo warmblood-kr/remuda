@@ -64,6 +64,7 @@ rustyline = "14.0.0"
 # `Cell::is_wide` — pinned to the same major version so a rendered row's own
 # width judgment can never disagree with vt100's. See steps/023.
 unicode-width = "0.2"
+unicode-segmentation = "1.13"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28.0", features = ["socket"] }

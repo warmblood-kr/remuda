@@ -126,6 +126,17 @@ impl ClusterClient {
         Self::new(Arc::new(crate::SystemWallClock::new()))
     }
 
+    pub(crate) fn with_request_timeout(&self, timeout: Duration) -> Self {
+        Self::with_timeouts(
+            self.clock.clone(),
+            ClientTimeouts {
+                connect: self.timeouts.connect,
+                read: timeout,
+                total: timeout,
+            },
+        )
+    }
+
     /// Seal and send one allowlisted request to a pinned cluster peer.
     pub fn request(
         &self,

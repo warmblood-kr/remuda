@@ -53,6 +53,35 @@ impl InputSender {
         )
     }
 
+    pub fn enqueue_line(
+        &mut self,
+        queue: &mut InputQueue,
+        target: InputTarget,
+        bytes: Vec<u8>,
+        now: Instant,
+    ) -> io::Result<u64> {
+        let cap = if target.remote_node.is_some() {
+            MAX_REMOTE_INPUT_BATCH_BYTES
+        } else {
+            MAX_INPUT_BYTES
+        };
+        if bytes.len() > cap {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("line too long ({} bytes, max {cap})", bytes.len()),
+            ));
+        }
+        if std::str::from_utf8(&bytes).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "input line must be UTF-8",
+            ));
+        }
+        let seq = self.enqueue_one(queue, target, None, bytes, now)?;
+        queue.mark_last_line();
+        Ok(seq)
+    }
+
     /// Queue a remote line as ordered batches within the listener's tighter cap.
     pub fn enqueue_remote(
         &mut self,
@@ -163,7 +192,12 @@ impl InputSender {
         now: Instant,
     ) -> Option<QueueEvent> {
         self.attempt_due(queue, now, |request| {
-            crate::client::request_with_timeout(path, request, INPUT_SEND_TIMEOUT)
+            let timeout = if matches!(request, Request::InputLine { .. }) {
+                std::time::Duration::from_secs(8)
+            } else {
+                INPUT_SEND_TIMEOUT
+            };
+            crate::client::request_with_timeout(path, request, timeout)
         })
     }
 
@@ -376,6 +410,15 @@ fn queue_full_error() -> io::Error {
 pub const INPUT_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub fn input_request(batch: &PendingBatch) -> Request {
+    if batch.line_submit {
+        return Request::InputLine {
+            name: batch.name.clone(),
+            instance_id: batch.instance_id.clone(),
+            client_id: batch.client_id.clone(),
+            seq: batch.seq,
+            bytes: batch.bytes.clone(),
+        };
+    }
     Request::Input {
         name: batch.name.clone(),
         instance_id: batch.instance_id.clone(),

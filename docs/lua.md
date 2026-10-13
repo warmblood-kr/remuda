@@ -542,7 +542,7 @@ Cluster contexts and native actions:
 | --- | --- |
 | `cluster.tree` | `cluster.detach`, `cluster.close`, `cluster.search`, `cluster.attention`, `cluster.remote.keys`, `cluster.up`, `cluster.down`, `cluster.left`, `cluster.right`, `cluster.select` |
 | `cluster.search` | `cluster.search.clear`, `cluster.search.delete`, plus the same navigation and select actions |
-| `cluster.composer` | `cluster.composer.submit`, `.clear`, `.back`, `.detach`, `.left`, `.right`, `.home`, `.end`, `.backspace`, `.delete` (all use the `cluster.composer` prefix) |
+| `cluster.composer` | `cluster.composer.submit`, `.clear`, `.back`, `.detach`, `.left`, `.right`, `.home`, `.end`, `.home_emacs`, `.end_emacs`, `.kill`, `.backspace`, `.delete` (all use the `cluster.composer` prefix) |
 | `cluster.confirm` | `cluster.confirm.accept`, `cluster.confirm.accept_upper` |
 | `cluster.remote.keys` | `cluster.remote.back` |
 | `cluster.runtime` | `cluster.redraw` |
@@ -601,3 +601,41 @@ transport failure or readiness timeout produces a visible startup error and
 never falls back to a hidden native key table. A failed `init.lua` is recorded
 in the snapshot and displayed in the footer; each completed binding operation
 remains valid, while a rejected operation leaves its prior map intact.
+
+### Cluster input editing
+
+The cluster composer wraps into up to three rows and scrolls to keep the cursor
+visible. The cursor highlights the existing grapheme instead of inserting an
+extra marker; Left/Right and erase operate on grapheme boundaries.
+Ctrl-A moves to the beginning, Ctrl-E to the end, and Ctrl-K removes the tail.
+These keys are Lua declarations and can be rebound or unbound. Bracketed paste
+inserts at the draft cursor; raw remote-key paste retains its existing transport.
+
+Enter queues an idempotent `InputLine` request pinned to the session instance.
+The receiver uses the shared session text/Return path, waits for text to appear
+when the terminal exposes a screen, and sends one Return. The composer's existing
+trailing CR is consumed. Retries retain the client ID and sequence, so an
+acknowledged request is not written again. Acknowledgment confirms input delivery;
+it does not prove the child accepted or executed the command. Cluster submission
+does not automatically send a second Return when a child inserts a newline.
+
+Local lines retain the 64 KiB input limit; remote composed lines must fit the
+12 KiB remote batch limit (including the composer's CR). Over-limit drafts remain
+editable. Raw remote paste still uses bounded chunks. Receivers must support
+`InputLine`; older receivers refuse it, and the client does not retry through a
+different write API. Screen observation uses an eight-second request deadline.
+Local submission can block cluster UI updates while that observation completes.
+
+The selected live session also receives instance-pinned `ResizeSession`
+requests matching its displayed pane, including raw remote-key mode.
+Layout, window size, draft wrapping, footer, notice and queue changes update
+the target dimensions. Unchanged successful sizes are cached; failures display
+a notice and retry at most once per second for the same target/size.
+Explicit viewport sizes allow short as well as narrow terminals, bounded to
+1–1000 columns and 1–500 rows. Ordinary terminal size defaults are unchanged.
+Remote resize requires remote control; read-only and ended sessions are skipped.
+Receivers must support the new request. Concurrent viewers can still resize
+the same session; there is no exclusive resize ownership or size restoration.
+
+Very small panes may leave a child TUI unusable even though the requested
+terminal geometry matches the viewport; one cell is the minimum resize size.
