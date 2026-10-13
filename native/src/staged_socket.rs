@@ -281,15 +281,24 @@ fn chmod_socket_nofollow(
 }
 
 fn rename_noreplace(parent: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    rename_noreplace_between(parent, from, parent, to)
+}
+
+fn rename_noreplace_between(
+    from_dir: &File,
+    from: &OsStr,
+    to_dir: &File,
+    to: &OsStr,
+) -> io::Result<()> {
     let from = c_name(from)?;
     let to = c_name(to)?;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let result = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
-            parent.as_raw_fd(),
+            from_dir.as_raw_fd(),
             from.as_ptr(),
-            parent.as_raw_fd(),
+            to_dir.as_raw_fd(),
             to.as_ptr(),
             libc::RENAME_NOREPLACE,
         ) as libc::c_int
@@ -297,9 +306,9 @@ fn rename_noreplace(parent: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     let result = unsafe {
         renameatx_np(
-            parent.as_raw_fd(),
+            from_dir.as_raw_fd(),
             from.as_ptr(),
-            parent.as_raw_fd(),
+            to_dir.as_raw_fd(),
             to.as_ptr(),
             0x0000_0004,
         )
@@ -522,7 +531,17 @@ impl StagedTransaction {
         })
     }
 
-    fn publish(mut self, destination: &OsStr) -> io::Result<NodeReceipt> {
+    fn publish(self, destination: &OsStr) -> io::Result<NodeReceipt> {
+        let parent = self.parent.try_clone()?;
+        self.publish_into(&parent, destination)
+    }
+
+    /// Exclusive rename from the staging directory into `destination_dir`.
+    fn publish_into(
+        mut self,
+        destination_dir: &File,
+        destination: &OsStr,
+    ) -> io::Result<NodeReceipt> {
         if self.receipt.kind != NodeKind::Socket
             || !self.receipt.matches(&self.parent, &self.source)
         {
@@ -531,7 +550,7 @@ impl StagedTransaction {
                 "staging receipt is not a matching socket before rename",
             ));
         }
-        rename_noreplace(&self.parent, &self.source, destination)?;
+        rename_noreplace_between(&self.parent, &self.source, destination_dir, destination)?;
         self.committed = true;
         Ok(self.receipt)
     }
