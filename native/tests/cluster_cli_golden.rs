@@ -492,11 +492,11 @@ fn cluster_help_output_is_routed_and_discloses_listener_controls() {
     let cases = [
         (
             &["cluster", "--help"][..],
-            "usage: remuda cluster <command>\n  init\n    creates identity; opens listener for cluster nodes on private LAN port 7441 by default\n    --no-listen skips opening it; listen --off stops it; listen --bind IP[:PORT] limits its address\n  invite\n  join\n  nodes\n  alias\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n",
+"Usage: remuda cluster <COMMAND>\n\nCommands:\n  init       Create this node identity and listen on a private LAN address by default (port 7441). Example: remuda cluster init --no-listen\n  invite     Create an invitation for another node. Example: remuda cluster invite\n  join       Join using a quoted invitation line; a fingerprint is needed when stdin is not a terminal. Example: remuda cluster join 'remuda-join-v1 …'\n  nodes      List the nodes known to this cluster. Example: remuda cluster nodes\n  alias      Set or clear a local display alias for a node. Example: remuda cluster alias node-abcd1234 macbook\n  control    Enable or disable remote control. Example: remuda cluster control off\n  revoke     Revoke a node or fingerprint; prompt before revoking unless --yes is used. Example: remuda cluster revoke node-abcd1234\n  remote     Attach to a remote session, or show the remote session picker. Example: remuda cluster remote node/session\n  listen     Manage the cluster listener. Example: remuda cluster listen --bind 127.0.0.1\n  call       Call a remote node API. Example: remuda cluster call node-abcd1234 list --addr 192.0.2.1\n  help       Print help for a cluster command\n"
         ),
         (
             &["cluster", "init", "--help"][..],
-            "usage: remuda cluster init [--no-listen | --new-identity [--yes]]\nCreates this node's identity and opens a listener for cluster nodes on a private LAN address (port 7441) by default.\nUse --no-listen to skip opening a port; run `remuda cluster listen --off` to stop it later; use `remuda cluster listen --bind IP[:PORT]` to limit the address (127.0.0.1:7441 for local-only).\nexample: remuda cluster init --no-listen\n",
+            "Create this node identity and listen on a private LAN address by default (port 7441). Example: remuda cluster init --no-listen\n\nUsage: remuda cluster init [--no-listen | --new-identity [--yes]]\n\nOptions:\n  -h, --help          Print help\n      --no-listen     Do not open the cluster listener\n      --new-identity  Replace this node identity and leave its current cluster\n      --yes           Confirm identity replacement without prompting\n\nNext: remuda cluster init [--no-listen | --new-identity [--yes]]\n",
         ),
     ];
     let mut failures = Vec::new();
@@ -527,12 +527,13 @@ fn cluster_help_verb_matches_verb_help_for_every_verb() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.status.success()
             || output.stdout != expected.stdout
-            || !stdout.starts_with(&format!("usage: remuda cluster {verb}"))
+            || !stdout.contains(&format!("Usage: remuda cluster {verb}"))
             || !stderr.is_empty()
         {
             failures.push(format!(
-                "cluster help {verb}: exit={:?}\nstdout: {stdout}\nstderr: {stderr}",
-                output.status.code()
+                "cluster help {verb}: exit={:?}\nexpected stdout: {}\nstdout: {stdout}\nstderr: {stderr}",
+                output.status.code(),
+                String::from_utf8_lossy(&expected.stdout)
             ));
         }
     }

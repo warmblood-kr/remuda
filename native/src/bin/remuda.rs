@@ -53,8 +53,7 @@ mod codex_tui;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (_, rest) = split_server_flag(&args);
-    if starts_interactive_client(rest) {
+    if starts_interactive_client(&args) {
         return run_cli(args);
     }
 
@@ -80,11 +79,34 @@ fn main() -> ExitCode {
 }
 
 fn starts_interactive_client(args: &[String]) -> bool {
-    match args {
-        [] => true,
-        [command, ..] if ["daemon", "run", "attach"].contains(&command.as_str()) => true,
-        [command, ..] if command == "_codex_tui" => true,
-        [command, verb, ..] if command == "cluster" && verb == "remote" => true,
+    let mut words = vec!["__dispatch".to_owned()];
+    words.extend(args.iter().cloned());
+    let argv = words.iter().map(String::as_str).collect::<Vec<_>>();
+    let report = remuda_native::cli_parse::parse_passthrough(&dispatch_cli_spec(), &argv);
+    if !report.ok {
+        return false;
+    }
+    if cli_flag(&report.values, "help") {
+        return false;
+    }
+    if report
+        .values
+        .get("eval")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+    {
+        return false;
+    }
+    let command_args = cli_positional_words(&report.values, "ARGS");
+    let command_args = if cli_flag(&report.values, "version") {
+        vec!["--version"]
+    } else {
+        command_args
+    };
+    match command_args.first().copied() {
+        None => true,
+        Some("daemon" | "run" | "attach" | "_codex_tui") => true,
+        Some("cluster") => command_args.get(1).is_some_and(|verb| *verb == "remote"),
         _ => false,
     }
 }
@@ -107,11 +129,20 @@ fn should_suppress_stdout_broken_pipe_panic(
 }
 
 fn run_cli(args: Vec<String>) -> ExitCode {
-    let (server, stdin_enabled, rest) = match checked_cli_flags(&args) {
+    let flags = match checked_cli_flags(&args) {
         Ok(flags) => flags,
         Err(code) => return code,
     };
-    let argv: Vec<&str> = rest.iter().map(String::as_str).collect();
+    if flags.help_requested {
+        return help_command();
+    }
+    let server = flags.server.as_str();
+    let stdin_enabled = flags.stdin_enabled;
+    let eval_code = flags.eval_code.as_deref();
+    let argv: Vec<&str> = eval_code.map_or_else(
+        || flags.args.iter().map(String::as_str).collect(),
+        |code| vec!["-e", code],
+    );
 
     if let Some(exit) = preflight_command(&argv) {
         return exit;
@@ -124,127 +155,103 @@ fn run_cli(args: Vec<String>) -> ExitCode {
         Err(error) => return fail(error),
     };
 
-    match argv.as_slice() {
-        // The whole ask: typing the program's name opens the herd. Only when
-        // both ends are a terminal — this also runs in CI and in pipes, where
-        // the usage text is the useful answer and a TUI is a hang.
-        [] if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
-            with_daemon(server, &path, |path| {
-                // The line above went to stderr, which the alternate screen is
-                // about to hide. The footer is where a TUI user can read it.
+    dispatch_cli_command(server, &path, skew, &argv, stdin_enabled, eval_code)
+}
+
+fn dispatch_cli_command(
+    server: &str,
+    path: &Path,
+    skew: Option<String>,
+    argv: &[&str],
+    stdin_enabled: bool,
+    eval_code: Option<&str>,
+) -> ExitCode {
+    if let Some(code) = eval_code {
+        return with_daemon(server, path, |path| eval_once(path, code));
+    }
+    let (command, rest) = argv
+        .split_first()
+        .map(|(command, rest)| (*command, rest))
+        .unwrap_or(("", &[]));
+    match command {
+        "" if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
+            with_daemon(server, path, |path| {
                 match remuda_native::tui::run(path, server, skew.clone()) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => fail(format!("tui: {e}")),
                 }
             })
         }
-
-        [] | ["help"] | ["-h"] | ["--help"] => help_command(),
-
-        ["--version"] | ["-V"] | ["version"] => {
+        "" | "-h" | "--help" => help_command(),
+        "help" => match ensure_no_args("help", rest) {
+            Err(code) => code,
+            Ok(()) => help_command(),
+        },
+        "version" | "--version" | "-V" => {
+            if let Err(code) = ensure_no_args("version", rest) {
+                return code;
+            }
             println!("remuda {}", dist::BUILD_VERSION);
             ExitCode::SUCCESS
         }
-
-        ["_codex_tui", rest @ ..] => codex_tui::run(rest),
-
-        ["_codex_watch", parent_pid, process_group] => run_codex_watch(parent_pid, process_group),
-
-        // No daemon involved: this replaces the binary, it does not talk to one.
-        ["upgrade", rest @ ..] => run_upgrade(rest),
-
-        // Not part of the user-facing set: this is what the auto-start spawns.
-        ["daemon"] => match daemon::serve_with_runtime(&path, &daemon::runtime_dir()) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => fail(e),
-            Err(e) => fail(format!("daemon: {e}")),
-        },
-
-        // Deliberately NOT behind `with_daemon`: the daemon this stops is often
-        // exactly the one that cannot be talked to, and starting one to stop it
-        // is not a thing to do.
-        ["stop", rest @ ..] => stop(server, &path, rest),
-
-        ["ls"] => with_existing_daemon(server, &path, list_sessions),
-        ["resize", rest @ ..] => resize_command(server, &path, rest),
-
-        ["run", rest @ ..] => run_session(server, &path, rest),
-
-        ["send", name, text @ ..] => send_command(server, &path, name, text),
-
-        ["attach", name] => with_daemon(server, &path, |path| ride(path, name)),
-        ["attach", name, "--mouse=false"] => {
-            with_daemon(server, &path, |path| ride_with_mouse(path, name, false))
-        }
-        ["attach", name, "--mouse=true"] => {
-            with_daemon(server, &path, |path| ride_with_mouse(path, name, true))
-        }
-        ["attach", "--mouse=false", name] => {
-            with_daemon(server, &path, |path| ride_with_mouse(path, name, false))
-        }
-        ["attach", "--mouse=true", name] => {
-            with_daemon(server, &path, |path| ride_with_mouse(path, name, true))
-        }
-
-        ["lua", script] => with_daemon(server, &path, |path| {
-            match remuda_native::script::run(path, Path::new(script)) {
+        "_codex_tui" => codex_tui::run(rest),
+        "_codex_watch" => run_codex_watch_cli(rest),
+        "upgrade" => run_upgrade(rest),
+        "daemon" => match ensure_no_args("daemon", rest) {
+            Err(code) => code,
+            Ok(()) => match daemon::serve_with_runtime(path, &daemon::runtime_dir()) {
                 Ok(()) => ExitCode::SUCCESS,
-                // Lua's own message, which already carries the file, the line
-                // and a traceback. Reformatting it would only lose the line.
-                Err(e) => fail(e),
-            }
-        }),
-
-        ["exec", name] => with_daemon(server, &path, |path| exec_command(path, name)),
-
-        ["cluster", rest @ ..] => cluster_command(server, &path, rest),
-
-        [command, rest @ ..]
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => fail(e),
+                Err(e) => fail(format!("daemon: {e}")),
+            },
+        },
+        "stop" => stop(server, path, rest),
+        "ls" => match ensure_no_args("ls", rest) {
+            Err(code) => code,
+            Ok(()) => with_existing_daemon(server, path, list_sessions),
+        },
+        "resize" => resize_command(server, path, rest),
+        "run" => run_session(server, path, rest),
+        "send" => send_command(server, path, rest),
+        "attach" => attach_command(server, path, rest),
+        "lua" => lua_command(server, path, rest),
+        "exec" => exec_cli_command(server, path, rest),
+        "cluster" => cluster_command(server, path, rest),
+        "mod" => match rest.first().copied() {
+            Some("install") => mod_install_command(server, path, &rest[1..]),
+            Some("list") => mod_list_command(&rest[1..]),
+            Some("info") => mod_info_command(&rest[1..]),
+            Some("test") => mod_test_command(&rest[1..]),
+            Some("update") => mod_update_command(server, path, &rest[1..]),
+            Some("remove") => mod_remove_command(&rest[1..]),
+            _ => unknown_command("mod"),
+        },
+        "doc" => doc_command(server, path, rest),
+        "repl" => match ensure_no_args("repl", rest) {
+            Err(code) => code,
+            Ok(()) => with_daemon(server, path, repl),
+        },
+        "mcp" => match ensure_no_args("mcp", rest) {
+            Err(code) => code,
+            Ok(()) => with_daemon(server, path, |path| {
+                let capability = std::env::var("REMUDA_SESSION_CAPABILITY")
+                    .ok()
+                    .filter(|token| !token.is_empty());
+                match remuda_native::mcp::serve_with_capability(path, capability.as_deref()) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => fail(format!("mcp: {e}")),
+                }
+            }),
+        },
+        "_print_lines" => run_print_lines_cli(rest),
+        command
             if remuda_native::packages::valid_component(command)
                 && remuda_native::packages::has_subcommand(command) =>
         {
-            extension_command(server, &path, command, rest, stdin_enabled)
+            extension_command(server, path, command, rest, stdin_enabled)
         }
-
-        // `emacsclient -e` for this runtime: the code runs in the daemon's
-        // long-lived image, so what it defines is still there next time.
-        ["-e", code] => with_daemon(server, &path, |path| eval_once(path, code)),
-
-        ["mod", "install", rest @ ..] => mod_install_command(server, &path, rest),
-        ["mod", "list", rest @ ..] => mod_list_command(rest),
-        ["mod", "info", rest @ ..] => mod_info_command(rest),
-        ["mod", "test", rest @ ..] => mod_test_command(rest),
-        ["mod", "update", rest @ ..] => mod_update_command(server, &path, rest),
-        ["mod", "remove", rest @ ..] => mod_remove_command(rest),
-
-        ["doc", rest @ ..] => doc_command(server, &path, rest),
-
-        ["repl"] => with_daemon(server, &path, repl),
-
-        // Speaks MCP on stdin/stdout, so the thing running *inside* a session
-        // can reach the manager. Not meant to be typed by hand — a client
-        // spawns it and owns both pipes.
-        ["mcp"] => with_daemon(server, &path, |path| {
-            // An extension may put an unforgeable per-session capability in
-            // this child process's environment. MCP JSON never supplies caller identity.
-            let capability = std::env::var("REMUDA_SESSION_CAPABILITY")
-                .ok()
-                .filter(|token| !token.is_empty());
-            match remuda_native::mcp::serve_with_capability(path, capability.as_deref()) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => fail(format!("mcp: {e}")),
-            }
-        }),
-
-        // Test-only plumbing for `remuda.process`, deliberately absent from
-        // `USAGE`: no daemon involved, just a cross-platform, dependency-free
-        // way to print N lines with a controllable pace.
-        ["_print_lines", n, delay_ms] => print_lines(n, delay_ms),
-
-        // Not a known verb or mod command. A mod directory with no readable
-        // manifest is named rather than answered with usage (#134).
         _ => {
-            let word = argv.first().copied().unwrap_or("");
+            let word = command;
             if !remuda_native::packages::valid_component(word) {
                 unknown_command(word)
             } else {
@@ -262,6 +269,160 @@ fn run_codex_watch(parent_pid: &str, process_group: &str) -> ExitCode {
         (Ok(parent_pid), Ok(process_group)) => codex_tui::watch_parent(parent_pid, process_group),
         _ => fail("invalid Codex app-server watch parameters"),
     }
+}
+
+fn ensure_no_args(verb: &str, args: &[&str]) -> Result<(), ExitCode> {
+    let about = match verb {
+        "help" => "Show Remuda commands and quick examples. Example: remuda help",
+        "version" => "Print the version of this CLI binary. Example: remuda version",
+        "daemon" => "Run the background daemon in this process",
+        "ls" => "List sessions for the selected server. Example: remuda ls",
+        "repl" => {
+            "Evaluate Lua in the persistent daemon image, one line at a time. Example: remuda repl"
+        }
+        "mcp" => "Serve the daemon image over MCP using stdin and stdout",
+        _ => "Run this command",
+    };
+    parse_top_level_cli(
+        &simple_cli_spec(verb, about, vec![], vec![], &format!("remuda {verb}")),
+        verb,
+        args,
+    )
+    .map(|_| ())
+}
+
+fn lua_cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::ArgSpec;
+    simple_cli_spec(
+        "lua",
+        "Run a Lua script in the daemon's living image. Example: remuda lua task.lua",
+        vec![ArgSpec {
+            name: "SCRIPT".into(),
+            help: "Lua script file".into(),
+            multiple: false,
+            required: true,
+        }],
+        vec![],
+        "remuda lua SCRIPT",
+    )
+}
+
+fn lua_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    let values = match parse_top_level_cli(&lua_cli_spec(), "lua", args) {
+        Ok(values) => values,
+        Err(code) => return code,
+    };
+    let script = values
+        .get("SCRIPT")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    with_daemon(server, path, |path| {
+        match remuda_native::script::run(path, Path::new(script)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        }
+    })
+}
+
+fn exec_cli_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    use remuda_native::cli_parse::ArgSpec;
+    let spec = simple_cli_spec(
+        "exec",
+        "Run an installed Lua mod. Example: remuda exec butler",
+        vec![ArgSpec {
+            name: "NAME".into(),
+            help: "Installed mod name".into(),
+            multiple: false,
+            required: true,
+        }],
+        vec![],
+        "remuda exec NAME",
+    );
+    let values = match parse_top_level_cli(&spec, "exec", args) {
+        Ok(values) => values,
+        Err(code) => return code,
+    };
+    let name = values
+        .get("NAME")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    with_daemon(server, path, |path| exec_command(path, name))
+}
+
+fn run_codex_watch_cli(args: &[&str]) -> ExitCode {
+    use remuda_native::cli_parse::ArgSpec;
+    let spec = simple_cli_spec(
+        "_codex_watch",
+        "Internal process-group watcher",
+        vec![
+            ArgSpec {
+                name: "PARENT_PID".into(),
+                help: "Parent process ID".into(),
+                multiple: false,
+                required: true,
+            },
+            ArgSpec {
+                name: "PROCESS_GROUP".into(),
+                help: "App-server process group ID".into(),
+                multiple: false,
+                required: true,
+            },
+        ],
+        vec![],
+        "remuda _codex_watch PARENT_PID PROCESS_GROUP",
+    );
+    let values = match parse_top_level_cli(&spec, "_codex_watch", args) {
+        Ok(values) => values,
+        Err(code) => return code,
+    };
+    run_codex_watch(
+        values
+            .get("PARENT_PID")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+        values
+            .get("PROCESS_GROUP")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+    )
+}
+
+fn run_print_lines_cli(args: &[&str]) -> ExitCode {
+    use remuda_native::cli_parse::ArgSpec;
+    let spec = simple_cli_spec(
+        "_print_lines",
+        "Internal process test helper",
+        vec![
+            ArgSpec {
+                name: "COUNT".into(),
+                help: "Number of lines".into(),
+                multiple: false,
+                required: true,
+            },
+            ArgSpec {
+                name: "DELAY_MS".into(),
+                help: "Delay between lines in milliseconds".into(),
+                multiple: false,
+                required: true,
+            },
+        ],
+        vec![],
+        "remuda _print_lines COUNT DELAY_MS",
+    );
+    let values = match parse_top_level_cli(&spec, "_print_lines", args) {
+        Ok(values) => values,
+        Err(code) => return code,
+    };
+    print_lines(
+        values
+            .get("COUNT")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+        values
+            .get("DELAY_MS")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+    )
 }
 
 #[allow(dead_code)]
@@ -589,68 +750,103 @@ enum CallAction {
     Capture(String),
 }
 
-fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
-    if args.is_empty() {
-        return ClusterCommand::Status;
-    }
-    if matches!(
-        args,
-        ["help"] | ["-h"] | ["--help"] | ["help", "help" | "-h" | "--help"]
-    ) {
-        return ClusterCommand::Help(None);
-    }
-    if let [verb, "--help"] | ["help", verb] = args {
-        if cluster_verb_known(verb) {
-            return ClusterCommand::Help(Some((*verb).to_owned()));
-        }
-    }
-    if let ["help", verb] = args {
-        return ClusterCommand::UnknownVerb((*verb).to_owned());
-    }
-    let (verb, rest) = args.split_first().expect("non-empty cluster args");
-    if !cluster_verb_known(verb) {
-        return ClusterCommand::UnknownVerb((*verb).to_owned());
-    }
-    let parsed = match *verb {
-        "init" => parse_cluster_init(rest),
-        "invite" => parse_cluster_invite(rest),
-        "join" => parse_cluster_join(rest),
-        "nodes" => parse_cluster_nodes(rest),
-        "alias" => match rest {
-            [target, "--clear"] => Ok(ClusterCommand::Alias {
-                target: (*target).into(),
-                alias: None,
-            }),
-            [target, alias] if !alias.starts_with('-') => Ok(ClusterCommand::Alias {
-                target: (*target).into(),
-                alias: Some((*alias).into()),
-            }),
-            _ => Err("expected NODE|FINGERPRINT ALIAS or NODE|FINGERPRINT --clear".into()),
-        },
-        "control" => parse_cluster_control(rest),
-        "revoke" => parse_cluster_revoke(rest),
-        "remote" => parse_cluster_remote(rest),
-        "listen" => parse_cluster_listen(rest),
-        "call" => parse_cluster_call_args(rest),
-        _ => unreachable!("cluster_verb_known and parser dispatch disagree"),
+fn cluster_cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::{ArgSpec, OptionSpec, RepeatPolicy, Spec, VerbSpec};
+    let option = |long: &str, value: Option<&str>, help: &str, required: bool| OptionSpec {
+        long: long.into(),
+        short: None,
+        value: value.map(str::to_owned),
+        help: help.into(),
+        global: false,
+        required,
+        repeat_policy: RepeatPolicy::Reject,
     };
-    parsed.unwrap_or_else(|reason| invalid_cluster(verb, reason))
+    let arg = |name: &str, help: &str, multiple: bool, required: bool| ArgSpec {
+        name: name.into(),
+        help: help.into(),
+        multiple,
+        required,
+    };
+    let verb =
+        |name: &str, about: &str, args: Vec<ArgSpec>, options: Vec<OptionSpec>, next: &str| {
+            VerbSpec {
+                name: name.into(),
+                about: about.into(),
+                usage: next.strip_prefix("remuda cluster ").map(str::to_owned),
+                args,
+                options,
+                next: next.into(),
+            }
+        };
+    let port = format!("Address; omitted port defaults to {CLUSTER_DEFAULT_PORT}");
+    Spec {
+        name: "remuda cluster".into(), options: vec![],
+        verbs: vec![
+            verb("init", &format!("Create this node identity and listen on a private LAN address by default (port {CLUSTER_DEFAULT_PORT}). Example: remuda cluster init --no-listen"),
+                vec![], vec![
+                    option("no-listen", None, "Do not open the cluster listener", false),
+                    option("new-identity", None, "Replace this node identity and leave its current cluster", false),
+                    option("yes", None, "Confirm identity replacement without prompting", false),
+                ], "remuda cluster init [--no-listen | --new-identity [--yes]]"),
+            verb("invite", "Create an invitation for another node. Example: remuda cluster invite",
+                vec![], vec![option("bind", Some("IP[:PORT]"), &port, false), option("addr", Some("IP[:PORT]"), "Advertised address for the invitee", false)],
+                "remuda cluster invite [--bind IP[:PORT]] [--addr IP[:PORT]]"),
+            verb("join", "Join using a quoted invitation line; a fingerprint is needed when stdin is not a terminal. Example: remuda cluster join 'remuda-join-v1 …'",
+                vec![arg("FINGERPRINT", "Optional fingerprint for non-terminal use", false, false), arg("JOIN_LINE", "Quoted join line", false, false)],
+                vec![option("bind", Some("IP[:PORT]"), &port, false)],
+                "remuda cluster join [FINGERPRINT] 'JOIN_LINE' [--bind IP[:PORT]]"),
+            verb("nodes", "List the nodes known to this cluster. Example: remuda cluster nodes", vec![], vec![], "remuda cluster nodes"),
+            verb("alias", "Set or clear a local display alias for a node. Example: remuda cluster alias node-abcd1234 macbook",
+                vec![arg("TARGET", "Node name or fingerprint", false, true), arg("ALIAS", "Local display alias; omit when using --clear", false, false)],
+                vec![option("clear", None, "Clear the local display alias", false)], "remuda cluster alias TARGET ALIAS | alias TARGET --clear"),
+            verb("control", "Enable or disable remote control. Example: remuda cluster control off",
+                vec![arg("MODE", "on or off", false, true)], vec![], "remuda cluster control on|off"),
+            verb("revoke", "Revoke a node or fingerprint; prompt before revoking unless --yes is used. Example: remuda cluster revoke node-abcd1234",
+                vec![arg("TARGET", "Node name or fingerprint", false, true)],
+                vec![option("yes", None, "Confirm without prompting", false)], "remuda cluster revoke TARGET [--yes]"),
+            verb("remote", "Attach to a remote session, or show the remote session picker. Example: remuda cluster remote node/session",
+                vec![arg("TARGET", "Optional NODE/SESSION target", false, false)], vec![], "remuda cluster remote [NODE/SESSION]"),
+            verb("listen", "Manage the cluster listener. Example: remuda cluster listen --bind 127.0.0.1",
+                vec![], vec![
+                    option("off", None, "Stop the cluster listener", false),
+                    option("bind", Some("IP[:PORT]"), &port, false),
+                    option("allow-public", None, "Allow binding to a public interface", false),
+                    option("foreground", None, "Run listener in the foreground", false),
+                ], "remuda cluster listen [--bind IP[:PORT] [--allow-public] [--foreground] | --off]"),
+            verb("call", "Call a remote node API. Example: remuda cluster call node-abcd1234 list --addr 192.0.2.1",
+                vec![arg("NODE", "Remote node name or fingerprint", false, true), arg("ACTION", "list or capture", false, true), arg("SESSION", "Session to capture; required for capture", false, false)],
+                vec![option("addr", Some("IP[:PORT]"), &port, true), option("json", None, "Print list results as JSON", false)],
+                "remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] [--json]"),
+        ],
+    }
 }
 
 fn cluster_verb_known(verb: &str) -> bool {
-    matches!(
-        verb,
-        "init"
-            | "invite"
-            | "join"
-            | "nodes"
-            | "alias"
-            | "control"
-            | "revoke"
-            | "remote"
-            | "listen"
-            | "call"
-    )
+    cluster_cli_spec()
+        .verbs
+        .iter()
+        .any(|spec| spec.name == verb)
+}
+
+fn cluster_help_alias_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::{ArgSpec, Spec, VerbSpec};
+    Spec {
+        name: "remuda cluster".into(),
+        options: vec![],
+        verbs: vec![VerbSpec {
+            name: "cluster-help".into(),
+            about: "Show cluster commands or help for one command".into(),
+            usage: Some("help [COMMAND]".into()),
+            args: vec![ArgSpec {
+                name: "TOPIC".into(),
+                help: "Cluster command name".into(),
+                multiple: false,
+                required: false,
+            }],
+            next: "remuda cluster --help".into(),
+            options: vec![],
+        }],
+    }
 }
 
 fn invalid_cluster(verb: &str, reason: impl Into<String>) -> ClusterCommand {
@@ -660,92 +856,196 @@ fn invalid_cluster(verb: &str, reason: impl Into<String>) -> ClusterCommand {
     }
 }
 
-fn parse_cluster_init(args: &[&str]) -> Result<ClusterCommand, String> {
-    match args {
-        [] => Ok(ClusterCommand::Init { no_listen: false }),
-        ["--no-listen"] => Ok(ClusterCommand::Init { no_listen: true }),
-        ["--new-identity"] => Ok(ClusterCommand::InitNewIdentity { yes: false }),
-        ["--new-identity", "--yes"] => Ok(ClusterCommand::InitNewIdentity { yes: true }),
-        _ => Err("expected [--no-listen | --new-identity [--yes]]".into()),
-    }
+fn cluster_value<'a>(
+    values: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a str> {
+    values.get(key).and_then(serde_json::Value::as_str)
 }
 
-fn parse_cluster_invite(args: &[&str]) -> Result<ClusterCommand, String> {
-    let mut bind_addr = None;
-    let mut advertised_addr = None;
-    let mut index = 0;
-    while index < args.len() {
-        let (option, value, consumed) = match args[index] {
-            "--bind" | "--addr" => {
-                let option = args[index];
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| format!("missing address after {option}"))?;
-                (option, *value, 2)
-            }
-            flag if flag.starts_with("--bind=") => ("--bind", &flag[7..], 1),
-            flag if flag.starts_with("--addr=") => ("--addr", &flag[7..], 1),
-            argument => return Err(format!("unexpected argument {argument}")),
-        };
-        let address = parse_addr_default_port(value)?;
-        match option {
-            "--bind" => {
-                if bind_addr.replace(address).is_some() {
-                    return Err("--bind may only be provided once".into());
-                }
-            }
-            "--addr" => {
-                remuda_native::cluster::join_line::validate_endpoint(address)
-                    .map_err(|_| "invalid advertised address")?;
-                if advertised_addr.replace(address).is_some() {
-                    return Err("--addr may only be provided once".into());
-                }
-            }
-            _ => unreachable!("invite option parser returned an unknown option"),
-        }
-        index += consumed;
+fn cluster_option_addr(
+    values: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<std::net::SocketAddr>, String> {
+    cluster_value(values, key)
+        .map(parse_addr_default_port)
+        .transpose()
+}
+
+fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
+    if args.is_empty() {
+        return ClusterCommand::Status;
     }
-    Ok(ClusterCommand::Invite {
+    if matches!(args.first(), Some(&"-h" | &"--help")) {
+        return ClusterCommand::Help(None);
+    }
+    let verb = args[0];
+    if verb == "help" {
+        let mut normalized = vec!["cluster-help"];
+        normalized.extend(args.iter().skip(1).copied());
+        let report = remuda_native::cli_parse::parse(&cluster_help_alias_spec(), &normalized);
+        if !report.ok {
+            return ClusterCommand::Help(None);
+        }
+        return match cluster_value(&report.values, "TOPIC") {
+            None | Some("help") => ClusterCommand::Help(None),
+            Some(topic) if cluster_verb_known(topic) => {
+                ClusterCommand::Help(Some(topic.to_owned()))
+            }
+            Some(topic) => ClusterCommand::UnknownVerb(topic.to_owned()),
+        };
+    }
+    if !cluster_verb_known(verb) {
+        return ClusterCommand::UnknownVerb(verb.to_owned());
+    }
+    let report = remuda_native::cli_parse::parse(&cluster_cli_spec(), args);
+    if !report.ok {
+        if report.kind.as_deref() == Some("help") {
+            return if verb == "help" {
+                ClusterCommand::Help(None)
+            } else {
+                ClusterCommand::Help(Some(verb.to_owned()))
+            };
+        }
+        // Join lines can contain bearer credentials, so never expose parser diagnostics.
+        let reason = if verb == "join" {
+            "quote the whole join line (it contains spaces); FINGERPRINT is optional on a terminal: remuda cluster join [FINGERPRINT] 'remuda-join-v1 …'".into()
+        } else {
+            report.text
+        };
+        return invalid_cluster(verb, reason);
+    }
+    let values = &report.values;
+    parse_cluster_values(verb, values)
+}
+
+fn parse_cluster_values(
+    verb: &str,
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> ClusterCommand {
+    let result: Result<ClusterCommand, String> = (|| match verb {
+        "init" => {
+            let no_listen = cli_flag(values, "no-listen");
+            let rotate = cli_flag(values, "new-identity");
+            if no_listen && rotate {
+                Err("--no-listen and --new-identity cannot be combined".into())
+            } else if rotate {
+                Ok(ClusterCommand::InitNewIdentity {
+                    yes: cli_flag(values, "yes"),
+                })
+            } else {
+                Ok(ClusterCommand::Init { no_listen })
+            }
+        }
+        "invite" => Ok(ClusterCommand::Invite {
+            bind_addr: cluster_option_addr(values, "bind")?,
+            advertised_addr: cluster_option_addr(values, "addr")?
+                .map(|address| {
+                    remuda_native::cluster::join_line::validate_endpoint(address).map(|_| address)
+                })
+                .transpose()
+                .map_err(|_| "invalid advertised address".to_string())?,
+        }),
+        "join" => parse_cluster_join(values),
+        "nodes" => Ok(ClusterCommand::Nodes),
+        "alias" => {
+            let target = cluster_value(values, "TARGET")
+                .unwrap_or_default()
+                .to_owned();
+            let alias = cluster_value(values, "ALIAS").map(str::to_owned);
+            if cli_flag(values, "clear") == alias.is_some() {
+                Err("expected TARGET ALIAS or TARGET --clear".into())
+            } else {
+                Ok(ClusterCommand::Alias { target, alias })
+            }
+        }
+        "control" => match cluster_value(values, "MODE") {
+            Some("on") => Ok(ClusterCommand::Control(true)),
+            Some("off") => Ok(ClusterCommand::Control(false)),
+            _ => Err("expected on or off".into()),
+        },
+        "revoke" => Ok(ClusterCommand::Revoke {
+            target: cluster_value(values, "TARGET")
+                .unwrap_or_default()
+                .to_owned(),
+            yes: cli_flag(values, "yes"),
+        }),
+        "remote" => Ok(ClusterCommand::Remote(
+            cluster_value(values, "TARGET").map(str::to_owned),
+        )),
+        "listen" => {
+            let off = cli_flag(values, "off");
+            let bind_addr = cluster_value(values, "bind")
+                .map(parse_addr_default_port)
+                .transpose()?;
+            let allow_public = cli_flag(values, "allow-public");
+            let foreground = cli_flag(values, "foreground");
+            if off && (bind_addr.is_some() || allow_public || foreground) {
+                Err("--off cannot be combined with listener options".into())
+            } else if bind_addr.is_none() && (allow_public || foreground) {
+                Err("--allow-public and --foreground require --bind ADDR".into())
+            } else if off {
+                Ok(ClusterCommand::ListenOff)
+            } else {
+                Ok(ClusterCommand::Listen {
+                    bind_addr,
+                    allow_public,
+                    foreground,
+                })
+            }
+        }
+        "call" => parse_cluster_call(values),
+        _ => unreachable!("cluster verb specification and dispatcher diverged"),
+    })();
+    result.unwrap_or_else(|reason| invalid_cluster(verb, reason))
+}
+
+fn parse_cluster_join(
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> Result<ClusterCommand, String> {
+    let fingerprint_value = cluster_value(values, "FINGERPRINT");
+    let line_value = cluster_value(values, "JOIN_LINE");
+    let (fingerprint, line) = match (fingerprint_value, line_value) {
+        (None, Some(line)) => (None, line),
+        (Some(line), None) if line.starts_with("remuda-join-v1") => (None, line),
+        (Some(fingerprint), Some(line)) => (Some(fingerprint.to_owned()), line),
+        _ => return Err(join_syntax_hint().into()),
+    };
+    let invitation = remuda_native::cluster::join_line::JoinLine::decode(line)
+        .map_err(|_| join_syntax_hint())?;
+    let bind_addr = cluster_value(values, "bind")
+        .map(parse_join_bind)
+        .transpose()?;
+    Ok(ClusterCommand::Join {
+        fingerprint,
+        invitation,
         bind_addr,
-        advertised_addr,
     })
 }
 
-fn parse_cluster_join(args: &[&str]) -> Result<ClusterCommand, String> {
-    if args.len() > 2 {
-        if let Some(index) = args
-            .iter()
-            .position(|arg| arg.starts_with("remuda-join-v1"))
-        {
-            if remuda_native::cluster::join_line::JoinLine::decode(args[index]).is_err() {
-                let reason = "quote the whole join line (it contains spaces); FINGERPRINT is optional on a terminal: remuda cluster join [FINGERPRINT] 'remuda-join-v1 …'";
-                return Err(reason.into());
-            }
-        }
-    }
-    let (fingerprint, line_index) = match args {
-        [] => return Err("missing join line".into()),
-        [_] => (None, 0),
-        [line, ..] if remuda_native::cluster::join_line::JoinLine::decode(line).is_ok() => {
-            (None, 0)
-        }
-        [fingerprint, ..] => (Some(*fingerprint), 1),
+fn join_syntax_hint() -> &'static str {
+    "quote the whole join line (it contains spaces); FINGERPRINT is optional on a terminal: remuda cluster join [FINGERPRINT] 'remuda-join-v1 …'"
+}
+
+fn parse_cluster_call(
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> Result<ClusterCommand, String> {
+    let target = cluster_value(values, "NODE").unwrap_or_default().to_owned();
+    let action = match (
+        cluster_value(values, "ACTION"),
+        cluster_value(values, "SESSION"),
+    ) {
+        (Some("list"), None) => CallAction::List,
+        (Some("capture"), Some(session)) => CallAction::Capture(session.to_owned()),
+        (Some("capture"), None) => return Err("missing SESSION for capture".into()),
+        _ => return Err("expected list or capture SESSION".into()),
     };
-    let line = args.get(line_index).ok_or("missing join line")?;
-    let invitation = match remuda_native::cluster::join_line::JoinLine::decode(line) {
-        Ok(invitation) => invitation,
-        Err(_) => return Err("invalid join line".into()),
-    };
-    let bind_addr = match &args[line_index + 1..] {
-        [] => None,
-        ["--bind", address] => Some(parse_join_bind(address)?),
-        [flag] if flag.starts_with("--bind=") => Some(parse_join_bind(&flag[7..])?),
-        _ => return Err("unexpected arguments".into()),
-    };
-    Ok(ClusterCommand::Join {
-        fingerprint: fingerprint.map(str::to_owned),
-        invitation,
-        bind_addr,
+    let address = cluster_option_addr(values, "addr")?.expect("required by parser");
+    Ok(ClusterCommand::Call {
+        target,
+        address,
+        action,
+        json: cli_flag(values, "json"),
     })
 }
 
@@ -759,136 +1059,6 @@ fn parse_join_bind(value: &str) -> Result<std::net::SocketAddr, String> {
             .map_err(|_| "invalid client bind address")?;
     }
     Ok(address)
-}
-
-fn parse_cluster_nodes(args: &[&str]) -> Result<ClusterCommand, String> {
-    if args.is_empty() {
-        Ok(ClusterCommand::Nodes)
-    } else {
-        Err("unexpected arguments".into())
-    }
-}
-
-fn parse_cluster_control(args: &[&str]) -> Result<ClusterCommand, String> {
-    match args {
-        ["on"] => Ok(ClusterCommand::Control(true)),
-        ["off"] => Ok(ClusterCommand::Control(false)),
-        _ => Err("expected on or off".into()),
-    }
-}
-
-fn parse_cluster_revoke(args: &[&str]) -> Result<ClusterCommand, String> {
-    match args {
-        [target] => Ok(ClusterCommand::Revoke {
-            target: (*target).to_owned(),
-            yes: false,
-        }),
-        [target, "--yes"] | ["--yes", target] => Ok(ClusterCommand::Revoke {
-            target: (*target).to_owned(),
-            yes: true,
-        }),
-        _ => Err("expected a node or fingerprint".into()),
-    }
-}
-
-fn parse_cluster_remote(args: &[&str]) -> Result<ClusterCommand, String> {
-    match args {
-        [] => Ok(ClusterCommand::Remote(None)),
-        [target] if target.contains('/') => Ok(ClusterCommand::Remote(Some((*target).to_owned()))),
-        _ => Err("expected NODE/SESSION".into()),
-    }
-}
-
-fn parse_cluster_listen(args: &[&str]) -> Result<ClusterCommand, String> {
-    if args == ["--off"] {
-        return Ok(ClusterCommand::ListenOff);
-    }
-    let mut address = None;
-    let mut allow_public = false;
-    let mut foreground = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index] {
-            "--bind" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err("missing --bind ADDR".into());
-                };
-                if address.replace(*value).is_some() {
-                    return Err("--bind may only be provided once".into());
-                }
-            }
-            flag if flag.starts_with("--bind=") => {
-                if address.replace(&flag[7..]).is_some() {
-                    return Err("--bind may only be provided once".into());
-                }
-            }
-            "--allow-public" => allow_public = true,
-            "--foreground" => foreground = true,
-            _ => return Err("expected --bind ADDR [--allow-public] [--foreground]".into()),
-        }
-        index += 1;
-    }
-    if address.is_none() && (allow_public || foreground) {
-        return Err("--allow-public and --foreground require --bind ADDR".into());
-    }
-    let bind_addr = address.map(parse_addr_default_port).transpose()?;
-    Ok(ClusterCommand::Listen {
-        bind_addr,
-        allow_public,
-        foreground,
-    })
-}
-
-fn parse_cluster_call_args(args: &[&str]) -> Result<ClusterCommand, String> {
-    let [target, operation, rest @ ..] = args else {
-        return Err("expected NODE and list or capture SESSION".into());
-    };
-    parse_cluster_call(target, operation, rest)
-}
-
-fn parse_cluster_call(
-    target: &str,
-    operation: &str,
-    args: &[&str],
-) -> Result<ClusterCommand, String> {
-    let action = match operation {
-        "list" => CallAction::List,
-        "capture" => match args.first() {
-            Some(session) if !session.starts_with('-') => CallAction::Capture((*session).into()),
-            _ => return Err("missing SESSION for capture".into()),
-        },
-        _ => return Err("expected list or capture SESSION".into()),
-    };
-    let option_start = usize::from(matches!(action, CallAction::Capture(_)));
-    let mut address = None;
-    let mut json = false;
-    let mut index = option_start;
-    while index < args.len() {
-        match args[index] {
-            "--json" if !json => {
-                json = true;
-                index += 1;
-            }
-            "--addr" if address.is_none() => {
-                let value = args.get(index + 1).ok_or("missing address after --addr")?;
-                address = Some(parse_addr_default_port(value)?);
-                index += 2;
-            }
-            flag if address.is_none() && flag.starts_with("--addr=") => {
-                address = Some(parse_addr_default_port(&flag[7..])?);
-                index += 1;
-            }
-            _ => return Err(format!("unexpected argument {}", args[index])),
-        }
-    }
-    let address = address.ok_or("missing --addr HOST:PORT")?;
-    Ok(ClusterCommand::Call {
-        target: target.into(),
-        address,
-        action,
-        json,
-    })
 }
 
 fn parse_addr_default_port(value: &str) -> Result<std::net::SocketAddr, String> {
@@ -912,19 +1082,16 @@ fn parse_addr_default_port(value: &str) -> Result<std::net::SocketAddr, String> 
 }
 
 pub fn cluster_usage(verb: &str) -> String {
-    match verb {
-        "init" => format!("usage: remuda cluster init [--no-listen | --new-identity [--yes]]\nCreates this node's identity and opens a listener for cluster nodes on a private LAN address (port {CLUSTER_DEFAULT_PORT}) by default.\nUse --no-listen to skip opening a port; run `remuda cluster listen --off` to stop it later; use `remuda cluster listen --bind IP[:PORT]` to limit the address (127.0.0.1:7441 for local-only).\nexample: remuda cluster init --no-listen\n"),
-        "invite" => format!("usage: remuda cluster invite [--bind IP[:PORT]] [--addr IP[:PORT]] (default port {CLUSTER_DEFAULT_PORT})\nexample: remuda cluster invite\n"),
-        "join" => format!("usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' (FINGERPRINT required when not on a terminal) [--bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})]\nexample: remuda cluster join 'remuda-join-v1 …'\n"),
-        "nodes" => "usage: remuda cluster nodes\nexample: remuda cluster nodes\n".into(),
-        "alias" => "usage: remuda cluster alias NODE|FINGERPRINT ALIAS|--clear\nAliases are local display labels; use the node id or fingerprint for commands.\nexample: remuda cluster alias node-abcd1234 macbook\n".into(),
-        "revoke" => "usage: remuda cluster revoke NODE|FINGERPRINT [--yes]\nexample: remuda cluster revoke node-abcd1234\n".into(),
-        "control" => "usage: remuda cluster control on|off\nexample: remuda cluster control off\n".into(),
-        "remote" => "usage: remuda cluster remote [NODE/SESSION]\nexample: remuda cluster remote\n".into(),
-        "listen" => format!("usage: remuda cluster listen [--bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})] [--allow-public] [--foreground]\nusage: remuda cluster listen --off\nexample: remuda cluster listen\n"),
-        "call" => format!("usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--json]\nexample: remuda cluster call node-abcd1234 list --addr 192.0.2.1\n"),
-        _ => "usage: remuda cluster <command>\n  init\n    creates identity; opens listener for cluster nodes on private LAN port 7441 by default\n    --no-listen skips opening it; listen --off stops it; listen --bind IP[:PORT] limits its address\n  invite\n  join\n  nodes\n  alias\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n".into(),
+    let spec = cluster_cli_spec();
+    if verb.is_empty() {
+        let mut output = "Usage: remuda cluster <COMMAND>\n\nCommands:\n".to_owned();
+        for command in &spec.verbs {
+            output.push_str(&format!("  {:<10} {}\n", command.name, command.about));
+        }
+        output.push_str("  help       Print help for a cluster command\n");
+        return output;
     }
+    remuda_native::cli_parse::parse(&spec, &[verb, "--help"]).text
 }
 
 fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
@@ -3882,26 +4049,40 @@ mod cluster_cli_tests {
 
     #[test]
     fn cluster_usage_has_one_verb_per_line_and_examples() {
-        assert_eq!(
-            cluster_usage("listen"),
-            "usage: remuda cluster listen [--bind IP[:PORT] (default port 7441)] [--allow-public] [--foreground]\nusage: remuda cluster listen --off\nexample: remuda cluster listen\n"
+        let listen = cluster_usage("listen");
+        assert!(listen.contains("Usage: remuda cluster listen"), "{listen}");
+        assert!(listen.contains("--bind IP[:PORT]"), "{listen}");
+        assert!(listen.contains("--off"), "{listen}");
+        assert!(listen.contains("defaults to 7441"), "{listen}");
+        assert!(
+            listen.contains("Example: remuda cluster listen --bind 127.0.0.1"),
+            "{listen}"
         );
         for verb in ["invite", "join", "call"] {
             let usage = cluster_usage(verb);
             assert!(usage.contains("IP[:PORT]"), "{verb}: {usage}");
-            assert!(usage.contains("default port 7441"), "{verb}: {usage}");
+            assert!(usage.contains("defaults to 7441"), "{verb}: {usage}");
         }
-        assert!(cluster_usage("call").contains("--addr 192.0.2.1"));
-        assert_eq!(
-            cluster_usage("join"),
-            "usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' (FINGERPRINT required when not on a terminal) [--bind IP[:PORT] (default port 7441)]\nexample: remuda cluster join 'remuda-join-v1 …'\n"
+        assert!(cluster_usage("call").contains("--addr IP[:PORT]"));
+        assert!(cluster_usage("call")
+            .contains("Example: remuda cluster call node-abcd1234 list --addr 192.0.2.1"));
+        let join = cluster_usage("join");
+        assert!(
+            join.contains(
+                "Usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' [--bind IP[:PORT]]"
+            ),
+            "{join}"
+        );
+        assert!(
+            join.contains("Example: remuda cluster join 'remuda-join-v1 …'"),
+            "{join}"
         );
         let usage = cluster_usage("");
         for verb in [
             "init", "invite", "join", "nodes", "revoke", "control", "remote", "listen", "call",
         ] {
             assert!(
-                usage.contains(&format!("  {verb}\n")),
+                usage.contains(&format!("  {verb}")),
                 "missing {verb}: {usage}"
             );
         }
@@ -4673,11 +4854,16 @@ mod cluster_cli_tests {
 /// comes first, so no leading positional can eat the program name — which is
 /// exactly what made `new claude-code` start a bare shell called "claude-code".
 fn run_session(server: &str, path: &Path, args: &[&str]) -> ExitCode {
-    let (name, argv) = match args {
-        ["-n", name, rest @ ..] => (Some((*name).to_string()), rest),
-        rest => (None, rest),
+    let values = match parse_top_level_cli(&run_cli_spec(), "run", args) {
+        Ok(values) => values,
+        Err(code) => return code,
     };
-    if let Some(refusal) = lua_script_refusal(argv) {
+    let name = values
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let argv = cli_positional_words(&values, "COMMAND");
+    if let Some(refusal) = lua_script_refusal(&argv) {
         return fail(refusal);
     }
     let command: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
@@ -4694,6 +4880,99 @@ fn run_session(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             other => fail(describe(other)),
         }
     })
+}
+
+fn run_cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::{ArgSpec, OptionSpec, Spec, VerbSpec};
+    Spec {
+        name: "remuda".into(), options: vec![],
+        verbs: vec![VerbSpec {
+            name: "run".into(),
+            about: "Start a program in a new session and attach to it. With no command, starts the default shell. Example: remuda run -n editor nvim".into(),
+            usage: None,
+            args: vec![ArgSpec { name: "COMMAND".into(), help: "Program and arguments to run".into(), multiple: true, required: false }],
+            next: "remuda run [--name NAME] [COMMAND…]".into(),
+            options: vec![OptionSpec { long: "name".into(), short: Some('n'), value: Some("NAME".into()), help: "Name the session (default: generated from the program)".into(), global: false, required: false, repeat_policy: Default::default() }],
+        }],
+    }
+}
+
+fn simple_cli_spec(
+    verb: &str,
+    about: &str,
+    args: Vec<remuda_native::cli_parse::ArgSpec>,
+    options: Vec<remuda_native::cli_parse::OptionSpec>,
+    next: &str,
+) -> remuda_native::cli_parse::Spec {
+    remuda_native::cli_parse::Spec {
+        name: "remuda".into(),
+        options: vec![],
+        verbs: vec![remuda_native::cli_parse::VerbSpec {
+            name: verb.into(),
+            about: about.into(),
+            usage: None,
+            args,
+            next: next.into(),
+            options,
+        }],
+    }
+}
+
+fn cli_positional_words<'a>(
+    values: &'a serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Vec<&'a str> {
+    match values.get(name) {
+        Some(serde_json::Value::String(value)) => vec![value],
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn attach_cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::{ArgSpec, OptionSpec};
+    simple_cli_spec(
+        "attach",
+        "Attach to a session. Mouse reporting defaults to on. Example: remuda attach editor",
+        vec![ArgSpec {
+            name: "NAME".into(),
+            help: "Session to attach to".into(),
+            multiple: false,
+            required: true,
+        }],
+        vec![OptionSpec {
+            long: "mouse".into(),
+            short: None,
+            value: Some("BOOL".into()),
+            help: "Enable or disable mouse reporting (default: true)".into(),
+            global: false,
+            required: false,
+            repeat_policy: Default::default(),
+        }],
+        "remuda attach NAME [--mouse true|false]",
+    )
+}
+
+fn attach_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    let values = match parse_top_level_cli(&attach_cli_spec(), "attach", args) {
+        Ok(values) => values,
+        Err(code) => return code,
+    };
+    let name = values
+        .get("NAME")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let mouse = match values.get("mouse").and_then(serde_json::Value::as_str) {
+        None | Some("true") => true,
+        Some("false") => false,
+        Some(_) => {
+            return fail("--mouse expects true or false; run `remuda attach --help` for usage")
+        }
+    };
+    with_daemon(server, path, |path| ride_with_mouse(path, name, mouse))
 }
 
 /// `run` used to mean "run a Lua script". Refuse, do not fall back: executing a
@@ -4807,6 +5086,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
         verbs: vec![VerbSpec {
             name: "stop".into(),
             about: "Stop this server's daemon and end its sessions".into(),
+            usage: None,
             args: vec![],
             next: "remuda stop --help".into(),
             options: vec![
@@ -4816,6 +5096,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
                     value: None,
                     help: "Skip confirmation; identity checks still apply".into(),
                     global: false,
+                    required: false,
                     repeat_policy: Default::default(),
                 },
                 OptionSpec {
@@ -4824,6 +5105,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
                     value: None,
                     help: "Confirm ending all sessions; identity checks still apply".into(),
                     global: false,
+                    required: false,
                     repeat_policy: Default::default(),
                 },
                 OptionSpec {
@@ -4833,6 +5115,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
                     help: "Override hosted or unverifiable identity checks; ends all sessions"
                         .into(),
                     global: false,
+                    required: false,
                     repeat_policy: Default::default(),
                 },
             ],
@@ -4841,10 +5124,9 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
 }
 
 fn stop_cli_preflight(argv: &[&str]) -> Option<ExitCode> {
-    let ["stop", args @ ..] = argv else {
-        return None;
-    };
-    parse_top_level_cli(&stop_cli_spec(), "stop", args).err()
+    (argv.first() == Some(&"stop"))
+        .then(|| parse_top_level_cli(&stop_cli_spec(), "stop", &argv[1..]).err())
+        .flatten()
 }
 
 fn parse_top_level_cli(
@@ -4950,14 +5232,19 @@ fn stop_daemon(path: &Path, shutdown: Request) -> Result<(), String> {
 fn version_skew(argv: &[&str], path: &Path) -> Result<Option<String>, String> {
     // Help, version and upgrade must answer with no daemon at all (#115).
     if matches!(
-        argv,
-        ["daemon"]
-            | ["mcp"]
-            | ["stop", ..]
-            | [
-                "help" | "-h" | "--help" | "version" | "-V" | "--version" | "upgrade",
-                ..
-            ]
+        argv.first().copied(),
+        Some(
+            "daemon"
+                | "mcp"
+                | "stop"
+                | "help"
+                | "-h"
+                | "--help"
+                | "version"
+                | "-V"
+                | "--version"
+                | "upgrade"
+        )
     ) || (argv.is_empty()
         && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()))
     {
@@ -5087,6 +5374,7 @@ fn upgrade_cli_spec() -> remuda_native::cli_parse::Spec {
         verbs: vec![VerbSpec {
             name: "upgrade".into(),
             about: "Install the latest stable or nightly CLI release".into(),
+            usage: None,
             args: vec![],
             next: "run `remuda upgrade --channel stable` (or choose nightly)".into(),
             options: vec![OptionSpec {
@@ -5095,6 +5383,7 @@ fn upgrade_cli_spec() -> remuda_native::cli_parse::Spec {
                 value: Some("CHANNEL".into()),
                 help: "Release channel: stable or nightly".into(),
                 global: false,
+                required: false,
                 repeat_policy: Default::default(),
             }],
         }],
@@ -5136,14 +5425,29 @@ fn upgrade_cli_parse(args: &[&str]) -> Result<Option<String>, ExitCode> {
 }
 
 fn upgrade_cli_preflight(argv: &[&str]) -> Option<ExitCode> {
-    let ["upgrade", args @ ..] = argv else {
-        return None;
-    };
-    upgrade_cli_parse(args).err()
+    (argv.first() == Some(&"upgrade"))
+        .then(|| upgrade_cli_parse(&argv[1..]).err())
+        .flatten()
 }
 
-fn send_command(server: &str, path: &Path, name: &str, text: &[&str]) -> ExitCode {
-    let text = text.join(" ");
+fn send_cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::ArgSpec;
+    simple_cli_spec("send", "Send one instruction to a session, followed by Enter. Example: remuda send agent Read the README", vec![
+        ArgSpec { name: "NAME".into(), help: "Target session".into(), multiple: false, required: true },
+        ArgSpec { name: "TEXT".into(), help: "Instruction text (joined with spaces)".into(), multiple: true, required: false },
+    ], vec![], "remuda send NAME TEXT…")
+}
+
+fn send_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    let values = match parse_top_level_cli(&send_cli_spec(), "send", args) {
+        Ok(values) => values,
+        Err(code) => return code,
+    };
+    let name = values
+        .get("NAME")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let text = cli_positional_words(&values, "TEXT").join(" ");
     with_daemon(server, path, |path| {
         let request = Request::SendLine {
             name: name.to_string(),
@@ -5155,10 +5459,7 @@ fn send_command(server: &str, path: &Path, name: &str, text: &[&str]) -> ExitCod
 
 /// Commands used by release automation must not start a daemon or run update checks.
 fn run_internal_command(argv: &[&str]) -> Option<ExitCode> {
-    match argv {
-        ["_latest-index", args @ ..] => Some(run_latest_index(args)),
-        _ => None,
-    }
+    (argv.first() == Some(&"_latest-index")).then(|| run_latest_index(&argv[1..]))
 }
 
 fn preflight_command(argv: &[&str]) -> Option<ExitCode> {
@@ -5170,19 +5471,50 @@ fn preflight_command(argv: &[&str]) -> Option<ExitCode> {
 }
 
 fn doc_cli_preflight(argv: &[&str]) -> Option<ExitCode> {
-    let ["doc", args @ ..] = argv else {
-        return None;
-    };
-    doc_cli_parse(args).err()
+    (argv.first() == Some(&"doc"))
+        .then(|| doc_cli_parse(&argv[1..]).err())
+        .flatten()
 }
 
 /// Internal release-workflow command. Reuse dist::is_newer so publication and
 /// update notices order channel versions identically.
 fn run_latest_index(args: &[&str]) -> ExitCode {
-    let [file, channel, version, updated] = args else {
-        return fail("usage: remuda _latest-index FILE CHANNEL VERSION UPDATED");
+    use remuda_native::cli_parse::ArgSpec;
+    let spec = simple_cli_spec(
+        "_latest-index",
+        "Internal release index updater",
+        ["FILE", "CHANNEL", "VERSION", "UPDATED"]
+            .into_iter()
+            .map(|name| ArgSpec {
+                name: name.into(),
+                help: format!("{name} value"),
+                multiple: false,
+                required: true,
+            })
+            .collect(),
+        vec![],
+        "remuda _latest-index FILE CHANNEL VERSION UPDATED",
+    );
+    let values = match parse_top_level_cli(&spec, "_latest-index", args) {
+        Ok(values) => values,
+        Err(code) => return code,
     };
-    let (file, channel, version, updated) = (*file, *channel, *version, *updated);
+    let file = values
+        .get("FILE")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let channel = values
+        .get("CHANNEL")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let version = values
+        .get("VERSION")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let updated = values
+        .get("UPDATED")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
     if !dist::is_channel(channel) {
         return fail(format!("unknown channel {channel:?} — stable or nightly"));
     }
@@ -5240,51 +5572,152 @@ fn run_latest_index(args: &[&str]) -> ExitCode {
 /// Pull a leading `-s <server>` off argv; `"default"` when absent. Only the
 /// *leading* position counts — in `remuda run -s x` the `-s` belongs to the
 /// spawned command's argv, not to us.
-fn split_server_flag(args: &[String]) -> (&str, &[String]) {
-    match args {
-        [flag, server, rest @ ..] if flag == "-s" => (server.as_str(), rest),
-        _ => ("default", args),
+#[derive(Debug)]
+struct CheckedCliFlags {
+    server: String,
+    stdin_enabled: bool,
+    eval_code: Option<String>,
+    help_requested: bool,
+    args: Vec<String>,
+}
+
+fn dispatch_cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::{ArgSpec, OptionSpec, Spec, VerbSpec};
+    let option = |long: &str, short: Option<char>, value: Option<&str>, help: &str| OptionSpec {
+        long: long.into(),
+        short,
+        value: value.map(str::to_owned),
+        help: help.into(),
+        global: false,
+        required: false,
+        repeat_policy: Default::default(),
+    };
+    Spec {
+        name: "remuda".into(),
+        options: vec![],
+        verbs: vec![VerbSpec {
+            name: "__dispatch".into(),
+            about: "Dispatch a Remuda core command. Run remuda COMMAND --help for command syntax."
+                .into(),
+            usage: Some("__dispatch [OPTIONS] [ARGS…]".into()),
+            args: vec![ArgSpec {
+                name: "ARGS".into(),
+                help: "Command and its arguments".into(),
+                multiple: true,
+                required: false,
+            }],
+            next: "run remuda --help for the command list".into(),
+            options: vec![
+                option(
+                    "server",
+                    Some('s'),
+                    Some("SERVER"),
+                    "Select a server (default: default)",
+                ),
+                option(
+                    "stdin",
+                    None,
+                    None,
+                    "Pass caller stdin to an installed mod handler",
+                ),
+                option(
+                    "eval",
+                    Some('e'),
+                    Some("CODE"),
+                    "Evaluate Lua code in the running daemon",
+                ),
+                option("version", Some('V'), None, "Print the CLI version"),
+                option("help", Some('h'), None, "Print help"),
+            ],
+        }],
     }
 }
 
-fn checked_cli_flags(args: &[String]) -> Result<(&str, bool, &[String]), ExitCode> {
-    let (server, rest) = split_server_flag(args);
+fn checked_cli_flags(args: &[String]) -> Result<CheckedCliFlags, ExitCode> {
+    let mut words = vec!["__dispatch".to_owned()];
+    words.extend(args.iter().cloned());
+    let argv = words.iter().map(String::as_str).collect::<Vec<_>>();
+    let report = remuda_native::cli_parse::parse_passthrough(&dispatch_cli_spec(), &argv);
+    if !report.ok {
+        if report.kind.as_deref() == Some("help") {
+            println!("{}", report.text);
+        } else {
+            eprintln!("{}", report.text);
+        }
+        return Err(ExitCode::from(report.code as u8));
+    }
+    let help_requested = cli_flag(&report.values, "help");
+    if help_requested {
+        return Ok(CheckedCliFlags {
+            server: "default".into(),
+            stdin_enabled: false,
+            eval_code: None,
+            help_requested,
+            args: vec![],
+        });
+    }
+    let server = report
+        .values
+        .get("server")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("default")
+        .to_owned();
     if server.trim().is_empty() {
         return Err(fail_invalid_server_name());
     }
-    match split_stdin_flag(rest) {
-        Ok((stdin_enabled, rest)) => Ok((server, stdin_enabled, rest)),
-        Err(error) => Err(fail(error)),
+    let stdin_enabled = cli_flag(&report.values, "stdin");
+    let mut args = cli_positional_words(&report.values, "ARGS")
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let eval_code = report
+        .values
+        .get("eval")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let version_requested = cli_flag(&report.values, "version");
+    if (eval_code.is_some() || version_requested) && !args.is_empty() {
+        return Err(fail(if eval_code.is_some() {
+            "remuda: -e accepts one CODE argument; command arguments cannot follow it\nUsage: remuda -e CODE"
+        } else {
+            "remuda: --version does not accept command arguments\nUsage: remuda --version"
+        }));
     }
-}
-
-/// Pull a leading caller-stdin opt-in from argv after the optional server
-/// selector. Without this flag, piped stdin remains untouched for mod commands.
-fn split_stdin_flag(args: &[String]) -> Result<(bool, &[String]), &'static str> {
-    match args {
-        [flag, command, ..]
-            if flag == "--stdin"
-                && remuda_native::packages::valid_component(command)
-                && remuda_native::packages::has_subcommand(command) =>
-        {
-            Ok((true, &args[1..]))
-        }
-        [flag, ..] if flag == "--stdin" => {
-            Err("--stdin is only valid before an installed mod command")
-        }
-        [command, rest @ ..]
-            if remuda_native::packages::valid_component(command)
-                && remuda_native::packages::has_subcommand(command) =>
-        {
-            let options = rest.split(|arg| arg == "--").next().unwrap_or(rest);
-            if options.iter().any(|arg| arg == "--stdin") {
-                Err("usage: remuda --stdin MOD [ARGS…] (put --stdin before the mod command)")
-            } else {
-                Ok((false, args))
-            }
-        }
-        _ => Ok((false, args)),
+    if eval_code.is_some() && version_requested {
+        return Err(fail(
+            "remuda: -e and --version cannot be combined\nUsage: remuda -e CODE | remuda --version",
+        ));
     }
+    if version_requested {
+        args = vec!["--version".into()];
+    }
+    if stdin_enabled {
+        if !args.first().is_some_and(|command| {
+            remuda_native::packages::valid_component(command)
+                && remuda_native::packages::has_subcommand(command)
+        }) {
+            return Err(fail(
+                "--stdin is only valid before an installed mod command",
+            ));
+        }
+    } else if args.first().is_some_and(|command| {
+        remuda_native::packages::valid_component(command)
+            && remuda_native::packages::has_subcommand(command)
+    }) {
+        let options = args.iter().skip(1).take_while(|arg| *arg != "--");
+        if options.into_iter().any(|arg| arg == "--stdin") {
+            return Err(fail(
+                "usage: remuda --stdin MOD [ARGS…] (put --stdin before the mod command)",
+            ));
+        }
+    }
+    Ok(CheckedCliFlags {
+        server,
+        stdin_enabled,
+        eval_code,
+        help_requested,
+        args,
+    })
 }
 
 /// Run `f`, starting the named daemon first if nothing is listening yet.
@@ -5459,14 +5892,29 @@ fn extension_command(
         Ok(None) => return fail(format!("no installed mod provides command {command}")),
         Err(error) => return fail(error),
     };
-    let launch = match args {
-        [] => Some((false, None)),
-        ["--headless"] => Some((true, None)),
-        ["--agent", agent] => Some((false, Some(*agent))),
-        ["--agent", agent, "--headless"] | ["--headless", "--agent", agent] => {
-            Some((true, Some(*agent)))
+    let spec = extension_cli_spec(command);
+    let values = match parse_top_level_cli(&spec, command, args) {
+        Ok(values) => values,
+        Err(_) => {
+            let mut words = vec![command.to_owned(), "--".to_owned()];
+            words.extend(args.iter().map(|arg| (*arg).to_owned()));
+            let words = words.iter().map(String::as_str).collect::<Vec<_>>();
+            let report = remuda_native::cli_parse::parse(&spec, &words);
+            if report.ok {
+                report.values
+            } else {
+                return fail(report.text);
+            }
         }
-        _ => None,
+    };
+    let body_args = cli_positional_words(&values, "ARGS");
+    let launch = if body_args.is_empty() {
+        Some((
+            cli_flag(&values, "headless"),
+            values.get("agent").and_then(serde_json::Value::as_str),
+        ))
+    } else {
+        None
     };
     if stdin_enabled && launch.is_some() {
         return fail("--stdin requires a mod command handler, not a mod launch");
@@ -5537,6 +5985,46 @@ fn extension_command(
             Err(failed) => failed,
         }
     })
+}
+
+fn extension_cli_spec(command: &str) -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::{ArgSpec, OptionSpec, Spec, VerbSpec};
+    Spec {
+        name: "remuda".into(),
+        options: vec![],
+        verbs: vec![VerbSpec {
+            name: command.into(),
+            about: format!("Run or call the installed {command} mod command"),
+            usage: Some(format!("{command} [--agent AGENT] [--headless] [ARGS…]")),
+            args: vec![ArgSpec {
+                name: "ARGS".into(),
+                help: "Arguments passed to the mod handler".into(),
+                multiple: true,
+                required: false,
+            }],
+            next: format!("remuda {command} [--agent AGENT] [--headless]"),
+            options: vec![
+                OptionSpec {
+                    long: "headless".into(),
+                    short: None,
+                    value: None,
+                    help: "Start the mod without entering the TUI".into(),
+                    global: false,
+                    required: false,
+                    repeat_policy: Default::default(),
+                },
+                OptionSpec {
+                    long: "agent".into(),
+                    short: None,
+                    value: Some("AGENT".into()),
+                    help: "Start the mod for this agent".into(),
+                    global: false,
+                    required: false,
+                    repeat_policy: Default::default(),
+                },
+            ],
+        }],
+    }
 }
 
 /// Load the mod behind a command on its first use, and say so: loading runs
@@ -5887,6 +6375,7 @@ fn resize_cli_spec() -> remuda_native::cli_parse::Spec {
         verbs: vec![VerbSpec {
             name: "resize".into(),
             about: "Resize one session".into(),
+            usage: None,
             args: ["NAME", "COLS", "ROWS"]
                 .into_iter()
                 .map(|name| ArgSpec {
@@ -5934,10 +6423,9 @@ fn resize_dimensions_usage_error() -> ExitCode {
 }
 
 fn resize_cli_preflight(argv: &[&str]) -> Option<ExitCode> {
-    let ["resize", args @ ..] = argv else {
-        return None;
-    };
-    resize_cli_parse(args).err()
+    (argv.first() == Some(&"resize"))
+        .then(|| resize_cli_parse(&argv[1..]).err())
+        .flatten()
 }
 
 /// Evaluate one chunk in the daemon's image and print what it came to. Nothing
@@ -6062,6 +6550,7 @@ fn doc_cli_spec() -> remuda_native::cli_parse::Spec {
         verbs: vec![VerbSpec {
             name: "doc".into(),
             about: "Print live Lua documentation".into(),
+            usage: None,
             args: vec![],
             next: "remuda doc --help".into(),
             options: vec![OptionSpec {
@@ -6070,6 +6559,7 @@ fn doc_cli_spec() -> remuda_native::cli_parse::Spec {
                 value: Some("FORMAT".into()),
                 help: "Output format: rst, markdown, or json".into(),
                 global: false,
+                required: false,
                 repeat_policy: Default::default(),
             }],
         }],
@@ -6132,6 +6622,7 @@ fn mod_cli_spec() -> remuda_native::cli_parse::Spec {
         value: value.map(str::to_owned),
         help: help.into(),
         global: false,
+        required: false,
         repeat_policy: Default::default(),
     };
     let arg = |name: &str, help: &str, required| ArgSpec {
@@ -6143,6 +6634,7 @@ fn mod_cli_spec() -> remuda_native::cli_parse::Spec {
     let verb = |name: &str, about: &str, next: &str, args, options| VerbSpec {
         name: name.into(),
         about: about.into(),
+        usage: None,
         args,
         next: next.into(),
         options,
@@ -6778,6 +7270,21 @@ mod cluster_call_tests {
     }
 
     #[test]
+    fn cluster_call_error_uses_the_declared_conditional_usage() {
+        let ClusterCommand::Invalid { reason, .. } =
+            parse_cluster_command(&["call", "node-abc", "list"])
+        else {
+            panic!("missing required address should be invalid");
+        };
+        assert!(
+            reason.contains(
+                "Usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] [--json]"
+            ),
+            "{reason}"
+        );
+    }
+
+    #[test]
     fn cluster_call_strips_osc52_and_osc0_from_peer_text() {
         let sessions = sanitize_peer_response(Response::Sessions(vec![SessionSummary {
             id: "id\u{1b}]52;c;clipboard\u{7}".into(),
@@ -6828,6 +7335,135 @@ mod cluster_call_tests {
             panic!("expected sanitized capture");
         };
         assert_eq!(rows[0][0].text, "screen]0;peer title");
+    }
+}
+
+#[cfg(test)]
+mod declared_cli_tests {
+    use super::{
+        attach_cli_spec, checked_cli_flags, cli_positional_words, parse_top_level_cli,
+        run_cli_spec, send_cli_spec,
+    };
+
+    #[test]
+    fn root_parser_extracts_global_server_and_preserves_command_argv() {
+        let flags = checked_cli_flags(&[
+            "-s".into(),
+            "build".into(),
+            "run".into(),
+            "nvim".into(),
+            "-x".into(),
+        ])
+        .unwrap();
+        assert_eq!(flags.server, "build");
+        assert!(!flags.stdin_enabled);
+        assert_eq!(flags.args, ["run", "nvim", "-x"]);
+        let default = checked_cli_flags(&[]).unwrap();
+        assert_eq!(default.server, "default");
+        assert!(default.args.is_empty());
+        assert_eq!(default.eval_code, None);
+        let eval = checked_cli_flags(&["-e".into(), "return 1".into()]).unwrap();
+        assert_eq!(eval.eval_code.as_deref(), Some("return 1"));
+        assert!(eval.args.is_empty());
+        let command = checked_cli_flags(&[
+            "run".into(),
+            "-s".into(),
+            "child".into(),
+            "-e".into(),
+            "--version".into(),
+            "--stdin".into(),
+        ])
+        .unwrap();
+        assert_eq!(command.server, "default");
+        assert_eq!(
+            command.args,
+            ["run", "-s", "child", "-e", "--version", "--stdin"]
+        );
+        assert!(
+            checked_cli_flags(&["-e".into(), "return 1".into(), "run".into(), "foo".into(),])
+                .is_err()
+        );
+        assert!(checked_cli_flags(&["--version".into(), "run".into()]).is_err());
+        assert!(checked_cli_flags(&["-e".into(), "return 1".into(), "--version".into()]).is_err());
+    }
+
+    #[test]
+    fn root_stdin_flag_is_declared_and_respects_the_separator_boundary() {
+        let valid =
+            checked_cli_flags(&["--stdin".into(), "butler".into(), "inbox".into()]).unwrap();
+        assert!(valid.stdin_enabled);
+        assert_eq!(valid.args, ["butler", "inbox"]);
+
+        let misplaced = checked_cli_flags(&["butler".into(), "inbox".into(), "--stdin".into()]);
+        assert!(misplaced.is_err());
+
+        let literal = checked_cli_flags(&[
+            "butler".into(),
+            "inbox".into(),
+            "--".into(),
+            "--stdin".into(),
+        ])
+        .unwrap();
+        assert!(!literal.stdin_enabled);
+        assert_eq!(literal.args, ["butler", "inbox", "--", "--stdin"]);
+    }
+
+    #[test]
+    fn run_parser_preserves_program_arguments_and_session_name() {
+        let values =
+            parse_top_level_cli(&run_cli_spec(), "run", &["-n", "editor", "nvim", "--clean"])
+                .unwrap();
+        assert_eq!(
+            values.get("name").and_then(serde_json::Value::as_str),
+            Some("editor")
+        );
+        assert_eq!(
+            cli_positional_words(&values, "COMMAND"),
+            ["nvim", "--clean"]
+        );
+        let default = parse_top_level_cli(&run_cli_spec(), "run", &[]).unwrap();
+        assert!(cli_positional_words(&default, "COMMAND").is_empty());
+    }
+
+    #[test]
+    fn attach_parser_accepts_boolean_flag_value_and_name_in_either_order() {
+        let first = parse_top_level_cli(&attach_cli_spec(), "attach", &["--mouse=false", "editor"])
+            .unwrap();
+        assert_eq!(
+            first.get("mouse").and_then(serde_json::Value::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            first.get("NAME").and_then(serde_json::Value::as_str),
+            Some("editor")
+        );
+        assert!(
+            parse_top_level_cli(&attach_cli_spec(), "attach", &["editor", "--mouse=true"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn send_parser_preserves_instruction_words_and_declares_help() {
+        let values = parse_top_level_cli(
+            &send_cli_spec(),
+            "send",
+            &["agent", "read", "the", "README"],
+        )
+        .unwrap();
+        assert_eq!(cli_positional_words(&values, "NAME"), ["agent"]);
+        assert_eq!(
+            cli_positional_words(&values, "TEXT").join(" "),
+            "read the README"
+        );
+        let report = remuda_native::cli_parse::parse(&send_cli_spec(), &["send", "--help"]);
+        assert_eq!(report.kind.as_deref(), Some("help"));
+        assert!(report.text.contains("remuda send NAME TEXT"));
+        assert!(report
+            .text
+            .contains("Example: remuda send agent Read the README"));
+        let leading_flag =
+            parse_top_level_cli(&send_cli_spec(), "send", &["agent", "--literal"]).unwrap();
+        assert_eq!(cli_positional_words(&leading_flag, "TEXT"), ["--literal"]);
     }
 }
 
