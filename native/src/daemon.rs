@@ -231,15 +231,21 @@ fn user_config_path() -> Option<PathBuf> {
 /// Absence is silent; a broken file is reported but never poisons the
 /// image the way an `Err` in `Image::spawn`'s `ready` chain would (steps/035).
 fn load_user_config(image: &Image) {
-    let Some(path) = user_config_path() else {
-        return;
+    let result = match user_config_path() {
+        Some(path) => match std::fs::read_to_string(&path) {
+            Ok(source) => image
+                .eval(&source, Some(&path.display().to_string()))
+                .map(|_| ())
+                .map_err(|error| format!("error loading {}: {error}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("cannot read {}: {error}", path.display())),
+        },
+        None => Ok(()),
     };
-    let Ok(source) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    if let Err(e) = image.eval(&source, Some(&path.display().to_string())) {
-        eprintln!("remuda: error loading {}: {e}", path.display());
+    if let Err(error) = &result {
+        eprintln!("remuda: {error}");
     }
+    image.finish_user_config(result);
 }
 
 /// Serve until the listener dies. Caution: connect before unlinking — an

@@ -28,55 +28,58 @@ impl LineComposer {
         self.cursor = self.text.chars().count();
     }
 
-    pub fn handle_key(&mut self, event: KeyEvent) -> ComposerAction {
-        if event.modifiers.contains(KeyModifiers::CONTROL) {
-            return match event.code {
-                KeyCode::Char('c') => {
-                    self.clear();
-                    ComposerAction::Cleared
-                }
-                // Crossterm decodes the raw Ctrl-\\ byte as Ctrl-4 on Unix.
-                KeyCode::Char('\\' | '4') => ComposerAction::Detach,
-                _ => ComposerAction::None,
-            };
-        }
-        match event.code {
-            KeyCode::Char(character) if !event.modifiers.contains(KeyModifiers::ALT) => {
-                self.insert(character);
-                ComposerAction::None
+    pub fn handle_key(
+        &mut self,
+        event: KeyEvent,
+        keymap: &crate::keybindings::Snapshot,
+    ) -> ComposerAction {
+        match keymap.resolve("cluster.composer", event) {
+            Some("cluster.composer.clear") => {
+                self.clear();
+                ComposerAction::Cleared
             }
-            KeyCode::Left => {
+            Some("cluster.composer.back" | "cluster.composer.detach") => ComposerAction::Detach,
+            Some("cluster.composer.left") => {
                 self.cursor = self.cursor.saturating_sub(1);
                 ComposerAction::None
             }
-            KeyCode::Right => {
+            Some("cluster.composer.right") => {
                 self.cursor = (self.cursor + 1).min(self.text.chars().count());
                 ComposerAction::None
             }
-            KeyCode::Home => {
+            Some("cluster.composer.home") => {
                 self.cursor = 0;
                 ComposerAction::None
             }
-            KeyCode::End => {
+            Some("cluster.composer.end") => {
                 self.cursor = self.text.chars().count();
                 ComposerAction::None
             }
-            KeyCode::Esc => ComposerAction::Detach,
-            KeyCode::Backspace => {
+            Some("cluster.composer.backspace") => {
                 self.backspace();
                 ComposerAction::None
             }
-            KeyCode::Delete => {
+            Some("cluster.composer.delete") => {
                 self.delete();
                 ComposerAction::None
             }
-            KeyCode::Enter => {
+            Some("cluster.composer.submit") => {
                 let mut bytes = self.text.as_bytes().to_vec();
                 bytes.push(b'\r');
                 self.clear();
                 ComposerAction::Submit(bytes)
             }
-            _ => ComposerAction::None,
+            _ => {
+                if !event
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    if let KeyCode::Char(character) = event.code {
+                        self.insert(character);
+                    }
+                }
+                ComposerAction::None
+            }
         }
     }
 
@@ -128,14 +131,24 @@ mod tests {
 
     #[test]
     fn line_composer_edits_and_submits_cr() {
+        let keymap = crate::keybindings::test_snapshot("");
         let mut composer = LineComposer::default();
-        composer.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        composer.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
-        composer.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        composer.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        composer.handle_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            &keymap,
+        );
+        composer.handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            &keymap,
+        );
+        composer.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &keymap);
+        composer.handle_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            &keymap,
+        );
         assert_eq!(composer.text(), "abc");
         assert_eq!(
-            composer.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            composer.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keymap),
             ComposerAction::Submit(b"abc\r".to_vec())
         );
         assert_eq!(composer.text(), "");
@@ -143,24 +156,37 @@ mod tests {
 
     #[test]
     fn ctrl_c_clears_while_ctrl_backslash_detaches_and_q_is_text() {
+        let keymap = crate::keybindings::test_snapshot("");
         let mut composer = LineComposer::default();
-        composer.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        composer.handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &keymap,
+        );
         assert_eq!(composer.text(), "q");
         assert_eq!(
-            composer.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL,)),
+            composer.handle_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL,),
+                &keymap
+            ),
             ComposerAction::Cleared
         );
         assert_eq!(composer.text(), "");
         assert_eq!(
-            composer.handle_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL,)),
+            composer.handle_key(
+                KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL,),
+                &keymap
+            ),
             ComposerAction::Detach
         );
         assert_eq!(
-            composer.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL)),
+            composer.handle_key(
+                KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL),
+                &keymap
+            ),
             ComposerAction::Detach
         );
         assert_eq!(
-            composer.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            composer.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &keymap),
             ComposerAction::Detach
         );
     }

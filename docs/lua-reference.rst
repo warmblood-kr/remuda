@@ -111,6 +111,11 @@ contributions
 
 ``contributions(point) -> {{id, owner, entry}...}`` — A point's entries as {id, owner, entry} rows, entry a shallow copy, by entry.order then id.
 
+define_key
+----------
+
+``define_key(spec) -> nil`` — Declare a contextual UI key, native action and generated help.
+
 emit
 ----
 
@@ -286,6 +291,11 @@ key
 
 ``key(name, spec) -> nil`` — Press a named key, in Emacs kbd notation.
 
+keymap_snapshot
+---------------
+
+``keymap_snapshot() -> table`` — Effective UI bindings and startup readiness; refresh by reopening the UI.
+
 kill
 ----
 
@@ -340,6 +350,11 @@ random_bytes
 ------------
 
 ``random_bytes(n) -> string`` — Return n binary-safe bytes from the OS CSPRNG. n must be a whole number from 1 through 65536; integer-valued Lua floats such as 32.0 are accepted. Raises a Lua error if the OS source fails.
+
+rebind
+------
+
+``rebind(context, action, key) -> nil`` — Atomically replace an action's key in its context.
 
 reload
 ------
@@ -465,6 +480,11 @@ unadvise
 --------
 
 ``unadvise(path, id) -> nil`` — Remove the advice with this id from a path; the last one removed restores the original.
+
+unbind
+------
+
+``unbind(context, key) -> nil`` — Remove an effective contextual UI binding.
 
 wait_for
 --------

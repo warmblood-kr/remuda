@@ -108,6 +108,7 @@ pub struct Ui {
     /// `None` follows the normal content-aware width; `Some` is a user drag.
     pub list_width: Option<u16>,
     list_visible: bool,
+    keymap: crate::keybindings::Snapshot,
     dragging_divider: bool,
     selecting_text: bool,
     text_selection: Option<TextSelection>,
@@ -167,6 +168,7 @@ impl Ui {
             pan: 0,
             list_width: None,
             list_visible: true,
+            keymap: crate::keybindings::Snapshot::default(),
             dragging_divider: false,
             selecting_text: false,
             text_selection: None,
@@ -197,6 +199,11 @@ impl Ui {
             session_rows: 1,
             preview_rows: 1,
         }
+    }
+
+    /// Inject one effective map; dispatch and help always share this snapshot.
+    pub fn set_keymap(&mut self, keymap: crate::keybindings::Snapshot) {
+        self.keymap = keymap;
     }
 
     pub fn selected(&self) -> Option<&SessionSummary> {
@@ -555,6 +562,16 @@ impl Ui {
         }
     }
 
+    fn toggle_list_key(&mut self, key: KeyEvent) -> bool {
+        if self.keymap.resolve(crate::keybindings::LIST_CONTEXT, key)
+            != Some(crate::keybindings::TOGGLE_LIST)
+        {
+            return false;
+        }
+        self.list_visible = !self.list_visible;
+        true
+    }
+
     fn browse_key(&mut self, key: KeyEvent) -> Action {
         if self.daemon_gone.is_some() {
             return match key.code {
@@ -605,6 +622,9 @@ impl Ui {
             }
             return Action::Nothing;
         }
+        if self.toggle_list_key(key) {
+            return Action::Nothing;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => Action::Quit,
@@ -626,10 +646,6 @@ impl Ui {
             KeyCode::End => Action::Scroll(i16::MIN),
             KeyCode::Char('h') => {
                 self.list_width = None;
-                Action::Nothing
-            }
-            KeyCode::Char('l') => {
-                self.list_visible = !self.list_visible;
                 Action::Nothing
             }
             KeyCode::Char('n') => {
@@ -2421,6 +2437,7 @@ fn fit_session_row(content: &str, width: u16) -> String {
 /// reads as absence is the failure this repo keeps re-discovering, and the
 /// footer is the only band left that is not the session's own screen.
 fn footer(ui: &Ui, server: &str, cut: bool, preview_w: u16, cols: u16) -> String {
+    let binding_help = ui.keymap.help(crate::keybindings::LIST_CONTEXT);
     let status = match &ui.mode {
         Mode::Prompt(buffer) => format!("start: {buffer}▏   ⏎ run · esc cancel"),
         Mode::Confirm(name) => format!("kill {name}? it is running — y / n"),
@@ -2453,9 +2470,21 @@ fn footer(ui: &Ui, server: &str, cut: bool, preview_w: u16, cols: u16) -> String
         Mode::Browse => match &ui.notice {
             Some(notice) => format!("remuda: {notice}"),
             None if ui.sessions.is_empty() => "n new   q quit".into(),
-            None if cut => format!("↑↓/jk ⏎ enter n new l list q quit · showing {preview_w}"),
-            None => "↑↓/jk select   ⏎ enter   n new   x kill   l list   q quit".into(),
+            None if cut => {
+                format!("↑↓/jk ⏎ enter n new {binding_help} q quit · showing {preview_w}")
+            }
+            None => format!("↑↓/jk select   ⏎ enter   n new   x kill   {binding_help}   q quit"),
         },
+    };
+    let status = match &ui.keymap.diagnostic {
+        Some(diagnostic) => {
+            let diagnostic: String = diagnostic
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            format!("keymap config: {diagnostic} · {status}")
+        }
+        None => status,
     };
     let brand = format!("remuda · {server} 🏇");
     let status_width = visible_width(&status);
@@ -2790,6 +2819,8 @@ pub(crate) fn paste_input(text: &str, bracketed: bool) -> Vec<u8> {
 /// alternate screen is entered exactly once. `notice` is what stderr cannot reach.
 #[allow(clippy::too_many_lines)]
 pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result<()> {
+    let keymap = crate::keybindings::fetch(path, Duration::from_secs(3))
+        .map_err(|error| std::io::Error::other(format!("key bindings unavailable: {error}")))?;
     let _terminal = RawMode::enable()?;
     // Scoped to the herd screen, not `RawMode` itself: `attach` uses `RawMode`
     // too, forwards every raw byte it reads, and has no list to click — a
@@ -2805,6 +2836,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     // specific diagnosis when both exist; only fall back to the raw list
     // failure if nothing else already explains why nothing works.
     let mut ui = Ui::new(sessions, &shell, notice.or(list_err));
+    ui.set_keymap(keymap);
     let mut painted = String::new();
     // The exclusive hold on the focused session, and the name it was taken on.
     // Its `Drop` is the detach, so letting it fall out of scope is the release.
@@ -3622,5 +3654,63 @@ mod key_bytes_tests {
         assert_eq!(key(KeyCode::Tab, KeyModifiers::NONE), b"\t");
         assert_eq!(key(KeyCode::Enter, KeyModifiers::NONE), b"\r");
         assert_eq!(key(KeyCode::Char('y'), KeyModifiers::NONE), b"y");
+    }
+}
+
+#[cfg(test)]
+mod keybindings_adopter_tests {
+    use super::*;
+
+    fn remapped() -> Ui {
+        let sessions = vec![SessionSummary {
+            id: "synthetic".into(),
+            name: "test".into(),
+            instance_id: Some("synthetic-instance".into()),
+            output_version: Some(0),
+            alive: true,
+            idle: Duration::ZERO,
+            output_idle: Some(Duration::ZERO),
+            size: Size::new(80, 24),
+            attached: false,
+            human_idle: None,
+            mouse_tracking: false,
+        }];
+        let mut ui = Ui::new(sessions, "sh", None);
+        ui.set_keymap(crate::keybindings::Snapshot::from_json(r#"{"generation":2,"ready":true,"rows":[{"context":"session.list.browse","key":"M-l","action":"session.toggle_list","help":"list"}]}"#).unwrap());
+        ui
+    }
+
+    #[test]
+    fn keybindings_adopter_uses_remap_only_in_browse() {
+        let mut ui = remapped();
+        ui.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(ui.list_visible);
+        ui.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT));
+        assert!(!ui.list_visible);
+        ui.visual = true;
+        ui.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(!ui.list_visible);
+        ui.visual = false;
+        ui.focus = Focus::Session;
+        assert_eq!(
+            ui.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+            Action::Type(b"l".to_vec())
+        );
+        ui.focus = Focus::List;
+        ui.mode = Mode::Prompt(String::new());
+        ui.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(ui.mode, Mode::Prompt("l".into()));
+    }
+
+    #[test]
+    fn keybindings_adopter_help_uses_the_dispatch_snapshot() {
+        let mut ui = remapped();
+        // A populated browse list uses the effective help in both layouts.
+        ui.notice = None;
+        assert!(footer(&ui, "test", false, 80, 180).contains("M-l list"));
+        assert!(footer(&ui, "test", true, 63, 180).contains("M-l list"));
+        assert_eq!(ui.keymap.help(crate::keybindings::LIST_CONTEXT), "M-l list");
+        ui.keymap.diagnostic = Some("bad init.lua".into());
+        assert!(footer(&ui, "test", false, 80, 180).contains("bad init.lua"));
     }
 }
