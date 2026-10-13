@@ -208,7 +208,15 @@ fn options(v: Option<&Value>, path: &str) -> Result<Vec<OptionSpec>, Rejection> 
         let m = fields(
             &item,
             &at,
-            &["long", "short", "value", "help", "global", "repeat_policy"],
+            &[
+                "long",
+                "short",
+                "value",
+                "help",
+                "global",
+                "required",
+                "repeat_policy",
+            ],
         )?;
         let short = match str_of(&m, "short", &at, false)? {
             None => None,
@@ -226,6 +234,7 @@ fn options(v: Option<&Value>, path: &str) -> Result<Vec<OptionSpec>, Rejection> 
             value: str_of(&m, "value", &at, false)?,
             help: str_of(&m, "help", &at, true)?.unwrap_or_default(),
             global: flag(&m, "global", &at)?.unwrap_or(false),
+            required: flag(&m, "required", &at)?.unwrap_or(false),
             repeat_policy: repeat_policy(&m, &at)?,
         };
         // Cross-scope repeats are not specified yet, so global options keep Reject.
@@ -246,7 +255,7 @@ fn options(v: Option<&Value>, path: &str) -> Result<Vec<OptionSpec>, Rejection> 
 }
 
 fn verb(name: &str, t: &Table, path: &str) -> Result<VerbSpec, Rejection> {
-    let m = fields(t, path, &["about", "next", "args", "options"])?;
+    let m = fields(t, path, &["about", "usage", "next", "args", "options"])?;
     let mut args = Vec::new();
     if let Some(Value::Table(list)) = typed(&m, "args", path, Ty::Table, false)? {
         for (at, item) in tables(list, &join(path, "args"))? {
@@ -262,6 +271,7 @@ fn verb(name: &str, t: &Table, path: &str) -> Result<VerbSpec, Rejection> {
     Ok(VerbSpec {
         name: name.to_owned(),
         about: str_of(&m, "about", path, false)?.unwrap_or_default(),
+        usage: str_of(&m, "usage", path, false)?,
         next: str_of(&m, "next", path, true)?.unwrap_or_default(),
         args,
         options: options(
