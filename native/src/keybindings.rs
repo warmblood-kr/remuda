@@ -10,25 +10,64 @@ pub const TOGGLE_LIST: &str = "session.toggle_list";
 
 /// The single native capability catalog. Keys and help belong to Lua.
 fn validate(context: &str, key: &str, action: Option<&str>) -> Result<String, String> {
-    if context != LIST_CONTEXT {
-        return Err(format!("unknown key context: {context}"));
-    }
-    if action.is_some_and(|action| action != TOGGLE_LIST) {
+    let actions: &[&str] = match context {
+        LIST_CONTEXT => &[TOGGLE_LIST],
+        "cluster.tree" => &[
+            "cluster.detach",
+            "cluster.close",
+            "cluster.search",
+            "cluster.attention",
+            "cluster.remote.keys",
+            "cluster.up",
+            "cluster.down",
+            "cluster.left",
+            "cluster.right",
+            "cluster.select",
+        ],
+        "cluster.search" => &[
+            "cluster.search.clear",
+            "cluster.search.delete",
+            "cluster.up",
+            "cluster.down",
+            "cluster.left",
+            "cluster.right",
+            "cluster.select",
+        ],
+        "cluster.composer" => &[
+            "cluster.composer.submit",
+            "cluster.composer.clear",
+            "cluster.composer.back",
+            "cluster.composer.detach",
+            "cluster.composer.left",
+            "cluster.composer.right",
+            "cluster.composer.home",
+            "cluster.composer.end",
+            "cluster.composer.backspace",
+            "cluster.composer.delete",
+        ],
+        "cluster.confirm" => &["cluster.confirm.accept", "cluster.confirm.accept_upper"],
+        "cluster.remote.keys" => &["cluster.remote.back"],
+        "cluster.runtime" => &["cluster.redraw"],
+        _ => return Err(format!("unknown key context: {context}")),
+    };
+    if action.is_some_and(|action| !actions.contains(&action)) {
         return Err(format!("unknown action: {}", action.unwrap()));
     }
     let event = normalize_event(parse_key(key)?);
     // Legacy browse handlers ignore most modifiers. Reserve their entire
     // event code until each command has migrated to the registry.
-    if matches!(
-        event.code,
-        KeyCode::Char('c' | 'q' | 'k' | 'j' | 'h' | 'n' | 'x' | 'y' | 'v' | 'p' | 'i')
-            | KeyCode::Up
-            | KeyCode::Down
-            | KeyCode::PageUp
-            | KeyCode::PageDown
-            | KeyCode::End
-            | KeyCode::Enter
-    ) {
+    if context == LIST_CONTEXT
+        && matches!(
+            event.code,
+            KeyCode::Char('c' | 'q' | 'k' | 'j' | 'h' | 'n' | 'x' | 'y' | 'v' | 'p' | 'i')
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::End
+                | KeyCode::Enter
+        )
+    {
         return Err(format!("key conflicts with a legacy browse command: {key}"));
     }
     canonical_event(event).ok_or_else(|| format!("unsupported key: {key}"))
@@ -123,7 +162,7 @@ pub fn canonical_key(spec: &str) -> Result<String, String> {
     canonical_event(parse_key(spec)?).ok_or_else(|| format!("unknown key: {spec}"))
 }
 
-fn normalize_event(mut event: KeyEvent) -> KeyEvent {
+pub(crate) fn normalize_event(mut event: KeyEvent) -> KeyEvent {
     if event.modifiers.contains(KeyModifiers::CONTROL) {
         if let KeyCode::Char(c) = event.code {
             event.code = match c.to_ascii_lowercase() {
@@ -246,6 +285,70 @@ impl Snapshot {
             .collect::<Vec<_>>()
             .join("   ")
     }
+    pub fn display_help(&self, context: &str, actions: &[&str]) -> String {
+        self.rows
+            .iter()
+            .filter(|row| {
+                row.context == context
+                    && (actions.is_empty() || actions.contains(&row.action.as_str()))
+            })
+            .map(|row| format!("{} {}", key_label(&row.key), row.help))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+}
+
+fn key_label(key: &str) -> String {
+    let mut base = key;
+    let mut prefix = String::new();
+    while let Some(rest) = base.strip_prefix("C-").or_else(|| base.strip_prefix("M-")) {
+        prefix.push_str(if base.starts_with("C-") {
+            "Ctrl-"
+        } else {
+            "Alt-"
+        });
+        base = rest;
+    }
+    let label = match base {
+        "RET" => "Enter",
+        "ESC" => "Esc",
+        "DEL" => "Backspace",
+        "SPC" => "Space",
+        "TAB" => "Tab",
+        "<up>" => "↑",
+        "<down>" => "↓",
+        "<left>" => "←",
+        "<right>" => "→",
+        "<home>" => "Home",
+        "<end>" => "End",
+        "<delete>" => "Delete",
+        "<insert>" => "Insert",
+        "<prior>" => "PageUp",
+        "<next>" => "PageDown",
+        "<backtab>" => "Shift-Tab",
+        other => other,
+    };
+    if key.starts_with("C-") && base.len() == 1 {
+        format!("{prefix}{}", label.to_ascii_uppercase())
+    } else {
+        format!("{prefix}{label}")
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_snapshot(overrides: &str) -> Snapshot {
+    let lua = mlua::Lua::new();
+    let table = lua.create_table().unwrap();
+    install(&lua, &table, || (true, None)).unwrap();
+    table.set("_registry", lua.create_table().unwrap()).unwrap();
+    table
+        .set("json", crate::json::bindings(&lua).unwrap())
+        .unwrap();
+    lua.globals().set("remuda", table).unwrap();
+    lua.load(include_str!("tools.lua")).exec().unwrap();
+    lua.load(overrides).exec().unwrap();
+    let wire = lua.load("local s=remuda.keymap_snapshot(); s.rows=remuda.json.array(s.rows); return remuda.json.encode(s)").eval::<String>().unwrap();
+    Snapshot::from_json(&wire).unwrap()
 }
 
 /// A bounded client-side readiness wait; neither the listener nor Lua thread
@@ -317,19 +420,8 @@ mod tests {
     fn lua() -> Lua {
         let lua = Lua::new();
         lua.load("remuda = { _registry = {} }").exec().unwrap();
-        lua.load(
-            r#"
-            remuda._keymap_validate = function(context, key, action)
-                assert(context == 'session.list.browse', 'unknown context')
-                assert(action == nil or action == 'session.toggle_list', 'unknown action')
-                assert(key == 'l' or key == 'M-l' or key == 'z', 'unknown or conflicting key')
-                return key
-            end
-            remuda._keymap_config_status = function() return true end
-        "#,
-        )
-        .exec()
-        .unwrap();
+        let table = lua.globals().get::<mlua::Table>("remuda").unwrap();
+        super::install(&lua, &table, || (true, None)).unwrap();
         let factory = lua
             .load(include_str!("keybindings.lua"))
             .eval::<mlua::Function>()
@@ -348,6 +440,21 @@ mod tests {
             )
             .unwrap();
         lua.load(include_str!("tools.lua")).exec().unwrap();
+        lua.load(
+            r#"
+            local snapshot = remuda.keymap_snapshot
+            remuda.keymap_snapshot = function()
+                local s, rows = snapshot(), {}
+                for _, row in ipairs(s.rows) do
+                    if row.context == 'session.list.browse' then rows[#rows+1] = row end
+                end
+                s.rows = rows
+                return s
+            end
+        "#,
+        )
+        .exec()
+        .unwrap();
         lua
     }
 
@@ -439,6 +546,47 @@ mod tests {
 mod native_tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn keybindings_cluster_snapshot_supports_contextual_commands_and_exit_alias() {
+        let map = Snapshot::from_json(r#"{"generation":1,"ready":true,"rows":[
+            {"context":"cluster.tree","key":"M-q","action":"cluster.detach","help":"detach"},
+            {"context":"cluster.remote.keys","key":"C-4","action":"cluster.remote.back","help":"back"},
+            {"context":"cluster.composer","key":"M-s","action":"cluster.composer.submit","help":"send"},
+            {"context":"cluster.runtime","key":"C-r","action":"cluster.redraw","help":"redraw"}
+        ]}"#).unwrap();
+        assert_eq!(
+            map.resolve(
+                "cluster.tree",
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT)
+            ),
+            Some("cluster.detach")
+        );
+        assert_eq!(
+            map.resolve(
+                "cluster.tree",
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
+            ),
+            None
+        );
+        for key in ['4', '\\'] {
+            assert_eq!(
+                map.resolve(
+                    "cluster.remote.keys",
+                    KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL)
+                ),
+                Some("cluster.remote.back")
+            );
+        }
+        assert!(map.help("cluster.tree").contains("M-q detach"));
+        assert!(map
+            .resolve(
+                "cluster.search",
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT)
+            )
+            .is_none());
+        assert!(validate("cluster.tree", "z", Some("cluster.composer.submit")).is_err());
+    }
 
     #[test]
     fn keybindings_startup_wait_is_bounded_and_accepts_only_completed_maps() {

@@ -1,4 +1,3 @@
-use crossterm::event::KeyCode;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Default)]
@@ -17,22 +16,11 @@ impl Confirmation {
         self.target = Some((name, instance_id));
     }
 
-    pub fn prompt(&self, width: usize) -> Option<String> {
+    pub fn prompt(&self, width: usize, help: &str) -> Option<String> {
         self.target.as_ref().map(|(name, _)| {
             let prefix = "kill ";
-            let long_suffix = "? it is running — y / n";
-            let short_suffix = "? y / n";
-            let suffix = if UnicodeWidthStr::width(prefix)
-                + UnicodeWidthStr::width(name.as_str())
-                + UnicodeWidthStr::width(long_suffix)
-                <= width
-            {
-                long_suffix
-            } else {
-                short_suffix
-            };
-            let available = width
-                .saturating_sub(UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(suffix));
+            let suffix = format!("? {help} · other key cancels");
+            let available = width.saturating_sub(UnicodeWidthStr::width(prefix) + 2);
             let name_width = UnicodeWidthStr::width(name.as_str());
             let target = if name_width <= available {
                 name.clone()
@@ -56,9 +44,9 @@ impl Confirmation {
         })
     }
 
-    pub fn handle(&mut self, key: KeyCode) -> Option<Decision> {
+    pub fn handle(&mut self, accepted: bool) -> Option<Decision> {
         let (name, instance_id) = self.target.take()?;
-        if matches!(key, KeyCode::Char('y' | 'Y')) {
+        if accepted {
             Some(Decision::Confirmed { name, instance_id })
         } else {
             Some(Decision::Cancelled)
@@ -69,18 +57,17 @@ impl Confirmation {
 #[cfg(test)]
 mod tests {
     use super::{Confirmation, Decision};
-    use crossterm::event::KeyCode;
 
     #[test]
     fn confirmation_names_target_and_accepts_only_y() {
         let mut confirmation = Confirmation::default();
         confirmation.begin("dev".into(), "instance-1".into());
         assert_eq!(
-            confirmation.prompt(80).as_deref(),
-            Some("kill dev? it is running — y / n")
+            confirmation.prompt(80, "y confirm").as_deref(),
+            Some("kill dev? y confirm · other key cancels")
         );
         assert_eq!(
-            confirmation.handle(KeyCode::Char('y')),
+            confirmation.handle(true),
             Some(Decision::Confirmed {
                 name: "dev".into(),
                 instance_id: "instance-1".into(),
@@ -88,9 +75,6 @@ mod tests {
         );
 
         confirmation.begin("dev".into(), "instance-1".into());
-        assert_eq!(
-            confirmation.handle(KeyCode::Char('n')),
-            Some(Decision::Cancelled)
-        );
+        assert_eq!(confirmation.handle(false), Some(Decision::Cancelled));
     }
 }

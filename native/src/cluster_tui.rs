@@ -31,7 +31,7 @@ const REMOTE_KEYS_COALESCE_INTERVAL: Duration = Duration::from_millis(40);
 const REMOTE_PASTE_FAILURE_NOTICE: &str =
     "remote input stopped after a failed chunk; remaining lines dropped";
 const REMOTE_PARTIAL_INPUT_NOTICE: &str =
-    "partial input may remain at the remote prompt; your new line would be appended to the leftover fragment and run with it — press Enter again to send anyway";
+    "partial input may remain at the remote prompt; your new line would be appended to the leftover fragment and run with it — confirm sending again to send anyway";
 pub mod composer;
 pub mod confirm;
 pub mod ended;
@@ -93,6 +93,7 @@ pub struct ClusterUi {
     query: Option<String>,
     attention_only: bool,
     composer: LineComposer,
+    keymap: crate::keybindings::Snapshot,
     composer_focused: bool,
     composer_target: Option<(String, String)>,
     input_sender: InputSender,
@@ -186,6 +187,7 @@ impl ClusterUi {
             query: None,
             attention_only: false,
             composer: LineComposer::default(),
+            keymap: crate::keybindings::Snapshot::default(),
             composer_focused: false,
             composer_target: None,
             input_sender,
@@ -207,6 +209,17 @@ impl ClusterUi {
             remote_input_enabled: false,
             remote_control_disabled: HashSet::new(),
         }
+    }
+
+    fn is_redraw(&self, event: &crossterm::event::Event) -> bool {
+        self.remote_keys_mode.is_none()
+            && matches!(event,
+            crossterm::event::Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press
+                && self.keymap.resolve("cluster.runtime", *key) == Some("cluster.redraw"))
+    }
+
+    pub fn set_keymap(&mut self, keymap: crate::keybindings::Snapshot) {
+        self.keymap = keymap;
     }
 
     pub fn sync_completed(&mut self, at: Duration) {
@@ -742,7 +755,12 @@ impl ClusterUi {
                 )
             },
         );
-        let status_lines = vec![remote_keys_hint(&node_label, &session_name, width)];
+        let status_lines = remote_keys_hint(
+            &node_label,
+            &session_name,
+            width,
+            &self.keymap.display_help("cluster.remote.keys", &[]),
+        );
         let mut frame = status_lines.clone();
         frame.extend(
             visible_remote_pane_lines(&body, true, height.saturating_sub(status_lines.len()))
@@ -777,56 +795,62 @@ impl ClusterUi {
     }
 
     fn append_footer(&self, frame: &mut Vec<String>, width: usize) {
-        if let Some(prompt) = self.confirmation.prompt(width) {
-            frame.push(prompt);
-        } else if self.remote_active.is_some() && self.composer_focused {
-            frame.push(self.composer_line());
-            frame.push("Enter send · Ctrl-C clear · Esc list".into());
-        } else if self.remote_active.as_ref().is_some_and(|target| {
-            self.remote_input_enabled
-                && self
-                    .remote_session(target)
-                    .is_some_and(|(_, session)| session.alive)
-        }) {
-            frame.push(if width < 48 {
-                "Enter · k keys · x close · q detach".into()
-            } else {
-                "Enter type · k keys · x close · q detach".into()
-            });
-        } else if self.remote_active.is_some() {
-            frame.push(if width < 48 {
-                "Read-only · q detach".into()
-            } else {
-                "Remote session is read-only · q detach".into()
-            });
-        } else if self.ended.is_some() {
-            frame.push(if width < 48 {
-                "Input disabled · x clear · q detach".into()
-            } else {
-                "Input is disabled · x clears ended session · q detaches".into()
-            });
+        let confirm_help = self.keymap.display_help("cluster.confirm", &[]);
+        let mut lines = if let Some(prompt) = self.confirmation.prompt(width, &confirm_help) {
+            wrap_help(&prompt, width)
         } else if self.composer_focused {
-            frame.push(self.composer_line());
-            frame.push("Enter send · Ctrl-C clear · Esc list".into());
+            let mut lines = vec![truncate(&self.composer_line(), width)];
+            lines.extend(wrap_help(
+                &self.keymap.display_help("cluster.composer", &[]),
+                width,
+            ));
+            lines
+        } else if self.remote_active.is_some() {
+            let input = self.remote_active.as_ref().is_some_and(|target| {
+                self.remote_input_enabled
+                    && self
+                        .remote_session(target)
+                        .is_some_and(|(_, session)| session.alive)
+            });
+            let actions: &[&str] = if input {
+                &[
+                    "cluster.select",
+                    "cluster.remote.keys",
+                    "cluster.close",
+                    "cluster.detach",
+                ]
+            } else {
+                &["cluster.detach"]
+            };
+            let help = self.keymap.display_help("cluster.tree", actions);
+            let status = if input { "" } else { "Read-only · " };
+            wrap_help(&format!("{status}{help}"), width)
+        } else if self.ended.is_some() {
+            wrap_help(
+                &format!(
+                    "Input disabled · {}",
+                    self.keymap
+                        .display_help("cluster.tree", &["cluster.close", "cluster.detach"])
+                ),
+                width,
+            )
         } else {
-            frame.extend(self.footer(width));
+            self.footer(width)
+        };
+        lines.extend(wrap_help(
+            &self.keymap.display_help("cluster.runtime", &[]),
+            width,
+        ));
+        if let Some(diagnostic) = &self.keymap.diagnostic {
+            lines.extend(wrap_help(&format!("keymap config: {diagnostic}"), width));
         }
+        frame.extend(lines);
     }
 
     fn footer_row_count(&self, width: usize) -> usize {
-        if self.composer_focused {
-            2
-        } else if self.confirmation.prompt(width).is_some()
-            || self.remote_active.is_some()
-            || self.ended.is_some()
-            || self.query.is_some()
-        {
-            1
-        } else if width < 52 {
-            2
-        } else {
-            1
-        }
+        let mut lines = Vec::new();
+        self.append_footer(&mut lines, width);
+        lines.len()
     }
 
     fn append_remote_tree(&self, frame: &mut Vec<String>, width: usize) {
@@ -982,7 +1006,10 @@ impl ClusterUi {
         {
             self.partial_input_confirm_target = None;
         }
-        if let Some(decision) = self.confirmation.handle(event.code) {
+        if let Some(decision) = self.confirmation.handle(matches!(
+            self.keymap.resolve("cluster.confirm", event),
+            Some("cluster.confirm.accept" | "cluster.confirm.accept_upper")
+        )) {
             match decision {
                 Decision::Confirmed { name, instance_id } => {
                     let remote = self.remote_close_confirmation.take();
@@ -1006,16 +1033,12 @@ impl ClusterUi {
             return false;
         }
         if let Some(target) = self.remote_keys_mode.clone() {
-            if event
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::CONTROL)
-                && matches!(event.code, crossterm::event::KeyCode::Char('\\' | '4'))
-            {
+            if self.keymap.resolve("cluster.remote.keys", event) == Some("cluster.remote.back") {
                 self.remote_keys_mode = None;
                 self.notice = None;
                 return false;
             }
-            if let Some(bytes) = crate::tui::to_bytes(event) {
+            if let Some(bytes) = crate::tui::to_bytes(crate::keybindings::normalize_event(event)) {
                 self.enqueue_remote_key_bytes(&target, bytes, now);
             }
             return false;
@@ -1024,41 +1047,46 @@ impl ClusterUi {
             self.handle_composer_event(event, now);
             return false;
         }
-        use crossterm::event::KeyModifiers;
-        if self.query.is_some() && event.modifiers.contains(KeyModifiers::CONTROL) {
-            return false;
-        }
-        use crossterm::event::KeyCode::*;
-        match event.code {
-            Char('q') if self.query.is_none() => return true,
-            Char('x') if self.query.is_none() => self.handle_close_key(now),
-            Char('/') if self.query.is_none() => self.query = Some(String::new()),
-            Char('!') if self.query.is_none() => {
+        let context = if self.query.is_some() {
+            "cluster.search"
+        } else {
+            "cluster.tree"
+        };
+        match self.keymap.resolve(context, event) {
+            Some("cluster.detach") => return true,
+            Some("cluster.close") => self.handle_close_key(now),
+            Some("cluster.search") => self.query = Some(String::new()),
+            Some("cluster.attention") => {
                 self.attention_only = !self.attention_only;
                 self.select_first_visible();
             }
-            Char('k') if self.query.is_none() => self.enter_remote_keys_mode(now),
-            Char(ch) if self.query.is_some() => {
-                if let Some(query) = self.query.as_mut() {
-                    query.push(ch);
-                }
-                self.select_first_visible();
-            }
-            Esc if self.query.is_some() => {
+            Some("cluster.remote.keys") => self.enter_remote_keys_mode(now),
+            Some("cluster.search.clear") => {
                 self.query = None;
                 self.select_first_visible();
             }
-            Backspace if self.query.is_some() => {
+            Some("cluster.search.delete") => {
                 if let Some(query) = self.query.as_mut() {
                     query.pop();
                 }
                 self.select_first_visible();
             }
-            Up => self.move_selection(false),
-            Down => self.move_selection(true),
-            Left => self.collapse_tree_selection(),
-            Right => self.expand_tree_selection(),
-            Enter => self.enter_selected(now),
+            Some("cluster.up") => self.move_selection(false),
+            Some("cluster.down") => self.move_selection(true),
+            Some("cluster.left") => self.collapse_tree_selection(),
+            Some("cluster.right") => self.expand_tree_selection(),
+            Some("cluster.select") => self.enter_selected(now),
+            _ if !event.modifiers.intersects(
+                crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
+            ) =>
+            {
+                if let (Some(query), crossterm::event::KeyCode::Char(ch)) =
+                    (self.query.as_mut(), event.code)
+                {
+                    query.push(ch);
+                    self.select_first_visible();
+                }
+            }
             _ => {}
         }
         false
@@ -1324,7 +1352,7 @@ impl ClusterUi {
         if self.composer_target.is_none() && self.remote_composer_target.is_none() {
             self.bind_composer_target();
         }
-        match self.composer.handle_key(event) {
+        match self.composer.handle_key(event, &self.keymap) {
             ComposerAction::None => {
                 if self
                     .partial_input_confirm_target
@@ -1726,18 +1754,25 @@ impl ClusterUi {
     }
 
     fn footer(&self, width: usize) -> Vec<String> {
-        let attention = if self.attention_only { "on" } else { "off" };
-        match &self.query {
-            Some(query) => {
-                let suffix = " · Esc clear · Enter select";
-                let available = width.saturating_sub(UnicodeWidthStr::width("search: ") + UnicodeWidthStr::width(suffix));
-                vec![format!("search: {}{suffix}", ellipsize(query, available))]
-            }
-            None if width < 52 => vec![
-                "↑↓ move · ←→ tree · Enter select".into(),
-                "k keys x close / find ! attn q detach".into(),
-            ],
-            None => vec![format!("↑/↓ move · ←/→ tree · Enter · k keys · x close · / search · ! attention: {attention} · q detach")],
+        if let Some(query) = &self.query {
+            let mut lines = vec![format!(
+                "search: {}",
+                ellipsize(query, width.saturating_sub(8))
+            )];
+            lines.extend(wrap_help(
+                &self.keymap.display_help("cluster.search", &[]),
+                width,
+            ));
+            lines
+        } else {
+            let attention = if self.attention_only { "on" } else { "off" };
+            wrap_help(
+                &format!(
+                    "{} · attention: {attention}",
+                    self.keymap.display_help("cluster.tree", &[])
+                ),
+                width,
+            )
         }
     }
 
@@ -2201,13 +2236,57 @@ fn tree_label_line(prefix: &str, label: &str, status: &str, pad_to: usize, width
     )
 }
 
-fn remote_keys_hint(node: &str, session: &str, width: usize) -> String {
+fn remote_keys_hint(node: &str, session: &str, width: usize, help: &str) -> Vec<String> {
     let prefix = "KEYS ";
-    let suffix = " · Ctrl-\\ back";
+    let suffix = format!(" · {help}");
     let target = format!("{node}/{session}");
-    let available =
-        width.saturating_sub(UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(suffix));
-    format!("{prefix}{}{suffix}", ellipsize(&target, available))
+    if UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(suffix.as_str()) <= width {
+        let available = width.saturating_sub(
+            UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(suffix.as_str()),
+        );
+        vec![format!("{prefix}{}{suffix}", ellipsize(&target, available))]
+    } else {
+        let mut lines = wrap_help(help, width);
+        lines.push(format!(
+            "{prefix}{}",
+            ellipsize(&target, width.saturating_sub(prefix.len()))
+        ));
+        lines
+    }
+}
+
+// Wrap every effective control; wide Unicode and long user keys must not be clipped.
+fn wrap_help(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if line.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{line} {word}")
+        };
+        if UnicodeWidthStr::width(candidate.as_str()) <= width.max(1) {
+            line = candidate;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        let mut used = 0;
+        for ch in word.chars() {
+            let size = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + size > width.max(1) && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                used = 0;
+            }
+            line.push(ch);
+            used += size;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 fn ellipsize(text: &str, width: usize) -> String {
@@ -2445,6 +2524,9 @@ pub fn read_frame(
 ) -> io::Result<String> {
     let clock = crate::SystemClock::new();
     let mut ui = ClusterUi::new(node, list(path)?, clock.now());
+    ui.set_keymap(
+        crate::keybindings::fetch(path, Duration::from_secs(3)).map_err(io::Error::other)?,
+    );
     ui.select_target(target)?;
     let body = match ui.sessions.get(ui.active) {
         Some(session) => {
@@ -2498,6 +2580,9 @@ fn run_loop(
     if let Some((identity, _)) = crate::cluster::nodes()? {
         ui.set_local_identity(&identity.node_fp, &crate::cluster::control::node_aliases()?);
     }
+    ui.set_keymap(
+        crate::keybindings::fetch(path, Duration::from_secs(3)).map_err(io::Error::other)?,
+    );
     ui.remote_input_enabled = remote_input.is_some();
     ui.remote_synced(remote_source);
     select_target_with_remote_wait(&mut ui, target, remote_source, Duration::from_secs(5))?;
@@ -2570,15 +2655,7 @@ fn run_loop(
             seen,
         )? {
             let event = crossterm::event::read()?;
-            let redraw = ui.remote_keys_mode.is_none()
-                && matches!(
-                    event,
-                    crossterm::event::Event::Key(crossterm::event::KeyEvent {
-                        code: crossterm::event::KeyCode::Char('l'),
-                        modifiers: crossterm::event::KeyModifiers::CONTROL,
-                        ..
-                    })
-                );
+            let redraw = ui.is_redraw(&event);
             if resize_requires_full_repaint(&event) || redraw {
                 previous = None;
             }
@@ -2686,6 +2763,188 @@ mod tests {
                 .all(|(index, _)| { frame.as_bytes().get(index + 1) == Some(&b'\n') }),
             "rendered frame contains a lone carriage return: {frame:?}"
         );
+    }
+
+    fn make_ui(node: &str, sessions: Vec<SessionSummary>, at: Duration) -> ClusterUi {
+        let mut ui = ClusterUi::new(node, sessions, at);
+        ui.set_keymap(crate::keybindings::test_snapshot(""));
+        ui
+    }
+
+    #[test]
+    fn registry_cluster_rebinds_tree_search_and_composer_without_stealing_text() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut ui = make_ui("studio", vec![session("dev", true)], Duration::ZERO);
+        ui.set_keymap(crate::keybindings::test_snapshot(
+            r#"
+            remuda.rebind('cluster.tree', 'cluster.detach', 'M-q')
+            remuda.rebind('cluster.tree', 'cluster.search', 'z')
+            remuda.rebind('cluster.search', 'cluster.search.clear', 'M-e')
+            remuda.rebind('cluster.composer', 'cluster.composer.submit', 'M-s')
+        "#,
+        ));
+        assert!(!ui.key_event(
+            crossterm::event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            Duration::ZERO
+        ));
+        assert!(ui.key_event(
+            crossterm::event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT),
+            Duration::ZERO
+        ));
+        ui.key(KeyCode::Char('/'));
+        assert!(ui.query.is_none());
+        ui.key(KeyCode::Char('z'));
+        ui.key(KeyCode::Char('q'));
+        ui.key(KeyCode::Esc);
+        assert_eq!(ui.query.as_deref(), Some("q"));
+        key_event(
+            &mut ui,
+            KeyCode::Char('e'),
+            KeyModifiers::ALT,
+            Duration::ZERO,
+        );
+        assert!(ui.query.is_none());
+        ui.composer_focused = true;
+        ui.key(KeyCode::Char('q'));
+        ui.key(KeyCode::Enter);
+        assert_eq!(ui.composer.text(), "q");
+        key_event(
+            &mut ui,
+            KeyCode::Char('s'),
+            KeyModifiers::ALT,
+            Duration::ZERO,
+        );
+        assert_eq!(ui.composer.text(), "");
+        assert!(ui
+            .keymap
+            .display_help("cluster.tree", &[])
+            .contains("Alt-q detach"));
+    }
+
+    #[test]
+    fn registry_cluster_confirmation_rebind_cancels_every_other_key() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut ui = make_ui("studio", sessions(), Duration::ZERO);
+        ui.set_keymap(crate::keybindings::test_snapshot(
+            r#"
+            remuda.rebind('cluster.confirm', 'cluster.confirm.accept', 'M-y')
+            remuda.unbind('cluster.confirm', 'Y')
+        "#,
+        ));
+        ui.confirmation.begin("dev".into(), "instance".into());
+        ui.key(KeyCode::Char('y'));
+        assert!(ui.pending_close.is_none());
+        ui.confirmation.begin("dev".into(), "instance".into());
+        key_event(
+            &mut ui,
+            KeyCode::Char('y'),
+            KeyModifiers::ALT,
+            Duration::ZERO,
+        );
+        assert_eq!(ui.pending_close.as_ref().unwrap().instance_id, "instance");
+        let mut footer = Vec::new();
+        ui.confirmation.begin("dev".into(), "instance".into());
+        ui.append_footer(&mut footer, 40);
+        let help = footer.join(" ");
+        assert!(help.contains("Alt-y confirm") && help.contains("other key cancels"));
+    }
+
+    #[test]
+    fn registry_cluster_remote_exit_redraw_and_input_safety_are_contextual() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        ui.set_keymap(crate::keybindings::test_snapshot(
+            r#"
+            remuda.rebind('cluster.remote.keys', 'cluster.remote.back', 'M-e')
+            remuda.rebind('cluster.tree', 'cluster.remote.keys', 'M-k')
+            remuda.rebind('cluster.runtime', 'cluster.redraw', 'M-r')
+        "#,
+        ));
+        let redraw = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT);
+        assert!(ui.is_redraw(&Event::Key(redraw)));
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            assert!(!ui.is_redraw(&Event::Key(KeyEvent { kind, ..redraw })));
+        }
+        ui.remote_input_enabled = false;
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::ALT, clock.now());
+        assert!(
+            ui.remote_keys_mode.is_none(),
+            "remapping cannot enable read-only input"
+        );
+        ui.remote_input_enabled = true;
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        assert!(
+            ui.remote_keys_mode.is_none(),
+            "old entry binding must disappear"
+        );
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::ALT, clock.now());
+        assert!(ui.remote_keys_mode.is_some());
+        assert!(
+            !ui.is_redraw(&Event::Key(redraw)),
+            "raw input owns redraw keys"
+        );
+        key_event(
+            &mut ui,
+            KeyCode::Char('4'),
+            KeyModifiers::CONTROL,
+            clock.now(),
+        );
+        key_event(
+            &mut ui,
+            KeyCode::Char('l'),
+            KeyModifiers::CONTROL,
+            clock.now(),
+        );
+        assert_eq!(ui.remote_key_buffers.front().unwrap().bytes, b"\x1c\x0c");
+        let frame = ui.render_text(40, 12, "", &clock);
+        assert!(frame.lines().next().unwrap().contains("Alt-e back"));
+        key_event(&mut ui, KeyCode::Char('e'), KeyModifiers::ALT, clock.now());
+        assert!(ui.remote_keys_mode.is_none());
+        assert_eq!(
+            ui.remote_key_buffers.front().unwrap().bytes,
+            b"\x1c\x0c",
+            "exit is not sent"
+        );
+        ui.remote_snapshot.nodes[0].sessions[0].alive = false;
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::ALT, clock.now());
+        assert!(ui.remote_keys_mode.is_none(), "ended target stays disabled");
+    }
+
+    #[test]
+    fn registry_cluster_unicode_help_wraps_and_unbinding_removes_dispatch_and_hint() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        ui.set_keymap(crate::keybindings::test_snapshot(r#"
+            remuda.unbind('cluster.remote.keys', 'C-4')
+            remuda.define_key{context='cluster.remote.keys', key='C-M-e', action='cluster.remote.back',
+                help='돌아가기 long effective exit description that requires wrapping'}
+            remuda.unbind('cluster.tree', 'q')
+        "#));
+        assert!(!ui.key(KeyCode::Char('q')));
+        assert!(!ui
+            .keymap
+            .display_help("cluster.tree", &[])
+            .contains("q detach"));
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        let frame = ui.render_text(40, 12, "", &clock);
+        assert!(frame.contains("Ctrl-Alt-E 돌아가기"), "{frame}");
+        assert!(frame.contains("requires wrapping"), "{frame}");
+        assert!(frame
+            .lines()
+            .all(|line| unicode_width::UnicodeWidthStr::width(line) <= 40));
+        key_event(
+            &mut ui,
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            clock.now(),
+        );
+        assert!(ui.remote_keys_mode.is_none());
+        ui.keymap.diagnostic = Some("bad init.lua".into());
+        let mut footer = Vec::new();
+        ui.append_footer(&mut footer, 40);
+        assert!(footer.join(" ").contains("keymap config: bad init.lua"));
     }
 
     #[test]
@@ -3134,7 +3393,7 @@ mod tests {
             Duration::ZERO,
             Some(screen),
         )));
-        let mut ui = ClusterUi::new("local", vec![session("local", true)], Duration::ZERO);
+        let mut ui = make_ui("local", vec![session("local", true)], Duration::ZERO);
         ui.remote_synced(&source);
         ui.select_target(Some("fp-laptop/build")).unwrap();
         for cols in [40, 100] {
@@ -3213,7 +3472,7 @@ mod tests {
 
     #[test]
     fn local_tree_uses_the_local_list_live_and_ended_colors() {
-        let ui = ClusterUi::new(
+        let ui = make_ui(
             "local",
             vec![session("live", true), session("dead", false)],
             Duration::ZERO,
@@ -3303,7 +3562,7 @@ mod tests {
     #[test]
     fn local_targets_stay_stable_when_the_display_alias_changes_or_clears() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         let fingerprint = "SHA256:local/identity";
         let node_id = crate::cluster::node_label(fingerprint);
         for alias in [Some("macbook"), Some("renamed"), None] {
@@ -3346,7 +3605,7 @@ mod tests {
     ) -> ClusterUi {
         let mut snapshot = remote_snapshot(RemoteState::Reachable, Duration::ZERO, Some(screen));
         snapshot.nodes[0].sessions[0].bracketed_paste = bracketed_paste;
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
         ui.remote_input_enabled = true;
         ui.select_target(Some("fp-laptop/build")).unwrap();
@@ -3370,7 +3629,7 @@ mod tests {
     #[test]
     fn input_key_controls_cannot_move_the_tree_or_add_status_rows() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.input_queue.enqueue(
             "dev".into(),
             "instance-dev".into(),
@@ -3393,7 +3652,7 @@ mod tests {
     #[test]
     fn acknowledged_input_does_not_keep_three_command_rows_on_screen() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         let now = Instant::now();
         for seq in 1..=3 {
             ui.input_queue.enqueue(
@@ -3422,7 +3681,7 @@ mod tests {
     #[test]
     fn remote_close_error_text_is_safe_in_the_rendered_frame() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         let hostile =
             "close \u{1b}[31mred\u{1b}[0m \u{1b}]0;title\u{7} \u{1b}]2;title\u{1b}\\ tail\rtext";
 
@@ -3444,7 +3703,7 @@ mod tests {
     #[test]
     fn remote_input_error_status_is_safe_in_the_rendered_frame() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         let now = Instant::now();
         let hostile =
             "tail\rtext \u{1b}[31mred\u{1b}[0m \u{1b}]0;title\u{7} \u{1b}]2;title\u{1b}\\";
@@ -3581,20 +3840,22 @@ mod tests {
             Some(remote_screen("remote")),
         );
         snapshot.nodes[0].name = "laptop-with-a-very-long-name".into();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
         ui.remote_input_enabled = true;
         ui.select_target(Some("fp-laptop/build")).unwrap();
         key_event(&mut ui, KeyCode::Char('x'), KeyModifiers::NONE, clock.now());
 
         let frame = ui.render_text(40, 24, "", &clock);
-        let prompt = frame.lines().last().expect("close prompt is rendered");
-        assert!(prompt.ends_with("y / n"), "prompt lost choices: {prompt:?}");
+        let help = frame.lines().collect::<Vec<_>>().join(" ");
         assert!(
-            prompt.contains('…'),
-            "long target should be elided: {prompt:?}"
+            help.contains("y confirm") && help.contains("other key cancels"),
+            "{frame}"
         );
-        assert!(prompt.chars().count() <= 40, "prompt too wide: {prompt:?}");
+        assert!(frame.contains('…'), "long target should be elided: {frame}");
+        assert!(frame
+            .lines()
+            .all(|line| unicode_width::UnicodeWidthStr::width(line) <= 40));
     }
 
     #[test]
@@ -3608,7 +3869,7 @@ mod tests {
             Some(remote_screen("remote")),
         );
         snapshot.nodes[0].name = "laptop-with-a-very-long-name".into();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
         ui.remote_input_enabled = true;
         ui.select_target(Some("fp-laptop/build")).unwrap();
@@ -3627,9 +3888,9 @@ mod tests {
     #[test]
     fn default_footer_keeps_action_keys_at_40_columns() {
         let clock = ManualClock::new();
-        let ui = ClusterUi::new("studio", sessions(), clock.now());
+        let ui = make_ui("studio", sessions(), clock.now());
         let frame = ui.render_text(40, 24, "", &clock);
-        let footer = frame.lines().rev().take(2).collect::<Vec<_>>().join(" ");
+        let footer = frame.lines().collect::<Vec<_>>().join(" ");
         for binding in ["↑", "←", "Enter", "k", "x", "/", "!", "q"] {
             assert!(
                 footer.contains(binding),
@@ -3644,7 +3905,7 @@ mod tests {
         let mut snapshot = remote_snapshot(RemoteState::Reachable, Duration::ZERO, None);
         snapshot.nodes[0].name = "laptop-with-a-very-long-node-name".into();
         snapshot.nodes[0].sessions[0].name = "build-with-a-very-long-session-name".into();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
         ui.remote_expanded.insert("fp-laptop".into());
 
@@ -3675,15 +3936,12 @@ mod tests {
             node.sessions.clear();
             snapshot.nodes.push(node);
         }
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
 
         let frame = ui.render_text(40, 24, "", &clock);
         assert!(frame.lines().count() <= 24, "tree overflowed viewport");
-        assert!(frame
-            .lines()
-            .last()
-            .is_some_and(|line| line.contains("q detach")));
+        assert!(frame.lines().any(|line| line.contains("q detach")));
     }
 
     #[test]
@@ -3714,7 +3972,7 @@ mod tests {
                 Duration::ZERO,
                 Some(remote_screen("remote")),
             )));
-            let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+            let mut ui = make_ui("studio", sessions(), clock.now());
             ui.remote_synced(&source);
             ui.remote_input_enabled = true;
             ui.select_target(Some("fp-laptop/build")).unwrap();
@@ -3957,7 +4215,7 @@ mod tests {
             Duration::ZERO,
             Some(remote_screen("remote")),
         )));
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.remote_synced(&source);
         ui.remote_input_enabled = true;
         ui.select_target(Some("fp-laptop/build")).unwrap();
@@ -4002,7 +4260,7 @@ mod tests {
             Duration::ZERO,
             Some(remote_screen("remote")),
         )));
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.remote_synced(&source);
         ui.remote_input_enabled = true;
         ui.select_target(Some("fp-laptop/build")).unwrap();
@@ -4112,7 +4370,7 @@ mod tests {
     #[test]
     fn local_node_is_expanded_and_tree_header_names_selected_target() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.capture_completed(clock.now());
         let frame = ui.render_text(80, 24, "snapshot", &clock);
         assert!(frame.contains("▼ studio  local"));
@@ -4137,7 +4395,7 @@ mod tests {
             output_version: None,
         });
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", sessions, clock.now());
+        let mut ui = make_ui("studio", sessions, clock.now());
         ui.key(crossterm::event::KeyCode::Down);
         assert!(ui
             .render_text(80, 24, "", &clock)
@@ -4151,7 +4409,7 @@ mod tests {
     #[test]
     fn snapshot_and_sync_ages_follow_the_injected_clock() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.capture_completed(clock.now());
         ui.sync_completed(clock.now());
         clock.advance(Duration::from_secs(5));
@@ -4163,7 +4421,7 @@ mod tests {
     #[test]
     fn search_render_shows_matching_node_and_sessions() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new(
+        let mut ui = make_ui(
             "studio",
             vec![session("dev", true), session("shell", true)],
             clock.now(),
@@ -4176,7 +4434,7 @@ mod tests {
         assert!(!frame.contains("    dev"));
         assert!(frame.contains("search: sh"));
 
-        let mut node_search = ClusterUi::new(
+        let mut node_search = make_ui(
             "studio",
             vec![session("dev", true), session("shell", true)],
             clock.now(),
@@ -4191,7 +4449,7 @@ mod tests {
     #[test]
     fn search_escape_clears_and_enter_selects_match() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new(
+        let mut ui = make_ui(
             "studio",
             vec![session("dev", true), session("shell", true)],
             clock.now(),
@@ -4216,7 +4474,7 @@ mod tests {
         let edited = ui.render_text(80, 24, "", &clock);
         assert!(edited.contains("    dev"));
         assert!(edited.contains("    shell"));
-        assert!(edited.contains("search:  ·"));
+        assert!(edited.contains("search: "));
         ui.key(crossterm::event::KeyCode::Char('z'));
         ui.key(crossterm::event::KeyCode::Esc);
         let frame = ui.render_text(80, 24, "", &clock);
@@ -4228,7 +4486,7 @@ mod tests {
     #[test]
     fn attention_filter_shows_only_attention_sessions() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new(
+        let mut ui = make_ui(
             "studio",
             vec![session("dev", true), session("ended", false)],
             clock.now(),
@@ -4245,7 +4503,7 @@ mod tests {
     fn uncertain_input_is_visible_but_does_not_count_as_pending_attention() {
         let clock = ManualClock::new();
         let now = Instant::now();
-        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], clock.now());
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
         ui.input_sender
             .enqueue(
                 &mut ui.input_queue,
@@ -4269,7 +4527,7 @@ mod tests {
 
     #[test]
     fn sent_input_clears_the_sending_notice() {
-        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], Duration::ZERO);
+        let mut ui = make_ui("studio", vec![session("dev", true)], Duration::ZERO);
         ui.notice = Some(("sending input to dev".into(), Duration::ZERO));
         ui.handle_send_event(
             Some(QueueEvent::Sent {
@@ -4294,7 +4552,7 @@ mod tests {
     #[test]
     fn sending_notice_shows_elapsed_time_while_pending() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], clock.now());
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
         ui.notice = Some(("sending input to dev".into(), clock.now()));
 
         assert!(ui
@@ -4308,7 +4566,7 @@ mod tests {
 
     #[test]
     fn uncertain_input_clears_the_sending_notice() {
-        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], Duration::ZERO);
+        let mut ui = make_ui("studio", vec![session("dev", true)], Duration::ZERO);
         ui.notice = Some(("sending input to dev".into(), Duration::ZERO));
         ui.handle_send_event(
             Some(QueueEvent::Uncertain {
@@ -4334,7 +4592,7 @@ mod tests {
         other.sessions[0].instance_id = "tablet-instance".into();
         snapshot.nodes.push(other);
 
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
         ui.remote_input_enabled = true;
         ui.select_target(Some("fp-laptop/build")).unwrap();
@@ -4357,7 +4615,7 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Enter);
         assert!(ui.notice.as_ref().is_some_and(|(notice, _)| {
             notice.contains("appended to the leftover fragment and run with it")
-                && notice.contains("press Enter again to send anyway")
+                && notice.contains("confirm sending again to send anyway")
         }));
     }
 
@@ -4406,7 +4664,7 @@ mod tests {
         assert!(ui
             .notice
             .as_ref()
-            .is_some_and(|(notice, _)| notice.contains("press Enter again to send anyway")));
+            .is_some_and(|(notice, _)| notice.contains("confirm sending again to send anyway")));
 
         ui.key(crossterm::event::KeyCode::Enter);
         *transport.response.lock().unwrap() = Some(Response::Uncertain);
@@ -4425,7 +4683,7 @@ mod tests {
         assert!(ui
             .notice
             .as_ref()
-            .is_some_and(|(notice, _)| notice.contains("press Enter again to send anyway")));
+            .is_some_and(|(notice, _)| notice.contains("confirm sending again to send anyway")));
         ui.start_pending(clock.now());
         ui.send_pending(
             std::path::Path::new("unused"),
@@ -4474,7 +4732,7 @@ mod tests {
         assert!(ui
             .notice
             .as_ref()
-            .is_some_and(|(notice, _)| notice.contains("press Enter again to send anyway")));
+            .is_some_and(|(notice, _)| notice.contains("confirm sending again to send anyway")));
 
         ui.select_target(Some("fp-tablet/build")).unwrap();
         ui.enter_selected(clock.now());
@@ -4487,7 +4745,7 @@ mod tests {
         assert!(ui
             .notice
             .as_ref()
-            .is_some_and(|(notice, _)| notice.contains("press Enter again to send anyway")));
+            .is_some_and(|(notice, _)| notice.contains("confirm sending again to send anyway")));
         ui.start_pending(clock.now());
         ui.send_pending(
             std::path::Path::new("unused"),
@@ -4517,7 +4775,7 @@ mod tests {
         assert!(ui
             .notice
             .as_ref()
-            .is_some_and(|(notice, _)| notice.contains("press Enter again to send anyway")));
+            .is_some_and(|(notice, _)| notice.contains("confirm sending again to send anyway")));
     }
 
     #[test]
@@ -4547,7 +4805,7 @@ mod tests {
         assert!(ui
             .notice
             .as_ref()
-            .is_some_and(|(notice, _)| notice.contains("press Enter again to send anyway")));
+            .is_some_and(|(notice, _)| notice.contains("confirm sending again to send anyway")));
     }
 
     #[test]
@@ -4570,13 +4828,13 @@ mod tests {
         assert!(ui
             .notice
             .as_ref()
-            .is_some_and(|(notice, _)| notice.contains("press Enter again to send anyway")));
+            .is_some_and(|(notice, _)| notice.contains("confirm sending again to send anyway")));
     }
 
     #[test]
     fn empty_attention_filter_has_clear_message_and_badges_remain_visible() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.key(crossterm::event::KeyCode::Char('!'));
         let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("no sessions need attention"));
@@ -4587,7 +4845,7 @@ mod tests {
     #[test]
     fn empty_cluster_tree_shows_start_hint_only_when_all_nodes_have_no_sessions() {
         let clock = ManualClock::new();
-        let mut empty_ui = ClusterUi::new("studio", vec![], clock.now());
+        let mut empty_ui = make_ui("studio", vec![], clock.now());
         let empty_remote = FakeRemoteSource(Mutex::new(remote_snapshot(
             RemoteState::Unreachable,
             Duration::from_secs(12),
@@ -4601,7 +4859,7 @@ mod tests {
         assert!(frame.contains("No sessions yet. Start one on any machine:"));
         assert!(frame.contains("remuda run -n NAME COMMAND"));
 
-        let mut stale_ui = ClusterUi::new("studio", vec![], clock.now());
+        let mut stale_ui = make_ui("studio", vec![], clock.now());
         let stale_remote = FakeRemoteSource(Mutex::new(remote_snapshot(
             RemoteState::Unreachable,
             Duration::from_secs(12),
@@ -4619,7 +4877,7 @@ mod tests {
     #[test]
     fn badges_show_local_node_and_session_status() {
         let clock = ManualClock::new();
-        let ui = ClusterUi::new(
+        let ui = make_ui(
             "studio",
             vec![session("dev", true), session("ended", false)],
             clock.now(),
@@ -4640,7 +4898,7 @@ mod tests {
             Duration::from_secs(17),
             Some(remote_screen("kept output")),
         )));
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.remote_synced(&source);
 
         let frame = ui.render_text(100, 24, "", &clock);
@@ -4655,7 +4913,7 @@ mod tests {
     #[test]
     fn long_notices_keep_the_next_step_visible_at_common_terminal_sizes() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         let screen = (0..30)
             .map(|line| format!("body-{line:02}"))
             .collect::<Vec<_>>()
@@ -4684,10 +4942,13 @@ mod tests {
                 "notice lost its next step at {cols}x{rows}: {frame}"
             );
             assert_eq!(notice_lines, 2, "notice should wrap to two rows: {frame}");
-            assert_eq!(
-                long_notice_body_rows + 1,
-                one_line_body_rows,
-                "a wrapped notice should reserve one additional row: {frame}"
+            assert!(
+                long_notice_body_rows <= one_line_body_rows,
+                "notice must reserve space: {frame}"
+            );
+            assert!(
+                frame.lines().count() <= usize::from(rows),
+                "frame exceeds viewport: {frame}"
             );
             ui.notice = Some(("short notice".into(), clock.now()));
         }
@@ -4727,7 +4988,7 @@ mod tests {
                 Duration::ZERO,
                 Some(remote_screen("remote")),
             )));
-            let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+            let mut ui = make_ui("studio", sessions(), clock.now());
             ui.remote_synced(&source);
             ui.remote_input_enabled = true;
             ui.select_target(Some("fp-laptop/build")).unwrap();
@@ -4746,11 +5007,11 @@ mod tests {
         };
 
         let (_, clock, focused) = make_ui();
-        assert!(focused.contains("Enter send · Ctrl-C clear · Esc list"));
+        assert!(focused.contains("Enter send"));
 
         let (ui, _, _) = make_ui();
         let footer = ui.render_text(100, 24, "", &clock);
-        assert!(footer.contains("Enter type · k keys · x close · q detach"));
+        assert!(footer.contains("x close · q detach · k keys · Enter select"));
 
         let (mut ui, _, _) = make_ui();
         ui.key(crossterm::event::KeyCode::Enter);
@@ -4763,7 +5024,9 @@ mod tests {
         let (mut ui, _, _) = make_ui();
         ui.key(crossterm::event::KeyCode::Char('x'));
         assert!(
-            ui.confirmation.prompt(40).is_some(),
+            ui.confirmation
+                .prompt(40, &ui.keymap.display_help("cluster.confirm", &[]))
+                .is_some(),
             "x should start close confirmation"
         );
 
@@ -4782,7 +5045,7 @@ mod tests {
             Duration::ZERO,
             Some(remote_screen("last good screen")),
         )));
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.remote_synced(&source);
         ui.key(crossterm::event::KeyCode::Down);
         ui.key(crossterm::event::KeyCode::Enter);
@@ -4804,7 +5067,9 @@ mod tests {
         let frame = ui.render_text(100, 24, "", &clock);
         assert!(frame.contains("laptop · unreachable"));
         assert!(frame.contains("last good screen"));
-        assert!(frame.contains("kill laptop(fp-lap)/build? it is running — y / n"));
+        assert!(
+            frame.contains("kill laptop(fp-lap)/build? y confirm · Y confirm · other key cancels")
+        );
         ui.key(crossterm::event::KeyCode::Char('n'));
         assert!(!ui
             .render_text(100, 24, "", &clock)
@@ -4823,7 +5088,7 @@ mod tests {
                 Some(remote_screen("ready")),
             ));
         });
-        let mut ui = ClusterUi::new("studio", Vec::new(), Duration::ZERO);
+        let mut ui = make_ui("studio", Vec::new(), Duration::ZERO);
         ui.remote_synced(source.as_ref());
         select_target_with_remote_wait(
             &mut ui,
@@ -4840,7 +5105,7 @@ mod tests {
 
     #[test]
     fn user_target_with_an_ambiguous_original_node_id_is_refused() {
-        let mut ui = ClusterUi::new("studio", Vec::new(), Duration::ZERO);
+        let mut ui = make_ui("studio", Vec::new(), Duration::ZERO);
         let mut snapshot = remote_snapshot(
             RemoteState::Reachable,
             Duration::ZERO,
@@ -4859,7 +5124,7 @@ mod tests {
     #[test]
     fn x_on_highlighted_remote_session_opens_the_close_confirmation() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         let mut snapshot = remote_snapshot(
             RemoteState::Reachable,
             Duration::ZERO,
@@ -4878,7 +5143,7 @@ mod tests {
 
         assert!(ui
             .render_text(100, 24, "", &clock)
-            .contains("kill laptop(RL+gta)/build? it is running — y / n"));
+            .contains("kill laptop(RL+gta)/build? y confirm · Y confirm · other key cancels"));
 
         ui.key(crossterm::event::KeyCode::Char('y'));
         let transport = FakeRemoteInput::new(Response::RemoteControlDisabled);
@@ -4920,7 +5185,7 @@ mod tests {
     #[test]
     fn fingerprint_target_sends_input_when_remote_labels_collide() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         let mut snapshot = remote_snapshot(
             RemoteState::Reachable,
             Duration::ZERO,
@@ -4974,7 +5239,7 @@ mod tests {
         second.instance_id = "shell-instance".into();
         snapshot.nodes[0].sessions.push(second);
 
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
         ui.remote_input_enabled = true;
         ui.remote_expanded.insert("fp-laptop".into());
@@ -5019,7 +5284,7 @@ mod tests {
             Duration::ZERO,
             Some(remote_screen("remote")),
         )));
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.remote_synced(&source);
         ui.remote_input_enabled = true;
         ui.remote_expanded.insert("fp-laptop".into());
@@ -5068,7 +5333,7 @@ mod tests {
         );
         snapshot.nodes[0].sessions[0].wire_name = "wire-build".into();
         let source = FakeRemoteSource(Mutex::new(snapshot));
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.remote_synced(&source);
         ui.remote_expanded.insert("fp-laptop".into());
         ui.input_sender
@@ -5101,7 +5366,7 @@ mod tests {
     #[test]
     fn remote_control_disabled_is_shown_and_stops_future_target_sends() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.remote_synced(&FakeRemoteSource(Mutex::new(remote_snapshot(
             RemoteState::Reachable,
             Duration::ZERO,
@@ -5144,7 +5409,7 @@ mod tests {
         let clock = ManualClock::new();
         let limit = crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES;
         let oversize = Response::Error(format!("remote Input batch exceeds {limit} bytes"));
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         let mut snapshot = remote_snapshot(
             RemoteState::Reachable,
             Duration::ZERO,
@@ -5249,7 +5514,7 @@ mod tests {
     #[test]
     fn search_q_does_not_detach_and_control_keys_are_ignored() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         assert!(!ui.key(crossterm::event::KeyCode::Char('/')));
         assert!(!ui.key(crossterm::event::KeyCode::Char('q')));
         ui.key_event(
@@ -5268,7 +5533,7 @@ mod tests {
     #[test]
     fn enter_on_an_empty_search_result_does_nothing() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.key(crossterm::event::KeyCode::Char('/'));
         ui.key(crossterm::event::KeyCode::Char('z'));
         ui.key(crossterm::event::KeyCode::Enter);
@@ -5282,7 +5547,7 @@ mod tests {
     #[test]
     fn enter_with_a_hidden_selection_does_nothing() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new(
+        let mut ui = make_ui(
             "studio",
             vec![session("dev", true), session("shell", true)],
             clock.now(),
@@ -5385,9 +5650,8 @@ mod tests {
         let frame = ui.render_text(100, 24, "", &clock);
         let lines: Vec<&str> = frame.lines().collect();
         assert!(lines
-            .last()
-            .unwrap()
-            .starts_with("Enter type · k keys · x close · q detach"));
+            .iter()
+            .any(|line| line.starts_with("x close · q detach · k keys · Enter select")));
         assert!(lines
             .iter()
             .any(|l| l.starts_with("heads up") && !l.contains('│')));
@@ -5401,7 +5665,7 @@ mod tests {
     #[test]
     fn enter_on_an_empty_attention_filter_does_nothing() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         ui.key(crossterm::event::KeyCode::Char('!'));
         ui.key(crossterm::event::KeyCode::Enter);
         let frame = ui.render_text(80, 24, "", &clock);
@@ -5413,7 +5677,7 @@ mod tests {
     #[test]
     fn toggling_attention_preserves_a_selection_when_it_remains_visible() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new(
+        let mut ui = make_ui(
             "studio",
             vec![session("dev", true), session("shell", true)],
             clock.now(),
@@ -5429,17 +5693,19 @@ mod tests {
     fn restored_composer_preview_is_safe_without_changing_delivery_bytes() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], clock.now());
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
         ui.composer_focused = true;
         ui.bind_composer_target();
         let draft = "before\u{009b}2J\u{202e}after\x1b[H\r\n";
         ui.restore_draft(format!("{draft}\r").as_bytes());
         // Put the cursor inside the restored draft, exercising both halves.
         ui.composer
-            .handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+            .handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), &ui.keymap);
         for _ in 0..8 {
-            ui.composer
-                .handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+            ui.composer.handle_key(
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+                &ui.keymap,
+            );
         }
         let frame = ui.render(80, 24, "pane", &clock);
         assert_remote_text_is_safe(&ui.composer_line());
@@ -5466,7 +5732,7 @@ mod tests {
     #[test]
     fn enter_focuses_the_composer_and_submits_to_its_bound_instance() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], clock.now());
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
         ui.key(crossterm::event::KeyCode::Enter);
         assert!(ui.composer_focused);
         ui.key(crossterm::event::KeyCode::Char('q'));
@@ -5504,21 +5770,21 @@ mod tests {
     #[test]
     fn x_opens_close_confirmation_and_any_non_y_key_cancels() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], clock.now());
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
         ui.key(crossterm::event::KeyCode::Char('x'));
         assert!(ui
             .render_text(80, 24, "", &clock)
-            .contains("kill dev? it is running — y / n"));
+            .contains("kill dev? y confirm · Y confirm · other key cancels"));
         ui.key(crossterm::event::KeyCode::Char('n'));
         assert!(!ui
             .render_text(80, 24, "", &clock)
-            .contains("kill dev? it is running — y / n"));
+            .contains("kill dev? y confirm · Y confirm · other key cancels"));
     }
 
     #[test]
     fn x_then_y_closes_the_selected_instance_and_shows_its_ended_frame() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], clock.now());
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
         let summary = ui.sessions[0].clone();
         assert!(ui.record_capture(&summary, "final output".into(), clock.now()));
         ui.key(crossterm::event::KeyCode::Char('x'));
@@ -5542,13 +5808,13 @@ mod tests {
         let frame = ui.render_text(80, 24, &final_frame, &clock);
         assert!(frame.contains("studio / dev · ended · final snapshot"));
         assert!(frame.contains("final output"));
-        assert!(frame.contains("Input is disabled"));
+        assert!(frame.contains("Input disabled"));
     }
 
     #[test]
     fn sync_keeps_tree_selection_while_showing_an_ended_frame() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new(
+        let mut ui = make_ui(
             "studio",
             vec![session("dev", true), session("worker", true)],
             clock.now(),
@@ -5571,7 +5837,7 @@ mod tests {
     #[test]
     fn x_on_a_dead_session_shows_an_already_ended_notice() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", vec![session("dev", false)], clock.now());
+        let mut ui = make_ui("studio", vec![session("dev", false)], clock.now());
 
         ui.key(crossterm::event::KeyCode::Char('x'));
 
@@ -5583,14 +5849,14 @@ mod tests {
     #[test]
     fn vanished_instance_keeps_its_last_frame_as_ended_until_x_clears_it() {
         let clock = ManualClock::new();
-        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], clock.now());
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
         let summary = ui.sessions[0].clone();
         assert!(ui.record_capture(&summary, "final output".into(), clock.now()));
         ui.sessions_synced(vec![], Duration::from_secs(2));
         let frame = ui.render_text(80, 24, &ui.ended.as_ref().unwrap().screen, &clock);
         assert!(frame.contains("studio / dev · ended · final snapshot"));
         assert!(frame.contains("final output"));
-        assert!(frame.contains("Input is disabled · x clears ended session"));
+        assert!(frame.contains("Input disabled · x close"));
         ui.key(crossterm::event::KeyCode::Char('x'));
         let frame = ui.render_text(80, 24, "", &clock);
         assert!(!frame.contains("studio / dev · ended"));

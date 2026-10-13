@@ -363,14 +363,19 @@ fn local_daemon_composer_input_appears_once_in_capture() {
         other => panic!("unexpected List response: {other:?}"),
     };
 
+    let keymap = remuda_native::keybindings::fetch(&daemon.path(), Duration::from_secs(3)).unwrap();
     let mut composer = LineComposer::default();
     for character in "once only".chars() {
-        composer.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        composer.handle_key(
+            KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            &keymap,
+        );
     }
-    let bytes = match composer.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
-        ComposerAction::Submit(bytes) => bytes,
-        other => panic!("expected composer submission, got {other:?}"),
-    };
+    let bytes =
+        match composer.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &keymap) {
+            ComposerAction::Submit(bytes) => bytes,
+            other => panic!("expected composer submission, got {other:?}"),
+        };
     let now = Instant::now();
     let mut sender = InputSender::with_client_id([0x72; 16]);
     let mut queue = InputQueue::default();
