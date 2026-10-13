@@ -785,6 +785,10 @@ fn start_listener(
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "daemon/staged_startup_tests.rs"]
+mod staged_startup_tests;
+
 /// Serialize stale-socket removal and bind for one daemon name. The lock file
 /// stays in the runtime directory; unlinking it would let contenders lock
 /// different inodes while one daemon still owns the old file.
