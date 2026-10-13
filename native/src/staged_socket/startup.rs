@@ -1,8 +1,9 @@
 //! Test-only startup transaction and bounded fault controls.
 
 use super::{
-    chmod_socket_nofollow, create_staging_dir, create_stream_socket, listen_and_validate,
-    preflight_socket_path, set_nonblocking, unlink_if_matches, NodeReceipt, StagedTransaction,
+    chmod_socket_nofollow, create_stream_socket, listen_and_validate, mkdir_exclusive,
+    open_staging_dir, preflight_socket_path, remove_dir_if_matches, set_nonblocking,
+    unlink_if_matches, NodeKind, NodeReceipt, Residue, StagedTransaction,
 };
 use std::ffi::OsStr;
 use std::fs::File;
@@ -24,8 +25,16 @@ pub(crate) enum Boundary {
 pub(crate) enum Failure {
     CaptureOnce,
     CapturePersistent,
+    StageOpen,
+    Bind,
+    Clone,
     Rename,
+    RenameUnsupported,
+    RenameCrossDevice,
     AfterPublish,
+    AfterPublishUnlink,
+    PostCommitRmdir,
+    Import,
 }
 
 pub(crate) struct Pause {
@@ -60,11 +69,20 @@ impl Controls {
     }
 }
 
-/// A published listener and the receipt authorizing its public cleanup.
+/// A published listener, the receipt authorizing its public cleanup, and any
+/// private residue left after commit (the generation stays active).
 pub(crate) struct Opened {
     pub listener: OwnedFd,
     pub dev: u64,
     pub ino: u64,
+    pub residue: Vec<String>,
+}
+
+/// The primary failure plus every entry left behind and why.
+#[derive(Debug)]
+pub(crate) struct OpenError {
+    pub error: io::Error,
+    pub residue: Vec<String>,
 }
 
 fn bind_path(fd: &OwnedFd, path: &Path) -> io::Result<()> {
@@ -97,24 +115,28 @@ fn open_dir_nofollow(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-fn remove_dir_if_matches(parent: &File, name: &OsStr, receipt: NodeReceipt) -> io::Result<()> {
-    if !receipt.matches(parent, name) {
-        return Ok(());
-    }
-    let c = super::c_name(name)?;
-    if unsafe { libc::unlinkat(parent.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 fn injected(what: &str) -> io::Error {
     io::Error::other(format!("injected {what} failure"))
 }
 
+fn note(residue: &mut Vec<String>, what: &str, outcome: io::Result<Residue>) {
+    match outcome {
+        Ok(Residue::Removed) => {}
+        Ok(Residue::Preserved) => residue.push(format!("{what}: changed, preserved")),
+        Err(error) => residue.push(format!("{what}: {error}")),
+    }
+}
+
 /// Test-only staged transaction: private staging, receipts, exclusive publish.
 /// Stale-socket takeover and lifecycle installation belong to slice 3.
-pub(crate) fn open(public: &Path, controls: &Controls) -> io::Result<Opened> {
+pub(crate) fn open(public: &Path, controls: &Controls) -> Result<Opened, OpenError> {
+    let mut residue = Vec::new();
+    run(public, controls, &mut residue).map_err(|error| OpenError { error, residue })
+}
+
+// One linear transaction: each boundary's cleanup is read top to bottom.
+#[allow(clippy::too_many_lines)]
+fn run(public: &Path, controls: &Controls, residue: &mut Vec<String>) -> io::Result<Opened> {
     let parent_path = public
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket has no parent"))?;
@@ -127,23 +149,64 @@ pub(crate) fn open(public: &Path, controls: &Controls) -> io::Result<Opened> {
     preflight_socket_path(public)?;
     preflight_socket_path(&staged_path)?;
     let parent = open_dir_nofollow(parent_path)?;
-    let (stage_dir, stage_receipt) = create_staging_dir(&parent, OsStr::new(&stage_name))?;
-    let finish_dir = |dir_ok: bool| {
-        if dir_ok {
-            let _ = remove_dir_if_matches(&parent, OsStr::new(&stage_name), stage_receipt);
+    let stage = OsStr::new(&stage_name);
+    mkdir_exclusive(&parent, stage)?;
+    // From here the directory exists; every exit reports what remains of it.
+    let mut stage_receipt = None;
+    for _ in 0..2 {
+        if let Ok(receipt) = NodeReceipt::capture(&parent, stage) {
+            stage_receipt = Some(receipt);
+            break;
+        }
+    }
+    let Some(stage_receipt) = stage_receipt.filter(|r| r.kind == NodeKind::Directory) else {
+        residue.push(format!("{}: unreceipted staging directory", stage_name));
+        return Err(io::Error::other("staging directory receipt unavailable"));
+    };
+    let drop_dir = |residue: &mut Vec<String>| {
+        note(
+            residue,
+            &format!("staging directory {stage_name}"),
+            remove_dir_if_matches(&parent, stage, stage_receipt),
+        );
+    };
+    let stage_dir = match if controls.failure == Some(Failure::StageOpen) {
+        Err(injected("staging open"))
+    } else {
+        open_staging_dir(&parent, stage, stage_receipt)
+    } {
+        Ok(dir) => dir,
+        Err(error) => {
+            drop_dir(residue);
+            return Err(error);
         }
     };
     let fd = match create_stream_socket() {
         Ok(fd) => fd,
         Err(error) => {
-            finish_dir(true);
+            drop_dir(residue);
             return Err(error);
         }
     };
-    // A bind error never authorizes a blind unlink: the leaf is unreceipted.
-    bind_path(&fd, &staged_path)?;
-    controls.checkpoint(Boundary::Bound, &staged_path)?;
+    // A failed bind created no leaf; only the empty directory can remain.
+    let bound = if controls.failure == Some(Failure::Bind) {
+        Err(injected("bind"))
+    } else {
+        bind_path(&fd, &staged_path)
+    };
+    if let Err(error) = bound {
+        drop_dir(residue);
+        return Err(error);
+    }
     let leaf_name = OsStr::new("s");
+    let unreceipted = |residue: &mut Vec<String>| {
+        residue.push(format!("{}: unreceipted socket", staged_path.display()));
+        residue.push(format!("staging directory {stage_name}: not empty"));
+    };
+    if let Err(error) = controls.checkpoint(Boundary::Bound, &staged_path) {
+        unreceipted(residue);
+        return Err(error);
+    }
     let mut attempts = 0;
     let receipt = loop {
         attempts += 1;
@@ -156,48 +219,98 @@ pub(crate) fn open(public: &Path, controls: &Controls) -> io::Result<Opened> {
             Ok(receipt) => break receipt,
             // One bounded recovery; persistent failure preserves the residue.
             Err(_) if attempts < 2 => continue,
-            Err(error) => return Err(error),
+            Err(error) => {
+                unreceipted(residue);
+                return Err(error);
+            }
         }
     };
-    let transaction = StagedTransaction::new(stage_dir.try_clone()?, leaf_name.into(), receipt)?;
+    let cloned = if controls.failure == Some(Failure::Clone) {
+        Err(injected("descriptor clone"))
+    } else {
+        stage_dir.try_clone()
+    };
+    let mut transaction =
+        match cloned.and_then(|dir| StagedTransaction::new(dir, leaf_name.into(), receipt)) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                note(
+                    residue,
+                    "staged socket",
+                    unlink_if_matches(&stage_dir, leaf_name, receipt).map(removed),
+                );
+                drop_dir(residue);
+                return Err(error);
+            }
+        };
+    let abort = |transaction: StagedTransaction, residue: &mut Vec<String>| {
+        note(residue, "staged socket", transaction.abort());
+    };
     let prepared = chmod_socket_nofollow(&stage_dir, leaf_name, receipt, 0o600)
         .and_then(|()| set_nonblocking(&fd))
-        .and_then(|()| listen_and_validate(&fd).map(drop));
+        .and_then(|()| listen_and_validate(&fd).map(drop))
+        .and_then(|()| controls.checkpoint(Boundary::Listening, &staged_path));
     if let Err(error) = prepared {
-        drop(transaction);
-        finish_dir(true);
+        abort(transaction, residue);
+        drop_dir(residue);
         return Err(error);
     }
-    if let Err(error) = controls.checkpoint(Boundary::Listening, &staged_path) {
-        drop(transaction);
-        finish_dir(true);
-        return Err(error);
-    }
-    let published = if controls.failure == Some(Failure::Rename) {
-        drop(transaction);
-        Err(injected("rename"))
-    } else {
-        transaction.publish_into(&parent, leaf)
+    let published = match controls.failure {
+        Some(Failure::Rename) => Err(injected("rename")),
+        Some(Failure::RenameUnsupported) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "exclusive rename unsupported",
+        )),
+        Some(Failure::RenameCrossDevice) => Err(io::Error::new(
+            io::ErrorKind::CrossesDevices,
+            "staging is on another filesystem",
+        )),
+        _ => transaction.publish_into(&parent, leaf),
     };
     let receipt = match published {
         Ok(receipt) => receipt,
         Err(error) => {
-            // StagedTransaction's Drop removed only a still-matching leaf.
-            finish_dir(true);
+            // Only the still-matching staged leaf goes; the destination stays.
+            abort(transaction, residue);
+            drop_dir(residue);
             return Err(error);
         }
     };
-    if controls.failure == Some(Failure::AfterPublish) {
-        let _ = unlink_if_matches(&parent, leaf, receipt);
-        finish_dir(true);
+    if matches!(
+        controls.failure,
+        Some(Failure::AfterPublish | Failure::AfterPublishUnlink)
+    ) {
+        let outcome = if controls.failure == Some(Failure::AfterPublishUnlink) {
+            Err(injected("published unlink"))
+        } else {
+            unlink_if_matches(&parent, leaf, receipt).map(removed)
+        };
+        note(residue, &format!("published {}", public.display()), outcome);
+        drop_dir(residue);
         return Err(injected("post-publish startup"));
     }
-    finish_dir(true);
+    // Commit is final: a staging-rmdir failure is residue, not a rollback.
+    if controls.failure == Some(Failure::PostCommitRmdir) {
+        residue.push(format!(
+            "staging directory {stage_name}: injected rmdir failure"
+        ));
+    } else {
+        drop_dir(residue);
+    }
     Ok(Opened {
         listener: fd,
         dev: receipt.dev,
         ino: receipt.ino,
+        residue: std::mem::take(residue),
     })
+}
+
+fn removed(done: bool) -> Residue {
+    if done {
+        Residue::Removed
+    } else {
+        Residue::Preserved
+    }
 }
 
 fn unique() -> u64 {

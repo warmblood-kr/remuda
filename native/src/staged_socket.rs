@@ -459,15 +459,18 @@ fn preflight_socket_path(path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Exclusively create a private (0700) staging directory; returns its
-/// no-follow CLOEXEC handle and receipt. Umask is left alone: an inaccessible
-/// directory is repaired through the parent fd, then reopened.
-fn create_staging_dir(parent: &File, name: &OsStr) -> io::Result<(File, NodeReceipt)> {
+fn mkdir_exclusive(parent: &File, name: &OsStr) -> io::Result<()> {
     let c = c_name(name)?;
     if unsafe { libc::mkdirat(parent.as_raw_fd(), c.as_ptr(), 0o700) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    let receipt = NodeReceipt::capture(parent, name)?;
+    Ok(())
+}
+
+/// Open and validate a receipted staging directory: no-follow, CLOEXEC, ours
+/// and private. An inaccessible mode is repaired through the no-follow adapter.
+fn open_staging_dir(parent: &File, name: &OsStr, receipt: NodeReceipt) -> io::Result<File> {
+    let c = c_name(name)?;
     if receipt.kind != NodeKind::Directory {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -491,13 +494,11 @@ fn create_staging_dir(parent: &File, name: &OsStr) -> io::Result<(File, NodeRece
     let dir = match open() {
         Ok(dir) => dir,
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            // Receipt-verified, no-follow repair of our own empty directory.
             chmod_receipted(parent, name, receipt, 0o700).map_err(|_| error)?;
             open()?
         }
         Err(error) => return Err(error),
     };
-    // Opened object must be the directory we created, owned by us and private.
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe { libc::fstat(dir.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
         return Err(io::Error::last_os_error());
@@ -511,7 +512,32 @@ fn create_staging_dir(parent: &File, name: &OsStr) -> io::Result<(File, NodeRece
             "staging directory is not private",
         ));
     }
-    Ok((dir, receipt))
+    Ok(dir)
+}
+
+/// Remove an empty directory only while it still matches its receipt.
+fn remove_dir_if_matches(parent: &File, name: &OsStr, receipt: NodeReceipt) -> io::Result<Residue> {
+    if !receipt.matches(parent, name) {
+        return Ok(Residue::Preserved);
+    }
+    let c = c_name(name)?;
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Residue::Removed)
+}
+
+/// Create and open a private staging directory, removing it on failure.
+fn create_staging_dir(parent: &File, name: &OsStr) -> io::Result<(File, NodeReceipt)> {
+    mkdir_exclusive(parent, name)?;
+    let receipt = NodeReceipt::capture(parent, name)?;
+    match open_staging_dir(parent, name, receipt) {
+        Ok(dir) => Ok((dir, receipt)),
+        Err(error) => {
+            let _ = remove_dir_if_matches(parent, name, receipt);
+            Err(error)
+        }
+    }
 }
 
 /// Nonblocking accept on the listener; accepted streams stay blocking.
@@ -549,14 +575,14 @@ impl StagedTransaction {
         })
     }
 
-    fn publish(self, destination: &OsStr) -> io::Result<NodeReceipt> {
+    fn publish(mut self, destination: &OsStr) -> io::Result<NodeReceipt> {
         let parent = self.parent.try_clone()?;
         self.publish_into(&parent, destination)
     }
 
     /// Exclusive rename from the staging directory into `destination_dir`.
     fn publish_into(
-        mut self,
+        &mut self,
         destination_dir: &File,
         destination: &OsStr,
     ) -> io::Result<NodeReceipt> {

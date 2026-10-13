@@ -45,13 +45,17 @@ type StartupResult = std::io::Result<(Listener, Arc<SocketOwnership>)>;
 /// Test-only seam: the staged transaction, imported the way slice 3 will wire
 /// it into startup. Production `serve_inner` still uses the legacy path.
 fn staged_startup_listener(path: &Path, controls: &Controls) -> StartupResult {
-    let opened = crate::staged_socket::startup::open(path, controls)?;
-    let listener = Listener::UdSocket(opened.listener.into());
-    listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
+    let opened = crate::staged_socket::startup::open(path, controls).map_err(|e| e.error)?;
+    // Install published authority first: a later import error cleans it up.
     let owner = SocketOwnership {
         path: path.to_path_buf(),
         identity: Mutex::new((opened.dev, opened.ino)),
     };
+    let listener = Listener::UdSocket(opened.listener.into());
+    if controls.failure == Some(Failure::Import) {
+        return Err(std::io::Error::other("injected import failure"));
+    }
+    listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
     Ok((listener, Arc::new(owner)))
 }
 struct Harness {
@@ -355,4 +359,99 @@ fn staged_startup_over_budget_path_mutates_nothing() {
     assert_eq!(public.as_os_str().len(), SOCKET_PATH_LIMIT);
     assert!(staged_startup_listener(&public, &Controls::default()).is_err());
     assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+}
+
+fn open_with(
+    scratch: &Scratch,
+    failure: Failure,
+) -> Result<crate::staged_socket::startup::Opened, crate::staged_socket::startup::OpenError> {
+    let controls = Controls {
+        failure: Some(failure),
+        ..Controls::default()
+    };
+    crate::staged_socket::startup::open(&scratch.public(), &controls)
+}
+
+#[test]
+fn staged_startup_failure_before_leaf_removes_only_the_empty_directory() {
+    for failure in [Failure::StageOpen, Failure::Bind] {
+        let scratch = Scratch::new();
+        let error = open_with(&scratch, failure).err().unwrap();
+        assert!(error.residue.is_empty(), "{failure:?}: {:?}", error.residue);
+        assert!(scratch.entries().is_empty(), "{failure:?}");
+    }
+}
+
+#[test]
+fn staged_startup_clone_failure_removes_receipted_leaf_and_directory() {
+    let scratch = Scratch::new();
+    let error = open_with(&scratch, Failure::Clone).err().unwrap();
+    assert!(error.residue.is_empty(), "{:?}", error.residue);
+    assert!(scratch.entries().is_empty());
+}
+
+#[test]
+fn staged_startup_persistent_capture_failure_reports_residue() {
+    let scratch = Scratch::new();
+    let error = open_with(&scratch, Failure::CapturePersistent)
+        .err()
+        .unwrap();
+    assert!(error
+        .residue
+        .iter()
+        .any(|r| r.contains("unreceipted socket")));
+    assert!(error.residue.iter().any(|r| r.contains("not empty")));
+    assert_eq!(scratch.entries().len(), 1);
+}
+
+#[test]
+fn staged_startup_unlink_failure_after_publish_is_reported() {
+    let scratch = Scratch::new();
+    let error = open_with(&scratch, Failure::AfterPublishUnlink)
+        .err()
+        .unwrap();
+    assert!(error
+        .residue
+        .iter()
+        .any(|r| r.contains(scratch.public().to_str().unwrap())));
+    assert!(std::fs::symlink_metadata(scratch.public())
+        .unwrap()
+        .file_type()
+        .is_socket());
+    assert_eq!(scratch.entries(), vec![scratch.public()]);
+}
+
+#[test]
+fn staged_startup_post_commit_rmdir_failure_keeps_generation_active() {
+    let scratch = Scratch::new();
+    let opened = open_with(&scratch, Failure::PostCommitRmdir).ok().unwrap();
+    assert!(opened
+        .residue
+        .iter()
+        .any(|r| r.contains("staging directory")));
+    assert!(ipc::connect(&scratch.public()).is_ok());
+    assert_eq!(scratch.entries().len(), 2);
+}
+
+#[test]
+fn staged_startup_import_failure_cleans_published_socket() {
+    let scratch = Scratch::new();
+    let controls = Controls {
+        failure: Some(Failure::Import),
+        ..Controls::default()
+    };
+    assert!(staged_startup_listener(&scratch.public(), &controls).is_err());
+    assert!(scratch.entries().is_empty());
+}
+
+#[test]
+fn staged_startup_unsupported_and_cross_device_preserve_occupied_destination() {
+    for failure in [Failure::RenameUnsupported, Failure::RenameCrossDevice] {
+        let scratch = Scratch::new();
+        std::fs::write(scratch.public(), b"sentinel").unwrap();
+        let error = open_with(&scratch, failure).err().unwrap();
+        assert!(error.residue.is_empty(), "{failure:?}: {:?}", error.residue);
+        assert_eq!(std::fs::read(scratch.public()).unwrap(), b"sentinel");
+        assert_eq!(scratch.entries(), vec![scratch.public()], "{failure:?}");
+    }
 }
