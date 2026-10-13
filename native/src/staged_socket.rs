@@ -70,10 +70,17 @@ impl NodeReceipt {
     }
 }
 
+const NAME_MAX: usize = 255;
+
 /// Names passed to the `*at` helpers must be one relative path component.
 fn c_name(name: &OsStr) -> io::Result<CString> {
     let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+    if bytes.is_empty()
+        || bytes.len() > NAME_MAX
+        || bytes == b"."
+        || bytes == b".."
+        || bytes.contains(&b'/')
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "path is not a single relative component",
@@ -182,8 +189,8 @@ fn listen_and_validate(fd: &OwnedFd) -> io::Result<ListenerIdentity> {
 }
 
 fn create_stream_socket() -> io::Result<OwnedFd> {
-    // Linux/Android set CLOEXEC atomically; elsewhere a fork/exec window
-    // between socket() and fcntl() remains (macOS has no SOCK_CLOEXEC).
+    // Atomic only on Linux/Android. Elsewhere a fork/exec window between
+    // socket() and fcntl() remains; do not certify atomic CLOEXEC there.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -447,6 +454,12 @@ pub(crate) const SOCKET_PATH_LIMIT: usize = if cfg!(any(target_os = "linux", tar
 /// encoded bytes, so non-ASCII components are measured as the kernel sees them.
 fn preflight_socket_path(path: &std::path::Path) -> io::Result<()> {
     let len = path.as_os_str().as_bytes().len();
+    if path.as_os_str().as_bytes().contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path contains NUL",
+        ));
+    }
     if len > SOCKET_PATH_LIMIT {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -499,11 +512,19 @@ fn open_staging_dir(parent: &File, name: &OsStr, receipt: NodeReceipt) -> io::Re
         }
         Err(error) => return Err(error),
     };
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(dir.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
-        return Err(io::Error::last_os_error());
+    let fstat = |dir: &File| {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(dir.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { stat.assume_init() })
+    };
+    let mut stat = fstat(&dir)?;
+    // Usable owner rwx before any contents: an openable 0500 cannot bind.
+    if stat.st_mode & 0o700 != 0o700 {
+        chmod_receipted(parent, name, receipt, 0o700)?;
+        stat = fstat(&dir)?;
     }
-    let stat = unsafe { stat.assume_init() };
     #[allow(clippy::unnecessary_cast)]
     let same = (stat.st_dev as u64, stat.st_ino) == (receipt.dev, receipt.ino);
     if !same || stat.st_uid != unsafe { libc::geteuid() } || stat.st_mode & 0o077 != 0 {
@@ -540,7 +561,8 @@ fn create_staging_dir(parent: &File, name: &OsStr) -> io::Result<(File, NodeRece
     }
 }
 
-/// Nonblocking accept on the listener; accepted streams stay blocking.
+/// Nonblocking accept on the listener only. BSD/macOS accepted streams inherit
+/// O_NONBLOCK, so request streams must be normalized to blocking after accept.
 fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
     if flags < 0

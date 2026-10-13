@@ -143,9 +143,10 @@ fn run(public: &Path, controls: &Controls, residue: &mut Vec<String>) -> io::Res
     let leaf = public
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket has no name"))?;
-    let stage_name = format!(".r660-{}-{}", std::process::id(), unique());
+    let stage_name = format!(".r660-{:08x}-{:016x}", std::process::id(), unique());
     let staged_path = parent_path.join(&stage_name).join("s");
-    // Everything is measured before any mutation.
+    // Everything is validated before any mutation, leaf and NUL included.
+    super::c_name(leaf)?;
     preflight_socket_path(public)?;
     preflight_socket_path(&staged_path)?;
     let parent = open_dir_nofollow(parent_path)?;
@@ -170,6 +171,10 @@ fn run(public: &Path, controls: &Controls, residue: &mut Vec<String>) -> io::Res
             remove_dir_if_matches(&parent, stage, stage_receipt),
         );
     };
+    if let Some(mode) = controls.directory_mode {
+        // Test seam: start the directory in an unusable mode to force repair.
+        let _ = super::chmod_receipted(&parent, stage, stage_receipt, mode);
+    }
     let stage_dir = match if controls.failure == Some(Failure::StageOpen) {
         Err(injected("staging open"))
     } else {

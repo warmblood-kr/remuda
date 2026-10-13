@@ -455,3 +455,64 @@ fn staged_startup_unsupported_and_cross_device_preserve_occupied_destination() {
         assert_eq!(scratch.entries(), vec![scratch.public()], "{failure:?}");
     }
 }
+
+#[test]
+fn staged_startup_finalizes_owner_mode_without_touching_umask() {
+    for mode in [0o000, 0o500, 0o600] {
+        let scratch = Scratch::new();
+        let controls = Controls {
+            directory_mode: Some(mode),
+            ..Controls::default()
+        };
+        let opened = crate::staged_socket::startup::open(&scratch.public(), &controls)
+            .map_err(|e| e.error)
+            .unwrap_or_else(|e| panic!("mode {mode:o}: {e}"));
+        assert!(opened.residue.is_empty(), "{:?}", opened.residue);
+        assert_eq!(scratch.entries(), vec![scratch.public()]);
+    }
+}
+
+#[test]
+fn staged_startup_rejects_bad_leaf_before_any_mutation() {
+    let scratch = Scratch::new();
+    let nul = scratch.0.join("a\0b");
+    let long = scratch.0.join("x".repeat(300));
+    for public in [nul, long] {
+        assert!(staged_startup_listener(&public, &Controls::default()).is_err());
+        assert!(scratch.entries().is_empty());
+    }
+}
+
+/// Staging path is `<dir>/.r660-<8hex>-<16hex>/s` = dir + 1 + 31 + 2 bytes.
+fn exact_budget_dir(scratch: &Scratch, glyph: &str, slack: usize) -> PathBuf {
+    use crate::staged_socket::SOCKET_PATH_LIMIT;
+    let fixed =
+        scratch.0.as_os_str().len() + "/".len() + "/.r660-00000000-0000000000000000/s".len();
+    let room = SOCKET_PATH_LIMIT + slack - fixed;
+    let dir = scratch.0.join(format!(
+        "{}{}",
+        glyph.repeat(room / glyph.len()),
+        "d".repeat(room % glyph.len())
+    ));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn staged_startup_binds_at_the_exact_byte_budget() {
+    for glyph in ["d", "é"] {
+        let scratch = Scratch::new();
+        let dir = exact_budget_dir(&scratch, glyph, 0);
+        let public = dir.join("p");
+        let opened = crate::staged_socket::startup::open(&public, &Controls::default())
+            .map_err(|e| e.error)
+            .unwrap();
+        assert!(ipc::connect(&public).is_ok(), "{glyph}");
+        drop(opened);
+        let scratch_over = Scratch::new();
+        let over = exact_budget_dir(&scratch_over, glyph, 1);
+        let refused = crate::staged_socket::startup::open(&over.join("p"), &Controls::default());
+        assert!(refused.is_err(), "{glyph}");
+        assert!(std::fs::read_dir(&over).unwrap().next().is_none());
+    }
+}
