@@ -1,3 +1,11 @@
-remuda: cluster nodes: unexpected arguments
-usage: remuda cluster nodes
-example: remuda cluster nodes
+remuda: cluster nodes: unexpected argument 'extra'
+Usage: remuda cluster nodes
+Next: remuda cluster nodes
+List the nodes known to this cluster. Example: remuda cluster nodes
+
+Usage: remuda cluster nodes
+
+Options:
+  -h, --help  Print help
+
+Next: remuda cluster nodes

@@ -1,4 +1,15 @@
 remuda: fingerprint confirmation requires stdin and stderr terminals
-usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' (FINGERPRINT required when not on a terminal) [--bind IP[:PORT] (default port 7441)]
-example: remuda cluster join 'remuda-join-v1 …'
+Join using a quoted invitation line; a fingerprint is needed when stdin is not a terminal. Example: remuda cluster join 'remuda-join-v1 …'
+
+Usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' [--bind IP[:PORT]]
+
+Arguments:
+  [FINGERPRINT]  Optional fingerprint for non-terminal use
+  [JOIN_LINE]    Quoted join line
+
+Options:
+  -h, --help              Print help
+      --bind <IP[:PORT]>  Address; omitted port defaults to 7441
+
+Next: remuda cluster join [FINGERPRINT] 'JOIN_LINE' [--bind IP[:PORT]]
 Next: use the two-argument join form with an independently supplied fingerprint.

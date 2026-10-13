@@ -1,3 +1,12 @@
 remuda: cluster control: expected on or off
-usage: remuda cluster control on|off
-example: remuda cluster control off
+Enable or disable remote control. Example: remuda cluster control off
+
+Usage: remuda cluster control on|off
+
+Arguments:
+  <MODE>  on or off
+
+Options:
+  -h, --help  Print help
+
+Next: remuda cluster control on|off

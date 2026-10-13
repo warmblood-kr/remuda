@@ -2347,7 +2347,8 @@ register("_registry_dump", "Render the live word registry as documentation.", "_
 -- reviewed public feature names below.
 -- The only caller strings ever echoed. Reviewed list: adding a public feature
 -- to cli_parse.rs FEATURES is a conscious edit here too.
-local public_features = { stable_report = true, strict_v2 = true, repeat_policy = true }
+local public_features = { stable_report = true, strict_v2 = true, repeat_policy = true,
+  option_required = true, custom_usage = true }
 local function cap_list_has(caps, key, want)
   local list = rawget(caps, key)
   if type(list) ~= "table" then return false end

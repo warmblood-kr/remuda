@@ -30,7 +30,7 @@
 <h2 id="cli.capabilities">cli.capabilities</h2>
 <p><code>cli.capabilities() -&gt; {spec_versions, report_versions, features}</code> — Report the spec versions, report versions and features this core supports; set report_version = 2 on a spec for the stable report envelope.</p>
 <h2 id="cli.parse">cli.parse</h2>
-<p><code>cli.parse(spec, argv) -&gt; report</code> — Parse a word list against a runtime command declaration without printing or exiting. Returns {ok, verb?, values, kind?, text, code}; set required = false on an optional positional (positionals are required by default), and set multiple = true on the final positional argument to collect message body words.</p>
+<p><code>cli.parse(spec, argv) -&gt; report</code> — Parse a word list against a runtime command declaration without printing or exiting. Returns {ok, verb?, values, kind?, text, code}; set required = false on an optional positional (positionals are required by default), and set multiple = true on the final positional argument to collect message body words. A valued option can set required = true; a verb can set usage to an exact usage tail when its positional syntax has conditional forms.</p>
 <h2 id="cli.require">cli.require</h2>
 <p><code>cli.require(need) -&gt; true | false, text</code> — Check remuda.cli.capabilities() before sending a v2 spec: need = {features?, spec_version?, report_version?}. Returns true, or false and a diagnostic ending in 'Next: remuda upgrade'; a core without capabilities counts as old.</p>
 <h2 id="click">click</h2>
