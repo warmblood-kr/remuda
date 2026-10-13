@@ -414,7 +414,8 @@ impl Lifecycle {
 }
 
 // Usable sun_path bytes (excluding NUL); mirrors `ipc::name`'s limits.
-const SOCKET_PATH_LIMIT: usize = if cfg!(any(target_os = "linux", target_os = "android")) {
+pub(crate) const SOCKET_PATH_LIMIT: usize = if cfg!(any(target_os = "linux", target_os = "android"))
+{
     107
 } else {
     103
@@ -436,10 +437,9 @@ fn preflight_socket_path(path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Exclusively create a private (0700) staging directory under `parent`, and
-/// return its no-follow CLOEXEC handle with a receipt. The process umask is
-/// left alone: a restrictive umask that blocks access is repaired through the
-/// parent fd without following links, then reopened and compared.
+/// Exclusively create a private (0700) staging directory; returns its
+/// no-follow CLOEXEC handle and receipt. Umask is left alone: an inaccessible
+/// directory is repaired through the parent fd, then reopened.
 fn create_staging_dir(parent: &File, name: &OsStr) -> io::Result<(File, NodeReceipt)> {
     let c = c_name(name)?;
     if unsafe { libc::mkdirat(parent.as_raw_fd(), c.as_ptr(), 0o700) } < 0 {

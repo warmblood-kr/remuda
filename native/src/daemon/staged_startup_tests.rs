@@ -344,11 +344,15 @@ fn staged_startup_preserves_occupied_symlink() {
 
 #[test]
 fn staged_startup_over_budget_path_mutates_nothing() {
+    use crate::staged_socket::SOCKET_PATH_LIMIT;
     let scratch = Scratch::new();
-    // Public path fits; the staging path (extra component + leaf) does not.
-    let room = 107usize.saturating_sub(scratch.0.as_os_str().len() + 1);
-    let public = scratch.0.join("p".repeat(room));
-    let controls = Controls::default();
-    assert!(staged_startup_listener(&public, &controls).is_err());
-    assert!(scratch.entries().is_empty());
+    // Public path sits exactly at the limit; the staging path (extra stage
+    // component) cannot fit, so preflight must refuse before any mutation.
+    let dir_len = SOCKET_PATH_LIMIT - scratch.0.as_os_str().len() - "/".len() - "/p".len();
+    let dir = scratch.0.join("d".repeat(dir_len));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let public = dir.join("p");
+    assert_eq!(public.as_os_str().len(), SOCKET_PATH_LIMIT);
+    assert!(staged_startup_listener(&public, &Controls::default()).is_err());
+    assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
 }
