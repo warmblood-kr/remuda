@@ -907,6 +907,9 @@ mod tests {
             assert!(c_name(OsStr::new(bad)).is_err(), "{bad:?}");
         }
         assert!(c_name(OsStr::new("ok")).is_ok());
+        assert!(c_name(OsStr::new(&"a".repeat(NAME_MAX))).is_ok());
+        assert!(c_name(OsStr::new(&"a".repeat(NAME_MAX + 1))).is_err());
+        assert!(c_name(OsStr::new("a\0b")).is_err());
     }
 
     #[test]
