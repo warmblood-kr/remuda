@@ -627,7 +627,7 @@ fn real_ctrl_backslash_byte_returns_from_remote_composer_to_tree() {
     tui.writer.write_all(b"\x1c").unwrap();
     tui.wait_for_from(
         output_start,
-        "Enter type · k keys · x close · q detach",
+        "x close · q detach · k keys · Enter select",
         Duration::from_secs(3),
     );
 }
@@ -767,7 +767,7 @@ fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
     tui.writer.write_all(b"\x1c").unwrap();
     tui.wait_for_from(
         back_start,
-        "Enter type · k keys · x close · q detach",
+        "x close · q detach · k keys · Enter select",
         Duration::from_secs(3),
     );
     tui.wait_for_from(output_start, "Input sent", Duration::from_secs(10));

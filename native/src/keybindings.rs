@@ -162,7 +162,7 @@ pub fn canonical_key(spec: &str) -> Result<String, String> {
     canonical_event(parse_key(spec)?).ok_or_else(|| format!("unknown key: {spec}"))
 }
 
-pub(crate) fn normalize_event(mut event: KeyEvent) -> KeyEvent {
+fn normalize_event(mut event: KeyEvent) -> KeyEvent {
     if event.modifiers.contains(KeyModifiers::CONTROL) {
         if let KeyCode::Char(c) = event.code {
             event.code = match c.to_ascii_lowercase() {

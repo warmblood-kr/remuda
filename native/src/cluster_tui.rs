@@ -1038,7 +1038,7 @@ impl ClusterUi {
                 self.notice = None;
                 return false;
             }
-            if let Some(bytes) = crate::tui::to_bytes(crate::keybindings::normalize_event(event)) {
+            if let Some(bytes) = remote_key_bytes(event) {
                 self.enqueue_remote_key_bytes(&target, bytes, now);
             }
             return false;
@@ -2236,6 +2236,19 @@ fn tree_label_line(prefix: &str, label: &str, status: &str, pad_to: usize, width
     )
 }
 
+// Crossterm names the raw Ctrl-backslash byte Ctrl-4. Other command
+// equivalences must never enter transport (BS, LF and NUL stay distinct).
+fn remote_key_bytes(mut event: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
+    if event
+        .modifiers
+        .contains(crossterm::event::KeyModifiers::CONTROL)
+        && event.code == crossterm::event::KeyCode::Char('4')
+    {
+        event.code = crossterm::event::KeyCode::Char('\\');
+    }
+    crate::tui::to_bytes(event)
+}
+
 fn remote_keys_hint(node: &str, session: &str, width: usize, help: &str) -> Vec<String> {
     let prefix = "KEYS ";
     let suffix = format!(" · {help}");
@@ -2909,6 +2922,55 @@ mod tests {
         ui.remote_snapshot.nodes[0].sessions[0].alive = false;
         key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::ALT, clock.now());
         assert!(ui.remote_keys_mode.is_none(), "ended target stays disabled");
+    }
+
+    #[test]
+    fn registry_cluster_raw_control_bytes_preserve_transport_identity() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        ui.set_keymap(crate::keybindings::test_snapshot(
+            r#"
+            remuda.rebind('cluster.remote.keys', 'cluster.remote.back', 'M-e')
+        "#,
+        ));
+        ui.key(KeyCode::Char('k'));
+        let mut expected = Vec::new();
+        for alt in [false, true] {
+            let modifiers = KeyModifiers::CONTROL
+                | if alt {
+                    KeyModifiers::ALT
+                } else {
+                    KeyModifiers::NONE
+                };
+            for (ch, byte) in [('h', 0x08), ('j', 0x0a), ('@', 0x00), (' ', 0x00)] {
+                key_event(&mut ui, KeyCode::Char(ch), modifiers, clock.now());
+                if alt {
+                    expected.push(0x1b);
+                }
+                expected.push(byte);
+            }
+        }
+        assert_eq!(
+            ui.remote_key_buffers.front().unwrap().bytes,
+            expected,
+            "command aliases must never change forwarded control bytes"
+        );
+        key_event(
+            &mut ui,
+            KeyCode::Char('4'),
+            KeyModifiers::CONTROL,
+            clock.now(),
+        );
+        expected.push(0x1c);
+        assert_eq!(ui.remote_key_buffers.front().unwrap().bytes, expected);
+        key_event(&mut ui, KeyCode::Char('e'), KeyModifiers::ALT, clock.now());
+        assert!(ui.remote_keys_mode.is_none());
+        assert_eq!(
+            ui.remote_key_buffers.front().unwrap().bytes,
+            expected,
+            "exit is intercepted"
+        );
     }
 
     #[test]

@@ -555,7 +555,10 @@ remuda.rebind("cluster.composer", "cluster.composer.submit", "M-s")
 ```
 
 The old remote exit chord then forwards to the child like other raw keys;
-the new exit chord is intercepted and shown in the remote status row. Rebind
+the new exit chord is intercepted and shown in the remote status row. Raw
+control bytes retain their transport identity (BS, LF, NUL and Alt prefixes);
+command canonicalization applies only to lookup, and byte encoding translates
+only the terminal numeric Ctrl-4 alias. Rebind
 composer submit also changes the second-send confirmation for possibly partial
 remote input; it retains the existing target and draft safety checks.
 
