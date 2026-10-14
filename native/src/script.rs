@@ -196,7 +196,7 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "cli.parse",
-        "Parse a word list against a runtime command declaration without printing or exiting. Returns {ok, verb?, values, kind?, text, code}; set required = false on an optional positional (positionals are required by default), and set multiple = true on the final positional argument to collect message body words.",
+        "Parse a word list against a runtime command declaration without printing or exiting. Returns {ok, verb?, values, kind?, text, code}; set required = false on an optional positional (positionals are required by default), and set multiple = true on the final positional argument to collect message body words. A valued option can set required = true; a verb can set usage to an exact usage tail when its positional syntax has conditional forms.",
         "cli.parse(spec, argv) -> report",
     ),
     (
@@ -579,6 +579,7 @@ fn cli_spec_from_lua(table: Table) -> mlua::Result<crate::cli_parse::Spec> {
     let mut verbs = Vec::new();
     for (name, verb) in verb_entries {
         let about = verb.get::<Option<String>>("about")?.unwrap_or_default();
+        let usage = verb.get::<Option<String>>("usage")?;
         let next = verb.get::<String>("next")?;
         let args_table = verb.get::<Option<Table>>("args")?;
         let mut args = Vec::new();
@@ -596,6 +597,7 @@ fn cli_spec_from_lua(table: Table) -> mlua::Result<crate::cli_parse::Spec> {
         verbs.push(VerbSpec {
             name,
             about,
+            usage,
             args,
             next,
             options: cli_options_from_lua(verb.get::<Option<Table>>("options")?)?,
@@ -793,6 +795,7 @@ fn cli_options_from_lua(table: Option<Table>) -> mlua::Result<Vec<crate::cli_par
                 value: item.get("value")?,
                 help: item.get("help")?,
                 global: item.get::<Option<bool>>("global")?.unwrap_or(false),
+                required: item.get::<Option<bool>>("required")?.unwrap_or(false),
                 repeat_policy: Default::default(),
             });
         }
@@ -2667,7 +2670,7 @@ mod binding_tests {
         let out = dump_of("remuda.cli.capabilities()");
         assert_eq!(
             out,
-            r#"{features={1="stable_report",2="strict_v2",3="repeat_policy"},report_versions={1=1,2=2},spec_versions={1=1,2=2}}"#
+            r#"{features={1="stable_report",2="strict_v2",3="repeat_policy",4="option_required",5="custom_usage"},report_versions={1=1,2=2},spec_versions={1=1,2=2}}"#
         );
     }
 
@@ -2722,6 +2725,33 @@ mod binding_tests {
         assert!(
             unknown.contains(r#"kind="error""#) && unknown.contains("path={}"),
             "{unknown}"
+        );
+    }
+
+    #[test]
+    fn cli_declared_required_option_and_custom_usage_work_from_lua() {
+        let out = dump_of(
+            r#"(function()
+            local spec = {
+              version = 2, report_version = 2,
+              requires = {"option_required", "custom_usage"},
+              name = "remuda",
+              verbs = {go = {
+                about = "Run the command", usage = "go --token TOKEN",
+                next = "remuda go --token TOKEN",
+                options = {{long = "token", value = "TOKEN", help = "Access token", required = true}}
+              }}
+            }
+            local missing = remuda.cli.parse(spec, {"go"})
+            local help = remuda.cli.parse(spec, {"go", "--help"})
+            return missing.text .. "\\n" .. help.text
+            end)()"#,
+        );
+        assert!(out.contains("required"), "{out}");
+        assert_eq!(
+            out.matches("Usage: remuda go --token TOKEN").count(),
+            2,
+            "{out}"
         );
     }
 

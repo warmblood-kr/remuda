@@ -1,3 +1,1 @@
-remuda: cluster remote: expected NODE/SESSION
-usage: remuda cluster remote [NODE/SESSION]
-example: remuda cluster remote
+remuda: cluster remote: <PLATFORM_ERROR>

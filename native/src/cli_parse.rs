@@ -28,6 +28,7 @@ pub struct OptionSpec {
     pub value: Option<String>,
     pub help: String,
     pub global: bool,
+    pub required: bool,
     pub repeat_policy: RepeatPolicy,
 }
 
@@ -43,6 +44,8 @@ pub struct ArgSpec {
 pub struct VerbSpec {
     pub name: String,
     pub about: String,
+    /// Optional complete usage tail, including the verb name.
+    pub usage: Option<String>,
     pub args: Vec<ArgSpec>,
     pub next: String,
     pub options: Vec<OptionSpec>,
@@ -85,7 +88,13 @@ impl Report {
 /// Versions and features this parser supports, for `remuda.cli.capabilities()`.
 pub const SPEC_VERSIONS: &[u32] = &[1, 2];
 pub const REPORT_VERSIONS: &[u32] = &[1, 2];
-pub const FEATURES: &[&str] = &["stable_report", "strict_v2", "repeat_policy"];
+pub const FEATURES: &[&str] = &[
+    "stable_report",
+    "strict_v2",
+    "repeat_policy",
+    "option_required",
+    "custom_usage",
+];
 
 /// Shape a report as the v2 envelope; vectors are always arrays.
 /// Error text is the legacy diagnostic and may quote input until G7b safe_errors;
@@ -124,15 +133,31 @@ pub fn report_v2(spec: &Spec, report: &Report) -> Value {
 /// Parse a verb's raw argument words with a runtime-built clap command.
 /// This function only returns a report; it never prints or exits.
 pub fn parse(spec: &Spec, argv: &[&str]) -> Report {
+    parse_with_help(spec, argv, true)
+}
+
+/// Parse a dispatch layer whose positional tail belongs to a downstream command.
+/// In this mode, `-h` and `--help` in that tail stay literal for the downstream parser.
+pub fn parse_passthrough(spec: &Spec, argv: &[&str]) -> Report {
+    parse_with_help(spec, argv, false)
+}
+
+fn parse_with_help(spec: &Spec, argv: &[&str], help_enabled: bool) -> Report {
     let Some((verb_index, verb)) = select_verb(spec, argv) else {
         return error_report(spec, None, None);
     };
     let verb_name = verb.name.as_str();
 
-    let command = command_for(spec, verb);
+    let command = command_for(spec, verb, help_enabled);
     let input =
         std::iter::once(command.get_name().to_owned()).chain(argv.iter().map(|s| (*s).to_owned()));
-    let input: Vec<String> = preserve_help_in_body(spec, verb, verb_index, argv, input.collect());
+    let input: Vec<String> = preserve_literal_flags_in_body(
+        spec,
+        verb,
+        verb_index,
+        argv,
+        preserve_help_in_body(spec, verb, verb_index, argv, input.collect(), help_enabled),
+    );
     match command.try_get_matches_from(input) {
         Ok(matches) => {
             let submatches = matches.subcommand().map(|(_, matches)| matches);
@@ -181,15 +206,17 @@ fn select_verb<'a>(spec: &'a Spec, argv: &[&str]) -> Option<(usize, &'a VerbSpec
     None
 }
 
-fn command_for(spec: &Spec, verb: &VerbSpec) -> Command {
+fn command_for(spec: &Spec, verb: &VerbSpec, help_enabled: bool) -> Command {
     let command_name = spec.name.split_whitespace().last().unwrap_or("remuda");
     let usage = format!("{} {}", spec.name, usage_tail(spec, verb));
     let mut child = Command::new(verb.name.clone())
         .about(verb.about.clone())
         .disable_help_flag(true)
         .override_usage(usage)
-        .after_help(format!("Next: {}", verb.next))
-        .arg(help_arg());
+        .after_help(format!("Next: {}", verb.next));
+    if help_enabled {
+        child = child.arg(help_arg());
+    }
     for option in &verb.options {
         child = child.arg(make_option(option));
     }
@@ -206,6 +233,7 @@ fn command_for(spec: &Spec, verb: &VerbSpec) -> Command {
     let mut command = Command::new(command_name.to_owned())
         .subcommand_required(true)
         .disable_help_flag(true)
+        .disable_help_subcommand(true)
         .subcommand(child);
 
     for option in &spec.options {
@@ -231,6 +259,7 @@ fn make_option(option: &OptionSpec) -> Arg {
     } else {
         arg = arg.action(ArgAction::SetTrue);
     }
+    arg = arg.required(option.required);
     if matches!(
         option.repeat_policy,
         RepeatPolicy::Last | RepeatPolicy::Coalesce
@@ -249,6 +278,9 @@ fn help_arg() -> Arg {
 }
 
 fn usage_tail(spec: &Spec, verb: &VerbSpec) -> String {
+    if let Some(usage) = &verb.usage {
+        return usage.clone();
+    }
     let mut parts = vec![verb.name.clone()];
     if !spec.options.is_empty() || !verb.options.is_empty() {
         parts.push("[OPTIONS]".into());
@@ -269,7 +301,11 @@ fn preserve_help_in_body(
     verb_index: usize,
     argv: &[&str],
     mut input: Vec<String>,
+    help_enabled: bool,
 ) -> Vec<String> {
+    if !help_enabled {
+        return input;
+    }
     // `trailing_var_arg` still recognizes declared `--help` wherever it appears.
     // `allow_hyphen_values` would also accept unknown `--name` flags, so insert `--` for body text.
     if !verb.args.last().is_some_and(|arg| arg.multiple) {
@@ -316,6 +352,30 @@ fn preserve_help_in_body(
     input
 }
 
+/// A variadic text body after a required leading positional accepts flag-like
+/// words as text. Preserve declared options, but keep unknown flags in the body.
+fn preserve_literal_flags_in_body(
+    spec: &Spec,
+    verb: &VerbSpec,
+    verb_index: usize,
+    argv: &[&str],
+    mut input: Vec<String>,
+) -> Vec<String> {
+    if !verb.args.last().is_some_and(|arg| arg.multiple)
+        || verb.args.len() < 2
+        || argv.contains(&"--")
+    {
+        return input;
+    }
+    let Some(body_start) = message_body_start(spec, verb, argv, verb_index + 1, argv.len()) else {
+        return input;
+    };
+    if argv[body_start].starts_with('-') {
+        input.insert(body_start + 1, "--".into());
+    }
+    input
+}
+
 fn message_body_start(
     spec: &Spec,
     verb: &VerbSpec,
@@ -337,6 +397,12 @@ fn message_body_start(
                 .split_once('=')
                 .map_or((long, false), |(name, _)| (name, true));
             let option = options.clone().find(|option| option.long == name);
+            if option.is_none()
+                && positionals_before_body > 0
+                && positionals_seen >= positionals_before_body
+            {
+                return Some(index);
+            }
             if option.is_some_and(|option| option.value.is_some() && !has_inline_value) {
                 index += 2;
             } else {
@@ -350,6 +416,14 @@ fn message_body_start(
                 .unwrap_or_default()
                 .chars()
                 .collect::<Vec<_>>();
+            if cluster
+                .first()
+                .is_some_and(|short| !options.clone().any(|option| option.short == Some(*short)))
+                && positionals_before_body > 0
+                && positionals_seen >= positionals_before_body
+            {
+                return Some(index);
+            }
             let value_option_position = cluster.iter().position(|short| {
                 options
                     .clone()
@@ -527,7 +601,7 @@ fn append_next(text: &mut String, next: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, ArgSpec, OptionSpec, Spec, VerbSpec};
+    use super::{parse, parse_passthrough, ArgSpec, OptionSpec, Spec, VerbSpec};
     use serde_json::Value;
 
     fn spec() -> Spec {
@@ -540,6 +614,7 @@ mod tests {
                     value: Some("ROOM".into()),
                     help: "Room ID".into(),
                     global: true,
+                    required: false,
                     repeat_policy: Default::default(),
                 },
                 OptionSpec {
@@ -548,6 +623,7 @@ mod tests {
                     value: None,
                     help: "Print JSON".into(),
                     global: true,
+                    required: false,
                     repeat_policy: Default::default(),
                 },
             ],
@@ -555,6 +631,7 @@ mod tests {
                 VerbSpec {
                     name: "thread".into(),
                     about: "Show every reply in a Matrix thread".into(),
+                    usage: None,
                     args: vec![ArgSpec {
                         name: "EVENT_ID".into(),
                         help: "Event that starts the thread".into(),
@@ -567,6 +644,7 @@ mod tests {
                 VerbSpec {
                     name: "send-to-leader".into(),
                     about: "Send a message to the team leader".into(),
+                    usage: None,
                     args: vec![ArgSpec {
                         name: "TEXT".into(),
                         help: "Message text".into(),
@@ -590,6 +668,7 @@ mod tests {
                     value: Some("ROOM".into()),
                     help: "Room ID".into(),
                     global: true,
+                    required: false,
                     repeat_policy: Default::default(),
                 },
                 OptionSpec {
@@ -598,6 +677,7 @@ mod tests {
                     value: Some("LEVEL".into()),
                     help: "Verbosity".into(),
                     global: true,
+                    required: false,
                     repeat_policy: Default::default(),
                 },
                 OptionSpec {
@@ -606,12 +686,14 @@ mod tests {
                     value: None,
                     help: "Print JSON".into(),
                     global: true,
+                    required: false,
                     repeat_policy: Default::default(),
                 },
             ],
             verbs: vec![VerbSpec {
                 name: "reply".into(),
                 about: "Reply to an event".into(),
+                usage: None,
                 args: vec![
                     ArgSpec {
                         name: "EVENT_ID".into(),
@@ -630,6 +712,38 @@ mod tests {
                 options: vec![],
             }],
         }
+    }
+
+    #[test]
+    fn exact_usage_applies_to_both_help_and_argument_errors() {
+        let spec = Spec {
+            name: "remuda cluster".into(),
+            options: vec![],
+            verbs: vec![VerbSpec {
+                name: "call".into(),
+                about: "Call a remote node".into(),
+                usage: Some("call NODE (list|capture SESSION) --addr IP[:PORT] [--json]".into()),
+                args: vec![ArgSpec {
+                    name: "NODE".into(),
+                    help: "Remote node".into(),
+                    multiple: false,
+                    required: true,
+                }],
+                next: "remuda cluster call node list --addr 127.0.0.1".into(),
+                options: vec![],
+            }],
+        };
+        let help = parse(&spec, &["call", "--help"]);
+        assert!(help.text.contains(
+            "Usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] [--json]"
+        ));
+        let invalid = parse(&spec, &["call"]);
+        assert!(invalid.text.contains(
+            "Usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] [--json]"
+        ));
+        assert!(!invalid
+            .text
+            .contains("Usage: remuda cluster call [OPTIONS] NODE"));
     }
 
     #[test]
@@ -710,6 +824,23 @@ mod tests {
             assert_eq!(report.kind.as_deref(), Some("error"), "case {name}");
             assert_eq!(report.code, 2, "case {name}");
         }
+    }
+
+    #[test]
+    fn passthrough_mode_leaves_downstream_help_flag_in_variadic_tail() {
+        let mut spec = spec();
+        spec.verbs[0].args = vec![ArgSpec {
+            name: "ARGS".into(),
+            help: "Downstream command and arguments".into(),
+            multiple: true,
+            required: false,
+        }];
+        let report = parse_passthrough(&spec, &["thread", "--", "command", "--help"]);
+        assert!(report.ok, "{report:?}");
+        assert_eq!(
+            report.values["ARGS"],
+            Value::Array(vec!["command".into(), "--help".into()])
+        );
     }
 
     #[test]

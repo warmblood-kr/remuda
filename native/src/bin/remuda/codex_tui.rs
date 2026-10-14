@@ -12,44 +12,88 @@ use std::time::{Duration, Instant};
 
 /// Butler probes `--help` for `-c KEY=VALUE` to learn whether this core can
 /// pass config overrides through, so that substring is a contract.
-const USAGE: &str = "remuda: Codex TUI takes --status PATH [--model M] [-c KEY=VALUE]...";
+fn cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::{OptionSpec, RepeatPolicy, Spec, VerbSpec};
+    Spec {
+        name: "remuda".into(),
+        options: vec![],
+        verbs: vec![VerbSpec {
+            name: "_codex_tui".into(),
+            about: "Run the Codex terminal interface with session status reporting. Example: remuda _codex_tui --status /tmp/status.json --model gpt-5".into(),
+            usage: None,
+            args: vec![],
+            next: "remuda _codex_tui --status PATH [--model MODEL] [-c KEY=VALUE]…".into(),
+            options: vec![
+                OptionSpec { long: "status".into(), short: None, value: Some("PATH".into()), help: "Status file updated while Codex runs".into(), global: false, required: true, repeat_policy: Default::default() },
+                OptionSpec { long: "model".into(), short: None, value: Some("MODEL".into()), help: "Model used by the Codex client (default: Codex configuration)".into(), global: false, required: false, repeat_policy: Default::default() },
+                OptionSpec { long: "config".into(), short: Some('c'), value: Some("KEY=VALUE".into()), help: "App-server configuration override; may be repeated".into(), global: false, required: false, repeat_policy: RepeatPolicy::Append },
+            ],
+        }],
+    }
+}
 
 /// Status path, model and app-server config overrides; `None` is a usage error.
-fn parse_args<'a>(args: &[&'a str]) -> Option<(&'a str, Option<&'a str>, Vec<&'a str>)> {
-    let ["--status", status, rest @ ..] = args else {
+fn parse_report(args: &[&str]) -> remuda_native::cli_parse::Report {
+    let mut words = vec!["_codex_tui"];
+    words.extend(args.iter().copied());
+    remuda_native::cli_parse::parse(&cli_spec(), &words)
+}
+
+#[cfg(test)]
+fn parse_args(args: &[&str]) -> Option<(String, Option<String>, Vec<String>)> {
+    parse_report_args(parse_report(args))
+}
+
+fn parse_report_args(
+    report: remuda_native::cli_parse::Report,
+) -> Option<(String, Option<String>, Vec<String>)> {
+    if !report.ok {
         return None;
-    };
-    let (mut rest, mut model) = (rest, None);
-    if let ["--model", value, tail @ ..] = rest {
-        model = Some(*value);
-        rest = tail;
     }
-    let mut config = Vec::new();
-    while let ["-c", value, tail @ ..] = rest {
-        config.push(*value);
-        rest = tail;
-    }
-    rest.is_empty().then_some((*status, model, config))
+    let status = report.values.get("status")?.as_str()?.to_owned();
+    let model = report
+        .values
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let config = report
+        .values
+        .get("config")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    Some((status, model, config))
 }
 
 pub fn run(args: &[&str]) -> ExitCode {
-    if args == ["--help"] {
-        println!("{USAGE}");
+    let report = parse_report(args);
+    if report.kind.as_deref() == Some("help") {
+        println!("{}", report.text);
         return ExitCode::SUCCESS;
     }
     // The arguments are never echoed: a config value can carry a session token.
-    let Some((status, model, config)) = parse_args(args) else {
-        eprintln!("{USAGE}");
+    if !report.ok {
+        eprintln!(
+            "{}",
+            remuda_native::cli_parse::parse(&cli_spec(), &["_codex_tui", "--help"]).text
+        );
         return ExitCode::FAILURE;
+    }
+    let Some((status, model, config)) = parse_report_args(report) else {
+        unreachable!("successful parser report has required values")
     };
     // The selected model is useful status even before the first prompt. The
     // app-server does not announce a thread (or its model) until a thread is
     // started, so waiting for `thread/started` leaves the caller showing its
     // previous/default model while the new TUI is idle.
-    seed_status(status, model);
+    seed_status(&status, model.as_deref());
     let socket = std::env::temp_dir().join(format!("remuda-codex-{}.sock", std::process::id()));
     let address = format!("unix://{}", socket.display());
-    let (server_args, client_args) = codex_args(&address, model, &config);
+    let config_refs = config.iter().map(String::as_str).collect::<Vec<_>>();
+    let (server_args, client_args) = codex_args(&address, model.as_deref(), &config_refs);
     let mut server_command = Command::new("codex");
     server_command
         .args(&server_args)
@@ -635,10 +679,13 @@ mod tests {
 
     #[test]
     fn arguments_parse_status_then_model_then_config_overrides() {
-        assert_eq!(parse_args(&["--status", "p"]), Some(("p", None, vec![])));
+        assert_eq!(
+            parse_args(&["--status", "p"]),
+            Some(("p".into(), None, vec![]))
+        );
         assert_eq!(
             parse_args(&["--status", "p", "--model", "m"]),
-            Some(("p", Some("m"), vec![]))
+            Some(("p".into(), Some("m".into()), vec![]))
         );
         assert_eq!(
             parse_args(&[
@@ -651,11 +698,15 @@ mod tests {
                 "-c",
                 "b=--model"
             ]),
-            Some(("p", Some("m"), vec!["a=1", "b=--model"]))
+            Some((
+                "p".into(),
+                Some("m".into()),
+                vec!["a=1".into(), "b=--model".into()]
+            ))
         );
         assert_eq!(
             parse_args(&["--status", "p", "-c", "a=1"]),
-            Some(("p", None, vec!["a=1"]))
+            Some(("p".into(), None, vec!["a=1".into()]))
         );
     }
 
@@ -668,18 +719,22 @@ mod tests {
             &["--status", "p", "--model"],
             &["--status", "p", "-c"],
             &["--status", "p", "-c", "a=1", "-c"],
-            &["--status", "p", "-c", "a=1", "--model", "m"],
             &["--status", "p", "--bogus"],
             &["--status", "p", "--help"],
         ] {
             assert_eq!(parse_args(args), None, "{args:?}");
         }
+        assert_eq!(
+            parse_args(&["--status", "p", "-c", "a=1", "--model", "m"]),
+            Some(("p".into(), Some("m".into()), vec!["a=1".into()]))
+        );
     }
 
     #[test]
     fn help_succeeds_without_spawning_codex_and_names_the_config_flag() {
         // Butler probes this output for `-c KEY=VALUE` to detect support.
-        assert!(USAGE.contains("-c KEY=VALUE"));
+        let help = remuda_native::cli_parse::parse(&cli_spec(), &["_codex_tui", "--help"]);
+        assert!(help.text.contains("-c KEY=VALUE"));
         assert_eq!(
             format!("{:?}", run(&["--help"])),
             format!("{:?}", ExitCode::SUCCESS)

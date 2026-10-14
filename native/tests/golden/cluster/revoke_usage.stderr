@@ -1,3 +1,15 @@
-remuda: cluster revoke: expected a node or fingerprint
-usage: remuda cluster revoke NODE|FINGERPRINT [--yes]
-example: remuda cluster revoke <NODE>
+remuda: cluster revoke: missing required argument <TARGET>
+Usage: remuda cluster revoke TARGET [--yes]
+Next: remuda cluster revoke TARGET [--yes]
+Revoke a node or fingerprint; prompt before revoking unless --yes is used. Example: remuda cluster revoke <NODE>
+
+Usage: remuda cluster revoke TARGET [--yes]
+
+Arguments:
+  <TARGET>  Node name or fingerprint
+
+Options:
+  -h, --help  Print help
+      --yes   Confirm without prompting
+
+Next: remuda cluster revoke TARGET [--yes]
