@@ -30,7 +30,7 @@ impl Scratch {
         std::fs::read_dir(&self.0)
             .unwrap()
             .map(|e| e.unwrap().path())
-            .filter(|p| p.file_name().unwrap() != "public.lock")
+            .filter(|p| p.extension().is_none_or(|e| e != "lock"))
             .collect()
     }
 }
@@ -196,6 +196,12 @@ fn socket_fd(listener: &Listener) -> i32 {
 fn assert_private_window(boundary: Boundary) {
     let scratch = Scratch::new();
     let public = scratch.public();
+    assert_private_window_at(&scratch, public, boundary);
+}
+
+/// Private windows, final mode, renamed-route reply and CLOEXEC/blocking
+/// contracts for a public path inside `scratch`.
+fn assert_private_window_at(scratch: &Scratch, public: PathBuf, boundary: Boundary) {
     let mut harness = Harness::start(public.clone(), boundary, None);
     let staged = harness.reached();
     assert!(
@@ -211,7 +217,13 @@ fn assert_private_window(boundary: Boundary) {
         std::fs::symlink_metadata(&public).unwrap().mode() & 0o777,
         0o600
     );
-    assert_eq!(scratch.entries(), vec![public.clone()]);
+    assert_eq!(
+        scratch.entries().len(),
+        1,
+        "only the public leaf remains: {:?}",
+        scratch.entries()
+    );
+    assert!(public.exists());
     let deadline = harness.deadline;
     let server = std::thread::spawn(move || {
         let Listener::UdSocket(ref socket) = listener;
@@ -571,22 +583,43 @@ fn exact_budget_dir(scratch: &Scratch, glyph: &str, slack: usize) -> PathBuf {
 }
 
 #[test]
-fn staged_startup_binds_at_the_exact_byte_budget() {
+fn staged_startup_exact_byte_budget_replies_and_one_over_is_refused() {
     for glyph in ["d", "é"] {
         let scratch = Scratch::new();
+        // Nest the exact-budget directory so `scratch.entries()` sees only it.
         let dir = exact_budget_dir(&scratch, glyph, 0);
         let public = dir.join("p");
-        let opened = crate::staged_socket::startup::open(&public, &Controls::default())
-            .map_err(|e| e.error)
-            .unwrap();
-        assert!(ipc::connect(&public).is_ok(), "{glyph}");
-        drop(opened);
+        let inner = Scratch(dir.clone());
+        assert_private_window_at(&inner, public, Boundary::Listening);
+        std::mem::forget(inner); // the outer scratch removes the tree
         let scratch_over = Scratch::new();
         let over = exact_budget_dir(&scratch_over, glyph, 1);
         let refused = crate::staged_socket::startup::open(&over.join("p"), &Controls::default());
         assert!(refused.is_err(), "{glyph}");
         assert!(std::fs::read_dir(&over).unwrap().next().is_none());
     }
+}
+
+#[test]
+fn staged_startup_bound_checkpoint_failure_recovers_the_leaf() {
+    let scratch = Scratch::new();
+    let (reached, _seen) = mpsc::channel();
+    let (_release_tx, release) = mpsc::channel::<()>();
+    drop(_release_tx); // recv fails at once: a channel failure at the boundary
+    let controls = Controls {
+        pause: Some(Pause {
+            boundary: Boundary::Bound,
+            reached,
+            release,
+            deadline: Instant::now() + Duration::from_secs(5),
+        }),
+        ..Controls::default()
+    };
+    let error = crate::staged_socket::startup::open(&scratch.public(), &controls)
+        .err()
+        .unwrap();
+    assert!(error.residue.is_empty(), "{:?}", error.residue);
+    assert!(scratch.entries().is_empty());
 }
 
 #[test]

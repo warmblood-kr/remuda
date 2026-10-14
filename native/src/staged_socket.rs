@@ -507,7 +507,10 @@ fn open_staging_dir(parent: &File, name: &OsStr, receipt: NodeReceipt) -> io::Re
     let dir = match open() {
         Ok(dir) => dir,
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            chmod_receipted(parent, name, receipt, 0o700).map_err(|_| error)?;
+            chmod_receipted(parent, name, receipt, 0o700).map_err(|repair| {
+                // Keep the capability cause (e.g. Unsupported) next to the open error.
+                io::Error::new(repair.kind(), format!("{error}; mode repair: {repair}"))
+            })?;
             open()?
         }
         Err(error) => return Err(error),

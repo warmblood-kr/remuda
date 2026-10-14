@@ -154,27 +154,40 @@ fn run(public: &Path, controls: &Controls, residue: &mut Vec<String>) -> io::Res
     let stage = OsStr::new(&stage_name);
     mkdir_exclusive(&parent, stage)?;
     // From here the directory exists; every exit reports what remains of it.
-    let mut stage_receipt = None;
-    for _ in 0..2 {
-        if let Ok(receipt) = NodeReceipt::capture(&parent, stage) {
-            stage_receipt = Some(receipt);
-            break;
-        }
+    let stage_path = parent_path.join(&stage_name);
+    let mut captured = NodeReceipt::capture(&parent, stage);
+    if captured.is_err() {
+        captured = NodeReceipt::capture(&parent, stage);
     }
-    let Some(stage_receipt) = stage_receipt.filter(|r| r.kind == NodeKind::Directory) else {
-        residue.push(format!("{}: unreceipted staging directory", stage_name));
-        return Err(io::Error::other("staging directory receipt unavailable"));
+    let stage_receipt = match captured {
+        Ok(receipt) if receipt.kind == NodeKind::Directory => receipt,
+        other => {
+            residue.push(format!(
+                "{}: unreceipted staging directory",
+                stage_path.display()
+            ));
+            return Err(match other {
+                Err(error) => io::Error::new(
+                    error.kind(),
+                    format!("staging directory receipt unavailable: {error}"),
+                ),
+                Ok(_) => io::Error::other("staging path is not a directory"),
+            });
+        }
     };
     let drop_dir = |residue: &mut Vec<String>| {
         note(
             residue,
-            &format!("staging directory {stage_name}"),
+            &format!("staging directory {}", stage_path.display()),
             remove_dir_if_matches(&parent, stage, stage_receipt),
         );
     };
     if let Some(mode) = controls.directory_mode {
         // Test seam: start the directory in an unusable mode to force repair.
-        let _ = super::chmod_receipted(&parent, stage, stage_receipt, mode);
+        if let Err(error) = super::chmod_receipted(&parent, stage, stage_receipt, mode) {
+            drop_dir(residue);
+            return Err(error);
+        }
     }
     let stage_dir = match if controls.failure == Some(Failure::StageOpen) {
         Err(injected("staging open"))
@@ -207,10 +220,26 @@ fn run(public: &Path, controls: &Controls, residue: &mut Vec<String>) -> io::Res
     let leaf_name = OsStr::new("s");
     let unreceipted = |residue: &mut Vec<String>| {
         residue.push(format!("{}: unreceipted socket", staged_path.display()));
-        residue.push(format!("staging directory {stage_name}: not empty"));
+        residue.push(format!(
+            "staging directory {}: not empty",
+            stage_path.display()
+        ));
     };
     if let Err(error) = controls.checkpoint(Boundary::Bound, &staged_path) {
-        unreceipted(residue);
+        // Bounded receipt recovery: a capturable leaf is ours to remove.
+        let recovered =
+            (0..2).find_map(|_| NodeReceipt::capture_socket(&stage_dir, leaf_name).ok());
+        match recovered {
+            Some(receipt) => {
+                note(
+                    residue,
+                    &format!("staged socket {}", staged_path.display()),
+                    unlink_if_matches(&stage_dir, leaf_name, receipt).map(removed),
+                );
+                drop_dir(residue);
+            }
+            None => unreceipted(residue),
+        }
         return Err(error);
     }
     let mut attempts = 0;
@@ -242,7 +271,7 @@ fn run(public: &Path, controls: &Controls, residue: &mut Vec<String>) -> io::Res
             Err(error) => {
                 note(
                     residue,
-                    "staged socket",
+                    &format!("staged socket {}", staged_path.display()),
                     unlink_if_matches(&stage_dir, leaf_name, receipt).map(removed),
                 );
                 drop_dir(residue);
@@ -250,7 +279,11 @@ fn run(public: &Path, controls: &Controls, residue: &mut Vec<String>) -> io::Res
             }
         };
     let abort = |transaction: StagedTransaction, residue: &mut Vec<String>| {
-        note(residue, "staged socket", transaction.abort());
+        note(
+            residue,
+            &format!("staged socket {}", staged_path.display()),
+            transaction.abort(),
+        );
     };
     let prepared = chmod_socket_nofollow(&stage_dir, leaf_name, receipt, 0o600)
         .and_then(|()| set_nonblocking(&fd))
