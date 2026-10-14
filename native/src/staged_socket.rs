@@ -548,19 +548,6 @@ fn remove_dir_if_matches(parent: &File, name: &OsStr, receipt: NodeReceipt) -> i
     Ok(Residue::Removed)
 }
 
-/// Create and open a private staging directory, removing it on failure.
-fn create_staging_dir(parent: &File, name: &OsStr) -> io::Result<(File, NodeReceipt)> {
-    mkdir_exclusive(parent, name)?;
-    let receipt = NodeReceipt::capture(parent, name)?;
-    match open_staging_dir(parent, name, receipt) {
-        Ok(dir) => Ok((dir, receipt)),
-        Err(error) => {
-            let _ = remove_dir_if_matches(parent, name, receipt);
-            Err(error)
-        }
-    }
-}
-
 /// Nonblocking accept on the listener only. BSD/macOS accepted streams inherit
 /// O_NONBLOCK, so request streams must be normalized to blocking after accept.
 fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
@@ -995,7 +982,9 @@ mod tests {
     fn staging_directory_is_private_cloexec_and_exclusive() {
         let scratch = Scratch::new();
         let parent = scratch.parent();
-        let (dir, receipt) = create_staging_dir(&parent, OsStr::new("stage")).unwrap();
+        mkdir_exclusive(&parent, OsStr::new("stage")).unwrap();
+        let receipt = NodeReceipt::capture(&parent, OsStr::new("stage")).unwrap();
+        let dir = open_staging_dir(&parent, OsStr::new("stage"), receipt).unwrap();
         assert_eq!(receipt.kind, NodeKind::Directory);
         let flags = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_GETFD) };
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
@@ -1007,7 +996,7 @@ mod tests {
                 & 0o777,
             0o700
         );
-        assert!(create_staging_dir(&parent, OsStr::new("stage")).is_err());
+        assert!(mkdir_exclusive(&parent, OsStr::new("stage")).is_err());
     }
 
     #[test]
