@@ -35,6 +35,7 @@ pub(crate) enum Failure {
     AfterPublishUnlink,
     PostCommitRmdir,
     Import,
+    ImportCleanup,
 }
 
 pub(crate) struct Pause {

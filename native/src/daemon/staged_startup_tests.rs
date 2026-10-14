@@ -40,24 +40,93 @@ impl Drop for Scratch {
     }
 }
 
-type StartupResult = std::io::Result<(Listener, Arc<SocketOwnership>)>;
+/// A listener imported from the staged transaction, plus private residue.
+struct Imported {
+    listener: Listener,
+    owner: Arc<SocketOwnership>,
+    residue: Vec<String>,
+}
+
+/// Primary failure plus every entry left behind, kept through the importer.
+#[derive(Debug)]
+struct SeamError {
+    error: std::io::Error,
+    residue: Vec<String>,
+}
+impl From<std::io::Error> for SeamError {
+    fn from(error: std::io::Error) -> Self {
+        Self {
+            error,
+            residue: Vec::new(),
+        }
+    }
+}
+type StartupResult = Result<Imported, SeamError>;
+
+/// Explicit, fallible removal of the published socket after an import error;
+/// the legacy `SocketOwnership` destructor stays only as a fallback.
+fn abort_published(
+    path: &Path,
+    opened: (u64, u64),
+    inject_failure: bool,
+    residue: &mut Vec<String>,
+) {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if (m.dev(), m.ino()) == opened => {
+            let removed = if inject_failure {
+                Err(std::io::Error::other("injected published unlink failure"))
+            } else {
+                std::fs::remove_file(path)
+            };
+            if let Err(error) = removed {
+                residue.push(format!("published socket {}: {error}", path.display()));
+            }
+        }
+        Ok(_) => residue.push(format!(
+            "published socket {}: changed, preserved",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => residue.push(format!("published socket {}: {error}", path.display())),
+    }
+}
 
 /// Test-only seam: the staged transaction, imported the way slice 3 will wire
 /// it into startup. Production `serve_inner` still uses the legacy path.
 fn staged_startup_listener(path: &Path, controls: &Controls) -> StartupResult {
-    let opened = crate::staged_socket::startup::open(path, controls).map_err(|e| e.error)?;
-    // Install published authority first: a later import error cleans it up.
+    let opened = crate::staged_socket::startup::open(path, controls).map_err(|e| SeamError {
+        error: e.error,
+        residue: e.residue,
+    })?;
+    let mut residue = opened.residue;
+    // Install published authority first so a panic still cleans up.
     let owner = SocketOwnership {
         path: path.to_path_buf(),
         identity: Mutex::new((opened.dev, opened.ino)),
     };
     let listener = Listener::UdSocket(opened.listener.into());
-    if controls.failure == Some(Failure::Import) {
-        return Err(std::io::Error::other("injected import failure"));
+    let imported = if matches!(
+        controls.failure,
+        Some(Failure::Import | Failure::ImportCleanup)
+    ) {
+        Err(std::io::Error::other("injected import failure"))
+    } else {
+        listener.set_nonblocking(ListenerNonblockingMode::Accept)
+    };
+    if let Err(error) = imported {
+        drop(listener);
+        let inject = controls.failure == Some(Failure::ImportCleanup);
+        abort_published(path, (opened.dev, opened.ino), inject, &mut residue);
+        return Err(SeamError { error, residue });
     }
-    listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
-    Ok((listener, Arc::new(owner)))
+    Ok(Imported {
+        listener,
+        owner: Arc::new(owner),
+        residue,
+    })
 }
+
 struct Harness {
     deadline: Instant,
     reached: Receiver<PathBuf>,
@@ -83,6 +152,7 @@ impl Harness {
                 ..Controls::default()
             };
             let result = SocketLock::acquire(&path, None)
+                .map_err(SeamError::from)
                 .and_then(|_lock| staged_startup_listener(&path, &controls));
             let _ = completed.send(result);
         });
@@ -133,7 +203,9 @@ fn assert_private_window(boundary: Boundary) {
         "public endpoint accepts before publication"
     );
     assert_ne!(staged, public);
-    let (listener, owner) = harness.finish().unwrap();
+    let Imported {
+        listener, owner, ..
+    } = harness.finish().unwrap();
     assert!(owner.owns_path());
     assert_eq!(
         std::fs::symlink_metadata(&public).unwrap().mode() & 0o777,
@@ -248,7 +320,7 @@ fn staged_startup_capture_recovers_once() {
     );
     harness.reached();
     let resources = harness.finish().unwrap();
-    assert!(resources.1.owns_path());
+    assert!(resources.owner.owns_path());
     drop(resources);
     assert!(scratch.entries().is_empty());
 }
@@ -515,4 +587,51 @@ fn staged_startup_binds_at_the_exact_byte_budget() {
         assert!(refused.is_err(), "{glyph}");
         assert!(std::fs::read_dir(&over).unwrap().next().is_none());
     }
+}
+
+#[test]
+fn staged_startup_seam_keeps_failure_residue() {
+    let scratch = Scratch::new();
+    let controls = Controls {
+        failure: Some(Failure::AfterPublishUnlink),
+        ..Controls::default()
+    };
+    let error = staged_startup_listener(&scratch.public(), &controls)
+        .err()
+        .unwrap();
+    assert!(error.residue.iter().any(|r| r.contains("published")));
+}
+
+#[test]
+fn staged_startup_seam_keeps_post_commit_residue_with_listener() {
+    let scratch = Scratch::new();
+    let controls = Controls {
+        failure: Some(Failure::PostCommitRmdir),
+        ..Controls::default()
+    };
+    let imported = staged_startup_listener(&scratch.public(), &controls)
+        .ok()
+        .unwrap();
+    assert!(imported
+        .residue
+        .iter()
+        .any(|r| r.contains("staging directory")));
+    assert!(imported.owner.owns_path());
+}
+
+#[test]
+fn staged_startup_import_cleanup_failure_is_reported_not_swallowed() {
+    let scratch = Scratch::new();
+    let controls = Controls {
+        failure: Some(Failure::ImportCleanup),
+        ..Controls::default()
+    };
+    let error = staged_startup_listener(&scratch.public(), &controls)
+        .err()
+        .unwrap();
+    assert!(error.error.to_string().contains("import"));
+    assert!(error
+        .residue
+        .iter()
+        .any(|r| r.contains(scratch.public().to_str().unwrap()) && r.contains("unlink")));
 }
