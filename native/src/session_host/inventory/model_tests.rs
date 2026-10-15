@@ -71,6 +71,22 @@ pub(super) fn completion() -> Completion {
         reply: Reply::Unit,
     }
 }
+#[test]
+fn corrupt_event_identity_cannot_hide_oversized_tail_behind_progress_credit() {
+    let (mut index, fence) = initial();
+    registered(&mut index, fence);
+    index
+        .events
+        .back_mut()
+        .unwrap()
+        .identity
+        .as_mut()
+        .unwrap()
+        .instance = "x".repeat(4096);
+    let bytes = index.encode().unwrap();
+    assert!(bytes.len() < MAX_BYTES);
+    assert!(matches!(Index::decode(&bytes), Err(Error::Corrupt)));
+}
 fn complete(sequence: u64, client: u8) -> Mutation {
     Mutation::Input {
         target: target(),

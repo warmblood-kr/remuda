@@ -30,6 +30,8 @@ unacknowledged result. The budget also normalizes the bounded event/tombstone
 tails to their worst-case byte size, counters to twenty decimal digits, and
 mutable phases/nonces to maximum serialized width. Already-present bytes spend
 their own credit, so progress never requires unrelated free capacity.
+Every event/tombstone is checked below its 2,048-byte slot before tail credit
+uses checked subtraction; malformed identities cannot hide an oversized tail.
 Completion exchanges pending credit for ACK credit (4 KiB reply plus wrapper
 fits the 6 KiB difference). Consumer ACK releases 10 KiB for at most 8 KiB raw
 checkpoint plus bounded wrapper. The projected budget and every replacement
@@ -75,7 +77,7 @@ Unix filesystem attacks fail closed. Windows tests must execute natively in CI.
 
 ## Actual
 
-macOS: 23 inventory tests passed; one internal subprocess helper is intentionally
+macOS: 24 inventory tests passed; one internal subprocess helper is intentionally
 ignored except when invoked by its parent fixtures. Tests kill only owned private
 fixture processes: a fresh process recovers the exact original reservation after
 writer death before caller ACK, and a dead lock holder releases the kernel lock.
@@ -96,7 +98,7 @@ restarted or migrated.
 
 ```text
 cargo test -p remuda-native session_host::inventory --lib --offline
-23 passed; 0 failed; 1 ignored
+24 passed; 0 failed; 1 ignored
 cargo clippy --workspace --all-targets --offline -- -D warnings
 Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.95s
 cargo fmt --all -- --check

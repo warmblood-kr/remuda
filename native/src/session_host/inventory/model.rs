@@ -414,8 +414,12 @@ impl Index {
         let tombstones = serde_json::to_vec(&self.tombstones)
             .map_err(|_| Error::Corrupt)?
             .len();
-        let mut bytes = (MAX_EVENTS * EVENT_BYTES + 2).saturating_sub(events)
-            + (MAX_TOMBSTONES * EVENT_BYTES + 2).saturating_sub(tombstones)
+        let mut bytes = (MAX_EVENTS * EVENT_BYTES + 2)
+            .checked_sub(events)
+            .ok_or(Error::Corrupt)?
+            + (MAX_TOMBSTONES * EVENT_BYTES + 2)
+                .checked_sub(tombstones)
+                .ok_or(Error::Corrupt)?
             + digits(self.revision)
             + digits(self.epoch);
         bytes += 65
@@ -682,12 +686,24 @@ impl Index {
         for (offset, event) in self.events.iter().enumerate() {
             if event.revision != first + offset as u64 + 1
                 || event.name.as_ref().is_some_and(|name| !valid_name(name))
+                || event
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| !valid_identity(identity))
+                || serde_json::to_vec(event).map_err(|_| Error::Corrupt)?.len() >= EVENT_BYTES
             {
                 return Err(Error::Corrupt);
             }
         }
         for tombstone in &self.tombstones {
             if !valid_name(&tombstone.name) || !self.allocations.contains(&tombstone.identity) {
+                return Err(Error::Corrupt);
+            }
+            if serde_json::to_vec(tombstone)
+                .map_err(|_| Error::Corrupt)?
+                .len()
+                >= EVENT_BYTES
+            {
                 return Err(Error::Corrupt);
             }
         }
