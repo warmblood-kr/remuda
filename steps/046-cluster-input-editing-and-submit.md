@@ -46,14 +46,21 @@ With the line path restored, captured daemon-free checks include:
 
 ```text
 test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
-test result: ok. 148 passed; 0 failed; 0 ignored; 0 measured; 1036 filtered out; finished in 3.14s
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1182 filtered out; finished in 0.00s
+test result: ok. 148 passed; 0 failed; 0 ignored; 0 measured; 1045 filtered out; finished in 3.14s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.08s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1192 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.08s
 ```
 
 Regression tests also cover CRLF/tab paste display and delivery, plus an old
 receiver's exact `invalid remote request` refusal for `InputLine` and
 `ResizeSession`. The refusal produces a clear unsupported result without
 retries, raw-input fallback, or a partial-delivery warning.
+
+Direct `InputLine` writer regressions prove that pre-body Busy can retry the
+same key, while Return Busy after the body, a timed-out body with a chained
+Return, and a late abandoned Return all become deduplicated uncertain results;
+retries do not send the body or Return again.
 
 These are core input tests, pure/mock cluster tests (including composer, sender
 and queue), and resize protocol/control tests. The full core suite, keymap

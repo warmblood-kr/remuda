@@ -1241,6 +1241,13 @@ impl Session {
                 .and_then(|outcome| match outcome {
                     InputSubmitOutcome::Late => Err(AgentError::SubmitPending),
                     _ => Ok(()),
+                })
+                .map_err(|error| match error {
+                    // The text is already delivered. Even if the Return was
+                    // refused before writing, releasing this reservation would
+                    // let a retry replay the text body.
+                    AgentError::LateSubmitAbandoned { .. } => AgentError::SubmitUncertain,
+                    error => error,
                 }),
             None => self.write_one_burst(batch.bytes),
         };

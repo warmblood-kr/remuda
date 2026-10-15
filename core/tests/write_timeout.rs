@@ -1087,6 +1087,263 @@ fn type_text_preserves_write_timeout_when_return_chaining_is_unsupported() {
     assert_eq!(*writer.writes.lock().unwrap(), [b"text".to_vec()]);
 }
 
+#[derive(Clone, Copy)]
+enum InputLineScenario {
+    BusyBeforeBody,
+    ReturnBusy,
+    BodyTimeoutChained,
+    ReturnAbandoned,
+}
+
+struct InputLineWriter {
+    scenario: InputLineScenario,
+    body: Mutex<String>,
+    writes: Mutex<Vec<Vec<u8>>>,
+    chained: Mutex<Vec<Vec<u8>>>,
+    timed_out: AtomicBool,
+}
+
+impl AgentWriter for InputLineWriter {
+    fn write_bounded(&self, bytes: &[u8]) -> Result<()> {
+        self.writes.lock().unwrap().push(bytes.to_vec());
+        match bytes {
+            b"alpha\r" => Ok(()),
+            b"alpha" => {
+                *self.body.lock().unwrap() = "alpha".to_owned();
+                if matches!(self.scenario, InputLineScenario::BodyTimeoutChained) {
+                    Err(AgentError::WriteTimeout {
+                        timeout: Duration::from_millis(10),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            b"\r" => match self.scenario {
+                InputLineScenario::ReturnBusy => Err(AgentError::Busy),
+                InputLineScenario::ReturnAbandoned => Err(AgentError::LateSubmitAbandoned {
+                    bound: Duration::from_secs(1),
+                }),
+                _ => Ok(()),
+            },
+            _ => Err(AgentError::Io("unexpected InputLine bytes".into())),
+        }
+    }
+
+    fn chain_after_stalled(&self, follow_up: &[u8], _settle: Duration) -> ChainOutcome {
+        self.chained.lock().unwrap().push(follow_up.to_vec());
+        ChainOutcome::Chained
+    }
+
+    fn is_busy(&self) -> bool {
+        false
+    }
+
+    fn is_timed_out(&self) -> bool {
+        self.timed_out.load(Ordering::Acquire)
+    }
+}
+
+struct InputLineAgent {
+    writer: Arc<InputLineWriter>,
+    versioned: bool,
+}
+
+impl AgentProcess for InputLineAgent {
+    fn write(&mut self, _bytes: &[u8]) -> Result<()> {
+        Err(AgentError::Io("unexpected direct write".into()))
+    }
+
+    fn input_writer(&mut self) -> Option<Arc<dyn AgentWriter>> {
+        Some(Arc::clone(&self.writer) as Arc<dyn AgentWriter>)
+    }
+
+    fn screen_text(&mut self) -> Result<String> {
+        Ok(self.writer.body.lock().unwrap().clone())
+    }
+
+    fn output_version(&mut self) -> Option<u64> {
+        self.versioned
+            .then(|| u64::from(!self.writer.body.lock().unwrap().is_empty()))
+    }
+
+    fn cursor(&mut self) -> Result<Cursor> {
+        Ok(Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        })
+    }
+
+    fn is_alive(&mut self) -> bool {
+        true
+    }
+
+    fn terminate(&mut self) -> Result<()> {
+        Err(AgentError::Io("not used".into()))
+    }
+
+    fn size(&self) -> Size {
+        Size::default()
+    }
+}
+
+fn input_line_batch<'a>(session: &'a Session) -> InputBatch<'a> {
+    InputBatch {
+        instance_id: session.instance_id(),
+        client_id: [82; 16],
+        seq: 1,
+        bytes: b"alpha\r",
+    }
+}
+
+fn apply_input_line_with_clock_driver(
+    session: &Session,
+    batch: InputBatch<'_>,
+    clock: &Arc<ManualClock>,
+) -> std::result::Result<InputOutcome, InputError> {
+    let done = Arc::new(AtomicBool::new(false));
+    let drive_done = Arc::clone(&done);
+    let drive_clock = Arc::clone(clock);
+    let driver = thread::spawn(move || {
+        while !drive_done.load(Ordering::Acquire) {
+            drive_clock.advance(Duration::from_millis(10));
+            thread::yield_now();
+        }
+    });
+    let result = session.apply_input_line_batch(batch);
+    done.store(true, Ordering::Release);
+    driver.join().unwrap();
+    result
+}
+
+#[test]
+fn input_line_busy_before_body_allows_same_key_retry_without_prior_effect() {
+    let writer = Arc::new(InputLineWriter {
+        scenario: InputLineScenario::BusyBeforeBody,
+        body: Mutex::new(String::new()),
+        writes: Mutex::new(Vec::new()),
+        chained: Mutex::new(Vec::new()),
+        timed_out: AtomicBool::new(true),
+    });
+    let session = Session::new(
+        "input-line-pre-body-busy",
+        Box::new(InputLineAgent {
+            writer: Arc::clone(&writer),
+            versioned: false,
+        }),
+        Arc::new(ManualClock::new()),
+    );
+    let batch = input_line_batch(&session);
+
+    assert_eq!(session.apply_input_line_batch(batch), Err(InputError::Busy));
+    assert!(writer.writes.lock().unwrap().is_empty());
+    writer.timed_out.store(false, Ordering::Release);
+    assert_eq!(
+        session.apply_input_line_batch(batch),
+        Ok(InputOutcome::Ack { duplicate: false })
+    );
+    assert_eq!(*writer.writes.lock().unwrap(), [b"alpha\r".to_vec()]);
+}
+
+#[test]
+fn input_line_return_busy_after_body_is_uncertain_and_same_key_does_not_replay() {
+    let writer = Arc::new(InputLineWriter {
+        scenario: InputLineScenario::ReturnBusy,
+        body: Mutex::new(String::new()),
+        writes: Mutex::new(Vec::new()),
+        chained: Mutex::new(Vec::new()),
+        timed_out: AtomicBool::new(false),
+    });
+    let clock = Arc::new(ManualClock::new());
+    let session = Session::new(
+        "input-line-return-busy",
+        Box::new(InputLineAgent {
+            writer: Arc::clone(&writer),
+            versioned: true,
+        }),
+        clock.clone() as Arc<dyn Clock>,
+    );
+    let batch = input_line_batch(&session);
+
+    assert_eq!(
+        apply_input_line_with_clock_driver(&session, batch, &clock),
+        Ok(InputOutcome::Uncertain)
+    );
+    let writes = writer.writes.lock().unwrap().clone();
+    assert_eq!(writes, [b"alpha".to_vec(), b"\r".to_vec()]);
+    assert_eq!(
+        session.apply_input_line_batch(batch),
+        Ok(InputOutcome::Uncertain)
+    );
+    assert_eq!(*writer.writes.lock().unwrap(), writes);
+}
+
+#[test]
+fn input_line_timeout_with_chained_return_is_uncertain_and_never_replays() {
+    let writer = Arc::new(InputLineWriter {
+        scenario: InputLineScenario::BodyTimeoutChained,
+        body: Mutex::new(String::new()),
+        writes: Mutex::new(Vec::new()),
+        chained: Mutex::new(Vec::new()),
+        timed_out: AtomicBool::new(false),
+    });
+    let session = Session::new(
+        "input-line-timeout-chained",
+        Box::new(InputLineAgent {
+            writer: Arc::clone(&writer),
+            versioned: true,
+        }),
+        Arc::new(ManualClock::new()),
+    );
+    let batch = input_line_batch(&session);
+
+    assert_eq!(
+        session.apply_input_line_batch(batch),
+        Ok(InputOutcome::Uncertain)
+    );
+    assert_eq!(*writer.writes.lock().unwrap(), [b"alpha".to_vec()]);
+    assert_eq!(*writer.chained.lock().unwrap(), [b"\r".to_vec()]);
+    assert_eq!(
+        session.apply_input_line_batch(batch),
+        Ok(InputOutcome::Uncertain)
+    );
+    assert_eq!(*writer.writes.lock().unwrap(), [b"alpha".to_vec()]);
+    assert_eq!(*writer.chained.lock().unwrap(), [b"\r".to_vec()]);
+}
+
+#[test]
+fn input_line_late_abandoned_return_keeps_an_uncertain_dedup_reservation() {
+    let writer = Arc::new(InputLineWriter {
+        scenario: InputLineScenario::ReturnAbandoned,
+        body: Mutex::new(String::new()),
+        writes: Mutex::new(Vec::new()),
+        chained: Mutex::new(Vec::new()),
+        timed_out: AtomicBool::new(false),
+    });
+    let clock = Arc::new(ManualClock::new());
+    let session = Session::new(
+        "input-line-return-abandoned",
+        Box::new(InputLineAgent {
+            writer: Arc::clone(&writer),
+            versioned: true,
+        }),
+        clock.clone() as Arc<dyn Clock>,
+    );
+    let batch = input_line_batch(&session);
+
+    assert_eq!(
+        apply_input_line_with_clock_driver(&session, batch, &clock),
+        Ok(InputOutcome::Uncertain)
+    );
+    let writes = writer.writes.lock().unwrap().clone();
+    assert_eq!(writes, [b"alpha".to_vec(), b"\r".to_vec()]);
+    assert_eq!(
+        session.apply_input_line_batch(batch),
+        Ok(InputOutcome::Uncertain)
+    );
+    assert_eq!(*writer.writes.lock().unwrap(), writes);
+}
+
 struct UnsupportedChainWriter {
     writes: Mutex<Vec<Vec<u8>>>,
     timeout: Duration,
