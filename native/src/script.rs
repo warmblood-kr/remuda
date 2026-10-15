@@ -30,7 +30,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 104] = [
+pub const BINDINGS: [&str; 107] = [
     "_advice_reattach",
     "_call",
     "_caller_live",
@@ -40,9 +40,12 @@ pub const BINDINGS: [&str; 104] = [
     "_exec_commands",
     "_extension_commands",
     "_function_source",
+    "_input_instance_bound_version",
+    "_input_key_if_instance",
     "_input_submit",
     "_input_text",
     "_input_type_text",
+    "_input_type_text_if_instance",
     "_load_extension_command",
     "_module_readiness",
     "_module_resume_supported",
@@ -995,6 +998,15 @@ fn input_bindings(
         )?,
     )?;
 
+    expected_instance_input_bindings(lua, table, input_registry)?;
+    Ok(())
+}
+
+fn expected_instance_input_bindings(
+    lua: &Lua,
+    table: &Table,
+    input_registry: std::sync::Arc<remuda_core::Registry>,
+) -> mlua::Result<()> {
     // Owner-input providers pass the identity captured with their approval.
     // Resolve the name exactly once, then validate and operate through that
     // captured Arc so a same-name replacement cannot receive the act.
