@@ -1,4 +1,4 @@
-# 048 — bound typed terminal views and latest-state resync
+# 049 — bound typed terminal views and latest-state resync
 
 ## Before
 

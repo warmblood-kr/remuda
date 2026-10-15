@@ -1,4 +1,4 @@
-# 046 — reserve identity and publish from the stable host
+# 047 — reserve identity and publish from the stable host
 
 ## Before
 
