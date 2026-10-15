@@ -1737,7 +1737,7 @@ impl PtyAgent {
     }
 }
 
-fn signal_number(description: &str) -> Option<i32> {
+pub(crate) fn signal_number(description: &str) -> Option<i32> {
     if let Some(number) = description
         .rsplit_once(':')
         .and_then(|(_, number)| number.trim().parse().ok())

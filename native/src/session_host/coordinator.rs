@@ -19,6 +19,8 @@ struct Running {
     token: ActId,
     client: [u8; 16],
     sequence: u64,
+    act: InputAct,
+    started: bool,
 }
 pub(crate) struct Coordinator {
     controller: Controller,
@@ -59,8 +61,21 @@ impl Coordinator {
             token,
             client,
             sequence,
+            act: act.clone(),
+            started: false,
         });
         Ok(Admission::Started(token))
+    }
+    /// Claim the exact admitted payload once before any effect. A delayed or
+    /// duplicate worker cannot replay an old act or substitute another payload.
+    pub fn claim(&mut self, token: ActId) -> Result<InputAct, Error> {
+        let running = self
+            .running
+            .as_mut()
+            .filter(|running| running.token == token && !running.started)
+            .ok_or(Error::StaleCompletion)?;
+        running.started = true;
+        Ok(running.act.clone())
     }
     /// Finish only after late workers/follow-ups settle, even if an RPC has
     /// already returned a timeout or Late. Retain the rich result before grant.
@@ -68,7 +83,7 @@ impl Coordinator {
         let running = self
             .running
             .as_ref()
-            .filter(|running| running.token == token)
+            .filter(|running| running.token == token && running.started)
             .ok_or(Error::StaleCompletion)?;
         if !self
             .ledger
@@ -128,6 +143,8 @@ mod tests {
             delivery: Delivery::Written,
             reply: Reply::Submission(Submission::Unverified),
         };
+        host.claim(token).unwrap();
+        assert!(host.claim(token).is_err());
         host.complete(token, result.clone()).unwrap();
         let replacement = host.acquire(ConnectionId(2)).unwrap();
         assert_eq!(host.recover([1; 16], 1, &act).unwrap().1, Some(&result));
@@ -146,6 +163,7 @@ mod tests {
             host.acquire(ConnectionId(3)),
             Err(Error::Control(Refusal::Busy))
         );
+        host.claim(next).unwrap();
         host.complete(next, result).unwrap();
         assert!(host.acquire(ConnectionId(3)).is_ok());
     }
@@ -159,6 +177,8 @@ mod tests {
             delivery: Delivery::Written,
             reply: Reply::Cleared(Some("draft".into())),
         };
+        host.claim(token).unwrap();
+        assert!(host.claim(token).is_err());
         host.complete(token, result.clone()).unwrap();
         assert_eq!(host.recover([4; 16], 1, &act).unwrap().1, Some(&result));
         let altered = InputAct::Bytes(vec![21]);

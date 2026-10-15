@@ -42,7 +42,7 @@ pub(crate) struct Completion {
 impl Completion {
     /// An oversized result after an effect is NOT a safe rejection/replay.
     pub fn bounded(self) -> Self {
-        if serde_json::to_vec(&self).is_ok_and(|bytes| bytes.len() <= MAX_REPLY) {
+        if serde_json::to_writer(Budget(0), &self).is_ok() {
             self
         } else {
             Self {
@@ -50,6 +50,20 @@ impl Completion {
                 reply: Reply::Error(ErrorCode::ResultTooLarge),
             }
         }
+    }
+}
+// Count serialization without allocating an oversized temporary result buffer.
+struct Budget(usize);
+impl std::io::Write for Budget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_REPLY.saturating_sub(self.0) {
+            return Err(std::io::Error::other("host result byte budget exceeded"));
+        }
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 #[cfg(test)]

@@ -1,10 +1,10 @@
 //! Isolated Unix host backend. Windows backend is a separate required gate.
 use super::terminal::Terminal;
 use crate::pty::{PtyInputWriter, SharedWriter, PTY_WRITE_TIMEOUT};
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use remuda_core::agent::{
-    AgentError, AgentProcess, AgentWriter, Cursor, ExitInfo, OutputSignal, OutputWakeup, Result,
-    Size, StyledCell, VersionedSnapshot,
+    AgentError, AgentProcess, AgentWriter, Cursor, ExitInfo, MouseEncoding, MouseMode, MouseState,
+    OutputSignal, OutputWakeup, Result, Size, StyledCell, VersionedSnapshot,
 };
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,16 +15,49 @@ use std::time::Duration;
 pub(crate) struct HostChild {
     terminal: Arc<Mutex<Terminal>>,
     writer: Arc<PtyInputWriter>,
-    child: Box<dyn Child + Send + Sync>,
+    reaper: super::reaper::Reaper,
     master: Box<dyn MasterPty + Send>,
     size: Size,
     version: Arc<AtomicU64>,
     wakes: Arc<Mutex<Vec<OutputSignal>>>,
     eof: Arc<AtomicBool>,
     fault: Arc<AtomicBool>,
-    exit: Option<ExitInfo>,
+}
+#[derive(Clone)]
+pub(crate) struct View {
+    terminal: Arc<Mutex<Terminal>>,
+    eof: Arc<AtomicBool>,
+    fault: Arc<AtomicBool>,
+}
+impl View {
+    pub fn capture(&self) -> Result<(u64, Vec<u8>, (u16, u16))> {
+        let terminal = self.terminal.lock().map_err(io)?;
+        Ok((
+            terminal.generation(),
+            terminal.screen().state_formatted(),
+            terminal.screen().size(),
+        ))
+    }
+    pub fn health(&self) -> Result<((u64, u64), bool, bool)> {
+        Ok((
+            self.terminal.lock().map_err(io)?.health(),
+            self.eof.load(Ordering::Acquire),
+            self.fault.load(Ordering::Acquire),
+        ))
+    }
 }
 impl HostChild {
+    pub fn view(&self) -> View {
+        View {
+            terminal: self.terminal.clone(),
+            eof: self.eof.clone(),
+            fault: self.fault.clone(),
+        }
+    }
+    pub fn writer(&self) -> Arc<dyn AgentWriter> {
+        self.writer.clone()
+    }
+
     pub fn spawn(command: CommandBuilder, size: Size) -> Result<Self> {
         let terminal = Arc::new(Mutex::new(
             Terminal::new(size.rows(), size.cols(), 1000).map_err(io)?,
@@ -63,6 +96,7 @@ impl HostChild {
         let mut reader = pair.master.try_clone_reader().map_err(io)?;
         let child = pair.slave.spawn_command(command).map_err(io)?;
         drop(pair.slave);
+        let reaper = super::reaper::Reaper::start(child, fault.clone());
         let context = Reader {
             terminal: Arc::clone(&terminal),
             version: Arc::clone(&version),
@@ -112,14 +146,13 @@ impl HostChild {
         Ok(Self {
             terminal,
             writer: input,
-            child,
+            reaper,
             master: pair.master,
             size,
             version,
             wakes,
             eof,
             fault,
-            exit: None,
         })
     }
     pub fn output_eof(&self) -> bool {
@@ -169,6 +202,30 @@ impl AgentProcess for HostChild {
     fn screen_snapshot_at(&mut self, scrollback: usize) -> Result<VersionedSnapshot> {
         Ok(self.terminal.lock().map_err(io)?.snapshot(scrollback))
     }
+    fn mouse_tracking(&mut self) -> bool {
+        self.mouse_state().mode != MouseMode::None
+    }
+    fn mouse_state(&mut self) -> MouseState {
+        let Ok(terminal) = self.terminal.lock() else {
+            return MouseState::default();
+        };
+        let screen = terminal.screen();
+        MouseState {
+            mode: match screen.mouse_protocol_mode() {
+                vt100::MouseProtocolMode::None => MouseMode::None,
+                vt100::MouseProtocolMode::Press => MouseMode::Press,
+                vt100::MouseProtocolMode::PressRelease => MouseMode::PressRelease,
+                vt100::MouseProtocolMode::ButtonMotion => MouseMode::ButtonMotion,
+                vt100::MouseProtocolMode::AnyMotion => MouseMode::AnyMotion,
+            },
+            encoding: match screen.mouse_protocol_encoding() {
+                vt100::MouseProtocolEncoding::Default => MouseEncoding::Default,
+                vt100::MouseProtocolEncoding::Utf8 => MouseEncoding::Utf8,
+                vt100::MouseProtocolEncoding::Sgr => MouseEncoding::Sgr,
+            },
+            bracketed_paste: screen.bracketed_paste(),
+        }
+    }
     fn cursor(&mut self) -> Result<Cursor> {
         let terminal = self.terminal.lock().map_err(io)?;
         let screen = terminal.screen();
@@ -183,10 +240,11 @@ impl AgentProcess for HostChild {
         Some(self.version.load(Ordering::Acquire))
     }
     fn process_id(&self) -> Option<u32> {
-        self.child.process_id()
+        self.reaper.pid
     }
     fn subscribe_output_wakeup(&mut self) -> Option<OutputWakeup> {
         let mut wakes = self.wakes.lock().ok()?;
+        wakes.retain(OutputSignal::is_connected);
         if wakes.len() >= 16 {
             return None;
         }
@@ -197,33 +255,13 @@ impl AgentProcess for HostChild {
         Some(wake)
     }
     fn is_alive(&mut self) -> bool {
-        if self.exit.is_some() {
-            return false;
-        }
-        match self.child.try_wait() {
-            Ok(None) => true,
-            Ok(Some(status)) => {
-                self.exit = Some(ExitInfo {
-                    exit_code: Some(status.exit_code()),
-                    ..ExitInfo::default()
-                });
-                false
-            }
-            Err(_) => {
-                self.fault.store(true, Ordering::Release);
-                true
-            } // unknown is not exit zero
-        }
+        self.reaper.alive()
     }
     fn exit_info(&mut self) -> Option<ExitInfo> {
-        self.exit.clone()
+        self.reaper.info()
     }
     fn terminate(&mut self) -> Result<()> {
-        if self.is_alive() {
-            self.child.kill().map_err(io)?;
-        }
-        // Reaping is polled separately; never join a descendant-held PTY here.
-        Ok(())
+        self.reaper.terminate()
     }
     fn resize(&mut self, size: Size) -> Result<()> {
         // Validate before mutating either PTY or parser.
@@ -282,6 +320,24 @@ mod tests {
         wait_for(&mut child.0, "computed:51");
         assert_eq!(child.0.process_id(), pid);
         assert_eq!(child.0.health(), ((0, 0), false));
+    }
+    #[test]
+    fn quiet_subscriber_drop_does_not_exhaust_registration() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.env_clear();
+        command.env("PATH", "/usr/bin:/bin");
+        command.args(["-c", "printf 'quiet-ready\\n'; read ignored"]);
+        let mut child = Cleanup(HostChild::spawn(command, Size::new(80, 24)).unwrap());
+        wait_for(&mut child.0, "quiet-ready");
+        for _ in 0..100 {
+            drop(
+                child
+                    .0
+                    .subscribe_output_wakeup()
+                    .expect("slot reclaimed without further output"),
+            );
+        }
+        assert!(child.0.wakes.lock().unwrap().len() <= 1);
     }
     #[test]
     fn wait_status_and_final_output_are_separate_and_nonzero_is_retained() {
