@@ -5633,7 +5633,11 @@ fn checked_cli_flags(args: &[String]) -> Result<CheckedCliFlags, ExitCode> {
     let mut words = vec!["__dispatch".to_owned()];
     words.extend(args.iter().cloned());
     let argv = words.iter().map(String::as_str).collect::<Vec<_>>();
-    let report = remuda_native::cli_parse::parse_passthrough(&dispatch_cli_spec(), &argv);
+    let report = remuda_native::cli_parse::parse_passthrough_with_opaque_values(
+        &dispatch_cli_spec(),
+        &argv,
+        &["eval"],
+    );
     if !report.ok {
         if report.kind.as_deref() == Some("help") {
             println!("{}", report.text);
@@ -7392,6 +7396,20 @@ mod declared_cli_tests {
         );
         assert!(checked_cli_flags(&["--version".into(), "run".into()]).is_err());
         assert!(checked_cli_flags(&["-e".into(), "return 1".into(), "--version".into()]).is_err());
+    }
+
+    #[test]
+    fn eval_code_is_an_opaque_value_even_when_it_starts_with_lua_comment_flags() {
+        let code = "-- comment resembling a flag\nreturn 1";
+        for option in ["-e", "--eval"] {
+            let parsed = checked_cli_flags(&[option.into(), code.into()]).unwrap();
+            assert_eq!(parsed.eval_code.as_deref(), Some(code));
+            assert!(parsed.args.is_empty());
+            assert!(!parsed.help_requested);
+        }
+        let parsed = checked_cli_flags(&["-e".into(), "--help".into()]).unwrap();
+        assert_eq!(parsed.eval_code.as_deref(), Some("--help"));
+        assert!(checked_cli_flags(&["-s".into(), "--eval".into(), "return 1".into()]).is_err());
     }
 
     #[test]

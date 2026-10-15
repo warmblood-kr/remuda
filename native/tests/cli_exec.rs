@@ -817,3 +817,30 @@ fn loaded_mod_without_its_command_fails_cleanly_and_lifecycle_start_runs_once() 
         );
     }
 }
+
+#[test]
+fn eval_accepts_lua_source_starting_with_a_comment() {
+    let (dir, _daemon_guard) = guarded_temp_dir("eval-comment");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_remuda"))
+            .args(["-s", "s"])
+            .args(args)
+            .env("REMUDA_RUNTIME_DIR", &dir)
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env("XDG_CONFIG_HOME", dir.join("config"))
+            .env("HOME", &dir)
+            .env("REMUDA_NO_UPDATE_CHECK", "1")
+            .output()
+            .expect("run isolated eval")
+    };
+    for option in ["-e", "--eval"] {
+        let output = run(&[option, "-- a valid Lua comment\nreturn 'opaque-code'"]);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "opaque-code"
+        );
+    }
+    run(&["stop", "-f", "--yes"]);
+    let _ = fs::remove_dir_all(&dir);
+}
