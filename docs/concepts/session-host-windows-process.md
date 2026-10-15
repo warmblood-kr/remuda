@@ -47,6 +47,14 @@ Fault injection covers pending/failed waits, query failure and terminate races;
 native invalid-handle tests exercise real OS error returns. Cross compilation
 and Unix passes cannot establish these native lifecycle assertions.
 
+The first native run passed the three wait/error unit tests but both process
+fixtures timed out. The synthetic harness now asynchronously answers initial
+cursor inheritance queries through a four-item reply queue, with a 512-byte
+diagnostic tail on failure. It is not the host terminal parser. Upstream enables
+PSEUDOCONSOLE_INHERIT_CURSOR; [Microsoft documents the async reply requirement](https://learn.microsoft.com/en-us/windows/console/createpseudoconsole).
+The native rerun must establish whether that explains the timeout; no support
+claim follows from source inspection or a hypothesized cause.
+
 Remaining Windows gates include actual stable host+authenticated named pipes,
 controller SIGKILL vs host death before/during/after spawn, enclosing Job failure,
 all creation/thread/fd/handle cleanup injection, CtrlC, ClosePseudoConsole during

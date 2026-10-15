@@ -47,3 +47,22 @@ Native Windows reproduction uses cargo test -p remuda-native --lib
 session_host::windows_process and cargo test -p remuda-native --test
 session_host_windows. Synthetic test processes use private scratch paths and
 finite lifetimes; they never contact a production daemon or real agent.
+
+The first genuine Windows run passed all three wait/error unit tests but both
+new process fixtures timed out awaiting their first marker. The synthetic drain
+discarded every byte and never answered any cursor query; the upstream constructor
+enables PSEUDOCONSOLE_INHERIT_CURSOR, a documented possible hang without replies.
+This is a hypothesis for the timeout, not yet proved by the native rerun. The harness now
+answers that initial request through a bounded independent writer and retains a
+512-byte diagnostic tail plus retained-process wait state on failure. The valid
+non-Job refusal fixture now uses a fresh ConPTY to avoid a previous-child state
+confound. Native rerun is pending; this is not recorded as a positive result yet.
+
+```text
+native_invalid_handles_surface_wait_query_and_termination_errors ... ok
+only_a_signaled_wait_allows_exit_query_and_exit259_is_final ... ok
+failed_termination_requires_observed_natural_exit_not_synthetic_success ... ok
+checked_direct_termination_observes_real_exit_and_invalid_job_never_runs_child ... FAILED
+creation_contains_immediate_descendant_and_retains_unicode_exit259_and_drained_output ... FAILED
+synthetic fixture timed out
+```

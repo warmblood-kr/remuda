@@ -2,13 +2,14 @@
 #![cfg(windows)]
 use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
 use remuda_native::session_host::windows_process::Process;
-use std::io::Read;
+use std::collections::VecDeque;
+use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     GetHandleInformation, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -78,25 +79,55 @@ fn job() -> (String, OwnedHandle) {
 struct Terminal {
     pair: Option<PtyPair>,
     bytes: Arc<AtomicUsize>,
+    queries: Arc<AtomicUsize>,
+    tail: Arc<Mutex<VecDeque<u8>>>,
 }
 impl Terminal {
     fn new() -> Self {
         let pair = native_pty_system().openpty(PtySize::default()).unwrap();
         let mut reader = pair.master.try_clone_reader().unwrap();
+        let mut writer = pair.master.take_writer().unwrap();
+        let (send, receive) = mpsc::sync_channel::<&'static [u8]>(4);
+        std::thread::spawn(move || {
+            while let Ok(reply) = receive.recv() {
+                writer.write_all(reply).unwrap();
+                writer.flush().unwrap();
+            }
+        });
         let bytes = Arc::new(AtomicUsize::new(0));
         let count = bytes.clone();
+        let queries = Arc::new(AtomicUsize::new(0));
+        let replies = queries.clone();
+        let tail = Arc::new(Mutex::new(VecDeque::with_capacity(512)));
+        let capture = tail.clone();
         std::thread::spawn(move || {
             let mut buffer = [0; 8192];
+            let mut matched = 0;
             while let Ok(size) = reader.read(&mut buffer) {
                 if size == 0 {
                     break;
                 }
                 count.fetch_add(size, Ordering::Relaxed);
+                // This synthetic byte stream contains only ConPTY controls
+                // and fixture ASCII. Answer initial cursor inheritance on a
+                // separate bounded writer; this is not a host terminal parser.
+                for byte in &buffer[..size] {
+                    cursor_query(*byte, &mut matched, &send, &replies);
+                }
+                let mut tail = capture.lock().unwrap();
+                for byte in &buffer[..size] {
+                    if tail.len() == 512 {
+                        tail.pop_front();
+                    }
+                    tail.push_back(*byte);
+                }
             }
         });
         Self {
             pair: Some(pair),
             bytes,
+            queries,
+            tail,
         }
     }
     fn spawn(&self, command: CommandBuilder, job: &OwnedHandle) -> Process {
@@ -110,6 +141,15 @@ impl Terminal {
 }
 impl Drop for Terminal {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            let tail: Vec<_> = self.tail.lock().unwrap().iter().copied().collect();
+            eprintln!(
+                "FACT fixture ConPTY bytes={} cursor_queries={} tail={:?}",
+                self.bytes.load(Ordering::Relaxed),
+                self.queries.load(Ordering::Relaxed),
+                String::from_utf8_lossy(&tail)
+            );
+        }
         let pair = self.pair.take();
         let (done, finished) = mpsc::sync_channel(1);
         // Keep the drain thread independent while ClosePseudoConsole runs.
@@ -121,6 +161,25 @@ impl Drop for Terminal {
             finished.recv_timeout(Duration::from_secs(5)).is_ok(),
             "ConPTY close blocked despite independent drain"
         );
+    }
+}
+fn cursor_query(
+    byte: u8,
+    matched: &mut usize,
+    send: &mpsc::SyncSender<&'static [u8]>,
+    queries: &AtomicUsize,
+) {
+    const QUERY: &[u8] = b"\x1b[6n";
+    if byte == QUERY[*matched] {
+        *matched += 1;
+    } else {
+        *matched = usize::from(byte == 0x1b);
+    }
+    if *matched == QUERY.len() {
+        *matched = 0;
+        queries.fetch_add(1, Ordering::Relaxed);
+        send.try_send(b"\x1b[1;1R")
+            .expect("bounded synthetic cursor reply");
     }
 }
 fn command(mode: &str, name: &str, root: &Path) -> CommandBuilder {
@@ -177,6 +236,18 @@ impl Drop for Outside {
         let _ = self.0.wait();
     }
 }
+struct ProcessFacts<'a>(&'a Process);
+impl Drop for ProcessFacts<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "FACT retained fixture process pid={:?} wait={:?}",
+                self.0.pid(),
+                self.0.wait_timeout(Duration::ZERO)
+            );
+        }
+    }
+}
 #[test]
 fn creation_contains_immediate_descendant_and_retains_unicode_exit259_and_drained_output() {
     let scratch = Scratch::new();
@@ -196,6 +267,7 @@ fn creation_contains_immediate_descendant_and_retains_unicode_exit259_and_draine
     let mut cmd = command("--job-probe", &name, &scratch.0);
     cmd.args(["259", "space arg", "", "quote\"slash\\", "한글"]);
     let process = terminal.spawn(cmd, &job);
+    let _facts = ProcessFacts(&process);
     let grandchild = descendant(&scratch.0, &job);
     let marker: serde_json::Value = eventually(|| {
         serde_json::from_slice(&std::fs::read(scratch.0.join("direct.json")).ok()?).ok()
@@ -235,6 +307,7 @@ fn checked_direct_termination_observes_real_exit_and_invalid_job_never_runs_chil
     let terminal = Terminal::new();
     let (name, job) = job();
     let process = terminal.spawn(command("--job-grandchild", &name, &scratch.0), &job);
+    let _facts = ProcessFacts(&process);
     eventually(|| scratch.0.join("grandchild.pid").exists().then_some(()));
     assert_eq!(process.wait_timeout(Duration::ZERO).unwrap(), None);
     assert_eq!(
@@ -246,12 +319,13 @@ fn checked_direct_termination_observes_real_exit_and_invalid_job_never_runs_chil
     let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
     assert!(!event.is_null());
     let event = unsafe { OwnedHandle::from_raw_handle(event) };
+    let fresh_terminal = Terminal::new();
     let mut cmd = CommandBuilder::new(FIXTURE);
     cmd.args(["--uncontained-marker", scratch.0.to_str().unwrap()]);
     cmd.env_clear();
     // Test creation itself, not Process's postcondition cleanup: the probe
     // deliberately has no membership guard that could hide an accidental run.
-    let refused = terminal
+    let refused = fresh_terminal
         .pair
         .as_ref()
         .unwrap()
