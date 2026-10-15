@@ -96,6 +96,15 @@ genuine Windows execution is required in CI before merge. No Windows stable host
 or production inventory adoption is claimed. No live session was inspected,
 restarted or migrated.
 
+First native Windows b5e run passed the model and four storage/process fixtures,
+but the malformed-index fixture expected Corrupt after replacing through the
+cluster-specific Windows private writer. It received a different refusal before
+the expected assertion (the error was not printed). The fixture now writes via
+the inventory's own Directory replacement policy, preserving the exact Corrupt
+assertion and adding diagnostics. This isolates content corruption from a change
+in file security policy; native confirmation is still required. Production
+security checks are unchanged.
+
 ```text
 cargo test -p remuda-native session_host::inventory --lib --offline
 24 passed; 0 failed; 1 ignored

@@ -323,11 +323,12 @@ fn corrupt_missing_or_incompatible_existing_root_is_never_initialized_as_empty()
     let (store, _, _) = bootstrap(&scratch.0);
     assert!(Store::create(&scratch.0).is_err());
     drop(store);
-    crate::fs_atomic::write_atomic_lua_private(&scratch.0.join("inventory.json"), b"{").unwrap();
-    assert!(matches!(
-        Store::open(&scratch.0),
-        Err(Error::Data(DataError::Corrupt))
-    ));
+    Directory::open(&scratch.0).unwrap().replace(b"{").unwrap();
+    let error = Store::open(&scratch.0).err();
+    assert!(
+        matches!(error, Some(Error::Data(DataError::Corrupt))),
+        "unexpected malformed-index refusal: {error:?}"
+    );
     std::fs::remove_file(scratch.0.join("inventory.json")).unwrap();
     assert!(Store::open(&scratch.0).is_err());
     assert!(Store::create(&scratch.0).is_err());
