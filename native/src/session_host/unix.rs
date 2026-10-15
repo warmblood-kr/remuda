@@ -24,7 +24,7 @@ fn denied() -> io::Error {
 fn uid() -> u32 {
     unsafe { libc::geteuid() }
 }
-fn directory(path: &Path) -> io::Result<File> {
+pub(super) fn directory(path: &Path) -> io::Result<File> {
     if !path.is_absolute() {
         return Err(denied());
     }
