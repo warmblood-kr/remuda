@@ -13,6 +13,8 @@ pub mod cluster;
 pub mod cluster_remote;
 pub mod cluster_tui;
 pub mod cmd_arguments;
+#[doc(hidden)]
+pub mod codex_observer;
 pub(crate) mod credential;
 pub mod daemon;
 pub mod dist;
