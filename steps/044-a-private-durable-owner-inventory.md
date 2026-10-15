@@ -44,7 +44,14 @@ remain subsequent work. Hosts must not receive the global controller writer
 fence. Exit observations here are caller assertions; no PID liveness inference
 or production session deletion is enabled.
 
-## Validation
+## Expected
+
+A killed writer leaves a recoverable original request; kernel locking serializes
+same-process and separate-process writers. Uncertain commits grant no admission,
+and stale fences/checkpoints, corrupt roots and bounded capacity refuse changes.
+Unix filesystem attacks fail closed. Windows tests must execute natively in CI.
+
+## Actual
 
 macOS: 19 inventory tests passed; one internal subprocess helper is intentionally
 ignored except when invoked by its parent fixtures. Tests kill only owned private
@@ -63,6 +70,7 @@ restarted or migrated.
 cargo test -p remuda-native session_host::inventory --lib --offline
 19 passed; 0 failed; 1 ignored
 cargo clippy --workspace --all-targets --offline -- -D warnings
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.11s
 cargo fmt --all -- --check
 git diff --check
 ```
