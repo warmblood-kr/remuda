@@ -182,6 +182,98 @@ fn type_text_submits_paste_once_and_preserves_embedded_newline() {
 }
 
 #[test]
+fn expected_instance_provider_refuses_a_replacement_before_writing_text_or_key() {
+    let dir = scratch("inst-race");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&socket, &dir);
+
+    client::request(
+        &socket,
+        &Request::New {
+            name: Some("bound-agent".into()),
+            command: fake_agent("paste"),
+            size: Size::new(80, 24),
+            cwd: Some(dir.display().to_string()),
+            env: None,
+        },
+    )
+    .expect("start original fake agent");
+    wait_screen(&socket, "bound-agent", "READY");
+    let original_instance = match client::request(&socket, &Request::List).unwrap() {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "bound-agent")
+            .and_then(|session| session.instance_id)
+            .expect("original instance id"),
+        other => panic!("list failed: {other:?}"),
+    };
+    let closed = client::request(
+        &socket,
+        &Request::Close {
+            name: "bound-agent".into(),
+            instance_id: Some(original_instance.clone()),
+            confirm: Some(true),
+        },
+    )
+    .expect("close original fake agent");
+    assert!(matches!(closed, Response::Ok), "close failed: {closed:?}");
+    let replacement = client::request(
+        &socket,
+        &Request::New {
+            name: Some("bound-agent".into()),
+            command: fake_agent("paste"),
+            size: Size::new(80, 24),
+            cwd: Some(dir.display().to_string()),
+            env: None,
+        },
+    )
+    .expect("start same-name replacement");
+    assert!(
+        matches!(replacement, Response::Value(ref name) if name == "bound-agent"),
+        "replacement failed: {replacement:?}"
+    );
+    let replacement_instance = match client::request(&socket, &Request::List).unwrap() {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "bound-agent")
+            .and_then(|session| session.instance_id)
+            .expect("replacement instance id"),
+        other => panic!("list failed: {other:?}"),
+    };
+    assert_ne!(original_instance, replacement_instance);
+    wait_screen(&socket, "bound-agent", "READY");
+    let replacement_before = capture(&socket, "bound-agent");
+
+    let script = format!(
+        "assert(remuda._input_instance_bound_version == 1)\n\
+         local ok, err = pcall(remuda._input_type_text_if_instance, 'bound-agent', {original_instance:?}, 'STALE_TEXT', 0)\n\
+         assert(not ok and tostring(err):find('instance changed', 1, true), tostring(err))\n\
+         ok, err = pcall(remuda._input_key_if_instance, 'bound-agent', {original_instance:?}, 'C-a')\n\
+         assert(not ok and tostring(err):find('instance changed', 1, true), tostring(err))"
+    );
+    script::run_source(&socket, "expected-instance-replacement", &script)
+        .expect("reject both stale owner-input operations");
+    let screen = capture(&socket, "bound-agent");
+    assert_eq!(
+        screen, replacement_before,
+        "stale text/key call changed replacement screen"
+    );
+    assert!(
+        screen.contains("READY"),
+        "replacement lost its ready screen: {screen}"
+    );
+    let key_result = format!(
+        "assert(remuda._input_key_if_instance('bound-agent', {replacement_instance:?}, 'C-a') == true)"
+    );
+    script::run_source(&socket, "expected-instance-key-success", &key_result)
+        .expect("report successful whole-key delivery explicitly");
+    assert!(
+        !screen.contains("STALE_TEXT"),
+        "stale text reached replacement: {screen}"
+    );
+}
+
+#[test]
 fn type_text_still_submits_plain_shell_commands_and_long_wrapped_text() {
     let dir = scratch("shell");
     let socket = daemon::socket_path_in(&dir, "s");

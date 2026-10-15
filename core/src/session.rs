@@ -9,8 +9,8 @@ use crate::agent::{
 };
 use crate::clock::Clock;
 use crate::input::{
-    ClearInputRateLimiter, InputBatch, InputDeduplicator, InputError, InputOutcome,
-    InputRateLimiter,
+    ClearInputRateLimiter, ExpectedInstanceInputError, InputBatch, InputDeduplicator, InputError,
+    InputOutcome, InputRateLimiter,
 };
 use crate::protocol::Step;
 use core::time::Duration;
@@ -64,6 +64,61 @@ mod input_text_tests {
         assert_eq!(occurrence_count("old: abc / new: abc", "abc"), 2);
         assert_eq!(occurrence_count("old: abc", "missing"), 0);
         assert_eq!(occurrence_count("anything", ""), 0);
+    }
+}
+
+#[cfg(test)]
+mod expected_instance_input_tests {
+    use super::*;
+
+    #[test]
+    fn wrong_instance_is_rejected_before_any_text_or_key_write() {
+        let (session, _clock, writes, _started, _release) =
+            super::clear_input_tests::session(false);
+        assert_eq!(
+            session.type_text_if_instance("stale-instance", "must not land", Duration::ZERO),
+            Err(ExpectedInstanceInputError::WrongInstance)
+        );
+        assert_eq!(
+            session.send_key_if_instance("stale-instance", b"\x1b[A"),
+            Err(ExpectedInstanceInputError::WrongInstance)
+        );
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn full_text_and_key_use_the_captured_instance_without_adding_key_bytes() {
+        let (session, _clock, writes, _started, _release) =
+            super::clear_input_tests::session(false);
+        let instance = session.instance_id().to_owned();
+        assert_eq!(
+            session
+                .type_text_if_instance(&instance, "alpha\nbeta", Duration::ZERO)
+                .unwrap(),
+            InputSubmitOutcome::Submitted
+        );
+        session.send_key_if_instance(&instance, b"\x1b[A").unwrap();
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![b"alpha\nbeta\r".to_vec(), b"\x1b[A".to_vec()]
+        );
+    }
+
+    #[test]
+    fn stopped_instance_is_a_prewrite_refusal() {
+        let (session, _clock, writes, _started, _release) =
+            super::clear_input_tests::session(false);
+        let instance = session.instance_id().to_owned();
+        session.terminate().unwrap();
+        assert_eq!(
+            session.type_text_if_instance(&instance, "no write", Duration::ZERO),
+            Err(ExpectedInstanceInputError::NotStarted)
+        );
+        assert_eq!(
+            session.send_key_if_instance(&instance, b"x"),
+            Err(ExpectedInstanceInputError::NotStarted)
+        );
+        assert!(writes.lock().unwrap().is_empty());
     }
 }
 
@@ -140,7 +195,7 @@ mod clear_input_tests {
         }
     }
 
-    type SessionFixture = (
+    pub(super) type SessionFixture = (
         Arc<Session>,
         Arc<ManualClock>,
         Arc<Mutex<Vec<Vec<u8>>>>,
@@ -148,7 +203,7 @@ mod clear_input_tests {
         Arc<(Mutex<bool>, Condvar)>,
     );
 
-    fn session(blocking: bool) -> SessionFixture {
+    pub(super) fn session(blocking: bool) -> SessionFixture {
         session_with_timeout(blocking, false)
     }
 
@@ -920,6 +975,43 @@ impl Session {
             Err(AgentError::Busy) => Err(AgentError::SubmitUncertain),
             result => result,
         }
+    }
+
+    /// Type and submit text only when this captured session is the expected
+    /// launch. The immutable identity check and liveness refusal happen before
+    /// the write path. Once that path begins, errors are conservatively
+    /// reported as uncertain because bytes may have reached the PTY.
+    pub fn type_text_if_instance(
+        &self,
+        expected_instance: &str,
+        text: &str,
+        settle: Duration,
+    ) -> core::result::Result<InputSubmitOutcome, ExpectedInstanceInputError> {
+        if self.instance_id() != expected_instance {
+            return Err(ExpectedInstanceInputError::WrongInstance);
+        }
+        if !self.is_alive() {
+            return Err(ExpectedInstanceInputError::NotStarted);
+        }
+        self.type_text(text, settle)
+            .map_err(|_| ExpectedInstanceInputError::OutcomeUncertain)
+    }
+
+    /// Send exactly the supplied key bytes to this captured session instance.
+    /// This does not append Return or otherwise change the key sequence.
+    pub fn send_key_if_instance(
+        &self,
+        expected_instance: &str,
+        bytes: &[u8],
+    ) -> core::result::Result<(), ExpectedInstanceInputError> {
+        if self.instance_id() != expected_instance {
+            return Err(ExpectedInstanceInputError::WrongInstance);
+        }
+        if !self.is_alive() {
+            return Err(ExpectedInstanceInputError::NotStarted);
+        }
+        self.write_one_burst(bytes)
+            .map_err(|_| ExpectedInstanceInputError::OutcomeUncertain)
     }
 
     fn submit_locked(&self, tail: &str, baseline_occurrences: usize) -> Result<InputSubmitOutcome> {

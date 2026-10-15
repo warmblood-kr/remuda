@@ -969,6 +969,7 @@ fn input_bindings(
         })?,
     )?;
 
+    let legacy_type_registry = input_registry.clone();
     table.set(
         "_input_type_text",
         lua.create_function(
@@ -979,7 +980,7 @@ fn input_bindings(
                         "settle must be between 0 and 5 seconds",
                     ));
                 }
-                let session = input_registry
+                let session = legacy_type_registry
                     .get(&name)
                     .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
                 session
@@ -993,6 +994,65 @@ fn input_bindings(
             },
         )?,
     )?;
+
+    // Owner-input providers pass the identity captured with their approval.
+    // Resolve the name exactly once, then validate and operate through that
+    // captured Arc so a same-name replacement cannot receive the act.
+    let expected_text_registry = input_registry.clone();
+    table.set(
+        "_input_type_text_if_instance",
+        lua.create_function(
+            move |_,
+                  (name, expected_instance, text, settle): (
+                String,
+                String,
+                String,
+                Option<f64>,
+            )| {
+                let settle = settle.unwrap_or(DEFAULT_INPUT_SETTLE.as_secs_f64());
+                if !settle.is_finite() || !(0.0..=5.0).contains(&settle) {
+                    return Err(mlua::Error::runtime(
+                        "settle must be between 0 and 5 seconds",
+                    ));
+                }
+                let session = expected_text_registry.get(&name).ok_or_else(|| {
+                    mlua::Error::runtime("session instance changed; no input was written")
+                })?;
+                session
+                    .type_text_if_instance(
+                        &expected_instance,
+                        &text,
+                        Duration::from_secs_f64(settle),
+                    )
+                    .map(|outcome| match outcome {
+                        InputSubmitOutcome::Submitted => "submitted",
+                        InputSubmitOutcome::Unverified => "unverified",
+                        InputSubmitOutcome::Late => "late",
+                    })
+                    .map_err(|error| mlua::Error::runtime(error.to_string()))
+            },
+        )?,
+    )?;
+
+    let expected_key_registry = input_registry.clone();
+    table.set(
+        "_input_key_if_instance",
+        lua.create_function(
+            move |_, (name, expected_instance, spec): (String, String, String)| {
+                let bytes = keys::key(&spec)
+                    .ok_or_else(|| mlua::Error::runtime(format!("no such key: {spec}")))?;
+                let session = expected_key_registry.get(&name).ok_or_else(|| {
+                    mlua::Error::runtime("session instance changed; no input was written")
+                })?;
+                session
+                    .send_key_if_instance(&expected_instance, &bytes)
+                    .map(|()| true)
+                    .map_err(|error| mlua::Error::runtime(error.to_string()))
+            },
+        )?,
+    )?;
+    // Advertise only after both fenced provider operations are installed.
+    table.set("_input_instance_bound_version", 1)?;
     Ok(())
 }
 
