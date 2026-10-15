@@ -7409,6 +7409,10 @@ mod declared_cli_tests {
         }
         let parsed = checked_cli_flags(&["-e".into(), "--help".into()]).unwrap();
         assert_eq!(parsed.eval_code.as_deref(), Some("--help"));
+        let parsed = checked_cli_flags(&["-e".into(), "--unknown".into()]).unwrap();
+        assert_eq!(parsed.eval_code.as_deref(), Some("--unknown"));
+        assert!(checked_cli_flags(&["-e".into()]).is_err());
+        assert!(checked_cli_flags(&["-e".into(), "return 1".into(), "--bogus".into()]).is_err());
         assert!(checked_cli_flags(&["-s".into(), "--eval".into(), "return 1".into()]).is_err());
     }
 

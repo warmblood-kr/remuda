@@ -841,6 +841,27 @@ fn eval_accepts_lua_source_starting_with_a_comment() {
             "opaque-code"
         );
     }
+    for comment in ["--help", "--unknown"] {
+        let output = run(&["-e", comment]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "Lua comments must not print CLI help: {output:?}"
+        );
+    }
+    let missing = run(&["-e"]);
+    assert!(!missing.status.success(), "missing CODE must fail");
+    let invalid = run(&["-e", "remuda._opaque_eval_marker = true", "--bogus"]);
+    assert!(
+        !invalid.status.success(),
+        "unrelated options must remain invalid"
+    );
+    let marker = run(&["-e", "return tostring(remuda._opaque_eval_marker)"]);
+    assert_eq!(
+        String::from_utf8_lossy(&marker.stdout).trim(),
+        "nil",
+        "invalid argv must not execute CODE"
+    );
     run(&["stop", "-f", "--yes"]);
     let _ = fs::remove_dir_all(&dir);
 }
