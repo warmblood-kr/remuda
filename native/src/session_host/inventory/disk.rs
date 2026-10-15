@@ -2,7 +2,9 @@
 //! Lock deadlines bound acquisition, not kernel filesystem I/O. No callback,
 //! host RPC, PTY/parser state, spawn or wait is executed beneath this lock.
 use super::directory::Directory;
-use super::model::{Applied, Error as DataError, Fence, Index, Mutation, Revision, MAX_BYTES};
+use super::model::{
+    Applied, Error as DataError, Fence, Index, Lease, Mutation, Publication, Revision, MAX_BYTES,
+};
 use std::fs::{File, TryLockError};
 use std::io::{self, Read};
 use std::path::Path;
@@ -112,6 +114,30 @@ impl Store {
         #[cfg(test)]
         fault(2)?;
         Ok(applied)
+    }
+    /// Scoped host-only publication; deliberately returns no global writer Fence.
+    pub fn publish(
+        &self,
+        expected: Revision,
+        lease: &Lease,
+        publication: Publication,
+        timeout: Duration,
+    ) -> Result<Revision> {
+        let _lock = self.lock(timeout)?;
+        let index = self.read()?;
+        let next = index.publish(expected, lease, publication)?;
+        if next.cursor() == index.cursor() {
+            return Ok(next.cursor());
+        }
+        let bytes = next.encode()?;
+        #[cfg(test)]
+        fault(1)?;
+        self.directory
+            .replace(&bytes)
+            .map_err(Error::CommitUnknown)?;
+        #[cfg(test)]
+        fault(2)?;
+        Ok(next.cursor())
     }
     fn lock(&self, timeout: Duration) -> Result<Lock> {
         let file = self.directory.lock_file()?;

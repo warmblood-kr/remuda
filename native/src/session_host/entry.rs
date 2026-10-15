@@ -83,7 +83,7 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
         });
     server.run()
 }
-fn validate(launch: &Launch) -> io::Result<()> {
+pub(super) fn validate(launch: &Launch) -> io::Result<()> {
     if launch.name.is_empty()
         || launch.name.len() > 64
         || launch.name.chars().any(char::is_control)

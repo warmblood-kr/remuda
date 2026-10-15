@@ -7,6 +7,15 @@ pub(crate) const MAX_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
 /// Ledger reserves before effects; clients/watermarks never recycle or reset
 /// within an immutable host incarnation. Forgotten can never become New.
 pub(crate) const RETAINED_LEDGER: &str = "retained-input-ledger-v1";
+pub(crate) const SCOPED_BIRTH: &str = "scoped-host-publisher-v1";
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub(crate) enum PublicationStatus {
+    Starting = 0,
+    Ready = 1,
+    Unavailable = 2,
+    Complete = 3,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Identity {
@@ -50,6 +59,8 @@ pub(crate) enum OutputEnd {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Info {
+    #[serde(default)]
+    pub publication: Option<PublicationStatus>,
     pub identity: Identity,
     pub name: String,
     pub pid: Option<u32>,

@@ -217,7 +217,7 @@ fn existing_work_at_exhaustion(index: &mut Index, fence: Fence) {
     assert!(index.entries["synthetic"].pending.is_none());
     assert!(index.entries["synthetic"].streams[0].results.is_empty());
 }
-fn fill_metadata(mut index: Index, fence: Fence, payload: &str) -> Index {
+pub(super) fn fill_metadata(mut index: Index, fence: Fence, payload: &str) -> Index {
     let mut filled = false;
     'fill: for number in 0..40 {
         let name = format!("fill-{number}");

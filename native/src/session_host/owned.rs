@@ -41,11 +41,46 @@ impl Owned {
         size: Size,
         clock: Arc<dyn remuda_core::Clock>,
     ) -> Result<Self, AgentError> {
+        Self::spawn_started(incarnation, name, command, size, clock, None)
+    }
+    pub fn spawn_reserved(
+        identity: super::api::Identity,
+        name: String,
+        mut command: CommandBuilder,
+        size: Size,
+    ) -> Result<Self, AgentError> {
+        let start =
+            remuda_core::session::StartIdentity::new(identity.session.clone(), identity.instance)?;
+        if name.is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
+            return Err(AgentError::Io("invalid reserved session name".into()));
+        }
+        command.env("REMUDA_SESSION_ID", identity.session);
+        command.env("REMUDA_SESSION_NAME", &name);
+        Self::spawn_started(
+            identity.host,
+            name,
+            command,
+            size,
+            Arc::new(crate::SystemClock::new()),
+            Some(start),
+        )
+    }
+    fn spawn_started(
+        incarnation: [u8; 16],
+        name: String,
+        command: CommandBuilder,
+        size: Size,
+        clock: Arc<dyn remuda_core::Clock>,
+        start: Option<remuda_core::session::StartIdentity>,
+    ) -> Result<Self, AgentError> {
         let child = HostChild::spawn(command, size)?;
         let pid = child.process_id();
         let view = child.view();
         let writer = child.writer();
-        let session = Arc::new(Session::new(name, Box::new(child), clock));
+        let session = Arc::new(match start {
+            Some(start) => Session::with_start_identity(name, start, Box::new(child), clock),
+            None => Session::new(name, Box::new(child), clock),
+        });
         Ok(Self {
             session,
             incarnation,
@@ -75,6 +110,7 @@ impl Owned {
             super::api::Lifecycle::Exited
         };
         Ok(super::api::Info {
+            publication: None,
             identity: self.identity(),
             name: self.session.name().into(),
             pid: self.pid,
@@ -248,6 +284,81 @@ mod tests {
             assert!(Instant::now() < until, "synthetic host output timeout");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+    #[test]
+    fn reserved_spawn_preserves_exact_core_and_host_identity_and_child_metadata() {
+        let identity = super::super::api::Identity {
+            host: [4; 16],
+            session: "reserved-session".into(),
+            instance: "reserved-instance".into(),
+        };
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.env_clear();
+        command.env("PATH", "/usr/bin:/bin");
+        command.env("REMUDA_SESSION_ID", "stale-caller-id");
+        command.env("REMUDA_SESSION_NAME", "stale-caller-name");
+        command.args([
+            "-c",
+            "printf '%s:%s\\n' \"$REMUDA_SESSION_ID\" \"$REMUDA_SESSION_NAME\"; read ignored",
+        ]);
+        let host = Cleanup(Arc::new(
+            Owned::spawn_reserved(
+                identity.clone(),
+                "reserved-name".into(),
+                command,
+                Size::new(80, 24),
+            )
+            .unwrap(),
+        ));
+        wait_for(&host.0, "reserved-session:reserved-name");
+        assert_eq!(host.0.identity(), identity);
+        assert_eq!(host.0.session.id(), "reserved-session");
+        assert_eq!(host.0.session.instance_id(), "reserved-instance");
+        assert_eq!(host.0.inspect().unwrap().identity, identity);
+        assert_eq!(
+            remuda_core::session_operations::SessionOperations::snapshot(
+                host.0.session.as_ref(),
+                0
+            )
+            .unwrap()
+            .instance_id
+            .as_deref(),
+            Some("reserved-instance")
+        );
+    }
+    #[test]
+    fn invalid_reserved_identity_and_name_refuse_before_process_creation() {
+        let identity = super::super::api::Identity {
+            host: [4; 16],
+            session: "".into(),
+            instance: "reserved-instance".into(),
+        };
+        let error = Owned::spawn_reserved(
+            identity.clone(),
+            "name".into(),
+            CommandBuilder::new("/nonexistent-reserved-fixture"),
+            Size::new(80, 24),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(error, AgentError::Io(ref message) if message == "invalid preassigned session identity")
+        );
+        let identity = super::super::api::Identity {
+            session: "reserved-session".into(),
+            ..identity
+        };
+        let error = Owned::spawn_reserved(
+            identity,
+            "invalid\nname".into(),
+            CommandBuilder::new("/nonexistent-reserved-fixture"),
+            Size::new(80, 24),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(error, AgentError::Io(ref message) if message == "invalid reserved session name")
+        );
     }
     struct Cleanup(Arc<Owned>);
     impl Drop for Cleanup {

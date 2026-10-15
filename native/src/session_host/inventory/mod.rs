@@ -1,4 +1,4 @@
-//! Inactive bounded inventory/request transaction domain. No daemon adoption.
+//! Bounded private inventory/request transactions; no daemon adoption.
 //! Persisted publications are not an atomic physical-process snapshot. Unknown
 //! stores/hosts and unresolved acts never become an authoritative empty fleet.
 #[cfg(any(unix, windows))]
