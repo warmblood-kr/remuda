@@ -1,8 +1,8 @@
 # Isolated runtime preparation gates (#713)
 
-This increment remains inactive: no host binary, daemon adoption, registry rebuild,
-cluster upgrade or production restart yet. A Unix HostChild backend and Owned
-Session exercise lifecycle/terminal/input contracts with synthetic PTYs. Windows
+The preparation increment added a Unix HostChild backend and Owned Session.
+A subsequent opt-in standalone prototype is documented in session-host-executable.md;
+no daemon adoption, registry rebuild, cluster rollout or production restart occurs. Windows
 ConPTY/job creation and identity checks remain required work, not a supported-path
 claim. These gates remain open through the usable cross-platform host and adapter.
 
