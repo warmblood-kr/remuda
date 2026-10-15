@@ -40,9 +40,12 @@ pub(crate) struct Completion {
     pub reply: Reply,
 }
 impl Completion {
+    pub fn fits(&self) -> bool {
+        serde_json::to_writer(Budget(0), self).is_ok()
+    }
     /// An oversized result after an effect is NOT a safe rejection/replay.
     pub fn bounded(self) -> Self {
-        if serde_json::to_writer(Budget(0), &self).is_ok() {
+        if self.fits() {
             self
         } else {
             Self {

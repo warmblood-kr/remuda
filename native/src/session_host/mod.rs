@@ -12,6 +12,7 @@ mod control;
 mod coordinator;
 #[cfg(unix)]
 mod entry;
+mod inventory;
 mod ledger;
 #[cfg(unix)]
 mod owned;

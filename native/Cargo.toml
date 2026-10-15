@@ -49,7 +49,7 @@ rustls-platform-verifier = { version = "0.7", default-features = false }
 sha2 = "0.10"
 base64 = "0.22"
 url = "2.5"
-serde_json = "1.0.140"
+serde_json = { version = "1.0.140", features = ["raw_value"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 getrandom = "=0.3.4"
 snow = { version = "=0.10.0", default-features = false, features = ["default-resolver", "use-chacha20poly1305", "use-curve25519", "use-getrandom", "use-sha2"] }
