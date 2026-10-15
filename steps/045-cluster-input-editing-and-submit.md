@@ -26,6 +26,10 @@ editable; raw input transport retains its old behavior. Rendered pane dimensions
 match the resize request in stacked and split layouts. Unchanged sizes are sent
 once; window/draft/instance changes propagate, stale instances cannot resize a
 replacement, and read-only/ended sessions are skipped.
+Pasted CRLF and tab characters remain visible as control glyphs in the draft,
+and the queued `InputLine` contains the same pasted characters. A receiver's
+pre-dispatch `invalid remote request` response is reported as unsupported with
+no retry, raw-input fallback or partial-delivery warning.
 
 ## Actual
 
@@ -42,9 +46,14 @@ With the line path restored, captured daemon-free checks include:
 
 ```text
 test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
-test result: ok. 143 passed; 0 failed; 0 ignored; 0 measured; 961 filtered out; finished in 3.09s
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1102 filtered out; finished in 0.00s
+test result: ok. 148 passed; 0 failed; 0 ignored; 0 measured; 1036 filtered out; finished in 3.14s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1182 filtered out; finished in 0.00s
 ```
+
+Regression tests also cover CRLF/tab paste display and delivery, plus an old
+receiver's exact `invalid remote request` refusal for `InputLine` and
+`ResizeSession`. The refusal produces a clear unsupported result without
+retries, raw-input fallback, or a partial-delivery warning.
 
 These are core input tests, pure/mock cluster tests (including composer, sender
 and queue), and resize protocol/control tests. The full core suite, keymap

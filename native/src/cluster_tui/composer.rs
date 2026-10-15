@@ -95,12 +95,12 @@ impl LineComposer {
             .graphemes(true)
             .map(|g| (g.to_owned(), false))
             .collect();
-        cells.extend(self.text.graphemes(true).enumerate().map(|(i, g)| {
-            (
-                crate::text::strip_terminal_controls(g).into_owned(),
-                i == self.cursor,
-            )
-        }));
+        cells.extend(
+            self.text
+                .graphemes(true)
+                .enumerate()
+                .map(|(i, g)| (Self::visible_grapheme(g), i == self.cursor)),
+        );
         if self.cursor == self.text.graphemes(true).count() {
             cells.push((" ".into(), true));
         }
@@ -129,6 +129,16 @@ impl LineComposer {
             .saturating_sub(1)
             .min(rows.len().saturating_sub(limit));
         rows.into_iter().skip(start).take(limit).collect()
+    }
+
+    fn visible_grapheme(grapheme: &str) -> String {
+        match grapheme {
+            "\r\n" => "␍↵".into(),
+            "\r" => "␍".into(),
+            "\n" => "↵".into(),
+            "\t" => "⇥".into(),
+            _ => crate::text::strip_terminal_controls(grapheme).into_owned(),
+        }
     }
 
     pub(super) fn insert_text(&mut self, text: &str) {
@@ -249,6 +259,15 @@ mod tests {
         moved.process(next.join("\r\n").as_bytes());
         assert_eq!(parser.screen().contents(), moved.screen().contents());
         assert!(moved.screen().cell(0, 4).unwrap().inverse());
+    }
+
+    #[test]
+    fn pasted_line_breaks_and_tabs_are_visible_in_the_draft() {
+        let mut composer = LineComposer::default();
+        composer.insert_text("echo one\r\necho\t two");
+        let rows = composer.display_lines("$ ", 80, 3);
+        assert_eq!(rows, ["$ echo one␍↵echo⇥ two\x1b[7m \x1b[27m"]);
+        assert_eq!(composer.text(), "echo one\r\necho\t two");
     }
 
     #[test]

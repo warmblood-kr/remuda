@@ -2881,7 +2881,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn resize_session_obeys_remote_control_setting() {
         let request = Request::ResizeSession {
@@ -2912,6 +2911,7 @@ mod tests {
         assert!(authorize_remote_request_with_control(&request, true).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_input_obeys_local_control_setting_and_close_stays_refused() {
         let settings = TestControlSettings::new(br#"{"allow_remote_control":true}"#);

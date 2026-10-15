@@ -273,6 +273,13 @@ impl InputSender {
             Ok(Response::WrongInstance) => SendOutcome::WrongInstance,
             Ok(Response::RateLimited) => SendOutcome::RateLimited,
             Ok(Response::RemoteControlDisabled) => SendOutcome::RemoteControlDisabled,
+            Ok(response) if super::unsupported_request_reason(&request, &response).is_some() => {
+                SendOutcome::UnsupportedRequest(
+                    super::unsupported_request_reason(&request, &response)
+                        .expect("checked unsupported response")
+                        .into(),
+                )
+            }
             Ok(Response::Error(reason)) if reason == remote_oversize_error() => {
                 SendOutcome::IoFailure(format!("bug: {reason}"))
             }
@@ -326,11 +333,20 @@ impl InputSender {
                 reason,
             });
         }
+        if let Some(QueueEvent::UnsupportedRequest { reason, .. }) = &event {
+            queue.drop_waiting_target(
+                batch.remote_node.as_deref(),
+                &batch.name,
+                &batch.instance_id,
+                reason,
+            );
+        }
         if matches!(
             event,
             Some(
                 QueueEvent::Uncertain { .. }
                     | QueueEvent::Failed { .. }
+                    | QueueEvent::UnsupportedRequest { .. }
                     | QueueEvent::PasteAborted { .. }
                     | QueueEvent::RemoteTargetFailed { .. }
             )
@@ -570,6 +586,50 @@ mod tests {
         );
         let third = queue.items().next_back().unwrap();
         assert_eq!(third.client_id, rotated_client);
+    }
+
+    #[test]
+    fn old_receiver_rejection_is_reported_unsupported_without_retry_or_partial_warning() {
+        use crate::cluster_tui::queue::InputTarget;
+
+        let now = Instant::now();
+        let mut sender = InputSender::with_client_id([7; 16]);
+        let mut queue = InputQueue::default();
+        sender
+            .enqueue_line(
+                &mut queue,
+                InputTarget {
+                    remote_node: Some("laptop".into()),
+                    name: "build".into(),
+                    instance_id: "remote-instance".into(),
+                },
+                b"echo hi\r".to_vec(),
+                now,
+            )
+            .unwrap();
+        assert!(sender.begin_due(&mut queue, now));
+        let requests = std::cell::RefCell::new(Vec::new());
+        let event = sender.send_remote_started(&mut queue, now, |node, request| {
+            requests
+                .borrow_mut()
+                .push((node.to_owned(), request.clone()));
+            Ok(Response::Error("invalid remote request".into()))
+        });
+        assert!(matches!(
+            event,
+            Some(QueueEvent::UnsupportedRequest {
+                seq: 1,
+                reason
+            }) if reason.contains("too old") && reason.contains("not submitted")
+        ));
+        assert_eq!(requests.borrow().len(), 1, "no raw Input fallback was sent");
+        assert!(matches!(
+            requests.borrow().first().map(|(_, request)| request),
+            Some(Request::InputLine { .. })
+        ));
+        assert_eq!(queue.items().next().unwrap().state, QueueState::Failed);
+        assert!(!sender.has_partial_input_warning_for("laptop", "build", "remote-instance"));
+        assert!(queue.begin_due(now + Duration::from_secs(60)).is_none());
     }
 
     #[test]

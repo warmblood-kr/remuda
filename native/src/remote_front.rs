@@ -311,6 +311,28 @@ mod tests {
     use super::*;
     use remuda_core::protocol::{Request, Response};
 
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    enum OldReceiverRequest {
+        Input {
+            name: String,
+            instance_id: String,
+            client_id: String,
+            seq: u64,
+            bytes: Vec<u8>,
+        },
+        Resize {
+            name: String,
+            size: remuda_core::Size,
+        },
+    }
+
+    fn old_receiver_response(request: &Request) -> Response {
+        serde_json::from_slice::<OldReceiverRequest>(&serde_json::to_vec(request).unwrap())
+            .map(|_| Response::Ok)
+            .unwrap_or_else(|_| Response::error("invalid remote request"))
+    }
+
     #[test]
     fn remote_sync_capacity_refusal_is_typed_on_wire() {
         let _lock = SYNC_CAPACITY_TEST_LOCK.lock().unwrap();
@@ -381,6 +403,30 @@ mod tests {
         assert!(authorize(&line(Vec::new())).is_err());
         assert!(authorize(&line(vec![b'a'; MAX_REMOTE_INPUT_BATCH_BYTES + 1])).is_err());
         assert_eq!(request_timeout(&request), std::time::Duration::from_secs(8));
+    }
+
+    #[test]
+    fn older_receiver_rejects_additive_requests_before_dispatch() {
+        let input_line = Request::InputLine {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000000".into(),
+            seq: 1,
+            bytes: b"echo hi\r".to_vec(),
+        };
+        let resize = Request::ResizeSession {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            size: remuda_core::Size::for_viewport(31, 9),
+        };
+        assert_eq!(
+            old_receiver_response(&input_line),
+            Response::error("invalid remote request")
+        );
+        assert_eq!(
+            old_receiver_response(&resize),
+            Response::error("invalid remote request")
+        );
     }
 
     #[test]

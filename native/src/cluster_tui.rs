@@ -23,6 +23,26 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+const INVALID_REMOTE_REQUEST: &str = "invalid remote request";
+
+fn unsupported_request_reason(request: &Request, response: &Response) -> Option<&'static str> {
+    let Response::Error(reason) = response else {
+        return None;
+    };
+    if reason != INVALID_REMOTE_REQUEST {
+        return None;
+    }
+    match request {
+        Request::InputLine { .. } => Some(
+            "remote receiver is too old for InputLine; upgrade it; this line was not submitted",
+        ),
+        Request::ResizeSession { .. } => {
+            Some("remote receiver is too old for ResizeSession; upgrade it; pane was not resized")
+        }
+        _ => None,
+    }
+}
+
 pub mod close_request;
 /// Below this many columns there is no room for two panes: the tree stacks above the pane.
 const SPLIT_MIN_COLS: usize = 60;
@@ -125,6 +145,7 @@ struct PaneResize {
     size: remuda_core::Size,
     attempted: Duration,
     succeeded: bool,
+    unsupported: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -788,21 +809,27 @@ impl ClusterUi {
         let size = self.pane_size(cols, rows, now);
         if let Some(old) = &self.last_resize {
             if (&old.node, &old.name, &old.instance, old.size) == (&node, &name, &instance, size)
-                && (old.succeeded || now.saturating_sub(old.attempted) < Duration::from_secs(1))
+                && (old.succeeded
+                    || old.unsupported
+                    || now.saturating_sub(old.attempted) < Duration::from_secs(1))
             {
                 return;
             }
         }
-        let result = send(
-            node.as_deref(),
-            &Request::ResizeSession {
-                name: name.clone(),
-                instance_id: instance.clone(),
-                size,
-            },
-        );
-        let succeeded = matches!(result, Ok(Response::Ok));
-        if !succeeded {
+        let request = Request::ResizeSession {
+            name: name.clone(),
+            instance_id: instance.clone(),
+            size,
+        };
+        let result = send(node.as_deref(), &request);
+        let unsupported = result
+            .as_ref()
+            .ok()
+            .and_then(|response| unsupported_request_reason(&request, response));
+        let succeeded = matches!(&result, Ok(Response::Ok));
+        if let Some(reason) = unsupported {
+            self.notice = Some((reason.into(), now));
+        } else if !succeeded {
             self.notice = Some((format!("pane resize unavailable: {result:?}"), now));
         }
         self.last_resize = Some(PaneResize {
@@ -812,6 +839,7 @@ impl ClusterUi {
             size,
             attempted: now,
             succeeded,
+            unsupported: unsupported.is_some(),
         });
     }
 
@@ -1756,6 +1784,9 @@ impl ClusterUi {
             }
             Some(QueueEvent::RemoteTargetFailed { .. }) => {
                 self.notice = Some((REMOTE_PASTE_FAILURE_NOTICE.into(), now));
+            }
+            Some(QueueEvent::UnsupportedRequest { reason, .. }) => {
+                self.notice = Some((reason, now));
             }
             Some(QueueEvent::Dropped { reason, .. }) | Some(QueueEvent::Failed { reason, .. }) => {
                 let mut draft_discarded = false;
@@ -3086,6 +3117,28 @@ mod tests {
         });
         ui.sessions[0].alive = false;
         ui.resize_pane(100, 24, clock.now(), |_, _| panic!("ended resize"));
+    }
+
+    #[test]
+    fn old_remote_receiver_reports_resize_unsupported_without_repeated_attempts() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen_rows(120));
+        let mut calls = 0;
+        ui.resize_pane(100, 24, clock.now(), |_, request| {
+            calls += 1;
+            assert!(matches!(request, Request::ResizeSession { .. }));
+            Ok(Response::Error("invalid remote request".into()))
+        });
+        assert_eq!(
+            ui.notice.as_ref().map(|(notice, _)| notice.as_str()),
+            Some("remote receiver is too old for ResizeSession; upgrade it; pane was not resized")
+        );
+        clock.advance(Duration::from_secs(5));
+        ui.resize_pane(100, 24, clock.now(), |_, _| {
+            calls += 1;
+            panic!("unsupported resize was retried")
+        });
+        assert_eq!(calls, 1);
     }
 
     #[test]
@@ -6144,6 +6197,38 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('!'));
         let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("dev          live · pending input 1"));
+    }
+
+    #[test]
+    fn composer_paste_shows_crlf_and_tab_boundaries_and_sends_the_same_text() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        ui.enter_selected(clock.now());
+        let pasted = "echo one\r\necho\t two";
+        ui.handle_event(Event::Paste(pasted.into()), clock.now());
+        let draft = ui.composer.display_lines("$ ", 80, 3).join("");
+        assert!(draft.contains("␍↵"), "hidden CRLF in {draft:?}");
+        assert!(draft.contains("⇥"), "hidden tab in {draft:?}");
+
+        ui.key_event(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            clock.now(),
+        );
+        let batch = ui.input_queue.items().next().expect("pasted line queued");
+        assert_eq!(batch.bytes, b"echo one\r\necho\t two\r");
+        ui.start_pending(clock.now());
+        let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+        assert!(matches!(
+            &transport.requests.lock().unwrap()[0].1,
+            Request::InputLine { bytes, .. } if bytes == b"echo one\r\necho\t two\r"
+        ));
     }
 
     #[test]
