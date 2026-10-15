@@ -20,6 +20,7 @@ pub struct PendingBatch {
     pub client_id: String,
     pub seq: u64,
     pub bytes: Vec<u8>,
+    pub line_submit: bool,
     pub state: QueueState,
     pub status: String,
     retry_at: Instant,
@@ -42,6 +43,7 @@ pub enum SendOutcome {
     WrongInstance,
     RateLimited,
     RemoteControlDisabled,
+    UnsupportedRequest(String),
     Error(String),
     IoFailure(String),
 }
@@ -54,6 +56,7 @@ pub enum QueueEvent {
     Dropped { seq: u64, reason: String },
     Failed { seq: u64, reason: String },
     RemoteControlDisabled { seq: u64, node: String },
+    UnsupportedRequest { seq: u64, reason: String },
     PasteAborted { seq: u64, reason: String },
     RemoteTargetFailed { seq: u64, reason: String },
 }
@@ -61,6 +64,7 @@ pub enum QueueEvent {
 pub const MAX_IO_RETRIES: u8 = 3;
 pub const MAX_RATE_LIMIT_RETRIES: u8 = 3;
 pub const MAX_BUSY_RETRIES: u8 = 3;
+pub const MAX_LINE_BUSY_RETRIES: u8 = 8;
 pub const MAX_QUEUED_BATCHES: usize = 128;
 
 #[derive(Default)]
@@ -112,6 +116,7 @@ impl InputQueue {
             client_id,
             seq,
             bytes,
+            line_submit: false,
             state: QueueState::Waiting,
             status: "waiting to send".into(),
             retry_at: now,
@@ -120,6 +125,12 @@ impl InputQueue {
             busy_retries: 0,
         });
         true
+    }
+
+    pub(super) fn mark_last_line(&mut self) {
+        if let Some(batch) = self.batches.back_mut() {
+            batch.line_submit = true;
+        }
     }
 
     pub fn can_enqueue(&self, count: usize) -> bool {
@@ -244,12 +255,17 @@ impl InputQueue {
                     })
                 }
                 SendOutcome::Busy => {
-                    if batch.busy_retries < MAX_BUSY_RETRIES {
+                    let retry_limit = if batch.line_submit {
+                        MAX_LINE_BUSY_RETRIES
+                    } else {
+                        MAX_BUSY_RETRIES
+                    };
+                    if batch.busy_retries < retry_limit {
                         batch.busy_retries += 1;
                         schedule_retry(batch, now, "input busy; retrying")
                     } else {
                         let reason =
-                            format!("busy after {MAX_BUSY_RETRIES} retries; no bytes were written");
+                            format!("busy after {retry_limit} retries; no bytes were written");
                         batch.state = QueueState::Failed;
                         batch.status = reason.clone();
                         Some(QueueEvent::Failed { seq, reason })
@@ -283,6 +299,11 @@ impl InputQueue {
                         seq,
                         node: batch.remote_node.clone().unwrap_or_default(),
                     })
+                }
+                SendOutcome::UnsupportedRequest(reason) => {
+                    batch.state = QueueState::Failed;
+                    batch.status = reason.clone();
+                    Some(QueueEvent::UnsupportedRequest { seq, reason })
                 }
                 SendOutcome::IoFailure(detail) if batch.io_retries < MAX_IO_RETRIES => {
                     batch.io_retries += 1;
@@ -416,6 +437,37 @@ mod tests {
                 now = retry_at;
             } else {
                 assert!(matches!(event, super::QueueEvent::Failed { seq: 1, .. }));
+            }
+        }
+        assert_eq!(queue.items().next().unwrap().state, QueueState::Failed);
+    }
+
+    #[test]
+    fn line_submit_busy_retries_cover_the_bounded_input_line_window() {
+        let mut queue = InputQueue::default();
+        let mut now = Instant::now();
+        queue.enqueue(
+            "dev".into(),
+            "instance-a".into(),
+            "client".into(),
+            1,
+            b"line\r".to_vec(),
+            now,
+        );
+        queue.mark_last_line();
+
+        for retry in 0..=super::MAX_LINE_BUSY_RETRIES {
+            assert!(queue.begin_due(now).is_some());
+            let event = queue.finish(1, SendOutcome::Busy, now).unwrap();
+            if retry < super::MAX_LINE_BUSY_RETRIES {
+                let super::QueueEvent::RetryScheduled { retry_at, .. } = event else {
+                    panic!("expected line retry {retry}, got {event:?}");
+                };
+                now = retry_at;
+            } else {
+                assert!(
+                    matches!(event, super::QueueEvent::Failed { seq: 1, reason } if reason.contains("8 retries"))
+                );
             }
         }
         assert_eq!(queue.items().next().unwrap().state, QueueState::Failed);

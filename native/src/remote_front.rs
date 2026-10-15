@@ -210,6 +210,7 @@ fn request_timeout(request: &Request) -> std::time::Duration {
             std::time::Duration::from_millis((*timeout_ms).min(remuda_core::sync::MAX_TIMEOUT_MS))
                 + SYNC_TIMEOUT_MARGIN
         }
+        Request::InputLine { .. } => std::time::Duration::from_secs(8),
         _ => CONNECTION_TIMEOUT,
     }
 }
@@ -244,7 +245,16 @@ pub fn authorize(request: &Request) -> Result<(), String> {
             seq,
             bytes,
             ..
+        }
+        | Request::InputLine {
+            client_id,
+            seq,
+            bytes,
+            ..
         } => {
+            if matches!(request, Request::InputLine { .. }) && std::str::from_utf8(bytes).is_err() {
+                return Err("input line must be UTF-8".into());
+            }
             if bytes.len() > MAX_REMOTE_INPUT_BATCH_BYTES {
                 return Err(format!(
                     "remote Input batch exceeds {MAX_REMOTE_INPUT_BATCH_BYTES} bytes"
@@ -258,6 +268,14 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::ClearInput { .. } => Err(refusal("ClearInput")),
         Request::Send { .. } => Err(refusal("Send")),
         Request::Feed { .. } => Err(refusal("Feed")),
+        Request::ResizeSession { size, .. } => {
+            if size.cols() > remuda_core::Size::MAX_RESIZE_COLS
+                || size.rows() > remuda_core::Size::MAX_RESIZE_ROWS
+            {
+                return Err("remote resize exceeds viewport limits".into());
+            }
+            Ok(())
+        }
         Request::Resize { .. } => Err(refusal("Resize")),
         Request::Capture { .. } => Err(refusal("Capture")),
         Request::MouseState { .. } => Err(refusal("MouseState")),
@@ -292,6 +310,28 @@ fn refusal(variant: &str) -> String {
 mod tests {
     use super::*;
     use remuda_core::protocol::{Request, Response};
+
+    #[allow(dead_code)]
+    #[derive(serde::Deserialize)]
+    enum OldReceiverRequest {
+        Input {
+            name: String,
+            instance_id: String,
+            client_id: String,
+            seq: u64,
+            bytes: Vec<u8>,
+        },
+        Resize {
+            name: String,
+            size: remuda_core::Size,
+        },
+    }
+
+    fn old_receiver_response(request: &Request) -> Response {
+        serde_json::from_slice::<OldReceiverRequest>(&serde_json::to_vec(request).unwrap())
+            .map(|_| Response::Ok)
+            .unwrap_or_else(|_| Response::error("invalid remote request"))
+    }
 
     #[test]
     fn remote_sync_capacity_refusal_is_typed_on_wire() {
@@ -342,6 +382,74 @@ mod tests {
             }
         );
         assert_eq!(serde_json::to_vec(&request).unwrap(), old_wire);
+    }
+
+    #[test]
+    fn input_line_roundtrip_validates_text_and_keeps_legacy_input_wire_unchanged() {
+        let wire = br#"{"Input":{"name":"dev","instance_id":"instance","client_id":"00000000000000000000000000000000","seq":1,"bytes":[97,13]}}"#;
+        let legacy: Request = serde_json::from_slice(wire).unwrap();
+        assert_eq!(serde_json::to_vec(&legacy).unwrap(), wire);
+        let line = |bytes| Request::InputLine {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000000".into(),
+            seq: 1,
+            bytes,
+        };
+        let request = line(b"hello\r".to_vec());
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert_eq!(decode_frame(&encoded).unwrap(), request);
+        assert!(authorize(&line(vec![255])).unwrap_err().contains("UTF-8"));
+        assert!(authorize(&line(Vec::new())).is_err());
+        assert!(authorize(&line(vec![b'a'; MAX_REMOTE_INPUT_BATCH_BYTES + 1])).is_err());
+        assert_eq!(request_timeout(&request), std::time::Duration::from_secs(8));
+    }
+
+    #[test]
+    fn older_receiver_rejects_additive_requests_before_dispatch() {
+        let input_line = Request::InputLine {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000000".into(),
+            seq: 1,
+            bytes: b"echo hi\r".to_vec(),
+        };
+        let resize = Request::ResizeSession {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            size: remuda_core::Size::for_viewport(31, 9),
+        };
+        assert_eq!(
+            old_receiver_response(&input_line),
+            Response::error("invalid remote request")
+        );
+        assert_eq!(
+            old_receiver_response(&resize),
+            Response::error("invalid remote request")
+        );
+    }
+
+    #[test]
+    fn resize_session_roundtrip_preserves_short_viewport_and_legacy_sizes() {
+        let request = Request::ResizeSession {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            size: remuda_core::Size::for_viewport(31, 9),
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert_eq!(decode_frame(&encoded).unwrap(), request);
+        assert!(authorize(&Request::Resize {
+            name: "dev".into(),
+            size: Default::default()
+        })
+        .is_err());
+        let normal: remuda_core::Size = serde_json::from_str(r#"{"cols":80,"rows":24}"#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&normal).unwrap(),
+            r#"{"cols":80,"rows":24}"#
+        );
+        let legacy: remuda_core::Size = serde_json::from_str(r#"{"cols":1,"rows":1}"#).unwrap();
+        assert_eq!((legacy.cols(), legacy.rows()), (80, 24));
     }
 
     #[test]

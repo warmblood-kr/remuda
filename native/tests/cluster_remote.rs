@@ -554,7 +554,7 @@ fn real_remote_tui_frames_start_each_row_at_column_zero_at_wide_and_narrow_sizes
     admit_pair(&client_node, &server_node);
     let listener = Listener::start(&server_node);
     server_node.start_session(
-        "for i in $(seq 1 22); do printf 'FILLER\\n'; done; while true; do printf 'CRLF-MARKER'; sleep 1; done",
+        "for i in $(seq 1 22); do printf 'FILLER\\n'; done; while true; do printf '\\rCRLF-MARKER'; sleep 1; done",
     );
 
     let registry_path = client_node

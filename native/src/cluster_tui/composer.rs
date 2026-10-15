@@ -1,4 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LineComposer {
@@ -25,7 +27,7 @@ impl LineComposer {
 
     pub fn restore_draft(&mut self, text: &str) {
         self.text = text.into();
-        self.cursor = self.text.chars().count();
+        self.cursor = self.text.graphemes(true).count();
     }
 
     pub fn handle_key(
@@ -44,15 +46,19 @@ impl LineComposer {
                 ComposerAction::None
             }
             Some("cluster.composer.right") => {
-                self.cursor = (self.cursor + 1).min(self.text.chars().count());
+                self.cursor = (self.cursor + 1).min(self.text.graphemes(true).count());
                 ComposerAction::None
             }
-            Some("cluster.composer.home") => {
+            Some("cluster.composer.kill") => {
+                self.text.truncate(self.byte_offset());
+                ComposerAction::None
+            }
+            Some("cluster.composer.home" | "cluster.composer.home_emacs") => {
                 self.cursor = 0;
                 ComposerAction::None
             }
-            Some("cluster.composer.end") => {
-                self.cursor = self.text.chars().count();
+            Some("cluster.composer.end" | "cluster.composer.end_emacs") => {
+                self.cursor = self.text.graphemes(true).count();
                 ComposerAction::None
             }
             Some("cluster.composer.backspace") => {
@@ -83,6 +89,69 @@ impl LineComposer {
         }
     }
 
+    pub(super) fn display_lines(&self, prefix: &str, width: usize, limit: usize) -> Vec<String> {
+        let safe_prefix = crate::text::strip_terminal_controls(prefix);
+        let mut cells: Vec<(String, bool)> = safe_prefix
+            .graphemes(true)
+            .map(|g| (g.to_owned(), false))
+            .collect();
+        cells.extend(
+            self.text
+                .graphemes(true)
+                .enumerate()
+                .map(|(i, g)| (Self::visible_grapheme(g), i == self.cursor)),
+        );
+        if self.cursor == self.text.graphemes(true).count() {
+            cells.push((" ".into(), true));
+        }
+        let mut rows = vec![String::new()];
+        let mut used = 0;
+        let mut cursor_row = 0;
+        for (cell, cursor) in cells {
+            let size = UnicodeWidthStr::width(cell.as_str());
+            if used + size > width.max(1) && used > 0 {
+                rows.push(String::new());
+                used = 0;
+            }
+            if cursor {
+                cursor_row = rows.len() - 1;
+                // Inverse the existing glyph; the cursor consumes no extra cell.
+                rows.last_mut()
+                    .unwrap()
+                    .push_str(&format!("\x1b[7m{cell}\x1b[27m"));
+            } else {
+                rows.last_mut().unwrap().push_str(&cell);
+            }
+            used += size;
+        }
+        let limit = limit.max(1);
+        let start = cursor_row
+            .saturating_sub(1)
+            .min(rows.len().saturating_sub(limit));
+        rows.into_iter().skip(start).take(limit).collect()
+    }
+
+    fn visible_grapheme(grapheme: &str) -> String {
+        match grapheme {
+            "\r\n" => "␍↵".into(),
+            "\r" => "␍".into(),
+            "\n" => "↵".into(),
+            "\t" => "⇥".into(),
+            _ => crate::text::strip_terminal_controls(grapheme).into_owned(),
+        }
+    }
+
+    pub(super) fn insert_text(&mut self, text: &str) {
+        let offset = self.byte_offset();
+        self.text.insert_str(offset, text);
+        let end = offset + text.len();
+        self.cursor = self
+            .text
+            .grapheme_indices(true)
+            .take_while(|(offset, _)| *offset < end)
+            .count();
+    }
+
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
@@ -91,7 +160,12 @@ impl LineComposer {
     fn insert(&mut self, character: char) {
         let offset = self.byte_offset();
         self.text.insert(offset, character);
-        self.cursor += 1;
+        let end = offset + character.len_utf8();
+        self.cursor = self
+            .text
+            .grapheme_indices(true)
+            .take_while(|(offset, _)| *offset < end)
+            .count();
     }
 
     fn backspace(&mut self) {
@@ -105,12 +179,12 @@ impl LineComposer {
     }
 
     fn delete(&mut self) {
-        if self.cursor >= self.text.chars().count() {
+        if self.cursor >= self.text.graphemes(true).count() {
             return;
         }
         let start = self.byte_offset();
         let end = self.text[start..]
-            .char_indices()
+            .grapheme_indices(true)
             .nth(1)
             .map_or(self.text.len(), |(offset, _)| start + offset);
         self.text.replace_range(start..end, "");
@@ -118,7 +192,7 @@ impl LineComposer {
 
     fn byte_offset(&self) -> usize {
         self.text
-            .char_indices()
+            .grapheme_indices(true)
             .nth(self.cursor)
             .map_or(self.text.len(), |(offset, _)| offset)
     }
@@ -128,6 +202,73 @@ impl LineComposer {
 mod tests {
     use super::{ComposerAction, LineComposer};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn emacs_keys_and_grapheme_navigation_edit_the_draft() {
+        let keymap = crate::keybindings::test_snapshot("");
+        let mut composer = LineComposer::default();
+        composer.restore_draft("a한e\u{301}👩‍💻z");
+        composer.handle_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &keymap,
+        );
+        assert_eq!(composer.cursor(), 0);
+        for _ in 0..3 {
+            composer.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &keymap);
+        }
+        assert_eq!(composer.cursor(), 3);
+        composer.handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            &keymap,
+        );
+        assert_eq!(composer.text(), "a한e\u{301}");
+        composer.handle_key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &keymap,
+        );
+        assert_eq!(composer.text(), "a한");
+        composer.handle_key(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &keymap,
+        );
+        assert_eq!(composer.cursor(), 2);
+    }
+
+    #[test]
+    fn viewport_wraps_and_scrolls_around_cursor_without_shifting_glyphs() {
+        let keymap = crate::keybindings::test_snapshot("");
+        let mut composer = LineComposer::default();
+        composer.restore_draft(&"한글abc".repeat(20));
+        let rows = composer.display_lines("$ ", 12, 3);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|row| row.contains("\x1b[7m \x1b[27m")));
+        for row in &rows {
+            let mut parser = vt100::Parser::new(1, 12, 0);
+            parser.process(row.as_bytes());
+            assert!(parser.screen().contents().chars().count() <= 12);
+        }
+        composer.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), &keymap);
+        let first = composer.display_lines("$ ", 12, 3);
+        let mut parser = vt100::Parser::new(3, 12, 0);
+        parser.process(first.join("\r\n").as_bytes());
+        assert!(parser.screen().cell(0, 2).unwrap().inverse());
+        assert_eq!(parser.screen().cell(0, 2).unwrap().contents(), "한");
+        composer.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &keymap);
+        let next = composer.display_lines("$ ", 12, 3);
+        let mut moved = vt100::Parser::new(3, 12, 0);
+        moved.process(next.join("\r\n").as_bytes());
+        assert_eq!(parser.screen().contents(), moved.screen().contents());
+        assert!(moved.screen().cell(0, 4).unwrap().inverse());
+    }
+
+    #[test]
+    fn pasted_line_breaks_and_tabs_are_visible_in_the_draft() {
+        let mut composer = LineComposer::default();
+        composer.insert_text("echo one\r\necho\t two");
+        let rows = composer.display_lines("$ ", 80, 3);
+        assert_eq!(rows, ["$ echo one␍↵echo⇥ two\x1b[7m \x1b[27m"]);
+        assert_eq!(composer.text(), "echo one\r\necho\t two");
+    }
 
     #[test]
     fn line_composer_edits_and_submits_cr() {

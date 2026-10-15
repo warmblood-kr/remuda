@@ -471,6 +471,48 @@ mod submit_window_tests {
         }
     }
 
+    #[test]
+    fn idempotent_line_waits_for_echo_and_sends_one_return_even_for_composer_newline() {
+        for redraw in [Redraw::Submit, Redraw::ComposerNewline] {
+            let clock = Arc::new(ManualClock::new());
+            let script = Arc::new(Mutex::new(Script {
+                echo_after: Duration::from_millis(300),
+                trailing_after: None,
+                redraw_after: Duration::from_millis(100),
+                redraw,
+                typed: String::new(),
+                typed_at: None,
+                returns: Vec::new(),
+            }));
+            let session = Session::new(
+                "line",
+                Box::new(SlowTui {
+                    clock: clock.clone(),
+                    script: script.clone(),
+                }),
+                clock.clone(),
+            );
+            let batch = crate::input::InputBatch {
+                instance_id: session.instance_id(),
+                client_id: [6; 16],
+                seq: 1,
+                bytes: b"alpha\r",
+            };
+            assert_eq!(
+                session.apply_input_line_batch(batch).unwrap(),
+                crate::input::InputOutcome::Ack { duplicate: false }
+            );
+            assert_eq!(
+                session.apply_input_line_batch(batch).unwrap(),
+                crate::input::InputOutcome::Ack { duplicate: true }
+            );
+            let script = script.lock().unwrap();
+            assert_eq!(script.typed, "alpha");
+            assert_eq!(script.returns.len(), 1);
+            assert!(script.returns[0] >= script.typed_at.unwrap() + script.echo_after);
+        }
+    }
+
     /// Types "alpha" into a scripted TUI; returns the outcome, the Return times,
     /// and how long `type_text` took after the first Return and in total.
     fn type_into(
@@ -829,6 +871,21 @@ impl Session {
         self.size.lock().map(|size| *size).unwrap_or_default()
     }
 
+    /// A stale pane must never resize a replacement session with the same name.
+    pub fn resize_instance(&self, instance_id: &str, size: Size) -> Result<bool> {
+        if self.instance_id != instance_id {
+            return Ok(false);
+        }
+        if !self.is_alive() {
+            return Err(AgentError::Exited);
+        }
+        if size.cols() > Size::MAX_RESIZE_COLS || size.rows() > Size::MAX_RESIZE_ROWS {
+            return Err(AgentError::Io("resize exceeds viewport limits".into()));
+        }
+        self.resize(size)?;
+        Ok(true)
+    }
+
     /// Resize the backing terminal and publish its new dimensions together.
     /// The agent lock serializes this with output capture and input delivery;
     /// a failed backend resize leaves the advertised session size unchanged.
@@ -919,9 +976,18 @@ impl Session {
     /// Deliver TEXT and submit it as one act. This is the composite used by
     /// type_text and SendLine; no other input sender can split the two units.
     pub fn type_text(&self, text: &str, settle: Duration) -> Result<InputSubmitOutcome> {
+        let _held = self.acquire_input_lock()?;
+        self.type_text_locked(text, settle, true)
+    }
+
+    fn type_text_locked(
+        &self,
+        text: &str,
+        settle: Duration,
+        retry_return: bool,
+    ) -> Result<InputSubmitOutcome> {
         let body = normalize_input_text(text);
         if body.is_empty() {
-            let _held = self.acquire_input_lock()?;
             if let Ok(mut pending) = self.pending_input.lock() {
                 *pending = None;
             }
@@ -931,13 +997,11 @@ impl Session {
         if self.output_version().is_none() || self.screen_text().is_err() {
             let mut bytes = body.into_bytes();
             bytes.extend_from_slice(crate::keys::RETURN_BYTES);
-            let _held = self.acquire_input_lock()?;
             self.write_one_burst(&bytes)?;
             return Ok(InputSubmitOutcome::Submitted);
         }
 
         let tail = input_tail(&body);
-        let _held = self.acquire_input_lock()?;
         if let Ok(mut pending) = self.pending_input.lock() {
             *pending = None;
         }
@@ -971,7 +1035,7 @@ impl Session {
         if !settle.is_zero() {
             self.clock.sleep(settle);
         }
-        match self.submit_locked(&tail, baseline) {
+        match self.submit_locked_with_retry(&tail, baseline, retry_return) {
             Err(AgentError::Busy) => Err(AgentError::SubmitUncertain),
             result => result,
         }
@@ -1014,6 +1078,15 @@ impl Session {
     }
 
     fn submit_locked(&self, tail: &str, baseline_occurrences: usize) -> Result<InputSubmitOutcome> {
+        self.submit_locked_with_retry(tail, baseline_occurrences, true)
+    }
+
+    fn submit_locked_with_retry(
+        &self,
+        tail: &str,
+        baseline_occurrences: usize,
+        retry_return: bool,
+    ) -> Result<InputSubmitOutcome> {
         if tail.is_empty() {
             self.write_one_burst(crate::keys::RETURN_BYTES)?;
             return Ok(InputSubmitOutcome::Submitted);
@@ -1062,7 +1135,7 @@ impl Session {
                 version = snapshot.output_version.unwrap_or(version);
             }
         }
-        if !composer_newline {
+        if !composer_newline || !retry_return {
             return Ok(InputSubmitOutcome::Unverified);
         }
 
@@ -1193,6 +1266,28 @@ impl Session {
         &self,
         batch: InputBatch<'_>,
     ) -> core::result::Result<InputOutcome, InputError> {
+        self.apply_input_batch_mode(batch, false)
+    }
+
+    /// Apply a deduplicated line with exactly one Return and no automatic retry.
+    pub fn apply_input_line_batch(
+        &self,
+        batch: InputBatch<'_>,
+    ) -> core::result::Result<InputOutcome, InputError> {
+        self.apply_input_batch_mode(batch, true)
+    }
+
+    fn apply_input_batch_mode(
+        &self,
+        batch: InputBatch<'_>,
+        line: bool,
+    ) -> core::result::Result<InputOutcome, InputError> {
+        let text = if line {
+            let bytes = batch.bytes.strip_suffix(b"\r").unwrap_or(batch.bytes);
+            Some(std::str::from_utf8(bytes).map_err(|_| InputError::Unavailable)?)
+        } else {
+            None
+        };
         if batch.seq == 0 {
             return Err(InputError::InvalidSequence);
         }
@@ -1231,7 +1326,23 @@ impl Session {
             self.refund_rate(batch.bytes.len());
             return Ok(outcome);
         }
-        self.finish_input_batch(batch, self.write_one_burst(batch.bytes))
+        let result = match text {
+            Some(text) => self
+                .type_text_locked(text, Duration::ZERO, false)
+                .and_then(|outcome| match outcome {
+                    InputSubmitOutcome::Late => Err(AgentError::SubmitPending),
+                    _ => Ok(()),
+                })
+                .map_err(|error| match error {
+                    // The text is already delivered. Even if the Return was
+                    // refused before writing, releasing this reservation would
+                    // let a retry replay the text body.
+                    AgentError::LateSubmitAbandoned { .. } => AgentError::SubmitUncertain,
+                    error => error,
+                }),
+            None => self.write_one_burst(batch.bytes),
+        };
+        self.finish_input_batch(batch, result)
     }
 
     fn batch_result(

@@ -550,3 +550,109 @@ fn apply(
         Ok(())
     })
 }
+
+#[test]
+fn input_line_delivers_one_return_and_deduplicates_with_or_without_composer_cr() {
+    for bytes in [b"hello".as_slice(), b"hello\r", b"\r"] {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let session = input_session(writes.clone(), true);
+        let batch = InputBatch {
+            instance_id: session.instance_id(),
+            client_id: [7; 16],
+            seq: 1,
+            bytes,
+        };
+        assert_eq!(
+            session.apply_input_line_batch(batch).unwrap(),
+            InputOutcome::Ack { duplicate: false }
+        );
+        assert_eq!(
+            session.apply_input_line_batch(batch).unwrap(),
+            InputOutcome::Ack { duplicate: true }
+        );
+        let delivered: Vec<u8> = writes.lock().unwrap().iter().flatten().copied().collect();
+        assert_eq!(
+            delivered,
+            if bytes == b"\r" {
+                b"\r".to_vec()
+            } else {
+                b"hello\r".to_vec()
+            }
+        );
+        assert_eq!(delivered.iter().filter(|b| **b == b'\r').count(), 1);
+    }
+}
+
+#[test]
+fn input_line_refuses_wrong_instance_and_invalid_utf8_without_writing() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let session = input_session(writes.clone(), true);
+    let batch = InputBatch {
+        instance_id: "other",
+        client_id: [8; 16],
+        seq: 1,
+        bytes: b"hello\r",
+    };
+    assert_eq!(
+        session.apply_input_line_batch(batch).unwrap(),
+        InputOutcome::WrongInstance
+    );
+    assert!(session
+        .apply_input_line_batch(InputBatch {
+            instance_id: session.instance_id(),
+            bytes: &[255],
+            ..batch
+        })
+        .is_err());
+    assert!(writes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn instance_pinned_resize_reaches_backend_and_stale_instance_writes_nothing() {
+    struct ResizeAgent(Arc<Mutex<Vec<Size>>>);
+    impl AgentProcess for ResizeAgent {
+        fn write(&mut self, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn screen_text(&mut self) -> Result<String> {
+            Ok(String::new())
+        }
+        fn cursor(&mut self) -> Result<Cursor> {
+            Ok(Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            })
+        }
+        fn is_alive(&mut self) -> bool {
+            true
+        }
+        fn terminate(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> Size {
+            Size::default()
+        }
+        fn resize(&mut self, size: Size) -> Result<()> {
+            self.0.lock().unwrap().push(size);
+            Ok(())
+        }
+    }
+    let sizes = Arc::new(Mutex::new(Vec::new()));
+    let session = Session::new(
+        "resize",
+        Box::new(ResizeAgent(sizes.clone())),
+        Arc::new(ManualClock::new()),
+    );
+    let size = Size::for_viewport(31, 9);
+    assert!(!session.resize_instance("stale", size).unwrap());
+    assert!(sizes.lock().unwrap().is_empty());
+    assert!(session
+        .resize_instance(session.instance_id(), size)
+        .unwrap());
+    assert_eq!(*sizes.lock().unwrap(), vec![size]);
+    assert!(session
+        .resize_instance(session.instance_id(), Size::new(2000, 600))
+        .is_err());
+    assert_eq!(*sizes.lock().unwrap(), vec![size]);
+}
