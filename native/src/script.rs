@@ -144,6 +144,16 @@ pub const BINDINGS: [&str; 107] = [
 /// own rows for the words it defines in pure Lua, into the same table.
 const WORDS: &[(&str, &str, &str)] = &[
     (
+        "_input_instance_bound_version",
+        "Capability version for the native expected-instance-bound full-text and key provider. Consumers must check this and both provider functions before use.",
+        "_input_instance_bound_version -> 1",
+    ),
+    (
+        "_input_key_if_instance",
+        "Write one named key to the expected captured session instance. WrongInstance and NotStarted are refused before writing; after the write path starts, errors have an uncertain outcome. Success returns true.",
+        "_input_key_if_instance(name, expected_instance, key_spec) -> true",
+    ),
+    (
         "_input_submit",
         "Submit visible session text; returns 'submitted' or 'unverified'.",
         "_input_submit(name, expect) -> status",
@@ -157,6 +167,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_input_type_text",
         "Deliver text and submit it while holding one input lock; returns 'submitted', 'unverified' or 'late'. 'late': the text is still being written to a slow pane and its Return follows when it lands (dropped after 30 s); do not resend, check the pane.",
         "_input_type_text(name, text, settle?) -> status",
+    ),
+    (
+        "_input_type_text_if_instance",
+        "Deliver and submit text using the expected captured session instance and the full type_text semantics. WrongInstance and NotStarted are refused before writing; after the write path starts, errors have an uncertain outcome. Returns 'submitted', 'unverified' or 'late'.",
+        "_input_type_text_if_instance(name, expected_instance, text, settle?) -> status",
     ),
     (
         "caller",
