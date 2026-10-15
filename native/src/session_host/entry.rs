@@ -177,6 +177,11 @@ impl Client {
             } if identity == manifest.identity
                 && capabilities.len() <= 16
                 && capabilities.iter().all(|value| value.len() <= 64)
+                && open
+                    .protocol
+                    .required
+                    .iter()
+                    .all(|required| capabilities.contains(required))
                 && max_payload == 65_519 =>
             {
                 Ok(Self {
@@ -320,3 +325,7 @@ fn screen(client: &mut Client) -> io::Result<(u64, Vec<u8>, u16, u16)> {
     }
     Ok((generation, assembled, rows, cols))
 }
+
+#[cfg(test)]
+#[path = "entry_tests.rs"]
+mod tests;

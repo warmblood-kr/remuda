@@ -61,3 +61,17 @@ inventing an EOF assumption. A separate descendant heartbeat proves direct-child
 exit cannot be treated as all descendants ended. Output end reason/drained
 generation are explicit. Passing tests are author evidence, not runtime/rollout
 approval; independent exact-head review and supported-platform CI remain required.
+
+Independent review found that the client requested required capabilities but
+did not verify them in the authenticated Opened response. An authenticated mock
+omits each Control requirement in turn and observes that no Acquire/Close request
+is sent. Before the fix it caught the actual Acquire; after checking every
+requested capability it passes, alongside the original process proofs.
+
+```text
+missing_required_capability_refuses_before_any_controller_mutation ... FAILED
+client sent a request after peer omitted inspect
+
+missing_required_capability_refuses_before_any_controller_mutation ... ok
+test result: ok. 38 passed; 0 failed
+```
