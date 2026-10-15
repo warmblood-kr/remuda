@@ -191,6 +191,33 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_publishers_share_a_persisted_version_sequence() {
+        let state = State::new();
+        let dir = state.dir();
+        let threads: Vec<_> = (1..=8)
+            .map(|last| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    publish_at(&dir, format!("192.168.100.{last}:7441").parse().unwrap()).unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            registry::load_registry_at(&dir).unwrap().authorized_nodes[0].version,
+            9
+        );
+        // A fresh caller reads the persisted version, with no process-local counter.
+        publish_at(&dir, "192.168.100.238:7441".parse().unwrap()).unwrap();
+        assert_eq!(
+            registry::load_registry_at(&dir).unwrap().authorized_nodes[0].version,
+            10
+        );
+    }
+
+    #[test]
     fn refresh_stops_after_three_attempts_when_listener_keeps_changing() {
         let mut samples = 0;
         let mut publications = 0;
