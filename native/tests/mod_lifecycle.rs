@@ -1848,4 +1848,15 @@ fn command_dispatch_reloads_changed_entry_and_loaded_helpers_without_losing_stat
         "fixed:3",
         "corrected source retries, preserving module state"
     );
+    let source = fs::read_to_string(&entry).unwrap().replace(
+        "state.starts = state.starts + 1",
+        "state.starts = state.starts + 10",
+    );
+    fs::write(&entry, source).unwrap();
+    assert_eq!(read_value(&image, "remuda._load_extension_command('sample', 'sample'); return remuda._dispatch_extension_command('sample', {}, {})"), "fixed:3");
+    assert_eq!(
+        read_value(&image, dispatch),
+        "fixed:13",
+        "entry edits remain detectable after default commands"
+    );
 }

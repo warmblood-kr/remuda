@@ -118,6 +118,7 @@ register("_exec_commands", "Load a mod and run its optional commands hook withou
 -- readiness, load from the CLI instead (probe, `remuda exec`, dispatch).
 function remuda._load_extension_command(name, owner, refresh)
   local registered = remuda._extension_commands[name] ~= nil
+  if registered and not refresh then return false end
   local loaded, err = pcall(remuda._exec_commands, owner, refresh)
   if loaded and remuda._extension_commands[name] then return not registered end
   if not registered then
@@ -1188,6 +1189,9 @@ end
 -- Source refresh must ask the active version before replacing any registrations.
 function remuda._source_refresh_check(name)
   local active = modules[name]
+  if active and not active.source_refresh_ready then
+    error("source refresh deferred: active mod lacks source_refresh_ready; explicitly reload it when idle before using source refresh", 0)
+  end
   if active and active.source_refresh_ready then
     local reason = active.source_refresh_ready(active.state)
     if reason ~= nil then error("source refresh deferred: " .. tostring(reason) .. "; retry when idle", 0) end
