@@ -817,3 +817,60 @@ fn loaded_mod_without_its_command_fails_cleanly_and_lifecycle_start_runs_once() 
         );
     }
 }
+
+#[test]
+fn eval_accepts_lua_source_starting_with_a_comment() {
+    let (dir, _daemon_guard) = guarded_temp_dir("eval-comment");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_remuda"))
+            .args(["-s", "s"])
+            .args(args)
+            .env("REMUDA_RUNTIME_DIR", &dir)
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env("XDG_CONFIG_HOME", dir.join("config"))
+            .env("HOME", &dir)
+            .env("REMUDA_NO_UPDATE_CHECK", "1")
+            .output()
+            .expect("run isolated eval")
+    };
+    for option in ["-e", "--eval"] {
+        let output = run(&[option, "-- a valid Lua comment\nreturn 'opaque-code'"]);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "opaque-code"
+        );
+    }
+    for comment in ["--help", "--unknown"] {
+        let output = run(&["-e", comment]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "Lua comments must not print CLI help: {output:?}"
+        );
+    }
+    let missing = run(&["-e"]);
+    assert!(!missing.status.success(), "missing CODE must fail");
+    let diagnostic = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        diagnostic.contains("Usage: remuda [OPTIONS]"),
+        "{diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("__dispatch"),
+        "internal parser names must not appear in root usage: {diagnostic}"
+    );
+    let invalid = run(&["-e", "remuda._opaque_eval_marker = true", "--bogus"]);
+    assert!(
+        !invalid.status.success(),
+        "unrelated options must remain invalid"
+    );
+    let marker = run(&["-e", "return tostring(remuda._opaque_eval_marker)"]);
+    assert_eq!(
+        String::from_utf8_lossy(&marker.stdout).trim(),
+        "nil",
+        "invalid argv must not execute CODE"
+    );
+    run(&["stop", "-f", "--yes"]);
+    let _ = fs::remove_dir_all(&dir);
+}
