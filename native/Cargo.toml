@@ -84,3 +84,9 @@ windows-sys = { version = "0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_F
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "session_host_fixture"
+path = "tests/daemon_support/session_host_fixture.rs"
+test = false
+bench = false

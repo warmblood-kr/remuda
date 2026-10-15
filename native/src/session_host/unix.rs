@@ -95,9 +95,32 @@ impl Endpoint {
     }
     /// Runtime limits concurrent accepted sockets BEFORE spawning workers.
     pub fn accept(&self) -> io::Result<Channel<UnixStream>> {
+        self.authenticate(self.accept_stream()?)
+    }
+    pub fn nonblocking(&self) -> io::Result<()> {
+        self.listener.set_nonblocking(true)
+    }
+    pub fn wait_connection(&self, timeout: Duration) {
+        let mut descriptor = libc::pollfd {
+            fd: self.listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Poll is only an availability wait; accept performs the actual check.
+        let _ = unsafe {
+            libc::poll(
+                &mut descriptor,
+                1,
+                timeout.as_millis().min(i32::MAX as u128) as i32,
+            )
+        };
+    }
+    pub fn accept_stream(&self) -> io::Result<UnixStream> {
         let (stream, _) = self.listener.accept()?;
         verify_peer(&stream, uid())?;
-        deadlines(&stream)?;
+        Ok(stream)
+    }
+    pub fn authenticate(&self, stream: UnixStream) -> io::Result<Channel<UnixStream>> {
         Channel::authenticate(stream, &self.key, false)
     }
     pub fn path(&self) -> &Path {
@@ -129,7 +152,6 @@ pub(crate) fn connect(path: &Path) -> io::Result<Channel<UnixStream>> {
     }
     let stream = connect_until(&socket, until)?;
     verify_peer(&stream, uid())?;
-    deadlines(&stream)?;
     Channel::authenticate_until(stream, &key, true, until)
 }
 fn connect_until(path: &Path, until: Instant) -> io::Result<UnixStream> {
@@ -152,7 +174,11 @@ fn connect_until(path: &Path, until: Instant) -> io::Result<UnixStream> {
     {
         address.sun_len = len as u8;
     }
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    #[cfg(target_os = "linux")]
+    let socket_flags = libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+    #[cfg(not(target_os = "linux"))]
+    let socket_flags = libc::SOCK_STREAM;
+    let fd = unsafe { libc::socket(libc::AF_UNIX, socket_flags, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -211,10 +237,6 @@ fn connect_until(path: &Path, until: Instant) -> io::Result<UnixStream> {
             _ => return Err(error),
         }
     }
-}
-fn deadlines(stream: &UnixStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))
 }
 fn verify_peer(stream: &UnixStream, expected: u32) -> io::Result<()> {
     #[cfg(target_os = "macos")]
