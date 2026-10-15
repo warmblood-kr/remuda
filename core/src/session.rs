@@ -977,10 +977,9 @@ impl Session {
         }
     }
 
-    /// Type and submit text only when this captured session is the expected
-    /// launch. The immutable identity check and liveness refusal happen before
-    /// the write path. Once that path begins, errors are conservatively
-    /// reported as uncertain because bytes may have reached the PTY.
+    /// Type and submit only when this captured session is the expected launch.
+    /// Identity/liveness are checked before writing; after entering the write
+    /// path, errors are uncertain because bytes may have reached the PTY.
     pub fn type_text_if_instance(
         &self,
         expected_instance: &str,
