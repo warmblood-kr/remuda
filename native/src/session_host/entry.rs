@@ -156,6 +156,9 @@ impl Client {
     ) -> io::Result<Self> {
         Self::open_with_capabilities(path, role, expected, &[])
     }
+    pub fn open_viewport(path: &Path, expected: super::api::Identity) -> io::Result<Self> {
+        Self::open_with_capabilities(path, Role::View, expected, &[super::api::TYPED_VIEW])
+    }
     pub fn open_recovering(path: &Path, expected: super::api::Identity) -> io::Result<Self> {
         Self::open_with_capabilities(
             path,
@@ -215,6 +218,11 @@ impl Client {
             }
             _ => Err(invalid("host identity/protocol refusal")),
         }
+    }
+    #[cfg(test)]
+    pub fn send_fixture(&mut self, request: &Request) -> io::Result<()> {
+        self.channel
+            .send(&serde_json::to_vec(request).map_err(invalid)?)
     }
     pub fn request(&mut self, request: &Request) -> io::Result<Response> {
         self.channel
@@ -292,6 +300,21 @@ pub(crate) fn command(path: &Path, operation: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn snapshot_admission(client: &mut Client) -> io::Result<Response> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let response = client.request(&Request::Snapshot)?;
+        if matches!(&response, Response::Error { code } if code == "snapshot_budget_busy")
+            && std::time::Instant::now() < until
+        {
+            // Only a confirmed read-only pre-capture refusal is retried.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        return Ok(response);
+    }
+}
+
 fn screen(client: &mut Client) -> io::Result<(u64, Vec<u8>, u16, u16)> {
     use base64::Engine;
     if !client
@@ -308,7 +331,7 @@ fn screen(client: &mut Client) -> io::Result<(u64, Vec<u8>, u16, u16)> {
         pages,
         rows,
         cols,
-    } = client.request(&Request::Snapshot)?
+    } = snapshot_admission(client)?
     else {
         return Err(invalid("snapshot refused; resync required"));
     };

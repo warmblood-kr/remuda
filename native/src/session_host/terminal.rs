@@ -1,6 +1,7 @@
 //! Host-only terminal preparation; not yet wired into PtyAgent.
 use super::strings::Strings;
-use remuda_core::agent::{Cursor, ScreenSnapshot, Size, VersionedSnapshot};
+use super::viewport::{Modes, RenderingProfile, Viewport};
+use remuda_core::agent::{Cursor, MouseEncoding, MouseMode, MouseState, VersionedSnapshot};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 const PARSE_BUDGET: usize = 4096;
@@ -70,45 +71,62 @@ impl Terminal {
         self.generation = next;
         Ok(count)
     }
-    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), &'static str> {
+    pub fn prepare_resize(&self, rows: u16, cols: u16) -> Result<u64, &'static str> {
         geometry(rows, cols, self.history)?;
-        let next = self
-            .generation
+        self.generation
             .checked_add(1)
-            .ok_or("terminal generation exhausted")?;
+            .ok_or("terminal generation exhausted")
+    }
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), &'static str> {
+        let next = self.prepare_resize(rows, cols)?;
         self.parser.screen_mut().set_size(rows, cols);
         self.generation = next;
         Ok(())
     }
     pub fn snapshot(&mut self, scrollback: usize) -> VersionedSnapshot {
+        let viewport = self.viewport(scrollback);
+        let generation = viewport.generation;
+        VersionedSnapshot {
+            snapshot: viewport.into_screen(),
+            output_version: Some(generation),
+            instance_id: None,
+        }
+    }
+    pub fn viewport(&mut self, scrollback: usize) -> Viewport {
         let (rows, cols) = self.parser.screen().size();
         let screen = self.parser.screen_mut();
         let previous = screen.scrollback();
         screen.set_scrollback(usize::MAX);
-        let scrollback_len = screen.scrollback();
+        let history_len = screen.scrollback() as u16;
         screen.set_scrollback(previous);
-        let (cells, wrapped, cursor) = crate::pty::with_scrollback(screen, scrollback, |screen| {
-            let (row, col) = crate::pty::display_cursor(screen);
-            (
-                crate::pty::styled_cells(screen, Size::for_pane(cols, rows)),
-                (0..rows).map(|row| screen.row_wrapped(row)).collect(),
-                Cursor {
-                    row,
-                    col,
-                    visible: scrollback == 0 && !screen.hide_cursor(),
-                },
-            )
-        });
-        VersionedSnapshot {
-            snapshot: ScreenSnapshot {
-                cells,
-                wrapped,
-                cursor,
-                scrollback_len,
-                scrollback_total: self.scrollback_total.load(Ordering::Relaxed),
-            },
-            output_version: Some(self.generation),
-            instance_id: None,
+        let (cells, wrapped, cursor, offset, modes) =
+            crate::pty::with_scrollback(screen, scrollback, |screen| {
+                let (row, col) = crate::pty::display_cursor(screen);
+                (
+                    crate::pty::styled_cells_in(screen, rows, cols),
+                    (0..rows).map(|row| screen.row_wrapped(row)).collect(),
+                    Cursor {
+                        row,
+                        col,
+                        visible: screen.scrollback() == 0 && !screen.hide_cursor(),
+                    },
+                    screen.scrollback() as u16,
+                    modes(screen),
+                )
+            });
+        Viewport {
+            schema: 1,
+            rendering_profile: RenderingProfile::Vt100Fixed22,
+            generation: self.generation,
+            rows,
+            cols,
+            offset,
+            history_len,
+            history_total: self.scrollback_total.load(Ordering::Relaxed) as u64,
+            cells,
+            wrapped,
+            cursor,
+            modes,
         }
     }
     pub fn screen(&self) -> &vt100::Screen {
@@ -116,6 +134,10 @@ impl Terminal {
     }
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+    #[cfg(test)]
+    pub fn generation_fixture(&mut self, generation: u64) {
+        self.generation = generation;
     }
     pub fn take_query(&mut self) -> Option<(u16, u16)> {
         self.parser.callbacks_mut().positions.pop_front()
@@ -126,6 +148,29 @@ impl Terminal {
         (self.strings.unsupported, self.parser.callbacks().overflow)
     }
 }
+fn modes(screen: &vt100::Screen) -> Modes {
+    Modes {
+        mouse: MouseState {
+            mode: match screen.mouse_protocol_mode() {
+                vt100::MouseProtocolMode::None => MouseMode::None,
+                vt100::MouseProtocolMode::Press => MouseMode::Press,
+                vt100::MouseProtocolMode::PressRelease => MouseMode::PressRelease,
+                vt100::MouseProtocolMode::ButtonMotion => MouseMode::ButtonMotion,
+                vt100::MouseProtocolMode::AnyMotion => MouseMode::AnyMotion,
+            },
+            encoding: match screen.mouse_protocol_encoding() {
+                vt100::MouseProtocolEncoding::Default => MouseEncoding::Default,
+                vt100::MouseProtocolEncoding::Utf8 => MouseEncoding::Utf8,
+                vt100::MouseProtocolEncoding::Sgr => MouseEncoding::Sgr,
+            },
+            bracketed_paste: screen.bracketed_paste(),
+        },
+        application_cursor: screen.application_cursor(),
+        application_keypad: screen.application_keypad(),
+        alternate_screen: screen.alternate_screen(),
+    }
+}
+
 fn geometry(rows: u16, cols: u16, history: usize) -> Result<(), &'static str> {
     if rows == 0
         || cols == 0

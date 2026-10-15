@@ -3,6 +3,45 @@ use super::*;
 use std::path::PathBuf;
 struct Cleanup(PathBuf);
 #[test]
+fn typed_view_refuses_missing_capability_before_requesting_a_snapshot() {
+    let path = PathBuf::from("/tmp").join(format!("rmv-cap-{}", std::process::id()));
+    let cleanup = Cleanup(path.clone());
+    let endpoint = Endpoint::bind(&path).unwrap();
+    let identity = super::super::api::Identity {
+        host: [8; 16],
+        session: "synthetic".into(),
+        instance: "instance".into(),
+    };
+    let expected = identity.clone();
+    let peer = std::thread::spawn(move || {
+        let mut channel = endpoint.accept().unwrap();
+        let open: Open = serde_json::from_slice(&channel.receive().unwrap()).unwrap();
+        assert!(open
+            .protocol
+            .required
+            .iter()
+            .any(|value| value == super::super::api::TYPED_VIEW));
+        channel
+            .send(
+                &serde_json::to_vec(&Response::Opened {
+                    identity,
+                    minor: 0,
+                    capabilities: vec!["inspect".into()],
+                    max_payload: 65_519,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            channel.receive().is_err(),
+            "client requested a typed frame from an incompatible peer"
+        );
+    });
+    assert!(Client::open_viewport(&path, expected).is_err());
+    peer.join().unwrap();
+    drop(cleanup);
+}
+#[test]
 fn recovery_refuses_missing_monotonic_ledger_capability_before_acquisition() {
     let path = std::env::temp_dir().join(format!("rm-host-recovery-cap-{}", std::process::id()));
     let cleanup = Cleanup(path.clone());

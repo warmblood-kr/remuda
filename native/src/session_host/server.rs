@@ -5,7 +5,6 @@ use super::control::{ConnectionId, Fence};
 use super::coordinator::Admission;
 use super::owned::Owned;
 use super::unix::Endpoint;
-use base64::Engine;
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -21,12 +20,14 @@ const CAPS: &[&str] = &[
     "controller-epoch-v1",
     "paged-screen-v1",
     super::api::RETAINED_LEDGER,
+    super::api::TYPED_VIEW,
 ];
 pub(crate) struct Server {
     endpoint: Arc<Endpoint>,
     host: Arc<Owned>,
     connections: Arc<AtomicUsize>,
-    snapshot_busy: Arc<AtomicBool>,
+    snapshots: super::view_budget::Budget,
+    frames: super::view_frames::Frames,
     next_snapshot: AtomicU64,
     stop: AtomicBool,
     publication: Option<Arc<super::birth::Gate>>,
@@ -41,7 +42,8 @@ impl Server {
             endpoint: Arc::new(endpoint),
             host,
             connections: Arc::new(AtomicUsize::new(0)),
-            snapshot_busy: Arc::new(AtomicBool::new(false)),
+            snapshots: super::view_budget::Budget::new(),
+            frames: super::view_frames::Frames::new(),
             next_snapshot: AtomicU64::new(1),
             stop: AtomicBool::new(false),
             publication: None,
@@ -59,6 +61,7 @@ impl Server {
     pub fn run(self: Arc<Self>) -> io::Result<()> {
         self.endpoint.nonblocking()?;
         while !self.stop.load(Ordering::Acquire) {
+            self.frames.expire(Instant::now());
             match self.endpoint.accept_stream() {
                 Ok(stream) => {
                     let Some(permit) = Permit::connection(self.connections.clone()) else {
@@ -140,6 +143,7 @@ impl Server {
             fence: None,
             snapshot: None,
             stop_after_reply: false,
+            latest: None,
         };
         loop {
             let bytes = channel.receive()?;
@@ -170,7 +174,6 @@ fn send(channel: &mut Channel<UnixStream>, response: &Response) -> io::Result<()
 }
 struct Permit {
     count: Option<Arc<AtomicUsize>>,
-    snapshot: Option<Arc<AtomicBool>>,
 }
 impl Permit {
     fn connection(count: Arc<AtomicUsize>) -> Option<Self> {
@@ -179,18 +182,7 @@ impl Permit {
                 (n < MAX_CONNECTIONS).then_some(n + 1)
             })
             .ok()?;
-        Some(Self {
-            count: Some(count),
-            snapshot: None,
-        })
-    }
-    fn snapshot(busy: Arc<AtomicBool>) -> Option<Self> {
-        busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()?;
-        Some(Self {
-            count: None,
-            snapshot: Some(busy),
-        })
+        Some(Self { count: Some(count) })
     }
 }
 impl Drop for Permit {
@@ -198,17 +190,14 @@ impl Drop for Permit {
         if let Some(count) = &self.count {
             count.fetch_sub(1, Ordering::AcqRel);
         }
-        if let Some(busy) = &self.snapshot {
-            busy.store(false, Ordering::Release);
-        }
     }
 }
 struct Snapshot {
     id: u64,
     generation: u64,
-    bytes: Vec<u8>,
+    frame: Arc<super::view_frames::Frame>,
     until: Instant,
-    _permit: Permit,
+    typed: bool,
     sent: Vec<bool>,
 }
 struct Connection {
@@ -218,9 +207,12 @@ struct Connection {
     fence: Option<Fence>,
     snapshot: Option<Snapshot>,
     stop_after_reply: bool,
+    latest: Option<super::latest::Latest>,
 }
 impl Drop for Connection {
     fn drop(&mut self) {
+        self.snapshot = None;
+        self.server.snapshots.forget(self.id);
         if let Some(fence) = self.fence.take() {
             let _ = self.server.host.release(fence);
         }
@@ -307,22 +299,12 @@ impl Connection {
                     .map_err(control_error)?;
                 Ok(Response::Ok)
             }
-            Request::Snapshot => self.begin_snapshot(),
-            Request::Page { snapshot, index } => self.page(snapshot, index),
-            Request::Acknowledge {
-                snapshot,
-                generation,
-            } => {
-                if !self.snapshot.as_ref().is_some_and(|s| {
-                    s.id == snapshot
-                        && s.generation == generation
-                        && s.sent.iter().all(|sent| *sent)
-                }) {
-                    return Err("expired_or_wrong_snapshot".into());
-                }
-                self.snapshot = None;
-                Ok(Response::Ok)
-            }
+            request @ (Request::Snapshot
+            | Request::Viewport { .. }
+            | Request::Page { .. }
+            | Request::Acknowledge { .. }
+            | Request::AcknowledgeViewport { .. }
+            | Request::WatchAfter { .. }) => self.terminal_request(request),
             Request::Stop => self.stop(),
         }
     }
@@ -398,43 +380,133 @@ impl Connection {
             }
         }
     }
-    fn begin_snapshot(&mut self) -> Result<Response, String> {
+    fn terminal_request(&mut self, request: Request) -> Result<Response, String> {
+        match request {
+            Request::Snapshot => self.begin_snapshot(None),
+            Request::Viewport { scrollback } => self.begin_snapshot(Some(scrollback)),
+            Request::Page { snapshot, index } => self.page(snapshot, index),
+            Request::Acknowledge {
+                snapshot,
+                generation,
+            } => self.acknowledge(snapshot, generation, false),
+            Request::AcknowledgeViewport {
+                snapshot,
+                generation,
+            } => self.acknowledge(snapshot, generation, true),
+            Request::WatchAfter {
+                generation,
+                timeout_ms,
+            } => self
+                .latest
+                .as_mut()
+                .ok_or("watch_requires_typed_snapshot_ack")?
+                .wait(generation, timeout_ms, &self.server.host.view),
+            _ => Err("invalid_terminal_request".into()),
+        }
+    }
+    fn acknowledge(&mut self, id: u64, generation: u64, typed: bool) -> Result<Response, String> {
+        if !self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.id == id
+                && snapshot.generation == generation
+                && snapshot.typed == typed
+                && snapshot.sent.iter().all(|sent| *sent)
+                && snapshot.frame.available(Instant::now())
+        }) {
+            return Err("expired_or_wrong_snapshot".into());
+        }
+        if let Some(snapshot) = self.snapshot.take() {
+            snapshot.frame.clear();
+        }
+        if typed {
+            self.latest
+                .as_mut()
+                .ok_or("watch_subscription_unavailable")?
+                .acknowledge(generation, &self.server.host.view)
+        } else {
+            Ok(Response::Ok)
+        }
+    }
+    fn begin_snapshot(&mut self, offset: Option<u16>) -> Result<Response, String> {
         if self.snapshot.is_some() {
             return Err("snapshot_ack_required".into());
         }
-        let permit =
-            Permit::snapshot(self.server.snapshot_busy.clone()).ok_or("snapshot_budget_busy")?;
+        if offset.is_some() && self.latest.is_none() {
+            // Register before capture; no output/ACK/wait handoff gap.
+            self.latest = Some(super::latest::Latest::new(&self.server.host.view)?);
+        }
+        let permit = self
+            .server
+            .snapshots
+            .acquire(self.id, Instant::now())
+            .ok_or("snapshot_budget_busy")?;
         let id = self
             .server
             .next_snapshot
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
             .map_err(|_| "snapshot_id_exhausted")?;
-        let (generation, bytes, (rows, cols)) = self
-            .server
-            .host
-            .view
-            .capture()
-            .map_err(|_| "capture_unavailable")?;
-        if bytes.len() > MAX_SNAPSHOT {
-            return Err("snapshot_byte_limit".into());
-        }
-        let response = Response::Snapshot {
-            snapshot: id,
-            generation,
-            bytes: bytes.len(),
-            pages: bytes.len().div_ceil(PAGE),
-            rows,
-            cols,
+        let (generation, bytes, rows, cols) = self.capture(offset)?;
+        let pages = bytes.len().div_ceil(PAGE);
+        let response = if offset.is_some() {
+            Response::Viewport {
+                identity: self.server.host.identity(),
+                snapshot: id,
+                generation,
+                bytes: bytes.len(),
+                pages,
+                rows,
+                cols,
+            }
+        } else {
+            Response::Snapshot {
+                snapshot: id,
+                generation,
+                bytes: bytes.len(),
+                pages,
+                rows,
+                cols,
+            }
         };
+        let until = Instant::now() + SNAPSHOT_TTL;
+        let frame = self
+            .server
+            .frames
+            .track(bytes, permit, until)
+            .ok_or("snapshot_registry_budget")?;
         self.snapshot = Some(Snapshot {
             id,
             generation,
-            sent: vec![false; bytes.len().div_ceil(PAGE)],
-            bytes,
-            until: Instant::now() + SNAPSHOT_TTL,
-            _permit: permit,
+            sent: vec![false; pages],
+            frame,
+            until,
+            typed: offset.is_some(),
         });
         Ok(response)
+    }
+    fn capture(&self, offset: Option<u16>) -> Result<(u64, Vec<u8>, u16, u16), String> {
+        if let Some(offset) = offset {
+            let view = self
+                .server
+                .host
+                .view
+                .viewport(usize::from(offset))
+                .map_err(|_| "capture_unavailable")?;
+            // Expensive encoding is outside the parser lock, with an in-write cap.
+            let bytes = view
+                .encode()
+                .map_err(|_| "typed_capture_budget_or_bounds")?;
+            Ok((view.generation, bytes, view.rows, view.cols))
+        } else {
+            let (generation, bytes, (rows, cols)) = self
+                .server
+                .host
+                .view
+                .capture()
+                .map_err(|_| "capture_unavailable")?;
+            if bytes.len() > MAX_SNAPSHOT {
+                return Err("snapshot_byte_limit".into());
+            }
+            Ok((generation, bytes, rows, cols))
+        }
     }
     fn page(&mut self, id: u64, index: usize) -> Result<Response, String> {
         let snapshot = self
@@ -442,16 +514,15 @@ impl Connection {
             .as_mut()
             .filter(|s| s.id == id)
             .ok_or("snapshot_expired")?;
-        let start = index
-            .checked_mul(PAGE)
-            .filter(|start| *start < snapshot.bytes.len())
-            .ok_or("invalid_page")?;
-        let end = snapshot.bytes.len().min(start + PAGE);
+        let base64 = snapshot
+            .frame
+            .page(index, Instant::now())
+            .ok_or("invalid_or_expired_page")?;
         snapshot.sent[index] = true;
         Ok(Response::Page {
             snapshot: id,
             index,
-            base64: base64::engine::general_purpose::STANDARD.encode(&snapshot.bytes[start..end]),
+            base64,
         })
     }
 }

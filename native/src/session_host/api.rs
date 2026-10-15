@@ -7,6 +7,7 @@ pub(crate) const MAX_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
 /// Ledger reserves before effects; clients/watermarks never recycle or reset
 /// within an immutable host incarnation. Forgotten can never become New.
 pub(crate) const RETAINED_LEDGER: &str = "retained-input-ledger-v1";
+pub(crate) const TYPED_VIEW: &str = "typed-terminal-view-v1";
 pub(crate) const SCOPED_BIRTH: &str = "scoped-host-publisher-v1";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -102,6 +103,17 @@ pub(crate) enum Request {
     },
     Close,
     Snapshot,
+    Viewport {
+        scrollback: u16,
+    },
+    AcknowledgeViewport {
+        snapshot: u64,
+        generation: u64,
+    },
+    WatchAfter {
+        generation: u64,
+        timeout_ms: u16,
+    },
     Page {
         snapshot: u64,
         index: usize,
@@ -138,6 +150,13 @@ impl From<super::ledger::Lookup> for OutcomeState {
         }
     }
 }
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ViewState {
+    Unchanged,
+    ResyncRequired,
+    Ended,
+    Degraded,
+}
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "result")]
 pub(crate) enum Response {
@@ -165,6 +184,23 @@ pub(crate) enum Response {
         pages: usize,
         rows: u16,
         cols: u16,
+    },
+    Viewport {
+        identity: Identity,
+        snapshot: u64,
+        generation: u64,
+        bytes: usize,
+        pages: usize,
+        rows: u16,
+        cols: u16,
+    },
+    ViewState {
+        generation: u64,
+        resync_required: bool,
+        state: ViewState,
+        output_end: OutputEnd,
+        unsupported_osc: u64,
+        query_overflow: u64,
     },
     Page {
         snapshot: u64,
