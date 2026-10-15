@@ -669,11 +669,6 @@ fn serve_bound_listener(
     let address = listener
         .local_addr()
         .map_err(|error| format!("read cluster listener address: {error}"))?;
-    if !address.ip().is_unspecified() {
-        if let Err(error) = crate::cluster::endpoint::publish_bound(address) {
-            eprintln!("remuda: could not publish cluster listener endpoint: {error}");
-        }
-    }
     set_listener_status(
         status,
         ListenerStatus::On {
@@ -683,6 +678,14 @@ fn serve_bound_listener(
             listen_addrs: vec![address],
         },
     );
+    // Expose the address first so a concurrent CLI refresh can detect rebinds.
+    let publish_pending = std::sync::atomic::AtomicBool::new(false);
+    if !address.ip().is_unspecified() {
+        if let Err(error) = crate::cluster::endpoint::publish_bound(address) {
+            eprintln!("remuda: could not publish cluster listener endpoint: {error}");
+            publish_pending.store(true, Ordering::Release);
+        }
+    }
     let _ = ready.send(());
 
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -713,7 +716,15 @@ fn serve_bound_listener(
             })
             .map_err(|error| format!("spawn cluster listener stop watcher: {error}"))?;
         let result = listener.serve_until_rechecking(&stop_flag, || {
-            auto && auto_listener_ip_changed(address.ip(), || detector())
+            if auto && auto_listener_ip_changed(address.ip(), || detector()) {
+                return true;
+            }
+            if publish_pending.load(Ordering::Acquire)
+                && crate::cluster::endpoint::publish_bound(address).is_ok()
+            {
+                publish_pending.store(false, Ordering::Release);
+            }
+            false
         });
         serve_done.store(true, Ordering::Release);
         let _ = watcher.join();
@@ -4052,7 +4063,7 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn listener_keeps_serving_when_endpoint_version_is_exhausted() {
+    fn listener_keeps_serving_and_retries_after_endpoint_publication_failure() {
         let environment = ListenerTaskEnvironment::new(Some(listener_config("127.0.0.1:0")));
         let mut registry = crate::cluster::load_registry().unwrap();
         registry.authorized_nodes[0].version = u64::MAX;
@@ -4061,6 +4072,21 @@ mod tests {
         let address = bound_listener_status(&task);
         let _connection = connect_listener(address, Duration::from_secs(5)).unwrap();
         assert_eq!(crate::cluster::load_registry().unwrap(), registry);
+        registry.authorized_nodes[0].version = 1;
+        crate::cluster::save_registry(&registry).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let current = crate::cluster::load_registry().unwrap();
+            if current.authorized_nodes[0].endpoint == Some(address.to_string()) {
+                assert_eq!(current.authorized_nodes[0].version, 2);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "publication did not retry"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[cfg(not(windows))]

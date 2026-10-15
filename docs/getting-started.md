@@ -134,6 +134,9 @@ with an updated CLI. It reads the running listener's concrete address and pushes
 the routing hint to admitted peers without restarting the listener or sessions.
 The listener must already be running; wildcard binds require a concrete address
 before this repair can be used. Membership and keys are preserved.
+Endpoint propagation follows the existing membership rules: peers must still
+admit this node and its original admission issuer. This command does not repair
+revoked membership or discovery when all peer addresses have changed.
 On every machine:
 
 ```sh
