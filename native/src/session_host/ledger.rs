@@ -1,4 +1,5 @@
 //! Stable client histories survive controller epochs, not host crashes.
+use super::result::{Completion, Delivery, Reply};
 use std::collections::VecDeque;
 
 const MAX_CLIENTS: usize = 16;
@@ -23,7 +24,7 @@ pub(crate) enum Lookup {
 struct Entry {
     sequence: u64,
     digest: [u8; 32],
-    outcome: Option<Outcome>,
+    outcome: Option<Completion>,
 }
 struct Client {
     id: [u8; 16],
@@ -58,7 +59,13 @@ impl Ledger {
             return if entry.digest != digest {
                 Lookup::Conflict
             } else {
-                entry.outcome.map_or(Lookup::Pending, Lookup::Complete)
+                entry.outcome.as_ref().map_or(Lookup::Pending, |result| {
+                    Lookup::Complete(match result.delivery {
+                        Delivery::Rejected => Outcome::Rejected,
+                        Delivery::Written => Outcome::Written,
+                        Delivery::Indeterminate => Outcome::Indeterminate,
+                    })
+                })
             };
         }
         if sequence <= client.highest {
@@ -102,6 +109,30 @@ impl Ledger {
         Lookup::New
     }
     pub fn complete(&mut self, id: [u8; 16], sequence: u64, outcome: Outcome) -> bool {
+        self.complete_result(
+            id,
+            sequence,
+            Completion {
+                delivery: match outcome {
+                    Outcome::Rejected => Delivery::Rejected,
+                    Outcome::Written => Delivery::Written,
+                    Outcome::Indeterminate => Delivery::Indeterminate,
+                },
+                reply: Reply::Unit,
+            },
+        )
+    }
+    pub fn result(&self, id: [u8; 16], sequence: u64) -> Option<&Completion> {
+        self.clients
+            .iter()
+            .find(|client| client.id == id)?
+            .entries
+            .iter()
+            .find(|entry| entry.sequence == sequence)?
+            .outcome
+            .as_ref()
+    }
+    pub fn complete_result(&mut self, id: [u8; 16], sequence: u64, outcome: Completion) -> bool {
         let entry = self
             .clients
             .iter_mut()
@@ -118,7 +149,7 @@ impl Ledger {
         if entry.outcome.is_some() {
             return false;
         }
-        entry.outcome = Some(outcome);
+        entry.outcome = Some(outcome.bounded());
         true
     }
 }

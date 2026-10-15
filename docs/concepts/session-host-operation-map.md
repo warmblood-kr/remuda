@@ -26,7 +26,8 @@ Delivery status Written is not the submission result and is not evidence the
 child executed input. In particular, a Late submit result does not release the
 physical reservation while its delayed Enter can still land. Full operation
 results must be retained alongside the delivery ledger before runtime adoption;
-the current outcome-only ledger is not a complete implementation of that RPC.
+the ledger now retains bounded delivery plus typed submission/clear/error replies.
+That is not a complete implementation of the RPC or attachment lifecycle.
 Returned text and error payloads need explicit byte budgets and oversized-result
 semantics; do not silently truncate a successful result and replay after lost ACK.
 

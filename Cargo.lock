@@ -962,6 +962,7 @@ dependencies = [
  "unicode-width 0.2.2",
  "url",
  "vt100",
+ "vte",
  "windows-sys 0.61.2",
  "zeroize",
 ]
