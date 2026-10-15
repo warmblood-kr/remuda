@@ -7,7 +7,7 @@ use remuda_core::agent::{
     OutputSignal, OutputWakeup, Result, Size, StyledCell, VersionedSnapshot,
 };
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,15 +21,23 @@ pub(crate) struct HostChild {
     version: Arc<AtomicU64>,
     wakes: Arc<Mutex<Vec<OutputSignal>>>,
     eof: Arc<AtomicBool>,
+    drained: Arc<AtomicU64>,
+    end: Arc<AtomicU8>,
     fault: Arc<AtomicBool>,
 }
 #[derive(Clone)]
 pub(crate) struct View {
     terminal: Arc<Mutex<Terminal>>,
     eof: Arc<AtomicBool>,
+    drained: Arc<AtomicU64>,
+    end: Arc<AtomicU8>,
     fault: Arc<AtomicBool>,
 }
 impl View {
+    pub fn status(&self) -> Result<(u64, (u16, u16))> {
+        let terminal = self.terminal.lock().map_err(io)?;
+        Ok((terminal.generation(), terminal.screen().size()))
+    }
     pub fn capture(&self) -> Result<(u64, Vec<u8>, (u16, u16))> {
         let terminal = self.terminal.lock().map_err(io)?;
         Ok((
@@ -37,6 +45,21 @@ impl View {
             terminal.screen().state_formatted(),
             terminal.screen().size(),
         ))
+    }
+    pub fn output_end(&self) -> super::api::OutputEnd {
+        if !self.eof.load(Ordering::Acquire) {
+            return super::api::OutputEnd::Open;
+        }
+        match self.end.load(Ordering::Acquire) {
+            1 => super::api::OutputEnd::Eof,
+            2 => super::api::OutputEnd::Hangup,
+            _ => super::api::OutputEnd::ReadFailure,
+        }
+    }
+    pub fn drained_generation(&self) -> Option<u64> {
+        self.eof
+            .load(Ordering::Acquire)
+            .then(|| self.drained.load(Ordering::Acquire))
     }
     pub fn health(&self) -> Result<((u64, u64), bool, bool)> {
         Ok((
@@ -51,6 +74,8 @@ impl HostChild {
         View {
             terminal: self.terminal.clone(),
             eof: self.eof.clone(),
+            drained: self.drained.clone(),
+            end: self.end.clone(),
             fault: self.fault.clone(),
         }
     }
@@ -75,6 +100,8 @@ impl HostChild {
         let version = Arc::new(AtomicU64::new(0));
         let wakes = Arc::new(Mutex::new(Vec::new()));
         let eof = Arc::new(AtomicBool::new(false));
+        let drained = Arc::new(AtomicU64::new(0));
+        let end = Arc::new(AtomicU8::new(0));
         let fault = Arc::new(AtomicBool::new(false));
         let (queries, replies) = sync_channel::<(u16, u16)>(32);
         let reply_fault = Arc::clone(&fault);
@@ -93,7 +120,7 @@ impl HostChild {
                 }
             }
         });
-        let mut reader = pair.master.try_clone_reader().map_err(io)?;
+        let reader = pair.master.try_clone_reader().map_err(io)?;
         let child = pair.slave.spawn_command(command).map_err(io)?;
         drop(pair.slave);
         let reaper = super::reaper::Reaper::start(child, fault.clone());
@@ -102,47 +129,11 @@ impl HostChild {
             version: Arc::clone(&version),
             wakes: Arc::clone(&wakes),
             eof: Arc::clone(&eof),
+            drained: Arc::clone(&drained),
+            end: Arc::clone(&end),
             fault: Arc::clone(&fault),
         };
-        std::thread::spawn(move || {
-            let mut bytes = [0; 8192];
-            loop {
-                match reader.read(&mut bytes) {
-                    Ok(0) => break,
-                    Ok(count) => {
-                        let mut remaining = &bytes[..count];
-                        while !remaining.is_empty() {
-                            let mut terminal = context.terminal.lock().unwrap();
-                            let Ok(consumed) = terminal.process(remaining) else {
-                                context.fault.store(true, Ordering::Release);
-                                break;
-                            };
-                            remaining = &remaining[consumed..];
-                            while let Some(query) = terminal.take_query() {
-                                if queries.try_send(query).is_err() {
-                                    context.fault.store(true, Ordering::Release);
-                                }
-                            }
-                            context
-                                .version
-                                .store(terminal.generation(), Ordering::Release);
-                            drop(terminal);
-                            context.wakes.lock().unwrap().retain(OutputSignal::wake);
-                            std::thread::yield_now();
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => {
-                        if error.raw_os_error() != Some(libc::EIO) {
-                            context.fault.store(true, Ordering::Release);
-                        }
-                        break;
-                    }
-                }
-            }
-            context.eof.store(true, Ordering::Release);
-            context.wakes.lock().unwrap().clear();
-        });
+        std::thread::spawn(move || drain(reader, context, queries));
         Ok(Self {
             terminal,
             writer: input,
@@ -152,6 +143,8 @@ impl HostChild {
             version,
             wakes,
             eof,
+            drained,
+            end,
             fault,
         })
     }
@@ -170,7 +163,61 @@ struct Reader {
     version: Arc<AtomicU64>,
     wakes: Arc<Mutex<Vec<OutputSignal>>>,
     eof: Arc<AtomicBool>,
+    drained: Arc<AtomicU64>,
+    end: Arc<AtomicU8>,
     fault: Arc<AtomicBool>,
+}
+fn drain(
+    mut reader: Box<dyn Read + Send>,
+    context: Reader,
+    queries: std::sync::mpsc::SyncSender<(u16, u16)>,
+) {
+    let mut bytes = [0; 8192];
+    loop {
+        match reader.read(&mut bytes) {
+            Ok(0) => {
+                context.end.store(1, Ordering::Release);
+                break;
+            }
+            Ok(count) => {
+                let mut remaining = &bytes[..count];
+                while !remaining.is_empty() {
+                    let mut terminal = context.terminal.lock().unwrap();
+                    let Ok(consumed) = terminal.process(remaining) else {
+                        context.fault.store(true, Ordering::Release);
+                        break;
+                    };
+                    remaining = &remaining[consumed..];
+                    while let Some(query) = terminal.take_query() {
+                        if queries.try_send(query).is_err() {
+                            context.fault.store(true, Ordering::Release);
+                        }
+                    }
+                    context
+                        .version
+                        .store(terminal.generation(), Ordering::Release);
+                    drop(terminal);
+                    context.wakes.lock().unwrap().retain(OutputSignal::wake);
+                    std::thread::yield_now();
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                if error.raw_os_error() == Some(libc::EIO) {
+                    context.end.store(2, Ordering::Release);
+                } else {
+                    context.fault.store(true, Ordering::Release);
+                    context.end.store(3, Ordering::Release);
+                }
+                break;
+            }
+        }
+    }
+    context
+        .drained
+        .store(context.version.load(Ordering::Acquire), Ordering::Release);
+    context.eof.store(true, Ordering::Release);
+    context.wakes.lock().unwrap().clear();
 }
 fn io(error: impl std::fmt::Display) -> AgentError {
     AgentError::Io(error.to_string())

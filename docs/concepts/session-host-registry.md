@@ -44,7 +44,9 @@ a late old exit never removes a same-name replacement. Adapter drop != exit.
 
 Proposed persistence shape for review (not implemented): one bounded local
 inventory transaction file under private storage, coordinated by a short OS file
-lock shared by hosts/controllers. Version+revision covers name/launch reservation,
+lock on a separate stable lockfile, never the replaced inventory inode. This is
+a cut of committed publications, not necessarily physical lifecycle state.
+Store incarnation+revision covers name/launch reservation,
 host incarnation/session instance, launch facts, namespaced owner metadata and
 bounded exit tombstones/events. Atomically replace/fsync one generation; do not
 pretend separate JSON files commit together. Host output drain never waits for

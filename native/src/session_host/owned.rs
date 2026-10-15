@@ -6,13 +6,15 @@ use super::ledger::Lookup;
 use super::result::{Completion, Delivery, ErrorCode, Reply, Submission};
 use super::wire::{InputAct, Step};
 use portable_pty::CommandBuilder;
-use remuda_core::agent::{AgentError, AgentWriter, Size};
+use remuda_core::agent::{AgentError, AgentProcess, AgentWriter, Size};
 use remuda_core::{InputSubmitOutcome, Session};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub(crate) struct Owned {
-    pub session: Arc<Session>,
+    session: Arc<Session>,
+    incarnation: [u8; 16],
+    pid: Option<u32>,
     pub view: View,
     writer: Arc<dyn AgentWriter>,
     coordinator: Mutex<Coordinator>,
@@ -40,15 +42,86 @@ impl Owned {
         clock: Arc<dyn remuda_core::Clock>,
     ) -> Result<Self, AgentError> {
         let child = HostChild::spawn(command, size)?;
+        let pid = child.process_id();
         let view = child.view();
         let writer = child.writer();
         let session = Arc::new(Session::new(name, Box::new(child), clock));
         Ok(Self {
             session,
+            incarnation,
+            pid,
             view,
             writer,
             coordinator: Mutex::new(Coordinator::new(incarnation)),
         })
+    }
+    pub fn identity(&self) -> super::api::Identity {
+        super::api::Identity {
+            host: self.incarnation,
+            session: self.session.id().into(),
+            instance: self.session.instance_id().into(),
+        }
+    }
+    pub fn inspect(&self) -> Result<super::api::Info, AgentError> {
+        let alive = self.session.is_alive();
+        let exit = self.session.exit_info();
+        let ((unsupported_osc, query_overflow), output_eof, backend_fault) = self.view.health()?;
+        let (generation, (rows, cols)) = self.view.status()?;
+        let lifecycle = if backend_fault || (!alive && exit.is_none()) {
+            super::api::Lifecycle::Unavailable
+        } else if alive {
+            super::api::Lifecycle::Running
+        } else {
+            super::api::Lifecycle::Exited
+        };
+        Ok(super::api::Info {
+            identity: self.identity(),
+            name: self.session.name().into(),
+            pid: self.pid,
+            lifecycle,
+            exit_code: exit.as_ref().and_then(|value| value.exit_code),
+            signal: exit.as_ref().and_then(|value| value.signal),
+            signal_name: exit.and_then(|value| value.signal_name),
+            generation,
+            rows,
+            cols,
+            output_eof,
+            output_end: self.view.output_end(),
+            drained_generation: self.view.drained_generation(),
+            host_build: crate::dist::BUILD_VERSION.into(),
+            unsupported_osc,
+            query_overflow,
+            backend_fault,
+            active_connections: 0,
+        })
+    }
+    pub fn resize(&self, fence: Fence, rows: u16, cols: u16) -> Result<(), Error> {
+        if rows < 24 || cols < 20 {
+            return Err(Error::Invalid("host resize minimum is 20x24"));
+        }
+        super::terminal::Terminal::validate_geometry(rows, cols, 1000).map_err(Error::Invalid)?;
+        let token = self.coordinator.lock().unwrap().begin_mutation(fence)?;
+        let result = self.session.resize(Size::for_pane(cols, rows));
+        self.coordinator.lock().unwrap().finish_mutation(token)?;
+        result.map_err(|_| Error::Invalid("host resize failed; inspect health"))
+    }
+    pub fn ensure_quiescent(&self, fence: Fence) -> Result<(), Error> {
+        let mut coordinator = self.coordinator.lock().unwrap();
+        let token = coordinator.begin_mutation(fence)?;
+        coordinator.finish_mutation(token)
+    }
+    pub fn close(&self, fence: Fence) -> Result<(), Error> {
+        let token = self.coordinator.lock().unwrap().begin_mutation(fence)?;
+        match self.session.terminate() {
+            Ok(()) => self.coordinator.lock().unwrap().finish_mutation(token),
+            Err(AgentError::Attached) => {
+                self.coordinator.lock().unwrap().finish_mutation(token)?;
+                Err(Error::Invalid("human attached"))
+            }
+            // Unknown in-flight close remains fenced; never grant while its
+            // old physical effect could still land later.
+            Err(_) => Err(Error::Invalid("host close unknown or pending")),
+        }
     }
     pub fn acquire(&self, connection: ConnectionId) -> Result<Fence, Error> {
         self.coordinator.lock().unwrap().acquire(connection)
@@ -63,10 +136,21 @@ impl Owned {
         seq: u64,
         act: &InputAct,
     ) -> Result<Admission, Error> {
+        if self
+            .view
+            .health()
+            .map_err(|_| Error::Invalid("host health unavailable"))?
+            .2
+        {
+            return Err(Error::Invalid("host backend unavailable"));
+        }
         self.coordinator
             .lock()
             .unwrap()
             .admit(fence, client, seq, act)
+    }
+    pub fn reject_unstarted(&self, token: ActId) -> Result<(), Error> {
+        self.coordinator.lock().unwrap().reject_unstarted(token)
     }
     pub fn recover(
         &self,
@@ -355,5 +439,25 @@ mod lifecycle_tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ECHILD)
         );
+    }
+}
+
+pub(crate) struct Staged(Option<Owned>);
+impl Staged {
+    pub fn new(host: Owned) -> Self {
+        Self(Some(host))
+    }
+    pub fn host(&self) -> &Owned {
+        self.0.as_ref().unwrap()
+    }
+    pub fn publish(mut self) -> Arc<Owned> {
+        Arc::new(self.0.take().unwrap())
+    }
+}
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if let Some(host) = &self.0 {
+            let _ = host.session.terminate();
+        }
     }
 }

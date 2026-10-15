@@ -26,6 +26,7 @@ pub(crate) struct Coordinator {
     controller: Controller,
     ledger: Ledger,
     running: Option<Running>,
+    mutation: Option<ActId>,
 }
 impl Coordinator {
     pub fn new(incarnation: [u8; 16]) -> Self {
@@ -33,6 +34,7 @@ impl Coordinator {
             controller: Controller::new(incarnation),
             ledger: Ledger::default(),
             running: None,
+            mutation: None,
         }
     }
     pub fn acquire(&mut self, connection: ConnectionId) -> Result<Fence, Error> {
@@ -40,6 +42,19 @@ impl Coordinator {
     }
     pub fn release(&mut self, fence: Fence) -> Result<(), Error> {
         self.controller.release(fence).map_err(Error::Control)
+    }
+    pub fn begin_mutation(&mut self, fence: Fence) -> Result<ActId, Error> {
+        let token = self.controller.begin_act(fence).map_err(Error::Control)?;
+        self.mutation = Some(token);
+        Ok(token)
+    }
+    pub fn finish_mutation(&mut self, token: ActId) -> Result<(), Error> {
+        if self.mutation != Some(token) {
+            return Err(Error::StaleCompletion);
+        }
+        self.controller.finish_act(token).map_err(Error::Control)?;
+        self.mutation = None;
+        Ok(())
     }
     /// Caller holds the coordinator lock only for admission, never across an
     /// OS write, pause or snapshot. Execution retains token until fully settled.
@@ -65,6 +80,26 @@ impl Coordinator {
             started: false,
         });
         Ok(Admission::Started(token))
+    }
+    pub fn reject_unstarted(&mut self, token: ActId) -> Result<(), Error> {
+        let running = self
+            .running
+            .as_ref()
+            .filter(|running| running.token == token && !running.started)
+            .ok_or(Error::StaleCompletion)?;
+        let completion = super::result::Completion {
+            delivery: super::result::Delivery::Rejected,
+            reply: super::result::Reply::Error(super::result::ErrorCode::Unavailable),
+        };
+        if !self
+            .ledger
+            .complete_result(running.client, running.sequence, completion)
+        {
+            return Err(Error::StaleCompletion);
+        }
+        self.controller.finish_act(token).map_err(Error::Control)?;
+        self.running = None;
+        Ok(())
     }
     /// Claim the exact admitted payload once before any effect. A delayed or
     /// duplicate worker cannot replay an old act or substitute another payload.
