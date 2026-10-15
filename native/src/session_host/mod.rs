@@ -18,6 +18,8 @@ mod ledger;
 mod owned;
 #[cfg(unix)]
 mod reaper;
+#[cfg(unix)]
+mod recovery;
 mod result;
 #[cfg(unix)]
 mod server;
