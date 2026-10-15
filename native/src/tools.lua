@@ -1066,6 +1066,7 @@ register("contributions", "A point's entries as {id, owner, entry} rows, entry a
 -- before replacing the mod's hook group and tools.
 local modules = {}
 remuda._module_resume_supported = true
+register("_module_resume_supported", "Whether rollback supports a cached resume callback without clearing restored registrations.", "_module_resume_supported: boolean")
 local field_owners = {}
 
 -- Rollback restores the old activation's declared registrations from the
