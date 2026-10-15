@@ -160,3 +160,33 @@ fn daemon_mod_error_log_escapes_and_caps_the_error() {
     );
     assert!(line.len() <= "remuda daemon: mod command failed: ".len() + 4096);
 }
+
+#[test]
+fn mod_help_and_options_reach_the_handler_without_envelope_diagnostics() {
+    let home = ModHome::new("argv", "return table.concat(args, '|')");
+    // The handler receives argv, as the installed extension defines its own CLI.
+    let entry = home
+        .0
+        .join("data/remuda/mods/sample/packages/sample/init.lua");
+    fs::write(
+        entry,
+        "remuda.extension_command('sample', function(args) return table.concat(args, '|') end)",
+    )
+    .unwrap();
+    for args in [
+        vec!["--help"],
+        vec!["doctor", "--help"],
+        vec!["send", "--file", "body.txt"],
+        vec!["send", "--", "--help"],
+    ] {
+        let mut command = vec!["sample"];
+        command.extend(args.iter().copied());
+        let output = home.remuda(&command);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            args.join("|")
+        );
+        assert!(diagnostic_lines(&output).is_empty(), "{output:?}");
+    }
+}

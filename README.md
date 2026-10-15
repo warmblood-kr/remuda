@@ -310,3 +310,15 @@ cargo check -p remuda-core --target wasm32-unknown-unknown    # the boundary gat
 ## License
 
 MIT. Copyright (c) 2026 Warmblood Co., Ltd.
+
+### Development source refresh
+
+For installed lifecycle mods, `REMUDA_RELOAD_SOURCE=1 remuda MOD COMMAND` checks
+already loaded entry/helper source before dispatch and reloads changed code in
+the same daemon. The default leaves an active mod alone. Refresh uses the normal
+lifecycle reload transaction and preserves module state; invalid source fails the
+command and corrected source is retried. Use it during idle development: reload
+can cancel active mod dialogs or pending work. There is no background watcher;
+Rust changes require rebuilding/installing the binary, and this flag does not
+replace code inside an already running daemon. Explicit `remuda.reload('MOD')`
+and `remuda mod update MOD --reload` remain available.

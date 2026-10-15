@@ -116,11 +116,13 @@ register("_exec_commands", "Load a mod and run its optional commands hook withou
 -- nothing else, never a path). A failed load leaves no handler behind.
 -- ponytail: no wait for a declared `ready` callback; if a handler ever needs
 -- readiness, load from the CLI instead (probe, `remuda exec`, dispatch).
-function remuda._load_extension_command(name, owner)
-  if remuda._extension_commands[name] then return false end
-  local loaded, err = pcall(remuda._exec_commands, owner)
-  if loaded and remuda._extension_commands[name] then return true end
-  remuda._extension_commands[name], extension_command_owners[name] = nil, nil
+function remuda._load_extension_command(name, owner, refresh)
+  local registered = remuda._extension_commands[name] ~= nil
+  local loaded, err = pcall(remuda._exec_commands, owner, refresh)
+  if loaded and remuda._extension_commands[name] then return not registered end
+  if not registered then
+    remuda._extension_commands[name], extension_command_owners[name] = nil, nil
+  end
   local reason = loaded and ("it did not register the command " .. tostring(name))
     or tostring(err):match("^[^\n]*")
   remuda.fail("remuda: mod " .. tostring(owner) .. " could not be loaded: " .. reason
@@ -1631,7 +1633,7 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
   end
   activation.rollback = rollback
   local launch_start = start
-  if commands_only and commands then launch_start = nil end
+  if commands_only and commands and not (previous and previous.started) then launch_start = nil end
   return true, state, launch_start, rollback, commands
 end
 
