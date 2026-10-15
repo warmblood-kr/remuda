@@ -82,3 +82,7 @@ windows-sys = { version = "0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_F
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Direct parser-event negative controls for the host's OSC memory boundary.
+vte = "0.15.0"
