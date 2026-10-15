@@ -1,7 +1,9 @@
 //! Native synthetic child; no daemon/config/session discovery.
 #[cfg(unix)]
 use std::io::Write;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
+#[cfg(unix)]
 fn main() {
     if std::env::args().nth(1).as_deref() != Some("close-terminal-handles") {
         std::process::exit(2);
@@ -38,8 +40,14 @@ fn detach_terminal() {
     }
     std::process::exit(7);
 }
-#[cfg(not(unix))]
-fn detach_terminal() {
-    let _ = (Duration::ZERO, Instant::now());
+#[cfg(windows)]
+#[path = "session_host_windows_fixture.rs"]
+mod windows_fixture;
+#[cfg(windows)]
+fn main() {
+    windows_fixture::run();
+}
+#[cfg(not(any(unix, windows)))]
+fn main() {
     std::process::exit(4);
 }

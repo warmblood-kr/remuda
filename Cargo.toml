@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["core", "native"]
+exclude = ["vendor/portable-pty"]
+
+[patch.crates-io]
+portable-pty = { path = "vendor/portable-pty" }
 
 # WHY A WORKSPACE, AND NOT A FEATURE FLAG.
 #

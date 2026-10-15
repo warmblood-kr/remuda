@@ -43,7 +43,7 @@ http-test-support = []
 clap = { version = "4.6", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions", "string"] }
 crossterm = "0.29.0"
 interprocess = "2.4.4"
-portable-pty = "0.9.0"
+portable-pty = "=0.9.0"
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-platform-verifier = { version = "0.7", default-features = false }
 sha2 = "0.10"
@@ -80,6 +80,7 @@ libc = "0.2"
 security-framework = "=3.7.0"
 
 [target.'cfg(windows)'.dependencies]
+portable-pty = { version = "=0.9.0", features = ["remuda-job-list"] }
 windows-sys = { version = "0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [lints]

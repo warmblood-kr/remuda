@@ -25,6 +25,9 @@ mod subscription;
 mod terminal;
 #[cfg(unix)]
 mod unix;
+#[cfg(windows)]
+#[doc(hidden)]
+pub mod windows_process;
 mod wire;
 
 /// Experimental standalone entry; never used by daemon launch/adoption.
