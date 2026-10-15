@@ -147,8 +147,31 @@ impl Client {
     pub fn open(path: &Path, role: Role) -> io::Result<Self> {
         // Expected intent comes from private local metadata, not server echo.
         let manifest = manifest(path)?;
+        Self::open_expected(path, role, manifest.identity)
+    }
+    pub fn open_expected(
+        path: &Path,
+        role: Role,
+        expected: super::api::Identity,
+    ) -> io::Result<Self> {
+        Self::open_with_capabilities(path, role, expected, &[])
+    }
+    pub fn open_recovering(path: &Path, expected: super::api::Identity) -> io::Result<Self> {
+        Self::open_with_capabilities(
+            path,
+            Role::Control,
+            expected,
+            &[super::api::RETAINED_LEDGER],
+        )
+    }
+    fn open_with_capabilities(
+        path: &Path,
+        role: Role,
+        expected: super::api::Identity,
+        additional: &[&str],
+    ) -> io::Result<Self> {
         let mut channel = super::unix::connect(path)?;
-        let required = if role == Role::Control {
+        let mut required = if role == Role::Control {
             vec![
                 "inspect".into(),
                 "controller-epoch-v1".into(),
@@ -157,6 +180,7 @@ impl Client {
         } else {
             vec!["inspect".into()]
         };
+        required.extend(additional.iter().map(|value| (*value).into()));
         let open = Open {
             protocol: Hello {
                 magic: MAGIC,
@@ -165,7 +189,7 @@ impl Client {
                 required,
             },
             role,
-            expected: Some(manifest.identity.clone()),
+            expected: Some(expected.clone()),
         };
         channel.send(&serde_json::to_vec(&open).map_err(invalid)?)?;
         match serde_json::from_slice::<Response>(&channel.receive()?).map_err(invalid)? {
@@ -174,7 +198,7 @@ impl Client {
                 minor: 0,
                 capabilities,
                 max_payload,
-            } if identity == manifest.identity
+            } if identity == expected
                 && capabilities.len() <= 16
                 && capabilities.iter().all(|value| value.len() <= 64)
                 && open

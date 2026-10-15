@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 thread_local! { static FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) }; }
 #[cfg(test)]
-pub(super) fn fail_at(stage: u8) {
+pub(crate) fn fail_at(stage: u8) {
     FAULT.with(|fault| fault.set(stage));
 }
 #[cfg(test)]

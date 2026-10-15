@@ -20,6 +20,7 @@ const CAPS: &[&str] = &[
     "input-act-v1",
     "controller-epoch-v1",
     "paged-screen-v1",
+    super::api::RETAINED_LEDGER,
 ];
 pub(crate) struct Server {
     endpoint: Arc<Endpoint>,
@@ -30,6 +31,10 @@ pub(crate) struct Server {
     stop: AtomicBool,
 }
 impl Server {
+    #[cfg(test)]
+    pub fn stop_fixture(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
     pub fn new(endpoint: Endpoint, host: Arc<Owned>) -> Self {
         Self {
             endpoint: Arc::new(endpoint),

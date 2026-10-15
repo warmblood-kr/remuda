@@ -4,6 +4,9 @@ use super::wire::{Hello, InputAct};
 use serde::{Deserialize, Serialize};
 pub(crate) const PAGE_BYTES: usize = 12 * 1024;
 pub(crate) const MAX_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
+/// Ledger reserves before effects; clients/watermarks never recycle or reset
+/// within an immutable host incarnation. Forgotten can never become New.
+pub(crate) const RETAINED_LEDGER: &str = "retained-input-ledger-v1";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Identity {
