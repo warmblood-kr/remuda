@@ -48,23 +48,23 @@ max escaped grid, explicit combining retention and unchanged legacy oracles.
 ## Actual
 
 On reviewed base8b1669da, all105 host tests pass; four private helpers are ignored
-outside their parent fixture. The seven standalone process and ten relevant PTY
-regressions pass. Full core133 tests and two compile-fail doctests pass. Twenty-one
-new tests cover the contract above. The initial standalone regression was a new
+outside their parent fixture. The eight standalone process tests (original seven plus controlled admission)
+and ten relevant PTY regressions pass. Full core133 tests and two compile-fail doctests pass. Twenty-one
+new host tests plus the controlled process-admission test cover the contract above. The initial standalone regression was a new
 cooldown refusal reaching a legacy client without admission retry; the bounded
 read-only helper fixed it without weakening process/snapshot assertions. Synthetic
 command fixtures use raw bounded bytes, avoiding unrelated composer-submit waits.
 
 ```text
 test result: ok. 105 passed; 0 failed; 4 ignored; 0 measured; 1103 filtered out; finished in 66.48s
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.86s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.48s
 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 1201 filtered out; finished in 0.07s
 synthetic frame G=128 bytes=250150 capture/pages/decode=101112 us parser-lock-wait-plus-copy=653 us copied-G=639
 synthetic frame G=2018 bytes=250153 capture/pages/decode=345875 us parser-lock-wait-plus-copy=589 us copied-G=2532
 synthetic frame G=3919 bytes=250153 capture/pages/decode=353752 us parser-lock-wait-plus-copy=714 us copied-G=4428
 synthetic control resize during output: 177 us
 cargo clippy --workspace --all-targets --offline -- -D warnings
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.06s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.89s
 ```
 
 Measurements are observations on this synthetic fixture, not hard scheduling or
@@ -74,3 +74,13 @@ soak, full provider/Registry/Butler integration, real Windows host IPC and rolli
 upgrade/rollout gates remain. Windows common-code native CI is still required.
 No human attachment/controller authority changes, production adoption/restart,
 live panes/agents or migration were used. Refs #713.
+
+First ARM CI found an additional raw-RPC fixture assumption: its initial
+snapshot required immediate admission despite the new global cooldown. The
+fixture now retries only exact snapshot_budget_busy within a bounded admission
+loop. Wrong identity/role, incomplete/wrong/duplicate ACK and physical lifetime
+assertions stay intact; unrelated errors still fail with the full response.
+A controlled two-viewer test proves the helper actually receives budget_busy
+while another viewer holds its snapshot, then admits only after release. Runtime
+source is unchanged from85737867. Fresh matching ARM/native CI is required after
+this test-only correction.
