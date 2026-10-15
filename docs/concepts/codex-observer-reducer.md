@@ -29,7 +29,9 @@ Unknown/unsupported methods produce diagnostic uncertainty; absent review
 events are unexercised, not proof of absence or lack of support.
 
 Disconnect/reconnect removes selection and current state. Old connection
-responses and superseded selection replies are ignored. A state event racing
+responses and superseded selection replies are ignored. Turn transitions invalidate older thread status and request reconciliation;
+turn observation freshness is independent of status freshness. Late completion
+of an older turn cannot invalidate a newer active turn. A state event racing
 a metadata snapshot invalidates that snapshot and requires a later clean read.
 A connection heartbeat cannot refresh state. Thirty-second producer-local
 status/transport expiry is only a diagnostic threshold, never admission policy;
@@ -57,4 +59,6 @@ The fake UDS test exchanges newline JSON to exercise the reducer's complete
 request plan. It is not Codex's WebSocket-over-UDS transport, a live observer
 receipt, nor a proof of production event subscription. No real server, model
 workload, existing session attachment or production pane is exercised.
+Bounded review-receipt retention and request retry budgets remain REQUIRED
+integration gates; this synthetic-only reducer does not yet enforce those bounds.
 Independent review is required before any future integration or live smoke.

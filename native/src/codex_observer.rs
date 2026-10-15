@@ -69,6 +69,7 @@ pub struct Diagnostic {
     pub unsupported_methods: Vec<String>,
     pub transport_age_ms: Option<u64>,
     pub status_age_ms: Option<u64>,
+    pub turn_age_ms: Option<u64>,
     pub reason: &'static str,
 }
 
@@ -92,6 +93,7 @@ pub struct Observer {
     pending: BTreeMap<u64, Request>,
     state: ThreadState,
     turn: Option<TurnObservation>,
+    turn_at: Option<u64>,
     reviews: BTreeMap<ReviewKey, ReviewObservation>,
     observed: BTreeSet<String>,
     unsupported: BTreeSet<String>,
@@ -125,6 +127,7 @@ impl Observer {
             pending: BTreeMap::new(),
             state: ThreadState::Unknown,
             turn: None,
+            turn_at: None,
             reviews: BTreeMap::new(),
             observed: BTreeSet::new(),
             unsupported: BTreeSet::new(),
@@ -135,7 +138,6 @@ impl Observer {
     }
     fn invalidate(&mut self, reason: &'static str) {
         self.state = ThreadState::Unknown;
-        self.turn = None;
         self.reconciled = None;
         self.reason = reason;
     }
@@ -153,6 +155,7 @@ impl Observer {
         self.pending.clear();
         self.loaded.clear();
         self.turn = None;
+        self.turn_at = None;
         self.selected = None;
         self.invalidate("awaiting_reconciliation");
         let request = self.request(
@@ -170,6 +173,7 @@ impl Observer {
         self.pending.clear();
         self.loaded.clear();
         self.turn = None;
+        self.turn_at = None;
         self.selected = None;
         self.invalidate("disconnected");
     }
@@ -183,6 +187,7 @@ impl Observer {
         self.pending
             .retain(|_, req| !matches!(req, Request::Read { .. }));
         self.turn = None;
+        self.turn_at = None;
         self.invalidate("selection_unproven");
         self.selected = if self.connected
             && evidence.connection_generation == self.generation
@@ -291,6 +296,7 @@ impl Observer {
                     Some(state) => {
                         if state == ThreadState::Idle {
                             self.turn = None;
+                            self.turn_at = None;
                         }
                         self.state = state;
                         self.reconciled = Some(now_ms);
@@ -334,6 +340,7 @@ impl Observer {
                         Some(state) => {
                             if state == ThreadState::Idle {
                                 self.turn = None;
+                                self.turn_at = None;
                             }
                             self.state = state;
                             self.reconciled = Some(now_ms);
@@ -342,29 +349,35 @@ impl Observer {
                     }
                 }
             }
-            "turn/started" | "turn/completed" => {
-                let Some(id) = p.pointer("/turn/id").and_then(Value::as_str) else {
-                    return vec![];
-                };
-                self.revision += 1;
-                if method == "turn/started" {
-                    self.turn = Some(TurnObservation {
-                        id: id.into(),
-                        state: "active".into(),
-                    });
-                } else if self.turn.as_ref().map(|t| t.id.as_str()) == Some(id) {
-                    self.turn = Some(TurnObservation {
-                        id: id.into(),
-                        state: "completed".into(),
-                    });
-                }
-            }
+            "turn/started" | "turn/completed" => return self.turn_event(method, p, now_ms),
             "item/autoApprovalReview/started" | "item/autoApprovalReview/completed" => {
                 self.review(p);
             }
             _ => {} // strict review/warning receipts only; no text or approval assumptions.
         }
         vec![]
+    }
+    fn turn_event(&mut self, method: &str, p: &Value, now_ms: u64) -> Vec<Value> {
+        let Some(id) = p.pointer("/turn/id").and_then(Value::as_str) else {
+            return vec![];
+        };
+        // An older completed turn cannot invalidate the newer selected turn.
+        if method == "turn/completed" && self.turn.as_ref().is_some_and(|t| t.id != id) {
+            return vec![];
+        }
+        self.revision += 1;
+        self.invalidate("turn_transition");
+        self.turn = Some(TurnObservation {
+            id: id.into(),
+            state: if method == "turn/started" {
+                "active"
+            } else {
+                "completed"
+            }
+            .into(),
+        });
+        self.turn_at = Some(now_ms);
+        self.reconcile()
     }
     fn review(&mut self, p: &Value) {
         if self.version != "0.162.1" {
@@ -413,6 +426,10 @@ impl Observer {
     pub fn diagnostic(&self, now_ms: u64) -> Diagnostic {
         let transport_age = self.liveness.and_then(|at| now_ms.checked_sub(at));
         let status_age = self.reconciled.and_then(|at| now_ms.checked_sub(at));
+        let turn_age = self.turn_at.and_then(|at| now_ms.checked_sub(at));
+        let turn_fresh = self.connected
+            && transport_age.is_some_and(|age| age <= 30_000)
+            && turn_age.is_some_and(|age| age <= 30_000);
         let fresh = self.connected
             && transport_age.is_some_and(|age| age <= 30_000)
             && status_age.is_some_and(|age| age <= 30_000);
@@ -429,7 +446,7 @@ impl Observer {
             } else {
                 ThreadState::Unknown
             },
-            turn: if fresh { self.turn.clone() } else { None },
+            turn: if turn_fresh { self.turn.clone() } else { None },
             review_receipts: self.reviews.values().cloned().collect(),
             schema_known_auto_review: self.version == "0.162.1",
             experimental_requested: false,
@@ -437,6 +454,7 @@ impl Observer {
             unsupported_methods: self.unsupported.iter().cloned().collect(),
             transport_age_ms: transport_age,
             status_age_ms: status_age,
+            turn_age_ms: turn_age,
             reason: if self.reconciled.is_some() && !fresh {
                 "stale_or_clock_changed"
             } else {

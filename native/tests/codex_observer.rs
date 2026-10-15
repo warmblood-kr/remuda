@@ -435,3 +435,62 @@ fn fake_uds_exercises_complete_outbound_allowlist_and_reconnect() {
         assert_eq!(o.diagnostic(5 + round * 100).thread, ThreadState::Unknown);
     }
 }
+
+#[test]
+fn lifecycle_transitions_invalidate_older_status_and_late_completion_is_ignored() {
+    let mut o = observer("0.162.1");
+    let g = ready(&mut o);
+    let read = o.receive(
+        g,
+        &notify("turn/started", json!({"threadId":"main","turn":{"id":"B"}})),
+        4,
+    );
+    assert_eq!(
+        o.diagnostic(4).thread,
+        ThreadState::Unknown,
+        "older idle must not remain fresh"
+    );
+    assert_eq!(o.diagnostic(4).turn.unwrap().id, "B");
+    assert_eq!(read.len(), 1);
+    o.receive(
+        g,
+        &reply(
+            read[0]["id"].as_u64().unwrap(),
+            json!({"thread":{"id":"main","status":{"type":"active","activeFlags":[]}}}),
+        ),
+        5,
+    );
+    assert!(matches!(o.diagnostic(5).thread, ThreadState::Active { .. }));
+    let out = o.receive(
+        g,
+        &notify(
+            "turn/completed",
+            json!({"threadId":"main","turn":{"id":"A"}}),
+        ),
+        6,
+    );
+    assert!(out.is_empty());
+    assert_eq!(o.diagnostic(6).turn.unwrap().id, "B");
+    assert!(matches!(o.diagnostic(6).thread, ThreadState::Active { .. }));
+    let read = o.receive(
+        g,
+        &notify(
+            "turn/completed",
+            json!({"threadId":"main","turn":{"id":"B"}}),
+        ),
+        7,
+    );
+    assert_eq!(o.diagnostic(7).thread, ThreadState::Unknown);
+    assert_eq!(o.diagnostic(7).turn.unwrap().state, "completed");
+    assert_eq!(read.len(), 1);
+    o.receive(
+        g,
+        &reply(
+            read[0]["id"].as_u64().unwrap(),
+            json!({"thread":{"id":"main","status":{"type":"idle"}}}),
+        ),
+        8,
+    );
+    assert_eq!(o.diagnostic(8).thread, ThreadState::Idle);
+    assert!(o.diagnostic(8).turn.is_none());
+}
