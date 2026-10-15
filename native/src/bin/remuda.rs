@@ -5595,7 +5595,7 @@ fn dispatch_cli_spec() -> remuda_native::cli_parse::Spec {
             name: "__dispatch".into(),
             about: "Dispatch a Remuda core command. Run remuda COMMAND --help for command syntax."
                 .into(),
-            usage: Some("__dispatch [OPTIONS] [ARGS…]".into()),
+            usage: Some("[OPTIONS] [COMMAND…]".into()),
             args: vec![ArgSpec {
                 name: "ARGS".into(),
                 help: "Command and its arguments".into(),
@@ -5642,7 +5642,12 @@ fn checked_cli_flags(args: &[String]) -> Result<CheckedCliFlags, ExitCode> {
         if report.kind.as_deref() == Some("help") {
             println!("{}", report.text);
         } else {
-            eprintln!("{}", report.text);
+            eprintln!(
+                "{}",
+                report
+                    .text
+                    .replacen("remuda: remuda __dispatch:", "remuda:", 1)
+            );
         }
         return Err(ExitCode::from(report.code as u8));
     }

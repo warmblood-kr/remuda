@@ -851,6 +851,15 @@ fn eval_accepts_lua_source_starting_with_a_comment() {
     }
     let missing = run(&["-e"]);
     assert!(!missing.status.success(), "missing CODE must fail");
+    let diagnostic = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        diagnostic.contains("Usage: remuda [OPTIONS]"),
+        "{diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("__dispatch"),
+        "internal parser names must not appear in root usage: {diagnostic}"
+    );
     let invalid = run(&["-e", "remuda._opaque_eval_marker = true", "--bogus"]);
     assert!(
         !invalid.status.success(),
