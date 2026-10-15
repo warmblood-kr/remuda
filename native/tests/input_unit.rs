@@ -31,6 +31,17 @@ fn capture(path: &Path, name: &str) -> String {
     }
 }
 
+fn listed_instance(path: &Path, name: &str) -> String {
+    match client::request(path, &Request::List).unwrap() {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == name)
+            .and_then(|session| session.instance_id)
+            .unwrap_or_else(|| panic!("missing instance id for {name}")),
+        other => panic!("list failed: {other:?}"),
+    }
+}
+
 fn wait_screen(path: &Path, name: &str, needle: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -199,14 +210,7 @@ fn expected_instance_provider_refuses_a_replacement_before_writing_text_or_key()
     )
     .expect("start original fake agent");
     wait_screen(&socket, "bound-agent", "READY");
-    let original_instance = match client::request(&socket, &Request::List).unwrap() {
-        Response::Sessions(sessions) => sessions
-            .into_iter()
-            .find(|session| session.name == "bound-agent")
-            .and_then(|session| session.instance_id)
-            .expect("original instance id"),
-        other => panic!("list failed: {other:?}"),
-    };
+    let original_instance = listed_instance(&socket, "bound-agent");
     let closed = client::request(
         &socket,
         &Request::Close {
@@ -232,14 +236,7 @@ fn expected_instance_provider_refuses_a_replacement_before_writing_text_or_key()
         matches!(replacement, Response::Value(ref name) if name == "bound-agent"),
         "replacement failed: {replacement:?}"
     );
-    let replacement_instance = match client::request(&socket, &Request::List).unwrap() {
-        Response::Sessions(sessions) => sessions
-            .into_iter()
-            .find(|session| session.name == "bound-agent")
-            .and_then(|session| session.instance_id)
-            .expect("replacement instance id"),
-        other => panic!("list failed: {other:?}"),
-    };
+    let replacement_instance = listed_instance(&socket, "bound-agent");
     assert_ne!(original_instance, replacement_instance);
     wait_screen(&socket, "bound-agent", "READY");
     let replacement_before = capture(&socket, "bound-agent");
@@ -261,6 +258,21 @@ fn expected_instance_provider_refuses_a_replacement_before_writing_text_or_key()
     assert!(
         screen.contains("READY"),
         "replacement lost its ready screen: {screen}"
+    );
+    let text_result = format!(
+        "local status = remuda._input_type_text_if_instance('bound-agent', {replacement_instance:?}, 'OWNER_ALPHA\\nOWNER_BETA', 0)\n\
+         assert(status == 'submitted' or status == 'unverified' or status == 'late', tostring(status))"
+    );
+    script::run_source(&socket, "expected-instance-text-success", &text_result)
+        .expect("preserve the full text submit result");
+    let submitted = wait_screen(&socket, "bound-agent", "SUBMITTED:");
+    assert!(
+        submitted.contains("SUBMITTED:OWNER_ALPHA\\nOWNER_BETA"),
+        "bound provider changed the full text: {submitted}"
+    );
+    assert!(
+        submitted.contains("COUNT:1") && submitted.contains("RETURNS:2"),
+        "bound provider changed multiline submit/Return semantics: {submitted}"
     );
     let key_result = format!(
         "assert(remuda._input_key_if_instance('bound-agent', {replacement_instance:?}, 'C-a') == true)"

@@ -408,6 +408,65 @@ fn a_send_sleeps_through_a_feed_pause_then_wakes_when_the_act_releases() {
     );
 }
 
+#[test]
+fn an_instance_bound_key_waits_through_a_feed_pause_without_interleaving() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (event_tx, event_rx) = mpsc::channel();
+    let clock = Arc::new(ManualClock::new());
+    let session = Arc::new(Session::new(
+        "bound-key-after-feed-pause",
+        Box::new(InputRecordingAgent {
+            writes: Arc::clone(&writes),
+            alive: true,
+            fail_write: false,
+            event_tx: Some(event_tx),
+        }),
+        clock.clone(),
+    ));
+    let expected_instance = session.instance_id().to_owned();
+    let feed_session = Arc::clone(&session);
+    let feed = thread::spawn(move || {
+        feed_session
+            .feed(&[
+                remuda_core::protocol::Step::Burst(b"feed-before".to_vec()),
+                remuda_core::protocol::Step::Pause(100),
+                remuda_core::protocol::Step::Burst(b"feed-after".to_vec()),
+            ])
+            .expect("feed act succeeds");
+    });
+    expect_input_event(&event_rx, b"feed-before");
+
+    let key_session = Arc::clone(&session);
+    let (key_tx, key_rx) = mpsc::channel();
+    let key = thread::spawn(move || {
+        key_tx
+            .send(key_session.send_key_if_instance(&expected_instance, b"\x1b[A"))
+            .unwrap();
+    });
+    assert!(key_rx
+        .recv_timeout(std::time::Duration::from_millis(40))
+        .is_err());
+    assert_no_input_event(&event_rx);
+
+    clock.advance(std::time::Duration::from_millis(100));
+    expect_input_event(&event_rx, b"feed-after");
+    expect_input_event(&event_rx, b"\x1b[A");
+    assert_eq!(
+        key_rx.recv_timeout(std::time::Duration::from_secs(1)),
+        Ok(Ok(()))
+    );
+    feed.join().unwrap();
+    key.join().unwrap();
+    assert_eq!(
+        *writes.lock().unwrap(),
+        vec![
+            b"feed-before".to_vec(),
+            b"feed-after".to_vec(),
+            b"\x1b[A".to_vec()
+        ]
+    );
+}
+
 fn expect_input_event(receiver: &mpsc::Receiver<Vec<u8>>, expected: &[u8]) {
     assert_eq!(
         receiver

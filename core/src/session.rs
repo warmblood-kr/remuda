@@ -1010,7 +1010,7 @@ impl Session {
         if !self.is_alive() {
             return Err(ExpectedInstanceInputError::NotStarted);
         }
-        self.write_one_burst(bytes)
+        self.send(bytes)
             .map_err(|_| ExpectedInstanceInputError::OutcomeUncertain)
     }
 
