@@ -30,7 +30,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 104] = [
+pub const BINDINGS: [&str; 107] = [
     "_advice_reattach",
     "_call",
     "_caller_live",
@@ -40,9 +40,12 @@ pub const BINDINGS: [&str; 104] = [
     "_exec_commands",
     "_extension_commands",
     "_function_source",
+    "_input_instance_bound_version",
+    "_input_key_if_instance",
     "_input_submit",
     "_input_text",
     "_input_type_text",
+    "_input_type_text_if_instance",
     "_load_extension_command",
     "_module_readiness",
     "_module_resume_supported",
@@ -141,6 +144,16 @@ pub const BINDINGS: [&str; 104] = [
 /// own rows for the words it defines in pure Lua, into the same table.
 const WORDS: &[(&str, &str, &str)] = &[
     (
+        "_input_instance_bound_version",
+        "Capability version for the native expected-instance-bound full-text and key provider. Consumers must check this and both provider functions before use.",
+        "_input_instance_bound_version -> 1",
+    ),
+    (
+        "_input_key_if_instance",
+        "Write one named key to the expected captured session instance. WrongInstance and NotStarted are refused before writing; after the write path starts, errors have an uncertain outcome. Success returns true.",
+        "_input_key_if_instance(name, expected_instance, key_spec) -> true",
+    ),
+    (
         "_input_submit",
         "Submit visible session text; returns 'submitted' or 'unverified'.",
         "_input_submit(name, expect) -> status",
@@ -154,6 +167,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_input_type_text",
         "Deliver text and submit it while holding one input lock; returns 'submitted', 'unverified' or 'late'. 'late': the text is still being written to a slow pane and its Return follows when it lands (dropped after 30 s); do not resend, check the pane.",
         "_input_type_text(name, text, settle?) -> status",
+    ),
+    (
+        "_input_type_text_if_instance",
+        "Deliver and submit text using the expected captured session instance and the full type_text semantics. WrongInstance and NotStarted are refused before writing; after the write path starts, errors have an uncertain outcome. Returns 'submitted', 'unverified' or 'late'.",
+        "_input_type_text_if_instance(name, expected_instance, text, settle?) -> status",
     ),
     (
         "caller",
@@ -969,6 +987,7 @@ fn input_bindings(
         })?,
     )?;
 
+    let legacy_type_registry = input_registry.clone();
     table.set(
         "_input_type_text",
         lua.create_function(
@@ -979,7 +998,7 @@ fn input_bindings(
                         "settle must be between 0 and 5 seconds",
                     ));
                 }
-                let session = input_registry
+                let session = legacy_type_registry
                     .get(&name)
                     .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
                 session
@@ -993,6 +1012,74 @@ fn input_bindings(
             },
         )?,
     )?;
+
+    expected_instance_input_bindings(lua, table, input_registry)?;
+    Ok(())
+}
+
+fn expected_instance_input_bindings(
+    lua: &Lua,
+    table: &Table,
+    input_registry: std::sync::Arc<remuda_core::Registry>,
+) -> mlua::Result<()> {
+    // Owner-input providers pass the identity captured with their approval.
+    // Resolve the name exactly once, then validate and operate through that
+    // captured Arc so a same-name replacement cannot receive the act.
+    let expected_text_registry = input_registry.clone();
+    table.set(
+        "_input_type_text_if_instance",
+        lua.create_function(
+            move |_,
+                  (name, expected_instance, text, settle): (
+                String,
+                String,
+                String,
+                Option<f64>,
+            )| {
+                let settle = settle.unwrap_or(DEFAULT_INPUT_SETTLE.as_secs_f64());
+                if !settle.is_finite() || !(0.0..=5.0).contains(&settle) {
+                    return Err(mlua::Error::runtime(
+                        "settle must be between 0 and 5 seconds",
+                    ));
+                }
+                let session = expected_text_registry.get(&name).ok_or_else(|| {
+                    mlua::Error::runtime("session instance changed; no input was written")
+                })?;
+                session
+                    .type_text_if_instance(
+                        &expected_instance,
+                        &text,
+                        Duration::from_secs_f64(settle),
+                    )
+                    .map(|outcome| match outcome {
+                        InputSubmitOutcome::Submitted => "submitted",
+                        InputSubmitOutcome::Unverified => "unverified",
+                        InputSubmitOutcome::Late => "late",
+                    })
+                    .map_err(|error| mlua::Error::runtime(error.to_string()))
+            },
+        )?,
+    )?;
+
+    let expected_key_registry = input_registry.clone();
+    table.set(
+        "_input_key_if_instance",
+        lua.create_function(
+            move |_, (name, expected_instance, spec): (String, String, String)| {
+                let bytes = keys::key(&spec)
+                    .ok_or_else(|| mlua::Error::runtime(format!("no such key: {spec}")))?;
+                let session = expected_key_registry.get(&name).ok_or_else(|| {
+                    mlua::Error::runtime("session instance changed; no input was written")
+                })?;
+                session
+                    .send_key_if_instance(&expected_instance, &bytes)
+                    .map(|()| true)
+                    .map_err(|error| mlua::Error::runtime(error.to_string()))
+            },
+        )?,
+    )?;
+    // Advertise only after both fenced provider operations are installed.
+    table.set("_input_instance_bound_version", 1)?;
     Ok(())
 }
 

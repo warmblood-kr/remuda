@@ -31,6 +31,17 @@ fn capture(path: &Path, name: &str) -> String {
     }
 }
 
+fn listed_instance(path: &Path, name: &str) -> String {
+    match client::request(path, &Request::List).unwrap() {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == name)
+            .and_then(|session| session.instance_id)
+            .unwrap_or_else(|| panic!("missing instance id for {name}")),
+        other => panic!("list failed: {other:?}"),
+    }
+}
+
 fn wait_screen(path: &Path, name: &str, needle: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -178,6 +189,99 @@ fn type_text_submits_paste_once_and_preserves_embedded_newline() {
     assert!(
         repeated.contains("RETURNS:3"),
         "the repeated tail must not trigger an early Return: {repeated}"
+    );
+}
+
+#[test]
+fn expected_instance_provider_refuses_a_replacement_before_writing_text_or_key() {
+    let dir = scratch("inst-race");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&socket, &dir);
+
+    client::request(
+        &socket,
+        &Request::New {
+            name: Some("bound-agent".into()),
+            command: fake_agent("paste"),
+            size: Size::new(80, 24),
+            cwd: Some(dir.display().to_string()),
+            env: None,
+        },
+    )
+    .expect("start original fake agent");
+    wait_screen(&socket, "bound-agent", "READY");
+    let original_instance = listed_instance(&socket, "bound-agent");
+    let closed = client::request(
+        &socket,
+        &Request::Close {
+            name: "bound-agent".into(),
+            instance_id: Some(original_instance.clone()),
+            confirm: Some(true),
+        },
+    )
+    .expect("close original fake agent");
+    assert!(matches!(closed, Response::Ok), "close failed: {closed:?}");
+    let replacement = client::request(
+        &socket,
+        &Request::New {
+            name: Some("bound-agent".into()),
+            command: fake_agent("paste"),
+            size: Size::new(80, 24),
+            cwd: Some(dir.display().to_string()),
+            env: None,
+        },
+    )
+    .expect("start same-name replacement");
+    assert!(
+        matches!(replacement, Response::Value(ref name) if name == "bound-agent"),
+        "replacement failed: {replacement:?}"
+    );
+    let replacement_instance = listed_instance(&socket, "bound-agent");
+    assert_ne!(original_instance, replacement_instance);
+    wait_screen(&socket, "bound-agent", "READY");
+    let replacement_before = capture(&socket, "bound-agent");
+
+    let script = format!(
+        "assert(remuda._input_instance_bound_version == 1)\n\
+         local ok, err = pcall(remuda._input_type_text_if_instance, 'bound-agent', {original_instance:?}, 'STALE_TEXT', 0)\n\
+         assert(not ok and tostring(err):find('instance changed', 1, true), tostring(err))\n\
+         ok, err = pcall(remuda._input_key_if_instance, 'bound-agent', {original_instance:?}, 'C-a')\n\
+         assert(not ok and tostring(err):find('instance changed', 1, true), tostring(err))"
+    );
+    script::run_source(&socket, "expected-instance-replacement", &script)
+        .expect("reject both stale owner-input operations");
+    let screen = capture(&socket, "bound-agent");
+    assert_eq!(
+        screen, replacement_before,
+        "stale text/key call changed replacement screen"
+    );
+    assert!(
+        screen.contains("READY"),
+        "replacement lost its ready screen: {screen}"
+    );
+    let text_result = format!(
+        "local status = remuda._input_type_text_if_instance('bound-agent', {replacement_instance:?}, 'OWNER_ALPHA\\nOWNER_BETA', 0)\n\
+         assert(status == 'submitted' or status == 'unverified' or status == 'late', tostring(status))"
+    );
+    script::run_source(&socket, "expected-instance-text-success", &text_result)
+        .expect("preserve the full text submit result");
+    let submitted = wait_screen(&socket, "bound-agent", "SUBMITTED:");
+    assert!(
+        submitted.contains("SUBMITTED:OWNER_ALPHA\\nOWNER_BETA"),
+        "bound provider changed the full text: {submitted}"
+    );
+    assert!(
+        submitted.contains("COUNT:1") && submitted.contains("RETURNS:2"),
+        "bound provider changed multiline submit/Return semantics: {submitted}"
+    );
+    let key_result = format!(
+        "assert(remuda._input_key_if_instance('bound-agent', {replacement_instance:?}, 'C-a') == true)"
+    );
+    script::run_source(&socket, "expected-instance-key-success", &key_result)
+        .expect("report successful whole-key delivery explicitly");
+    assert!(
+        !screen.contains("STALE_TEXT"),
+        "stale text reached replacement: {screen}"
     );
 }
 

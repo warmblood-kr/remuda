@@ -101,6 +101,31 @@ pub enum InputOutcome {
     Exited,
 }
 
+/// Result of an input operation pinned to one captured session instance.
+/// The first two errors are guaranteed to happen before any input write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpectedInstanceInputError {
+    WrongInstance,
+    NotStarted,
+    /// The operation entered its write path; delivery may be partial or may
+    /// already have reached the child. Callers must inspect before retrying.
+    OutcomeUncertain,
+}
+
+impl fmt::Display for ExpectedInstanceInputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::WrongInstance => "session instance changed; no input was written",
+            Self::NotStarted => "session is not started; no input was written",
+            Self::OutcomeUncertain => {
+                "input outcome is uncertain; inspect the session before retrying"
+            }
+        })
+    }
+}
+
+impl std::error::Error for ExpectedInstanceInputError {}
+
 #[derive(Default)]
 pub struct InputDeduplicator {
     clients: VecDeque<ClientHistory>,
