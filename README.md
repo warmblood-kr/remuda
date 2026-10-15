@@ -323,6 +323,17 @@ can cancel active mod dialogs or pending work unless the mod supplies
 replacement is safe or a reason string to defer it before stop/registration
 changes. Butler uses this guard for its active workflows. A deferred command
 fails visibly and can be retried when idle. There is no background watcher;
+Active modules must supply both `source_refresh_ready` and `resume`; older
+activations require an explicit reload when idle before opting in.
 Rust changes require rebuilding/installing the binary, and this flag does not
 replace code inside an already running daemon. Explicit `remuda.reload('MOD')`
 and `remuda mod update MOD --reload` remain available.
+
+Lifecycle modules with a cached `start` may declare `resume(state)`. After a
+failed replacement, core restores the previous registrations and calls its
+`resume` instead of clearing them and rerunning `start`. This callback reopens
+resources released by `stop` using the previous in-memory implementation; it
+must not duplicate registrations or read the replacement's broken source. It
+also runs for a previous commands-only activation. Without it, rollback keeps
+the existing clear-and-restart behavior. A failed resume leaves the mod inactive
+and reports the recovery error. Butler uses resume to reinstall its input gate.

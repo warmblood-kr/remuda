@@ -1065,6 +1065,7 @@ register("contributions", "A point's entries as {id, owner, entry} rows, entry a
 -- declare registrations as data. Reload stages the declaration and migrations
 -- before replacing the mod's hook group and tools.
 local modules = {}
+remuda._module_resume_supported = true
 local field_owners = {}
 
 -- Rollback restores the old activation's declared registrations from the
@@ -1192,6 +1193,9 @@ function remuda._source_refresh_check(name)
   if active and not active.source_refresh_ready then
     error("source refresh deferred: active mod lacks source_refresh_ready; explicitly reload it when idle before using source refresh", 0)
   end
+  if active and not active.resume then
+    error("source refresh deferred: active mod lacks resume; explicitly reload it when idle before using source refresh", 0)
+  end
   if active and active.source_refresh_ready then
     local reason = active.source_refresh_ready(active.state)
     if reason ~= nil then error("source refresh deferred: " .. tostring(reason) .. "; retry when idle", 0) end
@@ -1231,6 +1235,9 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
   end
   if candidate.stop ~= nil and type(candidate.stop) ~= "function" then
     error("module stop must be a function", 0)
+  end
+  if candidate.resume ~= nil and type(candidate.resume) ~= "function" then
+    error("module resume must be a function", 0)
   end
   if candidate.ready ~= nil and type(candidate.ready) ~= "function" then
     error("module ready must be a function", 0)
@@ -1523,6 +1530,7 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
     stop = stop,
     start = start,
     commands = commands,
+    resume = candidate.resume and function(state) return with_owner(name, candidate.resume, state) end,
     started = false,
     start_attempted = false,
     source_refresh_ready = candidate.source_refresh_ready and function(state) return with_owner(name, candidate.source_refresh_ready, state) end,
@@ -1606,11 +1614,15 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
       contributions[point] = restored
     end
     modules[name] = previous
-    if previous and previous.stopped and previous.start then
-      clear_imperative_module_registrations(name, previous)
+    -- Memoized starts cannot rebuild registrations after they have been cleared.
+    -- A resume callback reopens stopped resources against the restored snapshot;
+    -- it must not register the same hooks/schedules again or reread changed code.
+    local restart = previous and (previous.resume or (previous.stopped and previous.start))
+    if restart then
+      if not previous.resume then clear_imperative_module_registrations(name, previous) end
       local was_active = remuda._lifecycle_start_active
       remuda._lifecycle_start_active = true
-      local ok, err = pcall(previous.start, previous.state)
+      local ok, err = pcall(restart, previous.state)
       remuda._lifecycle_start_active = was_active
       if ok then
         previous.stopped = false
