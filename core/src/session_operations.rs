@@ -19,7 +19,8 @@
 use crate::agent::{AgentError, ExitInfo, MouseState, OutputWakeup, Size, VersionedSnapshot};
 use crate::input::{InputBatch, InputError, InputOutcome};
 use crate::protocol::Step;
-use crate::session::{Attached, InputSubmitOutcome, Session};
+use crate::session::{Attachment, InputSubmitOutcome, Session};
+use std::borrow::Borrow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -449,15 +450,15 @@ impl SessionOperations for Session {
         Ok(self.subscribe_output_wakeup())
     }
     fn attach(&self) -> Result<Box<dyn AttachmentOperations + '_>> {
-        Ok(Box::new(Session::attach(self)))
+        Ok(Box::new(Session::attach(self)?))
     }
 }
-impl AttachmentOperations for Attached<'_> {
+impl<S: Borrow<Session> + Send + Sync> AttachmentOperations for Attachment<S> {
     fn identity(&self) -> Identity {
         Identity::local(self.session())
     }
     fn generation(&self) -> u64 {
-        Attached::generation(self)
+        Attachment::generation(self)
     }
     fn displaced(&self) -> Result<bool> {
         Ok(self.is_displaced())
@@ -474,7 +475,7 @@ impl AttachmentOperations for Attached<'_> {
         Ok(self.write_raw_while_started(bytes, cancelled, on_start)?)
     }
     fn screen_bytes(&self) -> Result<Vec<u8>> {
-        Ok(Attached::screen_bytes(self)?)
+        Ok(Attachment::screen_bytes(self)?)
     }
     fn wakeup(&self) -> Result<Option<OutputWakeup>> {
         Ok(self.session().subscribe_output_wakeup())

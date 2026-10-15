@@ -175,7 +175,8 @@ fn send_line_reports_uncertain_when_enter_is_busy_after_body_lands() {
         .expect("send_line body landed");
 
     let attach_session = Arc::clone(&session);
-    let human_write = thread::spawn(move || attach_session.attach().write_raw(b"human key"));
+    let human_write =
+        thread::spawn(move || attach_session.attach().unwrap().write_raw(b"human key"));
     attached_started_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("attached writer stalled before Enter");
@@ -255,14 +256,14 @@ fn takeover_wakes_an_attached_write_without_holding_the_attach_slot() {
     let old_session = Arc::clone(&session);
     let (result_tx, result_rx) = mpsc::channel();
     let old_write = thread::spawn(move || {
-        let held = old_session.attach();
+        let held = old_session.attach().unwrap();
         result_tx.send(held.write_raw(b"old key")).unwrap();
     });
     started_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("old attachment write started");
 
-    let current = session.attach();
+    let current = session.attach().unwrap();
     assert!(current.generation() > 0);
     assert!(matches!(
         result_rx.recv_timeout(Duration::from_millis(100)),
@@ -303,7 +304,7 @@ fn cancelled_attach_write_drops_the_current_attachment() {
     let thread_detached = Arc::clone(&detached);
     let (result_tx, result_rx) = mpsc::channel();
     let write = thread::spawn(move || {
-        let held = thread_session.attach();
+        let held = thread_session.attach().unwrap();
         let result = held.write_raw_while(b"key", &|| thread_detached.load(Ordering::Acquire));
         let _ = result_tx.send(result);
     });
@@ -446,7 +447,7 @@ fn batch_rejected_before_submit_is_busy_and_refunds_rate_for_retry() {
     ));
     let attach_session = Arc::clone(&session);
     let attach = thread::spawn(move || {
-        let held = attach_session.attach();
+        let held = attach_session.attach().unwrap();
         held.write_raw(b"human input")
     });
     started_rx

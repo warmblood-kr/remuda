@@ -3130,7 +3130,10 @@ fn attach(
             &Response::error(format!("no such session: {name}")),
         );
     };
-    let held = session.attach();
+    let held = match session.attach() {
+        Ok(held) => held,
+        Err(error) => return reply(&stream, &Response::error(error.to_string())),
+    };
     let acknowledgement = if tracked {
         Response::AttachStarted {
             generation: held.generation(),
