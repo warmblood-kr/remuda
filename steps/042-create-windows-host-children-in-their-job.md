@@ -66,3 +66,18 @@ checked_direct_termination_observes_real_exit_and_invalid_job_never_runs_child .
 creation_contains_immediate_descendant_and_retains_unicode_exit259_and_drained_output ... FAILED
 synthetic fixture timed out
 ```
+
+Corrected088728db genuinely executed all five new tests on Windows; the completed
+job116407618183 recorded both process fixtures passing in0.42s. All24 checks passed
+before independent normal squash mergeacff601a. The responder change resolved the
+timeout without changing membership assertions/deadline; no uniquely proved cursor
+cause or Windows host support is claimed.
+
+```text
+failed_termination_requires_observed_natural_exit_not_synthetic_success ... ok
+native_invalid_handles_surface_wait_query_and_termination_errors ... ok
+only_a_signaled_wait_allows_exit_query_and_exit259_is_final ... ok
+checked_direct_termination_observes_real_exit_and_invalid_job_never_runs_child ... ok
+creation_contains_immediate_descendant_and_retains_unicode_exit259_and_drained_output ... ok
+test result: ok. 2 passed; 0 failed; finished in 0.42s
+```

@@ -52,8 +52,11 @@ fixtures timed out. The synthetic harness now asynchronously answers initial
 cursor inheritance queries through a four-item reply queue, with a 512-byte
 diagnostic tail on failure. It is not the host terminal parser. Upstream enables
 PSEUDOCONSOLE_INHERIT_CURSOR; [Microsoft documents the async reply requirement](https://learn.microsoft.com/en-us/windows/console/createpseudoconsole).
-The native rerun must establish whether that explains the timeout; no support
-claim follows from source inspection or a hypothesized cause.
+Native Windows rerun at088728db passed all3 unit and2 process fixtures; all24 CI
+checks were green before normal reviewed mergeacff601a. The responder change
+resolved the fixture timeout; a unique cursor-query cause was not proved by
+observed success counts or a controlled reversal. This remains process preparation,
+not actual Windows host support or a host-death/controller-death proof.
 
 Remaining Windows gates include actual stable host+authenticated named pipes,
 controller SIGKILL vs host death before/during/after spawn, enclosing Job failure,
