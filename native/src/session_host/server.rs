@@ -29,6 +29,7 @@ pub(crate) struct Server {
     snapshot_busy: Arc<AtomicBool>,
     next_snapshot: AtomicU64,
     stop: AtomicBool,
+    publication: Option<Arc<super::birth::Gate>>,
 }
 impl Server {
     #[cfg(test)]
@@ -43,7 +44,17 @@ impl Server {
             snapshot_busy: Arc::new(AtomicBool::new(false)),
             next_snapshot: AtomicU64::new(1),
             stop: AtomicBool::new(false),
+            publication: None,
         }
+    }
+    pub fn with_publication(
+        endpoint: Endpoint,
+        host: Arc<Owned>,
+        publication: Arc<super::birth::Gate>,
+    ) -> Self {
+        let mut server = Self::new(endpoint, host);
+        server.publication = Some(publication);
+        server
     }
     pub fn run(self: Arc<Self>) -> io::Result<()> {
         self.endpoint.nonblocking()?;
@@ -80,7 +91,11 @@ impl Server {
             return Err(invalid("hello limit"));
         }
         let open: Open = serde_json::from_slice(&frame).map_err(invalid)?;
-        let minor = match open.protocol.negotiate(CAPS) {
+        let mut capabilities = CAPS.to_vec();
+        if self.publication.is_some() {
+            capabilities.push(super::api::SCOPED_BIRTH);
+        }
+        let minor = match open.protocol.negotiate(&capabilities) {
             Ok(minor) => minor,
             Err(_) => {
                 send(
@@ -112,7 +127,7 @@ impl Server {
             &Response::Opened {
                 identity,
                 minor,
-                capabilities: CAPS.iter().map(|value| (*value).into()).collect(),
+                capabilities: capabilities.iter().map(|value| (*value).into()).collect(),
                 max_payload: 65_519,
             },
         )?;
@@ -225,10 +240,23 @@ impl Connection {
         self.fence.ok_or_else(|| "controller_required".into())
     }
     fn try_handle(&mut self, request: Request) -> Result<Response, String> {
+        if self
+            .server
+            .publication
+            .as_ref()
+            .is_some_and(|gate| !gate.effects_allowed())
+            && matches!(
+                &request,
+                Request::Acquire | Request::Input { .. } | Request::Resize { .. } | Request::Close
+            )
+        {
+            return Err("host_publication_pending".into());
+        }
         match request {
             Request::Inspect => {
                 let mut info = self.server.host.inspect().map_err(|_| "host_unavailable")?;
                 info.active_connections = self.server.connections.load(Ordering::Acquire);
+                info.publication = self.server.publication.as_ref().map(|gate| gate.status());
                 Ok(Response::Info { info })
             }
             Request::Acquire => {
@@ -295,20 +323,37 @@ impl Connection {
                 self.snapshot = None;
                 Ok(Response::Ok)
             }
-            Request::Stop => {
-                self.controller()?;
-                let info = self.server.host.inspect().map_err(|_| "host_unavailable")?;
-                if !matches!(info.lifecycle, Lifecycle::Exited) || !info.output_eof {
-                    return Err("host_stop_requires_confirmed_exit_and_output_eof".into());
-                }
-                self.server
-                    .host
-                    .ensure_quiescent(self.controller()?)
-                    .map_err(control_error)?;
-                self.stop_after_reply = true;
-                Ok(Response::Ok)
-            }
+            Request::Stop => self.stop(),
         }
+    }
+    fn stop(&mut self) -> Result<Response, String> {
+        self.controller()?;
+        if self
+            .server
+            .publication
+            .as_ref()
+            .is_some_and(|gate| gate.status() != super::api::PublicationStatus::Complete)
+        {
+            return Err("host_publication_pending".into());
+        }
+        if self
+            .server
+            .publication
+            .as_ref()
+            .is_some_and(|gate| !gate.retention_settled())
+        {
+            return Err("host_retention_pending".into());
+        }
+        let info = self.server.host.inspect().map_err(|_| "host_unavailable")?;
+        if !matches!(info.lifecycle, Lifecycle::Exited) || !info.output_eof {
+            return Err("host_stop_requires_confirmed_exit_and_output_eof".into());
+        }
+        self.server
+            .host
+            .ensure_quiescent(self.controller()?)
+            .map_err(control_error)?;
+        self.stop_after_reply = true;
+        Ok(Response::Ok)
     }
     fn input(
         &self,

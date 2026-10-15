@@ -4,6 +4,10 @@ use super::super::wire::InputAct;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::collections::{BTreeMap, VecDeque};
+#[path = "publication.rs"]
+mod publication;
+pub(crate) use publication::TerminalEnd;
+pub(crate) use publication::{Birth, Lease, Publication};
 
 pub(crate) const MAX_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_ENTRIES: usize = 128;
@@ -113,6 +117,8 @@ pub(crate) struct Entry {
     pub metadata: BTreeMap<String, Namespace>,
     pub streams: Vec<Stream>,
     pub pending: Option<Pending>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub birth: Option<Birth>,
 }
 impl Entry {
     pub fn reserved(identity: Identity, launch: [u8; 16], payload: &str) -> Result<Self> {
@@ -130,6 +136,7 @@ impl Entry {
             metadata: BTreeMap::new(),
             streams: Vec::new(),
             pending: None,
+            birth: None,
         })
     }
 }
@@ -158,6 +165,7 @@ pub(crate) enum EventKind {
     Outcome,
     Consumer,
     Exit,
+    Host,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -427,6 +435,9 @@ impl Index {
                 .map_err(|_| Error::Corrupt)?
                 .len();
         for entry in self.entries.values() {
+            if let Some(birth) = &entry.birth {
+                bytes += birth.reserved_bytes()?;
+            }
             bytes += 64
                 - serde_json::to_vec(&entry.phase)
                     .map_err(|_| Error::Corrupt)?
@@ -484,11 +495,18 @@ impl Index {
                     return Err(Error::Exhausted);
                 }
                 self.allocations.push(entry.identity.clone());
+                if entry.birth.is_some() && !self.required.iter().any(|cap| cap == publication::CAP)
+                {
+                    self.required.push(publication::CAP.into());
+                }
                 self.entries.insert(name.clone(), entry);
                 Ok((Some(name), EventKind::Launch))
             }
             Mutation::Register(target) => {
                 let entry = self.entry(&target.name, &target.identity)?;
+                if entry.birth.is_some() {
+                    return Err(Error::Invalid("host publisher lease required"));
+                }
                 if matches!(entry.phase, Phase::Exited { .. }) {
                     return Err(Error::Conflict);
                 }
@@ -578,6 +596,9 @@ impl Index {
         let entry = self.entry(&target.name, &target.identity)?;
         match operation {
             ExitMutation::Observe { generation } => {
+                if entry.birth.is_some() {
+                    return Err(Error::Invalid("host publisher lease required"));
+                }
                 match entry.phase {
                     Phase::Exited { generation: old } if old != generation => {
                         return Err(Error::Conflict)
@@ -588,6 +609,9 @@ impl Index {
                 entry.phase = Phase::Exited { generation };
             }
             ExitMutation::Retire => {
+                if entry.birth.as_ref().is_some_and(|birth| !birth.retirable()) {
+                    return Err(Error::Unavailable);
+                }
                 let Phase::Exited { generation } = entry.phase else {
                     return Err(Error::Unavailable);
                 };
@@ -626,7 +650,7 @@ impl Index {
             || header
                 .required
                 .iter()
-                .any(|cap| !REQUIRED.contains(&cap.as_str()))
+                .any(|cap| !REQUIRED.contains(&cap.as_str()) && cap != publication::CAP)
         {
             return Err(Error::Incompatible);
         }
@@ -668,6 +692,12 @@ impl Index {
         let mut identities = std::collections::BTreeSet::new();
         for (name, entry) in &self.entries {
             validate_entry(name, entry, self.incarnation, self.epoch)?;
+            if let Some(birth) = &entry.birth {
+                if !self.required.iter().any(|cap| cap == publication::CAP) {
+                    return Err(Error::Incompatible);
+                }
+                birth.validate(entry.phase)?;
+            }
             if !self.allocations.contains(&entry.identity) {
                 return Err(Error::Corrupt);
             }

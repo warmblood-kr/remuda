@@ -727,6 +727,30 @@ pub fn generate_instance_id(seed: u128) -> String {
     format!("{seed:032x}-{:016x}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Bounded identity allocated by the caller before child creation. This type
+/// validates shape; the owning store must establish uniqueness and durability.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartIdentity {
+    id: String,
+    instance: String,
+}
+impl StartIdentity {
+    pub fn new(id: impl Into<String>, instance: impl Into<String>) -> Result<Self> {
+        let identity = Self {
+            id: id.into(),
+            instance: instance.into(),
+        };
+        if [&identity.id, &identity.instance].iter().any(|value| {
+            value.is_empty() || value.len() > 256 || value.chars().any(char::is_control)
+        }) {
+            return Err(AgentError::Io(
+                "invalid preassigned session identity".into(),
+            ));
+        }
+        Ok(identity)
+    }
+}
+
 /// Identity and size only. Deliberately takes no lock: a `Debug` that locks
 /// deadlocks exactly where you reach for it — in a panic message printed while
 /// the session's own lock is held.
@@ -759,14 +783,35 @@ impl Session {
     }
 
     /// Construct a session with the identity injected into its child process.
-    #[allow(clippy::too_many_lines)]
     pub fn new_with_id(
         name: impl Into<String>,
         id: impl Into<String>,
-        mut agent: Box<dyn AgentProcess>,
+        agent: Box<dyn AgentProcess>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         let instance_id = generate_instance_id(clock.instance_id_seed());
+        Self::build(name.into(), id.into(), instance_id, agent, clock)
+    }
+
+    /// Preserve the caller's preassigned instance without minting another owner
+    /// identity after spawn. The caller must reserve it before creating a child.
+    pub fn with_start_identity(
+        name: impl Into<String>,
+        identity: StartIdentity,
+        agent: Box<dyn AgentProcess>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self::build(name.into(), identity.id, identity.instance, agent, clock)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn build(
+        name: String,
+        id: String,
+        instance_id: String,
+        mut agent: Box<dyn AgentProcess>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         let (started, last_output_at) = configure_writer_clock(agent.as_mut(), &clock);
         let size = agent.size();
         let output_changed = Arc::new((Mutex::new(0_u64), Condvar::new()));
@@ -809,8 +854,8 @@ impl Session {
             });
         }
         Self {
-            id: id.into(),
-            name: name.into(),
+            id,
+            name,
             agent: Mutex::new(agent),
             size: Mutex::new(size),
             clock,

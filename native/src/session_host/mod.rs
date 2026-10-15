@@ -1,10 +1,10 @@
-//! Inactive foundations for issue #713's stable session host.
-//!
-//! These state machines do not launch hosts, authenticate connections, or
-//! preserve sessions yet. Runtime integration must retain one host-owned
-//! `core::Session`, including complete logical input acts and delayed writes.
+//! Experimental standalone session hosts for issue #713; no daemon adoption.
+//! A host owns one complete Session, PTY/parser and admitted logical acts.
+//! Default daemon routing, existing sessions and production rollout are separate.
 #![allow(dead_code)]
 mod api;
+#[cfg(unix)]
+mod birth;
 mod channel;
 #[cfg(unix)]
 mod child;
@@ -40,6 +40,8 @@ pub fn executable(operation: &str, path: &std::path::Path) -> std::io::Result<()
     {
         if operation == "run" {
             entry::run(path)
+        } else if operation == "run-reserved" {
+            birth::run(path)
         } else {
             entry::command(path, operation)
         }
