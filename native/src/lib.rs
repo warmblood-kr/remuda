@@ -36,6 +36,7 @@ pub mod pty;
 pub mod remote_front;
 pub mod reply_limit;
 pub mod script;
+mod session_host;
 pub mod session_job;
 #[cfg(unix)]
 mod staged_socket;
