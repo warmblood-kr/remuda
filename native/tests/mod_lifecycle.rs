@@ -1794,7 +1794,9 @@ fn command_dispatch_reloads_changed_entry_and_loaded_helpers_without_losing_stat
       api = 'remuda-module-v1', state_version = 1,
       initialize = function() return {starts = 0} end,
       start = function(state) state.starts = state.starts + 1 end,
+      source_refresh_ready = function(state) if state.busy then return "test workflow is busy" end end,
       commands = function(state)
+        remuda.sample_state = state
         remuda.exec('sample/helper')
         remuda.extension_command('sample', function() return remuda.sample_value .. ':' .. state.starts end)
       end,
@@ -1816,6 +1818,19 @@ fn command_dispatch_reloads_changed_entry_and_loaded_helpers_without_losing_stat
         "unchanged source must not restart"
     );
     fs::write(&helper, "remuda.sample_value = 'new'").unwrap();
+    read_value(&image, "remuda.sample_state.busy = true");
+    assert!(image
+        .eval(dispatch, None)
+        .unwrap_err()
+        .contains("source refresh deferred"));
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample', {}, {})"
+        ),
+        "old:1"
+    );
+    read_value(&image, "remuda.sample_state.busy = false");
     assert_eq!(read_value(&image, "remuda._load_extension_command('sample', 'sample'); return remuda._dispatch_extension_command('sample', {}, {})"), "old:1", "default production dispatch keeps the active version");
     assert_eq!(
         read_value(&image, dispatch),

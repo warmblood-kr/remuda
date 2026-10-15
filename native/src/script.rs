@@ -1518,6 +1518,11 @@ fn exec_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
                 "_exec_commands",
                 lua.create_function(|lua, (name, refresh): (String, Option<bool>)| {
                     let changed = refresh == Some(true) && package_sources_changed(lua, &name)?;
+                    if changed {
+                        let check: mlua::Function =
+                            lua.named_registry_value("remuda.lifecycle.source_refresh_check")?;
+                        check.call::<()>(name.as_str())?;
+                    }
                     execute_package(lua, &name, changed, true)
                 })?,
             )
@@ -1699,6 +1704,9 @@ fn call_lifecycle_callback(lua: &Lua, callback: &mlua::Function, state: Value) -
 /// implementation helper on the public `remuda` table.
 pub(crate) fn hide_module_activator(lua: &Lua) -> mlua::Result<()> {
     let remuda: Table = lua.globals().get("remuda")?;
+    let check: mlua::Function = remuda.get("_source_refresh_check")?;
+    lua.set_named_registry_value("remuda.lifecycle.source_refresh_check", check)?;
+    remuda.set("_source_refresh_check", Value::Nil)?;
     let activate: mlua::Function = remuda.get("_activate_module")?;
     lua.set_named_registry_value("remuda.lifecycle.activate_module", activate)?;
     let stop_modules: mlua::Function = remuda.get("_stop_modules")?;

@@ -1185,6 +1185,15 @@ local function array_length(value, label)
   return length
 end
 
+-- Source refresh must ask the active version before replacing any registrations.
+function remuda._source_refresh_check(name)
+  local active = modules[name]
+  if active and active.source_refresh_ready then
+    local reason = active.source_refresh_ready(active.state)
+    if reason ~= nil then error("source refresh deferred: " .. tostring(reason) .. "; retry when idle", 0) end
+  end
+end
+
 -- REACTIVATE false is `exec`: ensure the mod is active and launch a
 -- commands-only activation once; leave a started mod alone. Only `reload`
 -- replaces an activation and re-runs its hooks (#116).
@@ -1329,6 +1338,9 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
     end
   end
 
+  if candidate.source_refresh_ready ~= nil and type(candidate.source_refresh_ready) ~= "function" then
+    error("module source_refresh_ready must be a function", 0)
+  end
   local previous = modules[name]
   local state
   if previous == nil then
@@ -1509,6 +1521,7 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
     commands = commands,
     started = false,
     start_attempted = false,
+    source_refresh_ready = candidate.source_refresh_ready and function(state) return with_owner(name, candidate.source_refresh_ready, state) end,
     ready = ready,
     timeout_ms = timeout_ms,
     stopped = false,
