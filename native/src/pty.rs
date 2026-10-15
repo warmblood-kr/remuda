@@ -795,9 +795,18 @@ pub(crate) fn display_cursor(screen: &vt100::Screen) -> (u16, u16) {
 }
 
 pub(crate) fn styled_cells(screen: &vt100::Screen, size: Size) -> Vec<Vec<StyledCell>> {
-    (0..size.rows())
+    styled_cells_in(screen, size.rows(), size.cols())
+}
+
+/// Exact parser geometry, including small synthetic terminal fixtures.
+pub(crate) fn styled_cells_in(
+    screen: &vt100::Screen,
+    rows: u16,
+    cols: u16,
+) -> Vec<Vec<StyledCell>> {
+    (0..rows)
         .map(|row| {
-            (0..size.cols())
+            (0..cols)
                 .map(|col| {
                     let cell = screen.cell(row, col);
                     let continuation = cell.is_some_and(|c| c.is_wide_continuation());

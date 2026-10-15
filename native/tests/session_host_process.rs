@@ -306,6 +306,66 @@ impl SessionClient {
             .expect("synthetic RPC response timeout");
         serde_json::from_slice(&bytes).unwrap()
     }
+    fn admitted_snapshot(&mut self) -> Value {
+        self.admitted_snapshot_with_busy(|| {})
+    }
+    fn admitted_snapshot_with_busy(&mut self, mut busy: impl FnMut()) -> Value {
+        let until = Instant::now() + Duration::from_secs(1);
+        loop {
+            let response = self.request(json!({"op":"Snapshot"}));
+            if response["result"] == "Error" && response["code"] == "snapshot_budget_busy" {
+                assert!(
+                    Instant::now() < until,
+                    "bounded snapshot admission: {response}"
+                );
+                busy();
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            assert_eq!(
+                response["result"], "Snapshot",
+                "unexpected admission response: {response}"
+            );
+            return response;
+        }
+    }
+}
+#[test]
+fn snapshot_admission_retries_a_proven_busy_without_weakening_ack_rules() {
+    let mut host = Host::start();
+    let original = host.inspect()["identity"].clone();
+    let mut first = SessionClient::view(&host.root);
+    let held = first.admitted_snapshot();
+    let mut second = SessionClient::view(&host.root);
+    let (busy, observed) = std::sync::mpsc::sync_channel(1);
+    let (release, released) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let mut first_busy = true;
+        second.admitted_snapshot_with_busy(|| {
+            if first_busy {
+                first_busy = false;
+                busy.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(1)).unwrap();
+            }
+        })
+    });
+    observed.recv_timeout(Duration::from_secs(1)).unwrap();
+    for index in 0..held["pages"].as_u64().unwrap() {
+        assert_eq!(
+            first.request(json!({"op":"Page","snapshot":held["snapshot"],"index":index}))["result"],
+            "Page"
+        );
+    }
+    assert_eq!(
+        first.request(
+            json!({"op":"Acknowledge","snapshot":held["snapshot"],"generation":held["generation"]})
+        )["result"],
+        "Ok"
+    );
+    release.send(()).unwrap();
+    assert_eq!(worker.join().unwrap()["result"], "Snapshot");
+    assert_eq!(host.inspect()["identity"], original);
+    host.stop();
 }
 #[test]
 fn view_role_wrong_manifest_and_incomplete_snapshot_ack_do_not_mutate_host() {
@@ -342,7 +402,7 @@ fn view_role_wrong_manifest_and_incomplete_snapshot_ack_do_not_mutate_host() {
     assert!(!status.success());
     fs::write(&path, bytes).unwrap();
     let mut viewer = SessionClient::view(&host.root);
-    let snapshot = viewer.request(json!({"op":"Snapshot"}));
+    let snapshot = viewer.admitted_snapshot();
     assert_eq!(snapshot["result"], "Snapshot");
     let id = snapshot["snapshot"].clone();
     let generation = snapshot["generation"].clone();

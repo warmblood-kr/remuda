@@ -27,6 +27,8 @@ pub(crate) struct HostChild {
 }
 #[derive(Clone)]
 pub(crate) struct View {
+    version: Arc<AtomicU64>,
+    wakes: Arc<Mutex<Vec<OutputSignal>>>,
     terminal: Arc<Mutex<Terminal>>,
     eof: Arc<AtomicBool>,
     drained: Arc<AtomicU64>,
@@ -34,6 +36,22 @@ pub(crate) struct View {
     fault: Arc<AtomicBool>,
 }
 impl View {
+    pub fn viewport(&self, offset: usize) -> Result<super::viewport::Viewport> {
+        Ok(self.terminal.lock().map_err(io)?.viewport(offset))
+    }
+    pub fn subscribe(&self) -> Result<OutputWakeup> {
+        let mut wakes = self.wakes.lock().map_err(io)?;
+        wakes.retain(OutputSignal::is_connected);
+        // One core idle observer plus the at-most-sixteen host connections.
+        if wakes.len() >= 17 {
+            return Err(io("host wake subscription limit"));
+        }
+        let (signal, wake) = OutputWakeup::pair(Arc::clone(&self.version));
+        if !self.eof.load(Ordering::Acquire) {
+            wakes.push(signal);
+        }
+        Ok(wake)
+    }
     pub fn status(&self) -> Result<(u64, (u16, u16))> {
         let terminal = self.terminal.lock().map_err(io)?;
         Ok((terminal.generation(), terminal.screen().size()))
@@ -72,6 +90,8 @@ impl View {
 impl HostChild {
     pub fn view(&self) -> View {
         View {
+            version: self.version.clone(),
+            wakes: self.wakes.clone(),
             terminal: self.terminal.clone(),
             eof: self.eof.clone(),
             drained: self.drained.clone(),
@@ -290,16 +310,7 @@ impl AgentProcess for HostChild {
         self.reaper.pid
     }
     fn subscribe_output_wakeup(&mut self) -> Option<OutputWakeup> {
-        let mut wakes = self.wakes.lock().ok()?;
-        wakes.retain(OutputSignal::is_connected);
-        if wakes.len() >= 16 {
-            return None;
-        }
-        let (signal, wake) = OutputWakeup::pair(Arc::clone(&self.version));
-        if !self.output_eof() {
-            wakes.push(signal);
-        }
-        Some(wake)
+        self.view().subscribe().ok()
     }
     fn is_alive(&mut self) -> bool {
         self.reaper.alive()
@@ -314,7 +325,14 @@ impl AgentProcess for HostChild {
         // Validate before mutating either PTY or parser.
         Terminal::validate_geometry(size.rows(), size.cols(), 1000).map_err(io)?;
         let mut terminal = self.terminal.lock().map_err(io)?;
-        self.master.resize(pty_size(size)).map_err(io)?;
+        if let Err(error) = terminal.prepare_resize(size.rows(), size.cols()) {
+            self.fault.store(true, Ordering::Release);
+            return Err(io(error));
+        }
+        if let Err(error) = self.master.resize(pty_size(size)) {
+            self.fault.store(true, Ordering::Release);
+            return Err(io(error));
+        }
         terminal.resize(size.rows(), size.cols()).map_err(io)?;
         self.version.store(terminal.generation(), Ordering::Release);
         self.size = size;
@@ -330,6 +348,27 @@ impl AgentProcess for HostChild {
 mod tests {
     use super::*;
     use std::time::Instant;
+    #[test]
+    fn exhausted_generation_refuses_before_os_resize_and_reports_degradation() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf 'resize-ready\\n'; while IFS= read -r line; do :; done",
+        ]);
+        let mut child = Cleanup(HostChild::spawn(command, Size::new(80, 24)).unwrap());
+        wait_for(&mut child.0, "resize-ready");
+        child
+            .0
+            .terminal
+            .lock()
+            .unwrap()
+            .generation_fixture(u64::MAX);
+        assert!(child.0.resize(Size::new(90, 25)).is_err());
+        let actual = child.0.master.get_size().unwrap();
+        assert_eq!((actual.rows, actual.cols), (24, 80));
+        assert_eq!(child.0.terminal.lock().unwrap().screen().size(), (24, 80));
+        assert!(child.0.fault.load(Ordering::Acquire));
+    }
     struct Cleanup(HostChild);
     impl Drop for Cleanup {
         fn drop(&mut self) {

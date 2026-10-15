@@ -13,6 +13,8 @@ mod coordinator;
 #[cfg(unix)]
 mod entry;
 mod inventory;
+#[cfg(unix)]
+mod latest;
 mod ledger;
 #[cfg(unix)]
 mod owned;
@@ -28,6 +30,9 @@ mod subscription;
 mod terminal;
 #[cfg(unix)]
 mod unix;
+mod view_budget;
+mod view_frames;
+mod viewport;
 #[cfg(windows)]
 #[doc(hidden)]
 pub mod windows_process;
