@@ -13,10 +13,15 @@ pub(crate) const MAX_CLIENTS: usize = 16;
 pub(crate) const MAX_RESULTS: usize = 32;
 const MAX_EVENTS: usize = 256;
 const MAX_TOMBSTONES: usize = 128;
-const REQUIRED: [&str; 3] = [
+const MAX_ALLOCATIONS: usize = 1024;
+const EVENT_BYTES: usize = 2048;
+const PENDING_BYTES: usize = 16 * 1024;
+const ACK_BYTES: usize = 10 * 1024;
+const REQUIRED: [&str; 4] = [
     "owner-fence-v1",
     "typed-input-json-sha256-v1",
     "raw-launch-json-sha256-v1",
+    "nonrecycled-identities-v1",
 ];
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -163,6 +168,7 @@ pub(crate) struct Index {
     pub(super) revision: u64,
     epoch: u64,
     nonce: [u8; 16],
+    allocations: Vec<Identity>,
     pub entries: BTreeMap<String, Entry>,
     pub tombstones: VecDeque<Tombstone>,
     pub events: VecDeque<Event>,
@@ -269,6 +275,7 @@ impl Index {
             revision: 0,
             epoch: 0,
             nonce: [0; 16],
+            allocations: Vec::new(),
             entries: BTreeMap::new(),
             tombstones: VecDeque::new(),
             events: VecDeque::new(),
@@ -398,6 +405,53 @@ impl Index {
             next,
         })
     }
+    fn reserved_bytes(&self) -> Result<usize> {
+        // Replacing already-present event/tombstone bytes spends their own
+        // credit. Decimal counters and phases are normalized to maximum width.
+        let events = serde_json::to_vec(&self.events)
+            .map_err(|_| Error::Corrupt)?
+            .len();
+        let tombstones = serde_json::to_vec(&self.tombstones)
+            .map_err(|_| Error::Corrupt)?
+            .len();
+        let mut bytes = (MAX_EVENTS * EVENT_BYTES + 2).saturating_sub(events)
+            + (MAX_TOMBSTONES * EVENT_BYTES + 2).saturating_sub(tombstones)
+            + digits(self.revision)
+            + digits(self.epoch);
+        bytes += 65
+            - serde_json::to_vec(&self.nonce)
+                .map_err(|_| Error::Corrupt)?
+                .len();
+        for entry in self.entries.values() {
+            bytes += 64
+                - serde_json::to_vec(&entry.phase)
+                    .map_err(|_| Error::Corrupt)?
+                    .len();
+            for metadata in entry.metadata.values() {
+                bytes += digits(metadata.revision);
+            }
+            if let Some(pending) = &entry.pending {
+                bytes += PENDING_BYTES;
+                bytes += digits(pending.writer_epoch) + 32
+                    - serde_json::to_vec(&pending.phase)
+                        .map_err(|_| Error::Corrupt)?
+                        .len();
+            }
+            for stream in &entry.streams {
+                bytes += digits(stream.forgotten_through) + stream.next.map_or(0, digits);
+                for result in &stream.results {
+                    if !result.consumer_ack {
+                        bytes += ACK_BYTES;
+                    }
+                    bytes += digits(result.reservation.writer_epoch) + 32
+                        - serde_json::to_vec(&result.reservation.phase)
+                            .map_err(|_| Error::Corrupt)?
+                            .len();
+                }
+            }
+        }
+        Ok(bytes)
+    }
     fn entry(&mut self, name: &str, identity: &Identity) -> Result<&mut Entry> {
         let entry = self.entries.get_mut(name).ok_or(Error::Unavailable)?;
         if entry.identity != *identity {
@@ -419,6 +473,13 @@ impl Index {
                 if self.entries.contains_key(&name) || entry.phase != Phase::Reserved {
                     return Err(Error::Conflict);
                 }
+                if self.allocations.contains(&entry.identity) {
+                    return Err(Error::Conflict);
+                }
+                if self.allocations.len() == MAX_ALLOCATIONS {
+                    return Err(Error::Exhausted);
+                }
+                self.allocations.push(entry.identity.clone());
                 self.entries.insert(name.clone(), entry);
                 Ok((Some(name), EventKind::Launch))
             }
@@ -431,7 +492,21 @@ impl Index {
                 Ok((Some(target.name), EventKind::Register))
             }
             Mutation::Metadata { target, update } => {
-                metadata(self.entry(&target.name, &target.identity)?, update)?;
+                if update.namespace == "consumer" {
+                    return Err(Error::Invalid("reserved consumer namespace"));
+                }
+                let entry = self.entry(&target.name, &target.identity)?;
+                if !entry.metadata.contains_key(&update.namespace)
+                    && entry
+                        .metadata
+                        .keys()
+                        .filter(|key| key.as_str() != "consumer")
+                        .count()
+                        >= MAX_NAMESPACES - 1
+                {
+                    return Err(Error::Capacity);
+                }
+                metadata(entry, update)?;
                 Ok((Some(target.name), EventKind::Metadata))
             }
             Mutation::Input { target, operation } => self.input(target, operation),
@@ -567,15 +642,31 @@ impl Index {
         if self.entries.len() > MAX_ENTRIES
             || self.events.len() > MAX_EVENTS
             || self.tombstones.len() > MAX_TOMBSTONES
+            || self.allocations.len() > MAX_ALLOCATIONS
         {
             return Err(Error::Capacity);
         }
         if self.epoch == 0 && (self.revision != 0 || !self.entries.is_empty()) {
             return Err(Error::Corrupt);
         }
+        let mut allocated = std::collections::BTreeSet::new();
+        for identity in &self.allocations {
+            if !valid_identity(identity)
+                || !allocated.insert((
+                    identity.host,
+                    identity.session.clone(),
+                    identity.instance.clone(),
+                ))
+            {
+                return Err(Error::Corrupt);
+            }
+        }
         let mut identities = std::collections::BTreeSet::new();
         for (name, entry) in &self.entries {
             validate_entry(name, entry, self.incarnation, self.epoch)?;
+            if !self.allocations.contains(&entry.identity) {
+                return Err(Error::Corrupt);
+            }
             if !identities.insert((
                 entry.identity.host,
                 entry.identity.session.clone(),
@@ -596,12 +687,18 @@ impl Index {
             }
         }
         for tombstone in &self.tombstones {
-            if !valid_name(&tombstone.name) || !valid_identity(&tombstone.identity) {
+            if !valid_name(&tombstone.name) || !self.allocations.contains(&tombstone.identity) {
                 return Err(Error::Corrupt);
             }
         }
+        if self.encode()?.len().saturating_add(self.reserved_bytes()?) > MAX_BYTES {
+            return Err(Error::Capacity);
+        }
         Ok(())
     }
+}
+fn digits(value: u64) -> usize {
+    20 - value.to_string().len()
 }
 fn pending<'a>(entry: &'a mut Entry, key: &Key) -> Result<&'a mut Pending> {
     entry
@@ -690,6 +787,9 @@ fn metadata(entry: &mut Entry, update: MetadataUpdate) -> Result<()> {
     Ok(())
 }
 fn consume(entry: &mut Entry, key: &Key, checkpoint: ConsumerCheckpoint) -> Result<()> {
+    if checkpoint.metadata.namespace != "consumer" || checkpoint.metadata.value.schema != 1 {
+        return Err(Error::Invalid("consumer checkpoint namespace/schema"));
+    }
     let result = entry
         .streams
         .iter()
@@ -748,6 +848,19 @@ fn validate_entry(name: &str, entry: &Entry, store: [u8; 16], epoch: u64) -> Res
         return Err(Error::Conflict);
     }
     if entry.metadata.len() > MAX_NAMESPACES || entry.streams.len() > MAX_CLIENTS {
+        return Err(Error::Capacity);
+    }
+    if entry
+        .metadata
+        .keys()
+        .filter(|key| key.as_str() != "consumer")
+        .count()
+        >= MAX_NAMESPACES
+        || entry
+            .metadata
+            .get("consumer")
+            .is_some_and(|value| value.schema != 1)
+    {
         return Err(Error::Capacity);
     }
     for (key, value) in &entry.metadata {

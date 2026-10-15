@@ -2,16 +2,14 @@
 use std::fs::File;
 use std::io;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
-use std::path::PathBuf;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::path::Path;
 
 pub(super) struct Directory {
     #[cfg(unix)]
-    path: PathBuf,
-    #[cfg(unix)]
-    _handle: File,
+    handle: File,
     #[cfg(windows)]
     handle: crate::windows_security::StorageDirectory,
 }
@@ -35,8 +33,7 @@ impl Directory {
         #[cfg(unix)]
         {
             Ok(Self {
-                path: path.into(),
-                _handle: super::super::unix::directory(path)?,
+                handle: super::super::unix::directory(path)?,
             })
         }
         #[cfg(windows)]
@@ -48,10 +45,7 @@ impl Directory {
     }
     pub fn read_index(&self) -> io::Result<File> {
         #[cfg(unix)]
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(self.path.join("inventory.json"))?;
+        let file = self.open_relative(c"inventory.json", libc::O_RDONLY)?;
         #[cfg(windows)]
         let file = self.handle.open_file("inventory.json", false)?;
         private_file(&file)?;
@@ -59,14 +53,7 @@ impl Directory {
     }
     pub fn lock_file(&self) -> io::Result<File> {
         #[cfg(unix)]
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(self.path.join("inventory.lock"))?;
+        let file = self.open_relative(c"inventory.lock", libc::O_RDWR | libc::O_CREAT)?;
         #[cfg(windows)]
         let file = self.handle.open_private_lock("inventory.lock")?;
         private_file(&file)?;
@@ -81,12 +68,63 @@ impl Directory {
     pub fn replace(&self, bytes: &[u8]) -> io::Result<()> {
         #[cfg(unix)]
         {
-            crate::fs_atomic::write_atomic_lua_private(&self.path.join("inventory.json"), bytes)
+            self.replace_relative(bytes)
         }
         #[cfg(windows)]
         {
             self.handle.write_atomic("inventory.json", bytes)
         }
+    }
+    #[cfg(unix)]
+    fn open_relative(&self, name: &std::ffi::CStr, flags: i32) -> io::Result<File> {
+        // SAFETY: held directory and NUL-terminated single-component name are live.
+        let fd = unsafe {
+            libc::openat(
+                self.handle.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful openat transfers exactly one new descriptor here.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+    #[cfg(unix)]
+    fn replace_relative(&self, bytes: &[u8]) -> io::Result<()> {
+        use std::io::Write;
+        let mut random = [0; 16];
+        getrandom::fill(&mut random).map_err(|_| io::Error::other("inventory entropy"))?;
+        let name =
+            std::ffi::CString::new(format!(".inventory-{:032x}", u128::from_le_bytes(random)))
+                .expect("fixed hex has no NUL");
+        let mut temporary =
+            self.open_relative(&name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
+        let result = (|| {
+            private_file(&temporary)?;
+            temporary.write_all(bytes)?;
+            temporary.sync_all()?;
+            // SAFETY: both names are fixed single components under one held directory.
+            if unsafe {
+                libc::renameat(
+                    self.handle.as_raw_fd(),
+                    name.as_ptr(),
+                    self.handle.as_raw_fd(),
+                    c"inventory.json".as_ptr(),
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            self.handle.sync_all()
+        })();
+        // SAFETY: best-effort cleanup of only our exclusive temporary name.
+        unsafe {
+            libc::unlinkat(self.handle.as_raw_fd(), name.as_ptr(), 0);
+        }
+        result
     }
 }
 fn validate_path(path: &Path) -> io::Result<()> {

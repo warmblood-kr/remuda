@@ -98,6 +98,337 @@ fn consume(sequence: u64, client: u8, expected: Option<u64>) -> Mutation {
     }
 }
 #[test]
+fn retired_identity_never_recycles_even_after_tombstone_wrap_and_lifetime_exhaustion() {
+    let (mut index, fence) = initial();
+    registered(&mut index, fence);
+    for number in 0..1024 {
+        let id = if number == 0 {
+            identity()
+        } else {
+            Identity {
+                host: [3; 16],
+                session: format!("session-{number}"),
+                instance: format!("instance-{number}"),
+            }
+        };
+        let target = || Target {
+            name: "synthetic".into(),
+            identity: id.clone(),
+        };
+        if number != 0 {
+            apply(
+                &mut index,
+                fence,
+                Mutation::ReserveLaunch {
+                    name: "synthetic".into(),
+                    entry: Entry::reserved(id.clone(), [4; 16], "{}").unwrap(),
+                },
+            );
+            apply(&mut index, fence, Mutation::Register(target()));
+        }
+        if number == 1023 {
+            break;
+        }
+        apply(
+            &mut index,
+            fence,
+            Mutation::Exit {
+                target: target(),
+                operation: ExitMutation::Observe { generation: 1 },
+            },
+        );
+        apply(
+            &mut index,
+            fence,
+            Mutation::Exit {
+                target: target(),
+                operation: ExitMutation::Retire,
+            },
+        );
+    }
+    assert_eq!(index.tombstones.len(), 128);
+    let mut index = Index::decode(&index.encode().unwrap()).unwrap();
+    let before = index.cursor();
+    assert!(matches!(
+        index.apply(
+            before,
+            Some(fence),
+            Mutation::ReserveLaunch {
+                name: "reuse".into(),
+                entry: Entry::reserved(identity(), [4; 16], "{}").unwrap()
+            }
+        ),
+        Err(Error::Conflict)
+    ));
+    let new = Identity {
+        host: [99; 16],
+        session: "new".into(),
+        instance: "new".into(),
+    };
+    assert!(matches!(
+        index.apply(
+            before,
+            Some(fence),
+            Mutation::ReserveLaunch {
+                name: "new".into(),
+                entry: Entry::reserved(new, [4; 16], "{}").unwrap()
+            }
+        ),
+        Err(Error::Exhausted)
+    ));
+    assert_eq!(index.cursor(), before);
+    existing_work_at_exhaustion(&mut index, fence);
+}
+fn existing_work_at_exhaustion(index: &mut Index, fence: Fence) {
+    let identity = index.entries["synthetic"].identity.clone();
+    for mutation in [reserve(1, 7), complete(1, 7), consume(1, 7, None)] {
+        let Mutation::Input { operation, .. } = mutation else {
+            unreachable!()
+        };
+        apply(
+            index,
+            fence,
+            Mutation::Input {
+                target: Target {
+                    name: "synthetic".into(),
+                    identity: identity.clone(),
+                },
+                operation,
+            },
+        );
+    }
+    let index = Index::decode(&index.encode().unwrap()).unwrap();
+    assert!(index.entries["synthetic"].pending.is_none());
+    assert!(index.entries["synthetic"].streams[0].results.is_empty());
+}
+fn fill_metadata(mut index: Index, fence: Fence, payload: &str) -> Index {
+    let mut filled = false;
+    'fill: for number in 0..40 {
+        let name = format!("fill-{number}");
+        let id = Identity {
+            host: [8; 16],
+            session: name.clone(),
+            instance: name.clone(),
+        };
+        apply(
+            &mut index,
+            fence,
+            Mutation::ReserveLaunch {
+                name: name.clone(),
+                entry: Entry::reserved(id.clone(), [4; 16], "{}").unwrap(),
+            },
+        );
+        for slot in 0..15 {
+            let mutation = Mutation::Metadata {
+                target: Target {
+                    name: name.clone(),
+                    identity: id.clone(),
+                },
+                update: MetadataUpdate {
+                    namespace: format!("slot-{slot}"),
+                    expected: None,
+                    value: Namespace::new(1, payload).unwrap(),
+                },
+            };
+            match index.apply(index.cursor(), Some(fence), mutation) {
+                Ok(applied) => index = applied.next,
+                Err(Error::Capacity) => {
+                    filled = true;
+                    break 'fill;
+                }
+                _ => panic!("unexpected fill result"),
+            }
+        }
+    }
+    assert!(filled && index.encode().unwrap().len() > 3_000_000);
+    index
+}
+fn fill_ordinary_slots(index: &mut Index, fence: Fence, payload: &str) {
+    for slot in 0..15 {
+        apply(
+            index,
+            fence,
+            Mutation::Metadata {
+                target: target(),
+                update: MetadataUpdate {
+                    namespace: format!("slot-{slot}"),
+                    expected: None,
+                    value: Namespace::new(1, payload).unwrap(),
+                },
+            },
+        );
+    }
+    assert!(matches!(
+        index.apply(
+            index.cursor(),
+            Some(fence),
+            Mutation::Metadata {
+                target: target(),
+                update: MetadataUpdate {
+                    namespace: "no-consumer-slot".into(),
+                    expected: None,
+                    value: Namespace::new(1, "{}").unwrap(),
+                }
+            }
+        ),
+        Err(Error::Capacity)
+    ));
+}
+#[test]
+fn projected_capacity_covers_multiple_pending_and_out_of_order_retained_acks() {
+    let (mut index, fence) = initial();
+    registered(&mut index, fence);
+    let second = || Target {
+        name: "second".into(),
+        identity: Identity {
+            host: [8; 16],
+            session: "second-session".into(),
+            instance: "second-instance".into(),
+        },
+    };
+    apply(
+        &mut index,
+        fence,
+        Mutation::ReserveLaunch {
+            name: "second".into(),
+            entry: Entry::reserved(second().identity, [5; 16], "{}").unwrap(),
+        },
+    );
+    apply(&mut index, fence, Mutation::Register(second()));
+    for sequence in 1..=2 {
+        apply(&mut index, fence, reserve(sequence, 7));
+        apply(&mut index, fence, complete(sequence, 7));
+    }
+    apply(&mut index, fence, reserve(3, 7));
+    let Mutation::Input { operation, .. } = reserve(1, 7) else {
+        unreachable!()
+    };
+    apply(
+        &mut index,
+        fence,
+        Mutation::Input {
+            target: second(),
+            operation,
+        },
+    );
+    let payload = format!("\"{}\"", "x".repeat(MAX_METADATA - 2));
+    index = fill_metadata(index, fence, &payload);
+    let mut corrupt = index.clone();
+    for slot in 0..2 {
+        corrupt.entries.get_mut("second").unwrap().metadata.insert(
+            format!("over-budget-{slot}"),
+            Namespace::new(1, &payload).unwrap(),
+        );
+    }
+    let encoded = corrupt.encode().unwrap();
+    assert!(encoded.len() < MAX_BYTES);
+    assert!(matches!(Index::decode(&encoded), Err(Error::Capacity)));
+    for (target, sequence) in [(target(), 3), (second(), 1)] {
+        let Mutation::Input { operation, .. } = complete(sequence, 7) else {
+            unreachable!()
+        };
+        apply(&mut index, fence, Mutation::Input { target, operation });
+    }
+    for (target, sequence, expected) in [
+        (target(), 2, None),
+        (target(), 1, Some(1)),
+        (target(), 3, Some(2)),
+        (second(), 1, None),
+    ] {
+        let Mutation::Input { operation, .. } = consume(sequence, 7, expected) else {
+            unreachable!()
+        };
+        apply(&mut index, fence, Mutation::Input { target, operation });
+        index = Index::decode(&index.encode().unwrap()).unwrap();
+        if sequence == 2 {
+            let stream = &index.entries["synthetic"].streams[0];
+            assert_eq!(stream.results.len(), 3);
+            assert!(stream.results[1].consumer_ack);
+            assert!(!stream.results[0].consumer_ack);
+        }
+    }
+    for name in ["synthetic", "second"] {
+        assert!(index.entries[name].streams[0].results.is_empty());
+        assert!(index.entries[name].pending.is_none());
+    }
+}
+#[test]
+fn aggregate_admission_reserves_completion_ack_and_progress_space_against_metadata_fill() {
+    let (mut index, fence) = initial();
+    registered(&mut index, fence);
+    apply(&mut index, fence, reserve(1, 7));
+    let payload = format!("\"{}\"", "x".repeat(MAX_METADATA - 2));
+    fill_ordinary_slots(&mut index, fence, &payload);
+    index = fill_metadata(index, fence, &payload);
+    for _ in 0..300 {
+        apply(
+            &mut index,
+            fence,
+            Mutation::Input {
+                target: target(),
+                operation: InputMutation::Adopt(key(1, 7)),
+            },
+        );
+    }
+    apply(
+        &mut index,
+        fence,
+        Mutation::Input {
+            target: target(),
+            operation: InputMutation::Observe {
+                key: key(1, 7),
+                phase: InputPhase::Indeterminate,
+            },
+        },
+    );
+    let completion = Completion {
+        delivery: Delivery::Written,
+        reply: Reply::Cleared(Some("r".repeat(4000))),
+    };
+    assert!(completion.fits());
+    apply(
+        &mut index,
+        fence,
+        Mutation::Input {
+            target: target(),
+            operation: InputMutation::Complete {
+                key: key(1, 7),
+                completion: completion.clone(),
+            },
+        },
+    );
+    apply(
+        &mut index,
+        fence,
+        Mutation::Input {
+            target: target(),
+            operation: InputMutation::Consume {
+                key: key(1, 7),
+                checkpoint: ConsumerCheckpoint {
+                    intent: [7; 16],
+                    outcome: hash(&serde_json::to_vec(&completion).unwrap()),
+                    metadata: MetadataUpdate {
+                        namespace: "consumer".into(),
+                        expected: None,
+                        value: Namespace::new(1, &payload).unwrap(),
+                    },
+                },
+            },
+        },
+    );
+    let recovered = Index::decode(&index.encode().unwrap()).unwrap();
+    assert!(matches!(
+        recovered.lookup(&target(), &key(1, 7)).unwrap(),
+        Lookup::Forgotten
+    ));
+    assert_eq!(
+        recovered.entries["synthetic"].metadata["consumer"]
+            .payload
+            .get(),
+        payload
+    );
+}
+#[test]
 fn independent_writer_fence_and_revision_refuse_stale_or_foreign_writes() {
     let (mut index, old) = initial();
     let before = index.cursor();

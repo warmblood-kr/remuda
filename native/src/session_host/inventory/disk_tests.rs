@@ -9,6 +9,36 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 static NEXT: AtomicU64 = AtomicU64::new(0);
+#[cfg(unix)]
+#[test]
+fn renamed_root_keeps_index_lock_and_replacement_anchored_to_original_directory() {
+    let root = Scratch::new();
+    let moved = Scratch::new();
+    let (store, index, fence) = bootstrap(&root.0);
+    std::fs::rename(&root.0, &moved.0).unwrap();
+    let replacement = Store::create(&root.0).unwrap();
+    let other = replacement.read().unwrap().cursor();
+    let committed = store
+        .commit(index.cursor(), Some(fence), reserve(1, 7), Duration::ZERO)
+        .unwrap();
+    assert_eq!(
+        Store::open(&moved.0).unwrap().read().unwrap().cursor(),
+        committed.next.cursor()
+    );
+    assert_eq!(replacement.read().unwrap().cursor(), other);
+    let directory = Directory::open(&moved.0).unwrap();
+    let held = directory.lock_file().unwrap();
+    held.lock().unwrap();
+    assert!(matches!(
+        store.commit(
+            committed.next.cursor(),
+            Some(fence),
+            reserve(2, 7),
+            Duration::ZERO
+        ),
+        Err(Error::Busy)
+    ));
+}
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
