@@ -698,6 +698,7 @@ fn levenshtein(left: &str, right: &str) -> usize {
 #[derive(Debug, PartialEq, Eq)]
 enum ClusterCommand {
     Status,
+    Advertise,
     Init {
         no_listen: bool,
     },
@@ -796,6 +797,7 @@ fn cluster_cli_spec() -> remuda_native::cli_parse::Spec {
                 vec![option("bind", Some("IP[:PORT]"), &port, false)],
                 "remuda cluster join [FINGERPRINT] 'JOIN_LINE' [--bind IP[:PORT]]"),
             verb("nodes", "List the nodes known to this cluster. Example: remuda cluster nodes", vec![], vec![], "remuda cluster nodes"),
+            verb("advertise", "Refresh this node's endpoint from its running listener without restarting it", vec![], vec![], "remuda cluster advertise"),
             verb("alias", "Set or clear a local display alias for a node. Example: remuda cluster alias node-abcd1234 macbook",
                 vec![arg("TARGET", "Node name or fingerprint", false, true), arg("ALIAS", "Local display alias; omit when using --clear", false, false)],
                 vec![option("clear", None, "Clear the local display alias", false)], "remuda cluster alias TARGET ALIAS | alias TARGET --clear"),
@@ -926,6 +928,7 @@ fn parse_cluster_values(
         }),
         "join" => parse_cluster_join(values),
         "nodes" => Ok(ClusterCommand::Nodes),
+        "advertise" => Ok(ClusterCommand::Advertise),
         "alias" => {
             let target = cluster_value(values, "TARGET")
                 .unwrap_or_default()
@@ -1074,6 +1077,17 @@ pub fn cluster_usage(verb: &str) -> String {
 fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     match parse_cluster_command(args) {
         ClusterCommand::Status => cluster_status(server, path),
+        ClusterCommand::Advertise => match remuda_native::cluster::endpoint::refresh(path) {
+            Ok((address, changed)) => {
+                println!(
+                    "Cluster endpoint {address} {}.",
+                    if changed { "updated" } else { "unchanged" }
+                );
+                report_cluster_pushes();
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(format!("cluster advertise: {error}")),
+        },
         ClusterCommand::Init { no_listen } => cluster_init(server, path, no_listen),
         ClusterCommand::InitNewIdentity { yes } => cluster_init_new_identity(yes),
         ClusterCommand::Invite {

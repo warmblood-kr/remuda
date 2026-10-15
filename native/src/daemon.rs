@@ -678,6 +678,14 @@ fn serve_bound_listener(
             listen_addrs: vec![address],
         },
     );
+    // Expose the address first so a concurrent CLI refresh can detect rebinds.
+    let publish_pending = std::sync::atomic::AtomicBool::new(false);
+    if !address.ip().is_unspecified() {
+        if let Err(error) = crate::cluster::endpoint::publish_bound(address) {
+            eprintln!("remuda: could not publish cluster listener endpoint: {error}");
+            publish_pending.store(true, Ordering::Release);
+        }
+    }
     let _ = ready.send(());
 
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -708,7 +716,15 @@ fn serve_bound_listener(
             })
             .map_err(|error| format!("spawn cluster listener stop watcher: {error}"))?;
         let result = listener.serve_until_rechecking(&stop_flag, || {
-            auto && auto_listener_ip_changed(address.ip(), || detector())
+            if auto && auto_listener_ip_changed(address.ip(), || detector()) {
+                return true;
+            }
+            if publish_pending.load(Ordering::Acquire)
+                && crate::cluster::endpoint::publish_bound(address).is_ok()
+            {
+                publish_pending.store(false, Ordering::Release);
+            }
+            false
         });
         serve_done.store(true, Ordering::Release);
         let _ = watcher.join();
@@ -4047,6 +4063,34 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
+    fn listener_keeps_serving_and_retries_after_endpoint_publication_failure() {
+        let environment = ListenerTaskEnvironment::new(Some(listener_config("127.0.0.1:0")));
+        let mut registry = crate::cluster::load_registry().unwrap();
+        registry.authorized_nodes[0].version = u64::MAX;
+        crate::cluster::save_registry(&registry).unwrap();
+        let task = ListenerTask::start(&environment.socket_path());
+        let address = bound_listener_status(&task);
+        let _connection = connect_listener(address, Duration::from_secs(5)).unwrap();
+        assert_eq!(crate::cluster::load_registry().unwrap(), registry);
+        registry.authorized_nodes[0].version = 1;
+        crate::cluster::save_registry(&registry).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let current = crate::cluster::load_registry().unwrap();
+            if current.authorized_nodes[0].endpoint == Some(address.to_string()) {
+                assert_eq!(current.authorized_nodes[0].version, 2);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "publication did not retry"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
     fn auto_listener_retries_until_private_address_is_available() {
         use std::net::{Ipv4Addr, SocketAddr};
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -4344,6 +4388,15 @@ mod tests {
         let old_address = bound_auto_listener_status(&task);
         assert_eq!(old_address.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
 
+        let (identity, before) = crate::cluster::nodes().unwrap().unwrap();
+        let own_before = before
+            .authorized_nodes
+            .iter()
+            .find(|entry| entry.node_fp == identity.node_fp)
+            .unwrap()
+            .clone();
+        assert_eq!(own_before.endpoint, Some(old_address.to_string()));
+
         changed.store(true, Ordering::Release);
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let new_address = loop {
@@ -4362,6 +4415,11 @@ mod tests {
         assert!(connect_listener(old_address, Duration::from_millis(200)).is_err());
         let _connection = connect_listener(new_address, Duration::from_secs(15))
             .expect("rebound listener accepts TCP");
+        let (_, after) = crate::cluster::nodes().unwrap().unwrap();
+        let mut expected = own_before;
+        expected.endpoint = Some(new_address.to_string());
+        expected.version += 1;
+        assert_eq!(after.authorized_nodes, vec![expected]);
     }
 
     #[cfg(not(windows))]

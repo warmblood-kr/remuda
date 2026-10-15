@@ -1003,6 +1003,94 @@ fn wait_for_endpoint_on(receiver: &PrivateNode, member_fp: &str, endpoint: Socke
     }
 }
 
+#[test]
+fn listener_endpoint_move_and_hot_refresh_converge() {
+    let _guard = live_test_guard();
+    let a = PrivateNode::start("endpoint-a");
+    let b = PrivateNode::start("endpoint-b");
+    for node in [&a, &b] {
+        successful(
+            node.run(&["cluster", "init", "--no-listen"]),
+            "initialize node",
+        );
+    }
+    let a_id = a.identity();
+    let b_id = b.identity();
+    let a_fp = identity_fingerprint(&a_id);
+    let before_listen = read_registry(&a);
+    assert!(!a.run(&["cluster", "advertise"]).status.success());
+    assert_eq!(read_registry(&a), before_listen);
+    let mut a_listener = ListenerProcess::start(&a);
+    let b_listener = ListenerProcess::start(&b);
+    join_member(&a, &b, &a_id, a_listener.address, b_listener.address);
+    wait_for_endpoint_on(&b, &a_fp, a_listener.address);
+    let before = read_registry(&a);
+    let old = before
+        .authorized_nodes
+        .iter()
+        .find(|entry| entry.node_fp == a_fp)
+        .unwrap()
+        .clone();
+    a_listener.configure(false);
+    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    a_listener.address = probe.local_addr().unwrap();
+    drop(probe);
+    a_listener.configure(true);
+    wait_for_endpoint_on(&b, &a_fp, a_listener.address);
+    let moved = read_registry(&a);
+    let mut expected = old.clone();
+    expected.endpoint = Some(a_listener.address.to_string());
+    expected.version += 1;
+    assert_eq!(
+        moved
+            .authorized_nodes
+            .iter()
+            .find(|entry| entry.node_fp == a_fp),
+        Some(&expected)
+    );
+    assert!(matches!(
+        list_from(&b_id, &a_id, a_listener.address),
+        Response::Sessions(_)
+    ));
+
+    // Simulate an old daemon's stale own routing hint, leaving its listener up.
+    // Only this disposable fixture is edited; the repair uses the shipped CLI.
+    let mut stale = moved.clone();
+    stale
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == a_fp)
+        .unwrap()
+        .endpoint = old.endpoint;
+    write_registry(&a, &stale);
+    let repaired = successful(a.run(&["cluster", "advertise"]), "hot endpoint repair");
+    assert!(repaired.contains("updated"), "{repaired}");
+    wait_for_endpoint_on(&b, &a_fp, a_listener.address);
+    let repaired_registry = read_registry(&a);
+    expected.version += 1;
+    assert_eq!(
+        repaired_registry
+            .authorized_nodes
+            .iter()
+            .find(|entry| entry.node_fp == a_fp),
+        Some(&expected)
+    );
+    assert_eq!(
+        repaired_registry.authorized_nodes.len(),
+        before.authorized_nodes.len()
+    );
+    let unchanged = successful(
+        a.run(&["cluster", "advertise"]),
+        "idempotent endpoint refresh",
+    );
+    assert!(unchanged.contains("unchanged"), "{unchanged}");
+    assert_eq!(read_registry(&a), repaired_registry);
+    assert!(matches!(
+        list_from(&b_id, &a_id, a_listener.address),
+        Response::Sessions(_)
+    ));
+}
+
 fn revoke_topology(
     label: &str,
 ) -> (
