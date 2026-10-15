@@ -1780,3 +1780,83 @@ fn a_mod_adopts_legacy_fields_only_in_its_own_namespace() {
         "{error}"
     );
 }
+
+#[test]
+fn command_dispatch_reloads_changed_entry_and_loaded_helpers_without_losing_state() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+    fs::write(&manifest, "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\ncommand = \"sample\"\n").unwrap();
+    let entry = home.entry();
+    write_entry(
+        &entry,
+        r#"return {
+      api = 'remuda-module-v1', state_version = 1,
+      initialize = function() return {starts = 0} end,
+      start = function(state) state.starts = state.starts + 1 end,
+      source_refresh_ready = function(state) if state.busy then return "test workflow is busy" end end,
+      commands = function(state)
+        remuda.sample_state = state
+        remuda.exec('sample/helper')
+        remuda.extension_command('sample', function() return remuda.sample_value .. ':' .. state.starts end)
+      end,
+    }"#,
+    );
+    let helper = entry.with_file_name("helper.lua");
+    fs::write(&helper, "remuda.sample_value = 'old'").unwrap();
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-source-refresh-unused.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, "remuda.exec('sample')");
+    let dispatch = "remuda._load_extension_command('sample', 'sample', true); return remuda._dispatch_extension_command('sample', {}, {})";
+    assert_eq!(read_value(&image, dispatch), "old:1");
+    assert_eq!(
+        read_value(&image, dispatch),
+        "old:1",
+        "unchanged source must not restart"
+    );
+    fs::write(&helper, "remuda.sample_value = 'new'").unwrap();
+    read_value(&image, "remuda.sample_state.busy = true");
+    assert!(image
+        .eval(dispatch, None)
+        .unwrap_err()
+        .contains("source refresh deferred"));
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample', {}, {})"
+        ),
+        "old:1"
+    );
+    read_value(&image, "remuda.sample_state.busy = false");
+    assert_eq!(read_value(&image, "remuda._load_extension_command('sample', 'sample'); return remuda._dispatch_extension_command('sample', {}, {})"), "old:1", "default production dispatch keeps the active version");
+    assert_eq!(
+        read_value(&image, dispatch),
+        "new:2",
+        "helper edits apply on next command"
+    );
+    fs::write(&helper, "this is invalid Lua").unwrap();
+    assert!(
+        image.eval(dispatch, None).is_err(),
+        "invalid edits must fail visibly"
+    );
+    fs::write(&helper, "remuda.sample_value = 'fixed'").unwrap();
+    assert_eq!(
+        read_value(&image, dispatch),
+        "fixed:3",
+        "corrected source retries, preserving module state"
+    );
+    let source = fs::read_to_string(&entry).unwrap().replace(
+        "state.starts = state.starts + 1",
+        "state.starts = state.starts + 10",
+    );
+    fs::write(&entry, source).unwrap();
+    assert_eq!(read_value(&image, "remuda._load_extension_command('sample', 'sample'); return remuda._dispatch_extension_command('sample', {}, {})"), "fixed:3");
+    assert_eq!(
+        read_value(&image, dispatch),
+        "fixed:13",
+        "entry edits remain detectable after default commands"
+    );
+}

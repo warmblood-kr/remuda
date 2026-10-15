@@ -5895,22 +5895,17 @@ fn extension_command(
         Err(error) => return fail(error),
     };
     let spec = extension_cli_spec(command);
-    let values = match parse_top_level_cli(&spec, command, args) {
-        Ok(values) => values,
-        Err(_) => {
-            let mut words = vec![command.to_owned(), "--".to_owned()];
-            words.extend(args.iter().map(|arg| (*arg).to_owned()));
-            let words = words.iter().map(String::as_str).collect::<Vec<_>>();
-            let report = remuda_native::cli_parse::parse(&spec, &words);
-            if report.ok {
-                report.values
-            } else {
-                return fail(report.text);
-            }
-        }
-    };
+    let words = std::iter::once(command)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>();
+    let report = remuda_native::cli_parse::parse_passthrough(&spec, &words);
+    if !report.ok {
+        eprintln!("{}", report.text);
+        return ExitCode::from(report.code as u8);
+    }
+    let values = report.values;
     let body_args = cli_positional_words(&values, "ARGS");
-    let launch = if body_args.is_empty() {
+    let launch = if body_args.is_empty() && !cli_flag(&values, "help") {
         Some((
             cli_flag(&values, "headless"),
             values.get("agent").and_then(serde_json::Value::as_str),
@@ -6007,6 +6002,15 @@ fn extension_cli_spec(command: &str) -> remuda_native::cli_parse::Spec {
             next: format!("remuda {command} [--agent AGENT] [--headless]"),
             options: vec![
                 OptionSpec {
+                    long: "help".into(),
+                    short: Some('h'),
+                    value: None,
+                    help: "Show the installed mod's help".into(),
+                    global: false,
+                    required: false,
+                    repeat_policy: Default::default(),
+                },
+                OptionSpec {
                     long: "headless".into(),
                     short: None,
                     value: None,
@@ -6037,9 +6041,10 @@ fn load_extension_command(path: &Path, command: &str, package: &str) -> Result<(
     // can reach the caller's stderr; fold it into the dispatch reply if that
     // ever shows up in timings.
     let load = format!(
-        "return remuda._load_extension_command({}, {})",
+        "return remuda._load_extension_command({}, {}, {})",
         serde_json::to_string(command).expect("command serializes"),
-        serde_json::to_string(package).expect("mod name serializes")
+        serde_json::to_string(package).expect("mod name serializes"),
+        std::env::var("REMUDA_RELOAD_SOURCE").as_deref() == Ok("1")
     );
     match remuda_native::script::eval_source(path, "=remuda mod command", &load) {
         Ok(loaded) => {

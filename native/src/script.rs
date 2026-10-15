@@ -1481,6 +1481,29 @@ fn function_source_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
     )
 }
 
+#[derive(Clone, Default)]
+struct LoadedPackageSources(std::collections::BTreeMap<String, String>);
+
+fn package_sources_changed(lua: &Lua, owner: &str) -> mlua::Result<bool> {
+    let sources = lua
+        .app_data_ref::<LoadedPackageSources>()
+        .map(|value| value.0.clone())
+        .unwrap_or_default();
+    for (name, source) in sources {
+        if name == owner
+            || name
+                .strip_prefix(owner)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            let current = crate::packages::resolve(&name).ok().flatten();
+            if current.as_ref().map(|package| package.source.as_str()) != Some(source.as_str()) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// `remuda.exec(name)` — split out of `bindings` for its line cap. Reentrant-
 /// safe: a nested `lua.load(...).exec()` on this same `Lua`, not a new
 /// interpreter. Mods must be installed independently of the Remuda binary.
@@ -1493,7 +1516,15 @@ fn exec_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
         .and_then(|()| {
             table.set(
                 "_exec_commands",
-                lua.create_function(|lua, name: String| execute_package(lua, &name, false, true))?,
+                lua.create_function(|lua, (name, refresh): (String, Option<bool>)| {
+                    let changed = refresh == Some(true) && package_sources_changed(lua, &name)?;
+                    if changed {
+                        let check: mlua::Function =
+                            lua.named_registry_value("remuda.lifecycle.source_refresh_check")?;
+                        check.call::<()>(name.as_str())?;
+                    }
+                    execute_package(lua, &name, changed, true)
+                })?,
             )
         })
         .and_then(|()| {
@@ -1512,7 +1543,24 @@ fn execute_package(
     require_lifecycle: bool,
     commands_only: bool,
 ) -> mlua::Result<()> {
+    let previous = lua
+        .app_data_ref::<LoadedPackageSources>()
+        .map(|value| value.clone())
+        .unwrap_or_default();
+    if require_lifecycle {
+        let mut retained = previous.clone();
+        retained.0.retain(|key, _| {
+            key != name
+                && !key
+                    .strip_prefix(name)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        });
+        lua.set_app_data(retained);
+    }
     let loaded = load_package(lua, name, require_lifecycle, commands_only);
+    if loaded.is_err() {
+        lua.set_app_data(previous);
+    }
     // A mod that redefined an advised function keeps its advice: the new
     // definition becomes the base (hook-design §2). Even after a failed
     // load, which may have redefined some before it stopped.
@@ -1556,7 +1604,8 @@ fn activate_package(
             "mod {name} uses the legacy entry format and cannot be reloaded in-process"
         )));
     }
-    if package.lifecycle.is_some() {
+    let loaded_source = package.source.clone();
+    let result = if package.lifecycle.is_some() {
         let active = Rc::new(Cell::new(false));
         let environment = lua.create_table()?;
         environment.set("_G", environment.clone())?;
@@ -1603,7 +1652,7 @@ fn activate_package(
             .eval()?;
         let activate: mlua::Function =
             lua.named_registry_value("remuda.lifecycle.activate_module")?;
-        let (_, state, start, rollback, commands): (bool, Value, Value, Value, Value) =
+        let (activated, state, start, rollback, commands): (bool, Value, Value, Value, Value) =
             activate.call((name, declaration, require_lifecycle, commands_only))?;
         active.set(true);
         if let Value::Function(commands) = &commands {
@@ -1623,12 +1672,24 @@ fn activate_package(
                 return Err(error);
             }
         }
+        if !activated {
+            return Ok(());
+        }
         Ok(())
     } else {
         lua.load(&package.source)
             .set_name(package.chunk_name)
             .exec()
+    };
+    if result.is_ok() {
+        let mut sources = lua
+            .app_data_ref::<LoadedPackageSources>()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        sources.0.insert(name.to_owned(), loaded_source);
+        lua.set_app_data(sources);
     }
+    result
 }
 
 /// Run lifecycle callbacks under the same error policy, so errors from hooks
@@ -1646,6 +1707,9 @@ fn call_lifecycle_callback(lua: &Lua, callback: &mlua::Function, state: Value) -
 /// implementation helper on the public `remuda` table.
 pub(crate) fn hide_module_activator(lua: &Lua) -> mlua::Result<()> {
     let remuda: Table = lua.globals().get("remuda")?;
+    let check: mlua::Function = remuda.get("_source_refresh_check")?;
+    lua.set_named_registry_value("remuda.lifecycle.source_refresh_check", check)?;
+    remuda.set("_source_refresh_check", Value::Nil)?;
     let activate: mlua::Function = remuda.get("_activate_module")?;
     lua.set_named_registry_value("remuda.lifecycle.activate_module", activate)?;
     let stop_modules: mlua::Function = remuda.get("_stop_modules")?;
