@@ -14,6 +14,7 @@ use crate::input::{
 };
 use crate::protocol::Step;
 use core::time::Duration;
+use std::borrow::Borrow;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex};
@@ -231,7 +232,7 @@ mod clear_input_tests {
     #[test]
     fn attach_write_waiting_after_clear_guard_lands_after_clear() {
         let (session, clock, writes, _started, _release) = session(false);
-        let attached = session.attach();
+        let attached = session.attach().unwrap();
         clock.advance(Duration::from_secs(10));
         let (spawned_tx, spawned_rx) = mpsc::channel();
         let (handle_tx, handle_rx) = mpsc::channel();
@@ -239,7 +240,7 @@ mod clear_input_tests {
         *session.clear_hook.lock().unwrap() = Some(Box::new(move || {
             let session = Arc::clone(&session_for_hook);
             let handle = std::thread::spawn(move || {
-                let attached = session.attach();
+                let attached = session.attach().unwrap();
                 let _ = spawned_tx.send(());
                 attached.write_raw(b"x").unwrap();
             });
@@ -263,7 +264,7 @@ mod clear_input_tests {
     fn clear_refuses_while_attach_write_is_in_flight_even_after_idle_window() {
         let (session, clock, _writes, started, release) = session(true);
         let worker_session = Arc::clone(&session);
-        let worker = std::thread::spawn(move || worker_session.attach().write_raw(b"x"));
+        let worker = std::thread::spawn(move || worker_session.attach().unwrap().write_raw(b"x"));
         started.recv_timeout(Duration::from_secs(1)).unwrap();
         clock.advance(Duration::from_secs(3));
         assert!(matches!(
@@ -695,7 +696,7 @@ pub struct Session {
     /// Current attachment generation and its takeover signal. The generation
     /// keeps an old guard's drop from clearing a newer attachment.
     attach_slot: Mutex<Option<(u64, Arc<AtomicBool>)>>,
-    next_attach_generation: AtomicU64,
+    last_attach_generation: AtomicU64,
     /// Held for the whole of one input act — every `Burst` **and** every
     /// `Pause` between them — so a second sender cannot land a write during a
     /// pause, when the `agent` lock is briefly free. See [`Self::feed`].
@@ -872,7 +873,7 @@ impl Session {
             closing: AtomicBool::new(false),
             alive: AtomicBool::new(true),
             attach_slot: Mutex::new(None),
-            next_attach_generation: AtomicU64::new(1),
+            last_attach_generation: AtomicU64::new(0),
             input_lock: Mutex::new(false),
             input_ready: Condvar::new(),
             pending_input: Mutex::new(None),
@@ -1871,20 +1872,41 @@ impl Session {
         Self::notify_output_changed(&self.output_changed);
     }
 
-    /// Take hold for a human at a terminal, displacing any current holder.
-    pub fn attach(&self) -> Attached<'_> {
+    /// Take hold for a human, displacing the current holder after a checked grant.
+    pub fn attach(&self) -> Result<Attached<'_>> {
+        let (generation, displaced) = self.claim_attachment()?;
+        Ok(Attachment {
+            session: self,
+            generation,
+            displaced,
+        })
+    }
+
+    /// Retain this exact Session for a host-owned attachment without borrowing it.
+    pub fn attach_owned(self: &Arc<Self>) -> Result<OwnedAttached> {
+        let (generation, displaced) = self.claim_attachment()?;
+        Ok(Attachment {
+            session: Arc::clone(self),
+            generation,
+            displaced,
+        })
+    }
+
+    fn claim_attachment(&self) -> Result<(u64, Arc<AtomicBool>)> {
         let mut slot = self.attach_slot.lock().unwrap_or_else(|p| p.into_inner());
-        let generation = self.next_attach_generation.fetch_add(1, Ordering::SeqCst);
+        let generation = self
+            .last_attach_generation
+            .load(Ordering::SeqCst)
+            .checked_add(1)
+            .ok_or_else(|| AgentError::Io("attachment generation exhausted".into()))?;
+        self.last_attach_generation
+            .store(generation, Ordering::SeqCst);
         let displaced = Arc::new(AtomicBool::new(false));
         if let Some((_, old)) = slot.replace((generation, Arc::clone(&displaced))) {
             old.store(true, Ordering::SeqCst);
         }
         self.attached.store(true, Ordering::SeqCst);
-        Attached {
-            session: self,
-            generation,
-            displaced,
-        }
+        Ok((generation, displaced))
     }
 
     /// Whether a human currently holds this session.
@@ -1894,12 +1916,7 @@ impl Session {
 
     /// Whether a live session has advanced beyond a tracked attachment.
     pub fn was_attachment_taken_over(&self, generation: u64) -> bool {
-        self.is_alive()
-            && self
-                .next_attach_generation
-                .load(Ordering::SeqCst)
-                .saturating_sub(1)
-                > generation
+        self.is_alive() && self.last_attach_generation.load(Ordering::SeqCst) > generation
     }
 
     /// How long since input was last accepted — the fleet's "this one is parked"
@@ -1941,13 +1958,18 @@ impl Drop for InputActGuard<'_> {
 
 /// Current viewer's hold: the only guard that can write raw bytes. A displaced
 /// guard cannot write or release its successor.
-pub struct Attached<'a> {
-    session: &'a Session,
+pub struct Attachment<S: Borrow<Session>> {
+    session: S,
     generation: u64,
     displaced: Arc<AtomicBool>,
 }
 
-impl Attached<'_> {
+/// Borrowed attachment for callers whose Session outlives their guard.
+pub type Attached<'a> = Attachment<&'a Session>;
+/// Host attachment retaining the exact Session until its checked guard is dropped.
+pub type OwnedAttached = Attachment<Arc<Session>>;
+
+impl<S: Borrow<Session>> Attachment<S> {
     /// The generation assigned when this client took the attachment.
     pub fn generation(&self) -> u64 {
         self.generation
@@ -1960,7 +1982,7 @@ impl Attached<'_> {
 
     /// Whether the active PTY input write has exceeded its bounded deadline.
     pub fn is_writer_timed_out(&self) -> bool {
-        self.session
+        self.session()
             .agent
             .lock()
             .ok()
@@ -1990,7 +2012,7 @@ impl Attached<'_> {
     ) -> Result<()> {
         {
             let slot = self
-                .session
+                .session()
                 .attach_slot
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
@@ -2003,7 +2025,7 @@ impl Attached<'_> {
             }
         }
         let _human_gate = loop {
-            match self.session.human_gate.try_lock() {
+            match self.session().human_gate.try_lock() {
                 Ok(gate) => break gate,
                 Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
                 Err(std::sync::TryLockError::WouldBlock) => {
@@ -2014,20 +2036,20 @@ impl Attached<'_> {
                 }
             }
         };
-        if let Ok(mut at) = self.session.last_human_input_at.lock() {
-            *at = Some(self.session.clock.now());
+        if let Ok(mut at) = self.session().last_human_input_at.lock() {
+            *at = Some(self.session().clock.now());
         }
-        self.session.human_inflight.fetch_add(1, Ordering::SeqCst);
+        self.session().human_inflight.fetch_add(1, Ordering::SeqCst);
         drop(_human_gate);
-        let _inflight = HumanInflightGuard(&self.session.human_inflight);
-        self.session.write_one_burst_to_completion_while_started(
+        let _inflight = HumanInflightGuard(&self.session().human_inflight);
+        self.session().write_one_burst_to_completion_while_started(
             bytes,
             &|| self.is_displaced() || cancelled(),
             on_start,
         )?;
         // Only after the write lands, as `last_input_at` is.
-        if let Ok(mut at) = self.session.last_human_input_at.lock() {
-            *at = Some(self.session.clock.now());
+        if let Ok(mut at) = self.session().last_human_input_at.lock() {
+            *at = Some(self.session().clock.now());
         }
         Ok(())
     }
@@ -2036,7 +2058,7 @@ impl Attached<'_> {
     /// viewer sees nothing until the program happens to redraw.
     pub fn screen_bytes(&self) -> Result<Vec<u8>> {
         let mut agent = self
-            .session
+            .session()
             .agent
             .lock()
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
@@ -2046,12 +2068,12 @@ impl Attached<'_> {
     /// Output as it arrives. `None` from a backend that cannot stream; the
     /// caller then has `screen_bytes` and nothing is silently lost.
     pub fn subscribe(&self) -> Option<Receiver<Vec<u8>>> {
-        let mut agent = self.session.agent.lock().ok()?;
+        let mut agent = self.session().agent.lock().ok()?;
         agent.subscribe()
     }
 
     pub fn session(&self) -> &Session {
-        self.session
+        self.session.borrow()
     }
 }
 
@@ -2063,10 +2085,10 @@ impl Drop for HumanInflightGuard<'_> {
     }
 }
 
-impl Drop for Attached<'_> {
+impl<S: Borrow<Session>> Drop for Attachment<S> {
     fn drop(&mut self) {
         let mut slot = self
-            .session
+            .session()
             .attach_slot
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -2075,7 +2097,11 @@ impl Drop for Attached<'_> {
             .is_some_and(|(generation, _)| *generation == self.generation)
         {
             *slot = None;
-            self.session.attached.store(false, Ordering::SeqCst);
+            self.session().attached.store(false, Ordering::SeqCst);
         }
     }
 }
+
+#[cfg(test)]
+#[path = "attachment_tests.rs"]
+mod attachment_tests;

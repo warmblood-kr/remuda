@@ -1384,7 +1384,7 @@ fn attach_detach_during_stalled_input_reports_loss_and_exits() {
         Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach();
+    let held = viewer.attach().unwrap();
     let output = held.subscribe().expect("capture attach terminal");
     wait_until_attached(&path, name);
     wait_for_session_screen(&viewer, "READY");
@@ -1503,7 +1503,7 @@ fn attach_keys_before_detach_in_one_read_reach_the_child() {
             Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
             Arc::new(SystemClock::new()),
         );
-        let held = viewer.attach();
+        let held = viewer.attach().unwrap();
         wait_until_attached(&path, &name);
         std::fs::write(&ready_marker, b"attached").expect("release child readiness");
         wait_for_session_screen(&viewer, "READY");
@@ -1542,7 +1542,7 @@ fn attach_large_paste_survives_a_slow_but_reading_child() {
         Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach();
+    let held = viewer.attach().unwrap();
     wait_until_attached(&path, name);
     wait_for_session_screen(&viewer, "READY");
 
@@ -1609,7 +1609,7 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
         Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach();
+    let held = viewer.attach().unwrap();
     let output = held.subscribe().expect("capture attach terminal");
     wait_until_attached(&path, "target");
     std::fs::write(&ready_marker, b"attached").expect("release child readiness");
@@ -3633,7 +3633,7 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach();
+    let held = viewer.attach().unwrap();
     let viewer_output = held.subscribe().expect("capture raw terminal output");
 
     // 1. Repaint: what was already there arrives without the program redrawing.
@@ -3785,7 +3785,7 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach();
+    let held = viewer.attach().unwrap();
     let viewer_output = held.subscribe().expect("capture viewer output");
     #[cfg(windows)]
     let mut conpty_pending = Vec::new();
@@ -4165,7 +4165,7 @@ fn direct_attach_mouse_scrolls_the_full_history_and_returns_to_live_output() {
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach();
+    let held = viewer.attach().unwrap();
     let output = held.subscribe().expect("capture viewer output");
     wait_for_session_screen(&viewer, "history-end");
 
@@ -4231,7 +4231,7 @@ fn direct_attach_keeps_scrolled_content_anchored_as_output_arrives() {
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach();
+    let held = viewer.attach().unwrap();
     let output = held.subscribe().expect("capture viewer output");
     wait_for_session_screen(&viewer, "seed-039");
 
@@ -4299,7 +4299,7 @@ fn direct_attach_clears_stale_scrollback_indicator_when_history_is_clamped_to_ze
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach();
+    let held = viewer.attach().unwrap();
     let output = held.subscribe().expect("capture viewer output");
     wait_for_session_screen(&viewer, "clearseed-039");
     held.write_raw(b"\x1b[<64;10;10M").expect("wheel up");
@@ -4346,7 +4346,7 @@ fn direct_attach_wheel_up_with_no_history_does_not_enter_scrollback() {
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach();
+    let held = viewer.attach().unwrap();
     let output = held.subscribe().expect("capture viewer output");
     collect_until_bytes(&output, b"$ ");
     held.write_raw(b"\x1b[<64;10;10M")
@@ -4390,7 +4390,7 @@ fn direct_attach_forwards_pagedown_at_live_bottom_to_the_child() {
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach();
+    let held = viewer.attach().unwrap();
     let output = held.subscribe().expect("capture viewer output");
     wait_for_session_screen(&viewer, "pgdn-ready");
     held.write_raw(b"\x1b[6~").expect("PageDown at live bottom");
@@ -4460,7 +4460,7 @@ fn direct_attach_forwards_paging_keys_when_the_child_tracks_mouse() {
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach();
+    let held = viewer.attach().unwrap();
     let output = held.subscribe().expect("capture viewer output");
     wait_for_session_screen(&viewer, "mouse-page-ready");
     held.write_raw(b"\x1b[5~")
@@ -4507,7 +4507,7 @@ fn direct_attach_history_exit_keys_are_swallowed_and_other_keys_pass_through() {
         Box::new(PtyAgent::spawn(cmd, Size::new(40, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach();
+    let held = viewer.attach().unwrap();
     let output = held.subscribe().expect("capture viewer output");
     wait_for_session_screen(&viewer, "history-key-ready");
     let _ = collect_until_bytes(&output, b"history-key-ready");
@@ -4599,7 +4599,7 @@ fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach();
+    let held = viewer.attach().unwrap();
     let output = held.subscribe().expect("capture viewer output");
     held.write_raw(b"\x1b[<64;10;10M")
         .expect("deliver host wheel report");
@@ -4647,7 +4647,7 @@ fn mouse_off_knob_and_toggle_pass_reports_to_the_child_and_restore_host_modes() 
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach();
+    let held = viewer.attach().unwrap();
     let output = held.subscribe().expect("capture viewer output");
     let initial = collect_until_bytes(&output, b"\x1b[?25");
     assert!(!initial
