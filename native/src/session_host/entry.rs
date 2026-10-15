@@ -141,26 +141,48 @@ pub(crate) fn manifest(path: &Path) -> io::Result<Manifest> {
 }
 pub(crate) struct Client {
     channel: Channel<std::os::unix::net::UnixStream>,
+    capabilities: Vec<String>,
 }
 impl Client {
     pub fn open(path: &Path, role: Role) -> io::Result<Self> {
         // Expected intent comes from private local metadata, not server echo.
         let manifest = manifest(path)?;
         let mut channel = super::unix::connect(path)?;
+        let required = if role == Role::Control {
+            vec![
+                "inspect".into(),
+                "controller-epoch-v1".into(),
+                "input-act-v1".into(),
+            ]
+        } else {
+            vec!["inspect".into()]
+        };
         let open = Open {
             protocol: Hello {
                 magic: MAGIC,
                 major: MAJOR,
                 minor: 0,
-                required: vec!["inspect".into()],
+                required,
             },
             role,
             expected: Some(manifest.identity.clone()),
         };
         channel.send(&serde_json::to_vec(&open).map_err(invalid)?)?;
         match serde_json::from_slice::<Response>(&channel.receive()?).map_err(invalid)? {
-            Response::Opened { identity, minor: 0 } if identity == manifest.identity => {
-                Ok(Self { channel })
+            Response::Opened {
+                identity,
+                minor: 0,
+                capabilities,
+                max_payload,
+            } if identity == manifest.identity
+                && capabilities.len() <= 16
+                && capabilities.iter().all(|value| value.len() <= 64)
+                && max_payload == 65_519 =>
+            {
+                Ok(Self {
+                    channel,
+                    capabilities,
+                })
             }
             _ => Err(invalid("host identity/protocol refusal")),
         }
@@ -243,6 +265,13 @@ pub(crate) fn command(path: &Path, operation: &str) -> io::Result<()> {
 
 fn screen(client: &mut Client) -> io::Result<(u64, Vec<u8>, u16, u16)> {
     use base64::Engine;
+    if !client
+        .capabilities
+        .iter()
+        .any(|value| value == "paged-screen-v1")
+    {
+        return Err(invalid("host lacks paged-screen-v1"));
+    }
     let Response::Snapshot {
         snapshot,
         generation,
@@ -255,8 +284,8 @@ fn screen(client: &mut Client) -> io::Result<(u64, Vec<u8>, u16, u16)> {
         return Err(invalid("snapshot refused; resync required"));
     };
     super::terminal::Terminal::validate_geometry(rows, cols, 1000).map_err(invalid)?;
-    const PAGE: usize = 12 * 1024;
-    if bytes > 32 * 1024 * 1024 || pages != bytes.div_ceil(PAGE) {
+    const PAGE: usize = super::api::PAGE_BYTES;
+    if bytes > super::api::MAX_SNAPSHOT_BYTES || pages != bytes.div_ceil(PAGE) {
         return Err(invalid("snapshot allocation budget"));
     }
     let mut assembled = Vec::with_capacity(bytes);

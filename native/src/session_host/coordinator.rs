@@ -203,6 +203,44 @@ mod tests {
         assert!(host.acquire(ConnectionId(3)).is_ok());
     }
     #[test]
+    fn failed_worker_rejects_only_unstarted_payload_and_mutation_tokens_cannot_cross() {
+        let mut host = Coordinator::new([5; 16]);
+        let owner = host.acquire(ConnectionId(1)).unwrap();
+        let mutation = host.begin_mutation(owner).unwrap();
+        let act = InputAct::Bytes(vec![1]);
+        assert_eq!(
+            host.admit(owner, [1; 16], 1, &act),
+            Err(Error::Control(Refusal::Busy))
+        );
+        host.finish_mutation(mutation).unwrap();
+        let token = admitted(host.admit(owner, [1; 16], 1, &act).unwrap());
+        assert_eq!(host.finish_mutation(mutation), Err(Error::StaleCompletion));
+        host.release(owner).unwrap();
+        host.reject_unstarted(token).unwrap();
+        assert_eq!(
+            host.recover([1; 16], 1, &act).unwrap().1.unwrap().delivery,
+            Delivery::Rejected
+        );
+        let replacement = host.acquire(ConnectionId(2)).unwrap();
+        let token = admitted(host.admit(replacement, [1; 16], 2, &act).unwrap());
+        host.claim(token).unwrap();
+        assert_eq!(host.reject_unstarted(token), Err(Error::StaleCompletion));
+        host.release(replacement).unwrap();
+        assert_eq!(
+            host.acquire(ConnectionId(3)),
+            Err(Error::Control(Refusal::Busy))
+        );
+        host.complete(
+            token,
+            Completion {
+                delivery: Delivery::Indeterminate,
+                reply: Reply::Unit,
+            },
+        )
+        .unwrap();
+        assert!(host.acquire(ConnectionId(3)).is_ok());
+    }
+    #[test]
     fn rich_clear_result_and_payload_binding_survive_replacement() {
         let mut host = Coordinator::new([9; 16]);
         let owner = host.acquire(ConnectionId(1)).unwrap();

@@ -1,5 +1,5 @@
 //! Standalone synthetic process tests. Never contact a real Remuda daemon.
-#![cfg(unix)]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 use base64::Engine;
 use serde_json::{json, Value};
 use std::fs;
@@ -91,6 +91,7 @@ impl Host {
         Self::start_ack(argv, true)
     }
     fn start_ack(argv: Vec<String>, read_ack: bool) -> Self {
+        #[cfg(target_os = "macos")]
         let parent = PathBuf::from("/private/tmp");
         #[cfg(not(target_os = "macos"))]
         let parent = PathBuf::from("/tmp");

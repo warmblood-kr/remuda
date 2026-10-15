@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 const MAX_CONNECTIONS: usize = 16;
-const MAX_SNAPSHOT: usize = 32 * 1024 * 1024;
-const PAGE: usize = 12 * 1024;
+const MAX_SNAPSHOT: usize = super::api::MAX_SNAPSHOT_BYTES;
+const PAGE: usize = super::api::PAGE_BYTES;
 const SNAPSHOT_TTL: Duration = Duration::from_secs(2);
 const CAPS: &[&str] = &[
     "inspect",
@@ -102,7 +102,15 @@ impl Server {
             )?;
             return Ok(());
         }
-        send(&mut channel, &Response::Opened { identity, minor })?;
+        send(
+            &mut channel,
+            &Response::Opened {
+                identity,
+                minor,
+                capabilities: CAPS.iter().map(|value| (*value).into()).collect(),
+                max_payload: 65_519,
+            },
+        )?;
         let mut random = [0; 16];
         getrandom::fill(&mut random).map_err(|_| invalid("connection entropy"))?;
         let mut connection = Connection {
