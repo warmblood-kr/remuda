@@ -12,6 +12,7 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Not temp_dir(): macOS's long $TMPDIR would overflow the sun_path budget.
         let path = PathBuf::from("/tmp").join(format!(
             "r660-{}-{}",
             std::process::id(),
@@ -118,6 +119,8 @@ fn staged_startup_listener(path: &Path, controls: &Controls) -> StartupResult {
         drop(listener);
         let inject = controls.failure == Some(Failure::ImportCleanup);
         abort_published(path, (opened.dev, opened.ino), inject, &mut residue);
+        // Explicit abort owns the outcome; the legacy Drop must not undo residue.
+        std::mem::forget(owner);
         return Err(SeamError { error, residue });
     }
     Ok(Imported {
@@ -667,4 +670,6 @@ fn staged_startup_import_cleanup_failure_is_reported_not_swallowed() {
         .residue
         .iter()
         .any(|r| r.contains(scratch.public().to_str().unwrap()) && r.contains("unlink")));
+    // Reported residue must really be left behind, not silently cleaned.
+    assert!(std::fs::symlink_metadata(scratch.public()).is_ok());
 }

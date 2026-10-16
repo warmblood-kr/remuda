@@ -1003,6 +1003,22 @@ mod tests {
     }
 
     #[test]
+    fn staging_directory_with_group_bits_is_refused() {
+        let scratch = Scratch::new();
+        let parent = scratch.parent();
+        std::fs::create_dir(scratch.0.join("stage")).unwrap();
+        std::fs::set_permissions(
+            scratch.0.join("stage"),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        let receipt = NodeReceipt::capture(&parent, OsStr::new("stage")).unwrap();
+        let error = open_staging_dir(&parent, OsStr::new("stage"), receipt).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("not private"));
+    }
+
+    #[test]
     fn nonblocking_applies_to_listener_only() {
         let fd = create_stream_socket().unwrap();
         set_nonblocking(&fd).unwrap();

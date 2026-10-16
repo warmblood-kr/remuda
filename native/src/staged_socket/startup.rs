@@ -331,7 +331,8 @@ fn run(public: &Path, controls: &Controls, residue: &mut Vec<String>) -> io::Res
     // Commit is final: a staging-rmdir failure is residue, not a rollback.
     if controls.failure == Some(Failure::PostCommitRmdir) {
         residue.push(format!(
-            "staging directory {stage_name}: injected rmdir failure"
+            "staging directory {}: injected rmdir failure",
+            stage_path.display()
         ));
     } else {
         drop_dir(residue);
