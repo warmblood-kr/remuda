@@ -45,6 +45,32 @@ impl Lease {
         }
         Ok((self.name.clone(), self.identity.clone()))
     }
+    pub fn settled(&self, index: &Index) -> Result<Settled> {
+        index.validate()?;
+        if index
+            .required
+            .iter()
+            .any(|cap| !REQUIRED.contains(&cap.as_str()) && cap != CAP)
+        {
+            return Err(Error::Incompatible);
+        }
+        if self.has_unconsumed(index)? {
+            return Err(Error::Busy);
+        }
+        let entry = &index.entries[&self.name];
+        let birth = entry.birth.as_ref().ok_or(Error::Unavailable)?;
+        let Phase::Exited { generation } = entry.phase else {
+            return Err(Error::Unavailable);
+        };
+        let exit = birth.progress.exit.ok_or(Error::Unavailable)?;
+        if exit.generation != generation || !birth.retirable() {
+            return Err(Error::Unavailable);
+        }
+        Ok(Settled {
+            lease: self.clone(),
+            exit_generation: generation,
+        })
+    }
     pub fn has_unconsumed(&self, index: &Index) -> Result<bool> {
         if self.store != index.incarnation {
             return Err(Error::StaleStore);
@@ -65,6 +91,20 @@ impl Lease {
                 .streams
                 .iter()
                 .any(|stream| !stream.results.is_empty()))
+    }
+}
+/// Evidence for one terminal immutable lease, never permission to stop a host.
+/// Construct before Retire; no filesystem I/O belongs under host admission locks.
+pub(crate) struct Settled {
+    lease: Lease,
+    exit_generation: u64,
+}
+impl Settled {
+    pub fn confirms(&self, lease: &Lease, identity: &Identity) -> bool {
+        &self.lease == lease && &self.lease.identity == identity
+    }
+    pub fn exit_generation(&self) -> u64 {
+        self.exit_generation
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -264,3 +304,7 @@ fn set_once<T: Copy + PartialEq>(slot: &mut Option<T>, value: T) -> Result<bool>
 #[cfg(test)]
 #[path = "publication_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "settlement_tests.rs"]
+mod settlement_tests;

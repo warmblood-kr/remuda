@@ -1,7 +1,7 @@
 use super::*;
 use crate::session_host::inventory::model_tests::{apply, identity, initial, target};
 
-fn reserved() -> (Index, Fence, Lease) {
+pub(super) fn reserved() -> (Index, Fence, Lease) {
     let (mut index, fence) = initial();
     let mut entry = Entry::reserved(identity(), [4; 16], "{}").unwrap();
     entry.birth = Some(Birth::new("/private/synthetic-host".into(), [7; 16]).unwrap());
