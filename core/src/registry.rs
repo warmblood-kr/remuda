@@ -132,6 +132,15 @@ impl Registry {
             .map(|session| session.apply_input_batch(batch))
     }
 
+    pub fn apply_input_line_batch(
+        &self,
+        name: &str,
+        batch: InputBatch<'_>,
+    ) -> Option<core::result::Result<InputOutcome, InputError>> {
+        self.get(name)
+            .map(|session| session.apply_input_line_batch(batch))
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -393,6 +402,16 @@ impl Registry {
 
     pub fn feed(&self, name: &str, steps: &[Step]) -> Option<Result<()>> {
         self.get(name).map(|s| s.feed(steps))
+    }
+
+    pub fn resize_instance(
+        &self,
+        name: &str,
+        instance_id: &str,
+        size: Size,
+    ) -> Option<Result<bool>> {
+        self.get(name)
+            .map(|session| session.resize_instance(instance_id, size))
     }
 
     pub fn resize(&self, name: &str, size: Size) -> Option<Result<()>> {

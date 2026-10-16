@@ -135,7 +135,7 @@ fn clear_input_writes_one_atomic_agent_key_and_is_safe_to_repeat() {
 fn clear_input_refuses_recent_human_input_without_writing() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let (session, _clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
-    let attached = session.attach();
+    let attached = session.attach().unwrap();
     attached.write_raw(b"human draft").unwrap();
     writes.lock().unwrap().clear();
 
@@ -352,7 +352,7 @@ fn human_idle_time_counts_only_attached_keystrokes() {
     session.send_line("scripted").unwrap();
     assert_eq!(session.human_idle_for(), None, "no human has typed yet");
 
-    let held = session.attach();
+    let held = session.attach().unwrap();
     held.write_raw(b"co").unwrap();
     clock.advance(Duration::from_secs(7));
     assert_eq!(session.human_idle_for(), Some(Duration::from_secs(7)));
@@ -517,7 +517,7 @@ fn listing_reports_human_idle_time() {
         .expect("registration");
     assert_eq!(registry.list()[0].human_idle, None);
     let session = registry.get("agent").expect("registered");
-    session.attach().write_raw(b"x").unwrap();
+    session.attach().unwrap().write_raw(b"x").unwrap();
     assert_eq!(registry.list()[0].human_idle, Some(Duration::ZERO));
 }
 
@@ -677,7 +677,7 @@ fn close_is_refused_while_attached_and_the_session_survives() {
         .expect("registration");
 
     let session = registry.get("worker").expect("handle");
-    let held = session.attach();
+    let held = session.attach().unwrap();
 
     assert!(
         matches!(registry.close("worker"), Some(Err(AgentError::Attached))),
@@ -724,7 +724,7 @@ fn confirmed_close_clears_its_closing_marker_when_attachment_refuses_it() {
         .expect("registration");
     let session = registry.get("worker").expect("handle");
     let instance_id = session.instance_id().to_owned();
-    let held = session.attach();
+    let held = session.attach().unwrap();
 
     assert!(matches!(
         registry.close_instance("worker", &instance_id),
@@ -760,7 +760,7 @@ fn orchestrated_input_reaches_a_session_while_a_human_is_attached() {
     session.send_line("before").expect("core drives when free");
     assert_eq!(writes.lock().unwrap().len(), 1, "one indivisible burst");
 
-    let held = session.attach();
+    let held = session.attach().unwrap();
     assert!(session.is_attached());
     session
         .send_line("during")
@@ -785,8 +785,8 @@ fn orchestrated_input_reaches_a_session_while_a_human_is_attached() {
 #[test]
 fn a_second_viewer_takes_over_and_old_drop_does_not_release_new_hold() {
     let (session, _clock) = session_with(Box::new(ScriptedAgent::new(vec![])));
-    let first = session.attach();
-    let second = session.attach();
+    let first = session.attach().unwrap();
+    let second = session.attach().unwrap();
     assert!(first.is_displaced());
     assert!(session.is_attached());
     assert!(first.write_raw(b"stale input").is_err());
@@ -800,7 +800,7 @@ fn a_second_viewer_takes_over_and_old_drop_does_not_release_new_hold() {
 fn a_raw_keystroke_carries_no_invented_enter() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let (session, _clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
-    let held = session.attach();
+    let held = session.attach().unwrap();
 
     held.write_raw(b"ls").expect("raw write");
 
@@ -1007,7 +1007,7 @@ fn attaching_during_a_feed_pause_does_not_block_the_remaining_bursts() {
 
     // `attach` takes neither lock a feed act holds, so it must succeed right
     // away — proving there is no deadlock behind an act sitting in a pause.
-    let held = session.attach();
+    let held = session.attach().unwrap();
 
     advance_until_finished(&clock, Duration::from_secs(1), &feeder);
     let result = feeder.join().unwrap();
@@ -1069,7 +1069,7 @@ fn attaching_and_detaching_inside_a_pause_does_not_block_the_next_burst() {
     }
 
     // Attach AND detach again, fully, before the second burst ever runs.
-    let held = session.attach();
+    let held = session.attach().unwrap();
     drop(held);
     assert!(
         !session.is_attached(),

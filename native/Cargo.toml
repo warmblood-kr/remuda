@@ -43,25 +43,28 @@ http-test-support = []
 clap = { version = "4.6", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions", "string"] }
 crossterm = "0.29.0"
 interprocess = "2.4.4"
-portable-pty = "0.9.0"
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+portable-pty = "=0.9.0"
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-platform-verifier = { version = "0.7", default-features = false }
 sha2 = "0.10"
 base64 = "0.22"
 url = "2.5"
-serde_json = "1.0.140"
+serde_json = { version = "1.0.140", features = ["raw_value"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 getrandom = "=0.3.4"
 snow = { version = "=0.10.0", default-features = false, features = ["default-resolver", "use-chacha20poly1305", "use-curve25519", "use-getrandom", "use-sha2"] }
 zeroize = "=1.9.0"
 remuda-core = { path = "../core" }
-vt100 = "0.16.2"
+# Host OSC preprocessing is audited against these exact parser state rules.
+vt100 = "=0.16.2"
+vte = "=0.15.0"
 mlua = { version = "0.12.1", features = ["lua54", "vendored"] }
 rustyline = "14.0.0"
 # Already in the dependency graph via `vt100` itself, which uses it to decide
 # `Cell::is_wide` — pinned to the same major version so a rendered row's own
 # width judgment can never disagree with vt100's. See steps/023.
 unicode-width = "0.2"
+unicode-segmentation = "1.13"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28.0", features = ["socket"] }
@@ -78,7 +81,14 @@ libc = "0.2"
 security-framework = "=3.7.0"
 
 [target.'cfg(windows)'.dependencies]
+portable-pty = { version = "=0.9.0", features = ["remuda-job-list"] }
 windows-sys = { version = "0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "session_host_fixture"
+path = "tests/daemon_support/session_host_fixture.rs"
+test = false
+bench = false

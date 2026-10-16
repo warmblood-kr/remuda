@@ -226,6 +226,15 @@ pub enum Request {
         seq: u64,
         bytes: Vec<u8>,
     },
+    /// Idempotent text and one Return, sharing the session line-delivery path.
+    /// A trailing composer CR is consumed rather than submitted twice.
+    InputLine {
+        name: String,
+        instance_id: String,
+        client_id: String,
+        seq: u64,
+        bytes: Vec<u8>,
+    },
     /// Deliver a burst of input bytes as an indivisible act, appending nothing —
     /// the primitive [`Request::SendLine`] is made of. Indivisible is the
     /// load-bearing word; an attached terminal does not block it.
@@ -238,6 +247,12 @@ pub enum Request {
     /// clamped during deserialization; an explicitly pane-sized value can
     /// retain its narrower visible width.
     Resize { name: String, size: Size },
+    /// Resize a specific session instance to its visible cluster viewport.
+    ResizeSession {
+        name: String,
+        instance_id: String,
+        size: Size,
+    },
     /// Move a session's retained terminal history; positive means older.
     /// Read the screen as text without taking the session over. Needs no
     /// terminal, raw mode or exclusivity, so it works while a human is attached.
@@ -590,6 +605,8 @@ struct SizeWire {
     rows: u16,
     #[serde(default, skip_serializing_if = "is_false")]
     allow_narrow: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    allow_short: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -602,6 +619,7 @@ impl Serialize for Size {
             cols: self.cols(),
             rows: self.rows(),
             allow_narrow: self.cols() < Size::MIN_COLS,
+            allow_short: self.rows() < Size::MIN_ROWS,
         }
         .serialize(s)
     }
@@ -610,7 +628,9 @@ impl Serialize for Size {
 impl<'de> Deserialize<'de> for Size {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let wire = SizeWire::deserialize(d)?;
-        Ok(if wire.allow_narrow {
+        Ok(if wire.allow_short {
+            Size::for_viewport(wire.cols, wire.rows)
+        } else if wire.allow_narrow {
             Size::for_pane(wire.cols, wire.rows)
         } else {
             Size::new(wire.cols, wire.rows)

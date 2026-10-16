@@ -128,6 +128,15 @@ port, but an unadmitted peer cannot join without a valid invitation; admitted
 nodes authenticate with their registered key. Use `--no-listen` on machines
 that do not need to accept connections. To limit the bind address, run
 `remuda cluster listen --bind IP[:PORT]` (use `127.0.0.1:7441` for local-only).
+The listener updates this node's registered endpoint when its address changes.
+To repair a stale endpoint left by an older daemon, run `remuda cluster advertise`
+with an updated CLI. It reads the running listener's concrete address and pushes
+the routing hint to admitted peers without restarting the listener or sessions.
+The listener must already be running; wildcard binds require a concrete address
+before this repair can be used. Membership and keys are preserved.
+Endpoint propagation follows the existing membership rules: peers must still
+admit this node and its original admission issuer. This command does not repair
+revoked membership or discovery when all peer addresses have changed.
 On every machine:
 
 ```sh

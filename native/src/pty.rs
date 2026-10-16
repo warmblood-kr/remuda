@@ -41,7 +41,7 @@ type Watchers = Arc<Mutex<Vec<Watcher>>>;
 
 /// The pty's input end. Shared, because the reader thread must answer the
 /// terminal's own questions — see [`DSR_CURSOR`].
-type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+pub(crate) type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 pub const PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_LATE_SUBMIT_BOUND: Duration = Duration::from_secs(30);
@@ -67,7 +67,7 @@ struct WriterState {
 
 /// One bounded worker owns blocking PTY writes. It accepts only one task at a
 /// time and never holds the process or screen lock while its write blocks.
-struct PtyInputWriter {
+pub(crate) struct PtyInputWriter {
     sender: SyncSender<WriteTask>,
     state: Arc<Mutex<WriterState>>,
     clock: Arc<Mutex<Arc<dyn remuda_core::Clock>>>,
@@ -76,7 +76,7 @@ struct PtyInputWriter {
 }
 
 impl PtyInputWriter {
-    fn spawn(
+    pub(crate) fn spawn(
         writer: SharedWriter,
         timeout: Duration,
         late_submit_bound: Duration,
@@ -452,7 +452,7 @@ fn io<E: std::fmt::Display>(e: E) -> AgentError {
 
 /// Temporarily selects a history viewport while guaranteeing the parser's
 /// live viewport is restored, including while unwinding from a panic.
-fn with_scrollback<T>(
+pub(crate) fn with_scrollback<T>(
     screen: &mut vt100::Screen,
     scrollback: usize,
     read: impl FnOnce(&vt100::Screen) -> T,
@@ -691,8 +691,8 @@ fn process_reader_chunk(
 
 /// Process bounded chunks while a temporary nonzero scroll offset counts
 /// every full-screen row pushed into history, even when the retained buffer is full.
-fn process_output(
-    parser: &mut vt100::Parser,
+pub(crate) fn process_output<CB: vt100::Callbacks>(
+    parser: &mut vt100::Parser<CB>,
     bytes: &[u8],
     scrollback_total: &AtomicUsize,
 ) -> (u16, u16) {
@@ -795,9 +795,18 @@ pub(crate) fn display_cursor(screen: &vt100::Screen) -> (u16, u16) {
 }
 
 pub(crate) fn styled_cells(screen: &vt100::Screen, size: Size) -> Vec<Vec<StyledCell>> {
-    (0..size.rows())
+    styled_cells_in(screen, size.rows(), size.cols())
+}
+
+/// Exact parser geometry, including small synthetic terminal fixtures.
+pub(crate) fn styled_cells_in(
+    screen: &vt100::Screen,
+    rows: u16,
+    cols: u16,
+) -> Vec<Vec<StyledCell>> {
+    (0..rows)
         .map(|row| {
-            (0..size.cols())
+            (0..cols)
                 .map(|col| {
                     let cell = screen.cell(row, col);
                     let continuation = cell.is_some_and(|c| c.is_wide_continuation());
@@ -1737,7 +1746,7 @@ impl PtyAgent {
     }
 }
 
-fn signal_number(description: &str) -> Option<i32> {
+pub(crate) fn signal_number(description: &str) -> Option<i32> {
     if let Some(number) = description
         .rsplit_once(':')
         .and_then(|(_, number)| number.trim().parse().ok())

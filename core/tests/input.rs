@@ -408,6 +408,65 @@ fn a_send_sleeps_through_a_feed_pause_then_wakes_when_the_act_releases() {
     );
 }
 
+#[test]
+fn an_instance_bound_key_waits_through_a_feed_pause_without_interleaving() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (event_tx, event_rx) = mpsc::channel();
+    let clock = Arc::new(ManualClock::new());
+    let session = Arc::new(Session::new(
+        "bound-key-after-feed-pause",
+        Box::new(InputRecordingAgent {
+            writes: Arc::clone(&writes),
+            alive: true,
+            fail_write: false,
+            event_tx: Some(event_tx),
+        }),
+        clock.clone(),
+    ));
+    let expected_instance = session.instance_id().to_owned();
+    let feed_session = Arc::clone(&session);
+    let feed = thread::spawn(move || {
+        feed_session
+            .feed(&[
+                remuda_core::protocol::Step::Burst(b"feed-before".to_vec()),
+                remuda_core::protocol::Step::Pause(100),
+                remuda_core::protocol::Step::Burst(b"feed-after".to_vec()),
+            ])
+            .expect("feed act succeeds");
+    });
+    expect_input_event(&event_rx, b"feed-before");
+
+    let key_session = Arc::clone(&session);
+    let (key_tx, key_rx) = mpsc::channel();
+    let key = thread::spawn(move || {
+        key_tx
+            .send(key_session.send_key_if_instance(&expected_instance, b"\x1b[A"))
+            .unwrap();
+    });
+    assert!(key_rx
+        .recv_timeout(std::time::Duration::from_millis(40))
+        .is_err());
+    assert_no_input_event(&event_rx);
+
+    clock.advance(std::time::Duration::from_millis(100));
+    expect_input_event(&event_rx, b"feed-after");
+    expect_input_event(&event_rx, b"\x1b[A");
+    assert_eq!(
+        key_rx.recv_timeout(std::time::Duration::from_secs(1)),
+        Ok(Ok(()))
+    );
+    feed.join().unwrap();
+    key.join().unwrap();
+    assert_eq!(
+        *writes.lock().unwrap(),
+        vec![
+            b"feed-before".to_vec(),
+            b"feed-after".to_vec(),
+            b"\x1b[A".to_vec()
+        ]
+    );
+}
+
 fn expect_input_event(receiver: &mpsc::Receiver<Vec<u8>>, expected: &[u8]) {
     assert_eq!(
         receiver
@@ -490,4 +549,110 @@ fn apply(
         writes.lock().unwrap().push(seq.to_be_bytes().to_vec());
         Ok(())
     })
+}
+
+#[test]
+fn input_line_delivers_one_return_and_deduplicates_with_or_without_composer_cr() {
+    for bytes in [b"hello".as_slice(), b"hello\r", b"\r"] {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let session = input_session(writes.clone(), true);
+        let batch = InputBatch {
+            instance_id: session.instance_id(),
+            client_id: [7; 16],
+            seq: 1,
+            bytes,
+        };
+        assert_eq!(
+            session.apply_input_line_batch(batch).unwrap(),
+            InputOutcome::Ack { duplicate: false }
+        );
+        assert_eq!(
+            session.apply_input_line_batch(batch).unwrap(),
+            InputOutcome::Ack { duplicate: true }
+        );
+        let delivered: Vec<u8> = writes.lock().unwrap().iter().flatten().copied().collect();
+        assert_eq!(
+            delivered,
+            if bytes == b"\r" {
+                b"\r".to_vec()
+            } else {
+                b"hello\r".to_vec()
+            }
+        );
+        assert_eq!(delivered.iter().filter(|b| **b == b'\r').count(), 1);
+    }
+}
+
+#[test]
+fn input_line_refuses_wrong_instance_and_invalid_utf8_without_writing() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let session = input_session(writes.clone(), true);
+    let batch = InputBatch {
+        instance_id: "other",
+        client_id: [8; 16],
+        seq: 1,
+        bytes: b"hello\r",
+    };
+    assert_eq!(
+        session.apply_input_line_batch(batch).unwrap(),
+        InputOutcome::WrongInstance
+    );
+    assert!(session
+        .apply_input_line_batch(InputBatch {
+            instance_id: session.instance_id(),
+            bytes: &[255],
+            ..batch
+        })
+        .is_err());
+    assert!(writes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn instance_pinned_resize_reaches_backend_and_stale_instance_writes_nothing() {
+    struct ResizeAgent(Arc<Mutex<Vec<Size>>>);
+    impl AgentProcess for ResizeAgent {
+        fn write(&mut self, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn screen_text(&mut self) -> Result<String> {
+            Ok(String::new())
+        }
+        fn cursor(&mut self) -> Result<Cursor> {
+            Ok(Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            })
+        }
+        fn is_alive(&mut self) -> bool {
+            true
+        }
+        fn terminate(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> Size {
+            Size::default()
+        }
+        fn resize(&mut self, size: Size) -> Result<()> {
+            self.0.lock().unwrap().push(size);
+            Ok(())
+        }
+    }
+    let sizes = Arc::new(Mutex::new(Vec::new()));
+    let session = Session::new(
+        "resize",
+        Box::new(ResizeAgent(sizes.clone())),
+        Arc::new(ManualClock::new()),
+    );
+    let size = Size::for_viewport(31, 9);
+    assert!(!session.resize_instance("stale", size).unwrap());
+    assert!(sizes.lock().unwrap().is_empty());
+    assert!(session
+        .resize_instance(session.instance_id(), size)
+        .unwrap());
+    assert_eq!(*sizes.lock().unwrap(), vec![size]);
+    assert!(session
+        .resize_instance(session.instance_id(), Size::new(2000, 600))
+        .is_err());
+    assert_eq!(*sizes.lock().unwrap(), vec![size]);
 }

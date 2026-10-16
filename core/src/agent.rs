@@ -22,12 +22,20 @@ use std::sync::Arc;
 pub struct OutputSignal {
     sender: SyncSender<()>,
     pending: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
 }
 
 impl OutputSignal {
-    /// Notify a subscriber once until it acknowledges the wake. `false` means
-    /// its receiver has gone away and the watcher can be removed.
+    /// Whether the receiver still exists, without emitting a spurious wake.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// Notify once until acknowledged; false means the receiver is gone.
     pub fn wake(&self) -> bool {
+        if !self.is_connected() {
+            return false;
+        }
         if self.pending.swap(true, Ordering::AcqRel) {
             return true;
         }
@@ -48,21 +56,25 @@ pub struct OutputWakeup {
     receiver: Receiver<()>,
     pending: Arc<AtomicBool>,
     output_version: Arc<AtomicU64>,
+    connected: Arc<AtomicBool>,
 }
 
 impl OutputWakeup {
     pub fn pair(output_version: Arc<AtomicU64>) -> (OutputSignal, Self) {
         let (sender, receiver) = mpsc::sync_channel(1);
         let pending = Arc::new(AtomicBool::new(false));
+        let connected = Arc::new(AtomicBool::new(true));
         (
             OutputSignal {
                 sender,
                 pending: Arc::clone(&pending),
+                connected: Arc::clone(&connected),
             },
             Self {
                 receiver,
                 pending,
                 output_version,
+                connected,
             },
         )
     }
@@ -81,6 +93,12 @@ impl OutputWakeup {
     pub fn version_after_wake(&self) -> u64 {
         self.pending.store(false, Ordering::Release);
         self.output_version.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for OutputWakeup {
+    fn drop(&mut self) {
+        self.connected.store(false, Ordering::Release);
     }
 }
 
@@ -118,6 +136,14 @@ impl Size {
         Self {
             cols: cols.max(1),
             rows: rows.max(Self::MIN_ROWS),
+        }
+    }
+
+    /// Explicit viewport sizing opts into both narrow and short terminals.
+    pub fn for_viewport(cols: u16, rows: u16) -> Self {
+        Self {
+            cols: cols.clamp(1, Self::MAX_RESIZE_COLS),
+            rows: rows.clamp(1, Self::MAX_RESIZE_ROWS),
         }
     }
 
@@ -637,5 +663,17 @@ impl AgentProcess for ScriptedAgent {
 
     fn size(&self) -> Size {
         self.size
+    }
+}
+
+#[cfg(test)]
+mod wakeup_lifetime_tests {
+    use super::*;
+    #[test]
+    fn dropped_receiver_is_detected_even_with_a_pending_wake() {
+        let (signal, receiver) = OutputWakeup::pair(Arc::new(AtomicU64::new(0)));
+        assert!(signal.wake());
+        drop(receiver);
+        assert!(!signal.wake());
     }
 }

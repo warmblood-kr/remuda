@@ -135,6 +135,9 @@ return function(owner, validate, config_status, validate_help)
   api.define_key{context="cluster.composer", key="<end>", action="cluster.composer.end", help="end"}
   api.define_key{context="cluster.composer", key="DEL", action="cluster.composer.backspace", help="erase"}
   api.define_key{context="cluster.composer", key="<delete>", action="cluster.composer.delete", help="delete"}
+  api.define_key{context="cluster.composer", key="C-a", action="cluster.composer.home_emacs", help="start"}
+  api.define_key{context="cluster.composer", key="C-e", action="cluster.composer.end_emacs", help="end"}
+  api.define_key{context="cluster.composer", key="C-k", action="cluster.composer.kill", help="kill tail"}
   api.define_key{context="cluster.confirm", key="y", action="cluster.confirm.accept", help="confirm"}
   api.define_key{context="cluster.confirm", key="Y", action="cluster.confirm.accept_upper", help="confirm"}
   api.define_key{context="cluster.remote.keys", key="C-\\", action="cluster.remote.back", help="back"}

@@ -142,13 +142,32 @@ pub fn parse_passthrough(spec: &Spec, argv: &[&str]) -> Report {
     parse_with_help(spec, argv, false)
 }
 
+/// Parse dispatch with selected valued options treated as opaque strings.
+/// These options may consume values beginning with hyphens, such as Lua comments.
+pub fn parse_passthrough_with_opaque_values(
+    spec: &Spec,
+    argv: &[&str],
+    options: &[&str],
+) -> Report {
+    parse_configured(spec, argv, false, options)
+}
+
 fn parse_with_help(spec: &Spec, argv: &[&str], help_enabled: bool) -> Report {
+    parse_configured(spec, argv, help_enabled, &[])
+}
+
+fn parse_configured(
+    spec: &Spec,
+    argv: &[&str],
+    help_enabled: bool,
+    opaque_values: &[&str],
+) -> Report {
     let Some((verb_index, verb)) = select_verb(spec, argv) else {
         return error_report(spec, None, None);
     };
     let verb_name = verb.name.as_str();
 
-    let command = command_for(spec, verb, help_enabled);
+    let command = command_for(spec, verb, help_enabled, opaque_values);
     let input =
         std::iter::once(command.get_name().to_owned()).chain(argv.iter().map(|s| (*s).to_owned()));
     let input: Vec<String> = preserve_literal_flags_in_body(
@@ -206,7 +225,15 @@ fn select_verb<'a>(spec: &'a Spec, argv: &[&str]) -> Option<(usize, &'a VerbSpec
     None
 }
 
-fn command_for(spec: &Spec, verb: &VerbSpec, help_enabled: bool) -> Command {
+fn command_for(
+    spec: &Spec,
+    verb: &VerbSpec,
+    help_enabled: bool,
+    opaque_values: &[&str],
+) -> Command {
+    let option_arg = |option: &OptionSpec| {
+        make_option(option).allow_hyphen_values(opaque_values.contains(&option.long.as_str()))
+    };
     let command_name = spec.name.split_whitespace().last().unwrap_or("remuda");
     let usage = format!("{} {}", spec.name, usage_tail(spec, verb));
     let mut child = Command::new(verb.name.clone())
@@ -218,7 +245,7 @@ fn command_for(spec: &Spec, verb: &VerbSpec, help_enabled: bool) -> Command {
         child = child.arg(help_arg());
     }
     for option in &verb.options {
-        child = child.arg(make_option(option));
+        child = child.arg(option_arg(option));
     }
     for arg in &verb.args {
         let mut positional = Arg::new(arg.name.clone())
@@ -237,7 +264,7 @@ fn command_for(spec: &Spec, verb: &VerbSpec, help_enabled: bool) -> Command {
         .subcommand(child);
 
     for option in &spec.options {
-        command = command.arg(make_option(option));
+        command = command.arg(option_arg(option));
     }
     command
 }

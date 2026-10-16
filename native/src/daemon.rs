@@ -678,6 +678,14 @@ fn serve_bound_listener(
             listen_addrs: vec![address],
         },
     );
+    // Expose the address first so a concurrent CLI refresh can detect rebinds.
+    let publish_pending = std::sync::atomic::AtomicBool::new(false);
+    if !address.ip().is_unspecified() {
+        if let Err(error) = crate::cluster::endpoint::publish_bound(address) {
+            eprintln!("remuda: could not publish cluster listener endpoint: {error}");
+            publish_pending.store(true, Ordering::Release);
+        }
+    }
     let _ = ready.send(());
 
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -708,7 +716,15 @@ fn serve_bound_listener(
             })
             .map_err(|error| format!("spawn cluster listener stop watcher: {error}"))?;
         let result = listener.serve_until_rechecking(&stop_flag, || {
-            auto && auto_listener_ip_changed(address.ip(), || detector())
+            if auto && auto_listener_ip_changed(address.ip(), || detector()) {
+                return true;
+            }
+            if publish_pending.load(Ordering::Acquire)
+                && crate::cluster::endpoint::publish_bound(address).is_ok()
+            {
+                publish_pending.store(false, Ordering::Release);
+            }
+            false
         });
         serve_done.store(true, Ordering::Release);
         let _ = watcher.join();
@@ -1635,6 +1651,27 @@ fn handle_request(
             |cleared| Response::ClearInput { cleared },
         ),
 
+        Request::InputLine {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+        } => input_line(
+            &stream,
+            registry,
+            &name,
+            remuda_core::input::InputBatch {
+                instance_id: &instance_id,
+                client_id: match remuda_core::input::validate_batch(&client_id, seq, &bytes) {
+                    Ok(id) => id,
+                    Err(error) => return reply(&stream, &Response::error(error)),
+                },
+                seq,
+                bytes: &bytes,
+            },
+        ),
+
         Request::Input {
             name,
             instance_id,
@@ -1662,6 +1699,23 @@ fn handle_request(
                 Response::Ok
             })
         }
+
+        Request::ResizeSession {
+            name,
+            instance_id,
+            size,
+        } => respond(
+            &stream,
+            &name,
+            registry.resize_instance(&name, &instance_id, size),
+            |resized| {
+                if resized {
+                    Response::Ok
+                } else {
+                    Response::WrongInstance
+                }
+            },
+        ),
 
         Request::Resize { name, size } => {
             respond(&stream, &name, registry.resize(&name, size), |()| {
@@ -2914,6 +2968,26 @@ fn input(
             bytes,
         },
     );
+    reply_input_result(stream, name, result)
+}
+
+fn input_line(
+    stream: &Stream,
+    registry: &Registry,
+    name: &str,
+    batch: remuda_core::input::InputBatch<'_>,
+) -> std::io::Result<()> {
+    if std::str::from_utf8(batch.bytes).is_err() {
+        return reply(stream, &Response::error("input line must be UTF-8"));
+    }
+    reply_input_result(stream, name, registry.apply_input_line_batch(name, batch))
+}
+
+fn reply_input_result(
+    stream: &Stream,
+    name: &str,
+    result: Option<Result<remuda_core::input::InputOutcome, remuda_core::input::InputError>>,
+) -> std::io::Result<()> {
     match result {
         None => reply(stream, &Response::error(format!("no such session: {name}"))),
         Some(Err(remuda_core::input::InputError::RateLimited)) => {
@@ -3118,7 +3192,10 @@ fn attach(
             &Response::error(format!("no such session: {name}")),
         );
     };
-    let held = session.attach();
+    let held = match session.attach() {
+        Ok(held) => held,
+        Err(error) => return reply(&stream, &Response::error(error.to_string())),
+    };
     let acknowledgement = if tracked {
         Response::AttachStarted {
             generation: held.generation(),
@@ -4051,6 +4128,34 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
+    fn listener_keeps_serving_and_retries_after_endpoint_publication_failure() {
+        let environment = ListenerTaskEnvironment::new(Some(listener_config("127.0.0.1:0")));
+        let mut registry = crate::cluster::load_registry().unwrap();
+        registry.authorized_nodes[0].version = u64::MAX;
+        crate::cluster::save_registry(&registry).unwrap();
+        let task = ListenerTask::start(&environment.socket_path());
+        let address = bound_listener_status(&task);
+        let _connection = connect_listener(address, Duration::from_secs(5)).unwrap();
+        assert_eq!(crate::cluster::load_registry().unwrap(), registry);
+        registry.authorized_nodes[0].version = 1;
+        crate::cluster::save_registry(&registry).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let current = crate::cluster::load_registry().unwrap();
+            if current.authorized_nodes[0].endpoint == Some(address.to_string()) {
+                assert_eq!(current.authorized_nodes[0].version, 2);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "publication did not retry"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
     fn auto_listener_retries_until_private_address_is_available() {
         use std::net::{Ipv4Addr, SocketAddr};
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -4348,6 +4453,15 @@ mod tests {
         let old_address = bound_auto_listener_status(&task);
         assert_eq!(old_address.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
 
+        let (identity, before) = crate::cluster::nodes().unwrap().unwrap();
+        let own_before = before
+            .authorized_nodes
+            .iter()
+            .find(|entry| entry.node_fp == identity.node_fp)
+            .unwrap()
+            .clone();
+        assert_eq!(own_before.endpoint, Some(old_address.to_string()));
+
         changed.store(true, Ordering::Release);
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let new_address = loop {
@@ -4366,6 +4480,11 @@ mod tests {
         assert!(connect_listener(old_address, Duration::from_millis(200)).is_err());
         let _connection = connect_listener(new_address, Duration::from_secs(15))
             .expect("rebound listener accepts TCP");
+        let (_, after) = crate::cluster::nodes().unwrap().unwrap();
+        let mut expected = own_before;
+        expected.endpoint = Some(new_address.to_string());
+        expected.version += 1;
+        assert_eq!(after.authorized_nodes, vec![expected]);
     }
 
     #[cfg(not(windows))]

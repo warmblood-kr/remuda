@@ -379,6 +379,23 @@ mod platform {
             self.open_file_policy(name, write)
         }
 
+        pub(crate) fn open_private_lock(&self, name: &str) -> io::Result<std::fs::File> {
+            if !self.secret {
+                return Err(policy_error("private lock requires a private root"));
+            }
+            let security = secret_descriptor(&UserSid::current()?.text, false)?;
+            let file = open_relative_with_security(
+                &self.file,
+                name,
+                false,
+                true,
+                0x0012_0083,
+                security.0,
+            )?;
+            verify_secret_security(&file, false)?;
+            Ok(file)
+        }
+
         pub(crate) fn write_atomic(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
             self.write_atomic_policy(name, bytes)
         }
@@ -1134,6 +1151,28 @@ mod platform {
         verify_storage_root(path)
     }
 
+    pub(crate) fn create_private_root(path: &Path) -> io::Result<StorageDirectory> {
+        let descriptor = secret_descriptor(&UserSid::current()?.text, true)?;
+        let attributes = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
+                as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        let encoded = wide(path.as_os_str());
+        // SAFETY: descriptor and NUL-terminated path remain live for the call.
+        if unsafe { CreateDirectoryW(encoded.as_ptr(), &attributes) } == 0 {
+            return Err(last_error());
+        }
+        verify_private_root(path)
+    }
+    pub(crate) fn verify_private_root(path: &Path) -> io::Result<StorageDirectory> {
+        let mut root = verify_storage_root(path)?;
+        verify_secret_security(&root.file, true)?;
+        root.secret = true;
+        Ok(root)
+    }
+
     pub(crate) fn verify_storage_root(path: &Path) -> io::Result<StorageDirectory> {
         let path_wide = wide(path.as_os_str());
         // SAFETY: path_wide is NUL-terminated; null optional pointers are permitted by CreateFileW.
@@ -1322,7 +1361,9 @@ mod platform {
 }
 
 #[cfg(windows)]
-pub(crate) use platform::{ensure_storage_root, StorageDirectory};
+pub(crate) use platform::{
+    create_private_root, ensure_storage_root, verify_private_root, StorageDirectory,
+};
 
 #[cfg(all(windows, test))]
 pub(crate) use platform::verify_storage_root;

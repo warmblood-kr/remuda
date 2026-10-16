@@ -2,6 +2,7 @@
 
 pub mod control;
 pub mod encoding;
+pub mod endpoint;
 pub mod identity;
 pub mod join_line;
 pub mod join_token;

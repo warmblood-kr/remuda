@@ -1685,6 +1685,66 @@ mod tests {
     }
 
     #[test]
+    fn owner_endpoint_updates_do_not_downgrade_when_reordered() {
+        let mut owner = entry("moving-owner", NodeState::Admitted, 10, "origin");
+        owner.by = owner.node_fp.clone();
+        owner.endpoint = Some("192.168.100.1:7441".into());
+        let mut receiver = entry("moving-receiver", NodeState::Admitted, 1, &owner.node_fp);
+        receiver.by = owner.node_fp.clone();
+        let mut middle = owner.clone();
+        middle.version += 1;
+        middle.endpoint = Some("192.168.100.2:7441".into());
+        let mut latest = middle.clone();
+        latest.version += 1;
+        latest.endpoint = Some("192.168.100.3:7441".into());
+        for order in [[&latest, &middle, &owner], [&middle, &latest, &owner]] {
+            let mut view = Registry {
+                authorized_nodes: vec![owner.clone(), receiver.clone()],
+            };
+            for update in order {
+                apply_update(
+                    &mut view,
+                    &RegistryUpdate {
+                        sender_fp: owner.node_fp.clone(),
+                        entries: vec![update.clone()],
+                    },
+                    &public_key(&owner),
+                    &receiver.node_fp,
+                )
+                .unwrap();
+            }
+            let accepted = view
+                .authorized_nodes
+                .iter()
+                .find(|entry| entry.node_fp == owner.node_fp)
+                .unwrap();
+            assert_eq!(accepted.endpoint, latest.endpoint);
+            assert_eq!(accepted.version, latest.version);
+            let mut conflicting = latest.clone();
+            conflicting.endpoint = Some("192.168.100.4:7441".into());
+            apply_update(
+                &mut view,
+                &RegistryUpdate {
+                    sender_fp: owner.node_fp.clone(),
+                    entries: vec![conflicting],
+                },
+                &public_key(&owner),
+                &receiver.node_fp,
+            )
+            .unwrap();
+            // Existing policy: equal version and authority retains current hint.
+            assert_eq!(
+                view.authorized_nodes
+                    .iter()
+                    .find(|entry| entry.node_fp == owner.node_fp)
+                    .unwrap()
+                    .endpoint,
+                latest.endpoint
+            );
+        }
+    }
+
+    #[test]
     fn relayed_admission_preserves_origin_and_converges_digest() {
         let mut origin = admitted_sender();
         origin.by = origin.node_fp.clone();

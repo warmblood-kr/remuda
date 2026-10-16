@@ -30,7 +30,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 103] = [
+pub const BINDINGS: [&str; 107] = [
     "_advice_reattach",
     "_call",
     "_caller_live",
@@ -40,11 +40,15 @@ pub const BINDINGS: [&str; 103] = [
     "_exec_commands",
     "_extension_commands",
     "_function_source",
+    "_input_instance_bound_version",
+    "_input_key_if_instance",
     "_input_submit",
     "_input_text",
     "_input_type_text",
+    "_input_type_text_if_instance",
     "_load_extension_command",
     "_module_readiness",
+    "_module_resume_supported",
     "_pending_create",
     "_pending_events",
     "_pending_line_events",
@@ -140,6 +144,16 @@ pub const BINDINGS: [&str; 103] = [
 /// own rows for the words it defines in pure Lua, into the same table.
 const WORDS: &[(&str, &str, &str)] = &[
     (
+        "_input_instance_bound_version",
+        "Capability version for the native expected-instance-bound full-text and key provider. Consumers must check this and both provider functions before use.",
+        "_input_instance_bound_version -> 1",
+    ),
+    (
+        "_input_key_if_instance",
+        "Write one named key to the expected captured session instance. WrongInstance and NotStarted are refused before writing; after the write path starts, errors have an uncertain outcome. Success returns true.",
+        "_input_key_if_instance(name, expected_instance, key_spec) -> true",
+    ),
+    (
         "_input_submit",
         "Submit visible session text; returns 'submitted' or 'unverified'.",
         "_input_submit(name, expect) -> status",
@@ -153,6 +167,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_input_type_text",
         "Deliver text and submit it while holding one input lock; returns 'submitted', 'unverified' or 'late'. 'late': the text is still being written to a slow pane and its Return follows when it lands (dropped after 30 s); do not resend, check the pane.",
         "_input_type_text(name, text, settle?) -> status",
+    ),
+    (
+        "_input_type_text_if_instance",
+        "Deliver and submit text using the expected captured session instance and the full type_text semantics. WrongInstance and NotStarted are refused before writing; after the write path starts, errors have an uncertain outcome. Returns 'submitted', 'unverified' or 'late'.",
+        "_input_type_text_if_instance(name, expected_instance, text, settle?) -> status",
     ),
     (
         "caller",
@@ -968,6 +987,7 @@ fn input_bindings(
         })?,
     )?;
 
+    let legacy_type_registry = input_registry.clone();
     table.set(
         "_input_type_text",
         lua.create_function(
@@ -978,7 +998,7 @@ fn input_bindings(
                         "settle must be between 0 and 5 seconds",
                     ));
                 }
-                let session = input_registry
+                let session = legacy_type_registry
                     .get(&name)
                     .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
                 session
@@ -992,6 +1012,74 @@ fn input_bindings(
             },
         )?,
     )?;
+
+    expected_instance_input_bindings(lua, table, input_registry)?;
+    Ok(())
+}
+
+fn expected_instance_input_bindings(
+    lua: &Lua,
+    table: &Table,
+    input_registry: std::sync::Arc<remuda_core::Registry>,
+) -> mlua::Result<()> {
+    // Owner-input providers pass the identity captured with their approval.
+    // Resolve the name exactly once, then validate and operate through that
+    // captured Arc so a same-name replacement cannot receive the act.
+    let expected_text_registry = input_registry.clone();
+    table.set(
+        "_input_type_text_if_instance",
+        lua.create_function(
+            move |_,
+                  (name, expected_instance, text, settle): (
+                String,
+                String,
+                String,
+                Option<f64>,
+            )| {
+                let settle = settle.unwrap_or(DEFAULT_INPUT_SETTLE.as_secs_f64());
+                if !settle.is_finite() || !(0.0..=5.0).contains(&settle) {
+                    return Err(mlua::Error::runtime(
+                        "settle must be between 0 and 5 seconds",
+                    ));
+                }
+                let session = expected_text_registry.get(&name).ok_or_else(|| {
+                    mlua::Error::runtime("session instance changed; no input was written")
+                })?;
+                session
+                    .type_text_if_instance(
+                        &expected_instance,
+                        &text,
+                        Duration::from_secs_f64(settle),
+                    )
+                    .map(|outcome| match outcome {
+                        InputSubmitOutcome::Submitted => "submitted",
+                        InputSubmitOutcome::Unverified => "unverified",
+                        InputSubmitOutcome::Late => "late",
+                    })
+                    .map_err(|error| mlua::Error::runtime(error.to_string()))
+            },
+        )?,
+    )?;
+
+    let expected_key_registry = input_registry.clone();
+    table.set(
+        "_input_key_if_instance",
+        lua.create_function(
+            move |_, (name, expected_instance, spec): (String, String, String)| {
+                let bytes = keys::key(&spec)
+                    .ok_or_else(|| mlua::Error::runtime(format!("no such key: {spec}")))?;
+                let session = expected_key_registry.get(&name).ok_or_else(|| {
+                    mlua::Error::runtime("session instance changed; no input was written")
+                })?;
+                session
+                    .send_key_if_instance(&expected_instance, &bytes)
+                    .map(|()| true)
+                    .map_err(|error| mlua::Error::runtime(error.to_string()))
+            },
+        )?,
+    )?;
+    // Advertise only after both fenced provider operations are installed.
+    table.set("_input_instance_bound_version", 1)?;
     Ok(())
 }
 
@@ -1481,6 +1569,29 @@ fn function_source_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
     )
 }
 
+#[derive(Clone, Default)]
+struct LoadedPackageSources(std::collections::BTreeMap<String, String>);
+
+fn package_sources_changed(lua: &Lua, owner: &str) -> mlua::Result<bool> {
+    let sources = lua
+        .app_data_ref::<LoadedPackageSources>()
+        .map(|value| value.0.clone())
+        .unwrap_or_default();
+    for (name, source) in sources {
+        if name == owner
+            || name
+                .strip_prefix(owner)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            let current = crate::packages::resolve(&name).ok().flatten();
+            if current.as_ref().map(|package| package.source.as_str()) != Some(source.as_str()) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// `remuda.exec(name)` — split out of `bindings` for its line cap. Reentrant-
 /// safe: a nested `lua.load(...).exec()` on this same `Lua`, not a new
 /// interpreter. Mods must be installed independently of the Remuda binary.
@@ -1493,7 +1604,15 @@ fn exec_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
         .and_then(|()| {
             table.set(
                 "_exec_commands",
-                lua.create_function(|lua, name: String| execute_package(lua, &name, false, true))?,
+                lua.create_function(|lua, (name, refresh): (String, Option<bool>)| {
+                    let changed = refresh == Some(true) && package_sources_changed(lua, &name)?;
+                    if changed {
+                        let check: mlua::Function =
+                            lua.named_registry_value("remuda.lifecycle.source_refresh_check")?;
+                        check.call::<()>(name.as_str())?;
+                    }
+                    execute_package(lua, &name, changed, true)
+                })?,
             )
         })
         .and_then(|()| {
@@ -1512,7 +1631,24 @@ fn execute_package(
     require_lifecycle: bool,
     commands_only: bool,
 ) -> mlua::Result<()> {
+    let previous = lua
+        .app_data_ref::<LoadedPackageSources>()
+        .map(|value| value.clone())
+        .unwrap_or_default();
+    if require_lifecycle {
+        let mut retained = previous.clone();
+        retained.0.retain(|key, _| {
+            key != name
+                && !key
+                    .strip_prefix(name)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        });
+        lua.set_app_data(retained);
+    }
     let loaded = load_package(lua, name, require_lifecycle, commands_only);
+    if loaded.is_err() {
+        lua.set_app_data(previous);
+    }
     // A mod that redefined an advised function keeps its advice: the new
     // definition becomes the base (hook-design §2). Even after a failed
     // load, which may have redefined some before it stopped.
@@ -1556,7 +1692,8 @@ fn activate_package(
             "mod {name} uses the legacy entry format and cannot be reloaded in-process"
         )));
     }
-    if package.lifecycle.is_some() {
+    let loaded_source = package.source.clone();
+    let result = if package.lifecycle.is_some() {
         let active = Rc::new(Cell::new(false));
         let environment = lua.create_table()?;
         environment.set("_G", environment.clone())?;
@@ -1603,7 +1740,7 @@ fn activate_package(
             .eval()?;
         let activate: mlua::Function =
             lua.named_registry_value("remuda.lifecycle.activate_module")?;
-        let (_, state, start, rollback, commands): (bool, Value, Value, Value, Value) =
+        let (activated, state, start, rollback, commands): (bool, Value, Value, Value, Value) =
             activate.call((name, declaration, require_lifecycle, commands_only))?;
         active.set(true);
         if let Value::Function(commands) = &commands {
@@ -1623,12 +1760,24 @@ fn activate_package(
                 return Err(error);
             }
         }
+        if !activated {
+            return Ok(());
+        }
         Ok(())
     } else {
         lua.load(&package.source)
             .set_name(package.chunk_name)
             .exec()
+    };
+    if result.is_ok() {
+        let mut sources = lua
+            .app_data_ref::<LoadedPackageSources>()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        sources.0.insert(name.to_owned(), loaded_source);
+        lua.set_app_data(sources);
     }
+    result
 }
 
 /// Run lifecycle callbacks under the same error policy, so errors from hooks
@@ -1646,6 +1795,9 @@ fn call_lifecycle_callback(lua: &Lua, callback: &mlua::Function, state: Value) -
 /// implementation helper on the public `remuda` table.
 pub(crate) fn hide_module_activator(lua: &Lua) -> mlua::Result<()> {
     let remuda: Table = lua.globals().get("remuda")?;
+    let check: mlua::Function = remuda.get("_source_refresh_check")?;
+    lua.set_named_registry_value("remuda.lifecycle.source_refresh_check", check)?;
+    remuda.set("_source_refresh_check", Value::Nil)?;
     let activate: mlua::Function = remuda.get("_activate_module")?;
     lua.set_named_registry_value("remuda.lifecycle.activate_module", activate)?;
     let stop_modules: mlua::Function = remuda.get("_stop_modules")?;
