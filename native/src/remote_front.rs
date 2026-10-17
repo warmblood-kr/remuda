@@ -292,6 +292,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::Mkdir { .. } => Err(refusal("Mkdir")),
         Request::RemoveDirAll { .. } => Err(refusal("RemoveDirAll")),
         Request::Version => Err(refusal("Version")),
+        Request::SocketPublication => Err(refusal("SocketPublication")),
         Request::ClusterRegistrySync { .. } => Err(refusal("ClusterRegistrySync")),
         Request::ClusterRegistryUpdate { .. } => Err(refusal("ClusterRegistryUpdate")),
         Request::ClusterListener(_) => Err(refusal("ClusterListener")),

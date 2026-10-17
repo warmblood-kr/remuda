@@ -940,7 +940,6 @@ fn sigusr1_rebind_refreshes_cleanup_identity() {
 #[test]
 fn sigusr1_on_the_owned_socket_is_silent() {
     use std::io::Read as _;
-    use std::os::fd::AsRawFd;
 
     let dir = scratch_dir("daemon-sigusr1-owned");
     let socket = daemon::socket_path_in(&dir, "s");
@@ -955,24 +954,25 @@ fn sigusr1_on_the_owned_socket_is_silent() {
         Ok(Response::Value(_))
     ));
 
-    // If SIGUSR1 takes the erroneous ipc::listen path, it writes its failure
-    // promptly. Wait on the captured pipe for that output without relying on
-    // whether a subsequent request happened to race the signal thread.
+    // If SIGUSR1 takes the erroneous ipc::listen path, it writes its failure.
+    // Give it time, then judge everything the daemon wrote except its one
+    // startup line naming a legacy fallback (long test paths take that path).
+    std::thread::sleep(std::time::Duration::from_millis(200));
     let mut stderr = daemon.0.stderr.take().expect("captured daemon stderr");
-    let mut pending = libc::pollfd {
-        fd: stderr.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let readable = unsafe { libc::poll(&mut pending, 1, 200) };
-
     let stopped = stop_and_clean(&mut daemon, &dir, &socket);
     let mut output = String::new();
     stderr
         .read_to_string(&mut output)
         .expect("read daemon stderr");
-    assert_eq!(
-        readable, 0,
+    let after_startup: Vec<&str> = output
+        .lines()
+        .filter(|line| {
+            !line.starts_with("remuda daemon: legacy socket bind")
+                && !line.ends_with("shutting down")
+        })
+        .collect();
+    assert!(
+        after_startup.is_empty(),
         "SIGUSR1 wrote stderr before shutdown: {output}"
     );
     assert!(stopped, "daemon stops and removes its socket");

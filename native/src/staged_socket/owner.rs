@@ -64,6 +64,22 @@ impl Owner {
     }
 }
 
+/// Remove a dead daemon's socket by receipt, never anything else at the path.
+pub(crate) fn remove_stale_socket(path: &Path) -> io::Result<()> {
+    let (parent, name) = split(path)?;
+    let node = match NodeReceipt::capture(&parent, &name) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        other => other?,
+    };
+    if node.kind != super::NodeKind::Socket {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} exists and is not a socket", path.display()),
+        ));
+    }
+    unlink_if_matches(&parent, &name, node).map(drop)
+}
+
 fn generation(number: u64, node: NodeReceipt, name: OsString) -> Generation {
     Generation {
         number,
@@ -169,6 +185,19 @@ mod tests {
         rebind_then_shutdown(|owner, stale| {
             unlink_if_matches(&owner.lifecycle.parent, &owner.name, stale)
         });
+    }
+
+    #[test]
+    fn failed_refresh_without_shutdown_is_not_terminal() {
+        // The SIGUSR1 caller keeps serving on such a failure.
+        let dir = Dir::new();
+        let _first = UnixListener::bind(dir.socket()).unwrap();
+        let owner = Owner::capture(&dir.socket()).unwrap();
+        std::fs::remove_file(dir.socket()).unwrap();
+        assert!(owner.refresh().is_err());
+        assert!(!owner.is_terminal());
+        owner.terminate().unwrap();
+        assert!(owner.is_terminal());
     }
 
     #[test]

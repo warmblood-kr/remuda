@@ -64,6 +64,17 @@ pub(crate) struct Controls {
 pub(crate) struct Controls;
 
 impl Controls {
+    /// No fault injection: what production passes.
+    #[cfg(test)]
+    pub(crate) fn none() -> Self {
+        Self::default()
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn none() -> Self {
+        Self
+    }
+
     pub(crate) fn fails(&self, which: Failure) -> bool {
         #[cfg(test)]
         return self.failure == Some(which);
