@@ -474,12 +474,12 @@ mod lifecycle_tests {
         let mut command = CommandBuilder::new("/bin/sh");
         command.env_clear();
         command.env("PATH", "/usr/bin:/bin");
-        command.args(["-c", "stty -echo -icanon min 1 time 10; printf '\\033[6n'; value=$(dd bs=1 count=6 2>/dev/null | od -An -tu1); printf 'reply: %s\\n' \"$value\""]);
+        command.args(["-c", "stty -echo -icanon min 1 time 10; printf '\\033[6n'; value=$(dd bs=1 count=6 2>/dev/null | od -An -tu1); printf 'reply: %s\\nreply-done\\n' \"$value\""]);
         let host = Owned::spawn([6; 16], "dsr-fixture".into(), command, Size::new(80, 24)).unwrap();
         let until = std::time::Instant::now() + Duration::from_secs(3);
         let output = loop {
             let text = host.session.screen_text().unwrap();
-            if text.contains("reply:") {
+            if text.contains("reply-done") {
                 break text;
             }
             assert!(std::time::Instant::now() < until);
@@ -499,7 +499,7 @@ mod lifecycle_tests {
         let mut command = CommandBuilder::new("/bin/sh");
         command.env_clear();
         command.env("PATH", "/usr/bin:/bin");
-        command.args(["-c", "stty -echo -icanon min 1 time 10; printf '\\033[?2004hpaste-ready\\n'; value=$(dd bs=1 count=17 2>/dev/null | od -An -tu1); printf 'paste: %s\\n' \"$value\""]);
+        command.args(["-c", "stty -echo -icanon min 1 time 10; printf '\\033[?2004hpaste-ready\\n'; value=$(dd bs=1 count=17 2>/dev/null | od -An -tu1); printf 'paste: %s\\npaste-done\\n' \"$value\""]);
         let host =
             Owned::spawn([5; 16], "paste-fixture".into(), command, Size::new(80, 24)).unwrap();
         let until = std::time::Instant::now() + Duration::from_secs(3);
@@ -511,7 +511,8 @@ mod lifecycle_tests {
         host.session.input_text("probe").unwrap();
         let output = loop {
             let text = host.session.screen_text().unwrap();
-            if text.contains("paste:") {
+            // od wraps 17 bytes onto two lines; the marker means all of them drew.
+            if text.contains("paste-done") {
                 break text;
             }
             assert!(std::time::Instant::now() < until);
