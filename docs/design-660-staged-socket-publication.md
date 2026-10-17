@@ -372,3 +372,14 @@ Historical design-review scope: no runtime tests or Cargo jobs were run for
 that docs-only revision. Static whitespace/link checks did not certify the
 platform matrix, RED/GREEN behavior, or the outstanding Butler/owner scope
 acceptance.
+
+## Slice 3a (inactive): promote, abort, probe
+
+`startup::open` is no longer `cfg(test)`; it has no production caller and
+fault controls compile to a unit type outside tests. `Published::abort`
+unlinks through the parent descriptor held since publication, bound to the
+published receipt (#731). `probe::qualify` returns a typed `Unsupported` for
+rename flags, no-follow chmod, `sun_path` budget (staged path included) and a
+parent ACL; it probes with absent names and mutates nothing. Android and the
+BSDs are refused by platform without calling any syscall; Windows has no
+module. No kernel floor is claimed: Linux qualifies when the calls work.

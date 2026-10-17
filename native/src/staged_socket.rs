@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
 
-#[cfg(test)]
+pub(crate) mod probe;
 pub(crate) mod startup;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
