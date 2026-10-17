@@ -107,6 +107,12 @@ starts. After rename, `getsockname` may retain the staging address; never requir
 it to equal the public spelling (see
 [XNU Unix address handling](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_usrreq.c)).
 
+**Platform limits (SEC-708):** CLOEXEC is atomic at socket creation only on
+Linux/Android (`SOCK_CLOEXEC`); elsewhere `socket`+`fcntl` leaves a fork/exec
+window, so atomic creation is not certified there. On macOS/BSD an accepted
+stream inherits the listener's `O_NONBLOCK`; the accept loop must normalize
+request streams to blocking (`daemon.rs`, `set_nonblocking(false)`).
+
 **Inference/limit:** successful exclusive bind in a fresh namespace establishes
 the node's provenance among cooperating processes; directory-relative metadata
 does not prove fd/node equality against a hostile same-UID writer. If strict
