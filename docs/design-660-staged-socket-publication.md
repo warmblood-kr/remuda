@@ -383,3 +383,12 @@ rename flags, no-follow chmod, `sun_path` budget (staged path included) and a
 parent ACL; it probes with absent names and mutates nothing. Android and the
 BSDs are refused by platform without calling any syscall; Windows has no
 module. No kernel floor is claimed: Linux qualifies when the calls work.
+
+## Slice 3b (behavior-preserving): lifecycle owner
+
+`SocketOwnership` is now backed by `staged_socket::owner::Owner` over
+`Lifecycle`, still on the legacy bind. Signal exit, protocol shutdown and
+SIGUSR1 all go through it: terminal first, then `unlink_if_matches` on the
+current receipt. A rebind after shutdown began is refused and its node removed;
+a refused replacement listener is never installed. Lock order is `SocketLock`,
+then the lifecycle lock; nothing nests.

@@ -109,7 +109,9 @@ fn has_acl(dir: &File) -> io::Result<bool> {
             _ => Err(error),
         };
     }
-    unsafe { acl_free(acl) };
+    if unsafe { acl_free(acl) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(true)
 }
 

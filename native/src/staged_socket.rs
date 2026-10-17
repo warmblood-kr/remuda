@@ -8,6 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
 
+pub(crate) mod owner;
 pub(crate) mod probe;
 pub(crate) mod startup;
 
@@ -386,7 +387,8 @@ fn unlink_if_matches(parent: &File, name: &OsStr, receipt: NodeReceipt) -> io::R
 #[derive(Debug)]
 struct Generation {
     number: u64,
-    listener: OwnedFd,
+    // None while the legacy bind still owns the listener (slice 3b).
+    listener: Option<OwnedFd>,
     node: NodeReceipt,
     name: OsString,
 }
@@ -427,6 +429,39 @@ impl Lifecycle {
             ));
         }
         Ok(state.current.replace(next))
+    }
+
+    /// Terminal first, then unlink only the node the current receipt names.
+    /// The state lock is held throughout, so no install can interleave.
+    fn terminate(&self) -> io::Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("lifecycle lock poisoned"))?;
+        state.terminal = true;
+        match &state.current {
+            Some(generation) => unlink_if_matches(&self.parent, &generation.name, generation.node),
+            None => Ok(false),
+        }
+    }
+
+    fn current_number(&self) -> io::Result<Option<u64>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("lifecycle lock poisoned"))?;
+        Ok(state.current.as_ref().map(|generation| generation.number))
+    }
+
+    /// Whether the current receipt still names the node at its path.
+    fn owns_current(&self) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        state
+            .current
+            .as_ref()
+            .is_some_and(|generation| generation.node.matches(&self.parent, &generation.name))
     }
 
     fn begin_shutdown(&self) -> io::Result<Option<(u64, NodeReceipt, OsString)>> {
@@ -822,7 +857,7 @@ mod tests {
                 None,
                 Generation {
                     number: 1,
-                    listener: fd,
+                    listener: Some(fd),
                     node: receipt,
                     name: OsString::from("published"),
                 },
@@ -836,7 +871,7 @@ mod tests {
                 Some(1),
                 Generation {
                     number: 2,
-                    listener: create_stream_socket().unwrap(),
+                    listener: Some(create_stream_socket().unwrap()),
                     node: receipt,
                     name: OsString::from("published")
                 }
@@ -945,7 +980,7 @@ mod tests {
         let scratch = Scratch::new();
         let generation = |number| Generation {
             number,
-            listener: create_stream_socket().unwrap(),
+            listener: Some(create_stream_socket().unwrap()),
             node: NodeReceipt {
                 kind: NodeKind::Socket,
                 dev: 0,
