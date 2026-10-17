@@ -39,6 +39,8 @@ pub fn base_command(dir: &Path) -> std::process::Command {
         .env("HOME", &home)
         .env("LOCALAPPDATA", &home)
         .env_remove("XDG_CONFIG_HOME")
+        // Else a daemon spawned while another test has XDG_STATE_HOME set shares its state (#735).
+        .env_remove("XDG_STATE_HOME")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
