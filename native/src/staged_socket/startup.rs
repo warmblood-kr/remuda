@@ -1,19 +1,23 @@
-//! Test-only startup transaction and bounded fault controls.
+//! Staged startup transaction (no production caller yet) and test-only fault controls.
 
 use super::{
     chmod_socket_nofollow, create_stream_socket, listen_and_validate, mkdir_exclusive,
     open_staging_dir, preflight_socket_path, remove_dir_if_matches, set_nonblocking,
     unlink_if_matches, NodeKind, NodeReceipt, Residue, StagedTransaction,
 };
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender};
-use std::time::Instant;
+use std::path::Path;
+#[cfg(test)]
+use std::{
+    path::PathBuf,
+    sync::mpsc::{Receiver, Sender},
+    time::Instant,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Boundary {
@@ -38,6 +42,7 @@ pub(crate) enum Failure {
     ImportCleanup,
 }
 
+#[cfg(test)]
 pub(crate) struct Pause {
     pub boundary: Boundary,
     pub reached: Sender<PathBuf>,
@@ -45,6 +50,8 @@ pub(crate) struct Pause {
     pub deadline: Instant,
 }
 
+/// Fault injection exists only in test builds; release builds get a unit type.
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct Controls {
     pub pause: Option<Pause>,
@@ -52,7 +59,33 @@ pub(crate) struct Controls {
     pub directory_mode: Option<u32>,
 }
 
+#[cfg(not(test))]
+#[derive(Default)]
+pub(crate) struct Controls;
+
 impl Controls {
+    fn fails(&self, which: Failure) -> bool {
+        #[cfg(test)]
+        return self.failure == Some(which);
+        #[cfg(not(test))]
+        return {
+            let _ = which;
+            false
+        };
+    }
+
+    fn fails_any(&self, which: &[Failure]) -> bool {
+        which.iter().any(|f| self.fails(*f))
+    }
+
+    fn directory_mode(&self) -> Option<u32> {
+        #[cfg(test)]
+        return self.directory_mode;
+        #[cfg(not(test))]
+        return None;
+    }
+
+    #[cfg(test)]
     pub(crate) fn checkpoint(&self, boundary: Boundary, leaf: &Path) -> io::Result<()> {
         if let Some(pause) = &self.pause {
             if pause.boundary == boundary {
@@ -68,6 +101,11 @@ impl Controls {
         }
         Ok(())
     }
+
+    #[cfg(not(test))]
+    pub(crate) fn checkpoint(&self, _boundary: Boundary, _leaf: &Path) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A published listener, the receipt authorizing its public cleanup, and any
@@ -77,6 +115,33 @@ pub(crate) struct Opened {
     pub dev: u64,
     pub ino: u64,
     pub residue: Vec<String>,
+    pub published: Published,
+}
+
+/// Authority to remove exactly the node this transaction published: the
+/// parent descriptor, leaf name and receipt, never a re-resolved path.
+#[derive(Debug)]
+pub(crate) struct Published {
+    parent: File,
+    name: OsString,
+    receipt: NodeReceipt,
+}
+
+impl Published {
+    /// Remove the published socket if it is still the receipted node. A
+    /// vanished node is silent; anything left behind is reported with `what`.
+    pub(crate) fn abort(&self, what: &Path, residue: &mut Vec<String>) {
+        let outcome = match NodeReceipt::capture(&self.parent, &self.name) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Residue::Removed),
+            Err(error) => Err(error),
+            Ok(_) => unlink_if_matches(&self.parent, &self.name, self.receipt).map(removed),
+        };
+        note(
+            residue,
+            &format!("published socket {}", what.display()),
+            outcome,
+        );
+    }
 }
 
 /// The primary failure plus every entry left behind and why.
@@ -182,14 +247,14 @@ fn run(public: &Path, controls: &Controls, residue: &mut Vec<String>) -> io::Res
             remove_dir_if_matches(&parent, stage, stage_receipt),
         );
     };
-    if let Some(mode) = controls.directory_mode {
+    if let Some(mode) = controls.directory_mode() {
         // Test seam: start the directory in an unusable mode to force repair.
         if let Err(error) = super::chmod_receipted(&parent, stage, stage_receipt, mode) {
             drop_dir(residue);
             return Err(error);
         }
     }
-    let stage_dir = match if controls.failure == Some(Failure::StageOpen) {
+    let stage_dir = match if controls.fails(Failure::StageOpen) {
         Err(injected("staging open"))
     } else {
         open_staging_dir(&parent, stage, stage_receipt)
@@ -208,7 +273,7 @@ fn run(public: &Path, controls: &Controls, residue: &mut Vec<String>) -> io::Res
         }
     };
     // A failed bind created no leaf; only the empty directory can remain.
-    let bound = if controls.failure == Some(Failure::Bind) {
+    let bound = if controls.fails(Failure::Bind) {
         Err(injected("bind"))
     } else {
         bind_path(&fd, &staged_path)
@@ -245,10 +310,12 @@ fn run(public: &Path, controls: &Controls, residue: &mut Vec<String>) -> io::Res
     let mut attempts = 0;
     let receipt = loop {
         attempts += 1;
-        let captured = match controls.failure {
-            Some(Failure::CapturePersistent) => Err(injected("capture")),
-            Some(Failure::CaptureOnce) if attempts == 1 => Err(injected("capture")),
-            _ => NodeReceipt::capture_socket(&stage_dir, leaf_name),
+        let captured = if controls.fails(Failure::CapturePersistent)
+            || (controls.fails(Failure::CaptureOnce) && attempts == 1)
+        {
+            Err(injected("capture"))
+        } else {
+            NodeReceipt::capture_socket(&stage_dir, leaf_name)
         };
         match captured {
             Ok(receipt) => break receipt,
@@ -260,7 +327,7 @@ fn run(public: &Path, controls: &Controls, residue: &mut Vec<String>) -> io::Res
             }
         }
     };
-    let cloned = if controls.failure == Some(Failure::Clone) {
+    let cloned = if controls.fails(Failure::Clone) {
         Err(injected("descriptor clone"))
     } else {
         stage_dir.try_clone()
@@ -285,26 +352,37 @@ fn run(public: &Path, controls: &Controls, residue: &mut Vec<String>) -> io::Res
             transaction.abort(),
         );
     };
-    let prepared = chmod_socket_nofollow(&stage_dir, leaf_name, receipt, 0o600)
-        .and_then(|()| set_nonblocking(&fd))
-        .and_then(|()| listen_and_validate(&fd).map(drop))
-        .and_then(|()| controls.checkpoint(Boundary::Listening, &staged_path));
-    if let Err(error) = prepared {
-        abort(transaction, residue);
-        drop_dir(residue);
-        return Err(error);
-    }
-    let published = match controls.failure {
-        Some(Failure::Rename) => Err(injected("rename")),
-        Some(Failure::RenameUnsupported) => Err(io::Error::new(
+    // The abort handle's descriptor is taken before publishing, so a failure
+    // to obtain it is still a pre-commit failure.
+    let prepared = parent.try_clone().and_then(|kept| {
+        chmod_socket_nofollow(&stage_dir, leaf_name, receipt, 0o600)
+            .and_then(|()| set_nonblocking(&fd))
+            .and_then(|()| listen_and_validate(&fd).map(drop))
+            .and_then(|()| controls.checkpoint(Boundary::Listening, &staged_path))
+            .map(|()| kept)
+    });
+    let kept_parent = match prepared {
+        Ok(kept) => kept,
+        Err(error) => {
+            abort(transaction, residue);
+            drop_dir(residue);
+            return Err(error);
+        }
+    };
+    let published = if controls.fails(Failure::Rename) {
+        Err(injected("rename"))
+    } else if controls.fails(Failure::RenameUnsupported) {
+        Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "exclusive rename unsupported",
-        )),
-        Some(Failure::RenameCrossDevice) => Err(io::Error::new(
+        ))
+    } else if controls.fails(Failure::RenameCrossDevice) {
+        Err(io::Error::new(
             io::ErrorKind::CrossesDevices,
             "staging is on another filesystem",
-        )),
-        _ => transaction.publish_into(&parent, leaf),
+        ))
+    } else {
+        transaction.publish_into(&parent, leaf)
     };
     let receipt = match published {
         Ok(receipt) => receipt,
@@ -315,11 +393,8 @@ fn run(public: &Path, controls: &Controls, residue: &mut Vec<String>) -> io::Res
             return Err(error);
         }
     };
-    if matches!(
-        controls.failure,
-        Some(Failure::AfterPublish | Failure::AfterPublishUnlink)
-    ) {
-        let outcome = if controls.failure == Some(Failure::AfterPublishUnlink) {
+    if controls.fails_any(&[Failure::AfterPublish, Failure::AfterPublishUnlink]) {
+        let outcome = if controls.fails(Failure::AfterPublishUnlink) {
             Err(injected("published unlink"))
         } else {
             unlink_if_matches(&parent, leaf, receipt).map(removed)
@@ -329,7 +404,7 @@ fn run(public: &Path, controls: &Controls, residue: &mut Vec<String>) -> io::Res
         return Err(injected("post-publish startup"));
     }
     // Commit is final: a staging-rmdir failure is residue, not a rollback.
-    if controls.failure == Some(Failure::PostCommitRmdir) {
+    if controls.fails(Failure::PostCommitRmdir) {
         residue.push(format!(
             "staging directory {}: injected rmdir failure",
             stage_path.display()
@@ -342,6 +417,11 @@ fn run(public: &Path, controls: &Controls, residue: &mut Vec<String>) -> io::Res
         dev: receipt.dev,
         ino: receipt.ino,
         residue: std::mem::take(residue),
+        published: Published {
+            parent: kept_parent,
+            name: leaf.to_os_string(),
+            receipt,
+        },
     })
 }
 

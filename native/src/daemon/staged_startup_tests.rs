@@ -64,35 +64,6 @@ impl From<std::io::Error> for SeamError {
 }
 type StartupResult = Result<Imported, SeamError>;
 
-/// Explicit, fallible removal of the published socket after an import error;
-/// the legacy `SocketOwnership` destructor stays only as a fallback.
-fn abort_published(
-    path: &Path,
-    opened: (u64, u64),
-    inject_failure: bool,
-    residue: &mut Vec<String>,
-) {
-    use std::os::unix::fs::MetadataExt;
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if (m.dev(), m.ino()) == opened => {
-            let removed = if inject_failure {
-                Err(std::io::Error::other("injected published unlink failure"))
-            } else {
-                std::fs::remove_file(path)
-            };
-            if let Err(error) = removed {
-                residue.push(format!("published socket {}: {error}", path.display()));
-            }
-        }
-        Ok(_) => residue.push(format!(
-            "published socket {}: changed, preserved",
-            path.display()
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => residue.push(format!("published socket {}: {error}", path.display())),
-    }
-}
-
 /// Test-only seam: the staged transaction, imported the way slice 3 will wire
 /// it into startup. Production `serve_inner` still uses the legacy path.
 fn staged_startup_listener(path: &Path, controls: &Controls) -> StartupResult {
@@ -100,6 +71,7 @@ fn staged_startup_listener(path: &Path, controls: &Controls) -> StartupResult {
         error: e.error,
         residue: e.residue,
     })?;
+    let published = opened.published;
     let mut residue = opened.residue;
     // Install published authority first so a panic still cleans up.
     let owner = SocketOwnership {
@@ -118,7 +90,14 @@ fn staged_startup_listener(path: &Path, controls: &Controls) -> StartupResult {
     if let Err(error) = imported {
         drop(listener);
         let inject = controls.failure == Some(Failure::ImportCleanup);
-        abort_published(path, (opened.dev, opened.ino), inject, &mut residue);
+        if inject {
+            residue.push(format!(
+                "published socket {}: injected published unlink failure",
+                path.display()
+            ));
+        } else {
+            published.abort(path, &mut residue);
+        }
         // Explicit abort owns the outcome; the legacy Drop must not undo residue.
         std::mem::forget(owner);
         return Err(SeamError { error, residue });
@@ -672,4 +651,136 @@ fn staged_startup_import_cleanup_failure_is_reported_not_swallowed() {
         .any(|r| r.contains(scratch.public().to_str().unwrap()) && r.contains("unlink")));
     // Reported residue must really be left behind, not silently cleaned.
     assert!(std::fs::symlink_metadata(scratch.public()).is_ok());
+}
+
+// --- #731: production abort is bound to the published node's parent fd ---
+
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Restores the directory mode so `Scratch` can clean up.
+struct Mode<'a>(&'a Path);
+impl Drop for Mode<'_> {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+fn published_in(scratch: &Scratch) -> crate::staged_socket::startup::Published {
+    let opened =
+        crate::staged_socket::startup::open(&scratch.public(), &Controls::default()).unwrap();
+    let _listener = opened.listener; // dropped: the node stays on disk
+    opened.published
+}
+
+fn deny(scratch: &Scratch, mode: u32) -> Mode<'_> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&scratch.0, std::fs::Permissions::from_mode(mode)).unwrap();
+    Mode(&scratch.0)
+}
+
+#[test]
+fn staged_abort_reports_real_unlink_error_in_read_only_parent() {
+    if is_root() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let published = published_in(&scratch);
+    let _restore = deny(&scratch, 0o500);
+    let mut residue = Vec::new();
+    published.abort(&scratch.public(), &mut residue);
+    assert_eq!(residue.len(), 1, "{residue:?}");
+    assert!(residue[0].contains("published socket"), "{residue:?}");
+    assert!(std::fs::symlink_metadata(scratch.public()).is_ok());
+}
+
+#[test]
+fn staged_abort_reports_non_notfound_metadata_error() {
+    if is_root() {
+        return;
+    }
+    let scratch = Scratch::new();
+    let published = published_in(&scratch);
+    let _restore = deny(&scratch, 0o400); // no search bit: lookup fails EACCES
+    let mut residue = Vec::new();
+    published.abort(&scratch.public(), &mut residue);
+    assert_eq!(residue.len(), 1, "{residue:?}");
+    assert!(residue[0].contains("published socket"), "{residue:?}");
+}
+
+#[test]
+fn staged_abort_is_silent_when_node_already_gone() {
+    let scratch = Scratch::new();
+    let published = published_in(&scratch);
+    std::fs::remove_file(scratch.public()).unwrap();
+    let mut residue = Vec::new();
+    published.abort(&scratch.public(), &mut residue);
+    assert!(residue.is_empty(), "{residue:?}");
+}
+
+/// The legacy path-based abort (stat + remove_file), kept as a control.
+fn path_based_abort(path: &Path, opened: (u64, u64), residue: &mut Vec<String>) {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if (m.dev(), m.ino()) == opened => {
+            if let Err(error) = std::fs::remove_file(path) {
+                residue.push(format!("published socket {}: {error}", path.display()));
+            }
+        }
+        Ok(_) => residue.push(format!("published socket {}: changed", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => residue.push(format!("published socket {}: {error}", path.display())),
+    }
+}
+
+/// Swap the parent directory for a lookalike holding a decoy, then abort.
+/// A correct abort removes the real node and leaves the decoy alone.
+fn abort_after_parent_swap(
+    abort: impl FnOnce(&Scratch, crate::staged_socket::startup::Published, &mut Vec<String>),
+) {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let scratch = Scratch::new();
+    let moved = scratch.0.with_extension("moved");
+    let _cleanup = Cleanup(moved.clone());
+    let published = published_in(&scratch);
+    std::fs::rename(&scratch.0, &moved).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&scratch.0)
+        .unwrap();
+    std::fs::write(scratch.public(), b"decoy").unwrap();
+    let mut residue = Vec::new();
+    abort(&scratch, published, &mut residue);
+    assert!(
+        std::fs::read(scratch.public()).is_ok_and(|d| d == b"decoy"),
+        "decoy was touched"
+    );
+    assert!(
+        std::fs::symlink_metadata(moved.join("public")).is_err(),
+        "real published node was left behind: {residue:?}"
+    );
+}
+
+#[test]
+fn staged_abort_follows_the_parent_fd_not_the_path() {
+    abort_after_parent_swap(|scratch, published, residue| {
+        published.abort(&scratch.public(), residue);
+    });
+}
+
+#[test]
+#[should_panic(expected = "real published node was left behind")]
+fn control_path_based_abort_misses_the_node_after_parent_swap() {
+    abort_after_parent_swap(|scratch, _published, residue| {
+        // Even handed the real dev/ino, a path lookup lands in the swapped dir.
+        let real = std::fs::symlink_metadata(scratch.0.with_extension("moved").join("public"))
+            .unwrap();
+        path_based_abort(&scratch.public(), (real.dev(), real.ino()), residue);
+    });
 }
