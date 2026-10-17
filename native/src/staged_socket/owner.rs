@@ -2,7 +2,7 @@
 //! One receipt per endpoint: shutdown sets terminal first, then unlinks only
 //! the node that receipt names. Lock order: `SocketLock`, then lifecycle.
 
-use super::{unlink_if_matches, Generation, Lifecycle, NodeReceipt};
+use super::{startup::Published, unlink_if_matches, Generation, Lifecycle, NodeReceipt};
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
@@ -22,6 +22,24 @@ impl Owner {
         Ok(Self { lifecycle, name })
     }
 
+    /// Adopt the node a staged publication just committed: its receipt came
+    /// from the transaction, not from a later look at the path.
+    pub(crate) fn from_published(published: Published) -> io::Result<Self> {
+        let Published {
+            parent,
+            name,
+            receipt,
+        } = published;
+        let lifecycle = Lifecycle::new(parent);
+        lifecycle.install(None, generation(1, receipt, name.clone()))?;
+        Ok(Self { lifecycle, name })
+    }
+
+    /// Whether shutdown has begun; a rebind after that must not install.
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.lifecycle.is_terminal()
+    }
+
     /// Shutdown: terminal first, then remove the current node if it matches.
     pub(crate) fn terminate(&self) -> io::Result<bool> {
         self.lifecycle.terminate()
@@ -31,19 +49,76 @@ impl Owner {
         self.lifecycle.owns_current()
     }
 
-    /// Adopt the node a rebind just created. After shutdown began it is
-    /// refused and that node is removed, so no endpoint outlives the daemon.
+    /// Adopt the rebind's node. Any failure unlinks it by receipt; one that
+    /// cannot be receipted stays and is named as residue in the error.
     pub(crate) fn refresh(&self) -> io::Result<()> {
-        let node = NodeReceipt::capture(&self.lifecycle.parent, &self.name)?;
-        let number = self.lifecycle.current_number()?.unwrap_or(0);
-        let next = generation(number + 1, node, self.name.clone());
-        self.lifecycle
-            .install(Some(number), next)
-            .map(drop)
-            .inspect_err(|_| {
-                let _ = unlink_if_matches(&self.lifecycle.parent, &self.name, node);
+        let parent = &self.lifecycle.parent;
+        let node = (0..2)
+            .map(|_| {
+                fault(Fault::Capture).map_or_else(|| NodeReceipt::capture(parent, &self.name), Err)
             })
+            .find_map(Result::ok)
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "rebound socket {:?} could not be receipted and is left in place",
+                    self.name
+                ))
+            })?;
+        let adopted = fault(Fault::Install).map_or_else(
+            || {
+                let number = self.lifecycle.current_number()?.unwrap_or(0);
+                let next = generation(number + 1, node, self.name.clone());
+                self.lifecycle.install(Some(number), next).map(drop)
+            },
+            Err,
+        );
+        adopted.map_err(|error| match unlink_if_matches(parent, &self.name, node) {
+            Ok(_) => error,
+            Err(left) => io::Error::other(format!(
+                "{error}; rebound socket {:?} left behind: {left}",
+                self.name
+            )),
+        })
     }
+}
+
+/// Test-only refresh faults; release builds have none.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Fault {
+    /// Every receipt capture of the candidate fails.
+    Capture,
+    /// Recording the receipt fails after it was captured.
+    Install,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAULT: std::cell::Cell<Option<Fault>> = const { std::cell::Cell::new(None) };
+}
+
+fn fault(which: Fault) -> Option<io::Error> {
+    #[cfg(test)]
+    if FAULT.with(std::cell::Cell::get) == Some(which) {
+        return Some(io::Error::other(format!("injected {which:?} failure")));
+    }
+    let _ = which;
+    None
+}
+
+/// Remove a dead daemon's socket by receipt, never anything else at the path.
+pub(crate) fn remove_stale_socket(path: &Path) -> io::Result<()> {
+    let (parent, name) = split(path)?;
+    let node = match NodeReceipt::capture(&parent, &name) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        other => other?,
+    };
+    if node.kind != super::NodeKind::Socket {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} exists and is not a socket", path.display()),
+        ));
+    }
+    unlink_if_matches(&parent, &name, node).map(drop)
 }
 
 fn generation(number: u64, node: NodeReceipt, name: OsString) -> Generation {
@@ -151,6 +226,19 @@ mod tests {
         rebind_then_shutdown(|owner, stale| {
             unlink_if_matches(&owner.lifecycle.parent, &owner.name, stale)
         });
+    }
+
+    #[test]
+    fn failed_refresh_without_shutdown_is_not_terminal() {
+        // The SIGUSR1 caller keeps serving on such a failure.
+        let dir = Dir::new();
+        let _first = UnixListener::bind(dir.socket()).unwrap();
+        let owner = Owner::capture(&dir.socket()).unwrap();
+        std::fs::remove_file(dir.socket()).unwrap();
+        assert!(owner.refresh().is_err());
+        assert!(!owner.is_terminal());
+        owner.terminate().unwrap();
+        assert!(owner.is_terminal());
     }
 
     #[test]

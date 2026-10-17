@@ -392,3 +392,28 @@ SIGUSR1 all go through it: terminal first, then `unlink_if_matches` on the
 current receipt. A rebind after shutdown began is refused and its node removed;
 a refused replacement listener is never installed. Lock order is `SocketLock`,
 then the lifecycle lock; nothing nests.
+
+## Slice 3c (activating): `serve_inner` uses staged publication
+
+- Choice, per start (`daemon/publication.rs`): `REMUDA_SOCKET_PUBLICATION=legacy`
+  is an operator setting, not a test hook, and wins. Otherwise `probe::qualify`
+  decides; a refusal, or an open-time `Unsupported`/`CrossesDevices` error,
+  falls back silently to the legacy bind. The reason is logged on stderr and
+  returned by `Request::SocketPublication` (`staged` or `legacy: <reason>`).
+  `remuda butler doctor` lives outside this repo and can print that value.
+- Order: `SocketLock`, live-peer probe, `catch_signals`, stale-socket removal
+  by receipt (sockets only; anything else at the path is refused and kept),
+  staged open, `Owner::from_published`. The lock is held for process life.
+- Closes SEC-674 MUST 1 (endpoint exposed only after its receipt exists: the
+  bound/listening windows are private, publication is an exclusive rename) and
+  MUST 2 (pre-rename failures clean only receipted staging artifacts and report
+  residue; later failure, signals, shutdown and SIGUSR1 all end in
+  `Owner::terminate`: terminal first, then `unlink_if_matches`).
+- SIGUSR1 (SEC-734 SHOULD, SEC-736 MUST): any `Owner::refresh` failure drops
+  the rebound listener and keeps the previous one. `refresh` receipts the
+  candidate node first (two attempts), and on any later failure unlinks it by
+  that receipt. A candidate that cannot be receipted is not provably ours: it
+  stays, the error names it as residue, and it is never adopted. No rebound
+  listener is installed without cleanup authority for its node.
+- Still advisory: same-UID processes can race any path-based step, and default
+  ACLs are only detected on the socket directory, not claimed isolated.

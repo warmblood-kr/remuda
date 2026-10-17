@@ -445,6 +445,10 @@ impl Lifecycle {
         }
     }
 
+    fn is_terminal(&self) -> bool {
+        self.state.lock().map_or(true, |state| state.terminal)
+    }
+
     fn current_number(&self) -> io::Result<Option<u64>> {
         let state = self
             .state
@@ -782,6 +786,45 @@ mod tests {
             b"sentinel"
         );
         assert_eq!(std::fs::read(scratch.0.join("source")).unwrap(), b"source");
+    }
+
+    // Mutation controls: each weakened primitive must be caught, so each is RED.
+
+    #[test]
+    #[should_panic(expected = "destination was clobbered")]
+    fn control_rename_with_flags_zero_clobbers_the_destination() {
+        let scratch = Scratch::new();
+        let parent = scratch.parent();
+        std::fs::write(scratch.0.join("source"), b"source").unwrap();
+        std::fs::write(scratch.0.join("destination"), b"sentinel").unwrap();
+        let (from, to) = (
+            c_name(OsStr::new("source")),
+            c_name(OsStr::new("destination")),
+        );
+        let (from, to) = (from.unwrap(), to.unwrap());
+        // Plain renameat is the no-flags rename: it replaces the destination.
+        let fd = parent.as_raw_fd();
+        assert_eq!(
+            unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) },
+            0
+        );
+        assert_eq!(
+            std::fs::read(scratch.0.join("destination")).unwrap(),
+            b"sentinel",
+            "destination was clobbered"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "swapped node was removed")]
+    fn control_unlink_without_a_receipt_removes_a_swapped_node() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("socket");
+        drop(UnixListener::bind(&path).unwrap());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"theirs").unwrap();
+        std::fs::remove_file(&path).unwrap(); // what skipping the receipt does
+        assert!(path.exists(), "swapped node was removed");
     }
 
     #[test]

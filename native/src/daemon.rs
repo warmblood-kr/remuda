@@ -261,6 +261,9 @@ pub fn serve_with_runtime(path: &Path, runtime: &Path) -> std::io::Result<()> {
     serve_inner(path, Some(runtime))
 }
 
+/// How the endpoint was published; `Request::SocketPublication` reports it.
+static SOCKET_PUBLICATION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     let _socket_lock = SocketLock::acquire(path, runtime)?;
     if ipc::connect(path).is_ok() {
@@ -275,11 +278,13 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     // `serve_unix` polls this together with the listener.
     #[cfg(unix)]
     let signals = catch_signals()?;
-    let listener: Listener = ipc::listen(path)?;
     #[cfg(unix)]
-    let listener = prepare_unix_listener(listener, path)?;
-    // Right after the bind: startup below can take seconds, and a path replaced
-    // meanwhile is not ours to delete on shutdown (#660).
+    let (listener, socket_owner, mode) = publication::bind_endpoint(path)?;
+    #[cfg(unix)]
+    let _ = SOCKET_PUBLICATION.set(mode.describe());
+    #[cfg(windows)]
+    let listener: Listener = ipc::listen(path)?;
+    #[cfg(windows)]
     let socket_owner = Arc::new(SocketOwnership::capture(path)?);
     pause_startup_for_tests();
     let anti_entropy = Arc::new(AntiEntropyTask::start()?);
@@ -807,6 +812,9 @@ fn start_listener(
     }
 }
 
+#[cfg(unix)]
+mod publication;
+
 #[cfg(all(test, unix))]
 #[path = "daemon/staged_startup_tests.rs"]
 mod staged_startup_tests;
@@ -1130,6 +1138,11 @@ impl SocketOwnership {
     }
 
     #[cfg(unix)]
+    fn from_owner(owner: crate::staged_socket::owner::Owner) -> Self {
+        Self { owner }
+    }
+
+    #[cfg(unix)]
     fn refresh(&self) -> std::io::Result<()> {
         self.owner.refresh()
     }
@@ -1414,10 +1427,13 @@ fn rebind_after_sigusr1(
     }
     match ipc::listen(path) {
         Ok(replacement) => match prepare_unix_listener(replacement, path) {
-            // A listener the owner refused (shutdown began) is never installed.
+            // Any refresh failure drops the rebound listener (the owner has
+            // removed its node, or named it as residue); the old one stays.
             Ok(replacement) => match socket_owner.refresh() {
                 Ok(()) => *listener = replacement,
-                Err(error) => eprintln!("remuda daemon: could not record rebound socket: {error}"),
+                Err(error) => eprintln!(
+                    "remuda daemon: rebound socket dropped, previous listener kept: {error}"
+                ),
             },
             Err(error) => eprintln!("remuda daemon: could not prepare rebound socket: {error}"),
         },
@@ -1556,6 +1572,15 @@ fn handle_request(
         }
 
         Request::Version => reply(&stream, &Response::Value(crate::dist::BUILD_VERSION.into())),
+        Request::SocketPublication => reply(
+            &stream,
+            &Response::Value(
+                SOCKET_PUBLICATION
+                    .get()
+                    .cloned()
+                    .unwrap_or_else(|| "legacy: not recorded".into()),
+            ),
+        ),
 
         Request::ClusterRegistrySync { .. } | Request::ClusterRegistryUpdate { .. } => {
             refuse_cluster_registry(&stream)
