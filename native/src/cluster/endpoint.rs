@@ -25,10 +25,8 @@ enum Publish {
     Superseded,
 }
 
-/// A refresh samples the listener over IPC, so its sample can be older than
-/// the listener's own publication. The write is therefore compare-and-set on
-/// the record version taken *before* the sample: a rebind that publishes in
-/// between bumps the version and the stale write is refused, never replicated.
+/// Compare-and-set on the own-record version taken before the status sample,
+/// so a stale sample never overwrites a newer listener endpoint.
 fn refresh_with(
     mut status: impl FnMut() -> ListenerStatus,
     mut version: impl FnMut() -> io::Result<u64>,
