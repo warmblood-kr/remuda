@@ -2,7 +2,7 @@
 //! One receipt per endpoint: shutdown sets terminal first, then unlinks only
 //! the node that receipt names. Lock order: `SocketLock`, then lifecycle.
 
-use super::{unlink_if_matches, Generation, Lifecycle, NodeReceipt};
+use super::{startup::Published, unlink_if_matches, Generation, Lifecycle, NodeReceipt};
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
@@ -20,6 +20,24 @@ impl Owner {
         let lifecycle = Lifecycle::new(parent);
         lifecycle.install(None, generation(1, node, name.clone()))?;
         Ok(Self { lifecycle, name })
+    }
+
+    /// Adopt the node a staged publication just committed: its receipt came
+    /// from the transaction, not from a later look at the path.
+    pub(crate) fn from_published(published: Published) -> io::Result<Self> {
+        let Published {
+            parent,
+            name,
+            receipt,
+        } = published;
+        let lifecycle = Lifecycle::new(parent);
+        lifecycle.install(None, generation(1, receipt, name.clone()))?;
+        Ok(Self { lifecycle, name })
+    }
+
+    /// Whether shutdown has begun; a rebind after that must not install.
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.lifecycle.is_terminal()
     }
 
     /// Shutdown: terminal first, then remove the current node if it matches.

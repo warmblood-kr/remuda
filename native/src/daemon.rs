@@ -807,6 +807,9 @@ fn start_listener(
     }
 }
 
+#[cfg(unix)]
+mod publication;
+
 #[cfg(all(test, unix))]
 #[path = "daemon/staged_startup_tests.rs"]
 mod staged_startup_tests;
@@ -1130,6 +1133,16 @@ impl SocketOwnership {
     }
 
     #[cfg(unix)]
+    fn from_owner(owner: crate::staged_socket::owner::Owner) -> Self {
+        Self { owner }
+    }
+
+    #[cfg(unix)]
+    fn is_terminal(&self) -> bool {
+        self.owner.is_terminal()
+    }
+
+    #[cfg(unix)]
     fn refresh(&self) -> std::io::Result<()> {
         self.owner.refresh()
     }
@@ -1414,10 +1427,15 @@ fn rebind_after_sigusr1(
     }
     match ipc::listen(path) {
         Ok(replacement) => match prepare_unix_listener(replacement, path) {
-            // A listener the owner refused (shutdown began) is never installed.
             Ok(replacement) => match socket_owner.refresh() {
                 Ok(()) => *listener = replacement,
-                Err(error) => eprintln!("remuda daemon: could not record rebound socket: {error}"),
+                // Shutdown began: the owner removed that node, so drop the listener.
+                Err(_) if socket_owner.is_terminal() => {}
+                // Otherwise stay reachable; only the cleanup record is missing.
+                Err(error) => {
+                    *listener = replacement;
+                    eprintln!("remuda daemon: could not record rebound socket: {error}");
+                }
             },
             Err(error) => eprintln!("remuda daemon: could not prepare rebound socket: {error}"),
         },

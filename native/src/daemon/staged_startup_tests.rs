@@ -41,69 +41,11 @@ impl Drop for Scratch {
     }
 }
 
-/// A listener imported from the staged transaction, plus private residue.
-struct Imported {
-    listener: Listener,
-    owner: Arc<SocketOwnership>,
-    residue: Vec<String>,
-}
-
-/// Primary failure plus every entry left behind, kept through the importer.
-#[derive(Debug)]
-struct SeamError {
-    error: std::io::Error,
-    residue: Vec<String>,
-}
-impl From<std::io::Error> for SeamError {
-    fn from(error: std::io::Error) -> Self {
-        Self {
-            error,
-            residue: Vec::new(),
-        }
-    }
-}
+use super::publication::{bind_staged, Imported, StagedError as SeamError};
 type StartupResult = Result<Imported, SeamError>;
 
-/// Test-only seam: the staged transaction, imported the way slice 3 will wire
-/// it into startup. Production `serve_inner` still uses the legacy path.
 fn staged_startup_listener(path: &Path, controls: &Controls) -> StartupResult {
-    let opened = crate::staged_socket::startup::open(path, controls).map_err(|e| SeamError {
-        error: e.error,
-        residue: e.residue,
-    })?;
-    let published = opened.published;
-    let mut residue = opened.residue;
-    // Install published authority first so a panic still cleans up.
-    let owner = SocketOwnership::capture(path)?;
-    let listener = Listener::UdSocket(opened.listener.into());
-    let imported = if matches!(
-        controls.failure,
-        Some(Failure::Import | Failure::ImportCleanup)
-    ) {
-        Err(std::io::Error::other("injected import failure"))
-    } else {
-        listener.set_nonblocking(ListenerNonblockingMode::Accept)
-    };
-    if let Err(error) = imported {
-        drop(listener);
-        let inject = controls.failure == Some(Failure::ImportCleanup);
-        if inject {
-            residue.push(format!(
-                "published socket {}: injected published unlink failure",
-                path.display()
-            ));
-        } else {
-            published.abort(path, &mut residue);
-        }
-        // Explicit abort owns the outcome; the legacy Drop must not undo residue.
-        std::mem::forget(owner);
-        return Err(SeamError { error, residue });
-    }
-    Ok(Imported {
-        listener,
-        owner: Arc::new(owner),
-        residue,
-    })
+    bind_staged(path, controls)
 }
 
 struct Harness {

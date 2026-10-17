@@ -445,6 +445,10 @@ impl Lifecycle {
         }
     }
 
+    fn is_terminal(&self) -> bool {
+        self.state.lock().map_or(true, |state| state.terminal)
+    }
+
     fn current_number(&self) -> io::Result<Option<u64>> {
         let state = self
             .state
