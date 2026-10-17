@@ -1004,27 +1004,32 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
     let anchor_text = terminal_rows_text(&anchor_cells);
     let anchor_history = ui.scrollback["stream"].history_rows;
 
+    // A capture taken while output is still arriving may settle on a stale
+    // offset that the next frame corrects (see `capture_anchored`), so keep
+    // polling until one capture is exact instead of asserting on the first.
+    let last = std::cell::RefCell::new(String::new());
     wait_for_output(
         || {
             let (cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("capture output");
             let state = ui.scrollback["stream"];
-            if state.history_rows >= anchor_history + 3 {
-                assert_eq!(
-                    state.offset,
-                    3 + (state.history_rows - anchor_history),
-                    "the offset must advance with appended history rows"
-                );
-                assert_eq!(
-                    terminal_rows_text(&cells),
-                    anchor_text,
-                    "new output must not move the scrolled content"
-                );
-                Some(())
-            } else {
-                None
+            if state.history_rows < anchor_history + 3 {
+                return None;
             }
+            let expected = 3 + (state.history_rows - anchor_history);
+            let exact = state.offset == expected && terminal_rows_text(&cells) == anchor_text;
+            *last.borrow_mut() = format!(
+                "offset {} (expected {expected}), content moved: {}",
+                state.offset,
+                terminal_rows_text(&cells) != anchor_text
+            );
+            exact.then_some(())
         },
-        || "history did not grow while scrolled".into(),
+        || {
+            format!(
+                "scrolled content never stayed anchored as history grew; last capture: {}",
+                last.borrow()
+            )
+        },
     );
     let _ = client::request(
         &path,
