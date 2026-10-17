@@ -174,7 +174,7 @@ fn bind_path(fd: &OwnedFd, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn open_dir_nofollow(path: &Path) -> io::Result<File> {
+pub(super) fn open_dir_nofollow(path: &Path) -> io::Result<File> {
     std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)

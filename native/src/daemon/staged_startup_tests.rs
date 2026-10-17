@@ -779,8 +779,8 @@ fn staged_abort_follows_the_parent_fd_not_the_path() {
 fn control_path_based_abort_misses_the_node_after_parent_swap() {
     abort_after_parent_swap(|scratch, _published, residue| {
         // Even handed the real dev/ino, a path lookup lands in the swapped dir.
-        let real = std::fs::symlink_metadata(scratch.0.with_extension("moved").join("public"))
-            .unwrap();
+        let real =
+            std::fs::symlink_metadata(scratch.0.with_extension("moved").join("public")).unwrap();
         path_based_abort(&scratch.public(), (real.dev(), real.ino()), residue);
     });
 }
