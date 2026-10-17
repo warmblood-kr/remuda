@@ -723,3 +723,67 @@ fn control_path_based_abort_misses_the_node_after_parent_swap() {
         path_based_abort(&scratch.public(), (real.dev(), real.ino()), residue);
     });
 }
+
+/// Clients that connect during the private listening window queue on the
+/// backlog and are served after publication; the public name stays absent
+/// until then, so nobody sees a half-published endpoint.
+#[test]
+fn staged_startup_queued_clients_are_served_after_publish() {
+    const QUEUED: usize = 3;
+    let scratch = Scratch::new();
+    let public = scratch.public();
+    let mut harness = Harness::start(public.clone(), Boundary::Listening, None);
+    let staged = harness.reached();
+    let deadline = harness.deadline;
+    let clients: Vec<_> = (0..QUEUED)
+        .map(|_| {
+            let staged = staged.clone();
+            std::thread::spawn(move || {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                crate::client::request_with_timeout(&staged, &Request::Version, remaining)
+            })
+        })
+        .collect();
+    // Let every client reach the backlog before publication.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(ipc::connect(&public).is_err(), "public name visible early");
+    assert!(
+        clients.iter().all(|c| !c.is_finished()),
+        "served unaccepted"
+    );
+    let Imported {
+        listener, owner, ..
+    } = harness.finish().unwrap();
+    assert!(owner.owns_path());
+    let server = std::thread::spawn(move || {
+        for _ in 0..=QUEUED {
+            let mut poll = libc::pollfd {
+                fd: socket_fd(&listener),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(unsafe { libc::poll(&mut poll, 1, remaining.as_millis() as i32) } > 0);
+            let stream = listener.accept().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            assert!(matches!(
+                read_request(&stream, &mut reader).unwrap(),
+                Some(Request::Version)
+            ));
+            reply(&stream, &Response::Value(crate::dist::BUILD_VERSION.into())).unwrap();
+        }
+    });
+    // One more client through the published name, behind the queued ones.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    assert!(matches!(
+        crate::client::request_with_timeout(&public, &Request::Version, remaining),
+        Ok(Response::Value(_))
+    ));
+    for client in clients {
+        assert!(matches!(client.join().unwrap(), Ok(Response::Value(_))));
+    }
+    server.join().unwrap();
+    drop(owner);
+    assert!(!public.exists());
+}
