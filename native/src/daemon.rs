@@ -1095,23 +1095,21 @@ fn socket_lock_timeout_message(lock_path: &Path, holder: Option<u32>) -> String 
     }
 }
 
-/// The socket inode this daemon actually bound. Cleanup is conditional so a
+/// The socket node this daemon actually bound. Cleanup is conditional so a
 /// replacement endpoint installed at the same pathname belongs to its creator.
 struct SocketOwnership {
-    path: PathBuf,
     #[cfg(unix)]
-    identity: Mutex<(u64, u64)>,
+    owner: crate::staged_socket::owner::Owner,
+    #[cfg(windows)]
+    path: PathBuf,
 }
 
 impl SocketOwnership {
     fn capture(path: &Path) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt;
-            let metadata = std::fs::symlink_metadata(path)?;
             Ok(Self {
-                path: path.to_path_buf(),
-                identity: Mutex::new((metadata.dev(), metadata.ino())),
+                owner: crate::staged_socket::owner::Owner::capture(path)?,
             })
         }
         #[cfg(windows)]
@@ -1126,39 +1124,19 @@ impl SocketOwnership {
         #[cfg(windows)]
         let _ = &self.path;
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let Ok(identity) = self.identity.lock() else {
-                return;
-            };
-            if std::fs::symlink_metadata(&self.path)
-                .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == *identity)
-            {
-                let _ = std::fs::remove_file(&self.path);
-            }
+        if let Err(error) = self.owner.terminate() {
+            eprintln!("remuda daemon: could not remove socket: {error}");
         }
     }
 
     #[cfg(unix)]
     fn refresh(&self) -> std::io::Result<()> {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = std::fs::symlink_metadata(&self.path)?;
-        let mut identity = self
-            .identity
-            .lock()
-            .map_err(|_| std::io::Error::other("socket ownership lock poisoned"))?;
-        *identity = (metadata.dev(), metadata.ino());
-        Ok(())
+        self.owner.refresh()
     }
 
     #[cfg(unix)]
     fn owns_path(&self) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        let Ok(identity) = self.identity.lock() else {
-            return false;
-        };
-        std::fs::symlink_metadata(&self.path)
-            .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == *identity)
+        self.owner.owns_path()
     }
 }
 
@@ -1436,13 +1414,11 @@ fn rebind_after_sigusr1(
     }
     match ipc::listen(path) {
         Ok(replacement) => match prepare_unix_listener(replacement, path) {
-            Ok(replacement) => {
-                let refreshed = socket_owner.refresh();
-                *listener = replacement;
-                if let Err(error) = refreshed {
-                    eprintln!("remuda daemon: could not record rebound socket: {error}");
-                }
-            }
+            // A listener the owner refused (shutdown began) is never installed.
+            Ok(replacement) => match socket_owner.refresh() {
+                Ok(()) => *listener = replacement,
+                Err(error) => eprintln!("remuda daemon: could not record rebound socket: {error}"),
+            },
             Err(error) => eprintln!("remuda daemon: could not prepare rebound socket: {error}"),
         },
         Err(error) => eprintln!("remuda daemon: could not rebind socket: {error}"),

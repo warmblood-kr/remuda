@@ -74,10 +74,7 @@ fn staged_startup_listener(path: &Path, controls: &Controls) -> StartupResult {
     let published = opened.published;
     let mut residue = opened.residue;
     // Install published authority first so a panic still cleans up.
-    let owner = SocketOwnership {
-        path: path.to_path_buf(),
-        identity: Mutex::new((opened.dev, opened.ino)),
-    };
+    let owner = SocketOwnership::capture(path)?;
     let listener = Listener::UdSocket(opened.listener.into());
     let imported = if matches!(
         controls.failure,
