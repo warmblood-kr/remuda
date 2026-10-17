@@ -1143,11 +1143,6 @@ impl SocketOwnership {
     }
 
     #[cfg(unix)]
-    fn is_terminal(&self) -> bool {
-        self.owner.is_terminal()
-    }
-
-    #[cfg(unix)]
     fn refresh(&self) -> std::io::Result<()> {
         self.owner.refresh()
     }
@@ -1432,15 +1427,13 @@ fn rebind_after_sigusr1(
     }
     match ipc::listen(path) {
         Ok(replacement) => match prepare_unix_listener(replacement, path) {
+            // Any refresh failure drops the rebound listener (the owner has
+            // removed its node, or named it as residue); the old one stays.
             Ok(replacement) => match socket_owner.refresh() {
                 Ok(()) => *listener = replacement,
-                // Shutdown began: the owner removed that node, so drop the listener.
-                Err(_) if socket_owner.is_terminal() => {}
-                // Otherwise stay reachable; only the cleanup record is missing.
-                Err(error) => {
-                    *listener = replacement;
-                    eprintln!("remuda daemon: could not record rebound socket: {error}");
-                }
+                Err(error) => eprintln!(
+                    "remuda daemon: rebound socket dropped, previous listener kept: {error}"
+                ),
             },
             Err(error) => eprintln!("remuda daemon: could not prepare rebound socket: {error}"),
         },

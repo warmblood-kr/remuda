@@ -735,22 +735,18 @@ fn staged_startup_queued_clients_are_served_after_publish() {
     let mut harness = Harness::start(public.clone(), Boundary::Listening, None);
     let staged = harness.reached();
     let deadline = harness.deadline;
-    let clients: Vec<_> = (0..QUEUED)
+    // connect() returns once the kernel queued the connection, so these are
+    // in the backlog before publication with no timing assumption; each request
+    // is written now and waits for its reply.
+    let queued: Vec<_> = (0..QUEUED)
         .map(|_| {
-            let staged = staged.clone();
-            std::thread::spawn(move || {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                crate::client::request_with_timeout(&staged, &Request::Version, remaining)
-            })
+            let stream = ipc::connect(&staged).unwrap();
+            let line = serde_json::to_string(&Request::Version).unwrap() + "\n";
+            (&stream).write_all(line.as_bytes()).unwrap();
+            stream
         })
         .collect();
-    // Let every client reach the backlog before publication.
-    std::thread::sleep(Duration::from_millis(200));
     assert!(ipc::connect(&public).is_err(), "public name visible early");
-    assert!(
-        clients.iter().all(|c| !c.is_finished()),
-        "served unaccepted"
-    );
     let Imported {
         listener, owner, ..
     } = harness.finish().unwrap();
@@ -780,10 +776,83 @@ fn staged_startup_queued_clients_are_served_after_publish() {
         crate::client::request_with_timeout(&public, &Request::Version, remaining),
         Ok(Response::Value(_))
     ));
-    for client in clients {
-        assert!(matches!(client.join().unwrap(), Ok(Response::Value(_))));
+    for stream in queued {
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut BufReader::new(&stream), &mut line).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Response>(&line),
+            Ok(Response::Value(_))
+        ));
     }
     server.join().unwrap();
     drop(owner);
+    assert!(!public.exists());
+}
+
+/// Clears the thread-local refresh fault even when an assertion panics.
+struct Armed;
+impl Armed {
+    fn new(fault: crate::staged_socket::owner::Fault) -> Self {
+        crate::staged_socket::owner::FAULT.with(|f| f.set(Some(fault)));
+        Self
+    }
+}
+impl Drop for Armed {
+    fn drop(&mut self) {
+        crate::staged_socket::owner::FAULT.with(|f| f.set(None));
+    }
+}
+
+/// A daemon whose socket node vanished, then a SIGUSR1 rebind with `fault`.
+/// Returns the scratch, public path, old fd, new fd and the owner.
+fn sigusr1_rebind(
+    fault: Option<crate::staged_socket::owner::Fault>,
+) -> (Scratch, PathBuf, i32, i32, Arc<SocketOwnership>) {
+    let scratch = Scratch::new();
+    let public = scratch.public();
+    let Imported {
+        mut listener,
+        owner,
+        ..
+    } = staged_startup_listener(&public, &Controls::default()).unwrap();
+    std::fs::remove_file(&public).unwrap();
+    assert!(!owner.owns_path());
+    let before = unix_listener_fd(&listener);
+    let _armed = fault.map(Armed::new);
+    rebind_after_sigusr1(&mut listener, &public, None, &owner);
+    let after = unix_listener_fd(&listener);
+    std::mem::forget(listener); // the fds are only compared, never reused
+    (scratch, public, before, after, owner)
+}
+
+#[test]
+fn sigusr1_refresh_failure_keeps_old_listener_and_removes_the_candidate() {
+    let (_scratch, public, before, after, owner) =
+        sigusr1_rebind(Some(crate::staged_socket::owner::Fault::Install));
+    assert_eq!(before, after, "the previous listener keeps serving");
+    assert!(!public.exists(), "candidate node removed by its receipt");
+    owner.cleanup();
+    assert!(!public.exists(), "shutdown leaves no node");
+}
+
+#[test]
+fn sigusr1_unreceiptable_candidate_is_dropped_and_reported_not_adopted() {
+    let (_scratch, public, before, after, owner) =
+        sigusr1_rebind(Some(crate::staged_socket::owner::Fault::Capture));
+    assert_eq!(before, after);
+    // Not provably ours, so it stays and the owner reports it instead.
+    let _armed = Armed::new(crate::staged_socket::owner::Fault::Capture);
+    let error = owner.refresh().unwrap_err().to_string();
+    assert!(error.contains("left in place"), "{error}");
+    assert!(public.exists());
+    assert!(!owner.owns_path(), "never adopted without a receipt");
+}
+
+#[test]
+fn sigusr1_rebind_without_fault_installs_and_shutdown_removes_it() {
+    let (_scratch, public, before, after, owner) = sigusr1_rebind(None);
+    assert_ne!(before, after, "the replacement listener is installed");
+    assert!(owner.owns_path());
+    owner.cleanup();
     assert!(!public.exists());
 }

@@ -409,10 +409,11 @@ then the lifecycle lock; nothing nests.
   MUST 2 (pre-rename failures clean only receipted staging artifacts and report
   residue; later failure, signals, shutdown and SIGUSR1 all end in
   `Owner::terminate`: terminal first, then `unlink_if_matches`).
-- SIGUSR1 availability (SEC-734 SHOULD): PR2 dropped a successfully rebound
-  listener on any refresh error. Now only a refresh refused because shutdown
-  began drops it (and removes its node); any other refresh error installs the
-  listener, so the daemon stays reachable, and logs that the cleanup record is
-  missing.
+- SIGUSR1 (SEC-734 SHOULD, SEC-736 MUST): any `Owner::refresh` failure drops
+  the rebound listener and keeps the previous one. `refresh` receipts the
+  candidate node first (two attempts), and on any later failure unlinks it by
+  that receipt. A candidate that cannot be receipted is not provably ours: it
+  stays, the error names it as residue, and it is never adopted. No rebound
+  listener is installed without cleanup authority for its node.
 - Still advisory: same-UID processes can race any path-based step, and default
   ACLs are only detected on the socket directory, not claimed isolated.
