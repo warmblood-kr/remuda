@@ -229,11 +229,14 @@ fn daemon_keeps_answering_ls_with_an_explicit_ephemeral_cluster_listener() {
         &Request::ClusterListener(ListenerOp::Status),
     )
     .expect("read listener status from the isolated daemon");
-    assert!(matches!(
-        response,
-        Response::ClusterListenerStatus(ListenerStatus::On { addr, .. })
-            if addr.ip().is_loopback() && addr.port() != 0
-    ));
+    assert!(
+        matches!(
+            &response,
+            Response::ClusterListenerStatus(ListenerStatus::On { addr, .. })
+                if addr.ip().is_loopback() && addr.port() != 0
+        ),
+        "unexpected listener status: {response:?}"
+    );
     let listed = Command::new(env!("CARGO_BIN_EXE_remuda"))
         .args(["-s", "s", "ls"])
         .env("REMUDA_RUNTIME_DIR", &daemon.runtime)
