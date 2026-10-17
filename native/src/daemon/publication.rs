@@ -145,7 +145,9 @@ pub(super) fn bind_endpoint(
 }
 
 fn legacy(path: &Path, mode: Mode) -> std::io::Result<(Listener, Arc<SocketOwnership>, Mode)> {
-    if let Mode::Legacy(reason) = &mode {
+    // Over the hard limit the bind below refuses with its own clear error.
+    let fits = path.as_os_str().len() <= crate::staged_socket::SOCKET_PATH_LIMIT;
+    if let (Mode::Legacy(reason), true) = (&mode, fits) {
         eprintln!("remuda daemon: legacy socket bind ({reason})");
     }
     let listener = prepare_unix_listener(ipc::listen(path)?, path)?;
