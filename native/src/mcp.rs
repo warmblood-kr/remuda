@@ -268,6 +268,10 @@ fn call_response(id: Value, response: Response) -> String {
         ),
         Response::ClusterRegistryPage { .. }
         | Response::ClusterRegistryAck { .. }
+        | Response::ClusterVfsIndexPage { .. }
+        | Response::ClusterVfsAck { .. }
+        | Response::ClusterVfsBlobHave(_)
+        | Response::ClusterVfsBlobChunk { .. }
         | Response::ClusterListenerStatus(_) => ok_reply(
             id,
             tool_error("cluster control responses are not exposed over MCP"),

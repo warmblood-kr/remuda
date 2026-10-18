@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Cluster: a cluster-wide virtual file store (#742). `remuda vfs put|get|ls|
+  stat|rm|resolve|sync|config` stores files at stable `remuda://CLUSTER/PATH`
+  URIs (`remuda:///PATH` means this cluster). Content is sha256-addressed and
+  kept on `--replicas N` nodes (default 3), chosen by rendezvous hashing over
+  admitted nodes. Names replicate to every node, last writer wins. A node that
+  has failed requests for longer than 120 s is treated as down, and the
+  next-ranked node pulls a copy, so the copy count recovers after a node is
+  lost. Daemon Lua gets read-only `remuda.vfs.stat/read/list`, which answer
+  from local data only. Transfer uses four new requests on the existing
+  authenticated cluster channel, served by the listener with their own
+  per-peer rate limit and refused on the remote-control front. Any admitted
+  node may read and write every path. Files are limited to 64 MiB. Existing
+  per-node paths are unchanged. Design: docs/design-742-cluster-vfs.md.
+
 - Lua: `remuda.session.new` and `remuda.new` now return `name, instance_id`, the
   ID of the launch that call started, taken from the same registry insertion
   (never a later lookup by name). Single-value assignments still get the name.
