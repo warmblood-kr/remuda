@@ -1,8 +1,10 @@
 //! Explicit reserved bootstrap; no daemon launch selector or legacy rescue.
-use super::api::{Manifest, PublicationStatus};
+use super::api::{Identity, Manifest, PublicationStatus};
 use super::entry::Launch;
 use super::inventory::disk::Store;
-use super::inventory::model::{hash, Lease, Publication, TerminalEnd};
+use super::inventory::model::{
+    hash, Error as InventoryError, Lease, Publication, Settled, TerminalEnd,
+};
 use super::owned::{Owned, Staged};
 use super::server::Server;
 use super::unix::Endpoint;
@@ -55,10 +57,20 @@ impl Gate {
             PublicationStatus::Ready | PublicationStatus::Complete
         )
     }
-    pub fn retention_settled(&self) -> bool {
-        self.store
+    /// One store read outside every host lock; the terminal fact is monotonic.
+    pub fn settle(&self, identity: &Identity) -> Result<Settled, &'static str> {
+        let index = self
+            .store
             .read()
-            .is_ok_and(|index| self.lease.has_unconsumed(&index) == Ok(false))
+            .map_err(|_| "host_settlement_unavailable")?;
+        let settled = self.lease.settled(&index).map_err(|error| match error {
+            InventoryError::Busy => "host_retention_pending",
+            _ => "host_settlement_unavailable",
+        })?;
+        if !settled.confirms(&self.lease, identity) {
+            return Err("wrong_host_or_session_identity");
+        }
+        Ok(settled)
     }
 }
 fn invalid(error: impl std::fmt::Display) -> io::Error {
