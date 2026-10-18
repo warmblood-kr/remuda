@@ -55,6 +55,7 @@ mod unix {
             let child = Command::new(env!("CARGO_BIN_EXE_remuda"))
                 .args(["-s", server, "daemon"])
                 .env("HOME", home)
+                .env("XDG_STATE_HOME", home.join(".local/state"))
                 .env("XDG_RUNTIME_DIR", runtime)
                 .env_remove("REMUDA_RUNTIME_DIR")
                 .env_remove("XDG_CONFIG_HOME")

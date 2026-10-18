@@ -83,6 +83,7 @@ fn env_command(args: &[&str], dir: &Path) -> Command {
         .env("XDG_DATA_HOME", dir.join("data"))
         .env("XDG_CACHE_HOME", dir.join("cache"))
         .env("HOME", dir.join("home"))
+        .env("XDG_STATE_HOME", dir.join("state"))
         .env("REMUDA_NO_UPDATE_CHECK", "1");
     command
 }
@@ -174,6 +175,7 @@ impl PromptClient {
             .env("XDG_DATA_HOME", dir.join("data"))
             .env("XDG_CACHE_HOME", dir.join("cache"))
             .env("HOME", dir.join("home"))
+            .env("XDG_STATE_HOME", dir.join("state"))
             .env("REMUDA_NO_UPDATE_CHECK", "1")
             .stdin(Stdio::from(
                 slave_file.try_clone().expect("clone pty slave"),
