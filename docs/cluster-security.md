@@ -14,6 +14,12 @@ Ancestor directories above the cluster directory are created with the
 platform's default permissions; only the cluster directory itself is forced
 to mode 0700.
 
+The identity is also encrypted at rest (XChaCha20-Poly1305) under a random
+per-node key kept in `keys/node.key`, outside the cluster directory, so a copy
+of the cluster state without that key holds no secret. Older plaintext
+identities are re-encrypted once at daemon start. See
+[credential-encryption.md](credential-encryption.md) (#746).
+
 This protects stored identity material from other local users under the normal
 Unix ownership model. It does not protect against compromise of the same user
 account, root, or a process that can modify the user's state directory.

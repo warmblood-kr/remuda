@@ -1,17 +1,18 @@
 //! Node identity: Snow key generation, secure local persistence, and fingerprints.
 
 use super::encoding;
+use super::sealed;
 use super::storage;
 use std::fs;
-#[cfg(not(windows))]
-use std::fs::OpenOptions;
 use std::io;
-use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 const NOISE_PATTERN: &str = "Noise_NN_25519_ChaChaPoly_SHA256";
 const IDENTITY_FILE: &str = "identity.key";
+const IDENTITY_LEN: usize = 64;
+// Authenticated with the sealed file, so it cannot be swapped into another slot.
+const IDENTITY_LABEL: &str = "cluster/identity.key";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeIdentity {
@@ -86,6 +87,9 @@ pub(super) fn init_identity_locked(dir: &Path) -> io::Result<(NodeIdentity, bool
                 ))
             }
             Ok(meta) if meta.file_type().is_file() && !meta.file_type().is_symlink() => {
+                if let Some(migrated) = migrate_identity_locked(dir)? {
+                    eprintln!("remuda: {}", super::describe_migrated_credential(&migrated));
+                }
                 (load_identity_at(dir)?, false)
             }
             Ok(_) => {
@@ -100,11 +104,12 @@ pub(super) fn init_identity_locked(dir: &Path) -> io::Result<(NodeIdentity, bool
                         .generate_keypair()
                         .map_err(io::Error::other)?;
                 let private = Zeroizing::new(keypair.private);
-                let mut material = Zeroizing::new(Vec::with_capacity(64));
+                let mut material = Zeroizing::new(Vec::with_capacity(IDENTITY_LEN));
                 material.extend_from_slice(&private);
                 material.extend_from_slice(&keypair.public);
-                storage::atomic_write(&key_path, &material)?;
-                (identity_from_parts(&material)?, true)
+                let identity = identity_from_parts(&material)?;
+                write_identity_locked(dir, &material)?;
+                (identity, true)
             }
             Err(e) => return Err(e),
         };
@@ -131,15 +136,67 @@ pub(super) fn rotate_identity_locked(dir: &Path) -> io::Result<NodeIdentity> {
         .generate_keypair()
         .map_err(io::Error::other)?;
     let private = Zeroizing::new(keypair.private);
-    let mut material = Zeroizing::new(Vec::with_capacity(64));
+    let mut material = Zeroizing::new(Vec::with_capacity(IDENTITY_LEN));
     material.extend_from_slice(&private);
     material.extend_from_slice(&keypair.public);
-    storage::atomic_write(&key_path, &material)?;
-    identity_from_parts(&material)
+    let identity = identity_from_parts(&material)?;
+    write_identity_locked(dir, &material)?;
+    Ok(identity)
+}
+
+/// Seal the 64-byte identity under the node key (creating the key on first
+/// use) and atomically replace `identity.key`. The caller holds the cluster lock.
+fn write_identity_locked(dir: &Path, material: &[u8]) -> io::Result<sealed::NodeKeyState> {
+    let (key, created) = sealed::load_or_create_node_key(dir)?;
+    let file = sealed::seal(&key, IDENTITY_LABEL, material)?;
+    storage::atomic_write(&dir.join(IDENTITY_FILE), &file)?;
+    Ok(if created {
+        sealed::NodeKeyState::Created
+    } else {
+        sealed::NodeKeyState::Existing
+    })
+}
+
+/// One plaintext credential re-encrypted in place by [`migrate_identity_locked`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigratedCredential {
+    /// The credential file, now sealed; its plaintext content was replaced.
+    pub path: PathBuf,
+    /// The node key that seals it.
+    pub node_key: PathBuf,
+    /// Whether the migration created that node key.
+    pub node_key_created: bool,
+}
+
+/// Re-encrypt a plaintext `identity.key` in place (same fingerprint); the
+/// atomic replace removes the plaintext. `None` when absent or already sealed.
+/// The caller holds the cluster lock.
+pub(super) fn migrate_identity_locked(dir: &Path) -> io::Result<Option<MigratedCredential>> {
+    let (material, format) = match read_identity_material_at(dir) {
+        Ok(read) => read,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if format == Format::Sealed {
+        return Ok(None);
+    }
+    let state = write_identity_locked(dir, &material[..])?;
+    // Read back through the sealed path before reporting success.
+    let (reread, format) = read_identity_material_at(dir)?;
+    if format != Format::Sealed || reread[..] != material[..] {
+        return Err(io::Error::other(
+            "cluster identity re-encryption did not read back identically",
+        ));
+    }
+    Ok(Some(MigratedCredential {
+        path: dir.join(IDENTITY_FILE),
+        node_key: sealed::node_key_path(dir),
+        node_key_created: state == sealed::NodeKeyState::Created,
+    }))
 }
 
 pub(super) fn load_identity_at(dir: &Path) -> io::Result<NodeIdentity> {
-    let bytes = read_identity_material_at(dir)?;
+    let (bytes, _) = read_identity_material_at(dir)?;
     identity_from_parts(&bytes[..])
 }
 
@@ -147,70 +204,64 @@ pub(super) fn load_identity_at(dir: &Path) -> io::Result<NodeIdentity> {
 /// The returned key is zeroized when dropped and must never be logged.
 pub fn load_static_private_key() -> io::Result<Zeroizing<Vec<u8>>> {
     let dir = storage::cluster_state_dir()?.join("cluster");
-    let bytes = read_identity_material_at(&dir)?;
+    let (bytes, _) = read_identity_material_at(&dir)?;
     Ok(Zeroizing::new(bytes[..32].to_vec()))
 }
 
-fn read_identity_material_at(dir: &Path) -> io::Result<Zeroizing<[u8; 64]>> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Format {
+    Sealed,
+    /// Written before #746: 64 plaintext bytes. Still read, so a node whose
+    /// migration has not run yet keeps working; every write seals.
+    LegacyPlaintext,
+}
+
+/// Load this node's 64-byte identity (32-byte Noise private key, then the
+/// public key) from a cluster directory, decrypting it with the node key.
+/// For tools and tests that need the raw key; it must never be logged.
+pub fn load_keypair_at(cluster_dir: &Path) -> io::Result<Zeroizing<Vec<u8>>> {
+    let (material, _) = read_identity_material_at(cluster_dir)?;
+    Ok(Zeroizing::new(material.to_vec()))
+}
+
+fn read_identity_material_at(dir: &Path) -> io::Result<(Zeroizing<[u8; IDENTITY_LEN]>, Format)> {
     let path = dir.join(IDENTITY_FILE);
-    #[cfg(windows)]
-    let mut file = {
-        let file = super::windows_security::open_for_read(&path).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                io::Error::new(
-                    error.kind(),
-                    format!("cluster identity {} not found", path.display()),
-                )
-            } else {
-                error
-            }
-        })?;
-        storage::check_private_file(&file, "cluster identity", &path)?;
-        file
+    let bytes =
+        sealed::read_private_file(&path, "cluster identity", sealed::sealed_len(IDENTITY_LEN))?;
+    let (plain, format) = if sealed::is_sealed(&bytes) {
+        let Some(key) = sealed::load_node_key(dir)? else {
+            // Never NotFound: callers treat that as "not initialized" and
+            // could otherwise mint a new identity over this one.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cluster identity {} is encrypted, but its node key {} is missing \
+                     (a state directory copied without its node key cannot be read). \
+                     Restore that node key from this machine, or remove {} and run \
+                     `remuda cluster init` to start a new identity",
+                    path.display(),
+                    sealed::node_key_path(dir).display(),
+                    dir.display()
+                ),
+            ));
+        };
+        (
+            sealed::open(&key, IDENTITY_LABEL, &bytes, &path)?,
+            Format::Sealed,
+        )
+    } else {
+        (bytes, Format::LegacyPlaintext)
     };
-    #[cfg(not(windows))]
-    let mut file = {
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
-        }
-        #[allow(unused_mut)]
-        let mut file = options.open(&path).map_err(|error| {
-            #[cfg(unix)]
-            if error.raw_os_error() == Some(libc::ELOOP) {
-                return io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "{} is a symlink; refusing (remove it to re-initialize)",
-                        path.display()
-                    ),
-                );
-            }
-            if error.kind() == io::ErrorKind::NotFound {
-                return io::Error::new(
-                    error.kind(),
-                    format!("cluster identity {} not found", path.display()),
-                );
-            }
-            error
-        })?;
-        storage::check_private_file(&file, "cluster identity", &path)?;
-        file
-    };
-    let mut bytes = Zeroizing::new([0u8; 64]);
-    file.read_exact(&mut bytes[..])?;
-    let mut trailing = [0u8; 1];
-    if file.read(&mut trailing)? != 0 {
+    if plain.len() != IDENTITY_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "cluster identity key must be exactly 64 bytes",
         ));
     }
-    identity_from_parts(&bytes[..])?;
-    Ok(bytes)
+    let mut material = Zeroizing::new([0u8; IDENTITY_LEN]);
+    material.copy_from_slice(&plain);
+    identity_from_parts(&material[..])?;
+    Ok((material, format))
 }
 
 fn identity_from_parts(bytes: &[u8]) -> io::Result<NodeIdentity> {
@@ -257,6 +308,7 @@ pub(super) fn node_name(fingerprint: &str) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -338,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_identity_file_longer_than_64_bytes() {
+    fn refuses_a_sealed_identity_with_an_appended_byte() {
         let dir = temp_dir().join("cluster");
         let _ = init_identity_at(&dir).unwrap();
         let path = dir.join(IDENTITY_FILE);
@@ -350,7 +402,152 @@ mod tests {
             .unwrap();
         let error = load_identity_at(&dir).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains(IDENTITY_FILE), "{error}");
+    }
+
+    #[test]
+    fn refuses_a_tampered_sealed_identity() {
+        let dir = temp_dir().join("cluster");
+        let _ = init_identity_at(&dir).unwrap();
+        let path = dir.join(IDENTITY_FILE);
+        let mut bytes = fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x80;
+        write_mode_600(&path, &bytes);
+        let error = load_identity_at(&dir).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("failed authentication"),
+            "{error}"
+        );
+        assert!(load_keypair_at(&dir).is_err());
+    }
+
+    #[test]
+    fn refuses_a_plaintext_identity_longer_than_64_bytes() {
+        let dir = temp_dir().join("cluster");
+        let (_, material) = legacy_identity_at(&dir);
+        let mut longer = material.to_vec();
+        longer.push(b'x');
+        write_mode_600(&dir.join(IDENTITY_FILE), &longer);
+        let error = load_identity_at(&dir).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("exactly 64 bytes"));
+    }
+
+    // A pre-#746 node: a private cluster directory holding 64 plaintext bytes.
+    fn legacy_identity_at(dir: &Path) -> (NodeIdentity, Zeroizing<Vec<u8>>) {
+        let _ = init_identity_at(dir).unwrap();
+        let material = load_keypair_at(dir).unwrap();
+        write_mode_600(&dir.join(IDENTITY_FILE), &material);
+        fs::remove_dir_all(dir.parent().unwrap().join(sealed::NODE_KEY_DIR)).unwrap();
+        (identity_from_parts(&material).unwrap(), material)
+    }
+
+    fn write_mode_600(path: &Path, bytes: &[u8]) {
+        crate::fs_atomic::write_atomic_exact_mode(path, bytes, 0o600).unwrap();
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[test]
+    fn a_new_identity_is_sealed_on_disk() {
+        let dir = temp_dir().join("cluster");
+        let _ = init_identity_at(&dir).unwrap();
+        let material = load_keypair_at(&dir).unwrap();
+        let on_disk = fs::read(dir.join(IDENTITY_FILE)).unwrap();
+        assert!(sealed::is_sealed(&on_disk));
+        assert!(
+            !contains(&on_disk, &material[..32]),
+            "private key in plaintext"
+        );
+        assert!(sealed::node_key_path(&dir).is_file());
+    }
+
+    #[test]
+    fn a_sealed_identity_without_its_node_key_is_not_readable_and_not_not_found() {
+        let dir = temp_dir().join("cluster");
+        let _ = init_identity_at(&dir).unwrap();
+        fs::remove_file(sealed::node_key_path(&dir)).unwrap();
+        let error = load_identity_at(&dir).unwrap_err();
+        // NotFound would make callers mint a new identity over this one.
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("node key"), "{error}");
+        assert!(error.to_string().contains("is missing"), "{error}");
+        let error = init_identity_at(&dir).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn migration_seals_a_plaintext_identity_once_and_keeps_its_fingerprint() {
+        let dir = temp_dir().join("cluster");
+        let (before, material) = legacy_identity_at(&dir);
+        // Reads keep working before the migration runs.
+        assert_eq!(load_identity_at(&dir).unwrap(), before);
+
+        let migrated = migrate_identity_locked(&dir).unwrap().expect("migrated");
+        assert_eq!(migrated.path, dir.join(IDENTITY_FILE));
+        assert_eq!(migrated.node_key, sealed::node_key_path(&dir));
+        assert!(migrated.node_key_created);
+
+        let on_disk = fs::read(dir.join(IDENTITY_FILE)).unwrap();
+        assert!(sealed::is_sealed(&on_disk));
+        assert!(!contains(&on_disk, &material[..32]), "plaintext copy kept");
+        assert_eq!(load_identity_at(&dir).unwrap(), before);
+        assert_eq!(&load_keypair_at(&dir).unwrap()[..], &material[..]);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.join(IDENTITY_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // No temporary or backup copy of the plaintext is left beside it.
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        for name in &names {
+            let bytes = fs::read(dir.join(name)).unwrap_or_default();
+            assert!(
+                !contains(&bytes, &material[..32]),
+                "{name} holds the plaintext"
+            );
+        }
+
+        assert_eq!(
+            migrate_identity_locked(&dir).unwrap(),
+            None,
+            "second run is a no-op"
+        );
+    }
+
+    #[test]
+    fn init_migrates_a_plaintext_identity() {
+        let dir = temp_dir().join("cluster");
+        let (before, _) = legacy_identity_at(&dir);
+        let (after, created) = init_identity_at(&dir).unwrap();
+        assert!(!created);
+        assert_eq!(after, before);
+        assert!(sealed::is_sealed(
+            &fs::read(dir.join(IDENTITY_FILE)).unwrap()
+        ));
+    }
+
+    #[test]
+    fn rotation_seals_the_new_identity_under_the_same_node_key() {
+        let dir = temp_dir().join("cluster");
+        let (first, _) = init_identity_at(&dir).unwrap();
+        let node_key = fs::read(sealed::node_key_path(&dir)).unwrap();
+        let second = rotate_identity_locked(&dir).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(load_identity_at(&dir).unwrap(), second);
+        assert_eq!(fs::read(sealed::node_key_path(&dir)).unwrap(), node_key);
     }
 
     #[test]

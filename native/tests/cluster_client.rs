@@ -58,7 +58,9 @@ impl PrivateNode {
             .output()
             .expect("run cluster init in isolated state");
         assert!(init.status.success(), "cluster init failed: {init:?}");
-        let key = fs::read(node.state.join("remuda/cluster/identity.key")).unwrap();
+        let key =
+            remuda_native::cluster::identity::load_keypair_at(&node.state.join("remuda/cluster"))
+                .unwrap();
         assert_eq!(key.len(), 64);
         node.private = key[..32].to_vec();
         node.public = key[32..].to_vec();

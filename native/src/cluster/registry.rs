@@ -990,11 +990,13 @@ mod tests {
     #[derive(Clone)]
     struct RegistryTempDir(std::sync::Arc<RegistryTempDirInner>);
 
+    // `.0` is `<root>/cluster`, so a test's node key lands in its own
+    // `<root>/keys`, never in a temp directory other tests share.
     struct RegistryTempDirInner(PathBuf);
 
     impl Drop for RegistryTempDirInner {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            let _ = fs::remove_dir_all(self.0.parent().unwrap_or(&self.0));
         }
     }
 
@@ -1023,8 +1025,13 @@ mod tests {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            match storage::create_private_directory(&path) {
-                Ok(()) => return RegistryTempDir(std::sync::Arc::new(RegistryTempDirInner(path))),
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    let path = path.join("cluster");
+                    storage::create_private_directory(&path)
+                        .unwrap_or_else(|error| panic!("create test registry directory: {error}"));
+                    return RegistryTempDir(std::sync::Arc::new(RegistryTempDirInner(path)));
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => panic!("create test registry directory: {error}"),
             }
