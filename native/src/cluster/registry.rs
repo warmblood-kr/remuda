@@ -846,18 +846,38 @@ pub fn load_registry() -> io::Result<Registry> {
 /// Listener request paths use this to invalidate a cached registry without
 /// taking the cluster state lock for every admitted peer.
 pub fn registry_revision_token() -> io::Result<String> {
+    registry_revision_token_at(&storage::cluster_state_dir()?.join("cluster"))
+}
+
+pub(super) fn registry_revision_token_at(dir: &Path) -> io::Result<String> {
+    let path = dir.join(REGISTRY_FILE);
+    // Windows std has no stable file-index API, and NTFS name tunneling can
+    // carry the old creation time across an atomic replace, so metadata alone
+    // can miss a change. Hash the capped file instead; it is small.
     #[cfg(windows)]
-    return Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
-    ));
+    {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        let file = match super::windows_security::open_for_read(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok("missing".to_owned());
+            }
+            Err(error) => return Err(error),
+        };
+        storage::check_private_file(&file, "cluster registry", &path)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_REGISTRY_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_REGISTRY_BYTES {
+            return Err(invalid_update("cluster registry exceeds byte cap"));
+        }
+        Ok(format!("sha256:{:x}", Sha256::digest(&bytes)))
+    }
     #[cfg(not(windows))]
     {
         use std::os::unix::fs::MetadataExt;
         use std::time::UNIX_EPOCH;
-        let path = storage::cluster_state_dir()?
-            .join("cluster")
-            .join(REGISTRY_FILE);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(io::Error::new(
@@ -2738,6 +2758,25 @@ mod tests {
         assert_eq!(registry.authorized_nodes.len(), 1);
         assert_eq!(registry.authorized_nodes[0].state, NodeState::Revoked);
     }
+
+    #[test]
+    fn revision_token_reports_missing_then_changes_with_the_registry() {
+        let dir = temp_dir();
+        assert_eq!(registry_revision_token_at(&dir).unwrap(), "missing");
+
+        let sender = admitted_sender();
+        save_registry_at(&dir, &registry_with_sender(&sender)).unwrap();
+        let first = registry_revision_token_at(&dir).unwrap();
+        assert_ne!(first, "missing");
+        assert_eq!(registry_revision_token_at(&dir).unwrap(), first);
+
+        let mut grown = registry_with_sender(&sender);
+        grown
+            .authorized_nodes
+            .push(entry("fp-b", NodeState::Admitted, 1, "b"));
+        save_registry_at(&dir, &grown).unwrap();
+        assert_ne!(registry_revision_token_at(&dir).unwrap(), first);
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -2745,6 +2784,39 @@ mod windows_private_state_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    // registry_revision_token used to refuse on Windows, which made every
+    // cluster listener bind fail. It must read the hardened file and change
+    // exactly when the bytes change.
+    #[test]
+    fn revision_token_reads_the_hardened_registry() {
+        use super::super::{storage, windows_security};
+        let dir = std::env::temp_dir().join(format!(
+            "remuda-registry-revision-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        storage::create_private_directory(&dir).unwrap();
+        assert_eq!(super::registry_revision_token_at(&dir).unwrap(), "missing");
+
+        let path = dir.join(super::REGISTRY_FILE);
+        storage::atomic_write(&path, br#"{"authorized_nodes":[]}"#).unwrap();
+        let first = super::registry_revision_token_at(&dir).unwrap();
+        assert!(first.starts_with("sha256:"), "{first}");
+
+        // An atomic replace with the same bytes keeps the token.
+        storage::atomic_write(&path, br#"{"authorized_nodes":[]}"#).unwrap();
+        assert_eq!(super::registry_revision_token_at(&dir).unwrap(), first);
+
+        // Same length, different bytes: the token changes.
+        storage::atomic_write(&path, br#"{"authorized_nodes":[] }"#).unwrap();
+        assert_ne!(super::registry_revision_token_at(&dir).unwrap(), first);
+
+        let file = windows_security::open_for_check(&path, false, true).unwrap();
+        assert!(windows_security::is_owner_acl_conforming(&file).unwrap());
+        drop(file);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn loading_legacy_default_acl_settings_tightens_acl_and_loads_data() {
