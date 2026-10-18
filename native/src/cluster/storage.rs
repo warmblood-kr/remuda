@@ -119,6 +119,7 @@ fn secure_known_children(dir: &Path) -> io::Result<()> {
         "settings.json",
         "authorized_nodes.json",
         "join_tokens.json",
+        "node.key",
     ] {
         let path = dir.join(name);
         match super::windows_security::open_for_check(&path, false, true) {

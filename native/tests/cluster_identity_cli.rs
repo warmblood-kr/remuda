@@ -65,7 +65,8 @@ fn init_and_status_never_print_private_key_material() {
         initialized.status.success(),
         "cluster init failed: {initialized:?}"
     );
-    let key = fs::read(state.join("remuda/cluster/identity.key")).unwrap();
+    let key =
+        remuda_native::cluster::identity::load_keypair_at(&state.join("remuda/cluster")).unwrap();
     let repeated = run(&["cluster", "init", "--no-listen"]);
     assert!(repeated.status.success());
     assert!(String::from_utf8_lossy(&repeated.stdout).contains("Already initialized"));

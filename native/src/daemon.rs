@@ -295,6 +295,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     #[cfg(windows)]
     let socket_owner = Arc::new(SocketOwnership::capture(path)?);
     pause_startup_for_tests();
+    encrypt_plaintext_credentials_at_startup();
     let anti_entropy = Arc::new(AntiEntropyTask::start()?);
     let listener_task = Arc::new(DaemonListenerControl::new(ListenerTask::start(path)));
 
@@ -370,6 +371,25 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
         anti_entropy.stop_and_join();
         socket_owner.cleanup();
         Ok(())
+    }
+}
+
+/// One-time migration (#746): seal credentials an older remuda left in
+/// plaintext. The report goes to the daemon log. A failure only warns, since
+/// reads still accept the plaintext and the next start retries.
+fn encrypt_plaintext_credentials_at_startup() {
+    match crate::cluster::encrypt_plaintext_credentials() {
+        Ok(migrated) => {
+            for credential in &migrated {
+                eprintln!(
+                    "remuda: {}",
+                    crate::cluster::describe_migrated_credential(credential)
+                );
+            }
+        }
+        Err(error) => eprintln!(
+            "remuda: warning: could not encrypt plaintext credentials at rest (will retry at next start): {error}"
+        ),
     }
 }
 

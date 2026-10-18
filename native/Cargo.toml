@@ -54,6 +54,8 @@ serde = { version = "=1.0.229", features = ["derive"] }
 getrandom = "=0.3.4"
 snow = { version = "=0.10.0", default-features = false, features = ["default-resolver", "use-chacha20poly1305", "use-curve25519", "use-getrandom", "use-sha2"] }
 zeroize = "=1.9.0"
+# Already in the graph through snow; used directly to seal credentials at rest (#746).
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
 remuda-core = { path = "../core" }
 # Host OSC preprocessing is audited against these exact parser state rules.
 vt100 = "=0.16.2"

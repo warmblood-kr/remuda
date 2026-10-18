@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Cluster: the node identity (`cluster/identity.key`) is now encrypted at rest
+  with XChaCha20-Poly1305 under a random per-node key in `keys/node.key`, kept
+  owner-only and apart from the cluster state, so a copied state directory
+  without that key reveals no secret (#746). The daemon reads it with no
+  prompt and no OS keystore, the same on macOS, Linux and Windows. A plaintext
+  identity from an older remuda is re-encrypted once at daemon start (same
+  fingerprint) and the daemon log reports each file. Keep `keys/` out of
+  backups. Downgrading after the migration fails safely: an older remuda
+  reports the identity as invalid and does not replace it. See
+  docs/credential-encryption.md.
+
 - Cluster: a cluster-wide virtual file store (#742). `remuda vfs put|get|ls|
   stat|rm|resolve|sync|config` stores files at stable `remuda://CLUSTER/PATH`
   URIs (`remuda:///PATH` means this cluster). Content is sha256-addressed and

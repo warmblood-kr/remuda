@@ -10,6 +10,7 @@ pub mod listener_config;
 pub mod listener_control;
 pub mod registry;
 pub mod replication;
+mod sealed;
 mod storage;
 pub mod vfs;
 pub mod vfs_sync;
@@ -198,6 +199,45 @@ pub fn init_new_identity() -> io::Result<NodeIdentity> {
     control::clear_revoked_notice_at(&dir)?;
     storage::write_cluster_init_marker(&state_dir, &node.node_fp)?;
     Ok(node)
+}
+
+/// Re-encrypt any plaintext credentials left by a remuda older than #746,
+/// once, under the cluster lock, and report each file that changed. Already
+/// sealed (or absent) credentials are left alone, so repeat calls are no-ops.
+pub fn encrypt_plaintext_credentials() -> io::Result<Vec<identity::MigratedCredential>> {
+    encrypt_plaintext_credentials_at(&storage::cluster_state_dir()?)
+}
+
+fn encrypt_plaintext_credentials_at(
+    state_dir: &Path,
+) -> io::Result<Vec<identity::MigratedCredential>> {
+    let dir = state_dir.join("cluster");
+    match fs::symlink_metadata(&dir) {
+        Ok(_) => {
+            identity::check_identity_path(&dir)?;
+            storage::verify_directory(&dir)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    }
+    let _guard = storage::lock_with_deadline(&dir, std::time::Duration::from_secs(2))?;
+    Ok(identity::migrate_identity_locked(&dir)?
+        .into_iter()
+        .collect())
+}
+
+/// One report line for a re-encrypted credential.
+pub fn describe_migrated_credential(migrated: &identity::MigratedCredential) -> String {
+    format!(
+        "encrypted {} at rest with node key {}{}; the plaintext copy was removed",
+        migrated.path.display(),
+        migrated.node_key.display(),
+        if migrated.node_key_created {
+            " (new)"
+        } else {
+            ""
+        }
+    )
 }
 
 /// Return the local identity and admitted member count, or `None` before init.
@@ -760,7 +800,8 @@ mod init_marker_tests {
         let key_path = cluster_dir.join("identity.key");
         let first_bytes = fs::read(&key_path).unwrap();
         let first_metadata = fs::metadata(&key_path).unwrap();
-        assert_eq!(first_bytes.len(), 64);
+        // Sealed: 40-byte header, 64-byte identity, 16-byte tag.
+        assert_eq!(first_bytes.len(), 120);
         assert_eq!(first_metadata.permissions().mode() & 0o777, 0o600);
         let registry = registry::load_registry_at(&cluster_dir).unwrap();
         assert_eq!(registry.authorized_nodes.len(), 1);
@@ -860,6 +901,8 @@ mod init_marker_tests {
         let cluster_dir = state_dir.0.join("cluster");
         fs::create_dir_all(&cluster_dir).unwrap();
         fs::set_permissions(&cluster_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        // The node key directory exists, so only the marker write can fail.
+        storage::create_private_directory(&state_dir.0.join("keys")).unwrap();
         fs::set_permissions(&state_dir.0, fs::Permissions::from_mode(0o500)).unwrap();
 
         let result = init_at(&state_dir.0);
@@ -907,6 +950,9 @@ mod nodes_revoke_tests {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&path);
+        // A state-directory layout, so the node key lands in this test's own
+        // `keys/` beside `cluster/`, not in a temp directory shared by tests.
+        let path = path.join("cluster");
         storage::create_private_directory(&path).unwrap();
         path
     }
@@ -943,7 +989,7 @@ mod nodes_revoke_tests {
         revoked_registry.authorized_nodes[0].state = NodeState::Revoked;
         let error = resolve_target_in_registry(&revoked_registry, &node.node_fp, None).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
     }
 
     #[test]
@@ -978,7 +1024,7 @@ mod nodes_revoke_tests {
             .unwrap();
         assert_eq!(admitted.endpoint.as_deref(), Some("192.0.2.40:9443"));
         assert_eq!(admitted.by, issuer.node_fp);
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
     #[test]

@@ -152,7 +152,10 @@ impl Node {
     }
 
     fn fingerprint(&self) -> String {
-        let key = std::fs::read(self.root.join("state/remuda/cluster/identity.key")).unwrap();
+        let key = remuda_native::cluster::identity::load_keypair_at(
+            &self.root.join("state/remuda/cluster"),
+        )
+        .unwrap();
         remuda_native::cluster::encoding::fingerprint(&key[32..])
     }
 

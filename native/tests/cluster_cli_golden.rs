@@ -346,11 +346,13 @@ fn add_peer_for_revoke(local: &Scratch, peer: &Scratch) -> String {
     )
     .expect("decode local registry");
     let peer_key =
-        fs::read(peer.root.join("state/remuda/cluster/identity.key")).expect("peer identity key");
+        remuda_native::cluster::identity::load_keypair_at(&peer.root.join("state/remuda/cluster"))
+            .expect("peer identity key");
     let peer_public = &peer_key[32..];
     let peer_fp = encoding::fingerprint(peer_public);
     let local_key =
-        fs::read(local.root.join("state/remuda/cluster/identity.key")).expect("local identity key");
+        remuda_native::cluster::identity::load_keypair_at(&local.root.join("state/remuda/cluster"))
+            .expect("local identity key");
     let local_fp = encoding::fingerprint(&local_key[32..]);
     registry.authorized_nodes.push(AuthorizedNode {
         node_fp: peer_fp.clone(),
@@ -900,8 +902,10 @@ fn cluster_join_and_peer_call_outputs_match_goldens() {
     let mut registry: Registry =
         serde_json::from_slice(&fs::read(&registry_path).expect("joined registry"))
             .expect("decode joined registry");
-    let joiner_key = fs::read(joiner.root.join("state/remuda/cluster/identity.key"))
-        .expect("joiner identity key");
+    let joiner_key = remuda_native::cluster::identity::load_keypair_at(
+        &joiner.root.join("state/remuda/cluster"),
+    )
+    .expect("joiner identity key");
     let wrong_pin = remuda_native::cluster::encoding::encode_base64(&joiner_key[32..]);
     registry
         .authorized_nodes
@@ -1150,7 +1154,7 @@ fn failed_join_preserves_listener_change_made_while_join_is_blocked() {
     let cluster_dir = scratch.root.join("state/remuda/cluster");
     let fake_issuer = TcpListener::bind("127.0.0.1:0").expect("bind stalled fake issuer");
     let issuer_addr = fake_issuer.local_addr().unwrap();
-    let key = fs::read(cluster_dir.join("identity.key")).unwrap();
+    let key = remuda_native::cluster::identity::load_keypair_at(&cluster_dir).unwrap();
     let issuer_public: [u8; 32] = key[32..].try_into().unwrap();
     let fingerprint = encoding::fingerprint(&issuer_public);
     let invitation = JoinLine {
@@ -1476,7 +1480,10 @@ fn explicit_join_sends_the_joiners_advertised_address_to_the_issuer_registry() {
         .root
         .join("state/remuda/cluster/authorized_nodes.json");
     let registry: Registry = serde_json::from_slice(&fs::read(registry_path).unwrap()).unwrap();
-    let joiner_key = fs::read(joiner.root.join("state/remuda/cluster/identity.key")).unwrap();
+    let joiner_key = remuda_native::cluster::identity::load_keypair_at(
+        &joiner.root.join("state/remuda/cluster"),
+    )
+    .unwrap();
     let joiner_fingerprint = encoding::fingerprint(&joiner_key[32..]);
     let entry = registry
         .authorized_nodes
@@ -1538,7 +1545,10 @@ fn d4_join_sends_the_joiners_bound_address_to_the_issuer_registry() {
         .root
         .join("state/remuda/cluster/authorized_nodes.json");
     let registry: Registry = serde_json::from_slice(&fs::read(registry_path).unwrap()).unwrap();
-    let joiner_key = fs::read(joiner.root.join("state/remuda/cluster/identity.key")).unwrap();
+    let joiner_key = remuda_native::cluster::identity::load_keypair_at(
+        &joiner.root.join("state/remuda/cluster"),
+    )
+    .unwrap();
     let joiner_fingerprint = encoding::fingerprint(&joiner_key[32..]);
     let entry = registry
         .authorized_nodes
@@ -1833,7 +1843,10 @@ fn d4_failed_join_turns_off_a_listener_enabled_by_the_join_command() {
     );
     let fake_issuer = TcpListener::bind("127.0.0.1:0").expect("bind delayed fake issuer");
     let issuer_addr = fake_issuer.local_addr().unwrap();
-    let joiner_key = fs::read(scratch.root.join("state/remuda/cluster/identity.key")).unwrap();
+    let joiner_key = remuda_native::cluster::identity::load_keypair_at(
+        &scratch.root.join("state/remuda/cluster"),
+    )
+    .unwrap();
     let issuer_public: [u8; 32] = joiner_key[32..].try_into().unwrap();
     let fingerprint = encoding::fingerprint(&issuer_public);
     let invitation = JoinLine {
@@ -1937,7 +1950,7 @@ fn assert_join_signal_restores_listener_config(signal: libc::c_int, expected_exi
     let fake_issuer = TcpListener::bind("127.0.0.1:0").expect("bind fake issuer");
     fake_issuer.set_nonblocking(true).unwrap();
     let issuer_addr = fake_issuer.local_addr().unwrap();
-    let key = fs::read(cluster_dir.join("identity.key")).unwrap();
+    let key = remuda_native::cluster::identity::load_keypair_at(&cluster_dir).unwrap();
     let issuer_public: [u8; 32] = key[32..].try_into().unwrap();
     let fingerprint = encoding::fingerprint(&issuer_public);
     let invitation = JoinLine {

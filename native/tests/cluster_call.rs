@@ -63,7 +63,9 @@ impl Node {
             .output()
             .unwrap();
         assert!(init.status.success(), "cluster init failed: {init:?}");
-        let key = fs::read(node.state.join("remuda/cluster/identity.key")).unwrap();
+        let key =
+            remuda_native::cluster::identity::load_keypair_at(&node.state.join("remuda/cluster"))
+                .unwrap();
         node.public = key[32..].to_vec();
         node.private = key[..32].to_vec();
         node

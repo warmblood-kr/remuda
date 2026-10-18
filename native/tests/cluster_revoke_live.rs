@@ -115,7 +115,8 @@ impl PrivateNode {
     }
 
     fn identity(&self) -> Zeroizing<Vec<u8>> {
-        Zeroizing::new(std::fs::read(self.root.join("state/remuda/cluster/identity.key")).unwrap())
+        remuda_native::cluster::identity::load_keypair_at(&self.root.join("state/remuda/cluster"))
+            .unwrap()
     }
 }
 
