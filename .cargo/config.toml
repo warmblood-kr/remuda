@@ -1,0 +1,5 @@
+[env]
+# Keep test daemons, including in-process ones, off a live node's cluster state:
+# its startup migration would rewrite the real identity (#746). Windows uses
+# LOCALAPPDATA, which tests set per command.
+XDG_STATE_HOME = { value = "target/test-state", force = true, relative = true }
