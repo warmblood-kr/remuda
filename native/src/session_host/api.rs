@@ -136,6 +136,11 @@ pub(crate) enum Request {
     RevokeHuman {
         grant: u64,
     },
+    HumanInput {
+        grant: u64,
+        sequence: u64,
+        bytes: Vec<u8>,
+    },
     RecoverRaw {
         grant: u64,
         sequence: u64,

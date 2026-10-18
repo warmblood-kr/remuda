@@ -21,7 +21,7 @@ pub(crate) struct Owned {
     writer: Arc<dyn AgentWriter>,
     coordinator: Mutex<Coordinator>,
     // Current human core guard; taken only under the coordinator lock.
-    human: Mutex<Option<OwnedAttached>>,
+    human: Mutex<Option<Arc<OwnedAttached>>>,
 }
 impl Owned {
     pub fn spawn(
@@ -188,13 +188,13 @@ impl Owned {
                         AttachRefusal::Exhausted => GrantError::Exhausted,
                     })?;
                 let generation = guard.generation();
-                displaced = self.human.lock().unwrap().replace(guard);
+                displaced = self.human.lock().unwrap().replace(Arc::new(guard));
                 Ok(generation)
             });
         drop(displaced);
         result
     }
-    fn release_guard(&self, grant: u64) -> Option<OwnedAttached> {
+    fn release_guard(&self, grant: u64) -> Option<Arc<OwnedAttached>> {
         let mut slot = self.human.lock().unwrap();
         slot.take_if(|guard| guard.generation() == grant)
     }
@@ -233,6 +233,77 @@ impl Owned {
     }
     pub fn discard_raw(&self, fence: Fence, cut: Cut) -> Result<Retire, Error> {
         self.coordinator.lock().unwrap().discard_raw(fence, cut)
+    }
+    /// Reserve outcome and physical ticket, then write once on a worker that
+    /// keeps the exact guard until the backend writer is idle again.
+    pub fn admit_human_raw(
+        self: &Arc<Self>,
+        connection: ConnectionId,
+        grant: u64,
+        sequence: u64,
+        bytes: Vec<u8>,
+    ) -> Result<Raw, Error> {
+        let digest = InputAct::Bytes(bytes.clone())
+            .digest()
+            .map_err(Error::Invalid)?;
+        let guard = {
+            let mut coordinator = self.coordinator.lock().unwrap();
+            let raw = coordinator.admit_raw(connection, grant, sequence, digest)?;
+            if raw != Raw::New {
+                return Ok(raw);
+            }
+            let guard = self
+                .human
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|guard| guard.generation() == grant)
+                .cloned();
+            if guard.is_none() {
+                coordinator.complete_raw(sequence, Delivery::Rejected)?;
+                return Ok(Raw::Complete(Delivery::Rejected));
+            }
+            guard
+        };
+        let host = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("session-host-human".into())
+            .spawn(move || host.write_human(guard, sequence, &bytes));
+        if spawned.is_err() {
+            // Proved pre-effect: no worker exists to touch the PTY.
+            self.coordinator
+                .lock()
+                .unwrap()
+                .complete_raw(sequence, Delivery::Rejected)?;
+            return Ok(Raw::Complete(Delivery::Rejected));
+        }
+        Ok(Raw::New)
+    }
+    fn write_human(&self, guard: Option<Arc<OwnedAttached>>, sequence: u64, bytes: &[u8]) {
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marker = started.clone();
+        let result = guard.as_ref().map(|guard| {
+            guard.write_raw_while_started(
+                bytes,
+                &|| false,
+                Arc::new(move || marker.store(true, std::sync::atomic::Ordering::SeqCst)),
+            )
+        });
+        let delivery = match result {
+            Some(Ok(())) => Delivery::Written,
+            _ if !started.load(std::sync::atomic::Ordering::SeqCst) => Delivery::Rejected,
+            _ => Delivery::Indeterminate,
+        };
+        // A returned call is not quiescence while a late backend write lives.
+        while self.writer.is_busy() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = self
+            .coordinator
+            .lock()
+            .unwrap()
+            .complete_raw(sequence, delivery);
+        drop(guard);
     }
     #[cfg(test)]
     pub fn human_attached_fixture(&self) -> bool {

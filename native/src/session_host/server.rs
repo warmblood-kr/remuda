@@ -263,6 +263,7 @@ impl Connection {
                     | Request::Resize { .. }
                     | Request::Close
                     | Request::HumanGrant { .. }
+                    | Request::HumanInput { .. }
             )
         {
             return Err("host_publication_pending".into());
@@ -364,6 +365,20 @@ impl Connection {
                 };
                 let (grant, state) = host.grant_human(self.id, request).map_err(control_error)?;
                 Ok(Response::HumanGranted { grant, state })
+            }
+            Request::HumanInput {
+                grant,
+                sequence,
+                bytes,
+            } => {
+                self.human()?;
+                if bytes.is_empty() || bytes.len() > super::wire::MAX_INPUT {
+                    return Err("invalid_raw_input".into());
+                }
+                let state = host
+                    .admit_human_raw(self.id, grant, sequence, bytes)
+                    .map_err(control_error)?;
+                Ok(Response::RawOutcome { state })
             }
             Request::RevokeHuman { grant } => {
                 let revoked = host
