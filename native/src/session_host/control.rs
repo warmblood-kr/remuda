@@ -70,6 +70,9 @@ impl Controller {
         self.active_act = Some(act);
         Ok(act)
     }
+    pub fn active(&self) -> bool {
+        self.active_act.is_some()
+    }
     pub fn release(&mut self, fence: Fence) -> Result<(), Refusal> {
         self.authorize(fence)?;
         self.draining = self.active_act.is_some();

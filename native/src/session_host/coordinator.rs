@@ -1,7 +1,8 @@
 //! One serialized admission boundary for fencing and retained operation results.
 use super::control::{ActId, ConnectionId, Controller, Fence, Refusal};
+use super::human::{Cut, GrantError, GrantRequest, GrantState, Human, Raw, Retire};
 use super::ledger::{Ledger, Lookup};
-use super::result::Completion;
+use super::result::{Completion, Delivery};
 use super::wire::InputAct;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -15,6 +16,8 @@ pub(crate) enum Error {
     Invalid(&'static str),
     StaleCompletion,
     Stopping,
+    Retained,
+    Grant(GrantError),
 }
 struct Running {
     token: ActId,
@@ -29,6 +32,8 @@ pub(crate) struct Coordinator {
     running: Option<Running>,
     mutation: Option<ActId>,
     stopped: bool,
+    human: Human,
+    physical: Option<u64>,
 }
 impl Coordinator {
     pub fn new(incarnation: [u8; 16]) -> Self {
@@ -38,6 +43,8 @@ impl Coordinator {
             running: None,
             mutation: None,
             stopped: false,
+            human: Human::new(incarnation),
+            physical: None,
         }
     }
     pub fn acquire(&mut self, connection: ConnectionId) -> Result<Fence, Error> {
@@ -49,6 +56,7 @@ impl Coordinator {
     }
     pub fn begin_mutation(&mut self, fence: Fence) -> Result<ActId, Error> {
         self.admitting()?;
+        self.physical_idle()?;
         let token = self.controller.begin_act(fence).map_err(Error::Control)?;
         self.mutation = Some(token);
         Ok(token)
@@ -72,8 +80,85 @@ impl Coordinator {
     pub fn latch_stop(&mut self, fence: Fence) -> Result<(), Error> {
         let token = self.begin_mutation(fence)?;
         self.finish_mutation(token)?;
+        if !self.human.settled() {
+            return Err(Error::Retained);
+        }
         self.stopped = true;
         Ok(())
+    }
+    /// One physical barrier: a human raw ticket excludes every controller act.
+    fn physical_idle(&self) -> Result<(), Error> {
+        if self.physical.is_some() {
+            return Err(Error::Control(Refusal::Busy));
+        }
+        Ok(())
+    }
+    /// Checked CAS against the host grant high-water; displaces any holder.
+    pub fn grant(
+        &mut self,
+        connection: ConnectionId,
+        request: GrantRequest,
+    ) -> Result<(u64, GrantState), Error> {
+        self.admitting()?;
+        self.human.grant(connection, request).map_err(Error::Grant)
+    }
+    pub fn disconnect_human(&mut self, connection: ConnectionId) {
+        self.human.disconnect(connection);
+    }
+    /// Management revoke of one exact grant; an in-flight ticket still drains.
+    pub fn revoke(&mut self, fence: Fence, grant: u64) -> Result<bool, Error> {
+        let token = self.begin_mutation(fence)?;
+        let revoked = self.human.revoke(grant);
+        self.finish_mutation(token)?;
+        Ok(revoked)
+    }
+    /// Reserve one raw outcome and the physical ticket together, or neither.
+    pub fn admit_raw(
+        &mut self,
+        connection: ConnectionId,
+        grant: u64,
+        sequence: u64,
+        digest: [u8; 32],
+    ) -> Result<Raw, Error> {
+        let retained = self.human.recover(grant, sequence, digest);
+        if retained != Raw::OutOfOrder {
+            return Ok(retained);
+        }
+        self.admitting()?;
+        if !self.human.holds(connection, grant) {
+            return Ok(Raw::Stale);
+        }
+        if self.physical.is_some() || self.controller.active() {
+            return Ok(Raw::Busy);
+        }
+        let raw = self.human.reserve(grant, sequence, digest);
+        if raw == Raw::New {
+            self.physical = Some(sequence);
+        }
+        Ok(raw)
+    }
+    /// Finish the exact ticket after all late writes; never by current owner.
+    pub fn complete_raw(&mut self, sequence: u64, delivery: Delivery) -> Result<(), Error> {
+        if self.physical != Some(sequence) || !self.human.complete(sequence, delivery) {
+            return Err(Error::StaleCompletion);
+        }
+        self.physical = None;
+        Ok(())
+    }
+    pub fn recover_raw(&self, grant: u64, sequence: u64, digest: [u8; 32]) -> Raw {
+        self.human.recover(grant, sequence, digest)
+    }
+    pub fn raw_cut(&self, last: u64) -> Result<Cut, Retire> {
+        self.human.cut(last)
+    }
+    pub fn ack_raw(&mut self, connection: ConnectionId, cut: Cut) -> Retire {
+        self.human.ack(connection, cut)
+    }
+    pub fn discard_raw(&mut self, fence: Fence, cut: Cut) -> Result<Retire, Error> {
+        let token = self.begin_mutation(fence)?;
+        let retired = self.human.discard(cut);
+        self.finish_mutation(token)?;
+        Ok(retired)
     }
     /// Caller holds the coordinator lock only for admission, never across an
     /// OS write, pause or snapshot. Execution retains token until fully settled.
@@ -85,6 +170,7 @@ impl Coordinator {
         act: &InputAct,
     ) -> Result<Admission, Error> {
         self.admitting()?;
+        self.physical_idle()?;
         let digest = act.digest().map_err(Error::Invalid)?;
         let token = self.controller.begin_act(fence).map_err(Error::Control)?;
         let state = self.ledger.reserve(client, sequence, digest);
@@ -282,6 +368,75 @@ mod tests {
         host.release(owner).unwrap();
         assert_eq!(host.acquire(ConnectionId(2)), Err(Error::Stopping));
         assert_eq!(host.recover([1; 16], 1, &act).unwrap().1, Some(&result));
+    }
+    fn grant_request(id: u8, expected: u64) -> GrantRequest {
+        GrantRequest {
+            request: [id; 16],
+            expected,
+            recovery: [id; 32],
+        }
+    }
+    #[test]
+    fn idle_controller_and_human_share_one_physical_barrier() {
+        let mut host = Coordinator::new([3; 16]);
+        let owner = host.acquire(ConnectionId(1)).unwrap();
+        let human = ConnectionId(9);
+        host.grant(human, grant_request(1, 0)).unwrap();
+        assert_eq!(host.admit_raw(human, 1, 1, [1; 32]), Ok(Raw::New));
+        assert_eq!(
+            host.begin_mutation(owner),
+            Err(Error::Control(Refusal::Busy))
+        );
+        let act = InputAct::Bytes(vec![1]);
+        assert_eq!(
+            host.admit(owner, [1; 16], 1, &act),
+            Err(Error::Control(Refusal::Busy))
+        );
+        // Takeover during the write: old ticket drains, never a second writer.
+        host.grant(ConnectionId(10), grant_request(2, 1)).unwrap();
+        assert_eq!(
+            host.admit_raw(ConnectionId(10), 2, 2, [2; 32]),
+            Ok(Raw::Busy)
+        );
+        assert_eq!(
+            host.complete_raw(2, Delivery::Written),
+            Err(Error::StaleCompletion)
+        );
+        host.complete_raw(1, Delivery::Written).unwrap();
+        let token = host.begin_mutation(owner).unwrap();
+        assert_eq!(
+            host.admit_raw(ConnectionId(10), 2, 2, [2; 32]),
+            Ok(Raw::Busy)
+        );
+        host.finish_mutation(token).unwrap();
+        assert_eq!(
+            host.admit_raw(ConnectionId(10), 2, 2, [2; 32]),
+            Ok(Raw::New)
+        );
+        assert_eq!(
+            host.admit_raw(human, 1, 1, [1; 32]),
+            Ok(Raw::Complete(Delivery::Written))
+        );
+    }
+    #[test]
+    fn stop_latch_refuses_live_grant_and_unretired_raw_until_explicit_retirement() {
+        let mut host = Coordinator::new([4; 16]);
+        let owner = host.acquire(ConnectionId(1)).unwrap();
+        let human = ConnectionId(9);
+        host.grant(human, grant_request(1, 0)).unwrap();
+        host.admit_raw(human, 1, 1, [1; 32]).unwrap();
+        assert_eq!(host.latch_stop(owner), Err(Error::Control(Refusal::Busy)));
+        host.complete_raw(1, Delivery::Written).unwrap();
+        assert_eq!(host.latch_stop(owner), Err(Error::Retained));
+        assert!(host.revoke(owner, 1).unwrap());
+        assert!(!host.revoke(owner, 1).unwrap());
+        assert_eq!(host.latch_stop(owner), Err(Error::Retained));
+        let cut = host.raw_cut(1).unwrap();
+        assert_eq!(host.discard_raw(owner, cut), Ok(Retire::Retired));
+        host.latch_stop(owner).unwrap();
+        assert_eq!(host.grant(human, grant_request(2, 1)), Err(Error::Stopping));
+        assert_eq!(host.admit_raw(human, 1, 2, [2; 32]), Err(Error::Stopping));
+        assert_eq!(host.recover_raw(1, 1, [1; 32]), Raw::Forgotten);
     }
     #[test]
     fn rich_clear_result_and_payload_binding_survive_replacement() {

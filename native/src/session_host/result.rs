@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 pub(crate) const MAX_REPLY: usize = 4096;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Delivery {
     Rejected,
     Written,
