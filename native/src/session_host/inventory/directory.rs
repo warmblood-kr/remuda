@@ -45,11 +45,28 @@ impl Directory {
     }
     pub fn read_index(&self) -> io::Result<File> {
         #[cfg(unix)]
-        let file = self.open_relative(c"inventory.json", libc::O_RDONLY)?;
+        {
+            // A concurrent rename may unlink the file between open and fstat;
+            // reopen the new cut instead of misreporting a link mismatch.
+            for _ in 0..8 {
+                let file = self.open_relative(c"inventory.json", libc::O_RDONLY)?;
+                if file.metadata()?.nlink() == 0 {
+                    continue;
+                }
+                private_file(&file)?;
+                return Ok(file);
+            }
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "inventory replaced during every read attempt",
+            ))
+        }
         #[cfg(windows)]
-        let file = self.handle.open_file("inventory.json", false)?;
-        private_file(&file)?;
-        Ok(file)
+        {
+            let file = self.handle.open_file("inventory.json", false)?;
+            private_file(&file)?;
+            Ok(file)
+        }
     }
     pub fn lock_file(&self) -> io::Result<File> {
         #[cfg(unix)]

@@ -363,3 +363,31 @@ fn private_index_refuses_aliases_symlinks_fifos_and_loose_modes_without_repair()
     assert!(Store::open(&scratch.0).is_err());
     assert!(before.elapsed() < Duration::from_secs(1));
 }
+#[cfg(unix)]
+#[test]
+fn reads_racing_atomic_replacement_never_misreport_a_link_mismatch() {
+    let root = Scratch::new();
+    let (_store, _index, _fence) = bootstrap(&root.0);
+    let directory = Arc::new(Directory::open(&root.0).unwrap());
+    let bytes = std::fs::read(root.0.join("inventory.json")).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (directory, stop) = (directory.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                directory.replace(&bytes).unwrap();
+            }
+        })
+    };
+    for _ in 0..2000 {
+        match directory.read_index() {
+            Ok(_) => {}
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}"),
+        }
+        if let Err(error) = Store::open(&root.0) {
+            assert!(!format!("{error:?}").contains("mismatch"), "{error:?}");
+        }
+    }
+    stop.store(true, Ordering::Release);
+    writer.join().unwrap();
+}
