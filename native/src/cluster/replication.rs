@@ -36,10 +36,10 @@ struct WorkPool {
     wake: Condvar,
 }
 
-struct PeerMaterial {
-    endpoint: SocketAddr,
-    peer_key: Vec<u8>,
-    local_private: Zeroizing<Vec<u8>>,
+pub(super) struct PeerMaterial {
+    pub(super) endpoint: SocketAddr,
+    pub(super) peer_key: Vec<u8>,
+    pub(super) local_private: Zeroizing<Vec<u8>>,
     registry: Registry,
 }
 
@@ -81,11 +81,13 @@ fn schedule_changes() {
 /// Schedule initial fetches without making listener or daemon startup wait.
 pub fn startup_sync() {
     enqueue_all(false);
+    super::vfs_sync::background_pass();
 }
 
 /// Run one pull-only anti-entropy pass for every admitted peer with an endpoint.
 pub fn anti_entropy_sync() {
     enqueue_all(false);
+    super::vfs_sync::background_pass();
 }
 
 #[derive(Clone, Debug)]
@@ -344,7 +346,7 @@ fn worker_loop(pool: Arc<WorkPool>) {
     }
 }
 
-fn peer_material(peer_fp: &str) -> io::Result<PeerMaterial> {
+pub(super) fn peer_material(peer_fp: &str) -> io::Result<PeerMaterial> {
     peer_material_for_revocation(peer_fp, false)
 }
 

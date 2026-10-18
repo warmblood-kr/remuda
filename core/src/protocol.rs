@@ -320,6 +320,18 @@ pub enum Request {
     },
     /// Apply one bounded, canonical registry update from an authenticated peer.
     ClusterRegistryUpdate { update_json: String },
+    /// Read a page of the authenticated peer's virtual file index (#742).
+    /// `digest` lets the peer answer `unchanged`.
+    ClusterVfsIndexSync {
+        digest: Option<String>,
+        offset: usize,
+    },
+    /// Merge bounded virtual file index entries from an authenticated peer.
+    ClusterVfsIndexUpdate { entries_json: String },
+    /// Which of these blob hashes the peer holds.
+    ClusterVfsBlobStat { hashes: Vec<String> },
+    /// Read one chunk of a blob the peer holds, from `offset`.
+    ClusterVfsBlobGet { sha256: String, offset: u64 },
     /// Read or reload the daemon-owned local cluster listener.
     ClusterListener(ListenerOp),
     /// Stop the daemon, so the next command starts a fresh one. The daemon
@@ -470,6 +482,28 @@ pub enum Response {
     ClusterRegistryAck {
         digest: String,
         applied: bool,
+    },
+    /// One page of a peer's virtual file index.
+    ClusterVfsIndexPage {
+        digest: String,
+        offset: usize,
+        entries_json: String,
+        next_offset: Option<usize>,
+        unchanged: bool,
+    },
+    /// Index entries were merged; `applied` counts those that changed state.
+    ClusterVfsAck {
+        digest: String,
+        applied: usize,
+    },
+    /// One flag per hash in the matching `ClusterVfsBlobStat`.
+    ClusterVfsBlobHave(Vec<bool>),
+    /// A blob chunk, base64 encoded, and the blob's total size.
+    ClusterVfsBlobChunk {
+        sha256: String,
+        offset: u64,
+        total: u64,
+        data_b64: String,
     },
     /// Current state of the daemon-owned cluster listener.
     ClusterListenerStatus(ListenerStatus),

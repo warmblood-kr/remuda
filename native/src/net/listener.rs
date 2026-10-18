@@ -44,6 +44,8 @@ const PREAUTH_EVICT_MIN_AGE: Duration = Duration::from_millis(250);
 pub const MAX_HELD_REQUEST: Duration = Duration::from_secs(30);
 const MAX_REGISTRY_UPDATE_JSON_BYTES: usize = 48 * 1024;
 const MAX_REGISTRY_PAGE_ENTRIES: usize = 32;
+/// Error text a peer retries on, like the registry's rate-limit message.
+pub const VFS_RATE_LIMITED: &str = "vfs rate limit exceeded";
 const MAX_REGISTRY_RATE_BUCKETS: usize = cluster::registry::MAX_REGISTRY_ENTRIES;
 const SOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_READ_TIME: Duration = Duration::from_secs(5);
@@ -246,6 +248,7 @@ struct RequestLimiter {
     large: Mutex<HashMap<String, usize>>,
     join_attempts: Mutex<HashMap<std::net::IpAddr, VecDeque<Instant>>>,
     registry_requests: Mutex<HashMap<String, RegistryTokenBucket>>,
+    vfs_requests: Mutex<HashMap<String, RegistryTokenBucket>>,
     remote_inputs: Mutex<RemoteInputRateLimiter>,
 }
 
@@ -651,6 +654,38 @@ impl RequestLimiter {
         bucket.tokens = (bucket.tokens + elapsed * REFILL_PER_SECOND).min(BURST);
         bucket.last_refill = now;
         if bucket.tokens < 1.0 || (!priority && bucket.tokens < 1.0 + UPDATE_RESERVE) {
+            return false;
+        }
+        bucket.tokens -= 1.0;
+        true
+    }
+
+    /// Virtual file store requests (#742) have their own bucket, so blob
+    /// transfer never starves registry replication. A 64 MiB blob is 64
+    /// chunk requests.
+    fn acquire_vfs_request(&self, fingerprint: &str) -> bool {
+        const BURST: f64 = 128.0;
+        const REFILL_PER_SECOND: f64 = 64.0;
+        let now = Instant::now();
+        let mut buckets = self
+            .vfs_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill) < Duration::from_secs(60));
+        if !buckets.contains_key(fingerprint) && buckets.len() >= MAX_REGISTRY_RATE_BUCKETS {
+            return false;
+        }
+        let bucket = buckets
+            .entry(fingerprint.to_owned())
+            .or_insert(RegistryTokenBucket {
+                tokens: BURST,
+                last_refill: now,
+            });
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * REFILL_PER_SECOND).min(BURST);
+        bucket.last_refill = now;
+        if bucket.tokens < 1.0 {
             return false;
         }
         bucket.tokens -= 1.0;
@@ -1108,7 +1143,12 @@ fn authorize_remote_request_with_control(
     // the local remote-control front, whose allowlist serves a different API.
     if matches!(
         request,
-        Request::ClusterRegistrySync { .. } | Request::ClusterRegistryUpdate { .. }
+        Request::ClusterRegistrySync { .. }
+            | Request::ClusterRegistryUpdate { .. }
+            | Request::ClusterVfsIndexSync { .. }
+            | Request::ClusterVfsIndexUpdate { .. }
+            | Request::ClusterVfsBlobStat { .. }
+            | Request::ClusterVfsBlobGet { .. }
     ) {
         return Ok(());
     }
@@ -1257,6 +1297,19 @@ fn dispatch_payload(
                 applied: !outcome.applied.is_empty(),
             })
             .map_err(|_| io::Error::other("registry acknowledgement encode failed"))
+        }
+        request @ (Request::ClusterVfsIndexSync { .. }
+        | Request::ClusterVfsIndexUpdate { .. }
+        | Request::ClusterVfsBlobStat { .. }
+        | Request::ClusterVfsBlobGet { .. }) => {
+            let peer_fp = cluster::encoding::fingerprint(peer_static);
+            if !limiter.acquire_vfs_request(&peer_fp) {
+                return serde_json::to_vec(&Response::error(VFS_RATE_LIMITED))
+                    .map_err(io::Error::other);
+            }
+            let response = cluster::vfs_sync::serve(&request);
+            serde_json::to_vec(&response)
+                .map_err(|_| io::Error::other("vfs response encode failed"))
         }
         request => {
             if let Err(response) =

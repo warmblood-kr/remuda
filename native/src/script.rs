@@ -30,7 +30,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 108] = [
+pub const BINDINGS: [&str; 109] = [
     "_advice_reattach",
     "_call",
     "_caller_live",
@@ -137,6 +137,7 @@ pub const BINDINGS: [&str; 108] = [
     "type_text",
     "unadvise",
     "unbind",
+    "vfs",
     "window",
     "windows",
 ];
@@ -430,6 +431,26 @@ const WORDS: &[(&str, &str, &str)] = &[
         "table",
     ),
     (
+        "vfs",
+        "Read-only access to the cluster file store at remuda:// URIs. Calls answer from this node's index and cached copies and never wait on the network. Failures return nil and a reason starting with a code: no_cluster, not_found, not_local, bad_uri, wrong_cluster, corrupt or io.",
+        "table",
+    ),
+    (
+        "vfs.stat",
+        "Describe a stored file: path, version, sha256, size, mtime, replicas, writer, local (whether this node holds a copy) and synced_at (unix time a peer index was last merged here, or nil). A file known here without a local copy still returns its table, with local = false.",
+        "vfs.stat(uri) -> {path, version, sha256, size, mtime, replicas, writer, local, synced_at} | nil, reason",
+    ),
+    (
+        "vfs.read",
+        "Return the bytes of a stored file from this node's verified copy. Returns nil, 'not_local: ...' when this node has no copy yet.",
+        "vfs.read(uri) -> bytes | nil, reason",
+    ),
+    (
+        "vfs.list",
+        "List stored files whose path starts with the prefix in a remuda:// URI (remuda:/// lists everything), as stat tables sorted by path.",
+        "vfs.list(prefix_uri) -> {stat...} | nil, reason",
+    ),
+    (
         "system",
         "OS services for trusted Lua callers.",
         "table",
@@ -524,6 +545,7 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
     table.set("daemon", daemon_bindings(lua)?)?;
     table.set("system", crate::credential::bindings(lua)?)?;
     table.set("storage", crate::storage::bindings(lua)?)?;
+    table.set("vfs", crate::vfs_lua::bindings(lua)?)?;
     fs_bindings(lua, table)?;
     table.set("_registry", registry)
 }
@@ -2490,6 +2512,10 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         )),
         Response::ClusterRegistryPage { .. }
         | Response::ClusterRegistryAck { .. }
+        | Response::ClusterVfsIndexPage { .. }
+        | Response::ClusterVfsAck { .. }
+        | Response::ClusterVfsBlobHave(_)
+        | Response::ClusterVfsBlobChunk { .. }
         | Response::ClusterListenerStatus(_) => Err(mlua::Error::runtime(
             "cluster control responses are not exposed to scripts",
         )),

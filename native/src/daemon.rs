@@ -1582,9 +1582,12 @@ fn handle_request(
         Request::Version => reply(&stream, &Response::Value(crate::dist::BUILD_VERSION.into())),
         Request::SocketPublication => reply(&stream, &Response::Value(socket_publication())),
 
-        Request::ClusterRegistrySync { .. } | Request::ClusterRegistryUpdate { .. } => {
-            refuse_cluster_registry(&stream)
-        }
+        Request::ClusterRegistrySync { .. }
+        | Request::ClusterRegistryUpdate { .. }
+        | Request::ClusterVfsIndexSync { .. }
+        | Request::ClusterVfsIndexUpdate { .. }
+        | Request::ClusterVfsBlobStat { .. }
+        | Request::ClusterVfsBlobGet { .. } => refuse_cluster_registry(&stream),
 
         Request::ClusterListener(ListenerOp::Status) => reply(
             &stream,

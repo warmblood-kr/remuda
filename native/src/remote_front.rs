@@ -295,6 +295,10 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::SocketPublication => Err(refusal("SocketPublication")),
         Request::ClusterRegistrySync { .. } => Err(refusal("ClusterRegistrySync")),
         Request::ClusterRegistryUpdate { .. } => Err(refusal("ClusterRegistryUpdate")),
+        Request::ClusterVfsIndexSync { .. } => Err(refusal("ClusterVfsIndexSync")),
+        Request::ClusterVfsIndexUpdate { .. } => Err(refusal("ClusterVfsIndexUpdate")),
+        Request::ClusterVfsBlobStat { .. } => Err(refusal("ClusterVfsBlobStat")),
+        Request::ClusterVfsBlobGet { .. } => Err(refusal("ClusterVfsBlobGet")),
         Request::ClusterListener(_) => Err(refusal("ClusterListener")),
         Request::Shutdown { .. } => Err(refusal("Shutdown")),
         Request::Eval { .. } => Err(refusal("Eval")),
@@ -558,6 +562,18 @@ mod tests {
             },
             Request::ClusterRegistryUpdate {
                 update_json: "private-registry-update".into(),
+            },
+            Request::ClusterVfsIndexSync {
+                digest: None,
+                offset: 0,
+            },
+            Request::ClusterVfsIndexUpdate {
+                entries_json: "[]".into(),
+            },
+            Request::ClusterVfsBlobStat { hashes: vec![] },
+            Request::ClusterVfsBlobGet {
+                sha256: "0".repeat(64),
+                offset: 0,
             },
             Request::ClusterListener(remuda_core::protocol::ListenerOp::Status),
             Request::Shutdown {

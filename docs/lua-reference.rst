@@ -496,6 +496,26 @@ unbind
 
 ``unbind(context, key) -> nil`` — Remove an effective contextual UI binding.
 
+vfs
+---
+
+``table`` — Read-only access to the cluster file store at remuda:// URIs. Calls answer from this node's index and cached copies and never wait on the network. Failures return nil and a reason starting with a code: no_cluster, not_found, not_local, bad_uri, wrong_cluster, corrupt or io.
+
+vfs.list
+--------
+
+``vfs.list(prefix_uri) -> {stat...} | nil, reason`` — List stored files whose path starts with the prefix in a remuda:// URI (remuda:/// lists everything), as stat tables sorted by path.
+
+vfs.read
+--------
+
+``vfs.read(uri) -> bytes | nil, reason`` — Return the bytes of a stored file from this node's verified copy. Returns nil, 'not_local: ...' when this node has no copy yet.
+
+vfs.stat
+--------
+
+``vfs.stat(uri) -> {path, version, sha256, size, mtime, replicas, writer, local, synced_at} | nil, reason`` — Describe a stored file: path, version, sha256, size, mtime, replicas, writer, local (whether this node holds a copy) and synced_at (unix time a peer index was last merged here, or nil). A file known here without a local copy still returns its table, with local = false.
+
 wait_for
 --------
 
