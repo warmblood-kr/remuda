@@ -102,8 +102,20 @@ impl Coordinator {
         self.admitting()?;
         self.human.grant(connection, request).map_err(Error::Grant)
     }
-    pub fn disconnect_human(&mut self, connection: ConnectionId) {
-        self.human.disconnect(connection);
+    /// Lock order: this coordinator, then the core attach slot inside `cas`.
+    pub fn grant_with(
+        &mut self,
+        connection: ConnectionId,
+        request: GrantRequest,
+        cas: impl FnOnce(u64) -> Result<u64, GrantError>,
+    ) -> Result<(u64, GrantState), Error> {
+        self.admitting()?;
+        self.human
+            .grant_with(connection, request, cas)
+            .map_err(Error::Grant)
+    }
+    pub fn disconnect_human(&mut self, connection: ConnectionId) -> Option<u64> {
+        self.human.disconnect(connection)
     }
     /// Management revoke of one exact grant; an in-flight ticket still drains.
     pub fn revoke(&mut self, fence: Fence, grant: u64) -> Result<bool, Error> {
@@ -147,6 +159,15 @@ impl Coordinator {
     }
     pub fn recover_raw(&self, grant: u64, sequence: u64, digest: [u8; 32]) -> Raw {
         self.human.recover(grant, sequence, digest)
+    }
+    /// Synthetic completed outcome; real raw writes arrive with the OS path.
+    #[cfg(test)]
+    pub fn raw_fixture(&mut self, grant: u64, sequence: u64, digest: [u8; 32], delivery: Delivery) {
+        assert_eq!(self.human.reserve(grant, sequence, digest), Raw::New);
+        assert!(self.human.complete(sequence, delivery));
+    }
+    pub fn holds_grant(&self, connection: ConnectionId, grant: u64) -> bool {
+        self.human.holds(connection, grant)
     }
     pub fn raw_cut(&self, last: u64) -> Result<Cut, Retire> {
         self.human.cut(last)

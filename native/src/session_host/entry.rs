@@ -167,6 +167,17 @@ impl Client {
             &[super::api::RETAINED_LEDGER],
         )
     }
+    /// Human input must be negotiated before any grant reaches an old host.
+    pub fn open_human(path: &Path, expected: super::api::Identity) -> io::Result<Self> {
+        Self::open_with_capabilities(path, Role::Human, expected, &[super::api::HUMAN_INPUT])
+    }
+    #[cfg(test)]
+    pub fn open_human_without_capability(
+        path: &Path,
+        expected: super::api::Identity,
+    ) -> io::Result<Self> {
+        Self::open_with_capabilities(path, Role::Human, expected, &[])
+    }
     fn open_with_capabilities(
         path: &Path,
         role: Role,

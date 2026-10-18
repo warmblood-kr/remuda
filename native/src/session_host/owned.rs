@@ -2,11 +2,13 @@
 use super::child::{HostChild, View};
 use super::control::{ActId, ConnectionId, Fence};
 use super::coordinator::{Admission, Coordinator, Error};
+use super::human::{Cut, GrantError, GrantRequest, GrantState, Raw, Retire};
 use super::ledger::Lookup;
 use super::result::{Completion, Delivery, ErrorCode, Reply, Submission};
 use super::wire::{InputAct, Step};
 use portable_pty::CommandBuilder;
 use remuda_core::agent::{AgentError, AgentProcess, AgentWriter, Size};
+use remuda_core::session::{AttachRefusal, OwnedAttached};
 use remuda_core::{InputSubmitOutcome, Session};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,6 +20,8 @@ pub(crate) struct Owned {
     pub view: View,
     writer: Arc<dyn AgentWriter>,
     coordinator: Mutex<Coordinator>,
+    // Current human core guard; taken only under the coordinator lock.
+    human: Mutex<Option<OwnedAttached>>,
 }
 impl Owned {
     pub fn spawn(
@@ -88,6 +92,7 @@ impl Owned {
             view,
             writer,
             coordinator: Mutex::new(Coordinator::new(incarnation)),
+            human: Mutex::new(None),
         })
     }
     pub fn identity(&self) -> super::api::Identity {
@@ -162,6 +167,90 @@ impl Owned {
             // old physical effect could still land later.
             Err(_) => Err(Error::Invalid("host close unknown or pending")),
         }
+    }
+    /// Core CAS runs under the coordinator; displaced guards drop after it.
+    pub fn grant_human(
+        &self,
+        connection: ConnectionId,
+        request: GrantRequest,
+    ) -> Result<(u64, GrantState), Error> {
+        let mut displaced = None;
+        let result = self
+            .coordinator
+            .lock()
+            .unwrap()
+            .grant_with(connection, request, |expected| {
+                let guard = self
+                    .session
+                    .attach_owned_expected(expected)
+                    .map_err(|refusal| match refusal {
+                        AttachRefusal::Stale { .. } => GrantError::Stale,
+                        AttachRefusal::Exhausted => GrantError::Exhausted,
+                    })?;
+                let generation = guard.generation();
+                displaced = self.human.lock().unwrap().replace(guard);
+                Ok(generation)
+            });
+        drop(displaced);
+        result
+    }
+    fn release_guard(&self, grant: u64) -> Option<OwnedAttached> {
+        let mut slot = self.human.lock().unwrap();
+        slot.take_if(|guard| guard.generation() == grant)
+    }
+    pub fn disconnect_human(&self, connection: ConnectionId) {
+        let released = {
+            let mut coordinator = self.coordinator.lock().unwrap();
+            coordinator
+                .disconnect_human(connection)
+                .and_then(|grant| self.release_guard(grant))
+        };
+        drop(released);
+    }
+    pub fn revoke_human(&self, fence: Fence, grant: u64) -> Result<bool, Error> {
+        let (result, released) = {
+            let mut coordinator = self.coordinator.lock().unwrap();
+            let result = coordinator.revoke(fence, grant);
+            let released = matches!(result, Ok(true))
+                .then(|| self.release_guard(grant))
+                .flatten();
+            (result, released)
+        };
+        drop(released);
+        result
+    }
+    pub fn recover_raw(&self, grant: u64, sequence: u64, digest: [u8; 32]) -> Raw {
+        self.coordinator
+            .lock()
+            .unwrap()
+            .recover_raw(grant, sequence, digest)
+    }
+    pub fn raw_cut(&self, last: u64) -> Result<Cut, Retire> {
+        self.coordinator.lock().unwrap().raw_cut(last)
+    }
+    pub fn ack_raw(&self, connection: ConnectionId, cut: Cut) -> Retire {
+        self.coordinator.lock().unwrap().ack_raw(connection, cut)
+    }
+    pub fn discard_raw(&self, fence: Fence, cut: Cut) -> Result<Retire, Error> {
+        self.coordinator.lock().unwrap().discard_raw(fence, cut)
+    }
+    #[cfg(test)]
+    pub fn human_attached_fixture(&self) -> bool {
+        self.session.is_attached()
+    }
+    #[cfg(test)]
+    pub fn admit_raw_fixture(&self, grant: u64, sequence: u64, bytes: &[u8], delivery: Delivery) {
+        let digest = InputAct::Bytes(bytes.to_vec()).digest().unwrap();
+        self.coordinator
+            .lock()
+            .unwrap()
+            .raw_fixture(grant, sequence, digest, delivery);
+    }
+    pub fn holds_grant(&self, connection: ConnectionId, grant: u64) -> bool {
+        self.coordinator
+            .lock()
+            .unwrap()
+            .holds_grant(connection, grant)
     }
     pub fn acquire(&self, connection: ConnectionId) -> Result<Fence, Error> {
         self.coordinator.lock().unwrap().acquire(connection)

@@ -2,7 +2,7 @@
 //! Pure model under the host coordinator; no OS effect, wire or core guard here.
 use super::control::ConnectionId;
 use super::result::Delivery;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 
@@ -14,7 +14,7 @@ pub(crate) struct GrantRequest {
     pub expected: u64,
     pub recovery: [u8; 32],
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum GrantState {
     Current,
     Superseded,
@@ -26,7 +26,7 @@ pub(crate) enum GrantError {
     Conflict,
     Exhausted,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Raw {
     New,
     Pending,
@@ -42,14 +42,14 @@ pub(crate) enum Kind {
     Ack,
     Discard,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Cut {
     pub grant: u64,
     pub first: u64,
     pub last: u64,
     pub hash: [u8; 32],
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Retire {
     Retired,
     Forgotten,
@@ -117,6 +117,22 @@ impl Human {
         connection: ConnectionId,
         request: GrantRequest,
     ) -> Result<(u64, GrantState), GrantError> {
+        let high_water = self.high_water;
+        self.grant_with(connection, request, |expected| {
+            if expected != high_water {
+                return Err(GrantError::Stale);
+            }
+            high_water.checked_add(1).ok_or(GrantError::Exhausted)
+        })
+    }
+    /// `cas` runs the authoritative compare-and-advance (core attach slot)
+    /// only after exact-receipt evidence, and returns the new generation.
+    pub fn grant_with(
+        &mut self,
+        connection: ConnectionId,
+        request: GrantRequest,
+        cas: impl FnOnce(u64) -> Result<u64, GrantError>,
+    ) -> Result<(u64, GrantState), GrantError> {
         if let Some(receipt) = self
             .receipt
             .filter(|r| r.request.request == request.request)
@@ -126,13 +142,7 @@ impl Human {
             }
             return Ok((receipt.grant, self.state(receipt)));
         }
-        if request.expected != self.high_water {
-            return Err(GrantError::Stale);
-        }
-        let grant = self
-            .high_water
-            .checked_add(1)
-            .ok_or(GrantError::Exhausted)?;
+        let grant = cas(request.expected)?;
         self.high_water = grant;
         self.current = Some(Holder { grant, connection });
         self.receipt = Some(Receipt {
@@ -172,10 +182,10 @@ impl Human {
         }
         true
     }
-    pub fn disconnect(&mut self, connection: ConnectionId) {
-        if let Some(holder) = self.current.filter(|h| h.connection == connection) {
-            self.revoke(holder.grant);
-        }
+    pub fn disconnect(&mut self, connection: ConnectionId) -> Option<u64> {
+        let holder = self.current.filter(|h| h.connection == connection)?;
+        self.revoke(holder.grant);
+        Some(holder.grant)
     }
     fn find(&self, sequence: u64) -> Option<&Entry> {
         let offset = sequence.checked_sub(self.retired_through + 1)?;
