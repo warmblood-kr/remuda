@@ -31,16 +31,20 @@ impl Scratch {
         self.local().join("remuda")
     }
 
-    fn remuda(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_remuda"))
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
+        command
             .args(["-s", "s"])
             .args(args)
             .env("REMUDA_RUNTIME_DIR", self.root.join("run"))
             .env("HOME", &self.root)
             .env("LOCALAPPDATA", self.local())
-            .env("REMUDA_NO_UPDATE_CHECK", "1")
-            .output()
-            .expect("run remuda")
+            .env("REMUDA_NO_UPDATE_CHECK", "1");
+        command
+    }
+
+    fn remuda(&self, args: &[&str]) -> Output {
+        self.command(args).output().expect("run remuda")
     }
 
     /// The daemon boots (its listener reads the cluster config) and runs Lua.
@@ -159,4 +163,30 @@ fn data_made_before_cluster_init_stays_usable() {
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert_eq!(icacls(&base, &[]), acl_before, "the base ACL was changed");
+}
+
+// The listener reads the registry's change token before it binds. That read
+// used to refuse on Windows ("not yet hardened on Windows"), so the daemon
+// listener behind `cluster listen` and `cluster join` never came up.
+#[test]
+fn the_daemon_cluster_listener_binds_after_init() {
+    use std::net::{TcpListener, TcpStream};
+
+    let scratch = Scratch::new("listen");
+    let init = scratch.remuda(&["cluster", "init", "--no-listen"]);
+    assert!(init.status.success(), "cluster init failed: {init:?}");
+
+    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = reservation.local_addr().unwrap();
+    drop(reservation);
+    let listen = scratch.remuda(&["cluster", "listen", "--bind", &addr.to_string()]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&listen.stdout),
+        String::from_utf8_lossy(&listen.stderr)
+    );
+    assert!(listen.status.success(), "cluster listen failed: {said}");
+    assert!(!said.contains("not yet hardened"), "{said}");
+    assert!(said.contains("Cluster listener on"), "{said}");
+    TcpStream::connect(addr).unwrap_or_else(|error| panic!("connect {addr}: {error}"));
 }
