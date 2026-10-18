@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, VecDeque};
 #[path = "publication.rs"]
 mod publication;
 pub(crate) use publication::TerminalEnd;
-pub(crate) use publication::{Birth, Lease, Publication};
+pub(crate) use publication::{Birth, Lease, Publication, Settled};
 
 pub(crate) const MAX_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_ENTRIES: usize = 128;

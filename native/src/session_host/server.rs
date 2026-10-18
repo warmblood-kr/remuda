@@ -309,7 +309,7 @@ impl Connection {
         }
     }
     fn stop(&mut self) -> Result<Response, String> {
-        self.controller()?;
+        let fence = self.controller()?;
         if self
             .server
             .publication
@@ -318,22 +318,18 @@ impl Connection {
         {
             return Err("host_publication_pending".into());
         }
-        if self
-            .server
-            .publication
-            .as_ref()
-            .is_some_and(|gate| !gate.retention_settled())
-        {
-            return Err("host_retention_pending".into());
-        }
+        let settled = match &self.server.publication {
+            Some(gate) => Some(gate.settle(&self.server.host.identity())?),
+            None => None,
+        };
         let info = self.server.host.inspect().map_err(|_| "host_unavailable")?;
         if !matches!(info.lifecycle, Lifecycle::Exited) || !info.output_eof {
             return Err("host_stop_requires_confirmed_exit_and_output_eof".into());
         }
-        self.server
-            .host
-            .ensure_quiescent(self.controller()?)
-            .map_err(control_error)?;
+        if settled.is_some_and(|proof| proof.exit_generation() > info.generation) {
+            return Err("host_settlement_unavailable".into());
+        }
+        self.server.host.latch_stop(fence).map_err(control_error)?;
         self.stop_after_reply = true;
         Ok(Response::Ok)
     }
@@ -534,6 +530,7 @@ fn control_error(error: super::coordinator::Error) -> String {
         Error::Control(Refusal::Stale) | Error::StaleCompletion => "stale_controller_or_act",
         Error::Control(Refusal::Exhausted) => "host_sequence_exhausted",
         Error::Invalid(_) => "invalid_or_unavailable_operation",
+        Error::Stopping => "host_stopping",
     }
     .into()
 }

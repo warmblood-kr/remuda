@@ -14,6 +14,7 @@ pub(crate) enum Error {
     Control(Refusal),
     Invalid(&'static str),
     StaleCompletion,
+    Stopping,
 }
 struct Running {
     token: ActId,
@@ -27,6 +28,7 @@ pub(crate) struct Coordinator {
     ledger: Ledger,
     running: Option<Running>,
     mutation: Option<ActId>,
+    stopped: bool,
 }
 impl Coordinator {
     pub fn new(incarnation: [u8; 16]) -> Self {
@@ -35,15 +37,18 @@ impl Coordinator {
             ledger: Ledger::default(),
             running: None,
             mutation: None,
+            stopped: false,
         }
     }
     pub fn acquire(&mut self, connection: ConnectionId) -> Result<Fence, Error> {
+        self.admitting()?;
         self.controller.acquire(connection).map_err(Error::Control)
     }
     pub fn release(&mut self, fence: Fence) -> Result<(), Error> {
         self.controller.release(fence).map_err(Error::Control)
     }
     pub fn begin_mutation(&mut self, fence: Fence) -> Result<ActId, Error> {
+        self.admitting()?;
         let token = self.controller.begin_act(fence).map_err(Error::Control)?;
         self.mutation = Some(token);
         Ok(token)
@@ -56,6 +61,20 @@ impl Coordinator {
         self.mutation = None;
         Ok(())
     }
+    fn admitting(&self) -> Result<(), Error> {
+        if self.stopped {
+            return Err(Error::Stopping);
+        }
+        Ok(())
+    }
+    /// Final admission: only the current idle controller may latch; after it,
+    /// acquire, mutation and input refuse forever. Outcome reads stay open.
+    pub fn latch_stop(&mut self, fence: Fence) -> Result<(), Error> {
+        let token = self.begin_mutation(fence)?;
+        self.finish_mutation(token)?;
+        self.stopped = true;
+        Ok(())
+    }
     /// Caller holds the coordinator lock only for admission, never across an
     /// OS write, pause or snapshot. Execution retains token until fully settled.
     pub fn admit(
@@ -65,6 +84,7 @@ impl Coordinator {
         sequence: u64,
         act: &InputAct,
     ) -> Result<Admission, Error> {
+        self.admitting()?;
         let digest = act.digest().map_err(Error::Invalid)?;
         let token = self.controller.begin_act(fence).map_err(Error::Control)?;
         let state = self.ledger.reserve(client, sequence, digest);
@@ -239,6 +259,29 @@ mod tests {
         )
         .unwrap();
         assert!(host.acquire(ConnectionId(3)).is_ok());
+    }
+    #[test]
+    fn stop_latch_waits_for_active_act_then_refuses_all_new_admission() {
+        let mut host = Coordinator::new([6; 16]);
+        let owner = host.acquire(ConnectionId(1)).unwrap();
+        let act = InputAct::Bytes(vec![1]);
+        let token = admitted(host.admit(owner, [1; 16], 1, &act).unwrap());
+        assert_eq!(host.latch_stop(owner), Err(Error::Control(Refusal::Busy)));
+        host.claim(token).unwrap();
+        let result = Completion {
+            delivery: Delivery::Written,
+            reply: Reply::Unit,
+        };
+        host.complete(token, result.clone()).unwrap();
+        let stale = Fence { epoch: 0, ..owner };
+        assert_eq!(host.latch_stop(stale), Err(Error::Control(Refusal::Stale)));
+        host.latch_stop(owner).unwrap();
+        assert_eq!(host.latch_stop(owner), Err(Error::Stopping));
+        assert_eq!(host.admit(owner, [1; 16], 2, &act), Err(Error::Stopping));
+        assert_eq!(host.begin_mutation(owner), Err(Error::Stopping));
+        host.release(owner).unwrap();
+        assert_eq!(host.acquire(ConnectionId(2)), Err(Error::Stopping));
+        assert_eq!(host.recover([1; 16], 1, &act).unwrap().1, Some(&result));
     }
     #[test]
     fn rich_clear_result_and_payload_binding_survive_replacement() {

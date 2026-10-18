@@ -141,10 +141,14 @@ impl Owned {
         self.coordinator.lock().unwrap().finish_mutation(token)?;
         result.map_err(|_| Error::Invalid("host resize failed; inspect health"))
     }
-    pub fn ensure_quiescent(&self, fence: Fence) -> Result<(), Error> {
+    /// Latch Stop under the coordinator lock; caller proves settlement first,
+    /// outside this lock. A human holder keeps the host alive.
+    pub fn latch_stop(&self, fence: Fence) -> Result<(), Error> {
         let mut coordinator = self.coordinator.lock().unwrap();
-        let token = coordinator.begin_mutation(fence)?;
-        coordinator.finish_mutation(token)
+        if self.session.is_attached() {
+            return Err(Error::Invalid("human attached"));
+        }
+        coordinator.latch_stop(fence)
     }
     pub fn close(&self, fence: Fence) -> Result<(), Error> {
         let token = self.coordinator.lock().unwrap().begin_mutation(fence)?;
