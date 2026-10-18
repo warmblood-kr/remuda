@@ -531,6 +531,8 @@ fn control_error(error: super::coordinator::Error) -> String {
         Error::Control(Refusal::Exhausted) => "host_sequence_exhausted",
         Error::Invalid(_) => "invalid_or_unavailable_operation",
         Error::Stopping => "host_stopping",
+        Error::Retained => "host_raw_retention_pending",
+        Error::Grant(_) => "human_grant_refused",
     }
     .into()
 }

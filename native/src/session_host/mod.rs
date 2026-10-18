@@ -12,6 +12,7 @@ mod control;
 mod coordinator;
 #[cfg(unix)]
 mod entry;
+mod human;
 mod inventory;
 #[cfg(unix)]
 mod latest;
