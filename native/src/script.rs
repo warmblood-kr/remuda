@@ -30,7 +30,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 107] = [
+pub const BINDINGS: [&str; 108] = [
     "_advice_reattach",
     "_call",
     "_caller_live",
@@ -85,6 +85,7 @@ pub const BINDINGS: [&str; 107] = [
     "close",
     "contribute",
     "contributions",
+    "daemon",
     "define_key",
     "emit",
     "emit_filter",
@@ -202,6 +203,16 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_timer_every",
         "Internal event-loop repeating timer binding.",
         "_timer_every(seconds, callback, owner?) -> handle",
+    ),
+    (
+        "daemon",
+        "Facts about the daemon this Lua image runs in.",
+        "table",
+    ),
+    (
+        "daemon.socket_publication",
+        "How this daemon published its socket. Returns {state = 'staged'} or {state = 'legacy', reason = text} (it fell back, or the operator set REMUDA_SOCKET_PUBLICATION=legacy). The same answer as the SocketPublication request; a core without remuda.daemon does not have it, so test remuda.daemon first.",
+        "daemon.socket_publication() -> {state, reason?}",
     ),
     (
         "clock",
@@ -510,10 +521,31 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
     }
     table.set("json", crate::json::bindings(lua)?)?;
     table.set("cli", cli_parse_bindings(lua)?)?;
+    table.set("daemon", daemon_bindings(lua)?)?;
     table.set("system", crate::credential::bindings(lua)?)?;
     table.set("storage", crate::storage::bindings(lua)?)?;
     fs_bindings(lua, table)?;
     table.set("_registry", registry)
+}
+
+fn daemon_bindings(lua: &Lua) -> mlua::Result<Table> {
+    let daemon = lua.create_table()?;
+    daemon.set(
+        "socket_publication",
+        lua.create_function(|lua, ()| {
+            let answer = crate::daemon::socket_publication();
+            let result = lua.create_table()?;
+            match answer.strip_prefix("legacy: ") {
+                Some(reason) => {
+                    result.set("state", "legacy")?;
+                    result.set("reason", reason)?;
+                }
+                None => result.set("state", answer.as_str())?,
+            }
+            Ok(result)
+        })?,
+    )?;
+    Ok(daemon)
 }
 
 fn cli_parse_bindings(lua: &Lua) -> mlua::Result<Table> {

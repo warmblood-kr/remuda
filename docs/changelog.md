@@ -2,6 +2,7 @@
 
 ## 2026-10-18
 
+- New `remuda.daemon.socket_publication()` returns `{state = 'staged'}` or `{state = 'legacy', reason = ...}`, the same answer as the `SocketPublication` request, so mods such as `remuda butler doctor` can show it. A core without `remuda.daemon` does not have it; test the table first.
 - The daemon now publishes its socket in two steps on macOS and Linux: it binds and chmods a private name, then renames it into place, so no client can connect before the daemon has recorded the node it will remove at shutdown. Platforms or paths that cannot do this (Android, BSD, a long runtime directory, a directory with an ACL) keep the old bind, and the reason is logged at start and reported by the new `SocketPublication` request. Set `REMUDA_SOCKET_PUBLICATION=legacy` in the daemon's environment to force the old bind. To roll back to an older `remuda`, stop the daemon first (`remuda stop`); an older binary does not know the staged leftovers, which are named `.r660-*` in the runtime directory and can be deleted while no daemon runs.
 
 ## 2026-10-02
