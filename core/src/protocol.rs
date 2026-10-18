@@ -308,6 +308,9 @@ pub enum Request {
     /// outlives the binary that spawned it, so this is a client's only way to
     /// learn it is talking to yesterday's code before a field mismatch does.
     Version,
+    /// How the daemon published its socket, as [`Response::Value`]: `staged`,
+    /// or `legacy: <reason>` when it fell back or the operator chose it.
+    SocketPublication,
     /// Read a bounded page of the authenticated peer's registry. `digest`
     /// lets the peer return an unchanged response; entries use canonical JSON
     /// strings so the policy crate does not depend on the host JSON codec.
