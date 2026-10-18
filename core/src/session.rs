@@ -1892,13 +1892,41 @@ impl Session {
         })
     }
 
+    /// Checked grant: displace only when the high-water still equals
+    /// `expected`, compared and advanced under the slot lock.
+    pub fn attach_owned_expected(
+        self: &Arc<Self>,
+        expected: u64,
+    ) -> std::result::Result<OwnedAttached, AttachRefusal> {
+        let (generation, displaced) = self.claim_checked(Some(expected))?;
+        Ok(Attachment {
+            session: Arc::clone(self),
+            generation,
+            displaced,
+        })
+    }
+
+    /// Latest grant generation; every grant path advances this one counter.
+    pub fn attach_high_water(&self) -> u64 {
+        let _slot = self.attach_slot.lock().unwrap_or_else(|p| p.into_inner());
+        self.last_attach_generation.load(Ordering::SeqCst)
+    }
+
     fn claim_attachment(&self) -> Result<(u64, Arc<AtomicBool>)> {
+        self.claim_checked(None)
+            .map_err(|_| AgentError::Io("attachment generation exhausted".into()))
+    }
+
+    fn claim_checked(
+        &self,
+        expected: Option<u64>,
+    ) -> std::result::Result<(u64, Arc<AtomicBool>), AttachRefusal> {
         let mut slot = self.attach_slot.lock().unwrap_or_else(|p| p.into_inner());
-        let generation = self
-            .last_attach_generation
-            .load(Ordering::SeqCst)
-            .checked_add(1)
-            .ok_or_else(|| AgentError::Io("attachment generation exhausted".into()))?;
+        let current = self.last_attach_generation.load(Ordering::SeqCst);
+        if expected.is_some_and(|expected| expected != current) {
+            return Err(AttachRefusal::Stale { current });
+        }
+        let generation = current.checked_add(1).ok_or(AttachRefusal::Exhausted)?;
         self.last_attach_generation
             .store(generation, Ordering::SeqCst);
         let displaced = Arc::new(AtomicBool::new(false));
@@ -1968,6 +1996,13 @@ pub struct Attachment<S: Borrow<Session>> {
 pub type Attached<'a> = Attachment<&'a Session>;
 /// Host attachment retaining the exact Session until its checked guard is dropped.
 pub type OwnedAttached = Attachment<Arc<Session>>;
+
+/// Why a checked attachment grant refused; nothing was displaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachRefusal {
+    Stale { current: u64 },
+    Exhausted,
+}
 
 impl<S: Borrow<Session>> Attachment<S> {
     /// The generation assigned when this client took the attachment.

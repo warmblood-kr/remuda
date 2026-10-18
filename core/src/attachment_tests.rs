@@ -234,3 +234,73 @@ fn owned_inflight_write_finishes_once_and_stale_drop_preserves_borrowed_successo
     drop(successor);
     assert!(!session.is_attached());
 }
+
+#[test]
+fn checked_grant_compares_the_shared_high_water() {
+    let session = session();
+    assert_eq!(session.attach_high_water(), 0);
+    assert!(matches!(
+        session.attach_owned_expected(1),
+        Err(AttachRefusal::Stale { current: 0 })
+    ));
+    let first = session.attach_owned_expected(0).unwrap();
+    assert_eq!(first.generation(), 1);
+    // An unchecked grant advances the same counter, staling old expectations.
+    let _borrowed = session.attach().unwrap();
+    assert_eq!(session.attach_high_water(), 2);
+    assert!(first.is_displaced());
+    assert!(matches!(
+        session.attach_owned_expected(1),
+        Err(AttachRefusal::Stale { current: 2 })
+    ));
+}
+
+#[test]
+fn stale_checked_grant_displaces_nothing_and_current_one_takes_over() {
+    let session = session();
+    let borrowed = session.attach().unwrap();
+    assert!(session.attach_owned_expected(0).is_err());
+    assert!(!borrowed.is_displaced(), "stale CAS displaced nothing");
+    borrowed.write_raw(b"still mine").unwrap();
+    let next = session.attach_owned_expected(1).unwrap();
+    assert!(borrowed.is_displaced());
+    drop(borrowed);
+    assert!(session.is_attached());
+    drop(next);
+    assert!(!session.is_attached());
+}
+
+#[test]
+fn checked_grant_exhaustion_fails_before_any_change() {
+    let session = session();
+    let held = session.attach_owned().unwrap();
+    session
+        .last_attach_generation
+        .store(u64::MAX, Ordering::SeqCst);
+    assert_eq!(
+        session.attach_owned_expected(u64::MAX).err(),
+        Some(AttachRefusal::Exhausted)
+    );
+    assert!(!held.is_displaced());
+    assert_eq!(session.attach_high_water(), u64::MAX);
+}
+
+#[test]
+fn concurrent_same_expectation_admits_exactly_one_grant() {
+    let session = session();
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let winners: Vec<_> = (0..8)
+        .map(|_| {
+            let (session, barrier) = (session.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                session.attach_owned_expected(0).ok()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(winners.iter().filter(|grant| grant.is_some()).count(), 1);
+    assert_eq!(session.attach_high_water(), 1);
+}
