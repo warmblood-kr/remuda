@@ -111,6 +111,16 @@ contributions
 
 ``contributions(point) -> {{id, owner, entry}...}`` — A point's entries as {id, owner, entry} rows, entry a shallow copy, by entry.order then id.
 
+daemon
+------
+
+``table`` — Facts about the daemon this Lua image runs in.
+
+daemon.socket_publication
+-------------------------
+
+``daemon.socket_publication() -> {state, reason?}`` — How this daemon published its socket. Returns {state = 'staged'} or {state = 'legacy', reason = text} (it fell back, or the operator set REMUDA_SOCKET_PUBLICATION=legacy). The same answer as the SocketPublication request; a core without remuda.daemon does not have it, so test remuda.daemon first.
+
 define_key
 ----------
 

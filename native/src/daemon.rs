@@ -264,6 +264,14 @@ pub fn serve_with_runtime(path: &Path, runtime: &Path) -> std::io::Result<()> {
 /// How the endpoint was published; `Request::SocketPublication` reports it.
 static SOCKET_PUBLICATION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// The `SocketPublication` answer, also read by `remuda.daemon.socket_publication()`.
+pub(crate) fn socket_publication() -> String {
+    SOCKET_PUBLICATION
+        .get()
+        .cloned()
+        .unwrap_or_else(|| "legacy: not recorded".into())
+}
+
 fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     let _socket_lock = SocketLock::acquire(path, runtime)?;
     if ipc::connect(path).is_ok() {
@@ -1572,15 +1580,7 @@ fn handle_request(
         }
 
         Request::Version => reply(&stream, &Response::Value(crate::dist::BUILD_VERSION.into())),
-        Request::SocketPublication => reply(
-            &stream,
-            &Response::Value(
-                SOCKET_PUBLICATION
-                    .get()
-                    .cloned()
-                    .unwrap_or_else(|| "legacy: not recorded".into()),
-            ),
-        ),
+        Request::SocketPublication => reply(&stream, &Response::Value(socket_publication())),
 
         Request::ClusterRegistrySync { .. } | Request::ClusterRegistryUpdate { .. } => {
             refuse_cluster_registry(&stream)
