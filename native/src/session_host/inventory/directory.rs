@@ -50,10 +50,12 @@ impl Directory {
             // reopen the new cut instead of misreporting a link mismatch.
             for _ in 0..8 {
                 let file = self.open_relative(c"inventory.json", libc::O_RDONLY)?;
-                if file.metadata()?.nlink() == 0 {
+                // One fstat snapshot: a second one could observe a later rename.
+                let metadata = file.metadata()?;
+                if metadata.nlink() == 0 {
                     continue;
                 }
-                private_file(&file)?;
+                private_metadata(&metadata)?;
                 return Ok(file);
             }
             Err(io::Error::new(
@@ -171,7 +173,12 @@ fn validate_path(path: &Path) -> io::Result<()> {
     Ok(())
 }
 fn private_file(file: &File) -> io::Result<()> {
-    let metadata = file.metadata()?;
+    private_metadata(&file.metadata()?)?;
+    #[cfg(windows)]
+    private_handle(file)?;
+    Ok(())
+}
+fn private_metadata(metadata: &std::fs::Metadata) -> io::Result<()> {
     if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -188,23 +195,24 @@ fn private_file(file: &File) -> io::Result<()> {
             "inventory file owner/mode/link mismatch",
         ));
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-        };
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: file remains live; info is a valid writable output structure.
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if info.nNumberOfLinks != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "inventory file has aliases",
-            ));
-        }
+    Ok(())
+}
+#[cfg(windows)]
+fn private_handle(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: file remains live; info is a valid writable output structure.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info.nNumberOfLinks != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "inventory file has aliases",
+        ));
     }
     Ok(())
 }
