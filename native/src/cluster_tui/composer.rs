@@ -2,10 +2,41 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+/// Most entries kept per target session; the oldest is dropped first.
+const HISTORY_LIMIT: usize = 500;
+
+/// Submitted-line history for one target session. Memory only: no file I/O,
+/// never serialized.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct History {
+    entries: Vec<String>,
+    /// Index of the recalled entry while browsing, `None` when editing a draft.
+    browsing: Option<usize>,
+    /// The in-progress draft (text, cursor) saved when browsing started.
+    draft: (String, usize),
+}
+
+impl History {
+    fn record(&mut self, text: &str) {
+        self.browsing = None;
+        if text.trim().is_empty() || self.entries.last().is_some_and(|last| last == text) {
+            return;
+        }
+        self.entries.push(text.to_owned());
+        if self.entries.len() > HISTORY_LIMIT {
+            self.entries.remove(0);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LineComposer {
     text: String,
     cursor: usize,
+    /// One history per target session: the composer is shared by every
+    /// session, but recalling another session's commands would be misleading.
+    histories: std::collections::HashMap<String, History>,
+    history_key: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,6 +54,17 @@ impl LineComposer {
 
     pub fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    /// Select which session's history Up/Down browse and submissions feed.
+    /// Switching away abandons any browsing in the previous history.
+    pub fn set_history_target(&mut self, key: &str) {
+        if self.history_key != key {
+            if let Some(history) = self.histories.get_mut(&self.history_key) {
+                history.browsing = None;
+            }
+            self.history_key = key.to_owned();
+        }
     }
 
     pub fn restore_draft(&mut self, text: &str) {
@@ -50,11 +92,19 @@ impl LineComposer {
                 ComposerAction::None
             }
             Some("cluster.composer.up") => {
-                self.move_line(false);
+                if self.line_bounds().0 == 0 {
+                    self.recall(false);
+                } else {
+                    self.move_line(false);
+                }
                 ComposerAction::None
             }
             Some("cluster.composer.down") => {
-                self.move_line(true);
+                if self.line_bounds().1 >= self.text.graphemes(true).count() {
+                    self.recall(true);
+                } else {
+                    self.move_line(true);
+                }
                 ComposerAction::None
             }
             Some("cluster.composer.kill") => {
@@ -100,6 +150,8 @@ impl LineComposer {
             Some("cluster.composer.submit") => {
                 let mut bytes = self.text.as_bytes().to_vec();
                 bytes.push(b'\r');
+                let key = self.history_key.clone();
+                self.histories.entry(key).or_default().record(&self.text);
                 self.clear();
                 ComposerAction::Submit(bytes)
             }
@@ -183,6 +235,43 @@ impl LineComposer {
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
+        if let Some(history) = self.histories.get_mut(&self.history_key) {
+            history.browsing = None;
+        }
+    }
+
+    /// Step through history. Up lands with the cursor at the end (readline), Down
+    /// at the start, so a multi-line entry is walked before history continues.
+    /// Past the newest entry the saved draft and cursor return.
+    fn recall(&mut self, newer: bool) {
+        let history = self.histories.entry(self.history_key.clone()).or_default();
+        let target = match (history.browsing, newer) {
+            (None, true) => return,
+            (None, false) => match history.entries.len().checked_sub(1) {
+                Some(last) => {
+                    history.draft = (std::mem::take(&mut self.text), self.cursor);
+                    Some(last)
+                }
+                None => return,
+            },
+            (Some(0), false) => return,
+            (Some(index), false) => Some(index - 1),
+            (Some(index), true) => (index + 1 < history.entries.len()).then_some(index + 1),
+        };
+        history.browsing = target;
+        match target {
+            Some(index) => {
+                self.text = history.entries[index].clone();
+                self.cursor = if newer {
+                    0
+                } else {
+                    self.text.graphemes(true).count()
+                };
+            }
+            None => {
+                (self.text, self.cursor) = std::mem::take(&mut history.draft);
+            }
+        }
     }
 
     fn insert(&mut self, character: char) {
@@ -290,6 +379,108 @@ impl LineComposer {
 mod tests {
     use super::{ComposerAction, LineComposer};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn history_composer(entries: &[&str]) -> LineComposer {
+        let mut composer = LineComposer::default();
+        for entry in entries {
+            composer.restore_draft(entry);
+            press(&mut composer, KeyCode::Enter, KeyModifiers::NONE);
+        }
+        composer
+    }
+
+    #[test]
+    fn up_recalls_history_and_down_restores_the_saved_draft() {
+        let mut composer = history_composer(&["one", "two"]);
+        composer.restore_draft("dra");
+        press(&mut composer, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!((composer.text(), composer.cursor()), ("two", 3));
+        press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(composer.text(), "one");
+        press(&mut composer, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(composer.text(), "two");
+        press(&mut composer, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!((composer.text(), composer.cursor()), ("dra", 2));
+    }
+
+    #[test]
+    fn history_boundaries_are_no_ops() {
+        let mut composer = LineComposer::default();
+        composer.restore_draft("abc");
+        press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut composer, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!((composer.text(), composer.cursor()), ("abc", 3));
+        let mut composer = history_composer(&["one", "two"]);
+        for _ in 0..5 {
+            press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        }
+        assert_eq!(composer.text(), "one");
+        for _ in 0..5 {
+            press(&mut composer, KeyCode::Down, KeyModifiers::NONE);
+        }
+        assert_eq!(composer.text(), "");
+    }
+
+    #[test]
+    fn multi_line_recall_moves_within_the_entry_before_continuing() {
+        let mut composer = history_composer(&["old", "a\nbc\nd"]);
+        press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            composer.cursor(),
+            6,
+            "Up recall ends at the end of the text"
+        );
+        press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(composer.text(), "a\nbc\nd", "still inside the entry");
+        assert_eq!(composer.cursor(), 1);
+        press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            composer.text(),
+            "old",
+            "first line: Up continues to history"
+        );
+        press(&mut composer, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(composer.text(), "a\nbc\nd");
+        assert_eq!(composer.cursor(), 0, "Down recall starts at the beginning");
+        press(&mut composer, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut composer, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(composer.text(), "a\nbc\nd");
+        press(&mut composer, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(composer.text(), "", "last line: Down returns to the draft");
+    }
+
+    #[test]
+    fn empty_and_repeated_submissions_are_not_recorded() {
+        let mut composer = history_composer(&["", "  ", "a", "a", "b", "a"]);
+        for _ in 0..3 {
+            press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        }
+        assert_eq!(composer.text(), "a", "entries are a, b, a");
+        press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(composer.text(), "a", "oldest entry; nothing older");
+    }
+
+    #[test]
+    fn history_is_capped_and_kept_per_target() {
+        let mut composer = LineComposer::default();
+        for i in 0..super::HISTORY_LIMIT + 10 {
+            composer.restore_draft(&i.to_string());
+            press(&mut composer, KeyCode::Enter, KeyModifiers::NONE);
+        }
+        for _ in 0..super::HISTORY_LIMIT + 10 {
+            press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        }
+        assert_eq!(composer.text(), "10", "oldest entries were dropped");
+        composer.clear();
+        composer.set_history_target("other");
+        press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(composer.text(), "", "another session has its own history");
+        composer.set_history_target("");
+        press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(composer.text(), (super::HISTORY_LIMIT + 9).to_string());
+    }
 
     #[test]
     fn emacs_keys_and_grapheme_navigation_edit_the_draft() {
