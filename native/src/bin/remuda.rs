@@ -801,9 +801,9 @@ fn cluster_cli_spec() -> remuda_native::cli_parse::Spec {
                 "remuda cluster join [FINGERPRINT] 'JOIN_LINE' [--bind IP[:PORT]]"),
             verb("nodes", "List the nodes known to this cluster. Example: remuda cluster nodes", vec![], vec![], "remuda cluster nodes"),
             verb("advertise", "Refresh this node's endpoint from its running listener without restarting it", vec![], vec![], "remuda cluster advertise"),
-            verb("alias", "Set or clear a local display alias for a node. Example: remuda cluster alias node-abcd1234 macbook",
+            verb("alias", "Set or clear a cluster-wide display alias for a node. Example: remuda cluster alias node-abcd1234 macbook",
                 vec![arg("TARGET", "Node name or fingerprint", false, true), arg("ALIAS", "Local display alias; omit when using --clear", false, false)],
-                vec![option("clear", None, "Clear the local display alias", false)], "remuda cluster alias TARGET ALIAS | alias TARGET --clear"),
+                vec![option("clear", None, "Clear the cluster-wide display alias", false)], "remuda cluster alias TARGET ALIAS | alias TARGET --clear"),
             verb("control", "Enable or disable remote control. Example: remuda cluster control off",
                 vec![arg("MODE", "on or off", false, true)], vec![], "remuda cluster control on|off"),
             verb("revoke", "Revoke a node or fingerprint; prompt before revoking unless --yes is used. Example: remuda cluster revoke node-abcd1234",
@@ -1116,8 +1116,9 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         ClusterCommand::Revoke { target, yes } => cluster_revoke(&target, yes),
         ClusterCommand::Alias { target, alias } => {
             match remuda_native::cluster::control::set_node_alias(&target, alias.as_deref()) {
-                Ok(()) => {
-                    println!("Local node alias updated.");
+                Ok(pushes) => {
+                    println!("Node alias updated and shared with the cluster.");
+                    report_cluster_push_results(pushes);
                     ExitCode::SUCCESS
                 }
                 Err(error) => fail(format!("cluster alias: {error}")),

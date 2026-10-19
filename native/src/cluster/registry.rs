@@ -279,7 +279,9 @@ impl Registry {
                     merged.insert(key, merge_known_entry(entry, current));
                 }
                 None => {
-                    merged.insert(key, entry.clone());
+                    let mut entry = entry.clone();
+                    normalize_alias(&mut entry);
+                    merged.insert(key, entry);
                 }
             }
         }
@@ -350,12 +352,87 @@ fn merge_known_entry(incoming: &AuthorizedNode, current: &AuthorizedNode) -> Aut
     }
     if incoming.version == current.version
         && incoming.by == current.by
-        && optional_fields_wins(&incoming.optional_fields, &current.optional_fields)
+        && optional_fields_wins(
+            &without_alias(&incoming.optional_fields),
+            &without_alias(&current.optional_fields),
+        )
     {
         winner.optional_fields.clone_from(&incoming.optional_fields);
     }
+    // The display alias is an independent last-writer-wins register, so it
+    // converges regardless of which entry version carried it.
+    match newest_alias(incoming, current) {
+        Some(value) => {
+            winner.optional_fields.insert(ALIAS_FIELD.into(), value);
+        }
+        None => {
+            winner.optional_fields.remove(ALIAS_FIELD);
+        }
+    }
     winner.format_minor = incoming.format_minor.max(current.format_minor);
     winner
+}
+
+/// Optional-field key carrying a node's replicated display alias.
+const ALIAS_FIELD: &str = "alias";
+
+/// Last-writer-wins display alias for one node. `name: None` is a tombstone
+/// so that a clear propagates instead of being resurrected by older copies.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct AliasRecord {
+    /// Milliseconds since the Unix epoch, forced above the prior record.
+    pub(super) at: u64,
+    /// Fingerprint of the node that wrote the record (deterministic tie-break).
+    pub(super) by: String,
+    #[serde(default)]
+    pub(super) name: Option<String>,
+}
+
+impl AliasRecord {
+    fn valid(&self) -> bool {
+        valid_fingerprint(&self.by) && self.name.as_deref().is_none_or(super::control::valid_alias)
+    }
+}
+
+/// Parse a valid alias record; malformed or unsafe records read as absent.
+pub(super) fn alias_record(fields: &BTreeMap<String, Value>) -> Option<AliasRecord> {
+    let record: AliasRecord = serde_json::from_value(fields.get(ALIAS_FIELD)?.clone()).ok()?;
+    record.valid().then_some(record)
+}
+
+/// Store a record as the node's alias field.
+pub(super) fn put_alias_record(entry: &mut AuthorizedNode, record: &AliasRecord) {
+    entry.optional_fields.insert(
+        ALIAS_FIELD.into(),
+        serde_json::to_value(record).expect("alias record serializes"),
+    );
+}
+
+/// Drop an alias field that is malformed or contains an unsafe name.
+fn normalize_alias(entry: &mut AuthorizedNode) {
+    if entry.optional_fields.contains_key(ALIAS_FIELD)
+        && alias_record(&entry.optional_fields).is_none()
+    {
+        entry.optional_fields.remove(ALIAS_FIELD);
+    }
+}
+
+fn without_alias(fields: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    let mut fields = fields.clone();
+    fields.remove(ALIAS_FIELD);
+    fields
+}
+
+fn newest_alias(incoming: &AuthorizedNode, current: &AuthorizedNode) -> Option<Value> {
+    let left = alias_record(&incoming.optional_fields);
+    let right = alias_record(&current.optional_fields);
+    match (left, right) {
+        (Some(left), Some(right)) if left < right => current.optional_fields.get(ALIAS_FIELD),
+        (Some(_), _) => incoming.optional_fields.get(ALIAS_FIELD),
+        (None, Some(_)) => current.optional_fields.get(ALIAS_FIELD),
+        (None, None) => None,
+    }
+    .cloned()
 }
 
 fn optional_fields_wins(
@@ -577,10 +654,11 @@ fn merge_update(
             .iter()
             .find(|known| known.node_fp == entry.node_fp);
         if !known.is_some_and(|known| same_replicated_entry(known, entry)) {
+            let origin_fp = membership_origin(known, entry);
             let origin = current
                 .authorized_nodes
                 .iter()
-                .find(|known| known.node_fp == entry.by);
+                .find(|known| known.node_fp == origin_fp);
             if origin.is_none_or(|known| known.state == NodeState::Revoked) {
                 outcome.dropped_origin_entries += 1;
                 continue;
@@ -644,6 +722,21 @@ fn merge_update(
         .cloned()
         .collect();
     Ok((current, outcome))
+}
+
+/// Fingerprint whose admission authorizes an incoming entry: the alias writer
+/// for an alias-only difference, otherwise the entry's membership origin.
+fn membership_origin(known: Option<&AuthorizedNode>, entry: &AuthorizedNode) -> String {
+    let strip = |node: &AuthorizedNode| AuthorizedNode {
+        optional_fields: without_alias(&node.optional_fields),
+        ..node.clone()
+    };
+    match (known, alias_record(&entry.optional_fields)) {
+        (Some(known), Some(record)) if same_replicated_entry(&strip(known), &strip(entry)) => {
+            record.by
+        }
+        _ => entry.by.clone(),
+    }
 }
 
 fn merge_update_entry(
@@ -1809,6 +1902,228 @@ mod tests {
             Some(relay.node_fp.as_str())
         );
         assert_eq!(learned.by, origin.node_fp);
+    }
+
+    fn alias(at: u64, by: &str, name: Option<&str>) -> AliasRecord {
+        AliasRecord {
+            at,
+            by: origin(by),
+            name: name.map(str::to_owned),
+        }
+    }
+
+    fn aliased(mut node: AuthorizedNode, record: &AliasRecord) -> AuthorizedNode {
+        put_alias_record(&mut node, record);
+        node
+    }
+
+    fn alias_of(registry: &Registry, node: &AuthorizedNode) -> Option<AliasRecord> {
+        alias_record(
+            &registry
+                .authorized_nodes
+                .iter()
+                .find(|entry| entry.node_fp == node.node_fp)
+                .unwrap()
+                .optional_fields,
+        )
+    }
+
+    fn merged(left: &AuthorizedNode, right: &AuthorizedNode) -> AuthorizedNode {
+        let mut registry = Registry {
+            authorized_nodes: vec![left.clone()],
+        };
+        registry
+            .merge(&Registry {
+                authorized_nodes: vec![right.clone()],
+            })
+            .unwrap();
+        registry.authorized_nodes.remove(0)
+    }
+
+    #[test]
+    fn alias_merge_is_last_writer_wins_commutative_and_tie_breaks_by_writer() {
+        let node = entry("alias-target", NodeState::Admitted, 1, "t");
+        let older = aliased(node.clone(), &alias(10, "a", Some("old")));
+        let newer = aliased(node.clone(), &alias(11, "a", Some("new")));
+        assert_eq!(merged(&older, &newer), merged(&newer, &older));
+        assert_eq!(
+            alias_record(&merged(&older, &newer).optional_fields)
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("new")
+        );
+        // Same instant: the larger writer fingerprint wins on every node.
+        let (low, high) = (alias(20, "a", Some("low")), alias(20, "b", Some("high")));
+        let (low, high) = if low.by < high.by {
+            (low, high)
+        } else {
+            (high, low)
+        };
+        let (x, y) = (aliased(node.clone(), &low), aliased(node.clone(), &high));
+        assert_eq!(merged(&x, &y), merged(&y, &x));
+        assert_eq!(alias_record(&merged(&x, &y).optional_fields), Some(high));
+    }
+
+    #[test]
+    fn alias_wins_across_entry_versions_and_entries_without_alias() {
+        let node = entry("alias-version", NodeState::Admitted, 1, "t");
+        let with_alias = aliased(node.clone(), &alias(5, "a", Some("kept")));
+        let mut bumped = node.clone();
+        bumped.version = 2;
+        let result = merged(&with_alias, &bumped);
+        assert_eq!(result.version, 2);
+        assert_eq!(
+            alias_record(&result.optional_fields)
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("kept")
+        );
+        assert_eq!(result, merged(&bumped, &with_alias));
+    }
+
+    #[test]
+    fn alias_tombstone_propagates_and_is_not_resurrected_by_older_copy() {
+        let node = entry("alias-tombstone", NodeState::Admitted, 1, "t");
+        let set = aliased(node.clone(), &alias(10, "a", Some("name")));
+        let cleared = aliased(node.clone(), &alias(11, "b", None));
+        for result in [merged(&set, &cleared), merged(&cleared, &set)] {
+            let record = alias_record(&result.optional_fields).unwrap();
+            assert_eq!(record.name, None);
+            assert_eq!(record.at, 11);
+        }
+        let set_again = aliased(node, &alias(12, "a", Some("again")));
+        assert_eq!(
+            alias_record(&merged(&cleared, &set_again).optional_fields)
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("again")
+        );
+    }
+
+    #[test]
+    fn invalid_remote_aliases_are_dropped_and_never_win() {
+        let node = entry("alias-invalid", NodeState::Admitted, 1, "t");
+        let good = aliased(node.clone(), &alias(1, "a", Some("good")));
+        for bad in ["x\u{1b}[31m", "x/y", " pad", "", "\u{202e}rtl"] {
+            let hostile = aliased(node.clone(), &alias(99, "b", Some(bad)));
+            let result = merged(&good, &hostile);
+            assert_eq!(
+                alias_record(&result.optional_fields)
+                    .unwrap()
+                    .name
+                    .as_deref(),
+                Some("good"),
+                "{bad:?}"
+            );
+            let mut alone = Registry::default();
+            alone
+                .merge(&Registry {
+                    authorized_nodes: vec![hostile],
+                })
+                .unwrap();
+            assert_eq!(alias_of(&alone, &node), None, "{bad:?}");
+        }
+        let mut malformed = node.clone();
+        malformed
+            .optional_fields
+            .insert("alias".into(), serde_json::json!("just a string"));
+        let mut alone = Registry::default();
+        alone
+            .merge(&Registry {
+                authorized_nodes: vec![malformed],
+            })
+            .unwrap();
+        assert_eq!(alias_of(&alone, &node), None);
+    }
+
+    #[test]
+    fn alias_replicates_through_updates_from_any_admitted_member() {
+        let mut a = entry("alias-a", NodeState::Admitted, 1, "a");
+        a.by = a.node_fp.clone();
+        let mut b = entry("alias-b", NodeState::Admitted, 1, "b");
+        b.by = a.node_fp.clone();
+        let mut c = entry("alias-c", NodeState::Admitted, 1, "c");
+        c.by = a.node_fp.clone();
+        let base = Registry {
+            authorized_nodes: vec![a.clone(), b.clone(), c.clone()],
+        };
+        let (mut a_view, mut c_view) = (base.clone(), base);
+        // Node B names node C; node A learns it from B, then C learns it
+        // from A's relay even though B is no longer reachable.
+        let mut b_view = a_view.clone();
+        let record = AliasRecord {
+            at: 100,
+            by: b.node_fp.clone(),
+            name: Some("workstation".into()),
+        };
+        for node in &mut b_view.authorized_nodes {
+            if node.node_fp == c.node_fp {
+                put_alias_record(node, &record);
+            }
+        }
+        let from_b = RegistryUpdate {
+            sender_fp: b.node_fp.clone(),
+            entries: b_view.authorized_nodes.clone(),
+        };
+        let outcome = apply_update(&mut a_view, &from_b, &public_key(&b), &a.node_fp).unwrap();
+        assert!(!outcome.applied.is_empty());
+        assert_eq!(alias_of(&a_view, &c), Some(record.clone()));
+        let from_a = RegistryUpdate {
+            sender_fp: a.node_fp.clone(),
+            entries: a_view.authorized_nodes.clone(),
+        };
+        apply_update(&mut c_view, &from_a, &public_key(&a), &c.node_fp).unwrap();
+        assert_eq!(alias_of(&c_view, &c), Some(record));
+        assert_eq!(a_view.digest().unwrap(), c_view.digest().unwrap());
+        // A later clear from C also propagates back.
+        let clear = AliasRecord {
+            at: 101,
+            by: c.node_fp.clone(),
+            name: None,
+        };
+        for node in &mut c_view.authorized_nodes {
+            if node.node_fp == c.node_fp {
+                put_alias_record(node, &clear);
+            }
+        }
+        let from_c = RegistryUpdate {
+            sender_fp: c.node_fp.clone(),
+            entries: c_view.authorized_nodes.clone(),
+        };
+        apply_update(&mut a_view, &from_c, &public_key(&c), &a.node_fp).unwrap();
+        assert_eq!(alias_of(&a_view, &c).unwrap().name, None);
+    }
+
+    #[test]
+    fn alias_update_is_accepted_when_entry_origin_is_revoked_but_writer_is_admitted() {
+        let mut a = entry("alias-origin-a", NodeState::Admitted, 1, "a");
+        a.by = a.node_fp.clone();
+        let mut b = entry("alias-origin-b", NodeState::Admitted, 1, "b");
+        b.by = a.node_fp.clone();
+        let mut gone = entry("alias-origin-gone", NodeState::Revoked, 2, "g");
+        gone.by = a.node_fp.clone();
+        let mut c = entry("alias-origin-c", NodeState::Admitted, 1, "c");
+        c.by = gone.node_fp.clone();
+        let mut view = Registry {
+            authorized_nodes: vec![a.clone(), b.clone(), gone, c.clone()],
+        };
+        let named = aliased(
+            c.clone(),
+            &AliasRecord {
+                at: 7,
+                by: b.node_fp.clone(),
+                name: Some("kept".into()),
+            },
+        );
+        let update = RegistryUpdate {
+            sender_fp: b.node_fp.clone(),
+            entries: vec![named],
+        };
+        apply_update(&mut view, &update, &public_key(&b), &a.node_fp).unwrap();
+        assert_eq!(alias_of(&view, &c).unwrap().name.as_deref(), Some("kept"));
     }
 
     #[test]
