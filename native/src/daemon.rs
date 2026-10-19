@@ -306,6 +306,19 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     // race the listener it will talk to.
     let counters = Arc::new(crate::tick::Counters::default());
     let image = Image::spawn(path, Arc::clone(&registry), Arc::clone(&counters));
+    // Hosts that outlived an earlier daemon come back as checked handles
+    // (#713). It reads only this daemon's own private inventory.
+    #[cfg(unix)]
+    match image.session_hosts().discover(&registry) {
+        Ok(names) if !names.is_empty() => {
+            eprintln!(
+                "remuda daemon: rediscovered session hosts: {}",
+                names.join(", ")
+            );
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("remuda daemon: session host discovery failed: {error}"),
+    }
     // Its own thread, not a synchronous call here — measured, not foreseen:
     // an inline call deadlocks the moment a real `init.lua` does what
     // butler's actually does, calling `remuda.new` (or `send`/`close`/...).
@@ -1204,7 +1217,9 @@ pub(crate) fn reap_and_notify(registry: &Registry, image: &Image) -> Vec<String>
 }
 
 fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<()>> {
-    let session = registry.get(name)?;
+    let Some(session) = registry.get(name) else {
+        return close_hosted(registry, image, name, None);
+    };
     let closed = registry.close(name)?;
     if let Ok(true) = closed {
         // If the reaper removed it first, close returns false and the reaper
@@ -1216,6 +1231,35 @@ fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<(
             session.instance_id(),
             "closed",
             session.exit_info().as_ref(),
+        );
+    }
+    Some(closed.map(drop))
+}
+
+/// A host-backed session (#713): close its child, then stop the host and
+/// retire its inventory entry in the background.
+fn close_hosted(
+    registry: &Registry,
+    image: &Image,
+    name: &str,
+    instance_id: Option<&str>,
+) -> Option<AgentResult<()>> {
+    let handle = registry.hosted(name)?;
+    let closed = match instance_id {
+        Some(instance_id) => registry.close_instance(name, instance_id)?,
+        None => registry.close(name)?,
+    };
+    if let Ok(true) = closed {
+        #[cfg(unix)]
+        image.session_hosts().retire_closed(name);
+        let identity = handle.identity();
+        notify_exited(
+            image,
+            name,
+            &identity.id,
+            &identity.instance,
+            "closed",
+            None,
         );
     }
     Some(closed.map(drop))
@@ -1579,6 +1623,22 @@ fn handle(
     )
 }
 
+/// Requests that still need a local Session (#713): a host-backed session
+/// answers them with a clear refusal instead of "no such session".
+fn local_only(request: &Request) -> Option<(&'static str, &str)> {
+    match request {
+        Request::CaptureStyled { name, .. } => Some(("styled capture", name)),
+        Request::Sync { name, .. } => Some(("sync", name)),
+        Request::MouseState { name } => Some(("mouse state", name)),
+        Request::Attach { name } | Request::AttachTracked { name } => Some(("attach", name)),
+        Request::AttachStatus { name, .. } => Some(("attach status", name)),
+        Request::Input { name, .. } | Request::InputLine { name, .. } => {
+            Some(("sequenced input", name))
+        }
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn handle_request(
     stream: Stream,
@@ -1591,6 +1651,16 @@ fn handle_request(
     request: Request,
     accepted: std::time::SystemTime,
 ) -> std::io::Result<()> {
+    if let Some((operation, name)) = local_only(&request) {
+        if registry.hosted(name).is_some() {
+            return reply(
+                &stream,
+                &Response::error(format!(
+                    "{operation} is not supported yet for host-backed session {name}"
+                )),
+            );
+        }
+    }
     match request {
         Request::List => {
             if !keep_exited() {
@@ -1824,7 +1894,9 @@ fn close_instance(
     name: &str,
     instance_id: &str,
 ) -> Option<AgentResult<()>> {
-    let session = registry.get(name)?;
+    let Some(session) = registry.get(name) else {
+        return close_hosted(registry, image, name, Some(instance_id));
+    };
     let closed = registry.close_instance(name, instance_id)?;
     if let Ok(true) = closed {
         // Closing the process can leave its PTY output monitor draining the
@@ -2829,6 +2901,38 @@ struct NewSessionRequest {
     return_instance_id: bool,
 }
 
+/// Opt-in (#713): the session lives in a separate host process that
+/// survives this daemon. No output monitor: hosted wakeups are not wired yet.
+#[cfg(unix)]
+fn handle_new_hosted(
+    stream: &Stream,
+    registry: &Registry,
+    image: &Image,
+    request: &crate::session_host::hosted::NewHosted<'_>,
+    return_instance_id: bool,
+) -> std::io::Result<()> {
+    if let Err(error) = image.session_hosts().spawn(registry, request) {
+        return reply(stream, &Response::error(error));
+    }
+    let Some(handle) = registry.hosted(request.name) else {
+        return reply(stream, &Response::error("hosted session vanished"));
+    };
+    let identity = handle.identity();
+    image
+        .session_output_notifier(&identity.name, &identity.id)
+        .finish_monitor();
+    let name = identity.name.clone();
+    let response = if return_instance_id {
+        Response::SessionStarted {
+            name,
+            instance_id: identity.instance.clone(),
+        }
+    } else {
+        Response::Value(name)
+    };
+    reply(stream, &response)
+}
+
 fn handle_new(
     stream: Stream,
     registry: &Registry,
@@ -2861,6 +2965,23 @@ fn handle_new(
     session_env.insert("REMUDA_DAEMON_ID".into(), std::process::id().to_string());
     session_env.insert("REMUDA_SESSION_ID".into(), session_id.clone());
     session_env.insert("REMUDA_SESSION_NAME".into(), name.clone());
+    #[cfg(unix)]
+    if crate::session_host::hosted::opted_in() {
+        return handle_new_hosted(
+            &stream,
+            registry,
+            image,
+            &crate::session_host::hosted::NewHosted {
+                name: &name,
+                session_id: &session_id,
+                command: &command,
+                size,
+                cwd: cwd.as_deref(),
+                env: &session_env,
+            },
+            return_instance_id,
+        );
+    }
     match spawn(
         &name,
         &session_id,

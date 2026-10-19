@@ -1,4 +1,4 @@
-//! Durable controller input bridge; no daemon/Registry adoption yet.
+//! Durable controller input bridge and launch/retire writes for one owner.
 use super::api::{OutcomeState, Request, Response};
 use super::entry::Client;
 use super::inventory::disk::{Error, Store};
@@ -18,9 +18,13 @@ pub(crate) enum Progress {
     OutOfOrder,
     /// Persisted admission and host absence disagree; never synthesize a retry.
     Indeterminate,
-    /// Includes physical lease contention and transport failure; retain identity.
+    /// The host answered but its lease is held, e.g. by the admitted act itself.
+    Busy,
+    /// Transport failure or a refused connection; retain identity.
     Unavailable,
 }
+/// Metadata namespace a daemon writes once it closed a session's child.
+pub(crate) const CLOSING: &str = "closing";
 pub(crate) struct Owner {
     store: Store,
     fence: Fence,
@@ -119,11 +123,11 @@ impl Owner {
         };
         // Prior connections and the entire admitted act must drain first. This
         // physical lease is independent of the durable controller writer fence.
-        if !matches!(
-            peer.request(&Request::Acquire),
-            Ok(Response::Granted { .. })
-        ) {
-            return Ok(Progress::Unavailable);
+        match peer.request(&Request::Acquire) {
+            Ok(Response::Granted { .. }) => {}
+            // A live host still running an admitted act (or another holder).
+            Ok(Response::Error { code }) if code == "controller_busy" => return Ok(Progress::Busy),
+            _ => return Ok(Progress::Unavailable),
         }
         let request = Request::Recover {
             client: key.client,
@@ -138,6 +142,70 @@ impl Owner {
     }
     pub fn index(&self) -> Result<model::Index, Error> {
         self.store.read()
+    }
+    /// Whether this owner's exact fence is still the store's current writer.
+    pub fn current(&self) -> Result<bool, Error> {
+        Ok(self.store.read()?.fence() == self.fence)
+    }
+    /// Durable launch reservation under this owner's fence, before any spawn.
+    pub fn reserve_launch(&self, name: String, entry: model::Entry) -> Result<(), Error> {
+        self.store.commit(
+            self.store.read()?.cursor(),
+            Some(self.fence),
+            Mutation::ReserveLaunch { name, entry },
+            Duration::from_secs(1),
+        )?;
+        Ok(())
+    }
+    /// Durable close intent: discovery tears such an entry down instead of
+    /// registering it again. Idempotent; contention is retried briefly.
+    pub fn mark_closing(&self, target: Target) -> Result<(), Error> {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let index = self.store.read()?;
+            if index
+                .entries
+                .get(&target.name)
+                .is_some_and(|entry| entry.metadata.contains_key(CLOSING))
+            {
+                return Ok(());
+            }
+            let update = model::MetadataUpdate {
+                namespace: CLOSING.into(),
+                expected: None,
+                value: model::Namespace::new(1, "true").map_err(Error::Data)?,
+            };
+            match self.store.commit(
+                index.cursor(),
+                Some(self.fence),
+                Mutation::Metadata {
+                    target: copy_target(&target),
+                    update,
+                },
+                Duration::from_secs(1),
+            ) {
+                Ok(_) => return Ok(()),
+                Err(Error::Busy | Error::Data(model::Error::StaleRevision))
+                    if std::time::Instant::now() < until =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    /// Remove an exited, settled entry; the host must already be stopped.
+    pub fn retire(&self, target: Target) -> Result<(), Error> {
+        self.store.commit(
+            self.store.read()?.cursor(),
+            Some(self.fence),
+            Mutation::Exit {
+                target,
+                operation: model::ExitMutation::Retire,
+            },
+            Duration::from_secs(1),
+        )?;
+        Ok(())
     }
     /// Publish that the caller received this exact result; then it may be GC'd.
     pub fn consume(

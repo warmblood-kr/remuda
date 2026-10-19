@@ -1,19 +1,12 @@
-//! Checked high-level seam. Registry still accepts only Local Session owners.
+//! Checked high-level seam. The legacy Registry map holds Local Session
+//! owners; host-backed handles live in its separate checked hosted map.
 //! A Remote implementation translates complete operations; it never owns an
-//! AgentProcess or a second input/dedup/human clock. No runtime selects it yet.
+//! AgentProcess or a second input/dedup/human clock.
 //!
 //! ```compile_fail
 //! use remuda_core::{Registry, session_operations::SessionHandle};
 //! fn cannot_register_remote(registry: &Registry, handle: SessionHandle) {
 //!     registry.register(handle);
-//! }
-//! ```
-//!
-//! ```compile_fail
-//! use remuda_core::session_operations::{SessionHandle, SessionOperations};
-//! use std::sync::Arc;
-//! fn no_unverified_production_constructor(backend: Arc<dyn SessionOperations>) {
-//!     let _ = SessionHandle::remote(backend);
 //! }
 //! ```
 use crate::agent::{AgentError, ExitInfo, MouseState, OutputWakeup, Size, VersionedSnapshot};
@@ -101,6 +94,16 @@ impl core::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl Error {
+    /// For legacy name-addressed routes: the typed agent error when there is
+    /// one, otherwise a message that keeps the no-retry meaning.
+    pub fn into_agent(self) -> AgentError {
+        match self {
+            Self::Agent(error) => error,
+            other => AgentError::Io(other.to_string()),
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestIdentity {
     pub session: Identity,
@@ -204,11 +207,10 @@ pub trait AttachmentOperations: Send + Sync {
 
 enum Backend {
     Local(Arc<Session>),
-    #[cfg_attr(not(test), allow(dead_code))]
     Remote(Arc<dyn SessionOperations>),
 }
 /// A checked handle with immutable identity and no local input safety state.
-/// It cannot be registered in the legacy Registry, whose type remains Session.
+/// The legacy Registry map keeps Session; `Registry::register_hosted` takes this.
 pub struct SessionHandle {
     identity: Identity,
     input_owner: Option<[u8; 16]>,
@@ -222,10 +224,9 @@ impl SessionHandle {
             backend: Backend::Local(session),
         }
     }
-    // Only mock construction exists until native verified identity, checked
-    // inventory and every consumer are implemented. Strings cannot select it.
-    #[cfg(test)]
-    fn remote(backend: Arc<dyn SessionOperations>) -> Result<Self> {
+    /// A checked host-backed handle: validated identity, a host incarnation
+    /// and a stable input owner are required. Strings cannot select it.
+    pub fn hosted(backend: Arc<dyn SessionOperations>) -> Result<Self> {
         let identity = backend.identity();
         identity.validate()?;
         if identity.host.is_none() {

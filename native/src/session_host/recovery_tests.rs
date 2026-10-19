@@ -231,7 +231,7 @@ fn exercise_cut(stage: u8) {
             .unwrap()
         {
             Progress::Complete(completion) => Some(completion),
-            Progress::Pending | Progress::Unavailable => None,
+            Progress::Pending | Progress::Busy | Progress::Unavailable => None,
             _ => panic!("unexpected recovery state"),
         }
     });
@@ -279,7 +279,7 @@ fn finish(fixture: &Fixture, owner: &Owner, key: &Key) {
             .unwrap()
         {
             Progress::Complete(result) => Some(result),
-            Progress::Pending | Progress::Unavailable => None,
+            Progress::Pending | Progress::Busy | Progress::Unavailable => None,
             _ => panic!("unexpected recovery state"),
         }
     });
@@ -318,7 +318,7 @@ fn stale_writer_changed_identity_and_live_physical_lease_cannot_admit() {
         current
             .resume(fixture.target(), key.clone(), &fixture.root.join("host"))
             .unwrap(),
-        Progress::Unavailable
+        Progress::Busy
     ));
     assert!(fixture.effects().is_empty());
     drop(held);
