@@ -195,13 +195,39 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         // Exact authenticated cleanup: close the child, then stop the host.
-        let Some(session) = try_adapter(&self.root) else {
-            assert!(std::thread::panicking(), "cleanup adapter unavailable");
-            return;
+        // The claim may meet store lock contention; retry it briefly.
+        let until = Instant::now() + Duration::from_secs(5);
+        let session = loop {
+            match try_adapter(&self.root) {
+                Some(session) => break session,
+                None if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
+                None => {
+                    assert!(std::thread::panicking(), "cleanup adapter unavailable");
+                    return;
+                }
+            }
         };
         let _ = session.terminate();
         let until = Instant::now() + Duration::from_secs(8);
         while Instant::now() < until {
+            // Stop requires no retained results: receipt any a test left behind.
+            if let Ok(index) = session.owner.index() {
+                for stream in index
+                    .entries
+                    .get("synthetic")
+                    .iter()
+                    .flat_map(|e| &e.streams)
+                {
+                    for result in stream.results.iter().filter(|r| !r.consumer_ack) {
+                        let _ = session.owner.consume(
+                            session.target(),
+                            result.reservation.key.clone(),
+                            result.reservation.intent,
+                            &result.completion,
+                        );
+                    }
+                }
+            }
             if let Ok(mut client) =
                 Client::open_expected(&session.endpoint, Role::Control, session.identity.clone())
             {

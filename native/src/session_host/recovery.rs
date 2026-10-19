@@ -27,19 +27,32 @@ pub(crate) struct Owner {
 }
 impl Owner {
     /// A process-level owner, shared across sessions; not one new claim per act.
+    /// A host publishing between our read and commit is retried, not fatal.
     pub fn claim(store: Store) -> Result<Self, Error> {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(|_| Error::Data(model::Error::Unavailable))?;
-        let applied = store.commit(
-            store.read()?.cursor(),
-            None,
-            Mutation::Claim { nonce },
-            Duration::from_secs(1),
-        )?;
-        Ok(Self {
-            store,
-            fence: applied.fence,
-        })
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match store.commit(
+                store.read()?.cursor(),
+                None,
+                Mutation::Claim { nonce },
+                Duration::from_secs(1),
+            ) {
+                Ok(applied) => {
+                    return Ok(Self {
+                        store,
+                        fence: applied.fence,
+                    })
+                }
+                Err(Error::Busy | Error::Data(model::Error::StaleRevision))
+                    if std::time::Instant::now() < until =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
     /// Durable publication precedes any host connection, effect or caller receipt.
     pub fn reserve(
