@@ -737,3 +737,7 @@ impl Drop for Staged {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "race_tests.rs"]
+mod race_tests;
