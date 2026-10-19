@@ -40,6 +40,11 @@ pub(crate) struct Fence {
     epoch: u64,
     nonce: [u8; 16],
 }
+impl Fence {
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Key {
@@ -361,7 +366,7 @@ impl Index {
                 .collect(),
         ))
     }
-    fn fence(&self) -> Fence {
+    pub fn fence(&self) -> Fence {
         Fence {
             store: self.incarnation,
             epoch: self.epoch,

@@ -23,6 +23,8 @@ mod owned;
 mod reaper;
 #[cfg(unix)]
 mod recovery;
+#[cfg(unix)]
+mod remote;
 mod result;
 #[cfg(unix)]
 mod server;

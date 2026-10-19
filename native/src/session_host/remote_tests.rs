@@ -1,0 +1,490 @@
+//! Adapter proofs against a separate host process; controllers die by SIGKILL.
+use super::*;
+use crate::session_host::birth::{run, Bootstrap};
+use crate::session_host::entry::Launch;
+use crate::session_host::inventory::disk::Store;
+use crate::session_host::inventory::model::{Birth, Entry, Lease, Mutation};
+use serde_json::value::RawValue;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+static NEXT: AtomicU64 = AtomicU64::new(0);
+const CLIENT: [u8; 16] = [5; 16];
+
+fn eventually<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
+    let until = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(value) = check() {
+            return value;
+        }
+        assert!(Instant::now() < until, "deadline: {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+struct Process(Child);
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn helper(root: &Path, mode: &str) -> Process {
+    Process(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "session_host::remote::tests::process_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("REMUDA_TEST_REMOTE_ROOT", root)
+            .env("REMUDA_TEST_REMOTE_MODE", mode)
+            // Only the "reserved" helper parks inside Owner::reserve's cut 1.
+            .env("REMUDA_TEST_RECOVERY_ROOT", root)
+            .env(
+                "REMUDA_TEST_RECOVERY_CUT",
+                if mode == "reserved" { "1" } else { "0" },
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    )
+}
+fn try_adapter(root: &Path) -> Option<HostSession> {
+    let store = Store::open(&root.join("inventory")).ok()?;
+    let owner = Arc::new(Owner::claim(store).ok()?);
+    HostSession::open(owner, "synthetic", CLIENT).ok()
+}
+fn adapter(root: &Path) -> HostSession {
+    try_adapter(root).expect("adapter over the private inventory")
+}
+#[test]
+#[ignore = "internal host/controller helper; invoked only by parent fixtures"]
+fn process_fixture() {
+    let root = PathBuf::from(std::env::var_os("REMUDA_TEST_REMOTE_ROOT").unwrap());
+    match std::env::var("REMUDA_TEST_REMOTE_MODE").unwrap().as_str() {
+        "host" => run(&root.join("h")).unwrap(),
+        // An old daemon: one long whole act, killed by the parent mid-act.
+        // An old daemon parked after the durable reservation, before any RPC.
+        "reserved" => {
+            let _ = adapter(&root).send_line("alpha");
+            panic!("parent did not kill its synthetic controller");
+        }
+        "controller" => {
+            let session = adapter(&root);
+            let _ = session.feed(&[
+                Step::Burst(b"first\n".to_vec()),
+                Step::Pause(1500),
+                Step::Burst(b"second\n".to_vec()),
+            ]);
+            panic!("parent did not kill its synthetic controller");
+        }
+        mode => panic!("unknown helper mode {mode}"),
+    }
+}
+struct Fixture {
+    root: PathBuf,
+    host: Option<Process>,
+}
+impl Fixture {
+    fn new() -> Self {
+        let root = PathBuf::from(if cfg!(target_os = "macos") {
+            "/private/tmp"
+        } else {
+            "/tmp"
+        })
+        .join(format!(
+            "rha-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let identity = HostIdentity {
+            host: [9; 16],
+            session: "adapter-session".into(),
+            instance: "adapter-instance".into(),
+        };
+        // Effects are appended once per line the child actually reads.
+        let script = "stty -echo; printf 'ready\\n'; while IFS= read -r line; do printf '%s\\n' \"$line\" >> \"$EFFECTS\"; printf 'effect:%s\\n' \"$line\"; done";
+        let launch = Launch {
+            name: "synthetic".into(),
+            argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            cwd: root.to_string_lossy().into(),
+            agent: "synthetic".into(),
+            rows: 24,
+            cols: 80,
+            env: vec![
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                (
+                    "EFFECTS".into(),
+                    root.join("effects").to_string_lossy().into(),
+                ),
+            ],
+        };
+        let raw = serde_json::to_string(&launch).unwrap();
+        let store = Store::create(&root.join("inventory")).unwrap();
+        let claim = store
+            .commit(
+                store.read().unwrap().cursor(),
+                None,
+                Mutation::Claim { nonce: [1; 16] },
+                Duration::ZERO,
+            )
+            .unwrap();
+        let mut entry = Entry::reserved(identity.clone(), [4; 16], &raw).unwrap();
+        entry.birth = Some(Birth::new(root.join("h").to_string_lossy().into(), [7; 16]).unwrap());
+        store
+            .commit(
+                claim.next.cursor(),
+                Some(claim.fence),
+                Mutation::ReserveLaunch {
+                    name: "synthetic".into(),
+                    entry,
+                },
+                Duration::ZERO,
+            )
+            .unwrap();
+        let lease = Lease::new(
+            store.read().unwrap().cursor().store,
+            Target {
+                name: "synthetic".into(),
+                identity,
+            },
+            [4; 16],
+            [7; 16],
+        );
+        let bootstrap = serde_json::to_vec(&Bootstrap {
+            store: root.join("inventory"),
+            lease,
+            launch: RawValue::from_string(raw).unwrap(),
+        })
+        .unwrap();
+        let mut host = helper(&root, "host");
+        super::super::wire::write_frame(&mut host.0.stdin.take().unwrap(), &bootstrap).unwrap();
+        let fixture = Self {
+            root,
+            host: Some(host),
+        };
+        eventually("host ready", || {
+            let store = Store::open(&fixture.root.join("inventory")).ok()?;
+            let owner = Arc::new(Owner::claim(store).ok()?);
+            let session = HostSession::open(owner, "synthetic", CLIENT).ok()?;
+            session
+                .screen_text()
+                .ok()
+                .filter(|text| text.contains("ready"))
+        });
+        fixture
+    }
+    fn effects(&self) -> Vec<String> {
+        std::fs::read_to_string(self.root.join("effects"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // Exact authenticated cleanup: close the child, then stop the host.
+        let Some(session) = try_adapter(&self.root) else {
+            assert!(std::thread::panicking(), "cleanup adapter unavailable");
+            return;
+        };
+        let _ = session.terminate();
+        let until = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < until {
+            if let Ok(mut client) =
+                Client::open_expected(&session.endpoint, Role::Control, session.identity.clone())
+            {
+                if matches!(
+                    client.request(&Request::Acquire),
+                    Ok(Response::Granted { .. })
+                ) && matches!(client.request(&Request::Stop), Ok(Response::Ok))
+                {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if let Some(mut host) = self.host.take() {
+            let exited = (0..200).any(|_| {
+                std::thread::sleep(Duration::from_millis(10));
+                matches!(host.0.try_wait(), Ok(Some(_)))
+            });
+            assert!(exited || std::thread::panicking(), "host did not stop");
+        }
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn whole_acts_reads_and_resize_go_through_one_separate_host() {
+    let fixture = Fixture::new();
+    let session = adapter(&fixture.root);
+    let before = session.inspect().unwrap();
+    assert_eq!(before.lifecycle, Lifecycle::Running);
+    assert!(before.pid.is_some());
+    assert_eq!(
+        before.cut,
+        ObservationCut::Host {
+            revision: before.output_version.unwrap()
+        }
+    );
+    assert_eq!(session.input_owner(), Some(CLIENT));
+    assert_eq!(session.identity().host, Some([9; 16]));
+
+    let version = session.snapshot(0).unwrap().output_version.unwrap();
+    session.send_line("one").unwrap();
+    assert_eq!(fixture.effects(), ["one"]);
+    let after = session.wait_after(version, Duration::from_secs(5)).unwrap();
+    assert!(after.output_version.unwrap() > version);
+    assert_eq!(after.instance_id.as_deref(), Some("adapter-instance"));
+    eventually("rendered effect", || {
+        session
+            .screen_text()
+            .ok()
+            .filter(|text| text.contains("effect:one"))
+    });
+    session.resize(Size::for_pane(100, 30)).unwrap();
+    let resized = session.inspect().unwrap().size;
+    assert_eq!((resized.cols(), resized.rows()), (100, 30));
+
+    // A consumed result is retired; asking again refuses rather than replaying.
+    let index = session.owner.index().unwrap();
+    let stream = &index.entries["synthetic"].streams[0];
+    assert_eq!(stream.next, Some(2));
+    let first = RequestIdentity {
+        session: session.identity(),
+        client: CLIENT,
+        sequence: 1,
+        payload: InputAct::SendLine("one".into()).digest().unwrap(),
+    };
+    assert!(matches!(
+        session.recover(&first).unwrap(),
+        Recovery::Forgotten
+    ));
+    assert_eq!(fixture.effects(), ["one"]);
+}
+
+#[test]
+fn controller_death_mid_act_recovers_the_original_input_without_replay() {
+    let fixture = Fixture::new();
+    let pid = adapter(&fixture.root).inspect().unwrap().pid;
+    let mut old = helper(&fixture.root, "controller");
+    // Kill once the act has started; a slow machine may already show second.
+    eventually("first effect", || {
+        (fixture.effects().first().map(String::as_str) == Some("first")).then_some(())
+    });
+    old.0.kill().unwrap();
+    old.0.wait().unwrap();
+
+    // A new daemon claims the inventory; the child and its terminal survived.
+    let session = adapter(&fixture.root);
+    let observed = session.inspect().unwrap();
+    assert_eq!(observed.pid, pid);
+    assert_eq!(observed.lifecycle, Lifecycle::Running);
+    let Err(Error::Indeterminate(request)) = session.send_line("third") else {
+        panic!("a new act must not start before the old one is recovered");
+    };
+    assert_eq!(request.client, CLIENT);
+    assert_eq!(request.sequence, 1);
+    let recovered = eventually("original act completes", || {
+        match session.recover(&request) {
+            Ok(Recovery::Complete { delivery, reply }) => Some((delivery, reply)),
+            Ok(Recovery::Pending) | Err(Error::Unavailable(_)) => None,
+            other => panic!("unexpected recovery {other:?}"),
+        }
+    });
+    assert!(matches!(
+        recovered,
+        (Delivery::Written, RecoveredReply::Unit)
+    ));
+    assert_eq!(fixture.effects(), ["first", "second"]);
+
+    session.send_line("third").unwrap();
+    assert!(matches!(
+        session.recover(&request).unwrap(),
+        Recovery::Forgotten
+    ));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(fixture.effects(), ["first", "second", "third"]);
+    assert_eq!(session.inspect().unwrap().pid, pid);
+}
+
+#[test]
+fn a_newer_owner_claim_fences_the_old_adapter_before_any_effect() {
+    let fixture = Fixture::new();
+    let old = adapter(&fixture.root);
+    let new = adapter(&fixture.root);
+    assert!(matches!(
+        old.send_line("stale"),
+        Err(Error::Unavailable(Unavailable::Recovering))
+    ));
+    new.send_line("current").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(fixture.effects(), ["current"]);
+}
+
+#[test]
+fn plain_text_skips_wide_continuations_and_joins_wrapped_rows() {
+    use remuda_core::agent::{Cursor, StyledCell};
+    let cell = |text: &str, wide: bool| StyledCell {
+        text: text.into(),
+        wide,
+        ..StyledCell::default()
+    };
+    let screen = ScreenSnapshot {
+        cells: vec![
+            vec![cell("a", false), cell("", false), cell("b", false)],
+            vec![cell("界", true), cell("", false), cell("c", false)],
+            vec![cell("d", false), cell("", false), cell("", false)],
+            vec![cell("", false), cell("", false), cell("", false)],
+        ],
+        wrapped: vec![false, true, false, false],
+        cursor: Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        },
+        scrollback_len: 0,
+        scrollback_total: 0,
+    };
+    assert_eq!(text(&screen), "a b\n界cd");
+}
+
+#[test]
+fn controller_death_after_reservation_before_any_rpc_sends_the_original_once() {
+    let fixture = Fixture::new();
+    let mut old = helper(&fixture.root, "reserved");
+    eventually("reservation cut", || {
+        fixture.root.join("cut").exists().then_some(())
+    });
+    old.0.kill().unwrap();
+    old.0.wait().unwrap();
+    assert!(fixture.effects().is_empty());
+
+    let session = adapter(&fixture.root);
+    let Err(Error::Indeterminate(request)) = session.send_line("beta") else {
+        panic!("the reserved act must be recovered first");
+    };
+    assert_eq!(
+        request.payload,
+        InputAct::SendLine("alpha".into()).digest().unwrap()
+    );
+    let recovered = eventually("reserved act completes", || {
+        match session.recover(&request) {
+            Ok(Recovery::Complete { delivery, reply }) => Some((delivery, reply)),
+            Ok(Recovery::Pending) | Err(Error::Unavailable(_)) => None,
+            other => panic!("unexpected recovery {other:?}"),
+        }
+    });
+    assert!(matches!(
+        recovered,
+        (Delivery::Written, RecoveredReply::Unit)
+    ));
+    assert!(matches!(
+        session.recover(&request).unwrap(),
+        Recovery::Forgotten
+    ));
+    session.send_line("beta").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(fixture.effects(), ["alpha", "beta"]);
+}
+
+#[test]
+fn a_newer_claim_fences_resume_of_an_act_the_old_owner_already_reserved() {
+    let fixture = Fixture::new();
+    let old = adapter(&fixture.root);
+    let act = InputAct::SendLine("stale".into());
+    let key = old
+        .owner
+        .reserve(old.target(), [8; 16], CLIENT, 1, act)
+        .unwrap();
+    let _newer = adapter(&fixture.root);
+    assert!(old.owner.resume(old.target(), key, &old.endpoint).is_err());
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(fixture.effects().is_empty());
+    // The current owner may still resolve that exact reserved act, once.
+    let current = adapter(&fixture.root);
+    let Err(Error::Indeterminate(request)) = current.send_line("next") else {
+        panic!("the reserved act must be recovered first");
+    };
+    eventually("reserved act completes", || {
+        match current.recover(&request) {
+            Ok(Recovery::Complete { .. }) => Some(()),
+            Ok(Recovery::Pending) | Err(Error::Unavailable(_)) => None,
+            other => panic!("unexpected recovery {other:?}"),
+        }
+    });
+    assert_eq!(fixture.effects(), ["stale"]);
+}
+
+#[test]
+fn possibly_written_failures_stay_recoverable_and_retention_is_bounded() {
+    let fixture = Fixture::new();
+    let session = adapter(&fixture.root);
+    // A refused clear key: the host reports every act error as Indeterminate.
+    let requests: Vec<_> = (0..20)
+        .map(|_| match session.clear_input(b"x") {
+            Err(Error::Indeterminate(request)) => request,
+            other => panic!("expected an unknown outcome, got {other:?}"),
+        })
+        .collect();
+    let sequences: Vec<u64> = requests.iter().map(|request| request.sequence).collect();
+    assert_eq!(sequences, (1..=20).collect::<Vec<_>>());
+    let mut forgotten = 0;
+    for request in &requests {
+        match session.recover(request).unwrap() {
+            Recovery::Forgotten => forgotten += 1,
+            Recovery::Complete {
+                delivery: Delivery::Indeterminate,
+                reply: RecoveredReply::Failed(Error::Agent(AgentError::Io(_))),
+            } => {}
+            other => panic!("unexpected recovery {other:?}"),
+        }
+    }
+    // Each reservation keeps at most RETAINED - 1 earlier open results.
+    assert_eq!(forgotten, 20 - RETAINED);
+    assert!(fixture.effects().is_empty());
+}
+
+#[test]
+fn an_exited_session_refuses_new_input_before_any_reservation() {
+    let fixture = Fixture::new();
+    let session = adapter(&fixture.root);
+    session.terminate().unwrap();
+    eventually("child exit", || {
+        matches!(session.inspect().ok()?.lifecycle, Lifecycle::Exited(_)).then_some(())
+    });
+    // Acts racing the exit publication may complete as possibly-written
+    // failures; those stay recoverable evidence until resolved by key.
+    eventually("exit published", || match session.send_line("late") {
+        Err(Error::Agent(AgentError::Exited)) => Some(()),
+        Err(Error::Indeterminate(request)) => {
+            // Resolve that exact key before the next act; never a new sequence.
+            eventually("late act resolves", || match session.recover(&request) {
+                Ok(Recovery::Complete { delivery, .. }) => {
+                    assert_eq!(delivery, Delivery::Indeterminate);
+                    Some(())
+                }
+                Ok(Recovery::Forgotten) => Some(()),
+                Ok(Recovery::Pending) | Err(Error::Unavailable(_)) => None,
+                other => panic!("unexpected recovery {other:?}"),
+            });
+            None
+        }
+        other => panic!("unexpected input result {other:?}"),
+    });
+    let index = session.owner.index().unwrap();
+    assert!(index.entries["synthetic"].pending.is_none());
+    assert!(fixture.effects().is_empty());
+}

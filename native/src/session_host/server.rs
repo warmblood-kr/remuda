@@ -22,6 +22,7 @@ const CAPS: &[&str] = &[
     super::api::RETAINED_LEDGER,
     super::api::TYPED_VIEW,
     super::api::HUMAN_INPUT,
+    super::api::ACTIVITY,
 ];
 pub(crate) struct Server {
     endpoint: Arc<Endpoint>,
