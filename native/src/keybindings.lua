@@ -131,6 +131,10 @@ return function(owner, validate, config_status, validate_help)
   api.define_key{context="cluster.composer", key="C-\\", action="cluster.composer.detach", help="list"}
   api.define_key{context="cluster.composer", key="<left>", action="cluster.composer.left", help="left"}
   api.define_key{context="cluster.composer", key="<right>", action="cluster.composer.right", help="right"}
+  api.define_key{context="cluster.composer", key="<up>", action="cluster.composer.up", help="up"}
+  api.define_key{context="cluster.composer", key="<down>", action="cluster.composer.down", help="down"}
+  api.define_key{context="cluster.composer", key="C-f", action="cluster.composer.forward", help="forward"}
+  api.define_key{context="cluster.composer", key="C-b", action="cluster.composer.backward", help="backward"}
   api.define_key{context="cluster.composer", key="<home>", action="cluster.composer.home", help="home"}
   api.define_key{context="cluster.composer", key="<end>", action="cluster.composer.end", help="end"}
   api.define_key{context="cluster.composer", key="DEL", action="cluster.composer.backspace", help="erase"}
