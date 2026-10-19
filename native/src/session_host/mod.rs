@@ -1,6 +1,6 @@
-//! Experimental standalone session hosts for issue #713; no daemon adoption.
+//! Experimental standalone session hosts for issue #713; opt-in daemon use.
 //! A host owns one complete Session, PTY/parser and admitted logical acts.
-//! Default daemon routing, existing sessions and production rollout are separate.
+//! The default spawn path, existing sessions and production rollout are separate.
 #![allow(dead_code)]
 mod api;
 #[cfg(unix)]
@@ -12,6 +12,8 @@ mod control;
 mod coordinator;
 #[cfg(unix)]
 mod entry;
+#[cfg(unix)]
+pub(crate) mod hosted;
 mod human;
 mod inventory;
 #[cfg(unix)]

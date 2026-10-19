@@ -406,9 +406,17 @@ pub struct Image {
     pending: crate::pending::PendingReplies,
     http: crate::net::HttpClient,
     session_outputs: Arc<Mutex<HashMap<String, SessionOutputNotifier>>>,
+    /// This daemon's opt-in host-backed sessions (#713); opened lazily.
+    #[cfg(unix)]
+    session_hosts: Arc<crate::session_host::hosted::Hosting>,
 }
 
 impl Image {
+    #[cfg(unix)]
+    pub(crate) fn session_hosts(&self) -> &crate::session_host::hosted::Hosting {
+        &self.session_hosts
+    }
+
     /// Start the interpreter and return a handle to it. `socket` is the
     /// daemon's own, for bindings that act on a session by name (attach,
     /// capture, ...).
@@ -428,6 +436,8 @@ impl Image {
             pending: crate::pending::PendingReplies::default(),
             http: crate::net::HttpClient::default(),
             session_outputs: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(unix)]
+            session_hosts: Arc::new(crate::session_host::hosted::Hosting::for_socket(&socket)),
         };
         let handle = image.clone();
 

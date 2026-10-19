@@ -3,9 +3,9 @@
 //! Every input act is reserved durably before any effect and resolved through
 //! the host ledger by its original key, so a lost reply is recovered, never
 //! replayed. Results are retained up to a bound, then retired as Forgotten.
-//! Expected identity and endpoint come only from the private
-//! inventory. Daemon and Registry routing do not select this adapter yet;
-//! attach and legacy raw batches are refused as Unsupported for now.
+//! Expected identity and endpoint come only from the private inventory.
+//! The opt-in daemon path (`hosted`) registers it; attach and legacy raw
+//! batches are refused as Unsupported for now.
 use super::api::{Identity as HostIdentity, Lifecycle as HostLifecycle, Request, Response, Role};
 use super::entry::Client;
 use super::inventory::disk::Error as StoreError;
@@ -101,9 +101,14 @@ impl HostSession {
         act.validate().map_err(Error::Protocol)?;
         let deadline = ACT_DEADLINE + Duration::from_millis(pauses(&act));
         let _serial = self.acts.lock().unwrap_or_else(|e| e.into_inner());
+        // An unreachable host is a clean refusal while nothing is reserved yet.
+        drop(Client::open_observer(&self.endpoint, self.identity.clone()).map_err(opened)?);
         let key = self.reserve(act)?;
         let until = Instant::now() + deadline;
         let mut delay = POLL;
+        // A host that stays unreachable leaves the act recoverable by its key,
+        // instead of holding the caller for the whole act deadline.
+        let mut unreachable: Option<Instant> = None;
         loop {
             // After the reservation a failure leaves the outcome unknown; only
             // store contention (lock or revision race) is retried in place.
@@ -111,7 +116,7 @@ impl HostSession {
                 .owner
                 .resume(self.target(), key.clone(), &self.endpoint)
             {
-                Err(error) if contended(&error) && Instant::now() < until => Progress::Unavailable,
+                Err(error) if contended(&error) && Instant::now() < until => Progress::Busy,
                 Err(_) => return Err(Error::Indeterminate(self.request(&key))),
                 Ok(progress) => progress,
             };
@@ -127,7 +132,19 @@ impl HostSession {
                     self.settle(&key);
                     return Ok(completion);
                 }
-                Progress::Pending | Progress::Unavailable if Instant::now() < until => {
+                Progress::Unavailable
+                    if unreachable.is_some_and(|since| since.elapsed() >= CONTROL_DEADLINE) =>
+                {
+                    return Err(Error::Indeterminate(self.request(&key)));
+                }
+                Progress::Pending | Progress::Busy | Progress::Unavailable
+                    if Instant::now() < until =>
+                {
+                    if matches!(progress, Progress::Unavailable) {
+                        unreachable.get_or_insert_with(Instant::now);
+                    } else {
+                        unreachable = None;
+                    }
                     std::thread::sleep(delay);
                     delay = (delay * 2).min(MAX_POLL);
                 }
@@ -151,9 +168,19 @@ impl HostSession {
     fn try_reserve(&self, act: InputAct) -> std::result::Result<Key, Attempt> {
         let index = self.owner.index().map_err(store)?;
         let entry = self.entry(&index)?;
-        // One act per session: an earlier unresolved act must be recovered first.
+        // One act per session. An earlier act (for example one an old daemon
+        // reserved) is first resolved by its original key, never re-issued as
+        // new input. Its result stays retained, so `recover` still answers it.
         if let Some(pending) = &entry.pending {
-            return Err(Error::Indeterminate(self.request(&pending.key)).into());
+            let key = pending.key.clone();
+            return match self
+                .owner
+                .resume(self.target(), key.clone(), &self.endpoint)
+            {
+                Ok(Progress::Complete(_) | Progress::Forgotten) => Err(Attempt::Contended),
+                Err(error) if contended(&error) => Err(Attempt::Contended),
+                _ => Err(Error::Indeterminate(self.request(&key)).into()),
+            };
         }
         // Published exit: a clean refusal before any reservation or effect.
         if matches!(entry.phase, Phase::Exited { .. }) {
@@ -230,7 +257,85 @@ impl HostSession {
             }
         }
     }
+    /// After `terminate`: wait for the published exit, resolve a pending act
+    /// by its key, retire retained results, stop the host, then retire the
+    /// inventory entry. Every step is idempotent, so a later retry may resume.
+    pub fn teardown(&self, deadline: Duration) -> Result<()> {
+        let until = Instant::now() + deadline;
+        let mut stopped = false;
+        loop {
+            match self.teardown_step(&mut stopped) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) if Instant::now() >= until => return Err(error),
+                Err(_) => {}
+            }
+            if Instant::now() >= until {
+                return Err(Error::Unavailable(Unavailable::Recovering));
+            }
+            std::thread::sleep(MAX_POLL);
+        }
+    }
+    fn teardown_step(&self, stopped: &mut bool) -> Result<bool> {
+        let index = self.owner.index().map_err(store)?;
+        let Some(entry) = index.entries.get(&self.name) else {
+            return Ok(true);
+        };
+        if entry.identity != self.identity {
+            return Ok(true);
+        }
+        if !matches!(entry.phase, Phase::Exited { .. }) {
+            // A gone host never publishes an exit; nothing more can settle.
+            return Ok(self.host_gone());
+        }
+        if let Some(pending) = &entry.pending {
+            self.owner
+                .resume(self.target(), pending.key.clone(), &self.endpoint)
+                .map_err(store)?;
+            return Ok(false);
+        }
+        for stream in &entry.streams {
+            for result in stream.results.iter().filter(|r| !r.consumer_ack) {
+                self.owner
+                    .consume(
+                        self.target(),
+                        result.reservation.key.clone(),
+                        result.reservation.intent,
+                        &result.completion,
+                    )
+                    .map_err(store)?;
+            }
+        }
+        // A host already stopped (say, before a crash) has no listener left;
+        // the store still refuses Retire unless the exit is settled.
+        if !*stopped && !self.host_gone() {
+            let mut client = self.controller()?;
+            match client.request(&Request::Stop).map_err(transport)? {
+                Response::Ok => *stopped = true,
+                Response::Error { code } => return Err(refused(&code)),
+                _ => return Err(Error::Protocol("unexpected host stop reply")),
+            }
+        }
+        self.owner.retire(self.target()).map_err(store)?;
+        Ok(true)
+    }
+    /// No listener at the endpoint: the host process is gone. Any other
+    /// failure (a slow or busy host) is not proof.
+    fn host_gone(&self) -> bool {
+        match std::os::unix::net::UnixStream::connect(self.endpoint.join("socket")) {
+            Ok(_) => false,
+            Err(error) => matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ),
+        }
+    }
+    /// Non-input control (resize, close, stop) is not reserved in the store,
+    /// so a superseded owner is refused here, before it takes the lease.
     fn controller(&self) -> Result<Client> {
+        if !self.owner.current().map_err(store)? {
+            return Err(Error::Unavailable(Unavailable::Recovering));
+        }
         let until = Instant::now() + CONTROL_DEADLINE;
         loop {
             let mut client =
@@ -441,7 +546,7 @@ impl SessionOperations for HostSession {
             .resume(self.target(), key.clone(), &self.endpoint)
             .map_err(store)?;
         Ok(match progress {
-            Progress::Pending => Recovery::Pending,
+            Progress::Pending | Progress::Busy => Recovery::Pending,
             Progress::Complete(completion) => {
                 self.settle(&key);
                 Recovery::Complete {
@@ -506,8 +611,17 @@ impl SessionOperations for HostSession {
             cols: size.cols(),
         })
     }
+    /// After Close, or when the host is provably gone (its PTY closed with
+    /// it), the close intent is recorded so a restart does not re-register.
     fn terminate(&self) -> Result<()> {
-        self.control(Request::Close)
+        match self.control(Request::Close) {
+            Ok(()) => {}
+            Err(Error::Unavailable(Unavailable::Transport)) if self.host_gone() => {}
+            Err(error) => return Err(error),
+        }
+        // Best effort: an exited child is torn down by discovery anyway.
+        let _ = self.owner.mark_closing(self.target());
+        Ok(())
     }
     fn screen_text(&self) -> Result<String> {
         Ok(text(&self.snapshot(0)?.snapshot))

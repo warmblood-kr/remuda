@@ -273,7 +273,7 @@ impl Drop for Guard {
     }
 }
 fn handle(shared: &Arc<Shared>) -> SessionHandle {
-    SessionHandle::remote(Arc::new(Remote {
+    SessionHandle::hosted(Arc::new(Remote {
         shared: shared.clone(),
     }))
     .unwrap()
@@ -396,7 +396,7 @@ fn a_local_owner_cannot_be_relabelled_as_authenticated_remote_or_recover_input()
         Arc::new(ManualClock::default()),
     ));
     assert!(matches!(
-        SessionHandle::remote(local.clone()),
+        SessionHandle::hosted(local.clone()),
         Err(Error::Protocol(_))
     ));
     let handle = SessionHandle::local(local);
@@ -541,4 +541,91 @@ fn local_handle_reuses_the_exact_owner_and_its_existing_human_gate() {
     assert_eq!(handle.inspect().unwrap().cut, ObservationCut::LocalFields);
     handle.terminate().unwrap();
     assert_eq!(handle.inspect().unwrap().lifecycle, Lifecycle::Exited(None));
+}
+
+fn scripted(name: &str) -> Session {
+    Session::new(
+        name,
+        Box::new(ScriptedAgent::new(vec![])),
+        Arc::new(ManualClock::default()),
+    )
+}
+#[test]
+fn hosted_and_local_sessions_share_one_registry_name_space() {
+    let registry = crate::Registry::new();
+    let shared = Shared::new();
+    registry.register(scripted("fixture")).unwrap();
+    // A hosted handle cannot take a local name, and comes back unregistered.
+    assert!(registry.register_hosted(handle(&shared)).is_err());
+    assert!(registry.remove("fixture").is_some());
+    assert!(registry.register_hosted(handle(&shared)).is_ok());
+    assert!(registry.register(scripted("fixture")).is_err());
+    assert!(registry.register_hosted(handle(&shared)).is_err());
+    assert_eq!(registry.unique_name("fixture"), "fixture-2");
+    // Legacy `get` never hands out a hosted session as a local Session.
+    assert!(registry.get("fixture").is_none());
+    assert!(registry.hosted("fixture").is_some());
+}
+#[test]
+fn name_routes_reach_a_hosted_handle_and_keep_its_errors() {
+    let registry = crate::Registry::new();
+    let shared = Shared::new();
+    assert!(registry.register_hosted(handle(&shared)).is_ok());
+    registry.send_line("fixture", "line").unwrap().unwrap();
+    registry.send("fixture", b"raw").unwrap().unwrap();
+    registry
+        .feed("fixture", &[Step::Pause(1)])
+        .unwrap()
+        .unwrap();
+    registry
+        .resize("fixture", Size::new(100, 30))
+        .unwrap()
+        .unwrap();
+    assert_eq!(registry.screen_text("fixture").unwrap().unwrap(), "screen");
+    assert_eq!(
+        registry.clear_input("fixture", b"k").unwrap().unwrap(),
+        Some("draft".into())
+    );
+    assert_eq!(
+        *shared.calls.lock().unwrap(),
+        vec![
+            Call::SendLine("line".into()),
+            Call::Send(b"raw".to_vec()),
+            Call::Feed(vec![Step::Pause(1)]),
+            Call::Resize(Size::new(100, 30)),
+            Call::Clear(b"k".to_vec()),
+        ]
+    );
+    let listed = registry.list();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].instance_id.as_deref(), Some("original-instance"));
+    assert_eq!(listed[0].size, Size::new(90, 25));
+    assert!(listed[0].alive);
+    // Unknown outcomes keep their no-retry meaning on the legacy route.
+    shared.unknown_input.store(true, Ordering::SeqCst);
+    let error = registry.send_line("fixture", "again").unwrap().unwrap_err();
+    assert!(error.to_string().contains("recover the original request"));
+    shared.unavailable.store(true, Ordering::SeqCst);
+    let error = registry.screen_text("fixture").unwrap().unwrap_err();
+    assert!(error.to_string().contains("unavailable"));
+    // An unreachable host is still listed: not exited, only unavailable.
+    assert!(registry.list()[0].alive);
+}
+#[test]
+fn closing_a_hosted_session_checks_its_instance_then_terminates_once() {
+    let registry = crate::Registry::new();
+    let shared = Shared::new();
+    assert!(registry.register_hosted(handle(&shared)).is_ok());
+    assert!(registry
+        .close_instance("fixture", "replacement")
+        .unwrap()
+        .is_err());
+    assert!(shared.calls.lock().unwrap().is_empty());
+    assert!(registry
+        .close_instance("fixture", "original-instance")
+        .unwrap()
+        .unwrap());
+    assert_eq!(*shared.calls.lock().unwrap(), vec![Call::Terminate]);
+    assert!(registry.hosted("fixture").is_none());
+    assert!(registry.close("fixture").is_none());
 }

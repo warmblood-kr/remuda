@@ -525,7 +525,7 @@ fn host_stop_retains_unconsumed_durable_outcome_until_exact_checkpoint_ack() {
             .unwrap()
         {
             Progress::Complete(result) => Some(result),
-            Progress::Pending | Progress::Unavailable => None,
+            Progress::Pending | Progress::Busy | Progress::Unavailable => None,
             _ => panic!("unexpected original input recovery state"),
         }
     });

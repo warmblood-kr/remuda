@@ -23,6 +23,7 @@ use crate::agent::{AgentError, Cursor, ExitInfo, Result, ScreenSnapshot, Size, S
 use crate::input::{InputBatch, InputError, InputOutcome};
 use crate::protocol::Step;
 use crate::session::Session;
+use crate::session_operations::{Lifecycle, SessionHandle};
 use core::time::Duration;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -120,6 +121,9 @@ pub fn slug(command: &str) -> String {
 #[derive(Default)]
 pub struct Registry {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    /// Host-backed sessions (#713). One name space with `sessions`; lock
+    /// order is always `sessions`, then `hosted`.
+    hosted: Mutex<HashMap<String, Arc<SessionHandle>>>,
 }
 
 impl Registry {
@@ -154,7 +158,8 @@ impl Registry {
     )]
     pub fn register(&self, session: Session) -> core::result::Result<Arc<Session>, Session> {
         let mut sessions = self.lock();
-        if sessions.contains_key(session.name()) {
+        if sessions.contains_key(session.name()) || self.hosted_lock().contains_key(session.name())
+        {
             return Err(session);
         }
         let handle = Arc::new(session);
@@ -167,13 +172,45 @@ impl Registry {
     /// the thing that decides, and it still refuses a collision.
     pub fn unique_name(&self, base: &str) -> String {
         let sessions = self.lock();
+        let hosted = self.hosted_lock();
         let mut candidate = base.to_string();
         let mut n = 1u32;
-        while sessions.contains_key(&candidate) {
+        while sessions.contains_key(&candidate) || hosted.contains_key(&candidate) {
             n += 1;
             candidate = format!("{base}-{n}");
         }
         candidate
+    }
+
+    /// Track a checked host-backed handle under its own name. A name already
+    /// used by either map is refused and the handle comes back unregistered.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the refused handle is handed back whole"
+    )]
+    pub fn register_hosted(
+        &self,
+        handle: SessionHandle,
+    ) -> core::result::Result<Arc<SessionHandle>, SessionHandle> {
+        let sessions = self.lock();
+        let mut hosted = self.hosted_lock();
+        let name = handle.identity().name.clone();
+        if sessions.contains_key(&name) || hosted.contains_key(&name) {
+            return Err(handle);
+        }
+        let handle = Arc::new(handle);
+        hosted.insert(name, Arc::clone(&handle));
+        Ok(handle)
+    }
+
+    /// A host-backed session by name. Legacy `get` never returns one.
+    pub fn hosted(&self, name: &str) -> Option<Arc<SessionHandle>> {
+        self.hosted_lock().get(name).map(Arc::clone)
+    }
+
+    /// Stop tracking a host-backed session; its host is not touched.
+    pub fn remove_hosted(&self, name: &str) -> Option<Arc<SessionHandle>> {
+        self.hosted_lock().remove(name)
     }
 
     /// A handle to a live session. Many callers may hold one at once: that is
@@ -320,6 +357,8 @@ impl Registry {
                 mouse_tracking: s.mouse_tracking(),
             })
             .collect();
+        let hosted: Vec<_> = self.hosted_lock().values().map(Arc::clone).collect();
+        out.extend(hosted.iter().map(|handle| hosted_summary(handle)));
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
@@ -383,25 +422,75 @@ impl Registry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    fn hosted_lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<SessionHandle>>> {
+        self.hosted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Run `local` on a legacy session, else `hosted` on a host-backed one.
+    fn route<T>(
+        &self,
+        name: &str,
+        local: impl FnOnce(&Session) -> Result<T>,
+        hosted: impl FnOnce(&SessionHandle) -> crate::session_operations::Result<T>,
+    ) -> Option<Result<T>> {
+        if let Some(session) = self.get(name) {
+            return Some(local(&session));
+        }
+        let handle = self.hosted(name)?;
+        Some(hosted(&handle).map_err(crate::session_operations::Error::into_agent))
+    }
+}
+
+/// One host Inspect cut. An unreachable host stays listed as not exited:
+/// the inventory says it is registered; its operations answer Unavailable.
+fn hosted_summary(handle: &SessionHandle) -> SessionSummary {
+    let identity = handle.identity();
+    let mut summary = SessionSummary {
+        id: identity.id.clone(),
+        name: identity.name.clone(),
+        instance_id: Some(identity.instance.clone()),
+        output_version: None,
+        alive: true,
+        idle: Duration::ZERO,
+        output_idle: None,
+        size: Size::new(0, 0),
+        attached: false,
+        human_idle: None,
+        mouse_tracking: false,
+    };
+    if let Ok(observation) = handle.inspect() {
+        summary.output_version = observation.output_version;
+        summary.alive = observation.lifecycle == Lifecycle::Running;
+        summary.idle = observation.idle;
+        summary.output_idle = Some(observation.output_idle);
+        summary.size = observation.size;
+        summary.attached = observation.attached;
+        summary.human_idle = observation.human_idle;
+        summary.mouse_tracking = observation.mouse.mode != crate::agent::MouseMode::default();
+    }
+    summary
 }
 
 /// Name-addressed sugar over `get` plus a session method — the shape a remote
 /// call takes: name in, result out, no handle crossing the boundary.
 impl Registry {
     pub fn send_line(&self, name: &str, text: &str) -> Option<Result<()>> {
-        self.get(name).map(|s| s.send_line(text))
+        self.route(name, |s| s.send_line(text), |h| h.send_line(text))
     }
 
     pub fn send(&self, name: &str, bytes: &[u8]) -> Option<Result<()>> {
-        self.get(name).map(|s| s.send(bytes))
+        self.route(name, |s| s.send(bytes), |h| h.send(bytes))
     }
 
     pub fn clear_input(&self, name: &str, key: &[u8]) -> Option<Result<Option<String>>> {
-        self.get(name).map(|session| session.clear_input(key))
+        self.route(name, |s| s.clear_input(key), |h| h.clear_input(key))
     }
 
     pub fn feed(&self, name: &str, steps: &[Step]) -> Option<Result<()>> {
-        self.get(name).map(|s| s.feed(steps))
+        self.route(name, |s| s.feed(steps), |h| h.feed(steps))
     }
 
     pub fn resize_instance(
@@ -410,16 +499,24 @@ impl Registry {
         instance_id: &str,
         size: Size,
     ) -> Option<Result<bool>> {
-        self.get(name)
-            .map(|session| session.resize_instance(instance_id, size))
+        self.route(
+            name,
+            |session| session.resize_instance(instance_id, size),
+            |handle| {
+                if handle.identity().instance != instance_id {
+                    return Ok(false);
+                }
+                handle.resize(size).map(|()| true)
+            },
+        )
     }
 
     pub fn resize(&self, name: &str, size: Size) -> Option<Result<()>> {
-        self.get(name).map(|s| s.resize(size))
+        self.route(name, |s| s.resize(size), |h| h.resize(size))
     }
 
     pub fn screen_text(&self, name: &str) -> Option<Result<String>> {
-        self.get(name).map(|s| s.screen_text())
+        self.route(name, |s| s.screen_text(), |h| h.screen_text())
     }
 
     pub fn screen_cells(&self, name: &str) -> Option<Result<Vec<Vec<StyledCell>>>> {
@@ -473,7 +570,10 @@ impl Registry {
     pub fn close(&self, name: &str) -> Option<Result<bool>> {
         let session = {
             let sessions = self.lock();
-            let session = Arc::clone(sessions.get(name)?);
+            let Some(session) = sessions.get(name).map(Arc::clone) else {
+                drop(sessions);
+                return self.close_hosted(name, None);
+            };
             session.mark_closing();
             session
         };
@@ -495,7 +595,10 @@ impl Registry {
     /// replacement can never be closed by a stale request.
     pub fn close_instance(&self, name: &str, instance_id: &str) -> Option<Result<bool>> {
         let mut sessions = self.lock();
-        let session = sessions.get(name)?.clone();
+        let Some(session) = sessions.get(name).cloned() else {
+            drop(sessions);
+            return self.close_hosted(name, Some(instance_id));
+        };
         if session.instance_id() != instance_id {
             return Some(Err(AgentError::Io(
                 "session restarted; close was refused".into(),
@@ -507,6 +610,28 @@ impl Registry {
             return Some(Err(error));
         }
         Some(Ok(sessions.remove(name).is_some()))
+    }
+
+    /// End a host-backed child, then stop tracking that exact handle. Host
+    /// teardown (Stop, inventory retirement) belongs to the native owner.
+    fn close_hosted(&self, name: &str, instance_id: Option<&str>) -> Option<Result<bool>> {
+        let handle = self.hosted(name)?;
+        if instance_id.is_some_and(|id| handle.identity().instance != id) {
+            return Some(Err(AgentError::Io(
+                "session restarted; close was refused".into(),
+            )));
+        }
+        if let Err(error) = handle.terminate() {
+            return Some(Err(error.into_agent()));
+        }
+        let mut hosted = self.hosted_lock();
+        let removed = hosted
+            .get(name)
+            .is_some_and(|current| Arc::ptr_eq(current, &handle));
+        if removed {
+            hosted.remove(name);
+        }
+        Some(Ok(removed))
     }
 }
 

@@ -194,6 +194,13 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        // A test may already have stopped and retired its host.
+        if let Some(host) = self.host.as_mut() {
+            if matches!(host.0.try_wait(), Ok(Some(_))) {
+                let _ = std::fs::remove_dir_all(&self.root);
+                return;
+            }
+        }
         // Exact authenticated cleanup: close the child, then stop the host.
         // The claim may meet store lock contention; retry it briefly.
         let until = Instant::now() + Duration::from_secs(5);
@@ -358,6 +365,16 @@ fn a_newer_owner_claim_fences_the_old_adapter_before_any_effect() {
     new.send_line("current").unwrap();
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(fixture.effects(), ["current"]);
+    // Resize and close are not reserved, so the fence is checked up front.
+    for refused in [old.resize(Size::new(100, 30)), old.terminate()] {
+        assert!(matches!(
+            refused,
+            Err(Error::Unavailable(Unavailable::Recovering))
+        ));
+    }
+    let observed = new.inspect().unwrap();
+    assert_eq!(observed.lifecycle, Lifecycle::Running);
+    assert_eq!(observed.size, Size::new(80, 24));
 }
 
 #[test]
@@ -508,9 +525,105 @@ fn an_exited_session_refuses_new_input_before_any_reservation() {
             });
             None
         }
+        // Nothing was reserved: a busy host may refuse the connection itself.
+        Err(Error::Unavailable(_)) => None,
         other => panic!("unexpected input result {other:?}"),
     });
     let index = session.owner.index().unwrap();
     assert!(index.entries["synthetic"].pending.is_none());
     assert!(fixture.effects().is_empty());
+}
+
+#[test]
+fn a_lease_held_longer_than_the_unavailability_cap_is_busy_not_absent() {
+    let fixture = Fixture::new();
+    let session = adapter(&fixture.root);
+    // Another controller holds the lease for 6 s: the host answers Busy.
+    let mut holder =
+        Client::open_expected(&session.endpoint, Role::Control, session.identity.clone()).unwrap();
+    assert!(matches!(
+        holder.request(&Request::Acquire),
+        Ok(Response::Granted { .. })
+    ));
+    let release = std::thread::spawn(move || {
+        // Keep the connection alive past the host's idle deadline.
+        for _ in 0..12 {
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = holder.request(&Request::Inspect);
+        }
+    });
+    session.send_line("late").unwrap();
+    release.join().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(fixture.effects(), ["late"]);
+}
+
+#[test]
+fn a_new_daemon_resolves_an_old_act_by_key_before_new_input_without_replay() {
+    let fixture = Fixture::new();
+    let mut old = helper(&fixture.root, "controller");
+    eventually("first effect", || {
+        (fixture.effects().first().map(String::as_str) == Some("first")).then_some(())
+    });
+    old.0.kill().unwrap();
+    old.0.wait().unwrap();
+    // The host finishes the admitted act on its own.
+    eventually("old act finished on the host", || {
+        (fixture.effects() == ["first", "second"]).then_some(())
+    });
+    let session = adapter(&fixture.root);
+    session.send_line("third").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(fixture.effects(), ["first", "second", "third"]);
+    // The old act's result is still retained for an explicit recovery.
+    let old_act = RequestIdentity {
+        session: session.identity(),
+        client: CLIENT,
+        sequence: 1,
+        payload: session.owner.index().unwrap().entries["synthetic"].streams[0].results[0]
+            .reservation
+            .key
+            .payload,
+    };
+    assert!(matches!(
+        session.recover(&old_act).unwrap(),
+        Recovery::Complete {
+            delivery: Delivery::Written,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn teardown_retires_an_entry_whose_host_was_stopped_before_a_crash() {
+    let mut fixture = Fixture::new();
+    let session = adapter(&fixture.root);
+    session.terminate().unwrap();
+    eventually("exit published", || {
+        let index = session.owner.index().ok()?;
+        matches!(index.entries["synthetic"].phase, Phase::Exited { .. }).then_some(())
+    });
+    // An old daemon stopped the host, then died before retiring the entry.
+    eventually("host stopped", || {
+        let mut client =
+            Client::open_expected(&session.endpoint, Role::Control, session.identity.clone())
+                .ok()?;
+        matches!(
+            client.request(&Request::Acquire),
+            Ok(Response::Granted { .. })
+        )
+        .then_some(())?;
+        matches!(client.request(&Request::Stop), Ok(Response::Ok)).then_some(())
+    });
+    let host = fixture.host.as_mut().unwrap();
+    eventually("host exited", || host.0.try_wait().ok().flatten());
+    // A new daemon finds no listener and still retires the settled entry.
+    let fresh = adapter(&fixture.root);
+    fresh.teardown(Duration::from_secs(10)).unwrap();
+    assert!(!fresh
+        .owner
+        .index()
+        .unwrap()
+        .entries
+        .contains_key("synthetic"));
 }
