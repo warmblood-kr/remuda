@@ -21,6 +21,7 @@ const CAPS: &[&str] = &[
     "paged-screen-v1",
     super::api::RETAINED_LEDGER,
     super::api::TYPED_VIEW,
+    super::api::HUMAN_INPUT,
 ];
 pub(crate) struct Server {
     endpoint: Arc<Endpoint>,
@@ -110,12 +111,27 @@ impl Server {
                 return Ok(());
             }
         };
+        if open.role == Role::Human
+            && !open
+                .protocol
+                .required
+                .iter()
+                .any(|cap| cap == super::api::HUMAN_INPUT)
+        {
+            send(
+                &mut channel,
+                &Response::Error {
+                    code: "human_input_capability_required".into(),
+                },
+            )?;
+            return Ok(());
+        }
         let identity = self.host.identity();
         if open
             .expected
             .as_ref()
             .is_some_and(|expected| expected != &identity)
-            || (open.role == Role::Control && open.expected.as_ref() != Some(&identity))
+            || (open.role != Role::View && open.expected.as_ref() != Some(&identity))
         {
             send(
                 &mut channel,
@@ -216,6 +232,9 @@ impl Drop for Connection {
         if let Some(fence) = self.fence.take() {
             let _ = self.server.host.release(fence);
         }
+        if self.role == Role::Human {
+            self.server.host.disconnect_human(self.id);
+        }
     }
 }
 impl Connection {
@@ -239,7 +258,11 @@ impl Connection {
             .is_some_and(|gate| !gate.effects_allowed())
             && matches!(
                 &request,
-                Request::Acquire | Request::Input { .. } | Request::Resize { .. } | Request::Close
+                Request::Acquire
+                    | Request::Input { .. }
+                    | Request::Resize { .. }
+                    | Request::Close
+                    | Request::HumanGrant { .. }
             )
         {
             return Err("host_publication_pending".into());
@@ -306,6 +329,83 @@ impl Connection {
             | Request::AcknowledgeViewport { .. }
             | Request::WatchAfter { .. }) => self.terminal_request(request),
             Request::Stop => self.stop(),
+            request => self.human_request(request),
+        }
+    }
+    fn human(&self) -> Result<(), String> {
+        if self.role != Role::Human {
+            return Err("human_role_required".into());
+        }
+        Ok(())
+    }
+    /// Raw outcomes are for the human holder and Control, never View.
+    fn raw_reader(&self, grant: u64) -> Result<(), String> {
+        match self.role {
+            Role::Control => Ok(()),
+            Role::Human if self.server.host.holds_grant(self.id, grant) => Ok(()),
+            _ => Err("raw_outcome_not_visible".into()),
+        }
+    }
+    fn human_request(&mut self, request: Request) -> Result<Response, String> {
+        use super::human::GrantRequest;
+        use sha2::{Digest, Sha256};
+        let host = &self.server.host;
+        match request {
+            Request::HumanGrant {
+                request,
+                expected,
+                recovery_secret,
+            } => {
+                self.human()?;
+                let request = GrantRequest {
+                    request,
+                    expected,
+                    recovery: Sha256::digest(recovery_secret).into(),
+                };
+                let (grant, state) = host.grant_human(self.id, request).map_err(control_error)?;
+                Ok(Response::HumanGranted { grant, state })
+            }
+            Request::RevokeHuman { grant } => {
+                let revoked = host
+                    .revoke_human(self.controller()?, grant)
+                    .map_err(control_error)?;
+                Ok(Response::Revoked { revoked })
+            }
+            Request::RecoverRaw {
+                grant,
+                sequence,
+                bytes,
+            } => {
+                self.raw_reader(grant)?;
+                let digest = raw_digest(bytes)?;
+                Ok(Response::RawOutcome {
+                    state: host.recover_raw(grant, sequence, digest),
+                })
+            }
+            Request::RawCut { last } => {
+                if self.role == Role::View {
+                    return Err("raw_outcome_not_visible".into());
+                }
+                let cut = match host.raw_cut(last) {
+                    Ok(cut) => cut,
+                    Err(state) => return Ok(Response::Retired { state }),
+                };
+                self.raw_reader(cut.grant)?;
+                Ok(Response::RawCut { cut })
+            }
+            Request::AcknowledgeRaw { cut } => {
+                self.human()?;
+                Ok(Response::Retired {
+                    state: host.ack_raw(self.id, cut),
+                })
+            }
+            Request::DiscardRaw { cut } => {
+                let state = host
+                    .discard_raw(self.controller()?, cut)
+                    .map_err(control_error)?;
+                Ok(Response::Retired { state })
+            }
+            _ => Err("unsupported_request".into()),
         }
     }
     fn stop(&mut self) -> Result<Response, String> {
@@ -522,6 +622,12 @@ impl Connection {
         })
     }
 }
+/// Raw bytes are digested as a typed Bytes act, binding operation kind.
+fn raw_digest(bytes: Vec<u8>) -> Result<[u8; 32], String> {
+    super::wire::InputAct::Bytes(bytes)
+        .digest()
+        .map_err(|_| "invalid_raw_input".into())
+}
 fn control_error(error: super::coordinator::Error) -> String {
     use super::control::Refusal;
     use super::coordinator::Error;
@@ -532,7 +638,13 @@ fn control_error(error: super::coordinator::Error) -> String {
         Error::Invalid(_) => "invalid_or_unavailable_operation",
         Error::Stopping => "host_stopping",
         Error::Retained => "host_raw_retention_pending",
-        Error::Grant(_) => "human_grant_refused",
+        Error::Grant(super::human::GrantError::Stale) => "human_grant_stale",
+        Error::Grant(super::human::GrantError::Conflict) => "human_grant_conflict",
+        Error::Grant(super::human::GrantError::Exhausted) => "human_grant_exhausted",
     }
     .into()
 }
+
+#[cfg(test)]
+#[path = "human_wire_tests.rs"]
+mod human_wire_tests;

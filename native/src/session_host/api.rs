@@ -1,4 +1,5 @@
 //! Experimental standalone-host RPC v1, separate from daemon/cluster APIs.
+use super::human::{Cut, GrantState, Raw, Retire};
 use super::result::Completion;
 use super::wire::{Hello, InputAct};
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,8 @@ pub(crate) const MAX_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const RETAINED_LEDGER: &str = "retained-input-ledger-v1";
 pub(crate) const TYPED_VIEW: &str = "typed-terminal-view-v1";
 pub(crate) const SCOPED_BIRTH: &str = "scoped-host-publisher-v1";
+/// Human role is refused unless the client required this capability first.
+pub(crate) const HUMAN_INPUT: &str = "human-input-v1";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub(crate) enum PublicationStatus {
@@ -28,6 +31,7 @@ pub(crate) struct Identity {
 pub(crate) enum Role {
     View,
     Control,
+    Human,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -123,6 +127,29 @@ pub(crate) enum Request {
         generation: u64,
     },
     Stop,
+    /// Checked human grant; only the secret's digest is retained.
+    HumanGrant {
+        request: [u8; 16],
+        expected: u64,
+        recovery_secret: [u8; 32],
+    },
+    RevokeHuman {
+        grant: u64,
+    },
+    RecoverRaw {
+        grant: u64,
+        sequence: u64,
+        bytes: Vec<u8>,
+    },
+    RawCut {
+        last: u64,
+    },
+    AcknowledgeRaw {
+        cut: Cut,
+    },
+    DiscardRaw {
+        cut: Cut,
+    },
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum OutcomeState {
@@ -206,6 +233,22 @@ pub(crate) enum Response {
         snapshot: u64,
         index: usize,
         base64: String,
+    },
+    HumanGranted {
+        grant: u64,
+        state: GrantState,
+    },
+    Revoked {
+        revoked: bool,
+    },
+    RawOutcome {
+        state: Raw,
+    },
+    RawCut {
+        cut: Cut,
+    },
+    Retired {
+        state: Retire,
     },
     Ok,
     Error {
