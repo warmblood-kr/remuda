@@ -167,6 +167,10 @@ impl Client {
             &[super::api::RETAINED_LEDGER],
         )
     }
+    /// Daemon observations need Session activity; an older host refuses.
+    pub fn open_observer(path: &Path, expected: super::api::Identity) -> io::Result<Self> {
+        Self::open_with_capabilities(path, Role::View, expected, &[super::api::ACTIVITY])
+    }
     /// Human input must be negotiated before any grant reaches an old host.
     pub fn open_human(path: &Path, expected: super::api::Identity) -> io::Result<Self> {
         Self::open_with_capabilities(path, Role::Human, expected, &[super::api::HUMAN_INPUT])

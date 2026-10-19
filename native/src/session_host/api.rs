@@ -12,6 +12,8 @@ pub(crate) const TYPED_VIEW: &str = "typed-terminal-view-v1";
 pub(crate) const SCOPED_BIRTH: &str = "scoped-host-publisher-v1";
 /// Human role is refused unless the client required this capability first.
 pub(crate) const HUMAN_INPUT: &str = "human-input-v1";
+/// Inspect carries Session activity; absent on older hosts, never read as zero.
+pub(crate) const ACTIVITY: &str = "activity-v1";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub(crate) enum PublicationStatus {
@@ -84,6 +86,19 @@ pub(crate) struct Info {
     pub query_overflow: u64,
     pub backend_fault: bool,
     pub active_connections: usize,
+    /// Optional for older hosts; daemon observations need these Session fields.
+    #[serde(default)]
+    pub activity: Option<Activity>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Activity {
+    pub idle_ms: u64,
+    pub output_idle_ms: u64,
+    pub human_idle_ms: Option<u64>,
+    pub attached: bool,
+    pub closing: bool,
+    pub mouse: remuda_core::agent::MouseState,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", deny_unknown_fields)]

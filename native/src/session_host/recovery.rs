@@ -27,19 +27,32 @@ pub(crate) struct Owner {
 }
 impl Owner {
     /// A process-level owner, shared across sessions; not one new claim per act.
+    /// A host publishing between our read and commit is retried, not fatal.
     pub fn claim(store: Store) -> Result<Self, Error> {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(|_| Error::Data(model::Error::Unavailable))?;
-        let applied = store.commit(
-            store.read()?.cursor(),
-            None,
-            Mutation::Claim { nonce },
-            Duration::from_secs(1),
-        )?;
-        Ok(Self {
-            store,
-            fence: applied.fence,
-        })
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match store.commit(
+                store.read()?.cursor(),
+                None,
+                Mutation::Claim { nonce },
+                Duration::from_secs(1),
+            ) {
+                Ok(applied) => {
+                    return Ok(Self {
+                        store,
+                        fence: applied.fence,
+                    })
+                }
+                Err(Error::Busy | Error::Data(model::Error::StaleRevision))
+                    if std::time::Instant::now() < until =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
     /// Durable publication precedes any host connection, effect or caller receipt.
     pub fn reserve(
@@ -95,7 +108,12 @@ impl Owner {
             Lookup::Absent => return Ok(Progress::Indeterminate),
             Lookup::Pending(pending) => pending.clone(),
         };
-        self.commit(copy_target(&target), InputMutation::Adopt(key.clone()))?;
+        // Skip the disk commit only while this exact fence (store incarnation,
+        // epoch, nonce) is current and already wrote the act; otherwise Adopt
+        // runs and a newer claim fails with StaleFence before any RPC.
+        if pending.writer_epoch != self.fence.epoch() || index.fence() != self.fence {
+            self.commit(copy_target(&target), InputMutation::Adopt(key.clone()))?;
+        }
         let Ok(mut peer) = Client::open_recovering(endpoint, target.identity.clone()) else {
             return Ok(Progress::Unavailable);
         };
@@ -117,6 +135,37 @@ impl Owner {
             Err(_) => return Ok(Progress::Unavailable),
         };
         self.reconcile(target, key, pending, peer, response)
+    }
+    pub fn index(&self) -> Result<model::Index, Error> {
+        self.store.read()
+    }
+    /// Publish that the caller received this exact result; then it may be GC'd.
+    pub fn consume(
+        &self,
+        target: Target,
+        key: Key,
+        intent: [u8; 16],
+        completion: &Completion,
+    ) -> Result<(), Error> {
+        let index = self.store.read()?;
+        let expected = index
+            .entries
+            .get(&target.name)
+            .and_then(|entry| entry.metadata.get("consumer"))
+            .map(|namespace| namespace.revision);
+        let encoded = serde_json::to_vec(completion)
+            .map_err(|_| Error::Data(model::Error::Invalid("completion encoding")))?;
+        let receipt = serde_json::json!({"sequence": key.sequence}).to_string();
+        let checkpoint = model::ConsumerCheckpoint {
+            intent,
+            outcome: model::hash(&encoded),
+            metadata: model::MetadataUpdate {
+                namespace: "consumer".into(),
+                expected,
+                value: model::Namespace::new(1, &receipt).map_err(Error::Data)?,
+            },
+        };
+        self.commit(target, InputMutation::Consume { key, checkpoint })
     }
     fn reconcile(
         &self,

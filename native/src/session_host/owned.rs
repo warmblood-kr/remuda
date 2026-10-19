@@ -134,6 +134,14 @@ impl Owned {
             query_overflow,
             backend_fault,
             active_connections: 0,
+            activity: Some(super::api::Activity {
+                idle_ms: millis(self.session.idle_for()),
+                output_idle_ms: millis(self.session.output_idle_for()),
+                human_idle_ms: self.session.human_idle_for().map(millis),
+                attached: self.session.is_attached(),
+                closing: self.session.is_closing(),
+                mouse: self.session.mouse_state(),
+            }),
         })
     }
     pub fn resize(&self, fence: Fence, rows: u16, cols: u16) -> Result<(), Error> {
@@ -415,6 +423,9 @@ impl Owned {
             },
         }
     }
+}
+fn millis(value: Duration) -> u64 {
+    u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
 }
 fn submission(value: InputSubmitOutcome) -> Reply {
     Reply::Submission(match value {
