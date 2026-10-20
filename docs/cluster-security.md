@@ -143,6 +143,22 @@ Recording is best effort: if the file cannot be written, the listener reports
 it once on stderr and still serves the request. `revoked` means the peer was
 revoked while its request was held, so the write may already have happened.
 
+## Remote session creation
+
+An admitted peer may start a session on this node only as this node's default
+shell (`$SHELL`, the same as a bare local `new`). The remote front accepts
+`New` and `NewWithInstance` only with an empty command, no working directory
+and no environment; anything else is refused before dispatch. A name, if
+given, must be 1–64 bytes of `A–Z a–z 0–9 . _ -` and must not start with `.`;
+otherwise the daemon derives a unique one. The size must be within the resize
+caps. Creation is gated by the same `cluster control` setting as input and
+close, limited to a burst of 5 per peer with one more every 10 seconds, and
+recorded in the audit log as `create` whatever the outcome.
+
+This adds no power beyond remote input: a peer that can type into a shell can
+already start any program there. It does stop a peer from choosing the program,
+directory or environment directly.
+
 ## Response chunking (v2)
 
 A Noise message is capped at 65,535 bytes, so a v1 response (one handshake
@@ -200,9 +216,9 @@ record plaintext = data
 
 ## Threat model
 
-An admitted peer can submit bounded Input batches to any session while remote
-control is enabled. The listener enforces a 256 KiB/s peer-wide aggregate
-budget, and the local daemon enforces its per-session cap. PTY writes have a
+An admitted peer can submit bounded Input batches to any session, and start
+default-shell sessions, while remote control is enabled. The listener
+enforces a 256 KiB/s peer-wide aggregate budget, and the local daemon enforces its per-session cap. PTY writes have a
 bounded timeout. The local flag defaults to enabled because joining a cluster
 is a trust decision; disabling it refuses remote Input and Close. A compromised
 admitted node can type into and close every session while the setting is on.

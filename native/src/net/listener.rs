@@ -250,6 +250,7 @@ struct RequestLimiter {
     join_attempts: Mutex<HashMap<std::net::IpAddr, VecDeque<Instant>>>,
     registry_requests: Mutex<HashMap<String, RegistryTokenBucket>>,
     vfs_requests: Mutex<HashMap<String, RegistryTokenBucket>>,
+    remote_creates: Mutex<HashMap<String, RegistryTokenBucket>>,
     remote_inputs: Mutex<RemoteInputRateLimiter>,
 }
 
@@ -694,6 +695,44 @@ impl RequestLimiter {
         true
     }
 
+    /// Sessions a peer may start: a burst of 5, then one every 10 s, so an
+    /// admitted node cannot fill this machine with shells.
+    fn acquire_remote_create(&self, fingerprint: &str) -> bool {
+        self.acquire_remote_create_at(fingerprint, Instant::now())
+    }
+
+    fn acquire_remote_create_at(&self, fingerprint: &str, now: Instant) -> bool {
+        const BURST: f64 = 5.0;
+        const REFILL_PER_SECOND: f64 = 0.1;
+        let mut buckets = self
+            .remote_creates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A bucket idle long enough to be full again is the same as none.
+        buckets.retain(|_, bucket| {
+            now.saturating_duration_since(bucket.last_refill) < Duration::from_secs(60)
+        });
+        if !buckets.contains_key(fingerprint) && buckets.len() >= MAX_REGISTRY_RATE_BUCKETS {
+            return false;
+        }
+        let bucket = buckets
+            .entry(fingerprint.to_owned())
+            .or_insert(RegistryTokenBucket {
+                tokens: BURST,
+                last_refill: now,
+            });
+        let elapsed = now
+            .saturating_duration_since(bucket.last_refill)
+            .as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * REFILL_PER_SECOND).min(BURST);
+        bucket.last_refill = now;
+        if bucket.tokens < 1.0 {
+            return false;
+        }
+        bucket.tokens -= 1.0;
+        true
+    }
+
     fn acquire_ip(self: &Arc<Self>, address: std::net::IpAddr) -> Option<Arc<IpPermit>> {
         let address = peer_prefix(address);
         let ipv6_48 = peer_ipv6_48(address);
@@ -1102,11 +1141,14 @@ fn authorize_remote_request_with_source(
             | Request::InputLine { .. }
             | Request::ResizeSession { .. }
             | Request::Close { .. }
+            | Request::New { .. }
+            | Request::NewWithInstance { .. }
     ) {
         control_source.enabled().map_err(|_| {
             let operation = match request {
                 Request::Input { .. } | Request::InputLine { .. } => "Input",
                 Request::ResizeSession { .. } => "ResizeSession",
+                Request::New { .. } | Request::NewWithInstance { .. } => "New",
                 _ => "Close",
             };
             Response::error(format!(
@@ -1131,6 +1173,9 @@ fn authorize_remote_request_with_control(
             return Err(Response::RemoteControlDisabled);
         }
         Request::Close { .. } if !allow_remote_control => {
+            return Err(Response::RemoteControlDisabled);
+        }
+        Request::New { .. } | Request::NewWithInstance { .. } if !allow_remote_control => {
             return Err(Response::RemoteControlDisabled);
         }
         _ => {}
@@ -1594,6 +1639,16 @@ fn handle_admitted_request(
     if let Err(response) = authorize_remote_request_with_source(&request, &control_source) {
         audit(cluster::audit::Outcome::Refused);
         let response = serde_json::to_vec(&response).unwrap_or_else(|_| b"null".to_vec());
+        return send_encrypted_response(stream, opened, &response);
+    }
+    if matches!(
+        request,
+        Request::New { .. } | Request::NewWithInstance { .. }
+    ) && !state.limiter.acquire_remote_create(&peer_fp)
+    {
+        audit(cluster::audit::Outcome::Limited);
+        let response =
+            serde_json::to_vec(&Response::RateLimited).unwrap_or_else(|_| b"null".to_vec());
         return send_encrypted_response(stream, opened, &response);
     }
     if let Request::Input { bytes, .. } | Request::InputLine { bytes, .. } = &request {
@@ -2966,16 +3021,7 @@ mod tests {
         use cluster::audit::{Op, Outcome};
         let (_, entries) = audited_exchange(
             br#"{"allow_remote_control":false}"#,
-            &[
-                audited_input(b"x"),
-                Request::New {
-                    name: Some("new".into()),
-                    command: vec!["sh".into()],
-                    size: remuda_core::Size::new(80, 24),
-                    cwd: None,
-                    env: None,
-                },
-            ],
+            &[audited_input(b"x"), shell_new(Some("new"))],
         );
         let summary: Vec<_> = entries
             .iter()
@@ -2988,6 +3034,81 @@ mod tests {
                 (Op::Create, Outcome::Refused)
             ]
         );
+    }
+
+    #[cfg(unix)]
+    fn shell_new(name: Option<&str>) -> Request {
+        Request::New {
+            name: name.map(str::to_owned),
+            command: Vec::new(),
+            size: remuda_core::Size::new(80, 24),
+            cwd: None,
+            env: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_may_start_only_the_default_shell_and_each_attempt_is_audited() {
+        use cluster::audit::{Op, Outcome};
+        let mut with_command = shell_new(Some("evil"));
+        if let Request::New { command, .. } = &mut with_command {
+            *command = vec!["sh".into(), "-c".into(), "id".into()];
+        }
+        let mut with_cwd = shell_new(None);
+        if let Request::New { cwd, .. } = &mut with_cwd {
+            *cwd = Some("/".into());
+        }
+        let (_, entries) = audited_exchange(
+            br#"{"allow_remote_control":true}"#,
+            &[shell_new(Some("work")), with_command, with_cwd],
+        );
+        let summary: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.op, entry.session.as_str(), entry.outcome))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (Op::Create, "work", Outcome::Done),
+                (Op::Create, "evil", Outcome::Refused),
+                (Op::Create, "", Outcome::Refused),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_creates_past_the_burst_are_rate_limited() {
+        use cluster::audit::Outcome;
+        let requests: Vec<_> = (0..6).map(|_| shell_new(None)).collect();
+        let (_, entries) = audited_exchange(br#"{"allow_remote_control":true}"#, &requests);
+        let outcomes: Vec<_> = entries.iter().map(|entry| entry.outcome).collect();
+        assert_eq!(
+            outcomes,
+            [
+                Outcome::Done,
+                Outcome::Done,
+                Outcome::Done,
+                Outcome::Done,
+                Outcome::Done,
+                Outcome::Limited
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_create_bucket_refills_one_every_ten_seconds_per_peer() {
+        let limiter = RequestLimiter::default();
+        let start = Instant::now();
+        for _ in 0..5 {
+            assert!(limiter.acquire_remote_create_at("a", start));
+        }
+        assert!(!limiter.acquire_remote_create_at("a", start));
+        assert!(limiter.acquire_remote_create_at("b", start), "per peer");
+        assert!(!limiter.acquire_remote_create_at("a", start + Duration::from_secs(9)));
+        assert!(limiter.acquire_remote_create_at("a", start + Duration::from_secs(10)));
+        assert!(!limiter.acquire_remote_create_at("a", start + Duration::from_secs(10)));
     }
 
     #[cfg(unix)]
