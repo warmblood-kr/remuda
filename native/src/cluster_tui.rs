@@ -2436,10 +2436,9 @@ fn normalized_terminal_size(cols: u16, rows: u16) -> (u16, u16) {
 const INPUT_WAIT: Duration = Duration::from_millis(250);
 const REMOTE_CHECK: Duration = Duration::from_millis(25);
 
-/// Wait up to `limit` (at most INPUT_WAIT) for terminal input, returning early
-/// (false) once the remote generation differs from `seen`, read before this
-/// frame's sync (#622). Input is polled first each slice, so a remote change
-/// never starves it.
+/// Wait up to `limit` (at most INPUT_WAIT) for input; return false early once
+/// the generation differs from `seen`, read before this frame's sync (#622).
+/// Input is polled first each slice, so a remote change never starves it.
 fn wait_for_input_or_remote(
     clock: &dyn Clock,
     mut poll: impl FnMut(Duration) -> io::Result<bool>,
