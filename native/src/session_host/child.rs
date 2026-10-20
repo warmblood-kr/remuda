@@ -54,14 +54,14 @@ impl View {
     }
     pub fn status(&self) -> Result<(u64, (u16, u16))> {
         let terminal = self.terminal.lock().map_err(io)?;
-        Ok((terminal.generation(), terminal.screen().size()))
+        Ok((terminal.generation(), crate::vt::size(terminal.screen())))
     }
     pub fn capture(&self) -> Result<(u64, Vec<u8>, (u16, u16))> {
         let terminal = self.terminal.lock().map_err(io)?;
         Ok((
             terminal.generation(),
-            terminal.screen().state_formatted(),
-            terminal.screen().size(),
+            terminal.screen().state_formatted().into_bytes(),
+            crate::vt::size(terminal.screen()),
         ))
     }
     pub fn output_end(&self) -> super::api::OutputEnd {
@@ -261,7 +261,13 @@ impl AgentProcess for HostChild {
         Ok(self.terminal.lock().map_err(io)?.screen().contents())
     }
     fn screen_bytes(&mut self) -> Result<Vec<u8>> {
-        Ok(self.terminal.lock().map_err(io)?.screen().state_formatted())
+        Ok(self
+            .terminal
+            .lock()
+            .map_err(io)?
+            .screen()
+            .state_formatted()
+            .into_bytes())
     }
     fn screen_cells(&mut self) -> Result<Vec<Vec<StyledCell>>> {
         Ok(self.terminal.lock().map_err(io)?.snapshot(0).snapshot.cells)
@@ -366,7 +372,10 @@ mod tests {
         assert!(child.0.resize(Size::new(90, 25)).is_err());
         let actual = child.0.master.get_size().unwrap();
         assert_eq!((actual.rows, actual.cols), (24, 80));
-        assert_eq!(child.0.terminal.lock().unwrap().screen().size(), (24, 80));
+        assert_eq!(
+            crate::vt::size(child.0.terminal.lock().unwrap().screen()),
+            (24, 80)
+        );
         assert!(child.0.fault.load(Ordering::Acquire));
     }
     struct Cleanup(HostChild);

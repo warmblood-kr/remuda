@@ -169,7 +169,7 @@ impl Host {
         let data = base64::engine::general_purpose::STANDARD
             .decode(value["screen_base64"].as_str().unwrap())
             .unwrap();
-        let mut parser = vt100::Parser::new(
+        let mut parser = remuda_native::vt::parser(
             value["rows"].as_u64().unwrap() as u16,
             value["cols"].as_u64().unwrap() as u16,
             0,
@@ -255,7 +255,10 @@ fn controller_sigkill_preserves_child_identity_terminal_and_admitted_input_resul
         "Ok"
     );
     assert_eq!(host.inspect()["cols"], 90);
-    assert_eq!(host.screen_state().screen().size(), (25, 90));
+    assert_eq!(
+        remuda_native::vt::size(host.screen_state().screen()),
+        (25, 90)
+    );
     host.stop();
 }
 

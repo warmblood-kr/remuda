@@ -596,19 +596,19 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().any(|row| row.contains("\x1b[7m \x1b[27m")));
         for row in &rows {
-            let mut parser = vt100::Parser::new(1, 12, 0);
+            let mut parser = crate::vt::parser(1, 12, 0);
             parser.process(row.as_bytes());
             assert!(parser.screen().contents().chars().count() <= 12);
         }
         composer.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), &keymap);
         let first = composer.display_lines("$ ", 12, 3);
-        let mut parser = vt100::Parser::new(3, 12, 0);
+        let mut parser = crate::vt::parser(3, 12, 0);
         parser.process(first.join("\r\n").as_bytes());
         assert!(parser.screen().cell(0, 2).unwrap().inverse());
         assert_eq!(parser.screen().cell(0, 2).unwrap().contents(), "한");
         composer.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &keymap);
         let next = composer.display_lines("$ ", 12, 3);
-        let mut moved = vt100::Parser::new(3, 12, 0);
+        let mut moved = crate::vt::parser(3, 12, 0);
         moved.process(next.join("\r\n").as_bytes());
         assert_eq!(parser.screen().contents(), moved.screen().contents());
         assert!(moved.screen().cell(0, 4).unwrap().inverse());

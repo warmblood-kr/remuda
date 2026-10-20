@@ -331,7 +331,7 @@ impl RemoteTui {
 
     fn screen_text(&self) -> String {
         let output = self.output.lock().unwrap();
-        let mut parser = vt100::Parser::new(self.rows, self.cols, 0);
+        let mut parser = remuda_native::vt::parser(self.rows, self.cols, 0);
         parser.process(&output);
         parser.screen().contents()
     }
@@ -348,7 +348,7 @@ impl RemoteTui {
     fn screens_from(&self, offset: usize) -> (String, String) {
         let output = self.output.lock().unwrap();
         let offset = offset.min(output.len());
-        let mut parser = vt100::Parser::new(self.rows, self.cols, 0);
+        let mut parser = remuda_native::vt::parser(self.rows, self.cols, 0);
         parser.process(&output[..offset]);
         let before = parser.screen().contents();
         parser.process(&output[offset..]);
@@ -359,7 +359,7 @@ impl RemoteTui {
     fn any_screen_contains_from(&self, offset: usize, needles: &[&str]) -> bool {
         let output = self.output.lock().unwrap();
         let offset = offset.min(output.len());
-        let mut parser = vt100::Parser::new(self.rows, self.cols, 0);
+        let mut parser = remuda_native::vt::parser(self.rows, self.cols, 0);
         parser.process(&output[..offset]);
         if needles
             .iter()
@@ -471,7 +471,7 @@ fn real_remote_tui_paints_the_selected_remote_session_screen() {
 }
 
 fn assert_remote_screen_columns(tui: &RemoteTui, cols: u16, server_label: &str) {
-    let mut parser = vt100::Parser::new(24, cols, 0);
+    let mut parser = remuda_native::vt::parser(24, cols, 0);
     parser.process(&tui.output.lock().unwrap());
     let screen_cells = (0..24)
         .map(|row| {
@@ -776,7 +776,7 @@ fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
     let payload = "received=108,105,110,101,49,13,108,105,110,101,50,";
     tui.wait_for_from(output_start, payload, Duration::from_secs(10));
     let output = tui.output.lock().unwrap();
-    let mut parser = vt100::Parser::new(24, 100, 0);
+    let mut parser = remuda_native::vt::parser(24, 100, 0);
     parser.process(&output);
     let screen = parser.screen().contents();
     let complete_paste_inputs = screen.lines().filter(|line| line.contains(payload)).count();

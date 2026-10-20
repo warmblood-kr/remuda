@@ -49,6 +49,7 @@ pub mod tick;
 pub mod tui;
 pub mod vfs_cli;
 mod vfs_lua;
+pub mod vt;
 pub(crate) mod windows_security;
 
 /// Path used to persist command history for the REPL binary.

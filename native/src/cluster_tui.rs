@@ -2309,7 +2309,7 @@ fn visually_blank_line(line: &str) -> bool {
         return line.trim().is_empty();
     }
     let mut chars = line.chars();
-    let mut parser = vt100::Parser::new(2, 2, 0);
+    let mut parser = crate::vt::parser(2, 2, 0);
     let mut decorated = false;
     while let Some(ch) = chars.next() {
         if ch == '\x1b' {
@@ -2352,10 +2352,10 @@ fn terminal_frame(frame: &str) -> String {
 // vt100 stores one base scalar plus combining marks in each cell; diffs inherit that cell limit.
 fn present(prev: Option<&vt100::Screen>, next: &vt100::Screen) -> Vec<u8> {
     match prev {
-        Some(prev) if prev.size() == next.size() => next.contents_diff(prev),
+        Some(prev) if prev.size() == next.size() => next.contents_diff(prev).into_bytes(),
         _ => {
             let mut output = b"\x1b[2J\x1b[H".to_vec();
-            output.extend(next.contents_formatted());
+            output.extend(next.contents_formatted().into_bytes());
             output
         }
     }
@@ -3051,7 +3051,7 @@ fn run_loop(
         let captured = capture_local_pane(&mut ui, path, clock);
         let body = captured.unwrap_or_default();
         let frame = ui.render(cols, rows, &body, clock);
-        let mut next = vt100::Parser::new(rows, cols, 0);
+        let mut next = crate::vt::parser(rows, cols, 0);
         next.process(format!("\x1b[H\x1b[2J{}", terminal_frame(&frame)).as_bytes());
         let output = present_with_recovery(
             previous.as_ref().map(vt100::Parser::screen),
@@ -3169,7 +3169,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn parsed_frame(frame: &str, cols: u16, rows: u16) -> vt100::Parser {
-        let mut parser = vt100::Parser::new(rows, cols, 0);
+        let mut parser = crate::vt::parser(rows, cols, 0);
         parser.process(format!("\x1b[H\x1b[2J{}", terminal_frame(frame)).as_bytes());
         parser
     }
@@ -3907,7 +3907,7 @@ mod tests {
     fn presenter_diff_round_trips_hangul_wide_cells() {
         let previous = parsed_frame("hello", 80, 24);
         let next = parsed_frame("안녕하세요", 80, 24);
-        let mut terminal = vt100::Parser::new(24, 80, 0);
+        let mut terminal = crate::vt::parser(24, 80, 0);
         terminal.process(&present(None, previous.screen()));
         terminal.process(&present(Some(previous.screen()), next.screen()));
 
@@ -3921,7 +3921,7 @@ mod tests {
         let repaint = present(Some(previous.screen()), next.screen());
 
         assert!(repaint.starts_with(b"\x1b[2J\x1b[H"));
-        let mut terminal = vt100::Parser::new(24, 40, 0);
+        let mut terminal = crate::vt::parser(24, 40, 0);
         terminal.process(&repaint);
         assert_eq!(terminal.screen().contents(), next.screen().contents());
     }
@@ -3943,7 +3943,7 @@ mod tests {
         let previous = parsed_frame("abc", 4, 2);
         let next = parsed_frame("abcd", 4, 2);
         let diff = present(Some(previous.screen()), next.screen());
-        let mut terminal = vt100::Parser::new(2, 4, 0);
+        let mut terminal = crate::vt::parser(2, 4, 0);
         terminal.process(&present(None, previous.screen()));
         terminal.process(&diff);
         terminal.process(b"X");
@@ -3960,10 +3960,10 @@ mod tests {
     fn resize_invalidates_the_frame_cache_even_when_dimensions_return() {
         let original = parsed_frame("preserved beyond narrow width", 16, 3);
         let next = parsed_frame("preserved beyond narrow width", 16, 3);
-        let mut terminal = vt100::Parser::new(3, 16, 0);
+        let mut terminal = crate::vt::parser(3, 16, 0);
         terminal.process(&present(None, original.screen()));
-        terminal.screen_mut().set_size(3, 8);
-        terminal.screen_mut().set_size(3, 16);
+        crate::vt::set_size(terminal.screen_mut(), 3, 8);
+        crate::vt::set_size(terminal.screen_mut(), 3, 16);
         assert!(!terminal.screen().contents().contains("beyond narrow"));
 
         let resize = crossterm::event::Event::Resize(8, 3);
@@ -3978,7 +3978,7 @@ mod tests {
         let text = "e\u{301}";
         let next = parsed_frame(text, 8, 2);
         assert_eq!(next.screen().cell(0, 0).unwrap().contents(), text);
-        let mut terminal = vt100::Parser::new(2, 8, 0);
+        let mut terminal = crate::vt::parser(2, 8, 0);
         terminal.process(&present(None, next.screen()));
         assert_eq!(terminal.screen().cell(0, 0).unwrap().contents(), text);
     }
