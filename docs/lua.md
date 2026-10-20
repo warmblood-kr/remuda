@@ -542,7 +542,7 @@ Cluster contexts and native actions:
 | --- | --- |
 | `cluster.tree` | `cluster.detach`, `cluster.close`, `cluster.search`, `cluster.attention`, `cluster.remote.keys`, `cluster.up`, `cluster.down`, `cluster.left`, `cluster.right`, `cluster.select` |
 | `cluster.search` | `cluster.search.clear`, `cluster.search.delete`, plus the same navigation and select actions |
-| `cluster.composer` | `cluster.composer.submit`, `.clear`, `.back`, `.detach`, `.left`, `.right`, `.home`, `.end`, `.home_emacs`, `.end_emacs`, `.kill`, `.backspace`, `.delete` (all use the `cluster.composer` prefix) |
+| `cluster.composer` | `cluster.composer.submit`, `.clear`, `.back`, `.detach`, `.left`, `.right`, `.forward`, `.backward`, `.up`, `.down`, `.home`, `.end`, `.home_emacs`, `.end_emacs`, `.kill`, `.backspace`, `.delete` (all use the `cluster.composer` prefix) |
 | `cluster.confirm` | `cluster.confirm.accept`, `cluster.confirm.accept_upper` |
 | `cluster.remote.keys` | `cluster.remote.back` |
 | `cluster.runtime` | `cluster.redraw` |

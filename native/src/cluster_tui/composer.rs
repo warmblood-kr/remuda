@@ -41,24 +41,52 @@ impl LineComposer {
                 ComposerAction::Cleared
             }
             Some("cluster.composer.back" | "cluster.composer.detach") => ComposerAction::Detach,
-            Some("cluster.composer.left") => {
+            Some("cluster.composer.left" | "cluster.composer.backward") => {
                 self.cursor = self.cursor.saturating_sub(1);
                 ComposerAction::None
             }
-            Some("cluster.composer.right") => {
+            Some("cluster.composer.right" | "cluster.composer.forward") => {
                 self.cursor = (self.cursor + 1).min(self.text.graphemes(true).count());
                 ComposerAction::None
             }
-            Some("cluster.composer.kill") => {
-                self.text.truncate(self.byte_offset());
+            Some("cluster.composer.up") => {
+                self.move_line(false);
                 ComposerAction::None
             }
-            Some("cluster.composer.home" | "cluster.composer.home_emacs") => {
+            Some("cluster.composer.down") => {
+                self.move_line(true);
+                ComposerAction::None
+            }
+            Some("cluster.composer.kill") => {
+                // Like readline: kill to the end of the current line, or join
+                // the next line when already at its end.
+                let (_, end) = self.line_bounds();
+                let from = self.byte_offset();
+                let to = if self.cursor == end {
+                    self.text[from..]
+                        .grapheme_indices(true)
+                        .nth(1)
+                        .map_or(self.text.len(), |(offset, _)| from + offset)
+                } else {
+                    self.byte_of(end)
+                };
+                self.text.replace_range(from..to, "");
+                ComposerAction::None
+            }
+            Some("cluster.composer.home") => {
                 self.cursor = 0;
                 ComposerAction::None
             }
-            Some("cluster.composer.end" | "cluster.composer.end_emacs") => {
+            Some("cluster.composer.home_emacs") => {
+                self.cursor = self.line_bounds().0;
+                ComposerAction::None
+            }
+            Some("cluster.composer.end") => {
                 self.cursor = self.text.graphemes(true).count();
+                ComposerAction::None
+            }
+            Some("cluster.composer.end_emacs") => {
+                self.cursor = self.line_bounds().1;
                 ComposerAction::None
             }
             Some("cluster.composer.backspace") => {
@@ -191,10 +219,70 @@ impl LineComposer {
     }
 
     fn byte_offset(&self) -> usize {
+        self.byte_of(self.cursor)
+    }
+
+    fn byte_of(&self, cursor: usize) -> usize {
         self.text
             .grapheme_indices(true)
-            .nth(self.cursor)
+            .nth(cursor)
             .map_or(self.text.len(), |(offset, _)| offset)
+    }
+
+    fn is_break(grapheme: &str) -> bool {
+        matches!(grapheme, "\n" | "\r\n" | "\r")
+    }
+
+    /// Grapheme indices of the start and end (before the break) of the
+    /// cursor's line. Pasted `\n`, `\r\n` and `\r` all separate lines.
+    fn line_bounds(&self) -> (usize, usize) {
+        let mut start = 0;
+        for (i, g) in self.text.graphemes(true).enumerate() {
+            if Self::is_break(g) {
+                if i >= self.cursor {
+                    return (start, i);
+                }
+                start = i + 1;
+            }
+        }
+        (start, self.text.graphemes(true).count())
+    }
+
+    /// Move one line up or down, keeping the column clamped to the target
+    /// line. On the first (last) line the cursor stays put.
+    fn move_line(&mut self, down: bool) {
+        let (start, end) = self.line_bounds();
+        let column = self.cursor - start;
+        let total = self.text.graphemes(true).count();
+        let (target_start, target_end) = if down {
+            if end >= total {
+                return;
+            }
+            let next = end + 1;
+            let mut stop = total;
+            for (i, g) in self.text.graphemes(true).enumerate().skip(next) {
+                if Self::is_break(g) {
+                    stop = i;
+                    break;
+                }
+            }
+            (next, stop)
+        } else {
+            if start == 0 {
+                return;
+            }
+            let prev_end = start - 1;
+            let prev_start = self
+                .text
+                .graphemes(true)
+                .take(prev_end)
+                .enumerate()
+                .filter(|(_, g)| Self::is_break(g))
+                .last()
+                .map_or(0, |(i, _)| i + 1);
+            (prev_start, prev_end)
+        };
+        self.cursor = (target_start + column).min(target_end);
     }
 }
 
@@ -232,6 +320,80 @@ mod tests {
             &keymap,
         );
         assert_eq!(composer.cursor(), 2);
+    }
+
+    fn press(composer: &mut LineComposer, code: KeyCode, modifiers: KeyModifiers) {
+        let keymap = crate::keybindings::test_snapshot("");
+        composer.handle_key(KeyEvent::new(code, modifiers), &keymap);
+    }
+
+    #[test]
+    fn ctrl_f_and_ctrl_b_move_by_grapheme_and_stop_at_the_ends() {
+        let mut composer = LineComposer::default();
+        composer.restore_draft("a한e\u{301}👩‍💻");
+        for _ in 0..3 {
+            press(&mut composer, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        }
+        assert_eq!(composer.cursor(), 1);
+        for _ in 0..10 {
+            press(&mut composer, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        }
+        assert_eq!(composer.cursor(), 0);
+        press(&mut composer, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        press(&mut composer, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert_eq!(composer.cursor(), 2);
+        press(&mut composer, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(composer.text(), "a한");
+        for _ in 0..10 {
+            press(&mut composer, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        }
+        assert_eq!(composer.cursor(), 2);
+    }
+
+    #[test]
+    fn up_and_down_move_between_lines_and_clamp_the_column() {
+        let mut composer = LineComposer::default();
+        composer.restore_draft("한글abc\nx\r\n가나다라");
+        // Cursor at the end of the last line (column 4).
+        press(&mut composer, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(composer.cursor(), 12, "last line: Down stays put");
+        press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(composer.cursor(), 7, "clamped to the one-char middle line");
+        press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(composer.cursor(), 1, "column follows from the middle line");
+        press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(composer.cursor(), 1, "first line: Up stays put");
+        press(&mut composer, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut composer, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(composer.cursor(), 9);
+    }
+
+    #[test]
+    fn single_line_up_and_down_do_not_move() {
+        let mut composer = LineComposer::default();
+        composer.restore_draft("abc");
+        press(&mut composer, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut composer, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(composer.cursor(), 2);
+        assert_eq!(composer.text(), "abc");
+    }
+
+    #[test]
+    fn ctrl_a_e_k_act_on_the_current_line() {
+        let mut composer = LineComposer::default();
+        composer.restore_draft("ab\ncd\nef");
+        press(&mut composer, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut composer, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(composer.cursor(), 3);
+        press(&mut composer, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(composer.cursor(), 5);
+        press(&mut composer, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        press(&mut composer, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        press(&mut composer, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(composer.text(), "ab\nc\nef");
+        press(&mut composer, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(composer.text(), "ab\ncef");
     }
 
     #[test]
