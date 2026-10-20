@@ -151,11 +151,9 @@ pub struct Ui {
     session_rows: usize,
     /// Visible preview rows, refreshed from the terminal dimensions each frame.
     preview_rows: u16,
-    /// The line composer (`m` on the list). While it has focus, keys edit a
-    /// local draft and nothing reaches the pty; Enter sends the whole line as
-    /// one InputLine batch, which the daemon writes under the session's input
-    /// lock. So text another writer injects (a Butler notice) can never land
-    /// inside a half-typed line.
+    /// Line composer (`m`): keys edit a local draft, never the pty, and Enter
+    /// sends one InputLine batch written under the session input lock, so
+    /// injected text (a Butler notice) cannot land inside a half-typed line.
     composer: crate::cluster_tui::composer::LineComposer,
     /// `(name, instance_id)` the composer writes to; `None` = raw keys.
     compose_target: Option<(String, String)>,
