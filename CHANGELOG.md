@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Input: `type_text` now reports `submitted` when the retry Return it sends
+  after a composer newline is what submits the text, instead of always
+  `unverified`. A delivered input was recorded as uncertain by Butler's input
+  queue, which then held back every later entry for that session.
+
 - Cluster: the node identity (`cluster/identity.key`) is now encrypted at rest
   with XChaCha20-Poly1305 under a random per-node key in `keys/node.key`, kept
   owner-only and apart from the cluster state, so a copied state directory
