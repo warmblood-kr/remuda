@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- VFS: `remuda vfs put` no longer reports success when no peer was reached.
+  It still prints `Told 0 of N peers about it.`, then says the file is stored
+  on this node only and exits 75 (EX_TEMPFAIL) so a script can retry. A
+  one-node cluster, with no peers to tell, still exits 0. With `--wait`, the
+  wait result decides; a timed-out wait with no peer reached also exits 75.
+
 - Cluster TUI: a slow or unreachable peer no longer freezes the cursor.
   Remote Input, InputLine, ResizeSession and Close now run on a background
   worker for each node, and the UI applies each reply when it arrives. Before,

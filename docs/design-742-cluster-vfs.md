@@ -81,7 +81,9 @@ cheap. The receiver hashes the assembled blob and drops it on a mismatch.
 
 - **put** (CLI, no daemon needed): store the blob locally, write the index
   entry, push the entry to admitted peers. With `--wait`, it then waits until
-  `R` placement nodes report the blob through `BlobStat`.
+  `R` placement nodes report the blob through `BlobStat`. When the node
+  knows peers but reached none of them, put says the file is stored on this
+  node only and exits 75 (EX_TEMPFAIL); the `Told N of M peers` line stays.
 - **get / resolve**: read the local blob if present. Otherwise ask the
   placement nodes in order, then any other admitted peer, and verify the hash.
   `resolve` keeps the blob locally and prints its file path for tools that
