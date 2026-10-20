@@ -613,6 +613,14 @@ inserts at the draft cursor. Pasted CR, LF and tab boundaries are shown as
 visible control glyphs while the draft retains its original characters; raw
 remote-key paste retains its existing transport.
 
+Up and Down move between lines of a multi-line draft. On the first line Up
+recalls the previous submitted entry, and on the last line Down recalls the next
+one; past the newest entry Down restores the draft you were editing. History is
+kept per target session, in memory only (never written to disk), holds the last
+500 entries, and skips empty submissions and repeats of the previous entry. Up
+recalls with the cursor at the end of the text, Down with it at the start, so a
+multi-line entry is walked line by line before history continues.
+
 Enter queues an idempotent `InputLine` request pinned to the session instance.
 The receiver uses the shared session text/Return path, waits for text to appear
 when the terminal exposes a screen, and sends one Return. The composer's existing

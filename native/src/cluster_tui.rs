@@ -1518,6 +1518,12 @@ impl ClusterUi {
         if self.composer_target.is_none() && self.remote_composer_target.is_none() {
             self.bind_composer_target();
         }
+        let history_key = match (&self.remote_composer_target, &self.composer_target) {
+            (Some((node, _, name, instance)), _) => format!("remote\0{node}\0{name}\0{instance}"),
+            (None, Some((name, instance))) => format!("local\0{name}\0{instance}"),
+            (None, None) => String::new(),
+        };
+        self.composer.set_history_target(&history_key);
         match self.composer.handle_key(event, &self.keymap) {
             ComposerAction::None => {
                 if self
