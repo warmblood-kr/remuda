@@ -7,6 +7,14 @@ use std::io;
 use std::path::Path;
 use std::time::Instant;
 
+/// A remote batch handed to a sender that replies later.
+#[derive(Clone, Debug)]
+pub struct RemoteStarted {
+    pub batch: PendingBatch,
+    pub node: String,
+    pub request: Request,
+}
+
 pub struct InputSender {
     client_id: [u8; 16],
     next_paste_id: u64,
@@ -256,26 +264,59 @@ impl InputSender {
     where
         F: FnMut(&str, &Request) -> io::Result<Response>,
     {
+        match self.prepare_remote(queue, now)? {
+            Err(event) => event,
+            Ok(started) => {
+                let result = send(&started.node, &started.request);
+                self.finish_remote(queue, &started, result, now)
+            }
+        }
+    }
+
+    /// The remote request for the batch now Sending, for a caller that sends
+    /// it elsewhere and later passes the reply to [`Self::finish_remote`]. A
+    /// batch without a remote node is finished here, as `Err(event)`.
+    pub fn prepare_remote(
+        &mut self,
+        queue: &mut InputQueue,
+        now: Instant,
+    ) -> Option<Result<RemoteStarted, Option<QueueEvent>>> {
         let batch = queue.sending_batch()?;
         let request = input_request(&batch);
-        let Some(node) = batch.remote_node.as_deref() else {
-            return self.finish(
+        let Some(node) = batch.remote_node.clone() else {
+            return Some(Err(self.finish(
                 queue,
                 &batch,
                 SendOutcome::Error("remote target is missing".into()),
                 now,
-            );
+            )));
         };
-        let outcome = match send(node, &request) {
+        Some(Ok(RemoteStarted {
+            batch,
+            node,
+            request,
+        }))
+    }
+
+    /// Apply the reply to a request from [`Self::prepare_remote`].
+    pub fn finish_remote(
+        &mut self,
+        queue: &mut InputQueue,
+        started: &RemoteStarted,
+        result: io::Result<Response>,
+        now: Instant,
+    ) -> Option<QueueEvent> {
+        let request = &started.request;
+        let outcome = match result {
             Ok(Response::Ack { duplicate }) => SendOutcome::Ack { duplicate },
             Ok(Response::Uncertain) => SendOutcome::Uncertain,
             Ok(Response::Busy) => SendOutcome::Busy,
             Ok(Response::WrongInstance) => SendOutcome::WrongInstance,
             Ok(Response::RateLimited) => SendOutcome::RateLimited,
             Ok(Response::RemoteControlDisabled) => SendOutcome::RemoteControlDisabled,
-            Ok(response) if super::unsupported_request_reason(&request, &response).is_some() => {
+            Ok(response) if super::unsupported_request_reason(request, &response).is_some() => {
                 SendOutcome::UnsupportedRequest(
-                    super::unsupported_request_reason(&request, &response)
+                    super::unsupported_request_reason(request, &response)
                         .expect("checked unsupported response")
                         .into(),
                 )
@@ -289,7 +330,7 @@ impl InputSender {
             }
             Err(error) => SendOutcome::IoFailure(error.to_string()),
         };
-        self.finish(queue, &batch, outcome, now)
+        self.finish(queue, &started.batch, outcome, now)
     }
 
     fn finish(

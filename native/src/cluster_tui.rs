@@ -12,6 +12,7 @@ use composer::{ComposerAction, LineComposer};
 use confirm::{Confirmation, Decision};
 use ended::EndedState;
 use queue::{InputQueue, PendingBatch, QueueEvent, QueueState};
+use remote_calls::{RemoteCall, RemoteDispatcher, RemotePort};
 use remuda_core::agent::StyledCell;
 use remuda_core::clock::Clock;
 use remuda_core::protocol::{expand_runs, Request, Response};
@@ -20,6 +21,8 @@ use sender::InputSender;
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -56,6 +59,7 @@ pub mod composer;
 pub mod confirm;
 pub mod ended;
 pub mod queue;
+pub mod remote_calls;
 pub mod sender;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -135,21 +139,46 @@ pub struct ClusterUi {
     partial_input_confirm_target: Option<(String, String, String, String)>,
     remote_input_enabled: bool,
     last_resize: Option<PaneResize>,
+    resize_in_flight: bool,
+    remote_input_in_flight: bool,
     remote_control_disabled: HashSet<String>,
 }
 
 struct PaneResize {
+    attempt: ResizeAttempt,
+    succeeded: bool,
+    unsupported: bool,
+    /// Failures in a row for this session; any size counts.
+    failures: u32,
+    retry_at: Duration,
+}
+
+/// One ResizeSession: the session it targets and the size it asks for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResizeAttempt {
     node: Option<String>,
     name: String,
     instance: String,
     size: remuda_core::Size,
-    attempted: Duration,
-    succeeded: bool,
-    unsupported: bool,
+}
+
+impl ResizeAttempt {
+    fn same_session(&self, other: &Self) -> bool {
+        (&self.node, &self.name, &self.instance) == (&other.node, &other.name, &other.instance)
+    }
+}
+
+const RESIZE_RETRY_BASE: Duration = Duration::from_secs(1);
+const RESIZE_RETRY_MAX: Duration = Duration::from_secs(30);
+
+fn resize_retry_delay(failures: u32) -> Duration {
+    RESIZE_RETRY_BASE
+        .saturating_mul(1 << failures.saturating_sub(1).min(5))
+        .min(RESIZE_RETRY_MAX)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingClose {
+pub struct PendingClose {
     remote_target: Option<(String, String)>,
     name: String,
     display_name: String,
@@ -166,7 +195,7 @@ struct RemoteCloseTarget {
 struct RemoteKeyBuffer {
     target: RemoteSelection,
     bytes: Vec<u8>,
-    last_input_at: Instant,
+    first_input_at: Instant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -239,6 +268,8 @@ impl ClusterUi {
             partial_input_confirm_target: None,
             remote_input_enabled: false,
             last_resize: None,
+            resize_in_flight: false,
+            remote_input_in_flight: false,
             remote_control_disabled: HashSet::new(),
         }
     }
@@ -521,24 +552,52 @@ impl ClusterUi {
         self.last_frame = None;
     }
 
+    #[cfg(test)]
     fn send_close_pending(
         &mut self,
         path: &Path,
         remote_input: Option<&dyn RemoteInputTransport>,
         now: Duration,
     ) {
+        let mut port = remote_input.map(remote_calls::InlinePort::new);
+        self.send_close_pending_via(
+            path,
+            port.as_mut().map(|port| port as &mut dyn RemotePort),
+            now,
+        );
+    }
+
+    /// Send a confirmed Close. A remote Close goes to `port`; its reply is
+    /// applied by [`Self::apply_remote_replies`].
+    fn send_close_pending_via(
+        &mut self,
+        path: &Path,
+        port: Option<&mut dyn RemotePort>,
+        now: Duration,
+    ) {
         let Some(pending) = self.pending_close.take() else {
             return;
         };
         let request = confirmed_close(pending.name.clone(), pending.instance_id.clone());
-        let response = if let Some((registry_key, _)) = &pending.remote_target {
-            match remote_input {
-                Some(transport) => transport.send_close(registry_key, &request),
-                None => Err(io::Error::other("remote Close transport is unavailable")),
+        let remote_node = pending.remote_target.as_ref().map(|(key, _)| key.clone());
+        let response = match (remote_node, port) {
+            (Some(registry_key), Some(port)) => {
+                port.submit(&registry_key, RemoteCall::Close(pending), request);
+                self.apply_remote_replies(port, now);
+                return;
             }
-        } else {
-            client::request_with_timeout(path, &request, UI_REQUEST_TIMEOUT)
+            (Some(_), None) => Err(io::Error::other("remote Close transport is unavailable")),
+            (None, _) => client::request_with_timeout(path, &request, UI_REQUEST_TIMEOUT),
         };
+        self.close_pending_completed(pending, response, now);
+    }
+
+    fn close_pending_completed(
+        &mut self,
+        pending: PendingClose,
+        response: io::Result<Response>,
+        now: Duration,
+    ) {
         self.close_completed(
             pending
                 .remote_target
@@ -550,6 +609,31 @@ impl ClusterUi {
             response,
             now,
         );
+    }
+
+    /// Apply every remote reply that has arrived.
+    fn apply_remote_replies(&mut self, port: &mut dyn RemotePort, now: Duration) {
+        for reply in port.take_replies() {
+            match reply.call {
+                RemoteCall::Input(started) => {
+                    self.remote_input_in_flight = false;
+                    let event = self.input_sender.finish_remote(
+                        &mut self.input_queue,
+                        &started,
+                        reply.result,
+                        Instant::now(),
+                    );
+                    self.handle_send_event(event, now);
+                }
+                RemoteCall::Close(pending) => {
+                    self.close_pending_completed(pending, reply.result, now);
+                }
+                RemoteCall::Resize(attempt) => {
+                    self.resize_in_flight = false;
+                    self.resize_finished(attempt, &reply.request, reply.result, now);
+                }
+            }
+        }
     }
 
     fn close_completed(
@@ -771,6 +855,7 @@ impl ClusterUi {
         remuda_core::Size::for_viewport(pane_cols as u16, pane_rows as u16)
     }
 
+    #[cfg(test)]
     fn resize_pane(
         &mut self,
         cols: u16,
@@ -778,9 +863,56 @@ impl ClusterUi {
         now: Duration,
         mut send: impl FnMut(Option<&str>, &Request) -> io::Result<Response>,
     ) {
+        if let Some((attempt, request)) = self.resize_plan(cols, rows, now) {
+            let result = send(attempt.node.as_deref(), &request);
+            self.resize_finished(attempt, &request, result, now);
+        }
+    }
+
+    /// Like [`Self::resize_pane`], but a remote resize goes to `port` and is
+    /// recorded when its reply is applied.
+    fn resize_pane_via(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        now: Duration,
+        port: Option<&mut dyn RemotePort>,
+        mut local: impl FnMut(&Request) -> io::Result<Response>,
+    ) {
+        let Some((attempt, request)) = self.resize_plan(cols, rows, now) else {
+            return;
+        };
+        match (attempt.node.clone(), port) {
+            (None, _) => {
+                let result = local(&request);
+                self.resize_finished(attempt, &request, result, now);
+            }
+            (Some(node), Some(port)) => {
+                self.resize_in_flight = true;
+                port.submit(&node, RemoteCall::Resize(attempt), request);
+            }
+            (Some(_), None) => {
+                let result = Err(io::Error::other("remote resize unavailable"));
+                self.resize_finished(attempt, &request, result, now);
+            }
+        }
+    }
+
+    /// The resize the active pane needs now, if any. Only one is in flight at
+    /// a time. After a failure the session waits out its backoff whatever the
+    /// size, because the failure notice itself changes the pane size.
+    fn resize_plan(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        now: Duration,
+    ) -> Option<(ResizeAttempt, Request)> {
+        if self.resize_in_flight {
+            return None;
+        }
         let target = if let Some(active) = self.remote_active.as_ref() {
             if !self.remote_input_enabled {
-                return;
+                return None;
             }
             self.remote_session(active)
                 .filter(|(_, session)| session.alive)
@@ -804,42 +936,58 @@ impl ClusterUi {
         };
         let Some((node, name, instance)) = target else {
             self.last_resize = None;
-            return;
+            return None;
         };
-        let size = self.pane_size(cols, rows, now);
+        let attempt = ResizeAttempt {
+            node,
+            name,
+            instance,
+            size: self.pane_size(cols, rows, now),
+        };
         if let Some(old) = &self.last_resize {
-            if (&old.node, &old.name, &old.instance, old.size) == (&node, &name, &instance, size)
-                && (old.succeeded
-                    || old.unsupported
-                    || now.saturating_sub(old.attempted) < Duration::from_secs(1))
+            let failed = !old.succeeded && !old.unsupported;
+            if old.attempt.same_session(&attempt)
+                && ((failed && now < old.retry_at) || (!failed && old.attempt == attempt))
             {
-                return;
+                return None;
             }
         }
         let request = Request::ResizeSession {
-            name: name.clone(),
-            instance_id: instance.clone(),
-            size,
+            name: attempt.name.clone(),
+            instance_id: attempt.instance.clone(),
+            size: attempt.size,
         };
-        let result = send(node.as_deref(), &request);
+        Some((attempt, request))
+    }
+
+    fn resize_finished(
+        &mut self,
+        attempt: ResizeAttempt,
+        request: &Request,
+        result: io::Result<Response>,
+        now: Duration,
+    ) {
         let unsupported = result
             .as_ref()
             .ok()
-            .and_then(|response| unsupported_request_reason(&request, response));
+            .and_then(|response| unsupported_request_reason(request, response));
         let succeeded = matches!(&result, Ok(Response::Ok));
         if let Some(reason) = unsupported {
             self.notice = Some((reason.into(), now));
         } else if !succeeded {
             self.notice = Some((format!("pane resize unavailable: {result:?}"), now));
         }
+        let failures = match &self.last_resize {
+            _ if succeeded || unsupported.is_some() => 0,
+            Some(old) if old.attempt.same_session(&attempt) => old.failures.saturating_add(1),
+            _ => 1,
+        };
         self.last_resize = Some(PaneResize {
-            node,
-            name,
-            instance,
-            size,
-            attempted: now,
+            attempt,
             succeeded,
             unsupported: unsupported.is_some(),
+            failures,
+            retry_at: now + resize_retry_delay(failures),
         });
     }
 
@@ -1332,12 +1480,11 @@ impl ClusterUi {
             .filter(|buffer| buffer.target == *target)
         {
             buffer.bytes.extend(bytes);
-            buffer.last_input_at = at;
         } else {
             self.remote_key_buffers.push_back(RemoteKeyBuffer {
                 target: target.clone(),
                 bytes,
-                last_input_at: at,
+                first_input_at: at,
             });
         }
     }
@@ -1349,7 +1496,8 @@ impl ClusterUi {
         let Some(buffer) = self.remote_key_buffers.front() else {
             return;
         };
-        if now.saturating_duration_since(buffer.last_input_at) < REMOTE_KEYS_COALESCE_INTERVAL {
+        // Measured from the first buffered key, so steady typing still streams.
+        if now.saturating_duration_since(buffer.first_input_at) < REMOTE_KEYS_COALESCE_INTERVAL {
             return;
         }
         let buffer = self
@@ -1741,36 +1889,82 @@ impl ClusterUi {
         }
     }
 
+    #[cfg(test)]
     fn send_pending(
         &mut self,
         path: &Path,
         now: Duration,
         remote_input: Option<&dyn RemoteInputTransport>,
     ) {
-        let remote_node = self
+        let mut port = remote_input.map(remote_calls::InlinePort::new);
+        self.send_pending_via(
+            path,
+            now,
+            port.as_mut().map(|port| port as &mut dyn RemotePort),
+        );
+    }
+
+    /// Send the batch now Sending. A local batch waits for the daemon; a
+    /// remote one goes to `port`, and its reply is applied when it arrives.
+    fn send_pending_via(&mut self, path: &Path, now: Duration, port: Option<&mut dyn RemotePort>) {
+        let remote = self
             .input_queue
             .sending_batch()
-            .and_then(|batch| batch.remote_node);
-        let event = if remote_node.is_some() {
-            match remote_input {
-                Some(remote_input) => self.input_sender.send_remote_started(
-                    &mut self.input_queue,
-                    Instant::now(),
-                    |node, request| remote_input.send_input(node, request),
-                ),
-                None => self.input_sender.send_remote_started(
-                    &mut self.input_queue,
-                    Instant::now(),
-                    |_, _| Err(io::Error::other("remote input transport is unavailable")),
-                ),
+            .map(|batch| batch.remote_node.is_some());
+        let event = match (remote, port) {
+            (Some(true), Some(port)) => {
+                if !self.remote_input_in_flight {
+                    match self
+                        .input_sender
+                        .prepare_remote(&mut self.input_queue, Instant::now())
+                    {
+                        Some(Ok(started)) => {
+                            self.remote_input_in_flight = true;
+                            let node = started.node.clone();
+                            let request = started.request.clone();
+                            port.submit(&node, RemoteCall::Input(Box::new(started)), request);
+                        }
+                        Some(Err(event)) => self.handle_send_event(event, now),
+                        None => {}
+                    }
+                }
+                self.apply_remote_replies(port, now);
+                return;
             }
-        } else {
-            self.input_sender
+            (Some(true), None) => self.input_sender.send_remote_started(
+                &mut self.input_queue,
+                Instant::now(),
+                |_, _| Err(io::Error::other("remote input transport is unavailable")),
+            ),
+            _ => self
+                .input_sender
                 .send_started(&mut self.input_queue, Instant::now(), |request| {
                     crate::client::request_with_timeout(path, request, sender::INPUT_SEND_TIMEOUT)
-                })
+                }),
         };
         self.handle_send_event(event, now);
+    }
+
+    /// How long the loop may wait for input before buffered remote keys are
+    /// due to be sent.
+    fn input_wait(&self, now: Instant) -> Duration {
+        // A remote batch that just started is handed off on the next pass. A
+        // local one keeps the old order: the frame shows it before the send.
+        if !self.remote_input_in_flight
+            && self
+                .input_queue
+                .sending_batch()
+                .is_some_and(|batch| batch.remote_node.is_some())
+        {
+            return Duration::ZERO;
+        }
+        match self.remote_key_buffers.front() {
+            Some(buffer) if self.input_queue.sending_batch().is_none() => (buffer.first_input_at
+                + REMOTE_KEYS_COALESCE_INTERVAL)
+                .saturating_duration_since(now)
+                .min(INPUT_WAIT),
+            _ => INPUT_WAIT,
+        }
     }
 
     fn handle_send_event(&mut self, event: Option<QueueEvent>, now: Duration) {
@@ -2242,16 +2436,18 @@ fn normalized_terminal_size(cols: u16, rows: u16) -> (u16, u16) {
 const INPUT_WAIT: Duration = Duration::from_millis(250);
 const REMOTE_CHECK: Duration = Duration::from_millis(25);
 
-/// Wait up to INPUT_WAIT for terminal input, returning early (false) once the
-/// remote generation differs from `seen`, read before this frame's sync (#622).
-/// Input is polled first each slice, so a remote change never starves it.
+/// Wait up to `limit` (at most INPUT_WAIT) for terminal input, returning early
+/// (false) once the remote generation differs from `seen`, read before this
+/// frame's sync (#622). Input is polled first each slice, so a remote change
+/// never starves it.
 fn wait_for_input_or_remote(
     clock: &dyn Clock,
     mut poll: impl FnMut(Duration) -> io::Result<bool>,
     generation: impl Fn() -> u64,
     seen: u64,
+    limit: Duration,
 ) -> io::Result<bool> {
-    let deadline = clock.now() + INPUT_WAIT;
+    let deadline = clock.now() + limit.min(INPUT_WAIT);
     loop {
         let left = deadline.saturating_sub(clock.now());
         if left.is_zero() {
@@ -2633,17 +2829,13 @@ pub fn run_with_remote_source(
     target: Option<&str>,
     source: &dyn RemoteSource,
 ) -> io::Result<()> {
-    let remote_input = ClusterRemoteInput::system().ok();
-    let remote_input = remote_input
-        .as_ref()
-        .map(|input| input as &dyn RemoteInputTransport);
     run_with_remote_selection_and_input(
         path,
         node,
         target,
         source,
         &RemotePollSelection::default(),
-        remote_input,
+        system_remote_input(),
     )
 }
 
@@ -2656,11 +2848,20 @@ pub fn run_with_remote_selection(
     source: &dyn RemoteSource,
     selection: &RemotePollSelection,
 ) -> io::Result<()> {
-    let remote_input = ClusterRemoteInput::system().ok();
-    let remote_input = remote_input
-        .as_ref()
-        .map(|input| input as &dyn RemoteInputTransport);
-    run_with_remote_selection_and_input(path, node, target, source, selection, remote_input)
+    run_with_remote_selection_and_input(
+        path,
+        node,
+        target,
+        source,
+        selection,
+        system_remote_input(),
+    )
+}
+
+fn system_remote_input() -> Option<Arc<dyn RemoteInputTransport>> {
+    ClusterRemoteInput::system()
+        .ok()
+        .map(|input| Arc::new(input) as Arc<dyn RemoteInputTransport>)
 }
 
 /// Run the cluster tree with remote snapshots and optional remote input.
@@ -2669,7 +2870,7 @@ pub fn run_with_remote_input(
     node: &str,
     target: Option<&str>,
     source: &dyn RemoteSource,
-    remote_input: Option<&dyn RemoteInputTransport>,
+    remote_input: Option<Arc<dyn RemoteInputTransport>>,
 ) -> io::Result<()> {
     run_with_remote_selection_and_input(
         path,
@@ -2688,7 +2889,7 @@ pub fn run_with_remote_selection_and_input(
     target: Option<&str>,
     source: &dyn RemoteSource,
     selection: &RemotePollSelection,
-    remote_input: Option<&dyn RemoteInputTransport>,
+    remote_input: Option<Arc<dyn RemoteInputTransport>>,
 ) -> io::Result<()> {
     let terminal_mode = RawMode::enable()?;
     let sync_reset = SyncReset(io::stdout());
@@ -2770,20 +2971,18 @@ fn capture_local_pane(ui: &mut ClusterUi, path: &Path, clock: &dyn Clock) -> Opt
 fn resize_active_pane(
     ui: &mut ClusterUi,
     path: &Path,
-    remote_input: Option<&dyn RemoteInputTransport>,
+    remote_calls: Option<&mut RemoteDispatcher>,
     cols: u16,
     rows: u16,
     now: Duration,
 ) {
-    ui.resize_pane(cols, rows, now, |node, request| {
-        if let Some(node) = node {
-            remote_input
-                .ok_or_else(|| io::Error::other("remote resize unavailable"))?
-                .send_input(node, request)
-        } else {
-            client::request_with_timeout(path, request, UI_REQUEST_TIMEOUT)
-        }
-    });
+    ui.resize_pane_via(
+        cols,
+        rows,
+        now,
+        remote_calls.map(|port| port as &mut dyn RemotePort),
+        |request| client::request_with_timeout(path, request, UI_REQUEST_TIMEOUT),
+    );
 }
 
 fn run_loop(
@@ -2792,10 +2991,20 @@ fn run_loop(
     target: Option<&str>,
     remote_source: &dyn RemoteSource,
     remote_selection: &RemotePollSelection,
-    remote_input: Option<&dyn RemoteInputTransport>,
+    remote_input: Option<Arc<dyn RemoteInputTransport>>,
     runtime: &mut ClusterTuiRuntime<'_>,
 ) -> io::Result<()> {
     let clock = runtime.clock;
+    let mut remote_calls = remote_input.map(RemoteDispatcher::new);
+    let replies = remote_calls.as_ref().map(RemoteDispatcher::finished);
+    // Moves when a remote poll lands or a remote call replies.
+    let wake = || {
+        remote_source.generation().wrapping_add(
+            replies
+                .as_ref()
+                .map_or(0, |count| count.load(Ordering::SeqCst)),
+        )
+    };
     let mut ui = ClusterUi::with_sender(node, list(path)?, clock.now(), InputSender::random()?);
     if let Some((identity, _)) = crate::cluster::nodes()? {
         ui.set_local_identity(&identity.node_fp, &crate::cluster::control::node_aliases()?);
@@ -2803,31 +3012,10 @@ fn run_loop(
     ui.set_keymap(
         crate::keybindings::fetch(path, Duration::from_secs(3)).map_err(io::Error::other)?,
     );
-    ui.remote_input_enabled = remote_input.is_some();
+    ui.remote_input_enabled = remote_calls.is_some();
     ui.remote_synced(remote_source);
     select_target_with_remote_wait(&mut ui, target, remote_source, Duration::from_secs(5))?;
-    if ui.remote_input_enabled {
-        if let Some(RemoteSelection::Session {
-            node,
-            name,
-            instance_id,
-        }) = ui.remote_active.clone()
-        {
-            let display_label = ui
-                .remote_session(&RemoteSelection::Session {
-                    node: node.clone(),
-                    name: name.clone(),
-                    instance_id: instance_id.clone(),
-                })
-                .map(|(snapshot, _)| snapshot.name.clone())
-                .unwrap_or_else(|| node.clone());
-            ui.set_remote_composer_target(
-                Some((node, display_label, name, instance_id)),
-                clock.now(),
-            );
-            ui.composer_focused = true;
-        }
-    }
+    focus_initial_remote_composer(&mut ui, clock.now());
     let mut previous = None;
     let mut last_full_repaint = clock.now();
     let mut frames = frame_writer()?;
@@ -2836,8 +3024,11 @@ fn run_loop(
             ui.sessions_synced(current, clock.now());
         }
         // Read before syncing: an update landing during sync/render wakes the wait.
-        let seen = remote_source.generation();
+        let seen = wake();
         ui.remote_synced(remote_source);
+        if let Some(port) = remote_calls.as_mut() {
+            ui.apply_remote_replies(port, clock.now());
+        }
         runtime
             .paste_capture
             .set(ui.remote_keys_mode.is_some() || ui.composer_focused)?;
@@ -2850,7 +3041,14 @@ fn run_loop(
         ui.active = ui.active.min(ui.sessions.len().saturating_sub(1));
         let terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
         let (cols, rows) = normalized_terminal_size(terminal_size.0, terminal_size.1);
-        resize_active_pane(&mut ui, path, remote_input, cols, rows, clock.now());
+        resize_active_pane(
+            &mut ui,
+            path,
+            remote_calls.as_mut(),
+            cols,
+            rows,
+            clock.now(),
+        );
         let captured = capture_local_pane(&mut ui, path, clock);
         let body = captured.unwrap_or_default();
         let frame = ui.render(cols, rows, &body, clock);
@@ -2868,14 +3066,15 @@ fn run_loop(
             write_frame(&mut frames, &output)?;
         }
         previous = Some(next);
-        ui.send_close_pending(path, remote_input, clock.now());
-        ui.send_pending(path, clock.now(), remote_input);
+        ui.send_close_pending_via(path, port(&mut remote_calls), clock.now());
+        ui.send_pending_via(path, clock.now(), port(&mut remote_calls));
         ui.start_pending(clock.now());
         if wait_for_input_or_remote(
             clock,
             crossterm::event::poll,
-            || remote_source.generation(),
+            wake,
             seen,
+            ui.input_wait(Instant::now()),
         )? {
             let event = crossterm::event::read()?;
             let redraw = ui.is_redraw(&event);
@@ -2888,9 +3087,40 @@ fn run_loop(
             if ui.handle_event(event, clock.now()) {
                 return Ok(());
             }
-            ui.send_close_pending(path, remote_input, clock.now());
+            ui.send_close_pending_via(path, port(&mut remote_calls), clock.now());
         }
     }
+}
+
+/// A remote session chosen on the command line starts with its composer focused.
+fn focus_initial_remote_composer(ui: &mut ClusterUi, now: Duration) {
+    if !ui.remote_input_enabled {
+        return;
+    }
+    let Some(RemoteSelection::Session {
+        node,
+        name,
+        instance_id,
+    }) = ui.remote_active.clone()
+    else {
+        return;
+    };
+    let display_label = ui
+        .remote_session(&RemoteSelection::Session {
+            node: node.clone(),
+            name: name.clone(),
+            instance_id: instance_id.clone(),
+        })
+        .map(|(snapshot, _)| snapshot.name.clone())
+        .unwrap_or_else(|| node.clone());
+    ui.set_remote_composer_target(Some((node, display_label, name, instance_id)), now);
+    ui.composer_focused = true;
+}
+
+fn port(remote_calls: &mut Option<RemoteDispatcher>) -> Option<&mut dyn RemotePort> {
+    remote_calls
+        .as_mut()
+        .map(|port| port as &mut dyn RemotePort)
 }
 
 fn select_target_with_remote_wait(
@@ -3389,6 +3619,7 @@ mod tests {
             },
             || generation.get(),
             7,
+            super::INPUT_WAIT,
         )
         .unwrap();
         assert!(!ready);
@@ -3410,6 +3641,7 @@ mod tests {
             },
             || 7,
             7,
+            super::INPUT_WAIT,
         )
         .unwrap();
         assert!(!ready);
@@ -3420,7 +3652,10 @@ mod tests {
         );
 
         let clock = ManualClock::new();
-        assert!(super::wait_for_input_or_remote(&clock, |_| Ok(true), || 7, 7).unwrap());
+        assert!(
+            super::wait_for_input_or_remote(&clock, |_| Ok(true), || 7, 7, super::INPUT_WAIT)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -3437,6 +3672,7 @@ mod tests {
             },
             || 8,
             7,
+            super::INPUT_WAIT,
         )
         .unwrap();
         assert!(!ready);
@@ -3460,6 +3696,7 @@ mod tests {
             },
             || 8,
             7,
+            super::INPUT_WAIT,
         )
         .unwrap();
         assert!(ready);
@@ -3477,6 +3714,7 @@ mod tests {
                 |_| Ok(pass % 2 == 0),
                 || generation.get(),
                 seen,
+                super::INPUT_WAIT,
             )
             .unwrap();
             if ready {
@@ -5591,6 +5829,192 @@ mod tests {
         assert_eq!(
             ui.notice.as_ref().unwrap().0,
             "remote control disabled on laptop"
+        );
+    }
+
+    /// A port whose replies the test supplies, standing in for a peer that
+    /// has not answered yet.
+    #[derive(Default)]
+    struct HeldPort {
+        submitted: Vec<(String, super::remote_calls::RemoteCall, Request)>,
+        replies: Vec<super::remote_calls::RemoteReply>,
+    }
+
+    impl HeldPort {
+        fn answer(&mut self, result: std::io::Result<Response>) {
+            let (_, call, request) = self.submitted.remove(0);
+            self.replies.push(super::remote_calls::RemoteReply {
+                call,
+                request,
+                result,
+            });
+        }
+    }
+
+    impl super::remote_calls::RemotePort for HeldPort {
+        fn submit(&mut self, node: &str, call: super::remote_calls::RemoteCall, request: Request) {
+            self.submitted.push((node.into(), call, request));
+        }
+
+        fn take_replies(&mut self) -> Vec<super::remote_calls::RemoteReply> {
+            std::mem::take(&mut self.replies)
+        }
+    }
+
+    #[test]
+    fn remote_input_is_handed_off_and_applied_when_the_peer_answers() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        let mut port = HeldPort::default();
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        key_event(&mut ui, KeyCode::Char('a'), KeyModifiers::NONE, clock.now());
+        std::thread::sleep(Duration::from_millis(50));
+        ui.start_pending(clock.now());
+        let path = std::path::Path::new("unused");
+
+        ui.send_pending_via(path, clock.now(), Some(&mut port));
+        ui.send_pending_via(path, clock.now(), Some(&mut port));
+        assert_eq!(port.submitted.len(), 1, "one call in flight, not resent");
+        assert!(matches!(
+            &port.submitted[0].2,
+            Request::Input { bytes, .. } if bytes == b"a"
+        ));
+        assert!(ui.input_queue.sending_batch().is_some());
+
+        port.answer(Ok(Response::Ack { duplicate: false }));
+        ui.apply_remote_replies(&mut port, clock.now());
+        assert!(ui.input_queue.sending_batch().is_none());
+        assert_eq!(ui.notice.as_ref().unwrap().0, "Input sent");
+    }
+
+    #[test]
+    fn remote_close_is_handed_off_and_reported_when_the_peer_answers() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        ui.pending_close = Some(super::PendingClose {
+            remote_target: Some(("fp-laptop".into(), "laptop".into())),
+            name: "build".into(),
+            display_name: "build".into(),
+            instance_id: "remote-instance".into(),
+        });
+        let mut port = HeldPort::default();
+
+        ui.send_close_pending_via(std::path::Path::new("unused"), Some(&mut port), clock.now());
+        assert_eq!(port.submitted.len(), 1);
+        assert_eq!(port.submitted[0].0, "fp-laptop");
+        assert!(matches!(&port.submitted[0].2, Request::Close { .. }));
+        assert!(ui.notice.is_none());
+
+        port.answer(Ok(Response::Ok));
+        ui.apply_remote_replies(&mut port, clock.now());
+        assert_eq!(ui.notice.as_ref().unwrap().0, "Close sent to build");
+    }
+
+    #[test]
+    fn failed_remote_resize_backs_off_even_when_its_notice_changes_the_size() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen_rows(120));
+        let mut port = HeldPort::default();
+        let resize = |ui: &mut ClusterUi, port: &mut HeldPort, now| {
+            ui.resize_pane_via(100, 24, now, Some(port), |_| panic!("local resize"));
+        };
+
+        resize(&mut ui, &mut port, clock.now());
+        resize(&mut ui, &mut port, clock.now());
+        assert_eq!(port.submitted.len(), 1, "one resize in flight at a time");
+        let first_size = match &port.submitted[0].2 {
+            Request::ResizeSession { size, .. } => *size,
+            other => panic!("{other:?}"),
+        };
+
+        port.answer(Err(std::io::Error::other("cluster client timeout")));
+        ui.apply_remote_replies(&mut port, clock.now());
+        assert!(ui
+            .notice
+            .as_ref()
+            .unwrap()
+            .0
+            .starts_with("pane resize unavailable"));
+        assert_ne!(
+            ui.pane_size(100, 24, clock.now()),
+            first_size,
+            "the notice takes a row"
+        );
+
+        resize(&mut ui, &mut port, clock.now());
+        clock.advance(Duration::from_millis(999));
+        resize(&mut ui, &mut port, clock.now());
+        assert!(
+            port.submitted.is_empty(),
+            "a new size must not bypass the backoff"
+        );
+
+        clock.advance(Duration::from_millis(1));
+        resize(&mut ui, &mut port, clock.now());
+        assert_eq!(port.submitted.len(), 1, "retried after 1 s");
+        port.answer(Err(std::io::Error::other("cluster client timeout")));
+        ui.apply_remote_replies(&mut port, clock.now());
+
+        clock.advance(Duration::from_millis(1999));
+        resize(&mut ui, &mut port, clock.now());
+        assert!(port.submitted.is_empty(), "second failure waits 2 s");
+        clock.advance(Duration::from_millis(1));
+        resize(&mut ui, &mut port, clock.now());
+        assert_eq!(port.submitted.len(), 1);
+        port.answer(Ok(Response::Ok));
+        ui.apply_remote_replies(&mut port, clock.now());
+        resize(&mut ui, &mut port, clock.now());
+        assert!(
+            port.submitted.is_empty(),
+            "a resize that succeeded is not repeated"
+        );
+    }
+
+    #[test]
+    fn steady_remote_typing_is_sent_while_keys_keep_arriving() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        let started = Instant::now();
+        let mut first_send = None;
+        // A key every 10 ms for 200 ms, faster than the coalesce interval.
+        while started.elapsed() < Duration::from_millis(200) {
+            key_event(&mut ui, KeyCode::Char('x'), KeyModifiers::NONE, clock.now());
+            ui.start_pending(clock.now());
+            if first_send.is_none() && ui.input_queue.sending_batch().is_some() {
+                first_send = Some(started.elapsed());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let first_send = first_send.expect("typing was held until it stopped");
+        assert!(first_send < Duration::from_millis(150), "{first_send:?}");
+    }
+
+    #[test]
+    fn the_input_wait_ends_when_buffered_keys_are_due() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        assert_eq!(ui.input_wait(Instant::now()), super::INPUT_WAIT);
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        key_event(&mut ui, KeyCode::Char('x'), KeyModifiers::NONE, clock.now());
+        assert!(ui.input_wait(Instant::now()) <= super::REMOTE_KEYS_COALESCE_INTERVAL);
+        assert_eq!(
+            ui.input_wait(Instant::now() + Duration::from_secs(1)),
+            Duration::ZERO
+        );
+        std::thread::sleep(super::REMOTE_KEYS_COALESCE_INTERVAL);
+        ui.start_pending(clock.now());
+        assert!(ui.input_queue.sending_batch().is_some());
+        assert_eq!(
+            ui.input_wait(Instant::now()),
+            Duration::ZERO,
+            "a remote batch that started waits for no input before its hand-off"
         );
     }
 
