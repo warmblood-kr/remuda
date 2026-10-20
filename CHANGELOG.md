@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Cluster: each node now keeps a local audit log of what peers asked it to
+  do, in `cluster/audit.jsonl` in the private cluster state directory. Each
+  line records when, which peer (by fingerprint), what (input, resize, close,
+  create), which session, and whether it was done, failed, refused or
+  limited. Input contents are never recorded. The log keeps the last 10,000
+  entries and is not replicated. Before, peer actions left no record.
+
 - Cluster TUI: a slow or unreachable peer no longer freezes the cursor.
   Remote Input, InputLine, ResizeSession and Close now run on a background
   worker for each node, and the UI applies each reply when it arrives. Before,

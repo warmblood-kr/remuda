@@ -1,5 +1,6 @@
 //! Cluster vocabulary composed from identity and membership registry units.
 
+pub mod audit;
 pub mod control;
 pub mod encoding;
 pub mod endpoint;
