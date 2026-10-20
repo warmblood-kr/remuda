@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Cluster TUI: a slow or unreachable peer no longer freezes the cursor.
+  Remote Input, InputLine, ResizeSession and Close now run on a background
+  worker for each node, and the UI applies each reply when it arrives. Before,
+  each call waited up to 1 s (8 s for a line) between drawing and reading the
+  next key. A failed pane resize now waits 1 s, 2 s, 4 s and so on, up to
+  30 s, before it is sent again to that session, even when the pane size
+  changes. Before, its own error notice changed the size and started another
+  resize at once. In keys mode, buffered keys are sent 40 ms after the first
+  one even while typing continues. Before, they waited until typing paused.
+
 - Input: `type_text` now reports `submitted` when the retry Return it sends
   after a composer newline is what submits the text, instead of always
   `unverified`. A delivered input was recorded as uncertain by Butler's input
