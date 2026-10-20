@@ -594,6 +594,65 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
 }
 
 #[test]
+fn node_alias_set_or_cleared_on_any_node_reaches_every_daemon() {
+    let _serial = live_test_guard();
+    let a = PrivateNode::start("alias-a");
+    let b = PrivateNode::start("alias-b");
+    let c = PrivateNode::start("alias-c");
+    for (node, name) in [(&a, "A"), (&b, "B"), (&c, "C")] {
+        successful(
+            node.run(&["cluster", "init", "--no-listen"]),
+            &format!("initialize node {name}"),
+        );
+    }
+    let a_identity = a.identity();
+    let c_fingerprint = identity_fingerprint(&c.identity());
+    let listener = ListenerProcess::start(&a);
+    let b_listener = ListenerProcess::start(&b);
+    let c_listener = ListenerProcess::start(&c);
+    join_member(&a, &b, &a_identity, listener.address, b_listener.address);
+    join_member(&a, &c, &a_identity, listener.address, c_listener.address);
+    wait_for_member_and_probe(
+        &b,
+        &c_fingerprint,
+        &c.identity(),
+        &b.identity(),
+        b_listener.address,
+    );
+
+    successful(
+        b.run(&["cluster", "alias", &c_fingerprint, "workstation"]),
+        "name node C from node B",
+    );
+    for node in [&a, &b, &c] {
+        wait_for_node_row(node, &c_fingerprint, "workstation", true);
+    }
+    successful(
+        a.run(&["cluster", "alias", &c_fingerprint, "--clear"]),
+        "clear node C's alias from node A",
+    );
+    for node in [&a, &b, &c] {
+        wait_for_node_row(node, &c_fingerprint, "workstation", false);
+    }
+}
+
+fn wait_for_node_row(receiver: &PrivateNode, member_fp: &str, needle: &str, present: bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let table = successful(receiver.run(&["cluster", "nodes"]), "read nodes table");
+        let row = table.lines().find(|line| line.contains(member_fp));
+        if row.is_some_and(|row| row.contains(needle)) == present {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "alias {needle:?} present={present} did not converge: {table}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
 fn revoked_offline_member_learns_from_pull_on_reconnect_and_unknown_key_gets_no_tombstone() {
     let _serial = live_test_guard();
     let a = PrivateNode::start("revoke-pull-a");

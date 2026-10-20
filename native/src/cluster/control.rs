@@ -34,23 +34,52 @@ impl Default for Settings {
     }
 }
 
-/// Read receiver-local display aliases; fingerprints remain routing identities.
+/// Read display aliases keyed by fingerprint. Aliases replicate through the
+/// membership registry; legacy receiver-local settings fill in only nodes with
+/// no replicated record (including a replicated clear).
 pub fn node_aliases() -> io::Result<BTreeMap<String, String>> {
-    Ok(settings_at(&super::storage::cluster_state_dir()?.join("cluster"))?.node_aliases)
+    let dir = super::storage::cluster_state_dir()?.join("cluster");
+    let registry = super::registry::load_registry_at(&dir)?;
+    Ok(merged_aliases(&registry, settings_at(&dir)?.node_aliases))
 }
 
-/// Assign or clear a local display alias using a node id or full fingerprint.
-pub fn set_node_alias(target: &str, alias: Option<&str>) -> io::Result<()> {
+fn merged_aliases(
+    registry: &super::Registry,
+    mut aliases: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    for node in &registry.authorized_nodes {
+        if let Some(record) = super::registry::alias_record(&node.optional_fields) {
+            match record.name {
+                Some(name) => aliases.insert(node.node_fp.clone(), name),
+                None => aliases.remove(&node.node_fp),
+            };
+        }
+    }
+    aliases
+}
+
+/// Assign or clear a cluster-wide display alias using a node id or full
+/// fingerprint, then push it to peers before the short-lived CLI exits.
+pub fn set_node_alias(target: &str, alias: Option<&str>) -> io::Result<Vec<super::PeerPushResult>> {
     let dir = super::storage::cluster_state_dir()?.join("cluster");
     super::identity::load_identity_at(&dir)?;
     super::storage::verify_directory(&dir)?;
-    let _guard = super::storage::StateLock::acquire(&dir)?;
-    let registry = super::registry::load_registry_at(&dir)?;
-    let node = super::resolve_node(&registry.authorized_nodes, target)?;
-    set_node_alias_at(&dir, &node.node_fp, alias)
+    {
+        let _guard = super::storage::StateLock::acquire(&dir)?;
+        let registry = super::registry::load_registry_at(&dir)?;
+        let node = super::resolve_node(&registry.authorized_nodes, target)?;
+        set_node_alias_at(&dir, &node.node_fp, alias, now_millis())?;
+    }
+    Ok(super::replication::push_now())
 }
 
-fn valid_alias(alias: &str) -> bool {
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+pub(super) fn valid_alias(alias: &str) -> bool {
     !alias.is_empty()
         && alias.len() <= 64
         && alias == alias.trim()
@@ -58,21 +87,56 @@ fn valid_alias(alias: &str) -> bool {
         && super::super::text::strip_terminal_controls(alias) == alias
 }
 
-fn set_node_alias_at(dir: &Path, fingerprint: &str, alias: Option<&str>) -> io::Result<()> {
-    let mut settings = settings_at(dir)?;
-    if let Some(alias) = alias {
-        if !valid_alias(alias) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "alias must be 1–64 bytes, without controls, slash or surrounding whitespace",
-            ));
-        }
-        settings
-            .node_aliases
-            .insert(fingerprint.into(), alias.into());
-    } else {
-        settings.node_aliases.remove(fingerprint);
+/// Write an alias record into the registry (caller holds the state lock).
+/// Its time is forced above any existing record so a local set wins despite
+/// clock skew; legacy local aliases migrate in at time zero.
+fn set_node_alias_at(
+    dir: &Path,
+    fingerprint: &str,
+    alias: Option<&str>,
+    now_ms: u64,
+) -> io::Result<()> {
+    if alias.is_some_and(|alias| !valid_alias(alias)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "alias must be 1–64 bytes, without controls, slash or surrounding whitespace",
+        ));
     }
+    let me = super::identity::load_identity_at(dir)?.node_fp;
+    let mut registry = super::registry::load_registry_at(dir)?;
+    let mut settings = settings_at(dir)?;
+    let legacy = std::mem::take(&mut settings.node_aliases);
+    for (fp, name) in legacy {
+        let Some(entry) = registry
+            .authorized_nodes
+            .iter_mut()
+            .find(|entry| entry.node_fp == fp && entry.state == super::NodeState::Admitted)
+        else {
+            settings.node_aliases.insert(fp, name);
+            continue;
+        };
+        if super::registry::alias_record(&entry.optional_fields).is_none() {
+            let record = super::registry::AliasRecord {
+                at: 0,
+                by: me.clone(),
+                name: Some(name),
+            };
+            super::registry::put_alias_record(entry, &record);
+        }
+    }
+    let entry = registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == fingerprint)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown cluster node"))?;
+    let previous = super::registry::alias_record(&entry.optional_fields).map_or(0, |r| r.at);
+    let record = super::registry::AliasRecord {
+        at: now_ms.max(previous.saturating_add(1)),
+        by: me,
+        name: alias.map(str::to_owned),
+    };
+    super::registry::put_alias_record(entry, &record);
+    super::registry::save_registry_at(dir, &registry)?;
     save_settings_at(dir, &settings)
 }
 
@@ -295,7 +359,9 @@ fn save_settings_at(dir: &Path, settings: &Settings) -> io::Result<()> {
 
 #[cfg(all(test, not(windows)))]
 mod tests {
-    use super::{enabled_at, set_enabled_at};
+    use super::{enabled_at, merged_aliases, set_enabled_at, settings_at};
+    use std::collections::BTreeMap;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -339,16 +405,45 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    fn alias_cluster() -> (PathBuf, String, String) {
+        use super::super::{encoding, registry, AuthorizedNode, NodeState, Registry};
+        let dir = cluster_dir().join("cluster");
+        crate::cluster::storage::create_private_directory(&dir).unwrap();
+        let (me, _) = crate::cluster::identity::init_identity_at(&dir).unwrap();
+        let key = [7u8; 32];
+        let peer_fp = encoding::fingerprint(&key);
+        let node = |node_fp: &str, pubkey: &[u8]| AuthorizedNode {
+            node_fp: node_fp.into(),
+            static_pubkey: encoding::encode_base64(pubkey),
+            delivered_by: None,
+            format_major: 1,
+            format_minor: 0,
+            optional_fields: BTreeMap::new(),
+            endpoint: None,
+            state: NodeState::Admitted,
+            version: 1,
+            by: me.node_fp.clone(),
+        };
+        let registry = Registry {
+            authorized_nodes: vec![node(&me.node_fp, &me.static_pubkey), node(&peer_fp, &key)],
+        };
+        registry::save_registry_at(&dir, &registry).unwrap();
+        (dir, me.node_fp, peer_fp)
+    }
+
+    fn registry_aliases(dir: &Path) -> BTreeMap<String, String> {
+        let registry = super::super::registry::load_registry_at(dir).unwrap();
+        merged_aliases(&registry, settings_at(dir).unwrap().node_aliases)
+    }
+
     #[test]
-    fn aliases_persist_clear_and_reject_terminal_controls_without_changing_settings() {
-        let dir = cluster_dir();
+    fn aliases_are_stored_in_the_registry_clear_with_a_tombstone_and_reject_controls() {
+        let (dir, me, peer) = alias_cluster();
         set_enabled_at(&dir, false).unwrap();
-        super::set_node_alias_at(&dir, "SHA256:peer", Some("맥북")).unwrap();
-        assert_eq!(
-            super::settings_at(&dir).unwrap().node_aliases["SHA256:peer"],
-            "맥북"
-        );
-        let before = std::fs::read(dir.join("settings.json")).unwrap();
+        super::set_node_alias_at(&dir, &peer, Some("맥북"), 1_000).unwrap();
+        assert_eq!(registry_aliases(&dir)[&peer], "맥북");
+        assert!(settings_at(&dir).unwrap().node_aliases.is_empty());
+        let before = std::fs::read(dir.join("authorized_nodes.json")).unwrap();
         for invalid in [
             "",
             " x",
@@ -357,13 +452,53 @@ mod tests {
             "x\u{202e}",
             &"a".repeat(65),
         ] {
-            assert!(super::set_node_alias_at(&dir, "SHA256:peer", Some(invalid)).is_err());
-            assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), before);
+            assert!(super::set_node_alias_at(&dir, &peer, Some(invalid), 2_000).is_err());
+            assert_eq!(
+                std::fs::read(dir.join("authorized_nodes.json")).unwrap(),
+                before
+            );
         }
-        super::set_node_alias_at(&dir, "SHA256:peer", None).unwrap();
-        assert!(super::settings_at(&dir).unwrap().node_aliases.is_empty());
+        // A clock earlier than the stored record still supersedes it.
+        super::set_node_alias_at(&dir, &me, Some("self"), 0).unwrap();
+        super::set_node_alias_at(&dir, &peer, None, 500).unwrap();
+        let aliases = registry_aliases(&dir);
+        assert!(!aliases.contains_key(&peer));
+        assert_eq!(aliases[&me], "self");
+        let registry = super::super::registry::load_registry_at(&dir).unwrap();
+        let entry = registry
+            .authorized_nodes
+            .iter()
+            .find(|n| n.node_fp == peer)
+            .unwrap();
+        let record = super::super::registry::alias_record(&entry.optional_fields).unwrap();
+        assert_eq!((record.name, record.at), (None, 1_001));
         assert!(!enabled_at(&dir).unwrap());
-        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn legacy_local_aliases_are_read_and_migrated_without_overriding_replicated_ones() {
+        let (dir, me, peer) = alias_cluster();
+        super::super::storage::atomic_write(
+            &dir.join("settings.json"),
+            format!(
+                r#"{{"allow_remote_control":true,"node_aliases":{{"{peer}":"legacy","{me}":"mine","SHA256:unknown":"gone"}}}}"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(registry_aliases(&dir)[&peer], "legacy");
+        super::set_node_alias_at(&dir, &me, Some("renamed"), 10).unwrap();
+        let aliases = registry_aliases(&dir);
+        assert_eq!(aliases[&peer], "legacy");
+        assert_eq!(aliases[&me], "renamed");
+        // Only the entry that is not an admitted member stays local.
+        let legacy = settings_at(&dir).unwrap().node_aliases;
+        assert_eq!(legacy.keys().collect::<Vec<_>>(), ["SHA256:unknown"]);
+        // A replicated clear beats the legacy value on read.
+        super::set_node_alias_at(&dir, &peer, None, 20).unwrap();
+        assert!(!registry_aliases(&dir).contains_key(&peer));
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
     #[test]

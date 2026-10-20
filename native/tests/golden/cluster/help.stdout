@@ -6,7 +6,7 @@ Commands:
   join       Join using a quoted invitation line; a fingerprint is needed when stdin is not a terminal. Example: remuda cluster join 'remuda-join-v1 …'
   nodes      List the nodes known to this cluster. Example: remuda cluster nodes
   advertise  Refresh this node's endpoint from its running listener without restarting it
-  alias      Set or clear a local display alias for a node. Example: remuda cluster alias <NODE> macbook
+  alias      Set or clear a cluster-wide display alias for a node. Example: remuda cluster alias <NODE> macbook
   control    Enable or disable remote control. Example: remuda cluster control off
   revoke     Revoke a node or fingerprint; prompt before revoking unless --yes is used. Example: remuda cluster revoke <NODE>
   remote     Attach to a remote session, or show the remote session picker. Example: remuda cluster remote node/session
