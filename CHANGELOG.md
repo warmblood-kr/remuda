@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Install: releases now ship `remuda-session-host` beside `remuda` in every
+  tarball, and `install.sh` and `install.ps1` install both as one pair. The
+  pair being replaced is kept as `remuda.prev` and `remuda-session-host.prev`
+  (`.exe.prev` on Windows) for rollback. Before, no release carried the host,
+  so `REMUDA_EXPERIMENTAL_SESSION_HOST=1` failed with "session host binary
+  not found" on any installed remuda. The daemon now also looks for
+  `remuda-session-host.exe` on Windows.
+
 - Cluster TUI: a slow or unreachable peer no longer freezes the cursor.
   Remote Input, InputLine, ResizeSession and Close now run on a background
   worker for each node, and the UI applies each reply when it arrives. Before,
