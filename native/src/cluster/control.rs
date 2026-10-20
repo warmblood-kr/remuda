@@ -88,9 +88,8 @@ pub(super) fn valid_alias(alias: &str) -> bool {
 }
 
 /// Write an alias record into the registry (caller holds the state lock).
-/// The record time is forced above any existing record so a local set always
-/// wins locally despite clock skew. Legacy local aliases are migrated into the
-/// registry with time zero, so any real set or clear supersedes them.
+/// Its time is forced above any existing record so a local set wins despite
+/// clock skew; legacy local aliases migrate in at time zero.
 fn set_node_alias_at(
     dir: &Path,
     fingerprint: &str,
