@@ -17,7 +17,7 @@
 
 #[cfg(test)]
 use crate::client;
-use crate::client::{Hold, RawMode};
+use crate::client::RawMode;
 use crate::mcp;
 use remuda_core::agent::{Color, Cursor, StyledCell};
 use remuda_core::protocol::{expand_runs, Request, Response};
@@ -35,7 +35,9 @@ use crossterm::event::{
 /// How often an idle herd is relisted, recaptured and redrawn — see
 /// [`should_refresh`]. A key always forces an immediate refresh regardless.
 mod port;
+mod remote_port;
 pub use port::{KeyStream, SessionPort};
+pub use remote_port::RemotePort;
 const TICK: Duration = Duration::from_millis(250);
 const DAEMON_FAILURES_BEFORE_GONE: u8 = 3;
 
@@ -2558,17 +2560,7 @@ fn refresh<P: SessionPort + ?Sized>(
         // paying for it there would be the exact per-keystroke IPC cost
         // steps/017/022 exist to avoid.
         if ui.daemon_gone.is_none() {
-            let (list_w, _) = ui_layout(ui, cols);
-            match sessions_buffer_lines(path, list_w, ui.selected, selected_name.as_deref()) {
-                Ok((session_rows, lines, order)) => {
-                    ui.session_rows = session_rows;
-                    ui.sessions_text = lines;
-                    apply_session_order(ui, selected_name.as_deref(), &order);
-                }
-                // Same fallback as the relist: keep whatever was last drawn
-                // rather than blanking the tail column on a transport hiccup.
-                Err(e) => ui.notice = Some(e),
-            }
+            refresh_list_text(path, ui, cols, selected_name.as_deref());
         }
     }
     ui.clamp();
@@ -2655,6 +2647,36 @@ fn refresh<P: SessionPort + ?Sized>(
     Ok((cols, rows))
 }
 
+/// The list column's text: Lua's sessions buffer, or plain names for a node
+/// whose Lua this screen cannot ask (a cluster peer).
+fn refresh_list_text<P: SessionPort + ?Sized>(
+    path: &P,
+    ui: &mut Ui,
+    cols: u16,
+    selected_name: Option<&str>,
+) {
+    if !path.has_lua() {
+        ui.session_rows = 1;
+        ui.sessions_text = if ui.sessions.is_empty() {
+            vec!["no sessions on this node".into()]
+        } else {
+            Vec::new()
+        };
+        return;
+    }
+    let (list_w, _) = ui_layout(ui, cols);
+    match sessions_buffer_lines(path, list_w, ui.selected, selected_name) {
+        Ok((session_rows, lines, order)) => {
+            ui.session_rows = session_rows;
+            ui.sessions_text = lines;
+            apply_session_order(ui, selected_name, &order);
+        }
+        // Same fallback as the relist: keep whatever was last drawn
+        // rather than blanking the tail column on a transport hiccup.
+        Err(e) => ui.notice = Some(e),
+    }
+}
+
 fn sync_shown_session<P: SessionPort + ?Sized>(
     path: &P,
     ui: &mut Ui,
@@ -2662,6 +2684,10 @@ fn sync_shown_session<P: SessionPort + ?Sized>(
     selection_moved: bool,
 ) {
     let selected_name = ui.selected().map(|s| s.name.clone());
+    if !path.has_lua() {
+        *shown = selected_name.map(ShownTarget::Session);
+        return;
+    }
     // `selection_moved` is `true` only for a real Up/Down keypress that
     // actually moved `ui.selected` (see `run()`) — never a session
     // first appearing in the list, `clamp()`, or `follow_focus()`.
@@ -2821,9 +2847,21 @@ pub(crate) fn paste_input(text: &str, bracketed: bool) -> Vec<u8> {
 /// Draw the herd until the user quits. One screen for the whole run: focus
 /// moves between the panes, and the terminal is never handed over, so the
 /// alternate screen is entered exactly once. `notice` is what stderr cannot reach.
-#[allow(clippy::too_many_lines)]
 pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result<()> {
-    let keymap = crate::keybindings::fetch(path, Duration::from_secs(3))
+    run_port(path, path, server, notice)
+}
+
+/// The session screen for PORT's node. LOCAL is this machine's daemon, which
+/// still supplies key bindings and is the only daemon `r` may restart.
+#[allow(clippy::too_many_lines)]
+pub fn run_port<P: SessionPort + ?Sized>(
+    local: &Path,
+    port: &P,
+    server: &str,
+    notice: Option<String>,
+) -> std::io::Result<()> {
+    let path = port;
+    let keymap = crate::keybindings::fetch(local, Duration::from_secs(3))
         .map_err(|error| std::io::Error::other(format!("key bindings unavailable: {error}")))?;
     let _terminal = RawMode::enable()?;
     // Scoped to the herd screen, not `RawMode` itself: `attach` uses `RawMode`
@@ -2844,7 +2882,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     let mut painted = String::new();
     // The exclusive hold on the focused session, and the name it was taken on.
     // Its `Drop` is the detach, so letting it fall out of scope is the release.
-    let mut held: Option<(String, Hold)> = None;
+    let mut held: Option<(String, P::Keys)> = None;
     let mut paste_capture = BracketedPasteCapture::new(std::io::stdout());
     // What the window last reported showing — refreshed only on a
     // non-skip_list wake, and reused as-is on a Type-forced one.
@@ -2923,7 +2961,10 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
         match action {
             Action::Nothing => {}
             Action::Quit => return Ok(()),
-            Action::Restart => match restart_daemon(path, server) {
+            Action::Restart if !path.restartable() => {
+                ui.notice = Some(format!("restart remuda on {} itself", path.label()));
+            }
+            Action::Restart => match restart_daemon(local, server) {
                 Ok(()) => {
                     ui.daemon_gone = None;
                     ui.consecutive_transport_failures = 0;
