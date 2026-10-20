@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Cluster: `remuda cluster remote NODE` now opens NODE's own session screen,
+  the same screen plain `remuda` shows there: its session list on the left
+  and the selected session on the right. Press `m` to write a line for the
+  selected session and Enter to send it whole; `x` closes a session (bound
+  to the instance you saw). Live keys to a remote session are not available
+  yet. The peer is read on a background thread, so a slow or unreachable
+  node never freezes the screen; the footer says `stale Ns` when its screen
+  may be out of date. `cluster remote` with no node, or `NODE/SESSION`,
+  still opens the cluster tree. Naming this machine opens the local screen.
+
 - Session screen: press `m` on the session list to write a line for the
   selected session in a line editor at the bottom of the screen. Nothing reaches the
   session while you type. Enter sends the whole line, with its Return, as one

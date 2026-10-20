@@ -46,6 +46,8 @@ const DAEMON_FAILURES_BEFORE_GONE: u8 = 3;
 /// also be the redraw cadence; see steps/017 for why that was the bug.
 const TICK_TYPING: Duration = Duration::from_millis(40);
 const MAX_ANCHOR_CAPTURES: usize = 3;
+/// A node silent longer than this is marked stale (WezTerm's "tardy" floor).
+const STALE_AFTER: Duration = Duration::from_secs(3);
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -157,6 +159,8 @@ pub struct Ui {
     session_rows: usize,
     /// Visible preview rows, refreshed from the terminal dimensions each frame.
     preview_rows: u16,
+    /// Set while the shown node has not answered lately; its screen may be old.
+    node_stale: Option<Duration>,
     /// Line composer (`m`): keys edit a local draft, never the pty, and Enter
     /// sends one InputLine batch written under the session input lock, so
     /// injected text (a Butler notice) cannot land inside a half-typed line.
@@ -218,6 +222,7 @@ impl Ui {
             sessions_text: Vec::new(),
             session_rows: 1,
             preview_rows: 1,
+            node_stale: None,
             composer: Default::default(),
             compose_target: None,
             compose_drafts: HashMap::new(),
@@ -2609,7 +2614,11 @@ fn footer(ui: &Ui, server: &str, cut: bool, preview_w: u16, cols: u16) -> String
         }
         None => status,
     };
-    let brand = format!("remuda · {server} 🏇");
+    let brand = match ui.node_stale {
+        Some(age) if age == Duration::MAX => format!("remuda · {server} · waiting 🏇"),
+        Some(age) => format!("remuda · {server} · stale {}s 🏇", age.as_secs()),
+        None => format!("remuda · {server} 🏇"),
+    };
     let status_width = visible_width(&status);
     let brand_width = visible_width(&brand);
     if status_width + 3 + brand_width <= cols as usize {
@@ -2647,6 +2656,7 @@ fn refresh<P: SessionPort + ?Sized>(
     selection_moved: bool,
 ) -> std::io::Result<(u16, u16)> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    ui.node_stale = path.staleness().filter(|age| *age > STALE_AFTER);
     ui.preview_rows = rows.saturating_sub(1).max(1);
     ui.preview_width = ui_layout(ui, cols).1;
     if !skip_list {
@@ -3005,6 +3015,8 @@ pub fn run_port<P: SessionPort + ?Sized>(
     // client id and sequence, so a retry is deduplicated, never written twice.
     let mut line_sender = crate::cluster_tui::sender::InputSender::random()?;
     let mut line_queue = crate::cluster_tui::queue::InputQueue::default();
+    // The one remote line in flight; its reply arrives through `take_replies`.
+    let mut line_in_flight: Option<crate::cluster_tui::sender::RemoteStarted> = None;
     // What the window last reported showing — refreshed only on a
     // non-skip_list wake, and reused as-is on a Type-forced one.
     let mut shown: Option<ShownTarget> = None;
@@ -3045,7 +3057,9 @@ pub fn run_port<P: SessionPort + ?Sized>(
             selection_moved = false;
         }
 
-        if let Some(event) = send_due_line(&mut line_sender, &mut line_queue, path) {
+        if let Some(event) =
+            pump_lines(path, &mut line_sender, &mut line_queue, &mut line_in_flight)
+        {
             if let Some(notice) = line_notice(event) {
                 ui.notice = Some(notice);
             }
@@ -3122,7 +3136,14 @@ pub fn run_port<P: SessionPort + ?Sized>(
                     Err(_) => {}
                 }
             }
-            Action::Kill(name) => ui.notice = kill(path, &name).err(),
+            Action::Kill(name) => {
+                let instance = ui
+                    .sessions
+                    .iter()
+                    .find(|session| session.name == name)
+                    .and_then(|session| session.instance_id.clone());
+                ui.notice = kill(path, &name, instance).err();
+            }
             Action::Focus(name) => reconcile_hold(path, &mut ui, &mut held, &name),
             Action::Scroll(delta) => {
                 scroll_selected(&mut ui, delta);
@@ -3138,7 +3159,7 @@ pub fn run_port<P: SessionPort + ?Sized>(
                 bytes,
             } => {
                 let target = crate::cluster_tui::queue::InputTarget {
-                    remote_node: None,
+                    remote_node: path.remote_node(),
                     name: name.clone(),
                     instance_id,
                 };
@@ -3160,7 +3181,41 @@ fn send_due_line<P: SessionPort + ?Sized>(
     queue: &mut crate::cluster_tui::queue::InputQueue,
     path: &P,
 ) -> Option<crate::cluster_tui::queue::QueueEvent> {
-    sender.attempt_due(queue, Instant::now(), |request| path.request(request))
+    sender.attempt_due(queue, Instant::now(), |request| {
+        path.request_bounded(request, crate::cluster_tui::sender::INPUT_SEND_TIMEOUT)
+    })
+}
+
+/// Move composed lines along: in place for this machine, through the port's
+/// background sender for a peer, one line at a time and in order.
+fn pump_lines<P: SessionPort + ?Sized>(
+    path: &P,
+    sender: &mut crate::cluster_tui::sender::InputSender,
+    queue: &mut crate::cluster_tui::queue::InputQueue,
+    in_flight: &mut Option<crate::cluster_tui::sender::RemoteStarted>,
+) -> Option<crate::cluster_tui::queue::QueueEvent> {
+    if path.remote_node().is_none() {
+        return send_due_line(sender, queue, path);
+    }
+    let now = Instant::now();
+    if let Some(started) = in_flight.take() {
+        let Some(reply) = path.take_replies().into_iter().next() else {
+            *in_flight = Some(started);
+            return None;
+        };
+        return sender.finish_remote(queue, &started, reply, now);
+    }
+    queue.begin_due(now)?;
+    match sender.prepare_remote(queue, now)? {
+        Err(event) => event,
+        Ok(started) => match path.submit(started.request.clone()) {
+            Ok(()) => {
+                *in_flight = Some(started);
+                None
+            }
+            Err(error) => sender.finish_remote(queue, &started, Err(error), now),
+        },
+    }
 }
 
 /// What the footer says about a composed line. A retry stays quiet; an
@@ -3769,11 +3824,17 @@ fn resize<P: SessionPort + ?Sized>(path: &P, name: &str, size: Size) -> Result<(
     }
 }
 
-fn kill<P: SessionPort + ?Sized>(path: &P, name: &str) -> Result<(), String> {
+/// A peer only closes a confirmed close bound to the instance the user saw.
+fn kill<P: SessionPort + ?Sized>(
+    path: &P,
+    name: &str,
+    instance_id: Option<String>,
+) -> Result<(), String> {
+    let remote = path.remote_node().is_some();
     let request = Request::Close {
         name: name.to_string(),
-        instance_id: None,
-        confirm: None,
+        instance_id: if remote { instance_id } else { None },
+        confirm: remote.then_some(true),
     };
     match path.request(&request) {
         Ok(Response::Ok) => Ok(()),
