@@ -567,7 +567,7 @@ impl PtyAgent {
             .map_err(io)?,
         );
         let reader = pair.master.try_clone_reader().map_err(io)?;
-        let screen = Arc::new(Mutex::new(vt100::Parser::new(
+        let screen = Arc::new(Mutex::new(crate::vt::parser(
             size.rows(),
             size.cols(),
             SCROLLBACK_ROWS,
@@ -689,6 +689,26 @@ fn process_reader_chunk(
     true
 }
 
+/// Resize, counting rows a shorter main screen pushes into history: vt100
+/// first drops the rows below the cursor, then scrolls the rest up.
+pub(crate) fn resize_output<CB: vt100::Callbacks>(
+    parser: &mut vt100::Parser<CB>,
+    rows: u16,
+    cols: u16,
+    scrollback_total: &AtomicUsize,
+) {
+    let screen = parser.screen_mut();
+    let (old_rows, _) = crate::vt::size(screen);
+    let pushed = if screen.alternate_screen() || screen.scrollback_capacity() == 0 {
+        0
+    } else {
+        let below_cursor = old_rows - screen.cursor_position().0 - 1;
+        old_rows.saturating_sub(rows).saturating_sub(below_cursor)
+    };
+    crate::vt::set_size(screen, rows, cols);
+    scrollback_total.fetch_add(usize::from(pushed), Ordering::Relaxed);
+}
+
 /// Process bounded chunks while a temporary nonzero scroll offset counts
 /// every full-screen row pushed into history, even when the retained buffer is full.
 pub(crate) fn process_output<CB: vt100::Callbacks>(
@@ -791,7 +811,7 @@ fn answer_cursor_query(pending: &SyncSender<Vec<u8>>, (row, col): (u16, u16)) {
 /// (DSR 6n) the last column, so clamp to `cols - 1`.
 pub(crate) fn display_cursor(screen: &vt100::Screen) -> (u16, u16) {
     let (row, col) = screen.cursor_position();
-    (row, col.min(screen.size().1.saturating_sub(1)))
+    (row, col.min(screen.size().1.get() - 1))
 }
 
 pub(crate) fn styled_cells(screen: &vt100::Screen, size: Size) -> Vec<Vec<StyledCell>> {
@@ -866,7 +886,7 @@ impl AgentProcess for PtyAgent {
     /// modes, which a just-attached terminal needs even if the child is idle.
     fn screen_bytes(&mut self) -> Result<Vec<u8>> {
         let parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
-        Ok(parser.screen().state_formatted())
+        Ok(parser.screen().state_formatted().into_bytes())
     }
 
     fn mouse_tracking(&mut self) -> bool {
@@ -1038,7 +1058,12 @@ impl AgentProcess for PtyAgent {
             })
             .map_err(io)?;
         let mut parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
-        parser.screen_mut().set_size(size.rows(), size.cols());
+        resize_output(
+            &mut parser,
+            size.rows(),
+            size.cols(),
+            &self.scrollback_total,
+        );
         self.output_version.fetch_add(1, Ordering::SeqCst);
         self.size = size;
         Ok(())
@@ -1664,7 +1689,7 @@ mod input_writer_tests {
             Arc::new(Mutex::new(Box::new(CaptureWrites(Arc::clone(&captured)))));
         let reader_closed = Arc::new(AtomicBool::new(false));
         let pending = spawn_cursor_reply_worker(Arc::clone(&writer), reader_closed);
-        let screen = Arc::new(Mutex::new(vt100::Parser::new(24, 80, SCROLLBACK_ROWS)));
+        let screen = Arc::new(Mutex::new(crate::vt::parser(24, 80, SCROLLBACK_ROWS)));
         let scrollback_total = AtomicUsize::new(0);
         let output_version = AtomicU64::new(0);
         let mut dsr_carry = Vec::new();
@@ -1698,7 +1723,7 @@ mod input_writer_tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let writer: SharedWriter =
             Arc::new(Mutex::new(Box::new(CaptureWrites(Arc::clone(&captured)))));
-        let screen = Arc::new(Mutex::new(vt100::Parser::new(24, 80, SCROLLBACK_ROWS)));
+        let screen = Arc::new(Mutex::new(crate::vt::parser(24, 80, SCROLLBACK_ROWS)));
         let scrollback_total = AtomicUsize::new(0);
         let output_version = AtomicU64::new(0);
         let mut dsr_carry = Vec::new();
@@ -1953,7 +1978,7 @@ mod tests {
 
     #[test]
     fn temporary_scrollback_view_restores_after_panic() {
-        let mut parser = vt100::Parser::new(2, 5, 4);
+        let mut parser = crate::vt::parser(2, 5, 4);
         parser.process(b"one\r\ntwo\r\nthree\r\nfour\r\n");
         parser.screen_mut().set_scrollback(1);
         let original = parser.screen().scrollback();
@@ -1968,7 +1993,7 @@ mod tests {
 
     #[test]
     fn monotonic_scrollback_counter_advances_after_retained_history_is_full() {
-        let mut parser = vt100::Parser::new(24, 80, SCROLLBACK_ROWS);
+        let mut parser = crate::vt::parser(24, 80, SCROLLBACK_ROWS);
         let total = AtomicUsize::new(0);
         let fill: String = (0..SCROLLBACK_ROWS + 100)
             .map(|row| format!("row-{row:05}\r\n"))
@@ -1985,13 +2010,212 @@ mod tests {
 
     #[test]
     fn scrollback_counter_is_exact_when_crlf_is_split_across_output_chunks() {
-        let mut parser = vt100::Parser::new(2, 10, 20);
+        let mut parser = crate::vt::parser(2, 10, 20);
         let total = AtomicUsize::new(0);
         for part in [b"a\r".as_slice(), b"\n", b"b\r", b"\n", b"c\r", b"\n"] {
             process_output(&mut parser, part, &total);
         }
         assert_eq!(total.load(Ordering::Relaxed), 2);
         assert_eq!(retained_history_len(&mut parser), 2);
+    }
+
+    #[test]
+    fn shrinking_height_counts_rows_pushed_into_history() {
+        let mut parser = crate::vt::parser(10, 20, 100);
+        let total = AtomicUsize::new(0);
+        let fill: String = (0..10).map(|row| format!("\r\nrow-{row}")).collect();
+        process_output(&mut parser, fill.as_bytes(), &total);
+        let (before_total, before_len) = (
+            total.load(Ordering::Relaxed),
+            retained_history_len(&mut parser),
+        );
+
+        resize_output(&mut parser, 6, 20, &total);
+        let pushed = retained_history_len(&mut parser) - before_len;
+        assert_eq!(
+            pushed, 4,
+            "cursor on the bottom row: every removed row is pushed"
+        );
+        assert_eq!(total.load(Ordering::Relaxed) - before_total, pushed);
+        assert!(parser.screen().contents().ends_with("row-9"));
+    }
+
+    #[test]
+    fn shrinking_height_drops_rows_below_the_cursor_before_pushing() {
+        let mut parser = crate::vt::parser(10, 20, 100);
+        let total = AtomicUsize::new(0);
+        process_output(&mut parser, b"one\r\ntwo\r\nthree", &total);
+
+        resize_output(&mut parser, 6, 20, &total);
+        assert_eq!(retained_history_len(&mut parser), 0);
+        assert_eq!(total.load(Ordering::Relaxed), 0);
+
+        resize_output(&mut parser, 2, 20, &total);
+        assert_eq!(retained_history_len(&mut parser), 1);
+        assert_eq!(total.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn shrinking_height_counts_pushes_after_retained_history_is_full() {
+        let mut parser = crate::vt::parser(10, 20, 5);
+        let total = AtomicUsize::new(0);
+        let fill: String = (0..30).map(|row| format!("\r\nrow-{row}")).collect();
+        process_output(&mut parser, fill.as_bytes(), &total);
+        let before = total.load(Ordering::Relaxed);
+
+        resize_output(&mut parser, 7, 20, &total);
+        assert_eq!(retained_history_len(&mut parser), 5);
+        assert_eq!(total.load(Ordering::Relaxed) - before, 3);
+    }
+
+    #[test]
+    fn resizing_on_the_alternate_screen_counts_nothing() {
+        let mut parser = crate::vt::parser(10, 20, 100);
+        let total = AtomicUsize::new(0);
+        process_output(&mut parser, b"\x1b[?1049h\x1b[10;1Hbottom", &total);
+        resize_output(&mut parser, 4, 20, &total);
+        assert_eq!(total.load(Ordering::Relaxed), 0);
+    }
+
+    /// Each case panicked vt100 0.16.2 inside the screen lock, which poisoned
+    /// it ("screen lock poisoned"). The first is the minimal wide-glyph repro.
+    #[test]
+    fn wide_glyph_resize_sequences_do_not_panic_the_parser() {
+        type Step = (&'static str, Option<(u16, u16)>);
+        let cases: [(u16, u16, &[Step]); 6] = [
+            (
+                24,
+                80,
+                &[("\x1b[1;79H가", Some((24, 79))), ("\x1b[1;79Hx", None)],
+            ),
+            (
+                24,
+                80,
+                &[("\x1b[1;79H가", Some((24, 79))), ("\x1b[1;79H\x1b[K", None)],
+            ),
+            (
+                24,
+                80,
+                &[("\x1b[1;79H가", Some((24, 79))), ("\x1b[1;79H\x1b[P", None)],
+            ),
+            (
+                24,
+                80,
+                &[
+                    ("\x1b[1;79H가\x1b[?1049h", Some((24, 79))),
+                    ("\x1b[?1049l\x1b[1;79Hx", None),
+                ],
+            ),
+            (24, 1, &[("가", None)]),
+            (
+                3,
+                6,
+                &[
+                    ("\x1b[?6h\x1b[0J\x1bM\x1b7😀", None),
+                    ("\x1b[?1049h\x1b[?6h\x1b[r", Some((1, 2))),
+                    ("😀\x1b[2;3r\x1bM\x1b[24;80H", None),
+                ],
+            ),
+        ];
+        for (rows, cols, steps) in cases {
+            let mut parser = crate::vt::parser(rows, cols, SCROLLBACK_ROWS);
+            let total = AtomicUsize::new(0);
+            for (bytes, resize) in steps {
+                process_output(&mut parser, bytes.as_bytes(), &total);
+                if let Some((rows, cols)) = resize {
+                    resize_output(&mut parser, *rows, *cols, &total);
+                }
+            }
+            let (rows, cols) = crate::vt::size(parser.screen());
+            let _ = styled_cells_in(parser.screen(), rows, cols);
+        }
+    }
+
+    /// Random output, resizes and history reads, as the reader and snapshot
+    /// paths issue them. vt100 0.16.2 failed this within a few hundred seeds.
+    #[test]
+    fn random_output_and_resizes_do_not_panic_the_parser() {
+        const TOKENS: &[&str] = &[
+            "a",
+            "가",
+            "한",
+            "😀",
+            "\u{301}",
+            "\r",
+            "\n",
+            "\t",
+            "\x08",
+            "\x1b[K",
+            "\x1b[2K",
+            "\x1b[1J",
+            "\x1b[0J",
+            "\x1b[2J",
+            "\x1b[3J",
+            "\x1b[H",
+            "\x1b[5;1H",
+            "\x1b[1;200H",
+            "\x1b[24;80H",
+            "\x1b[999C",
+            "\x1b[999B",
+            "\x1b[?1049h",
+            "\x1b[?1049l",
+            "\x1b[2;3r",
+            "\x1b[1;1r",
+            "\x1b[r",
+            "\x1b[S",
+            "\x1b[T",
+            "\x1b[L",
+            "\x1b[M",
+            "\x1b[P",
+            "\x1b[@",
+            "\x1b[3@",
+            "\x1b[X",
+            "\x1b7",
+            "\x1b8",
+            "\x1bM",
+            "\x1b[?6h",
+            "\x1b[?7l",
+            "\x1b[?7h",
+            "\x1b[4h",
+            "\x1b[4l",
+            "\x1b[6n",
+        ];
+        for seed in 1..=2_000u64 {
+            let mut state = seed.wrapping_mul(2_654_435_761) | 1;
+            let mut next = |bound: u64| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state % bound
+            };
+            let size =
+                |next: &mut dyn FnMut(u64) -> u64| (1 + next(30) as u16, 1 + next(90) as u16);
+            let (rows, cols) = size(&mut next);
+            let mut parser = crate::vt::parser(rows, cols, 100);
+            let total = AtomicUsize::new(0);
+            for _ in 0..40 {
+                match next(10) {
+                    0 => {
+                        let (rows, cols) = size(&mut next);
+                        resize_output(&mut parser, rows, cols, &total);
+                    }
+                    1 => {
+                        let (rows, cols) = crate::vt::size(parser.screen());
+                        let offset = next(5) as usize;
+                        with_scrollback(parser.screen_mut(), offset, |screen| {
+                            let _ = styled_cells_in(screen, rows, cols);
+                            let _ = screen.state_formatted();
+                        });
+                    }
+                    _ => {
+                        let bytes: String = (0..1 + next(8))
+                            .map(|_| TOKENS[next(TOKENS.len() as u64) as usize])
+                            .collect();
+                        process_output(&mut parser, bytes.as_bytes(), &total);
+                    }
+                }
+            }
+        }
     }
 
     fn retained_history_len(parser: &mut vt100::Parser) -> usize {

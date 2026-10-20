@@ -119,7 +119,7 @@ impl Strings {
 mod tests {
     use super::*;
     fn filtered(bytes: &[u8], split: usize) -> (vt100::Parser, Strings) {
-        let mut parser = vt100::Parser::new(24, 80, 10);
+        let mut parser = crate::vt::parser(24, 80, 10);
         let mut filter = Strings::default();
         filter.feed(&bytes[..split], |chunk| parser.process(chunk));
         filter.feed(&bytes[split..], |chunk| parser.process(chunk));
@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn supported_strings_match_reference_for_every_split() {
         let bytes = b"abc\x1b]0;title\x07\x1bPignored\x1b\\\x1b]title\x1b[31mred\x1b]cancel\x18end";
-        let mut reference = vt100::Parser::new(24, 80, 10);
+        let mut reference = crate::vt::parser(24, 80, 10);
         reference.process(bytes);
         for split in 0..=bytes.len() {
             let (parser, filter) = filtered(bytes, split);
@@ -214,7 +214,7 @@ mod tests {
             }
         }
         let bytes = b"\x1bPqpayload\x9cvisible";
-        let mut reference = vt100::Parser::new(24, 80, 10);
+        let mut reference = crate::vt::parser(24, 80, 10);
         reference.process(bytes);
         for split in 0..=bytes.len() {
             let (parser, filter) = filtered(bytes, split);
@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn endless_osc_and_dcs_stay_bounded_across_many_chunks() {
         for start in *b"]P" {
-            let mut parser = vt100::Parser::new(24, 80, 10);
+            let mut parser = crate::vt::parser(24, 80, 10);
             let mut filter = Strings::default();
             filter.feed(&[27, start], |bytes| parser.process(bytes));
             for _ in 0..1024 {

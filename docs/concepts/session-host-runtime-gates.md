@@ -27,8 +27,9 @@ The host terminal caps current cells at65,536, geometry at1000x500 subject to th
 cell product, retained history at1000 rows/1,000,000 cells, work per parse at4096
 bytes and pending DSR positions at32. Unsupported OSC strings over4096 bytes are
 counted and discarded through BEL/ST/CAN/SUB. DCS/SOS/PM/APC pass through pinned
-vte's non-accumulating states. vt1000.16.2/vte0.15.0 are pinned exactly because this
-boundary relies on their escape state rules. Dependency changes need a new audit.
+vte's non-accumulating states. vt100 0.18.1/vte0.15.0 are pinned exactly because this
+boundary relies on their escape state rules. The audit was against vt100 0.16.2;
+re-audit 0.18.1 before wiring the host. Dependency changes need a new audit.
 DSR queue failures/overflow are explicit degraded health, not healthy lossless I/O.
 These component caps do not prove an aggregate RSS/latency bound.
 

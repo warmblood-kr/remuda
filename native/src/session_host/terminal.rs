@@ -28,7 +28,7 @@ impl vt100::Callbacks for Queries {
             } else {
                 let (row, col) = screen.cursor_position();
                 self.positions
-                    .push_back((row + 1, col.min(screen.size().1 - 1) + 1));
+                    .push_back((row + 1, col.min(screen.size().1.get() - 1) + 1));
             }
         }
     }
@@ -47,7 +47,7 @@ impl Terminal {
     pub fn new(rows: u16, cols: u16, history: usize) -> Result<Self, &'static str> {
         geometry(rows, cols, history)?;
         Ok(Self {
-            parser: vt100::Parser::new_with_callbacks(rows, cols, history, Queries::default()),
+            parser: crate::vt::parser_with_callbacks(rows, cols, history, Queries::default()),
             strings: Strings::default(),
             history,
             generation: 0,
@@ -79,7 +79,7 @@ impl Terminal {
     }
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), &'static str> {
         let next = self.prepare_resize(rows, cols)?;
-        self.parser.screen_mut().set_size(rows, cols);
+        crate::pty::resize_output(&mut self.parser, rows, cols, &self.scrollback_total);
         self.generation = next;
         Ok(())
     }
@@ -93,7 +93,7 @@ impl Terminal {
         }
     }
     pub fn viewport(&mut self, scrollback: usize) -> Viewport {
-        let (rows, cols) = self.parser.screen().size();
+        let (rows, cols) = crate::vt::size(self.parser.screen());
         let screen = self.parser.screen_mut();
         let previous = screen.scrollback();
         screen.set_scrollback(usize::MAX);
@@ -200,7 +200,7 @@ mod tests {
         let bytes =
             "abc\x1b[6ndef\x1b[6n\r\n\u{754c}e\u{301}\x1b[?2004h\x1b[?1049halt\x1b[?1049l\x1b[?25l"
                 .as_bytes();
-        let mut reference = vt100::Parser::new(24, 80, 10);
+        let mut reference = crate::vt::parser(24, 80, 10);
         reference.process(bytes);
         for split in 0..=bytes.len() {
             let mut terminal = Terminal::new(24, 80, 10).unwrap();

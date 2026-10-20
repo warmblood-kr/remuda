@@ -1764,7 +1764,7 @@ mod cursor_width_tests {
     fn caret_after_typing(typed: &str) -> (u16, u16) {
         use remuda_core::protocol::{collapse_runs, expand_runs};
         let size = remuda_core::Size::new(80, 24);
-        let mut parser = vt100::Parser::new(size.rows(), size.cols(), 0);
+        let mut parser = crate::vt::parser(size.rows(), size.cols(), 0);
         // A claude/codex-style input box: a right border, then "│ > " + input.
         parser.process(format!("\x1b[1;80H│\x1b[1;1H│ > {typed}").as_bytes());
         let (_, col) = crate::pty::display_cursor(parser.screen());
@@ -1786,7 +1786,7 @@ mod cursor_width_tests {
     fn caret_stays_on_the_last_column_in_pending_wrap() {
         for typed in ["a".repeat(80), "한".repeat(40)] {
             let size = remuda_core::Size::new(80, 24);
-            let mut parser = vt100::Parser::new(size.rows(), size.cols(), 0);
+            let mut parser = crate::vt::parser(size.rows(), size.cols(), 0);
             parser.process(typed.as_bytes());
             let (row, col) = crate::pty::display_cursor(parser.screen());
             assert_eq!((row, col), (0, 79), "{typed:?}");

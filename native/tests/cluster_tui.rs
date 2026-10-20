@@ -165,7 +165,7 @@ impl TuiPty {
 
     fn screen_text(&self) -> String {
         let output = self.output.lock().unwrap();
-        let mut parser = vt100::Parser::new(24, 100, 0);
+        let mut parser = remuda_native::vt::parser(24, 100, 0);
         parser.process(&output);
         parser.screen().contents()
     }
@@ -177,7 +177,7 @@ impl TuiPty {
     fn screens_from(&self, offset: usize) -> (String, String) {
         let output = self.output.lock().unwrap();
         let offset = offset.min(output.len());
-        let mut parser = vt100::Parser::new(24, 100, 0);
+        let mut parser = remuda_native::vt::parser(24, 100, 0);
         parser.process(&output[..offset]);
         let before = parser.screen().contents();
         parser.process(&output[offset..]);
