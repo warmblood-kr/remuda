@@ -15,7 +15,7 @@ fn entry_table(lua: &Lua, store: &VfsStore, entry: &VfsEntry) -> mlua::Result<Ta
     table.set("mtime", entry.mtime)?;
     table.set("replicas", entry.replicas)?;
     table.set("writer", entry.writer.as_str())?;
-    table.set("local", store.has_blob(&entry.sha256))?;
+    table.set("local", store.has_blob(&entry.sha256, entry.size))?;
     table.set("synced_at", store.synced_at())?;
     Ok(table)
 }

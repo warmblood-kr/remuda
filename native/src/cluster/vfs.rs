@@ -476,7 +476,18 @@ impl VfsStore {
         Ok(self.root.join("blobs").join(&sha256[..2]).join(sha256))
     }
 
-    pub fn has_blob(&self, sha256: &str) -> bool {
+    /// True when a blob file of exactly `size` bytes is here. A file of the
+    /// wrong size (a torn copy, say) counts as missing so repair fetches it
+    /// again. The content hash is checked when the blob is read or served.
+    pub fn has_blob(&self, sha256: &str, size: u64) -> bool {
+        self.blob_path(sha256)
+            .and_then(|path| Ok(fs::metadata(path)?))
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == size)
+    }
+
+    /// True when a blob file exists, whatever its size. Only for peers asking
+    /// by hash alone (`ClusterVfsBlobStat` carries no size).
+    pub fn blob_present(&self, sha256: &str) -> bool {
         self.blob_path(sha256)
             .map(|path| path.is_file())
             .unwrap_or(false)
@@ -504,7 +515,9 @@ impl VfsStore {
         }
         let sha256 = sha256_hex(bytes);
         let path = self.blob_path(&sha256)?;
-        if !path.is_file() {
+        let intact = fs::metadata(&path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == bytes.len() as u64);
+        if !intact {
             if let Some(parent) = path.parent() {
                 storage::create_private_directory(parent)?;
             }
@@ -691,7 +704,7 @@ mod tests {
         let live = index.live("notes/a.md").unwrap();
         assert_eq!(live.sha256, sha256_hex(b"world"));
         assert_eq!(store.read_blob(&live.sha256).unwrap(), b"world");
-        assert!(store.has_blob(&first.sha256));
+        assert!(store.has_blob(&first.sha256, first.size));
     }
 
     #[test]
@@ -742,9 +755,9 @@ mod tests {
             store.import_blob(&expected, b"wrong").unwrap_err().kind,
             VfsErrorKind::Corrupt
         );
-        assert!(!store.has_blob(&expected));
+        assert!(!store.has_blob(&expected, 5));
         store.import_blob(&expected, b"right").unwrap();
-        assert!(store.has_blob(&expected));
+        assert!(store.has_blob(&expected, 5));
     }
 
     #[test]
@@ -757,7 +770,7 @@ mod tests {
             store.read_blob(&hash).unwrap_err().kind,
             VfsErrorKind::Corrupt
         );
-        assert!(!store.has_blob(&hash));
+        assert!(!store.blob_present(&hash));
     }
 
     #[test]
@@ -782,15 +795,15 @@ mod tests {
         let old = store.put("a", b"old", 1, "SHA256:me").unwrap();
         let new = store.put("a", b"new", 1, "SHA256:me").unwrap();
         assert_eq!(store.collect_garbage().unwrap(), 0, "fresh blobs are kept");
-        assert!(store.has_blob(&old.sha256));
+        assert!(store.has_blob(&old.sha256, old.size));
         assert_eq!(
             store
                 .collect_garbage_older_than(std::time::Duration::ZERO)
                 .unwrap(),
             1
         );
-        assert!(!store.has_blob(&old.sha256));
-        assert!(store.has_blob(&new.sha256));
+        assert!(!store.blob_present(&old.sha256));
+        assert!(store.has_blob(&new.sha256, new.size));
     }
 
     #[test]
@@ -835,6 +848,23 @@ mod tests {
         assert_ne!(left.digest(), right.digest());
         right.merge(entry);
         assert_eq!(left.digest(), right.digest());
+    }
+
+    #[test]
+    fn a_copy_of_the_wrong_size_is_not_a_copy_and_repair_replaces_it() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        let entry = store.put("a", b"whole content", 1, "SHA256:me").unwrap();
+        assert!(store.has_blob(&entry.sha256, entry.size));
+        assert!(!store.has_blob(&entry.sha256, entry.size + 1));
+        let path = store.blob_path(&entry.sha256).unwrap();
+        fs::write(&path, b"whole").unwrap();
+        assert!(store.blob_present(&entry.sha256));
+        assert!(!store.has_blob(&entry.sha256, entry.size));
+        // The pulled copy replaces the torn file instead of being skipped.
+        store.import_blob(&entry.sha256, b"whole content").unwrap();
+        assert!(store.has_blob(&entry.sha256, entry.size));
+        assert_eq!(store.read_blob(&entry.sha256).unwrap(), b"whole content");
     }
 
     fn peer_entry(path: String, deleted: bool) -> VfsEntry {

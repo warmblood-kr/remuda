@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- VFS: a local blob file whose size differs from its index entry (a torn
+  copy, for example) now counts as missing. `stat`, `ls`, Lua `local`,
+  `--wait` and the repair pass used to treat any file with the right name as
+  a good copy, so repair never replaced it. A pulled copy now replaces such a
+  file. Peers asking by hash alone (`BlobStat`) still get existence only.
+
 - VFS: deleted files (tombstones) no longer count toward the 10,000-file cap.
   Before, deletes filled the cap, and once full a node silently stopped
   taking new paths from peers and diverged from them for good. The whole

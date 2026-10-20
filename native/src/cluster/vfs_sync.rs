@@ -102,7 +102,7 @@ pub fn serve_with(store: &VfsStore, request: &Request) -> VfsResult<Response> {
                 return Err(VfsError::new(VfsErrorKind::TooLarge, "too many hashes"));
             }
             Ok(Response::ClusterVfsBlobHave(
-                hashes.iter().map(|hash| store.has_blob(hash)).collect(),
+                hashes.iter().map(|hash| store.blob_present(hash)).collect(),
             ))
         }
         Request::ClusterVfsBlobGet { sha256, offset } => {
@@ -467,7 +467,7 @@ pub fn wait_for_replicas(entry: &VfsEntry, timeout: Duration) -> VfsResult<usize
         let mut holders = 0;
         for node in &wanted {
             let has = if *node == members.self_fp {
-                store.has_blob(&entry.sha256)
+                store.has_blob(&entry.sha256, entry.size)
             } else {
                 matches!(
                     request_peer(node, &Request::ClusterVfsBlobStat { hashes: vec![entry.sha256.clone()] }),
@@ -557,7 +557,7 @@ pub fn sync_once() -> SyncReport {
     };
     let mut attempts = 0;
     for entry in index.entries.values().filter(|entry| !entry.deleted) {
-        if store.has_blob(&entry.sha256) {
+        if store.has_blob(&entry.sha256, entry.size) {
             continue;
         }
         if !live_placement(entry, &members).contains(&members.self_fp) {

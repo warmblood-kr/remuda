@@ -362,7 +362,7 @@ fn entry_json(store: &VfsStore, entry: &VfsEntry) -> Value {
         "replicas": entry.replicas,
         "writer": entry.writer,
         "mtime": entry.mtime,
-        "local": store.has_blob(&entry.sha256),
+        "local": store.has_blob(&entry.sha256, entry.size),
     })
 }
 
@@ -394,7 +394,7 @@ fn stat(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
     println!("writer    {}", crate::cluster::node_label(&entry.writer));
     println!(
         "here      {}",
-        if store.has_blob(&entry.sha256) {
+        if store.has_blob(&entry.sha256, entry.size) {
             "yes"
         } else {
             "no"
@@ -439,7 +439,7 @@ fn list(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
             entry.version,
             &entry.sha256[..12],
             entry.path,
-            if store.has_blob(&entry.sha256) {
+            if store.has_blob(&entry.sha256, entry.size) {
                 ""
             } else {
                 "  (not here)"
