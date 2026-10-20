@@ -7,7 +7,10 @@
   taking new paths from peers and diverged from them for good. The whole
   index, files and tombstones, is now capped at 30,000 entries, and a node
   pulls up to that many from each peer. Older nodes still cap the whole index
-  at 10,000 and pull at most about 10,500 entries from a peer.
+  at 10,000 and pull at most about 10,500 entries from a peer. When the index
+  is full and a peer sends newer entries it cannot take, the daemon log now
+  says how many it skipped and that the node now differs from its peers (at
+  most once every 10 minutes).
 
 - VFS: `remuda vfs put` no longer reports success when no peer was reached.
   It still prints `Told 0 of N peers about it.`, then says the file is stored

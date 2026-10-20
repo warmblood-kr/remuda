@@ -364,15 +364,18 @@ impl VfsStore {
         Ok(())
     }
 
-    /// Merge peer entries under the index lock. Invalid entries are skipped,
-    /// and so are entries that would pass the caps. Returns the entries that
-    /// changed the index.
+    /// Merge peer entries under the index lock and return those that changed
+    /// it. Invalid entries are skipped; entries past the caps are skipped and
+    /// logged, since this node's index then differs from its peers.
     pub fn merge_entries(&self, incoming: Vec<VfsEntry>) -> VfsResult<Vec<VfsEntry>> {
-        self.merge_entries_report(incoming)
-            .map(|report| report.changed)
+        let report = self.merge_entries_report(incoming)?;
+        if report.skipped_full > 0 && full_log_due(unix_now()) {
+            eprintln!("remuda: {}", full_index_message(&report));
+        }
+        Ok(report.changed)
     }
 
-    /// `merge_entries` with the counts and the number of skipped entries.
+    /// `merge_entries` without the log line.
     pub fn merge_entries_report(&self, incoming: Vec<VfsEntry>) -> VfsResult<MergeReport> {
         let _guard = self.lock()?;
         let mut index = self.load_index()?;
@@ -623,6 +626,27 @@ impl VfsStore {
         }
         Ok(removed)
     }
+}
+
+/// A full index stays full, and every peer pull hits it again, so the line
+/// is written at most once per `FULL_LOG_INTERVAL_SECS`.
+const FULL_LOG_INTERVAL_SECS: u64 = 600;
+
+fn full_log_due(now: u64) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let last = LAST.load(Ordering::Relaxed);
+    (last == 0 || now.saturating_sub(last) >= FULL_LOG_INTERVAL_SECS)
+        && LAST
+            .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
+
+fn full_index_message(report: &MergeReport) -> String {
+    format!(
+        "vfs index is full ({} of {MAX_ENTRIES} files, {} of {MAX_INDEX_ENTRIES} entries); skipped {} newer peer entries, so this node's index now differs from its peers",
+        report.counts.live, report.counts.total, report.skipped_full
+    )
 }
 
 #[cfg(test)]
@@ -879,6 +903,41 @@ mod tests {
         newer.version = 2;
         assert_eq!(index.merge_capped(newer, &mut counts), CappedMerge::Changed);
         assert_eq!(counts.live, 0);
+    }
+
+    #[test]
+    fn a_full_index_reports_what_it_skipped() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        let files: Vec<VfsEntry> = (0..MAX_ENTRIES)
+            .map(|n| peer_entry(format!("f/{n}"), false))
+            .collect();
+        store.merge_entries(files).unwrap();
+        let mut update = peer_entry("f/1".into(), false);
+        update.version = 9;
+        let report = store
+            .merge_entries_report(vec![
+                peer_entry("late/a".into(), false),
+                update.clone(),
+                peer_entry("late/b".into(), false),
+            ])
+            .unwrap();
+        assert_eq!(report.changed, vec![update]);
+        assert_eq!(report.skipped_full, 2);
+        let message = full_index_message(&report);
+        assert!(
+            message.contains("skipped 2 newer peer entries"),
+            "{message}"
+        );
+        assert!(message.contains("10000 of 10000 files"), "{message}");
+        assert!(full_log_due(1_000_000));
+        assert!(!full_log_due(1_000_000 + FULL_LOG_INTERVAL_SECS - 1));
+        assert!(full_log_due(1_000_000 + FULL_LOG_INTERVAL_SECS));
+        // An entry this node already has is not a skip.
+        let report = store
+            .merge_entries_report(vec![peer_entry("f/2".into(), false)])
+            .unwrap();
+        assert_eq!(report.skipped_full, 0);
     }
 
     #[test]
