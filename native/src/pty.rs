@@ -676,7 +676,11 @@ fn process_reader_chunk(
     dsr_carry.extend_from_slice(&query_window[query_window.len() - carry_len..]);
     let at = match screen.lock() {
         Ok(mut parser) => {
-            let at = process_output(&mut parser, bytes, scrollback_total);
+            let size = parser.screen().size();
+            let at = guard_parser(&mut parser, "output", size, |parser| {
+                process_output(parser, bytes, scrollback_total)
+            })
+            .unwrap_or((1, 1));
             output_version.fetch_add(1, Ordering::SeqCst);
             at
         }
@@ -687,6 +691,40 @@ fn process_reader_chunk(
         answer_cursor_query(pending_cursor_replies, at);
     }
     true
+}
+
+/// Resize the parsed grid to match the pty.
+fn resize_screen(screen: &Mutex<vt100::Parser>, size: Size) -> Result<()> {
+    let mut parser = screen.lock().map_err(|_| io("screen lock poisoned"))?;
+    let (rows, cols) = (size.rows(), size.cols());
+    guard_parser(&mut parser, "resize", (rows, cols), |parser| {
+        parser.screen_mut().set_size(rows, cols);
+    });
+    Ok(())
+}
+
+/// vt100 can panic on ordinary output (a wide glyph cut by a resize). Log it and
+/// start a blank grid at `size` rather than poison the screen lock; the child
+/// repaints.
+fn guard_parser<T>(
+    parser: &mut vt100::Parser,
+    what: &str,
+    (rows, cols): (u16, u16),
+    run: impl FnOnce(&mut vt100::Parser) -> T,
+) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(parser))) {
+        Ok(value) => Some(value),
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            eprintln!("remuda pty: terminal parser panicked on {what}; screen reset: {message}");
+            *parser = vt100::Parser::new(rows, cols, SCROLLBACK_ROWS);
+            None
+        }
+    }
 }
 
 /// Process bounded chunks while a temporary nonzero scroll offset counts
@@ -1037,8 +1075,7 @@ impl AgentProcess for PtyAgent {
                 pixel_height: 0,
             })
             .map_err(io)?;
-        let mut parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
-        parser.screen_mut().set_size(size.rows(), size.cols());
+        resize_screen(&self.screen, size)?;
         self.output_version.fetch_add(1, Ordering::SeqCst);
         self.size = size;
         Ok(())
@@ -1655,6 +1692,36 @@ mod input_writer_tests {
             Err(AgentError::Io(_))
         ));
         assert!(!writer.is_busy());
+    }
+
+    /// vt100 0.16.2 panics when a wide glyph cut in half by a narrower resize
+    /// is overwritten. That panic used to poison the screen lock, so every later
+    /// call on the session failed with "screen lock poisoned".
+    #[test]
+    fn parser_panic_resets_the_grid_instead_of_poisoning_the_screen_lock() {
+        let (pending, _replies) = sync_channel(1);
+        let screen = Arc::new(Mutex::new(vt100::Parser::new(24, 80, SCROLLBACK_ROWS)));
+        let scrollback_total = AtomicUsize::new(0);
+        let output_version = AtomicU64::new(0);
+        let mut dsr_carry = Vec::new();
+        let mut feed = |bytes: &[u8]| {
+            process_reader_chunk(
+                bytes,
+                &mut dsr_carry,
+                &screen,
+                &scrollback_total,
+                &output_version,
+                &pending,
+            )
+        };
+        assert!(feed("\x1b[1;79H가".as_bytes()));
+        resize_screen(&screen, Size::for_pane(79, 24)).unwrap();
+        assert!(feed(b"\x1b[1;79Hx"), "the reader must keep running");
+        assert!(feed(b"\x1b[1;1Hafter"));
+
+        let parser = screen.lock().expect("screen lock must not be poisoned");
+        assert_eq!(parser.screen().size(), (24, 79));
+        assert!(parser.screen().contents().starts_with("after"));
     }
 
     #[test]
