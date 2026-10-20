@@ -2177,33 +2177,14 @@ impl ClusterUi {
 
     fn select_target(&mut self, target: Option<&str>) -> io::Result<()> {
         let Some(target) = target else { return Ok(()) };
+        if self.is_node_target(target) {
+            return self.select_node(target);
+        }
         let Some((node, session)) = self.split_target(target) else {
-            return Err(io::Error::other("target must be node/session"));
+            return Err(io::Error::other("target must be node or node/session"));
         };
         if !self.local_targets.iter().any(|identity| identity == node) {
-            let exact = self
-                .remote_snapshot
-                .nodes
-                .iter()
-                .find(|snapshot| snapshot.registry_key == node);
-            let remote = if let Some(exact) = exact {
-                exact
-            } else {
-                let mut matches =
-                    self.remote_snapshot.nodes.iter().filter(|snapshot| {
-                        crate::cluster::node_label(&snapshot.registry_key) == node
-                    });
-                let remote = matches
-                    .next()
-                    .ok_or_else(|| io::Error::other(format!("node {node} was not found")))?;
-                if matches.next().is_some() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("node label {node} is ambiguous; use the fingerprint"),
-                    ));
-                }
-                remote
-            };
+            let remote = self.resolve_remote_node(node)?;
             let session = remote
                 .sessions
                 .iter()
@@ -2230,6 +2211,80 @@ impl ClusterUi {
             })?;
         self.active = self.selected;
         Ok(())
+    }
+
+    /// A whole known identity, or a word without '/', names a node rather
+    /// than a session. Fingerprints may contain '/', so check them first.
+    fn is_node_target(&self, target: &str) -> bool {
+        !target.contains('/')
+            || self.local_targets.iter().any(|identity| identity == target)
+            || self
+                .remote_snapshot
+                .nodes
+                .iter()
+                .any(|node| node.registry_key == target)
+    }
+
+    fn resolve_remote_node(&self, node: &str) -> io::Result<&RemoteNodeSnapshot> {
+        if let Some(exact) = self
+            .remote_snapshot
+            .nodes
+            .iter()
+            .find(|snapshot| snapshot.registry_key == node)
+        {
+            return Ok(exact);
+        }
+        let mut matches = self
+            .remote_snapshot
+            .nodes
+            .iter()
+            .filter(|snapshot| crate::cluster::node_label(&snapshot.registry_key) == node);
+        let remote = matches
+            .next()
+            .ok_or_else(|| io::Error::other(format!("node {node} was not found")))?;
+        if matches.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("node label {node} is ambiguous; use the fingerprint"),
+            ));
+        }
+        Ok(remote)
+    }
+
+    /// `cluster remote NODE` is that node's session picker, as plain `remuda`
+    /// is locally: its group is the one expanded and its first session is
+    /// highlighted, but nothing is opened until Enter.
+    fn select_node(&mut self, node: &str) -> io::Result<()> {
+        if self.local_targets.iter().any(|identity| identity == node) {
+            self.expanded = true;
+            self.remote_selected = None;
+            return Ok(());
+        }
+        let remote = self.resolve_remote_node(node)?;
+        let registry_key = remote.registry_key.clone();
+        let first = remote
+            .sessions
+            .iter()
+            .find(|session| session.alive)
+            .or_else(|| remote.sessions.first())
+            .map(|session| RemoteSelection::Session {
+                node: registry_key.clone(),
+                name: session.name.clone(),
+                instance_id: session.instance_id.clone(),
+            });
+        self.expanded = false;
+        self.remote_expanded.insert(registry_key.clone());
+        self.remote_selected = Some(first.unwrap_or(RemoteSelection::Node(registry_key)));
+        Ok(())
+    }
+
+    /// True once a node target can be shown: the node is known and its first
+    /// session list has arrived (or it has none).
+    fn node_target_ready(&self, target: &str) -> bool {
+        self.local_targets.iter().any(|identity| identity == target)
+            || self
+                .resolve_remote_node(target)
+                .is_ok_and(|node| !node.sessions.is_empty() || node.last_sync_age.is_some())
     }
 
     fn split_target<'a>(&self, target: &'a str) -> Option<(&'a str, &'a str)> {
@@ -3129,6 +3184,16 @@ fn select_target_with_remote_wait(
     timeout: Duration,
 ) -> io::Result<()> {
     let Some(target) = target else { return Ok(()) };
+    if ui.is_node_target(target) {
+        let deadline = Instant::now() + timeout;
+        while !ui.node_target_ready(target) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            ui.remote_synced(source);
+        }
+        if ui.is_node_target(target) {
+            return ui.select_target(Some(target));
+        }
+    }
     let Some((node, _)) = ui.split_target(target) else {
         return ui.select_target(Some(target));
     };
@@ -5761,6 +5826,129 @@ mod tests {
         assert!(matches!(
             ui.remote_active,
             Some(RemoteSelection::Session { .. })
+        ));
+    }
+
+    #[test]
+    fn bare_remote_node_target_opens_that_nodes_picker_without_attaching() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        );
+        let mut ended = snapshot.nodes[0].sessions[0].clone();
+        ended.name = "old".into();
+        ended.instance_id = "old-instance".into();
+        ended.alive = false;
+        snapshot.nodes[0].sessions.insert(0, ended);
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        ui.remote_input_enabled = true;
+
+        ui.select_target(Some("fp-laptop")).unwrap();
+        super::focus_initial_remote_composer(&mut ui, clock.now());
+
+        assert_eq!(
+            ui.remote_selected,
+            Some(RemoteSelection::Session {
+                node: "fp-laptop".into(),
+                name: "build".into(),
+                instance_id: "remote-instance".into(),
+            })
+        );
+        assert!(ui.remote_expanded.contains("fp-laptop"));
+        assert!(!ui.expanded, "only the target node's group is expanded");
+        assert_eq!(ui.remote_active, None, "a node target does not attach");
+        assert!(!ui.composer_focused);
+    }
+
+    #[test]
+    fn bare_remote_node_without_sessions_selects_the_node_row() {
+        let mut ui = make_ui("studio", Vec::new(), Duration::ZERO);
+        let mut snapshot = remote_snapshot(RemoteState::Reachable, Duration::ZERO, None);
+        snapshot.nodes[0].sessions.clear();
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+
+        ui.select_target(Some("fp-laptop")).unwrap();
+
+        assert_eq!(
+            ui.remote_selected,
+            Some(RemoteSelection::Node("fp-laptop".into()))
+        );
+    }
+
+    #[test]
+    fn fingerprint_with_slash_is_a_node_target_not_node_slash_session() {
+        let mut ui = make_ui("studio", Vec::new(), Duration::ZERO);
+        let mut snapshot = remote_snapshot(RemoteState::Reachable, Duration::ZERO, None);
+        snapshot.nodes[0].registry_key = "SHA256:ab/cd".into();
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+
+        ui.select_target(Some("SHA256:ab/cd")).unwrap();
+        assert!(matches!(
+            &ui.remote_selected,
+            Some(RemoteSelection::Session { node, name, .. }) if node == "SHA256:ab/cd" && name == "build"
+        ));
+        ui.select_target(Some("SHA256:ab/cd/build")).unwrap();
+        assert!(ui.remote_active.is_some(), "node/session still attaches");
+    }
+
+    #[test]
+    fn bare_local_node_target_keeps_the_local_picker() {
+        let mut ui = make_ui("studio", sessions(), Duration::ZERO);
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            None,
+        ))));
+
+        ui.select_target(Some("studio")).unwrap();
+
+        assert!(ui.expanded);
+        assert_eq!(ui.remote_selected, None);
+        assert_eq!(ui.remote_active, None);
+    }
+
+    #[test]
+    fn unknown_bare_node_target_is_refused() {
+        let mut ui = make_ui("studio", Vec::new(), Duration::ZERO);
+        let error = select_target_with_remote_wait(
+            &mut ui,
+            Some("nowhere"),
+            &FakeRemoteSource(Mutex::new(RemoteSnapshot::default())),
+            Duration::from_millis(60),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("node nowhere was not found"));
+    }
+
+    #[test]
+    fn bare_remote_node_target_waits_for_its_first_session_list() {
+        let source = std::sync::Arc::new(FakeRemoteSource(Mutex::new(RemoteSnapshot::default())));
+        let producer = std::sync::Arc::clone(&source);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let mut listing = remote_snapshot(RemoteState::Reachable, Duration::ZERO, None);
+            listing.nodes[0].last_sync_age = None;
+            let sessions = std::mem::take(&mut listing.nodes[0].sessions);
+            producer.replace(listing.clone());
+            std::thread::sleep(Duration::from_millis(40));
+            listing.nodes[0].sessions = sessions;
+            producer.replace(listing);
+        });
+        let mut ui = make_ui("studio", Vec::new(), Duration::ZERO);
+        ui.remote_synced(source.as_ref());
+        select_target_with_remote_wait(
+            &mut ui,
+            Some("fp-laptop"),
+            source.as_ref(),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(matches!(
+            &ui.remote_selected,
+            Some(RemoteSelection::Session { name, .. }) if name == "build"
         ));
     }
 

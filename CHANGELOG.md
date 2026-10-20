@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Cluster: `remuda cluster remote NODE` now opens that node's session picker,
+  as plain `remuda` does on the node itself: the node's group is expanded and
+  its first live session is highlighted; Enter opens it. Before, a target
+  without `/session` failed with "target must be node/session".
+  `NODE/SESSION` still opens the session directly. A full fingerprint that
+  contains `/` is read as a node.
+
 - Cluster TUI: a slow or unreachable peer no longer freezes the cursor.
   Remote Input, InputLine, ResizeSession and Close now run on a background
   worker for each node, and the UI applies each reply when it arrives. Before,

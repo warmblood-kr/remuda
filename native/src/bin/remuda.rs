@@ -462,7 +462,7 @@ remuda — a pty manager you can attach to
   remuda cluster join             join another node's cluster
   remuda cluster nodes            list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
-  remuda cluster remote [node/session] open the read-only cluster tree
+  remuda cluster remote [node[/session]] open a node's sessions, or one session
   remuda cluster listen [--bind ADDR] [--allow-public] configure the daemon listener
                                   --foreground holds the listener in this terminal
                                   [::] may accept IPv4 too on dual-stack systems
@@ -551,7 +551,7 @@ remuda — terminal orchestration for coding agents
   remuda cluster join             join another node's cluster
   remuda cluster nodes           list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
-  remuda cluster remote [node/session] open the read-only cluster tree
+  remuda cluster remote [node[/session]] open a node's sessions, or one session
   remuda cluster listen [--bind ADDR] [--allow-public] configure the daemon listener
                                   --foreground holds the listener in this terminal
                                   [::] may accept IPv4 too on dual-stack systems
@@ -810,7 +810,7 @@ fn cluster_cli_spec() -> remuda_native::cli_parse::Spec {
                 vec![arg("TARGET", "Node name or fingerprint", false, true)],
                 vec![option("yes", None, "Confirm without prompting", false)], "remuda cluster revoke TARGET [--yes]"),
             verb("remote", "Attach to a remote session, or show the remote session picker. Example: remuda cluster remote node/session",
-                vec![arg("TARGET", "Optional NODE/SESSION target", false, false)], vec![], "remuda cluster remote [NODE/SESSION]"),
+                vec![arg("TARGET", "Optional NODE (its session picker) or NODE/SESSION target", false, false)], vec![], "remuda cluster remote [NODE[/SESSION]]"),
             verb("listen", "Manage the cluster listener. Example: remuda cluster listen --bind 127.0.0.1",
                 vec![], vec![
                     option("off", None, "Stop the cluster listener", false),
