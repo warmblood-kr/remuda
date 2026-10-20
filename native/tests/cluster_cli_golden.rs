@@ -942,7 +942,16 @@ fn fresh_state_cli_join_creates_identity_at_the_command_callsite() {
         !identity_path.exists(),
         "fresh joiner unexpectedly has an identity"
     );
-    let joined = joiner.run(&["cluster", "join", &fingerprint, &join_line]);
+    // Fresh state has no listener config, so join would bind the default
+    // cluster port (7441) and collide with a live daemon on the host.
+    let joined = joiner.run(&[
+        "cluster",
+        "join",
+        &fingerprint,
+        &join_line,
+        "--bind",
+        "127.0.0.1:0",
+    ]);
 
     assert!(
         joined.status.success(),
