@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Session hosts (experimental): a host now refuses input, resize, close and
+  stop from a daemon whose inventory writer epoch is older than one it has
+  seen (`writer-fence-v1`, error `superseded_writer`). Before, an older daemon
+  that passed its store check just before a newer daemon claimed could still
+  act on the host. The wire change is additive: older hosts get the plain
+  `Acquire`, and older daemons are still accepted. CI now hands a hosted
+  session between the base build and this build in both directions.
+
 - Cluster TUI: a slow or unreachable peer no longer freezes the cursor.
   Remote Input, InputLine, ResizeSession and Close now run on a background
   worker for each node, and the UI applies each reply when it arrives. Before,
