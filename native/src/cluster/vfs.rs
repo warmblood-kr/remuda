@@ -14,7 +14,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+/// Live paths (files) the store holds. Tombstones do not count.
 pub const MAX_ENTRIES: usize = 10_000;
+/// Index entries, live and tombstone. Tombstones are never removed yet, so
+/// they get their own room past `MAX_ENTRIES` instead of taking file slots.
+pub const MAX_INDEX_ENTRIES: usize = 30_000;
 pub const DEFAULT_CLUSTER_NAME: &str = "default";
 const INDEX_FORMAT: u32 = 1;
 pub const GC_GRACE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
@@ -155,6 +159,42 @@ impl VfsIndex {
         }
     }
 
+    pub fn counts(&self) -> IndexCounts {
+        let live = self.entries.values().filter(|entry| !entry.deleted).count();
+        IndexCounts {
+            live,
+            total: self.entries.len(),
+        }
+    }
+
+    /// Merge one entry within the caps, keeping `counts` current. A tombstone
+    /// replacing a live entry, or any entry replacing one of its own kind, is
+    /// always accepted: it adds nothing.
+    pub fn merge_capped(&mut self, incoming: VfsEntry, counts: &mut IndexCounts) -> CappedMerge {
+        let current = self.entries.get(&incoming.path);
+        if current.is_some_and(|current| !incoming.supersedes(current)) {
+            return CappedMerge::Unchanged;
+        }
+        let was_live = current.map(|current| !current.deleted);
+        let is_new = was_live.is_none();
+        let becomes_live = !incoming.deleted && was_live != Some(true);
+        if (becomes_live && counts.live >= MAX_ENTRIES)
+            || (is_new && counts.total >= MAX_INDEX_ENTRIES)
+        {
+            return CappedMerge::Full;
+        }
+        if becomes_live {
+            counts.live += 1;
+        } else if incoming.deleted && was_live == Some(true) {
+            counts.live -= 1;
+        }
+        if is_new {
+            counts.total += 1;
+        }
+        self.entries.insert(incoming.path.clone(), incoming);
+        CappedMerge::Changed
+    }
+
     /// Live entries whose path starts with `prefix`.
     pub fn list(&self, prefix: &str) -> Vec<&VfsEntry> {
         self.entries
@@ -164,6 +204,30 @@ impl VfsIndex {
             .filter(|entry| !entry.deleted)
             .collect()
     }
+}
+
+/// How many live paths and index entries an index holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IndexCounts {
+    pub live: usize,
+    pub total: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CappedMerge {
+    Changed,
+    Unchanged,
+    /// Refused: it would pass `MAX_ENTRIES` or `MAX_INDEX_ENTRIES`.
+    Full,
+}
+
+/// What a peer merge did.
+#[derive(Debug, Default)]
+pub struct MergeReport {
+    pub changed: Vec<VfsEntry>,
+    /// Newer entries refused because the index is full.
+    pub skipped_full: usize,
+    pub counts: IndexCounts,
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -300,28 +364,36 @@ impl VfsStore {
         Ok(())
     }
 
-    /// Merge peer entries under the index lock. Invalid entries are skipped;
-    /// a merge that would pass `MAX_ENTRIES` stops adding new paths. Returns
-    /// the entries that changed the index.
+    /// Merge peer entries under the index lock. Invalid entries are skipped,
+    /// and so are entries that would pass the caps. Returns the entries that
+    /// changed the index.
     pub fn merge_entries(&self, incoming: Vec<VfsEntry>) -> VfsResult<Vec<VfsEntry>> {
+        self.merge_entries_report(incoming)
+            .map(|report| report.changed)
+    }
+
+    /// `merge_entries` with the counts and the number of skipped entries.
+    pub fn merge_entries_report(&self, incoming: Vec<VfsEntry>) -> VfsResult<MergeReport> {
         let _guard = self.lock()?;
         let mut index = self.load_index()?;
-        let mut changed = Vec::new();
+        let mut report = MergeReport {
+            counts: index.counts(),
+            ..MergeReport::default()
+        };
         for entry in incoming {
             if entry.validate().is_err() {
                 continue;
             }
-            if !index.entries.contains_key(&entry.path) && index.entries.len() >= MAX_ENTRIES {
-                continue;
-            }
-            if index.merge(entry.clone()) {
-                changed.push(entry);
+            match index.merge_capped(entry.clone(), &mut report.counts) {
+                CappedMerge::Changed => report.changed.push(entry),
+                CappedMerge::Unchanged => {}
+                CappedMerge::Full => report.skipped_full += 1,
             }
         }
-        if !changed.is_empty() {
+        if !report.changed.is_empty() {
             self.save_index(&index)?;
         }
-        Ok(changed)
+        Ok(report)
     }
 
     /// Record that a peer index was merged at `now`.
@@ -378,13 +450,19 @@ impl VfsStore {
         let _guard = self.lock()?;
         let mut index = self.load_index()?;
         let entry = make(index.next_version());
-        if !index.entries.contains_key(&entry.path) && index.entries.len() >= MAX_ENTRIES {
+        let mut counts = index.counts();
+        if index.merge_capped(entry.clone(), &mut counts) == CappedMerge::Full {
             return Err(VfsError::new(
                 VfsErrorKind::TooLarge,
-                format!("the store already holds {MAX_ENTRIES} paths"),
+                if counts.live >= MAX_ENTRIES {
+                    format!("the store already holds {MAX_ENTRIES} files")
+                } else {
+                    format!(
+                        "the store index already holds {MAX_INDEX_ENTRIES} entries, most of them deleted files"
+                    )
+                },
             ));
         }
-        index.merge(entry.clone());
         self.save_index(&index)?;
         Ok(entry)
     }
@@ -733,6 +811,74 @@ mod tests {
         assert_ne!(left.digest(), right.digest());
         right.merge(entry);
         assert_eq!(left.digest(), right.digest());
+    }
+
+    fn peer_entry(path: String, deleted: bool) -> VfsEntry {
+        VfsEntry {
+            path,
+            sha256: "a".repeat(64),
+            size: 1,
+            replicas: 1,
+            version: 1,
+            writer: "SHA256:peer".into(),
+            deleted,
+            mtime: 0,
+        }
+    }
+
+    #[test]
+    fn tombstones_do_not_take_file_slots() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        let files: Vec<VfsEntry> = (0..MAX_ENTRIES)
+            .map(|n| peer_entry(format!("f/{n}"), false))
+            .collect();
+        assert_eq!(store.merge_entries(files).unwrap().len(), MAX_ENTRIES);
+        assert_eq!(
+            store.put("new", b"x", 1, "SHA256:me").unwrap_err().kind,
+            VfsErrorKind::TooLarge
+        );
+        // A peer's tombstone for a path we never saw still merges.
+        let tomb = peer_entry("gone/elsewhere".into(), true);
+        assert_eq!(store.merge_entries(vec![tomb]).unwrap().len(), 1);
+        // Deleting a file frees its file slot even though the tombstone stays.
+        store.delete("f/0", "SHA256:me").unwrap();
+        store.put("new", b"x", 1, "SHA256:me").unwrap();
+        let counts = store.load_index().unwrap().counts();
+        assert_eq!(
+            counts,
+            IndexCounts {
+                live: MAX_ENTRIES,
+                total: MAX_ENTRIES + 2
+            }
+        );
+        // Bringing back a deleted path needs a file slot again.
+        assert_eq!(
+            store.put("f/0", b"y", 1, "SHA256:me").unwrap_err().kind,
+            VfsErrorKind::TooLarge
+        );
+    }
+
+    #[test]
+    fn the_whole_index_is_still_bounded() {
+        let mut index = VfsIndex::default();
+        let mut counts = IndexCounts {
+            live: 0,
+            total: MAX_INDEX_ENTRIES,
+        };
+        assert_eq!(
+            index.merge_capped(peer_entry("t".into(), true), &mut counts),
+            CappedMerge::Full
+        );
+        // Replacing an existing entry adds nothing, so it is always allowed.
+        index
+            .entries
+            .insert("old".into(), peer_entry("old".into(), false));
+        counts.live = 1;
+        let mut newer = peer_entry("old".into(), true);
+        newer.version = 2;
+        assert_eq!(index.merge_capped(newer, &mut counts), CappedMerge::Changed);
+        assert_eq!(counts.live, 0);
     }
 
     #[test]

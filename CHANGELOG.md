@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- VFS: deleted files (tombstones) no longer count toward the 10,000-file cap.
+  Before, deletes filled the cap, and once full a node silently stopped
+  taking new paths from peers and diverged from them for good. The whole
+  index, files and tombstones, is now capped at 30,000 entries, and a node
+  pulls up to that many from each peer. Older nodes still cap the whole index
+  at 10,000 and pull at most about 10,500 entries from a peer.
+
 - VFS: `remuda vfs put` no longer reports success when no peer was reached.
   It still prints `Told 0 of N peers about it.`, then says the file is stored
   on this node only and exits 75 (EX_TEMPFAIL) so a script can retry. A

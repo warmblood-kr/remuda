@@ -48,7 +48,10 @@ Index entry (one per path, kept on every node):
 Merge rule: last writer wins. The higher `(version, writer)` pair wins. A write
 uses `version = max(local index versions) + 1`, a Lamport clock. Deleting
 writes a tombstone (`deleted: true`) with the same rule, so a delete cannot be
-undone by an older replica. At most 10,000 entries.
+undone by an older replica. At most 10,000 live files. Tombstones are not
+removed yet, so they do not count toward that cap; the whole index, files and
+tombstones together, is capped at 30,000 entries. A delete always fits, since
+it replaces a live entry.
 
 ## Replica placement
 

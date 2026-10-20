@@ -342,7 +342,7 @@ fn pull_index(store: &VfsStore, peer_fp: &str) -> Result<usize, String> {
         .digest();
     let mut offset = 0;
     let mut collected = Vec::new();
-    for _ in 0..(super::vfs::MAX_ENTRIES / INDEX_PAGE_ENTRIES + 2) {
+    for _ in 0..(super::vfs::MAX_INDEX_ENTRIES / INDEX_PAGE_ENTRIES + 2) {
         let response = request_peer(
             peer_fp,
             &Request::ClusterVfsIndexSync {
