@@ -78,7 +78,9 @@ limit.
 
 Content moves by pull only. A request is limited to about 64 KB, so a push
 would need many small requests. A response may be 4 MiB, so a chunked pull is
-cheap. The receiver hashes the assembled blob and drops it on a mismatch.
+cheap. The sender hashes its copy before it serves the first chunk and drops
+a damaged copy; the receiver hashes the assembled blob and drops it on a
+mismatch.
 
 ## Operations
 

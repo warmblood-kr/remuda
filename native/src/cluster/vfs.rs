@@ -563,8 +563,43 @@ impl VfsStore {
         Ok(bytes)
     }
 
+    /// Hash a local blob without loading it whole. A damaged copy is removed
+    /// (so repair fetches it again) and reported as `Corrupt`.
+    pub fn verify_blob(&self, sha256: &str) -> VfsResult<()> {
+        let path = self.blob_path(sha256)?;
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(VfsError::new(
+                    VfsErrorKind::NotLocal,
+                    format!("blob {sha256} is not on this node"),
+                ))
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        drop(file);
+        if hex(&hasher.finalize()) != sha256 {
+            let _ = fs::remove_file(&path);
+            return Err(VfsError::new(
+                VfsErrorKind::Corrupt,
+                format!("local copy of {sha256} was damaged and has been removed"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Read up to `max` bytes of a local blob from `offset` (no hash check:
-    /// the receiver verifies the whole blob).
+    /// callers verify, see `verify_blob`, and the receiver checks the whole
+    /// blob).
     pub fn read_blob_range(&self, sha256: &str, offset: u64, max: usize) -> VfsResult<Vec<u8>> {
         use std::io::{Seek, SeekFrom};
         let path = self.blob_path(sha256)?;
@@ -771,6 +806,25 @@ mod tests {
             VfsErrorKind::Corrupt
         );
         assert!(!store.blob_present(&hash));
+    }
+
+    #[test]
+    fn verify_blob_streams_the_hash_and_drops_a_damaged_copy() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        let data: Vec<u8> = (0..200_000u32).map(|n| (n % 251) as u8).collect();
+        let hash = store.put_blob(&data).unwrap();
+        store.verify_blob(&hash).unwrap();
+        fs::write(store.blob_path(&hash).unwrap(), &data[1..]).unwrap();
+        assert_eq!(
+            store.verify_blob(&hash).unwrap_err().kind,
+            VfsErrorKind::Corrupt
+        );
+        assert!(!store.blob_present(&hash));
+        assert_eq!(
+            store.verify_blob(&hash).unwrap_err().kind,
+            VfsErrorKind::NotLocal
+        );
     }
 
     #[test]

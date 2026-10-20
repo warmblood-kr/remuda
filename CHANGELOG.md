@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- VFS: a node now checks a blob's hash before it serves the first chunk to a
+  peer. A damaged copy is removed and refused (`corrupt`), so the peer tries
+  another holder and this node's repair pass fetches a good copy. Before,
+  the damage showed only as a hash mismatch at the end of the peer's pull.
+
 - VFS: a local blob file whose size differs from its index entry (a torn
   copy, for example) now counts as missing. `stat`, `ls`, Lua `local`,
   `--wait` and the repair pass used to treat any file with the right name as
