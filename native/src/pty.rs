@@ -703,10 +703,9 @@ fn resize_screen(screen: &Mutex<vt100::Parser>, size: Size) -> Result<()> {
     Ok(())
 }
 
-/// vt100 0.16.2 can panic on ordinary output, for example when a wide glyph
-/// cut in half by a narrower resize is overwritten. A panic here would poison
-/// the screen lock and fail every later call with "screen lock poisoned".
-/// Instead, log it and start a blank grid at `size`; the child repaints.
+/// vt100 can panic on ordinary output (a wide glyph cut by a resize). Log it and
+/// start a blank grid at `size` rather than poison the screen lock; the child
+/// repaints.
 fn guard_parser<T>(
     parser: &mut vt100::Parser,
     what: &str,
