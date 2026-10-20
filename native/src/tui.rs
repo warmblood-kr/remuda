@@ -80,6 +80,12 @@ pub enum Action {
     Copy(String),
     CopySelection(String),
     Paste,
+    /// One composed line (ending in CR) for the session's input queue.
+    SendLine {
+        name: String,
+        instance_id: String,
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -151,6 +157,14 @@ pub struct Ui {
     session_rows: usize,
     /// Visible preview rows, refreshed from the terminal dimensions each frame.
     preview_rows: u16,
+    /// Line composer (`m`): keys edit a local draft, never the pty, and Enter
+    /// sends one InputLine batch written under the session input lock, so
+    /// injected text (a Butler notice) cannot land inside a half-typed line.
+    composer: crate::cluster_tui::composer::LineComposer,
+    /// `(name, instance_id)` the composer writes to; `None` = raw keys.
+    compose_target: Option<(String, String)>,
+    /// Unsent drafts of other sessions, kept when the composer moves away.
+    compose_drafts: HashMap<String, String>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -204,6 +218,79 @@ impl Ui {
             sessions_text: Vec::new(),
             session_rows: 1,
             preview_rows: 1,
+            composer: Default::default(),
+            compose_target: None,
+            compose_drafts: HashMap::new(),
+        }
+    }
+
+    /// The session the composer is open on, if it has focus.
+    pub fn composing(&self) -> Option<&str> {
+        match (&self.compose_target, self.focus) {
+            (Some((name, _)), Focus::Session) => Some(name),
+            _ => None,
+        }
+    }
+
+    pub fn compose_text(&self) -> &str {
+        self.composer.text()
+    }
+
+    /// Insert pasted text into the open composer; false when it is not open.
+    pub fn compose_paste(&mut self, text: &str) -> bool {
+        if self.composing().is_none() {
+            return false;
+        }
+        self.composer.insert_text(text);
+        true
+    }
+
+    fn open_composer(&mut self) -> Action {
+        let Some(session) = self.selected() else {
+            return Action::Nothing;
+        };
+        if !session.alive {
+            self.notice = Some(format!("{} has exited; nothing to send to", session.name));
+            return Action::Nothing;
+        }
+        let Some(instance_id) = session.instance_id.clone() else {
+            self.notice = Some(format!("{}: session identity is missing", session.name));
+            return Action::Nothing;
+        };
+        let name = session.name.clone();
+        if let Some((previous, _)) = self.compose_target.take() {
+            if previous != name && !self.composer.text().is_empty() {
+                self.compose_drafts
+                    .insert(previous, self.composer.text().to_owned());
+                self.composer.clear();
+            }
+        }
+        if let Some(draft) = self.compose_drafts.remove(&name) {
+            self.composer.restore_draft(&draft);
+        }
+        self.composer.set_history_target(&name);
+        self.compose_target = Some((name, instance_id));
+        self.notice = None;
+        self.focus = Focus::Session;
+        Action::Nothing
+    }
+
+    fn compose_key(&mut self, key: KeyEvent) -> Action {
+        use crate::cluster_tui::composer::ComposerAction;
+        let Some((name, instance_id)) = self.compose_target.clone() else {
+            return Action::Nothing;
+        };
+        match self.composer.handle_key(key, &self.keymap) {
+            ComposerAction::Detach => {
+                self.focus = Focus::List;
+                Action::Nothing
+            }
+            ComposerAction::Submit(bytes) => Action::SendLine {
+                name,
+                instance_id,
+                bytes,
+            },
+            ComposerAction::None | ComposerAction::Cleared => Action::Nothing,
         }
     }
 
@@ -248,7 +335,9 @@ impl Ui {
         if self.focus == Focus::List && self.list_first_visible.is_some() {
             self.list_first_visible = Some(list_viewport(self, self.preview_rows));
         }
-        let action = if self.focus == Focus::Session {
+        let action = if self.focus == Focus::Session && self.compose_target.is_some() {
+            self.compose_key(key)
+        } else if self.focus == Focus::Session {
             self.session_key(key)
         } else {
             match self.mode.clone() {
@@ -568,6 +657,16 @@ impl Ui {
         }
     }
 
+    /// List commands bound in Lua rather than hard-coded in `browse_key`.
+    fn list_binding(&mut self, key: KeyEvent) -> Option<Action> {
+        if self.toggle_list_key(key) {
+            return Some(Action::Nothing);
+        }
+        (self.keymap.resolve(crate::keybindings::LIST_CONTEXT, key)
+            == Some(crate::keybindings::COMPOSE))
+        .then(|| self.open_composer())
+    }
+
     fn toggle_list_key(&mut self, key: KeyEvent) -> bool {
         if self.keymap.resolve(crate::keybindings::LIST_CONTEXT, key)
             != Some(crate::keybindings::TOGGLE_LIST)
@@ -628,8 +727,8 @@ impl Ui {
             }
             return Action::Nothing;
         }
-        if self.toggle_list_key(key) {
-            return Action::Nothing;
+        if let Some(action) = self.list_binding(key) {
+            return action;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -984,6 +1083,13 @@ impl Ui {
         let name = session.name.clone();
         self.notice = None;
         self.focus = Focus::Session;
+        if let Some((previous, _)) = self.compose_target.take() {
+            if !self.composer.text().is_empty() {
+                self.compose_drafts
+                    .insert(previous, self.composer.text().to_owned());
+                self.composer.clear();
+            }
+        }
         Action::Focus(name)
     }
 
@@ -2290,7 +2396,7 @@ pub fn render_styled(
     // happen BEFORE the caret move below, or `\x1b[J` erases from the caret's
     // new position instead of the footer's.
     out.push_str("\x1b[J");
-    match caret {
+    match caret.filter(|_| ui.composing().is_none()) {
         Some((row, col)) => out.push_str(&format!("\x1b[{row};{col}H\x1b[?25h")),
         None => out.push_str("\x1b[?25l"),
     }
@@ -2447,6 +2553,17 @@ fn footer(ui: &Ui, server: &str, cut: bool, preview_w: u16, cols: u16) -> String
     let status = match &ui.mode {
         Mode::Prompt(buffer) => format!("start: {buffer}▏   ⏎ run · esc cancel"),
         Mode::Confirm(name) => format!("kill {name}? it is running — y / n"),
+        Mode::Browse if let Some(name) = ui.composing() => {
+            let prefix = format!("✎ {name} › ");
+            let width = (cols as usize).saturating_sub(visible_width(&prefix));
+            let line = ui
+                .composer
+                .display_lines("", width, 1)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            return format!("{prefix}{line}");
+        }
         // Focus is named in words as well as drawn, because the one thing a
         // person must never wonder is where their next keystroke lands.
         Mode::Browse if ui.focus == Focus::Session => format!(
@@ -2884,6 +3001,10 @@ pub fn run_port<P: SessionPort + ?Sized>(
     // Its `Drop` is the detach, so letting it fall out of scope is the release.
     let mut held: Option<(String, P::Keys)> = None;
     let mut paste_capture = BracketedPasteCapture::new(std::io::stdout());
+    // Composed lines wait here until the daemon acknowledges them. Each has a
+    // client id and sequence, so a retry is deduplicated, never written twice.
+    let mut line_sender = crate::cluster_tui::sender::InputSender::random()?;
+    let mut line_queue = crate::cluster_tui::queue::InputQueue::default();
     // What the window last reported showing — refreshed only on a
     // non-skip_list wake, and reused as-is on a Type-forced one.
     let mut shown: Option<ShownTarget> = None;
@@ -2917,9 +3038,18 @@ pub fn run_port<P: SessionPort + ?Sized>(
                 skip_list,
                 selection_moved,
             )?;
-            paste_capture.set(held.is_some())?;
+            // A composer needs whole pastes too: a key-by-key paste would
+            // turn its first newline into Enter and send half of it.
+            paste_capture.set(held.is_some() || ui.composing().is_some())?;
             skip_list = false;
             selection_moved = false;
+        }
+
+        if let Some(event) = send_due_line(&mut line_sender, &mut line_queue, path) {
+            if let Some(notice) = line_notice(event) {
+                ui.notice = Some(notice);
+            }
+            force_refresh = true;
         }
 
         if !crossterm::event::poll(tick)? {
@@ -2937,6 +3067,10 @@ pub fn run_port<P: SessionPort + ?Sized>(
                 action
             }
             Event::Paste(text) => {
+                if ui.compose_paste(&text) {
+                    force_refresh = true;
+                    continue;
+                }
                 // Crossterm emits this only after finding the matching end
                 // marker; it buffers an unterminated host paste internally.
                 let Some((name, _)) = &held else { continue };
@@ -2998,11 +3132,52 @@ pub fn run_port<P: SessionPort + ?Sized>(
             Action::Paste => {
                 paste(path, &mut ui, &mut held);
             }
+            Action::SendLine {
+                name,
+                instance_id,
+                bytes,
+            } => {
+                let target = crate::cluster_tui::queue::InputTarget {
+                    remote_node: None,
+                    name: name.clone(),
+                    instance_id,
+                };
+                match line_sender.enqueue_line(&mut line_queue, target, bytes, Instant::now()) {
+                    Ok(_) => ui.notice = Some(format!("sending line to {name}")),
+                    Err(error) => ui.notice = Some(format!("{name}: {error}")),
+                }
+            }
         }
         // Not `painted.clear()`: the frame-vs-`painted` compare in `refresh`
         // already skips the write when a key changed nothing visible — see
         // steps/026. Only the immediate re-check is forced here.
         force_refresh = true;
+    }
+}
+
+fn send_due_line<P: SessionPort + ?Sized>(
+    sender: &mut crate::cluster_tui::sender::InputSender,
+    queue: &mut crate::cluster_tui::queue::InputQueue,
+    path: &P,
+) -> Option<crate::cluster_tui::queue::QueueEvent> {
+    sender.attempt_due(queue, Instant::now(), |request| path.request(request))
+}
+
+/// What the footer says about a composed line. A retry stays quiet; an
+/// uncertain line is reported, never sent again under a new id.
+fn line_notice(event: crate::cluster_tui::queue::QueueEvent) -> Option<String> {
+    use crate::cluster_tui::queue::QueueEvent;
+    match event {
+        QueueEvent::Sent { .. } => Some("line sent".into()),
+        QueueEvent::RetryScheduled { .. } => None,
+        QueueEvent::Uncertain { reason, .. } => Some(format!(
+            "delivery uncertain; check the session before resending: {reason}"
+        )),
+        QueueEvent::Dropped { reason, .. }
+        | QueueEvent::Failed { reason, .. }
+        | QueueEvent::UnsupportedRequest { reason, .. }
+        | QueueEvent::PasteAborted { reason, .. } => Some(format!("line not sent: {reason}")),
+        other => Some(format!("line not sent: {other:?}")),
     }
 }
 
@@ -3761,5 +3936,166 @@ mod keybindings_adopter_tests {
         assert_eq!(ui.keymap.help(crate::keybindings::LIST_CONTEXT), "M-l list");
         ui.keymap.diagnostic = Some("bad init.lua".into());
         assert!(footer(&ui, "test", false, 80, 180).contains("bad init.lua"));
+    }
+}
+
+#[cfg(test)]
+mod composer_tests {
+    use super::*;
+
+    fn summary(name: &str, alive: bool) -> SessionSummary {
+        SessionSummary {
+            id: format!("id-{name}"),
+            name: name.into(),
+            instance_id: Some(format!("instance-{name}")),
+            output_version: Some(0),
+            alive,
+            idle: Duration::ZERO,
+            output_idle: Some(Duration::ZERO),
+            size: Size::new(80, 24),
+            attached: false,
+            human_idle: None,
+            mouse_tracking: false,
+        }
+    }
+
+    fn ui() -> Ui {
+        let mut ui = Ui::new(
+            vec![
+                summary("agent", true),
+                summary("shell", true),
+                summary("gone", false),
+            ],
+            "sh",
+            None,
+        );
+        ui.set_keymap(crate::keybindings::test_snapshot(""));
+        ui
+    }
+
+    fn press(ui: &mut Ui, code: KeyCode) -> Action {
+        ui.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn type_text(ui: &mut Ui, text: &str) -> Vec<Action> {
+        text.chars().map(|c| press(ui, KeyCode::Char(c))).collect()
+    }
+
+    #[test]
+    fn composing_writes_nothing_to_the_session_until_enter_sends_one_line() {
+        let mut ui = ui();
+        assert_eq!(press(&mut ui, KeyCode::Char('m')), Action::Nothing);
+        assert_eq!(ui.composing(), Some("agent"));
+        let typed = type_text(&mut ui, "hello world");
+        assert!(typed.iter().all(|action| *action == Action::Nothing));
+        assert_eq!(ui.compose_text(), "hello world");
+        assert_eq!(
+            press(&mut ui, KeyCode::Enter),
+            Action::SendLine {
+                name: "agent".into(),
+                instance_id: "instance-agent".into(),
+                bytes: b"hello world\r".to_vec(),
+            }
+        );
+        assert_eq!(ui.compose_text(), "");
+        assert_eq!(ui.composing(), Some("agent"), "the composer stays open");
+    }
+
+    #[test]
+    fn leaving_the_composer_keeps_each_sessions_draft() {
+        let mut ui = ui();
+        press(&mut ui, KeyCode::Char('m'));
+        type_text(&mut ui, "half");
+        let back = ui.on_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+        assert_eq!(back, Action::Nothing);
+        assert_eq!(ui.focus, Focus::List);
+        assert_eq!(ui.composing(), None);
+
+        press(&mut ui, KeyCode::Down);
+        press(&mut ui, KeyCode::Char('m'));
+        assert_eq!(ui.composing(), Some("shell"));
+        assert_eq!(ui.compose_text(), "");
+        type_text(&mut ui, "other");
+        ui.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        press(&mut ui, KeyCode::Up);
+        press(&mut ui, KeyCode::Char('m'));
+        assert_eq!(ui.composing(), Some("agent"));
+        assert_eq!(ui.compose_text(), "half");
+    }
+
+    #[test]
+    fn raw_focus_closes_the_composer_and_sends_keys_again() {
+        let mut ui = ui();
+        press(&mut ui, KeyCode::Char('m'));
+        type_text(&mut ui, "draft");
+        ui.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            press(&mut ui, KeyCode::Enter),
+            Action::Focus("agent".into())
+        );
+        assert_eq!(ui.composing(), None);
+        assert_eq!(
+            press(&mut ui, KeyCode::Char('x')),
+            Action::Type(b"x".to_vec())
+        );
+        // The unsent draft is still there for the next `m`.
+        ui.on_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+        press(&mut ui, KeyCode::Char('m'));
+        assert_eq!(ui.compose_text(), "draft");
+    }
+
+    #[test]
+    fn ended_session_has_no_composer() {
+        let mut ui = ui();
+        press(&mut ui, KeyCode::Down);
+        press(&mut ui, KeyCode::Down);
+        assert_eq!(press(&mut ui, KeyCode::Char('m')), Action::Nothing);
+        assert_eq!(ui.composing(), None);
+        assert!(ui.notice.as_deref().unwrap().contains("exited"));
+    }
+
+    #[test]
+    fn paste_goes_into_the_draft_whole() {
+        let mut ui = ui();
+        assert!(!ui.compose_paste("ignored"));
+        press(&mut ui, KeyCode::Char('m'));
+        assert!(ui.compose_paste("line one\nline two"));
+        assert_eq!(ui.compose_text(), "line one\nline two");
+    }
+
+    #[test]
+    fn footer_shows_the_draft_and_the_target() {
+        let mut ui = ui();
+        press(&mut ui, KeyCode::Char('m'));
+        type_text(&mut ui, "hi");
+        let footer = footer(&ui, "test", false, 80, 80);
+        assert!(footer.starts_with("✎ agent › hi"));
+    }
+
+    #[test]
+    fn a_composed_line_is_one_idempotent_input_line_request() {
+        let mut sender = crate::cluster_tui::sender::InputSender::with_client_id([7; 16]);
+        let mut queue = crate::cluster_tui::queue::InputQueue::default();
+        let target = crate::cluster_tui::queue::InputTarget {
+            remote_node: None,
+            name: "agent".into(),
+            instance_id: "instance-agent".into(),
+        };
+        sender
+            .enqueue_line(&mut queue, target, b"hello\r".to_vec(), Instant::now())
+            .unwrap();
+        let mut sent = Vec::new();
+        let event = sender.attempt_due(&mut queue, Instant::now(), |request| {
+            sent.push(request.clone());
+            Ok(Response::Ack { duplicate: false })
+        });
+        assert_eq!(sent.len(), 1);
+        assert!(matches!(
+            &sent[0],
+            Request::InputLine { name, instance_id, seq: 1, bytes, .. }
+                if name == "agent" && instance_id == "instance-agent" && bytes == b"hello\r"
+        ));
+        assert_eq!(line_notice(event.unwrap()).as_deref(), Some("line sent"));
     }
 }
