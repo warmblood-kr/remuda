@@ -382,6 +382,8 @@ mod submit_window_tests {
     enum Redraw {
         Submit,
         ComposerNewline,
+        /// The first Return is a composer newline; a second one submits.
+        NewlineThenSubmit,
         Nothing,
     }
 
@@ -426,8 +428,17 @@ mod submit_window_tests {
                     match script.redraw {
                         Redraw::Submit => screen.push_str("\nworking on it"),
                         Redraw::ComposerNewline => screen.push_str("\n  "),
+                        Redraw::NewlineThenSubmit => screen.push_str("\n  "),
                         Redraw::Nothing => version -= 1,
                     }
+                    version += 1;
+                }
+            }
+            if let (Redraw::NewlineThenSubmit, Some(second)) =
+                (script.redraw, script.returns.get(1))
+            {
+                if now >= *second + script.redraw_after {
+                    screen.push_str("\nworking on it");
                     version += 1;
                 }
             }
@@ -567,6 +578,15 @@ mod submit_window_tests {
         let (outcome, returns, _, _) = type_into(0, None, 200, Redraw::ComposerNewline);
         assert_eq!(outcome, InputSubmitOutcome::Unverified);
         assert_eq!(returns.len(), 2);
+    }
+
+    /// Regression: the retry Return is the one that submits, yet the outcome
+    /// was always Unverified, so a delivered input was recorded as uncertain.
+    #[test]
+    fn a_retry_return_that_submits_is_reported_submitted() {
+        let (outcome, returns, _, _) = type_into(0, None, 200, Redraw::NewlineThenSubmit);
+        assert_eq!(returns.len(), 2, "the composer newline gets one retry");
+        assert_eq!(outcome, InputSubmitOutcome::Submitted);
     }
 
     #[test]
@@ -1159,20 +1179,57 @@ impl Session {
             return Ok(InputSubmitOutcome::Unverified);
         }
 
-        version = before_version;
         let left = budget_end.saturating_sub(self.clock.now());
-        let deadline = self.clock.now() + submit_window(echo).min(left);
+        let window = submit_window(echo).min(left);
+        let (submitted, composer_newline, version) =
+            self.watch_after_return(&before_raw, &before_compact, before_version, window)?;
+        if submitted {
+            return Ok(InputSubmitOutcome::Submitted);
+        }
+        if !composer_newline || !retry_return {
+            return Ok(InputSubmitOutcome::Unverified);
+        }
+
+        // The first Return inserted a composer newline. A single retry is
+        // justified. Watch the screen again afterwards: if the retry changed
+        // it beyond another newline, it was the Return that submitted. Without
+        // that proof the delivery stays unverified.
+        let newline_raw = self.screen_text().unwrap_or_default();
+        let newline_compact = compact_screen(&newline_raw);
+        self.write_one_burst(crate::keys::RETURN_BYTES)?;
+        let left = budget_end.saturating_sub(self.clock.now());
+        let window = submit_window(echo).min(left);
+        let (submitted, _, _) =
+            self.watch_after_return(&newline_raw, &newline_compact, version, window)?;
+        Ok(if submitted {
+            InputSubmitOutcome::Submitted
+        } else {
+            InputSubmitOutcome::Unverified
+        })
+    }
+
+    /// Watch the screen for `window` after a Return. Returns whether it changed
+    /// beyond the whitespace (a submit), whether it only gained whitespace (a
+    /// composer newline), and the last output version seen.
+    fn watch_after_return(
+        &self,
+        before_raw: &str,
+        before_compact: &str,
+        mut version: u64,
+        window: Duration,
+    ) -> Result<(bool, bool, u64)> {
+        let deadline = self.clock.now() + window;
         let mut composer_newline = false;
         while self.clock.now() < deadline {
             if !self.is_alive() {
-                return Ok(InputSubmitOutcome::Unverified);
+                return Ok((false, composer_newline, version));
             }
             let raw = self.screen_text().unwrap_or_default();
             if raw != before_raw {
                 if compact_screen(&raw) == before_compact {
                     composer_newline = true;
                 } else {
-                    return Ok(InputSubmitOutcome::Submitted);
+                    return Ok((true, composer_newline, version));
                 }
             }
             let remaining = deadline.saturating_sub(self.clock.now());
@@ -1181,15 +1238,7 @@ impl Session {
                 version = snapshot.output_version.unwrap_or(version);
             }
         }
-        if !composer_newline || !retry_return {
-            return Ok(InputSubmitOutcome::Unverified);
-        }
-
-        // The first Return inserted a composer newline. A single retry is
-        // justified; after sending it, report that delivery is unverified
-        // because the screen did not prove whether the child submitted it.
-        self.write_one_burst(crate::keys::RETURN_BYTES)?;
-        Ok(InputSubmitOutcome::Unverified)
+        Ok((false, composer_newline, version))
     }
 
     fn wait_for_visible_tail(

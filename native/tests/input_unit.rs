@@ -148,9 +148,9 @@ fn type_text_submits_paste_once_and_preserves_embedded_newline() {
     script::run_source(
         &socket,
         "input-unit-submit",
-        "remuda.type_text('paste-agent', 'alpha\\nbeta')",
+        "assert(remuda.type_text('paste-agent', 'alpha\\nbeta') == 'submitted')",
     )
-    .expect("type_text");
+    .expect("the retry Return submitted, so type_text must report submitted, not unverified");
     eprintln!("type_text elapsed_ms={}", started.elapsed().as_millis());
 
     let screen = wait_screen(&socket, "paste-agent", "SUBMITTED:");
