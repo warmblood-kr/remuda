@@ -217,6 +217,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "daemon.socket_publication() -> {state, reason?}",
     ),
     (
+        "daemon.reloaded_from",
+        "The pid of the daemon this one took over from in a `remuda reload`, or nil when it started fresh. That daemon may still be finishing its last requests for up to 10 s. A core without it lacks the field, so test remuda.daemon.reloaded_from first.",
+        "daemon.reloaded_from() -> pid | nil",
+    ),
+    (
         "clock",
         "Monotonic milliseconds since this Lua image started.",
         "clock() -> milliseconds",
@@ -583,6 +588,10 @@ fn daemon_bindings(lua: &Lua) -> mlua::Result<Table> {
             }
             Ok(result)
         })?,
+    )?;
+    daemon.set(
+        "reloaded_from",
+        lua.create_function(|_, ()| Ok(crate::daemon::RELOADED_FROM.get().copied()))?,
     )?;
     Ok(daemon)
 }
