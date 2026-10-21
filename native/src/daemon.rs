@@ -3152,32 +3152,32 @@ fn handle_shutdown(
             requester_session_id,
             requester_session_name,
         };
-        let classify = || {
-            match process_ancestry::peer_pid(&stream) {
-                Ok(Some(peer_pid)) => {
-                    let session_pids = match session_process_ids(registry) {
-                        Ok(pids) => pids,
-                        Err(error) => {
-                            eprintln!("remuda: shutdown {error}; refusing unverifiable requester");
-                            return ShutdownPeer::Error(error);
-                        }
-                    };
-                    let ancestry = process_ancestry::is_self_or_descendant(peer_pid, &session_pids);
-                    if let process_ancestry::Ancestry::Unreadable { pid, ref error } = ancestry {
-                        eprintln!(
+        let classify = || match process_ancestry::peer_pid(&stream) {
+            Ok(Some(peer_pid)) => {
+                let session_pids = match session_process_ids(registry) {
+                    Ok(pids) => pids,
+                    Err(error) => {
+                        eprintln!("remuda: shutdown {error}; refusing unverifiable requester");
+                        return ShutdownPeer::Error(error);
+                    }
+                };
+                let ancestry = process_ancestry::is_self_or_descendant(peer_pid, &session_pids);
+                if let process_ancestry::Ancestry::Unreadable { pid, ref error } = ancestry {
+                    eprintln!(
                             "remuda: shutdown ancestry stopped at unreadable pid {pid} ({error}); refusing unverifiable requester"
                         );
-                    }
-                    ShutdownPeer::Ancestry(ancestry)
                 }
-                Ok(None) => {
-                    eprintln!("remuda: shutdown peer process ID unavailable; refusing unverifiable requester");
-                    ShutdownPeer::Unavailable
-                }
-                Err(error) => {
-                    eprintln!("remuda: shutdown peer process ID unavailable ({error}); refusing unverifiable requester");
-                    ShutdownPeer::Error(error.to_string())
-                }
+                ShutdownPeer::Ancestry(ancestry)
+            }
+            Ok(None) => {
+                eprintln!(
+                    "remuda: shutdown peer process ID unavailable; refusing unverifiable requester"
+                );
+                ShutdownPeer::Unavailable
+            }
+            Err(error) => {
+                eprintln!("remuda: shutdown peer process ID unavailable ({error}); refusing unverifiable requester");
+                ShutdownPeer::Error(error.to_string())
             }
         };
         shutdown_verdict_with_classifier(false, claims, || {
@@ -3187,8 +3187,10 @@ fn handle_shutdown(
             // early is in no session yet, so let in-flight starts finish and
             // look again, as caller attribution does.
             #[cfg(not(windows))]
-            if matches!(peer, ShutdownPeer::Ancestry(process_ancestry::Ancestry::Outside))
-                && wait_for_starting_sessions()
+            if matches!(
+                peer,
+                ShutdownPeer::Ancestry(process_ancestry::Ancestry::Outside)
+            ) && wait_for_starting_sessions()
             {
                 return classify();
             }
