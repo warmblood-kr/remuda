@@ -52,6 +52,15 @@ extern "C" fn record_join_interrupt(signal: libc::c_int) {
 mod codex_tui;
 
 fn main() -> ExitCode {
+    // A reload candidate that re-executed itself to look like the daemon.
+    // Cleared first, while one thread runs, so no session inherits it.
+    #[cfg(unix)]
+    if let Some(socket) = std::env::var_os(remuda_native::reload::CANDIDATE_ENV) {
+        std::env::remove_var(remuda_native::reload::CANDIDATE_ENV);
+        if remuda_native::reload::handoff_fd_is_socket() {
+            return reload_candidate(Path::new(&socket));
+        }
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if starts_interactive_client(&args) {
         return run_cli(args);
@@ -5641,7 +5650,14 @@ fn run_reload_candidate(args: &[&str]) -> ExitCode {
             remuda_native::reload::CANDIDATE_VERB
         ));
     };
-    match remuda_native::reload::candidate(Path::new(socket)) {
+    let error = remuda_native::reload::reexec_as_daemon(Path::new(socket));
+    eprintln!("remuda: reload candidate keeps its verb name: {error}");
+    reload_candidate(Path::new(socket))
+}
+
+#[cfg(unix)]
+fn reload_candidate(socket: &Path) -> ExitCode {
+    match remuda_native::reload::candidate(socket) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => fail(format!("reload candidate: {error}")),
     }

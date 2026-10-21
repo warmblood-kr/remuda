@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- After `remuda reload` (Unix), the new daemon shows in `ps` as
+  `remuda -s NAME daemon`, like any other daemon, instead of
+  `remuda _reload-candidate SOCKET`.
 - `remuda reload` (experimental, Unix) replaces the running daemon with the
   installed remuda without closing a host-backed session.
   - The old daemon checks the new build as for `--check`, then hands it the
