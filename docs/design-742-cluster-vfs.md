@@ -48,7 +48,10 @@ Index entry (one per path, kept on every node):
 Merge rule: last writer wins. The higher `(version, writer)` pair wins. A write
 uses `version = max(local index versions) + 1`, a Lamport clock. Deleting
 writes a tombstone (`deleted: true`) with the same rule, so a delete cannot be
-undone by an older replica. At most 10,000 entries.
+undone by an older replica. At most 10,000 live files. Tombstones are not
+removed yet, so they do not count toward that cap; the whole index, files and
+tombstones together, is capped at 30,000 entries. A delete always fits, since
+it replaces a live entry.
 
 ## Replica placement
 
@@ -75,13 +78,17 @@ limit.
 
 Content moves by pull only. A request is limited to about 64 KB, so a push
 would need many small requests. A response may be 4 MiB, so a chunked pull is
-cheap. The receiver hashes the assembled blob and drops it on a mismatch.
+cheap. The sender hashes its copy before it serves the first chunk and drops
+a damaged copy; the receiver hashes the assembled blob and drops it on a
+mismatch.
 
 ## Operations
 
 - **put** (CLI, no daemon needed): store the blob locally, write the index
   entry, push the entry to admitted peers. With `--wait`, it then waits until
-  `R` placement nodes report the blob through `BlobStat`.
+  `R` placement nodes report the blob through `BlobStat`. When the node
+  knows peers but reached none of them, put says the file is stored on this
+  node only and exits 75 (EX_TEMPFAIL); the `Told N of M peers` line stays.
 - **get / resolve**: read the local blob if present. Otherwise ask the
   placement nodes in order, then any other admitted peer, and verify the hash.
   `resolve` keeps the blob locally and prints its file path for tools that
