@@ -283,21 +283,23 @@ fn still_the_old_daemon(root: &Root, old: &mut Daemon) {
     assert_eq!(send_line(&path, "work", "echo BACK-$((6*7))"), Response::Ok);
     wait_for(&path, "work", "BACK-42");
     new_session(&path, "fresh");
-    let still = Command::new("/usr/bin/pgrep")
-        .args(["-f", "_reload-candidate"])
+    // A candidate is the old daemon's child until it serves, under its verb
+    // or, once it re-executed, as `-s s daemon`. Hosts are children too.
+    let ps = Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=", "-o", "ppid=", "-o", "args="])
         .output()
         .unwrap();
-    let root_name = root.0.to_string_lossy().into_owned();
-    let left: Vec<_> = String::from_utf8_lossy(&still.stdout)
+    let old_pid = old.0.id().to_string();
+    let left: Vec<String> = String::from_utf8_lossy(&ps.stdout)
         .lines()
-        .filter_map(|pid| pid.trim().parse::<u32>().ok())
-        .filter(|pid| {
-            let args = Command::new("/bin/ps")
-                .args(["-o", "args=", "-p", &pid.to_string()])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&args.stdout).contains(&root_name)
+        .filter(|line| {
+            let mut fields = line.split_whitespace();
+            let (_, ppid) = (fields.next(), fields.next());
+            let args = fields.collect::<Vec<_>>().join(" ");
+            ppid == Some(old_pid.as_str())
+                && (args.ends_with(" daemon") || args.contains("_reload-candidate"))
         })
+        .map(str::to_owned)
         .collect();
     assert!(left.is_empty(), "candidate left running: {left:?}");
 }
