@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `remuda reload` (experimental, Unix) replaces the running daemon with the
+  installed remuda without closing a host-backed session.
+  - The old daemon checks the new build as for `--check`, then hands it the
+    socket and its session hosts.
+  - Clients keep using the same socket throughout; one waiting to be
+    accepted is answered by the new daemon.
+  - If the new daemon fails or stalls before it serves, it is stopped, the
+    old daemon takes everything back and keeps serving, and `reload` exits
+    1.
+  - In-process sessions still block a reload.
+
 - `remuda reload --check` (experimental, Unix) reports whether the installed
   remuda could take over the running daemon without losing a session. It
   starts the new build as a candidate beside the running daemon and checks
