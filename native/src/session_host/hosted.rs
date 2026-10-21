@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 /// daemon, and anything else takes [`HOSTED_BY_DEFAULT`].
 pub const OPT_IN: &str = "REMUDA_EXPERIMENTAL_SESSION_HOST";
 /// Whether new sessions are host-backed when [`OPT_IN`] names no mode.
-pub const HOSTED_BY_DEFAULT: bool = false;
+pub const HOSTED_BY_DEFAULT: bool = true;
 /// The daemon's stable input identity, so a restarted daemon recovers acts
 /// an earlier one reserved. The writer fence, not this id, excludes owners.
 const CLIENT: [u8; 16] = *b"remuda-daemon-01";
