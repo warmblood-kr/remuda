@@ -445,10 +445,9 @@ impl Registry {
             .collect()
     }
 
-    /// Drop host-backed sessions (#713) whose child has exited, with what the
-    /// host saw. Each host is asked outside the lock; an entry is removed
-    /// only if it is still the handle that was asked, so a concurrent close
-    /// or replacement keeps its own notice. An unreachable host is kept.
+    /// Drop host-backed sessions (#713) whose child exited, with what the host
+    /// saw. Hosts are asked outside the lock; only the handle asked is removed,
+    /// so a concurrent close keeps its notice. An unreachable host is kept.
     pub fn reap_hosted_with_exit_info(
         &self,
     ) -> Vec<(String, String, String, &'static str, Option<ExitInfo>)> {
