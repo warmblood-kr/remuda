@@ -369,6 +369,14 @@ pub fn candidate(socket: &Path) -> Result<(), String> {
     let mut stream = unsafe { UnixStream::from_raw_fd(CANDIDATE_FD) };
     // Sessions this daemon starts must not inherit it.
     set_cloexec(CANDIDATE_FD).map_err(|e| format!("handoff fd: {e}"))?;
+    let fault = std::env::var(TEST_FAULT).ok();
+    // Tests: die at each step before the take.
+    let die_at = |step: &str| {
+        if fault.as_deref() == Some(step) {
+            std::process::exit(1);
+        }
+    };
+    die_at("exit-before-hello");
     write_frame(
         &mut stream,
         &FromCandidate::Hello {
@@ -377,6 +385,7 @@ pub fn candidate(socket: &Path) -> Result<(), String> {
         },
     )
     .map_err(|e| format!("hello: {e}"))?;
+    die_at("exit-in-preflight");
     let report = match Hosting::for_socket(socket).preflight() {
         Ok(checked) => FromCandidate::Ready {
             hosts: checked.into_iter().map(HostView::from).collect(),
@@ -386,6 +395,7 @@ pub fn candidate(socket: &Path) -> Result<(), String> {
         },
     };
     write_frame(&mut stream, &report).map_err(|e| format!("report: {e}"))?;
+    die_at("exit-after-ready");
     // Abort, or O gone: either way this candidate is done.
     match read_word(&stream) {
         Ok((FromOld::Take, fds)) => take(socket, stream, fds),
