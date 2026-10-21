@@ -529,7 +529,15 @@ impl Registry {
     }
 
     pub fn clear_input(&self, name: &str, key: &[u8]) -> Option<Result<Option<String>>> {
-        self.route(name, |s| s.clear_input(key), |h| h.clear_input(key))
+        self.route(
+            name,
+            |s| s.clear_input(key),
+            // Checked here too, so a host-backed session refuses in the same words.
+            |h| {
+                crate::session::check_clear_key(key)?;
+                h.clear_input(key)
+            },
+        )
     }
 
     pub fn feed(&self, name: &str, steps: &[Step]) -> Option<Result<()>> {
