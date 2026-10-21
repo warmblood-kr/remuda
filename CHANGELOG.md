@@ -10,6 +10,33 @@
   `Acquire`, and older daemons are still accepted. CI now hands a hosted
   session between the base build and this build in both directions.
 
+- VFS: a node now checks a blob's hash before it serves the first chunk to a
+  peer. A damaged copy is removed and refused (`corrupt`), so the peer tries
+  another holder and this node's repair pass fetches a good copy. Before,
+  the damage showed only as a hash mismatch at the end of the peer's pull.
+
+- VFS: a local blob file whose size differs from its index entry (a torn
+  copy, for example) now counts as missing. `stat`, `ls`, Lua `local`,
+  `--wait` and the repair pass used to treat any file with the right name as
+  a good copy, so repair never replaced it. A pulled copy now replaces such a
+  file. Peers asking by hash alone (`BlobStat`) still get existence only.
+
+- VFS: deleted files (tombstones) no longer count toward the 10,000-file cap.
+  Before, deletes filled the cap, and once full a node silently stopped
+  taking new paths from peers and diverged from them for good. The whole
+  index, files and tombstones, is now capped at 30,000 entries, and a node
+  pulls up to that many from each peer. Older nodes still cap the whole index
+  at 10,000 and pull at most about 10,500 entries from a peer. When the index
+  is full and a peer sends newer entries it cannot take, the daemon log now
+  says how many it skipped and that the node now differs from its peers (at
+  most once every 10 minutes).
+
+- VFS: `remuda vfs put` no longer reports success when no peer was reached.
+  It still prints `Told 0 of N peers about it.`, then says the file is stored
+  on this node only and exits 75 (EX_TEMPFAIL) so a script can retry. A
+  one-node cluster, with no peers to tell, still exits 0. With `--wait`, the
+  wait result decides; a timed-out wait with no peer reached also exits 75.
+
 - Cluster TUI: a slow or unreachable peer no longer freezes the cursor.
   Remote Input, InputLine, ResizeSession and Close now run on a background
   worker for each node, and the UI applies each reply when it arrives. Before,
