@@ -629,3 +629,18 @@ fn closing_a_hosted_session_checks_its_instance_then_terminates_once() {
     assert!(registry.hosted("fixture").is_none());
     assert!(registry.close("fixture").is_none());
 }
+#[test]
+fn a_hosted_session_id_names_its_session_for_the_shutdown_guard() {
+    let registry = crate::Registry::new();
+    let shared = Shared::new();
+    assert!(registry.name_for_id("session-id").is_none());
+    assert!(registry.register_hosted(handle(&shared)).is_ok());
+    assert_eq!(
+        registry.name_for_id("session-id").as_deref(),
+        Some("fixture")
+    );
+    assert!(registry.name_for_id("other-id").is_none());
+    let handles = registry.hosted_handles();
+    assert_eq!(handles.len(), 1);
+    assert_eq!(handles[0].identity().name, "fixture");
+}
