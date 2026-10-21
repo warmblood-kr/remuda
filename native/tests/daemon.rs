@@ -1795,7 +1795,8 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
 fn session_identity_survives_as_a_new_value_after_daemon_restart_and_output_versions_advance() {
     let runtime = scratch_dir("ver-restart");
     let socket = daemon::socket_path_in(&runtime, "s");
-    let mut first_daemon = spawn::Daemon::spawn(&runtime);
+    // In-process behaviour: hosted sessions survive a daemon restart.
+    let mut first_daemon = spawn::Daemon::spawn_in_process(&runtime);
     start_shell_session(
         &socket,
         "sleep 1; printf first; sleep 1; printf later; sleep 30",
@@ -1835,7 +1836,7 @@ fn session_identity_survives_as_a_new_value_after_daemon_restart_and_output_vers
         "first daemon should stop cleanly"
     );
 
-    let mut second_daemon = spawn::Daemon::spawn(&runtime);
+    let mut second_daemon = spawn::Daemon::spawn_in_process(&runtime);
     start_shell_session(&socket, "printf second; sleep 30");
     let second_summary = listed_session(&socket);
     assert_ne!(first_summary.instance_id, second_summary.instance_id);
@@ -1898,7 +1899,8 @@ fn input_batches_acknowledge_duplicates_and_check_instance_before_deduplication(
 fn stalled_pty_write_times_out_without_blocking_reads_and_recovers() {
     let runtime = scratch_dir("pty-write-timeout");
     let socket = daemon::socket_path_in(&runtime, "s");
-    let mut running = spawn::Daemon::spawn(&runtime);
+    // In-process behaviour: hosted input acts are limited to 8 KiB.
+    let mut running = spawn::Daemon::spawn_in_process(&runtime);
     let reader_marker = start_reader_waiting_session(&socket, &runtime);
 
     let bytes = vec![b'\n'; 1024 * 1024];
@@ -2241,6 +2243,10 @@ fn attach_eof_drains_input_already_read_by_the_key_pump() {
 #[cfg(unix)]
 #[test]
 fn attach_during_stalled_send_preserves_human_input_before_and_after_timeout() {
+    // In-process behaviour: hosted input acts are limited to 8 KiB (docs/concepts/session-host-parity.md).
+    if remuda_native::session_host::hosting() {
+        return;
+    }
     let runtime = unique_scratch_dir("probe-attach-stall");
     let socket = daemon::socket_path_in(&runtime, "s");
     let _daemon = daemon_at(&socket);
@@ -4630,6 +4636,10 @@ fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
 #[cfg(unix)]
 #[test]
 fn mouse_off_knob_and_toggle_pass_reports_to_the_child_and_restore_host_modes() {
+    // In-process behaviour: hosted attach paints the parsed screen, not the child's raw bytes (docs/concepts/session-host-parity.md).
+    if remuda_native::session_host::hosting() {
+        return;
+    }
     let dir = scratch_dir("attach-mouse-toggle");
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
