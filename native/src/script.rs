@@ -218,6 +218,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "daemon.socket_publication() -> {state, reason?}",
     ),
     (
+        "daemon.reloaded_from",
+        "The pid of the daemon this one took over from in a `remuda reload`, or nil when it started fresh. That daemon may still be finishing its last requests for up to 10 s. A core without it lacks the field, so test remuda.daemon.reloaded_from first.",
+        "daemon.reloaded_from() -> pid | nil",
+    ),
+    (
         "clock",
         "Monotonic milliseconds since this Lua image started.",
         "clock() -> milliseconds",
@@ -584,6 +589,10 @@ fn daemon_bindings(lua: &Lua) -> mlua::Result<Table> {
             }
             Ok(result)
         })?,
+    )?;
+    daemon.set(
+        "reloaded_from",
+        lua.create_function(|_, ()| Ok(crate::daemon::RELOADED_FROM.get().copied()))?,
     )?;
     Ok(daemon)
 }
@@ -1032,11 +1041,9 @@ fn input_bindings(
     table.set(
         "_input_text",
         lua.create_function(move |_, (name, text): (String, String)| {
-            let session = text_registry
-                .get(&name)
-                .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
-            session
-                .input_text(&text)
+            text_registry
+                .input_text(&name, &text)
+                .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?
                 .map_err(|error| mlua::Error::runtime(error.to_string()))
         })?,
     )?;
@@ -1045,11 +1052,9 @@ fn input_bindings(
     table.set(
         "_input_submit",
         lua.create_function(move |_, (name, expect): (String, String)| {
-            let session = submit_registry
-                .get(&name)
-                .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
-            session
-                .submit(&expect)
+            submit_registry
+                .submit(&name, &expect)
+                .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?
                 .map(|outcome| match outcome {
                     InputSubmitOutcome::Submitted => "submitted",
                     InputSubmitOutcome::Unverified => "unverified",
@@ -1070,11 +1075,9 @@ fn input_bindings(
                         "settle must be between 0 and 5 seconds",
                     ));
                 }
-                let session = legacy_type_registry
-                    .get(&name)
-                    .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
-                session
-                    .type_text(&text, Duration::from_secs_f64(settle))
+                legacy_type_registry
+                    .type_text(&name, &text, Duration::from_secs_f64(settle))
+                    .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?
                     .map(|outcome| match outcome {
                         InputSubmitOutcome::Submitted => "submitted",
                         InputSubmitOutcome::Unverified => "unverified",
@@ -1114,15 +1117,16 @@ fn expected_instance_input_bindings(
                         "settle must be between 0 and 5 seconds",
                     ));
                 }
-                let session = expected_text_registry.get(&name).ok_or_else(|| {
-                    mlua::Error::runtime("session instance changed; no input was written")
-                })?;
-                session
+                expected_text_registry
                     .type_text_if_instance(
+                        &name,
                         &expected_instance,
                         &text,
                         Duration::from_secs_f64(settle),
                     )
+                    .ok_or_else(|| {
+                        mlua::Error::runtime("session instance changed; no input was written")
+                    })?
                     .map(|outcome| match outcome {
                         InputSubmitOutcome::Submitted => "submitted",
                         InputSubmitOutcome::Unverified => "unverified",
@@ -1140,11 +1144,11 @@ fn expected_instance_input_bindings(
             move |_, (name, expected_instance, spec): (String, String, String)| {
                 let bytes = keys::key(&spec)
                     .ok_or_else(|| mlua::Error::runtime(format!("no such key: {spec}")))?;
-                let session = expected_key_registry.get(&name).ok_or_else(|| {
-                    mlua::Error::runtime("session instance changed; no input was written")
-                })?;
-                session
-                    .send_key_if_instance(&expected_instance, &bytes)
+                expected_key_registry
+                    .send_key_if_instance(&name, &expected_instance, &bytes)
+                    .ok_or_else(|| {
+                        mlua::Error::runtime("session instance changed; no input was written")
+                    })?
                     .map(|()| true)
                     .map_err(|error| mlua::Error::runtime(error.to_string()))
             },
