@@ -126,6 +126,7 @@ impl SessionOperations for Remote {
             mouse: MouseState::default(),
             attached: self.shared.active.load(Ordering::SeqCst) != 0,
             closing: false,
+            host_build: Some("test-host".into()),
         })
     }
     fn recover(&self, key: &RequestIdentity) -> Result<Recovery> {
