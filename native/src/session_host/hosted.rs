@@ -509,9 +509,15 @@ fn start(
     let written = child
         .stdin
         .take()
-        .ok_or_else(|| "session host stdin".to_owned())
+        .ok_or_else(|| Unwritten {
+            text: "session host stdin".into(),
+            broken_pipe: false,
+        })
         .and_then(|mut stdin| {
-            super::wire::write_frame(&mut stdin, bootstrap).map_err(|e| e.to_string())
+            super::wire::write_frame(&mut stdin, bootstrap).map_err(|e| Unwritten {
+                broken_pipe: e.kind() == io::ErrorKind::BrokenPipe,
+                text: e.to_string(),
+            })
         });
     // The host calls setsid; this thread only reaps it if it exits first.
     let (ended, exit) = mpsc::channel();
@@ -520,7 +526,17 @@ fn start(
             let _ = ended.send(status);
         }
     });
-    written.map(|()| exit)
+    match written {
+        Ok(()) => Ok(exit),
+        // A host that exits before reading its bootstrap (another build) is
+        // reported by its exit status, not by this lost write.
+        Err(error) if error.broken_pipe => Ok(exit),
+        Err(error) => Err(error.text),
+    }
+}
+struct Unwritten {
+    text: String,
+    broken_pipe: bool,
 }
 
 fn random<const N: usize>() -> Result<[u8; N], String> {
@@ -530,4 +546,26 @@ fn random<const N: usize>() -> Result<[u8; N], String> {
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod start_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_host_that_exits_before_its_bootstrap_is_reported_by_its_status() {
+        let dir = std::env::temp_dir().join(format!("rhst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("host");
+        std::fs::write(&exe, "#!/bin/sh\nexit 3\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // With its length prefix, more than a pipe holds: the write cannot
+        // finish before the host is gone.
+        let bootstrap = vec![b' '; super::super::wire::MAX_FRAME];
+        let exit = start(&exe, &dir.join("endpoint"), &bootstrap).expect("exit receiver");
+        let status = exit.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(status.code(), Some(super::super::BUILD_MISMATCH));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
