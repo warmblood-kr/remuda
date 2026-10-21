@@ -13,7 +13,7 @@ pub(super) fn lock_with_deadline(dir: &Path, timeout: Duration) -> io::Result<St
 }
 
 #[cfg(not(windows))]
-pub(super) fn cluster_state_dir() -> io::Result<PathBuf> {
+pub(crate) fn cluster_state_dir() -> io::Result<PathBuf> {
     let base = match std::env::var_os("XDG_STATE_HOME") {
         Some(value) if !value.is_empty() => PathBuf::from(value),
         _ => PathBuf::from(
@@ -48,7 +48,7 @@ pub(super) fn create_private_directory(dir: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-pub(super) fn cluster_state_dir() -> io::Result<PathBuf> {
+pub(crate) fn cluster_state_dir() -> io::Result<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .or_else(|| {

@@ -17,6 +17,7 @@ pub mod cmd_arguments;
 pub mod codex_observer;
 pub(crate) mod credential;
 pub mod daemon;
+pub(crate) mod db_lua;
 pub mod dist;
 pub mod find_command;
 pub(crate) mod fs_atomic;
