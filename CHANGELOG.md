@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `remuda upgrade` (Unix) now reloads the running daemon into the version it
+  just installed, so host-backed sessions keep running. A daemon that cannot
+  reload keeps its old version and says why: an in-process session blocks it,
+  or it is older than `remuda reload`. `--no-reload` installs only. The notice
+  for a daemon of another build now suggests `remuda reload` instead of
+  `remuda stop`, and `reload` is listed in `remuda --help`.
 - `remuda reload` (experimental, Unix) replaces the running daemon with the
   installed remuda without closing a host-backed session.
   - The old daemon checks the new build as for `--check`, then hands it the

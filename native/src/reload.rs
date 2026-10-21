@@ -5,6 +5,7 @@
 //! aborts (a check) or sends `Take` with its listener and socket lock, and C
 //! claims the hosts and serves in O's place.
 pub mod fds;
+pub mod upgrade;
 
 use crate::session_host::hosted::{Checked, CheckedState, Hosting};
 use serde::{Deserialize, Serialize};
