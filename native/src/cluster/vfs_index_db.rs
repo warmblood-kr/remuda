@@ -51,6 +51,8 @@ pub(super) fn open(root: &Path) -> VfsResult<Connection> {
     crate::sqlite_migrate::upgrade(&mut conn, DB_FILE, &steps(), true)
         .map_err(|error| VfsError::new(VfsErrorKind::Corrupt, error))?;
     let tx = immediate(&mut conn)?;
+    // `meta` is not a schema step on purpose: #794 builds create it the same
+    // way, so it needs no version bump and a downgrade may leave it behind.
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL) WITHOUT ROWID;",
     )?;
