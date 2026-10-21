@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `remuda version --hosts` prints the daemon's build and the build of each
+  host-backed session's host (experimental session hosts, #713). Hosts
+  outlive daemons, so after an upgrade some sessions can still run on an
+  older host; these are marked, and unreachable hosts are named. Plain
+  `remuda version` is unchanged.
+
 - VFS: a node now checks a blob's hash before it serves the first chunk to a
   peer. A damaged copy is removed and refused (`corrupt`), so the peer tries
   another holder and this node's repair pass fetches a good copy. Before,

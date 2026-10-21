@@ -222,6 +222,10 @@ fn call_response(id: Value, response: Response) -> String {
             ok_reply(id, tool_error("directory listing is not exposed over MCP"))
         }
         Response::MouseState(_) => ok_reply(id, tool_error("mouse state is not exposed over MCP")),
+        Response::SessionHostBuilds(_) => ok_reply(
+            id,
+            tool_error("session host builds are not exposed over MCP"),
+        ),
         // This arm used to say `TOOLS` exposes no eval, deliberately — because
         // MCP was the door for the agent running *inside* a session, and giving
         // it the image would let it rewrite the manager holding it. **The
