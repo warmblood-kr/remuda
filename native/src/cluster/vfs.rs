@@ -4,6 +4,7 @@
 //! `vfs_sync`. See docs/design-742-cluster-vfs.md.
 
 use super::storage;
+use super::vfs_index_db;
 use remuda_core::vfs::{self as rules, VfsEntry, VfsUri};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,7 +21,6 @@ pub const MAX_ENTRIES: usize = 10_000;
 /// they get their own room past `MAX_ENTRIES` instead of taking file slots.
 pub const MAX_INDEX_ENTRIES: usize = 30_000;
 pub const DEFAULT_CLUSTER_NAME: &str = "default";
-const INDEX_FORMAT: u32 = 1;
 pub const GC_GRACE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// A failure a caller may want to tell apart (Lua reason codes use these).
@@ -113,12 +113,6 @@ impl Default for VfsSettings {
             default_replicas: default_replicas(),
         }
     }
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct IndexFile {
-    format: u32,
-    entries: Vec<VfsEntry>,
 }
 
 /// The name index: one entry per path, live or tombstone.
@@ -332,36 +326,20 @@ impl VfsStore {
         Ok(uri)
     }
 
-    pub fn load_index(&self) -> VfsResult<VfsIndex> {
-        let bytes = match fs::read(self.root.join("index.json")) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(VfsIndex::default()),
-            Err(error) => return Err(error.into()),
-        };
-        let file: IndexFile = serde_json::from_slice(&bytes).map_err(|error| {
-            VfsError::new(VfsErrorKind::Corrupt, format!("index.json: {error}"))
-        })?;
-        if file.format != INDEX_FORMAT {
-            return Err(VfsError::new(
-                VfsErrorKind::Corrupt,
-                format!("index.json format {} is not supported", file.format),
-            ));
-        }
-        let mut index = VfsIndex::default();
-        for entry in file.entries {
-            index.merge(entry);
-        }
-        Ok(index)
+    /// Open the index database (see `vfs_index_db`).
+    fn index_db(&self) -> VfsResult<rusqlite::Connection> {
+        vfs_index_db::open(&self.root)
     }
 
-    fn save_index(&self, index: &VfsIndex) -> VfsResult<()> {
-        let file = IndexFile {
-            format: INDEX_FORMAT,
-            entries: index.entries.values().cloned().collect(),
-        };
-        let bytes = serde_json::to_vec(&file).map_err(io::Error::other)?;
-        storage::atomic_write(&self.root.join("index.json"), &bytes)?;
-        Ok(())
+    pub fn load_index(&self) -> VfsResult<VfsIndex> {
+        vfs_index_db::load(&self.index_db()?)
+    }
+
+    /// Write `index.json` from the database for an older remuda (downgrade).
+    /// Returns how many entries it wrote.
+    pub fn export_legacy_index(&self) -> VfsResult<usize> {
+        let _guard = self.lock()?;
+        vfs_index_db::export_json(&self.index_db()?, &self.root)
     }
 
     /// Merge peer entries under the index lock and return those that changed
@@ -378,24 +356,23 @@ impl VfsStore {
     /// `merge_entries` without the log line.
     pub fn merge_entries_report(&self, incoming: Vec<VfsEntry>) -> VfsResult<MergeReport> {
         let _guard = self.lock()?;
-        let mut index = self.load_index()?;
+        let mut conn = self.index_db()?;
+        let tx = vfs_index_db::immediate(&mut conn)?;
         let mut report = MergeReport {
-            counts: index.counts(),
+            counts: vfs_index_db::counts(&tx)?,
             ..MergeReport::default()
         };
         for entry in incoming {
             if entry.validate().is_err() {
                 continue;
             }
-            match index.merge_capped(entry.clone(), &mut report.counts) {
+            match merge_row(&tx, entry.clone(), &mut report.counts)? {
                 CappedMerge::Changed => report.changed.push(entry),
                 CappedMerge::Unchanged => {}
                 CappedMerge::Full => report.skipped_full += 1,
             }
         }
-        if !report.changed.is_empty() {
-            self.save_index(&index)?;
-        }
+        tx.commit()?;
         Ok(report)
     }
 
@@ -432,29 +409,30 @@ impl VfsStore {
     /// Write a tombstone for a live path.
     pub fn delete(&self, path: &str, writer: &str) -> VfsResult<VfsEntry> {
         let _guard = self.lock()?;
-        let mut index = self.load_index()?;
-        let current = index
-            .live(path)
-            .cloned()
+        let mut conn = self.index_db()?;
+        let tx = vfs_index_db::immediate(&mut conn)?;
+        let current = vfs_index_db::get(&tx, path)?
+            .filter(|entry| !entry.deleted)
             .ok_or_else(|| VfsError::new(VfsErrorKind::NotFound, format!("no file at {path}")))?;
         let entry = VfsEntry {
             deleted: true,
-            version: index.next_version(),
+            version: vfs_index_db::next_version(&tx)?,
             writer: writer.to_owned(),
             mtime: unix_now(),
             ..current
         };
-        index.merge(entry.clone());
-        self.save_index(&index)?;
+        vfs_index_db::upsert(&tx, &entry)?;
+        tx.commit()?;
         Ok(entry)
     }
 
     fn write_entry(&self, make: impl FnOnce(u64) -> VfsEntry) -> VfsResult<VfsEntry> {
         let _guard = self.lock()?;
-        let mut index = self.load_index()?;
-        let entry = make(index.next_version());
-        let mut counts = index.counts();
-        if index.merge_capped(entry.clone(), &mut counts) == CappedMerge::Full {
+        let mut conn = self.index_db()?;
+        let tx = vfs_index_db::immediate(&mut conn)?;
+        let entry = make(vfs_index_db::next_version(&tx)?);
+        let mut counts = vfs_index_db::counts(&tx)?;
+        if merge_row(&tx, entry.clone(), &mut counts)? == CappedMerge::Full {
             return Err(VfsError::new(
                 VfsErrorKind::TooLarge,
                 if counts.live >= MAX_ENTRIES {
@@ -466,7 +444,7 @@ impl VfsStore {
                 },
             ));
         }
-        self.save_index(&index)?;
+        tx.commit()?;
         Ok(entry)
     }
 
@@ -650,13 +628,7 @@ impl VfsStore {
 
     pub fn collect_garbage_older_than(&self, grace: std::time::Duration) -> VfsResult<usize> {
         let _guard = self.lock()?;
-        let index = self.load_index()?;
-        let referenced: std::collections::HashSet<&str> = index
-            .entries
-            .values()
-            .filter(|entry| !entry.deleted)
-            .map(|entry| entry.sha256.as_str())
-            .collect();
+        let referenced = vfs_index_db::live_hashes(&self.index_db()?)?;
         let mut removed = 0;
         for hash in self.local_blobs()? {
             if referenced.contains(hash.as_str()) {
@@ -674,6 +646,25 @@ impl VfsStore {
         }
         Ok(removed)
     }
+}
+
+/// `VfsIndex::merge_capped` on one stored row: the cap rules stay in one place,
+/// and only the row that changed is written.
+fn merge_row(
+    tx: &rusqlite::Transaction<'_>,
+    incoming: VfsEntry,
+    counts: &mut IndexCounts,
+) -> VfsResult<CappedMerge> {
+    let mut one = VfsIndex::default();
+    if let Some(current) = vfs_index_db::get(tx, &incoming.path)? {
+        one.entries.insert(current.path.clone(), current);
+    }
+    let path = incoming.path.clone();
+    let outcome = one.merge_capped(incoming, counts);
+    if outcome == CappedMerge::Changed {
+        vfs_index_db::upsert(tx, &one.entries[&path])?;
+    }
+    Ok(outcome)
 }
 
 /// A full index stays full, and every peer pull hits it again, so the line

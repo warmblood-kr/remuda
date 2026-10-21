@@ -17,6 +17,7 @@ pub mod cmd_arguments;
 pub mod codex_observer;
 pub(crate) mod credential;
 pub mod daemon;
+pub(crate) mod db_lua;
 pub mod dist;
 pub mod find_command;
 pub(crate) mod fs_atomic;
@@ -43,6 +44,7 @@ pub mod script;
 #[doc(hidden)]
 pub mod session_host;
 pub mod session_job;
+pub mod sqlite;
 #[cfg(unix)]
 mod staged_socket;
 pub(crate) mod storage;

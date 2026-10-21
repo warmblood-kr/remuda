@@ -11,8 +11,9 @@ pub mod listener_control;
 pub mod registry;
 pub mod replication;
 mod sealed;
-mod storage;
+pub(crate) mod storage;
 pub mod vfs;
+mod vfs_index_db;
 pub mod vfs_sync;
 #[cfg(windows)]
 pub(crate) mod windows_security;
