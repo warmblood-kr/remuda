@@ -124,6 +124,9 @@ pub struct Registry {
     /// Host-backed sessions (#713). One name space with `sessions`; lock
     /// order is always `sessions`, then `hosted`.
     hosted: Mutex<HashMap<String, Arc<SessionHandle>>>,
+    /// Host-backed launches (by instance id) a close has started ending, so a
+    /// reaper that sees the child die first still reports "closed".
+    closing_hosted: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Registry {
@@ -472,15 +475,26 @@ impl Registry {
                     return None;
                 }
                 hosted.remove(&identity.name);
+                let closed = self.closing_hosted_lock().remove(&identity.instance);
                 Some((
                     identity.name.clone(),
                     identity.id.clone(),
                     identity.instance.clone(),
-                    if closing { "closed" } else { "exited" },
+                    if closing || closed {
+                        "closed"
+                    } else {
+                        "exited"
+                    },
                     info,
                 ))
             })
             .collect()
+    }
+
+    fn closing_hosted_lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
+        self.closing_hosted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// A panic under this lock cannot leave the map half-updated — an entry is
@@ -690,7 +704,11 @@ impl Registry {
                 "session restarted; close was refused".into(),
             )));
         }
+        self.closing_hosted_lock()
+            .insert(handle.identity().instance.clone());
         if let Err(error) = handle.terminate() {
+            self.closing_hosted_lock()
+                .remove(&handle.identity().instance);
             return Some(Err(error.into_agent()));
         }
         let mut hosted = self.hosted_lock();
@@ -700,6 +718,9 @@ impl Registry {
         if removed {
             hosted.remove(name);
         }
+        // Lock order: `hosted`, then `closing_hosted`, as in the reaper.
+        self.closing_hosted_lock()
+            .remove(&handle.identity().instance);
         Some(Ok(removed))
     }
 }
