@@ -301,14 +301,9 @@ impl Registry {
             .collect()
     }
 
-    /// Live process candidates with their launch identity captured together
-    /// under the registry lock. Carry this value through ancestry resolution
-    /// instead of looking the session name up again afterwards.
-    ///
-    /// Host-backed sessions (#713) are included by their running child's pid,
-    /// asked of each host after the lock is released; a host's identity is
-    /// fixed per handle, so no replacement can slip in between. A host that
-    /// cannot answer is left out: its PTY, and so its child, went with it.
+    /// Live process candidates with their launch identity, in-process and
+    /// host-backed (#713, child pid asked after the lock; a host that cannot
+    /// answer is left out). Carry this through ancestry resolution.
     pub fn live_processes_with_identity(&self) -> Vec<LiveSessionProcess> {
         let mut live: Vec<LiveSessionProcess> = self
             .lock()
