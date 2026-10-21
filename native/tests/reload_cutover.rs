@@ -284,22 +284,8 @@ fn still_the_old_daemon(root: &Root, old: &mut Daemon) {
     assert_eq!(send_line(&path, "work", "echo BACK-$((6*7))"), Response::Ok);
     wait_for(&path, "work", "BACK-42");
     new_session(&path, "fresh");
-    let still = Command::new("/usr/bin/pgrep")
-        .args(["-f", "_reload-candidate"])
-        .output()
-        .unwrap();
-    let root_name = root.0.to_string_lossy().into_owned();
-    let left: Vec<_> = String::from_utf8_lossy(&still.stdout)
-        .lines()
-        .filter_map(|pid| pid.trim().parse::<u32>().ok())
-        .filter(|pid| {
-            let args = Command::new("/bin/ps")
-                .args(["-o", "args=", "-p", &pid.to_string()])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&args.stdout).contains(&root_name)
-        })
-        .collect();
+    let root_name = format!("{}/", root.0.to_string_lossy());
+    let left = reap::processes_naming(&["_reload-candidate", &root_name]);
     assert!(left.is_empty(), "candidate left running: {left:?}");
 }
 

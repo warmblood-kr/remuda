@@ -16,6 +16,11 @@ use std::process::Command;
 /// Pids whose command line names a path under `root`: its session hosts,
 /// and a daemon that took the socket over in a reload.
 pub fn processes_under(root: &Path) -> Vec<i32> {
+    processes_naming(&[&format!("{}/", root.to_string_lossy())])
+}
+
+/// Pids whose command line contains every one of `parts`, read from `ps`.
+pub fn processes_naming(parts: &[&str]) -> Vec<i32> {
     let output = match Command::new("/bin/ps")
         .args(["-A", "-o", "pid=", "-o", "args="])
         .output()
@@ -23,10 +28,9 @@ pub fn processes_under(root: &Path) -> Vec<i32> {
         Ok(output) => output,
         Err(_) => return Vec::new(),
     };
-    let needle = format!("{}/", root.to_string_lossy());
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|line| line.contains(&needle))
+        .filter(|line| parts.iter().all(|part| line.contains(part)))
         .filter_map(|line| line.split_whitespace().next()?.parse().ok())
         .filter(|&pid: &i32| pid != std::process::id() as i32)
         .collect()

@@ -256,13 +256,10 @@ fn a_hung_candidate_is_stopped_at_its_deadline() {
         "{:?}",
         started.elapsed()
     );
-    let still = Command::new("/usr/bin/pgrep")
-        .args(["-f", &hung.to_string_lossy()])
-        .output()
-        .unwrap();
+    let still = reap::processes_naming(&[&hung.to_string_lossy()]);
     assert!(
-        still.stdout.is_empty(),
-        "the hung candidate was left running"
+        still.is_empty(),
+        "the hung candidate was left running: {still:?}"
     );
 }
 
