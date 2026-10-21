@@ -2006,3 +2006,64 @@ fn a_mod_opens_databases_in_its_own_namespace_and_eval_code_gets_none() {
     assert_eq!(native_hidden, "nil");
     assert!(exists, "{} was not created", file.display());
 }
+
+#[test]
+fn a_mod_applies_its_shipped_migration_files_on_open() {
+    let home = DataHome::new();
+    let state_var = if cfg!(windows) {
+        "LOCALAPPDATA"
+    } else {
+        "XDG_STATE_HOME"
+    };
+    let old_state = std::env::var_os(state_var);
+    std::env::set_var(state_var, home.root.join("state"));
+    let package = home.root.join("remuda/mods/sample/packages/sample");
+    let migrations = package.join("migrations/notes");
+    fs::create_dir_all(&migrations).unwrap();
+    fs::write(
+        home.root.join("remuda/mods/sample/extension.toml"),
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    for (file, sql) in [
+        ("0001_create.up.sql", "CREATE TABLE n (x TEXT NOT NULL);"),
+        ("0001_create.down.sql", "DROP TABLE n;"),
+        (
+            "0002_seen.up.sql",
+            "ALTER TABLE n ADD COLUMN seen INTEGER NOT NULL DEFAULT 0;",
+        ),
+    ] {
+        fs::write(migrations.join(file), sql).unwrap();
+    }
+    write_entry(
+        &home.entry(),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function(state)
+            state.db = assert(remuda.db.open("notes", { migrations = true }))
+            assert(state.db:exec("INSERT INTO n (x) VALUES (?)", {"from start"}))
+          end,
+          tools = {{ name = "sample_schema",
+            about = "Report the notes database's version and a row.",
+            run = function(state)
+              local v = state.db:query("PRAGMA user_version")[1].user_version
+              local row = state.db:query("SELECT x, seen FROM n")[1]
+              return v .. " " .. row.x .. " " .. row.seen
+            end }},
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-migrate.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(&image, "remuda.exec('sample')");
+    let schema = read_value(&image, "return remuda.tools.sample_schema()");
+    match old_state {
+        Some(old) => std::env::set_var(state_var, old),
+        None => std::env::remove_var(state_var),
+    }
+    assert_eq!(schema, "2 from start 0");
+}

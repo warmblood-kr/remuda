@@ -222,6 +222,7 @@ fn dispatch_cli_command(
         "exec" => exec_cli_command(server, path, rest),
         "cluster" => cluster_command(server, path, rest),
         "vfs" => remuda_native::vfs_cli::run(server, path, rest),
+        "db" => remuda_native::db_cli::run(server, path, rest),
         "mod" => match rest.first().copied() {
             Some("install") => mod_install_command(server, path, &rest[1..]),
             Some("list") => mod_list_command(&rest[1..]),
@@ -640,6 +641,7 @@ remuda — a pty manager you can attach to
                                   --foreground holds the listener in this terminal
                                   [::] may accept IPv4 too on dual-stack systems
   remuda vfs put|get|ls|stat|rm|resolve  cluster file store at remuda:// URIs
+  remuda db status|upgrade|downgrade  schema migrations of mod databases
   remuda doc [--format F]        print live Lua documentation (rst by default)
   remuda -e <code>              evaluate one chunk in that same image
   remuda repl                   the same image, a line at a time
@@ -729,6 +731,7 @@ remuda — terminal orchestration for coding agents
                                   --foreground holds the listener in this terminal
                                   [::] may accept IPv4 too on dual-stack systems
   remuda vfs put|get|ls|stat|rm|resolve  cluster file store at remuda:// URIs
+  remuda db status|upgrade|downgrade  schema migrations of mod databases
 
   remuda doc | repl | -e CODE    use the persistent Lua runtime
   remuda --stdin MOD [ARGS…]     opt in to passing up to 1 MiB of stdin to the mod
@@ -837,7 +840,7 @@ fn suggest_command(word: &str) -> Option<String> {
 
     const TOP_LEVEL_VERBS: &[&str] = &[
         "run", "attach", "ls", "send", "resize", "stop", "mod", "doc", "repl", "lua", "exec",
-        "mcp", "upgrade", "cluster", "vfs",
+        "mcp", "upgrade", "cluster", "vfs", "db",
     ];
     closest_word(word, TOP_LEVEL_VERBS).map(str::to_owned)
 }

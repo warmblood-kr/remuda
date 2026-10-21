@@ -4,6 +4,9 @@
 //! before it serves is killed, and the old daemon takes everything back.
 #![cfg(unix)]
 
+#[path = "daemon_support/reap.rs"]
+mod reap;
+
 use remuda_core::protocol::{Request, Response};
 use remuda_core::Size;
 use remuda_native::{client, daemon};
@@ -60,38 +63,7 @@ impl Root {
 }
 impl Drop for Root {
     fn drop(&mut self) {
-        // By checked pid, never by pattern. Hosts name the root in argv; a
-        // daemon that took over runs as `remuda -s s daemon`, which names
-        // no root, so the lock names it instead.
-        let ps = Command::new("/bin/ps")
-            .args(["-A", "-o", "pid=", "-o", "args="])
-            .output()
-            .unwrap();
-        let needle = format!("{}/", self.0.display());
-        let mut pids: Vec<i32> = String::from_utf8_lossy(&ps.stdout)
-            .lines()
-            .filter(|line| line.contains(&needle))
-            .filter_map(|line| line.split_whitespace().next()?.parse().ok())
-            .collect();
-        let mut lock = self.socket().into_os_string();
-        lock.push(".lock");
-        if let Some(pid) = std::fs::read_to_string(lock)
-            .ok()
-            .and_then(|text| text.trim().parse::<i32>().ok())
-        {
-            let args = Command::new("/bin/ps")
-                .args(["-o", "args=", "-p", &pid.to_string()])
-                .output()
-                .unwrap();
-            let args = String::from_utf8_lossy(&args.stdout);
-            if args.contains("remuda") && args.trim_end().ends_with(" daemon") {
-                pids.push(pid);
-            }
-        }
-        for pid in pids {
-            // SAFETY: a signal to a pid just checked as under this root.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
+        reap::kill_processes_under(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -390,4 +362,30 @@ fn a_candidate_that_hangs_after_take_is_killed_at_its_deadline_and_rolled_back()
         started.elapsed()
     );
     still_the_old_daemon(&root, &mut old);
+}
+
+/// `remuda.daemon.reloaded_from()` names the daemon this one took over
+/// from, so a mod can tell a reload from a fresh start.
+#[test]
+fn the_new_daemon_names_the_daemon_it_took_over_from() {
+    let root = Root::new("from");
+    let path = root.socket();
+    let mut old = Daemon::spawn(&root, true, &[]);
+    let ask = |path: &Path| {
+        request(
+            path,
+            &Request::Eval {
+                code: "return tostring(remuda.daemon.reloaded_from())".into(),
+                name: None,
+            },
+        )
+    };
+    assert_eq!(ask(&path), Response::Value("nil".into()));
+    let old_pid = old.0.id();
+
+    let out = root.remuda(&["reload"]);
+    assert!(out.status.success(), "{:?}", text(&out));
+    assert!(old.exited(), "the old daemon did not exit cleanly");
+    assert_ne!(root.lock_pid(), old_pid);
+    assert_eq!(ask(&path), Response::Value(old_pid.to_string()));
 }

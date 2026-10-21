@@ -305,6 +305,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::Shutdown { .. } => Err(refusal("Shutdown")),
         Request::Eval { .. } => Err(refusal("Eval")),
         Request::Vfs { .. } => Err(refusal("Vfs")),
+        Request::Db { .. } => Err(refusal("Db")),
         Request::SecretAnswer { .. } => Err(refusal("SecretAnswer")),
         Request::LineAnswer { .. } => Err(refusal("LineAnswer")),
     }
