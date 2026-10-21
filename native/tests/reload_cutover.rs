@@ -223,6 +223,44 @@ fn a_reload_hands_over_every_host_and_no_client_sees_the_socket_go() {
 }
 
 #[test]
+fn a_request_the_old_daemon_accepted_is_still_answered_after_the_handover() {
+    let root = Root::new("slow");
+    let path = root.socket();
+    let mut old = Daemon::spawn(&root, true, &[("REMUDA_TEST_RELOAD_READY_MS", "15000")]);
+    new_session(&path, "one");
+    // Accepted by the old daemon, answered by its Lua two seconds later.
+    let slow = {
+        let path = path.clone();
+        std::thread::spawn(move || {
+            client::request(
+                &path,
+                &Request::Eval {
+                    code: "local reply = remuda.pending { timeout = 20 }\n\
+                           local s\n\
+                           s = remuda.schedule { every = 2, run = function()\n\
+                             remuda.cancel(s)\n\
+                             reply:resolve(0, 'late', '')\n\
+                           end }\n\
+                           return reply"
+                        .into(),
+                    name: None,
+                },
+            )
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    let out = root.remuda(&["reload"]);
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    let answer = slow.join().unwrap();
+    assert!(
+        matches!(&answer, Ok(Response::CommandResult { exit_code: 0, .. })),
+        "{answer:?}"
+    );
+    assert!(old.exited());
+}
+
+#[test]
 fn in_process_sessions_block_a_reload_and_nothing_changes() {
     let root = Root::new("legacy");
     let path = root.socket();

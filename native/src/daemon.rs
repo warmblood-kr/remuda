@@ -1576,6 +1576,7 @@ fn serve_unix(
                     let socket_owner = Arc::clone(&socket_owner);
                     let anti_entropy = Arc::clone(&anti_entropy);
                     let listener_task = Arc::clone(&listener_task);
+                    let answering = accept::Answering::begin();
                     std::thread::spawn(move || {
                         let _ = handle(
                             stream,
@@ -1587,6 +1588,7 @@ fn serve_unix(
                             listener_task,
                             accepted,
                         );
+                        drop(answering);
                     });
                 }
                 Err(error)
@@ -2024,6 +2026,14 @@ fn handle_request(
             let (response, replaced) = reload(image, registry, &listener_task, &binary, check);
             reply(&stream, &response)?;
             if replaced {
+                // Requests accepted before the pause still get their answers.
+                #[cfg(unix)]
+                {
+                    let left = accept::Answering::wait_for_others(1, RELOAD_DRAIN_DEADLINE);
+                    if left > 0 {
+                        eprintln!("remuda daemon: reload: {left} request(s) cut at exit");
+                    }
+                }
                 // The candidate owns the socket now: never unlink it here.
                 anti_entropy.stop_and_join();
                 std::process::exit(0);

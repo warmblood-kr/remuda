@@ -1,7 +1,9 @@
 //! Pausing the accept loop for a reload handover (#713). While paused, the
 //! loop leaves the listener out of its poll, so clients wait in the backlog
 //! for whichever daemon accepts next. A pause returns only once the loop has
-//! seen it, so no accept is in progress or still to come.
+//! seen it, so no accept is in progress or still to come. [`Answering`]
+//! counts accepted requests, so a daemon handing over waits for their
+//! answers before it exits.
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -87,6 +89,36 @@ impl AcceptGate {
     fn wake(&self) {
         // A full pair already holds a wake; the loop drains it next turn.
         let _ = (&self.wake_tx).write(&[1]);
+    }
+}
+
+static ANSWERING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Held from accept until a request is answered.
+pub(crate) struct Answering(());
+impl Answering {
+    pub(crate) fn begin() -> Self {
+        ANSWERING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(())
+    }
+    /// Wait up to `deadline` until at most `own` requests (the caller's)
+    /// are still being answered; answers how many others were left.
+    pub(crate) fn wait_for_others(own: usize, deadline: Duration) -> usize {
+        let until = Instant::now() + deadline;
+        loop {
+            let left = ANSWERING
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .saturating_sub(own);
+            if left == 0 || Instant::now() >= until {
+                return left;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+impl Drop for Answering {
+    fn drop(&mut self) {
+        ANSWERING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

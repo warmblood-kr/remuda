@@ -21,8 +21,10 @@ client saw the socket vanish.
      so no accept is in progress. New clients wait in the backlog.
   4. sends `Take` with the listener and the lock, and waits for `Serving`.
 - **Commit:** on `Serving`, O answers `reloaded: BUILD now serves this
-  socket` and exits 0. It never unlinks the socket, because C owns it. The
-  CLI then asks the socket for its version and prints `daemon now BUILD`.
+  socket`. It waits up to 10 s for requests it accepted before the pause to
+  be answered, then exits 0. It never unlinks the socket, because C owns
+  it. The CLI then asks the socket for its version and prints `daemon now
+  BUILD`.
 - **Rollback:** on `Failed`, C's exit, or no `Serving` within the deadline
   (30 s), O kills C, then:
   - claims the hosts again under a newer epoch, which fences C;
@@ -45,6 +47,8 @@ client saw the socket vanish.
     throughout, and none of its requests fails. The old daemon exits 0.
     The lock names a new pid that leads its own session. Both sessions keep
     their screens and take input.
+  - **Accepted request:** a deferred Lua eval that O accepted before the
+    handover, and answers 2 s later, still gets its answer.
   - **Blocker:** an in-process session blocks, and nothing changes.
   - **Candidate dies:** it exits after claiming the hosts, before serving.
     The reload exits 1. The same daemon holds the lock, drives the host and
@@ -63,7 +67,7 @@ client saw the socket vanish.
 
 ```
 $ cargo test -p remuda-native --test reload_cutover
-test result: ok. 4 passed; 0 failed
+test result: ok. 5 passed; 0 failed
 
 $ REMUDA_COMPAT_PREVIOUS=<step 067 build> cargo test -p remuda-native --test session_host_daemon -- --ignored --nocapture reload
 reloaded: 0.1.0+git.dd784c8dd319 now serves this socket
@@ -77,11 +81,13 @@ left: Error("agent io error: session owner unavailable: Recovering")
 left: Error("agent io error: session owner unavailable: Recovering")
 # red: the old daemon not exiting after the handover
 the old daemon did not exit cleanly
+# red: exiting without waiting for accepted requests (first seen in CI)
+Ok(Error("the daemon hung up without answering"))
 ```
 
 Limits:
-- O's open connections are cut when it exits: an attached TUI, or an
-  answer still being written. New connections are never lost.
+- A request O accepted that takes longer than 10 s is cut when O exits.
+  New connections are never lost.
 - Lua state (timers, pending replies) does not move. C loads `init.lua`
   afresh.
 - The test faults (`REMUDA_TEST_RELOAD_FAULT`) are read only by a
