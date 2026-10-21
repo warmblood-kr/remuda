@@ -44,9 +44,9 @@ file is then left as it was and no longer read. Peers see no change: entries,
 digest and messages are the same as before.
 
 Downgrade: an older remuda reads only `index.json`, which still holds the
-index as it was at the upgrade. `VfsStore::export_legacy_index` writes it
-again from the database first (the CLI for it comes with the daemon-owned
-step).
+index as it was at the upgrade. Before a downgrade, run
+`remuda vfs export-index`, which writes it again from the database; then
+stop the daemon and install the older remuda.
 
 Blobs are written to a temporary file, hashed, then renamed into place, so a
 blob file is never partial. A read verifies the hash again before returning.
@@ -98,7 +98,14 @@ mismatch.
 
 ## Operations
 
-- **put** (CLI, no daemon needed): store the blob locally, write the index
+Every `remuda vfs` command runs in the daemon, which owns the index (#778).
+The CLI parses the command, reads `put`'s source, writes `get`'s
+destination, and sends the rest as one local `Vfs` request; the remote front
+refuses that request. With no daemon running, the command prints one line
+saying the daemon is needed and exits 1. It does not start a daemon, and it
+does not touch the store.
+
+- **put**: store the blob locally, write the index
   entry, push the entry to admitted peers. With `--wait`, it then waits until
   `R` placement nodes report the blob through `BlobStat`. When the node
   knows peers but reached none of them, put says the file is stored on this

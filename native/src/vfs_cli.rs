@@ -1,14 +1,28 @@
 //! `remuda vfs …`: the cluster virtual file store from the command line
-//! (#742). Talks to no daemon: it reads and writes this node's store and
-//! reaches peers directly over the cluster channel.
+//! (#742). The daemon owns the store (#778): the CLI parses, reads `put`'s
+//! source and writes `get`'s destination, and the daemon runs the command
+//! (`Request::Vfs`). With no daemon running, it fails with one line.
 
 use crate::cli_parse::{self, ArgSpec, OptionSpec, RepeatPolicy, Spec, VerbSpec};
 use crate::cluster::vfs::{VfsError, VfsErrorKind, VfsStore};
 use crate::cluster::vfs_sync;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use remuda_core::protocol::{Request, Response};
 use remuda_core::vfs::{self as rules, VfsEntry, VfsUri};
 use serde_json::{Map, Value};
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::ExitCode;
+
+/// `println!` into `out.stdout`.
+macro_rules! say {
+    ($out:expr, $($arg:tt)*) => {{ let _ = writeln!($out.stdout, $($arg)*); }};
+}
+/// `eprintln!` into `out.stderr`.
+macro_rules! warn {
+    ($out:expr, $($arg:tt)*) => {{ let _ = writeln!($out.stderr, $($arg)*); }};
+}
 use std::time::Duration;
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -70,6 +84,8 @@ fn spec() -> Spec {
                 vec![], vec![option("cluster", Some("NAME"), "Cluster name used in remuda://NAME/ URIs"),
                              option("replicas", Some("N"), "Default copies for new files (1-16)")],
                 "remuda vfs config [--cluster NAME] [--replicas N]"),
+            verb("export-index", "Write index.json for an older remuda, before a downgrade. Example: remuda vfs export-index",
+                vec![], vec![], "remuda vfs export-index"),
             verb("help", "Print help for a vfs command", vec![arg("COMMAND", "vfs command name", false)], vec![], "remuda vfs help [COMMAND]"),
         ],
     }
@@ -95,13 +111,13 @@ fn flag(values: &Map<String, Value>, key: &str) -> bool {
     values.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
-fn fail(verb: &str, error: impl std::fmt::Display) -> ExitCode {
-    eprintln!("remuda: vfs {verb}: {error}");
-    ExitCode::FAILURE
+fn fail(out: &mut Out, verb: &str, error: impl std::fmt::Display) -> u8 {
+    warn!(out, "remuda: vfs {verb}: {error}");
+    1
 }
 
-fn fail_vfs(verb: &str, error: &VfsError) -> ExitCode {
-    eprintln!("remuda: vfs {verb}: {error}");
+fn fail_vfs(out: &mut Out, verb: &str, error: &VfsError) -> u8 {
+    warn!(out, "remuda: vfs {verb}: {error}");
     let next = match error.kind {
         VfsErrorKind::NoCluster => Some("run `remuda cluster init` or `remuda cluster join` first"),
         VfsErrorKind::NotFound => Some("run `remuda vfs ls` to see stored files"),
@@ -114,13 +130,22 @@ fn fail_vfs(verb: &str, error: &VfsError) -> ExitCode {
         _ => None,
     };
     if let Some(next) = next {
-        eprintln!("Next: {next}.");
+        warn!(out, "Next: {next}.");
     }
-    ExitCode::FAILURE
+    1
 }
 
-/// Run `remuda vfs ARGS…`.
-pub fn run(args: &[&str]) -> ExitCode {
+/// What a vfs command printed and its exit code. The daemon fills it; the
+/// CLI copies it to its own stdout and stderr.
+#[derive(Default)]
+pub struct Out {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Parse `args`. `Err` carries the exit code once help or a parse error
+/// has been written to `out`.
+fn parse(args: &[&str], out: &mut Out) -> Result<(String, Map<String, Value>), u8> {
     let help_alias = ["help"];
     let args = match args.first() {
         None | Some(&"-h" | &"--help") => &help_alias[..],
@@ -129,42 +154,184 @@ pub fn run(args: &[&str]) -> ExitCode {
     let verb = args[0];
     let spec = spec();
     if !spec.verbs.iter().any(|known| known.name == verb) {
-        eprintln!("remuda: unknown vfs command '{}'", verb.escape_debug());
-        eprint!("{}", usage(""));
-        return ExitCode::from(2);
+        warn!(out, "remuda: unknown vfs command '{}'", verb.escape_debug());
+        let _ = write!(out.stderr, "{}", usage(""));
+        return Err(2);
     }
     let report = cli_parse::parse(&spec, args);
     if verb == "help" {
         let topic = value(&report.values, "COMMAND").filter(|topic| *topic != "help");
-        print!("{}", usage(topic.unwrap_or("")));
-        return ExitCode::SUCCESS;
+        let _ = write!(out.stdout, "{}", usage(topic.unwrap_or("")));
+        return Err(0);
     }
     if !report.ok {
         if report.kind.as_deref() == Some("help") {
-            print!("{}", usage(verb));
-            return ExitCode::SUCCESS;
+            let _ = write!(out.stdout, "{}", usage(verb));
+            return Err(0);
         }
-        eprintln!("{}", report.text.trim_end());
-        return ExitCode::from(2);
+        warn!(out, "{}", report.text.trim_end());
+        return Err(2);
     }
-    let values = &report.values;
+    Ok((verb.to_owned(), report.values))
+}
+
+/// Run `remuda vfs ARGS…` from the CLI: parse here, run in the daemon of
+/// `server` (socket `socket`), which owns the index. Never starts a daemon.
+pub fn run(server: &str, socket: &Path, args: &[&str]) -> ExitCode {
+    let mut out = Out::default();
+    let (verb, values) = match parse(args, &mut out) {
+        Ok(parsed) => parsed,
+        Err(code) => return finish(out, code),
+    };
+    if crate::ipc::connect(socket).is_err() {
+        eprintln!(
+            "remuda: vfs {verb} needs the remuda daemon, and none is running for {server:?}; start it with `remuda run ...` or `remuda -e 1`, then retry"
+        );
+        return ExitCode::FAILURE;
+    }
+    let mut input = None;
+    if verb == "put" {
+        let source = value(&values, "SOURCE").unwrap_or_default();
+        match read_source(source) {
+            Ok(bytes) => input = Some(BASE64.encode(bytes)),
+            Err(error) => return finish_fail(&verb, format!("cannot read {source}: {error}")),
+        }
+    }
+    let request = Request::Vfs {
+        args: forward(&verb, &values),
+        input_base64: input,
+    };
+    let (code, stdout, stderr) = match crate::client::request(socket, &request) {
+        Ok(Response::CommandResult {
+            exit_code,
+            stdout_base64,
+            stderr_base64,
+        }) => (
+            exit_code,
+            BASE64.decode(stdout_base64).unwrap_or_default(),
+            BASE64.decode(stderr_base64).unwrap_or_default(),
+        ),
+        Ok(Response::Error(error)) => return finish_fail(&verb, error),
+        Ok(other) => return finish_fail(&verb, format!("unexpected daemon answer: {other:?}")),
+        Err(error) => return finish_fail(&verb, format!("daemon request failed: {error}")),
+    };
+    let _ = std::io::stderr().lock().write_all(&stderr);
+    if verb == "get" && code == 0 {
+        if let Some(dest) = value(&values, "DEST").filter(|dest| *dest != "-") {
+            return match std::fs::write(dest, &stdout) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => finish_fail(&verb, error),
+            };
+        }
+    }
+    let _ = std::io::stdout().lock().write_all(&stdout);
+    ExitCode::from(code)
+}
+
+/// `verb` and its parsed `values` as daemon arguments, in spec order. SOURCE
+/// becomes `-` (the content travels as input) and DEST stays with the CLI.
+fn forward(verb: &str, values: &Map<String, Value>) -> Vec<String> {
+    let spec = spec();
+    let Some(command) = spec.verbs.iter().find(|command| command.name == verb) else {
+        return vec![verb.to_owned()];
+    };
+    let mut args = vec![verb.to_owned()];
+    for arg in &command.args {
+        match (arg.name.as_str(), value(values, &arg.name)) {
+            ("SOURCE", _) => args.push("-".into()),
+            ("DEST", _) | (_, None) => {}
+            (_, Some(text)) => args.push(text.to_owned()),
+        }
+    }
+    for option in &command.options {
+        match values.get(&option.long) {
+            Some(Value::Bool(true)) => args.push(format!("--{}", option.long)),
+            Some(Value::String(text)) => args.extend([format!("--{}", option.long), text.clone()]),
+            _ => {}
+        }
+    }
+    args
+}
+
+fn read_source(source: &str) -> std::io::Result<Vec<u8>> {
+    let limit = crate::cluster::vfs::MAX_BLOB_BYTES;
+    let mut bytes = Vec::new();
+    if source == "-" {
+        std::io::stdin()
+            .lock()
+            .take(limit + 1)
+            .read_to_end(&mut bytes)?;
+    } else {
+        std::fs::File::open(source)?
+            .take(limit + 1)
+            .read_to_end(&mut bytes)?;
+    }
+    Ok(bytes)
+}
+
+fn finish(out: Out, code: u8) -> ExitCode {
+    let _ = std::io::stdout().lock().write_all(&out.stdout);
+    let _ = std::io::stderr().lock().write_all(&out.stderr);
+    ExitCode::from(code)
+}
+
+fn finish_fail(verb: &str, error: impl std::fmt::Display) -> ExitCode {
+    let mut out = Out::default();
+    let code = fail(&mut out, verb, error);
+    finish(out, code)
+}
+
+/// The daemon's half of [`Request::Vfs`]: run the command against this
+/// node's store and answer with what it printed.
+pub fn serve_request(args: &[String], input_base64: Option<&str>) -> Response {
+    let input = match input_base64.map(|text| BASE64.decode(text)).transpose() {
+        Ok(input) => input.unwrap_or_default(),
+        Err(error) => return Response::error(format!("vfs: bad input encoding: {error}")),
+    };
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut out = Out::default();
+    let code = serve(&args, &input, &mut out);
+    Response::CommandResult {
+        exit_code: code,
+        stdout_base64: BASE64.encode(&out.stdout),
+        stderr_base64: BASE64.encode(&out.stderr),
+    }
+}
+
+fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
+    let (verb, values) = match parse(args, out) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    let values = &values;
     let store = match VfsStore::open_default() {
         Ok(store) => store,
-        Err(error) => return fail_vfs(verb, &error),
+        Err(error) => return fail_vfs(out, &verb, &error),
     };
-    match verb {
-        "put" => put(&store, values),
-        "get" => get(&store, values),
-        "resolve" => resolve(&store, values),
-        "stat" => stat(&store, values),
-        "ls" => list(&store, values),
-        "rm" => remove(&store, values),
+    match verb.as_str() {
+        "put" => put(&store, values, input, out),
+        "get" => get(&store, values, out),
+        "resolve" => resolve(&store, values, out),
+        "stat" => stat(&store, values, out),
+        "ls" => list(&store, values, out),
+        "rm" => remove(&store, values, out),
         "sync" => {
             let report = vfs_sync::sync_once();
-            println!("{report}");
-            ExitCode::SUCCESS
+            say!(out, "{report}");
+            0
         }
-        "config" => config(&store, values),
+        "config" => config(&store, values, out),
+        "export-index" => match store.export_legacy_index() {
+            Ok(count) => {
+                say!(
+                    out,
+                    "Wrote {count} entries to {}.",
+                    store.root().join("index.json").display()
+                );
+                0
+            }
+            Err(error) => fail_vfs(out, &verb, &error),
+        },
         _ => unreachable!("vfs verb specification and dispatcher diverged"),
     }
 }
@@ -186,46 +353,33 @@ fn parse_replicas(text: &str) -> Result<u8, String> {
         .ok_or_else(|| format!("--replicas must be 1-{}", rules::MAX_REPLICAS))
 }
 
-fn put(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
-    let source = value(values, "SOURCE").unwrap_or_default();
+fn put(store: &VfsStore, values: &Map<String, Value>, bytes: &[u8], out: &mut Out) -> u8 {
     let uri = match store.parse_uri(value(values, "URI").unwrap_or_default()) {
         Ok(uri) => uri,
-        Err(error) => return fail_vfs("put", &error),
+        Err(error) => return fail_vfs(out, "put", &error),
     };
     let replicas = match value(values, "replicas") {
         Some(text) => match parse_replicas(text) {
             Ok(replicas) => replicas,
-            Err(error) => return fail("put", error),
+            Err(error) => return fail(out, "put", error),
         },
         None => match store.settings() {
             Ok(settings) => settings.default_replicas,
-            Err(error) => return fail_vfs("put", &error),
+            Err(error) => return fail_vfs(out, "put", &error),
         },
     };
-    let limit = crate::cluster::vfs::MAX_BLOB_BYTES;
-    let mut bytes = Vec::new();
-    let read = if source == "-" {
-        std::io::stdin()
-            .lock()
-            .take(limit + 1)
-            .read_to_end(&mut bytes)
-    } else {
-        std::fs::File::open(source).and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
-    };
-    if let Err(error) = read {
-        return fail("put", format!("cannot read {source}: {error}"));
-    }
     let writer = match writer() {
         Ok(writer) => writer,
-        Err(error) => return fail_vfs("put", &error),
+        Err(error) => return fail_vfs(out, "put", &error),
     };
-    let entry = match store.put(&uri.path, &bytes, replicas, &writer) {
+    let entry = match store.put(&uri.path, bytes, replicas, &writer) {
         Ok(entry) => entry,
-        Err(error) => return fail_vfs("put", &error),
+        Err(error) => return fail_vfs(out, "put", &error),
     };
     let pushed = vfs_sync::push_entries(std::slice::from_ref(&entry));
     let cluster = store.settings().map(|s| s.cluster_name).unwrap_or_default();
-    println!(
+    say!(
+        out,
         "Stored {} (version {}, sha256 {}, {} bytes, {} copies wanted).",
         VfsUri::format(&cluster, &entry.path),
         entry.version,
@@ -236,30 +390,26 @@ fn put(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
     let reached = pushed.iter().filter(|result| result.reached).count();
     let outcome = push_outcome(pushed.len(), reached);
     if let Some(told) = &outcome.told {
-        println!("{told}");
+        say!(out, "{told}");
     }
     if let Some(warning) = &outcome.warning {
-        eprintln!("remuda: vfs put: {warning}");
-        eprintln!("Next: start the other nodes, or check `remuda cluster nodes`; peers copy the file when they next reach this node.");
+        warn!(out, "remuda: vfs put: {warning}");
+        warn!(out, "Next: start the other nodes, or check `remuda cluster nodes`; peers copy the file when they next reach this node.");
     }
     if flag(values, "wait") {
         match vfs_sync::wait_for_replicas(&entry, WAIT_TIMEOUT) {
-            Ok(holders) => println!("{holders} copies confirmed."),
+            Ok(holders) => say!(out, "{holders} copies confirmed."),
             Err(error) => {
-                fail_vfs("put", &error);
-                return if outcome.only_here {
-                    ExitCode::from(EXIT_TEMPFAIL)
-                } else {
-                    ExitCode::FAILURE
-                };
+                fail_vfs(out, "put", &error);
+                return if outcome.only_here { EXIT_TEMPFAIL } else { 1 };
             }
         }
-        return ExitCode::SUCCESS;
+        return 0;
     }
     if outcome.only_here {
-        ExitCode::from(EXIT_TEMPFAIL)
+        EXIT_TEMPFAIL
     } else {
-        ExitCode::SUCCESS
+        0
     }
 }
 
@@ -318,38 +468,32 @@ fn fetch(
     }
 }
 
-fn get(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
+fn get(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
     let uri = match store.parse_uri(value(values, "URI").unwrap_or_default()) {
         Ok(uri) => uri,
-        Err(error) => return fail_vfs("get", &error),
+        Err(error) => return fail_vfs(out, "get", &error),
     };
     let (_, bytes) = match fetch(store, &uri, flag(values, "local")) {
         Ok(found) => found,
-        Err(error) => return fail_vfs("get", &error),
+        Err(error) => return fail_vfs(out, "get", &error),
     };
-    let written = match value(values, "DEST") {
-        None | Some("-") => std::io::stdout().lock().write_all(&bytes),
-        Some(dest) => std::fs::write(dest, &bytes),
-    };
-    match written {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => fail("get", error),
-    }
+    out.stdout.extend_from_slice(&bytes);
+    0
 }
 
-fn resolve(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
+fn resolve(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
     let uri = match store.parse_uri(value(values, "URI").unwrap_or_default()) {
         Ok(uri) => uri,
-        Err(error) => return fail_vfs("resolve", &error),
+        Err(error) => return fail_vfs(out, "resolve", &error),
     };
     match fetch(store, &uri, flag(values, "local"))
         .and_then(|(entry, _)| store.blob_path(&entry.sha256))
     {
         Ok(path) => {
-            println!("{}", path.display());
-            ExitCode::SUCCESS
+            say!(out, "{}", path.display());
+            0
         }
-        Err(error) => fail_vfs("resolve", &error),
+        Err(error) => fail_vfs(out, "resolve", &error),
     }
 }
 
@@ -366,33 +510,39 @@ fn entry_json(store: &VfsStore, entry: &VfsEntry) -> Value {
     })
 }
 
-fn stat(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
+fn stat(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
     let uri = match store.parse_uri(value(values, "URI").unwrap_or_default()) {
         Ok(uri) => uri,
-        Err(error) => return fail_vfs("stat", &error),
+        Err(error) => return fail_vfs(out, "stat", &error),
     };
     let index = match store.load_index() {
         Ok(index) => index,
-        Err(error) => return fail_vfs("stat", &error),
+        Err(error) => return fail_vfs(out, "stat", &error),
     };
     let Some(entry) = index.live(&uri.path) else {
         return fail_vfs(
+            out,
             "stat",
             &VfsError::new(VfsErrorKind::NotFound, format!("no file at {}", uri.path)),
         );
     };
     if flag(values, "json") {
-        println!("{}", entry_json(store, entry));
-        return ExitCode::SUCCESS;
+        say!(out, "{}", entry_json(store, entry));
+        return 0;
     }
     let holders = vfs_sync::placement_for(entry);
-    println!("path      {}", entry.path);
-    println!("version   {}", entry.version);
-    println!("sha256    {}", entry.sha256);
-    println!("size      {}", entry.size);
-    println!("replicas  {}", entry.replicas);
-    println!("writer    {}", crate::cluster::node_label(&entry.writer));
-    println!(
+    say!(out, "path      {}", entry.path);
+    say!(out, "version   {}", entry.version);
+    say!(out, "sha256    {}", entry.sha256);
+    say!(out, "size      {}", entry.size);
+    say!(out, "replicas  {}", entry.replicas);
+    say!(
+        out,
+        "writer    {}",
+        crate::cluster::node_label(&entry.writer)
+    );
+    say!(
+        out,
         "here      {}",
         if store.has_blob(&entry.sha256, entry.size) {
             "yes"
@@ -400,7 +550,8 @@ fn stat(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
             "no"
         }
     );
-    println!(
+    say!(
+        out,
         "placed on {}",
         holders
             .iter()
@@ -408,20 +559,20 @@ fn stat(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    ExitCode::SUCCESS
+    0
 }
 
-fn list(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
+fn list(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
     let prefix = match value(values, "PREFIX") {
         None => String::new(),
         Some(text) => match list_prefix(store, text) {
             Ok(prefix) => prefix,
-            Err(error) => return fail_vfs("ls", &error),
+            Err(error) => return fail_vfs(out, "ls", &error),
         },
     };
     let index = match store.load_index() {
         Ok(index) => index,
-        Err(error) => return fail_vfs("ls", &error),
+        Err(error) => return fail_vfs(out, "ls", &error),
     };
     let entries = index.list(&prefix);
     if flag(values, "json") {
@@ -429,11 +580,12 @@ fn list(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
             .iter()
             .map(|entry| entry_json(store, entry))
             .collect();
-        println!("{}", Value::Array(rows));
-        return ExitCode::SUCCESS;
+        say!(out, "{}", Value::Array(rows));
+        return 0;
     }
     for entry in entries {
-        println!(
+        say!(
+            out,
             "{:>10}  v{:<5} {}  {}{}",
             entry.size,
             entry.version,
@@ -446,7 +598,7 @@ fn list(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
             }
         );
     }
-    ExitCode::SUCCESS
+    0
 }
 
 /// A listing prefix is a URI whose path may end in `/` (or be empty).
@@ -470,34 +622,34 @@ pub fn list_prefix(store: &VfsStore, text: &str) -> Result<String, VfsError> {
     Ok(path.to_owned())
 }
 
-fn remove(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
+fn remove(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
     let uri = match store.parse_uri(value(values, "URI").unwrap_or_default()) {
         Ok(uri) => uri,
-        Err(error) => return fail_vfs("rm", &error),
+        Err(error) => return fail_vfs(out, "rm", &error),
     };
     let writer = match writer() {
         Ok(writer) => writer,
-        Err(error) => return fail_vfs("rm", &error),
+        Err(error) => return fail_vfs(out, "rm", &error),
     };
     match store.delete(&uri.path, &writer) {
         Ok(entry) => {
             vfs_sync::push_entries(std::slice::from_ref(&entry));
-            println!("Deleted {} (version {}).", uri.path, entry.version);
-            ExitCode::SUCCESS
+            say!(out, "Deleted {} (version {}).", uri.path, entry.version);
+            0
         }
-        Err(error) => fail_vfs("rm", &error),
+        Err(error) => fail_vfs(out, "rm", &error),
     }
 }
 
-fn config(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
+fn config(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
     let mut settings = match store.settings() {
         Ok(settings) => settings,
-        Err(error) => return fail_vfs("config", &error),
+        Err(error) => return fail_vfs(out, "config", &error),
     };
     let mut changed = false;
     if let Some(name) = value(values, "cluster") {
         if let Err(error) = rules::validate_cluster_name(name) {
-            return fail("config", error);
+            return fail(out, "config", error);
         }
         settings.cluster_name = name.to_owned();
         changed = true;
@@ -505,23 +657,63 @@ fn config(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
     if let Some(text) = value(values, "replicas") {
         match parse_replicas(text) {
             Ok(replicas) => settings.default_replicas = replicas,
-            Err(error) => return fail("config", error),
+            Err(error) => return fail(out, "config", error),
         }
         changed = true;
     }
     if changed {
         if let Err(error) = store.save_settings(&settings) {
-            return fail_vfs("config", &error);
+            return fail_vfs(out, "config", &error);
         }
     }
-    println!("cluster   {}", settings.cluster_name);
-    println!("replicas  {}", settings.default_replicas);
-    println!("store     {}", store.root().display());
-    ExitCode::SUCCESS
+    say!(out, "cluster   {}", settings.cluster_name);
+    say!(out, "replicas  {}", settings.default_replicas);
+    say!(out, "store     {}", store.root().display());
+    0
 }
 
 #[cfg(test)]
 mod tests {
+
+    fn forwarded(args: &[&str]) -> Vec<String> {
+        let mut out = Out::default();
+        let (verb, values) = parse(args, &mut out).unwrap();
+        forward(&verb, &values)
+    }
+
+    #[test]
+    fn the_daemon_gets_options_but_never_local_paths() {
+        assert_eq!(
+            forwarded(&[
+                "put",
+                "./notes.md",
+                "remuda:///n.md",
+                "--replicas",
+                "2",
+                "--wait"
+            ]),
+            ["put", "-", "remuda:///n.md", "--replicas", "2", "--wait"]
+        );
+        assert_eq!(
+            forwarded(&["get", "remuda:///n.md", "out.md", "--local"]),
+            ["get", "remuda:///n.md", "--local"]
+        );
+        assert_eq!(forwarded(&["ls", "--json"]), ["ls", "--json"]);
+        assert_eq!(
+            forwarded(&["config", "--cluster", "home"]),
+            ["config", "--cluster", "home"]
+        );
+    }
+
+    #[test]
+    fn help_and_parse_errors_need_no_daemon() {
+        let mut out = Out::default();
+        assert_eq!(parse(&["help"], &mut out).unwrap_err(), 0);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("export-index"));
+        let mut out = Out::default();
+        assert_eq!(parse(&["put"], &mut out).unwrap_err(), 2);
+    }
+
     use super::*;
 
     #[test]

@@ -121,6 +121,25 @@ impl Node {
         }
     }
 
+    /// Kill the daemon but keep the node's files (`kill` is also `Drop`'s).
+    fn kill_daemon_only(&self) {
+        let path = self.daemon_path();
+        let _ = remuda_native::client::request(
+            &path,
+            &Request::Shutdown {
+                requester_daemon_id: None,
+                requester_session_id: None,
+                requester_session_name: None,
+                override_hosted: false,
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while remuda_native::ipc::connect(&path).is_ok() {
+            assert!(Instant::now() < deadline, "daemon did not stop");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Kill the daemon, which also closes its cluster listener.
     fn kill(&mut self) {
         if let Some(mut child) = self.child.take() {
@@ -453,15 +472,34 @@ fn clear_errors_for_wrong_cluster_missing_and_no_cluster() {
         "1"
     );
 
-    // A node with no cluster identity says so.
-    let bare = Node {
+    // A node with no cluster identity says so; its daemon answers (#778).
+    let mut bare = Node {
         child: None,
         root: a.root.join("bare"),
-        runtime: a.runtime.clone(),
-        name: a.name.clone(),
+        runtime: a.root.join("bare-runtime"),
+        name: format!("{}-bare", a.name),
         address: a.address,
     };
+    std::fs::create_dir_all(&bare.runtime).unwrap();
+    std::fs::create_dir_all(bare.root.join("home")).unwrap();
+    bare.spawn_daemon();
     let output = bare.run(&["vfs", "ls"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no cluster"));
+
+    // With no daemon, vfs fails with one line and touches no store (#778).
+    bare.kill();
+    let index = a.root.join("state/remuda/cluster/vfs/index.db");
+    a.kill_daemon_only();
+    std::fs::remove_dir_all(a.root.join("state/remuda/cluster/vfs")).unwrap();
+    let output = a.run_with_stdin(&["vfs", "put", "-", "remuda:///y"], Some(b"2"));
+    assert!(!output.status.success());
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.contains("needs the remuda daemon"), "{text}");
+    assert!(
+        !index.exists(),
+        "a CLI with no daemon created {}",
+        index.display()
+    );
 }
