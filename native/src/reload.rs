@@ -511,6 +511,8 @@ fn read_frame(
     }
 }
 
+pub mod post_check;
+
 #[cfg(test)]
 mod tests {
     use super::*;

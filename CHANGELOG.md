@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `remuda reload` (Unix) now checks the new daemon after the handover: it
+  answers as the target build, lists every host-backed session the reload
+  moved, and loaded `init.lua`. An `init.lua` that fails only in the new
+  daemon, for example one edited since the old daemon started, is named and
+  `reload` exits 1. The reload itself has gone through.
 - `remuda reload` (experimental, Unix) replaces the running daemon with the
   installed remuda without closing a host-backed session.
   - The old daemon checks the new build as for `--check`, then hands it the

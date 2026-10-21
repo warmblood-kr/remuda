@@ -418,11 +418,12 @@ fn reload_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         check: mod_cli_flag(&values, "check"),
     };
     with_existing_daemon(server, path, |path| {
+        let before = remuda_native::reload::post_check::config_error_before(path);
         match remuda_native::client::request(path, &request) {
             Ok(Response::Value(report)) => {
                 println!("{report}");
                 if report.starts_with("reloaded:") {
-                    return reload_post_check(path);
+                    return reload_post_check(path, &report, before.as_deref());
                 }
                 if report.starts_with("ready:") {
                     ExitCode::SUCCESS
@@ -443,17 +444,18 @@ fn reload_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     })
 }
 
-/// After a reload: the socket must answer, and from the new daemon.
-fn reload_post_check(path: &Path) -> ExitCode {
-    match remuda_native::client::request(path, &Request::Version) {
-        Ok(Response::Value(build)) => {
-            println!("daemon now {build}");
-            ExitCode::SUCCESS
-        }
-        Ok(other) => fail(format!("after the reload the daemon answered {other:?}")),
-        Err(error) => fail(format!(
-            "after the reload the daemon did not answer: {error}"
-        )),
+/// After a reload: the new daemon answers as the target build, lists every
+/// host the reload moved, and loaded its `init.lua`.
+fn reload_post_check(path: &Path, report: &str, before: Option<&str>) -> ExitCode {
+    use remuda_native::reload::post_check::{post_check, CONFIG_DEADLINE};
+    let checked = post_check(path, report, before, CONFIG_DEADLINE);
+    for line in &checked.lines {
+        println!("{line}");
+    }
+    if checked.ok {
+        ExitCode::SUCCESS
+    } else {
+        fail("the reload went through, but the new daemon failed a check above")
     }
 }
 
