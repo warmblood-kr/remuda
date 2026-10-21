@@ -388,6 +388,9 @@ pub fn candidate(socket: &Path) -> Result<(), String> {
 /// Become the daemon: adopt O's listener and lock, claim the hosts, serve.
 /// Returns only if that fails before serving, after telling O why.
 fn take(socket: &Path, mut stream: UnixStream, fds: Vec<OwnedFd>) -> Result<(), String> {
+    // O started this process and is alive until we serve.
+    // SAFETY: getppid has no preconditions.
+    let _ = crate::daemon::RELOADED_FROM.set(unsafe { libc::getppid() } as u32);
     let error = match serve_taken(socket, &stream, fds) {
         Ok(()) => return Ok(()),
         Err(error) => error,

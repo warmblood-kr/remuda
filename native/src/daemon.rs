@@ -296,6 +296,10 @@ pub(crate) fn socket_publication() -> String {
         .unwrap_or_else(|| "legacy: not recorded".into())
 }
 
+/// The pid of the daemon this one took over from in a reload; unset when
+/// it started fresh. `remuda.daemon.reloaded_from()` reads it.
+pub(crate) static RELOADED_FROM: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
 /// Set once per daemon from `<socket>.daemon-id`; see `daemon_instance_id`.
 static DAEMON_INSTANCE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -335,6 +339,18 @@ fn serve_from(
     let (_socket_lock, listener, socket_owner) = open_endpoint(path, runtime)?;
     pause_startup_for_tests();
     encrypt_plaintext_credentials_at_startup();
+    // Only the daemon serving this socket writes the VFS index (#778). A
+    // reload candidate claims it just before it serves; see `claim_vfs`.
+    if let Err(error) = crate::cluster::vfs::start_writer(path) {
+        eprintln!("remuda daemon: vfs writer token: {error}");
+    }
+    #[cfg(unix)]
+    let candidate = serving.is_some();
+    #[cfg(windows)]
+    let candidate = false;
+    if !candidate {
+        claim_vfs();
+    }
     let anti_entropy = Arc::new(AntiEntropyTask::start()?);
     let listener_task = Arc::new(DaemonListenerControl::new(ListenerTask::start(path)));
 
@@ -382,6 +398,7 @@ fn serve_from(
     #[cfg(unix)]
     {
         if let Some(serving) = serving {
+            claim_vfs();
             serving();
         }
         serve_unix(
@@ -1846,6 +1863,13 @@ fn cut_over(
     Ok(build)
 }
 
+/// Make this daemon the VFS index writer; a failure is logged, not fatal.
+fn claim_vfs() {
+    if let Err(error) = crate::cluster::vfs::claim_writer() {
+        eprintln!("remuda daemon: vfs: could not claim the index: {error}");
+    }
+}
+
 /// Take back what a failed handover gave away: the hosts (a newer epoch
 /// fences the candidate), host work, the lock's pid, accepting, the cluster
 /// listener.
@@ -1869,6 +1893,7 @@ fn roll_back(
         Err(error) => eprintln!("remuda daemon: reload rollback: reclaim failed: {error}"),
     }
     hosting.reopen();
+    claim_vfs();
     if let Err(error) = SocketLock::name_this_process(lock) {
         eprintln!("remuda daemon: reload rollback: socket lock: {error}");
     }
@@ -1974,7 +1999,6 @@ fn handle(
 /// answers them with a clear refusal instead of "no such session".
 fn local_only(request: &Request) -> Option<(&'static str, &str)> {
     match request {
-        Request::CaptureStyled { name, .. } => Some(("styled capture", name)),
         Request::Sync { name, .. } => Some(("sync", name)),
         Request::MouseState { name } => Some(("mouse state", name)),
         Request::Attach { name } | Request::AttachTracked { name } => Some(("attach", name)),
@@ -2231,6 +2255,8 @@ fn handle_request(
             &stream,
             &crate::vfs_cli::serve_request(&args, input_base64.as_deref()),
         ),
+
+        Request::Db { args } => reply(&stream, &crate::db_cli::serve_request(&args)),
 
         Request::SecretAnswer { .. } => reply(
             &stream,
@@ -3348,6 +3374,13 @@ fn handle_new_hosted(
     request: &crate::session_host::hosted::NewHosted<'_>,
     return_instance_id: bool,
 ) -> std::io::Result<()> {
+    // The same refusal an in-process `new` gives, before any host starts.
+    if registry.get(request.name).is_some() || registry.hosted(request.name).is_some() {
+        return reply(
+            stream,
+            &Response::error(format!("name taken: {}", request.name)),
+        );
+    }
     if let Err(error) = image.session_hosts().spawn(registry, request) {
         return reply(stream, &Response::error(error));
     }

@@ -45,12 +45,14 @@
 <p><code>contributions(point) -&gt; {{id, owner, entry}...}</code> — A point's entries as {id, owner, entry} rows, entry a shallow copy, by entry.order then id.</p>
 <h2 id="daemon">daemon</h2>
 <p><code>table</code> — Facts about the daemon this Lua image runs in.</p>
+<h2 id="daemon.reloaded_from">daemon.reloaded_from</h2>
+<p><code>daemon.reloaded_from() -&gt; pid | nil</code> — The pid of the daemon this one took over from in a <span class="title-ref">remuda reload</span>, or nil when it started fresh. That daemon may still be finishing its last requests for up to 10 s. A core without it lacks the field, so test remuda.daemon.reloaded_from first.</p>
 <h2 id="daemon.socket_publication">daemon.socket_publication</h2>
 <p><code>daemon.socket_publication() -&gt; {state, reason?}</code> — How this daemon published its socket. Returns {state = 'staged'} or {state = 'legacy', reason = text} (it fell back, or the operator set REMUDA_SOCKET_PUBLICATION=legacy). The same answer as the SocketPublication request; a core without remuda.daemon does not have it, so test remuda.daemon first.</p>
 <h2 id="db">db</h2>
 <p><code>table</code> — SQLite databases owned by mods. Each mod has its own namespace of databases, private to this user and daemon.</p>
 <h2 id="db.open">db.open</h2>
-<p><code>db.open(name [, opts]) -&gt; db | nil, reason</code> — Open (creating if needed) database NAME in the running mod's namespace: &lt;state&gt;/remuda/db/MOD/NAME.db. NAME is a plain identifier. opts may set max_bytes (default 64 MiB, at most 1 GiB), timeout_ms per statement (default 1000, at most 10000) and max_rows per query (default 10000, at most 100000). The handle has query(sql, params) -&gt; rows, exec(sql, params) -&gt; changes, batch(sql) -&gt; true, limits() and close(); params is an array of nil, boolean, number or string. Failures return nil and a reason starting with no_mod, io, sql, too_large, timeout, too_many_rows, denied (ATTACH, DETACH and most PRAGMAs) or closed. Outside a mod's own code it returns nil, 'no_mod: ...'.</p>
+<p><code>db.open(name [, opts]) -&gt; db | nil, reason</code> — Open (creating if needed) database NAME in the running mod's namespace: &lt;state&gt;/remuda/db/MOD/NAME.db. NAME is a plain identifier. opts may set max_bytes (default 64 MiB, at most 1 GiB), timeout_ms per statement (default 1000, at most 10000) and max_rows per query (default 10000, at most 100000). opts.migrations = true applies the mod's migrations/NAME/NNNN_x.up.sql steps (or pass an array of {name, up, down}); see docs/lua.md. The handle has query(sql, params) -&gt; rows, exec(sql, params) -&gt; changes, batch(sql) -&gt; true, limits() and close(); params is an array of nil, boolean, number or string. Failures return nil and a reason starting with no_mod, io, sql, too_large, timeout, too_many_rows, denied (ATTACH, DETACH and most PRAGMAs), migration, too_new, drift, foreign_key or closed. Outside a mod's own code it returns nil, 'no_mod: ...'.</p>
 <h2 id="define_key">define_key</h2>
 <p><code>define_key(spec) -&gt; nil</code> — Declare a contextual UI key, native action and generated help.</p>
 <h2 id="emit">emit</h2>

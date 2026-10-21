@@ -633,3 +633,34 @@ fn pre_sqlite_downgrade_and_upgrade_again_keep_every_name() {
         "{listed}"
     );
 }
+
+/// A previous build that knows fewer schema steps refuses a newer `index.db`
+/// with one clear line, and touches nothing.
+#[test]
+#[ignore = "needs REMUDA_COMPAT_PREVIOUS from a build with index.db; run by CI job host-compat-n-plus-one"]
+fn older_build_refuses_a_newer_index_db_cleanly() {
+    let _serial = live_test_guard();
+    let mut node = Node::start();
+    put(&node, "remuda:///kept.txt", b"kept");
+    node.kill_daemon_only();
+    // As if this build had added schema step 2.
+    let index = node.root.join("state/remuda/cluster/vfs/index.db");
+    rusqlite::Connection::open(&index)
+        .unwrap()
+        .pragma_update(None, "user_version", 2)
+        .unwrap();
+    node.exe = previous();
+    node.spawn_daemon();
+    let output = node.run(&["vfs", "ls"]);
+    assert!(!output.status.success());
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        text.contains("newer than this remuda") && text.contains("upgrade remuda"),
+        "{text}"
+    );
+    let version: i64 = rusqlite::Connection::open(&index)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+}
