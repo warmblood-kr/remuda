@@ -261,6 +261,23 @@ pub fn serve_with_runtime(path: &Path, runtime: &Path) -> std::io::Result<()> {
     serve_inner(path, Some(runtime))
 }
 
+/// What a reload candidate takes over from the daemon it replaces (#713):
+/// the listening socket, backlog included, and the held socket lock.
+#[cfg(unix)]
+pub struct Handed {
+    pub listener: std::os::fd::OwnedFd,
+    pub lock: std::os::fd::OwnedFd,
+    /// Called once this daemon is about to accept, its hosts claimed.
+    pub serving: Box<dyn FnOnce() + Send>,
+}
+
+/// Serve on a handed listener: no bind, no lock wait, and the published
+/// socket node is adopted as it is.
+#[cfg(unix)]
+pub fn serve_handed(path: &Path, handed: Handed) -> std::io::Result<()> {
+    serve_from(path, None, Some(handed))
+}
+
 /// The socket this daemon serves, for a reload candidate to find its hosts.
 static DAEMON_SOCKET: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
@@ -288,38 +305,30 @@ fn daemon_instance_id() -> String {
 }
 
 fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
-    let _socket_lock = SocketLock::acquire(path, runtime)?;
-    let _ = DAEMON_SOCKET.set(path.to_path_buf());
-    if ipc::connect(path).is_ok() {
-        return Err(std::io::Error::other(format!(
-            "a daemon is already listening at {} — pick a different name (remuda -s <name>) \
-             or stop it first",
-            path.display()
-        )));
-    }
-    // Under the socket lock: a replacement daemon reads what this one wrote.
     #[cfg(unix)]
-    match instance_id::load_or_create(path) {
-        Ok(id) => {
-            let _ = DAEMON_INSTANCE_ID.set(id);
-        }
-        Err(error) => eprintln!(
-            "remuda daemon: no stable daemon id ({error}); sessions get the process ID instead"
-        ),
-    }
-    // Before the bind: once a client can see the socket, a signal must find
-    // the handler, not the default action. Signals queue in the pair until
-    // `serve_unix` polls this together with the listener.
-    #[cfg(unix)]
-    let signals = catch_signals()?;
-    #[cfg(unix)]
-    let (listener, socket_owner, mode) = publication::bind_endpoint(path)?;
-    #[cfg(unix)]
-    let _ = SOCKET_PUBLICATION.set(mode.describe());
+    return serve_from(path, runtime, None);
     #[cfg(windows)]
-    let listener: Listener = ipc::listen(path)?;
+    serve_from(path, runtime)
+}
+
+fn serve_from(
+    path: &Path,
+    runtime: Option<&Path>,
+    #[cfg(unix)] handed: Option<Handed>,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let (handed, serving) = match handed {
+        Some(Handed {
+            listener,
+            lock,
+            serving,
+        }) => (Some((listener, lock)), Some(serving)),
+        None => (None, None),
+    };
+    #[cfg(unix)]
+    let (_socket_lock, signals, listener, socket_owner) = open_endpoint(path, runtime, handed)?;
     #[cfg(windows)]
-    let socket_owner = Arc::new(SocketOwnership::capture(path)?);
+    let (_socket_lock, listener, socket_owner) = open_endpoint(path, runtime)?;
     pause_startup_for_tests();
     encrypt_plaintext_credentials_at_startup();
     let anti_entropy = Arc::new(AntiEntropyTask::start()?);
@@ -368,6 +377,9 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     spawn_ticker(image.clone(), Arc::clone(&counters), Arc::clone(&registry));
     #[cfg(unix)]
     {
+        if let Some(serving) = serving {
+            serving();
+        }
         serve_unix(
             listener,
             (path, runtime),
@@ -411,6 +423,76 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
         socket_owner.cleanup();
         Ok(())
     }
+}
+
+/// Lock, refuse a live peer, load the daemon id, catch signals, bind (or
+/// adopt a handed listener): everything before the daemon starts work.
+#[cfg(unix)]
+fn open_endpoint(
+    path: &Path,
+    runtime: Option<&Path>,
+    handed: Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
+) -> std::io::Result<(
+    SocketLock,
+    std::os::unix::net::UnixStream,
+    Listener,
+    Arc<SocketOwnership>,
+)> {
+    let (lock, handed) = match handed {
+        Some((listener, lock)) => (SocketLock::adopt(lock)?, Some(listener)),
+        None => (SocketLock::acquire(path, runtime)?, None),
+    };
+    let _ = DAEMON_SOCKET.set(path.to_path_buf());
+    // A handed listener answers this connect itself: it is ours already.
+    if handed.is_none() {
+        refuse_if_listening(path)?;
+    }
+    // Under the socket lock: a replacement daemon reads what this one wrote.
+    match instance_id::load_or_create(path) {
+        Ok(id) => {
+            let _ = DAEMON_INSTANCE_ID.set(id);
+        }
+        Err(error) => eprintln!(
+            "remuda daemon: no stable daemon id ({error}); sessions get the process ID instead"
+        ),
+    }
+    // Before the bind: once a client can see the socket, a signal must find
+    // the handler, not the default action. Signals queue in the pair until
+    // `serve_unix` polls this together with the listener.
+    let signals = catch_signals()?;
+    let (listener, owner, publication) = match handed {
+        Some(fd) => adopt_listener(path, fd)?,
+        None => {
+            let (listener, owner, mode) = publication::bind_endpoint(path)?;
+            (listener, owner, mode.describe())
+        }
+    };
+    let _ = SOCKET_PUBLICATION.set(publication);
+    Ok((lock, signals, listener, owner))
+}
+
+#[cfg(windows)]
+fn open_endpoint(
+    path: &Path,
+    runtime: Option<&Path>,
+) -> std::io::Result<(SocketLock, Listener, Arc<SocketOwnership>)> {
+    let lock = SocketLock::acquire(path, runtime)?;
+    let _ = DAEMON_SOCKET.set(path.to_path_buf());
+    refuse_if_listening(path)?;
+    let listener: Listener = ipc::listen(path)?;
+    let owner = Arc::new(SocketOwnership::capture(path)?);
+    Ok((lock, listener, owner))
+}
+
+fn refuse_if_listening(path: &Path) -> std::io::Result<()> {
+    if ipc::connect(path).is_ok() {
+        return Err(std::io::Error::other(format!(
+            "a daemon is already listening at {} — pick a different name (remuda -s <name>) \
+             or stop it first",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// One-time migration (#746): seal credentials an older remuda left in
@@ -978,6 +1060,19 @@ impl SocketLock {
             Ok(Self {})
         }
     }
+
+    /// The lock a replaced daemon handed over: already held, since a passed
+    /// fd shares its `flock`. It now names this process.
+    #[cfg(unix)]
+    fn adopt(lock: std::os::fd::OwnedFd) -> std::io::Result<Self> {
+        use std::io::{Seek, SeekFrom};
+        let mut file = std::fs::File::from(lock);
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        writeln!(file, "{}", std::process::id())?;
+        file.flush()?;
+        Ok(Self { _file: file })
+    }
 }
 
 #[cfg(unix)]
@@ -1498,6 +1593,19 @@ fn prepare_unix_listener(mut listener: Listener, path: &Path) -> std::io::Result
     listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
+}
+
+/// A reload candidate's endpoint: the handed listener, and the socket node
+/// the replaced daemon published, which this daemon now owns.
+#[cfg(unix)]
+fn adopt_listener(
+    path: &Path,
+    fd: std::os::fd::OwnedFd,
+) -> std::io::Result<(Listener, Arc<SocketOwnership>, String)> {
+    let listener = Listener::UdSocket(interprocess::os::unix::uds_local_socket::Listener::from(fd));
+    listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
+    let owner = Arc::new(SocketOwnership::capture(path)?);
+    Ok((listener, owner, "handed over by reload".into()))
 }
 
 #[cfg(unix)]
