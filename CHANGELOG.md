@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `remuda reload` (Unix): fixed a daemon that had just handed over being
+  able to hand over again. A reload request it had accepted just before the
+  handover could start a second one, giving the socket to two new daemons.
+  It now refuses and points to the new daemon.
 - `remuda reload` (experimental, Unix) replaces the running daemon with the
   installed remuda without closing a host-backed session.
   - The old daemon checks the new build as for `--check`, then hands it the
