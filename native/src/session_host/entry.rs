@@ -92,10 +92,8 @@ const MAX_ENV_VARS: usize = 4096;
 const MAX_ENV_VALUE: usize = 128 * 1024;
 const MAX_ENV_BYTES: usize = 512 * 1024;
 
-/// Size has no floor here: the daemon's `Size` already applies the 80x24
-/// safety floor unless a caller explicitly opted into a pane or viewport
-/// size, which an in-process session honours too. The terminal's own
-/// geometry budget below still bounds both ends.
+/// No size floor here: the daemon's `Size` applies it unless the caller
+/// opted out, as in-process; the terminal's geometry budget bounds both ends.
 pub(super) fn validate(launch: &Launch) -> io::Result<()> {
     if let Some(reason) = refusal(launch) {
         return Err(invalid(format!("host-backed launch refused: {reason}")));

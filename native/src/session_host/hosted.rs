@@ -31,10 +31,8 @@ pub const OPT_IN: &str = "REMUDA_EXPERIMENTAL_SESSION_HOST";
 const CLIENT: [u8; 16] = *b"remuda-daemon-01";
 const PUBLISH_DEADLINE: Duration = Duration::from_secs(10);
 const TEARDOWN_DEADLINE: Duration = Duration::from_secs(10);
-/// A session child, hosted or in-process, inherits the daemon's environment
-/// except these daemon-only variables: the session-host opt-in itself, and
-/// service-manager handles meant for the daemon process alone (systemd
-/// readiness, socket activation and journal, launchd's XPC service name).
+/// Left out of every session child's environment, hosted or in-process: the
+/// session-host switch and the daemon's systemd/launchd service handles.
 pub(crate) const DAEMON_ONLY: &[&str] = &[
     OPT_IN,
     "NOTIFY_SOCKET",
