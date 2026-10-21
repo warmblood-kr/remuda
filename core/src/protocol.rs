@@ -183,6 +183,15 @@ mod secret_bytes_base64 {
     }
 }
 
+/// One host-backed session and the build of its host.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct HostBuild {
+    pub name: String,
+    /// `None` when the host could not be reached.
+    #[serde(default)]
+    pub build: Option<String>,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Request {
     /// Every session this node holds.
@@ -308,6 +317,10 @@ pub enum Request {
     /// outlives the binary that spawned it, so this is a client's only way to
     /// learn it is talking to yesterday's code before a field mismatch does.
     Version,
+    /// Each host-backed session's host build, as [`Response::SessionHostBuilds`]:
+    /// hosts outlive daemons, so builds can differ (#713). Older daemons
+    /// answer `bad request`.
+    SessionHostBuilds,
     /// How the daemon published its socket, as [`Response::Value`]: `staged`,
     /// or `legacy: <reason>` when it fell back or the operator chose it.
     SocketPublication,
@@ -357,6 +370,14 @@ pub enum Request {
         /// because only the caller knows where the source came from.
         name: Option<String>,
     },
+    /// Run `remuda vfs ARGS…` in the daemon, which owns the VFS index (#778).
+    /// `input_base64` is `put`'s content, read by the CLI. Answered with
+    /// [`Response::CommandResult`]. Local only: the remote front refuses it.
+    Vfs {
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_base64: Option<String>,
+    },
     /// Answer an outstanding secret prompt on this pending word's connection.
     SecretAnswer {
         id: u32,
@@ -386,6 +407,8 @@ pub enum Step {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Response {
     Sessions(Vec<SessionSummary>),
+    /// Answer to [`Request::SessionHostBuilds`], sorted by name.
+    SessionHostBuilds(Vec<HostBuild>),
     Screen(String),
     /// The session-level clear-line key was written; cleared text is optional
     /// because terminal screens do not generally identify composer contents.

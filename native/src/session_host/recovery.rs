@@ -25,38 +25,53 @@ pub(crate) enum Progress {
 }
 /// Metadata namespace a daemon writes once it closed a session's child.
 pub(crate) const CLOSING: &str = "closing";
+/// One writer claim: a fresh nonce under the next epoch. A host publishing
+/// between our read and commit is retried, not fatal.
+fn new_claim(store: &Store) -> Result<Fence, Error> {
+    let mut nonce = [0; 16];
+    getrandom::fill(&mut nonce).map_err(|_| Error::Data(model::Error::Unavailable))?;
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match store.commit(
+            store.read()?.cursor(),
+            None,
+            Mutation::Claim { nonce },
+            Duration::from_secs(1),
+        ) {
+            Ok(applied) => return Ok(applied.fence),
+            Err(Error::Busy | Error::Data(model::Error::StaleRevision))
+                if std::time::Instant::now() < until =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 pub(crate) struct Owner {
     store: Store,
-    fence: Fence,
+    /// Replaced only by [`Owner::reclaim`].
+    fence: std::sync::Mutex<Fence>,
 }
 impl Owner {
     /// A process-level owner, shared across sessions; not one new claim per act.
-    /// A host publishing between our read and commit is retried, not fatal.
     pub fn claim(store: Store) -> Result<Self, Error> {
-        let mut nonce = [0; 16];
-        getrandom::fill(&mut nonce).map_err(|_| Error::Data(model::Error::Unavailable))?;
-        let until = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            match store.commit(
-                store.read()?.cursor(),
-                None,
-                Mutation::Claim { nonce },
-                Duration::from_secs(1),
-            ) {
-                Ok(applied) => {
-                    return Ok(Self {
-                        store,
-                        fence: applied.fence,
-                    })
-                }
-                Err(Error::Busy | Error::Data(model::Error::StaleRevision))
-                    if std::time::Instant::now() < until =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        let fence = new_claim(&store)?;
+        Ok(Self {
+            store,
+            fence: std::sync::Mutex::new(fence),
+        })
+    }
+    /// Claim again with a newer epoch, fencing whoever claimed since; for a
+    /// daemon that takes its sessions back after a failed handover (#713).
+    /// Work under the old fence then fails with `StaleFence`, never twice.
+    pub fn reclaim(&self) -> Result<(), Error> {
+        let fence = new_claim(&self.store)?;
+        *self.fence.lock().unwrap_or_else(|e| e.into_inner()) = fence;
+        Ok(())
+    }
+    fn fence(&self) -> Fence {
+        *self.fence.lock().unwrap_or_else(|e| e.into_inner())
     }
     /// Durable publication precedes any host connection, effect or caller receipt.
     pub fn reserve(
@@ -115,7 +130,8 @@ impl Owner {
         // Skip the disk commit only while this exact fence (store incarnation,
         // epoch, nonce) is current and already wrote the act; otherwise Adopt
         // runs and a newer claim fails with StaleFence before any RPC.
-        if pending.writer_epoch != self.fence.epoch() || index.fence() != self.fence {
+        let fence = self.fence();
+        if pending.writer_epoch != fence.epoch() || index.fence() != fence {
             self.commit(copy_target(&target), InputMutation::Adopt(key.clone()))?;
         }
         let Ok(mut peer) = Client::open_recovering(endpoint, target.identity.clone()) else {
@@ -123,10 +139,14 @@ impl Owner {
         };
         // Prior connections and the entire admitted act must drain first. This
         // physical lease is independent of the durable controller writer fence.
-        match peer.request(&Request::Acquire) {
+        match peer.acquire(self.writer()) {
             Ok(Response::Granted { .. }) => {}
             // A live host still running an admitted act (or another holder).
             Ok(Response::Error { code }) if code == "controller_busy" => return Ok(Progress::Busy),
+            // A newer daemon reached this host first; this owner may not write.
+            Ok(Response::Error { code }) if code == "superseded_writer" => {
+                return Err(Error::Data(model::Error::StaleFence))
+            }
             _ => return Ok(Progress::Unavailable),
         }
         let request = Request::Recover {
@@ -143,15 +163,19 @@ impl Owner {
     pub fn index(&self) -> Result<model::Index, Error> {
         self.store.read()
     }
+    /// What a fencing host is shown; it refuses every older writer after this.
+    pub fn writer(&self) -> super::api::Writer {
+        self.fence().writer()
+    }
     /// Whether this owner's exact fence is still the store's current writer.
     pub fn current(&self) -> Result<bool, Error> {
-        Ok(self.store.read()?.fence() == self.fence)
+        Ok(self.store.read()?.fence() == self.fence())
     }
     /// Durable launch reservation under this owner's fence, before any spawn.
     pub fn reserve_launch(&self, name: String, entry: model::Entry) -> Result<(), Error> {
         self.store.commit(
             self.store.read()?.cursor(),
-            Some(self.fence),
+            Some(self.fence()),
             Mutation::ReserveLaunch { name, entry },
             Duration::from_secs(1),
         )?;
@@ -177,7 +201,7 @@ impl Owner {
             };
             match self.store.commit(
                 index.cursor(),
-                Some(self.fence),
+                Some(self.fence()),
                 Mutation::Metadata {
                     target: copy_target(&target),
                     update,
@@ -198,7 +222,7 @@ impl Owner {
     pub fn retire(&self, target: Target) -> Result<(), Error> {
         self.store.commit(
             self.store.read()?.cursor(),
-            Some(self.fence),
+            Some(self.fence()),
             Mutation::Exit {
                 target,
                 operation: model::ExitMutation::Retire,
@@ -305,7 +329,7 @@ impl Owner {
     fn commit(&self, target: Target, operation: InputMutation) -> Result<(), Error> {
         self.store.commit(
             self.store.read()?.cursor(),
-            Some(self.fence),
+            Some(self.fence()),
             Mutation::Input { target, operation },
             Duration::from_secs(1),
         )?;

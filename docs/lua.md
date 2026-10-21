@@ -158,6 +158,49 @@ kind of symlink; treat that result as **not Butler-created**. The caller must
 also check that the path is under its own home before trusting the directory.
 Other failures return `nil, error`.
 
+## Mod databases (`remuda.db`)
+
+`remuda.db.open(name [, opts])` opens a SQLite database that belongs to the
+mod whose code is running (#778). In mod `butler`, `remuda.db.open("notes")`
+opens `<state>/remuda/db/butler/notes.db` and `open("inbox")` opens
+`butler/inbox.db`. `name` is a plain identifier, never a path. Outside a
+mod's own code (`initialize`, `commands`, `start`, or its hooks, tools and
+schedules), for example in `remuda -e` or the REPL, it returns
+`nil, "no_mod: ..."`. Keep the handle in the mod's state.
+
+```lua
+start = function(state)
+  state.db = assert(remuda.db.open("notes"))
+  assert(state.db:batch("CREATE TABLE IF NOT EXISTS note (id INTEGER PRIMARY KEY, body TEXT)"))
+  assert(state.db:exec("INSERT INTO note (body) VALUES (?)", {"hello"}))
+  for _, row in ipairs(assert(state.db:query("SELECT id, body FROM note"))) do
+    print(row.id, row.body)
+  end
+end
+```
+
+A handle has `query(sql, params) -> rows`, `exec(sql, params) -> changes`,
+`batch(sql) -> true` (several statements, no parameters), `limits()` and
+`close()`. `params` is an array of nil, boolean, number or string; a string
+that is not UTF-8 is stored as a blob. Rows are tables keyed by column name,
+and SQL NULL is a missing key.
+
+The files are private (0600 in a 0700 directory; the owner-only ACL on
+Windows) and in WAL mode. Lua is not a sandbox, so the limits guard against
+mistakes that would stall or bloat the daemon, not against hostile code:
+
+| Limit | Default | Most `opts` may ask for | Failure |
+|---|---|---|---|
+| `max_bytes`, database size | 64 MiB | 1 GiB | `too_large: ...` |
+| `timeout_ms`, per statement | 1000 | 10000 | `timeout: ...` |
+| `max_rows`, per query | 10000 | 100000 | `too_many_rows: ...` |
+
+`ATTACH`, `DETACH` (and so `VACUUM INTO`) and PRAGMAs outside a short list
+(`user_version`, `table_info`, `index_list`, `integrity_check`, and a few
+other read-only ones) fail with `denied: ...`, so a handle cannot reach
+another file, the VFS index included, or undo its limits. Other failures
+are `sql: ...`, `io: ...` and, after `close()`, `closed: ...`.
+
 ## JSON values
 
 `remuda.json.decode(text)` reads at most 8 MiB of UTF-8 JSON and returns
