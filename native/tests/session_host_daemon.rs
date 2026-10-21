@@ -291,16 +291,23 @@ fn a_hosted_session_survives_daemon_sigkill_and_is_rediscovered() {
     std::thread::sleep(Duration::from_millis(500));
     let screen = wait_for(&path, "keeper", "AGAIN:2");
     assert_eq!(screen.matches("AGAIN:2").count(), 1, "sent exactly once");
-    // Routes that still need a local Session refuse clearly.
-    match request(
-        &path,
-        &Request::MouseState {
-            name: "keeper".into(),
-        },
-    ) {
-        Response::Error(message) => assert!(message.contains("not supported yet"), "{message}"),
-        other => panic!("expected a refusal, got {other:?}"),
-    }
+    // Sync reads the rediscovered host instead of refusing: #799 made hosted
+    // Sync reach a host, so there is no local-only route left to probe here.
+    assert!(
+        matches!(
+            request(
+                &path,
+                &Request::Sync {
+                    name: "keeper".into(),
+                    instance_id: None,
+                    since: 0,
+                    timeout_ms: 0,
+                },
+            ),
+            Response::Sync { .. }
+        ),
+        "a rediscovered hosted session answers Sync"
+    );
 
     // The host dies: the daemon keeps the name and answers Unavailable.
     assert_eq!(unsafe { libc::kill(host, libc::SIGKILL) }, 0);
