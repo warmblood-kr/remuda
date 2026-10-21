@@ -472,6 +472,23 @@ fn clear_errors_for_wrong_cluster_missing_and_no_cluster() {
         "1"
     );
 
+    // Lua writes the store only through remuda.vfs.put and rm (#778).
+    let put = successful(
+        a.run(&["-e", "local s, e = remuda.vfs.put('remuda://home/lua.txt', 'from lua'); return s and s.path or e"]),
+        "lua vfs.put",
+    );
+    assert_eq!(put.trim(), "lua.txt");
+    assert_eq!(
+        successful(a.run(&["vfs", "get", "remuda:///lua.txt"]), "get lua file"),
+        "from lua"
+    );
+    let removed = successful(
+        a.run(&["-e", "return tostring(remuda.vfs.rm('remuda:///lua.txt'))"]),
+        "lua vfs.rm",
+    );
+    assert_eq!(removed.trim(), "true");
+    assert!(!a.run(&["vfs", "get", "remuda:///lua.txt"]).status.success());
+
     // A node with no cluster identity says so; its daemon answers (#778).
     let mut bare = Node {
         child: None,

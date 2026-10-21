@@ -139,7 +139,7 @@ The writer always keeps its own copy, even outside the placement. GC removes a
 blob that no live entry references and whose file is older than 24 h. The age
 check covers a put that has written its blob but not yet its entry.
 
-## Lua (daemon, read-only)
+## Lua (daemon)
 
 `remuda.vfs.stat(uri)`, `remuda.vfs.read(uri)` and `remuda.vfs.list(prefix)`
 answer from the local index and cached copies only and never wait on the
@@ -148,6 +148,12 @@ network. A failure returns `nil, "code: detail"` with code `no_cluster`,
 also returns entries this node holds no copy of (`local = false`) and
 `synced_at`, so a caller can judge staleness. Cluster guidance (#741) reads
 `remuda:///butler/guidance/cluster.md` this way.
+
+`remuda.vfs.put(uri, bytes [, replicas])` and `remuda.vfs.rm(uri)` are the
+only ways Lua writes the store (#778). They follow the same version and
+tombstone rules as the CLI, write on this node, and tell peers on a background
+thread, so they never wait on the network either. Lua never opens the index
+database itself; `remuda.db` handles cannot attach it.
 
 ## Phases
 

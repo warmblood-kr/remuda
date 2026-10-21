@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Lua: `remuda.db.open(name [, opts])` gives each mod its own SQLite
+  databases (#778): `open("notes")` in mod `butler` opens
+  `<state>/remuda/db/butler/notes.db`. Handles have `query`, `exec`, `batch`,
+  `limits` and `close`. Default limits are 64 MiB per database, 1 s per
+  statement and 10,000 rows per query; a mod may ask for up to 1 GiB, 10 s
+  and 100,000. `ATTACH`, `DETACH` and most PRAGMAs are refused. Outside a
+  mod's own code, `open` returns `nil, "no_mod: ..."`.
+- Lua: `remuda.vfs.put(uri, bytes [, replicas])` and `remuda.vfs.rm(uri)`
+  write the cluster file store, with the same rules as `remuda vfs put/rm`.
+  Peers are told in the background, so the Lua thread never waits on them.
+
 - VFS: `remuda vfs` commands now run in the daemon, which owns the index
   (#778). With no daemon running, a command prints one line saying the
   daemon is needed and exits 1; it does not start one, and it does not

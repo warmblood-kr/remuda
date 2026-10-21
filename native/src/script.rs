@@ -30,7 +30,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 109] = [
+pub const BINDINGS: [&str; 110] = [
     "_advice_reattach",
     "_call",
     "_caller_live",
@@ -86,6 +86,7 @@ pub const BINDINGS: [&str; 109] = [
     "contribute",
     "contributions",
     "daemon",
+    "db",
     "define_key",
     "emit",
     "emit_filter",
@@ -432,7 +433,7 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "vfs",
-        "Read-only access to the cluster file store at remuda:// URIs. Calls answer from this node's index and cached copies and never wait on the network. Failures return nil and a reason starting with a code: no_cluster, not_found, not_local, bad_uri, wrong_cluster, corrupt or io.",
+        "Access to the cluster file store at remuda:// URIs. Calls answer from this node's index and cached copies and never wait on the network; put and rm tell peers in the background. Failures return nil and a reason starting with a code: no_cluster, not_found, not_local, bad_uri, wrong_cluster, corrupt, too_large or io.",
         "table",
     ),
     (
@@ -449,6 +450,21 @@ const WORDS: &[(&str, &str, &str)] = &[
         "vfs.list",
         "List stored files whose path starts with the prefix in a remuda:// URI (remuda:/// lists everything), as stat tables sorted by path.",
         "vfs.list(prefix_uri) -> {stat...} | nil, reason",
+    ),
+    (
+        "vfs.put",
+        "Store bytes at a remuda:// URI on this node and tell peers in the background, like `remuda vfs put`. replicas defaults to the vfs setting. This and vfs.rm are the only ways Lua writes the store; the index database is never opened from Lua.",
+        "vfs.put(uri, bytes [, replicas]) -> stat | nil, reason",
+    ),
+    (
+        "vfs.rm",
+        "Delete a stored file everywhere (a tombstone), like `remuda vfs rm`, telling peers in the background.",
+        "vfs.rm(uri) -> true | nil, reason",
+    ),
+    (
+        "db",
+        "SQLite databases owned by mods. Each mod has its own namespace of databases, private to this user and daemon.",
+        "table",
     ),
     (
         "system",
@@ -546,6 +562,7 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
     table.set("system", crate::credential::bindings(lua)?)?;
     table.set("storage", crate::storage::bindings(lua)?)?;
     table.set("vfs", crate::vfs_lua::bindings(lua)?)?;
+    crate::db_lua::register(lua, table)?;
     fs_bindings(lua, table)?;
     table.set("_registry", registry)
 }
