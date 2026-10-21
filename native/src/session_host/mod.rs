@@ -13,6 +13,8 @@ mod coordinator;
 #[cfg(unix)]
 mod entry;
 #[cfg(unix)]
+mod host_build;
+#[cfg(unix)]
 pub(crate) mod hosted;
 mod human;
 mod inventory;
@@ -42,6 +44,26 @@ mod viewport;
 #[doc(hidden)]
 pub mod windows_process;
 mod wire;
+
+/// Set by the daemon on every host it starts, to the daemon's own build. A
+/// host of another build exits with [`BUILD_MISMATCH`] before it reads its
+/// bootstrap, so a daemon never adopts a host it did not ship with.
+pub const EXPECTED_BUILD: &str = "REMUDA_SESSION_HOST_BUILD";
+/// Exit status of a host refused by [`EXPECTED_BUILD`].
+pub const BUILD_MISMATCH: i32 = 3;
+
+/// The refusal for a host started by a daemon of another build, if any.
+#[doc(hidden)]
+pub fn other_build_refusal(expected: Option<&std::ffi::OsStr>) -> Option<String> {
+    let expected = expected?;
+    (expected != crate::dist::BUILD_VERSION).then(|| {
+        format!(
+            "this host is build {}, but the daemon expects {}",
+            crate::dist::BUILD_VERSION,
+            expected.to_string_lossy()
+        )
+    })
+}
 
 /// Experimental standalone entry; never used by daemon launch/adoption.
 #[doc(hidden)]

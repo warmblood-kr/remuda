@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Session hosts (experimental): a daemon now starts only a session host of
+  its own build. Before, a daemon still running after an upgrade started the
+  newly installed host. `install.sh` now also keeps each host as
+  `remuda-session-host-<build>` (the three most recent), and the daemon
+  looks there first. If no host of its build is left, `new` is refused at
+  once with a message to restart the daemon. `remuda-session-host version`
+  prints the host's build.
+
 - VFS: a node now checks a blob's hash before it serves the first chunk to a
   peer. A damaged copy is removed and refused (`corrupt`), so the peer tries
   another holder and this node's repair pass fetches a good copy. Before,

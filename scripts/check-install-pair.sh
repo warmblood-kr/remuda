@@ -2,6 +2,8 @@
 # install.sh lands remuda and remuda-session-host as one pair and keeps the
 # pair it replaced as *.prev for rollback. An asset from before the pair (no
 # host) must not leave a host from another build beside the new daemon.
+# Each host that can say its build is also kept as remuda-session-host-<build>
+# (three most recent), so a daemon still running keeps its own build's host.
 # No network: a curl shim serves a fake release.
 #
 # Run it yourself:  scripts/check-install-pair.sh
@@ -41,12 +43,18 @@ fail() {
 }
 
 # Publish a release whose binaries say BUILD; with "nohost", only remuda.
+# Its host answers `version` with BUILD+b; with "oldhost", it cannot.
 publish() {
 	rm -rf "$tmp/pkg" && mkdir -p "$tmp/pkg"
 	printf '#!/bin/sh\necho remuda %s\n' "$1" >"$tmp/pkg/remuda"
 	files=remuda
-	if [ "${2:-}" != nohost ]; then
+	if [ "${2:-}" = oldhost ]; then
 		printf '#!/bin/sh\necho host %s\n' "$1" >"$tmp/pkg/remuda-session-host"
+		files="remuda remuda-session-host"
+	elif [ "${2:-}" != nohost ]; then
+		printf '#!/bin/sh\n[ "$1" = version ] && echo %s+b && exit 0\necho host %s\n' "$1" "$1" \
+			>"$tmp/pkg/remuda-session-host"
+		chmod +x "$tmp/pkg/remuda-session-host"
 		files="remuda remuda-session-host"
 	fi
 	# shellcheck disable=SC2086
@@ -102,8 +110,44 @@ has "pair after a hostless release" remuda-session-host "host 4"
 has "pair after a hostless release" remuda.prev "remuda 3"
 has "pair after a hostless release" remuda-session-host.prev -
 
+# The kept hosts, oldest build first, as "1 2 4".
+kept() {
+	find "$tmp/bin" -name 'remuda-session-host-*' | sed 's/.*remuda-session-host-//; s/+b$//' |
+		sort -n | tr '\n' ' ' | sed 's/ $//'
+}
+keeps() {
+	got=$(kept)
+	[ "$got" = "$2" ] || fail "$1: kept hosts are '$got', want '$2'"
+}
+
+keeps "pair after a hostless release" "1 2 4"
+has "versioned host" remuda-session-host-1+b "host 1"
+has "versioned host" remuda-session-host-4+b "host 4"
+
+publish 5
+install "a fourth build"
+keeps "a fourth build" "2 4 5"
+
+publish 6
+install "a fifth build"
+keeps "a fifth build" "4 5 6"
+
+# Reinstalling an older build keeps its copy, and its copy counts as newest.
+publish 4
+install "reinstall build 4"
+keeps "reinstall build 4" "4 5 6"
+publish 7
+install "build 7 after build 4"
+keeps "build 7 after build 4" "4 6 7"
+
+# A host that cannot say its build installs as before, without a copy.
+publish 8 oldhost
+install "host without a version answer"
+has "host without a version answer" remuda-session-host "host 8"
+keeps "host without a version answer" "4 6 7"
+
 leftover=$(find "$tmp/bin" -name '.*' -type f)
 [ -z "$leftover" ] || fail "staging files left behind: $leftover"
 
 [ "$failed" -eq 0 ] || exit 1
-echo "ok — install.sh lands the remuda/session-host pair and keeps the previous pair as .prev"
+echo "ok — install.sh lands the remuda/session-host pair, keeps the previous pair as .prev, and keeps versioned hosts"
