@@ -2014,6 +2014,7 @@ fn capture_snapshot<CB: vt100::Callbacks + Default>(
             scrollback_total: scrollback_total.load(Ordering::Relaxed),
         },
         output_version: Some(version),
+        modes: None,
         instance_id: None,
     })
 }
