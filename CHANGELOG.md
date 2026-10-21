@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- VFS: `remuda vfs ls --conflicts` lists paths with kept concurrent writes,
+  `remuda vfs stat` shows them, and `remuda vfs resolve-conflict URI --keep
+  winner|VERSION` settles them by writing the chosen side again (fetched
+  from a peer if needed). Lua `vfs.stat()` gains `conflicts`; the JSON of
+  `stat` and `ls` gains `conflicts` and `deleted` (#778).
+
 - VFS: two writes to the same path made while nodes could not see each
   other no longer drop one silently (#778). Each entry carries a version
   vector (schema step 3). The winner is picked as before, so older nodes
