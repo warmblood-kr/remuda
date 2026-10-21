@@ -51,9 +51,98 @@ pub(super) fn open(root: &Path) -> VfsResult<Connection> {
     crate::sqlite_migrate::upgrade(&mut conn, DB_FILE, &steps(), true)
         .map_err(|error| VfsError::new(VfsErrorKind::Corrupt, error))?;
     let tx = immediate(&mut conn)?;
-    merge_legacy(&tx, root)?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL) WITHOUT ROWID;",
+    )?;
+    if may_write(&tx)? {
+        merge_legacy(&tx, root)?;
+    }
     tx.commit()?;
+    if serving() && claimed(&conn)?.is_none() {
+        claim(&mut conn)?;
+    }
     Ok(conn)
+}
+
+/// This daemon's `(socket, token)`, or `None` outside a daemon.
+static WRITER: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// Name this process as a writer of the index for `socket`. It may write
+/// only while `meta.writer` is its own, or names another socket, or is unset.
+pub(super) fn set_writer(socket: &str, token: &str) {
+    *WRITER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((socket.to_owned(), token.to_owned()));
+    SERVING.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Set once this daemon serves; a store first opened then is claimed.
+static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn mark_serving() {
+    SERVING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn serving() -> bool {
+    SERVING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn claimed(conn: &Connection) -> VfsResult<Option<String>> {
+    Ok(conn
+        .query_row("SELECT value FROM meta WHERE key = 'writer'", [], |row| {
+            row.get(0)
+        })
+        .optional()?)
+}
+
+fn writer() -> Option<(String, String)> {
+    WRITER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// False when a daemon that replaced this one on the same socket claimed.
+pub(super) fn may_write(conn: &Connection) -> VfsResult<bool> {
+    let Some((socket, token)) = writer() else {
+        return Ok(true);
+    };
+    let claimed = claimed(conn)?;
+    Ok(
+        match claimed.as_deref().and_then(|value| value.split_once('\t')) {
+            Some((claimed_socket, claimed_token)) => {
+                claimed_socket != socket || claimed_token == token
+            }
+            None => true,
+        },
+    )
+}
+
+/// `immediate`, refused with `superseded` if this daemon may not write.
+pub(super) fn write_tx(conn: &mut Connection) -> VfsResult<Transaction<'_>> {
+    let tx = immediate(conn)?;
+    if !may_write(&tx)? {
+        return Err(VfsError::new(
+            VfsErrorKind::Superseded,
+            "this daemon was replaced by `remuda reload` and no longer writes the index; run the command again to reach the new daemon",
+        ));
+    }
+    Ok(tx)
+}
+
+/// Record this daemon as the index writer for its socket.
+pub(super) fn claim(conn: &mut Connection) -> VfsResult<()> {
+    let Some((socket, token)) = writer() else {
+        return Ok(());
+    };
+    let tx = immediate(conn)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('writer', ?1)",
+        [format!("{socket}\t{token}")],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// The schema, one `(name, up, down)` per step. Never edit a shipped step;
@@ -92,9 +181,6 @@ pub(super) fn immediate(conn: &mut Connection) -> VfsResult<Transaction<'_>> {
 /// Merge `index.json` when its size or mtime differs from the last merge or
 /// export. Entries a row already supersedes are skipped.
 fn merge_legacy(tx: &Transaction<'_>, root: &Path) -> VfsResult<()> {
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL) WITHOUT ROWID;",
-    )?;
     let Some(stamp) = legacy_stamp(root)? else {
         return Ok(());
     };
@@ -387,6 +473,42 @@ mod tests {
         assert_eq!(applied.len(), 1);
         assert_eq!(applied[0].name, "entries");
         assert!(!applied[0].reversible);
+    }
+
+    #[test]
+    fn only_the_last_claimant_on_a_socket_writes_the_index() {
+        let scratch = Scratch::new();
+        let store = VfsStore::open_at(&scratch.root()).unwrap();
+        store.put("a.txt", b"a", 1, "SHA256:me").unwrap();
+        set_writer("/s.sock", "old");
+        store.claim_writer().unwrap();
+        store.put("b.txt", b"b", 1, "SHA256:me").unwrap();
+        // A reload candidate on the same socket claims: the old one is fenced.
+        set_writer("/s.sock", "new");
+        store.claim_writer().unwrap();
+        set_writer("/s.sock", "old");
+        let error = store.put("c.txt", b"c", 1, "SHA256:me").unwrap_err();
+        assert_eq!(error.kind, VfsErrorKind::Superseded);
+        assert_eq!(
+            store.delete("a.txt", "SHA256:me").unwrap_err().kind,
+            VfsErrorKind::Superseded
+        );
+        assert_eq!(
+            store
+                .collect_garbage_older_than(std::time::Duration::ZERO)
+                .unwrap(),
+            0
+        );
+        // A daemon on another socket is not this socket's successor.
+        set_writer("/other.sock", "x");
+        store.put("d.txt", b"d", 1, "SHA256:me").unwrap();
+        // Rollback: the old daemon claims again and writes.
+        set_writer("/s.sock", "old");
+        store.claim_writer().unwrap();
+        store.put("e.txt", b"e", 1, "SHA256:me").unwrap();
+        *WRITER.lock().unwrap() = None;
+        let names: Vec<String> = store.load_index().unwrap().entries.into_keys().collect();
+        assert_eq!(names, ["a.txt", "b.txt", "d.txt", "e.txt"]);
     }
 
     #[test]

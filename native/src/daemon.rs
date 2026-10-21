@@ -335,6 +335,18 @@ fn serve_from(
     let (_socket_lock, listener, socket_owner) = open_endpoint(path, runtime)?;
     pause_startup_for_tests();
     encrypt_plaintext_credentials_at_startup();
+    // Only the daemon serving this socket writes the VFS index (#778). A
+    // reload candidate claims it just before it serves; see `claim_vfs`.
+    if let Err(error) = crate::cluster::vfs::start_writer(path) {
+        eprintln!("remuda daemon: vfs writer token: {error}");
+    }
+    #[cfg(unix)]
+    let candidate = serving.is_some();
+    #[cfg(windows)]
+    let candidate = false;
+    if !candidate {
+        claim_vfs();
+    }
     let anti_entropy = Arc::new(AntiEntropyTask::start()?);
     let listener_task = Arc::new(DaemonListenerControl::new(ListenerTask::start(path)));
 
@@ -382,6 +394,7 @@ fn serve_from(
     #[cfg(unix)]
     {
         if let Some(serving) = serving {
+            claim_vfs();
             serving();
         }
         serve_unix(
@@ -1846,6 +1859,13 @@ fn cut_over(
     Ok(build)
 }
 
+/// Make this daemon the VFS index writer; a failure is logged, not fatal.
+fn claim_vfs() {
+    if let Err(error) = crate::cluster::vfs::claim_writer() {
+        eprintln!("remuda daemon: vfs: could not claim the index: {error}");
+    }
+}
+
 /// Take back what a failed handover gave away: the hosts (a newer epoch
 /// fences the candidate), host work, the lock's pid, accepting, the cluster
 /// listener.
@@ -1869,6 +1889,7 @@ fn roll_back(
         Err(error) => eprintln!("remuda daemon: reload rollback: reclaim failed: {error}"),
     }
     hosting.reopen();
+    claim_vfs();
     if let Err(error) = SocketLock::name_this_process(lock) {
         eprintln!("remuda daemon: reload rollback: socket lock: {error}");
     }
