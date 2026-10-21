@@ -201,9 +201,17 @@ impl Candidate {
         outcome
     }
     fn hand_over(&mut self, listener: RawFd, lock: RawFd, until: Instant) -> Result<(), String> {
+        let fault = std::env::var(TEST_FAULT).ok();
+        // Tests: O dies just before or just after the handover.
+        if fault.as_deref() == Some("old-exits-before-take") {
+            std::process::exit(1);
+        }
         let bytes = frame(&FromOld::Take).map_err(|e| format!("take: {e}"))?;
         fds::send(&self.stream, &bytes, &[listener, lock])
             .map_err(|e| format!("could not hand over the listener: {e}"))?;
+        if fault.as_deref() == Some("old-exits-after-take") {
+            std::process::exit(1);
+        }
         match read_frame(&mut self.stream, &mut self.child, until, "serving")? {
             FromCandidate::Serving => Ok(()),
             FromCandidate::Failed { reason } => {
