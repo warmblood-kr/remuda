@@ -229,8 +229,11 @@ fn a_hosted_session_survives_daemon_sigkill_and_is_rediscovered() {
     // Routes that still need a local Session refuse clearly.
     match request(
         &path,
-        &Request::MouseState {
+        &Request::Sync {
             name: "keeper".into(),
+            instance_id: None,
+            since: 0,
+            timeout_ms: 0,
         },
     ) {
         Response::Error(message) => assert!(message.contains("not supported yet"), "{message}"),

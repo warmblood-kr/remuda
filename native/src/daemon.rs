@@ -980,6 +980,7 @@ fn start_listener(
 
 #[cfg(unix)]
 mod accept;
+mod hosted_attach;
 #[cfg(unix)]
 mod instance_id;
 #[cfg(unix)]
@@ -1976,9 +1977,6 @@ fn local_only(request: &Request) -> Option<(&'static str, &str)> {
     match request {
         Request::CaptureStyled { name, .. } => Some(("styled capture", name)),
         Request::Sync { name, .. } => Some(("sync", name)),
-        Request::MouseState { name } => Some(("mouse state", name)),
-        Request::Attach { name } | Request::AttachTracked { name } => Some(("attach", name)),
-        Request::AttachStatus { name, .. } => Some(("attach status", name)),
         Request::Input { name, .. } | Request::InputLine { name, .. } => {
             Some(("sequenced input", name))
         }
@@ -3050,12 +3048,14 @@ fn attach_status(
     name: &str,
     generation: u64,
 ) -> std::io::Result<()> {
-    let response = registry.get(name).map_or_else(
-        || Response::error(format!("no such session: {name}")),
-        |session| Response::AttachStatus {
+    let response = match (registry.get(name), registry.hosted(name)) {
+        (Some(session), _) => Response::AttachStatus {
             taken_over: session.was_attachment_taken_over(generation),
         },
-    );
+        // A read-only view of a host-backed session is never displaced.
+        (None, Some(_)) => Response::AttachStatus { taken_over: false },
+        (None, None) => Response::error(format!("no such session: {name}")),
+    };
     reply(stream, &response)
 }
 
@@ -3596,7 +3596,16 @@ fn mouse_state(stream: &Stream, registry: &Registry, name: &str) -> std::io::Res
     respond(
         stream,
         name,
-        registry.get(name).map(|session| Ok(session.mouse_state())),
+        match registry.get(name) {
+            Some(session) => Some(Ok(session.mouse_state())),
+            // A host reports its child's mouse modes with every Inspect (#713).
+            None => registry.hosted(name).map(|handle| {
+                handle
+                    .inspect()
+                    .map(|observation| observation.mouse)
+                    .map_err(remuda_core::session_operations::Error::into_agent)
+            }),
+        },
         Response::MouseState,
     )
 }
@@ -3769,6 +3778,9 @@ fn attach(
     tracked: bool,
 ) -> std::io::Result<()> {
     let Some(session) = registry.get(name) else {
+        if let Some(handle) = registry.hosted(name) {
+            return hosted_attach::serve(stream, reader, &handle, tracked);
+        }
         return reply(
             &stream,
             &Response::error(format!("no such session: {name}")),
