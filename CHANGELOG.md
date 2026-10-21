@@ -7,6 +7,19 @@
   them, and every host it has open then refuses the other daemon at once.
   A candidate daemon can check every host read-only, without claiming. No
   command uses these yet.
+- Session hosts (experimental): `remuda stop` now lets an act a host is
+  already running finish and answers it, instead of hanging up on it. New
+  host-backed input, resize and close are refused while the daemon drains.
+  `stop` still returns at once, and hosts keep running. Before, such an act
+  answered "the daemon hung up without answering" and was left for the next
+  daemon to resolve.
+- Session hosts (experimental): a daemon now starts only a session host of
+  its own build. Before, a daemon still running after an upgrade started the
+  newly installed host. `install.sh` now also keeps each host as
+  `remuda-session-host-<build>` (the three most recent), and the daemon
+  looks there first. If no host of its build is left, `new` is refused at
+  once with a message to restart the daemon. `remuda-session-host version`
+  prints the host's build.
 - `remuda version --hosts` prints the daemon's build and the build of each
   host-backed session's host (experimental session hosts, #713). Hosts
   outlive daemons, so after an upgrade some sessions can still run on an

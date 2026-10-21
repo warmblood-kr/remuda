@@ -8,6 +8,7 @@
 use super::api::Identity as HostIdentity;
 use super::birth::Bootstrap;
 use super::entry::Launch;
+use super::gate::{Drained, Gate};
 use super::inventory::disk::Store;
 use super::inventory::model::{Birth, Entry, Lease, Phase, Target};
 use super::recovery::Owner;
@@ -19,8 +20,8 @@ use std::collections::HashMap;
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Daemon environment switch; anything but "1" keeps the default path.
@@ -56,10 +57,12 @@ pub fn opted_in() -> bool {
 pub struct Hosting {
     root: PathBuf,
     hosts: Mutex<Option<Arc<Hosts>>>,
+    gate: Arc<Gate>,
 }
 struct Hosts {
     owner: Arc<Owner>,
     root: PathBuf,
+    gate: Arc<Gate>,
     /// Opened handles by name, kept for teardown after the Registry drops one.
     open: Mutex<HashMap<String, Arc<HostSession>>>,
 }
@@ -79,6 +82,7 @@ impl Hosting {
         Self {
             root: socket.with_file_name(name),
             hosts: Mutex::new(None),
+            gate: Arc::default(),
         }
     }
     /// Hosting over an existing private directory, for tests.
@@ -87,6 +91,7 @@ impl Hosting {
         Self {
             root,
             hosts: Mutex::new(None),
+            gate: Arc::default(),
         }
     }
     fn hosts(&self, create: bool) -> io::Result<Option<Arc<Hosts>>> {
@@ -113,6 +118,7 @@ impl Hosting {
         let opened = Arc::new(Hosts {
             owner: Arc::new(owner),
             root: self.root.clone(),
+            gate: Arc::clone(&self.gate),
             open: Mutex::new(HashMap::new()),
         });
         *hosts = Some(opened.clone());
@@ -214,6 +220,12 @@ impl Hosting {
             .collect())
     }
 
+    /// Stop admitting host-backed work, then wait up to `deadline` for acts,
+    /// control calls and host starts already admitted. Hosts keep running.
+    pub fn drain(&self, deadline: Duration) -> Drained {
+        self.gate.drain(deadline)
+    }
+
     /// After the Registry closed `name`: stop its host and retire its entry,
     /// off the request thread. Unknown names are ignored.
     pub fn retire_closed(&self, name: &str) {
@@ -279,7 +291,9 @@ fn reply_kind(response: &super::api::Response) -> &'static str {
 impl Hosts {
     fn open(&self, name: &str) -> Result<Arc<HostSession>, String> {
         let session = Arc::new(
-            HostSession::open(self.owner.clone(), name, CLIENT).map_err(|e| e.to_string())?,
+            HostSession::open(self.owner.clone(), name, CLIENT)
+                .map_err(|e| e.to_string())?
+                .gated(Arc::clone(&self.gate)),
         );
         self.open
             .lock()
@@ -296,6 +310,7 @@ impl Hosts {
         }
     }
     fn spawn(self: &Arc<Self>, request: &NewHosted<'_>) -> Result<Arc<HostSession>, String> {
+        let _pass = self.gate.enter().map_err(|error| error.to_string())?;
         let launch = launch(request)?;
         // Checked before the durable reservation, which a missing binary
         // would otherwise leave behind under this name.
@@ -351,8 +366,8 @@ impl Hosts {
             launch: RawValue::from_string(raw).map_err(|e| e.to_string())?,
         })
         .map_err(|e| e.to_string())?;
-        start(&exe, &endpoint, &bootstrap)?;
-        match self.published(request.name) {
+        let exit = start(&exe, &endpoint, &bootstrap)?;
+        match self.published(request.name, &exit) {
             Ok(()) => self.open(request.name),
             Err(Published::Exited) => {
                 // Stop the host and retire the entry, as for a closed session.
@@ -369,10 +384,23 @@ impl Hosts {
                     .into(),
             ),
             Err(Published::Store(error)) => Err(error),
+            Err(Published::HostEnded(status)) if status.code() == Some(super::BUILD_MISMATCH) => {
+                Err(format!(
+                    "session host {} is not this daemon's build {}: the installed remuda \
+                     changed while it started; restart the daemon to use it",
+                    exe.display(),
+                    crate::dist::BUILD_VERSION
+                ))
+            }
+            Err(Published::HostEnded(status)) => Err(format!(
+                "session host {} ended before it published ({status})",
+                exe.display()
+            )),
         }
     }
-    fn published(&self, name: &str) -> Result<(), Published> {
+    fn published(&self, name: &str, exit: &mpsc::Receiver<ExitStatus>) -> Result<(), Published> {
         let until = Instant::now() + PUBLISH_DEADLINE;
+        let mut ended = None;
         loop {
             let index = self
                 .owner
@@ -381,8 +409,23 @@ impl Hosts {
             match index.entries.get(name).map(|entry| entry.phase) {
                 Some(Phase::Registered) => return Ok(()),
                 Some(Phase::Exited { .. }) => return Err(Published::Exited),
-                _ if Instant::now() >= until => return Err(Published::Late),
-                _ => std::thread::sleep(Duration::from_millis(20)),
+                _ => {}
+            }
+            // Checked after reading the index, so a host that published and
+            // then ended is not taken for one that never published.
+            if let Some(status) = ended {
+                return Err(Published::HostEnded(status));
+            }
+            if Instant::now() >= until {
+                return Err(Published::Late);
+            }
+            match exit.recv_timeout(Duration::from_millis(20)) {
+                Ok(status) => ended = Some(status),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                // The reaper could not wait for it: keep polling the index.
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
             }
         }
     }
@@ -392,6 +435,8 @@ enum Published {
     /// The host may still publish: an unknown outcome, not a clean failure.
     Late,
     Store(String),
+    /// The host process ended without publishing; nothing of it is left running.
+    HostEnded(ExitStatus),
 }
 
 fn launch(request: &NewHosted<'_>) -> Result<Launch, String> {
@@ -434,26 +479,28 @@ fn launch(request: &NewHosted<'_>) -> Result<Launch, String> {
     Ok(launch)
 }
 
-/// The host binary ships beside the daemon's own executable.
+/// The host of this daemon's own build, beside the daemon's executable.
 fn host_executable() -> Result<PathBuf, String> {
-    let exe = host_beside(&std::env::current_exe().map_err(|e| e.to_string())?);
-    if !exe.is_file() {
-        return Err(format!("session host binary not found: {}", exe.display()));
-    }
-    Ok(exe)
+    let daemon = std::env::current_exe().map_err(|e| e.to_string())?;
+    super::host_build::choose(
+        &daemon,
+        crate::dist::BUILD_VERSION,
+        super::host_build::probe,
+    )
 }
-fn host_beside(daemon: &Path) -> PathBuf {
-    daemon.with_file_name(format!(
-        "remuda-session-host{}",
-        std::env::consts::EXE_SUFFIX
-    ))
-}
-fn start(exe: &Path, endpoint: &Path, bootstrap: &[u8]) -> Result<(), String> {
+/// Start the host. The receiver gets its exit status if it ends; a host that
+/// ends before it publishes failed to start.
+fn start(
+    exe: &Path,
+    endpoint: &Path,
+    bootstrap: &[u8],
+) -> Result<mpsc::Receiver<ExitStatus>, String> {
     let mut child = Command::new(exe)
         .arg("run-reserved")
         .arg(endpoint)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
+        .env(super::EXPECTED_BUILD, crate::dist::BUILD_VERSION)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -467,10 +514,13 @@ fn start(exe: &Path, endpoint: &Path, bootstrap: &[u8]) -> Result<(), String> {
             super::wire::write_frame(&mut stdin, bootstrap).map_err(|e| e.to_string())
         });
     // The host calls setsid; this thread only reaps it if it exits first.
+    let (ended, exit) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = child.wait();
+        if let Ok(status) = child.wait() {
+            let _ = ended.send(status);
+        }
     });
-    written
+    written.map(|()| exit)
 }
 
 fn random<const N: usize>() -> Result<[u8; N], String> {
@@ -480,16 +530,4 @@ fn random<const N: usize>() -> Result<[u8; N], String> {
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn host_binary_is_looked_up_beside_the_daemon_with_the_platform_suffix() {
-        let daemon = Path::new("/opt/bin").join(format!("remuda{}", std::env::consts::EXE_SUFFIX));
-        let want = format!("remuda-session-host{}", std::env::consts::EXE_SUFFIX);
-        assert_eq!(host_beside(&daemon), Path::new("/opt/bin").join(want));
-    }
 }
