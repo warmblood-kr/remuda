@@ -79,6 +79,24 @@ fn wait_for_new_requests() {
     }
 }
 
+/// Longest a caller found in no session waits for in-flight `new` requests:
+/// a host-backed start may wait this long for its host to publish.
+#[cfg(not(windows))]
+const STARTING_SESSIONS_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait, bounded, until no `new` request is in flight; `true` when one was.
+#[cfg(not(windows))]
+fn wait_for_starting_sessions() -> bool {
+    if ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst) == 0 {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + STARTING_SESSIONS_WAIT;
+    while ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst) != 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    true
+}
+
 struct SyncPermit;
 
 impl SyncPermit {
@@ -2374,14 +2392,25 @@ fn caller_context(
     #[cfg(not(windows))]
     {
         let _ = accepted;
-        let candidates = registry.live_processes_with_identity();
-        caller_context_from_ancestry(
-            process_ancestry::peer_pid(stream),
-            &candidates,
-            std::process::id(),
-            process_ancestry::parent_pid,
-            registry,
-        )
+        let resolve = || {
+            let candidates = registry.live_processes_with_identity();
+            caller_context_from_ancestry(
+                process_ancestry::peer_pid(stream),
+                &candidates,
+                std::process::id(),
+                process_ancestry::parent_pid,
+                registry,
+            )
+        };
+        let caller = resolve();
+        // A session's child runs before `new` registers it; a host-backed one
+        // (#713) waits for its host to publish first. A caller that early is
+        // in no session yet, so let in-flight starts finish and look again.
+        if !matches!(caller.kind, crate::image::CallerKind::Session) && wait_for_starting_sessions()
+        {
+            return resolve();
+        }
+        caller
     }
 }
 
