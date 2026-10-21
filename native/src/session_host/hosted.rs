@@ -429,9 +429,16 @@ impl Hosts {
                 .owner
                 .index()
                 .map_err(|error| Published::Store(format!("session host inventory: {error:?}")))?;
-            match index.entries.get(name).map(|entry| entry.phase) {
-                Some(Phase::Registered) => return Ok(()),
-                Some(Phase::Exited { .. }) => return Err(Published::Exited),
+            match index.entries.get(name) {
+                // The host records Registered just before it starts taking
+                // input; wait for that too, so an attach or input sent right
+                // after `new` is not refused as still starting.
+                Some(entry) if entry.phase == Phase::Registered && accepting(entry) => {
+                    return Ok(())
+                }
+                Some(entry) if matches!(entry.phase, Phase::Exited { .. }) => {
+                    return Err(Published::Exited)
+                }
                 _ => {}
             }
             // Checked after reading the index, so a host that published and
@@ -451,6 +458,24 @@ impl Hosts {
                 }
             }
         }
+    }
+}
+/// True once a registered host takes input. A host that cannot be asked
+/// counts as accepting: the request that follows reports what is wrong.
+fn accepting(entry: &Entry) -> bool {
+    use super::api::{PublicationStatus, Request, Response};
+    let Some(birth) = entry.birth.as_ref() else {
+        return true;
+    };
+    let inspected =
+        super::entry::Client::open_observer(Path::new(birth.endpoint()), entry.identity.clone())
+            .and_then(|mut client| client.request(&Request::Inspect));
+    match inspected {
+        Ok(Response::Info { info }) => !matches!(
+            info.publication,
+            Some(PublicationStatus::Starting | PublicationStatus::Unavailable)
+        ),
+        _ => true,
     }
 }
 enum Published {
