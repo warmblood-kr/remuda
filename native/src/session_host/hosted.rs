@@ -182,7 +182,7 @@ impl Hosting {
         registry
             .register_hosted(handle)
             .map(|_| ())
-            .map_err(|_| format!("session name already in use: {}", request.name))
+            .map_err(|_| format!("name taken: {}", request.name))
     }
 
     /// Claim the inventory again under a newer epoch, then show every open
@@ -332,13 +332,10 @@ impl Hosts {
         // Checked before the durable reservation, which a missing binary
         // would otherwise leave behind under this name.
         let exe = host_executable()?;
-        if self
-            .owner
-            .index()
-            .map_err(|error| format!("session host inventory: {error:?}"))?
-            .entries
-            .contains_key(request.name)
-        {
+        // A name the registry no longer holds can still have an entry while
+        // its closed host is torn down. Wait for that, as a close of an
+        // in-process session frees its name at once.
+        if !self.wait_released(request.name)? {
             return Err(format!(
                 "session name {} is still held by a closing host-backed session",
                 request.name
@@ -353,6 +350,7 @@ impl Hosts {
         let launch_id = random()?;
         let nonce = random()?;
         let endpoint = self.root.join(hex(&random::<8>()?));
+        socket_fits(&endpoint.join("socket"))?;
         let endpoint_text = endpoint
             .to_str()
             .ok_or("session host path is not UTF-8")?
@@ -415,6 +413,26 @@ impl Hosts {
             )),
         }
     }
+    /// True once `name` has no inventory entry, waiting up to the teardown
+    /// deadline for a closing host to retire it.
+    fn wait_released(&self, name: &str) -> Result<bool, String> {
+        let until = Instant::now() + TEARDOWN_DEADLINE;
+        loop {
+            let held = self
+                .owner
+                .index()
+                .map_err(|error| format!("session host inventory: {error:?}"))?
+                .entries
+                .contains_key(name);
+            if !held {
+                return Ok(true);
+            }
+            if Instant::now() >= until {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     fn published(&self, name: &str, exit: &mpsc::Receiver<ExitStatus>) -> Result<(), Published> {
         let until = Instant::now() + PUBLISH_DEADLINE;
         let mut ended = None;
@@ -423,9 +441,16 @@ impl Hosts {
                 .owner
                 .index()
                 .map_err(|error| Published::Store(format!("session host inventory: {error:?}")))?;
-            match index.entries.get(name).map(|entry| entry.phase) {
-                Some(Phase::Registered) => return Ok(()),
-                Some(Phase::Exited { .. }) => return Err(Published::Exited),
+            match index.entries.get(name) {
+                // The host records Registered just before it starts taking
+                // input; wait for that too, so an attach or input sent right
+                // after `new` is not refused as still starting.
+                Some(entry) if entry.phase == Phase::Registered && accepting(entry) => {
+                    return Ok(())
+                }
+                Some(entry) if matches!(entry.phase, Phase::Exited { .. }) => {
+                    return Err(Published::Exited)
+                }
                 _ => {}
             }
             // Checked after reading the index, so a host that published and
@@ -445,6 +470,24 @@ impl Hosts {
                 }
             }
         }
+    }
+}
+/// True once a registered host takes input. A host that cannot be asked
+/// counts as accepting: the request that follows reports what is wrong.
+fn accepting(entry: &Entry) -> bool {
+    use super::api::{PublicationStatus, Request, Response};
+    let Some(birth) = entry.birth.as_ref() else {
+        return true;
+    };
+    let inspected =
+        super::entry::Client::open_observer(Path::new(birth.endpoint()), entry.identity.clone())
+            .and_then(|mut client| client.request(&Request::Inspect));
+    match inspected {
+        Ok(Response::Info { info }) => !matches!(
+            info.publication,
+            Some(PublicationStatus::Starting | PublicationStatus::Unavailable)
+        ),
+        _ => true,
     }
 }
 enum Published {
@@ -581,5 +624,35 @@ mod start_tests {
         let status = exit.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(status.code(), Some(super::super::BUILD_MISMATCH));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A host binds its socket 23 bytes deeper than its daemon's, so a runtime
+/// directory the daemon fits in can still be too long for the host. Said
+/// before anything is reserved, instead of the host exiting unexplained.
+fn socket_fits(socket: &Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let len = socket.as_os_str().as_bytes().len();
+    let limit = crate::staged_socket::SOCKET_PATH_LIMIT;
+    if len > limit {
+        return Err(format!(
+            "session host socket path too long ({len} bytes, limit {limit}): {}\nNext: set a shorter REMUDA_RUNTIME_DIR",
+            socket.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod socket_path_tests {
+    #[test]
+    fn a_host_socket_too_long_for_the_kernel_is_refused_with_the_remedy() {
+        let limit = crate::staged_socket::SOCKET_PATH_LIMIT;
+        let fits = format!("/{}", "a".repeat(limit - 1));
+        assert!(super::socket_fits(std::path::Path::new(&fits)).is_ok());
+        let long = format!("/{}", "a".repeat(limit));
+        let error = super::socket_fits(std::path::Path::new(&long)).unwrap_err();
+        assert!(error.contains("socket path too long"), "{error}");
+        assert!(error.contains("REMUDA_RUNTIME_DIR"), "{error}");
     }
 }

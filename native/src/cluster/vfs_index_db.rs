@@ -5,8 +5,8 @@
 //! caps stay in `VfsIndex`; this file only stores rows. The wire format and
 //! the digest are unchanged, since peers still see the same `VfsIndex`.
 //!
-//! On first open, a format-1 `index.json` is imported in the same transaction
-//! that creates the table. The JSON file is left untouched (an older binary
+//! The schema is `STEPS`, run by `sqlite_migrate`. On first open, a format-1
+//! `index.json` is imported. The JSON file is left untouched (an older binary
 //! reads only it); `export_json` writes it again before a downgrade. If it
 //! changes later, say an older binary wrote it after a downgrade, the next
 //! open merges it again: per path, the higher version wins, as between peers.
@@ -26,7 +26,6 @@ use std::path::Path;
 pub(super) const DB_FILE: &str = "index.db";
 pub(super) const LEGACY_FILE: &str = "index.json";
 const LEGACY_FORMAT: u32 = 1;
-const SCHEMA_VERSION: i64 = 1;
 const COLUMNS: &str = "path, sha256, size, replicas, version, writer, deleted, mtime";
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -35,27 +34,145 @@ struct LegacyFile {
     entries: Vec<VfsEntry>,
 }
 
-/// Open `root/index.db`, creating the table and importing `index.json` once.
+/// Open `root/index.db`: run the schema steps, then merge `index.json` if it
+/// changed. A database from before the runner (#791) is adopted at step 1.
 pub(super) fn open(root: &Path) -> VfsResult<Connection> {
     let mut conn = crate::sqlite::open(root, DB_FILE)?;
+    let known = STEPS.len() as i64;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > known {
+        return Err(VfsError::new(
+            VfsErrorKind::Corrupt,
+            format!(
+                "{DB_FILE} schema {version} is newer than this remuda ({known}); upgrade remuda"
+            ),
+        ));
+    }
+    crate::sqlite_migrate::upgrade(&mut conn, DB_FILE, &steps(), true)
+        .map_err(|error| VfsError::new(VfsErrorKind::Corrupt, error))?;
     let tx = immediate(&mut conn)?;
-    let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    match version {
-        SCHEMA_VERSION => merge_legacy(&tx, root)?,
-        0 => {
-            create_schema(&tx)?;
-            merge_legacy(&tx, root)?;
-            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        }
-        newer => {
-            return Err(VfsError::new(
-                VfsErrorKind::Corrupt,
-                format!("{DB_FILE} schema {newer} is newer than this remuda ({SCHEMA_VERSION}); upgrade remuda"),
-            ))
-        }
+    // `meta` is not a schema step on purpose: #794 builds create it the same
+    // way, so it needs no version bump and a downgrade may leave it behind.
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL) WITHOUT ROWID;",
+    )?;
+    if may_write(&tx)? {
+        merge_legacy(&tx, root)?;
     }
     tx.commit()?;
+    if serving() && claimed(&conn)?.is_none() {
+        claim(&mut conn)?;
+    }
     Ok(conn)
+}
+
+/// This daemon's `(socket, token)`, or `None` outside a daemon.
+static WRITER: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// Name this process as a writer of the index for `socket`. It may write
+/// only while `meta.writer` is its own, or names another socket, or is unset.
+pub(super) fn set_writer(socket: &str, token: &str) {
+    *WRITER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((socket.to_owned(), token.to_owned()));
+    SERVING.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Set once this daemon serves; a store first opened then is claimed.
+static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn mark_serving() {
+    SERVING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn serving() -> bool {
+    SERVING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn claimed(conn: &Connection) -> VfsResult<Option<String>> {
+    Ok(conn
+        .query_row("SELECT value FROM meta WHERE key = 'writer'", [], |row| {
+            row.get(0)
+        })
+        .optional()?)
+}
+
+fn writer() -> Option<(String, String)> {
+    WRITER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// False when a daemon that replaced this one on the same socket claimed.
+pub(super) fn may_write(conn: &Connection) -> VfsResult<bool> {
+    let Some((socket, token)) = writer() else {
+        return Ok(true);
+    };
+    let claimed = claimed(conn)?;
+    Ok(
+        match claimed.as_deref().and_then(|value| value.split_once('\t')) {
+            Some((claimed_socket, claimed_token)) => {
+                claimed_socket != socket || claimed_token == token
+            }
+            None => true,
+        },
+    )
+}
+
+/// `immediate`, refused with `superseded` if this daemon may not write.
+pub(super) fn write_tx(conn: &mut Connection) -> VfsResult<Transaction<'_>> {
+    let tx = immediate(conn)?;
+    if !may_write(&tx)? {
+        return Err(VfsError::new(
+            VfsErrorKind::Superseded,
+            "this daemon was replaced by `remuda reload` and no longer writes the index; run the command again to reach the new daemon",
+        ));
+    }
+    Ok(tx)
+}
+
+/// Record this daemon as the index writer for its socket.
+pub(super) fn claim(conn: &mut Connection) -> VfsResult<()> {
+    let Some((socket, token)) = writer() else {
+        return Ok(());
+    };
+    let tx = immediate(conn)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('writer', ?1)",
+        [format!("{socket}\t{token}")],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The schema, one `(name, up, down)` per step. Never edit a shipped step;
+/// add one. Step 1 has no down: dropping the index loses every name.
+const STEPS: [(&str, &str, Option<&str>); 1] = [(
+    "entries",
+    "CREATE TABLE entries (
+         path     TEXT PRIMARY KEY NOT NULL,
+         sha256   TEXT NOT NULL,
+         size     INTEGER NOT NULL,
+         replicas INTEGER NOT NULL,
+         version  INTEGER NOT NULL,
+         writer   TEXT NOT NULL,
+         deleted  INTEGER NOT NULL,
+         mtime    INTEGER NOT NULL
+     ) WITHOUT ROWID;",
+    None,
+)];
+
+fn steps() -> Vec<crate::sqlite_migrate::Step> {
+    STEPS
+        .iter()
+        .map(|(name, up, down)| crate::sqlite_migrate::Step {
+            name: (*name).to_owned(),
+            up: (*up).to_owned(),
+            down: down.map(str::to_owned),
+        })
+        .collect()
 }
 
 /// A write transaction that takes SQLite's write lock up front.
@@ -63,28 +180,9 @@ pub(super) fn immediate(conn: &mut Connection) -> VfsResult<Transaction<'_>> {
     Ok(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
 }
 
-fn create_schema(tx: &Transaction<'_>) -> VfsResult<()> {
-    tx.execute_batch(
-        "CREATE TABLE entries (
-             path     TEXT PRIMARY KEY NOT NULL,
-             sha256   TEXT NOT NULL,
-             size     INTEGER NOT NULL,
-             replicas INTEGER NOT NULL,
-             version  INTEGER NOT NULL,
-             writer   TEXT NOT NULL,
-             deleted  INTEGER NOT NULL,
-             mtime    INTEGER NOT NULL
-         ) WITHOUT ROWID;",
-    )?;
-    Ok(())
-}
-
 /// Merge `index.json` when its size or mtime differs from the last merge or
 /// export. Entries a row already supersedes are skipped.
 fn merge_legacy(tx: &Transaction<'_>, root: &Path) -> VfsResult<()> {
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL) WITHOUT ROWID;",
-    )?;
     let Some(stamp) = legacy_stamp(root)? else {
         return Ok(());
     };
@@ -360,11 +458,67 @@ mod tests {
     }
 
     #[test]
+    fn an_index_from_before_the_runner_is_adopted_at_step_1() {
+        let scratch = Scratch::new();
+        let root = scratch.root();
+        storage::private_directory(&root).unwrap();
+        let conn = crate::sqlite::open(&root, DB_FILE).unwrap();
+        conn.execute_batch(STEPS[0].1).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        upsert(&tx, &entry(3, false)).unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+        let conn = open(&root).unwrap();
+        assert_eq!(load(&conn).unwrap().entries.len(), 1);
+        let applied = crate::sqlite_migrate::status(&conn).unwrap();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].name, "entries");
+        assert!(!applied[0].reversible);
+    }
+
+    #[test]
+    fn only_the_last_claimant_on_a_socket_writes_the_index() {
+        let scratch = Scratch::new();
+        let store = VfsStore::open_at(&scratch.root()).unwrap();
+        store.put("a.txt", b"a", 1, "SHA256:me").unwrap();
+        set_writer("/s.sock", "old");
+        store.claim_writer().unwrap();
+        store.put("b.txt", b"b", 1, "SHA256:me").unwrap();
+        // A reload candidate on the same socket claims: the old one is fenced.
+        set_writer("/s.sock", "new");
+        store.claim_writer().unwrap();
+        set_writer("/s.sock", "old");
+        let error = store.put("c.txt", b"c", 1, "SHA256:me").unwrap_err();
+        assert_eq!(error.kind, VfsErrorKind::Superseded);
+        assert_eq!(
+            store.delete("a.txt", "SHA256:me").unwrap_err().kind,
+            VfsErrorKind::Superseded
+        );
+        assert_eq!(
+            store
+                .collect_garbage_older_than(std::time::Duration::ZERO)
+                .unwrap(),
+            0
+        );
+        // A daemon on another socket is not this socket's successor.
+        set_writer("/other.sock", "x");
+        store.put("d.txt", b"d", 1, "SHA256:me").unwrap();
+        // Rollback: the old daemon claims again and writes.
+        set_writer("/s.sock", "old");
+        store.claim_writer().unwrap();
+        store.put("e.txt", b"e", 1, "SHA256:me").unwrap();
+        *WRITER.lock().unwrap() = None;
+        let names: Vec<String> = store.load_index().unwrap().entries.into_keys().collect();
+        assert_eq!(names, ["a.txt", "b.txt", "d.txt", "e.txt"]);
+    }
+
+    #[test]
     fn a_newer_schema_is_refused() {
         let scratch = Scratch::new();
         drop(open(&scratch.root()).unwrap());
         let conn = crate::sqlite::open(&scratch.root(), DB_FILE).unwrap();
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+        conn.pragma_update(None, "user_version", STEPS.len() as i64 + 1)
             .unwrap();
         let error = open(&scratch.root()).unwrap_err();
         assert!(error.detail.contains("newer than this remuda"), "{error}");

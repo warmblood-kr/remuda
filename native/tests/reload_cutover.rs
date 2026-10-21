@@ -4,6 +4,9 @@
 //! before it serves is killed, and the old daemon takes everything back.
 #![cfg(unix)]
 
+#[path = "daemon_support/reap.rs"]
+mod reap;
+
 use remuda_core::protocol::{Request, Response};
 use remuda_core::Size;
 use remuda_native::{client, daemon};
@@ -60,9 +63,7 @@ impl Root {
 }
 impl Drop for Root {
     fn drop(&mut self) {
-        let _ = Command::new("/usr/bin/pkill")
-            .args(["-KILL", "-f", &self.0.to_string_lossy()])
-            .status();
+        reap::kill_processes_under(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -283,22 +284,8 @@ fn still_the_old_daemon(root: &Root, old: &mut Daemon) {
     assert_eq!(send_line(&path, "work", "echo BACK-$((6*7))"), Response::Ok);
     wait_for(&path, "work", "BACK-42");
     new_session(&path, "fresh");
-    let still = Command::new("/usr/bin/pgrep")
-        .args(["-f", "_reload-candidate"])
-        .output()
-        .unwrap();
-    let root_name = root.0.to_string_lossy().into_owned();
-    let left: Vec<_> = String::from_utf8_lossy(&still.stdout)
-        .lines()
-        .filter_map(|pid| pid.trim().parse::<u32>().ok())
-        .filter(|pid| {
-            let args = Command::new("/bin/ps")
-                .args(["-o", "args=", "-p", &pid.to_string()])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&args.stdout).contains(&root_name)
-        })
-        .collect();
+    let root_name = format!("{}/", root.0.to_string_lossy());
+    let left = reap::processes_naming(&["_reload-candidate", &root_name]);
     assert!(left.is_empty(), "candidate left running: {left:?}");
 }
 
@@ -358,4 +345,30 @@ fn a_candidate_that_hangs_after_take_is_killed_at_its_deadline_and_rolled_back()
         started.elapsed()
     );
     still_the_old_daemon(&root, &mut old);
+}
+
+/// `remuda.daemon.reloaded_from()` names the daemon this one took over
+/// from, so a mod can tell a reload from a fresh start.
+#[test]
+fn the_new_daemon_names_the_daemon_it_took_over_from() {
+    let root = Root::new("from");
+    let path = root.socket();
+    let mut old = Daemon::spawn(&root, true, &[]);
+    let ask = |path: &Path| {
+        request(
+            path,
+            &Request::Eval {
+                code: "return tostring(remuda.daemon.reloaded_from())".into(),
+                name: None,
+            },
+        )
+    };
+    assert_eq!(ask(&path), Response::Value("nil".into()));
+    let old_pid = old.0.id();
+
+    let out = root.remuda(&["reload"]);
+    assert!(out.status.success(), "{:?}", text(&out));
+    assert!(old.exited(), "the old daemon did not exit cleanly");
+    assert_ne!(root.lock_pid(), old_pid);
+    assert_eq!(ask(&path), Response::Value(old_pid.to_string()));
 }

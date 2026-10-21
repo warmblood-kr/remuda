@@ -145,7 +145,8 @@ impl Owned {
         })
     }
     pub fn resize(&self, fence: Fence, rows: u16, cols: u16) -> Result<(), Error> {
-        super::terminal::Terminal::validate_geometry(rows, cols, 1000).map_err(Error::Invalid)?;
+        super::terminal::Terminal::validate_geometry(rows, cols, super::terminal::HISTORY_ROWS)
+            .map_err(Error::Invalid)?;
         let token = self.coordinator.lock().unwrap().begin_mutation(fence)?;
         // The daemon already applied the floor, or the caller opted out of it.
         let result = self.session.resize(Size::for_viewport(cols, rows));
