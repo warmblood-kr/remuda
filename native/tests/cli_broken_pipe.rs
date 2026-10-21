@@ -23,12 +23,18 @@ impl Scratch {
     }
 
     fn remuda(&self, args: &[&str]) -> Output {
+        self.remuda_with(args, &[])
+    }
+
+    /// `env` reaches a daemon this command autostarts.
+    fn remuda_with(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_remuda"))
             .args(args)
             .env("REMUDA_RUNTIME_DIR", &self.0)
             .env("XDG_DATA_HOME", self.0.join("data"))
             .env("HOME", &self.0)
             .env("REMUDA_NO_UPDATE_CHECK", "1")
+            .envs(env.iter().copied())
             .output()
             .expect("run remuda")
     }
@@ -112,7 +118,12 @@ fn listing_commands_allow_the_reader_to_stop_after_one_line() {
     lua.push_str(
         "remuda.session.new(string.rep('x', 1800)..string.format('%03d', i), {'/bin/sleep','60'}) end",
     );
-    let setup = scratch.remuda(&["-s", "s", "-e", &lua]);
+    // Autostarts the daemon with sessions in process: the long names that
+    // make a large listing are over the 64 bytes hosted sessions allow.
+    let setup = scratch.remuda_with(
+        &["-s", "s", "-e", &lua],
+        &[("REMUDA_EXPERIMENTAL_SESSION_HOST", "0")],
+    );
     assert!(
         setup.status.success(),
         "start listing fixture: {}",
