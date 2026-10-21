@@ -129,7 +129,7 @@ db
 db.open
 -------
 
-``db.open(name [, opts]) -> db | nil, reason`` — Open (creating if needed) database NAME in the running mod's namespace: <state>/remuda/db/MOD/NAME.db. NAME is a plain identifier. opts may set max_bytes (default 64 MiB, at most 1 GiB), timeout_ms per statement (default 1000, at most 10000) and max_rows per query (default 10000, at most 100000). The handle has query(sql, params) -> rows, exec(sql, params) -> changes, batch(sql) -> true, limits() and close(); params is an array of nil, boolean, number or string. Failures return nil and a reason starting with no_mod, io, sql, too_large, timeout, too_many_rows, denied (ATTACH, DETACH and most PRAGMAs) or closed. Outside a mod's own code it returns nil, 'no_mod: ...'.
+``db.open(name [, opts]) -> db | nil, reason`` — Open (creating if needed) database NAME in the running mod's namespace: <state>/remuda/db/MOD/NAME.db. NAME is a plain identifier. opts may set max_bytes (default 64 MiB, at most 1 GiB), timeout_ms per statement (default 1000, at most 10000) and max_rows per query (default 10000, at most 100000). opts.migrations = true applies the mod's migrations/NAME/NNNN_x.up.sql steps (or pass an array of {name, up, down}); see docs/lua.md. The handle has query(sql, params) -> rows, exec(sql, params) -> changes, batch(sql) -> true, limits() and close(); params is an array of nil, boolean, number or string. Failures return nil and a reason starting with no_mod, io, sql, too_large, timeout, too_many_rows, denied (ATTACH, DETACH and most PRAGMAs), migration, too_new, drift, foreign_key or closed. Outside a mod's own code it returns nil, 'no_mod: ...'.
 
 define_key
 ----------
