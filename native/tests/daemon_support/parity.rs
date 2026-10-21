@@ -32,6 +32,11 @@ pub struct Parity {
 
 impl Parity {
     pub fn start(mode: Mode) -> Self {
+        Self::start_with_env(mode, &[])
+    }
+
+    /// Start a daemon that also carries `env` in its own environment.
+    pub fn start_with_env(mode: Mode, env: &[(String, String)]) -> Self {
         let base = if cfg!(target_os = "macos") {
             "/private/tmp"
         } else {
@@ -57,6 +62,7 @@ impl Parity {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        command.envs(env.iter().map(|(key, value)| (key, value)));
         if mode == Mode::Hosted {
             command.env("REMUDA_EXPERIMENTAL_SESSION_HOST", "1");
         }
