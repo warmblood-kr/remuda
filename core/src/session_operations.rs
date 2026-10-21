@@ -175,6 +175,9 @@ pub struct Observation {
     /// The build of the session host serving it; `None` for an in-process
     /// session, which runs the daemon's own build (#713).
     pub host_build: Option<String>,
+    /// The newest human attach generation; an attachment older than this was
+    /// taken over. `None` from a host that does not report it.
+    pub attach_generation: Option<u64>,
 }
 
 /// Implementations retain stable client/sequence/payload context across adapter
@@ -423,6 +426,7 @@ impl SessionOperations for Session {
             program_status_age_ms: program
                 .map(|o| o.age.as_millis().try_into().unwrap_or(u64::MAX)),
             host_build: None,
+            attach_generation: Some(self.last_attach_generation()),
         })
     }
     fn send(&self, bytes: &[u8]) -> Result<()> {

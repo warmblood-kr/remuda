@@ -129,6 +129,7 @@ impl SessionOperations for Remote {
             program_status: None,
             program_status_age_ms: None,
             host_build: Some("test-host".into()),
+            attach_generation: None,
         })
     }
     fn recover(&self, key: &RequestIdentity) -> Result<Recovery> {

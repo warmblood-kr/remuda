@@ -220,7 +220,7 @@ impl Fixture {
         let mut peer =
             Client::open_expected(&self.root.join("h"), Role::View, self.identity.clone()).ok()?;
         match peer.request(&Request::Inspect).ok()? {
-            Response::Info { info } => Some(info),
+            Response::Info { info } => Some(*info),
             _ => None,
         }
     }

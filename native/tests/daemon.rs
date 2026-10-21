@@ -4232,15 +4232,10 @@ fn a_new_attach_takes_over_and_old_raw_clients_get_a_plain_notice() {
     let old = raw_attach(&path, "target");
     let mut current = raw_attach(&path, "target");
     let old_view = ViewerReader::new(&old);
-    let current_view = ViewerReader::new(&current);
-    let hosted = hosted_session(&path, "target");
-    if hosted {
-        assert_hosted_viewers_coexist(&path, &old_view, &current_view);
-        return;
-    }
 
-    // In-process attach hands the terminal to the newer viewer, so the old one
-    // gets a printable explanation and then EOF.
+    // In-process and hosted attach both hand the terminal to the newer viewer,
+    // so the old one gets a printable explanation and then EOF. The read is
+    // bounded, so a regression that leaves the viewer attached cannot hang.
     let old_output = old_view.read_for(Duration::from_millis(500));
     assert!(
         contains_text(&old_output, "[remuda] attached elsewhere, detached"),
@@ -4265,32 +4260,58 @@ fn a_new_attach_takes_over_and_old_raw_clients_get_a_plain_notice() {
     }
 }
 
-/// #802's hosted attach is a read-only view, so a second viewer coexists with
-/// the first instead of displacing it, and both keep following output.
-fn assert_hosted_viewers_coexist(path: &Path, old: &ViewerReader, current: &ViewerReader) {
-    let quiet = old.read_for(Duration::from_millis(500));
-    assert!(
-        !contains_text(&quiet, "[remuda] attached elsewhere, detached"),
-        "a read-only hosted viewer is not displaced: {quiet:?}"
-    );
-    client::request(
-        path,
-        &Request::SendLine {
-            name: "target".into(),
-            text: "echo VIEWBOTH".into(),
+/// A takeover must reach the old hosted viewer even while the child keeps
+/// printing; displacement is checked per frame, not only on a quiet tick.
+#[test]
+fn a_takeover_reaches_an_old_viewer_while_the_child_keeps_printing() {
+    let path = scratch("takeover-flood");
+    let _daemon = daemon_at(&path);
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while :; do printf 'flood-'; sleep 0.01; done".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
         },
     )
-    .expect("send a line the child echoes");
-    wait_for(path, "target", "VIEWBOTH");
-    let old_later = old.read_for(Duration::from_millis(500));
-    let current_later = current.read_for(Duration::from_millis(500));
-    assert!(
-        contains_text(&old_later, "VIEWBOTH"),
-        "the first viewer still follows output: {old_later:?}"
+    .expect("new");
+    assert!(matches!(response, Response::Value(_)));
+    if !hosted_session(&path, "target") {
+        let _ = client::request(
+            &path,
+            &Request::Close {
+                name: "target".into(),
+                instance_id: None,
+                confirm: None,
+            },
+        );
+        return;
+    }
+
+    let old = raw_attach(&path, "target");
+    let old_view = ViewerReader::new(&old);
+    std::thread::sleep(Duration::from_millis(100));
+    let current = raw_attach(&path, "target");
+    let seen = old_view.read_for(Duration::from_secs(2));
+    let _ = client::request(
+        &path,
+        &Request::Close {
+            name: "target".into(),
+            instance_id: None,
+            confirm: None,
+        },
     );
+    drop(current);
     assert!(
-        contains_text(&current_later, "VIEWBOTH"),
-        "the second viewer follows output: {current_later:?}"
+        contains_text(&seen, "[remuda] attached elsewhere, detached"),
+        "the takeover notice must not wait for output to stop: {}",
+        String::from_utf8_lossy(&seen)
     );
 }
 

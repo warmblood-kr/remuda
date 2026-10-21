@@ -284,7 +284,9 @@ impl Connection {
                 let mut info = self.server.host.inspect().map_err(|_| "host_unavailable")?;
                 info.active_connections = self.server.connections.load(Ordering::Acquire);
                 info.publication = self.server.publication.as_ref().map(|gate| gate.status());
-                Ok(Response::Info { info })
+                Ok(Response::Info {
+                    info: Box::new(info),
+                })
             }
             Request::Acquire => self.acquire(None),
             Request::AcquireWriter { writer } => self.acquire(Some(writer)),
