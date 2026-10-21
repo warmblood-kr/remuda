@@ -278,6 +278,10 @@ pub fn serve_handed(path: &Path, handed: Handed) -> std::io::Result<()> {
     serve_from(path, None, Some(handed))
 }
 
+/// The held socket lock's fd; a reload hands it over (#713).
+#[cfg(unix)]
+static SOCKET_LOCK_FD: std::sync::OnceLock<std::os::fd::RawFd> = std::sync::OnceLock::new();
+
 /// The socket this daemon serves, for a reload candidate to find its hosts.
 static DAEMON_SOCKET: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
@@ -442,6 +446,10 @@ fn open_endpoint(
         Some((listener, lock)) => (SocketLock::adopt(lock)?, Some(listener)),
         None => (SocketLock::acquire(path, runtime)?, None),
     };
+    {
+        use std::os::fd::AsRawFd;
+        let _ = SOCKET_LOCK_FD.set(lock._file.as_raw_fd());
+    }
     let _ = DAEMON_SOCKET.set(path.to_path_buf());
     // A handed listener answers this connect itself: it is ours already.
     if handed.is_none() {
@@ -780,6 +788,15 @@ impl DaemonListenerControl {
             .unwrap_or_else(|error| error.into_inner())
             .restart()
     }
+
+    /// Stop it and release its host lock, for a reload handover.
+    #[cfg(unix)]
+    fn stop(&self) {
+        self.task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .stop_and_join();
+    }
 }
 
 /// Read the listener's current daemon-owned status word.
@@ -962,6 +979,8 @@ fn start_listener(
 }
 
 #[cfg(unix)]
+mod accept;
+#[cfg(unix)]
 mod instance_id;
 #[cfg(unix)]
 mod publication;
@@ -1065,13 +1084,21 @@ impl SocketLock {
     /// fd shares its `flock`. It now names this process.
     #[cfg(unix)]
     fn adopt(lock: std::os::fd::OwnedFd) -> std::io::Result<Self> {
-        use std::io::{Seek, SeekFrom};
-        let mut file = std::fs::File::from(lock);
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        writeln!(file, "{}", std::process::id())?;
-        file.flush()?;
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::from(lock);
+        Self::name_this_process(file.as_raw_fd())?;
         Ok(Self { _file: file })
+    }
+
+    /// Write this process's pid into the held lock file `fd`.
+    #[cfg(unix)]
+    fn name_this_process(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::fs::FileExt;
+        // SAFETY: `fd` is the lock this daemon holds; ManuallyDrop keeps it open.
+        let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+        file.set_len(0)?;
+        file.write_all_at(format!("{}\n", std::process::id()).as_bytes(), 0)
     }
 }
 
@@ -1486,19 +1513,9 @@ fn serve_unix(
     let (socket_owner, anti_entropy, listener_task) = lifecycle;
     let detached = unsafe { libc::getsid(0) == libc::getpid() };
     let mut signal_bytes = [0u8; 1];
+    let gate = accept_gate();
     'poll_loop: loop {
-        let mut watched = [
-            libc::pollfd {
-                fd: unix_listener_fd(&listener),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: signals.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
+        let mut watched = poll_set(unix_listener_fd(&listener), signals.as_raw_fd(), gate);
         let ready = unsafe { libc::poll(watched.as_mut_ptr(), watched.len() as _, -1) };
         if ready < 0 {
             let error = std::io::Error::last_os_error();
@@ -1559,6 +1576,7 @@ fn serve_unix(
                     let socket_owner = Arc::clone(&socket_owner);
                     let anti_entropy = Arc::clone(&anti_entropy);
                     let listener_task = Arc::clone(&listener_task);
+                    let answering = accept::Answering::begin();
                     std::thread::spawn(move || {
                         let _ = handle(
                             stream,
@@ -1570,6 +1588,7 @@ fn serve_unix(
                             listener_task,
                             accepted,
                         );
+                        drop(answering);
                     });
                 }
                 Err(error)
@@ -1606,6 +1625,35 @@ fn adopt_listener(
     listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
     let owner = Arc::new(SocketOwnership::capture(path)?);
     Ok((listener, owner, "handed over by reload".into()))
+}
+
+/// The accept loop's fds: the listener (left out while paused for a reload,
+/// so clients wait queued), the signal pair and the pause control's wake.
+#[cfg(unix)]
+fn poll_set(
+    listener: std::os::fd::RawFd,
+    signals: std::os::fd::RawFd,
+    gate: Option<&accept::AcceptGate>,
+) -> [libc::pollfd; 3] {
+    let listening = gate.is_none_or(|gate| gate.turn(listener));
+    let watch = |fd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    [
+        watch(if listening { listener } else { -1 }),
+        watch(signals),
+        watch(gate.map_or(-1, accept::AcceptGate::wake_fd)),
+    ]
+}
+
+/// The accept loop's pause control, for a reload; `None` if it could not be
+/// made, and then a reload is refused.
+#[cfg(unix)]
+fn accept_gate() -> Option<&'static accept::AcceptGate> {
+    static GATE: std::sync::OnceLock<Option<accept::AcceptGate>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| accept::AcceptGate::new().ok()).as_ref()
 }
 
 #[cfg(unix)]
@@ -1682,16 +1730,18 @@ fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
     Ok(reader)
 }
 
-/// `Request::Reload`: only the check exists yet.
-fn reload(image: &Image, registry: &Registry, binary: &str, check: bool) -> Response {
+/// `Request::Reload`. A check starts a candidate, reports and stops it. A
+/// reload hands this daemon's endpoint to the candidate; `true` means it
+/// took over, and this daemon exits once the answer is sent.
+fn reload(
+    image: &Image,
+    registry: &Registry,
+    listener_task: &DaemonListenerControl,
+    binary: &str,
+    check: bool,
+) -> (Response, bool) {
     #[cfg(unix)]
     {
-        if !check {
-            return Response::error(
-                "reload without --check is not implemented yet; `remuda reload --check` \
-                 reports whether it would be safe",
-            );
-        }
         let hosted: Vec<String> = registry
             .hosted_handles()
             .iter()
@@ -1704,24 +1754,126 @@ fn reload(image: &Image, registry: &Registry, binary: &str, check: bool) -> Resp
             .map(|session| session.name)
             .collect();
         let Some(socket) = DAEMON_SOCKET.get() else {
-            return Response::error("reload: this daemon does not know its socket");
+            return (
+                Response::error("reload: this daemon does not know its socket"),
+                false,
+            );
         };
-        match crate::reload::check(
+        let deadlines = crate::reload::Deadlines::default();
+        let candidate = match crate::reload::start(
             socket,
             Path::new(binary),
             image.session_hosts(),
             &legacy,
-            crate::reload::Deadlines::default(),
+            deadlines,
         ) {
-            Ok(report) => Response::Value(report.lines().join("\n")),
-            Err(error) => Response::error(format!("reload check failed: {error}")),
+            Ok(candidate) => candidate,
+            Err(error) => {
+                return (
+                    Response::error(format!("reload check failed: {error}")),
+                    false,
+                )
+            }
+        };
+        if check || !candidate.report().blockers.is_empty() {
+            let report = candidate.abort();
+            return (Response::Value(report.lines().join("\n")), false);
+        }
+        let mut lines = candidate.report().lines();
+        match cut_over(image, listener_task, candidate, deadlines.serving) {
+            Ok(build) => {
+                lines[0] = format!("reloaded: {build} now serves this socket");
+                eprintln!("remuda daemon: reloaded into {build}; this daemon exits");
+                (Response::Value(lines.join("\n")), true)
+            }
+            Err(error) => (
+                Response::error(format!(
+                    "reload failed and was rolled back; this daemon still serves: {error}"
+                )),
+                false,
+            ),
         }
     }
     #[cfg(windows)]
     {
-        let _ = (image, registry, binary, check);
-        Response::error("reload is not supported on Windows yet: sessions there have no host")
+        let _ = (image, registry, listener_task, binary, check);
+        (
+            Response::error("reload is not supported on Windows yet: sessions there have no host"),
+            false,
+        )
     }
+}
+
+/// How long a reload waits for admitted host work before the handover.
+/// Work left then is resolved by the next daemon, as after a stop.
+#[cfg(unix)]
+const RELOAD_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Drain, stop the cluster listener, pause accepting, then hand over. On
+/// any failure this daemon takes everything back and keeps serving.
+#[cfg(unix)]
+fn cut_over(
+    image: &Image,
+    listener_task: &DaemonListenerControl,
+    candidate: crate::reload::Candidate,
+    serving: std::time::Duration,
+) -> Result<String, String> {
+    let (Some(gate), Some(&lock)) = (accept_gate(), SOCKET_LOCK_FD.get()) else {
+        candidate.abort();
+        return Err("this daemon cannot pause accepting".into());
+    };
+    let build = candidate.report().candidate.clone();
+    let hosting = image.session_hosts();
+    let drained = hosting.drain(RELOAD_DRAIN_DEADLINE);
+    if drained.left > 0 {
+        eprintln!(
+            "remuda daemon: reload: {} host-backed act(s) still running; the next daemon resolves them",
+            drained.left
+        );
+    }
+    listener_task.stop();
+    let listener = match gate.pause(std::time::Duration::from_secs(5)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            candidate.abort();
+            roll_back(image, listener_task, gate, lock);
+            return Err(error.to_string());
+        }
+    };
+    candidate
+        .take(listener, lock, serving)
+        .inspect_err(|_| roll_back(image, listener_task, gate, lock))?;
+    Ok(build)
+}
+
+/// Take back what a failed handover gave away: the hosts (a newer epoch
+/// fences the candidate), host work, the lock's pid, accepting, the cluster
+/// listener.
+#[cfg(unix)]
+fn roll_back(
+    image: &Image,
+    listener_task: &DaemonListenerControl,
+    gate: &accept::AcceptGate,
+    lock: std::os::fd::RawFd,
+) {
+    let hosting = image.session_hosts();
+    match hosting.reclaim() {
+        Ok(announced) => {
+            for (name, answer) in announced {
+                use crate::session_host::Announced;
+                if !matches!(answer, Announced::Fenced | Announced::Unfenced) {
+                    eprintln!("remuda daemon: reload rollback: host {name}: {answer:?}");
+                }
+            }
+        }
+        Err(error) => eprintln!("remuda daemon: reload rollback: reclaim failed: {error}"),
+    }
+    hosting.reopen();
+    if let Err(error) = SocketLock::name_this_process(lock) {
+        eprintln!("remuda daemon: reload rollback: socket lock: {error}");
+    }
+    gate.resume();
+    let _ = listener_task.reload();
 }
 
 /// Longest act (30 s plus its pauses) a clean shutdown waits for.
@@ -1871,7 +2023,22 @@ fn handle_request(
             &Response::SessionHostBuilds(registry.hosted_builds()),
         ),
         Request::Reload { binary, check } => {
-            reply(&stream, &reload(image, registry, &binary, check))
+            let (response, replaced) = reload(image, registry, &listener_task, &binary, check);
+            reply(&stream, &response)?;
+            if replaced {
+                // Requests accepted before the pause still get their answers.
+                #[cfg(unix)]
+                {
+                    let left = accept::Answering::wait_for_others(1, RELOAD_DRAIN_DEADLINE);
+                    if left > 0 {
+                        eprintln!("remuda daemon: reload: {left} request(s) cut at exit");
+                    }
+                }
+                // The candidate owns the socket now: never unlink it here.
+                anti_entropy.stop_and_join();
+                std::process::exit(0);
+            }
+            Ok(())
         }
 
         Request::ClusterRegistrySync { .. }

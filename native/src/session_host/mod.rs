@@ -31,6 +31,9 @@ mod reaper;
 mod recovery;
 #[cfg(unix)]
 mod remote;
+/// A host's answer to a reclaim, for the daemon's reload rollback.
+#[cfg(unix)]
+pub(crate) use remote::Announced;
 mod result;
 #[cfg(unix)]
 mod server;

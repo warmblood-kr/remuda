@@ -369,8 +369,8 @@ fn reload_cli_spec() -> remuda_native::cli_parse::Spec {
     };
     simple_cli_spec(
         "reload",
-        "Replace the running daemon with this remuda, keeping host-backed sessions. \
-         Only --check works yet. Example: remuda reload --check",
+        "Replace the running daemon with this remuda, keeping host-backed sessions \
+         and the socket. Example: remuda reload",
         vec![],
         vec![
             option(
@@ -384,7 +384,7 @@ fn reload_cli_spec() -> remuda_native::cli_parse::Spec {
                 "The remuda to reload into (default: this one)",
             ),
         ],
-        "remuda reload --check",
+        "remuda reload",
     )
 }
 
@@ -420,6 +420,9 @@ fn reload_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         match remuda_native::client::request(path, &request) {
             Ok(Response::Value(report)) => {
                 println!("{report}");
+                if report.starts_with("reloaded:") {
+                    return reload_post_check(path);
+                }
                 if report.starts_with("ready:") {
                     ExitCode::SUCCESS
                 } else {
@@ -437,6 +440,20 @@ fn reload_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             Err(error) => fail(error),
         }
     })
+}
+
+/// After a reload: the socket must answer, and from the new daemon.
+fn reload_post_check(path: &Path) -> ExitCode {
+    match remuda_native::client::request(path, &Request::Version) {
+        Ok(Response::Value(build)) => {
+            println!("daemon now {build}");
+            ExitCode::SUCCESS
+        }
+        Ok(other) => fail(format!("after the reload the daemon answered {other:?}")),
+        Err(error) => fail(format!(
+            "after the reload the daemon did not answer: {error}"
+        )),
+    }
 }
 
 fn lua_cli_spec() -> remuda_native::cli_parse::Spec {

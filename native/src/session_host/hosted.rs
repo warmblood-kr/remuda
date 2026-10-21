@@ -226,6 +226,11 @@ impl Hosting {
         self.gate.drain(deadline)
     }
 
+    /// Admit host-backed work again after a drain, for a reload rolled back.
+    pub fn reopen(&self) {
+        self.gate.reopen();
+    }
+
     /// After the Registry closed `name`: stop its host and retire its entry,
     /// off the request thread. Unknown names are ignored.
     pub fn retire_closed(&self, name: &str) {
