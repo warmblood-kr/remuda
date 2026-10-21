@@ -2998,7 +2998,14 @@ fn handle_sync(
 ) -> std::io::Result<()> {
     let Some(session) = registry.get(name) else {
         return match registry.hosted(name) {
-            Some(handle) => sync_hosted(stream, &handle, expected_instance, since, timeout_ms),
+            Some(handle) => sync_hosted(
+                stream,
+                registry,
+                &handle,
+                expected_instance,
+                since,
+                timeout_ms,
+            ),
             None => reply(stream, &Response::error(format!("no such session: {name}"))),
         };
     };
@@ -3049,16 +3056,21 @@ fn handle_sync(
 }
 
 /// `Sync` for a host-backed session (#713): the same bounded wait and frame.
-/// A handle is bound to one launch, so its instance cannot change mid-wait.
+/// A handle is bound to one launch, but its name can be closed and launched
+/// again mid-wait, so the expected instance is checked again afterwards.
 fn sync_hosted(
     stream: &Stream,
+    registry: &Registry,
     handle: &remuda_core::session_operations::SessionHandle,
     expected_instance: Option<String>,
     since: u64,
     timeout_ms: u64,
 ) -> std::io::Result<()> {
     let instance_id = handle.identity().instance.clone();
-    if expected_instance.is_some_and(|expected| expected != instance_id) {
+    if expected_instance
+        .as_deref()
+        .is_some_and(|expected| expected != instance_id)
+    {
         return reply(stream, &Response::WrongInstance);
     }
     let _permit = match acquire_sync_permit() {
@@ -3066,7 +3078,26 @@ fn sync_hosted(
         Err(response) => return reply(stream, &response),
     };
     let timeout = Duration::from_millis(remuda_core::sync::bounded_timeout_ms(timeout_ms));
-    let versioned = match handle.wait_after(since, timeout) {
+    let result = handle.wait_after(since, timeout);
+    // As in-process: a name closed (and perhaps relaunched) during the wait
+    // answers WrongInstance, not the old launch's exit or screen. The host
+    // stops with a closing child, which can wake this wait before or after
+    // the close stops tracking the handle, so the close itself is asked.
+    // A handle reaped after its child exited still answers that exit: an
+    // in-process wait wakes at the exit, before any reap.
+    if expected_instance.is_some() {
+        let name = &handle.identity().name;
+        let replaced = match registry.get(name) {
+            Some(session) => session.instance_id() != instance_id,
+            None => registry
+                .hosted(name)
+                .is_some_and(|current| current.identity().instance != instance_id),
+        };
+        if replaced || registry.hosted_closed(&instance_id) {
+            return reply(stream, &Response::WrongInstance);
+        }
+    }
+    let versioned = match result {
         Ok(snapshot) => snapshot,
         Err(error) => return reply(stream, &Response::error(error.to_string())),
     };

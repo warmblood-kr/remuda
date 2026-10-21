@@ -120,6 +120,8 @@ pub fn slug(command: &str) -> String {
     }
 }
 
+const CLOSED_HOSTED_KEPT: usize = 256;
+
 #[derive(Default)]
 pub struct Registry {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -129,6 +131,10 @@ pub struct Registry {
     /// Host-backed launches (by instance id) a close has started ending, so a
     /// reaper that sees the child die first still reports "closed".
     closing_hosted: Mutex<std::collections::HashSet<String>>,
+    /// The latest host-backed launches a close ended, newest last and at most
+    /// [`CLOSED_HOSTED_KEPT`], so a Sync that woke as the host stopped can
+    /// tell a close from an exit after the handle is gone.
+    closed_hosted: Mutex<std::collections::VecDeque<String>>,
     /// Sequenced-input state per host-backed launch, by instance id: the same
     /// duplicate memory and rate budget an in-process Session keeps itself.
     /// Daemon memory only; a daemon restart forgets it, as it would for an
@@ -605,6 +611,18 @@ impl Registry {
             .collect()
     }
 
+    /// True once a close of the host-backed start `instance` has begun: from
+    /// before its child is ended, and for a while after the close finished.
+    pub fn hosted_closed(&self, instance: &str) -> bool {
+        self.closing_hosted_lock().contains(instance)
+            || self
+                .closed_hosted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|closed| closed == instance)
+    }
+
     fn closing_hosted_lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
         self.closing_hosted
             .lock()
@@ -824,6 +842,13 @@ impl Registry {
             self.closing_hosted_lock()
                 .remove(&handle.identity().instance);
             return Some(Err(error.into_agent()));
+        }
+        {
+            let mut closed = self.closed_hosted.lock().unwrap_or_else(|e| e.into_inner());
+            if closed.len() == CLOSED_HOSTED_KEPT {
+                closed.pop_front();
+            }
+            closed.push_back(handle.identity().instance.clone());
         }
         let mut hosted = self.hosted_lock();
         let removed = hosted
