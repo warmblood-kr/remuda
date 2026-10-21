@@ -202,8 +202,17 @@ impl Candidate {
     }
     fn hand_over(&mut self, listener: RawFd, lock: RawFd, until: Instant) -> Result<(), String> {
         let bytes = frame(&FromOld::Take).map_err(|e| format!("take: {e}"))?;
-        fds::send(&self.stream, &bytes, &[listener, lock])
-            .map_err(|e| format!("could not hand over the listener: {e}"))?;
+        fds::send(&self.stream, &bytes, &[listener, lock]).map_err(|e| {
+            // C may exit right after its report, before reading `Take`.
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ) {
+                exited(&mut self.child, "take")
+            } else {
+                format!("could not hand over the listener: {e}")
+            }
+        })?;
         match read_frame(&mut self.stream, &mut self.child, until, "serving")? {
             FromCandidate::Serving => Ok(()),
             FromCandidate::Failed { reason } => {
@@ -518,16 +527,19 @@ fn read_frame(
         {
             Err(format!("candidate sent no {awaited} in time"))
         }
-        Err(_) => {
-            reap(child);
-            let status = child
-                .try_wait()
-                .ok()
-                .flatten()
-                .map_or_else(|| "unknown status".into(), |status| status.to_string());
-            Err(format!("candidate exited before its {awaited} ({status})"))
-        }
+        Err(_) => Err(exited(child, awaited)),
     }
+}
+
+/// C closed its end: reap it and say what it was waited on for.
+fn exited(child: &mut Child, awaited: &str) -> String {
+    reap(child);
+    let status = child
+        .try_wait()
+        .ok()
+        .flatten()
+        .map_or_else(|| "unknown status".into(), |status| status.to_string());
+    format!("candidate exited before its {awaited} ({status})")
 }
 
 #[cfg(test)]
