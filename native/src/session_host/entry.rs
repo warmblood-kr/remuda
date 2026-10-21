@@ -241,6 +241,10 @@ impl Client {
     }
     /// Fenced acquisition where the host understands it; an older host gets
     /// the plain request it knows, since it would reject the new variant.
+    /// Whether the host advertised `capability` in its Hello.
+    pub fn offers(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
+    }
     pub fn acquire(&mut self, writer: super::api::Writer) -> io::Result<Response> {
         if self
             .capabilities

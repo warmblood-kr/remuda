@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Session hosts (experimental, internal): building blocks for `remuda reload`.
+  A daemon can claim its session hosts again after another daemon claimed
+  them, and every host it has open then refuses the other daemon at once.
+  A candidate daemon can check every host read-only, without claiming. No
+  command uses these yet.
+
 - Session hosts (experimental): a host now refuses input, resize, close and
   stop from a daemon whose inventory writer epoch is older than one it has
   seen (`writer-fence-v1`, error `superseded_writer`). Before, an older daemon

@@ -646,3 +646,86 @@ fn teardown_retires_an_entry_whose_host_was_stopped_before_a_crash() {
         .entries
         .contains_key("synthetic"));
 }
+
+#[test]
+fn a_reclaim_fences_a_newer_claimant_at_the_store_and_at_the_host() {
+    use crate::session_host::hosted::Hosting;
+    let fixture = Fixture::new();
+    let registry = remuda_core::Registry::new();
+    let old = Hosting::at(fixture.root.clone());
+    assert_eq!(old.discover(&registry).unwrap(), ["synthetic"]);
+    let ours = registry.hosted("synthetic").unwrap();
+    ours.send_line("old-1").unwrap();
+
+    // A candidate claims: the old daemon is fenced.
+    let candidate = adapter(&fixture.root);
+    candidate.send_line("new-1").unwrap();
+    assert!(matches!(
+        ours.send_line("old-refused"),
+        Err(Error::Unavailable(Unavailable::Recovering))
+    ));
+
+    // Rollback: the old daemon claims again and shows the host.
+    assert_eq!(
+        old.reclaim().unwrap(),
+        [("synthetic".to_owned(), Announced::Fenced)]
+    );
+    // The host refuses the candidate's writer before the old daemon's next
+    // act reaches it, store check or not.
+    let mut raw = Client::open_expected(
+        &candidate.endpoint,
+        Role::Control,
+        candidate.identity.clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        raw.acquire(candidate.owner.writer()).unwrap(),
+        Response::Error { code } if code == "superseded_writer"
+    ));
+    drop(raw);
+    ours.send_line("old-2").unwrap();
+    assert!(matches!(
+        candidate.send_line("new-refused"),
+        Err(Error::Unavailable(Unavailable::Recovering))
+    ));
+    assert_eq!(fixture.effects(), ["old-1", "new-1", "old-2"]);
+}
+
+#[test]
+fn a_preflight_reads_every_host_without_claiming_or_taking_the_lease() {
+    use crate::session_host::hosted::{Checked, CheckedState, Hosting};
+    let mut fixture = Fixture::new();
+    let session = adapter(&fixture.root);
+    let before = session.owner.index().unwrap().fence();
+
+    let checked = Hosting::at(fixture.root.clone()).preflight().unwrap();
+    assert_eq!(
+        checked,
+        [Checked {
+            name: "synthetic".into(),
+            state: CheckedState::Running {
+                build: crate::dist::BUILD_VERSION.into()
+            },
+        }]
+    );
+    // No claim: the existing owner is still the writer and acts at once.
+    assert_eq!(session.owner.index().unwrap().fence(), before);
+    assert!(session.owner.current().unwrap());
+    session.send_line("after-preflight").unwrap();
+    assert_eq!(fixture.effects(), ["after-preflight"]);
+
+    let host = fixture.host.as_mut().unwrap();
+    host.0.kill().unwrap();
+    host.0.wait().unwrap();
+    let checked = Hosting::at(fixture.root.clone()).preflight().unwrap();
+    assert!(
+        matches!(
+            &checked[..],
+            [Checked {
+                state: CheckedState::Unreachable(_),
+                ..
+            }]
+        ),
+        "{checked:?}"
+    );
+}

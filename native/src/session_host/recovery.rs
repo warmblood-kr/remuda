@@ -165,7 +165,7 @@ impl Owner {
     }
     /// What a fencing host is shown; it refuses every older writer after this.
     pub fn writer(&self) -> super::api::Writer {
-        self.fence.writer()
+        self.fence().writer()
     }
     /// Whether this owner's exact fence is still the store's current writer.
     pub fn current(&self) -> Result<bool, Error> {

@@ -11,7 +11,7 @@ use super::entry::Launch;
 use super::inventory::disk::Store;
 use super::inventory::model::{Birth, Entry, Lease, Phase, Target};
 use super::recovery::Owner;
-use super::remote::HostSession;
+use super::remote::{Announced, HostSession};
 use remuda_core::session_operations::SessionHandle;
 use remuda_core::{Registry, Size};
 use serde_json::value::RawValue;
@@ -78,6 +78,14 @@ impl Hosting {
         name.push(".hosts");
         Self {
             root: socket.with_file_name(name),
+            hosts: Mutex::new(None),
+        }
+    }
+    /// Hosting over an existing private directory, for tests.
+    #[cfg(test)]
+    pub(crate) fn at(root: PathBuf) -> Self {
+        Self {
+            root,
             hosts: Mutex::new(None),
         }
     }
@@ -159,17 +167,31 @@ impl Hosting {
             .map_err(|_| format!("session name already in use: {}", request.name))
     }
 
-    /// Claim the inventory again under a newer epoch, fencing any daemon that
-    /// claimed since. No-op before this daemon opened its inventory.
-    pub fn reclaim(&self) -> io::Result<()> {
+    /// Claim the inventory again under a newer epoch, then show every open
+    /// host the new writer, fencing any daemon that claimed since. Returns
+    /// each host's answer; none before this daemon opened its inventory.
+    pub fn reclaim(&self) -> io::Result<Vec<(String, Announced)>> {
         let hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        match hosts {
-            Some(hosts) => hosts
-                .owner
-                .reclaim()
-                .map_err(|error| io::Error::other(format!("session host reclaim: {error:?}"))),
-            None => Ok(()),
-        }
+        let Some(hosts) = hosts else {
+            return Ok(Vec::new());
+        };
+        hosts
+            .owner
+            .reclaim()
+            .map_err(|error| io::Error::other(format!("session host reclaim: {error:?}")))?;
+        let open: Vec<_> = hosts
+            .open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(name, session)| (name.clone(), session.clone()))
+            .collect();
+        let mut announced: Vec<_> = open
+            .into_iter()
+            .map(|(name, session)| (name, session.announce_writer()))
+            .collect();
+        announced.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(announced)
     }
 
     /// Read-only check of every registered host, for a daemon that must not
@@ -233,11 +255,9 @@ fn checked(entry: &Entry) -> CheckedState {
     let Some(birth) = entry.birth.as_ref() else {
         return CheckedState::Unreachable("no endpoint recorded".into());
     };
-    let inspected = super::entry::Client::open_observer(
-        Path::new(birth.endpoint()),
-        entry.identity.clone(),
-    )
-    .and_then(|mut client| client.request(&super::api::Request::Inspect));
+    let inspected =
+        super::entry::Client::open_observer(Path::new(birth.endpoint()), entry.identity.clone())
+            .and_then(|mut client| client.request(&super::api::Request::Inspect));
     match inspected {
         Ok(super::api::Response::Info { info }) if info.identity == entry.identity => {
             CheckedState::Running {
