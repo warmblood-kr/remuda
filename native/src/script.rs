@@ -2427,6 +2427,18 @@ fn lua_env_to_wire(env: Table) -> mlua::Result<std::collections::HashMap<String,
     env.pairs::<String, String>().collect()
 }
 
+/// `{ {name = ..., build = ...}, ... }`; `build` is nil for an unreachable host.
+fn host_builds(lua: &Lua, builds: Vec<remuda_core::protocol::HostBuild>) -> mlua::Result<Value> {
+    let rows = lua.create_table()?;
+    for (index, host) in builds.into_iter().enumerate() {
+        let row = lua.create_table()?;
+        row.set("name", host.name)?;
+        row.set("build", host.build)?;
+        rows.set(index + 1, row)?;
+    }
+    Ok(Value::Table(rows))
+}
+
 /// Turn a response into what the script sees. Caution: [`Response::Error`]
 /// raises rather than returning a value — a script that forgot to check one
 /// would otherwise carry on over a session that was never created.
@@ -2501,6 +2513,7 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
             }
             Ok(Value::Table(rows))
         }
+        Response::SessionHostBuilds(builds) => host_builds(lua, builds),
         Response::Entries(names) => {
             let rows = lua.create_table()?;
             for (index, name) in names.into_iter().enumerate() {

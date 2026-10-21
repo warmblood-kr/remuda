@@ -171,19 +171,44 @@ try {
     $installDir = (Get-Item -Force -LiteralPath $installDir).FullName
     $installed = Join-Path $installDir 'remuda.exe'
 
+    # remuda.exe and remuda-session-host.exe are one pair: the daemon starts the
+    # host from beside itself. A release older than the pair has no host, and
+    # then no host from a different build may stay beside the new daemon either.
+    $pair = @('remuda-session-host.exe', 'remuda.exe')
+    $hostUnpacked = Test-Path (Join-Path $tmp 'remuda-session-host.exe')
+
+    # Copy the installed pair aside as .prev first, for rollback. A .prev pair
+    # with no host is still one pair, so a stale host .prev goes too.
+    if (Test-Path $installed) {
+        foreach ($bin in $pair) {
+            $current = Join-Path $installDir $bin
+            if (Test-Path $current) {
+                Copy-Item -Force $current "$current.prev"
+            } else {
+                Remove-Item -Force -ErrorAction SilentlyContinue "$current.prev"
+            }
+        }
+    }
+
     # Windows refuses to overwrite a RUNNING executable but allows renaming it,
     # which is this platform's version of install.sh's land-by-rename: `remuda
-    # upgrade` runs this while that very binary is executing.
-    $retired = Join-Path $installDir ('.remuda.exe.old-' + [guid]::NewGuid())
-    if (Test-Path $installed) { Move-Item -Force $installed $retired }
-    try {
-        Move-Item -Force $unpacked $installed
-    } catch {
-        if (Test-Path $retired) { Move-Item -Force $retired $installed }
-        Die "cannot place remuda.exe in $installDir - $($_.Exception.Message)"
+    # upgrade` runs this while that very binary is executing. The host lands
+    # first, so a new daemon never starts beside an old host.
+    foreach ($bin in $pair) {
+        $target = Join-Path $installDir $bin
+        $retired = Join-Path $installDir (".$bin.old-" + [guid]::NewGuid())
+        if (Test-Path $target) { Move-Item -Force $target $retired }
+        if ($bin -eq 'remuda.exe' -or $hostUnpacked) {
+            try {
+                Move-Item -Force (Join-Path $tmp $bin) $target
+            } catch {
+                if (Test-Path $retired) { Move-Item -Force $retired $target }
+                Die "cannot place $bin in $installDir - $($_.Exception.Message)"
+            }
+        }
+        Get-ChildItem -Path $installDir -Filter ".$bin.old-*" -Force -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
     }
-    Get-ChildItem -Path $installDir -Filter '.remuda.exe.old-*' -Force -ErrorAction SilentlyContinue |
-        Remove-Item -Force -ErrorAction SilentlyContinue
 
     Set-Content -Path $channelFile -Value $channel -NoNewline
 

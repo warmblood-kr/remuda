@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- Session hosts (experimental, internal): building blocks for `remuda reload`.
+  A daemon can claim its session hosts again after another daemon claimed
+  them, and every host it has open then refuses the other daemon at once.
+  A candidate daemon can check every host read-only, without claiming. No
+  command uses these yet.
+- Session hosts (experimental): `remuda stop` now lets an act a host is
+  already running finish and answers it, instead of hanging up on it. New
+  host-backed input, resize and close are refused while the daemon drains.
+  `stop` still returns at once, and hosts keep running. Before, such an act
+  answered "the daemon hung up without answering" and was left for the next
+  daemon to resolve.
+- Session hosts (experimental): a daemon now starts only a session host of
+  its own build. Before, a daemon still running after an upgrade started the
+  newly installed host. `install.sh` now also keeps each host as
+  `remuda-session-host-<build>` (the three most recent), and the daemon
+  looks there first. If no host of its build is left, `new` is refused at
+  once with a message to restart the daemon. `remuda-session-host version`
+  prints the host's build.
+- `remuda version --hosts` prints the daemon's build and the build of each
+  host-backed session's host (experimental session hosts, #713). Hosts
+  outlive daemons, so after an upgrade some sessions can still run on an
+  older host; these are marked, and unreachable hosts are named. Plain
+  `remuda version` is unchanged.
+
+- Session hosts (experimental): a host now refuses input, resize, close and
+  stop from a daemon whose inventory writer epoch is older than one it has
+  seen (`writer-fence-v1`, error `superseded_writer`). Before, an older daemon
+  that passed its store check just before a newer daemon claimed could still
+  act on the host. The wire change is additive: older hosts get the plain
+  `Acquire`, and older daemons are still accepted. CI now hands a hosted
+  session between the base build and this build in both directions.
+
 - Lua: `remuda.db.open(name [, opts])` gives each mod its own SQLite
   databases (#778): `open("notes")` in mod `butler` opens
   `<state>/remuda/db/butler/notes.db`. Handles have `query`, `exec`, `batch`,
@@ -30,8 +62,8 @@
   difference: the entries, the digest and the messages are the same, so
   upgraded and older nodes sync with each other as before.
 
-- SQLite is now built into the binary (`rusqlite`, bundled; #778). Nothing
-  uses it yet: it is the base for a daemon-owned VFS index and for Lua
+- SQLite is now built into the binary (`rusqlite`, bundled; #778). It backs
+  the daemon-owned VFS index and Lua
   databases. A database opened through it keeps its file, `-wal` and `-shm`
   private: 0600 in a 0700 directory on Unix, the owner-only ACL on Windows.
   The `-wal` and `-shm` files are kept when the database closes, so SQLite
@@ -65,6 +97,14 @@
   on this node only and exits 75 (EX_TEMPFAIL) so a script can retry. A
   one-node cluster, with no peers to tell, still exits 0. With `--wait`, the
   wait result decides; a timed-out wait with no peer reached also exits 75.
+
+- Install: releases now ship `remuda-session-host` beside `remuda` in every
+  tarball, and `install.sh` and `install.ps1` install both as one pair. The
+  pair being replaced is kept as `remuda.prev` and `remuda-session-host.prev`
+  (`.exe.prev` on Windows) for rollback. Before, no release carried the host,
+  so `REMUDA_EXPERIMENTAL_SESSION_HOST=1` failed with "session host binary
+  not found" on any installed remuda. The daemon now also looks for
+  `remuda-session-host.exe` on Windows.
 
 - Cluster TUI: a slow or unreachable peer no longer freezes the cursor.
   Remote Input, InputLine, ResizeSession and Close now run on a background

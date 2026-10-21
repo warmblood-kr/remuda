@@ -15,7 +15,9 @@
 //! is typing. [`render`] and [`Ui::on_key`] stay pure, so the state machine is
 //! testable on a machine with no tty; everything needing one lives in [`run`].
 
-use crate::client::{self, Hold, RawMode};
+#[cfg(test)]
+use crate::client;
+use crate::client::{Hold, RawMode};
 use crate::mcp;
 use remuda_core::agent::{Color, Cursor, StyledCell};
 use remuda_core::protocol::{expand_runs, Request, Response};
@@ -32,6 +34,8 @@ use crossterm::event::{
 
 /// How often an idle herd is relisted, recaptured and redrawn — see
 /// [`should_refresh`]. A key always forces an immediate refresh regardless.
+mod port;
+pub use port::{KeyStream, SessionPort};
 const TICK: Duration = Duration::from_millis(250);
 const DAEMON_FAILURES_BEFORE_GONE: u8 = 3;
 
@@ -2513,11 +2517,11 @@ fn should_refresh(forced: bool, since_last: Duration, tick: Duration) -> bool {
 // ponytail: 8 plain params over clippy's 7 rather than a bundling struct
 // only `refresh` would ever construct — split out if a 9th ever shows up.
 #[allow(clippy::too_many_arguments)]
-fn refresh(
-    path: &Path,
+fn refresh<P: SessionPort + ?Sized>(
+    path: &P,
     server: &str,
     ui: &mut Ui,
-    held: &mut Option<(String, Hold)>,
+    held: &mut Option<(String, P::Keys)>,
     painted: &mut String,
     shown: &mut Option<ShownTarget>,
     skip_list: bool,
@@ -2541,7 +2545,7 @@ fn refresh(
             }
             // Keep the last known herd rather than blanking it: a transport
             // failure is not a report that every session vanished. See steps/021.
-            Err(e) => match crate::ipc::connect(path) {
+            Err(e) => match path.probe() {
                 Ok(_) => {
                     ui.consecutive_transport_failures = 0;
                     ui.notice = Some(e);
@@ -2651,8 +2655,8 @@ fn refresh(
     Ok((cols, rows))
 }
 
-fn sync_shown_session(
-    path: &Path,
+fn sync_shown_session<P: SessionPort + ?Sized>(
+    path: &P,
     ui: &mut Ui,
     shown: &mut Option<ShownTarget>,
     selection_moved: bool,
@@ -2670,8 +2674,8 @@ fn sync_shown_session(
     }
 }
 
-fn resize_shown_session(
-    path: &Path,
+fn resize_shown_session<P: SessionPort + ?Sized>(
+    path: &P,
     ui: &mut Ui,
     shown: &Option<ShownTarget>,
     held_name: Option<&str>,
@@ -2683,11 +2687,11 @@ fn resize_shown_session(
     });
 }
 
-fn resize_held_shown_session(
-    path: &Path,
+fn resize_held_shown_session<P: SessionPort + ?Sized>(
+    path: &P,
     ui: &mut Ui,
     shown: &Option<ShownTarget>,
-    held: &Option<(String, Hold)>,
+    held: &Option<(String, P::Keys)>,
     cols: u16,
     rows: u16,
 ) {
@@ -2898,7 +2902,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 // Crossterm emits this only after finding the matching end
                 // marker; it buffers an unterminated host paste internally.
                 let Some((name, _)) = &held else { continue };
-                match client::request(path, &Request::MouseState { name: name.clone() }) {
+                match path.request(&Request::MouseState { name: name.clone() }) {
                     Ok(Response::MouseState(state)) => {
                         Action::Type(paste_input(&text, state.bracketed_paste))
                     }
@@ -2961,7 +2965,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     }
 }
 
-fn copy_screen(path: &Path, ui: &mut Ui, name: &str) {
+fn copy_screen<P: SessionPort + ?Sized>(path: &P, ui: &mut Ui, name: &str) {
     match capture_styled(path, name, 0) {
         Ok((cells, wrapped, _, _, _)) => {
             ui.yank = all_screen_text(&cells, &wrapped);
@@ -2974,7 +2978,7 @@ fn copy_screen(path: &Path, ui: &mut Ui, name: &str) {
     }
 }
 
-fn copy_selection(path: &Path, ui: &mut Ui, name: &str) {
+fn copy_selection<P: SessionPort + ?Sized>(path: &P, ui: &mut Ui, name: &str) {
     let offset = ui.scrollback.get(name).map_or(0, |state| state.offset);
     match capture_styled(path, name, offset) {
         Ok((cells, wrapped, _, _, _)) => {
@@ -3115,7 +3119,11 @@ fn capture_anchored<T>(
 }
 
 /// Keep a scrolled preview on the same history rows as output pushes new rows.
-fn capture_preview(path: &Path, ui: &mut Ui, name: &str) -> Result<PreviewCapture, String> {
+fn capture_preview<P: SessionPort + ?Sized>(
+    path: &P,
+    ui: &mut Ui,
+    name: &str,
+) -> Result<PreviewCapture, String> {
     let state = ui.scrollback.entry(name.to_string()).or_default();
     let (capture, history_rows, history_total, anchored, anchor_total) =
         capture_anchored(state.offset, state.anchor_total, |offset| {
@@ -3146,7 +3154,7 @@ fn input_write_failed<T>(ui: &mut Ui, name: &str, error: &std::io::Error, held: 
     *held = None;
 }
 
-fn paste(path: &Path, ui: &mut Ui, held: &mut Option<(String, Hold)>) {
+fn paste<P: SessionPort + ?Sized>(path: &P, ui: &mut Ui, held: &mut Option<(String, P::Keys)>) {
     if ui.yank.is_empty() {
         ui.notice = Some("kill ring is empty".into());
     } else if let Some((name, hold)) = &*held {
@@ -3155,13 +3163,10 @@ fn paste(path: &Path, ui: &mut Ui, held: &mut Option<(String, Hold)>) {
             input_write_failed(ui, &name, &e, held);
         }
     } else if let Some(name) = ui.selected().map(|session| session.name.clone()) {
-        match client::request(
-            path,
-            &Request::Send {
-                name: name.clone(),
-                bytes: ui.yank.as_bytes().to_vec(),
-            },
-        ) {
+        match path.request(&Request::Send {
+            name: name.clone(),
+            bytes: ui.yank.as_bytes().to_vec(),
+        }) {
             Ok(Response::Ok) => {}
             Ok(Response::Error(reason)) => ui.notice = Some(reason),
             other => ui.notice = Some(format!("{other:?}")),
@@ -3172,7 +3177,12 @@ fn paste(path: &Path, ui: &mut Ui, held: &mut Option<(String, Hold)>) {
 /// [`Action::Focus`]`(name)` just fired. Already held: no-op. A different
 /// name: drop the stale hold (its `Drop` is the detach) and take the new one
 /// immediately — `refresh` must never be the one to notice. See steps/030.
-fn reconcile_hold(path: &Path, ui: &mut Ui, held: &mut Option<(String, Hold)>, name: &str) {
+fn reconcile_hold<P: SessionPort + ?Sized>(
+    path: &P,
+    ui: &mut Ui,
+    held: &mut Option<(String, P::Keys)>,
+    name: &str,
+) {
     if held.as_ref().is_some_and(|(held, _)| held == name) {
         return;
     }
@@ -3183,12 +3193,12 @@ fn reconcile_hold(path: &Path, ui: &mut Ui, held: &mut Option<(String, Hold)>, n
 /// Take the exclusive hold focus needs, or say why not and stay on the list.
 /// The refusal is the daemon's — a session someone else attached is refused
 /// there, not here, so a second viewer over any transport is refused too.
-fn take(path: &Path, ui: &mut Ui) -> Option<(String, Hold)> {
+fn take<P: SessionPort + ?Sized>(path: &P, ui: &mut Ui) -> Option<(String, P::Keys)> {
     let Some(name) = ui.selected().map(|s| s.name.clone()) else {
         ui.focus = Focus::List;
         return None;
     };
-    match client::hold(path, &name) {
+    match path.hold(&name) {
         Ok(hold) => Some((name, hold)),
         Err(e) => {
             ui.notice = Some(format!("{name}: {e}"));
@@ -3201,8 +3211,8 @@ fn take(path: &Path, ui: &mut Ui) -> Option<(String, Hold)> {
 /// A transport failure and a daemon `Response::Error` are both real answers —
 /// `start`/`kill` already say so this way; see steps/021 for why the herd list
 /// and the styled capture used to say it a different, worse way instead.
-fn list(path: &Path) -> Result<Vec<SessionSummary>, String> {
-    match client::request(path, &Request::List) {
+fn list<P: SessionPort + ?Sized>(path: &P) -> Result<Vec<SessionSummary>, String> {
+    match path.request(&Request::List) {
         Ok(Response::Sessions(sessions)) => Ok(sessions),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
@@ -3229,16 +3239,13 @@ fn daemon_failure_marks_gone(consecutive: u8, definitive: bool) -> bool {
     definitive || consecutive >= DAEMON_FAILURES_BEFORE_GONE
 }
 
-fn record_daemon_probe_failure(
-    path: &Path,
+fn record_daemon_probe_failure<P: SessionPort + ?Sized>(
+    path: &P,
     ui: &mut Ui,
     list_error: String,
     probe_error: std::io::Error,
 ) {
-    let definitive = daemon_is_definitively_gone(path, &probe_error);
-    let busy_refusal = probe_error.kind() == std::io::ErrorKind::ConnectionRefused
-        && path.exists()
-        && !socket_lock_is_free(path);
+    let (definitive, busy_refusal) = path.probe_verdict(&probe_error);
     if !definitive {
         if busy_refusal {
             ui.consecutive_transport_failures = 0;
@@ -3247,7 +3254,7 @@ fn record_daemon_probe_failure(
         }
     }
     if daemon_failure_marks_gone(ui.consecutive_transport_failures, definitive) {
-        ui.daemon_gone = Some(path.display().to_string());
+        ui.daemon_gone = Some(path.label());
         ui.notice = None;
         ui.focus = Focus::List;
         ui.mode = Mode::Browse;
@@ -3291,8 +3298,8 @@ fn socket_lock_is_free(socket: &Path) -> bool {
 /// The "*sessions*" buffer's content, refreshed at WIDTH and fetched in one
 /// `Eval` round trip (`tools.lua`'s `remuda._refresh_sessions_buffer`, then
 /// `remuda.buffer.new("*sessions*"):get()`).
-fn sessions_buffer_lines(
-    path: &Path,
+fn sessions_buffer_lines<P: SessionPort + ?Sized>(
+    path: &P,
     width: u16,
     selected: usize,
     selected_name: Option<&str>,
@@ -3301,7 +3308,7 @@ fn sessions_buffer_lines(
     let code = format!(
         "remuda._refresh_sessions_buffer({width}, {selected}, {selected_name}); return remuda.buffer.new('*sessions*'):get()"
     );
-    match client::request(path, &Request::Eval { code, name: None }) {
+    match path.request(&Request::Eval { code, name: None }) {
         Ok(Response::Value(text)) => parse_sessions_buffer(&text),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
@@ -3363,14 +3370,14 @@ enum ShownTarget {
 /// Reconciles the window with NAME, the session Rust wants to auto-follow.
 /// SELECTION_CHANGED is the only thing allowed to reclaim the window from a
 /// buffer a script explicitly showed — a bare tick must leave one alone.
-fn window_shown_session(
-    path: &Path,
+fn window_shown_session<P: SessionPort + ?Sized>(
+    path: &P,
     name: Option<&str>,
     selection_changed: bool,
 ) -> Result<Option<ShownTarget>, String> {
     let target = name.map_or_else(|| "nil".to_string(), mcp::lua_string);
     let code = format!("return remuda._sync_window_shown({target}, {selection_changed})");
-    match client::request(path, &Request::Eval { code, name: None }) {
+    match path.request(&Request::Eval { code, name: None }) {
         Ok(Response::Value(shown)) => Ok(parse_shown_target(&shown)),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
@@ -3395,14 +3402,15 @@ type PreviewCapture = (Vec<Vec<StyledCell>>, Vec<bool>, Cursor);
 /// Styled counterpart of the (now unused) plain `capture` — see steps/020,
 /// 021. The wire carries runs, expanded back to cells here — see steps/022.
 /// The cursor rides the same round trip — see steps/027.
-fn capture_styled(path: &Path, name: &str, scrollback: usize) -> Result<StyledCapture, String> {
-    match client::request(
-        path,
-        &Request::CaptureStyled {
-            name: name.to_string(),
-            scrollback,
-        },
-    ) {
+fn capture_styled<P: SessionPort + ?Sized>(
+    path: &P,
+    name: &str,
+    scrollback: usize,
+) -> Result<StyledCapture, String> {
+    match path.request(&Request::CaptureStyled {
+        name: name.to_string(),
+        scrollback,
+    }) {
         Ok(Response::StyledScreen {
             rows,
             wrapped,
@@ -3488,9 +3496,12 @@ fn selected_screen_text(
 /// A shown buffer's counterpart to `capture_styled` — same `Eval`/`Value`
 /// round trip `sessions_buffer_lines` already uses, not a new wire path.
 /// Plain text, one default-styled cell per char; no cursor, always hidden.
-fn capture_buffer(path: &Path, name: &str) -> Result<(Vec<Vec<StyledCell>>, Cursor), String> {
+fn capture_buffer<P: SessionPort + ?Sized>(
+    path: &P,
+    name: &str,
+) -> Result<(Vec<Vec<StyledCell>>, Cursor), String> {
     let code = format!("return remuda.buffer.new({}):get()", mcp::lua_string(name));
-    let text = match client::request(path, &Request::Eval { code, name: None }) {
+    let text = match path.request(&Request::Eval { code, name: None }) {
         Ok(Response::Value(text)) => text,
         Ok(Response::Error(reason)) => return Err(reason),
         other => return Err(format!("{other:?}")),
@@ -3516,7 +3527,7 @@ fn capture_buffer(path: &Path, name: &str) -> Result<(Vec<Vec<StyledCell>>, Curs
 
 /// A session started here begins at its panel size; later panel changes resize
 /// the PTY through the same path.
-fn start(path: &Path, command: &str, size: Size) -> Result<(), String> {
+fn start<P: SessionPort + ?Sized>(path: &P, command: &str, size: Size) -> Result<(), String> {
     let request = Request::New {
         name: None,
         command: command.split_whitespace().map(str::to_string).collect(),
@@ -3524,34 +3535,31 @@ fn start(path: &Path, command: &str, size: Size) -> Result<(), String> {
         cwd: None,
         env: None,
     };
-    match client::request(path, &request) {
+    match path.request(&request) {
         Ok(Response::Value(_)) => Ok(()),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
     }
 }
 
-fn resize(path: &Path, name: &str, size: Size) -> Result<(), String> {
-    match client::request(
-        path,
-        &Request::Resize {
-            name: name.to_string(),
-            size,
-        },
-    ) {
+fn resize<P: SessionPort + ?Sized>(path: &P, name: &str, size: Size) -> Result<(), String> {
+    match path.request(&Request::Resize {
+        name: name.to_string(),
+        size,
+    }) {
         Ok(Response::Ok) => Ok(()),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
     }
 }
 
-fn kill(path: &Path, name: &str) -> Result<(), String> {
+fn kill<P: SessionPort + ?Sized>(path: &P, name: &str) -> Result<(), String> {
     let request = Request::Close {
         name: name.to_string(),
         instance_id: None,
         confirm: None,
     };
-    match client::request(path, &request) {
+    match path.request(&request) {
         Ok(Response::Ok) => Ok(()),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),

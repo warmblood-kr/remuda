@@ -239,6 +239,23 @@ impl Client {
         self.channel
             .send(&serde_json::to_vec(request).map_err(invalid)?)
     }
+    /// Fenced acquisition where the host understands it; an older host gets
+    /// the plain request it knows, since it would reject the new variant.
+    /// Whether the host advertised `capability` in its Hello.
+    pub fn offers(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
+    }
+    pub fn acquire(&mut self, writer: super::api::Writer) -> io::Result<Response> {
+        if self
+            .capabilities
+            .iter()
+            .any(|c| c == super::api::WRITER_FENCE)
+        {
+            self.request(&Request::AcquireWriter { writer })
+        } else {
+            self.request(&Request::Acquire)
+        }
+    }
     pub fn request(&mut self, request: &Request) -> io::Result<Response> {
         self.channel
             .send(&serde_json::to_vec(request).map_err(invalid)?)?;

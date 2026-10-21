@@ -236,12 +236,40 @@ impl Registry {
         Ok(())
     }
 
-    /// Look up a tracked session identity without reaping exited sessions.
+    /// Look up a tracked session identity, legacy or host-backed, without
+    /// reaping exited sessions. A host-backed id survives a daemon restart.
     pub fn name_for_id(&self, id: &str) -> Option<String> {
-        self.lock()
+        let legacy = self
+            .lock()
             .values()
             .find(|session| session.id() == id)
-            .map(|session| session.name().to_string())
+            .map(|session| session.name().to_string());
+        legacy.or_else(|| {
+            self.hosted_lock()
+                .values()
+                .find(|handle| handle.identity().id == id)
+                .map(|handle| handle.identity().name.clone())
+        })
+    }
+
+    /// Each host-backed session's host build, by name; `None` if unreachable.
+    pub fn hosted_builds(&self) -> Vec<crate::protocol::HostBuild> {
+        let mut builds: Vec<_> = self
+            .hosted_handles()
+            .iter()
+            .map(|handle| crate::protocol::HostBuild {
+                name: handle.identity().name.clone(),
+                build: handle.inspect().ok().and_then(|seen| seen.host_build),
+            })
+            .collect();
+        builds.sort_by(|a, b| a.name.cmp(&b.name));
+        builds
+    }
+
+    /// Every host-backed handle, copied out so callers can inspect each host
+    /// without holding the registry lock.
+    pub fn hosted_handles(&self) -> Vec<Arc<SessionHandle>> {
+        self.hosted_lock().values().map(Arc::clone).collect()
     }
 
     /// Process IDs for the live session children. Exited sessions remain
