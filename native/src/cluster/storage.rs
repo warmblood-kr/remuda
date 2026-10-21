@@ -13,7 +13,7 @@ pub(super) fn lock_with_deadline(dir: &Path, timeout: Duration) -> io::Result<St
 }
 
 #[cfg(not(windows))]
-pub(super) fn cluster_state_dir() -> io::Result<PathBuf> {
+pub(crate) fn cluster_state_dir() -> io::Result<PathBuf> {
     let base = match std::env::var_os("XDG_STATE_HOME") {
         Some(value) if !value.is_empty() => PathBuf::from(value),
         _ => PathBuf::from(
@@ -48,7 +48,7 @@ pub(super) fn create_private_directory(dir: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-pub(super) fn cluster_state_dir() -> io::Result<PathBuf> {
+pub(crate) fn cluster_state_dir() -> io::Result<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())
         .or_else(|| {
@@ -265,11 +265,16 @@ pub(super) fn check_directory_type(dir: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-pub(super) fn check_private_file(_file: &File, description: &str, path: &Path) -> io::Result<()> {
+pub(super) fn check_private_file(file: &File, description: &str, path: &Path) -> io::Result<()> {
+    check_private_metadata(&file.metadata()?, description, path)
+}
+
+#[cfg(not(windows))]
+fn check_private_metadata(_meta: &fs::Metadata, description: &str, path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let meta = _file.metadata()?;
+        let meta = _meta;
         let expected_uid = unsafe { libc::geteuid() };
         if meta.uid() != expected_uid {
             return Err(io::Error::new(
@@ -302,6 +307,55 @@ pub(super) fn check_private_file(_file: &File, description: &str, path: &Path) -
 #[cfg(not(windows))]
 pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     crate::fs_atomic::write_atomic_exact_mode(path, bytes, 0o600)
+}
+
+/// Create `dir` private (0700, or the owner-only DACL) if missing, then verify it.
+pub(crate) fn private_directory(dir: &Path) -> io::Result<()> {
+    create_private_directory(dir)?;
+    verify_directory(dir)
+}
+
+/// Create `path` empty and private if missing; an existing file must be private.
+/// An existing file is only `lstat`ed, never opened: closing any descriptor of
+/// a file drops this process's fcntl locks on it, SQLite's included.
+#[cfg(not(windows))]
+pub(crate) fn private_file(path: &Path) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    match options.open(path) {
+        Ok(file) => return check_private_file(&file, "database file", path),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "database file {} is not a regular file; refusing",
+                path.display()
+            ),
+        ));
+    }
+    check_private_metadata(&meta, "database file", path)
+}
+
+/// Create `path` empty and private if missing; an existing file gets the
+/// owner-only DACL. Never truncates, so it is safe on a live SQLite file.
+#[cfg(windows)]
+pub(crate) fn private_file(path: &Path) -> io::Result<()> {
+    match super::windows_security::create_new_file(path) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let file = super::windows_security::open_for_check(path, false, true)?;
+    check_private_file(&file, "database file", path)
 }
 
 const CLUSTER_INIT_MARKER: &str = "cluster-initialized";

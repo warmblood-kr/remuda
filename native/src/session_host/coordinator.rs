@@ -48,8 +48,22 @@ impl Coordinator {
         }
     }
     pub fn acquire(&mut self, connection: ConnectionId) -> Result<Fence, Error> {
+        self.acquire_writer(connection, None)
+    }
+    pub fn acquire_writer(
+        &mut self,
+        connection: ConnectionId,
+        writer: Option<super::api::Writer>,
+    ) -> Result<Fence, Error> {
         self.admitting()?;
-        self.controller.acquire(connection).map_err(Error::Control)
+        self.controller
+            .acquire_writer(connection, writer)
+            .map_err(Error::Control)
+    }
+    pub fn authorize_writer(&self, fence: Fence) -> Result<(), Error> {
+        self.controller
+            .authorize_writer(fence)
+            .map_err(Error::Control)
     }
     pub fn release(&mut self, fence: Fence) -> Result<(), Error> {
         self.controller.release(fence).map_err(Error::Control)
