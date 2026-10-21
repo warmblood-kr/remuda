@@ -10,7 +10,7 @@ use crate::net::cluster_client::{ClientTimeouts, ClusterClient};
 use base64::Engine;
 use remuda_core::protocol::{Request, Response};
 use remuda_core::vfs::{self as rules, VfsEntry};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -682,6 +682,7 @@ pub struct SyncReport {
     pub copies_fetched: usize,
     pub copies_failed: usize,
     pub copies_waiting: usize,
+    pub copies_trimmed: usize,
     pub garbage_removed: usize,
     pub tombstones_removed: usize,
     pub error: Option<String>,
@@ -694,13 +695,14 @@ impl std::fmt::Display for SyncReport {
         }
         write!(
             formatter,
-            "Peers reached {}, unreachable {}; index entries merged {}; copies fetched {}, failed {}, waiting to retry {}; old blobs removed {}, old deletes forgotten {}.",
+            "Peers reached {}, unreachable {}; index entries merged {}; copies fetched {}, failed {}, waiting to retry {}, trimmed {}; old blobs removed {}, old deletes forgotten {}.",
             self.peers_reached,
             self.peers_failed,
             self.entries_merged,
             self.copies_fetched,
             self.copies_failed,
             self.copies_waiting,
+            self.copies_trimmed,
             self.garbage_removed,
             self.tombstones_removed
         )
@@ -743,6 +745,7 @@ pub fn sync_once(force: bool) -> SyncReport {
         }
     };
     repair(&store, &members, &index, force, &mut report);
+    report.copies_trimmed = trim(&store, &members, &index);
     report.garbage_removed = store.collect_garbage().unwrap_or(0);
     let others: Vec<String> = members
         .admitted
@@ -785,7 +788,8 @@ fn repair(
     let wanted: Vec<String> = missing.keys().map(|sha| (*sha).to_owned()).collect();
     let due = lock(repair_queue()).due(&wanted, Instant::now(), force, MAX_REPAIRS_PER_PASS);
     for sha in &due {
-        let fetched = fetch_blob(store, missing[sha.as_str()]).is_ok();
+        let fetched =
+            fetch_blob(store, missing[sha.as_str()]).is_ok() && store.mark_stand_in(sha).is_ok();
         lock(repair_queue()).tried(sha, fetched, Instant::now());
         if fetched {
             report.copies_fetched += 1;
@@ -794,6 +798,54 @@ fn repair(
         }
     }
     report.copies_waiting = lock(repair_queue()).waiting(Instant::now());
+}
+
+/// Delete stand-in copies this node no longer places, once every placement
+/// node confirms a copy. Writer copies and kept conflicts stay.
+fn trim(store: &VfsStore, members: &Members, index: &VfsIndex) -> usize {
+    let Ok(marked) = store.stand_ins() else {
+        return 0;
+    };
+    let mut users: HashMap<&str, Vec<&VfsEntry>> = HashMap::new();
+    let mut pinned: HashSet<&str> = HashSet::new();
+    for entry in index.entries.values() {
+        pinned.extend(
+            entry
+                .conflicts
+                .iter()
+                .map(|conflict| conflict.sha256.as_str()),
+        );
+        if entry.deleted {
+            continue;
+        }
+        if entry.writer == members.self_fp {
+            pinned.insert(&entry.sha256);
+        }
+        users.entry(&entry.sha256).or_default().push(entry);
+    }
+    let mut trimmed = 0;
+    for sha in &marked {
+        let Some(entries) = users.get(sha.as_str()) else {
+            continue; // unreferenced: blob GC removes it with its mark
+        };
+        if pinned.contains(sha.as_str()) {
+            continue;
+        }
+        let mut holders = BTreeSet::new();
+        for entry in entries {
+            holders.extend(live_placement(entry, members));
+        }
+        if holders.is_empty() || holders.contains(&members.self_fp) {
+            continue;
+        }
+        let holders: Vec<String> = holders.into_iter().collect();
+        if count_holders(store, &members.self_fp, entries[0], &holders) == holders.len()
+            && store.trim_stand_in(sha).unwrap_or(false)
+        {
+            trimmed += 1;
+        }
+    }
+    trimmed
 }
 
 static PASS_RUNNING: AtomicBool = AtomicBool::new(false);

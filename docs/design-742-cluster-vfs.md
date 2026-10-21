@@ -178,8 +178,11 @@ VFS pass:
 
 When a node is lost, the next-ranked node joins the placement on its next pass
 and pulls a copy, which restores `R` copies. When the lost node comes back,
-placement returns to the original set. The extra copy stays (a correct state);
-trimming copies is future work.
+placement returns to the original set. A copy the repair pass fetched is
+marked as a stand-in (`vfs/stand-ins/<sha256>`). Once this node is outside
+the placement again and every placement node confirms a copy by `BlobStat`,
+the pass deletes it. Copies this node wrote, kept conflicts, and copies read
+with `get` stay; `resolve` clears the mark, since a tool may hold the path.
 
 The writer always keeps its own copy, even outside the placement. GC removes a
 blob that no live entry references and whose file is older than 24 h. The age
