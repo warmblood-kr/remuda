@@ -8,3 +8,7 @@ send_line_reports_pending_when_the_child_drains_slowly # input acts are limited 
 type_text_delivers_and_submits_when_the_child_drains_slowly # input acts are limited to 8 KiB
 session_secret_prompt_tag_caps_the_session_name_at_64_chars # session names are limited to 64 bytes
 session_identity_survives_as_a_new_value_after_daemon_restart_and_output_versions_advance # hosted sessions survive a daemon restart
+listing_commands_allow_the_reader_to_stop_after_one_line # session names are limited to 64 bytes
+selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_restart # hosted sessions survive a daemon restart
+selected_remote_session_with_hangul_text_syncs_within_the_frame_limit # terminals are limited to 65,536 cells
+mouse_off_knob_and_toggle_pass_reports_to_the_child_and_restore_host_modes # attach paints the parsed screen, not the child's raw bytes
