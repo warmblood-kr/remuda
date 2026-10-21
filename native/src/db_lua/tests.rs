@@ -164,27 +164,27 @@ fn a_handle_cannot_reach_other_files_or_undo_its_limits() {
     let scratch = Scratch::new();
     let lua = lua_at(&scratch.0);
     let other = scratch.0.join("victim.db");
-    let code = format!(
-        r#"
+    lua.globals()
+        .set("victim", other.display().to_string())
+        .unwrap();
+    let code = r#"
         local db = assert(open("m", "reach"))
-        local out = {{}}
-        for _, sql in ipairs({{
-          "ATTACH DATABASE '{victim}' AS v",
-          "VACUUM INTO '{victim}'",
+        local out = {}
+        for _, sql in ipairs({
+          "ATTACH DATABASE '" .. victim .. "' AS v",
+          "VACUUM INTO '" .. victim .. "'",
           "PRAGMA journal_mode = DELETE",
           "PRAGMA max_page_count = 999999999",
           "PRAGMA writable_schema = ON",
-        }}) do
+        }) do
           local ok, err = db:exec(sql)
           out[#out + 1] = ok and ("allowed " .. sql) or err:match("^(%a+):")
         end
         assert(db:exec("PRAGMA user_version = 3"))
         out[#out + 1] = db:query("PRAGMA user_version")[1].user_version
         return table.concat(out, ",")
-    "#,
-        victim = other.display().to_string()
-    );
-    let got = run(&lua, &code);
+    "#;
+    let got = run(&lua, code);
     assert_eq!(got, "denied,denied,denied,denied,denied,3");
     assert!(!other.exists(), "a handle wrote {}", other.display());
 }
