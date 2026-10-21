@@ -1995,7 +1995,6 @@ fn handle(
 /// answers them with a clear refusal instead of "no such session".
 fn local_only(request: &Request) -> Option<(&'static str, &str)> {
     match request {
-        Request::CaptureStyled { name, .. } => Some(("styled capture", name)),
         Request::Sync { name, .. } => Some(("sync", name)),
         Request::MouseState { name } => Some(("mouse state", name)),
         Request::Attach { name } | Request::AttachTracked { name } => Some(("attach", name)),
