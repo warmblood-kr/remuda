@@ -24,6 +24,7 @@ const CAPS: &[&str] = &[
     super::api::HUMAN_INPUT,
     super::api::ACTIVITY,
     super::api::WRITER_FENCE,
+    super::api::DEEP_HISTORY,
 ];
 pub(crate) struct Server {
     endpoint: Arc<Endpoint>,
@@ -162,6 +163,7 @@ impl Server {
             snapshot: None,
             stop_after_reply: false,
             latest: None,
+            deep: false,
         };
         loop {
             let bytes = channel.receive()?;
@@ -226,6 +228,8 @@ struct Connection {
     snapshot: Option<Snapshot>,
     stop_after_reply: bool,
     latest: Option<super::latest::Latest>,
+    /// The last viewport asked for the host's full history (`ViewportDeep`).
+    deep: bool,
 }
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -322,6 +326,7 @@ impl Connection {
             }
             request @ (Request::Snapshot
             | Request::Viewport { .. }
+            | Request::ViewportDeep { .. }
             | Request::Page { .. }
             | Request::Acknowledge { .. }
             | Request::AcknowledgeViewport { .. }
@@ -505,7 +510,14 @@ impl Connection {
     fn terminal_request(&mut self, request: Request) -> Result<Response, String> {
         match request {
             Request::Snapshot => self.begin_snapshot(None),
-            Request::Viewport { scrollback } => self.begin_snapshot(Some(scrollback)),
+            Request::Viewport { scrollback } => {
+                self.deep = false;
+                self.begin_snapshot(Some(scrollback))
+            }
+            Request::ViewportDeep { scrollback } => {
+                self.deep = true;
+                self.begin_snapshot(Some(scrollback))
+            }
             Request::Page { snapshot, index } => self.page(snapshot, index),
             Request::Acknowledge {
                 snapshot,
@@ -606,12 +618,17 @@ impl Connection {
     }
     fn capture(&self, offset: Option<u16>) -> Result<(u64, Vec<u8>, u16, u16), String> {
         if let Some(offset) = offset {
-            let view = self
+            let legacy = super::terminal::LEGACY_HISTORY_ROWS;
+            let offset = if self.deep { offset } else { offset.min(legacy) };
+            let mut view = self
                 .server
                 .host
                 .view
                 .viewport(usize::from(offset))
                 .map_err(|_| "capture_unavailable")?;
+            if !self.deep {
+                view = view.within_legacy_history();
+            }
             // Expensive encoding is outside the parser lock, with an in-write cap.
             let bytes = view
                 .encode()

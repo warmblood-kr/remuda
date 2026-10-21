@@ -136,3 +136,18 @@ fn fixed_combining_text_retention_is_an_explicit_rendering_profile() {
     assert_eq!(view.cells[0][1].text, " ");
     view.validate().unwrap();
 }
+
+#[test]
+fn a_plain_viewport_stays_within_the_history_older_daemons_accept() {
+    let mut terminal = Terminal::new(3, 8, crate::session_host::terminal::HISTORY_ROWS).unwrap();
+    let lines: String = (0..2500).map(|n| format!("{n}\r\n")).collect();
+    feed(&mut terminal, lines.as_bytes());
+    let deep = terminal.viewport(2000);
+    assert!(deep.history_len >= 2400, "{}", deep.history_len);
+    assert_eq!(deep.offset, 2000);
+    deep.validate().unwrap();
+    let legacy = terminal.viewport(2000).within_legacy_history();
+    assert_eq!(legacy.history_len, 1000);
+    assert!(legacy.offset <= 1000);
+    legacy.validate().unwrap();
+}

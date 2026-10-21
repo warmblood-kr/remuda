@@ -34,7 +34,6 @@ const ACT_DEADLINE: Duration = Duration::from_secs(30);
 const CONTROL_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_WATCH: Duration = Duration::from_millis(750);
 const WATCH_GAP: Duration = Duration::from_millis(25);
-const MAX_OFFSET: usize = 1000;
 /// Below the store's per-client result cap, so a new reservation always fits.
 const RETAINED: usize = model::MAX_RESULTS / 2;
 
@@ -417,9 +416,13 @@ impl HostSession {
     fn capture(&self, client: &mut Client, offset: u16) -> Result<Viewport> {
         let until = Instant::now() + CONTROL_DEADLINE;
         let (snapshot, generation, bytes, pages) = loop {
-            match client
-                .request(&Request::Viewport { scrollback: offset })
-                .map_err(transport)?
+            // An older host knows only `Viewport`, within the legacy history.
+            let request = if client.offers(super::api::DEEP_HISTORY) {
+                Request::ViewportDeep { scrollback: offset }
+            } else {
+                Request::Viewport { scrollback: offset }
+            };
+            match client.request(&request).map_err(transport)?
             {
                 Response::Viewport {
                     identity,
@@ -679,8 +682,13 @@ impl SessionOperations for HostSession {
         Ok(text(&self.snapshot(0)?.snapshot))
     }
     fn snapshot(&self, scrollback: usize) -> Result<VersionedSnapshot> {
-        let offset = u16::try_from(scrollback.min(MAX_OFFSET)).unwrap_or(u16::MAX);
         let mut client = self.viewer()?;
+        let reach = if client.offers(super::api::DEEP_HISTORY) {
+            super::terminal::HISTORY_ROWS
+        } else {
+            usize::from(super::terminal::LEGACY_HISTORY_ROWS)
+        };
+        let offset = u16::try_from(scrollback.min(reach)).unwrap_or(u16::MAX);
         Ok(self.versioned(self.capture(&mut client, offset)?))
     }
     fn wait_after(&self, version: u64, timeout: Duration) -> Result<VersionedSnapshot> {

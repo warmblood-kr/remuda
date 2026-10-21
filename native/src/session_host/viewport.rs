@@ -35,11 +35,15 @@ pub(crate) struct Viewport {
 impl Viewport {
     pub fn validate(&self) -> io::Result<()> {
         let invalid = || io::Error::new(io::ErrorKind::InvalidData, "typed viewport bounds");
-        super::terminal::Terminal::validate_geometry(self.rows, self.cols, 1000)
+        super::terminal::Terminal::validate_geometry(
+            self.rows,
+            self.cols,
+            super::terminal::HISTORY_ROWS,
+        )
             .map_err(|_| invalid())?;
         if self.schema != 1
             || self.offset > self.history_len
-            || self.history_len > 1000
+            || usize::from(self.history_len) > super::terminal::HISTORY_ROWS
             || self.cells.len() != usize::from(self.rows)
             || self.wrapped.len() != usize::from(self.rows)
             || self.cursor.row >= self.rows
@@ -55,6 +59,14 @@ impl Viewport {
             }
         }
         Ok(())
+    }
+    /// What a plain `Viewport` answers: an older daemon refuses a viewport
+    /// claiming more history than [`super::terminal::LEGACY_HISTORY_ROWS`].
+    pub fn within_legacy_history(mut self) -> Self {
+        let legacy = super::terminal::LEGACY_HISTORY_ROWS;
+        self.history_len = self.history_len.min(legacy);
+        self.offset = self.offset.min(self.history_len);
+        self
     }
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         self.validate()?;
