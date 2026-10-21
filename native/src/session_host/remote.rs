@@ -422,8 +422,7 @@ impl HostSession {
             } else {
                 Request::Viewport { scrollback: offset }
             };
-            match client.request(&request).map_err(transport)?
-            {
+            match client.request(&request).map_err(transport)? {
                 Response::Viewport {
                     identity,
                     snapshot,

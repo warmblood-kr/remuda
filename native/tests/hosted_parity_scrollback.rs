@@ -28,7 +28,10 @@ fn scrollback_reaches_thousands_of_rows_back_in_both_backends() {
         else {
             panic!("{mode:?}: styled capture refused");
         };
-        assert!(scrollback_len >= 2900, "{mode:?}: only {scrollback_len} rows kept");
+        assert!(
+            scrollback_len >= 2900,
+            "{mode:?}: only {scrollback_len} rows kept"
+        );
         let earliest = rows
             .iter()
             .filter_map(|runs| {

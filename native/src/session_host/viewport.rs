@@ -40,7 +40,7 @@ impl Viewport {
             self.cols,
             super::terminal::HISTORY_ROWS,
         )
-            .map_err(|_| invalid())?;
+        .map_err(|_| invalid())?;
         if self.schema != 1
             || self.offset > self.history_len
             || usize::from(self.history_len) > super::terminal::HISTORY_ROWS

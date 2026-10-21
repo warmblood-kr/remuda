@@ -619,7 +619,11 @@ impl Connection {
     fn capture(&self, offset: Option<u16>) -> Result<(u64, Vec<u8>, u16, u16), String> {
         if let Some(offset) = offset {
             let legacy = super::terminal::LEGACY_HISTORY_ROWS;
-            let offset = if self.deep { offset } else { offset.min(legacy) };
+            let offset = if self.deep {
+                offset
+            } else {
+                offset.min(legacy)
+            };
             let mut view = self
                 .server
                 .host
