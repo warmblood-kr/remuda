@@ -28,11 +28,27 @@ created with the same hardened helpers as the rest of `cluster/`):
 
 ```
 vfs/blobs/<aa>/<64-hex>   immutable content; name = sha256(content)
-vfs/index.json            name index (all entries, see below)
+vfs/index.db              name index in SQLite, one row per entry (#778)
+vfs/index.db-wal, -shm    SQLite's write-ahead log and its shared index
+vfs/index.json            format-1 index of older remuda; imported once
 vfs/vfs.json              local settings: cluster name, default replicas
 vfs/synced_at             unix time a peer index was last merged here
 vfs/identity.lock         the cluster StateLock, held for index writes
 ```
+
+The index is a SQLite database (`index.db`, WAL mode, `PRAGMA user_version`
+1). A write changes only its own rows, in one transaction. All three SQLite
+files are 0600 (owner-only ACL on Windows). On first open, an existing
+`index.json` is imported in the transaction that creates the table; the JSON
+file is then left as it was and no longer read. Peers see no change: entries,
+digest and messages are the same as before.
+
+Downgrade: an older remuda reads only `index.json`, which still holds the
+index as it was at the upgrade. Before a downgrade, run
+`remuda vfs export-index`, which writes it again from the database; then
+stop the daemon and install the older remuda. On the next upgrade, a changed
+`index.json` (writes the older remuda made) is merged into the database again:
+per path the higher version wins, so a stale file cannot undo a newer write.
 
 Blobs are written to a temporary file, hashed, then renamed into place, so a
 blob file is never partial. A read verifies the hash again before returning.
@@ -84,7 +100,14 @@ mismatch.
 
 ## Operations
 
-- **put** (CLI, no daemon needed): store the blob locally, write the index
+Every `remuda vfs` command runs in the daemon, which owns the index (#778).
+The CLI parses the command, reads `put`'s source, writes `get`'s
+destination, and sends the rest as one local `Vfs` request; the remote front
+refuses that request. With no daemon running, the command prints one line
+saying the daemon is needed and exits 1. It does not start a daemon, and it
+does not touch the store.
+
+- **put**: store the blob locally, write the index
   entry, push the entry to admitted peers. With `--wait`, it then waits until
   `R` placement nodes report the blob through `BlobStat`. When the node
   knows peers but reached none of them, put says the file is stored on this
@@ -118,7 +141,7 @@ The writer always keeps its own copy, even outside the placement. GC removes a
 blob that no live entry references and whose file is older than 24 h. The age
 check covers a put that has written its blob but not yet its entry.
 
-## Lua (daemon, read-only)
+## Lua (daemon)
 
 `remuda.vfs.stat(uri)`, `remuda.vfs.read(uri)` and `remuda.vfs.list(prefix)`
 answer from the local index and cached copies only and never wait on the
@@ -127,6 +150,12 @@ network. A failure returns `nil, "code: detail"` with code `no_cluster`,
 also returns entries this node holds no copy of (`local = false`) and
 `synced_at`, so a caller can judge staleness. Cluster guidance (#741) reads
 `remuda:///butler/guidance/cluster.md` this way.
+
+`remuda.vfs.put(uri, bytes [, replicas])` and `remuda.vfs.rm(uri)` are the
+only ways Lua writes the store (#778). They follow the same version and
+tombstone rules as the CLI, write on this node, and tell peers on a background
+thread, so they never wait on the network either. Lua never opens the index
+database itself; `remuda.db` handles cannot attach it.
 
 ## Phases
 

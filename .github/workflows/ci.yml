@@ -75,6 +75,11 @@ jobs:
       - run: rustup target add aarch64-linux-android
       - name: build Android release binary
         run: cargo build --release --bin remuda --target aarch64-linux-android
+      - name: record binary size
+        # A dependency's cost on the phone build, as a number per PR (#778).
+        run: |
+          size=$(wc -c < target/aarch64-linux-android/release/remuda | tr -d ' ')
+          echo "aarch64-linux-android binary: $size bytes" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: set up QEMU for Termux smoke
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
         with:
@@ -144,6 +149,28 @@ jobs:
           cp "$RUNNER_TEMP/base-target/debug/remuda" "$RUNNER_TEMP/base-target/debug/remuda-session-host" "$RUNNER_TEMP/n/"
       - name: N/N+1 in both directions
         run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test session_host_daemon -- --ignored n_plus_one
+      - name: N/N+1 VFS sync across three daemons
+        run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live -- --ignored n_plus_one
+
+  vfs-compat-pre-sqlite:
+    # Nodes from before index.db (#778) still run in clusters. Two daemons of
+    # this build and one from the last commit before it must sync both ways,
+    # and the documented downgrade and re-upgrade must keep every name.
+    # Drop this job once no supported build reads only index.json.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build the last commit before index.db
+        run: |
+          git worktree add "$RUNNER_TEMP/pre" df13592f
+          cargo build --manifest-path "$RUNNER_TEMP/pre/Cargo.toml" --bin remuda --target-dir "$RUNNER_TEMP/pre-target"
+          mkdir "$RUNNER_TEMP/n"
+          cp "$RUNNER_TEMP/pre-target/debug/remuda" "$RUNNER_TEMP/n/"
+      - name: Mixed cluster, downgrade and upgrade again
+        run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live -- --ignored n_plus_one pre_sqlite
 
   principles-are-documented:
     # PRINCIPLES.md §2: a gate nobody has watched go red is a claim, not a

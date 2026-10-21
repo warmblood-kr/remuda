@@ -121,6 +121,16 @@ daemon.socket_publication
 
 ``daemon.socket_publication() -> {state, reason?}`` — How this daemon published its socket. Returns {state = 'staged'} or {state = 'legacy', reason = text} (it fell back, or the operator set REMUDA_SOCKET_PUBLICATION=legacy). The same answer as the SocketPublication request; a core without remuda.daemon does not have it, so test remuda.daemon first.
 
+db
+--
+
+``table`` — SQLite databases owned by mods. Each mod has its own namespace of databases, private to this user and daemon.
+
+db.open
+-------
+
+``db.open(name [, opts]) -> db | nil, reason`` — Open (creating if needed) database NAME in the running mod's namespace: <state>/remuda/db/MOD/NAME.db. NAME is a plain identifier. opts may set max_bytes (default 64 MiB, at most 1 GiB), timeout_ms per statement (default 1000, at most 10000) and max_rows per query (default 10000, at most 100000). The handle has query(sql, params) -> rows, exec(sql, params) -> changes, batch(sql) -> true, limits() and close(); params is an array of nil, boolean, number or string. Failures return nil and a reason starting with no_mod, io, sql, too_large, timeout, too_many_rows, denied (ATTACH, DETACH and most PRAGMAs) or closed. Outside a mod's own code it returns nil, 'no_mod: ...'.
+
 define_key
 ----------
 
@@ -499,17 +509,27 @@ unbind
 vfs
 ---
 
-``table`` — Read-only access to the cluster file store at remuda:// URIs. Calls answer from this node's index and cached copies and never wait on the network. Failures return nil and a reason starting with a code: no_cluster, not_found, not_local, bad_uri, wrong_cluster, corrupt or io.
+``table`` — Access to the cluster file store at remuda:// URIs. Calls answer from this node's index and cached copies and never wait on the network; put and rm tell peers in the background. Failures return nil and a reason starting with a code: no_cluster, not_found, not_local, bad_uri, wrong_cluster, corrupt, too_large or io.
 
 vfs.list
 --------
 
 ``vfs.list(prefix_uri) -> {stat...} | nil, reason`` — List stored files whose path starts with the prefix in a remuda:// URI (remuda:/// lists everything), as stat tables sorted by path.
 
+vfs.put
+-------
+
+``vfs.put(uri, bytes [, replicas]) -> stat | nil, reason`` — Store bytes at a remuda:// URI on this node and tell peers in the background, like `remuda vfs put`. replicas defaults to the vfs setting. This and vfs.rm are the only ways Lua writes the store; the index database is never opened from Lua.
+
 vfs.read
 --------
 
 ``vfs.read(uri) -> bytes | nil, reason`` — Return the bytes of a stored file from this node's verified copy. Returns nil, 'not_local: ...' when this node has no copy yet.
+
+vfs.rm
+------
+
+``vfs.rm(uri) -> true | nil, reason`` — Delete a stored file everywhere (a tombstone), like `remuda vfs rm`, telling peers in the background.
 
 vfs.stat
 --------

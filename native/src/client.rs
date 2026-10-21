@@ -471,6 +471,9 @@ pub fn request(path: &Path, request: &Request) -> std::io::Result<Response> {
         Request::Reload { check: true, .. } => Duration::from_secs(45),
         // A reload adds a 10 s drain and 30 s for the candidate to serve.
         Request::Reload { .. } => Duration::from_secs(90),
+        // `put --wait` waits up to 60 s for copies, and `sync` pulls from
+        // every peer; leave room for both.
+        Request::Vfs { .. } => Duration::from_secs(125),
         _ => Duration::from_secs(10),
     };
     read_response_with_timeout(path, stream, client_timeout(timeout))
