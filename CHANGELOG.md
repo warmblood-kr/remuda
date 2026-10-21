@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Session screen: press `m` on the session list to write a line for the
+  selected session in a line editor at the bottom of the screen. Nothing reaches the
+  session while you type. Enter sends the whole line, with its Return, as one
+  input that the daemon writes without letting other input in between. So a
+  Butler notice or other injected text can no longer land inside a
+  half-typed line and be submitted with it. Esc or Ctrl-\ goes back to the
+  list and keeps the draft for that session; Enter or `i` still attaches
+  with every key sent live, as before. Editing keys are the cluster
+  composer's (`cluster.composer`), including Up/Down history.
+
 - VFS: upgrading again after a downgrade keeps the files the older remuda
   wrote meanwhile (#778). If `index.json` changed since the last import or
   `export-index`, the daemon merges it into `index.db` again; per path the
