@@ -117,7 +117,15 @@ impl HostSession {
     }
     /// Run one whole act: reserve, drive through the host, then publish receipt.
     fn act(&self, act: InputAct) -> Result<Completion> {
-        act.validate().map_err(Error::Protocol)?;
+        act.validate().map_err(|reason| match reason {
+            // Kept small so an older build can still read the inventory that
+            // records every act; callers must split larger input (#713).
+            "input act limit exceeded" => Error::Agent(AgentError::Io(format!(
+                "hosted input acts are limited to {} KiB; split the message",
+                super::wire::MAX_INPUT / 1024
+            ))),
+            reason => Error::Protocol(reason),
+        })?;
         let _pass = self.gate.enter()?;
         let deadline = ACT_DEADLINE + Duration::from_millis(pauses(&act));
         let _serial = self.acts.lock().unwrap_or_else(|e| e.into_inner());
