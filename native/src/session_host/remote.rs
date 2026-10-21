@@ -561,7 +561,9 @@ impl SessionOperations for HostSession {
             HostLifecycle::Exited => Lifecycle::Exited(Some(ExitInfo {
                 exit_code: info.exit_code,
                 signal: info.signal,
-                signal_name: info.signal_name,
+                // Named from the number, as in-process: an older host sent
+                // the platform's description ("Terminated: 15").
+                signal_name: info.signal.and_then(crate::pty::signal_name),
             })),
             // An unavailable host is never reported as an exited session.
             HostLifecycle::Unavailable => return Err(Error::Unavailable(Unavailable::Recovering)),
