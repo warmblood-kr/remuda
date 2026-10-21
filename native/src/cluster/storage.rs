@@ -265,11 +265,16 @@ pub(super) fn check_directory_type(dir: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-pub(super) fn check_private_file(_file: &File, description: &str, path: &Path) -> io::Result<()> {
+pub(super) fn check_private_file(file: &File, description: &str, path: &Path) -> io::Result<()> {
+    check_private_metadata(&file.metadata()?, description, path)
+}
+
+#[cfg(not(windows))]
+fn check_private_metadata(_meta: &fs::Metadata, description: &str, path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let meta = _file.metadata()?;
+        let meta = _meta;
         let expected_uid = unsafe { libc::geteuid() };
         if meta.uid() != expected_uid {
             return Err(io::Error::new(
@@ -311,18 +316,33 @@ pub(crate) fn private_directory(dir: &Path) -> io::Result<()> {
 }
 
 /// Create `path` empty and private if missing; an existing file must be private.
-/// Never truncates, so it is safe on a live SQLite file.
+/// An existing file is only `lstat`ed, never opened: closing any descriptor of
+/// a file drops this process's fcntl locks on it, SQLite's included.
 #[cfg(not(windows))]
 pub(crate) fn private_file(path: &Path) -> io::Result<()> {
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options.open(path)?;
-    check_private_file(&file, "database file", path)
+    match options.open(path) {
+        Ok(file) => return check_private_file(&file, "database file", path),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "database file {} is not a regular file; refusing",
+                path.display()
+            ),
+        ));
+    }
+    check_private_metadata(&meta, "database file", path)
 }
 
 /// Create `path` empty and private if missing; an existing file gets the

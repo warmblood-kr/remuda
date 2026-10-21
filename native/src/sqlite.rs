@@ -239,6 +239,53 @@ mod tests {
         assert!(open(&dir, "index.db").is_err());
     }
 
+    #[cfg(unix)]
+    const LOCK_PROBE: &str = "REMUDA_SQLITE_LOCK_PROBE";
+
+    /// Child half of the lock test: is SQLite's `-shm` dead-man byte locked?
+    #[cfg(unix)]
+    #[test]
+    fn lock_probe_child() {
+        use std::os::fd::AsRawFd;
+        let Some(shm) = std::env::var_os(LOCK_PROBE) else {
+            return;
+        };
+        let file = fs::OpenOptions::new().read(true).open(shm).unwrap();
+        // SAFETY: plain struct of integers; F_GETLK fills it in.
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_WRLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        lock.l_start = 128; // UNIX_SHM_DMS in SQLite's os_unix.c
+        lock.l_len = 1;
+        // SAFETY: valid descriptor and a valid flock for the call's duration.
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) },
+            0
+        );
+        let held = i64::from(lock.l_type) != i64::from(libc::F_UNLCK);
+        println!("dms {}", if held { "held" } else { "free" });
+    }
+
+    /// A second `open` must not drop the first connection's locks: closing
+    /// any descriptor of a file drops all of a process's fcntl locks on it.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_open_keeps_the_first_connections_locks() {
+        let tmp = TempDir::new("locks");
+        let dir = tmp.0.join("db");
+        let first = open(&dir, "index.db").unwrap();
+        write_rows(&first);
+        let second = open(&dir, "index.db").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "sqlite::tests::lock_probe_child", "--nocapture"])
+            .env(LOCK_PROBE, dir.join("index.db-shm"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("dms held"), "{stdout}");
+        drop((first, second));
+    }
+
     #[test]
     fn a_name_with_a_path_is_refused() {
         let tmp = TempDir::new("names");
