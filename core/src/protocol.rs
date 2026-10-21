@@ -382,6 +382,9 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_base64: Option<String>,
     },
+    /// Run `remuda db ARGS…` in the daemon, the only opener of mod databases
+    /// (#778). Answered with [`Response::CommandResult`]. Local only.
+    Db { args: Vec<String> },
     /// Answer an outstanding secret prompt on this pending word's connection.
     SecretAnswer {
         id: u32,
