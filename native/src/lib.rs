@@ -36,6 +36,8 @@ pub mod pending;
 pub mod process;
 mod process_ancestry;
 pub mod pty;
+#[cfg(unix)]
+pub mod reload;
 pub mod remote_front;
 pub mod reply_limit;
 pub mod script;

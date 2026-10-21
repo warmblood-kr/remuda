@@ -293,6 +293,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::RemoveDirAll { .. } => Err(refusal("RemoveDirAll")),
         Request::Version => Err(refusal("Version")),
         Request::SessionHostBuilds => Err(refusal("SessionHostBuilds")),
+        Request::Reload { .. } => Err(refusal("Reload")),
         Request::SocketPublication => Err(refusal("SocketPublication")),
         Request::ClusterRegistrySync { .. } => Err(refusal("ClusterRegistrySync")),
         Request::ClusterRegistryUpdate { .. } => Err(refusal("ClusterRegistryUpdate")),
