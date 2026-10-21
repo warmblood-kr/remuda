@@ -126,6 +126,9 @@ pub struct Registry {
     /// Host-backed sessions (#713). One name space with `sessions`; lock
     /// order is always `sessions`, then `hosted`.
     hosted: Mutex<HashMap<String, Arc<SessionHandle>>>,
+    /// Host-backed launches (by instance id) a close has started ending, so a
+    /// reaper that sees the child die first still reports "closed".
+    closing_hosted: Mutex<std::collections::HashSet<String>>,
     /// Sequenced-input state per host-backed launch, by instance id: the same
     /// duplicate memory and rate budget an in-process Session keeps itself.
     /// Daemon memory only; a daemon restart forgets it, as it would for an
@@ -545,6 +548,69 @@ impl Registry {
             .collect()
     }
 
+    /// Drop host-backed sessions (#713) whose child has exited, with what the
+    /// host saw. Each host is asked outside the lock; an entry is removed
+    /// only if it is still the handle that was asked, so a concurrent close
+    /// or replacement keeps its own notice. An unreachable host is kept.
+    pub fn reap_hosted_with_exit_info(
+        &self,
+    ) -> Vec<(String, String, String, &'static str, Option<ExitInfo>)> {
+        let exited: Vec<_> = self
+            .hosted_handles()
+            .into_iter()
+            .filter_map(|handle| {
+                let observation = handle.inspect().ok()?;
+                match observation.lifecycle {
+                    Lifecycle::Exited(info) => Some((handle, observation.closing, info)),
+                    Lifecycle::Running => None,
+                }
+            })
+            .collect();
+        let mut hosted = self.hosted_lock();
+        let reaped: Vec<_> = exited
+            .into_iter()
+            .filter_map(|(handle, closing, info)| {
+                let identity = handle.identity();
+                let current = hosted
+                    .get(&identity.name)
+                    .is_some_and(|entry| Arc::ptr_eq(entry, &handle));
+                if !current {
+                    return None;
+                }
+                hosted.remove(&identity.name);
+                let closed = self.closing_hosted_lock().remove(&identity.instance);
+                let reason = if closing || closed {
+                    "closed"
+                } else {
+                    "exited"
+                };
+                Some((handle, reason, info))
+            })
+            .collect();
+        drop(hosted);
+        reaped
+            .into_iter()
+            .map(|(handle, reason, info)| {
+                // Its sequenced-input memory goes with it, as on close.
+                self.forget_hosted_input(&handle);
+                let identity = handle.identity();
+                (
+                    identity.name.clone(),
+                    identity.id.clone(),
+                    identity.instance.clone(),
+                    reason,
+                    info,
+                )
+            })
+            .collect()
+    }
+
+    fn closing_hosted_lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
+        self.closing_hosted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A panic under this lock cannot leave the map half-updated — an entry is
     /// either inserted or it is not — so the contents stay meaningful and
     /// recovering beats poisoning every later call.
@@ -752,7 +818,11 @@ impl Registry {
                 "session restarted; close was refused".into(),
             )));
         }
+        self.closing_hosted_lock()
+            .insert(handle.identity().instance.clone());
         if let Err(error) = handle.terminate() {
+            self.closing_hosted_lock()
+                .remove(&handle.identity().instance);
             return Some(Err(error.into_agent()));
         }
         let mut hosted = self.hosted_lock();
@@ -764,6 +834,9 @@ impl Registry {
             drop(hosted);
             self.forget_hosted_input(&handle);
         }
+        // Lock order: `hosted`, then `closing_hosted`, as in the reaper.
+        self.closing_hosted_lock()
+            .remove(&handle.identity().instance);
         Some(Ok(removed))
     }
 }
