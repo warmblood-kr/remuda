@@ -113,15 +113,17 @@ its content about 24 h later. Nobody is told.
     (version, writer, …) order still picks the winner, so every node agrees.
   - The loser goes into a `conflicts` table, and its blob stays referenced,
     so GC keeps it.
-- **Surface:** `remuda vfs ls --conflicts`, and
-  `remuda vfs resolve-conflict URI --keep winner|VERSION`. Lua gets
-  `stat().conflicts`.
+- **Settling (as built, #826):** a local write takes a vector that covers
+  the entry and every conflict on it. So the next write to a path settles its
+  conflicts on every node. No separate resolution marker is needed.
+- **Surface (#827):** `remuda vfs ls --conflicts`, and
+  `remuda vfs resolve-conflict URI --keep winner|VERSION`, which writes the
+  chosen side again. Lua gets `stat().conflicts`.
 - **Mixed versions:** an entry that arrives without `vv` merges as today
   (last write wins). Detection is complete only once every node is upgraded.
 
-**Owner decision:** keep losers in a `conflicts` table (proposed), or as
-conflict-copy paths such as `notes.md.conflict-<time>-<node>`. Copies need
-no new commands, but they take cap slots and can pile up.
+**Owner decision (2026-10-21):** losers are kept in a `conflicts` table,
+with their blobs. A later write settles them (accepted 2026-10-22).
 
 ## Step 5: tombstone GC by causal stability
 
