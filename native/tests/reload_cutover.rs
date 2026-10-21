@@ -77,7 +77,7 @@ impl Daemon {
             .env("REMUDA_RUNTIME_DIR", &root.0)
             .env("HOME", &root.0)
             .env("XDG_STATE_HOME", root.0.join("state"))
-            .env_remove("REMUDA_EXPERIMENTAL_SESSION_HOST")
+            .env("REMUDA_EXPERIMENTAL_SESSION_HOST", "0")
             .env_remove("REMUDA_TEST_RELOAD_FAULT")
             .envs(env.iter().copied())
             .stdin(Stdio::null())

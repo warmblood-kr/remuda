@@ -24,8 +24,11 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Daemon environment switch; anything but "1" keeps the default path.
+/// Daemon environment switch: "1" hosts new sessions, "0" keeps them in the
+/// daemon, and anything else takes [`HOSTED_BY_DEFAULT`].
 pub const OPT_IN: &str = "REMUDA_EXPERIMENTAL_SESSION_HOST";
+/// Whether new sessions are host-backed when [`OPT_IN`] names no mode.
+pub const HOSTED_BY_DEFAULT: bool = false;
 /// The daemon's stable input identity, so a restarted daemon recovers acts
 /// an earlier one reserved. The writer fence, not this id, excludes owners.
 const CLIENT: [u8; 16] = *b"remuda-daemon-01";
@@ -48,8 +51,13 @@ const INHERITED: &[&str] = &[
     "SSH_AUTH_SOCK",
 ];
 
-pub fn opted_in() -> bool {
-    std::env::var(OPT_IN).is_ok_and(|value| value == "1")
+/// True when this daemon starts new sessions host-backed.
+pub fn hosting() -> bool {
+    match std::env::var(OPT_IN).as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => HOSTED_BY_DEFAULT,
+    }
 }
 
 /// Private per-daemon state: `<socket>.hosts/` holds the inventory and one
