@@ -220,14 +220,18 @@ pub(super) fn notice(screen: &ScreenSnapshot) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// The mode sequences that move a viewer's terminal from `before` (none: an
-/// unknown terminal, so every mode is stated) to `after`, so keys, pastes and
+/// The mode sequences that move a viewer's terminal from `before` (none: a
+/// terminal in default modes) to `after`, so keys, pastes and
 /// mouse reports reach the child encoded as it asked. Nothing when the host
 /// does not report modes.
 pub(super) fn modes(before: Option<TerminalModes>, after: Option<TerminalModes>) -> Vec<u8> {
     let Some(after) = after else {
         return Vec::new();
     };
+    // Like the in-process paint (vt100 `state_formatted`), a fresh terminal is
+    // taken to be in default modes, so only modes the child changed are sent.
+    // Stating "mouse off" would also undo the attach client's own wheel mode.
+    let before = Some(before.unwrap_or_default());
     let mut out = String::new();
     let changed =
         |pick: fn(&TerminalModes) -> bool| before.is_none_or(|b| pick(&b) != pick(&after));
@@ -356,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn modes_are_stated_in_full_first_then_only_when_they_change() {
+    fn modes_differing_from_default_are_stated_first_then_only_when_they_change() {
         let vim = TerminalModes {
             application_cursor: true,
             mouse: remuda_core::agent::MouseState {
@@ -366,15 +370,8 @@ mod tests {
             ..Default::default()
         };
         let first = text(modes(None, Some(vim)));
-        for sequence in [
-            "\x1b[?1000l",
-            "\x1b[?1006l",
-            "\x1b[?2004h",
-            "\x1b[?1h",
-            "\x1b>",
-        ] {
-            assert!(first.contains(sequence), "{sequence:?} in {first:?}");
-        }
+        assert_eq!(first, "\x1b[?2004h\x1b[?1h");
+        assert!(modes(None, Some(TerminalModes::default())).is_empty());
         assert!(modes(Some(vim), Some(vim)).is_empty());
         let mut mouse = vim;
         mouse.mouse.mode = MouseMode::PressRelease;
