@@ -149,8 +149,8 @@ jobs:
           cp "$RUNNER_TEMP/base-target/debug/remuda" "$RUNNER_TEMP/base-target/debug/remuda-session-host" "$RUNNER_TEMP/n/"
       - name: N/N+1 in both directions
         run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test session_host_daemon -- --ignored n_plus_one
-      - name: N/N+1 VFS sync across three daemons
-        run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live -- --ignored n_plus_one
+      - name: N/N+1 VFS sync across three daemons; N refuses a newer index.db
+        run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live -- --ignored n_plus_one older_build
 
   vfs-compat-pre-sqlite:
     # Nodes from before index.db (#778) still run in clusters. Two daemons of

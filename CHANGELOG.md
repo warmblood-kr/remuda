@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Lua and CLI: schema migrations for mod databases (#778). A mod ships
+  numbered plain-SQL steps (`migrations/NAME/0001_create.up.sql`, an
+  optional `.down.sql`) and opens with `remuda.db.open(name, { migrations =
+  true })`. Pending steps run in one transaction, so a crash leaves the old
+  schema. An edited step (`drift`) or a database newer than the mod
+  (`too_new`) refuses the open. Each step's down SQL is stored in the
+  database, so `remuda db downgrade MOD NAME VERSION --yes` can step back
+  without the newer mod; it writes a private backup first. `remuda db
+  status` and `remuda db upgrade` run in the daemon, like `remuda vfs`. A
+  handle can no longer set `user_version`. The VFS `index.db` now uses the
+  same runner. Its schema is unchanged (version 1), so older builds still
+  open it.
+
 - `remuda reload --check` (experimental, Unix) reports whether the installed
   remuda could take over the running daemon without losing a session. It
   starts the new build as a candidate beside the running daemon and checks

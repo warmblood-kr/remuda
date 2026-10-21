@@ -1,6 +1,6 @@
 # Schema migrations for remuda's SQLite databases
 
-Status: design, not built yet. Follows #778 (the daemon owns SQLite).
+Status: built in #796 (`native/src/sqlite_migrate.rs`, `db_cli.rs`). Follows #778.
 
 ## The ask
 

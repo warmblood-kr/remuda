@@ -5,8 +5,8 @@
 //! caps stay in `VfsIndex`; this file only stores rows. The wire format and
 //! the digest are unchanged, since peers still see the same `VfsIndex`.
 //!
-//! On first open, a format-1 `index.json` is imported in the same transaction
-//! that creates the table. The JSON file is left untouched (an older binary
+//! The schema is `STEPS`, run by `sqlite_migrate`. On first open, a format-1
+//! `index.json` is imported. The JSON file is left untouched (an older binary
 //! reads only it); `export_json` writes it again before a downgrade. If it
 //! changes later, say an older binary wrote it after a downgrade, the next
 //! open merges it again: per path, the higher version wins, as between peers.
@@ -26,7 +26,6 @@ use std::path::Path;
 pub(super) const DB_FILE: &str = "index.db";
 pub(super) const LEGACY_FILE: &str = "index.json";
 const LEGACY_FORMAT: u32 = 1;
-const SCHEMA_VERSION: i64 = 1;
 const COLUMNS: &str = "path, sha256, size, replicas, version, writer, deleted, mtime";
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -35,48 +34,59 @@ struct LegacyFile {
     entries: Vec<VfsEntry>,
 }
 
-/// Open `root/index.db`, creating the table and importing `index.json` once.
+/// Open `root/index.db`: run the schema steps, then merge `index.json` if it
+/// changed. A database from before the runner (#791) is adopted at step 1.
 pub(super) fn open(root: &Path) -> VfsResult<Connection> {
     let mut conn = crate::sqlite::open(root, DB_FILE)?;
-    let tx = immediate(&mut conn)?;
-    let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    match version {
-        SCHEMA_VERSION => merge_legacy(&tx, root)?,
-        0 => {
-            create_schema(&tx)?;
-            merge_legacy(&tx, root)?;
-            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        }
-        newer => {
-            return Err(VfsError::new(
-                VfsErrorKind::Corrupt,
-                format!("{DB_FILE} schema {newer} is newer than this remuda ({SCHEMA_VERSION}); upgrade remuda"),
-            ))
-        }
+    let known = STEPS.len() as i64;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > known {
+        return Err(VfsError::new(
+            VfsErrorKind::Corrupt,
+            format!(
+                "{DB_FILE} schema {version} is newer than this remuda ({known}); upgrade remuda"
+            ),
+        ));
     }
+    crate::sqlite_migrate::upgrade(&mut conn, DB_FILE, &steps(), true)
+        .map_err(|error| VfsError::new(VfsErrorKind::Corrupt, error))?;
+    let tx = immediate(&mut conn)?;
+    merge_legacy(&tx, root)?;
     tx.commit()?;
     Ok(conn)
+}
+
+/// The schema, one `(name, up, down)` per step. Never edit a shipped step;
+/// add one. Step 1 has no down: dropping the index loses every name.
+const STEPS: [(&str, &str, Option<&str>); 1] = [(
+    "entries",
+    "CREATE TABLE entries (
+         path     TEXT PRIMARY KEY NOT NULL,
+         sha256   TEXT NOT NULL,
+         size     INTEGER NOT NULL,
+         replicas INTEGER NOT NULL,
+         version  INTEGER NOT NULL,
+         writer   TEXT NOT NULL,
+         deleted  INTEGER NOT NULL,
+         mtime    INTEGER NOT NULL
+     ) WITHOUT ROWID;",
+    None,
+)];
+
+fn steps() -> Vec<crate::sqlite_migrate::Step> {
+    STEPS
+        .iter()
+        .map(|(name, up, down)| crate::sqlite_migrate::Step {
+            name: (*name).to_owned(),
+            up: (*up).to_owned(),
+            down: down.map(str::to_owned),
+        })
+        .collect()
 }
 
 /// A write transaction that takes SQLite's write lock up front.
 pub(super) fn immediate(conn: &mut Connection) -> VfsResult<Transaction<'_>> {
     Ok(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
-}
-
-fn create_schema(tx: &Transaction<'_>) -> VfsResult<()> {
-    tx.execute_batch(
-        "CREATE TABLE entries (
-             path     TEXT PRIMARY KEY NOT NULL,
-             sha256   TEXT NOT NULL,
-             size     INTEGER NOT NULL,
-             replicas INTEGER NOT NULL,
-             version  INTEGER NOT NULL,
-             writer   TEXT NOT NULL,
-             deleted  INTEGER NOT NULL,
-             mtime    INTEGER NOT NULL
-         ) WITHOUT ROWID;",
-    )?;
-    Ok(())
 }
 
 /// Merge `index.json` when its size or mtime differs from the last merge or
@@ -360,11 +370,31 @@ mod tests {
     }
 
     #[test]
+    fn an_index_from_before_the_runner_is_adopted_at_step_1() {
+        let scratch = Scratch::new();
+        let root = scratch.root();
+        storage::private_directory(&root).unwrap();
+        let conn = crate::sqlite::open(&root, DB_FILE).unwrap();
+        conn.execute_batch(STEPS[0].1).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        upsert(&tx, &entry(3, false)).unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+        let conn = open(&root).unwrap();
+        assert_eq!(load(&conn).unwrap().entries.len(), 1);
+        let applied = crate::sqlite_migrate::status(&conn).unwrap();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].name, "entries");
+        assert!(!applied[0].reversible);
+    }
+
+    #[test]
     fn a_newer_schema_is_refused() {
         let scratch = Scratch::new();
         drop(open(&scratch.root()).unwrap());
         let conn = crate::sqlite::open(&scratch.root(), DB_FILE).unwrap();
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+        conn.pragma_update(None, "user_version", STEPS.len() as i64 + 1)
             .unwrap();
         let error = open(&scratch.root()).unwrap_err();
         assert!(error.detail.contains("newer than this remuda"), "{error}");
