@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Session hosts (experimental): `remuda stop` now lets an act a host is
+  already running finish and answers it, instead of hanging up on it. New
+  host-backed input, resize and close are refused while the daemon drains.
+  `stop` still returns at once, and hosts keep running. Before, such an act
+  answered "the daemon hung up without answering" and was left for the next
+  daemon to resolve.
 - Session hosts (experimental): a daemon now starts only a session host of
   its own build. Before, a daemon still running after an upgrade started the
   newly installed host. `install.sh` now also keeps each host as

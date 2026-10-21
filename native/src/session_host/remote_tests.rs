@@ -646,3 +646,29 @@ fn teardown_retires_an_entry_whose_host_was_stopped_before_a_crash() {
         .entries
         .contains_key("synthetic"));
 }
+
+#[test]
+fn a_drained_gate_refuses_acts_and_control_before_any_effect_but_reads_go_on() {
+    let fixture = Fixture::new();
+    let gate = Arc::new(crate::session_host::gate::Gate::default());
+    let session = adapter(&fixture.root).gated(Arc::clone(&gate));
+    session.send_line("before").unwrap();
+    assert_eq!(fixture.effects(), ["before"]);
+    let size = session.inspect().unwrap().size;
+
+    assert_eq!(gate.drain(Duration::from_secs(1)).left, 0);
+    let refused = |result: remuda_core::session_operations::Result<()>| {
+        matches!(result, Err(Error::Unavailable(Unavailable::Recovering)))
+    };
+    assert!(refused(session.send_line("after")));
+    assert!(refused(session.resize(Size::for_pane(100, 30))));
+    assert!(refused(session.terminate()));
+    // Nothing reached the host: no effect, no resize, no reservation.
+    assert_eq!(fixture.effects(), ["before"]);
+    let seen = session.inspect().unwrap();
+    assert_eq!(seen.lifecycle, Lifecycle::Running);
+    assert_eq!(seen.size, size);
+    assert!(session.screen_text().unwrap().contains("effect:before"));
+    let index = session.owner.index().unwrap();
+    assert_eq!(index.entries["synthetic"].streams[0].next, Some(2));
+}

@@ -13,6 +13,8 @@ mod coordinator;
 #[cfg(unix)]
 mod entry;
 #[cfg(unix)]
+mod gate;
+#[cfg(unix)]
 mod host_build;
 #[cfg(unix)]
 pub(crate) mod hosted;
