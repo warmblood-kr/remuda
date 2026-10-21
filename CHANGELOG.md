@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `remuda reload --check` (experimental, Unix) reports whether the installed
+  remuda could take over the running daemon without losing a session. It
+  starts the new build as a candidate beside the running daemon and checks
+  that it can drive every session host. Then it stops the candidate and
+  changes nothing. In-process sessions, and any host the new build cannot
+  drive, are reported as blockers. `remuda reload` without `--check` is not
+  available yet.
 - Session screen: press `m` on the session list to write a line for the
   selected session in a line editor at the bottom of the screen. Nothing reaches the
   session while you type. Enter sends the whole line, with its Return, as one

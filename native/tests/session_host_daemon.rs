@@ -463,3 +463,59 @@ fn an_agent_hosted_by_an_earlier_daemon_cannot_stop_its_replacement() {
     assert_eq!(stopped, Response::Ok);
     drop(second);
 }
+
+/// `remuda reload --check` run by the CLI build `cli`, against the daemon
+/// at `root`, into `target`; answers the exit status, stdout and stderr.
+fn reload_check(root: &Root, cli: &Path, target: &Path) -> (Option<i32>, String, String) {
+    let out = Command::new(cli)
+        .args(["-s", "s", "reload", "--check", "--binary"])
+        .arg(target)
+        .env("REMUDA_RUNTIME_DIR", &root.0)
+        .env("HOME", &root.0)
+        .env("XDG_STATE_HOME", root.0.join("state"))
+        .env("REMUDA_NO_UPDATE_CHECK", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("reload check");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Whatever either build supports, a reload check across N and N+1 leaves the
+/// hosted session working, and a refusal says why.
+fn check_leaves_the_session_alone(daemon_exe: &Path, cli: &Path, target: &Path) {
+    let root = Root::new();
+    let path = root.socket();
+    let daemon = Daemon::spawn_exe(&root, daemon_exe, true);
+    new_session(&path, "compat");
+    let (code, stdout, stderr) = reload_check(&root, cli, target);
+    let understood = stdout.starts_with("ready: ")
+        || stderr.contains("candidate exited before its hello")
+        || stderr.contains("predates `remuda reload`");
+    assert!(understood, "exit {code:?}\n{stdout}\n{stderr}");
+    // `remuda stop` would end every session: never the advice here.
+    assert!(!stderr.contains("run `remuda stop`"), "{stderr}");
+    assert_eq!(
+        send_line(&path, "compat", "echo AFTER:$((7*8))"),
+        Response::Ok
+    );
+    wait_for(&path, "compat", "AFTER:56");
+    drop(daemon);
+}
+
+#[test]
+#[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS; run by CI job host-compat-n-plus-one"]
+fn n_plus_one_daemon_checks_a_reload_into_the_older_build() {
+    let this = Path::new(env!("CARGO_BIN_EXE_remuda"));
+    check_leaves_the_session_alone(this, this, &previous());
+}
+
+#[test]
+#[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS; run by CI job host-compat-n-plus-one"]
+fn n_plus_one_older_daemon_is_asked_to_check_a_reload() {
+    let this = Path::new(env!("CARGO_BIN_EXE_remuda"));
+    check_leaves_the_session_alone(&previous(), this, this);
+}
