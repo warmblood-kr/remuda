@@ -169,7 +169,7 @@ impl LineComposer {
         }
     }
 
-    pub(super) fn display_lines(&self, prefix: &str, width: usize, limit: usize) -> Vec<String> {
+    pub(crate) fn display_lines(&self, prefix: &str, width: usize, limit: usize) -> Vec<String> {
         let safe_prefix = crate::text::strip_terminal_controls(prefix);
         let mut cells: Vec<(String, bool)> = safe_prefix
             .graphemes(true)
@@ -221,7 +221,7 @@ impl LineComposer {
         }
     }
 
-    pub(super) fn insert_text(&mut self, text: &str) {
+    pub(crate) fn insert_text(&mut self, text: &str) {
         let offset = self.byte_offset();
         self.text.insert_str(offset, text);
         let end = offset + text.len();
