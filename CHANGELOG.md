@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- VFS: only the daemon that serves the socket writes the index, also during
+  `remuda reload` (#778, #713). The new daemon claims `index.db` just
+  before it serves; a rollback gives it back to the old daemon. A write on
+  the replaced daemon fails with `superseded` and a hint to run the command
+  again. Before, both daemons could write while they overlapped.
+
 - `remuda reload` (experimental, Unix) replaces the running daemon with the
   installed remuda without closing a host-backed session.
   - The old daemon checks the new build as for `--check`, then hands it the
