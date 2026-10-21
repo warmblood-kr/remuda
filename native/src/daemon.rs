@@ -3118,7 +3118,7 @@ fn handle_shutdown(
             requester_session_id,
             requester_session_name,
         };
-        shutdown_verdict_with_classifier(false, claims, || {
+        let classify = || {
             match process_ancestry::peer_pid(&stream) {
                 Ok(Some(peer_pid)) => {
                     let session_pids = match session_process_ids(registry) {
@@ -3145,6 +3145,20 @@ fn handle_shutdown(
                     ShutdownPeer::Error(error.to_string())
                 }
             }
+        };
+        shutdown_verdict_with_classifier(false, claims, || {
+            let peer = classify();
+            // A session's child runs before `new` registers it; a host-backed
+            // one (#713) waits for its host to publish first. A requester that
+            // early is in no session yet, so let in-flight starts finish and
+            // look again, as caller attribution does.
+            #[cfg(not(windows))]
+            if matches!(peer, ShutdownPeer::Ancestry(process_ancestry::Ancestry::Outside))
+                && wait_for_starting_sessions()
+            {
+                return classify();
+            }
+            peer
         })
     };
     finish_shutdown_verdict(
