@@ -1031,11 +1031,9 @@ fn input_bindings(
     table.set(
         "_input_text",
         lua.create_function(move |_, (name, text): (String, String)| {
-            let session = text_registry
-                .get(&name)
-                .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
-            session
-                .input_text(&text)
+            text_registry
+                .input_text(&name, &text)
+                .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?
                 .map_err(|error| mlua::Error::runtime(error.to_string()))
         })?,
     )?;
@@ -1044,11 +1042,9 @@ fn input_bindings(
     table.set(
         "_input_submit",
         lua.create_function(move |_, (name, expect): (String, String)| {
-            let session = submit_registry
-                .get(&name)
-                .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
-            session
-                .submit(&expect)
+            submit_registry
+                .submit(&name, &expect)
+                .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?
                 .map(|outcome| match outcome {
                     InputSubmitOutcome::Submitted => "submitted",
                     InputSubmitOutcome::Unverified => "unverified",
@@ -1069,11 +1065,9 @@ fn input_bindings(
                         "settle must be between 0 and 5 seconds",
                     ));
                 }
-                let session = legacy_type_registry
-                    .get(&name)
-                    .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
-                session
-                    .type_text(&text, Duration::from_secs_f64(settle))
+                legacy_type_registry
+                    .type_text(&name, &text, Duration::from_secs_f64(settle))
+                    .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?
                     .map(|outcome| match outcome {
                         InputSubmitOutcome::Submitted => "submitted",
                         InputSubmitOutcome::Unverified => "unverified",
@@ -1113,15 +1107,16 @@ fn expected_instance_input_bindings(
                         "settle must be between 0 and 5 seconds",
                     ));
                 }
-                let session = expected_text_registry.get(&name).ok_or_else(|| {
-                    mlua::Error::runtime("session instance changed; no input was written")
-                })?;
-                session
+                expected_text_registry
                     .type_text_if_instance(
+                        &name,
                         &expected_instance,
                         &text,
                         Duration::from_secs_f64(settle),
                     )
+                    .ok_or_else(|| {
+                        mlua::Error::runtime("session instance changed; no input was written")
+                    })?
                     .map(|outcome| match outcome {
                         InputSubmitOutcome::Submitted => "submitted",
                         InputSubmitOutcome::Unverified => "unverified",
@@ -1139,11 +1134,11 @@ fn expected_instance_input_bindings(
             move |_, (name, expected_instance, spec): (String, String, String)| {
                 let bytes = keys::key(&spec)
                     .ok_or_else(|| mlua::Error::runtime(format!("no such key: {spec}")))?;
-                let session = expected_key_registry.get(&name).ok_or_else(|| {
-                    mlua::Error::runtime("session instance changed; no input was written")
-                })?;
-                session
-                    .send_key_if_instance(&expected_instance, &bytes)
+                expected_key_registry
+                    .send_key_if_instance(&name, &expected_instance, &bytes)
+                    .ok_or_else(|| {
+                        mlua::Error::runtime("session instance changed; no input was written")
+                    })?
                     .map(|()| true)
                     .map_err(|error| mlua::Error::runtime(error.to_string()))
             },
