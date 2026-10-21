@@ -374,15 +374,11 @@ impl Hosts {
         let exit = start(&exe, &endpoint, &bootstrap)?;
         match self.published(request.name, &exit) {
             Ok(()) => self.open(request.name),
-            Err(Published::Exited) => {
-                // Stop the host and retire the entry, as for a closed session.
-                if let Ok(session) = self.open(request.name) {
-                    let name = request.name.to_owned();
-                    let hosts = self.clone();
-                    std::thread::spawn(move || hosts.teardown(&name, session));
-                }
-                Err("session host child exited at once".into())
-            }
+            // The child already ended. Like an in-process `new` of a short
+            // command, the session still starts: it is registered, its last
+            // screen can be read, and the reaper announces the exit and
+            // retires its host.
+            Err(Published::Exited) => self.open(request.name),
             Err(Published::Late) => Err(
                 "session host did not publish in time; it may still start, and a daemon \
                  restart will rediscover it"
