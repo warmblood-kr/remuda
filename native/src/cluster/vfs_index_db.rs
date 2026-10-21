@@ -411,28 +411,103 @@ pub(super) fn live_hashes(conn: &Connection) -> VfsResult<std::collections::Hash
 }
 
 /// Delete tombstones written before `before` whose `seq` every peer in
-/// `others` has acked. Rows with conflicts stay, and so does the row with
-/// the highest version, which `next_version` must never go below.
+/// `others` has acked, except peers whose last pull is before `stale_before`.
+/// Rows with conflicts stay, and so does the highest version.
 pub(super) fn collect_tombstones(
     tx: &Transaction<'_>,
     others: &[String],
     before: u64,
+    stale_before: u64,
 ) -> VfsResult<usize> {
     let mut acked = i64::MAX;
     for peer in others {
-        let seq: Option<i64> = tx
-            .query_row("SELECT acked_seq FROM peers WHERE fp = ?1", [peer], |row| {
-                row.get(0)
-            })
+        let row: Option<(i64, Option<i64>)> = tx
+            .query_row(
+                "SELECT acked_seq, last_seen FROM peers WHERE fp = ?1",
+                [peer],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .optional()?;
-        acked = acked.min(seq.unwrap_or(0));
+        match row {
+            Some((_, Some(seen))) if (seen as u64) < stale_before => {}
+            Some((seq, _)) => acked = acked.min(seq),
+            None => acked = 0,
+        }
     }
     let top = next_version(tx)?.wrapping_sub(1) as i64;
-    Ok(tx.execute(
-        "DELETE FROM entries WHERE deleted = 1 AND seq <= ?1 AND mtime < ?2 AND version != ?3
-           AND NOT EXISTS (SELECT 1 FROM conflicts WHERE conflicts.path = entries.path)",
-        params![acked, before as i64, top],
-    )?)
+    const WHERE: &str = "deleted = 1 AND seq <= ?1 AND mtime < ?2 AND version != ?3
+           AND NOT EXISTS (SELECT 1 FROM conflicts WHERE conflicts.path = entries.path)";
+    let args = params![acked, before as i64, top];
+    let highest: Option<i64> = tx.query_row(
+        &format!("SELECT max(seq) FROM entries WHERE {WHERE}"),
+        args,
+        |row| row.get(0),
+    )?;
+    let removed = tx.execute(&format!("DELETE FROM entries WHERE {WHERE}"), args)?;
+    if let Some(highest) = highest {
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('gc_seq', ?1)
+             ON CONFLICT (key) DO UPDATE SET value = max(CAST(value AS INTEGER), ?1)",
+            [highest],
+        )?;
+    }
+    Ok(removed)
+}
+
+/// True when `peer` last pulled before `stale_before` and asks from below
+/// a collected tombstone, so it may hold names deleted everywhere else.
+pub(super) fn is_stale(
+    conn: &Connection,
+    peer: &str,
+    since: u64,
+    stale_before: u64,
+) -> VfsResult<bool> {
+    let gc_seq: Option<i64> = conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'gc_seq'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let seen: Option<Option<i64>> = conn
+        .query_row("SELECT last_seen FROM peers WHERE fp = ?1", [peer], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    Ok(match (gc_seq, seen.flatten()) {
+        (Some(gc_seq), Some(seen)) => since < gc_seq as u64 && (seen as u64) < stale_before,
+        _ => false,
+    })
+}
+
+/// Note that `peer` pulled from this node at `now`.
+pub(super) fn set_seen(conn: &Connection, peer: &str, now: u64) -> VfsResult<()> {
+    conn.execute(
+        "INSERT INTO peers (fp, last_seen) VALUES (?1, ?2)
+         ON CONFLICT (fp) DO UPDATE SET last_seen = ?2",
+        params![peer, now as i64],
+    )?;
+    Ok(())
+}
+
+/// Keep only `me`'s writes after `keep_after` and forget every cursor, so
+/// the next pulls rebuild the index from peers that collected deletes.
+pub(super) fn rejoin(tx: &Transaction<'_>, me: &str, keep_after: u64) -> VfsResult<usize> {
+    let dropped = tx.execute(
+        "DELETE FROM entries WHERE NOT (writer = ?1 AND seq > ?2)",
+        params![me, keep_after as i64],
+    )?;
+    tx.execute(
+        "DELETE FROM conflicts WHERE path NOT IN (SELECT path FROM entries)",
+        [],
+    )?;
+    tx.execute("UPDATE peers SET index_id = NULL, pulled_seq = 0", [])?;
+    Ok(dropped)
+}
+
+/// This index's id, as peers see it in change pages.
+pub(super) fn index_id(conn: &Connection) -> VfsResult<String> {
+    Ok(conn.query_row("SELECT index_id FROM seq_state", [], |row| row.get(0))?)
 }
 
 /// Write `entry` with the next change sequence number.
@@ -564,9 +639,9 @@ pub(super) fn set_cursor(
     seq: u64,
 ) -> VfsResult<()> {
     tx.execute(
-        "INSERT INTO peers (fp, index_id, pulled_seq, last_seen) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT (fp) DO UPDATE SET index_id = ?2, pulled_seq = ?3, last_seen = ?4",
-        params![peer, index_id, seq as i64, super::vfs::unix_now() as i64],
+        "INSERT INTO peers (fp, index_id, pulled_seq) VALUES (?1, ?2, ?3)
+         ON CONFLICT (fp) DO UPDATE SET index_id = ?2, pulled_seq = ?3",
+        params![peer, index_id, seq as i64],
     )?;
     Ok(())
 }
@@ -574,9 +649,9 @@ pub(super) fn set_cursor(
 /// Record that `peer` holds every change of ours up to `seq` (step 5's input).
 pub(super) fn set_acked(conn: &Connection, peer: &str, seq: u64) -> VfsResult<()> {
     conn.execute(
-        "INSERT INTO peers (fp, acked_seq, last_seen) VALUES (?1, ?2, ?3)
-         ON CONFLICT (fp) DO UPDATE SET acked_seq = max(acked_seq, ?2), last_seen = ?3",
-        params![peer, seq as i64, super::vfs::unix_now() as i64],
+        "INSERT INTO peers (fp, acked_seq) VALUES (?1, ?2)
+         ON CONFLICT (fp) DO UPDATE SET acked_seq = max(acked_seq, ?2)",
+        params![peer, seq as i64],
     )?;
     Ok(())
 }
