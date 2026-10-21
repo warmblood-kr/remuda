@@ -41,6 +41,7 @@ pub mod script;
 #[doc(hidden)]
 pub mod session_host;
 pub mod session_job;
+pub mod sqlite;
 #[cfg(unix)]
 mod staged_socket;
 pub(crate) mod storage;

@@ -61,6 +61,10 @@ remuda-core = { path = "../core" }
 vt100 = "=0.16.2"
 vte = "=0.15.0"
 mlua = { version = "0.12.1", features = ["lua54", "vendored"] }
+# The daemon-owned SQLite capability (#778). `bundled` compiles the SQLite
+# amalgamation with `cc`, the same C toolchain `mlua`'s `vendored` already needs
+# on every release target, so no system libsqlite (absent on Windows/Android).
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustyline = "14.0.0"
 # Already in the dependency graph via `vt100` itself, which uses it to decide
 # `Cell::is_wide` — pinned to the same major version so a rendered row's own

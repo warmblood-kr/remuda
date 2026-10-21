@@ -304,6 +304,40 @@ pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     crate::fs_atomic::write_atomic_exact_mode(path, bytes, 0o600)
 }
 
+/// Create `dir` private (0700, or the owner-only DACL) if missing, then verify it.
+pub(crate) fn private_directory(dir: &Path) -> io::Result<()> {
+    create_private_directory(dir)?;
+    verify_directory(dir)
+}
+
+/// Create `path` empty and private if missing; an existing file must be private.
+/// Never truncates, so it is safe on a live SQLite file.
+#[cfg(not(windows))]
+pub(crate) fn private_file(path: &Path) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    check_private_file(&file, "database file", path)
+}
+
+/// Create `path` empty and private if missing; an existing file gets the
+/// owner-only DACL. Never truncates, so it is safe on a live SQLite file.
+#[cfg(windows)]
+pub(crate) fn private_file(path: &Path) -> io::Result<()> {
+    match super::windows_security::create_new_file(path) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let file = super::windows_security::open_for_check(path, false, true)?;
+    check_private_file(&file, "database file", path)
+}
+
 const CLUSTER_INIT_MARKER: &str = "cluster-initialized";
 
 pub(super) fn read_cluster_init_marker(state_dir: &Path) -> io::Result<Option<String>> {

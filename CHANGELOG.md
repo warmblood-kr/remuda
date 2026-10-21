@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- SQLite is now built into the binary (`rusqlite`, bundled; #778). Nothing
+  uses it yet: it is the base for a daemon-owned VFS index and for Lua
+  databases. A database opened through it keeps its file, `-wal` and `-shm`
+  private: 0600 in a 0700 directory on Unix, the owner-only ACL on Windows.
+  The `-wal` and `-shm` files are kept when the database closes, so SQLite
+  never recreates them with default permissions. A loose or symlinked file is
+  refused, not used. The release build adds about 1.8 MB once SQLite is
+  linked (measured on aarch64-apple-darwin).
+
 - VFS: a node now checks a blob's hash before it serves the first chunk to a
   peer. A damaged copy is removed and refused (`corrupt`), so the peer tries
   another holder and this node's repair pass fetches a good copy. Before,
