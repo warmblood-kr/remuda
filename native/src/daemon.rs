@@ -2028,6 +2028,14 @@ fn handle_request(
     }
     match request {
         Request::List => {
+            // A session's child runs before `new` registers it, and a
+            // host-backed one (#713) only once its host published, so a
+            // listing from inside a session still starting would miss it.
+            // Resolving the caller lets in-flight starts finish first.
+            #[cfg(not(windows))]
+            if ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst) != 0 {
+                let _ = caller_context(&stream, registry, accepted);
+            }
             if !keep_exited() {
                 reap_and_notify(registry, image);
             }
