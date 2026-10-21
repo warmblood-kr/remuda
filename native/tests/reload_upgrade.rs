@@ -48,13 +48,13 @@ impl Root {
             .env("HOME", &self.0)
             .env("XDG_STATE_HOME", self.0.join("state"))
             .env("REMUDA_NO_UPDATE_CHECK", "1")
-            .env_remove("REMUDA_EXPERIMENTAL_SESSION_HOST")
+            .env(
+                "REMUDA_EXPERIMENTAL_SESSION_HOST",
+                if hosted { "1" } else { "0" },
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if hosted {
-            command.env("REMUDA_EXPERIMENTAL_SESSION_HOST", "1");
-        }
         if let Some(fault) = fault {
             command.env("REMUDA_TEST_RELOAD_FAULT", fault);
         }
