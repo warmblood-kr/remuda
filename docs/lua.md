@@ -554,7 +554,10 @@ current implementation.
 The Lua image owns UI declarations and help metadata. The native UI takes one
 validated snapshot after user configuration finishes, then resolves keys and
 renders help from that same snapshot. Reopen the UI to pick up later changes.
-The session-list browse toggle and cluster command controls use the registry.
+The session-list browse toggle, the line composer key (`m`,
+`session.compose`) and cluster command controls use the registry. The
+composer's editing keys are the `cluster.composer` bindings, shared by the
+session screen and the cluster tree.
 Other list/visual/attach/prompt controls still use existing handlers, pending
 migration (see #704). Cluster snapshots come from the local daemon; remote
 nodes do not supply key declarations.

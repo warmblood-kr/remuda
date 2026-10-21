@@ -9,6 +9,16 @@
   limited. Input contents are never recorded. The log keeps the last 10,000
   entries and is not replicated. Before, peer actions left no record.
 
+- Session screen: press `m` on the session list to write a line for the
+  selected session in a line editor at the bottom of the screen. Nothing reaches the
+  session while you type. Enter sends the whole line, with its Return, as one
+  input that the daemon writes without letting other input in between. So a
+  Butler notice or other injected text can no longer land inside a
+  half-typed line and be submitted with it. Esc or Ctrl-\ goes back to the
+  list and keeps the draft for that session; Enter or `i` still attaches
+  with every key sent live, as before. Editing keys are the cluster
+  composer's (`cluster.composer`), including Up/Down history.
+
 - Session hosts (experimental, internal): building blocks for `remuda reload`.
   A daemon can claim its session hosts again after another daemon claimed
   them, and every host it has open then refuses the other daemon at once.

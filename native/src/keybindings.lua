@@ -108,6 +108,7 @@ return function(owner, validate, config_status, validate_help)
   end
   -- Defaults appear nowhere in Rust or footer code.
   api.define_key{context='session.list.browse', key='l', action='session.toggle_list', help='list'}
+  api.define_key{context='session.list.browse', key='m', action='session.compose', help='message'}
   api.define_key{context="cluster.tree", key="<up>", action="cluster.up", help="up"}
   api.define_key{context="cluster.tree", key="<down>", action="cluster.down", help="down"}
   api.define_key{context="cluster.tree", key="<left>", action="cluster.left", help="collapse"}
