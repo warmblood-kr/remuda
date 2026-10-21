@@ -50,6 +50,15 @@ stop the daemon and install the older remuda. On the next upgrade, a changed
 `index.json` (writes the older remuda made) is merged into the database again:
 per path the higher version wins, so a stale file cannot undo a newer write.
 
+Only the daemon that serves the socket writes the index. During `remuda
+reload` the old and new daemon run side by side, so `index.db` records the
+writer (`meta.writer`: socket and a per-process token). A reload candidate
+claims it just before it serves, and a rollback claims it back. A daemon
+whose claim was taken gets `superseded` on any index write, skips its sync
+and GC passes, and exits soon after. A daemon on another socket is not
+fenced. The fence needs both builds to have it: an older daemon neither
+claims nor checks, so during a mixed-build reload it writes as before.
+
 Blobs are written to a temporary file, hashed, then renamed into place, so a
 blob file is never partial. A read verifies the hash again before returning.
 The largest file is 64 MiB.

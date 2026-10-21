@@ -542,6 +542,10 @@ pub fn sync_once() -> SyncReport {
             return report;
         }
     };
+    // A daemon a reload replaced stops syncing quietly; the new one syncs.
+    if !store.writes_here() {
+        return report;
+    }
     for peer in &members.reachable {
         match pull_index(&store, peer) {
             Ok(merged) => {
