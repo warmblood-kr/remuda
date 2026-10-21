@@ -1,16 +1,20 @@
-//! `remuda attach` to a host-backed session (#713), read-only for now.
+//! `remuda attach` to a host-backed session (#713).
 //!
 //! A host keeps no raw output stream, only typed screens, so the viewer is
 //! painted from snapshots: the first frame in full, then only rows that
-//! changed, each frame wrapped in synchronized output. Keys are not
-//! forwarded yet; the first key shows a one-line notice instead.
+//! changed, each frame wrapped in synchronized output. Keys go to the host
+//! through a human grant (one per attach; a newer attach takes over). A host
+//! too old to grant gets a read-only view, and the first key shows a notice.
 use crate::ipc::{self, Stream, TryClone};
 use remuda_core::agent::{Cursor, ScreenSnapshot, StyledCell};
 use remuda_core::protocol::Response;
-use remuda_core::session_operations::{Lifecycle, SessionHandle};
+use remuda_core::session_operations::{
+    Error, Lifecycle, SessionAttachment, SessionHandle, Unavailable,
+};
 use std::fmt::Write as _;
 use std::io::{BufReader, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How long one wait for new output lasts before liveness is checked again.
@@ -18,9 +22,18 @@ const WATCH: Duration = Duration::from_millis(250);
 /// At most this many frames a second, however fast the child prints.
 const MIN_FRAME_GAP: Duration = Duration::from_millis(33);
 
-/// Serve one viewer until it detaches, the session ends, or a write fails.
-/// A tracked attach is acknowledged with generation 0: a read-only view
-/// takes nothing over, so it is never displaced.
+/// What a viewer leaves behind: set by the key side, read by the paint side.
+#[derive(Default)]
+struct Viewer {
+    gone: AtomicBool,
+    typed: AtomicBool,
+    input_failed: AtomicBool,
+    stop: AtomicBool,
+}
+
+/// Serve one viewer until it detaches, is taken over, the session ends, or
+/// a write fails. A tracked attach is acknowledged with its grant; a
+/// read-only one with generation 0, which nothing can take over.
 pub(super) fn serve(
     stream: Stream,
     reader: BufReader<Stream>,
@@ -31,40 +44,50 @@ pub(super) fn serve(
         Ok(first) => first,
         Err(error) => return super::reply(&stream, &Response::error(error.to_string())),
     };
+    let attachment = match handle.attach() {
+        Ok(attachment) => Some(attachment),
+        Err(Error::Unavailable(Unavailable::Unsupported)) => None,
+        Err(error) => return super::reply(&stream, &Response::error(error.to_string())),
+    };
     let acknowledgement = if tracked {
-        Response::AttachStarted { generation: 0 }
+        Response::AttachStarted {
+            generation: attachment.as_ref().map_or(0, SessionAttachment::generation),
+        }
     } else {
         Response::Ok
     };
     super::reply(&stream, &acknowledgement)?;
     let mut out = stream.try_clone()?;
-    let gone = AtomicBool::new(false);
-    let typed = AtomicBool::new(false);
-    let stop = AtomicBool::new(false);
+    let viewer = Viewer::default();
     std::thread::scope(|scope| {
-        let keys = scope.spawn(|| discard_keys(reader, &gone, &typed, &stop));
-        let _ = paint(&mut out, handle, first, &gone, &typed);
-        ipc::stop_reader(&stream, &stop, || keys.is_finished());
+        let keys = scope.spawn(|| pump_keys(reader, attachment.as_ref(), &viewer));
+        let _ = paint(&mut out, handle, attachment.as_ref(), first, &viewer);
+        if viewer.input_failed.load(Ordering::SeqCst) {
+            let _ = out
+                .write_all(super::ATTACH_INPUT_FAILURE_NOTICE.as_bytes())
+                .and_then(|()| out.flush());
+        }
+        ipc::stop_reader(&stream, &viewer.stop, || keys.is_finished());
         let _ = keys.join();
     });
     Ok(())
 }
 
-/// The output side: repaint on every new generation until the viewer leaves
-/// or the session stops running.
+/// The output side: repaint on every new generation until the viewer leaves,
+/// is taken over, or the session stops running.
 fn paint(
     out: &mut Stream,
     handle: &SessionHandle,
+    attachment: Option<&SessionAttachment<'_>>,
     first: remuda_core::agent::VersionedSnapshot,
-    gone: &AtomicBool,
-    typed: &AtomicBool,
+    viewer: &Viewer,
 ) -> std::io::Result<()> {
     out.write_all(&frame(None, &first.snapshot))?;
     out.flush()?;
     let mut shown = first;
     let mut noticed = false;
-    while !gone.load(Ordering::SeqCst) {
-        if !noticed && typed.load(Ordering::SeqCst) {
+    while !viewer.gone.load(Ordering::SeqCst) {
+        if attachment.is_none() && !noticed && viewer.typed.load(Ordering::SeqCst) {
             noticed = true;
             out.write_all(&notice(&shown.snapshot))?;
             out.flush()?;
@@ -85,36 +108,58 @@ fn paint(
             std::thread::sleep(MIN_FRAME_GAP.saturating_sub(started.elapsed()));
             continue;
         }
+        if attachment.is_some_and(|attachment| attachment.displaced().unwrap_or(false)) {
+            // Same plain text as an in-process takeover, before the EOF.
+            out.write_all(b"\r\n[remuda] attached elsewhere, detached\r\n")?;
+            out.flush()?;
+            break;
+        }
         let running = handle
             .inspect()
             .is_ok_and(|observation| observation.lifecycle == Lifecycle::Running);
-        if !running {
+        if !running || viewer.input_failed.load(Ordering::SeqCst) {
             break;
         }
     }
     Ok(())
 }
 
-/// The input side: nothing is forwarded yet. EOF means the viewer left.
-fn discard_keys(
+/// The input side: each read goes to the host as one write, in order. EOF
+/// means the viewer left. Without a grant, keys only raise the notice.
+fn pump_keys(
     mut reader: BufReader<Stream>,
-    gone: &AtomicBool,
-    typed: &AtomicBool,
-    stop: &AtomicBool,
+    attachment: Option<&SessionAttachment<'_>>,
+    viewer: &Viewer,
 ) {
-    let mut buf = [0u8; 1024];
-    while !stop.load(Ordering::SeqCst) {
-        match reader.read(&mut buf) {
+    let mut buf = [0u8; 4096];
+    let started: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+    let cancelled = || viewer.stop.load(Ordering::SeqCst);
+    while !viewer.stop.load(Ordering::SeqCst) {
+        let n = match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
-            Ok(_) => typed.store(true, Ordering::SeqCst),
+            Ok(n) => n,
+        };
+        let Some(attachment) = attachment else {
+            viewer.typed.store(true, Ordering::SeqCst);
+            continue;
+        };
+        if attachment
+            .write_raw(&buf[..n], &cancelled, Arc::clone(&started))
+            .is_err()
+        {
+            // A takeover is reported by the paint side; anything else here.
+            if !attachment.displaced().unwrap_or(false) {
+                viewer.input_failed.store(true, Ordering::SeqCst);
+            }
+            break;
         }
     }
-    gone.store(true, Ordering::SeqCst);
+    viewer.gone.store(true, Ordering::SeqCst);
 }
 
 /// What the viewer sees when it types into a read-only view.
 pub(super) const READ_ONLY_NOTICE: &str =
-    "[remuda] read-only view: input to host-backed sessions is not supported yet (detach with your usual key)";
+    "[remuda] read-only view: this session's host is too old to accept input (detach with your usual key)";
 
 /// The terminal bytes that turn `before` (none: a blank, unknown terminal)
 /// into `after`.

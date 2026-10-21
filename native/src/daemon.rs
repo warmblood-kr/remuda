@@ -3052,8 +3052,17 @@ fn attach_status(
         (Some(session), _) => Response::AttachStatus {
             taken_over: session.was_attachment_taken_over(generation),
         },
-        // A read-only view of a host-backed session is never displaced.
-        (None, Some(_)) => Response::AttachStatus { taken_over: false },
+        // A host reports its newest grant; a read-only view (0) is never
+        // displaced, and a live session is the only one that can be.
+        (None, Some(handle)) => Response::AttachStatus {
+            taken_over: generation > 0
+                && handle.inspect().is_ok_and(|observation| {
+                    observation.lifecycle == remuda_core::session_operations::Lifecycle::Running
+                        && observation
+                            .attach_generation
+                            .is_some_and(|newest| newest > generation)
+                }),
+        },
         (None, None) => Response::error(format!("no such session: {name}")),
     };
     reply(stream, &response)
@@ -4535,6 +4544,7 @@ mod tests {
                 attached: false,
                 closing: false,
                 host_build: Some("test-host".into()),
+                attach_generation: None,
             })
         };
         let pids = super::hosted_child_pids([

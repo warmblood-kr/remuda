@@ -1992,6 +1992,11 @@ impl Session {
     }
 
     /// Whether a live session has advanced beyond a tracked attachment.
+    /// The generation of the newest attach, taken over or not.
+    pub fn last_attach_generation(&self) -> u64 {
+        self.last_attach_generation.load(Ordering::SeqCst)
+    }
+
     pub fn was_attachment_taken_over(&self, generation: u64) -> bool {
         self.is_alive() && self.last_attach_generation.load(Ordering::SeqCst) > generation
     }

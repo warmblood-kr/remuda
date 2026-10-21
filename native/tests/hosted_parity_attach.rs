@@ -183,27 +183,74 @@ fn attaching_to_a_missing_session_is_refused_in_both_backends() {
     }
 }
 
-/// Known gap (#713): a host-backed attach is read-only for now. Typing shows
-/// a notice there instead of reaching the child; in-process it reaches it.
-/// When hosted input lands, both arms become the in-process one.
 #[test]
-fn typing_into_an_attach_in_both_backends() {
+fn typing_into_an_attach_reaches_the_child_in_both_backends() {
     for mode in MODES {
         let daemon = Parity::start(mode);
         daemon.shell("sh");
         let mut viewer = Viewer::attach(&daemon, "sh");
+        assert!(attached(&daemon, "sh"), "{mode:?}: not marked attached");
         viewer.type_keys(b"echo TYPED:$((5+6))\r");
-        match mode {
-            Mode::InProcess => {
-                viewer.wait_for("TYPED:11");
-                daemon.wait_for("sh", "TYPED:11");
-            }
-            Mode::Hosted => {
-                viewer.wait_for("read-only view");
-                std::thread::sleep(Duration::from_millis(300));
-                assert!(!daemon.screen("sh").contains("TYPED"), "{mode:?}");
-            }
+        viewer.wait_for("TYPED:11");
+        daemon.wait_for("sh", "TYPED:11");
+        // Keystrokes one at a time keep their order.
+        for key in b"echo ORDER:$((7*8))\r" {
+            viewer.type_keys(&[*key]);
         }
+        viewer.wait_for("ORDER:56");
+
+        // Typed input leaves nothing behind that would hold up a close.
+        drop(viewer);
+        let deadline = Instant::now() + PATIENCE;
+        while attached(&daemon, "sh") {
+            assert!(Instant::now() < deadline, "{mode:?}: still attached");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            daemon.request(&Request::Close {
+                name: "sh".into(),
+                instance_id: None,
+                confirm: None,
+            }),
+            Response::Ok,
+            "{mode:?}"
+        );
+        let deadline = Instant::now() + PATIENCE;
+        while matches!(daemon.request(&Request::List), Response::Sessions(s) if !s.is_empty()) {
+            assert!(
+                Instant::now() < deadline,
+                "{mode:?}: close left the session listed"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[test]
+fn a_second_attach_takes_over_the_first_in_both_backends() {
+    for mode in MODES {
+        let daemon = Parity::start(mode);
+        daemon.shell("sh");
+        let mut first = Viewer::attach(&daemon, "sh");
+        let mut second = Viewer::attach(&daemon, "sh");
+        assert!(second.generation > first.generation, "{mode:?}");
+        first.wait_for("attached elsewhere");
+        first.wait_ended();
+        assert_eq!(
+            daemon.request(&Request::AttachStatus {
+                name: "sh".into(),
+                generation: first.generation,
+            }),
+            Response::AttachStatus { taken_over: true },
+            "{mode:?}"
+        );
+        // Only the new holder types.
+        second.type_keys(b"echo SECOND:$((8+9))\r");
+        second.wait_for("SECOND:17");
+        // Its stream has ended, so the write may simply fail.
+        let _ = first.stream.write_all(b"echo FIRST:$((9+9))\r");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!daemon.screen("sh").contains("FIRST:18"), "{mode:?}");
     }
 }
 
