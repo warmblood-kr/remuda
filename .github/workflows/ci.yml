@@ -121,6 +121,30 @@ jobs:
           fetch-depth: 0
       - run: BUTLER_REPO="$GITHUB_WORKSPACE/remuda-butler" scripts/check-butler-contract.sh
 
+  host-compat-n-plus-one:
+    # A reload replaces the daemon while session hosts keep running, so a
+    # daemon and a host from adjacent builds must work in both directions.
+    # N is the commit this change lands on; N+1 is this checkout. One daemon
+    # creates a hosted session, dies, and the other build adopts it.
+    # Planting an AcquireWriter sent without the capability check, or a host
+    # that refuses a plain Acquire, turns one direction red (steps/061).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build N from the base commit
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          git worktree add "$RUNNER_TEMP/base" "$BASE"
+          cargo build --manifest-path "$RUNNER_TEMP/base/Cargo.toml" --bins --target-dir "$RUNNER_TEMP/base-target"
+          mkdir "$RUNNER_TEMP/n"
+          cp "$RUNNER_TEMP/base-target/debug/remuda" "$RUNNER_TEMP/base-target/debug/remuda-session-host" "$RUNNER_TEMP/n/"
+      - name: N/N+1 in both directions
+        run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test session_host_daemon -- --ignored n_plus_one
+
   principles-are-documented:
     # PRINCIPLES.md §2: a gate nobody has watched go red is a claim, not a
     # control. This applies to the principles document about itself — every

@@ -44,6 +44,12 @@ impl Fence {
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
+    pub fn writer(&self) -> crate::session_host::api::Writer {
+        crate::session_host::api::Writer {
+            store: self.store,
+            epoch: self.epoch,
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

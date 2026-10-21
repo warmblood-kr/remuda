@@ -330,8 +330,9 @@ impl HostSession {
             ),
         }
     }
-    /// Non-input control (resize, close, stop) is not reserved in the store,
-    /// so a superseded owner is refused here, before it takes the lease.
+    /// Non-input control (resize, close, stop) is not reserved in the store.
+    /// A fencing host refuses a superseded owner atomically; the store check
+    /// below is the only guard on an older host without writer-fence-v1.
     fn controller(&self) -> Result<Client> {
         if !self.owner.current().map_err(store)? {
             return Err(Error::Unavailable(Unavailable::Recovering));
@@ -341,7 +342,7 @@ impl HostSession {
             let mut client =
                 Client::open_expected(&self.endpoint, Role::Control, self.identity.clone())
                     .map_err(opened)?;
-            match client.request(&Request::Acquire).map_err(transport)? {
+            match client.acquire(self.owner.writer()).map_err(transport)? {
                 Response::Granted { .. } => return Ok(client),
                 Response::Error { code } if code == "controller_busy" && Instant::now() < until => {
                     std::thread::sleep(POLL);
@@ -716,7 +717,7 @@ fn refused(code: &str) -> Error {
     match code {
         "controller_busy" | "snapshot_budget_busy" => Error::Agent(AgentError::Busy),
         // A stopping or unpublished host is not an exited session.
-        "host_stopping" | "host_publication_pending" | "host_unavailable" => {
+        "host_stopping" | "host_publication_pending" | "host_unavailable" | "superseded_writer" => {
             Error::Unavailable(Unavailable::Recovering)
         }
         _ => Error::Protocol("host refused the operation"),
