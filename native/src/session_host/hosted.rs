@@ -170,7 +170,7 @@ impl Hosting {
         registry
             .register_hosted(handle)
             .map(|_| ())
-            .map_err(|_| format!("session name already in use: {}", request.name))
+            .map_err(|_| format!("name taken: {}", request.name))
     }
 
     /// Claim the inventory again under a newer epoch, then show every open
@@ -320,13 +320,10 @@ impl Hosts {
         // Checked before the durable reservation, which a missing binary
         // would otherwise leave behind under this name.
         let exe = host_executable()?;
-        if self
-            .owner
-            .index()
-            .map_err(|error| format!("session host inventory: {error:?}"))?
-            .entries
-            .contains_key(request.name)
-        {
+        // A name the registry no longer holds can still have an entry while
+        // its closed host is torn down. Wait for that, as a close of an
+        // in-process session frees its name at once.
+        if !self.wait_released(request.name)? {
             return Err(format!(
                 "session name {} is still held by a closing host-backed session",
                 request.name
@@ -401,6 +398,26 @@ impl Hosts {
                 "session host {} ended before it published ({status})",
                 exe.display()
             )),
+        }
+    }
+    /// True once `name` has no inventory entry, waiting up to the teardown
+    /// deadline for a closing host to retire it.
+    fn wait_released(&self, name: &str) -> Result<bool, String> {
+        let until = Instant::now() + TEARDOWN_DEADLINE;
+        loop {
+            let held = self
+                .owner
+                .index()
+                .map_err(|error| format!("session host inventory: {error:?}"))?
+                .entries
+                .contains_key(name);
+            if !held {
+                return Ok(true);
+            }
+            if Instant::now() >= until {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
     fn published(&self, name: &str, exit: &mpsc::Receiver<ExitStatus>) -> Result<(), Published> {
