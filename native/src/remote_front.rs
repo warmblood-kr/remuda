@@ -236,7 +236,8 @@ fn write_response(stream: &mut crate::ipc::Stream, reply: Vec<u8>) -> std::io::R
 }
 
 /// Explicit request allowlist; new variants need a policy decision.
-/// Threat model: Sync is read-only and bounded; Eval and writes stay refused.
+/// Threat model: Sync is read-only and bounded; New starts only the default
+/// shell; Eval, arbitrary commands and raw writes stay refused.
 pub fn authorize(request: &Request) -> Result<(), String> {
     match request {
         Request::List | Request::CaptureStyled { .. } | Request::Sync { .. } => Ok(()),
@@ -262,8 +263,26 @@ pub fn authorize(request: &Request) -> Result<(), String> {
             }
             validate_batch(client_id, *seq, bytes).map(|_| ())
         }
-        Request::New { .. } => Err(refusal("New")),
-        Request::NewWithInstance { .. } => Err(refusal("NewWithInstance")),
+        Request::New {
+            name,
+            command,
+            size,
+            cwd,
+            env,
+        }
+        | Request::NewWithInstance {
+            name,
+            command,
+            size,
+            cwd,
+            env,
+        } => authorize_new(
+            name.as_deref(),
+            command,
+            *size,
+            cwd.is_some(),
+            env.is_some(),
+        ),
         Request::SendLine { .. } => Err(refusal("SendLine")),
         Request::ClearInput { .. } => Err(refusal("ClearInput")),
         Request::Send { .. } => Err(refusal("Send")),
@@ -305,6 +324,52 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::SecretAnswer { .. } => Err(refusal("SecretAnswer")),
         Request::LineAnswer { .. } => Err(refusal("LineAnswer")),
     }
+}
+
+/// Longest session name a peer may choose.
+pub const MAX_REMOTE_SESSION_NAME_BYTES: usize = 64;
+
+/// A peer may start only this node's default shell: no command, working
+/// directory or environment of its own. What runs is the receiver's choice;
+/// the peer picks at most a name and the starting size.
+fn authorize_new(
+    name: Option<&str>,
+    command: &[String],
+    size: remuda_core::Size,
+    has_cwd: bool,
+    has_env: bool,
+) -> Result<(), String> {
+    if !command.is_empty() {
+        return Err(
+            "remote front starts only this node's default shell; a command is refused".into(),
+        );
+    }
+    if has_cwd || has_env {
+        return Err("remote front refuses a working directory or environment for New".into());
+    }
+    if let Some(name) = name {
+        if !valid_remote_session_name(name) {
+            return Err(format!(
+                "remote session name must be 1-{MAX_REMOTE_SESSION_NAME_BYTES} letters, digits, '-', '_' or '.'"
+            ));
+        }
+    }
+    // Decoding already clamps a size to at least 1x1; only the top is open.
+    if size.cols() > remuda_core::Size::MAX_RESIZE_COLS
+        || size.rows() > remuda_core::Size::MAX_RESIZE_ROWS
+    {
+        return Err("remote New size exceeds viewport limits".into());
+    }
+    Ok(())
+}
+
+fn valid_remote_session_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_REMOTE_SESSION_NAME_BYTES
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn refusal(variant: &str) -> String {
@@ -517,13 +582,83 @@ mod tests {
         );
     }
 
+    fn new_request(
+        name: Option<&str>,
+        command: Vec<String>,
+        size: remuda_core::Size,
+        cwd: Option<String>,
+        env: Option<std::collections::HashMap<String, String>>,
+    ) -> Request {
+        Request::New {
+            name: name.map(str::to_owned),
+            command,
+            size,
+            cwd,
+            env,
+        }
+    }
+
+    #[test]
+    fn remote_new_starts_only_the_default_shell() {
+        let size = remuda_core::Size::new(80, 24);
+        assert!(authorize(&new_request(None, vec![], size, None, None)).is_ok());
+        assert!(authorize(&new_request(Some("work-1.a_b"), vec![], size, None, None)).is_ok());
+        assert!(authorize(&Request::NewWithInstance {
+            name: None,
+            command: vec![],
+            size,
+            cwd: None,
+            env: None,
+        })
+        .is_ok());
+
+        let command = authorize(&new_request(None, vec!["claude".into()], size, None, None));
+        assert!(command.unwrap_err().contains("default shell"));
+        assert!(authorize(&new_request(None, vec![], size, Some("/".into()), None)).is_err());
+        let env = std::collections::HashMap::from([("PATH".to_owned(), "/tmp".to_owned())]);
+        assert!(authorize(&new_request(None, vec![], size, None, Some(env))).is_err());
+    }
+
+    #[test]
+    fn remote_new_names_and_sizes_are_bounded() {
+        let size = remuda_core::Size::new(80, 24);
+        let long = "a".repeat(MAX_REMOTE_SESSION_NAME_BYTES + 1);
+        for name in [
+            "",
+            ".hidden",
+            "has space",
+            "a/b",
+            "esc\x1b",
+            "탭",
+            long.as_str(),
+        ] {
+            assert!(
+                authorize(&new_request(Some(name), vec![], size, None, None)).is_err(),
+                "{name:?}"
+            );
+        }
+        let max = "a".repeat(MAX_REMOTE_SESSION_NAME_BYTES);
+        assert!(authorize(&new_request(Some(&max), vec![], size, None, None)).is_ok());
+        for (cols, rows) in [
+            (remuda_core::Size::MAX_RESIZE_COLS + 1, 24),
+            (80, remuda_core::Size::MAX_RESIZE_ROWS + 1),
+        ] {
+            let bad: remuda_core::Size =
+                serde_json::from_str(&format!(r#"{{"cols":{cols},"rows":{rows}}}"#)).unwrap();
+            assert!(
+                authorize(&new_request(None, vec![], bad, None, None)).is_err(),
+                "{cols}x{rows}"
+            );
+        }
+    }
+
     #[test]
     fn refuses_every_other_request_variant() {
         let dangerous = [
             Request::New {
                 name: None,
-                command: vec![],
-                size: Default::default(),
+                command: vec!["sh".into(), "-c".into(), "id".into()],
+                size: remuda_core::Size::new(80, 24),
                 cwd: None,
                 env: None,
             },

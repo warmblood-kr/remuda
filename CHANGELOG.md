@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Cluster: an admitted peer may now start a session on this node, but only
+  this node's default shell: no command, working directory or environment of
+  its own, a name of at most 64 letters, digits, `.`, `_` or `-`, and a size
+  within the resize limits. It is allowed only while `cluster control` is on,
+  at most 5 at once and then one every 10 seconds per peer, and each attempt
+  is written to the audit log as `create`. Before, every remote New was
+  refused.
+
 - Cluster: each node now keeps a local audit log of what peers asked it to
   do, in `cluster/audit.jsonl` in the private cluster state directory. Each
   line records when, which peer (by fingerprint), what (input, resize, close,
