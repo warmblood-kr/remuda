@@ -6,9 +6,10 @@
 //! the digest are unchanged, since peers still see the same `VfsIndex`.
 //!
 //! On first open, a format-1 `index.json` is imported in the same transaction
-//! that creates the table, and `PRAGMA user_version` becomes 1. The JSON file
-//! is left untouched (an older binary reads only it); `export_json` writes it
-//! again from the database before a downgrade.
+//! that creates the table. The JSON file is left untouched (an older binary
+//! reads only it); `export_json` writes it again before a downgrade. If it
+//! changes later, say an older binary wrote it after a downgrade, the next
+//! open merges it again: per path, the higher version wins, as between peers.
 //!
 //! `u64` fields are stored bit-cast to SQLite's `i64` and cast back, so every
 //! value a peer can send round-trips exactly.
@@ -40,12 +41,10 @@ pub(super) fn open(root: &Path) -> VfsResult<Connection> {
     let tx = immediate(&mut conn)?;
     let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     match version {
-        SCHEMA_VERSION => {}
+        SCHEMA_VERSION => merge_legacy(&tx, root)?,
         0 => {
             create_schema(&tx)?;
-            if let Some(index) = read_legacy(root)? {
-                index.entries.values().try_for_each(|entry| upsert(&tx, entry))?;
-            }
+            merge_legacy(&tx, root)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         newer => {
@@ -76,6 +75,55 @@ fn create_schema(tx: &Transaction<'_>) -> VfsResult<()> {
              deleted  INTEGER NOT NULL,
              mtime    INTEGER NOT NULL
          ) WITHOUT ROWID;",
+    )?;
+    Ok(())
+}
+
+/// Merge `index.json` when its size or mtime differs from the last merge or
+/// export. Entries a row already supersedes are skipped.
+fn merge_legacy(tx: &Transaction<'_>, root: &Path) -> VfsResult<()> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL) WITHOUT ROWID;",
+    )?;
+    let Some(stamp) = legacy_stamp(root)? else {
+        return Ok(());
+    };
+    let seen: Option<String> = tx
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'legacy_stamp'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if seen.as_deref() == Some(stamp.as_str()) {
+        return Ok(());
+    }
+    for entry in read_legacy(root)?.unwrap_or_default().entries.into_values() {
+        if get(tx, &entry.path)?.is_none_or(|current| entry.supersedes(&current)) {
+            upsert(tx, &entry)?;
+        }
+    }
+    record_stamp(tx, &stamp)
+}
+
+fn legacy_stamp(root: &Path) -> VfsResult<Option<String>> {
+    match fs::metadata(root.join(LEGACY_FILE)) {
+        Ok(meta) => {
+            let mtime = meta
+                .modified()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            Ok(Some(format!("{}:{}", meta.len(), mtime.as_nanos())))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn record_stamp(conn: &Connection, stamp: &str) -> VfsResult<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('legacy_stamp', ?1)",
+        [stamp],
     )?;
     Ok(())
 }
@@ -111,6 +159,9 @@ pub(super) fn export_json(conn: &Connection, root: &Path) -> VfsResult<usize> {
     };
     let bytes = serde_json::to_vec(&file).map_err(io::Error::other)?;
     storage::atomic_write(&root.join(LEGACY_FILE), &bytes)?;
+    if let Some(stamp) = legacy_stamp(root)? {
+        record_stamp(conn, &stamp)?;
+    }
     Ok(file.entries.len())
 }
 
@@ -276,13 +327,25 @@ mod tests {
     }
 
     #[test]
-    fn the_import_runs_once_and_the_json_file_is_no_longer_read() {
+    fn a_json_index_written_after_a_downgrade_merges_and_older_entries_lose() {
         let scratch = Scratch::new();
-        write_legacy(&scratch.root(), vec![entry(1, false)]);
-        let store = VfsStore::open_at(&scratch.root()).unwrap();
-        assert_eq!(store.load_index().unwrap().entries.len(), 1);
-        write_legacy(&scratch.root(), vec![entry(1, false), entry(2, false)]);
-        assert_eq!(store.load_index().unwrap().entries.len(), 1);
+        let root = scratch.root();
+        write_legacy(&root, vec![entry(1, false)]);
+        let store = VfsStore::open_at(&root).unwrap();
+        store.put("new.txt", b"new", 2, "SHA256:me").unwrap();
+        assert_eq!(store.export_legacy_index().unwrap(), 2);
+        // The exported file is not merged back; a newer row is not undone.
+        store.delete("new.txt", "SHA256:me").unwrap();
+        assert!(store.load_index().unwrap().entries["new.txt"].deleted);
+        // An older binary then writes a file after the downgrade.
+        let mut after = read_legacy(&root).unwrap().unwrap();
+        let mut late = entry(2, false);
+        late.version = 1_000;
+        after.merge(late.clone());
+        write_legacy(&root, after.entries.into_values().collect());
+        let index = store.load_index().unwrap();
+        assert_eq!(index.entries[&late.path], late);
+        assert!(index.entries["new.txt"].deleted, "a stale live entry won");
     }
 
     #[test]
