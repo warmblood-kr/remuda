@@ -161,10 +161,12 @@ fn processes_naming(root: &Path) -> Vec<i32> {
     else {
         return Vec::new();
     };
-    let root = root.to_string_lossy();
+    // With the separator: root `rhp-1-1` must not match `rhp-1-12`'s hosts,
+    // which belong to another test still running.
+    let root = format!("{}/", root.to_string_lossy());
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|line| line.contains(root.as_ref()) && line.contains("run-reserved"))
+        .filter(|line| line.contains(&root) && line.contains("run-reserved"))
         .filter_map(|line| line.split_whitespace().next()?.parse().ok())
         .collect()
 }
