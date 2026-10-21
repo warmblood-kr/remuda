@@ -1,6 +1,8 @@
 # Schema migrations: prior art survey for remuda (SQLite, daemon-only, plain SQL)
 
 Date: 2026-10-22. Context: remuda bundles rusqlite 0.40.2 / libsqlite3-sys 0.38.2 = **SQLite 3.53.2**
+Unverified against docs (from memory): Alembic's "Can't locate revision" text, goose's
+`goose_db_version` table, Flyway `repair` details. The rest was checked against the cited docs/source.
 (checked in `~/.cargo/registry/.../sqlite3.h`), so `RENAME COLUMN` (3.25), `DROP COLUMN` (3.35)
 and `ALTER COLUMN … SET/DROP NOT NULL` (3.53) are all available.
 
