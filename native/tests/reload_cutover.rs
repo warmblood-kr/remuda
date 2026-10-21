@@ -346,3 +346,29 @@ fn a_candidate_that_hangs_after_take_is_killed_at_its_deadline_and_rolled_back()
     );
     still_the_old_daemon(&root, &mut old);
 }
+
+/// `remuda.daemon.reloaded_from()` names the daemon this one took over
+/// from, so a mod can tell a reload from a fresh start.
+#[test]
+fn the_new_daemon_names_the_daemon_it_took_over_from() {
+    let root = Root::new("from");
+    let path = root.socket();
+    let mut old = Daemon::spawn(&root, true, &[]);
+    let ask = |path: &Path| {
+        request(
+            path,
+            &Request::Eval {
+                code: "return tostring(remuda.daemon.reloaded_from())".into(),
+                name: None,
+            },
+        )
+    };
+    assert_eq!(ask(&path), Response::Value("nil".into()));
+    let old_pid = old.0.id();
+
+    let out = root.remuda(&["reload"]);
+    assert!(out.status.success(), "{:?}", text(&out));
+    assert!(old.exited(), "the old daemon did not exit cleanly");
+    assert_ne!(root.lock_pid(), old_pid);
+    assert_eq!(ask(&path), Response::Value(old_pid.to_string()));
+}

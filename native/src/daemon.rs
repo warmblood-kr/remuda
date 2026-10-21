@@ -296,6 +296,10 @@ pub(crate) fn socket_publication() -> String {
         .unwrap_or_else(|| "legacy: not recorded".into())
 }
 
+/// The pid of the daemon this one took over from in a reload; unset when
+/// it started fresh. `remuda.daemon.reloaded_from()` reads it.
+pub(crate) static RELOADED_FROM: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
 /// Set once per daemon from `<socket>.daemon-id`; see `daemon_instance_id`.
 static DAEMON_INSTANCE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
