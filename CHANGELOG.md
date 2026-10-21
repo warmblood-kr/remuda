@@ -27,6 +27,8 @@
     old daemon takes everything back and keeps serving, and `reload` exits
     1.
   - In-process sessions still block a reload.
+  - Lua: `remuda.daemon.reloaded_from()` returns the pid of the daemon this
+    one took over from, or nil after a fresh start.
 
 - Lua and CLI: schema migrations for mod databases (#778). A mod ships
   numbered plain-SQL steps (`migrations/NAME/0001_create.up.sql`, an

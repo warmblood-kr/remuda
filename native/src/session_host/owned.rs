@@ -148,7 +148,8 @@ impl Owned {
         if rows < 24 || cols < 20 {
             return Err(Error::Invalid("host resize minimum is 20x24"));
         }
-        super::terminal::Terminal::validate_geometry(rows, cols, 1000).map_err(Error::Invalid)?;
+        super::terminal::Terminal::validate_geometry(rows, cols, super::terminal::HISTORY_ROWS)
+            .map_err(Error::Invalid)?;
         let token = self.coordinator.lock().unwrap().begin_mutation(fence)?;
         let result = self.session.resize(Size::for_pane(cols, rows));
         self.coordinator.lock().unwrap().finish_mutation(token)?;
