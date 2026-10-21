@@ -122,6 +122,10 @@ limit.
 | `ClusterVfsIndexUpdate {entries_json}` | ack and index digest |
 | `ClusterVfsBlobStat {hashes}` | which of ≤ 64 hashes this node holds |
 | `ClusterVfsBlobGet {sha256, offset}` | ≤ 1 MiB chunk, total size |
+| `ClusterVfsTake {hashes}` | ack; this node pulls and keeps those of ≤ 64 live blobs it lacks |
+
+Change pages list `caps`: the requests beyond this table's base set that the
+peer serves. `ClusterVfsTake` is sent only to a peer listing `take`.
 
 Index pull uses change cursors (#778): every row change takes the next
 `seq` (merged rows too, so changes relay), and a node keeps a cursor per peer
@@ -183,6 +187,13 @@ marked as a stand-in (`vfs/stand-ins/<sha256>`). Once this node is outside
 the placement again and every placement node confirms a copy by `BlobStat`,
 the pass deletes it. Copies this node wrote, kept conflicts, and copies read
 with `get` stay; `resolve` clears the mark, since a tool may hold the path.
+
+Before a node leaves, `remuda vfs drain` works out, for each blob it holds,
+the placement without itself, and asks each placement node that lacks it to
+take it (`ClusterVfsTake`). It repeats until every such node confirms by
+`BlobStat`, or `--timeout` passes (exit 75). A peer too old to take copies is
+named. Drain revokes nothing: it then says to run `remuda cluster revoke`
+on another node. Taken copies are not stand-ins and are never trimmed.
 
 The writer always keeps its own copy, even outside the placement. GC removes a
 blob that no live entry references and whose file is older than 24 h. The age
