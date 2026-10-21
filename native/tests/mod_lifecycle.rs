@@ -1952,8 +1952,14 @@ fn failed_reload_resumes_cached_module_without_rebuilding_registrations() {
 #[test]
 fn a_mod_opens_databases_in_its_own_namespace_and_eval_code_gets_none() {
     let home = DataHome::new();
-    let old_state = std::env::var_os("XDG_STATE_HOME");
-    std::env::set_var("XDG_STATE_HOME", home.root.join("state"));
+    // The state dir is XDG_STATE_HOME on Unix and LOCALAPPDATA on Windows.
+    let state_var = if cfg!(windows) {
+        "LOCALAPPDATA"
+    } else {
+        "XDG_STATE_HOME"
+    };
+    let old_state = std::env::var_os(state_var);
+    std::env::set_var(state_var, home.root.join("state"));
     let manifest = home.root.join("remuda/mods/sample/extension.toml");
     fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
     fs::write(
@@ -1992,8 +1998,8 @@ fn a_mod_opens_databases_in_its_own_namespace_and_eval_code_gets_none() {
     let file = home.root.join("state/remuda/db/sample/notes.db");
     let exists = file.is_file();
     match old_state {
-        Some(old) => std::env::set_var("XDG_STATE_HOME", old),
-        None => std::env::remove_var("XDG_STATE_HOME"),
+        Some(old) => std::env::set_var(state_var, old),
+        None => std::env::remove_var(state_var),
     }
     assert_eq!(count, "1");
     assert!(outside.starts_with("nil no_mod: "), "{outside}");
