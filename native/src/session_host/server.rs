@@ -577,7 +577,7 @@ impl Connection {
             // Register before capture; no output/ACK/wait handoff gap.
             self.latest = Some(super::latest::Latest::new(&self.server.host.view)?);
         }
-        let permit = self
+        let mut permit = self
             .server
             .snapshots
             .acquire(self.id, Instant::now())
@@ -589,6 +589,7 @@ impl Connection {
             .map_err(|_| "snapshot_id_exhausted")?;
         let (generation, bytes, rows, cols) = self.capture(offset)?;
         let pages = bytes.len().div_ceil(PAGE);
+        permit.charge(pages);
         let response = if offset.is_some() {
             Response::Viewport {
                 identity: self.server.host.identity(),
