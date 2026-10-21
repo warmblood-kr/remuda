@@ -786,6 +786,8 @@ mod tests {
             writer: "SHA256:w".into(),
             deleted: false,
             mtime: 0,
+            vv: Default::default(),
+            conflicts: Vec::new(),
         }
     }
 
@@ -1132,6 +1134,34 @@ mod tests {
         pull_from(&b, &a, "SHA256:a");
         assert_eq!(pull_from(&c, &b, "SHA256:b").0, 1);
         assert!(c.load_index().unwrap().live("from-a.txt").is_some());
+    }
+
+    #[test]
+    fn concurrent_writes_end_as_one_winner_and_one_conflict_on_every_node() {
+        let (_a, a) = scratch_store();
+        let (_b, b) = scratch_store();
+        let (_c, c) = scratch_store();
+        a.put("same.txt", b"from a", 2, "SHA256:a").unwrap();
+        b.put("same.txt", b"from b", 2, "SHA256:b").unwrap();
+        pull_from(&a, &b, "SHA256:b");
+        pull_from(&b, &a, "SHA256:a");
+        // C only talks to B, and still learns about the conflict.
+        pull_from(&c, &b, "SHA256:b");
+        let entries: Vec<VfsEntry> = [&a, &b, &c]
+            .iter()
+            .map(|store| store.load_index().unwrap().entries["same.txt"].clone())
+            .collect();
+        assert_eq!(entries[0], entries[1]);
+        assert_eq!(entries[1], entries[2]);
+        assert_eq!(
+            entries[0].writer, "SHA256:b",
+            "the usual tie-break still wins"
+        );
+        assert_eq!(entries[0].conflicts.len(), 1);
+        assert_eq!(entries[0].conflicts[0].writer, "SHA256:a");
+        // Pulling again changes nothing anywhere.
+        assert_eq!(pull_from(&a, &b, "SHA256:b").0, 0);
+        assert_eq!(pull_from(&c, &b, "SHA256:b").0, 0);
     }
 
     #[test]
