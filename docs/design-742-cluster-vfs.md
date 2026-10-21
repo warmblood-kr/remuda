@@ -28,11 +28,25 @@ created with the same hardened helpers as the rest of `cluster/`):
 
 ```
 vfs/blobs/<aa>/<64-hex>   immutable content; name = sha256(content)
-vfs/index.json            name index (all entries, see below)
+vfs/index.db              name index in SQLite, one row per entry (#778)
+vfs/index.db-wal, -shm    SQLite's write-ahead log and its shared index
+vfs/index.json            format-1 index of older remuda; imported once
 vfs/vfs.json              local settings: cluster name, default replicas
 vfs/synced_at             unix time a peer index was last merged here
 vfs/identity.lock         the cluster StateLock, held for index writes
 ```
+
+The index is a SQLite database (`index.db`, WAL mode, `PRAGMA user_version`
+1). A write changes only its own rows, in one transaction. All three SQLite
+files are 0600 (owner-only ACL on Windows). On first open, an existing
+`index.json` is imported in the transaction that creates the table; the JSON
+file is then left as it was and no longer read. Peers see no change: entries,
+digest and messages are the same as before.
+
+Downgrade: an older remuda reads only `index.json`, which still holds the
+index as it was at the upgrade. `VfsStore::export_legacy_index` writes it
+again from the database first (the CLI for it comes with the daemon-owned
+step).
 
 Blobs are written to a temporary file, hashed, then renamed into place, so a
 blob file is never partial. A read verifies the hash again before returning.

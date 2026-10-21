@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- VFS: the name index is now a SQLite database, `vfs/index.db` (#778). A
+  write changes only its own row instead of rewriting the whole
+  `index.json`, and a crash cannot lose a committed write. On first use an
+  existing `index.json` is imported once and then left untouched, so an
+  older remuda still finds the index as it was at the upgrade. Peers see no
+  difference: the entries, the digest and the messages are the same, so
+  upgraded and older nodes sync with each other as before.
+
 - SQLite is now built into the binary (`rusqlite`, bundled; #778). Nothing
   uses it yet: it is the base for a daemon-owned VFS index and for Lua
   databases. A database opened through it keeps its file, `-wal` and `-shm`
