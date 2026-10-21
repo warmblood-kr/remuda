@@ -60,9 +60,38 @@ impl Root {
 }
 impl Drop for Root {
     fn drop(&mut self) {
-        let _ = Command::new("/usr/bin/pkill")
-            .args(["-KILL", "-f", &self.0.to_string_lossy()])
-            .status();
+        // By checked pid, never by pattern. Hosts name the root in argv; a
+        // daemon that took over runs as `remuda -s s daemon`, which names
+        // no root, so the lock names it instead.
+        let ps = Command::new("/bin/ps")
+            .args(["-A", "-o", "pid=", "-o", "args="])
+            .output()
+            .unwrap();
+        let needle = format!("{}/", self.0.display());
+        let mut pids: Vec<i32> = String::from_utf8_lossy(&ps.stdout)
+            .lines()
+            .filter(|line| line.contains(&needle))
+            .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+            .collect();
+        let mut lock = self.socket().into_os_string();
+        lock.push(".lock");
+        if let Some(pid) = std::fs::read_to_string(lock)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+        {
+            let args = Command::new("/bin/ps")
+                .args(["-o", "args=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let args = String::from_utf8_lossy(&args.stdout);
+            if args.contains("remuda") && args.trim_end().ends_with(" daemon") {
+                pids.push(pid);
+            }
+        }
+        for pid in pids {
+            // SAFETY: a signal to a pid just checked as under this root.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -125,7 +154,8 @@ fn new_session(path: &Path, name: &str) {
             command: vec!["/bin/sh".into()],
             size: Size::new(80, 24),
             cwd: Some("/".into()),
-            env: None,
+            // No history file lands in the root after it is removed.
+            env: Some([("HISTFILE".into(), "/dev/null".into())].into()),
         },
     );
     assert_eq!(made, Response::Value(name.into()));
