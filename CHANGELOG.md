@@ -7,6 +7,13 @@
   moved, and loaded `init.lua`. An `init.lua` that fails only in the new
   daemon, for example one edited since the old daemon started, is named and
   `reload` exits 1. The reload itself has gone through.
+
+- VFS: only the daemon that serves the socket writes the index, also during
+  `remuda reload` (#778, #713). The new daemon claims `index.db` just
+  before it serves; a rollback gives it back to the old daemon. A write on
+  the replaced daemon fails with `superseded` and a hint to run the command
+  again. Before, both daemons could write while they overlapped.
+
 - `remuda reload` (experimental, Unix) replaces the running daemon with the
   installed remuda without closing a host-backed session.
   - The old daemon checks the new build as for `--check`, then hands it the
@@ -17,6 +24,8 @@
     old daemon takes everything back and keeps serving, and `reload` exits
     1.
   - In-process sessions still block a reload.
+  - Lua: `remuda.daemon.reloaded_from()` returns the pid of the daemon this
+    one took over from, or nil after a fresh start.
 
 - Lua and CLI: schema migrations for mod databases (#778). A mod ships
   numbered plain-SQL steps (`migrations/NAME/0001_create.up.sql`, an
