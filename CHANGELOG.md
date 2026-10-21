@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Session hosts (experimental): `remuda stop` now lets an act a host is
+  already running finish and answers it, instead of hanging up on it. New
+  host-backed input, resize and close are refused while the daemon drains.
+  `stop` still returns at once, and hosts keep running. Before, such an act
+  answered "the daemon hung up without answering" and was left for the next
+  daemon to resolve.
+
 - VFS: a node now checks a blob's hash before it serves the first chunk to a
   peer. A damaged copy is removed and refused (`corrupt`), so the peer tries
   another holder and this node's repair pass fetches a good copy. Before,

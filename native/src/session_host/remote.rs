@@ -45,6 +45,7 @@ pub(crate) struct HostSession {
     endpoint: PathBuf,
     client: [u8; 16],
     acts: Mutex<()>,
+    gate: Arc<super::gate::Gate>,
 }
 impl HostSession {
     /// `client` is the daemon's stable input identity for this host incarnation.
@@ -68,9 +69,16 @@ impl HostSession {
             endpoint: PathBuf::from(birth.endpoint()),
             client,
             acts: Mutex::new(()),
+            gate: Arc::default(),
         };
         session.identity().validate()?;
         Ok(session)
+    }
+    /// Admit this session's acts and control calls through `gate`, so a
+    /// daemon drain can stop and wait for them.
+    pub fn gated(mut self, gate: Arc<super::gate::Gate>) -> Self {
+        self.gate = gate;
+        self
     }
     fn target(&self) -> Target {
         Target {
@@ -99,6 +107,7 @@ impl HostSession {
     /// Run one whole act: reserve, drive through the host, then publish receipt.
     fn act(&self, act: InputAct) -> Result<Completion> {
         act.validate().map_err(Error::Protocol)?;
+        let _pass = self.gate.enter()?;
         let deadline = ACT_DEADLINE + Duration::from_millis(pauses(&act));
         let _serial = self.acts.lock().unwrap_or_else(|e| e.into_inner());
         // An unreachable host is a clean refusal while nothing is reserved yet.
@@ -352,6 +361,7 @@ impl HostSession {
         }
     }
     fn control(&self, request: Request) -> Result<()> {
+        let _pass = self.gate.enter()?;
         let mut client = self.controller()?;
         match client.request(&request).map_err(transport)? {
             Response::Ok => Ok(()),

@@ -8,6 +8,7 @@
 use super::api::Identity as HostIdentity;
 use super::birth::Bootstrap;
 use super::entry::Launch;
+use super::gate::{Drained, Gate};
 use super::inventory::disk::Store;
 use super::inventory::model::{Birth, Entry, Lease, Phase, Target};
 use super::recovery::Owner;
@@ -56,10 +57,12 @@ pub fn opted_in() -> bool {
 pub struct Hosting {
     root: PathBuf,
     hosts: Mutex<Option<Arc<Hosts>>>,
+    gate: Arc<Gate>,
 }
 struct Hosts {
     owner: Arc<Owner>,
     root: PathBuf,
+    gate: Arc<Gate>,
     /// Opened handles by name, kept for teardown after the Registry drops one.
     open: Mutex<HashMap<String, Arc<HostSession>>>,
 }
@@ -79,6 +82,7 @@ impl Hosting {
         Self {
             root: socket.with_file_name(name),
             hosts: Mutex::new(None),
+            gate: Arc::default(),
         }
     }
     fn hosts(&self, create: bool) -> io::Result<Option<Arc<Hosts>>> {
@@ -105,6 +109,7 @@ impl Hosting {
         let opened = Arc::new(Hosts {
             owner: Arc::new(owner),
             root: self.root.clone(),
+            gate: Arc::clone(&self.gate),
             open: Mutex::new(HashMap::new()),
         });
         *hosts = Some(opened.clone());
@@ -159,6 +164,12 @@ impl Hosting {
             .map_err(|_| format!("session name already in use: {}", request.name))
     }
 
+    /// Stop admitting host-backed work, then wait up to `deadline` for acts,
+    /// control calls and host starts already admitted. Hosts keep running.
+    pub fn drain(&self, deadline: Duration) -> Drained {
+        self.gate.drain(deadline)
+    }
+
     /// After the Registry closed `name`: stop its host and retire its entry,
     /// off the request thread. Unknown names are ignored.
     pub fn retire_closed(&self, name: &str) {
@@ -181,7 +192,9 @@ impl Hosting {
 impl Hosts {
     fn open(&self, name: &str) -> Result<Arc<HostSession>, String> {
         let session = Arc::new(
-            HostSession::open(self.owner.clone(), name, CLIENT).map_err(|e| e.to_string())?,
+            HostSession::open(self.owner.clone(), name, CLIENT)
+                .map_err(|e| e.to_string())?
+                .gated(Arc::clone(&self.gate)),
         );
         self.open
             .lock()
@@ -198,6 +211,7 @@ impl Hosts {
         }
     }
     fn spawn(self: &Arc<Self>, request: &NewHosted<'_>) -> Result<Arc<HostSession>, String> {
+        let _pass = self.gate.enter().map_err(|error| error.to_string())?;
         let launch = launch(request)?;
         // Checked before the durable reservation, which a missing binary
         // would otherwise leave behind under this name.
