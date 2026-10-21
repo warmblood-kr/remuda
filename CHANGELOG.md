@@ -19,6 +19,12 @@
   with every key sent live, as before. Editing keys are the cluster
   composer's (`cluster.composer`), including Up/Down history.
 
+- VFS: upgrading again after a downgrade keeps the files the older remuda
+  wrote meanwhile (#778). If `index.json` changed since the last import or
+  `export-index`, the daemon merges it into `index.db` again; per path the
+  higher version wins. Before, the node's index missed those files until a
+  peer synced them back, and a lone node missed them for good.
+
 - Session hosts (experimental, internal): building blocks for `remuda reload`.
   A daemon can claim its session hosts again after another daemon claimed
   them, and every host it has open then refuses the other daemon at once.

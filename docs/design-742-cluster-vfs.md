@@ -46,7 +46,9 @@ digest and messages are the same as before.
 Downgrade: an older remuda reads only `index.json`, which still holds the
 index as it was at the upgrade. Before a downgrade, run
 `remuda vfs export-index`, which writes it again from the database; then
-stop the daemon and install the older remuda.
+stop the daemon and install the older remuda. On the next upgrade, a changed
+`index.json` (writes the older remuda made) is merged into the database again:
+per path the higher version wins, so a stale file cannot undo a newer write.
 
 Blobs are written to a temporary file, hashed, then renamed into place, so a
 blob file is never partial. A read verifies the hash again before returning.
