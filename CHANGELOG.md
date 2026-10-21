@@ -8,6 +8,11 @@
   `stop` still returns at once, and hosts keep running. Before, such an act
   answered "the daemon hung up without answering" and was left for the next
   daemon to resolve.
+- `remuda version --hosts` prints the daemon's build and the build of each
+  host-backed session's host (experimental session hosts, #713). Hosts
+  outlive daemons, so after an upgrade some sessions can still run on an
+  older host; these are marked, and unreachable hosts are named. Plain
+  `remuda version` is unchanged.
 
 - Session hosts (experimental): a host now refuses input, resize, close and
   stop from a daemon whose inventory writer epoch is older than one it has

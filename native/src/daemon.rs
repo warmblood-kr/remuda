@@ -1712,6 +1712,10 @@ fn handle_request(
 
         Request::Version => reply(&stream, &Response::Value(crate::dist::BUILD_VERSION.into())),
         Request::SocketPublication => reply(&stream, &Response::Value(socket_publication())),
+        Request::SessionHostBuilds => reply(
+            &stream,
+            &Response::SessionHostBuilds(registry.hosted_builds()),
+        ),
 
         Request::ClusterRegistrySync { .. }
         | Request::ClusterRegistryUpdate { .. }
@@ -4189,6 +4193,7 @@ mod tests {
                 mouse: remuda_core::agent::MouseState::default(),
                 attached: false,
                 closing: false,
+                host_build: Some("test-host".into()),
             })
         };
         let pids = super::hosted_child_pids([
