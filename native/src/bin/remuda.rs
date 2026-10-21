@@ -217,7 +217,7 @@ fn dispatch_cli_command(
         "lua" => lua_command(server, path, rest),
         "exec" => exec_cli_command(server, path, rest),
         "cluster" => cluster_command(server, path, rest),
-        "vfs" => remuda_native::vfs_cli::run(rest),
+        "vfs" => remuda_native::vfs_cli::run(server, path, rest),
         "mod" => match rest.first().copied() {
             Some("install") => mod_install_command(server, path, &rest[1..]),
             Some("list") => mod_list_command(&rest[1..]),
@@ -5244,7 +5244,6 @@ fn version_skew(argv: &[&str], path: &Path) -> Result<Option<String>, String> {
                 | "-V"
                 | "--version"
                 | "upgrade"
-                | "vfs"
         )
     ) || (argv.is_empty()
         && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()))

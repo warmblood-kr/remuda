@@ -467,6 +467,9 @@ pub fn request(path: &Path, request: &Request) -> std::io::Result<Response> {
         // Deferred extension replies are capped at 300 seconds by
         // remuda.pending; leave five seconds for delivery and scheduling.
         Request::Eval { .. } => Duration::from_secs(305),
+        // `put --wait` waits up to 60 s for copies, and `sync` pulls from
+        // every peer; leave room for both.
+        Request::Vfs { .. } => Duration::from_secs(125),
         _ => Duration::from_secs(10),
     };
     read_response_with_timeout(path, stream, client_timeout(timeout))

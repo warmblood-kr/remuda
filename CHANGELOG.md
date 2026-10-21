@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- VFS: `remuda vfs` commands now run in the daemon, which owns the index
+  (#778). With no daemon running, a command prints one line saying the
+  daemon is needed and exits 1; it does not start one, and it does not
+  touch the store. Start the daemon with `remuda run ...` or `remuda -e 1`.
+  `put` still reads its source and `get` still writes its destination in
+  your shell, so relative paths and stdin work as before. New:
+  `remuda vfs export-index` writes `index.json` from the database for an
+  older remuda; run it before a downgrade.
+
 - VFS: the name index is now a SQLite database, `vfs/index.db` (#778). A
   write changes only its own row instead of rewriting the whole
   `index.json`, and a crash cannot lose a committed write. On first use an
