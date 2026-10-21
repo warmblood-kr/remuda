@@ -571,6 +571,7 @@ impl SessionOperations for HostSession {
             mouse: activity.mouse,
             attached: activity.attached,
             closing: activity.closing,
+            host_build: Some(info.host_build),
         })
     }
     fn recover(&self, request: &RequestIdentity) -> Result<Recovery> {
