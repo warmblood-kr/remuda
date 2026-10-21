@@ -2232,6 +2232,8 @@ fn handle_request(
             &crate::vfs_cli::serve_request(&args, input_base64.as_deref()),
         ),
 
+        Request::Db { args } => reply(&stream, &crate::db_cli::serve_request(&args)),
+
         Request::SecretAnswer { .. } => reply(
             &stream,
             &Response::error("secret answer has no outstanding prompt"),

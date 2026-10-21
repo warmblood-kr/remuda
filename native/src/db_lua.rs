@@ -14,9 +14,13 @@
 //!   short read-mostly list, so a handle cannot open another file (the VFS
 //!   index included) or undo the limits.
 //!
+//! `opts.migrations` (the mod's `migrations/NAME/` files, or inline steps)
+//! runs `sqlite_migrate` before the handle is returned.
+//!
 //! Failures are `nil, "code: detail"`; Lua usage errors raise.
 
 use crate::cluster::storage;
+use crate::sqlite_migrate;
 use mlua::{Lua, Table, UserData, UserDataMethods, Value};
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::types::Value as SqlValue;
@@ -70,18 +74,19 @@ pub(crate) fn register(lua: &Lua, remuda: &Table) -> mlua::Result<()> {
         "_db_open",
         lua.create_function(
             |lua, (owner, name, opts): (String, String, Option<Table>)| {
-                let limits = limits_from(opts)?;
+                let limits = limits_from(opts.as_ref())?;
+                let migrations = migrations_from(opts.as_ref())?;
                 let root = match db_root() {
                     Ok(root) => root,
                     Err(error) => return failure(lua, format!("io: {error}")),
                 };
-                open_answer(lua, &root, &owner, &name, limits)
+                open_answer(lua, &root, &owner, &name, limits, migrations)
             },
         )?,
     )
 }
 
-fn db_root() -> std::io::Result<PathBuf> {
+pub(crate) fn db_root() -> std::io::Result<PathBuf> {
     let root = storage::cluster_state_dir()?.join("db");
     storage::private_directory(&root)?;
     Ok(root)
@@ -93,10 +98,19 @@ fn open_answer(
     owner: &str,
     name: &str,
     limits: Limits,
+    migrations: Migrations,
 ) -> mlua::Result<(Value, Value)> {
     check_identifier("mod", owner, true)?;
     check_identifier("database", name, false)?;
-    match open_db(&root.join(owner), name, limits) {
+    let steps = match migrations {
+        Migrations::None => Vec::new(),
+        Migrations::Steps(steps) => steps,
+        Migrations::Files => match migration_files(owner, name) {
+            Ok(steps) => steps,
+            Err(reason) => return failure(lua, reason),
+        },
+    };
+    match open_db(&root.join(owner), name, limits, &steps) {
         Ok(db) => Ok((Value::UserData(lua.create_userdata(db)?), Value::Nil)),
         Err(reason) => failure(lua, reason),
     }
@@ -122,7 +136,56 @@ fn check_identifier(what: &str, text: &str, dash: bool) -> mlua::Result<()> {
     }
 }
 
-fn limits_from(opts: Option<Table>) -> mlua::Result<Limits> {
+/// What `opts.migrations` asked for.
+pub enum Migrations {
+    None,
+    Files,
+    Steps(Vec<sqlite_migrate::Step>),
+}
+
+fn migrations_from(opts: Option<&Table>) -> mlua::Result<Migrations> {
+    let Some(opts) = opts else {
+        return Ok(Migrations::None);
+    };
+    let usage = || {
+        mlua::Error::runtime(
+            "remuda.db.open: migrations must be true or an array of { name = ..., up = ..., down = ... }",
+        )
+    };
+    match opts.get::<Value>("migrations")? {
+        Value::Nil | Value::Boolean(false) => Ok(Migrations::None),
+        Value::Boolean(true) => Ok(Migrations::Files),
+        Value::Table(list) => {
+            let mut steps = Vec::new();
+            for index in 1..=list.raw_len() {
+                let Value::Table(entry) = list.raw_get::<Value>(index)? else {
+                    return Err(usage());
+                };
+                steps.push(sqlite_migrate::Step {
+                    name: entry.get::<Option<String>>("name")?.ok_or_else(usage)?,
+                    up: entry.get::<Option<String>>("up")?.ok_or_else(usage)?,
+                    down: entry.get("down")?,
+                });
+            }
+            Ok(Migrations::Steps(steps))
+        }
+        _ => Err(usage()),
+    }
+}
+
+/// The installed mod's `migrations/NAME/` files.
+fn migration_files(owner: &str, name: &str) -> Result<Vec<sqlite_migrate::Step>, String> {
+    let dir = crate::packages::package_dir(owner)
+        .map_err(|error| format!("migration: {error}"))?
+        .ok_or_else(|| {
+            format!("migration: mod {owner} is not installed, so it has no migration files")
+        })?
+        .join("migrations")
+        .join(name);
+    sqlite_migrate::load_dir(&dir)
+}
+
+fn limits_from(opts: Option<&Table>) -> mlua::Result<Limits> {
     let mut limits = DEFAULT_LIMITS;
     let Some(opts) = opts else {
         return Ok(limits);
@@ -154,8 +217,14 @@ pub struct Db {
     limits: Limits,
 }
 
-fn open_db(dir: &Path, name: &str, limits: Limits) -> Result<Db, String> {
-    let conn = crate::sqlite::open(dir, &format!("{name}.db")).map_err(|e| format!("io: {e}"))?;
+fn open_db(
+    dir: &Path,
+    name: &str,
+    limits: Limits,
+    steps: &[sqlite_migrate::Step],
+) -> Result<Db, String> {
+    let file = format!("{name}.db");
+    let mut conn = crate::sqlite::open(dir, &file).map_err(|e| format!("io: {e}"))?;
     let page_size: i64 = conn
         .query_row("PRAGMA page_size", [], |row| row.get(0))
         .map_err(reason)?;
@@ -177,6 +246,16 @@ fn open_db(dir: &Path, name: &str, limits: Limits) -> Result<Db, String> {
         }),
     )
     .map_err(reason)?;
+    // Migrations get the ceiling's time; the size limit is the handle's.
+    *deadline
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(Instant::now() + Duration::from_millis(CEILING.timeout_ms));
+    let migrated = sqlite_migrate::upgrade(&mut conn, &file, steps, false);
+    *deadline
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    migrated.map_err(|error| migration_reason(error, limits))?;
     conn.authorizer(Some(authorize)).map_err(reason)?;
     Ok(Db {
         conn: RefCell::new(Some(conn)),
@@ -185,17 +264,40 @@ fn open_db(dir: &Path, name: &str, limits: Limits) -> Result<Db, String> {
     })
 }
 
+fn migration_reason(error: String, limits: Limits) -> String {
+    if error.contains("interrupted") {
+        format!(
+            "timeout: migrations ran longer than {} ms",
+            CEILING.timeout_ms
+        )
+    } else if error.contains("database or disk is full") {
+        format!(
+            "too_large: migrations reached the limit of {} bytes",
+            limits.max_bytes
+        )
+    } else {
+        error
+    }
+}
+
+/// The handle's reach. `user_version` and `_remuda_*` tables belong to the
+/// migration runner, so a handle may read them but not write them.
 fn authorize(context: AuthContext<'_>) -> Authorization {
     match context.action {
         AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
-        AuthAction::Pragma { pragma_name, .. } => {
-            if ALLOWED_PRAGMAS.contains(&pragma_name.to_ascii_lowercase().as_str()) {
+        AuthAction::Pragma {
+            pragma_name,
+            pragma_value,
+        } => {
+            let name = pragma_name.to_ascii_lowercase();
+            let writes_version = name == "user_version" && pragma_value.is_some();
+            if ALLOWED_PRAGMAS.contains(&name.as_str()) && !writes_version {
                 Authorization::Allow
             } else {
                 Authorization::Deny
             }
         }
-        _ => Authorization::Allow,
+        action => sqlite_migrate::deny_internal_write(action),
     }
 }
 
