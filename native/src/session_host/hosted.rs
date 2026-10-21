@@ -159,6 +159,39 @@ impl Hosting {
             .map_err(|_| format!("session name already in use: {}", request.name))
     }
 
+    /// Claim the inventory again under a newer epoch, fencing any daemon that
+    /// claimed since. No-op before this daemon opened its inventory.
+    pub fn reclaim(&self) -> io::Result<()> {
+        let hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        match hosts {
+            Some(hosts) => hosts
+                .owner
+                .reclaim()
+                .map_err(|error| io::Error::other(format!("session host reclaim: {error:?}"))),
+            None => Ok(()),
+        }
+    }
+
+    /// Read-only check of every registered host, for a daemon that must not
+    /// claim yet (a reload candidate): no fence moves and no lease is taken.
+    pub fn preflight(&self) -> io::Result<Vec<Checked>> {
+        let inventory = self.root.join("inventory");
+        if !inventory.exists() {
+            return Ok(Vec::new());
+        }
+        let index = Store::open(&inventory)
+            .and_then(|store| store.read())
+            .map_err(|error| io::Error::other(format!("session host inventory: {error:?}")))?;
+        Ok(index
+            .entries
+            .iter()
+            .map(|(name, entry)| Checked {
+                name: name.clone(),
+                state: checked(entry),
+            })
+            .collect())
+    }
+
     /// After the Registry closed `name`: stop its host and retire its entry,
     /// off the request thread. Unknown names are ignored.
     pub fn retire_closed(&self, name: &str) {
@@ -175,6 +208,51 @@ impl Hosting {
             let name = name.to_owned();
             std::thread::spawn(move || hosts.teardown(&name, session));
         }
+    }
+}
+
+/// One inventory entry as a preflight saw it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Checked {
+    pub name: String,
+    pub state: CheckedState,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub enum CheckedState {
+    /// The host answered Inspect for the expected identity.
+    Running { build: String },
+    /// Not published yet, exited, or closing: nothing to hand over.
+    Settling,
+    /// Published, but its host did not answer as expected.
+    Unreachable(String),
+}
+fn checked(entry: &Entry) -> CheckedState {
+    if entry.phase != Phase::Registered || entry.metadata.contains_key(super::recovery::CLOSING) {
+        return CheckedState::Settling;
+    }
+    let Some(birth) = entry.birth.as_ref() else {
+        return CheckedState::Unreachable("no endpoint recorded".into());
+    };
+    let inspected = super::entry::Client::open_observer(
+        Path::new(birth.endpoint()),
+        entry.identity.clone(),
+    )
+    .and_then(|mut client| client.request(&super::api::Request::Inspect));
+    match inspected {
+        Ok(super::api::Response::Info { info }) if info.identity == entry.identity => {
+            CheckedState::Running {
+                build: info.host_build,
+            }
+        }
+        Ok(other) => CheckedState::Unreachable(format!("unexpected reply {}", reply_kind(&other))),
+        Err(error) => CheckedState::Unreachable(error.to_string()),
+    }
+}
+fn reply_kind(response: &super::api::Response) -> &'static str {
+    match response {
+        super::api::Response::Info { .. } => "info for another identity",
+        super::api::Response::Error { .. } => "error",
+        _ => "other",
     }
 }
 
