@@ -56,12 +56,21 @@ pub(super) fn serve(
     } else {
         Response::Ok
     };
-    super::reply(&stream, &acknowledgement)?;
+    // Best effort, as in-process: a viewer that stopped reading may still
+    // have sent keys, and those must reach the child before its EOF.
+    let _ = super::reply(&stream, &acknowledgement);
     let mut out = stream.try_clone()?;
     let viewer = Viewer::default();
     std::thread::scope(|scope| {
         let keys = scope.spawn(|| pump_keys(reader, attachment.as_ref(), &viewer));
-        let _ = paint(&mut out, handle, attachment.as_ref(), first, &viewer);
+        if paint(&mut out, handle, attachment.as_ref(), first, &viewer).is_err() {
+            // The output side failed, which can just mean the viewer closed
+            // its read half after typing. Let the key pump drain to EOF unless
+            // there is nowhere safe left to deliver its keys.
+            while !keys.is_finished() && !must_stop(handle, attachment.as_ref(), &viewer) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         if viewer.input_failed.load(Ordering::SeqCst) {
             let _ = out
                 .write_all(super::ATTACH_INPUT_FAILURE_NOTICE.as_bytes())
@@ -71,6 +80,20 @@ pub(super) fn serve(
         let _ = keys.join();
     });
     Ok(())
+}
+
+/// Input has nowhere safe to go: the input failed, a newer attach took
+/// over, or the session stopped running.
+fn must_stop(
+    handle: &SessionHandle,
+    attachment: Option<&SessionAttachment<'_>>,
+    viewer: &Viewer,
+) -> bool {
+    viewer.input_failed.load(Ordering::SeqCst)
+        || attachment.is_some_and(|attachment| attachment.displaced().unwrap_or(false))
+        || !handle
+            .inspect()
+            .is_ok_and(|observation| observation.lifecycle == Lifecycle::Running)
 }
 
 /// The output side: repaint on every new generation until the viewer leaves,
