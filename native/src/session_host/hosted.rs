@@ -338,13 +338,17 @@ fn launch(request: &NewHosted<'_>) -> Result<Launch, String> {
 
 /// The host binary ships beside the daemon's own executable.
 fn host_executable() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| e.to_string())?
-        .with_file_name("remuda-session-host");
+    let exe = host_beside(&std::env::current_exe().map_err(|e| e.to_string())?);
     if !exe.is_file() {
         return Err(format!("session host binary not found: {}", exe.display()));
     }
     Ok(exe)
+}
+fn host_beside(daemon: &Path) -> PathBuf {
+    daemon.with_file_name(format!(
+        "remuda-session-host{}",
+        std::env::consts::EXE_SUFFIX
+    ))
 }
 fn start(exe: &Path, endpoint: &Path, bootstrap: &[u8]) -> Result<(), String> {
     let mut child = Command::new(exe)
@@ -378,4 +382,16 @@ fn random<const N: usize>() -> Result<[u8; N], String> {
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_binary_is_looked_up_beside_the_daemon_with_the_platform_suffix() {
+        let daemon = Path::new("/opt/bin").join(format!("remuda{}", std::env::consts::EXE_SUFFIX));
+        let want = format!("remuda-session-host{}", std::env::consts::EXE_SUFFIX);
+        assert_eq!(host_beside(&daemon), Path::new("/opt/bin").join(want));
+    }
 }

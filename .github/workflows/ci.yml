@@ -102,6 +102,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: cargo test --workspace --all-targets --no-fail-fast
+      - run: pwsh -NoProfile -File scripts/check-install-pair.ps1
 
   butler-contract:
     # remuda-butler depends on this core's mod boot/reload contract, and a core
@@ -197,6 +198,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: sh scripts/check-cold-install.sh
       - run: sh scripts/check-install-path-line.sh
+      - run: sh scripts/check-install-pair.sh
 
   cold-room:
     # cold-install above runs check-cold-install.sh directly on the runner,
