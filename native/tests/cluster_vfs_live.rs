@@ -1,6 +1,7 @@
 //! Live coverage of the cluster virtual file store (#742) across isolated
 //! daemons on loopback: put on one node, read on another, delete everywhere,
-//! and re-replicate after a holder is lost.
+//! and re-replicate after a holder is lost. The `n_plus_one` and `pre_sqlite`
+//! tests also run an older build, named by `REMUDA_COMPAT_PREVIOUS`.
 
 #![cfg(unix)]
 // This integration test deliberately exercises the real loopback cluster wire.
@@ -27,6 +28,7 @@ fn live_test_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 struct Node {
+    exe: PathBuf,
     child: Option<Child>,
     root: PathBuf,
     runtime: PathBuf,
@@ -36,6 +38,10 @@ struct Node {
 
 impl Node {
     fn start() -> Self {
+        Self::start_exe(PathBuf::from(env!("CARGO_BIN_EXE_remuda")))
+    }
+
+    fn start_exe(exe: PathBuf) -> Self {
         let id = NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("cv{}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -46,6 +52,7 @@ impl Node {
         let address = probe.local_addr().unwrap();
         drop(probe);
         let mut node = Self {
+            exe,
             child: None,
             root,
             runtime,
@@ -79,7 +86,7 @@ impl Node {
     }
 
     fn spawn_daemon(&mut self) {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
+        let mut command = Command::new(&self.exe);
         command.args(["-s", &self.name, "daemon"]);
         self.env(&mut command);
         command
@@ -153,7 +160,7 @@ impl Node {
     }
 
     fn run_with_stdin(&self, args: &[&str], stdin: Option<&[u8]>) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
+        let mut command = Command::new(&self.exe);
         command.args(["-s", &self.name]).args(args);
         self.env(&mut command);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -259,9 +266,10 @@ fn registry_endpoints(node: &Node) -> usize {
 
 /// Three joined nodes that all know every endpoint.
 fn three_nodes() -> (Node, Node, Node) {
-    let a = Node::start();
-    let b = Node::start();
-    let c = Node::start();
+    joined(Node::start(), Node::start(), Node::start())
+}
+
+fn joined(a: Node, b: Node, c: Node) -> (Node, Node, Node) {
     join(&a, &b);
     join(&b, &c);
     wait_until(
@@ -491,6 +499,7 @@ fn clear_errors_for_wrong_cluster_missing_and_no_cluster() {
 
     // A node with no cluster identity says so; its daemon answers (#778).
     let mut bare = Node {
+        exe: a.exe.clone(),
         child: None,
         root: a.root.join("bare"),
         runtime: a.root.join("bare-runtime"),
@@ -518,5 +527,109 @@ fn clear_errors_for_wrong_cluster_missing_and_no_cluster() {
         !index.exists(),
         "a CLI with no daemon created {}",
         index.display()
+    );
+}
+
+/// The previous build's `remuda`. CI sets the directory; there is no default,
+/// so a compat test cannot pass without running the older build.
+fn previous() -> PathBuf {
+    let dir = std::env::var_os("REMUDA_COMPAT_PREVIOUS")
+        .expect("REMUDA_COMPAT_PREVIOUS names the previous build's binary directory");
+    let exe = PathBuf::from(dir).join("remuda");
+    assert!(exe.is_file(), "{} missing", exe.display());
+    exe
+}
+
+fn put(node: &Node, uri: &str, body: &[u8]) {
+    successful(
+        node.run_with_stdin(&["vfs", "put", "-", uri, "--replicas", "2"], Some(body)),
+        "vfs put",
+    );
+}
+
+fn wait_for_body(node: &Node, uri: &str, body: &[u8]) {
+    wait_until("content reaches peer", Duration::from_secs(20), || {
+        node.stat_json(uri)
+            .is_some_and(|stat| stat["sha256"] == sha256_hex(body))
+    });
+    let got = successful(node.run(&["vfs", "get", uri]), "vfs get");
+    assert_eq!(got.as_bytes(), body);
+}
+
+fn wait_gone(node: &Node, uri: &str) {
+    wait_until("tombstone reaches peer", Duration::from_secs(20), || {
+        node.stat_json(uri).is_none()
+    });
+}
+
+/// Two nodes of this build and one of the previous build sync both ways (#778).
+#[test]
+#[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS; run by CI jobs host-compat-n-plus-one and vfs-compat-pre-sqlite"]
+fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
+    let _serial = live_test_guard();
+    let (a, old, c) = joined(Node::start(), Node::start_exe(previous()), Node::start());
+    let (from_old, from_new) = (
+        "remuda:///mixed/from-old.txt",
+        "remuda:///mixed/from-new.txt",
+    );
+
+    put(&old, from_old, b"written by N");
+    for node in [&a, &c] {
+        wait_for_body(node, from_old, b"written by N");
+    }
+    put(&a, from_new, b"written by N+1");
+    for node in [&old, &c] {
+        wait_for_body(node, from_new, b"written by N+1");
+    }
+
+    // A newer write on the older node wins on both newer nodes.
+    put(&old, from_new, b"rewritten by N");
+    for node in [&a, &c] {
+        wait_for_body(node, from_new, b"rewritten by N");
+    }
+
+    // Deletes cross in both directions.
+    successful(c.run(&["vfs", "rm", from_old]), "rm on N+1");
+    wait_gone(&old, from_old);
+    successful(old.run(&["vfs", "rm", from_new]), "rm on N");
+    for node in [&a, &c] {
+        wait_gone(node, from_new);
+    }
+}
+
+/// The documented downgrade from `index.db` to a build that reads only
+/// `index.json`, and the upgrade back, keep every name on a lone node.
+#[test]
+#[ignore = "needs REMUDA_COMPAT_PREVIOUS from before index.db; run by CI job vfs-compat-pre-sqlite"]
+fn pre_sqlite_downgrade_and_upgrade_again_keep_every_name() {
+    let _serial = live_test_guard();
+    let mut node = Node::start();
+    let current = node.exe.clone();
+    put(&node, "remuda:///gone.txt", b"deleted under N+1");
+    put(&node, "remuda:///kept.txt", b"written by N+1");
+    successful(node.run(&["vfs", "rm", "remuda:///gone.txt"]), "rm");
+    successful(node.run(&["vfs", "export-index"]), "export-index");
+
+    node.kill_daemon_only();
+    node.exe = previous();
+    node.spawn_daemon();
+    let listed = successful(node.run(&["vfs", "ls"]), "ls on N");
+    assert!(
+        listed.contains("kept.txt") && !listed.contains("gone.txt"),
+        "{listed}"
+    );
+    put(
+        &node,
+        "remuda:///later.txt",
+        b"written by N after the downgrade",
+    );
+
+    node.kill_daemon_only();
+    node.exe = current;
+    node.spawn_daemon();
+    let listed = successful(node.run(&["vfs", "ls"]), "ls on N+1");
+    assert!(
+        listed.contains("kept.txt") && listed.contains("later.txt") && !listed.contains("gone.txt"),
+        "{listed}"
     );
 }
