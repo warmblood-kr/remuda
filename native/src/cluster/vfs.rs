@@ -34,6 +34,8 @@ pub enum VfsErrorKind {
     Unreachable,
     Corrupt,
     TooLarge,
+    /// A newer daemon took over this socket's index (`remuda reload`).
+    Superseded,
     Io,
 }
 
@@ -48,6 +50,7 @@ impl VfsErrorKind {
             Self::Unreachable => "unreachable",
             Self::Corrupt => "corrupt",
             Self::TooLarge => "too_large",
+            Self::Superseded => "superseded",
             Self::Io => "io",
         }
     }
@@ -224,6 +227,25 @@ pub struct MergeReport {
     pub counts: IndexCounts,
 }
 
+/// Daemon start: this process serves `socket`. Its index writes are refused
+/// once a later daemon on the same socket claims (`claim_writer`, #778).
+pub fn start_writer(socket: &Path) -> io::Result<()> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|_| io::Error::other("randomness unavailable"))?;
+    vfs_index_db::set_writer(&socket.to_string_lossy(), &hex(&random));
+    Ok(())
+}
+
+/// Claim the index for this daemon, if this node has a cluster store.
+pub fn claim_writer() -> VfsResult<()> {
+    vfs_index_db::mark_serving();
+    match VfsStore::open_default() {
+        Ok(store) => store.claim_writer(),
+        Err(error) if error.kind == VfsErrorKind::NoCluster => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 pub fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -326,6 +348,19 @@ impl VfsStore {
         Ok(uri)
     }
 
+    /// Make this daemon the index writer for its socket (`start_writer`).
+    pub fn claim_writer(&self) -> VfsResult<()> {
+        let _guard = self.lock()?;
+        vfs_index_db::claim(&mut self.index_db()?)
+    }
+
+    /// False once a daemon that replaced this one claimed the index.
+    pub fn writes_here(&self) -> bool {
+        self.index_db()
+            .and_then(|conn| vfs_index_db::may_write(&conn))
+            .unwrap_or(true)
+    }
+
     /// Open the index database (see `vfs_index_db`).
     fn index_db(&self) -> VfsResult<rusqlite::Connection> {
         vfs_index_db::open(&self.root)
@@ -357,7 +392,7 @@ impl VfsStore {
     pub fn merge_entries_report(&self, incoming: Vec<VfsEntry>) -> VfsResult<MergeReport> {
         let _guard = self.lock()?;
         let mut conn = self.index_db()?;
-        let tx = vfs_index_db::immediate(&mut conn)?;
+        let tx = vfs_index_db::write_tx(&mut conn)?;
         let mut report = MergeReport {
             counts: vfs_index_db::counts(&tx)?,
             ..MergeReport::default()
@@ -410,7 +445,7 @@ impl VfsStore {
     pub fn delete(&self, path: &str, writer: &str) -> VfsResult<VfsEntry> {
         let _guard = self.lock()?;
         let mut conn = self.index_db()?;
-        let tx = vfs_index_db::immediate(&mut conn)?;
+        let tx = vfs_index_db::write_tx(&mut conn)?;
         let current = vfs_index_db::get(&tx, path)?
             .filter(|entry| !entry.deleted)
             .ok_or_else(|| VfsError::new(VfsErrorKind::NotFound, format!("no file at {path}")))?;
@@ -429,7 +464,7 @@ impl VfsStore {
     fn write_entry(&self, make: impl FnOnce(u64) -> VfsEntry) -> VfsResult<VfsEntry> {
         let _guard = self.lock()?;
         let mut conn = self.index_db()?;
-        let tx = vfs_index_db::immediate(&mut conn)?;
+        let tx = vfs_index_db::write_tx(&mut conn)?;
         let entry = make(vfs_index_db::next_version(&tx)?);
         let mut counts = vfs_index_db::counts(&tx)?;
         if merge_row(&tx, entry.clone(), &mut counts)? == CappedMerge::Full {
@@ -628,7 +663,11 @@ impl VfsStore {
 
     pub fn collect_garbage_older_than(&self, grace: std::time::Duration) -> VfsResult<usize> {
         let _guard = self.lock()?;
-        let referenced = vfs_index_db::live_hashes(&self.index_db()?)?;
+        let conn = self.index_db()?;
+        if !vfs_index_db::may_write(&conn)? {
+            return Ok(0);
+        }
+        let referenced = vfs_index_db::live_hashes(&conn)?;
         let mut removed = 0;
         for hash in self.local_blobs()? {
             if referenced.contains(hash.as_str()) {

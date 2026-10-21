@@ -207,8 +207,17 @@ impl Candidate {
             std::process::exit(1);
         }
         let bytes = frame(&FromOld::Take).map_err(|e| format!("take: {e}"))?;
-        fds::send(&self.stream, &bytes, &[listener, lock])
-            .map_err(|e| format!("could not hand over the listener: {e}"))?;
+        fds::send(&self.stream, &bytes, &[listener, lock]).map_err(|e| {
+            // C may exit right after its report, before reading `Take`.
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ) {
+                exited(&mut self.child, "take")
+            } else {
+                format!("could not hand over the listener: {e}")
+            }
+        })?;
         if fault.as_deref() == Some("old-exits-after-take") {
             std::process::exit(1);
         }
@@ -414,6 +423,9 @@ pub fn candidate(socket: &Path) -> Result<(), String> {
 /// Become the daemon: adopt O's listener and lock, claim the hosts, serve.
 /// Returns only if that fails before serving, after telling O why.
 fn take(socket: &Path, mut stream: UnixStream, fds: Vec<OwnedFd>) -> Result<(), String> {
+    // O started this process and is alive until we serve.
+    // SAFETY: getppid has no preconditions.
+    let _ = crate::daemon::RELOADED_FROM.set(unsafe { libc::getppid() } as u32);
     let error = match serve_taken(socket, &stream, fds) {
         Ok(()) => return Ok(()),
         Err(error) => error,
@@ -526,16 +538,19 @@ fn read_frame(
         {
             Err(format!("candidate sent no {awaited} in time"))
         }
-        Err(_) => {
-            reap(child);
-            let status = child
-                .try_wait()
-                .ok()
-                .flatten()
-                .map_or_else(|| "unknown status".into(), |status| status.to_string());
-            Err(format!("candidate exited before its {awaited} ({status})"))
-        }
+        Err(_) => Err(exited(child, awaited)),
     }
+}
+
+/// C closed its end: reap it and say what it was waited on for.
+fn exited(child: &mut Child, awaited: &str) -> String {
+    reap(child);
+    let status = child
+        .try_wait()
+        .ok()
+        .flatten()
+        .map_or_else(|| "unknown status".into(), |status| status.to_string());
+    format!("candidate exited before its {awaited} ({status})")
 }
 
 #[cfg(test)]
