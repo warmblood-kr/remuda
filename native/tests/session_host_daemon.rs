@@ -492,9 +492,11 @@ fn check_leaves_the_session_alone(daemon_exe: &Path, cli: &Path, target: &Path) 
     let daemon = Daemon::spawn_exe(&root, daemon_exe, true);
     new_session(&path, "compat");
     let (code, stdout, stderr) = reload_check(&root, cli, target);
+    // Builds that speak different handoff versions refuse each other cleanly.
     let understood = stdout.starts_with("ready: ")
         || stderr.contains("candidate exited before its hello")
-        || stderr.contains("predates `remuda reload`");
+        || stderr.contains("predates `remuda reload`")
+        || stderr.contains(" speaks handoff version ");
     assert!(understood, "exit {code:?}\n{stdout}\n{stderr}");
     // `remuda stop` would end every session: never the advice here.
     assert!(!stderr.contains("run `remuda stop`"), "{stderr}");
