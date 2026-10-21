@@ -155,13 +155,38 @@ fi
 install_dir="${REMUDA_INSTALL_DIR:-$install_dir_default}"
 mkdir -p "$install_dir" "$data_dir"
 
-# Land it by rename, never by writing in place: `remuda upgrade` runs this while
-# that very binary is executing, and truncating it would be ETXTBSY (or worse,
-# a half-written binary). A rename swaps the directory entry and leaves the
-# running process on its old inode.
-cp remuda "$install_dir/.remuda.incoming"
-chmod 755 "$install_dir/.remuda.incoming"
-mv -f "$install_dir/.remuda.incoming" "$install_dir/remuda"
+# remuda and remuda-session-host are one pair: the daemon starts the host from
+# beside itself. A release older than the pair has no host, and then no host
+# from a different build may stay beside the new daemon either.
+host=remuda-session-host
+[ -f "$host" ] || host=
+
+# Copy the installed pair aside as .prev first, for rollback. A .prev pair with
+# no host is still one pair, so a stale host.prev goes too.
+if [ -f "$install_dir/remuda" ]; then
+	for bin in remuda remuda-session-host; do
+		if [ -f "$install_dir/$bin" ]; then
+			cp -p "$install_dir/$bin" "$install_dir/.$bin.prev.incoming"
+			mv -f "$install_dir/.$bin.prev.incoming" "$install_dir/$bin.prev"
+		else
+			rm -f "$install_dir/$bin.prev"
+		fi
+	done
+fi
+
+# Land each by rename, never by writing in place: `remuda upgrade` runs this
+# while that very binary is executing, and truncating it would be ETXTBSY (or
+# worse, a half-written binary). A rename swaps the directory entry and leaves
+# the running process on its old inode. The host lands first, so a new daemon
+# never starts beside an old host.
+for bin in $host remuda; do
+	cp "$bin" "$install_dir/.$bin.incoming"
+	chmod 755 "$install_dir/.$bin.incoming"
+done
+for bin in $host remuda; do
+	mv -f "$install_dir/.$bin.incoming" "$install_dir/$bin"
+done
+[ -n "$host" ] || rm -f "$install_dir/remuda-session-host"
 
 echo "$channel" >"$channel_file"
 

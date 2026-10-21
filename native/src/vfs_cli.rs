@@ -12,6 +12,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// `put` stored the file but reached no peer: a temporary failure
+/// (EX_TEMPFAIL from sysexits.h), so scripts can retry or wait.
+const EXIT_TEMPFAIL: u8 = 75;
 
 fn spec() -> Spec {
     let option = |long: &str, value: Option<&str>, help: &str| OptionSpec {
@@ -230,17 +233,66 @@ fn put(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
         entry.size,
         entry.replicas
     );
-    if !pushed.is_empty() {
-        let reached = pushed.iter().filter(|result| result.reached).count();
-        println!("Told {reached} of {} peers about it.", pushed.len());
+    let reached = pushed.iter().filter(|result| result.reached).count();
+    let outcome = push_outcome(pushed.len(), reached);
+    if let Some(told) = &outcome.told {
+        println!("{told}");
+    }
+    if let Some(warning) = &outcome.warning {
+        eprintln!("remuda: vfs put: {warning}");
+        eprintln!("Next: start the other nodes, or check `remuda cluster nodes`; peers copy the file when they next reach this node.");
     }
     if flag(values, "wait") {
         match vfs_sync::wait_for_replicas(&entry, WAIT_TIMEOUT) {
             Ok(holders) => println!("{holders} copies confirmed."),
-            Err(error) => return fail_vfs("put", &error),
+            Err(error) => {
+                fail_vfs("put", &error);
+                return if outcome.only_here {
+                    ExitCode::from(EXIT_TEMPFAIL)
+                } else {
+                    ExitCode::FAILURE
+                };
+            }
         }
+        return ExitCode::SUCCESS;
     }
-    ExitCode::SUCCESS
+    if outcome.only_here {
+        ExitCode::from(EXIT_TEMPFAIL)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// What `put` reports after telling peers about a new entry.
+#[derive(Debug, PartialEq, Eq)]
+struct PushOutcome {
+    told: Option<String>,
+    warning: Option<String>,
+    /// Peers exist but none was reached: the only copy is on this node.
+    only_here: bool,
+}
+
+/// `peers` is how many reachable peers this node knows; `reached` is how many
+/// acknowledged the entry. With no peers at all (a one-node cluster) this
+/// node is the whole placement, so that is not a failure.
+fn push_outcome(peers: usize, reached: usize) -> PushOutcome {
+    if peers == 0 {
+        return PushOutcome {
+            told: None,
+            warning: None,
+            only_here: false,
+        };
+    }
+    let only_here = reached == 0;
+    PushOutcome {
+        told: Some(format!("Told {reached} of {peers} peers about it.")),
+        warning: only_here.then(|| {
+            format!(
+                "stored on this node only: none of {peers} peers was reached (exit code {EXIT_TEMPFAIL})"
+            )
+        }),
+        only_here,
+    }
 }
 
 fn fetch(
@@ -310,7 +362,7 @@ fn entry_json(store: &VfsStore, entry: &VfsEntry) -> Value {
         "replicas": entry.replicas,
         "writer": entry.writer,
         "mtime": entry.mtime,
-        "local": store.has_blob(&entry.sha256),
+        "local": store.has_blob(&entry.sha256, entry.size),
     })
 }
 
@@ -342,7 +394,7 @@ fn stat(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
     println!("writer    {}", crate::cluster::node_label(&entry.writer));
     println!(
         "here      {}",
-        if store.has_blob(&entry.sha256) {
+        if store.has_blob(&entry.sha256, entry.size) {
             "yes"
         } else {
             "no"
@@ -387,7 +439,7 @@ fn list(store: &VfsStore, values: &Map<String, Value>) -> ExitCode {
             entry.version,
             &entry.sha256[..12],
             entry.path,
-            if store.has_blob(&entry.sha256) {
+            if store.has_blob(&entry.sha256, entry.size) {
                 ""
             } else {
                 "  (not here)"
@@ -478,6 +530,28 @@ mod tests {
             assert!(usage(&verb.name).contains("Usage"), "{}", verb.name);
         }
         assert!(usage("").contains("resolve"));
+    }
+
+    #[test]
+    fn put_with_no_peer_reached_is_a_temporary_failure() {
+        let none = push_outcome(4, 0);
+        assert!(none.only_here);
+        assert_eq!(none.told.as_deref(), Some("Told 0 of 4 peers about it."));
+        assert!(none
+            .warning
+            .as_deref()
+            .is_some_and(|text| text.contains("stored on this node only") && text.contains("75")));
+
+        let some = push_outcome(4, 1);
+        assert!(!some.only_here);
+        assert_eq!(some.told.as_deref(), Some("Told 1 of 4 peers about it."));
+        assert_eq!(some.warning, None);
+
+        // A one-node cluster has nobody to tell; that is not a failure.
+        let alone = push_outcome(0, 0);
+        assert!(!alone.only_here);
+        assert_eq!(alone.told, None);
+        assert_eq!(alone.warning, None);
     }
 
     #[test]
