@@ -38,6 +38,18 @@ const MAX_OFFSET: usize = 1000;
 /// Below the store's per-client result cap, so a new reservation always fits.
 const RETAINED: usize = model::MAX_RESULTS / 2;
 
+/// What a host made of [`HostSession::announce_writer`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Announced {
+    /// It now refuses every older writer.
+    Fenced,
+    /// It predates `writer-fence-v1`: only the inventory fence guards it.
+    Unfenced,
+    /// It has seen a newer writer than ours.
+    Superseded,
+    Unreachable(String),
+}
+
 pub(crate) struct HostSession {
     owner: Arc<Owner>,
     name: String,
@@ -359,6 +371,34 @@ impl HostSession {
                 Response::Error { code } => return Err(refused(&code)),
                 _ => return Err(Error::Protocol("unexpected host acquire reply")),
             }
+        }
+    }
+    /// Show the host this daemon's current writer, so it refuses older ones
+    /// from now on, without waiting for this daemon's next act. Takes the
+    /// lease only for that moment.
+    pub fn announce_writer(&self) -> Announced {
+        let mut client =
+            match Client::open_expected(&self.endpoint, Role::Control, self.identity.clone()) {
+                Ok(client) => client,
+                Err(error) => return Announced::Unreachable(error.to_string()),
+            };
+        let fences = client.offers(super::api::WRITER_FENCE);
+        let fenced = if fences {
+            Announced::Fenced
+        } else {
+            Announced::Unfenced
+        };
+        match client.acquire(self.owner.writer()) {
+            Ok(Response::Granted { .. }) => {
+                let _ = client.request(&Request::Release);
+                fenced
+            }
+            // The host raised its writer high-water before the lease check.
+            Ok(Response::Error { code }) if code == "controller_busy" => fenced,
+            Ok(Response::Error { code }) if code == "superseded_writer" => Announced::Superseded,
+            Ok(Response::Error { code }) => Announced::Unreachable(code),
+            Ok(_) => Announced::Unreachable("unexpected host acquire reply".into()),
+            Err(error) => Announced::Unreachable(error.to_string()),
         }
     }
     fn control(&self, request: Request) -> Result<()> {

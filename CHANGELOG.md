@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Session hosts (experimental, internal): building blocks for `remuda reload`.
+  A daemon can claim its session hosts again after another daemon claimed
+  them, and every host it has open then refuses the other daemon at once.
+  A candidate daemon can check every host read-only, without claiming. No
+  command uses these yet.
 - Session hosts (experimental): `remuda stop` now lets an act a host is
   already running finish and answers it, instead of hanging up on it. New
   host-backed input, resize and close are refused while the daemon drains.
