@@ -41,6 +41,8 @@ allow = [
     # Required by the TLS stack.
     "ISC",
     "CDLA-Permissive-2.0",
+    # foldhash, via rusqlite's statement cache (hashlink), #778.
+    "Zlib",
 ]
 confidence-threshold = 0.8
 
