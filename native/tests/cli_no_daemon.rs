@@ -3,6 +3,8 @@
 
 #![cfg(unix)]
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -133,6 +135,7 @@ impl Drop for SessionAutoStartScratch {
                 .args(["-TERM", &pid.to_string()])
                 .status();
         }
+        hosts::stop_hosts_under(&self.root);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }

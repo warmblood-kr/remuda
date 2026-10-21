@@ -4,6 +4,8 @@
 // This integration test deliberately exercises the real loopback cluster wire.
 #![allow(clippy::disallowed_types)]
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use remuda_core::protocol::{Request, Response};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -155,6 +157,7 @@ impl Drop for PrivateNode {
         );
         let _ = self.child.kill();
         let _ = self.child.wait();
+        hosts::stop_hosts_under(&self.root);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }

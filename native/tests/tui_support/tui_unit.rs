@@ -874,7 +874,7 @@ fn session_input_returns_to_live_view_without_swallowing_the_key() {
 #[test]
 fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     let path = scratch_socket("preview-follow-after-wheel");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     let command = streaming_command(
         "i=0; while [ $i -lt 200 ]; do printf 'newest-%03d\\n' $i; i=$((i + 1)); sleep 0.02; done; sleep 3",
         "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 200; $i++) { Write-Output ('newest-{0:D3}' -f $i); Start-Sleep -Milliseconds 20 }; Start-Sleep -Seconds 3",
@@ -960,7 +960,7 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
 #[test]
 fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
     let path = scratch_socket("preview-content-anchor");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     let command = streaming_command(
         "i=0; while [ $i -lt 70 ]; do printf 'row-%02d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 3",
         "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 70; $i++) { Write-Output ('row-{0:D2}' -f $i); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 3",
@@ -1044,7 +1044,7 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
 #[test]
 fn real_preview_keeps_content_anchored_after_wheel_down_enters_settle() {
     let path = scratch_socket("preview-settle-content-anchor");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     let command = streaming_command(
         "i=0; while [ $i -lt 90 ]; do printf 'settle-%03d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 2",
         "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 90; $i++) { Write-Output ('settle-{0:D3}' -f $i); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 2",
@@ -1125,7 +1125,7 @@ fn real_preview_keeps_content_anchored_after_wheel_down_enters_settle() {
 #[cfg(unix)]
 fn real_preview_keeps_content_anchored_after_scrollback_reaches_its_cap() {
     let path = scratch_socket("preview-content-anchor-at-cap");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     let command = streaming_command(
         "i=0; while [ $i -lt 10100 ]; do printf 'row-%05d\\n' $i; i=$((i + 1)); done; j=0; while [ $j -lt 30 ]; do printf 'tail-%02d\\n' $j; j=$((j + 1)); sleep 0.1; done; sleep 3",
         "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 10100; $i++) { Write-Output ('row-{0:D5}' -f $i) }; for ($j=0; $j -lt 30; $j++) { Write-Output ('tail-{0:D2}' -f $j); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 3",
@@ -1989,7 +1989,7 @@ fn new_session(path: &std::path::Path, name: &str) {
 #[test]
 fn render_styled_of_the_session_list_moves_the_real_brand_to_the_footer() {
     let path = scratch_socket("e2e-sessions-oracle");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
 
     new_session(&path, "alpha");
     new_session(&path, "bravo");
@@ -2049,7 +2049,7 @@ fn render_styled_of_the_session_list_moves_the_real_brand_to_the_footer() {
 #[test]
 fn session_order_hook_indents_rows_and_an_error_keeps_the_legacy_buffer_bytes() {
     let path = scratch_socket("session-order-hook");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     new_session(&path, "alpha");
     new_session(&path, "bravo");
     new_session(&path, "charlie");
@@ -2116,7 +2116,7 @@ fn session_order_hook_indents_rows_and_an_error_keeps_the_legacy_buffer_bytes() 
 #[test]
 fn every_row_of_a_nested_entry_shares_one_offset() {
     let path = scratch_socket("session-order-indent");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     for name in ["alpha", "bravo", "charlie"] {
         new_session(&path, name);
     }
@@ -2149,7 +2149,7 @@ fn every_row_of_a_nested_entry_shares_one_offset() {
 #[test]
 fn a_nested_entry_never_overflows_a_narrow_list() {
     let path = scratch_socket("session-order-narrow");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     new_session(&path, "root");
     new_session(&path, "a-deeply-nested-child-with-a-long-name");
     eval(
@@ -2184,7 +2184,7 @@ fn attached_horse_marker_joins_the_name_row_with_two_cell_width() {
     // before the next begins: the selection style must not reach the dot,
     // and the dot colour must not reach anything after it.
     let path = scratch_socket("status-dot");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     eval(
         &path,
         r#"
@@ -2251,7 +2251,7 @@ fn the_status_dot_counts_as_one_column() {
     // here instead of silently shifting the list divider.
     assert_eq!(char_width('●'), 1);
     let path = scratch_socket("status-dot-width");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     eval(
         &path,
         r#"remuda.ls = function() return {
@@ -2268,7 +2268,7 @@ fn the_list_has_no_caret_column_at_any_depth() {
     // The dot column stays fixed while the tree indentation consumes name
     // space, with no gutter or caret column.
     let path = scratch_socket("no-caret");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     for name in ["alpha", "bravo", "charlie"] {
         new_session(&path, name);
     }
@@ -2306,7 +2306,7 @@ fn the_selected_entry_stands_out_without_a_caret() {
     // A zero-width cue: reverse video on the selected name, focused or not,
     // live or dead, and on the fallback row before Lua has answered.
     let path = scratch_socket("selection-cue");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     eval(
         &path,
         r#"remuda.ls = function() return {
@@ -2356,7 +2356,7 @@ fn the_selected_entry_stands_out_without_a_caret() {
 #[test]
 fn render_styled_of_the_empty_session_list_moves_the_real_brand_to_the_footer() {
     let path = scratch_socket("e2e-empty-oracle");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
 
     let lines = sessions_buffer_lines(&path, 16, 0, None)
         .expect("refresh sessions buffer")
@@ -2390,7 +2390,7 @@ fn render_styled_of_the_empty_session_list_moves_the_real_brand_to_the_footer() 
 #[test]
 fn the_attached_marker_stays_on_the_name_row_at_narrow_widths() {
     let path = scratch_socket("e2e-live-dead-threshold");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
 
     new_session(&path, "alpha");
     new_session(&path, "bravo");
@@ -2423,7 +2423,7 @@ fn long_names_keep_the_status_dot_aligned_and_attached_horse_visible() {
     const ATTACHED: &str = "attached-name-abcdefghijklmnopqrstuvwxyz-한글";
     const PLAIN: &str = "plain-name-abcdefghijklmnopqrstuvwxyz-한글";
     let path = scratch_socket("attached-marker-long-name");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     eval(
         &path,
         r#"
@@ -2896,16 +2896,31 @@ fn scratch_socket(tag: &str) -> std::path::PathBuf {
     } else {
         std::env::temp_dir()
     };
-    let dir = root.join(format!("remuda-tuitest-{}-{tag}", std::process::id()));
+    // A hosted session's endpoint is `<socket>.hosts/<16 hex>`, 23 bytes past
+    // the daemon socket, and must still fit sun_path (103 bytes on macOS):
+    // keep the directory short, with a hash so truncated tags stay unique.
+    let hash = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        tag.hash(&mut hasher);
+        hasher.finish() as u32
+    };
+    let short: String = tag.chars().take(20).collect();
+    let dir = root.join(format!(
+        "remuda-tuitest-{}-{hash:08x}-{short}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
     crate::daemon::socket_path_in(&dir, "s")
 }
 
 /// Starts a real daemon and returns once it answers, in scratch cluster state
-/// under the env lock like every in-process test daemon (#672).
-fn daemon_at(path: &std::path::Path) {
-    super::serve_in_scratch(path.parent().expect("socket has a parent"), path);
+/// under the env lock like every in-process test daemon (#672). Hold the
+/// guard for the test: its drop stops the daemon's session hosts (#713).
+#[must_use = "dropping it stops the daemon's session hosts at once"]
+fn daemon_at(path: &std::path::Path) -> super::test_hosts::HostSweep {
+    super::serve_in_scratch(path.parent().expect("socket has a parent"), path)
 }
 
 /// [MEASURED] `list` (the pane's own function, not a stand-in) must say a
@@ -3115,7 +3130,7 @@ fn a_missing_daemon_marks_the_cached_list_stale_and_offers_restart_or_quit() {
 #[test]
 fn capture_styled_reports_the_daemons_own_words_instead_of_an_empty_grid() {
     let path = scratch_socket("capture-no-session");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
 
     let result = capture_styled(&path, "no-such-session", 0);
     let err = result.expect_err(
@@ -3136,7 +3151,7 @@ fn capture_styled_reports_the_daemons_own_words_instead_of_an_empty_grid() {
 #[ignore]
 fn capture_styled_10k_history_measurement() {
     let path = scratch_socket("capture-10k-baseline");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     let command = "i=0; while [ $i -lt 10000 ]; do printf '%05d\\n' $i; i=$((i+1)); done; sleep 5";
     let response = client::request(
         &path,
@@ -3206,7 +3221,7 @@ fn capture_styled_10k_history_measurement() {
 #[test]
 fn window_shown_session_round_trips_a_real_name_and_clears_to_none() {
     let path = scratch_socket("window-shown-round-trip");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
 
     let shown = window_shown_session(&path, Some("alpha"), false).expect("show alpha");
     assert_eq!(shown, Some(ShownTarget::Session("alpha".to_string())));
@@ -3228,7 +3243,7 @@ fn window_shown_session_round_trips_a_real_name_and_clears_to_none() {
 #[test]
 fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_session() {
     let path = scratch_socket("window-preview-oracle");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
 
     let response = client::request(
         &path,
@@ -3319,7 +3334,7 @@ fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_sessio
 #[test]
 fn refresh_skips_the_herd_relist_only_when_asked() {
     let path = scratch_socket("refresh-skip-list");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     start(&path, "sh", Size::new(80, 24)).unwrap();
 
     let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
@@ -3407,7 +3422,7 @@ fn request_counts(path: &std::path::Path) -> (u64, u64, u64) {
 #[test]
 fn a_type_forced_refresh_with_unchanged_selection_costs_one_daemon_request() {
     let path = scratch_socket("type-forced-request-count");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     start(&path, "sh", Size::new(80, 24)).unwrap();
 
     let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
@@ -3468,7 +3483,7 @@ fn a_type_forced_refresh_with_unchanged_selection_costs_one_daemon_request() {
 #[test]
 fn a_tick_refresh_sends_exactly_one_request_list() {
     let path = scratch_socket("tick-refresh-list-count");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     start(&path, "sh", Size::new(80, 24)).unwrap();
 
     let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
@@ -3503,7 +3518,7 @@ fn a_tick_refresh_sends_exactly_one_request_list() {
 #[test]
 fn reconcile_hold_switches_the_real_attach_not_just_ui_state() {
     let path = scratch_socket("reconcile-hold-switch");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     start(&path, "sh", Size::new(80, 24)).unwrap();
     start(&path, "sh", Size::new(80, 24)).unwrap();
 
@@ -3589,7 +3604,7 @@ fn show_scratch_buffer(path: &std::path::Path, text: &str) {
 #[test]
 fn a_buffer_shown_via_window_renders_its_text_not_a_no_such_session_error() {
     let path = scratch_socket("buffer-shown-renders-text");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
 
     show_scratch_buffer(&path, "hello from buffer");
 
@@ -3629,7 +3644,7 @@ fn a_buffer_shown_via_window_renders_its_text_not_a_no_such_session_error() {
 #[test]
 fn a_shown_buffers_unchanged_update_does_not_repaint() {
     let path = scratch_socket("buffer-unchanged-no-repaint");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
 
     show_scratch_buffer(&path, "hello from buffer");
 
@@ -3681,7 +3696,7 @@ fn a_shown_buffers_unchanged_update_does_not_repaint() {
 #[test]
 fn a_shown_buffers_changed_update_does_repaint_without_full_erase() {
     let path = scratch_socket("buffer-changed-repaints");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
 
     show_scratch_buffer(&path, "before");
 
@@ -3741,7 +3756,7 @@ fn a_shown_buffers_changed_update_does_repaint_without_full_erase() {
 #[test]
 fn a_type_forced_refresh_while_a_buffer_is_shown_costs_one_daemon_request() {
     let path = scratch_socket("buffer-type-forced-request-count");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
 
     show_scratch_buffer(&path, "hello from buffer");
 
@@ -3799,7 +3814,7 @@ fn a_type_forced_refresh_while_a_buffer_is_shown_costs_one_daemon_request() {
 #[test]
 fn a_selection_change_reclaims_the_window_from_a_shown_buffer() {
     let path = scratch_socket("buffer-selection-change-reclaims");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     start(&path, "sh", Size::new(80, 24)).unwrap();
     start(&path, "sh", Size::new(80, 24)).unwrap();
 
@@ -3859,7 +3874,7 @@ fn a_selection_change_reclaims_the_window_from_a_shown_buffer() {
 #[test]
 fn a_tick_refresh_keeps_a_shown_buffer() {
     let path = scratch_socket("buffer-tick-refresh-keeps-it");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
 
     // No sessions at all, so there is nothing to compete for the window
     // via a default selection either — isolates "a tick fired" from
@@ -3915,7 +3930,7 @@ fn a_tick_refresh_keeps_a_shown_buffer() {
 #[test]
 fn a_shown_buffer_survives_the_first_refresh_when_a_default_selection_is_assigned() {
     let path = scratch_socket("buffer-first-refresh-default-selection");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     start(&path, "sh", Size::new(80, 24)).unwrap();
 
     // Show the buffer BEFORE ever calling refresh() — nothing has
@@ -3955,7 +3970,7 @@ fn a_shown_buffer_survives_the_first_refresh_when_a_default_selection_is_assigne
 #[test]
 fn a_key_driven_selection_move_still_reclaims_the_window_from_a_shown_buffer() {
     let path = scratch_socket("buffer-key-driven-selection-reclaims");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     start(&path, "sh", Size::new(80, 24)).unwrap();
     start(&path, "sh", Size::new(80, 24)).unwrap();
 
@@ -4012,7 +4027,7 @@ fn a_key_driven_selection_move_still_reclaims_the_window_from_a_shown_buffer() {
 #[test]
 fn a_shown_buffer_survives_a_tick_while_a_real_session_is_selected() {
     let path = scratch_socket("buffer-tick-with-real-session-selected");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     start(&path, "sh", Size::new(80, 24)).unwrap();
 
     let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
@@ -4065,7 +4080,7 @@ fn a_shown_buffer_survives_a_tick_while_a_real_session_is_selected() {
 #[test]
 fn a_type_forced_refresh_with_a_real_session_and_a_shown_buffer_costs_one_daemon_request() {
     let path = scratch_socket("buffer-type-forced-request-count-with-session");
-    daemon_at(&path);
+    let _daemon = daemon_at(&path);
     start(&path, "sh", Size::new(80, 24)).unwrap();
 
     let mut ui = Ui::new(Vec::new(), "/bin/sh", None);

@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use std::fs;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +26,8 @@ fn init_and_status_never_print_private_key_material() {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(&root).unwrap();
+    // Dropped after the daemon guard below: stops its session hosts (#713).
+    let _hosts = hosts::HostSweep::new(&root);
     let runtime = root.join("r");
     let state = root.join("state");
     fs::create_dir_all(&runtime).unwrap();

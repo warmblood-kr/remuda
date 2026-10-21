@@ -257,6 +257,7 @@ struct RemoveDirectoryOnDrop(PathBuf);
 
 impl Drop for RemoveDirectoryOnDrop {
     fn drop(&mut self) {
+        spawn::hosts::stop_hosts_under(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -1192,8 +1193,8 @@ fn concurrent_daemon_starts_serialize_stale_socket_replacement() {
     let second = spawn::base_command(&dir)
         .spawn()
         .expect("spawn second daemon");
-    let mut first = Daemon(first);
-    let mut second = Daemon(second);
+    let mut first = Daemon::adopt(first, &dir);
+    let mut second = Daemon::adopt(second, &dir);
     let deadline = Instant::now() + PATIENCE;
     loop {
         let serving = ipc::connect(&socket).is_ok();
@@ -1234,9 +1235,14 @@ fn concurrent_daemon_starts_serialize_stale_socket_replacement() {
     );
 }
 
+/// A socket path; dropping it also stops the session hosts started under the
+/// socket's directory, which outlive the daemon by design (#713).
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
     fn drop(&mut self) {
+        if let Some(dir) = self.0.parent() {
+            spawn::hosts::stop_hosts_under(dir);
+        }
         let _ = std::fs::remove_file(&self.0);
     }
 }
@@ -7199,7 +7205,7 @@ fn a_socket_replaced_during_startup_survives_the_daemon_shutdown() {
         "REMUDA_TEST_STARTUP_PAUSE_MS",
         pause.as_millis().to_string(),
     );
-    let mut daemon = Daemon(command.spawn().expect("spawn daemon"));
+    let mut daemon = Daemon::adopt(command.spawn().expect("spawn daemon"), &dir);
     let deadline = Instant::now() + PATIENCE;
     let original_ino = loop {
         if let Ok(metadata) = std::fs::symlink_metadata(&socket) {
