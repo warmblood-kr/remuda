@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- After `remuda reload` (Unix), the old daemon ends what `remuda stop` ends,
+  except the sessions and the socket. A deferred reply still waiting is told
+  the daemon reloaded and to run the command again, instead of the daemon
+  hanging up on it. Processes its Lua started are killed instead of running
+  on beside the new daemon's, and modules are stopped. `docs/reload.md` says
+  what a reload keeps and what starts fresh.
 - `remuda reload` (experimental, Unix) replaces the running daemon with the
   installed remuda without closing a host-backed session.
   - The old daemon checks the new build as for `--check`, then hands it the

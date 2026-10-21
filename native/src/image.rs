@@ -693,7 +693,17 @@ impl Image {
 
     /// Notify every deferred caller before modules and the Lua runtime stop.
     pub fn shutdown_pending_replies(&self) {
-        self.pending.shutdown();
+        self.finish_pending_replies(false);
+    }
+
+    /// Fail every deferred reply still waiting, as a stop does; `reloaded`
+    /// tells the caller a reload handed the socket over and to ask again.
+    pub fn finish_pending_replies(&self, reloaded: bool) {
+        if reloaded {
+            self.pending.reloaded();
+        } else {
+            self.pending.shutdown();
+        }
         const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
         if let Ok(answer) = self.submit("__remuda_pending_tick()", Some("@remuda/pending-shutdown"))
         {
