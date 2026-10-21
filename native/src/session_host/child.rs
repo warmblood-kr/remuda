@@ -105,7 +105,7 @@ impl HostChild {
 
     pub fn spawn(command: CommandBuilder, size: Size) -> Result<Self> {
         let terminal = Arc::new(Mutex::new(
-            Terminal::new(size.rows(), size.cols(), 1000).map_err(io)?,
+            Terminal::new(size.rows(), size.cols(), super::terminal::HISTORY_ROWS).map_err(io)?,
         ));
         let pair = native_pty_system().openpty(pty_size(size)).map_err(io)?;
         let writer: SharedWriter = Arc::new(Mutex::new(pair.master.take_writer().map_err(io)?));
@@ -323,7 +323,8 @@ impl AgentProcess for HostChild {
     }
     fn resize(&mut self, size: Size) -> Result<()> {
         // Validate before mutating either PTY or parser.
-        Terminal::validate_geometry(size.rows(), size.cols(), 1000).map_err(io)?;
+        Terminal::validate_geometry(size.rows(), size.cols(), super::terminal::HISTORY_ROWS)
+            .map_err(io)?;
         let mut terminal = self.terminal.lock().map_err(io)?;
         if let Err(error) = terminal.prepare_resize(size.rows(), size.cols()) {
             self.fault.store(true, Ordering::Release);
