@@ -1,4 +1,5 @@
 //! Connection-bound epochs; a started act includes pauses and late writes.
+use super::api::Writer;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConnectionId(pub u128);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,6 +19,8 @@ pub(crate) enum Refusal {
     Busy,
     Stale,
     Exhausted,
+    /// A newer durable writer reached this host; this one is fenced out.
+    Superseded,
 }
 #[derive(Default)]
 pub(crate) struct Controller {
@@ -27,6 +30,9 @@ pub(crate) struct Controller {
     active_act: Option<ActId>,
     next_act: u64,
     draining: bool,
+    /// Highest durable writer presented; never lowered or moved to another store.
+    writer: Option<Writer>,
+    owner_writer: Option<Writer>,
 }
 impl Controller {
     pub fn new(incarnation: [u8; 16]) -> Self {
@@ -37,6 +43,23 @@ impl Controller {
     }
     /// Connection IDs come exclusively from the future authenticated runtime.
     pub fn acquire(&mut self, connection: ConnectionId) -> Result<Fence, Refusal> {
+        self.acquire_writer(connection, None)
+    }
+    /// The writer high-water rises before the lease check, so a busy older
+    /// holder is fenced out of its next effect. Unfenced (older daemon) stays allowed.
+    pub fn acquire_writer(
+        &mut self,
+        connection: ConnectionId,
+        writer: Option<Writer>,
+    ) -> Result<Fence, Refusal> {
+        if let Some(writer) = writer {
+            match self.writer {
+                Some(high) if high.store != writer.store || writer.epoch < high.epoch => {
+                    return Err(Refusal::Superseded)
+                }
+                _ => self.writer = Some(writer),
+            }
+        }
         if self.owner.is_some() || self.active_act.is_some() {
             return Err(Refusal::Busy);
         }
@@ -47,6 +70,7 @@ impl Controller {
             epoch: self.epoch,
         };
         self.owner = Some(fence);
+        self.owner_writer = writer;
         Ok(fence)
     }
     fn authorize(&self, fence: Fence) -> Result<(), Refusal> {
@@ -55,10 +79,18 @@ impl Controller {
         }
         Ok(())
     }
+    /// The current owner, not fenced out by a newer durable writer.
+    pub fn authorize_writer(&self, fence: Fence) -> Result<(), Refusal> {
+        self.authorize(fence)?;
+        if matches!((self.owner_writer, self.writer), (Some(own), Some(high)) if own != high) {
+            return Err(Refusal::Superseded);
+        }
+        Ok(())
+    }
     /// Reserve every effect (input, resize, close) atomically; authorization
     /// alone is private so callers cannot split a check from effect admission.
     pub fn begin_act(&mut self, fence: Fence) -> Result<ActId, Refusal> {
-        self.authorize(fence)?;
+        self.authorize_writer(fence)?;
         if self.active_act.is_some() {
             return Err(Refusal::Busy);
         }
@@ -138,6 +170,35 @@ mod tests {
         assert_eq!(control.acquire(ConnectionId(2)), Err(Refusal::Busy));
         control.finish_act(second).unwrap();
         assert!(control.acquire(ConnectionId(2)).is_ok());
+    }
+    #[test]
+    fn a_newer_writer_fences_an_older_holder_and_older_writers() {
+        let writer = |store, epoch| Some(Writer { store, epoch });
+        let mut control = Controller::default();
+        let old = control
+            .acquire_writer(ConnectionId(1), writer([1; 16], 5))
+            .unwrap();
+        // The newer writer is still Busy, but the older holder's next effect is refused.
+        let newer = control.acquire_writer(ConnectionId(2), writer([1; 16], 6));
+        assert_eq!(newer, Err(Refusal::Busy));
+        assert_eq!(control.begin_act(old), Err(Refusal::Superseded));
+        control.release(old).unwrap();
+        let new = control
+            .acquire_writer(ConnectionId(2), writer([1; 16], 6))
+            .unwrap();
+        control.release(new).unwrap();
+        for stale in [writer([1; 16], 5), writer([2; 16], 7)] {
+            let refused = control.acquire_writer(ConnectionId(3), stale);
+            assert_eq!(refused, Err(Refusal::Superseded));
+        }
+        // An equal writer and an unfenced (older daemon) acquire stay allowed.
+        let same = control
+            .acquire_writer(ConnectionId(4), writer([1; 16], 6))
+            .unwrap();
+        control.begin_act(same).unwrap();
+        let mut control = Controller::default();
+        let plain = control.acquire(ConnectionId(5)).unwrap();
+        control.begin_act(plain).unwrap();
     }
     #[test]
     fn epoch_never_wraps_or_allows_two_acts() {

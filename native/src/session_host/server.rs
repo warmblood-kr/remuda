@@ -23,6 +23,7 @@ const CAPS: &[&str] = &[
     super::api::TYPED_VIEW,
     super::api::HUMAN_INPUT,
     super::api::ACTIVITY,
+    super::api::WRITER_FENCE,
 ];
 pub(crate) struct Server {
     endpoint: Arc<Endpoint>,
@@ -260,6 +261,7 @@ impl Connection {
             && matches!(
                 &request,
                 Request::Acquire
+                    | Request::AcquireWriter { .. }
                     | Request::Input { .. }
                     | Request::Resize { .. }
                     | Request::Close
@@ -276,14 +278,8 @@ impl Connection {
                 info.publication = self.server.publication.as_ref().map(|gate| gate.status());
                 Ok(Response::Info { info })
             }
-            Request::Acquire => {
-                if self.role != Role::Control || self.fence.is_some() {
-                    return Err("invalid_control_acquisition".into());
-                }
-                let fence = self.server.host.acquire(self.id).map_err(control_error)?;
-                self.fence = Some(fence);
-                Ok(Response::Granted { epoch: fence.epoch })
-            }
+            Request::Acquire => self.acquire(None),
+            Request::AcquireWriter { writer } => self.acquire(Some(writer)),
             Request::Release => {
                 let fence = self.controller()?;
                 self.server.host.release(fence).map_err(control_error)?;
@@ -333,6 +329,17 @@ impl Connection {
             Request::Stop => self.stop(),
             request => self.human_request(request),
         }
+    }
+    fn acquire(&mut self, writer: Option<super::api::Writer>) -> Result<Response, String> {
+        if self.role != Role::Control || self.fence.is_some() {
+            return Err("invalid_control_acquisition".into());
+        }
+        let host = &self.server.host;
+        let fence = host
+            .acquire_writer(self.id, writer)
+            .map_err(control_error)?;
+        self.fence = Some(fence);
+        Ok(Response::Granted { epoch: fence.epoch })
     }
     fn human(&self) -> Result<(), String> {
         if self.role != Role::Human {
@@ -426,6 +433,9 @@ impl Connection {
     }
     fn stop(&mut self) -> Result<Response, String> {
         let fence = self.controller()?;
+        // Before settlement work; latch_stop still re-checks under the lock.
+        let host = &self.server.host;
+        host.authorize_writer(fence).map_err(control_error)?;
         if self
             .server
             .publication
@@ -651,6 +661,7 @@ fn control_error(error: super::coordinator::Error) -> String {
         Error::Control(Refusal::Busy) => "controller_busy",
         Error::Control(Refusal::Stale) | Error::StaleCompletion => "stale_controller_or_act",
         Error::Control(Refusal::Exhausted) => "host_sequence_exhausted",
+        Error::Control(Refusal::Superseded) => "superseded_writer",
         Error::Invalid(_) => "invalid_or_unavailable_operation",
         Error::Stopping => "host_stopping",
         Error::Retained => "host_raw_retention_pending",
@@ -664,3 +675,6 @@ fn control_error(error: super::coordinator::Error) -> String {
 #[cfg(test)]
 #[path = "human_wire_tests.rs"]
 mod human_wire_tests;
+#[cfg(test)]
+#[path = "writer_fence_tests.rs"]
+mod writer_fence_tests;

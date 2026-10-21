@@ -332,7 +332,20 @@ impl Owned {
             .holds_grant(connection, grant)
     }
     pub fn acquire(&self, connection: ConnectionId) -> Result<Fence, Error> {
-        self.coordinator.lock().unwrap().acquire(connection)
+        self.acquire_writer(connection, None)
+    }
+    pub fn acquire_writer(
+        &self,
+        connection: ConnectionId,
+        writer: Option<super::api::Writer>,
+    ) -> Result<Fence, Error> {
+        self.coordinator
+            .lock()
+            .unwrap()
+            .acquire_writer(connection, writer)
+    }
+    pub fn authorize_writer(&self, fence: Fence) -> Result<(), Error> {
+        self.coordinator.lock().unwrap().authorize_writer(fence)
     }
     pub fn release(&self, fence: Fence) -> Result<(), Error> {
         self.coordinator.lock().unwrap().release(fence)

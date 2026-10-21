@@ -139,10 +139,14 @@ impl Owner {
         };
         // Prior connections and the entire admitted act must drain first. This
         // physical lease is independent of the durable controller writer fence.
-        match peer.request(&Request::Acquire) {
+        match peer.acquire(self.writer()) {
             Ok(Response::Granted { .. }) => {}
             // A live host still running an admitted act (or another holder).
             Ok(Response::Error { code }) if code == "controller_busy" => return Ok(Progress::Busy),
+            // A newer daemon reached this host first; this owner may not write.
+            Ok(Response::Error { code }) if code == "superseded_writer" => {
+                return Err(Error::Data(model::Error::StaleFence))
+            }
             _ => return Ok(Progress::Unavailable),
         }
         let request = Request::Recover {
@@ -158,6 +162,10 @@ impl Owner {
     }
     pub fn index(&self) -> Result<model::Index, Error> {
         self.store.read()
+    }
+    /// What a fencing host is shown; it refuses every older writer after this.
+    pub fn writer(&self) -> super::api::Writer {
+        self.fence.writer()
     }
     /// Whether this owner's exact fence is still the store's current writer.
     pub fn current(&self) -> Result<bool, Error> {

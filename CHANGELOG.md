@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Session hosts (experimental): a host now refuses input, resize, close and
+  stop from a daemon whose inventory writer epoch is older than one it has
+  seen (`writer-fence-v1`, error `superseded_writer`). Before, an older daemon
+  that passed its store check just before a newer daemon claimed could still
+  act on the host. The wire change is additive: older hosts get the plain
+  `Acquire`, and older daemons are still accepted. CI now hands a hosted
+  session between the base build and this build in both directions.
+
 - VFS: a node now checks a blob's hash before it serves the first chunk to a
   peer. A damaged copy is removed and refused (`corrupt`), so the peer tries
   another holder and this node's repair pass fetches a good copy. Before,
