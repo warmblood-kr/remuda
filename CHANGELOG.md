@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `remuda reload` (experimental, Unix) replaces the running daemon with the
+  installed remuda without closing a host-backed session.
+  - The old daemon checks the new build as for `--check`, then hands it the
+    socket and its session hosts.
+  - Clients keep using the same socket throughout; one waiting to be
+    accepted is answered by the new daemon.
+  - If the new daemon fails or stalls before it serves, it is stopped, the
+    old daemon takes everything back and keeps serving, and `reload` exits
+    1.
+  - In-process sessions still block a reload.
+
 - Lua and CLI: schema migrations for mod databases (#778). A mod ships
   numbered plain-SQL steps (`migrations/NAME/0001_create.up.sql`, an
   optional `.down.sql`) and opens with `remuda.db.open(name, { migrations =

@@ -143,18 +143,22 @@ fn begin(client: &mut Client) -> Captured {
 fn read(client: &mut Client, captured: &Captured) -> Viewport {
     let mut bytes = Vec::new();
     for index in 0..captured.pages {
-        let Response::Page {
-            snapshot,
-            index: received,
-            base64,
-        } = client
+        let answer = client
             .request(&Request::Page {
                 snapshot: captured.id,
                 index,
             })
-            .unwrap()
+            .unwrap();
+        let Response::Page {
+            snapshot,
+            index: received,
+            base64,
+        } = answer
         else {
-            panic!("typed page refusal");
+            panic!(
+                "typed page refusal: page {index}/{}: {answer:?}",
+                captured.pages
+            );
         };
         assert_eq!((snapshot, received), (captured.id, index));
         bytes.extend(
@@ -529,15 +533,20 @@ fn typed_view_child_fixture() {
         }
     }
 }
+/// Output until the host closes the PTY. Tests assert on output still
+/// arriving, so it must outlast them however slow the machine; the cap only
+/// bounds a child that was somehow left behind.
 fn continuous(input: &mut impl Read, output: &mut impl Write, root: &std::path::Path) {
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + Duration::from_secs(60);
     let mut count = 0u64;
     while Instant::now() < until {
-        writeln!(
+        let row = writeln!(
             output,
             "\x1b[33mrow:{count:08}:wide:界:abcdefghijklmnopqrstuvwxyz\x1b[0m\r"
-        )
-        .unwrap();
+        );
+        if row.is_err() {
+            return;
+        }
         count += 1;
         if count.is_multiple_of(1024) {
             output.write_all(b"\x1b[6n").unwrap();

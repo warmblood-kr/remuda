@@ -1,12 +1,15 @@
 //! `remuda reload` (#713), Unix. The running daemon (O) starts a candidate
 //! daemon (C) from the target binary, joined by a private socketpair on
-//! C's fd 3. This step runs the check only: C reports its build and what it
-//! sees of every session host, without claiming anything, then exits. O
-//! compares C's view with its own. Nothing is handed over yet.
+//! C's fd 3. C reports its build and what it sees of every session host,
+//! without claiming anything. O compares C's view with its own. Then O either
+//! aborts (a check) or sends `Take` with its listener and socket lock, and C
+//! claims the hosts and serves in O's place.
+pub mod fds;
+
 use crate::session_host::hosted::{Checked, CheckedState, Hosting};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -14,7 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// The O-C message version; a candidate of another version is refused.
-pub const HANDOFF: u16 = 1;
+/// 2 added `Take` and `Serving`.
+pub const HANDOFF: u16 = 2;
 /// C's end of the socketpair.
 pub const CANDIDATE_FD: RawFd = 3;
 /// The hidden CLI verb that runs a candidate.
@@ -23,20 +27,33 @@ const FRAME_LIMIT: usize = 64 * 1024;
 const HELLO_DEADLINE: Duration = Duration::from_secs(10);
 const READY_DEADLINE: Duration = Duration::from_secs(30);
 const EXIT_DEADLINE: Duration = Duration::from_secs(2);
+/// Test-only: make a candidate fail after `Take` (see `serve_taken`).
+const TEST_FAULT: &str = "REMUDA_TEST_RELOAD_FAULT";
 
 /// C to O.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind")]
-enum FromCandidate {
-    Hello { handoff: u16, build: String },
-    Ready { hosts: Vec<HostView> },
-    Failed { reason: String },
+pub enum FromCandidate {
+    Hello {
+        handoff: u16,
+        build: String,
+    },
+    Ready {
+        hosts: Vec<HostView>,
+    },
+    Failed {
+        reason: String,
+    },
+    /// After `Take`: C claimed the hosts and is about to accept.
+    Serving,
 }
 /// O to C.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind")]
-enum FromOld {
+pub enum FromOld {
     Abort,
+    /// Carries the listener, then the socket lock, as SCM_RIGHTS.
+    Take,
 }
 /// One session host as a daemon saw it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +123,8 @@ impl Report {
 pub struct Deadlines {
     pub hello: Duration,
     pub ready: Duration,
+    /// From `Take` to `Serving`.
+    pub serving: Duration,
 }
 impl Default for Deadlines {
     fn default() -> Self {
@@ -116,6 +135,7 @@ impl Default for Deadlines {
         Self {
             hello: HELLO_DEADLINE.min(ready),
             ready,
+            serving: ready,
         }
     }
 }
@@ -136,16 +156,65 @@ impl Drop for InFlight {
     }
 }
 
-/// O's side of a check. `legacy` names this daemon's in-process sessions,
-/// which a reload would end.
-pub(crate) fn check(
+/// A candidate that has reported. O either aborts it (a check, or a
+/// blocked reload) or hands it the endpoint.
+pub(crate) struct Candidate {
+    stream: UnixStream,
+    child: Child,
+    report: Report,
+    _one: InFlight,
+}
+impl Candidate {
+    pub(crate) fn report(&self) -> &Report {
+        &self.report
+    }
+    /// Tell C to stop and reap it.
+    pub(crate) fn abort(mut self) -> Report {
+        let _ = write_frame(&mut self.stream, &FromOld::Abort);
+        drop(self.stream);
+        reap(&mut self.child);
+        self.report
+    }
+    /// Send `Take` with the listener and the socket lock, then wait for
+    /// `Serving`. Anything else kills C: O keeps its copies and rolls back.
+    pub(crate) fn take(
+        mut self,
+        listener: RawFd,
+        lock: RawFd,
+        until: Duration,
+    ) -> Result<(), String> {
+        let outcome = self.hand_over(listener, lock, Instant::now() + until);
+        if outcome.is_err() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        // On success C outlives this daemon; nobody reaps it here.
+        outcome
+    }
+    fn hand_over(&mut self, listener: RawFd, lock: RawFd, until: Instant) -> Result<(), String> {
+        let bytes = frame(&FromOld::Take).map_err(|e| format!("take: {e}"))?;
+        fds::send(&self.stream, &bytes, &[listener, lock])
+            .map_err(|e| format!("could not hand over the listener: {e}"))?;
+        match read_frame(&mut self.stream, &mut self.child, until, "serving")? {
+            FromCandidate::Serving => Ok(()),
+            FromCandidate::Failed { reason } => {
+                Err(format!("candidate failed to take over: {reason}"))
+            }
+            other => Err(format!("candidate sent {other:?} instead of serving")),
+        }
+    }
+}
+
+/// O's side of a check: start C and hear its report. `legacy` names this
+/// daemon's in-process sessions, which a reload would end.
+pub(crate) fn start(
     socket: &Path,
     binary: &Path,
     hosting: &Hosting,
     legacy: &[String],
     deadlines: Deadlines,
-) -> Result<Report, String> {
-    let _one = InFlight::take()?;
+) -> Result<Candidate, String> {
+    let one = InFlight::take()?;
     if !binary.is_absolute() || !binary.is_file() {
         return Err(format!(
             "reload target {} is not an absolute path to a file",
@@ -159,12 +228,20 @@ pub(crate) fn check(
         .map(HostView::from)
         .collect();
     let (mut stream, mut child) = spawn(socket, binary)?;
-    let outcome = converse(&mut stream, &mut child, deadlines);
-    let _ = write_frame(&mut stream, &FromOld::Abort);
-    drop(stream);
-    reap(&mut child);
-    let (candidate, theirs) = outcome?;
-    Ok(compare(candidate, ours, theirs, legacy))
+    match converse(&mut stream, &mut child, deadlines) {
+        Ok((candidate, theirs)) => Ok(Candidate {
+            stream,
+            child,
+            report: compare(candidate, ours, theirs, legacy),
+            _one: one,
+        }),
+        Err(error) => {
+            let _ = write_frame(&mut stream, &FromOld::Abort);
+            drop(stream);
+            reap(&mut child);
+            Err(error)
+        }
+    }
 }
 
 fn converse(
@@ -276,11 +353,13 @@ fn reap(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// C's side: say hello, check every host read-only, report, then wait for
-/// O's word. Never claims, binds or writes anything.
+/// C's side: say hello, check every host read-only and report. Claims,
+/// binds and writes nothing unless O then sends `Take`.
 pub fn candidate(socket: &Path) -> Result<(), String> {
     // SAFETY: O placed our end of the socketpair on this fd before exec.
     let mut stream = unsafe { UnixStream::from_raw_fd(CANDIDATE_FD) };
+    // Sessions this daemon starts must not inherit it.
+    set_cloexec(CANDIDATE_FD).map_err(|e| format!("handoff fd: {e}"))?;
     write_frame(
         &mut stream,
         &FromCandidate::Hello {
@@ -299,17 +378,87 @@ pub fn candidate(socket: &Path) -> Result<(), String> {
     };
     write_frame(&mut stream, &report).map_err(|e| format!("report: {e}"))?;
     // Abort, or O gone: either way this candidate is done.
-    let _ = read_raw(&mut stream, None);
+    match read_word(&stream) {
+        Ok((FromOld::Take, fds)) => take(socket, stream, fds),
+        Ok((FromOld::Abort, _)) | Err(_) => Ok(()),
+    }
+}
+
+/// Become the daemon: adopt O's listener and lock, claim the hosts, serve.
+/// Returns only if that fails before serving, after telling O why.
+fn take(socket: &Path, mut stream: UnixStream, fds: Vec<OwnedFd>) -> Result<(), String> {
+    let error = match serve_taken(socket, &stream, fds) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    let reason = error.clone();
+    let _ = write_frame(&mut stream, &FromCandidate::Failed { reason });
+    Err(error)
+}
+
+fn serve_taken(socket: &Path, stream: &UnixStream, fds: Vec<OwnedFd>) -> Result<(), String> {
+    let [listener, lock] = <[OwnedFd; 2]>::try_from(fds)
+        .map_err(|fds| format!("take carried {} fds, not 2", fds.len()))?;
+    let mut reply = stream.try_clone().map_err(|e| format!("handoff fd: {e}"))?;
+    // Outlive O: its session and process group are not this daemon's.
+    // SAFETY: setsid has no memory effects; failure only means we lead one.
+    unsafe { libc::setsid() };
+    let fault = std::env::var(TEST_FAULT).ok();
+    let serving = Box::new(move || {
+        match fault.as_deref() {
+            // Tests: fail after claiming the hosts, before serving.
+            Some("exit-before-serving") => std::process::exit(1),
+            Some("hang-before-serving") => loop {
+                std::thread::sleep(Duration::from_secs(60));
+            },
+            _ => {}
+        }
+        let _ = write_frame(&mut reply, &FromCandidate::Serving);
+    });
+    let handed = crate::daemon::Handed {
+        listener,
+        lock,
+        serving,
+    };
+    crate::daemon::serve_handed(socket, handed).map_err(|error| error.to_string())
+}
+
+/// O's next word and any fds sent with it.
+fn read_word(stream: &UnixStream) -> std::io::Result<(FromOld, Vec<OwnedFd>)> {
+    stream.set_read_timeout(None)?;
+    let mut length = [0; 4];
+    let mut fds = fds::recv(stream, &mut length)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length > FRAME_LIMIT {
+        return Err(std::io::Error::other("handoff frame too large"));
+    }
+    let mut bytes = vec![0; length];
+    fds.extend(fds::recv(stream, &mut bytes)?);
+    let word = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+    Ok((word, fds))
+}
+
+fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl on an fd this process owns.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
-fn write_frame(stream: &mut UnixStream, message: &impl Serialize) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec(message).map_err(std::io::Error::other)?;
-    if bytes.len() > FRAME_LIMIT {
+fn frame(message: &impl Serialize) -> std::io::Result<Vec<u8>> {
+    let body = serde_json::to_vec(message).map_err(std::io::Error::other)?;
+    if body.len() > FRAME_LIMIT {
         return Err(std::io::Error::other("handoff frame too large"));
     }
-    stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
-    stream.write_all(&bytes)?;
+    let mut bytes = (body.len() as u32).to_be_bytes().to_vec();
+    bytes.extend_from_slice(&body);
+    Ok(bytes)
+}
+
+fn write_frame(stream: &mut UnixStream, message: &impl Serialize) -> std::io::Result<()> {
+    stream.write_all(&frame(message)?)?;
     stream.flush()
 }
 

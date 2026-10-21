@@ -278,7 +278,7 @@ fn a_candidate_speaking_a_newer_handoff_is_refused() {
     let out = root.remuda(&["reload", "--check", "--binary", &newer.to_string_lossy()]);
     let (_, stderr) = text(&out);
     assert!(
-        stderr.contains("candidate 9.9.9+future speaks handoff version 99, this daemon 1"),
+        stderr.contains("candidate 9.9.9+future speaks handoff version 99, this daemon 2"),
         "{stderr}"
     );
     let _ = path;
@@ -294,7 +294,7 @@ fn a_candidate_that_cannot_drive_a_host_blocks_the_reload() {
     let blind = root.candidate(
         "blind-remuda",
         &[
-            r#"{"kind":"Hello","handoff":1,"build":"9.9.9+future"}"#,
+            r#"{"kind":"Hello","handoff":2,"build":"9.9.9+future"}"#,
             r#"{"kind":"Ready","hosts":[{"name":"one","build":null,"problem":"incompatible host protocol"}]}"#,
         ],
         "exec sleep 60",
