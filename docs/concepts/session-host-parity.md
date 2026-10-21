@@ -23,3 +23,21 @@ Open item for making hosting the default: large hosted input. Options: allow
 large acts and have reload refuse to roll back while such records exist, or
 send large text through the human raw input path (ordered, not stored, no
 submit verification).
+
+## Owner decision: orphaned hosts
+
+A host whose private directory (and so its socket) has been deleted can never
+be reached, adopted or closed by any daemon again. It keeps its PTY and its
+program running until the program exits on its own. Tests used to leak
+hundreds of these per run; their fixtures now stop their own hosts
+(`native/tests/daemon_support/hosts.rs`), so the product is unchanged.
+
+Option: such a host ends itself and its program. That frees PTYs and stops
+programs nobody can reach. The risk is ending a user's program, perhaps
+mid-task, because a directory disappeared: a /tmp cleaner, a mistaken `rm`, a
+cache sweep. Mitigations, all required together:
+- the endpoint directory is gone, not merely unreachable;
+- it has been gone for N minutes (e.g. 30), re-checked;
+- the program has been idle (no output) for that whole time.
+
+Not done: ending users' programs is the owner's call.
