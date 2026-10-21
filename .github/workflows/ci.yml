@@ -75,6 +75,11 @@ jobs:
       - run: rustup target add aarch64-linux-android
       - name: build Android release binary
         run: cargo build --release --bin remuda --target aarch64-linux-android
+      - name: record binary size
+        # A dependency's cost on the phone build, as a number per PR (#778).
+        run: |
+          size=$(wc -c < target/aarch64-linux-android/release/remuda | tr -d ' ')
+          echo "aarch64-linux-android binary: $size bytes" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: set up QEMU for Termux smoke
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
         with:

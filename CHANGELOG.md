@@ -42,6 +42,43 @@
   `Acquire`, and older daemons are still accepted. CI now hands a hosted
   session between the base build and this build in both directions.
 
+- Lua: `remuda.db.open(name [, opts])` gives each mod its own SQLite
+  databases (#778): `open("notes")` in mod `butler` opens
+  `<state>/remuda/db/butler/notes.db`. Handles have `query`, `exec`, `batch`,
+  `limits` and `close`. Default limits are 64 MiB per database, 1 s per
+  statement and 10,000 rows per query; a mod may ask for up to 1 GiB, 10 s
+  and 100,000. `ATTACH`, `DETACH` and most PRAGMAs are refused. Outside a
+  mod's own code, `open` returns `nil, "no_mod: ..."`.
+- Lua: `remuda.vfs.put(uri, bytes [, replicas])` and `remuda.vfs.rm(uri)`
+  write the cluster file store, with the same rules as `remuda vfs put/rm`.
+  Peers are told in the background, so the Lua thread never waits on them.
+
+- VFS: `remuda vfs` commands now run in the daemon, which owns the index
+  (#778). With no daemon running, a command prints one line saying the
+  daemon is needed and exits 1; it does not start one, and it does not
+  touch the store. Start the daemon with `remuda run ...` or `remuda -e 1`.
+  `put` still reads its source and `get` still writes its destination in
+  your shell, so relative paths and stdin work as before. New:
+  `remuda vfs export-index` writes `index.json` from the database for an
+  older remuda; run it before a downgrade.
+
+- VFS: the name index is now a SQLite database, `vfs/index.db` (#778). A
+  write changes only its own row instead of rewriting the whole
+  `index.json`, and a crash cannot lose a committed write. On first use an
+  existing `index.json` is imported once and then left untouched, so an
+  older remuda still finds the index as it was at the upgrade. Peers see no
+  difference: the entries, the digest and the messages are the same, so
+  upgraded and older nodes sync with each other as before.
+
+- SQLite is now built into the binary (`rusqlite`, bundled; #778). It backs
+  the daemon-owned VFS index and Lua
+  databases. A database opened through it keeps its file, `-wal` and `-shm`
+  private: 0600 in a 0700 directory on Unix, the owner-only ACL on Windows.
+  The `-wal` and `-shm` files are kept when the database closes, so SQLite
+  never recreates them with default permissions. A loose or symlinked file is
+  refused, not used. The release build adds about 1.8 MB once SQLite is
+  linked (measured on aarch64-apple-darwin).
+
 - VFS: a node now checks a blob's hash before it serves the first chunk to a
   peer. A damaged copy is removed and refused (`corrupt`), so the peer tries
   another holder and this node's repair pass fetches a good copy. Before,

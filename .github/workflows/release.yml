@@ -204,6 +204,9 @@ jobs:
           listed=$(tar -tzf "dist/$name.tar.gz" | sort | tr '\n' ' ')
           want=$(printf '%s\n' ${{ matrix.bin }} ${{ matrix.host }} | sort | tr '\n' ' ')
           [ "$listed" = "$want" ] || { echo "::error::$name.tar.gz holds '$listed', want '$want'"; exit 1; }
+          # Binary size per target, so a dependency's cost is a number (#778).
+          size=$(wc -c < "target/${{ matrix.target }}/release/${{ matrix.bin }}" | tr -d ' ')
+          echo "${{ matrix.target }} binary: $size bytes" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:

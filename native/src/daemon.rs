@@ -2060,6 +2060,11 @@ fn handle_request(
             handle_eval(stream, reader, image, &code, name.as_deref(), caller)
         }
 
+        Request::Vfs { args, input_base64 } => reply(
+            &stream,
+            &crate::vfs_cli::serve_request(&args, input_base64.as_deref()),
+        ),
+
         Request::SecretAnswer { .. } => reply(
             &stream,
             &Response::error("secret answer has no outstanding prompt"),
