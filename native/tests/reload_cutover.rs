@@ -359,3 +359,74 @@ fn a_candidate_that_hangs_after_take_is_killed_at_its_deadline_and_rolled_back()
     );
     still_the_old_daemon(&root, &mut old);
 }
+
+/// A mod can say "not now": its `daemon_reload_ready` reason blocks both
+/// `reload --check` and `reload`. A mod without the field never blocks.
+#[test]
+fn a_busy_mod_blocks_a_reload_until_it_says_ready() {
+    let root = Root::new("busy");
+    let path = root.socket();
+    let data = root.0.join("data");
+    for (name, ready) in [
+        (
+            "launcher",
+            "daemon_reload_ready = function(state) if state.busy then return 'launching a task' end end,",
+        ),
+        ("plain", ""),
+    ] {
+        let dir = data.join("remuda/mods").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("extension.toml"),
+            format!("name = \"{name}\"\nentry = \"packages/{name}/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("packages").join(name)).unwrap();
+        std::fs::write(
+            dir.join("packages").join(name).join("init.lua"),
+            format!(
+                "return {{ api = 'remuda-module-v1', state_version = 1,\n  initialize = function() return {{}} end,\n  start = function(state) remuda['{name}_state'] = state end,\n  {ready}\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let data_env = data.to_string_lossy().into_owned();
+    let mut old = Daemon::spawn(&root, true, &[("XDG_DATA_HOME", data_env.as_str())]);
+    let eval = |code: &str| {
+        request(
+            &path,
+            &Request::Eval {
+                code: code.into(),
+                name: None,
+            },
+        )
+    };
+    assert_eq!(
+        eval("remuda.exec('launcher'); remuda.exec('plain'); remuda.launcher_state.busy = true; return 'up'"),
+        Response::Value("up".into())
+    );
+
+    let out = root.remuda(&["reload", "--check"]);
+    let (stdout, stderr) = text(&out);
+    assert!(stdout.starts_with("blocked: "), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("\nblocker: mod launcher: launching a task"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("plain"), "{stdout}");
+    let out = root.remuda(&["reload"]);
+    let (stdout, stderr) = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("mod launcher: launching a task"),
+        "{stdout}"
+    );
+    assert_eq!(root.lock_pid(), old.0.id());
+
+    eval("remuda.launcher_state.busy = false");
+    let out = root.remuda(&["reload"]);
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.starts_with("reloaded: "), "{stdout}");
+    assert!(old.exited(), "the old daemon did not exit cleanly");
+}

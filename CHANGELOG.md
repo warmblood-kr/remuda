@@ -12,6 +12,8 @@
     old daemon takes everything back and keeps serving, and `reload` exits
     1.
   - In-process sessions still block a reload.
+  - A mod can hold off a reload while it is busy: its optional
+    `daemon_reload_ready(state)` returns a reason, shown as a blocker.
 
 - Lua and CLI: schema migrations for mod databases (#778). A mod ships
   numbered plain-SQL steps (`migrations/NAME/0001_create.up.sql`, an

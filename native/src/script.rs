@@ -34,6 +34,7 @@ pub const BINDINGS: [&str; 110] = [
     "_advice_reattach",
     "_call",
     "_caller_live",
+    "_daemon_reload_check",
     "_descriptors",
     "_dispatch_extension_command",
     "_event_counts",
