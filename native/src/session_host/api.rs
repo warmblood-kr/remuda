@@ -14,6 +14,15 @@ pub(crate) const SCOPED_BIRTH: &str = "scoped-host-publisher-v1";
 pub(crate) const HUMAN_INPUT: &str = "human-input-v1";
 /// Inspect carries Session activity; absent on older hosts, never read as zero.
 pub(crate) const ACTIVITY: &str = "activity-v1";
+/// AcquireWriter is understood; the host refuses any writer older than one seen.
+pub(crate) const WRITER_FENCE: &str = "writer-fence-v1";
+/// The durable inventory writer a daemon presents: store incarnation, epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Writer {
+    pub store: [u8; 16],
+    pub epoch: u64,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub(crate) enum PublicationStatus {
@@ -105,6 +114,10 @@ pub(crate) struct Activity {
 pub(crate) enum Request {
     Inspect,
     Acquire,
+    /// Only sent to a host advertising WRITER_FENCE; older hosts reject it.
+    AcquireWriter {
+        writer: Writer,
+    },
     Release,
     Input {
         client: [u8; 16],
