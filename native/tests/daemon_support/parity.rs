@@ -58,7 +58,8 @@ impl Parity {
             .env("REMUDA_RUNTIME_DIR", &root)
             .env("HOME", &root)
             .env("XDG_STATE_HOME", root.join("state"))
-            .env_remove("REMUDA_EXPERIMENTAL_SESSION_HOST")
+            // Named either way, so a change of default never changes the mode.
+            .env("REMUDA_EXPERIMENTAL_SESSION_HOST", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
