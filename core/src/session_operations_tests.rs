@@ -76,6 +76,7 @@ impl Remote {
     }
     fn frame(&self) -> VersionedSnapshot {
         VersionedSnapshot {
+            modes: None,
             instance_id: Some(if self.shared.changed_instance.load(Ordering::SeqCst) {
                 "replacement".into()
             } else {

@@ -90,6 +90,7 @@ impl Terminal {
             snapshot: viewport.into_screen(),
             output_version: Some(generation),
             instance_id: None,
+            modes: None,
         }
     }
     pub fn viewport(&mut self, scrollback: usize) -> Viewport {

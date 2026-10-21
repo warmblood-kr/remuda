@@ -281,3 +281,26 @@ fn mouse_state_follows_the_child_in_both_backends() {
         }
     }
 }
+
+#[test]
+fn attach_passes_the_childs_input_modes_to_the_viewer_in_both_backends() {
+    for mode in MODES {
+        let daemon = Parity::start(mode);
+        daemon.shell("sh");
+        // Set before the attach: the first paint must state it.
+        send_line(&daemon, "sh", r"printf '\033[?1hBEFORE\n'");
+        daemon.wait_for("sh", "BEFORE");
+        let viewer = Viewer::attach(&daemon, "sh");
+        viewer.wait_for("\x1b[?1h");
+        // Set while attached: the next frame must carry them. Bracketed
+        // paste goes last; a plain shell cannot read pasted lines after it.
+        send_line(
+            &daemon,
+            "sh",
+            r"printf '\033[?1000h\033[?1006h\033[?2004hDURING\n'",
+        );
+        viewer.wait_for("\x1b[?1000h");
+        viewer.wait_for("\x1b[?1006h");
+        viewer.wait_for("\x1b[?2004h");
+    }
+}

@@ -486,7 +486,13 @@ impl HostSession {
         }
     }
     fn versioned(&self, view: Viewport) -> VersionedSnapshot {
+        let modes = remuda_core::agent::TerminalModes {
+            mouse: view.modes.mouse,
+            application_cursor: view.modes.application_cursor,
+            application_keypad: view.modes.application_keypad,
+        };
         VersionedSnapshot {
+            modes: Some(modes),
             output_version: Some(view.generation),
             instance_id: Some(self.identity.instance.clone()),
             snapshot: view.into_screen(),

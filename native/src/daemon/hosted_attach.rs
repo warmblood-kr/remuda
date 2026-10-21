@@ -6,7 +6,9 @@
 //! through a human grant (one per attach; a newer attach takes over). A host
 //! too old to grant gets a read-only view, and the first key shows a notice.
 use crate::ipc::{self, Stream, TryClone};
-use remuda_core::agent::{Cursor, ScreenSnapshot, StyledCell};
+use remuda_core::agent::{
+    Cursor, MouseEncoding, MouseMode, ScreenSnapshot, StyledCell, TerminalModes,
+};
 use remuda_core::protocol::Response;
 use remuda_core::session_operations::{
     Error, Lifecycle, SessionAttachment, SessionHandle, Unavailable,
@@ -82,6 +84,7 @@ fn paint(
     first: remuda_core::agent::VersionedSnapshot,
     viewer: &Viewer,
 ) -> std::io::Result<()> {
+    out.write_all(&modes(None, first.modes))?;
     out.write_all(&frame(None, &first.snapshot))?;
     out.flush()?;
     let mut shown = first;
@@ -102,6 +105,7 @@ fn paint(
             .wait_after(since, WATCH)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         if next.output_version.unwrap_or(0) > since {
+            out.write_all(&modes(shown.modes, next.modes))?;
             out.write_all(&frame(Some(&shown.snapshot), &next.snapshot))?;
             out.flush()?;
             shown = next;
@@ -193,6 +197,59 @@ pub(super) fn notice(screen: &ScreenSnapshot) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// The mode sequences that move a viewer's terminal from `before` (none: an
+/// unknown terminal, so every mode is stated) to `after`, so keys, pastes and
+/// mouse reports reach the child encoded as it asked. Nothing when the host
+/// does not report modes.
+pub(super) fn modes(before: Option<TerminalModes>, after: Option<TerminalModes>) -> Vec<u8> {
+    let Some(after) = after else {
+        return Vec::new();
+    };
+    let mut out = String::new();
+    let changed =
+        |pick: fn(&TerminalModes) -> bool| before.is_none_or(|b| pick(&b) != pick(&after));
+    if before.is_none_or(|b| b.mouse.mode != after.mouse.mode) {
+        out.push_str("\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l");
+        out.push_str(match after.mouse.mode {
+            MouseMode::None => "",
+            MouseMode::Press => "\x1b[?9h",
+            MouseMode::PressRelease => "\x1b[?1000h",
+            MouseMode::ButtonMotion => "\x1b[?1002h",
+            MouseMode::AnyMotion => "\x1b[?1003h",
+        });
+    }
+    if before.is_none_or(|b| b.mouse.encoding != after.mouse.encoding) {
+        out.push_str("\x1b[?1005l\x1b[?1006l");
+        out.push_str(match after.mouse.encoding {
+            MouseEncoding::Default => "",
+            MouseEncoding::Utf8 => "\x1b[?1005h",
+            MouseEncoding::Sgr => "\x1b[?1006h",
+        });
+    }
+    if changed(|m| m.mouse.bracketed_paste) {
+        out.push_str(if after.mouse.bracketed_paste {
+            "\x1b[?2004h"
+        } else {
+            "\x1b[?2004l"
+        });
+    }
+    if changed(|m| m.application_cursor) {
+        out.push_str(if after.application_cursor {
+            "\x1b[?1h"
+        } else {
+            "\x1b[?1l"
+        });
+    }
+    if changed(|m| m.application_keypad) {
+        out.push_str(if after.application_keypad {
+            "\x1b="
+        } else {
+            "\x1b>"
+        });
+    }
+    out.into_bytes()
+}
+
 fn paint_row(out: &mut String, index: usize, row: &[StyledCell]) {
     let _ = write!(out, "\x1b[{};1H\x1b[0m", index + 1);
     out.push_str(&crate::tui::render_styled_row(row));
@@ -273,6 +330,38 @@ mod tests {
         let mut after = screen(&["ab"], (0, 0));
         after.cursor.visible = false;
         assert!(text(frame(None, &after)).contains("\x1b[?25l"));
+    }
+
+    #[test]
+    fn modes_are_stated_in_full_first_then_only_when_they_change() {
+        let vim = TerminalModes {
+            application_cursor: true,
+            mouse: remuda_core::agent::MouseState {
+                bracketed_paste: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let first = text(modes(None, Some(vim)));
+        for sequence in [
+            "\x1b[?1000l",
+            "\x1b[?1006l",
+            "\x1b[?2004h",
+            "\x1b[?1h",
+            "\x1b>",
+        ] {
+            assert!(first.contains(sequence), "{sequence:?} in {first:?}");
+        }
+        assert!(modes(Some(vim), Some(vim)).is_empty());
+        let mut mouse = vim;
+        mouse.mouse.mode = MouseMode::PressRelease;
+        mouse.mouse.encoding = MouseEncoding::Sgr;
+        let changed = text(modes(Some(vim), Some(mouse)));
+        assert!(
+            changed.ends_with("\x1b[?1000h\x1b[?1005l\x1b[?1006l\x1b[?1006h"),
+            "{changed:?}"
+        );
+        assert!(modes(None, None).is_empty());
     }
 
     #[test]
