@@ -174,6 +174,28 @@ if [ -f "$install_dir/remuda" ]; then
 	done
 fi
 
+# A running daemon keeps starting session hosts after this install, and it
+# must start its own build's host, never the new one. So each host is also
+# kept as remuda-session-host-<build>, the name the daemon looks for first,
+# and the installed host gets that name before the new one replaces it. A
+# host older than this rule cannot say its build and gets no such name.
+# The three most recently installed are kept; a daemon whose copy is gone refuses new
+# hosted sessions with a clear message rather than start a foreign host.
+keep_versioned() {
+	build=$("$1" version 2>/dev/null) || return 0
+	case $build in '' | *[!A-Za-z0-9._+-]*) return 0 ;; esac
+	[ "${#build}" -le 200 ] || return 0
+	kept="$install_dir/remuda-session-host-$build"
+	if [ ! -e "$kept" ]; then
+		ln "$1" "$install_dir/.versioned-host.incoming" 2>/dev/null ||
+			cp -p "$1" "$install_dir/.versioned-host.incoming"
+		mv -f "$install_dir/.versioned-host.incoming" "$kept"
+	fi
+	# Newest first when pruning, so the previous and current builds survive.
+	touch "$kept"
+}
+[ ! -f "$install_dir/remuda-session-host" ] || keep_versioned "$install_dir/remuda-session-host"
+
 # Land each by rename, never by writing in place: `remuda upgrade` runs this
 # while that very binary is executing, and truncating it would be ETXTBSY (or
 # worse, a half-written binary). A rename swaps the directory entry and leaves
@@ -187,6 +209,11 @@ for bin in $host remuda; do
 	mv -f "$install_dir/.$bin.incoming" "$install_dir/$bin"
 done
 [ -n "$host" ] || rm -f "$install_dir/remuda-session-host"
+[ -z "$host" ] || keep_versioned "$install_dir/remuda-session-host"
+# shellcheck disable=SC2012 # build names are checked above: no odd characters
+ls -t "$install_dir"/remuda-session-host-* 2>/dev/null | tail -n +4 | while IFS= read -r old; do
+	rm -f "$old"
+done
 
 echo "$channel" >"$channel_file"
 

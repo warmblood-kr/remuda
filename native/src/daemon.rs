@@ -1570,6 +1570,23 @@ fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
     Ok(reader)
 }
 
+/// Longest act (30 s plus its pauses) a clean shutdown waits for.
+#[cfg(unix)]
+const HOST_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(35);
+
+/// Refuse new host-backed work and let admitted work finish (#758). Hosts are
+/// never stopped; what is still running at the deadline stays recoverable.
+#[cfg(unix)]
+fn drain_session_hosts(image: &Image) {
+    let drained = image.session_hosts().drain(HOST_DRAIN_DEADLINE);
+    if drained.left > 0 {
+        eprintln!(
+            "remuda daemon: exiting with {} host-backed act(s) still running; the next daemon recovers them",
+            drained.left
+        );
+    }
+}
+
 /// Best-effort group-wide reap before a clean `Request::Shutdown` exits —
 /// covers a grandchild PDEATHSIG alone can't reach (see child_guard.rs).
 /// Only THIS death mode runs any code at all; SIGTERM/SIGKILL run none.
@@ -1695,6 +1712,10 @@ fn handle_request(
 
         Request::Version => reply(&stream, &Response::Value(crate::dist::BUILD_VERSION.into())),
         Request::SocketPublication => reply(&stream, &Response::Value(socket_publication())),
+        Request::SessionHostBuilds => reply(
+            &stream,
+            &Response::SessionHostBuilds(registry.hosted_builds()),
+        ),
 
         Request::ClusterRegistrySync { .. }
         | Request::ClusterRegistryUpdate { .. }
@@ -1881,6 +1902,11 @@ fn handle_request(
             let caller = caller_context(&stream, registry, accepted);
             handle_eval(stream, reader, image, &code, name.as_deref(), caller)
         }
+
+        Request::Vfs { args, input_base64 } => reply(
+            &stream,
+            &crate::vfs_cli::serve_request(&args, input_base64.as_deref()),
+        ),
 
         Request::SecretAnswer { .. } => reply(
             &stream,
@@ -2780,6 +2806,10 @@ fn handle_shutdown(
             reap_processes_before_exit(image);
             anti_entropy.stop_and_join();
             socket_owner.cleanup();
+            // After the socket is gone, so `stop` returns at once; an act the
+            // host is running still gets its answer instead of a cut.
+            #[cfg(unix)]
+            drain_session_hosts(image);
             std::process::exit(0);
         },
     )
@@ -4168,6 +4198,7 @@ mod tests {
                 mouse: remuda_core::agent::MouseState::default(),
                 attached: false,
                 closing: false,
+                host_build: Some("test-host".into()),
             })
         };
         let pids = super::hosted_child_pids([

@@ -252,6 +252,20 @@ impl Registry {
         })
     }
 
+    /// Each host-backed session's host build, by name; `None` if unreachable.
+    pub fn hosted_builds(&self) -> Vec<crate::protocol::HostBuild> {
+        let mut builds: Vec<_> = self
+            .hosted_handles()
+            .iter()
+            .map(|handle| crate::protocol::HostBuild {
+                name: handle.identity().name.clone(),
+                build: handle.inspect().ok().and_then(|seen| seen.host_build),
+            })
+            .collect();
+        builds.sort_by(|a, b| a.name.cmp(&b.name));
+        builds
+    }
+
     /// Every host-backed handle, copied out so callers can inspect each host
     /// without holding the registry lock.
     pub fn hosted_handles(&self) -> Vec<Arc<SessionHandle>> {

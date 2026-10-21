@@ -56,7 +56,11 @@ impl Drop for Root {
 struct Daemon(Child);
 impl Daemon {
     fn spawn(root: &Root, opt_in: bool) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
+        Self::spawn_exe(root, Path::new(env!("CARGO_BIN_EXE_remuda")), opt_in)
+    }
+    /// The daemon launches the `remuda-session-host` beside `exe`.
+    fn spawn_exe(root: &Root, exe: &Path, opt_in: bool) -> Self {
+        let mut command = Command::new(exe);
         command
             .args(["-s", "s", "daemon"])
             .env("REMUDA_RUNTIME_DIR", &root.0)
@@ -324,6 +328,57 @@ fn a_session_whose_host_died_can_still_be_closed_and_stays_closed() {
     let second = Daemon::spawn(&root, false);
     assert!(names(&path).is_empty(), "a closed session came back");
     drop(second);
+}
+
+/// The previous build N: a directory with its `remuda` and `remuda-session-host`.
+/// CI builds it from the base commit; there is no default, so it cannot pass unmeasured.
+fn previous() -> PathBuf {
+    let dir = std::env::var_os("REMUDA_COMPAT_PREVIOUS")
+        .expect("REMUDA_COMPAT_PREVIOUS names the previous build's binary directory");
+    let dir = PathBuf::from(dir);
+    for bin in ["remuda", "remuda-session-host"] {
+        assert!(
+            dir.join(bin).is_file(),
+            "{bin} missing in {}",
+            dir.display()
+        );
+    }
+    dir.join("remuda")
+}
+/// One daemon creates a hosted session and dies; the other adopts its
+/// inventory and host, then sends input and closes through it.
+fn hand_over(first: &Path, second: &Path) {
+    let root = Root::new();
+    let path = root.socket();
+    let creator = Daemon::spawn_exe(&root, first, true);
+    new_session(&path, "compat");
+    send_line(&path, "compat", "echo BEFORE:$((6*7))");
+    wait_for(&path, "compat", "BEFORE:42");
+    let host = host_pid(&root);
+    creator.sigkill();
+    let adopter = Daemon::spawn_exe(&root, second, false);
+    assert_eq!(names(&path), vec!["compat".to_owned()]);
+    assert_eq!(
+        send_line(&path, "compat", "echo AFTER:$((7*8))"),
+        Response::Ok
+    );
+    wait_for(&path, "compat", "AFTER:56");
+    assert_eq!(close(&path, "compat"), Response::Ok);
+    wait_gone(host);
+    assert!(names(&path).is_empty());
+    drop(adopter);
+}
+
+#[test]
+#[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS; run by CI job host-compat-n-plus-one"]
+fn n_plus_one_daemon_adopts_an_older_host_and_inventory() {
+    hand_over(&previous(), Path::new(env!("CARGO_BIN_EXE_remuda")));
+}
+
+#[test]
+#[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS; run by CI job host-compat-n-plus-one"]
+fn n_plus_one_older_daemon_adopts_a_newer_host_and_inventory() {
+    hand_over(Path::new(env!("CARGO_BIN_EXE_remuda")), &previous());
 }
 
 fn daemon_id_in(path: &Path, name: &str) -> String {

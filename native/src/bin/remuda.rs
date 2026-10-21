@@ -187,13 +187,7 @@ fn dispatch_cli_command(
             Err(code) => code,
             Ok(()) => help_command(),
         },
-        "version" | "--version" | "-V" => {
-            if let Err(code) = ensure_no_args("version", rest) {
-                return code;
-            }
-            println!("remuda {}", dist::BUILD_VERSION);
-            ExitCode::SUCCESS
-        }
+        "version" | "--version" | "-V" => version_command(server, path, rest),
         "_codex_tui" => codex_tui::run(rest),
         "_codex_watch" => run_codex_watch_cli(rest),
         "upgrade" => run_upgrade(rest),
@@ -217,7 +211,7 @@ fn dispatch_cli_command(
         "lua" => lua_command(server, path, rest),
         "exec" => exec_cli_command(server, path, rest),
         "cluster" => cluster_command(server, path, rest),
-        "vfs" => remuda_native::vfs_cli::run(rest),
+        "vfs" => remuda_native::vfs_cli::run(server, path, rest),
         "mod" => match rest.first().copied() {
             Some("install") => mod_install_command(server, path, &rest[1..]),
             Some("list") => mod_list_command(&rest[1..]),
@@ -290,6 +284,75 @@ fn ensure_no_args(verb: &str, args: &[&str]) -> Result<(), ExitCode> {
         args,
     )
     .map(|_| ())
+}
+
+fn version_cli_spec() -> remuda_native::cli_parse::Spec {
+    simple_cli_spec(
+        "version",
+        "Print the version of this CLI binary. Example: remuda version",
+        vec![],
+        vec![remuda_native::cli_parse::OptionSpec {
+            long: "hosts".into(),
+            short: None,
+            value: None,
+            help: "Also print the running daemon's build and each session host's build".into(),
+            global: false,
+            required: false,
+            repeat_policy: Default::default(),
+        }],
+        "remuda version --hosts",
+    )
+}
+
+/// Plain `version` never touches the daemon. `--hosts` asks the running one:
+/// hosts outlive daemons, so one daemon can serve hosts of several builds.
+fn version_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    let values = match parse_top_level_cli(&version_cli_spec(), "version", args) {
+        Ok(values) => values,
+        Err(code) => return code,
+    };
+    println!("remuda {}", dist::BUILD_VERSION);
+    if !mod_cli_flag(&values, "hosts") {
+        return ExitCode::SUCCESS;
+    }
+    with_existing_daemon(server, path, |path| {
+        let daemon = match remuda_native::client::request(path, &Request::Version) {
+            Ok(Response::Value(build)) => build,
+            Ok(other) => return fail(format!("daemon version: unexpected reply {other:?}")),
+            Err(error) => return fail(error),
+        };
+        let hosts = match remuda_native::client::request(path, &Request::SessionHostBuilds) {
+            Ok(Response::SessionHostBuilds(hosts)) => Some(hosts),
+            Ok(Response::Error(_)) => None,
+            Ok(other) => return fail(format!("session host builds: unexpected reply {other:?}")),
+            Err(error) => return fail(error),
+        };
+        for line in host_build_lines(&daemon, hosts.as_deref()) {
+            println!("{line}");
+        }
+        ExitCode::SUCCESS
+    })
+}
+
+/// `daemon BUILD`, then one `host NAME BUILD` line per host-backed session.
+/// `None` is a daemon from before `SessionHostBuilds`.
+fn host_build_lines(
+    daemon: &str,
+    hosts: Option<&[remuda_core::protocol::HostBuild]>,
+) -> Vec<String> {
+    let mut lines = vec![format!("daemon {daemon}")];
+    let Some(hosts) = hosts else {
+        lines.push("hosts unknown (the daemon predates this query)".into());
+        return lines;
+    };
+    for host in hosts {
+        lines.push(match &host.build {
+            Some(build) if build == daemon => format!("host {} {build}", host.name),
+            Some(build) => format!("host {} {build} (not the daemon's build)", host.name),
+            None => format!("host {} unreachable", host.name),
+        });
+    }
+    lines
 }
 
 fn lua_cli_spec() -> remuda_native::cli_parse::Spec {
@@ -5244,7 +5307,6 @@ fn version_skew(argv: &[&str], path: &Path) -> Result<Option<String>, String> {
                 | "-V"
                 | "--version"
                 | "upgrade"
-                | "vfs"
         )
     ) || (argv.is_empty()
         && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()))
@@ -8240,5 +8302,47 @@ mod upgrade_cli_tests {
                 "{args:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod host_build_tests {
+    use super::host_build_lines;
+    use remuda_core::protocol::HostBuild;
+
+    fn host(name: &str, build: Option<&str>) -> HostBuild {
+        HostBuild {
+            name: name.into(),
+            build: build.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn hosts_of_another_build_and_unreachable_hosts_are_named() {
+        let hosts = [
+            host("a", Some("2+b")),
+            host("b", Some("1+a")),
+            host("c", None),
+        ];
+        assert_eq!(
+            host_build_lines("2+b", Some(&hosts)),
+            [
+                "daemon 2+b",
+                "host a 2+b",
+                "host b 1+a (not the daemon's build)",
+                "host c unreachable",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_daemon_from_before_the_query_says_so() {
+        assert_eq!(
+            host_build_lines("1+a", None),
+            [
+                "daemon 1+a",
+                "hosts unknown (the daemon predates this query)"
+            ]
+        );
     }
 }
