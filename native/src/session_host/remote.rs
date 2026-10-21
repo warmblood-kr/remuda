@@ -688,7 +688,18 @@ impl SessionOperations for HostSession {
         let mut client = self.viewer()?;
         loop {
             let view = self.capture(&mut client, 0)?;
-            if view.generation > version || !self.watch(&mut client, view.generation, until)? {
+            if view.generation > version {
+                return Ok(self.versioned(view));
+            }
+            if !self.watch(&mut client, view.generation, until)? {
+                // As an in-process wait does: nothing new and the child gone
+                // is an exit, not a frame.
+                if matches!(
+                    SessionOperations::inspect(self)?.lifecycle,
+                    Lifecycle::Exited(_)
+                ) {
+                    return Err(Error::Agent(AgentError::Exited));
+                }
                 return Ok(self.versioned(view));
             }
         }

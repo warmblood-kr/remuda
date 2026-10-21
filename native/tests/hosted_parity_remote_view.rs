@@ -153,3 +153,41 @@ fn sequenced_input_is_delivered_once_in_both_backends() {
         }
     }
 }
+
+#[test]
+fn a_sync_waiting_on_a_child_that_exits_answers_exited_in_both_backends() {
+    for mode in MODES {
+        let daemon = Parity::start(mode);
+        let instance = daemon.shell("sh");
+        daemon.wait_for("sh", "$");
+        let (since, _) = frame_text(&sync(&daemon, Some(&instance), 0, 2000));
+        let started = std::time::Instant::now();
+        let waiter = {
+            let socket = daemon.socket();
+            let instance = instance.clone();
+            std::thread::spawn(move || {
+                remuda_native::client::request(
+                    &socket,
+                    &Request::Sync {
+                        name: "sh".into(),
+                        instance_id: Some(instance),
+                        since: since + 1_000_000,
+                        timeout_ms: 8_000,
+                    },
+                )
+                .expect("sync")
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        daemon.eval("remuda.send('sh', 'exit')").unwrap();
+        let response = waiter.join().unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(7),
+            "{mode:?}: the exit did not wake the waiter"
+        );
+        assert!(
+            matches!(&response, Response::Error(message) if message.contains("exited")),
+            "{mode:?}: {response:?}"
+        );
+    }
+}
