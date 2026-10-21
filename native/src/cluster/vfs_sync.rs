@@ -102,10 +102,16 @@ pub fn serve_with(store: &VfsStore, request: &Request) -> VfsResult<Response> {
                 return Err(VfsError::new(VfsErrorKind::TooLarge, "too many hashes"));
             }
             Ok(Response::ClusterVfsBlobHave(
-                hashes.iter().map(|hash| store.has_blob(hash)).collect(),
+                hashes.iter().map(|hash| store.blob_present(hash)).collect(),
             ))
         }
         Request::ClusterVfsBlobGet { sha256, offset } => {
+            // Check the content before a peer starts pulling it, so a damaged
+            // copy is dropped here instead of failing the peer's whole pull.
+            // Later chunks are not re-hashed; the peer checks the whole blob.
+            if *offset == 0 {
+                store.verify_blob(sha256)?;
+            }
             let total = store.blob_len(sha256)?;
             if *offset > total {
                 return Err(VfsError::new(
@@ -342,7 +348,7 @@ fn pull_index(store: &VfsStore, peer_fp: &str) -> Result<usize, String> {
         .digest();
     let mut offset = 0;
     let mut collected = Vec::new();
-    for _ in 0..(super::vfs::MAX_ENTRIES / INDEX_PAGE_ENTRIES + 2) {
+    for _ in 0..(super::vfs::MAX_INDEX_ENTRIES / INDEX_PAGE_ENTRIES + 2) {
         let response = request_peer(
             peer_fp,
             &Request::ClusterVfsIndexSync {
@@ -467,7 +473,7 @@ pub fn wait_for_replicas(entry: &VfsEntry, timeout: Duration) -> VfsResult<usize
         let mut holders = 0;
         for node in &wanted {
             let has = if *node == members.self_fp {
-                store.has_blob(&entry.sha256)
+                store.has_blob(&entry.sha256, entry.size)
             } else {
                 matches!(
                     request_peer(node, &Request::ClusterVfsBlobStat { hashes: vec![entry.sha256.clone()] }),
@@ -557,7 +563,7 @@ pub fn sync_once() -> SyncReport {
     };
     let mut attempts = 0;
     for entry in index.entries.values().filter(|entry| !entry.deleted) {
-        if store.has_blob(&entry.sha256) {
+        if store.has_blob(&entry.sha256, entry.size) {
             continue;
         }
         if !live_placement(entry, &members).contains(&members.self_fp) {
@@ -852,6 +858,29 @@ mod tests {
             }
         )
         .is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn blob_get_refuses_to_serve_a_damaged_copy() {
+        let (root, store) = scratch_store();
+        let hash = store.put_blob(b"good content").unwrap();
+        std::fs::write(store.blob_path(&hash).unwrap(), b"bad content!").unwrap();
+        let request = Request::ClusterVfsBlobGet {
+            sha256: hash.clone(),
+            offset: 0,
+        };
+        assert_eq!(
+            serve_with(&store, &request).unwrap_err().kind,
+            VfsErrorKind::Corrupt
+        );
+        // The damaged copy is gone, so this node now reports it does not
+        // hold the blob and its repair pass fetches a good one.
+        assert_eq!(
+            serve_with(&store, &request).unwrap_err().kind,
+            VfsErrorKind::NotLocal
+        );
+        assert!(!store.blob_present(&hash));
         let _ = std::fs::remove_dir_all(root);
     }
 

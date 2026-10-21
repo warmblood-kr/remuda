@@ -2,6 +2,110 @@
 
 ## Unreleased
 
+- Session hosts (experimental, internal): building blocks for `remuda reload`.
+  A daemon can claim its session hosts again after another daemon claimed
+  them, and every host it has open then refuses the other daemon at once.
+  A candidate daemon can check every host read-only, without claiming. No
+  command uses these yet.
+- Session hosts (experimental): `remuda stop` now lets an act a host is
+  already running finish and answers it, instead of hanging up on it. New
+  host-backed input, resize and close are refused while the daemon drains.
+  `stop` still returns at once, and hosts keep running. Before, such an act
+  answered "the daemon hung up without answering" and was left for the next
+  daemon to resolve.
+- Session hosts (experimental): a daemon now starts only a session host of
+  its own build. Before, a daemon still running after an upgrade started the
+  newly installed host. `install.sh` now also keeps each host as
+  `remuda-session-host-<build>` (the three most recent), and the daemon
+  looks there first. If no host of its build is left, `new` is refused at
+  once with a message to restart the daemon. `remuda-session-host version`
+  prints the host's build.
+- `remuda version --hosts` prints the daemon's build and the build of each
+  host-backed session's host (experimental session hosts, #713). Hosts
+  outlive daemons, so after an upgrade some sessions can still run on an
+  older host; these are marked, and unreachable hosts are named. Plain
+  `remuda version` is unchanged.
+
+- Session hosts (experimental): a host now refuses input, resize, close and
+  stop from a daemon whose inventory writer epoch is older than one it has
+  seen (`writer-fence-v1`, error `superseded_writer`). Before, an older daemon
+  that passed its store check just before a newer daemon claimed could still
+  act on the host. The wire change is additive: older hosts get the plain
+  `Acquire`, and older daemons are still accepted. CI now hands a hosted
+  session between the base build and this build in both directions.
+
+- Lua: `remuda.db.open(name [, opts])` gives each mod its own SQLite
+  databases (#778): `open("notes")` in mod `butler` opens
+  `<state>/remuda/db/butler/notes.db`. Handles have `query`, `exec`, `batch`,
+  `limits` and `close`. Default limits are 64 MiB per database, 1 s per
+  statement and 10,000 rows per query; a mod may ask for up to 1 GiB, 10 s
+  and 100,000. `ATTACH`, `DETACH` and most PRAGMAs are refused. Outside a
+  mod's own code, `open` returns `nil, "no_mod: ..."`.
+- Lua: `remuda.vfs.put(uri, bytes [, replicas])` and `remuda.vfs.rm(uri)`
+  write the cluster file store, with the same rules as `remuda vfs put/rm`.
+  Peers are told in the background, so the Lua thread never waits on them.
+
+- VFS: `remuda vfs` commands now run in the daemon, which owns the index
+  (#778). With no daemon running, a command prints one line saying the
+  daemon is needed and exits 1; it does not start one, and it does not
+  touch the store. Start the daemon with `remuda run ...` or `remuda -e 1`.
+  `put` still reads its source and `get` still writes its destination in
+  your shell, so relative paths and stdin work as before. New:
+  `remuda vfs export-index` writes `index.json` from the database for an
+  older remuda; run it before a downgrade.
+
+- VFS: the name index is now a SQLite database, `vfs/index.db` (#778). A
+  write changes only its own row instead of rewriting the whole
+  `index.json`, and a crash cannot lose a committed write. On first use an
+  existing `index.json` is imported once and then left untouched, so an
+  older remuda still finds the index as it was at the upgrade. Peers see no
+  difference: the entries, the digest and the messages are the same, so
+  upgraded and older nodes sync with each other as before.
+
+- SQLite is now built into the binary (`rusqlite`, bundled; #778). It backs
+  the daemon-owned VFS index and Lua
+  databases. A database opened through it keeps its file, `-wal` and `-shm`
+  private: 0600 in a 0700 directory on Unix, the owner-only ACL on Windows.
+  The `-wal` and `-shm` files are kept when the database closes, so SQLite
+  never recreates them with default permissions. A loose or symlinked file is
+  refused, not used. The release build adds about 1.8 MB once SQLite is
+  linked (measured on aarch64-apple-darwin).
+
+- VFS: a node now checks a blob's hash before it serves the first chunk to a
+  peer. A damaged copy is removed and refused (`corrupt`), so the peer tries
+  another holder and this node's repair pass fetches a good copy. Before,
+  the damage showed only as a hash mismatch at the end of the peer's pull.
+
+- VFS: a local blob file whose size differs from its index entry (a torn
+  copy, for example) now counts as missing. `stat`, `ls`, Lua `local`,
+  `--wait` and the repair pass used to treat any file with the right name as
+  a good copy, so repair never replaced it. A pulled copy now replaces such a
+  file. Peers asking by hash alone (`BlobStat`) still get existence only.
+
+- VFS: deleted files (tombstones) no longer count toward the 10,000-file cap.
+  Before, deletes filled the cap, and once full a node silently stopped
+  taking new paths from peers and diverged from them for good. The whole
+  index, files and tombstones, is now capped at 30,000 entries, and a node
+  pulls up to that many from each peer. Older nodes still cap the whole index
+  at 10,000 and pull at most about 10,500 entries from a peer. When the index
+  is full and a peer sends newer entries it cannot take, the daemon log now
+  says how many it skipped and that the node now differs from its peers (at
+  most once every 10 minutes).
+
+- VFS: `remuda vfs put` no longer reports success when no peer was reached.
+  It still prints `Told 0 of N peers about it.`, then says the file is stored
+  on this node only and exits 75 (EX_TEMPFAIL) so a script can retry. A
+  one-node cluster, with no peers to tell, still exits 0. With `--wait`, the
+  wait result decides; a timed-out wait with no peer reached also exits 75.
+
+- Install: releases now ship `remuda-session-host` beside `remuda` in every
+  tarball, and `install.sh` and `install.ps1` install both as one pair. The
+  pair being replaced is kept as `remuda.prev` and `remuda-session-host.prev`
+  (`.exe.prev` on Windows) for rollback. Before, no release carried the host,
+  so `REMUDA_EXPERIMENTAL_SESSION_HOST=1` failed with "session host binary
+  not found" on any installed remuda. The daemon now also looks for
+  `remuda-session-host.exe` on Windows.
+
 - Cluster TUI: a slow or unreachable peer no longer freezes the cursor.
   Remote Input, InputLine, ResizeSession and Close now run on a background
   worker for each node, and the UI applies each reply when it arrives. Before,

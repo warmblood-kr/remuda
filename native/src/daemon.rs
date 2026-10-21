@@ -272,6 +272,18 @@ pub(crate) fn socket_publication() -> String {
         .unwrap_or_else(|| "legacy: not recorded".into())
 }
 
+/// Set once per daemon from `<socket>.daemon-id`; see `daemon_instance_id`.
+static DAEMON_INSTANCE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The `REMUDA_DAEMON_ID` this daemon bakes into sessions: the per-socket id
+/// that a restart keeps, or the process ID where none is stored (Windows).
+fn daemon_instance_id() -> String {
+    DAEMON_INSTANCE_ID
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::process::id().to_string())
+}
+
 fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     let _socket_lock = SocketLock::acquire(path, runtime)?;
     if ipc::connect(path).is_ok() {
@@ -280,6 +292,16 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
              or stop it first",
             path.display()
         )));
+    }
+    // Under the socket lock: a replacement daemon reads what this one wrote.
+    #[cfg(unix)]
+    match instance_id::load_or_create(path) {
+        Ok(id) => {
+            let _ = DAEMON_INSTANCE_ID.set(id);
+        }
+        Err(error) => eprintln!(
+            "remuda daemon: no stable daemon id ({error}); sessions get the process ID instead"
+        ),
     }
     // Before the bind: once a client can see the socket, a signal must find
     // the handler, not the default action. Signals queue in the pair until
@@ -853,6 +875,8 @@ fn start_listener(
     }
 }
 
+#[cfg(unix)]
+mod instance_id;
 #[cfg(unix)]
 mod publication;
 
@@ -1546,6 +1570,23 @@ fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
     Ok(reader)
 }
 
+/// Longest act (30 s plus its pauses) a clean shutdown waits for.
+#[cfg(unix)]
+const HOST_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(35);
+
+/// Refuse new host-backed work and let admitted work finish (#758). Hosts are
+/// never stopped; what is still running at the deadline stays recoverable.
+#[cfg(unix)]
+fn drain_session_hosts(image: &Image) {
+    let drained = image.session_hosts().drain(HOST_DRAIN_DEADLINE);
+    if drained.left > 0 {
+        eprintln!(
+            "remuda daemon: exiting with {} host-backed act(s) still running; the next daemon recovers them",
+            drained.left
+        );
+    }
+}
+
 /// Best-effort group-wide reap before a clean `Request::Shutdown` exits —
 /// covers a grandchild PDEATHSIG alone can't reach (see child_guard.rs).
 /// Only THIS death mode runs any code at all; SIGTERM/SIGKILL run none.
@@ -1671,6 +1712,10 @@ fn handle_request(
 
         Request::Version => reply(&stream, &Response::Value(crate::dist::BUILD_VERSION.into())),
         Request::SocketPublication => reply(&stream, &Response::Value(socket_publication())),
+        Request::SessionHostBuilds => reply(
+            &stream,
+            &Response::SessionHostBuilds(registry.hosted_builds()),
+        ),
 
         Request::ClusterRegistrySync { .. }
         | Request::ClusterRegistryUpdate { .. }
@@ -1857,6 +1902,11 @@ fn handle_request(
             let caller = caller_context(&stream, registry, accepted);
             handle_eval(stream, reader, image, &code, name.as_deref(), caller)
         }
+
+        Request::Vfs { args, input_base64 } => reply(
+            &stream,
+            &crate::vfs_cli::serve_request(&args, input_base64.as_deref()),
+        ),
 
         Request::SecretAnswer { .. } => reply(
             &stream,
@@ -2707,7 +2757,7 @@ fn handle_shutdown(
         ShutdownVerdict::Allow
     } else {
         let claims = ShutdownClaims {
-            own_daemon_id: std::process::id().to_string(),
+            own_daemon_ids: own_daemon_ids(),
             known_session_name: requester_session_id
                 .as_deref()
                 .and_then(|id| registry.name_for_id(id)),
@@ -2718,10 +2768,14 @@ fn handle_shutdown(
         shutdown_verdict_with_classifier(false, claims, || {
             match process_ancestry::peer_pid(&stream) {
                 Ok(Some(peer_pid)) => {
-                    let ancestry = process_ancestry::is_self_or_descendant(
-                        peer_pid,
-                        &registry.live_process_ids(),
-                    );
+                    let session_pids = match session_process_ids(registry) {
+                        Ok(pids) => pids,
+                        Err(error) => {
+                            eprintln!("remuda: shutdown {error}; refusing unverifiable requester");
+                            return ShutdownPeer::Error(error);
+                        }
+                    };
+                    let ancestry = process_ancestry::is_self_or_descendant(peer_pid, &session_pids);
                     if let process_ancestry::Ancestry::Unreadable { pid, ref error } = ancestry {
                         eprintln!(
                             "remuda: shutdown ancestry stopped at unreadable pid {pid} ({error}); refusing unverifiable requester"
@@ -2752,6 +2806,10 @@ fn handle_shutdown(
             reap_processes_before_exit(image);
             anti_entropy.stop_and_join();
             socket_owner.cleanup();
+            // After the socket is gone, so `stop` returns at once; an act the
+            // host is running still gets its answer instead of a cut.
+            #[cfg(unix)]
+            drain_session_hosts(image);
             std::process::exit(0);
         },
     )
@@ -2769,9 +2827,61 @@ enum ShutdownRefusal {
     Unverifiable(String),
 }
 
+/// Every `REMUDA_DAEMON_ID` that names this daemon: the stable id, plus the
+/// process ID that sessions from before the stable id carry.
+fn own_daemon_ids() -> Vec<String> {
+    let mut ids = vec![daemon_instance_id(), std::process::id().to_string()];
+    ids.dedup();
+    ids
+}
+
+/// Child process IDs of every live session, legacy and host-backed. A
+/// host that cannot report its child makes the ancestry unverifiable.
+fn session_process_ids(registry: &Registry) -> Result<Vec<u32>, String> {
+    let mut pids = registry.live_process_ids();
+    let hosted = registry
+        .hosted_handles()
+        .into_iter()
+        .map(|handle| (handle.identity().name.clone(), handle.inspect()));
+    pids.extend(hosted_child_pids(hosted)?);
+    Ok(pids)
+}
+
+/// Running host children's pids; exited ones identify no caller.
+fn hosted_child_pids(
+    observations: impl IntoIterator<
+        Item = (
+            String,
+            remuda_core::session_operations::Result<remuda_core::session_operations::Observation>,
+        ),
+    >,
+) -> Result<Vec<u32>, String> {
+    use remuda_core::session_operations::Lifecycle;
+    let mut pids = Vec::new();
+    for (name, observation) in observations {
+        match observation {
+            Ok(observation) => match (observation.lifecycle, observation.pid) {
+                (Lifecycle::Exited(_), _) => {}
+                (Lifecycle::Running, Some(pid)) => pids.push(pid),
+                (Lifecycle::Running, None) => {
+                    return Err(format!(
+                        "hosted session {name} reported no child process ID"
+                    ))
+                }
+            },
+            Err(error) => {
+                return Err(format!(
+                    "cannot read hosted session {name} child process ID ({error})"
+                ))
+            }
+        }
+    }
+    Ok(pids)
+}
+
 #[derive(Debug)]
 struct ShutdownClaims {
-    own_daemon_id: String,
+    own_daemon_ids: Vec<String>,
     requester_daemon_id: Option<String>,
     requester_session_id: Option<String>,
     requester_session_name: Option<String>,
@@ -2793,7 +2903,10 @@ struct ShutdownInputs {
 
 fn claim_refusal(claims: &ShutdownClaims) -> Option<ShutdownRefusal> {
     if claims.known_session_name.is_some()
-        || (claims.requester_daemon_id.as_deref() == Some(claims.own_daemon_id.as_str())
+        || (claims
+            .requester_daemon_id
+            .as_ref()
+            .is_some_and(|id| claims.own_daemon_ids.contains(id))
             && (claims.requester_session_id.is_some() || claims.requester_session_name.is_some()))
     {
         Some(ShutdownRefusal::Hosted(
@@ -2962,7 +3075,7 @@ fn handle_new(
         .entry("REMUDA_RUNTIME_DIR".into())
         .or_insert_with(|| runtime_dir().to_string_lossy().into_owned());
     let session_id = Session::new_id();
-    session_env.insert("REMUDA_DAEMON_ID".into(), std::process::id().to_string());
+    session_env.insert("REMUDA_DAEMON_ID".into(), daemon_instance_id());
     session_env.insert("REMUDA_SESSION_ID".into(), session_id.clone());
     session_env.insert("REMUDA_SESSION_NAME".into(), name.clone());
     #[cfg(unix)]
@@ -3798,7 +3911,7 @@ mod tests {
         known_session_name: Option<&str>,
     ) -> ShutdownClaims {
         ShutdownClaims {
-            own_daemon_id: "42".into(),
+            own_daemon_ids: vec!["stable-id".into(), "42".into()],
             requester_daemon_id: requester_daemon_id.map(str::to_owned),
             requester_session_id: requester_session_id.map(str::to_owned),
             requester_session_name: requester_session_name.map(str::to_owned),
@@ -4031,6 +4144,98 @@ mod tests {
             message.contains("pass --i-am-inside to override"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn a_session_from_an_earlier_daemon_on_this_socket_is_still_refused() {
+        // A hosted agent started before a restart carries the stable id; one
+        // from before the stable id carries the process ID. Both are ours.
+        for daemon_id in ["stable-id", "42"] {
+            let verdict = shutdown_verdict(shutdown_input(
+                shutdown_claims(Some(daemon_id), Some("stale"), None, None),
+                ShutdownPeer::Ancestry(Ancestry::Outside),
+                false,
+            ));
+            assert_eq!(
+                verdict,
+                ShutdownVerdict::Refuse(ShutdownRefusal::Hosted("stale".into())),
+                "{daemon_id}"
+            );
+        }
+        let verdict = shutdown_verdict(shutdown_input(
+            shutdown_claims(Some("another-socket-id"), Some("stale"), None, None),
+            ShutdownPeer::Ancestry(Ancestry::Outside),
+            false,
+        ));
+        assert_eq!(
+            verdict,
+            ShutdownVerdict::Allow,
+            "a foreign daemon id is no claim"
+        );
+    }
+
+    #[test]
+    fn host_children_join_the_ancestry_set_and_an_unreadable_host_fails_closed() {
+        use remuda_core::session_operations::{
+            Error, Identity, Lifecycle, Observation, ObservationCut, Unavailable,
+        };
+        let observed = |lifecycle, pid| {
+            Ok(Observation {
+                identity: Identity {
+                    host: Some([1; 16]),
+                    id: "id".into(),
+                    name: "agent".into(),
+                    instance: "instance".into(),
+                },
+                lifecycle,
+                cut: ObservationCut::Host { revision: 1 },
+                size: remuda_core::Size::new(80, 24),
+                pid,
+                output_version: None,
+                idle: Duration::ZERO,
+                output_idle: Duration::ZERO,
+                human_idle: None,
+                mouse: remuda_core::agent::MouseState::default(),
+                attached: false,
+                closing: false,
+                host_build: Some("test-host".into()),
+            })
+        };
+        let pids = super::hosted_child_pids([
+            (
+                "running".to_owned(),
+                observed(Lifecycle::Running, Some(700)),
+            ),
+            (
+                "exited".to_owned(),
+                observed(Lifecycle::Exited(None), Some(701)),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            pids,
+            vec![700],
+            "only running host children identify a caller"
+        );
+        let error = super::hosted_child_pids([(
+            "gone".to_owned(),
+            Err(Error::Unavailable(Unavailable::Transport)),
+        )])
+        .unwrap_err();
+        assert!(error.contains("hosted session gone"), "{error}");
+        let error =
+            super::hosted_child_pids([("pidless".to_owned(), observed(Lifecycle::Running, None))])
+                .unwrap_err();
+        assert!(error.contains("no child process ID"), "{error}");
+        let verdict = shutdown_verdict(shutdown_input(
+            shutdown_claims(None, None, None, None),
+            ShutdownPeer::Error(error),
+            false,
+        ));
+        assert!(matches!(
+            verdict,
+            ShutdownVerdict::Refuse(ShutdownRefusal::Unverifiable(_))
+        ));
     }
 
     #[test]

@@ -56,7 +56,11 @@ impl Drop for Root {
 struct Daemon(Child);
 impl Daemon {
     fn spawn(root: &Root, opt_in: bool) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
+        Self::spawn_exe(root, Path::new(env!("CARGO_BIN_EXE_remuda")), opt_in)
+    }
+    /// The daemon launches the `remuda-session-host` beside `exe`.
+    fn spawn_exe(root: &Root, exe: &Path, opt_in: bool) -> Self {
+        let mut command = Command::new(exe);
         command
             .args(["-s", "s", "daemon"])
             .env("REMUDA_RUNTIME_DIR", &root.0)
@@ -323,5 +327,139 @@ fn a_session_whose_host_died_can_still_be_closed_and_stays_closed() {
     first.sigkill();
     let second = Daemon::spawn(&root, false);
     assert!(names(&path).is_empty(), "a closed session came back");
+    drop(second);
+}
+
+/// The previous build N: a directory with its `remuda` and `remuda-session-host`.
+/// CI builds it from the base commit; there is no default, so it cannot pass unmeasured.
+fn previous() -> PathBuf {
+    let dir = std::env::var_os("REMUDA_COMPAT_PREVIOUS")
+        .expect("REMUDA_COMPAT_PREVIOUS names the previous build's binary directory");
+    let dir = PathBuf::from(dir);
+    for bin in ["remuda", "remuda-session-host"] {
+        assert!(
+            dir.join(bin).is_file(),
+            "{bin} missing in {}",
+            dir.display()
+        );
+    }
+    dir.join("remuda")
+}
+/// One daemon creates a hosted session and dies; the other adopts its
+/// inventory and host, then sends input and closes through it.
+fn hand_over(first: &Path, second: &Path) {
+    let root = Root::new();
+    let path = root.socket();
+    let creator = Daemon::spawn_exe(&root, first, true);
+    new_session(&path, "compat");
+    send_line(&path, "compat", "echo BEFORE:$((6*7))");
+    wait_for(&path, "compat", "BEFORE:42");
+    let host = host_pid(&root);
+    creator.sigkill();
+    let adopter = Daemon::spawn_exe(&root, second, false);
+    assert_eq!(names(&path), vec!["compat".to_owned()]);
+    assert_eq!(
+        send_line(&path, "compat", "echo AFTER:$((7*8))"),
+        Response::Ok
+    );
+    wait_for(&path, "compat", "AFTER:56");
+    assert_eq!(close(&path, "compat"), Response::Ok);
+    wait_gone(host);
+    assert!(names(&path).is_empty());
+    drop(adopter);
+}
+
+#[test]
+#[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS; run by CI job host-compat-n-plus-one"]
+fn n_plus_one_daemon_adopts_an_older_host_and_inventory() {
+    hand_over(&previous(), Path::new(env!("CARGO_BIN_EXE_remuda")));
+}
+
+#[test]
+#[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS; run by CI job host-compat-n-plus-one"]
+fn n_plus_one_older_daemon_adopts_a_newer_host_and_inventory() {
+    hand_over(Path::new(env!("CARGO_BIN_EXE_remuda")), &previous());
+}
+
+fn daemon_id_in(path: &Path, name: &str) -> String {
+    // The marker is computed, so the echoed command line cannot match it.
+    assert_eq!(
+        send_line(path, name, "echo \"D$((1+1))=$REMUDA_DAEMON_ID.\""),
+        Response::Ok
+    );
+    let screen = wait_for(path, name, "D2=");
+    let rest = &screen[screen.find("D2=").unwrap() + 3..];
+    rest[..rest.find('.').expect("terminated id")].to_owned()
+}
+
+fn run_in(path: &Path, name: &str, command: &str, done: &str) -> String {
+    let line = format!("printf '\\033[2J\\033[H'; {command}; echo {done}$((1+1))");
+    assert_eq!(send_line(path, name, &line), Response::Ok);
+    wait_for(path, name, &format!("{done}2"))
+}
+
+#[test]
+fn an_agent_hosted_by_an_earlier_daemon_cannot_stop_its_replacement() {
+    let root = Root::new();
+    let path = root.socket();
+    let binary = env!("CARGO_BIN_EXE_remuda");
+    let first = Daemon::spawn(&root, true);
+    new_session(&path, "agent");
+    let stable = daemon_id_in(&path, "agent");
+    let stored = std::fs::read_to_string(root.0.join("remuda").join("s.sock.daemon-id")).unwrap();
+    assert_eq!(stable, stored.trim_end(), "sessions carry the stored id");
+    assert_ne!(stable, first.0.id().to_string(), "not the process ID");
+    first.sigkill();
+
+    // The replacement daemon has a new pid but the same id, for every session.
+    let second = Daemon::spawn(&root, false);
+    new_session(&path, "fresh");
+    assert_eq!(daemon_id_in(&path, "fresh"), stable);
+
+    // Inherited identity: the hosted agent's REMUDA_* environment is intact.
+    let screen = run_in(
+        &path,
+        "agent",
+        &format!("'{binary}' -s s stop -f --yes"),
+        "A",
+    );
+    assert!(screen.contains("cannot stop this daemon"), "{screen}");
+    // Stripped identity: only the host child's pid in its ancestry refuses it.
+    let stripped = format!(
+        "/usr/bin/env -i PATH=\"$PATH\" REMUDA_RUNTIME_DIR=\"$REMUDA_RUNTIME_DIR\" '{binary}' -s s stop -f --yes"
+    );
+    let screen = run_in(&path, "agent", &stripped, "B");
+    assert!(screen.contains("cannot stop this daemon"), "{screen}");
+    assert!(
+        remuda_native::ipc::connect(&path).is_ok(),
+        "the daemon was stopped"
+    );
+
+    // The stored id alone, with a session claim, names this daemon too.
+    let claimed = request(
+        &path,
+        &Request::Shutdown {
+            requester_daemon_id: Some(stable.clone()),
+            requester_session_id: Some("stale-session-id".into()),
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
+    assert!(
+        matches!(&claimed, Response::Error(reason) if reason.contains("one of its own sessions")),
+        "{claimed:?}"
+    );
+
+    // A caller outside every session, legacy or hosted, still stops it.
+    let stopped = request(
+        &path,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
+    assert_eq!(stopped, Response::Ok);
     drop(second);
 }

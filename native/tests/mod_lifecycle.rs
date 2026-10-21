@@ -1948,3 +1948,61 @@ fn failed_reload_resumes_cached_module_without_rebuilding_registrations() {
         "true"
     );
 }
+
+#[test]
+fn a_mod_opens_databases_in_its_own_namespace_and_eval_code_gets_none() {
+    let home = DataHome::new();
+    // The state dir is XDG_STATE_HOME on Unix and LOCALAPPDATA on Windows.
+    let state_var = if cfg!(windows) {
+        "LOCALAPPDATA"
+    } else {
+        "XDG_STATE_HOME"
+    };
+    let old_state = std::env::var_os(state_var);
+    std::env::set_var(state_var, home.root.join("state"));
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    write_entry(
+        &home.entry(),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function(state)
+            state.db = assert(remuda.db.open("notes"))
+            assert(state.db:batch("CREATE TABLE IF NOT EXISTS n (x)"))
+            assert(state.db:exec("INSERT INTO n VALUES (?)", {"from start"}))
+          end,
+          tools = {{ name = "sample_note_count",
+            about = "Count rows in this mod's notes database.",
+            run = function(state) return state.db:query("SELECT count(*) AS c FROM n")[1].c end }},
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-db.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(&image, "remuda.exec('sample')");
+    let count = read_value(&image, "return remuda.tools.sample_note_count()");
+    let outside = read_value(
+        &image,
+        "local db, err = remuda.db.open('notes'); return tostring(db) .. ' ' .. err",
+    );
+    let native_hidden = read_value(&image, "return tostring(remuda._db_open)");
+    let file = home.root.join("state/remuda/db/sample/notes.db");
+    let exists = file.is_file();
+    match old_state {
+        Some(old) => std::env::set_var(state_var, old),
+        None => std::env::remove_var(state_var),
+    }
+    assert_eq!(count, "1");
+    assert!(outside.starts_with("nil no_mod: "), "{outside}");
+    assert_eq!(native_hidden, "nil");
+    assert!(exists, "{} was not created", file.display());
+}

@@ -38,6 +38,18 @@ const MAX_OFFSET: usize = 1000;
 /// Below the store's per-client result cap, so a new reservation always fits.
 const RETAINED: usize = model::MAX_RESULTS / 2;
 
+/// What a host made of [`HostSession::announce_writer`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Announced {
+    /// It now refuses every older writer.
+    Fenced,
+    /// It predates `writer-fence-v1`: only the inventory fence guards it.
+    Unfenced,
+    /// It has seen a newer writer than ours.
+    Superseded,
+    Unreachable(String),
+}
+
 pub(crate) struct HostSession {
     owner: Arc<Owner>,
     name: String,
@@ -45,6 +57,7 @@ pub(crate) struct HostSession {
     endpoint: PathBuf,
     client: [u8; 16],
     acts: Mutex<()>,
+    gate: Arc<super::gate::Gate>,
 }
 impl HostSession {
     /// `client` is the daemon's stable input identity for this host incarnation.
@@ -68,9 +81,16 @@ impl HostSession {
             endpoint: PathBuf::from(birth.endpoint()),
             client,
             acts: Mutex::new(()),
+            gate: Arc::default(),
         };
         session.identity().validate()?;
         Ok(session)
+    }
+    /// Admit this session's acts and control calls through `gate`, so a
+    /// daemon drain can stop and wait for them.
+    pub fn gated(mut self, gate: Arc<super::gate::Gate>) -> Self {
+        self.gate = gate;
+        self
     }
     fn target(&self) -> Target {
         Target {
@@ -99,6 +119,7 @@ impl HostSession {
     /// Run one whole act: reserve, drive through the host, then publish receipt.
     fn act(&self, act: InputAct) -> Result<Completion> {
         act.validate().map_err(Error::Protocol)?;
+        let _pass = self.gate.enter()?;
         let deadline = ACT_DEADLINE + Duration::from_millis(pauses(&act));
         let _serial = self.acts.lock().unwrap_or_else(|e| e.into_inner());
         // An unreachable host is a clean refusal while nothing is reserved yet.
@@ -330,8 +351,9 @@ impl HostSession {
             ),
         }
     }
-    /// Non-input control (resize, close, stop) is not reserved in the store,
-    /// so a superseded owner is refused here, before it takes the lease.
+    /// Non-input control (resize, close, stop) is not reserved in the store.
+    /// A fencing host refuses a superseded owner atomically; the store check
+    /// below is the only guard on an older host without writer-fence-v1.
     fn controller(&self) -> Result<Client> {
         if !self.owner.current().map_err(store)? {
             return Err(Error::Unavailable(Unavailable::Recovering));
@@ -341,7 +363,7 @@ impl HostSession {
             let mut client =
                 Client::open_expected(&self.endpoint, Role::Control, self.identity.clone())
                     .map_err(opened)?;
-            match client.request(&Request::Acquire).map_err(transport)? {
+            match client.acquire(self.owner.writer()).map_err(transport)? {
                 Response::Granted { .. } => return Ok(client),
                 Response::Error { code } if code == "controller_busy" && Instant::now() < until => {
                     std::thread::sleep(POLL);
@@ -351,7 +373,36 @@ impl HostSession {
             }
         }
     }
+    /// Show the host this daemon's current writer, so it refuses older ones
+    /// from now on, without waiting for this daemon's next act. Takes the
+    /// lease only for that moment.
+    pub fn announce_writer(&self) -> Announced {
+        let mut client =
+            match Client::open_expected(&self.endpoint, Role::Control, self.identity.clone()) {
+                Ok(client) => client,
+                Err(error) => return Announced::Unreachable(error.to_string()),
+            };
+        let fences = client.offers(super::api::WRITER_FENCE);
+        let fenced = if fences {
+            Announced::Fenced
+        } else {
+            Announced::Unfenced
+        };
+        match client.acquire(self.owner.writer()) {
+            Ok(Response::Granted { .. }) => {
+                let _ = client.request(&Request::Release);
+                fenced
+            }
+            // The host raised its writer high-water before the lease check.
+            Ok(Response::Error { code }) if code == "controller_busy" => fenced,
+            Ok(Response::Error { code }) if code == "superseded_writer" => Announced::Superseded,
+            Ok(Response::Error { code }) => Announced::Unreachable(code),
+            Ok(_) => Announced::Unreachable("unexpected host acquire reply".into()),
+            Err(error) => Announced::Unreachable(error.to_string()),
+        }
+    }
     fn control(&self, request: Request) -> Result<()> {
+        let _pass = self.gate.enter()?;
         let mut client = self.controller()?;
         match client.request(&request).map_err(transport)? {
             Response::Ok => Ok(()),
@@ -530,6 +581,7 @@ impl SessionOperations for HostSession {
             mouse: activity.mouse,
             attached: activity.attached,
             closing: activity.closing,
+            host_build: Some(info.host_build),
         })
     }
     fn recover(&self, request: &RequestIdentity) -> Result<Recovery> {
@@ -716,7 +768,7 @@ fn refused(code: &str) -> Error {
     match code {
         "controller_busy" | "snapshot_budget_busy" => Error::Agent(AgentError::Busy),
         // A stopping or unpublished host is not an exited session.
-        "host_stopping" | "host_publication_pending" | "host_unavailable" => {
+        "host_stopping" | "host_publication_pending" | "host_unavailable" | "superseded_writer" => {
             Error::Unavailable(Unavailable::Recovering)
         }
         _ => Error::Protocol("host refused the operation"),
