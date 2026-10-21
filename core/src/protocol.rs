@@ -321,6 +321,10 @@ pub enum Request {
     /// hosts outlive daemons, so builds can differ (#713). Older daemons
     /// answer `bad request`.
     SessionHostBuilds,
+    /// Replace this daemon with one started from `binary`, keeping host-backed
+    /// sessions (#713). Only `check` runs yet: a report in [`Response::Value`],
+    /// or a refusal in [`Response::Error`].
+    Reload { binary: String, check: bool },
     /// How the daemon published its socket, as [`Response::Value`]: `staged`,
     /// or `legacy: <reason>` when it fell back or the operator chose it.
     SocketPublication,

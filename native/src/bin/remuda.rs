@@ -200,6 +200,7 @@ fn dispatch_cli_command(
             },
         },
         "stop" => stop(server, path, rest),
+        "reload" => reload_command(server, path, rest),
         "ls" => match ensure_no_args("ls", rest) {
             Err(code) => code,
             Ok(()) => with_existing_daemon(server, path, list_sessions),
@@ -353,6 +354,89 @@ fn host_build_lines(
         });
     }
     lines
+}
+
+fn reload_cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::OptionSpec;
+    let option = |long: &str, value: Option<&str>, help: &str| OptionSpec {
+        long: long.into(),
+        short: None,
+        value: value.map(str::to_owned),
+        help: help.into(),
+        global: false,
+        required: false,
+        repeat_policy: Default::default(),
+    };
+    simple_cli_spec(
+        "reload",
+        "Replace the running daemon with this remuda, keeping host-backed sessions. \
+         Only --check works yet. Example: remuda reload --check",
+        vec![],
+        vec![
+            option(
+                "check",
+                None,
+                "Start the new daemon as a candidate, report what it sees, change nothing",
+            ),
+            option(
+                "binary",
+                Some("PATH"),
+                "The remuda to reload into (default: this one)",
+            ),
+        ],
+        "remuda reload --check",
+    )
+}
+
+/// The target is this CLI's own binary unless `--binary` names one: the
+/// freshly installed remuda, never the daemon's own (possibly replaced) file.
+fn reload_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    let values = match parse_top_level_cli(&reload_cli_spec(), "reload", args) {
+        Ok(values) => values,
+        Err(code) => return code,
+    };
+    let binary = match values.get("binary").and_then(serde_json::Value::as_str) {
+        Some(binary) => PathBuf::from(binary),
+        None => match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(error) => return fail(format!("cannot find own binary: {error}")),
+        },
+    };
+    if binary.to_string_lossy().ends_with(" (deleted)") {
+        return fail(format!(
+            "{} was replaced since this command started; run the installed remuda",
+            binary.display()
+        ));
+    }
+    let binary = match binary.canonicalize() {
+        Ok(binary) => binary,
+        Err(error) => return fail(format!("reload target {}: {error}", binary.display())),
+    };
+    let request = Request::Reload {
+        binary: binary.to_string_lossy().into_owned(),
+        check: mod_cli_flag(&values, "check"),
+    };
+    with_existing_daemon(server, path, |path| {
+        match remuda_native::client::request(path, &request) {
+            Ok(Response::Value(report)) => {
+                println!("{report}");
+                if report.starts_with("ready:") {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                }
+            }
+            // The client words a request the daemon cannot read as skew and
+            // says `remuda stop`, which would end every session: not here.
+            Ok(Response::Error(reason)) if reason.contains("unknown variant `Reload`") => fail(
+                "the running daemon predates `remuda reload`, so it cannot hand its \
+                 sessions over; they keep running on it",
+            ),
+            Ok(Response::Error(reason)) => fail(reason),
+            Ok(other) => fail(format!("reload: unexpected reply {other:?}")),
+            Err(error) => fail(error),
+        }
+    })
 }
 
 fn lua_cli_spec() -> remuda_native::cli_parse::Spec {
@@ -5523,7 +5607,28 @@ fn send_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
 
 /// Commands used by release automation must not start a daemon or run update checks.
 fn run_internal_command(argv: &[&str]) -> Option<ExitCode> {
-    (argv.first() == Some(&"_latest-index")).then(|| run_latest_index(&argv[1..]))
+    match argv.first().copied() {
+        Some("_latest-index") => Some(run_latest_index(&argv[1..])),
+        #[cfg(unix)]
+        Some(remuda_native::reload::CANDIDATE_VERB) => Some(run_reload_candidate(&argv[1..])),
+        _ => None,
+    }
+}
+
+/// A reload candidate, started by the running daemon with a socketpair on
+/// fd 3. Talks to no daemon socket and checks for no update.
+#[cfg(unix)]
+fn run_reload_candidate(args: &[&str]) -> ExitCode {
+    let [socket] = args else {
+        return fail(format!(
+            "usage: remuda {} SOCKET (started by the daemon)",
+            remuda_native::reload::CANDIDATE_VERB
+        ));
+    };
+    match remuda_native::reload::candidate(Path::new(socket)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => fail(format!("reload candidate: {error}")),
+    }
 }
 
 fn preflight_command(argv: &[&str]) -> Option<ExitCode> {

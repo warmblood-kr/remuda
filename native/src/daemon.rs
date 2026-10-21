@@ -261,6 +261,9 @@ pub fn serve_with_runtime(path: &Path, runtime: &Path) -> std::io::Result<()> {
     serve_inner(path, Some(runtime))
 }
 
+/// The socket this daemon serves, for a reload candidate to find its hosts.
+static DAEMON_SOCKET: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 /// How the endpoint was published; `Request::SocketPublication` reports it.
 static SOCKET_PUBLICATION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -286,6 +289,7 @@ fn daemon_instance_id() -> String {
 
 fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     let _socket_lock = SocketLock::acquire(path, runtime)?;
+    let _ = DAEMON_SOCKET.set(path.to_path_buf());
     if ipc::connect(path).is_ok() {
         return Err(std::io::Error::other(format!(
             "a daemon is already listening at {} — pick a different name (remuda -s <name>) \
@@ -1570,6 +1574,48 @@ fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
     Ok(reader)
 }
 
+/// `Request::Reload`: only the check exists yet.
+fn reload(image: &Image, registry: &Registry, binary: &str, check: bool) -> Response {
+    #[cfg(unix)]
+    {
+        if !check {
+            return Response::error(
+                "reload without --check is not implemented yet; `remuda reload --check` \
+                 reports whether it would be safe",
+            );
+        }
+        let hosted: Vec<String> = registry
+            .hosted_handles()
+            .iter()
+            .map(|handle| handle.identity().name.clone())
+            .collect();
+        let legacy: Vec<String> = registry
+            .list()
+            .into_iter()
+            .filter(|session| session.alive && !hosted.contains(&session.name))
+            .map(|session| session.name)
+            .collect();
+        let Some(socket) = DAEMON_SOCKET.get() else {
+            return Response::error("reload: this daemon does not know its socket");
+        };
+        match crate::reload::check(
+            socket,
+            Path::new(binary),
+            image.session_hosts(),
+            &legacy,
+            crate::reload::Deadlines::default(),
+        ) {
+            Ok(report) => Response::Value(report.lines().join("\n")),
+            Err(error) => Response::error(format!("reload check failed: {error}")),
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = (image, registry, binary, check);
+        Response::error("reload is not supported on Windows yet: sessions there have no host")
+    }
+}
+
 /// Longest act (30 s plus its pauses) a clean shutdown waits for.
 #[cfg(unix)]
 const HOST_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(35);
@@ -1716,6 +1762,9 @@ fn handle_request(
             &stream,
             &Response::SessionHostBuilds(registry.hosted_builds()),
         ),
+        Request::Reload { binary, check } => {
+            reply(&stream, &reload(image, registry, &binary, check))
+        }
 
         Request::ClusterRegistrySync { .. }
         | Request::ClusterRegistryUpdate { .. }
