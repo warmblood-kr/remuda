@@ -20,7 +20,9 @@
 //! `core/clippy.toml` denies outright.
 
 use crate::agent::{AgentError, Cursor, ExitInfo, Result, ScreenSnapshot, Size, StyledCell};
-use crate::input::{InputBatch, InputError, InputOutcome};
+use crate::input::{
+    InputBatch, InputDeduplicator, InputError, InputOutcome, InputRateLimiter, MAX_INPUT_BYTES,
+};
 use crate::protocol::Step;
 use crate::session::Session;
 use crate::session_operations::{Lifecycle, SessionHandle};
@@ -124,6 +126,17 @@ pub struct Registry {
     /// Host-backed sessions (#713). One name space with `sessions`; lock
     /// order is always `sessions`, then `hosted`.
     hosted: Mutex<HashMap<String, Arc<SessionHandle>>>,
+    /// Sequenced-input state per host-backed launch, by instance id: the same
+    /// duplicate memory and rate budget an in-process Session keeps itself.
+    /// Daemon memory only; a daemon restart forgets it, as it would for an
+    /// in-process session.
+    hosted_input: Mutex<HashMap<String, Arc<HostedInput>>>,
+}
+
+#[derive(Default)]
+struct HostedInput {
+    dedup: Mutex<InputDeduplicator>,
+    rate: Mutex<InputRateLimiter>,
 }
 
 impl Registry {
@@ -143,6 +156,85 @@ impl Registry {
     ) -> Option<core::result::Result<InputOutcome, InputError>> {
         self.get(name)
             .map(|session| session.apply_input_line_batch(batch))
+    }
+
+    /// `apply_input_batch` (or, with `line`, `apply_input_line_batch`) for a
+    /// host-backed session (#713): the in-process checks, rate budget and
+    /// duplicate memory here, the write as one host act. One batch at a time
+    /// per session; a concurrent one is told Busy. `now` is the caller's
+    /// clock reading for the rate budget. `None` when no hosted session has
+    /// `name`.
+    pub fn apply_hosted_input_batch(
+        &self,
+        name: &str,
+        batch: InputBatch<'_>,
+        line: bool,
+        now: Duration,
+    ) -> Option<core::result::Result<InputOutcome, InputError>> {
+        let handle = self.hosted(name)?;
+        Some(self.apply_hosted_batch(&handle, batch, line, now))
+    }
+
+    fn apply_hosted_batch(
+        &self,
+        handle: &SessionHandle,
+        batch: InputBatch<'_>,
+        line: bool,
+        now: Duration,
+    ) -> core::result::Result<InputOutcome, InputError> {
+        let text = if line {
+            let bytes = batch.bytes.strip_suffix(b"\r").unwrap_or(batch.bytes);
+            Some(std::str::from_utf8(bytes).map_err(|_| InputError::Unavailable)?)
+        } else {
+            None
+        };
+        if batch.seq == 0 {
+            return Err(InputError::InvalidSequence);
+        }
+        if batch.bytes.is_empty() || batch.bytes.len() > MAX_INPUT_BYTES {
+            return Err(InputError::InvalidLength);
+        }
+        if batch.instance_id != handle.identity().instance {
+            return Ok(InputOutcome::WrongInstance);
+        }
+        match handle.inspect() {
+            Ok(observation) if observation.lifecycle == Lifecycle::Running => {}
+            Ok(_) => return Ok(InputOutcome::Exited),
+            Err(_) => return Err(InputError::Unavailable),
+        }
+        let state = Arc::clone(
+            self.hosted_input
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(handle.identity().instance.clone())
+                .or_default(),
+        );
+        let Ok(mut dedup) = state.dedup.try_lock() else {
+            return Err(InputError::Busy);
+        };
+        if dedup.lookup(batch.client_id, batch.seq).is_none() {
+            state
+                .rate
+                .lock()
+                .map_err(|_| InputError::Unavailable)?
+                .check_rate(now, batch.bytes.len())?;
+        }
+        Ok(dedup.apply(batch.client_id, batch.seq, || {
+            let written = match text {
+                Some(text) => {
+                    handle
+                        .type_text(text, Duration::ZERO)
+                        .and_then(|outcome| match outcome {
+                            crate::session::InputSubmitOutcome::Late => Err(
+                                crate::session_operations::Error::Agent(AgentError::SubmitPending),
+                            ),
+                            _ => Ok(()),
+                        })
+                }
+                None => handle.send(batch.bytes),
+            };
+            written.map_err(crate::session_operations::Error::into_agent)
+        }))
     }
 
     pub fn new() -> Self {
@@ -210,7 +302,18 @@ impl Registry {
 
     /// Stop tracking a host-backed session; its host is not touched.
     pub fn remove_hosted(&self, name: &str) -> Option<Arc<SessionHandle>> {
-        self.hosted_lock().remove(name)
+        let removed = self.hosted_lock().remove(name);
+        if let Some(handle) = &removed {
+            self.forget_hosted_input(handle);
+        }
+        removed
+    }
+
+    fn forget_hosted_input(&self, handle: &SessionHandle) {
+        self.hosted_input
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&handle.identity().instance);
     }
 
     /// A handle to a live session. Many callers may hold one at once: that is
@@ -658,6 +761,8 @@ impl Registry {
             .is_some_and(|current| Arc::ptr_eq(current, &handle));
         if removed {
             hosted.remove(name);
+            drop(hosted);
+            self.forget_hosted_input(&handle);
         }
         Some(Ok(removed))
     }

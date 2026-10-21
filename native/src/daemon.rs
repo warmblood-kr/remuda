@@ -1975,13 +1975,9 @@ fn handle(
 fn local_only(request: &Request) -> Option<(&'static str, &str)> {
     match request {
         Request::CaptureStyled { name, .. } => Some(("styled capture", name)),
-        Request::Sync { name, .. } => Some(("sync", name)),
         Request::MouseState { name } => Some(("mouse state", name)),
         Request::Attach { name } | Request::AttachTracked { name } => Some(("attach", name)),
         Request::AttachStatus { name, .. } => Some(("attach status", name)),
-        Request::Input { name, .. } | Request::InputLine { name, .. } => {
-            Some(("sequenced input", name))
-        }
         _ => None,
     }
 }
@@ -2991,7 +2987,10 @@ fn handle_sync(
     timeout_ms: u64,
 ) -> std::io::Result<()> {
     let Some(session) = registry.get(name) else {
-        return reply(stream, &Response::error(format!("no such session: {name}")));
+        return match registry.hosted(name) {
+            Some(handle) => sync_hosted(stream, &handle, expected_instance, since, timeout_ms),
+            None => reply(stream, &Response::error(format!("no such session: {name}"))),
+        };
     };
     if expected_instance
         .as_deref()
@@ -3030,6 +3029,53 @@ fn handle_sync(
             snapshot: StyledScreen {
                 rows,
                 bracketed_paste: session.mouse_state().bracketed_paste,
+                wrapped: versioned.snapshot.wrapped,
+                scrollback_len: versioned.snapshot.scrollback_len,
+                scrollback_total: versioned.snapshot.scrollback_total,
+                cursor: versioned.snapshot.cursor,
+            },
+        },
+    )
+}
+
+/// `Sync` for a host-backed session (#713): the same bounded wait and frame.
+/// A handle is bound to one launch, so its instance cannot change mid-wait.
+fn sync_hosted(
+    stream: &Stream,
+    handle: &remuda_core::session_operations::SessionHandle,
+    expected_instance: Option<String>,
+    since: u64,
+    timeout_ms: u64,
+) -> std::io::Result<()> {
+    let instance_id = handle.identity().instance.clone();
+    if expected_instance.is_some_and(|expected| expected != instance_id) {
+        return reply(stream, &Response::WrongInstance);
+    }
+    let _permit = match acquire_sync_permit() {
+        Ok(permit) => permit,
+        Err(response) => return reply(stream, &response),
+    };
+    let timeout = Duration::from_millis(remuda_core::sync::bounded_timeout_ms(timeout_ms));
+    let versioned = match handle.wait_after(since, timeout) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return reply(stream, &Response::error(error.to_string())),
+    };
+    let bracketed_paste = handle
+        .inspect()
+        .is_ok_and(|observation| observation.mouse.bracketed_paste);
+    reply(
+        stream,
+        &Response::Sync {
+            instance_id,
+            output_version: versioned.output_version.unwrap_or(0),
+            snapshot: StyledScreen {
+                rows: versioned
+                    .snapshot
+                    .cells
+                    .iter()
+                    .map(|row| collapse_runs(row))
+                    .collect(),
+                bracketed_paste,
                 wrapped: versioned.snapshot.wrapped,
                 scrollback_len: versioned.snapshot.scrollback_len,
                 scrollback_total: versioned.snapshot.scrollback_total,
@@ -3543,16 +3589,23 @@ fn input(
         Ok(client_id) => client_id,
         Err(error) => return reply(stream, &Response::error(error)),
     };
-    let result = registry.apply_input_batch(
-        name,
-        remuda_core::input::InputBatch {
-            instance_id,
-            client_id,
-            seq,
-            bytes,
-        },
-    );
+    let batch = remuda_core::input::InputBatch {
+        instance_id,
+        client_id,
+        seq,
+        bytes,
+    };
+    let result = registry
+        .apply_input_batch(name, batch)
+        .or_else(|| registry.apply_hosted_input_batch(name, batch, false, input_clock()));
     reply_input_result(stream, name, result)
+}
+
+/// The rate-budget clock for host-backed sequenced input: one monotonic
+/// origin per daemon, as an in-process session's own clock would be.
+fn input_clock() -> Duration {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    ORIGIN.get_or_init(std::time::Instant::now).elapsed()
 }
 
 fn input_line(
@@ -3564,7 +3617,10 @@ fn input_line(
     if std::str::from_utf8(batch.bytes).is_err() {
         return reply(stream, &Response::error("input line must be UTF-8"));
     }
-    reply_input_result(stream, name, registry.apply_input_line_batch(name, batch))
+    let result = registry
+        .apply_input_line_batch(name, batch)
+        .or_else(|| registry.apply_hosted_input_batch(name, batch, true, input_clock()));
+    reply_input_result(stream, name, result)
 }
 
 fn reply_input_result(
