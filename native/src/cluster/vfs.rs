@@ -393,22 +393,99 @@ impl VfsStore {
         let _guard = self.lock()?;
         let mut conn = self.index_db()?;
         let tx = vfs_index_db::write_tx(&mut conn)?;
-        let mut report = MergeReport {
-            counts: vfs_index_db::counts(&tx)?,
-            ..MergeReport::default()
-        };
-        for entry in incoming {
-            if entry.validate().is_err() {
-                continue;
-            }
-            match merge_row(&tx, entry.clone(), &mut report.counts)? {
-                CappedMerge::Changed => report.changed.push(entry),
-                CappedMerge::Unchanged => {}
-                CappedMerge::Full => report.skipped_full += 1,
-            }
-        }
+        let report = merge_into(&tx, incoming)?;
         tx.commit()?;
         Ok(report)
+    }
+
+    /// Step `index.db` back to schema `to` with its stored down SQL, after a
+    /// backup. Without `run`, only say what it would undo. Afterwards this
+    /// daemon stops using the index, so it cannot upgrade it again.
+    pub fn index_downgrade(&self, to: u32, run: bool) -> VfsResult<String> {
+        use crate::sqlite_migrate as migrate;
+        let _guard = self.lock()?;
+        let corrupt = |error: String| VfsError::new(VfsErrorKind::Corrupt, error);
+        let mut conn = crate::sqlite::open(&self.root, vfs_index_db::DB_FILE)?;
+        let from = migrate::version(&conn).map_err(corrupt)?;
+        if to >= from {
+            return Err(corrupt(format!(
+                "index.db is at schema {from}; nothing to undo down to {to}"
+            )));
+        }
+        let plan = migrate::planned_downs(&conn, to).map_err(corrupt)?;
+        if let Some((number, name, _)) = plan.iter().find(|(_, _, down)| down.is_none()) {
+            return Err(corrupt(format!(
+                "index.db step {number} ({name}) cannot be undone; use `remuda vfs export-index` for a remuda older than index.db"
+            )));
+        }
+        let steps: Vec<String> = plan
+            .iter()
+            .map(|(n, name, _)| format!("{n} ({name})"))
+            .collect();
+        if !run {
+            return Ok(format!(
+                "Would back up index.db, then undo schema steps {}. Run again with --yes.",
+                steps.join(", ")
+            ));
+        }
+        let copy = migrate::backup(&conn, &self.root.join(vfs_index_db::DB_FILE), from)
+            .map_err(corrupt)?;
+        migrate::downgrade(&mut conn, "index.db", to).map_err(corrupt)?;
+        vfs_index_db::hold_schema();
+        Ok(format!(
+            "Backed up to {}.\nindex.db is now at schema {to} (was {from}). This daemon no longer uses the VFS: stop it and start the older remuda.",
+            copy.display()
+        ))
+    }
+
+    /// Rows changed after `since`, for a peer's `ClusterVfsChanges`.
+    pub fn changes(
+        &self,
+        known_id: Option<&str>,
+        since: u64,
+        limit: usize,
+    ) -> VfsResult<vfs_index_db::ChangesPage> {
+        vfs_index_db::changes(&self.index_db()?, known_id, since, limit)
+    }
+
+    /// This node's cursor into `peer`: its index id and the last seq merged.
+    pub fn cursor(&self, peer: &str) -> VfsResult<(Option<String>, u64)> {
+        vfs_index_db::cursor(&self.index_db()?, peer)
+    }
+
+    /// Merge one page from `peer` and move the cursor in the same
+    /// transaction, so a crash never skips a row.
+    pub fn merge_page(
+        &self,
+        peer: &str,
+        page: &vfs_index_db::ChangesPage,
+    ) -> VfsResult<MergeReport> {
+        let _guard = self.lock()?;
+        let mut conn = self.index_db()?;
+        let tx = vfs_index_db::write_tx(&mut conn)?;
+        let report = merge_into(&tx, page.entries.clone())?;
+        vfs_index_db::set_cursor(&tx, peer, Some(&page.index_id), page.last_seq)?;
+        tx.commit()?;
+        Ok(report)
+    }
+
+    /// Forget this node's cursor into `peer` (its index was replaced).
+    pub fn reset_cursor(&self, peer: &str) -> VfsResult<()> {
+        let _guard = self.lock()?;
+        let mut conn = self.index_db()?;
+        let tx = vfs_index_db::write_tx(&mut conn)?;
+        vfs_index_db::set_cursor(&tx, peer, None, 0)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record that `peer` holds our changes up to `seq`. Best effort.
+    pub fn record_ack(&self, peer: &str, seq: u64) {
+        if let Ok(conn) = self.index_db() {
+            if vfs_index_db::may_write(&conn).unwrap_or(false) {
+                let _ = vfs_index_db::set_acked(&conn, peer, seq);
+            }
+        }
     }
 
     /// Record that a peer index was merged at `now`.
@@ -689,6 +766,24 @@ impl VfsStore {
 
 /// `VfsIndex::merge_capped` on one stored row: the cap rules stay in one place,
 /// and only the row that changed is written.
+fn merge_into(tx: &rusqlite::Transaction<'_>, incoming: Vec<VfsEntry>) -> VfsResult<MergeReport> {
+    let mut report = MergeReport {
+        counts: vfs_index_db::counts(tx)?,
+        ..MergeReport::default()
+    };
+    for entry in incoming {
+        if entry.validate().is_err() {
+            continue;
+        }
+        match merge_row(tx, entry.clone(), &mut report.counts)? {
+            CappedMerge::Changed => report.changed.push(entry),
+            CappedMerge::Unchanged => {}
+            CappedMerge::Full => report.skipped_full += 1,
+        }
+    }
+    Ok(report)
+}
+
 fn merge_row(
     tx: &rusqlite::Transaction<'_>,
     incoming: VfsEntry,

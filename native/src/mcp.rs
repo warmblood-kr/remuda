@@ -273,6 +273,7 @@ fn call_response(id: Value, response: Response) -> String {
         Response::ClusterRegistryPage { .. }
         | Response::ClusterRegistryAck { .. }
         | Response::ClusterVfsIndexPage { .. }
+        | Response::ClusterVfsChangesPage { .. }
         | Response::ClusterVfsAck { .. }
         | Response::ClusterVfsBlobHave(_)
         | Response::ClusterVfsBlobChunk { .. }

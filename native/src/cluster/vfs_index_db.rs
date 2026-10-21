@@ -37,6 +37,12 @@ struct LegacyFile {
 /// Open `root/index.db`: run the schema steps, then merge `index.json` if it
 /// changed. A database from before the runner (#791) is adopted at step 1.
 pub(super) fn open(root: &Path) -> VfsResult<Connection> {
+    if HELD.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(VfsError::new(
+            VfsErrorKind::Corrupt,
+            "index.db was stepped back for an older remuda; stop this daemon and start that remuda",
+        ));
+    }
     let mut conn = crate::sqlite::open(root, DB_FILE)?;
     let known = STEPS.len() as i64;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -64,6 +70,13 @@ pub(super) fn open(root: &Path) -> VfsResult<Connection> {
         claim(&mut conn)?;
     }
     Ok(conn)
+}
+
+/// Set by `remuda vfs index-downgrade`: this process must not upgrade again.
+static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn hold_schema() {
+    HELD.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// This daemon's `(socket, token)`, or `None` outside a daemon.
@@ -149,7 +162,8 @@ pub(super) fn claim(conn: &mut Connection) -> VfsResult<()> {
 
 /// The schema, one `(name, up, down)` per step. Never edit a shipped step;
 /// add one. Step 1 has no down: dropping the index loses every name.
-const STEPS: [(&str, &str, Option<&str>); 1] = [(
+const STEPS: [(&str, &str, Option<&str>); 2] = [
+    (
     "entries",
     "CREATE TABLE entries (
          path     TEXT PRIMARY KEY NOT NULL,
@@ -162,7 +176,35 @@ const STEPS: [(&str, &str, Option<&str>); 1] = [(
          mtime    INTEGER NOT NULL
      ) WITHOUT ROWID;",
     None,
-)];
+),
+    // Change cursors (docs/design-778-vfs-delta-sync.md, step 3): every row
+    // change takes the next `seq`; peers pull `seq > cursor`.
+    (
+        "change-cursors",
+        "ALTER TABLE entries ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+         UPDATE entries SET seq = (SELECT count(*) FROM entries e2 WHERE e2.path <= entries.path);
+         CREATE UNIQUE INDEX entries_seq ON entries (seq);
+         CREATE TABLE seq_state (
+             id       INTEGER PRIMARY KEY CHECK (id = 1),
+             next_seq INTEGER NOT NULL,
+             index_id TEXT NOT NULL
+         );
+         INSERT INTO seq_state VALUES (1, (SELECT count(*) + 1 FROM entries), lower(hex(randomblob(16))));
+         CREATE TABLE peers (
+             fp         TEXT PRIMARY KEY NOT NULL,
+             index_id   TEXT,
+             pulled_seq INTEGER NOT NULL DEFAULT 0,
+             acked_seq  INTEGER NOT NULL DEFAULT 0,
+             last_seen  INTEGER
+         ) WITHOUT ROWID;",
+        Some(
+            "DROP TABLE peers;
+             DROP TABLE seq_state;
+             DROP INDEX entries_seq;
+             ALTER TABLE entries DROP COLUMN seq;",
+        ),
+    ),
+];
 
 fn steps() -> Vec<crate::sqlite_migrate::Step> {
     STEPS
@@ -309,10 +351,16 @@ pub(super) fn live_hashes(conn: &Connection) -> VfsResult<std::collections::Hash
     Ok(hashes.collect::<Result<_, _>>()?)
 }
 
+/// Write `entry` with the next change sequence number.
 pub(super) fn upsert(tx: &Transaction<'_>, entry: &VfsEntry) -> VfsResult<()> {
+    let seq: i64 = tx.query_row(
+        "UPDATE seq_state SET next_seq = next_seq + 1 RETURNING next_seq - 1",
+        [],
+        |row| row.get(0),
+    )?;
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO entries ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+            "INSERT OR REPLACE INTO entries ({COLUMNS}, seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
         ),
         params![
             entry.path,
@@ -323,7 +371,109 @@ pub(super) fn upsert(tx: &Transaction<'_>, entry: &VfsEntry) -> VfsResult<()> {
             entry.writer,
             entry.deleted,
             entry.mtime as i64,
+            seq,
         ],
+    )?;
+    Ok(())
+}
+
+/// One page of changes after `since`, as `ClusterVfsChanges` answers it.
+#[derive(Debug, Default, PartialEq)]
+pub struct ChangesPage {
+    pub index_id: String,
+    pub entries: Vec<VfsEntry>,
+    /// The highest `seq` in `entries`, or `since` when there are none.
+    pub last_seq: u64,
+    pub more: bool,
+    /// The caller's cursor is not into this index: start again at 0.
+    pub reset: bool,
+}
+
+/// Rows with `seq > since`, oldest change first, at most `limit`.
+pub(super) fn changes(
+    conn: &Connection,
+    known_id: Option<&str>,
+    since: u64,
+    limit: usize,
+) -> VfsResult<ChangesPage> {
+    let (next_seq, index_id): (i64, String) =
+        conn.query_row("SELECT next_seq, index_id FROM seq_state", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+    // Another index (recreated, restored), or a cursor past our last row.
+    let foreign = known_id.is_some_and(|known| known != index_id);
+    if foreign || since >= next_seq as u64 {
+        return Ok(ChangesPage {
+            index_id,
+            last_seq: since,
+            reset: true,
+            ..ChangesPage::default()
+        });
+    }
+    let mut statement = conn.prepare(&format!(
+        "SELECT {COLUMNS}, seq FROM entries WHERE seq > ?1 ORDER BY seq LIMIT ?2"
+    ))?;
+    let mut last_seq = since;
+    let mut entries = Vec::new();
+    let rows = statement.query_map(params![since as i64, limit as i64 + 1], |row| {
+        Ok((entry_from_row(row)?, row.get::<_, i64>(8)?))
+    })?;
+    for row in rows {
+        let (entry, seq) = row?;
+        if entries.len() == limit {
+            return Ok(ChangesPage {
+                index_id,
+                entries,
+                last_seq,
+                more: true,
+                reset: false,
+            });
+        }
+        last_seq = seq as u64;
+        entries.push(entry);
+    }
+    Ok(ChangesPage {
+        index_id,
+        entries,
+        last_seq,
+        more: false,
+        reset: false,
+    })
+}
+
+/// The cursor this node holds into `peer`: `(index_id, pulled_seq)`.
+pub(super) fn cursor(conn: &Connection, peer: &str) -> VfsResult<(Option<String>, u64)> {
+    Ok(conn
+        .query_row(
+            "SELECT index_id, pulled_seq FROM peers WHERE fp = ?1",
+            [peer],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
+        )
+        .optional()?
+        .unwrap_or((None, 0)))
+}
+
+/// Move this node's cursor into `peer`, in the merge's transaction.
+pub(super) fn set_cursor(
+    tx: &Transaction<'_>,
+    peer: &str,
+    index_id: Option<&str>,
+    seq: u64,
+) -> VfsResult<()> {
+    tx.execute(
+        "INSERT INTO peers (fp, index_id, pulled_seq, last_seen) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (fp) DO UPDATE SET index_id = ?2, pulled_seq = ?3, last_seen = ?4",
+        params![peer, index_id, seq as i64, super::vfs::unix_now() as i64],
+    )?;
+    Ok(())
+}
+
+/// Record that `peer` holds every change of ours up to `seq` (step 5's input).
+pub(super) fn set_acked(conn: &Connection, peer: &str, seq: u64) -> VfsResult<()> {
+    conn.execute(
+        "INSERT INTO peers (fp, acked_seq, last_seen) VALUES (?1, ?2, ?3)
+         ON CONFLICT (fp) DO UPDATE SET acked_seq = max(acked_seq, ?2), last_seen = ?3",
+        params![peer, seq as i64, super::vfs::unix_now() as i64],
     )?;
     Ok(())
 }
@@ -465,14 +615,16 @@ mod tests {
         let conn = crate::sqlite::open(&root, DB_FILE).unwrap();
         conn.execute_batch(STEPS[0].1).unwrap();
         conn.pragma_update(None, "user_version", 1).unwrap();
-        let tx = conn.unchecked_transaction().unwrap();
-        upsert(&tx, &entry(3, false)).unwrap();
-        tx.commit().unwrap();
+        conn.execute(
+            &format!("INSERT INTO entries ({COLUMNS}) VALUES ('a', '', 1, 1, 7, 'w', 0, 1)"),
+            [],
+        )
+        .unwrap();
         drop(conn);
         let conn = open(&root).unwrap();
         assert_eq!(load(&conn).unwrap().entries.len(), 1);
         let applied = crate::sqlite_migrate::status(&conn).unwrap();
-        assert_eq!(applied.len(), 1);
+        assert_eq!(applied.len(), 2, "adopted step 1, then ran step 2");
         assert_eq!(applied[0].name, "entries");
         assert!(!applied[0].reversible);
     }

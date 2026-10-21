@@ -2065,6 +2065,7 @@ fn handle_request(
         Request::ClusterRegistrySync { .. }
         | Request::ClusterRegistryUpdate { .. }
         | Request::ClusterVfsIndexSync { .. }
+        | Request::ClusterVfsChanges { .. }
         | Request::ClusterVfsIndexUpdate { .. }
         | Request::ClusterVfsBlobStat { .. }
         | Request::ClusterVfsBlobGet { .. } => refuse_cluster_registry(&stream),

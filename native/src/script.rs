@@ -2543,17 +2543,15 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::ClusterRegistryPage { .. }
         | Response::ClusterRegistryAck { .. }
         | Response::ClusterVfsIndexPage { .. }
+        | Response::ClusterVfsChangesPage { .. }
         | Response::ClusterVfsAck { .. }
         | Response::ClusterVfsBlobHave(_)
         | Response::ClusterVfsBlobChunk { .. }
         | Response::ClusterListenerStatus(_) => Err(mlua::Error::runtime(
             "cluster control responses are not exposed to scripts",
         )),
-        Response::PromptSecret { .. } => Err(mlua::Error::runtime(
-            "secret prompts are not supported by this client path",
-        )),
-        Response::PromptLine { .. } => Err(mlua::Error::runtime(
-            "line prompts are not supported by this client path",
+        Response::PromptSecret { .. } | Response::PromptLine { .. } => Err(mlua::Error::runtime(
+            "secret and line prompts are not supported by this client path",
         )),
     }
 }

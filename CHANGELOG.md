@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- VFS: nodes pull only what a peer changed since they last asked (#778).
+  `index.db` gets a change sequence and a cursor per peer (schema step 2).
+  An unchanged peer costs one request per tick instead of a whole-index
+  digest and a full re-pull whenever anything differs. Merged rows relay to
+  peers that never talk to the writer. Older peers keep the digest pull.
+  To go back to a remuda one schema step older, run `remuda vfs
+  index-downgrade 1 --yes` (it writes a backup), then stop the daemon and
+  start the older remuda.
+
 - VFS: only the daemon that serves the socket writes the index, also during
   `remuda reload` (#778, #713). The new daemon claims `index.db` just
   before it serves; a rollback gives it back to the old daemon. A write on
