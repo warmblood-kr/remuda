@@ -9,7 +9,8 @@ for now:
 | Difference | Why | Caller sees |
 |---|---|---|
 | An input act (send, send_line, type_text, feed, clear) is at most 8 KiB | The host inventory stores every act in full and validates it on load; a larger act would make an older build reject the whole inventory, which breaks reload rollback | `hosted input acts are limited to 8 KiB; split the message` |
-| Session names are at most 64 bytes | The inventory validates every name it holds, including old events and tombstones, with the same rollback concern | the launch is refused |
+| Launch limits: name 64 bytes; command 4096 arguments / 512 KiB; working directory 1024 bytes; environment 4096 variables, 128 KiB per value, 512 KiB in all | The inventory validates every name it holds, with the same rollback concern; the rest bound what a launch commits to disk and memory | `host-backed launch refused: ...` naming the limit |
+| The runtime directory needs 23 more bytes of path | A host's socket sits under `<socket>.hosts/<id>/` | `session host socket path too long`; the default `/tmp/remuda-$USER` is far below it |
 | Attach shows the host's parsed screen, not the child's raw bytes | A host keeps typed screens, no raw output stream | bell, window title, OSC 52 clipboard, OSC 8 links and image protocols do not reach the viewer; modes (mouse, paste, cursor keys) do |
 | Terminal size at most 65,536 cells | Host terminal budget | very large terminals (e.g. 300x250) are refused |
 | Sequenced remote input forgets duplicates across a daemon restart | Duplicate memory lives in the daemon, as for an in-process session, which would not survive the restart at all | a retry spanning a restart or reload is not recognised as a duplicate |
