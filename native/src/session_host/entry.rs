@@ -97,34 +97,57 @@ const MAX_ENV_BYTES: usize = 512 * 1024;
 /// size, which an in-process session honours too. The terminal's own
 /// geometry budget below still bounds both ends.
 pub(super) fn validate(launch: &Launch) -> io::Result<()> {
-    if launch.name.is_empty()
-        || launch.name.len() > 64
-        || launch.name.chars().any(char::is_control)
-        || launch.argv.is_empty()
-        || launch.argv.len() > MAX_ARGS
-        || launch.argv.iter().map(String::len).sum::<usize>() > MAX_ARGV_BYTES
-        || launch.argv[0].is_empty()
-        || launch.agent.len() > 32
-        || launch.cwd.len() > 1024
-        || !Path::new(&launch.cwd).is_absolute()
-        || launch.env.len() > MAX_ENV_VARS
-        || launch.env.iter().any(|(key, value)| {
-            key.is_empty()
-                || key.contains('=')
-                || key.len() > 1024
-                || value.len() > MAX_ENV_VALUE
-                || key.starts_with("REMUDA_SESSION_HOST_")
-        })
-        || launch
-            .env
-            .iter()
-            .map(|(key, value)| key.len() + value.len())
-            .sum::<usize>()
-            > MAX_ENV_BYTES
-    {
-        return Err(invalid("invalid or oversized experimental host launch"));
+    if let Some(reason) = refusal(launch) {
+        return Err(invalid(format!("host-backed launch refused: {reason}")));
     }
     super::terminal::Terminal::validate_geometry(launch.rows, launch.cols, 1000).map_err(invalid)
+}
+/// Which host launch limit `launch` breaks, in words a caller can act on.
+fn refusal(launch: &Launch) -> Option<&'static str> {
+    let env_bytes: usize = launch.env.iter().map(|(k, v)| k.len() + v.len()).sum();
+    Some(if launch.name.is_empty() {
+        "the session name is empty"
+    } else if launch.name.len() > 64 {
+        "the session name is over 64 bytes"
+    } else if launch.name.chars().any(char::is_control) {
+        "the session name contains a control character"
+    } else if launch.argv.first().is_none_or(String::is_empty) {
+        "the command is empty"
+    } else if launch.argv.len() > MAX_ARGS {
+        "the command has more than 4096 arguments"
+    } else if launch.argv.iter().map(String::len).sum::<usize>() > MAX_ARGV_BYTES {
+        "the command is over 512 KiB"
+    } else if launch.agent.len() > 32 {
+        "the agent name is over 32 bytes"
+    } else if launch.cwd.len() > 1024 {
+        "the working directory is over 1024 bytes"
+    } else if !Path::new(&launch.cwd).is_absolute() {
+        "the working directory is not absolute"
+    } else if launch.env.len() > MAX_ENV_VARS {
+        "the environment has more than 4096 variables"
+    } else if launch
+        .env
+        .iter()
+        .any(|(key, _)| key.is_empty() || key.contains('=') || key.len() > 1024)
+    {
+        "an environment variable name is empty, contains '=', or is over 1024 bytes"
+    } else if launch
+        .env
+        .iter()
+        .any(|(_, value)| value.len() > MAX_ENV_VALUE)
+    {
+        "an environment variable value is over 128 KiB"
+    } else if launch
+        .env
+        .iter()
+        .any(|(key, _)| key.starts_with("REMUDA_SESSION_HOST_"))
+    {
+        "REMUDA_SESSION_HOST_* environment variables are reserved"
+    } else if env_bytes > MAX_ENV_BYTES {
+        "the environment is over 512 KiB"
+    } else {
+        return None;
+    })
 }
 pub(crate) fn manifest(path: &Path) -> io::Result<Manifest> {
     let file = std::fs::OpenOptions::new()

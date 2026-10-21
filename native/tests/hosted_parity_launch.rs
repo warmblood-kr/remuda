@@ -85,3 +85,22 @@ fn an_explicitly_small_size_is_honoured_in_both_backends() {
         assert_eq!(stty_size(&daemon, "floored", "FLOOR"), "24x80", "{mode:?}");
     }
 }
+
+#[test]
+fn a_hosted_launch_over_a_limit_is_refused_naming_the_limit() {
+    let daemon = Parity::start(parity::Mode::Hosted);
+    let refused = daemon.request(&Request::New {
+        name: Some("n".repeat(65)),
+        command: vec!["/bin/sh".into()],
+        size: Size::new(80, 24),
+        cwd: Some("/".into()),
+        env: None,
+    });
+    match refused {
+        Response::Error(message) => assert!(
+            message.contains("host-backed launch refused: the session name is over 64 bytes"),
+            "{message}"
+        ),
+        other => panic!("a 65-byte name was not refused: {other:?}"),
+    }
+}
