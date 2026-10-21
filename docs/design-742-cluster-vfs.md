@@ -150,6 +150,9 @@ does not touch the store.
   `R` placement nodes report the blob through `BlobStat`. When the node
   knows peers but reached none of them, put says the file is stored on this
   node only and exits 75 (EX_TEMPFAIL); the `Told N of M peers` line stays.
+  `--min-copies K` (1 to R) waits instead until K nodes hold the blob, this
+  one included. If fewer do within 60 s, put says the write is committed
+  here and still replicating, and exits 75. Nothing is rolled back.
 - **get / resolve**: read the local blob if present. Otherwise ask the
   placement nodes in order, then any other admitted peer, and verify the hash.
   `resolve` keeps the blob locally and prints its file path for tools that

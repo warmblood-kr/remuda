@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- VFS: `remuda vfs put --min-copies K` waits until K nodes hold the file,
+  this one included (#778). If fewer do within 60 s, it says the write is
+  committed here and still replicating, and exits 75; nothing is rolled
+  back. K is at most the copies wanted (`--replicas`).
+
 - VFS: a node that has not pulled for 30 days (`remuda vfs config
   --stale-days DAYS`) no longer holds deleted files back on its peers
   (#778). When it returns, a peer that forgot deletes in the meantime tells

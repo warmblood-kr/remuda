@@ -622,18 +622,7 @@ pub fn wait_for_replicas(entry: &VfsEntry, timeout: Duration) -> VfsResult<usize
     loop {
         let members = members()?;
         let wanted = live_placement(entry, &members);
-        let mut holders = 0;
-        for node in &wanted {
-            let has = if *node == members.self_fp {
-                store.has_blob(&entry.sha256, entry.size)
-            } else {
-                matches!(
-                    request_peer(node, &Request::ClusterVfsBlobStat { hashes: vec![entry.sha256.clone()] }),
-                    Ok(Response::ClusterVfsBlobHave(have)) if have.first() == Some(&true)
-                )
-            };
-            holders += usize::from(has);
-        }
+        let holders = count_holders(&store, &members.self_fp, entry, &wanted);
         if holders >= wanted.len() {
             return Ok(holders);
         }
@@ -645,6 +634,37 @@ pub fn wait_for_replicas(entry: &VfsEntry, timeout: Duration) -> VfsResult<usize
                     wanted.len()
                 ),
             ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// How many of `nodes` hold the entry's blob, asking peers by `BlobStat`.
+fn count_holders(store: &VfsStore, self_fp: &str, entry: &VfsEntry, nodes: &[String]) -> usize {
+    let has = |node: &String| {
+        if node == self_fp {
+            return store.has_blob(&entry.sha256, entry.size);
+        }
+        matches!(
+            request_peer(node, &Request::ClusterVfsBlobStat { hashes: vec![entry.sha256.clone()] }),
+            Ok(Response::ClusterVfsBlobHave(have)) if have.first() == Some(&true)
+        )
+    };
+    nodes.iter().filter(|node| has(node)).count()
+}
+
+/// Poll until `min` nodes hold the entry's blob, this one included, or
+/// `timeout` passes. Returns the last count; the caller compares it to `min`.
+pub fn wait_for_copies(entry: &VfsEntry, min: usize, timeout: Duration) -> VfsResult<usize> {
+    let deadline = Instant::now() + timeout;
+    let store = VfsStore::open_default()?;
+    loop {
+        let members = members()?;
+        let mut nodes = vec![members.self_fp.clone()];
+        nodes.extend(members.reachable.iter().cloned());
+        let holders = count_holders(&store, &members.self_fp, entry, &nodes);
+        if holders >= min || Instant::now() >= deadline {
+            return Ok(holders);
         }
         std::thread::sleep(Duration::from_millis(250));
     }

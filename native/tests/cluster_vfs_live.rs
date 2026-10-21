@@ -318,6 +318,8 @@ fn put_on_one_node_reads_on_every_node_and_delete_reaches_all() {
         "vfs put",
     );
     assert!(put.contains("2 copies confirmed"), "{put}");
+    let said = put_min_copies(&a, "remuda:///min.md", 3);
+    assert!(said.contains("3 copies confirmed"), "{said}");
 
     // The name reaches every node, and every node can read the content,
     // fetching it from a holder when it has no copy.
@@ -574,6 +576,29 @@ fn put(node: &Node, uri: &str, body: &[u8]) {
     );
 }
 
+/// `put --replicas 3 --min-copies MIN`; returns stdout and stderr.
+fn put_min_copies(node: &Node, uri: &str, min: u8) -> String {
+    let min = min.to_string();
+    let args = [
+        "vfs",
+        "put",
+        "-",
+        uri,
+        "--replicas",
+        "3",
+        "--min-copies",
+        &min,
+    ];
+    let output = node.run_with_stdin(&args, Some(b"three copies"));
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "put --min-copies: {said}");
+    said
+}
+
 fn wait_for_body(node: &Node, uri: &str, body: &[u8]) {
     wait_until("content reaches peer", Duration::from_secs(20), || {
         node.stat_json(uri)
@@ -608,6 +633,10 @@ fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
     for node in [&old, &c] {
         wait_for_body(node, from_new, b"written by N+1");
     }
+
+    // --min-copies counts the older node's copy through BlobStat.
+    let said = put_min_copies(&a, "remuda:///mixed/three.txt", 3);
+    assert!(said.contains("3 copies confirmed"), "{said}");
 
     // A newer write on the older node wins on both newer nodes.
     put(&old, from_new, b"rewritten by N");

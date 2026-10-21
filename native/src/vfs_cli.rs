@@ -61,8 +61,9 @@ fn spec() -> Spec {
             verb("put", "Store a local file (or - for stdin) at a remuda:// URI. Example: remuda vfs put notes.md remuda:///notes.md",
                 vec![arg("SOURCE", "Local file, or - for stdin", true), arg("URI", "remuda://CLUSTER/PATH or remuda:///PATH", true)],
                 vec![option("replicas", Some("N"), "Copies to keep (1-16; default from vfs settings)"),
-                     option("wait", None, "Wait until the copies exist on their nodes")],
-                "remuda vfs put SOURCE URI [--replicas N] [--wait]"),
+                     option("wait", None, "Wait until the copies exist on their nodes"),
+                     option("min-copies", Some("K"), "Wait until K nodes hold it, this one included; exit 75 if not in 60 s")],
+                "remuda vfs put SOURCE URI [--replicas N] [--wait | --min-copies K]"),
             verb("get", "Print a file, or write it to DEST. Example: remuda vfs get remuda:///notes.md notes.md",
                 vec![arg("URI", "remuda:// URI", true), arg("DEST", "Local file; omit or - for stdout", false)],
                 vec![option("local", None, "Do not ask other nodes")],
@@ -393,6 +394,16 @@ fn put(store: &VfsStore, values: &Map<String, Value>, bytes: &[u8], out: &mut Ou
             Err(error) => return fail_vfs(out, "put", &error),
         },
     };
+    let min_copies = match value(values, "min-copies") {
+        Some(_) if flag(values, "wait") => {
+            return fail(out, "put", "use --wait or --min-copies, not both")
+        }
+        Some(text) => match parse_min_copies(text, replicas) {
+            Ok(min) => Some(min),
+            Err(error) => return fail(out, "put", error),
+        },
+        None => None,
+    };
     let writer = match writer() {
         Ok(writer) => writer,
         Err(error) => return fail_vfs(out, "put", &error),
@@ -431,11 +442,52 @@ fn put(store: &VfsStore, values: &Map<String, Value>, bytes: &[u8], out: &mut Ou
         }
         return 0;
     }
+    if let Some(min) = min_copies {
+        return match vfs_sync::wait_for_copies(&entry, min, WAIT_TIMEOUT) {
+            Ok(holders) => {
+                let (said, code) = min_copies_outcome(holders, min);
+                if code == 0 {
+                    say!(out, "{said}");
+                } else {
+                    warn!(out, "remuda: vfs put: {said}");
+                }
+                code
+            }
+            Err(error) => {
+                fail_vfs(out, "put", &error);
+                EXIT_TEMPFAIL
+            }
+        };
+    }
     if outcome.only_here {
         EXIT_TEMPFAIL
     } else {
         0
     }
+}
+
+/// `--min-copies K`: 1 up to the copies wanted, since nodes outside the
+/// placement do not keep a copy.
+fn parse_min_copies(text: &str, replicas: u8) -> Result<usize, String> {
+    text.parse::<usize>()
+        .ok()
+        .filter(|min| (1..=usize::from(replicas)).contains(min))
+        .ok_or_else(|| format!("--min-copies must be 1-{replicas} (the copies wanted)"))
+}
+
+/// The line and exit code after waiting for `min` copies. A short count is
+/// not a rollback: the write stands and peers keep copying it.
+fn min_copies_outcome(holders: usize, min: usize) -> (String, u8) {
+    if holders >= min {
+        return (format!("{holders} copies confirmed."), 0);
+    }
+    (
+        format!(
+            "committed here, but only {holders} of {min} copies confirmed in {} s; still replicating (exit code {EXIT_TEMPFAIL})",
+            WAIT_TIMEOUT.as_secs()
+        ),
+        EXIT_TEMPFAIL,
+    )
 }
 
 /// What `put` reports after telling peers about a new entry.
@@ -918,6 +970,28 @@ mod tests {
         assert!(!alone.only_here);
         assert_eq!(alone.told, None);
         assert_eq!(alone.warning, None);
+    }
+
+    #[test]
+    fn min_copies_is_checked_against_the_copies_wanted() {
+        assert_eq!(parse_min_copies("2", 3), Ok(2));
+        assert_eq!(parse_min_copies("3", 3), Ok(3));
+        assert!(parse_min_copies("4", 3).is_err_and(|e| e.contains("1-3")));
+        assert!(parse_min_copies("0", 3).is_err());
+        assert!(parse_min_copies("x", 3).is_err());
+        assert_eq!(
+            forwarded(&["put", "a", "remuda:///n.md", "--min-copies", "2"]),
+            ["put", "-", "remuda:///n.md", "--min-copies", "2"]
+        );
+    }
+
+    #[test]
+    fn too_few_copies_in_time_is_a_temporary_failure_not_a_rollback() {
+        assert_eq!(min_copies_outcome(2, 2), ("2 copies confirmed.".into(), 0));
+        let (said, code) = min_copies_outcome(1, 3);
+        assert_eq!(code, EXIT_TEMPFAIL);
+        assert!(said.starts_with("committed here, but only 1 of 3 copies confirmed"));
+        assert!(said.contains("still replicating"));
     }
 
     #[test]
