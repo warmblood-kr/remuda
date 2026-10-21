@@ -632,6 +632,7 @@ pub struct SyncReport {
     pub copies_fetched: usize,
     pub copies_failed: usize,
     pub garbage_removed: usize,
+    pub tombstones_removed: usize,
     pub error: Option<String>,
 }
 
@@ -642,13 +643,14 @@ impl std::fmt::Display for SyncReport {
         }
         write!(
             formatter,
-            "Peers reached {}, unreachable {}; index entries merged {}; copies fetched {}, failed {}; old blobs removed {}.",
+            "Peers reached {}, unreachable {}; index entries merged {}; copies fetched {}, failed {}; old blobs removed {}, old deletes forgotten {}.",
             self.peers_reached,
             self.peers_failed,
             self.entries_merged,
             self.copies_fetched,
             self.copies_failed,
-            self.garbage_removed
+            self.garbage_removed,
+            self.tombstones_removed
         )
     }
 }
@@ -706,6 +708,13 @@ pub fn sync_once() -> SyncReport {
         }
     }
     report.garbage_removed = store.collect_garbage().unwrap_or(0);
+    let others: Vec<String> = members
+        .admitted
+        .iter()
+        .filter(|fp| **fp != members.self_fp)
+        .cloned()
+        .collect();
+    report.tombstones_removed = store.collect_tombstones(&others, unix_now()).unwrap_or(0);
     report
 }
 
@@ -1162,6 +1171,86 @@ mod tests {
         // Pulling again changes nothing anywhere.
         assert_eq!(pull_from(&a, &b, "SHA256:b").0, 0);
         assert_eq!(pull_from(&c, &b, "SHA256:b").0, 0);
+    }
+
+    #[test]
+    fn a_delete_is_forgotten_only_after_every_peer_pulled_it_and_it_aged() {
+        let (_a, server) = scratch_store();
+        let (_b, client) = scratch_store();
+        server.put("gone.txt", b"x", 2, "SHA256:s").unwrap();
+        let tombstone = server.delete("gone.txt", "SHA256:s").unwrap();
+        // A later write elsewhere, so the tombstone is not the newest version.
+        server.put("kept.txt", b"y", 2, "SHA256:s").unwrap();
+        let later = tombstone.mtime + 8 * 86_400;
+        let peers = ["SHA256:client".to_owned()];
+        assert_eq!(
+            server.collect_tombstones(&peers, later).unwrap(),
+            0,
+            "not pulled yet"
+        );
+        pull_from(&client, &server, "SHA256:server");
+        assert_eq!(
+            server.collect_tombstones(&peers, later).unwrap(),
+            0,
+            "pulled, not acked"
+        );
+        // The next pull says how far the client got: that is the ack.
+        pull_from(&client, &server, "SHA256:server");
+        assert_eq!(
+            server
+                .collect_tombstones(&peers, tombstone.mtime + 86_400)
+                .unwrap(),
+            0,
+            "too young"
+        );
+        let two = [peers[0].clone(), "SHA256:silent".to_owned()];
+        assert_eq!(
+            server.collect_tombstones(&two, later).unwrap(),
+            0,
+            "a silent member blocks"
+        );
+        assert_eq!(server.collect_tombstones(&peers, later).unwrap(), 1);
+        let index = server.load_index().unwrap();
+        assert!(!index.entries.contains_key("gone.txt"));
+        assert!(index.live("kept.txt").is_some());
+        // The client still has the tombstone; pulling again brings nothing back.
+        assert_eq!(pull_from(&client, &server, "SHA256:server").0, 0);
+        assert!(client.load_index().unwrap().entries["gone.txt"].deleted);
+    }
+
+    #[test]
+    fn the_newest_version_and_deletes_with_conflicts_are_never_forgotten() {
+        let (_a, store) = scratch_store();
+        store.put("a.txt", b"a", 2, "SHA256:s").unwrap();
+        let newest = store.delete("a.txt", "SHA256:s").unwrap();
+        let later = newest.mtime + 30 * 86_400;
+        assert_eq!(store.collect_tombstones(&[], later).unwrap(), 0);
+        let next = store.put("b.txt", b"b", 2, "SHA256:s").unwrap();
+        assert!(next.version > newest.version, "versions never go back");
+        // A delete that won over a concurrent write keeps that write's content.
+        let concurrent = VfsEntry {
+            path: "c.txt".into(),
+            sha256: store.put_blob(b"theirs").unwrap(),
+            size: 6,
+            replicas: 2,
+            version: 1,
+            writer: "SHA256:t".into(),
+            deleted: false,
+            mtime: 0,
+            vv: VfsEntry::next_vv(None, "SHA256:t"),
+            conflicts: Vec::new(),
+        };
+        store.put("c.txt", b"mine", 2, "SHA256:s").unwrap();
+        store.delete("c.txt", "SHA256:s").unwrap();
+        store.merge_entries(vec![concurrent]).unwrap();
+        store.put("d.txt", b"d", 2, "SHA256:s").unwrap();
+        assert_eq!(
+            store.collect_tombstones(&[], later).unwrap(),
+            1,
+            "only a.txt"
+        );
+        let index = store.load_index().unwrap();
+        assert!(index.entries["c.txt"].deleted && index.entries["c.txt"].conflicts.len() == 1);
     }
 
     #[test]

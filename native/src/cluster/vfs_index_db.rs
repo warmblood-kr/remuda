@@ -410,6 +410,31 @@ pub(super) fn live_hashes(conn: &Connection) -> VfsResult<std::collections::Hash
     Ok(hashes.collect::<Result<_, _>>()?)
 }
 
+/// Delete tombstones written before `before` whose `seq` every peer in
+/// `others` has acked. Rows with conflicts stay, and so does the row with
+/// the highest version, which `next_version` must never go below.
+pub(super) fn collect_tombstones(
+    tx: &Transaction<'_>,
+    others: &[String],
+    before: u64,
+) -> VfsResult<usize> {
+    let mut acked = i64::MAX;
+    for peer in others {
+        let seq: Option<i64> = tx
+            .query_row("SELECT acked_seq FROM peers WHERE fp = ?1", [peer], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        acked = acked.min(seq.unwrap_or(0));
+    }
+    let top = next_version(tx)?.wrapping_sub(1) as i64;
+    Ok(tx.execute(
+        "DELETE FROM entries WHERE deleted = 1 AND seq <= ?1 AND mtime < ?2 AND version != ?3
+           AND NOT EXISTS (SELECT 1 FROM conflicts WHERE conflicts.path = entries.path)",
+        params![acked, before as i64, top],
+    )?)
+}
+
 /// Write `entry` with the next change sequence number.
 pub(super) fn upsert(tx: &Transaction<'_>, entry: &VfsEntry) -> VfsResult<()> {
     let seq: i64 = tx.query_row(

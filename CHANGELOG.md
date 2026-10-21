@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- VFS: deleted files are forgotten at last (#778). A tombstone goes once
+  every other node has pulled it from this one and it is 7 days old
+  (`remuda vfs config --tombstone-days DAYS`). Until then, and for as long
+  as any member never pulls (an older build, a node that is down), it
+  stays. `remuda vfs sync` reports how many were forgotten. A concurrent
+  delete that loses to a write is no longer kept as a conflict.
+
 - VFS: `remuda vfs ls --conflicts` lists paths with kept concurrent writes,
   `remuda vfs stat` shows them, and `remuda vfs resolve-conflict URI --keep
   winner|VERSION` settles them by writing the chosen side again (fetched
