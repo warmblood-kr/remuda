@@ -32,7 +32,7 @@ fn random() -> io::Result<[u8; 16]> {
     Ok(bytes)
 }
 pub(crate) fn run(path: &Path) -> io::Result<()> {
-    let bytes = super::wire::read_frame(&mut io::stdin().lock(), MAX_FRAME)?;
+    let bytes = super::wire::read_bootstrap(&mut io::stdin().lock())?;
     let launch: Launch = serde_json::from_slice(&bytes).map_err(invalid)?;
     validate(&launch)?;
     // A host has its own process session; inherited bootstrap stdin closing
@@ -54,7 +54,7 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
             random()?,
             launch.name.clone(),
             command,
-            Size::new(launch.cols, launch.rows),
+            Size::for_viewport(launch.cols, launch.rows),
         )
         .map_err(invalid)?,
     );
@@ -83,22 +83,36 @@ pub(crate) fn run(path: &Path) -> io::Result<()> {
         });
     server.run()
 }
+/// Launch bounds. A hosted child inherits the daemon's environment (#713), so
+/// these hold a real one with room to spare; together they fit one
+/// [`super::wire::MAX_BOOTSTRAP`] frame even with JSON escaping.
+const MAX_ARGS: usize = 4096;
+const MAX_ARGV_BYTES: usize = 512 * 1024;
+const MAX_ENV_VARS: usize = 4096;
+const MAX_ENV_VALUE: usize = 128 * 1024;
+const MAX_ENV_BYTES: usize = 512 * 1024;
+
+/// Size has no floor here: the daemon's `Size` already applies the 80x24
+/// safety floor unless a caller explicitly opted into a pane or viewport
+/// size, which an in-process session honours too. The terminal's own
+/// geometry budget below still bounds both ends.
 pub(super) fn validate(launch: &Launch) -> io::Result<()> {
     if launch.name.is_empty()
         || launch.name.len() > 64
         || launch.name.chars().any(char::is_control)
         || launch.argv.is_empty()
-        || launch.argv.len() > 32
-        || launch.argv.iter().map(String::len).sum::<usize>() > 16 * 1024
+        || launch.argv.len() > MAX_ARGS
+        || launch.argv.iter().map(String::len).sum::<usize>() > MAX_ARGV_BYTES
         || launch.argv[0].is_empty()
         || launch.agent.len() > 32
         || launch.cwd.len() > 1024
         || !Path::new(&launch.cwd).is_absolute()
-        || launch.env.len() > 64
+        || launch.env.len() > MAX_ENV_VARS
         || launch.env.iter().any(|(key, value)| {
             key.is_empty()
-                || key.len() > 128
-                || value.len() > 4096
+                || key.contains('=')
+                || key.len() > 1024
+                || value.len() > MAX_ENV_VALUE
                 || key.starts_with("REMUDA_SESSION_HOST_")
         })
         || launch
@@ -106,9 +120,7 @@ pub(super) fn validate(launch: &Launch) -> io::Result<()> {
             .iter()
             .map(|(key, value)| key.len() + value.len())
             .sum::<usize>()
-            > 16 * 1024
-        || launch.rows < 24
-        || launch.cols < 80
+            > MAX_ENV_BYTES
     {
         return Err(invalid("invalid or oversized experimental host launch"));
     }
