@@ -341,6 +341,7 @@ impl Hosts {
         let launch_id = random()?;
         let nonce = random()?;
         let endpoint = self.root.join(hex(&random::<8>()?));
+        socket_fits(&endpoint.join("socket"))?;
         let endpoint_text = endpoint
             .to_str()
             .ok_or("session host path is not UTF-8")?
@@ -572,5 +573,35 @@ mod start_tests {
         let status = exit.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(status.code(), Some(super::super::BUILD_MISMATCH));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A host binds its socket 23 bytes deeper than its daemon's, so a runtime
+/// directory the daemon fits in can still be too long for the host. Said
+/// before anything is reserved, instead of the host exiting unexplained.
+fn socket_fits(socket: &Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let len = socket.as_os_str().as_bytes().len();
+    let limit = crate::staged_socket::SOCKET_PATH_LIMIT;
+    if len > limit {
+        return Err(format!(
+            "session host socket path too long ({len} bytes, limit {limit}): {}\nNext: set a shorter REMUDA_RUNTIME_DIR",
+            socket.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod socket_path_tests {
+    #[test]
+    fn a_host_socket_too_long_for_the_kernel_is_refused_with_the_remedy() {
+        let limit = crate::staged_socket::SOCKET_PATH_LIMIT;
+        let fits = format!("/{}", "a".repeat(limit - 1));
+        assert!(super::socket_fits(std::path::Path::new(&fits)).is_ok());
+        let long = format!("/{}", "a".repeat(limit));
+        let error = super::socket_fits(std::path::Path::new(&long)).unwrap_err();
+        assert!(error.contains("socket path too long"), "{error}");
+        assert!(error.contains("REMUDA_RUNTIME_DIR"), "{error}");
     }
 }
