@@ -18,6 +18,10 @@ pub(crate) const ACTIVITY: &str = "activity-v1";
 /// ([`super::terminal::HISTORY_ROWS`]). A plain `Viewport` keeps answering
 /// within [`super::terminal::LEGACY_HISTORY_ROWS`], which older daemons check.
 pub(crate) const DEEP_HISTORY: &str = "deep-history-v1";
+/// `ViewportCompact` is understood: a deep viewport whose cells travel as
+/// style runs ([`super::viewport::Viewport::encode_compact`]), a few KB
+/// instead of ~130 bytes per cell.
+pub(crate) const COMPACT_VIEW: &str = "compact-view-v1";
 /// AcquireWriter is understood; the host refuses any writer older than one seen.
 pub(crate) const WRITER_FENCE: &str = "writer-fence-v1";
 /// The durable inventory writer a daemon presents: store incarnation, epoch.
@@ -144,6 +148,10 @@ pub(crate) enum Request {
     },
     /// Only sent to a host advertising DEEP_HISTORY; older hosts reject it.
     ViewportDeep {
+        scrollback: u16,
+    },
+    /// Only sent to a host advertising COMPACT_VIEW; older hosts reject it.
+    ViewportCompact {
         scrollback: u16,
     },
     AcknowledgeViewport {

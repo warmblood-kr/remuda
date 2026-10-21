@@ -1,5 +1,5 @@
 //! Typed relative history viewport; no raw byte replay or incremental baseline.
-use remuda_core::agent::{Cursor, MouseState, ScreenSnapshot, StyledCell};
+use remuda_core::agent::{Color, Cursor, MouseState, ScreenSnapshot, StyledCell};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 
@@ -72,6 +72,87 @@ impl Viewport {
         self.validate()?;
         encode(self, super::api::MAX_SNAPSHOT_BYTES)
     }
+    /// The `compact-view-v1` form: each row as runs of neighbouring cells
+    /// that share a style, default fields left out. Exact cells come back
+    /// from [`Viewport::decode`].
+    pub fn encode_compact(&self) -> io::Result<Vec<u8>> {
+        self.validate()?;
+        let runs = self
+            .cells
+            .iter()
+            .map(|row| {
+                let mut runs: Vec<Run> = Vec::new();
+                for cell in row {
+                    let style = Style::of(cell);
+                    match runs.last_mut() {
+                        Some(run) if run.style == style => run.c.push(cell.text.clone()),
+                        _ => runs.push(Run {
+                            c: vec![cell.text.clone()],
+                            style,
+                        }),
+                    }
+                }
+                runs
+            })
+            .collect();
+        encode(
+            &CompactViewport {
+                schema: COMPACT_SCHEMA,
+                rendering_profile: RenderingProfile::Vt100Fixed22,
+                generation: self.generation,
+                rows: self.rows,
+                cols: self.cols,
+                offset: self.offset,
+                history_len: self.history_len,
+                history_total: self.history_total,
+                runs,
+                wrapped: self.wrapped.clone(),
+                cursor: self.cursor,
+                modes: self.modes.clone(),
+            },
+            super::api::MAX_SNAPSHOT_BYTES,
+        )
+    }
+    /// Either wire form; the caller still validates the result.
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        #[derive(Deserialize)]
+        struct Schema {
+            schema: u16,
+        }
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "typed viewport encoding");
+        let schema: Schema = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+        if schema.schema != COMPACT_SCHEMA {
+            return serde_json::from_slice(bytes).map_err(|_| invalid());
+        }
+        let compact: CompactViewport = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+        let cols = usize::from(compact.cols);
+        let mut cells = Vec::with_capacity(compact.runs.len());
+        for runs in compact.runs {
+            let mut row = Vec::with_capacity(cols);
+            for run in runs {
+                // Bounded before expanding: a row never holds more than `cols`.
+                if run.c.is_empty() || run.c.len() > cols - row.len().min(cols) {
+                    return Err(invalid());
+                }
+                row.extend(run.c.into_iter().map(|text| run.style.cell(text)));
+            }
+            cells.push(row);
+        }
+        Ok(Self {
+            schema: 1,
+            rendering_profile: compact.rendering_profile,
+            generation: compact.generation,
+            rows: compact.rows,
+            cols: compact.cols,
+            offset: compact.offset,
+            history_len: compact.history_len,
+            history_total: compact.history_total,
+            cells,
+            wrapped: compact.wrapped,
+            cursor: compact.cursor,
+            modes: compact.modes,
+        })
+    }
     pub fn into_screen(self) -> ScreenSnapshot {
         ScreenSnapshot {
             cells: self.cells,
@@ -81,6 +162,80 @@ impl Viewport {
             scrollback_total: usize::try_from(self.history_total).unwrap_or(usize::MAX),
         }
     }
+}
+const COMPACT_SCHEMA: u16 = 2;
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompactViewport {
+    schema: u16,
+    rendering_profile: RenderingProfile,
+    generation: u64,
+    rows: u16,
+    cols: u16,
+    offset: u16,
+    history_len: u16,
+    history_total: u64,
+    runs: Vec<Vec<Run>>,
+    wrapped: Vec<bool>,
+    cursor: Cursor,
+    modes: Modes,
+}
+/// Neighbouring cells with one style: their texts, in order.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Run {
+    c: Vec<String>,
+    #[serde(flatten)]
+    style: Style,
+}
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
+struct Style {
+    #[serde(default, skip_serializing_if = "is_default")]
+    fg: Color,
+    #[serde(default, skip_serializing_if = "is_default")]
+    bg: Color,
+    #[serde(default, skip_serializing_if = "is_default")]
+    bold: bool,
+    #[serde(default, skip_serializing_if = "is_default")]
+    dim: bool,
+    #[serde(default, skip_serializing_if = "is_default")]
+    italic: bool,
+    #[serde(default, skip_serializing_if = "is_default")]
+    underline: bool,
+    #[serde(default, skip_serializing_if = "is_default")]
+    inverse: bool,
+    #[serde(default, skip_serializing_if = "is_default")]
+    wide: bool,
+}
+impl Style {
+    fn of(cell: &StyledCell) -> Self {
+        Self {
+            fg: cell.fg,
+            bg: cell.bg,
+            bold: cell.bold,
+            dim: cell.dim,
+            italic: cell.italic,
+            underline: cell.underline,
+            inverse: cell.inverse,
+            wide: cell.wide,
+        }
+    }
+    fn cell(&self, text: String) -> StyledCell {
+        StyledCell {
+            text,
+            fg: self.fg,
+            bg: self.bg,
+            bold: self.bold,
+            dim: self.dim,
+            italic: self.italic,
+            underline: self.underline,
+            inverse: self.inverse,
+            wide: self.wide,
+        }
+    }
+}
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 fn encode(value: &impl Serialize, limit: usize) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();

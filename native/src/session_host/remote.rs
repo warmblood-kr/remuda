@@ -417,7 +417,9 @@ impl HostSession {
         let until = Instant::now() + CONTROL_DEADLINE;
         let (snapshot, generation, bytes, pages) = loop {
             // An older host knows only `Viewport`, within the legacy history.
-            let request = if client.offers(super::api::DEEP_HISTORY) {
+            let request = if client.offers(super::api::COMPACT_VIEW) {
+                Request::ViewportCompact { scrollback: offset }
+            } else if client.offers(super::api::DEEP_HISTORY) {
                 Request::ViewportDeep { scrollback: offset }
             } else {
                 Request::Viewport { scrollback: offset }
@@ -468,8 +470,8 @@ impl HostSession {
             }
             assembled.extend_from_slice(&data);
         }
-        let view: Viewport = serde_json::from_slice(&assembled)
-            .map_err(|_| Error::Protocol("host viewport decoding"))?;
+        let view =
+            Viewport::decode(&assembled).map_err(|_| Error::Protocol("host viewport decoding"))?;
         view.validate()
             .map_err(|_| Error::Protocol("host viewport bounds"))?;
         if view.generation != generation {

@@ -25,6 +25,7 @@ const CAPS: &[&str] = &[
     super::api::ACTIVITY,
     super::api::WRITER_FENCE,
     super::api::DEEP_HISTORY,
+    super::api::COMPACT_VIEW,
 ];
 pub(crate) struct Server {
     endpoint: Arc<Endpoint>,
@@ -164,6 +165,7 @@ impl Server {
             stop_after_reply: false,
             latest: None,
             deep: false,
+            compact: false,
         };
         loop {
             let bytes = channel.receive()?;
@@ -230,6 +232,8 @@ struct Connection {
     latest: Option<super::latest::Latest>,
     /// The last viewport asked for the host's full history (`ViewportDeep`).
     deep: bool,
+    /// ... and wanted its cells as style runs (`ViewportCompact`).
+    compact: bool,
 }
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -327,6 +331,7 @@ impl Connection {
             request @ (Request::Snapshot
             | Request::Viewport { .. }
             | Request::ViewportDeep { .. }
+            | Request::ViewportCompact { .. }
             | Request::Page { .. }
             | Request::Acknowledge { .. }
             | Request::AcknowledgeViewport { .. }
@@ -511,11 +516,15 @@ impl Connection {
         match request {
             Request::Snapshot => self.begin_snapshot(None),
             Request::Viewport { scrollback } => {
-                self.deep = false;
+                (self.deep, self.compact) = (false, false);
                 self.begin_snapshot(Some(scrollback))
             }
             Request::ViewportDeep { scrollback } => {
-                self.deep = true;
+                (self.deep, self.compact) = (true, false);
+                self.begin_snapshot(Some(scrollback))
+            }
+            Request::ViewportCompact { scrollback } => {
+                (self.deep, self.compact) = (true, true);
                 self.begin_snapshot(Some(scrollback))
             }
             Request::Page { snapshot, index } => self.page(snapshot, index),
@@ -634,9 +643,12 @@ impl Connection {
                 view = view.within_legacy_history();
             }
             // Expensive encoding is outside the parser lock, with an in-write cap.
-            let bytes = view
-                .encode()
-                .map_err(|_| "typed_capture_budget_or_bounds")?;
+            let bytes = if self.compact {
+                view.encode_compact()
+            } else {
+                view.encode()
+            }
+            .map_err(|_| "typed_capture_budget_or_bounds")?;
             Ok((view.generation, bytes, view.rows, view.cols))
         } else {
             let (generation, bytes, (rows, cols)) = self
