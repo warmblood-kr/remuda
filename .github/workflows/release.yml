@@ -97,15 +97,19 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04 # older glibc → runs on more distros
             bin: remuda
+            host: remuda-session-host
           - target: aarch64-linux-android
             os: ubuntu-22.04
             bin: remuda
+            host: remuda-session-host
           - target: aarch64-apple-darwin
             os: macos-14
             bin: remuda
+            host: remuda-session-host
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             bin: remuda.exe
+            host: remuda-session-host.exe
     runs-on: ${{ matrix.os }}
     # A self-hosted runner can be busy, offline, or simply not permitted to
     # serve this repository, and GitHub leaves such a job QUEUED rather than
@@ -154,7 +158,9 @@ jobs:
         env:
           REMUDA_VERSION: ${{ needs.plan.outputs.version }}
           REMUDA_BUILD: gha.${{ github.run_number }}.${{ github.run_attempt }}.${{ github.sha }}
-        run: cargo build --release --bin remuda --target ${{ matrix.target }}
+        # The daemon starts the host from beside its own executable, so the two
+        # ship as one pair from one build or not at all.
+        run: cargo build --release --bin remuda --bin remuda-session-host --target ${{ matrix.target }}
 
       - name: the binary reports the version it was built with
         # A build-time env var that silently fails to reach the binary produces
@@ -191,7 +197,13 @@ jobs:
           set -eu
           name="remuda-${{ needs.plan.outputs.version }}-${{ matrix.target }}"
           mkdir -p dist
-          tar -czf "dist/$name.tar.gz" -C "target/${{ matrix.target }}/release" ${{ matrix.bin }}
+          tar -czf "dist/$name.tar.gz" -C "target/${{ matrix.target }}/release" \
+            ${{ matrix.bin }} ${{ matrix.host }}
+          # A tarball missing either half of the pair is a release that fails
+          # only later, on the opt-in host path, in a user's terminal.
+          listed=$(tar -tzf "dist/$name.tar.gz" | sort | tr '\n' ' ')
+          want=$(printf '%s\n' ${{ matrix.bin }} ${{ matrix.host }} | sort | tr '\n' ' ')
+          [ "$listed" = "$want" ] || { echo "::error::$name.tar.gz holds '$listed', want '$want'"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         with:

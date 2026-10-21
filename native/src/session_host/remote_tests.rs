@@ -377,6 +377,25 @@ fn a_newer_owner_claim_fences_the_old_adapter_before_any_effect() {
     assert_eq!(observed.size, Size::new(80, 24));
 }
 
+/// The store check and the host lease are not atomic; the host closes that gap.
+#[test]
+fn the_host_refuses_an_older_writer_that_already_passed_the_store_check() {
+    let fixture = Fixture::new();
+    let old = adapter(&fixture.root);
+    let new = adapter(&fixture.root);
+    assert!(new.owner.writer().epoch > old.owner.writer().epoch);
+    new.resize(Size::for_pane(100, 30)).unwrap();
+    // As if `old` had passed `current()` just before `new` claimed.
+    let mut client =
+        Client::open_expected(&old.endpoint, Role::Control, old.identity.clone()).unwrap();
+    match client.acquire(old.owner.writer()).unwrap() {
+        Response::Error { code } => assert_eq!(code, "superseded_writer"),
+        _ => panic!("the host granted a superseded writer"),
+    }
+    let size = new.inspect().unwrap().size;
+    assert_eq!((size.cols(), size.rows()), (100, 30));
+}
+
 #[test]
 fn plain_text_skips_wide_continuations_and_joins_wrapped_rows() {
     use remuda_core::agent::{Cursor, StyledCell};

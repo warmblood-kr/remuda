@@ -8,6 +8,14 @@
   older host; these are marked, and unreachable hosts are named. Plain
   `remuda version` is unchanged.
 
+- Session hosts (experimental): a host now refuses input, resize, close and
+  stop from a daemon whose inventory writer epoch is older than one it has
+  seen (`writer-fence-v1`, error `superseded_writer`). Before, an older daemon
+  that passed its store check just before a newer daemon claimed could still
+  act on the host. The wire change is additive: older hosts get the plain
+  `Acquire`, and older daemons are still accepted. CI now hands a hosted
+  session between the base build and this build in both directions.
+
 - VFS: a node now checks a blob's hash before it serves the first chunk to a
   peer. A damaged copy is removed and refused (`corrupt`), so the peer tries
   another holder and this node's repair pass fetches a good copy. Before,
@@ -34,6 +42,14 @@
   on this node only and exits 75 (EX_TEMPFAIL) so a script can retry. A
   one-node cluster, with no peers to tell, still exits 0. With `--wait`, the
   wait result decides; a timed-out wait with no peer reached also exits 75.
+
+- Install: releases now ship `remuda-session-host` beside `remuda` in every
+  tarball, and `install.sh` and `install.ps1` install both as one pair. The
+  pair being replaced is kept as `remuda.prev` and `remuda-session-host.prev`
+  (`.exe.prev` on Windows) for rollback. Before, no release carried the host,
+  so `REMUDA_EXPERIMENTAL_SESSION_HOST=1` failed with "session host binary
+  not found" on any installed remuda. The daemon now also looks for
+  `remuda-session-host.exe` on Windows.
 
 - Cluster TUI: a slow or unreachable peer no longer freezes the cursor.
   Remote Input, InputLine, ResizeSession and Close now run on a background
