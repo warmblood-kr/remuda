@@ -418,7 +418,12 @@ fn reload_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         check: mod_cli_flag(&values, "check"),
     };
     with_existing_daemon(server, path, |path| {
+        // Reload is Unix-only; a Windows daemon refuses it and never says
+        // `reloaded:`, so nothing here is checked there.
+        #[cfg(unix)]
         let before = remuda_native::reload::post_check::config_error_before(path);
+        #[cfg(windows)]
+        let before: Option<String> = None;
         match remuda_native::client::request(path, &request) {
             Ok(Response::Value(report)) => {
                 println!("{report}");
@@ -444,8 +449,14 @@ fn reload_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     })
 }
 
+#[cfg(windows)]
+fn reload_post_check(_path: &Path, _report: &str, _before: Option<&str>) -> ExitCode {
+    ExitCode::SUCCESS
+}
+
 /// After a reload: the new daemon answers as the target build, lists every
 /// host the reload moved, and loaded its `init.lua`.
+#[cfg(unix)]
 fn reload_post_check(path: &Path, report: &str, before: Option<&str>) -> ExitCode {
     use remuda_native::reload::post_check::{post_check, CONFIG_DEADLINE};
     let checked = post_check(path, report, before, CONFIG_DEADLINE);
