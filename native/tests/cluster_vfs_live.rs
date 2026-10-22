@@ -643,11 +643,11 @@ fn older_build_refuses_a_newer_index_db_cleanly() {
     let mut node = Node::start();
     put(&node, "remuda:///kept.txt", b"kept");
     node.kill_daemon_only();
-    // As if this build had added schema step 2.
+    // As if a much later build had added schema steps.
     let index = node.root.join("state/remuda/cluster/vfs/index.db");
     rusqlite::Connection::open(&index)
         .unwrap()
-        .pragma_update(None, "user_version", 2)
+        .pragma_update(None, "user_version", 99)
         .unwrap();
     node.exe = previous();
     node.spawn_daemon();
@@ -662,7 +662,7 @@ fn older_build_refuses_a_newer_index_db_cleanly() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 99);
 }
 
 /// `remuda vfs index-downgrade` steps index.db back so the previous build
