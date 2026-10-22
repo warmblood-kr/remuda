@@ -715,6 +715,10 @@ fn wait_gone(node: &Node, uri: &str) {
 #[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS; run by CI jobs host-compat-n-plus-one and vfs-compat-pre-sqlite"]
 fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
     let _serial = live_test_guard();
+    if !previous_has_vfs_verb("put") {
+        skip("N has no vfs");
+        return;
+    }
     let (a, old, c) = joined(Node::start(), Node::start_exe(previous()), Node::start());
     let (from_old, from_new) = (
         "remuda:///mixed/from-old.txt",
@@ -790,6 +794,10 @@ fn kept_conflicts(node: &Node) -> i64 {
 fn pre_sqlite_downgrade_and_upgrade_again_keep_every_name() {
     let _serial = live_test_guard();
     // Only an N from before index.db reads index.json; export-index came with it.
+    if !previous_has_vfs_verb("put") {
+        skip("N has no vfs");
+        return;
+    }
     if previous_has_vfs_verb("export-index") {
         skip("N already has index.db");
         return;
