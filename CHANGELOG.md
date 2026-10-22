@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `remuda reload` (Unix): fixed a daemon that had just handed over being
+  able to hand over again. A reload request it had accepted just before the
+  handover could start a second one, giving the socket to two new daemons.
+  It now refuses and points to the new daemon.
+
 - VFS: `remuda vfs ls --conflicts` lists paths with kept concurrent writes,
   `remuda vfs stat` shows them, and `remuda vfs resolve-conflict URI --keep
   winner|VERSION` settles them by writing the chosen side again (fetched
