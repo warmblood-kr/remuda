@@ -141,10 +141,9 @@ pub struct Registry {
     /// [`CLOSED_HOSTED_KEPT`], so a Sync that woke as the host stopped can
     /// tell a close from an exit after the handle is gone.
     closed_hosted: Mutex<std::collections::VecDeque<String>>,
-    /// Sequenced-input state per host-backed launch, by instance id: the same
+    /// Sequenced-input state per host-backed launch, by instance id: the
     /// duplicate memory and rate budget an in-process Session keeps itself.
-    /// Daemon memory only; a daemon restart forgets it, as it would for an
-    /// in-process session.
+    /// Daemon memory only, so a daemon restart forgets it.
     hosted_input: Mutex<HashMap<String, Arc<HostedInput>>>,
 }
 
@@ -173,12 +172,9 @@ impl Registry {
             .map(|session| session.apply_input_line_batch(batch))
     }
 
-    /// `apply_input_batch` (or, with `line`, `apply_input_line_batch`) for a
-    /// host-backed session (#713): the in-process checks, rate budget and
-    /// duplicate memory here, the write as one host act. One batch at a time
-    /// per session; a concurrent one is told Busy. `now` is the caller's
-    /// clock reading for the rate budget. `None` when no hosted session has
-    /// `name`.
+    /// `apply_input_batch` (or `apply_input_line_batch`) for a host-backed
+    /// session (#713): in-process checks here, the write as one host act; a
+    /// concurrent batch is told Busy. `None` when no hosted session has `name`.
     pub fn apply_hosted_input_batch(
         &self,
         name: &str,
