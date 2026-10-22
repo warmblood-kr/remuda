@@ -3723,6 +3723,12 @@ fn spawn(
     if std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true) {
         builder.env("TERM", "xterm-256color");
     }
+    // Same as a host-backed child: the daemon's own switches and
+    // service-manager handles are not the session's.
+    #[cfg(unix)]
+    for key in crate::session_host::hosted::DAEMON_ONLY {
+        builder.env_remove(key);
+    }
     if let Some(env) = env {
         for (k, v) in env {
             builder.env(k, v);
