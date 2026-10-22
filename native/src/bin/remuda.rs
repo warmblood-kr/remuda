@@ -5599,6 +5599,10 @@ fn after_upgrade(path: &Path, no_reload: bool) -> ExitCode {
             eprintln!("{UPGRADE_NEXT}");
             ExitCode::SUCCESS
         }
+        AfterUpgrade::Unhealthy(report) => {
+            println!("{report}");
+            fail("the new version is installed and the daemon runs it, but the new daemon failed a check above")
+        }
         // Installed as asked; the daemon staying put is a choice, not a failure.
         AfterUpgrade::Kept(why) => {
             eprintln!(
