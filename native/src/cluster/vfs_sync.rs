@@ -432,6 +432,9 @@ fn batch_entries(entries: &[VfsEntry]) -> Vec<String> {
 static LEGACY_PEERS: std::sync::Mutex<BTreeMap<String, Instant>> =
     std::sync::Mutex::new(BTreeMap::new());
 const LEGACY_RETRY: Duration = Duration::from_secs(3600);
+/// What a listener answers to a request it cannot decode (an older build).
+pub(super) const OLD_BUILD_REFUSALS: [&str; 2] =
+    ["invalid remote request", "invalid cluster request"];
 
 /// Pull what `peer` changed since our cursor; fall back to the whole-index
 /// digest pull for a peer that does not know change cursors.
@@ -446,7 +449,7 @@ fn pull(store: &VfsStore, me: &str, peer: &str) -> Result<usize, String> {
     }
     match pull_changes(store, me, peer, &mut |request| request_peer(peer, request)) {
         Ok(Some(merged)) => Ok(merged),
-        Ok(None) | Err(_) => {
+        Ok(None) => {
             let merged = pull_index(store, peer)?;
             LEGACY_PEERS
                 .lock()
@@ -454,6 +457,9 @@ fn pull(store: &VfsStore, me: &str, peer: &str) -> Result<usize, String> {
                 .insert(peer.to_owned(), Instant::now());
             Ok(merged)
         }
+        // A timeout or a bad page is not an older build: pull the whole
+        // index this once, and ask for changes again next time.
+        Err(_) => pull_index(store, peer),
     }
 }
 
@@ -486,7 +492,12 @@ pub fn pull_changes(
             caps,
         } = response
         else {
-            return Ok(None);
+            return match response {
+                Response::Error(reason) if !OLD_BUILD_REFUSALS.contains(&reason.as_str()) => {
+                    Err(reason)
+                }
+                _ => Ok(None),
+            };
         };
         lock(peer_caps()).insert(peer.to_owned(), caps);
         if reset {
@@ -1642,5 +1653,14 @@ mod tests {
             Ok(Response::error("invalid cluster request"))
         });
         assert_eq!(answer, Ok(None));
+    }
+
+    #[test]
+    fn a_busy_peer_is_an_error_not_an_older_build() {
+        let (_b, client) = scratch_store();
+        let answer = pull_changes(&client, "SHA256:client", "SHA256:busy", &mut |_| {
+            Ok(Response::error("request timed out"))
+        });
+        assert_eq!(answer, Err("request timed out".to_owned()));
     }
 }
