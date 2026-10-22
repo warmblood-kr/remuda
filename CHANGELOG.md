@@ -7,6 +7,13 @@
   restart is moving this session; try again)". The text before the
   bracket is unchanged.
 
+- Cluster: each node now keeps a local audit log of what peers asked it to
+  do, in `cluster/audit.jsonl` in the private cluster state directory. Each
+  line records when, which peer (by fingerprint), what (input, resize, close,
+  create), which session, and whether it was done, failed, refused or
+  limited. Input contents are never recorded. The log keeps the last 10,000
+  entries and is not replicated. Before, peer actions left no record.
+
 - Lua: a mod can squash its database migrations (#778). One
   `NNNN_name.base.sql` holds the whole schema as of step NNNN, so the step
   files up to it can be deleted and the mod stays within its 64 assets. A
