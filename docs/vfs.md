@@ -28,6 +28,28 @@ remuda vfs rm remuda:///notes.md               # delete everywhere
 
 Exit 75 is `EX_TEMPFAIL` from `sysexits.h`. Nothing is rolled back.
 
+## Checking health: `remuda vfs status`
+
+```text
+$ remuda vfs status --copies
+Files: 1234 live of 10000; index 1450 of 30000 entries (216 deletes remembered)
+Conflicts: 3 paths (remuda vfs ls --conflicts)
+This node (node-a1b2c3d4): 812 copies, 1.2 GiB; 4 copies waiting to retry
+Peers:
+  node-e5f6a7b8  up; pulled from here 2m ago; caps: take
+  node-c9d0e1f2  down 3h; pulled from here 3h ago; holds back 12 deletes
+Settings: replicas 3, tombstone-days 7, stale-days 30
+Copies: 1230 files complete; 4 short (first: notes.md 1 of 3, …)
+```
+
+- Without `--copies` it reads only what this node knows and answers at
+  once. "Holds back N deletes" counts deletes that peer has not pulled from
+  here yet; until it does, they are remembered.
+- `--copies` also asks each node that should hold a file whether it does
+  (for up to 30 s). It exits 75 while any file is short, so a script can
+  wait for it. Nodes that did not answer in time are named.
+- `--json` prints the same report as JSON.
+
 ## Making sure a write has copies: `put --min-copies K`
 
 By default `put` returns once this node has stored the file and told its

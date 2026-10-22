@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- VFS: `remuda vfs status [--copies] [--json]` shows the cluster store at a
+  glance (#778): live files and index size against their limits, paths
+  with conflicts, this node's copies and retry backlog, and for each peer
+  whether it is up, when it last pulled from here and how many deletes it
+  holds back. `--copies` also asks the nodes which copies they hold, lists
+  short files, and exits 75 while any file is short.
+- VFS: a peer that was busy or timed out is no longer treated as an older
+  build for an hour (whole-index pulls, "old build" in `vfs status`). Only
+  a peer that cannot decode change pulls is.
 - Sessions: input or a command refused while a reload moves a hosted
   session now says so: "session owner unavailable: Recovering (a reload or
   restart is moving this session; try again)". The text before the
