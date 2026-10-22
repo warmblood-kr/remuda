@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-22
+
+- `remuda stop` now ends host-backed sessions too, and prints one line saying how many sessions end and how to keep them. `remuda reload` keeps them; the new `remuda stop --keep-sessions` stops the daemon and leaves host-backed sessions running for the next daemon (in-process sessions still end). A daemon started from an older build keeps its old behaviour when stopped: host-backed sessions keep running, with or without the flag.
+
 ## 2026-10-18
 
 - New `remuda.daemon.socket_publication()` returns `{state = 'staged'}` or `{state = 'legacy', reason = ...}`, the same answer as the `SocketPublication` request, so mods such as `remuda butler doctor` can show it. A core without `remuda.daemon` does not have it; test the table first.

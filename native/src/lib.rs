@@ -17,6 +17,7 @@ pub mod cmd_arguments;
 pub mod codex_observer;
 pub(crate) mod credential;
 pub mod daemon;
+pub mod db_cli;
 pub(crate) mod db_lua;
 pub mod dist;
 pub mod find_command;
@@ -36,6 +37,8 @@ pub mod pending;
 pub mod process;
 mod process_ancestry;
 pub mod pty;
+#[cfg(unix)]
+pub mod reload;
 pub mod remote_front;
 pub mod reply_limit;
 pub mod script;
@@ -43,6 +46,7 @@ pub mod script;
 pub mod session_host;
 pub mod session_job;
 pub mod sqlite;
+pub(crate) mod sqlite_migrate;
 #[cfg(unix)]
 mod staged_socket;
 pub(crate) mod storage;

@@ -20,9 +20,10 @@ fn caller_identifies_a_client_running_inside_a_managed_session() {
     // Lua accepts forward slashes on Windows; raw `Path::display()` backslashes
     // become escape sequences in the Lua string passed through the shell.
     let result_path_lua = result_path.to_string_lossy().replace('\\', "/");
+    // Write then rename: the poll below must never see an empty, just-opened file.
     let lua = format!(
-        "remuda.caller=function() return {{kind='outside'}} end; remuda.extension_command('probe', function(_, caller) local f=assert(io.open('{}','w')); f:write(tostring(caller.session), ':', caller.kind, ':', tostring(caller.instance_id)); f:close() end); return remuda._dispatch_extension_command('probe')",
-        result_path_lua
+        "remuda.caller=function() return {{kind='outside'}} end; remuda.extension_command('probe', function(_, caller) local f=assert(io.open('{path}.tmp','w')); f:write(tostring(caller.session), ':', caller.kind, ':', tostring(caller.instance_id)); f:close(); assert(os.rename('{path}.tmp','{path}')) end); return remuda._dispatch_extension_command('probe')",
+        path = result_path_lua
     );
     let remuda = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
     let command = format!("sleep 0.2; \"{remuda}\" -s s -e \"{lua}\"", lua = lua);

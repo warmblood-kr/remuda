@@ -34,7 +34,6 @@ const ACT_DEADLINE: Duration = Duration::from_secs(30);
 const CONTROL_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_WATCH: Duration = Duration::from_millis(750);
 const WATCH_GAP: Duration = Duration::from_millis(25);
-const MAX_OFFSET: usize = 1000;
 /// Below the store's per-client result cap, so a new reservation always fits.
 const RETAINED: usize = model::MAX_RESULTS / 2;
 
@@ -118,7 +117,15 @@ impl HostSession {
     }
     /// Run one whole act: reserve, drive through the host, then publish receipt.
     fn act(&self, act: InputAct) -> Result<Completion> {
-        act.validate().map_err(Error::Protocol)?;
+        act.validate().map_err(|reason| match reason {
+            // Kept small so an older build can still read the inventory that
+            // records every act; callers must split larger input (#713).
+            "input act limit exceeded" => Error::Agent(AgentError::Io(format!(
+                "hosted input acts are limited to {} KiB; split the message",
+                super::wire::MAX_INPUT / 1024
+            ))),
+            reason => Error::Protocol(reason),
+        })?;
         let _pass = self.gate.enter()?;
         let deadline = ACT_DEADLINE + Duration::from_millis(pauses(&act));
         let _serial = self.acts.lock().unwrap_or_else(|e| e.into_inner());
@@ -298,6 +305,9 @@ impl HostSession {
         }
     }
     fn teardown_step(&self, stopped: &mut bool) -> Result<bool> {
+        // An act in flight here (say, input that ended the child) collects and
+        // settles its own result first; teardown only resolves orphaned keys.
+        let _serial = self.acts.lock().unwrap_or_else(|e| e.into_inner());
         let index = self.owner.index().map_err(store)?;
         let Some(entry) = index.entries.get(&self.name) else {
             return Ok(true);
@@ -342,6 +352,35 @@ impl HostSession {
     }
     /// No listener at the endpoint: the host process is gone. Any other
     /// failure (a slow or busy host) is not proof.
+    fn wait_for_frame(&self, version: u64, timeout: Duration) -> Result<VersionedSnapshot> {
+        let until = Instant::now() + timeout;
+        let mut client = self.viewer()?;
+        loop {
+            let view = self.capture(&mut client, 0)?;
+            if view.generation > version {
+                return Ok(self.versioned(view));
+            }
+            let watched = self.watch(&mut client, view.generation, until)?;
+            if watched == Watched::New {
+                continue;
+            }
+            // As an in-process wait does: nothing new and the child gone is
+            // an exit, not a frame. Output can end (pty EOF) before the host
+            // reaps the child, so an ended view waits for the exit until `until`.
+            loop {
+                if matches!(
+                    SessionOperations::inspect(self)?.lifecycle,
+                    Lifecycle::Exited(_)
+                ) {
+                    return Err(Error::Agent(AgentError::Exited));
+                }
+                if watched != Watched::Ended || Instant::now() >= until {
+                    return Ok(self.versioned(view));
+                }
+                std::thread::sleep(EXIT_POLL);
+            }
+        }
+    }
     fn host_gone(&self) -> bool {
         match std::os::unix::net::UnixStream::connect(self.endpoint.join("socket")) {
             Ok(_) => false,
@@ -417,10 +456,15 @@ impl HostSession {
     fn capture(&self, client: &mut Client, offset: u16) -> Result<Viewport> {
         let until = Instant::now() + CONTROL_DEADLINE;
         let (snapshot, generation, bytes, pages) = loop {
-            match client
-                .request(&Request::Viewport { scrollback: offset })
-                .map_err(transport)?
-            {
+            // An older host knows only `Viewport`, within the legacy history.
+            let request = if client.offers(super::api::COMPACT_VIEW) {
+                Request::ViewportCompact { scrollback: offset }
+            } else if client.offers(super::api::DEEP_HISTORY) {
+                Request::ViewportDeep { scrollback: offset }
+            } else {
+                Request::Viewport { scrollback: offset }
+            };
+            match client.request(&request).map_err(transport)? {
                 Response::Viewport {
                     identity,
                     snapshot,
@@ -466,8 +510,8 @@ impl HostSession {
             }
             assembled.extend_from_slice(&data);
         }
-        let view: Viewport = serde_json::from_slice(&assembled)
-            .map_err(|_| Error::Protocol("host viewport decoding"))?;
+        let view =
+            Viewport::decode(&assembled).map_err(|_| Error::Protocol("host viewport decoding"))?;
         view.validate()
             .map_err(|_| Error::Protocol("host viewport bounds"))?;
         if view.generation != generation {
@@ -493,13 +537,13 @@ impl HostSession {
         }
     }
     /// Bounded watch on an acknowledged viewport; true when output may differ.
-    fn watch(&self, client: &mut Client, generation: u64, until: Instant) -> Result<bool> {
+    fn watch(&self, client: &mut Client, generation: u64, until: Instant) -> Result<Watched> {
         loop {
             let wait = until
                 .saturating_duration_since(Instant::now())
                 .min(MAX_WATCH);
             if wait.is_zero() {
-                return Ok(false);
+                return Ok(Watched::Quiet);
             }
             match client
                 .request(&Request::WatchAfter {
@@ -514,11 +558,13 @@ impl HostSession {
                     ..
                 } => {
                     if now != generation {
-                        return Ok(true);
+                        return Ok(Watched::New);
                     }
-                    if state != super::api::ViewState::Unchanged {
-                        // Ended/Degraded at the same generation: nothing new arrives.
-                        return Ok(false);
+                    match state {
+                        super::api::ViewState::Unchanged => {}
+                        super::api::ViewState::Ended => return Ok(Watched::Ended),
+                        // Degraded at the same generation: nothing new arrives.
+                        _ => return Ok(Watched::Quiet),
                     }
                 }
                 Response::Error { code } if code == "watch_request_cooldown" => {
@@ -561,7 +607,9 @@ impl SessionOperations for HostSession {
             HostLifecycle::Exited => Lifecycle::Exited(Some(ExitInfo {
                 exit_code: info.exit_code,
                 signal: info.signal,
-                signal_name: info.signal_name,
+                // Named from the number, as in-process: an older host sent
+                // the platform's description ("Terminated: 15").
+                signal_name: info.signal.and_then(crate::pty::signal_name),
             })),
             // An unavailable host is never reported as an exited session.
             HostLifecycle::Unavailable => return Err(Error::Unavailable(Unavailable::Recovering)),
@@ -572,7 +620,9 @@ impl SessionOperations for HostSession {
             cut: ObservationCut::Host {
                 revision: info.generation,
             },
-            size: Size::for_pane(info.cols, info.rows),
+            // The host's real size: the daemon already floored it, or the
+            // caller opted out of the floor.
+            size: Size::for_viewport(info.cols, info.rows),
             pid: info.pid,
             output_version: Some(info.generation),
             idle: Duration::from_millis(activity.idle_ms),
@@ -679,25 +729,81 @@ impl SessionOperations for HostSession {
         Ok(text(&self.snapshot(0)?.snapshot))
     }
     fn snapshot(&self, scrollback: usize) -> Result<VersionedSnapshot> {
-        let offset = u16::try_from(scrollback.min(MAX_OFFSET)).unwrap_or(u16::MAX);
         let mut client = self.viewer()?;
+        let reach = if client.offers(super::api::DEEP_HISTORY) {
+            super::terminal::HISTORY_ROWS
+        } else {
+            usize::from(super::terminal::LEGACY_HISTORY_ROWS)
+        };
+        let offset = u16::try_from(scrollback.min(reach)).unwrap_or(u16::MAX);
         Ok(self.versioned(self.capture(&mut client, offset)?))
     }
     fn wait_after(&self, version: u64, timeout: Duration) -> Result<VersionedSnapshot> {
-        let until = Instant::now() + timeout;
-        let mut client = self.viewer()?;
-        loop {
-            let view = self.capture(&mut client, 0)?;
-            if view.generation > version || !self.watch(&mut client, view.generation, until)? {
-                return Ok(self.versioned(view));
+        match self.wait_for_frame(version, timeout) {
+            // The child exited and the host stopped with it mid-wait: that is
+            // the exit an in-process wait reports, not a transport fault.
+            Err(Error::Unavailable(Unavailable::Transport)) if self.host_gone() => {
+                Err(Error::Agent(AgentError::Exited))
             }
+            result => result,
         }
     }
+    /// Output wakes from one persistent observer connection that polls the
+    /// host's output generation (Inspect carries it; no screen is copied).
+    /// The wake disconnects once the child stops running or the host goes.
     fn wakeup(&self) -> Result<Option<OutputWakeup>> {
-        Ok(None)
+        let client =
+            Client::open_observer(&self.endpoint, self.identity.clone()).map_err(opened)?;
+        let version = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (signal, wakeup) = OutputWakeup::pair(Arc::clone(&version));
+        std::thread::Builder::new()
+            .name("session-host-output".into())
+            .spawn(move || watch_generation(client, &signal, &version))
+            .map_err(|_| Error::Unavailable(Unavailable::Transport))?;
+        Ok(Some(wakeup))
     }
     fn attach(&self) -> Result<Box<dyn AttachmentOperations + '_>> {
         Err(Error::Unavailable(Unavailable::Unsupported))
+    }
+}
+/// Fastest and slowest generation polls: fast right after output, backing
+/// off while the session is quiet.
+/// Why a host watch stopped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Watched {
+    New,
+    Ended,
+    Quiet,
+}
+/// How often a wait whose output ended checks for the child's exit.
+const EXIT_POLL: Duration = Duration::from_millis(20);
+const GENERATION_POLL: Duration = Duration::from_millis(50);
+const GENERATION_IDLE_POLL: Duration = Duration::from_millis(250);
+
+fn watch_generation(
+    mut client: Client,
+    signal: &remuda_core::agent::OutputSignal,
+    version: &std::sync::atomic::AtomicU64,
+) {
+    use std::sync::atomic::Ordering;
+    let mut poll = GENERATION_POLL;
+    while signal.is_connected() {
+        let Ok(Response::Info { info }) = client.request(&Request::Inspect) else {
+            return;
+        };
+        if info.generation > version.load(Ordering::Acquire) {
+            version.store(info.generation, Ordering::Release);
+            if !signal.wake() {
+                return;
+            }
+            poll = GENERATION_POLL;
+        } else {
+            poll = (poll * 2).min(GENERATION_IDLE_POLL);
+        }
+        if !matches!(info.lifecycle, HostLifecycle::Running) {
+            return;
+        }
+        std::thread::sleep(poll);
     }
 }
 fn pauses(act: &InputAct) -> u64 {
