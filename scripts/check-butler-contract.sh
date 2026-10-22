@@ -32,7 +32,7 @@ fi
 git -C "$BUTLER_REPO" rev-parse --verify --quiet "$OLD_REF^{commit}" >/dev/null \
   || { echo "BUTLER_REPO lacks $OLD_REF (shallow clone?)" >&2; exit 2; }
 
-cargo build --quiet --manifest-path "$CORE/Cargo.toml" -p remuda-native --bin remuda
+cargo build --quiet --manifest-path "$CORE/Cargo.toml" -p remuda-native --bin remuda --bin remuda-session-host
 export PATH="$CORE/target/debug:$PATH"
 export REMUDA_NO_UPDATE_CHECK=1
 unset REMUDA_SERVER

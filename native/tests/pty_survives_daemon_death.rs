@@ -51,6 +51,8 @@ impl Daemon {
     fn spawn(dir: &Path) -> Self {
         let child = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"))
             .args(["-s", "s", "daemon"])
+            // The accident this file pins is in-process only: hosted children outlive the daemon.
+            .env("REMUDA_EXPERIMENTAL_SESSION_HOST", "0")
             .env("REMUDA_RUNTIME_DIR", dir)
             .env("HOME", dir)
             .env("XDG_STATE_HOME", dir.join("state"))
