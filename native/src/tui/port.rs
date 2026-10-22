@@ -48,6 +48,35 @@ pub trait SessionPort {
     fn accepts_lines(&self) -> bool {
         true
     }
+
+    /// A request with a bounded wait, for composed lines on this machine.
+    fn request_bounded(
+        &self,
+        request: &Request,
+        _timeout: std::time::Duration,
+    ) -> io::Result<Response> {
+        self.request(request)
+    }
+
+    /// The peer this port reaches; `None` for this machine's daemon, whose
+    /// composed lines are sent in place rather than through `submit`.
+    fn remote_node(&self) -> Option<String> {
+        None
+    }
+
+    /// Start one composed line in the background; `take_replies` returns its answer.
+    fn submit(&self, _request: Request) -> io::Result<()> {
+        Err(io::Error::other("this node sends lines in place"))
+    }
+
+    fn take_replies(&self) -> Vec<io::Result<Response>> {
+        Vec::new()
+    }
+
+    /// How long since the node last answered, for nodes whose answers lag.
+    fn staleness(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 impl SessionPort for Path {
@@ -55,6 +84,14 @@ impl SessionPort for Path {
 
     fn request(&self, request: &Request) -> io::Result<Response> {
         client::request(self, request)
+    }
+
+    fn request_bounded(
+        &self,
+        request: &Request,
+        timeout: std::time::Duration,
+    ) -> io::Result<Response> {
+        client::request_with_timeout(self, request, timeout)
     }
 
     fn hold(&self, name: &str) -> io::Result<Hold> {
@@ -83,6 +120,14 @@ impl SessionPort for std::path::PathBuf {
 
     fn request(&self, request: &Request) -> io::Result<Response> {
         self.as_path().request(request)
+    }
+
+    fn request_bounded(
+        &self,
+        request: &Request,
+        timeout: std::time::Duration,
+    ) -> io::Result<Response> {
+        self.as_path().request_bounded(request, timeout)
     }
 
     fn hold(&self, name: &str) -> io::Result<Hold> {
@@ -254,6 +299,113 @@ mod tests {
         );
     }
 
+    /// A peer whose lines are answered from `replies` once submitted.
+    struct PeerPort {
+        sent: Mutex<Vec<Request>>,
+        replies: Mutex<Vec<io::Result<Response>>>,
+    }
+
+    impl SessionPort for PeerPort {
+        type Keys = FakeKeys;
+
+        fn request(&self, request: &Request) -> io::Result<Response> {
+            self.sent.lock().unwrap().push(request.clone());
+            Ok(Response::Ok)
+        }
+
+        fn hold(&self, _name: &str) -> io::Result<FakeKeys> {
+            Err(io::Error::other("no keys"))
+        }
+
+        fn probe(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn probe_verdict(&self, _error: &io::Error) -> (bool, bool) {
+            (false, false)
+        }
+
+        fn label(&self) -> String {
+            "node peer".into()
+        }
+
+        fn remote_node(&self) -> Option<String> {
+            Some("peer".into())
+        }
+
+        fn submit(&self, request: Request) -> io::Result<()> {
+            self.sent.lock().unwrap().push(request);
+            Ok(())
+        }
+
+        fn take_replies(&self) -> Vec<io::Result<Response>> {
+            std::mem::take(&mut *self.replies.lock().unwrap())
+        }
+    }
+
+    #[test]
+    fn a_peer_close_is_confirmed_and_bound_to_the_instance() {
+        let port = PeerPort {
+            sent: Mutex::new(Vec::new()),
+            replies: Mutex::new(Vec::new()),
+        };
+        super::super::kill(&port, "build", Some("inst".into())).unwrap();
+        assert!(matches!(
+            &port.sent.lock().unwrap()[0],
+            Request::Close { name, instance_id: Some(id), confirm: Some(true) }
+                if name == "build" && id == "inst"
+        ));
+    }
+
+    #[test]
+    fn a_peer_line_is_submitted_once_and_finished_by_its_reply() {
+        use crate::cluster_tui::queue::{InputQueue, InputTarget, QueueEvent};
+        use crate::cluster_tui::sender::InputSender;
+        let port = PeerPort {
+            sent: Mutex::new(Vec::new()),
+            replies: Mutex::new(Vec::new()),
+        };
+        let mut sender = InputSender::with_client_id([3; 16]);
+        let mut queue = InputQueue::default();
+        let mut in_flight = None;
+        let target = InputTarget {
+            remote_node: port.remote_node(),
+            name: "build".into(),
+            instance_id: "inst".into(),
+        };
+        sender
+            .enqueue_line(
+                &mut queue,
+                target,
+                b"make\r".to_vec(),
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        let pump = |sender: &mut InputSender, queue: &mut InputQueue, in_flight: &mut _| {
+            super::super::pump_lines(&port, sender, queue, in_flight)
+        };
+        assert_eq!(pump(&mut sender, &mut queue, &mut in_flight), None);
+        assert!(in_flight.is_some(), "handed to the background sender");
+        assert_eq!(
+            pump(&mut sender, &mut queue, &mut in_flight),
+            None,
+            "no reply yet"
+        );
+        assert_eq!(port.sent.lock().unwrap().len(), 1, "sent once, not again");
+        port.replies
+            .lock()
+            .unwrap()
+            .push(Ok(Response::Ack { duplicate: false }));
+        assert!(matches!(
+            pump(&mut sender, &mut queue, &mut in_flight),
+            Some(QueueEvent::Sent { .. })
+        ));
+        assert!(matches!(
+            &port.sent.lock().unwrap()[0],
+            Request::InputLine { name, bytes, .. } if name == "build" && bytes == b"make\r"
+        ));
+    }
+
     #[test]
     fn session_screen_helpers_run_over_any_port() {
         let port = FakePort {
@@ -261,11 +413,14 @@ mod tests {
             keys: Default::default(),
         };
         assert_eq!(super::super::list(&port).unwrap(), Vec::new());
-        super::super::kill(&port, "dev").unwrap();
+        super::super::kill(&port, "dev", Some("i".into())).unwrap();
         super::super::resize(&port, "dev", remuda_core::Size::new(80, 24)).unwrap();
         let sent = port.sent.lock().unwrap();
         assert!(matches!(sent[0], Request::List));
-        assert!(matches!(&sent[1], Request::Close { name, .. } if name == "dev"));
+        assert!(matches!(
+            &sent[1],
+            Request::Close { name, instance_id: None, confirm: None } if name == "dev"
+        ));
         assert!(matches!(&sent[2], Request::Resize { name, .. } if name == "dev"));
         drop(sent);
         port.hold("dev").unwrap().keys(b"ls\r").unwrap();
