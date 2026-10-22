@@ -633,6 +633,38 @@ fn previous() -> PathBuf {
     exe
 }
 
+/// Whether the previous build's `remuda vfs help` lists `verb`. Help runs
+/// without a daemon; a scratch home keeps it away from real state.
+fn previous_has_vfs_verb(verb: &str) -> bool {
+    let home = std::env::temp_dir().join(format!("cvp{}-{verb}", std::process::id()));
+    let output = Command::new(previous())
+        .args(["vfs", "help"])
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("REMUDA_RUNTIME_DIR", home.join("runtime"))
+        .env("REMUDA_NO_UPDATE_CHECK", "1")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&home);
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        line.trim_start()
+            .strip_prefix(verb)
+            .is_some_and(|rest| rest.starts_with(' '))
+    })
+}
+
+/// Skip a compat test whose N predates what it tests. Jobs whose N must have
+/// everything set REMUDA_COMPAT_NO_SKIP, so a skip there fails instead.
+fn skip(reason: &str) {
+    assert!(
+        std::env::var_os("REMUDA_COMPAT_NO_SKIP").is_none(),
+        "REMUDA_COMPAT_NO_SKIP is set but {reason}"
+    );
+    eprintln!("skipped: {reason}");
+}
+
 fn put(node: &Node, uri: &str, body: &[u8]) {
     successful(
         node.run_with_stdin(&["vfs", "put", "-", uri, "--replicas", "2"], Some(body)),
@@ -757,6 +789,11 @@ fn kept_conflicts(node: &Node) -> i64 {
 #[ignore = "needs REMUDA_COMPAT_PREVIOUS from before index.db; run by CI job vfs-compat-pre-sqlite"]
 fn pre_sqlite_downgrade_and_upgrade_again_keep_every_name() {
     let _serial = live_test_guard();
+    // Only an N from before index.db reads index.json; export-index came with it.
+    if previous_has_vfs_verb("export-index") {
+        skip("N already has index.db");
+        return;
+    }
     let mut node = Node::start();
     let current = node.exe.clone();
     put(&node, "remuda:///gone.txt", b"deleted under N+1");
@@ -794,6 +831,10 @@ fn pre_sqlite_downgrade_and_upgrade_again_keep_every_name() {
 #[ignore = "needs REMUDA_COMPAT_PREVIOUS from a build with index.db; run by CI job host-compat-n-plus-one"]
 fn older_build_refuses_a_newer_index_db_cleanly() {
     let _serial = live_test_guard();
+    if !previous_has_vfs_verb("export-index") {
+        skip("N has no index.db");
+        return;
+    }
     let mut node = Node::start();
     put(&node, "remuda:///kept.txt", b"kept");
     node.kill_daemon_only();
@@ -826,6 +867,10 @@ fn older_build_refuses_a_newer_index_db_cleanly() {
 #[ignore = "needs REMUDA_COMPAT_PREVIOUS from a build with index.db; run by CI job host-compat-n-plus-one"]
 fn older_build_reads_the_index_after_index_downgrade() {
     let _serial = live_test_guard();
+    if !previous_has_vfs_verb("export-index") {
+        skip("N has no index.db");
+        return;
+    }
     let mut node = Node::start();
     let current = node.exe.clone();
     put(&node, "remuda:///kept.txt", b"kept");

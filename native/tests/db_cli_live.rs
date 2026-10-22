@@ -239,6 +239,14 @@ fn older_build_handles_a_base_created_database() {
     home.exe = PathBuf::from(previous).join("remuda");
     home.start();
     let probe = home.run(&["db", "upgrade", "sample", "notes"]);
+    if String::from_utf8_lossy(&probe.stderr).contains("no command or mod named db") {
+        assert!(
+            std::env::var_os("REMUDA_COMPAT_NO_SKIP").is_none(),
+            "REMUDA_COMPAT_NO_SKIP is set but N has no `remuda db`"
+        );
+        eprintln!("skipped: N has no `remuda db`");
+        return;
+    }
     if probe.status.success() {
         // N knows bases: same files, nothing to do, and it keeps working.
         let said = String::from_utf8_lossy(&probe.stdout);

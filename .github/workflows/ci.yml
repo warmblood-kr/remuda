@@ -152,9 +152,37 @@ jobs:
       - name: N/N+1 in both directions
         run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test session_host_daemon -- --ignored n_plus_one
       - name: N/N+1 VFS sync across three daemons; N refuses a newer index.db
-        run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live -- --ignored n_plus_one older_build
+        run: REMUDA_COMPAT_NO_SKIP=1 REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live -- --ignored n_plus_one older_build
       - name: N refuses a mod database created from a squashed base
-        run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test db_cli_live -- --ignored older_build
+        run: REMUDA_COMPAT_NO_SKIP=1 REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test db_cli_live -- --ignored older_build
+
+  compat-week-old-nightly:
+    # Users update every few days, not every PR, so they cross several schema
+    # steps at once. N is the newest nightly tag at least 7 days old (else the
+    # oldest nightly). The VFS and db N/N+1 tests ask N what it has and skip
+    # what it predates. Non-blocking from 2026-10-22 while its flake rate is
+    # learned; make it blocking after a week of runs.
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build N from a week-old nightly
+        run: |
+          git fetch --tags --force --quiet
+          cutoff=$(date -u -d '7 days ago' +%Y%m%d%H%M%S)
+          nightlies=$(git tag -l '*-nightly.*' | sort -t. -k4,4)
+          tag=$(echo "$nightlies" | awk -F. -v c="$cutoff" '$4 <= c' | tail -1)
+          [ -n "$tag" ] || tag=$(echo "$nightlies" | head -1)
+          echo "N is $tag"
+          git worktree add "$RUNNER_TEMP/old" "$tag"
+          cargo build --manifest-path "$RUNNER_TEMP/old/Cargo.toml" --bins --target-dir "$RUNNER_TEMP/old-target"
+          mkdir "$RUNNER_TEMP/n"
+          cp "$RUNNER_TEMP/old-target/debug/remuda" "$RUNNER_TEMP/n/"
+      - name: VFS and db N/N+1 against a week-old N
+        run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live --test db_cli_live -- --ignored
 
   vfs-compat-pre-sqlite:
     # Nodes from before index.db (#778) still run in clusters. Two daemons of
@@ -174,7 +202,7 @@ jobs:
           mkdir "$RUNNER_TEMP/n"
           cp "$RUNNER_TEMP/pre-target/debug/remuda" "$RUNNER_TEMP/n/"
       - name: Mixed cluster, downgrade and upgrade again
-        run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live -- --ignored n_plus_one pre_sqlite
+        run: REMUDA_COMPAT_NO_SKIP=1 REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live -- --ignored n_plus_one pre_sqlite
 
   principles-are-documented:
     # PRINCIPLES.md §2: a gate nobody has watched go red is a claim, not a
