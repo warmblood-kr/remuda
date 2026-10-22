@@ -219,11 +219,14 @@ fn a_mod_with_a_base_file_creates_its_database_from_it() {
     assert!(status.contains("2  base  (irreversible)"), "{status}");
 }
 
-/// The previous release refuses a database created from a base, before it
-/// changes anything (#778). Needs REMUDA_COMPAT_PREVIOUS (a build with `remuda db`).
+/// N on a database N+1 created from a base (#778). CI's N is the PR base,
+/// so it may know bases: then it keeps using the database. An N without
+/// bases refuses it before changing anything. Needs REMUDA_COMPAT_PREVIOUS.
 #[test]
 #[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS from a build with remuda db; run by CI job host-compat-n-plus-one"]
-fn older_build_refuses_a_base_created_database() {
+fn older_build_handles_a_base_created_database() {
+    // N is the PR's base sha: never assume N lacks a feature that base
+    // already merged. Ask N (here: does `db upgrade` read the base file?).
     let previous = std::env::var_os("REMUDA_COMPAT_PREVIOUS").expect("REMUDA_COMPAT_PREVIOUS");
     let mut home = Home::new();
     home.install_mod_with(SQUASHED);
@@ -234,6 +237,17 @@ fn older_build_refuses_a_base_created_database() {
     let before = std::fs::read(&file).unwrap();
 
     home.exe = PathBuf::from(previous).join("remuda");
+    home.start();
+    let probe = home.run(&["db", "upgrade", "sample", "notes"]);
+    if probe.status.success() {
+        // N knows bases: same files, nothing to do, and it keeps working.
+        let said = String::from_utf8_lossy(&probe.stdout);
+        assert!(said.contains("already at version 3"), "{said}");
+        ok(home.run(&["exec", "sample"]), "exec sample on N");
+        return;
+    }
+    let text = String::from_utf8_lossy(&probe.stderr);
+    assert!(text.contains(".base.sql"), "{text}");
     // Step files the older build can read, so only the record stops it.
     home.install_mod_with(&[
         (
@@ -243,7 +257,6 @@ fn older_build_refuses_a_base_created_database() {
         ("0002_seen.up.sql", "SELECT 1;"),
         ("0003_tag.up.sql", "ALTER TABLE n ADD COLUMN tag TEXT;"),
     ]);
-    home.start();
     let output = home.run(&["db", "upgrade", "sample", "notes"]);
     assert!(!output.status.success());
     let text = String::from_utf8_lossy(&output.stderr);
