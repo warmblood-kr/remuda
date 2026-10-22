@@ -45,8 +45,9 @@ impl Root {
 }
 impl Drop for Root {
     fn drop(&mut self) {
-        // Only processes whose argv names this unique root: our hosts.
-        for pid in processes_naming(&self.0) {
+        // Only processes whose argv names this unique root: our hosts, and
+        // a daemon that took the socket over in a reload.
+        for pid in processes_under(&self.0) {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
         let _ = std::fs::remove_dir_all(&self.0);
@@ -162,14 +163,21 @@ fn wait_gone(pid: i32) {
     }
 }
 fn processes_naming(root: &Path) -> Vec<i32> {
+    processes_matching(root, "run-reserved")
+}
+fn processes_under(root: &Path) -> Vec<i32> {
+    processes_matching(root, "")
+}
+fn processes_matching(root: &Path, also: &str) -> Vec<i32> {
     let output = Command::new("/bin/ps")
         .args(["-A", "-o", "pid=", "-o", "args="])
         .output()
         .expect("ps");
-    let needle = root.to_string_lossy().into_owned();
+    // The trailing slash keeps root `…-1` from matching `…-10`.
+    let needle = format!("{}/", root.to_string_lossy());
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|line| line.contains(&needle) && line.contains("run-reserved"))
+        .filter(|line| line.contains(&needle) && line.contains(also))
         .filter_map(|line| line.split_whitespace().next()?.parse().ok())
         .collect()
 }
