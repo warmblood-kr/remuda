@@ -11,6 +11,10 @@
   index-downgrade 1 --yes` (it writes a backup), then stop the daemon and
   start the older remuda.
 
+- After `remuda reload` (Unix), the new daemon shows in `ps` as
+  `remuda -s NAME daemon`, like any other daemon, instead of
+  `remuda _reload-candidate SOCKET`.
+
 - After `remuda reload` (Unix), the old daemon ends what `remuda stop` ends,
   except the sessions and the socket. A deferred reply still waiting is told
   the daemon reloaded and to run the command again, instead of the daemon
