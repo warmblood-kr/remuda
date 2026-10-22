@@ -495,7 +495,8 @@ fn clear_errors_for_wrong_cluster_missing_and_no_cluster() {
         "{text}"
     );
     let missing = a.run(&["vfs", "get", "remuda:///x"]);
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("no file at x"));
+    let text = String::from_utf8_lossy(&missing.stderr);
+    assert!(text.contains("no file at x"), "{text}");
 
     successful(a.run(&["vfs", "config", "--cluster", "home"]), "vfs config");
     successful(
@@ -538,7 +539,8 @@ fn clear_errors_for_wrong_cluster_missing_and_no_cluster() {
     bare.spawn_daemon();
     let output = bare.run(&["vfs", "ls"]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no cluster"));
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(text.contains("no cluster"), "{text}");
 
     // With no daemon, vfs fails with one line and touches no store (#778).
     bare.kill();
