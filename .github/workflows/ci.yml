@@ -167,9 +167,53 @@ jobs:
       - name: N/N+1 in both directions
         run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test session_host_daemon -- --ignored n_plus_one
       - name: N/N+1 VFS sync across three daemons; N refuses a newer index.db
-        run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live -- --ignored n_plus_one older_build
+        run: REMUDA_COMPAT_NO_SKIP=1 REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live -- --ignored n_plus_one older_build
       - name: N refuses a mod database created from a squashed base
-        run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test db_cli_live -- --ignored older_build
+        run: REMUDA_COMPAT_NO_SKIP=1 REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test db_cli_live -- --ignored older_build
+
+  compat-week-old-main:
+    # Users update every few days, not every PR, so they cross several schema
+    # steps at once. N is the last main commit at least 7 days old (old
+    # nightly tags are deleted, so they cannot be used). Each step asks N
+    # what it has (vfs, session host, reload) and skips what it predates. Non-blocking from
+    # 2026-10-22 while its flake rate is learned; make it blocking after a
+    # week of runs.
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build N from a week-old main
+        run: |
+          git fetch --quiet origin main
+          sha=$(git rev-list -1 --before='7 days ago' FETCH_HEAD)
+          [ -n "$sha" ] || { echo "no main commit is 7 days old"; exit 1; }
+          echo "N is $sha ($(git log -1 --format=%ci "$sha"))"
+          echo "N_SHA=$sha" >> "$GITHUB_ENV"
+          git worktree add "$RUNNER_TEMP/old" "$sha"
+          cargo build --manifest-path "$RUNNER_TEMP/old/Cargo.toml" --bins --target-dir "$RUNNER_TEMP/old-target"
+          mkdir "$RUNNER_TEMP/n"
+          cp "$RUNNER_TEMP/old-target/debug/remuda" "$RUNNER_TEMP/n/"
+          # Session hosting (#759) came later; its step skips an N without it.
+          host="$RUNNER_TEMP/old-target/debug/remuda-session-host"
+          if [ -f "$host" ]; then cp "$host" "$RUNNER_TEMP/n/"; fi
+      - name: VFS and db N/N+1 against a week-old N
+        run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live --test db_cli_live -- --ignored
+      - name: Session host N/N+1 against a week-old N
+        run: |
+          if [ ! -f "$RUNNER_TEMP/n/remuda-session-host" ]; then
+            echo "skipped: N has no remuda-session-host"; exit 0
+          fi
+          # The reload tests need N to have `remuda reload` (#793, 3c140ca1).
+          if git merge-base --is-ancestor 3c140ca1 "$N_SHA"; then
+            filter=n_plus_one
+          else
+            echo "skipped reload tests: N predates remuda reload (3c140ca1)"
+            filter=adopts
+          fi
+          REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test session_host_daemon -- --ignored "$filter"
 
   vfs-compat-pre-sqlite:
     # Nodes from before index.db (#778) still run in clusters. Two daemons of
@@ -189,7 +233,7 @@ jobs:
           mkdir "$RUNNER_TEMP/n"
           cp "$RUNNER_TEMP/pre-target/debug/remuda" "$RUNNER_TEMP/n/"
       - name: Mixed cluster, downgrade and upgrade again
-        run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live -- --ignored n_plus_one pre_sqlite
+        run: REMUDA_COMPAT_NO_SKIP=1 REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live -- --ignored n_plus_one pre_sqlite
 
   principles-are-documented:
     # PRINCIPLES.md §2: a gate nobody has watched go red is a claim, not a
