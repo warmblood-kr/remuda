@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `remuda upgrade` (Unix) checks the reloaded daemon as `remuda reload` does:
+  it answers as the new build, lists every session it took over, and loaded
+  `init.lua`. An `init.lua` that fails only in the new daemon is named and
+  `upgrade` exits 1. Before, it checked only the build.
+
 - SQLite migrations no longer fail when two connections open a database
   for the first time at once (#778). The one that waited for the write lock
   now checks the version again and skips steps the other already ran,
