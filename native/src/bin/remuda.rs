@@ -199,7 +199,7 @@ fn dispatch_cli_command(
         "version" | "--version" | "-V" => version_command(server, path, rest),
         "_codex_tui" => codex_tui::run(rest),
         "_codex_watch" => run_codex_watch_cli(rest),
-        "upgrade" => run_upgrade(rest),
+        "upgrade" => run_upgrade(path, rest),
         "daemon" => match ensure_no_args("daemon", rest) {
             Err(code) => code,
             Ok(()) => match daemon::serve_with_runtime(path, &daemon::runtime_dir()) {
@@ -659,7 +659,11 @@ remuda — a pty manager you can attach to
   remuda -e <code>              evaluate one chunk in that same image
   remuda repl                   the same image, a line at a time
   remuda mcp                    serve the image as an MCP tool on stdin/stdout
-  remuda upgrade [--channel C]  re-run the installer on stable or nightly
+  remuda upgrade [--channel C]  re-run the installer on stable or nightly,
+                                  then reload the daemon into it
+  remuda reload [--check]       hand the daemon's socket and host-backed
+                                  sessions to this build (Unix); --check only
+                                  says whether it could, and changes nothing
   remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon; its sessions and
                                   Lua image end with it. Unverifiable callers
                                   are refused; --i-am-inside overrides the guard.
@@ -722,7 +726,8 @@ remuda — terminal orchestration for coding agents
                                  --mouse=false disables mouse handling (before or after NAME)
   remuda ls | send NAME TEXT     inspect or message sessions
   remuda resize NAME COLS ROWS   resize a session (cols 20..1000, rows 24..500)
-  remuda upgrade [--channel stable|nightly]  replace the CLI binary
+  remuda upgrade [--channel stable|nightly]  replace the CLI binary, then reload
+  remuda reload [--check]        move the daemon onto this build; host-backed sessions keep running
   remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon (sessions are lost)
                                   --i-am-inside overrides hosted or unverifiable identity checks.
 
@@ -756,11 +761,13 @@ Next: run `remuda run -n NAME COMMAND` to start a session, or `remuda ls` to ins
 ";
 
 const UPGRADE_HELP: &str = "\
-Usage: remuda upgrade [--channel stable|nightly]
+Usage: remuda upgrade [--channel stable|nightly] [--no-reload]
 
 Re-runs the installer to replace the CLI with the latest stable or nightly
-release. The running daemon and its sessions keep using the old version until
-you run `remuda stop`.
+release. On Unix it then reloads the running daemon into the new version
+(`remuda reload`), and host-backed sessions keep running. A daemon that cannot
+reload keeps its old version and says why; `--no-reload` leaves it alone. On
+Windows the daemon keeps the old version until you run `remuda stop`.
 
 Next: run `remuda upgrade` to install the latest version from your channel.
 ";
@@ -5210,9 +5217,8 @@ fn fate(path: &Path, name: &str) -> String {
     }
 }
 
-/// `stop [-f]`: stop this server's daemon. `remuda upgrade` replaces the
-/// binary but cannot touch a daemon already running — this is the verb that
-/// closes that gap.
+/// `stop [-f]`: stop this server's daemon, ending its sessions. Where a
+/// reload cannot move the daemon onto a new build, this is the way.
 fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     let values = match parse_top_level_cli(&stop_cli_spec(), "stop", args) {
         Ok(values) => values,
@@ -5448,6 +5454,15 @@ fn version_skew(argv: &[&str], path: &Path) -> Result<Option<String>, String> {
     }
 }
 
+/// A reload keeps host-backed sessions or refuses and says why, so it is
+/// safe advice; `stop` ends every session.
+#[cfg(unix)]
+const SKEW_CURE: &str = "the daemon is not this build — `remuda reload` moves it \
+     onto this one and keeps host-backed sessions, or says why it cannot.";
+#[cfg(windows)]
+const SKEW_CURE: &str = "the daemon is not this build — `remuda stop` replaces it, and \
+     its sessions and Lua image go with it.";
+
 /// What to say about a `Request::Version` outcome — split out of
 /// `version_skew` so this decision is testable without a socket. See
 /// steps/024.
@@ -5471,8 +5486,8 @@ fn skew_notice(response: std::io::Result<Response>) -> Option<String> {
     // Cure first, and no "remuda:" prefix — the caller adds one, and this also
     // goes to a TUI footer that crops the tail at the terminal's width.
     Some(format!(
-        "the daemon is not this build — `remuda stop` replaces it, and its \
-         sessions and Lua image go with it. It is {theirs}; this command is {}",
+        "{} It is {theirs}; this command is {}",
+        SKEW_CURE,
         dist::BUILD_VERSION
     ))
 }
@@ -5536,23 +5551,76 @@ fn prepare_command(argv: &[&str], path: &Path) -> Result<Option<String>, String>
 
 /// Split out of `main` for the same reason `list_sessions` was: clippy's line
 /// budget. This one talks to no daemon — it replaces this very binary.
-fn run_upgrade(args: &[&str]) -> ExitCode {
-    let channel = match upgrade_cli_parse(args) {
-        Ok(channel) => channel,
+fn run_upgrade(path: &Path, args: &[&str]) -> ExitCode {
+    let (channel, no_reload) = match upgrade_cli_parse(args) {
+        Ok(parsed) => parsed,
         Err(code) => return code,
     };
-    match dist::upgrade(channel.as_deref()) {
-        Ok(()) => {
+    if let Err(e) = dist::upgrade(channel.as_deref()) {
+        return fail(e);
+    }
+    after_upgrade(path, no_reload)
+}
+
+#[cfg(unix)]
+const UPGRADE_NEXT: &str = "Next: run `remuda --version` to check the installed version.";
+
+/// Move the running daemon onto the build just installed (#713).
+#[cfg(unix)]
+fn after_upgrade(path: &Path, no_reload: bool) -> ExitCode {
+    use remuda_native::reload::upgrade::{self, AfterUpgrade};
+    if no_reload {
+        eprintln!(
+            "The running daemon keeps the old version.\nNext: run `remuda reload` to move it and its sessions onto the new one; `remuda reload --check` says first whether it can."
+        );
+        return ExitCode::SUCCESS;
+    }
+    let installed = match upgrade::installed_binary() {
+        Ok(installed) => installed,
+        Err(error) => {
+            return fail(format!(
+                "the new version is installed, but this command cannot find it to reload the daemon: {error}\nNext: run `remuda reload`."
+            ))
+        }
+    };
+    match upgrade::after_upgrade(path, &installed) {
+        AfterUpgrade::NoDaemon => {
             eprintln!(
-                "The running daemon and its sessions keep using the old version until you run `remuda stop` (that ends those sessions); the next remuda command starts the new version."
-            );
-            eprintln!(
-                "Next: run `remuda stop` when your sessions can end, then `remuda --version` to check the installed version."
+                "No daemon is running, so no session needed moving; the next remuda command starts the new version.\n{UPGRADE_NEXT}"
             );
             ExitCode::SUCCESS
         }
-        Err(e) => fail(e),
+        AfterUpgrade::Current(build) => {
+            eprintln!("The daemon already runs {build}; its sessions are untouched.\n{UPGRADE_NEXT}");
+            ExitCode::SUCCESS
+        }
+        AfterUpgrade::Reloaded(report) => {
+            println!("{report}");
+            eprintln!("{UPGRADE_NEXT}");
+            ExitCode::SUCCESS
+        }
+        // Installed as asked; the daemon staying put is a choice, not a failure.
+        AfterUpgrade::Kept(why) => {
+            eprintln!(
+                "The daemon keeps the old version, and its sessions keep running:\n{why}\nNext: run `remuda reload` once that is resolved, or `remuda stop` when those sessions can end."
+            );
+            ExitCode::SUCCESS
+        }
+        AfterUpgrade::Failed(error) => fail(format!(
+            "the new version is installed, but reloading the daemon failed: {error}\nNext: run `remuda reload` to try again, or `remuda stop` when the sessions can end."
+        )),
     }
+}
+
+#[cfg(windows)]
+fn after_upgrade(_path: &Path, _no_reload: bool) -> ExitCode {
+    eprintln!(
+        "The running daemon and its sessions keep using the old version until you run `remuda stop` (that ends those sessions); the next remuda command starts the new version."
+    );
+    eprintln!(
+        "Next: run `remuda stop` when your sessions can end, then `remuda --version` to check the installed version."
+    );
+    ExitCode::SUCCESS
 }
 
 fn upgrade_cli_spec() -> remuda_native::cli_parse::Spec {
@@ -5566,20 +5634,31 @@ fn upgrade_cli_spec() -> remuda_native::cli_parse::Spec {
             usage: None,
             args: vec![],
             next: "run `remuda upgrade --channel stable` (or choose nightly)".into(),
-            options: vec![OptionSpec {
-                long: "channel".into(),
-                short: None,
-                value: Some("CHANNEL".into()),
-                help: "Release channel: stable or nightly".into(),
-                global: false,
-                required: false,
-                repeat_policy: Default::default(),
-            }],
+            options: vec![
+                OptionSpec {
+                    long: "channel".into(),
+                    short: None,
+                    value: Some("CHANNEL".into()),
+                    help: "Release channel: stable or nightly".into(),
+                    global: false,
+                    required: false,
+                    repeat_policy: Default::default(),
+                },
+                OptionSpec {
+                    long: "no-reload".into(),
+                    short: None,
+                    value: None,
+                    help: "Leave the running daemon on its old version".into(),
+                    global: false,
+                    required: false,
+                    repeat_policy: Default::default(),
+                },
+            ],
         }],
     }
 }
 
-fn upgrade_cli_parse(args: &[&str]) -> Result<Option<String>, ExitCode> {
+fn upgrade_cli_parse(args: &[&str]) -> Result<(Option<String>, bool), ExitCode> {
     let words = std::iter::once("upgrade")
         .chain(args.iter().copied())
         .collect::<Vec<_>>();
@@ -5594,7 +5673,7 @@ fn upgrade_cli_parse(args: &[&str]) -> Result<Option<String>, ExitCode> {
             .strip_prefix("remuda: remuda upgrade: ")
             .unwrap_or(detail);
         eprintln!(
-            "remuda: upgrade: {detail}\nFix: choose --channel stable or --channel nightly, or omit --channel to keep the installed channel.\nUsage: remuda upgrade [--channel stable|nightly]\nNext: run `remuda upgrade --channel stable` (or choose nightly)."
+            "remuda: upgrade: {detail}\nFix: choose --channel stable or --channel nightly, or omit --channel to keep the installed channel.\nUsage: remuda upgrade [--channel stable|nightly] [--no-reload]\nNext: run `remuda upgrade --channel stable` (or choose nightly)."
         );
         return Err(ExitCode::FAILURE);
     }
@@ -5605,12 +5684,15 @@ fn upgrade_cli_parse(args: &[&str]) -> Result<Option<String>, ExitCode> {
     if let Some(channel) = channel {
         if !dist::is_channel(channel) {
             eprintln!(
-                "remuda: upgrade: unknown channel {channel:?}; choose --channel stable or --channel nightly.\nFix: choose stable or nightly, or omit --channel to keep the installed channel.\nUsage: remuda upgrade [--channel stable|nightly]\nNext: run `remuda upgrade --channel stable` (or choose nightly)."
+                "remuda: upgrade: unknown channel {channel:?}; choose --channel stable or --channel nightly.\nFix: choose stable or nightly, or omit --channel to keep the installed channel.\nUsage: remuda upgrade [--channel stable|nightly] [--no-reload]\nNext: run `remuda upgrade --channel stable` (or choose nightly)."
             );
             return Err(ExitCode::FAILURE);
         }
     }
-    Ok(channel.map(str::to_owned))
+    Ok((
+        channel.map(str::to_owned),
+        cli_flag(&report.values, "no-reload"),
+    ))
 }
 
 fn upgrade_cli_preflight(argv: &[&str]) -> Option<ExitCode> {
@@ -8432,6 +8514,21 @@ mod tests {
         assert!(notice.unwrap().contains("remuda stop"));
     }
 
+    /// A mismatched daemon is cured by a reload, which keeps sessions, and
+    /// the cure survives an 80-column footer crop.
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_of_another_build_is_cured_by_a_reload_not_a_stop() {
+        let notice = skew_notice(Ok(Response::Value("0.0.1+old".into()))).unwrap();
+        let shown: String = format!("remuda: {notice}").chars().take(80).collect();
+        assert!(shown.contains("`remuda reload`"), "{shown}");
+        assert!(!notice.contains("remuda stop"), "{notice}");
+        assert!(notice.ends_with(&format!(
+            "It is 0.0.1+old; this command is {}",
+            dist::BUILD_VERSION
+        )));
+    }
+
     #[test]
     fn caller_env_keeps_only_remuda_vars_as_escaped_lua_fields() {
         let vars = [
@@ -8458,11 +8555,17 @@ mod upgrade_cli_tests {
             (&["--channel", "nightly"][..], Some("nightly")),
         ] {
             assert_eq!(
-                upgrade_cli_parse(args).unwrap().as_deref(),
+                upgrade_cli_parse(args).unwrap().0.as_deref(),
                 expected,
                 "{args:?}"
             );
         }
+    }
+
+    #[test]
+    fn upgrade_reloads_the_daemon_unless_told_not_to() {
+        assert!(!upgrade_cli_parse(&[]).unwrap().1);
+        assert!(upgrade_cli_parse(&["--no-reload"]).unwrap().1);
     }
 }
 

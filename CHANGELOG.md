@@ -2,11 +2,20 @@
 
 ## Unreleased
 
+<<<<<<< HEAD
 - VFS: `remuda vfs ls --conflicts` lists paths with kept concurrent writes,
   `remuda vfs stat` shows them, and `remuda vfs resolve-conflict URI --keep
   winner|VERSION` settles them by writing the chosen side again (fetched
   from a peer if needed). Lua `vfs.stat()` gains `conflicts`; the JSON of
   `stat` and `ls` gains `conflicts` and `deleted` (#778).
+=======
+- `remuda upgrade` (Unix) now reloads the running daemon into the version it
+  just installed, so host-backed sessions keep running. A daemon that cannot
+  reload keeps its old version and says why: an in-process session blocks it,
+  or it is older than `remuda reload`. `--no-reload` installs only. The notice
+  for a daemon of another build now suggests `remuda reload` instead of
+  `remuda stop`, and `reload` is listed in `remuda --help`.
+>>>>>>> origin/main
 
 - `remuda reload` (Unix) now checks the new daemon after the handover: it
   answers as the target build, lists every host-backed session the reload
