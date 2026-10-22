@@ -233,15 +233,23 @@ impl Registry {
         name: &str,
         instance_id: &str,
     ) -> std::result::Result<(), LiveInstanceError> {
-        let sessions = self.lock();
-        let session = sessions.get(name).ok_or(LiveInstanceError::NotRegistered)?;
-        if session.instance_id() != instance_id {
+        if let Some(session) = self.lock().get(name) {
+            if session.instance_id() != instance_id {
+                return Err(LiveInstanceError::InstanceChanged);
+            }
+            if !session.is_alive() {
+                return Err(LiveInstanceError::NotLive);
+            }
+            return Ok(());
+        }
+        let handle = self.hosted(name).ok_or(LiveInstanceError::NotRegistered)?;
+        if handle.identity().instance != instance_id {
             return Err(LiveInstanceError::InstanceChanged);
         }
-        if !session.is_alive() {
-            return Err(LiveInstanceError::NotLive);
+        match handle.inspect() {
+            Ok(observation) if observation.lifecycle == Lifecycle::Running => Ok(()),
+            _ => Err(LiveInstanceError::NotLive),
         }
-        Ok(())
     }
 
     /// Look up a tracked session identity, legacy or host-backed, without
@@ -301,11 +309,12 @@ impl Registry {
             .collect()
     }
 
-    /// Live process candidates with their launch identity captured together
-    /// under the registry lock. Carry this value through ancestry resolution
-    /// instead of looking the session name up again afterwards.
+    /// Live process candidates with their launch identity, in-process and
+    /// host-backed (#713, child pid asked after the lock; a host that cannot
+    /// answer is left out). Carry this through ancestry resolution.
     pub fn live_processes_with_identity(&self) -> Vec<LiveSessionProcess> {
-        self.lock()
+        let mut live: Vec<LiveSessionProcess> = self
+            .lock()
             .values()
             .filter_map(|session| {
                 session.process_id_if_alive().map(|pid| LiveSessionProcess {
@@ -316,7 +325,22 @@ impl Registry {
                     pid,
                 })
             })
-            .collect()
+            .collect();
+        live.extend(self.hosted_handles().iter().filter_map(|handle| {
+            let observation = handle.inspect().ok()?;
+            if observation.lifecycle != Lifecycle::Running {
+                return None;
+            }
+            let identity = handle.identity();
+            Some(LiveSessionProcess {
+                attribution: SessionAttribution {
+                    name: identity.name.clone(),
+                    instance_id: identity.instance.clone(),
+                },
+                pid: observation.pid?,
+            })
+        }));
+        live
     }
 
     /// The session whose backend holds `pid` as its own. Every listed session
