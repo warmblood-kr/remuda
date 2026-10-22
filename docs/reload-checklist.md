@@ -72,6 +72,13 @@ every update is a reload.
      the new daemon serves your sessions. Fix what the line above names,
      for example `init.lua`.
 
+## What keeps its old build
+
+A session's host keeps running the build it started with. The new daemon
+drives it; CI checks this on every change against the previous build. New
+sessions get the new build's host. A session moves onto the new host build
+only when you start it again.
+
 ## What starts fresh
 
 Lua state lives in the daemon, so the new daemon starts it again from
