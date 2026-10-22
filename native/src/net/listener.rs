@@ -1153,6 +1153,7 @@ fn authorize_remote_request_with_control(
             | Request::ClusterVfsBlobStat { .. }
             | Request::ClusterVfsBlobGet { .. }
             | Request::ClusterVfsTake { .. }
+            | Request::ClusterLeave
     ) {
         return Ok(());
     }
@@ -1226,6 +1227,24 @@ where
     }
     authorize(peer_static)?;
     Ok(response)
+}
+
+/// A rate-limited VFS request, or a leave, from an authenticated member.
+fn serve_vfs(
+    request: &Request,
+    peer_static: &[u8],
+    limiter: &RequestLimiter,
+) -> io::Result<Vec<u8>> {
+    let peer_fp = cluster::encoding::fingerprint(peer_static);
+    if !limiter.acquire_vfs_request(&peer_fp) {
+        return serde_json::to_vec(&Response::error(VFS_RATE_LIMITED)).map_err(io::Error::other);
+    }
+    let response = match request {
+        // Revokes only the authenticated caller, never another node.
+        Request::ClusterLeave => cluster::leave::serve(&peer_fp),
+        request => cluster::vfs_sync::serve(&peer_fp, request),
+    };
+    serde_json::to_vec(&response).map_err(|_| io::Error::other("vfs response encode failed"))
 }
 
 fn dispatch_payload(
@@ -1307,16 +1326,8 @@ fn dispatch_payload(
         | Request::ClusterVfsIndexUpdate { .. }
         | Request::ClusterVfsBlobStat { .. }
         | Request::ClusterVfsBlobGet { .. }
-        | Request::ClusterVfsTake { .. }) => {
-            let peer_fp = cluster::encoding::fingerprint(peer_static);
-            if !limiter.acquire_vfs_request(&peer_fp) {
-                return serde_json::to_vec(&Response::error(VFS_RATE_LIMITED))
-                    .map_err(io::Error::other);
-            }
-            let response = cluster::vfs_sync::serve(&peer_fp, &request);
-            serde_json::to_vec(&response)
-                .map_err(|_| io::Error::other("vfs response encode failed"))
-        }
+        | Request::ClusterVfsTake { .. }
+        | Request::ClusterLeave) => serve_vfs(&request, peer_static, limiter),
         request => {
             if let Err(response) =
                 authorize_remote_request_with_source(&request, &ControlSource::DefaultStateDir)
@@ -1616,6 +1627,9 @@ fn handle_admitted_request(
             b"peer request capacity reached",
         ));
     };
+    // A granted leave revokes the caller, so only the check before dispatch
+    // applies to it.
+    let leaving = matches!(request, Request::ClusterLeave);
     let payload = opened.payload.clone();
     let peer_static = opened.peer_static.clone();
     let dispatch_worker = dispatch.clone();
@@ -1628,9 +1642,16 @@ fn handle_admitted_request(
         .spawn(move || {
             let _global = worker_global;
             let _peer = worker_peer;
+            let mut checked = false;
             let result = dispatch_and_reauthorize(
                 &peer_static,
-                |key| authorize_worker(key),
+                |key| {
+                    if leaving && checked {
+                        return Ok(());
+                    }
+                    checked = true;
+                    authorize_worker(key)
+                },
                 limits.post_dispatch_hold,
                 || dispatch_worker(&payload, &peer_static),
             );
@@ -1649,7 +1670,7 @@ fn handle_admitted_request(
             encode_error("request worker failed")
         }
     };
-    if authorize(&opened.peer_static).is_err() {
+    if !leaving && authorize(&opened.peer_static).is_err() {
         // The write may already have happened; the record says so.
         audit(cluster::audit::Outcome::Revoked);
         let refused = encode_error("remote node was revoked while the request was held");

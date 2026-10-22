@@ -649,6 +649,7 @@ remuda — a pty manager you can attach to
   remuda cluster join             join another node's cluster
   remuda cluster nodes            list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
+  remuda cluster leave [--yes]    leave the cluster; another node revokes this one
   remuda cluster remote [node[/session]] a node's session screen, or the cluster tree
   remuda cluster listen [--bind ADDR] [--allow-public] configure the daemon listener
                                   --foreground holds the listener in this terminal
@@ -747,6 +748,7 @@ remuda — terminal orchestration for coding agents
   remuda cluster join             join another node's cluster
   remuda cluster nodes           list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
+  remuda cluster leave [--yes]    leave the cluster; another node revokes this one
   remuda cluster remote [node[/session]] a node's session screen, or the cluster tree
   remuda cluster listen [--bind ADDR] [--allow-public] configure the daemon listener
                                   --foreground holds the listener in this terminal
@@ -855,7 +857,7 @@ fn is_command_word(word: &str) -> bool {
 
 fn suggest_command(word: &str) -> Option<String> {
     const CLUSTER_VERBS: &[&str] = &[
-        "nodes", "init", "invite", "join", "revoke", "remote", "listen", "control", "call",
+        "nodes", "init", "invite", "join", "revoke", "leave", "remote", "listen", "control", "call",
     ];
     if CLUSTER_VERBS.contains(&word) {
         return Some(format!("cluster {word}"));
@@ -924,6 +926,9 @@ enum ClusterCommand {
     Control(bool),
     Revoke {
         target: String,
+        yes: bool,
+    },
+    Leave {
         yes: bool,
     },
     Remote(Option<String>),
@@ -1008,6 +1013,8 @@ fn cluster_cli_spec() -> remuda_native::cli_parse::Spec {
             verb("revoke", "Revoke a node or fingerprint; prompt before revoking unless --yes is used. Example: remuda cluster revoke node-abcd1234",
                 vec![arg("TARGET", "Node name or fingerprint", false, true)],
                 vec![option("yes", None, "Confirm without prompting", false)], "remuda cluster revoke TARGET [--yes]"),
+            verb("leave", "Leave the cluster: copy files to other nodes, have one of them revoke this node, then forget its membership. Example: remuda cluster leave",
+                vec![], vec![option("yes", None, "Confirm without prompting", false)], "remuda cluster leave [--yes]"),
             verb("remote", "Attach to a remote session, or show the remote session picker. Example: remuda cluster remote node/session",
                 vec![arg("TARGET", "Optional NODE (its session screen) or NODE/SESSION target", false, false)], vec![], "remuda cluster remote [NODE[/SESSION]]"),
             verb("listen", "Manage the cluster listener. Example: remuda cluster listen --bind 127.0.0.1",
@@ -1147,6 +1154,9 @@ fn parse_cluster_values(
             Some("off") => Ok(ClusterCommand::Control(false)),
             _ => Err("expected on or off".into()),
         },
+        "leave" => Ok(ClusterCommand::Leave {
+            yes: cli_flag(values, "yes"),
+        }),
         "revoke" => Ok(ClusterCommand::Revoke {
             target: cluster_value(values, "TARGET")
                 .unwrap_or_default()
@@ -1313,6 +1323,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             Err(error) => fail(format!("cluster nodes: {error}")),
         },
         ClusterCommand::Revoke { target, yes } => cluster_revoke(&target, yes),
+        ClusterCommand::Leave { yes } => cluster_leave(path, yes),
         ClusterCommand::Alias { target, alias } => {
             match remuda_native::cluster::control::set_node_alias(&target, alias.as_deref()) {
                 Ok(pushes) => {
@@ -2944,6 +2955,108 @@ fn sanitize_peer_response(
         _ => {}
     }
     response
+}
+
+/// `remuda cluster leave`: drain, have a peer revoke this node, then move the
+/// cluster folder aside. Exits 75 with nothing changed while a peer refuses.
+fn cluster_leave(path: &Path, yes: bool) -> ExitCode {
+    use remuda_native::cluster::leave::{self, Asked};
+    let (identity, registry) = match remuda_native::cluster::nodes() {
+        Ok(Some(nodes)) => nodes,
+        Ok(None) => return fail("cluster is not initialized; nothing to leave"),
+        Err(error) => return fail(format!("cluster leave: {error}")),
+    };
+    let label = remuda_native::cluster::node_label(&identity.node_fp);
+    let peers = registry
+        .authorized_nodes
+        .iter()
+        .filter(|node| {
+            node.node_fp != identity.node_fp
+                && node.state == remuda_native::cluster::NodeState::Admitted
+        })
+        .count();
+    let left = match leave::left_dir() {
+        Ok(left) => left,
+        Err(error) => return fail(format!("cluster leave: {error}")),
+    };
+    let cluster_dir = left.with_file_name("cluster");
+    println!("Leaving the cluster as {label}:");
+    if peers > 0 {
+        println!("  - other nodes take copies of its files, then one of them revokes it");
+    }
+    println!("  - move {} to {}", cluster_dir.display(), left.display());
+    println!(
+        "  - delete there: {} (vfs/ and audit.jsonl stay)",
+        leave::FORGOTTEN_FILES.join(", ")
+    );
+    let prompt = match revoke_confirmation(
+        yes,
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+    ) {
+        Ok(prompt) => prompt,
+        Err(message) => return fail(message),
+    };
+    match confirm_leave(prompt) {
+        Ok(true) => {}
+        Ok(false) => {
+            println!("Leave cancelled.");
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => return fail(format!("cluster leave: {error}")),
+    }
+    let daemon_up = remuda_native::ipc::connect(path).is_ok();
+    if peers > 0 {
+        let mut asked = leave::ask_peers();
+        if matches!(asked, Ok(Asked::Refused(_))) && daemon_up {
+            match remuda_native::vfs_cli::drain_in_daemon(path) {
+                Ok(_) => asked = leave::ask_peers(),
+                Err(error) => return fail(format!("cluster leave: drain: {error}")),
+            }
+        }
+        match asked {
+            Ok(Asked::Revoked(by)) => println!("{by} revoked this node."),
+            Ok(Asked::Refused(refusals)) => {
+                for (node, reason) in refusals {
+                    eprintln!("{node} refused: {reason}");
+                }
+                eprintln!("Nothing changed here. Fix the above, then run `remuda cluster leave` again.");
+                return ExitCode::from(75);
+            }
+            Ok(Asked::Unreachable) => eprintln!(
+                "warning: no other node answered; later, on one of them, run `remuda cluster revoke {label}`"
+            ),
+            Err(error) => return fail(format!("cluster leave: {error}")),
+        }
+    }
+    if daemon_up {
+        if let Err(error) = remuda_native::cluster::listener_control::stop(path) {
+            return fail(format!("cluster leave: stopping the listener: {error}"));
+        }
+    }
+    if let Err(error) = leave::forget(&left) {
+        return fail(format!(
+            "cluster leave: moving {} failed: {error}",
+            cluster_dir.display()
+        ));
+    }
+    println!("Moved the cluster folder to {}.", left.display());
+    println!("Its vfs/ keeps this node's files for reading; do not move it back to rejoin, or deleted files can return.");
+    println!("Next: run `remuda cluster init` or `remuda cluster join` to start again.");
+    ExitCode::SUCCESS
+}
+
+fn confirm_leave(prompt: bool) -> std::io::Result<bool> {
+    use std::io::{self, Write};
+    if !prompt {
+        return Ok(true);
+    }
+    let mut stderr = io::stderr().lock();
+    write!(stderr, "Leave the cluster? [y/N] ")?;
+    stderr.flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(confirmation_answer_is_yes(&answer))
 }
 
 fn cluster_revoke(target: &str, yes: bool) -> ExitCode {

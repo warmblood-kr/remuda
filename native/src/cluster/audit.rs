@@ -1,8 +1,8 @@
 //! Local, owner-only audit log of what admitted peers asked this node to do.
 //!
 //! One JSON object per line in `cluster/audit.jsonl`. Only actions that change
-//! a session are recorded: input, resize, close and create. Reads (List, Sync,
-//! capture) are not. Input contents and lengths are never recorded. The file
+//! a session are recorded (input, resize, close, create), and a peer asking to
+//! be revoked (leave). Reads (List, Sync, capture) are not. Input contents and lengths are never recorded. The file
 //! keeps the most recent [`MAX_ENTRIES`] lines; older lines are trimmed in one
 //! atomic rewrite once [`TRIM_SLACK`] extra lines have been appended.
 //!
@@ -27,6 +27,8 @@ pub enum Op {
     Resize,
     Close,
     Create,
+    /// The peer asked to be revoked (`remuda cluster leave`).
+    Leave,
 }
 
 /// What this node did with the request.
@@ -91,6 +93,7 @@ pub fn action(request: &Request) -> Option<Action> {
         Request::New { name, .. } | Request::NewWithInstance { name, .. } => {
             (Op::Create, name.clone().unwrap_or_default(), None)
         }
+        Request::ClusterLeave => (Op::Leave, String::new(), None),
         _ => return None,
     };
     Some(Action {

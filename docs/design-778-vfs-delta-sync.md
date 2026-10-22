@@ -107,11 +107,13 @@ Owner decision: 7-day minimum and 30-day stale horizon, both configurable
   timeout (exit 75). It is sent only to peers whose change pages list the
   `take` cap; others are named "too old". A take lapses after 1 h; taken
   copies are not stand-ins. Unlike the plan, drain revokes nothing: it says
-  to run `remuda cluster revoke NODE` on another node. A `cluster leave`
-  that does both is not built.
+  to run `remuda cluster revoke NODE` on another node.
+- **Leave:** `remuda cluster leave` asks a peer to revoke it
+  (`ClusterLeave`); the peer revokes only the caller, after `BlobStat`
+  confirms every placement without it, and audits it. The leaver then moves
+  its cluster folder to `cluster.left-DATE`, so a rejoin starts empty.
 
 ## Not done
 
 - Squashing old migration steps (mods ship at most 64 asset files).
 - An N/N+1 test of the VFS across `remuda reload`.
-- `remuda cluster leave`.
