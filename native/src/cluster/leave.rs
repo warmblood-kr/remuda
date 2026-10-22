@@ -8,7 +8,7 @@
 
 use super::vfs::VfsStore;
 use super::vfs_status::copy_status;
-use super::vfs_sync::{members, request_peer_within};
+use super::vfs_sync::{members, request_peer_within, OLD_BUILD_REFUSALS};
 use remuda_core::protocol::{Request, Response};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -72,7 +72,7 @@ pub fn ask_peers() -> io::Result<Asked> {
         let label = super::node_label(peer);
         match request_peer_within(peer, &Request::ClusterLeave, ASK_TIMEOUT) {
             Ok(Response::Ok) => return Ok(Asked::Revoked(label)),
-            Ok(Response::Error(reason)) if reason == "invalid remote request" => {
+            Ok(Response::Error(reason)) if OLD_BUILD_REFUSALS.contains(&reason.as_str()) => {
                 refused.push((label, "too old to revoke a leaving node".into()))
             }
             Ok(Response::Error(reason)) => refused.push((label, reason)),
