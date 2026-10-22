@@ -369,9 +369,33 @@ fn previous() -> PathBuf {
     }
     dir.join("remuda")
 }
+/// Whether N hosts sessions at all: builds before #759 ignore the opt-in,
+/// keep sessions in-process and never create a host inventory.
+fn previous_hosts() -> bool {
+    let root = Root::new();
+    let daemon = Daemon::spawn_exe(&root, &previous(), true);
+    new_session(&root.socket(), "probe");
+    let hosts = root.hosts().exists();
+    drop(daemon);
+    hosts
+}
+
+/// Skip a test N cannot take part in. A job that must run everything sets
+/// REMUDA_COMPAT_NO_SKIP, so a skip there fails instead.
+fn skip(reason: &str) {
+    assert!(
+        std::env::var_os("REMUDA_COMPAT_NO_SKIP").is_none(),
+        "REMUDA_COMPAT_NO_SKIP is set but {reason}"
+    );
+    eprintln!("skipped: {reason}");
+}
+
 /// One daemon creates a hosted session and dies; the other adopts its
 /// inventory and host, then sends input and closes through it.
 fn hand_over(first: &Path, second: &Path) {
+    if !previous_hosts() {
+        return skip("N predates daemon hosting (#759)");
+    }
     let root = Root::new();
     let path = root.socket();
     let creator = Daemon::spawn_exe(&root, first, true);
