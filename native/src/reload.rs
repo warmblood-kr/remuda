@@ -144,9 +144,16 @@ impl Default for Deadlines {
 }
 
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// Set once this daemon handed its endpoint over; it only exits after.
+static HANDED_OVER: AtomicBool = AtomicBool::new(false);
 struct InFlight;
 impl InFlight {
     fn take() -> Result<Self, String> {
+        // A request it accepted before pausing can still arrive in the
+        // answer window; another handover would give the socket away twice.
+        if HANDED_OVER.load(Ordering::SeqCst) {
+            return Err("this daemon already handed its socket to a new daemon and is exiting; run the command again to reach the new one".into());
+        }
         IN_FLIGHT
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .map(|_| Self)
@@ -194,6 +201,8 @@ impl Candidate {
         if outcome.is_err() {
             let _ = self.child.kill();
             let _ = self.child.wait();
+        } else {
+            HANDED_OVER.store(true, Ordering::SeqCst);
         }
         // On success C outlives this daemon; nobody reaps it here.
         outcome

@@ -108,3 +108,39 @@ fn an_exit_and_a_close_are_each_announced_once_in_both_backends() {
         assert!(!listed(&daemon, "closed"), "{mode:?}");
     }
 }
+
+#[test]
+fn a_command_that_ends_at_once_still_starts_and_is_announced_in_both_backends() {
+    for mode in MODES {
+        let daemon = Parity::start(mode);
+        let log = daemon.root().join("exited.log");
+        daemon
+            .eval(&format!(
+                "remuda.on('session_exited', function(name, d) \
+                   local f = assert(io.open('{}', 'a')); \
+                   f:write(name, ':', d.reason, ':', tostring(d.exit_code), '\\n'); \
+                   f:close() end, {{ group = 'parity' }})",
+                log.display()
+            ))
+            .unwrap();
+        // `new` answers with the name, as for any start.
+        daemon.start_command(
+            "quick",
+            vec!["/bin/sh".into(), "-c".into(), "echo QUICK; exit 3".into()],
+        );
+        let deadline = Instant::now() + PATIENCE;
+        while !events(&log).contains(&"quick:exited:3".to_owned()) {
+            assert!(
+                Instant::now() < deadline,
+                "{mode:?}: no exit event: {:?}",
+                events(&log)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let deadline = Instant::now() + PATIENCE;
+        while listed(&daemon, "quick") {
+            assert!(Instant::now() < deadline, "{mode:?}: stayed listed");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}

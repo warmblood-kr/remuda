@@ -349,6 +349,27 @@ impl HostSession {
     }
     /// No listener at the endpoint: the host process is gone. Any other
     /// failure (a slow or busy host) is not proof.
+    fn wait_for_frame(&self, version: u64, timeout: Duration) -> Result<VersionedSnapshot> {
+        let until = Instant::now() + timeout;
+        let mut client = self.viewer()?;
+        loop {
+            let view = self.capture(&mut client, 0)?;
+            if view.generation > version {
+                return Ok(self.versioned(view));
+            }
+            if !self.watch(&mut client, view.generation, until)? {
+                // As an in-process wait does: nothing new and the child gone
+                // is an exit, not a frame.
+                if matches!(
+                    SessionOperations::inspect(self)?.lifecycle,
+                    Lifecycle::Exited(_)
+                ) {
+                    return Err(Error::Agent(AgentError::Exited));
+                }
+                return Ok(self.versioned(view));
+            }
+        }
+    }
     fn host_gone(&self) -> bool {
         match std::os::unix::net::UnixStream::connect(self.endpoint.join("socket")) {
             Ok(_) => false,
@@ -705,13 +726,13 @@ impl SessionOperations for HostSession {
         Ok(self.versioned(self.capture(&mut client, offset)?))
     }
     fn wait_after(&self, version: u64, timeout: Duration) -> Result<VersionedSnapshot> {
-        let until = Instant::now() + timeout;
-        let mut client = self.viewer()?;
-        loop {
-            let view = self.capture(&mut client, 0)?;
-            if view.generation > version || !self.watch(&mut client, view.generation, until)? {
-                return Ok(self.versioned(view));
+        match self.wait_for_frame(version, timeout) {
+            // The child exited and the host stopped with it mid-wait: that is
+            // the exit an in-process wait reports, not a transport fault.
+            Err(Error::Unavailable(Unavailable::Transport)) if self.host_gone() => {
+                Err(Error::Agent(AgentError::Exited))
             }
+            result => result,
         }
     }
     fn wakeup(&self) -> Result<Option<OutputWakeup>> {
