@@ -2655,6 +2655,7 @@ mod binding_tests {
                     attached: false,
                     human_idle: None,
                     mouse_tracking: false,
+                    unavailable: false,
                 }]),
                 other => panic!("unexpected test request: {other:?}"),
             };

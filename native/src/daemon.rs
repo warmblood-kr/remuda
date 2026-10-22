@@ -79,6 +79,24 @@ fn wait_for_new_requests() {
     }
 }
 
+/// Longest a caller found in no session waits for in-flight `new` requests:
+/// a host-backed start may wait this long for its host to publish.
+#[cfg(not(windows))]
+const STARTING_SESSIONS_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait, bounded, until no `new` request is in flight; `true` when one was.
+#[cfg(not(windows))]
+fn wait_for_starting_sessions() -> bool {
+    if ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst) == 0 {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + STARTING_SESSIONS_WAIT;
+    while ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst) != 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    true
+}
+
 struct SyncPermit;
 
 impl SyncPermit {
@@ -1380,6 +1398,16 @@ pub(crate) fn reap_and_notify(registry: &Registry, image: &Image) -> Vec<String>
     for (name, id, instance_id, reason, exit_info) in &dead {
         notify_exited(image, name, id, instance_id, reason, exit_info.as_ref());
     }
+    // A host-backed session's child exits inside its host (#713): stop the
+    // host and retire its entry as a close would, then announce it the same way.
+    let hosted = registry.reap_hosted_with_exit_info();
+    for (name, id, instance_id, reason, exit_info) in &hosted {
+        #[cfg(unix)]
+        image.session_hosts().retire_closed(name);
+        notify_exited(image, name, id, instance_id, reason, exit_info.as_ref());
+    }
+    let mut dead = dead;
+    dead.extend(hosted);
     dead.into_iter().map(|(name, _, _, _, _)| name).collect()
 }
 
@@ -2064,6 +2092,14 @@ fn handle_request(
     }
     match request {
         Request::List => {
+            // A session's child runs before `new` registers it, and a
+            // host-backed one (#713) only once its host published, so a
+            // listing from inside a session still starting would miss it.
+            // Resolving the caller lets in-flight starts finish first.
+            #[cfg(not(windows))]
+            if ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst) != 0 {
+                let _ = caller_context(&stream, registry, accepted);
+            }
             if !keep_exited() {
                 reap_and_notify(registry, image);
             }
@@ -2435,14 +2471,25 @@ fn caller_context(
     #[cfg(not(windows))]
     {
         let _ = accepted;
-        let candidates = registry.live_processes_with_identity();
-        caller_context_from_ancestry(
-            process_ancestry::peer_pid(stream),
-            &candidates,
-            std::process::id(),
-            process_ancestry::parent_pid,
-            registry,
-        )
+        let resolve = || {
+            let candidates = registry.live_processes_with_identity();
+            caller_context_from_ancestry(
+                process_ancestry::peer_pid(stream),
+                &candidates,
+                std::process::id(),
+                process_ancestry::parent_pid,
+                registry,
+            )
+        };
+        let caller = resolve();
+        // A session's child runs before `new` registers it; a host-backed one
+        // (#713) waits for its host to publish first. A caller that early is
+        // in no session yet, so let in-flight starts finish and look again.
+        if !matches!(caller.kind, crate::image::CallerKind::Session) && wait_for_starting_sessions()
+        {
+            return resolve();
+        }
+        caller
     }
 }
 
@@ -3150,33 +3197,49 @@ fn handle_shutdown(
             requester_session_id,
             requester_session_name,
         };
-        shutdown_verdict_with_classifier(false, claims, || {
-            match process_ancestry::peer_pid(&stream) {
-                Ok(Some(peer_pid)) => {
-                    let session_pids = match session_process_ids(registry) {
-                        Ok(pids) => pids,
-                        Err(error) => {
-                            eprintln!("remuda: shutdown {error}; refusing unverifiable requester");
-                            return ShutdownPeer::Error(error);
-                        }
-                    };
-                    let ancestry = process_ancestry::is_self_or_descendant(peer_pid, &session_pids);
-                    if let process_ancestry::Ancestry::Unreadable { pid, ref error } = ancestry {
-                        eprintln!(
+        let classify = || match process_ancestry::peer_pid(&stream) {
+            Ok(Some(peer_pid)) => {
+                let session_pids = match session_process_ids(registry) {
+                    Ok(pids) => pids,
+                    Err(error) => {
+                        eprintln!("remuda: shutdown {error}; refusing unverifiable requester");
+                        return ShutdownPeer::Error(error);
+                    }
+                };
+                let ancestry = process_ancestry::is_self_or_descendant(peer_pid, &session_pids);
+                if let process_ancestry::Ancestry::Unreadable { pid, ref error } = ancestry {
+                    eprintln!(
                             "remuda: shutdown ancestry stopped at unreadable pid {pid} ({error}); refusing unverifiable requester"
                         );
-                    }
-                    ShutdownPeer::Ancestry(ancestry)
                 }
-                Ok(None) => {
-                    eprintln!("remuda: shutdown peer process ID unavailable; refusing unverifiable requester");
-                    ShutdownPeer::Unavailable
-                }
-                Err(error) => {
-                    eprintln!("remuda: shutdown peer process ID unavailable ({error}); refusing unverifiable requester");
-                    ShutdownPeer::Error(error.to_string())
-                }
+                ShutdownPeer::Ancestry(ancestry)
             }
+            Ok(None) => {
+                eprintln!(
+                    "remuda: shutdown peer process ID unavailable; refusing unverifiable requester"
+                );
+                ShutdownPeer::Unavailable
+            }
+            Err(error) => {
+                eprintln!("remuda: shutdown peer process ID unavailable ({error}); refusing unverifiable requester");
+                ShutdownPeer::Error(error.to_string())
+            }
+        };
+        shutdown_verdict_with_classifier(false, claims, || {
+            let peer = classify();
+            // A session's child runs before `new` registers it; a host-backed
+            // one (#713) waits for its host to publish first. A requester that
+            // early is in no session yet, so let in-flight starts finish and
+            // look again, as caller attribution does.
+            #[cfg(not(windows))]
+            if matches!(
+                peer,
+                ShutdownPeer::Ancestry(process_ancestry::Ancestry::Outside)
+            ) && wait_for_starting_sessions()
+            {
+                return classify();
+            }
+            peer
         })
     };
     finish_shutdown_verdict(
@@ -3746,6 +3809,12 @@ fn spawn(
     // `dumb` and its TUI degrades for a reason nobody can see from inside.
     if std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true) {
         builder.env("TERM", "xterm-256color");
+    }
+    // Same as a host-backed child: the daemon's own switches and
+    // service-manager handles are not the session's.
+    #[cfg(unix)]
+    for key in crate::session_host::hosted::DAEMON_ONLY {
+        builder.env_remove(key);
     }
     if let Some(env) = env {
         for (k, v) in env {
