@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- SQLite migrations no longer fail when two connections open a database
+  for the first time at once (#778). The one that waited for the write lock
+  now checks the version again and skips steps the other already ran,
+  instead of failing with `table ... already exists`. This hit the VFS
+  index.db in CI. `remuda db downgrade` checks under the lock too.
+
 - `remuda reload` (Unix): fixed a daemon that had just handed over being
   able to hand over again. A reload request it had accepted just before the
   handover could start a second one, giving the socket to two new daemons.
