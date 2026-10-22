@@ -7,6 +7,12 @@
   hands it over. It now holds the pid padded with newlines to a fixed
   width; readers that trim are unaffected.
 
+- VFS: `remuda vfs drain [--timeout SECS]` prepares a node to leave (#778).
+  The nodes that will hold its files once it is gone are asked to take a
+  copy, and drain waits until they confirm. Then it says to run `remuda
+  cluster revoke NODE` on another node; it revokes nothing itself. A peer
+  too old to take copies is named, and drain exits 75 while files are short.
+
 - `remuda upgrade` (Unix) checks the reloaded daemon as `remuda reload` does:
   it answers as the new build, lists every session it took over, and loaded
   `init.lua`. An `init.lua` that fails only in the new daemon is named and

@@ -21,6 +21,7 @@ pub const MAX_UPDATE_JSON_BYTES: usize = 48 * 1024;
 pub const MAX_STAT_HASHES: usize = 64;
 pub const BLOB_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_REPAIRS_PER_PASS: usize = 256;
+const TAKE_TTL: Duration = Duration::from_secs(60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_DOWN_GRACE: Duration = Duration::from_secs(120);
 
@@ -77,6 +78,7 @@ pub fn serve_changes(
             stale: true,
             seen_seq,
             seen_index_id,
+            caps: caps(),
         });
     }
     let mut page = store.changes(
@@ -100,7 +102,13 @@ pub fn serve_changes(
         stale: false,
         seen_seq: 0,
         seen_index_id: None,
+        caps: caps(),
     })
+}
+
+/// Requests beyond the base set that this build serves, sent with each page.
+fn caps() -> Vec<String> {
+    vec![remuda_core::protocol::VFS_CAP_TAKE.to_owned()]
 }
 
 pub fn serve_with(store: &VfsStore, request: &Request) -> VfsResult<Response> {
@@ -149,6 +157,15 @@ pub fn serve_with(store: &VfsStore, request: &Request) -> VfsResult<Response> {
             Ok(Response::ClusterVfsAck {
                 digest: store.load_index()?.digest(),
                 applied: changed.len(),
+            })
+        }
+        Request::ClusterVfsTake { hashes } => {
+            if hashes.len() > MAX_STAT_HASHES {
+                return Err(VfsError::new(VfsErrorKind::TooLarge, "too many hashes"));
+            }
+            Ok(Response::ClusterVfsAck {
+                digest: String::new(),
+                applied: take(store, hashes)?,
             })
         }
         Request::ClusterVfsBlobStat { hashes } => {
@@ -213,7 +230,7 @@ fn record_health(peer_fp: &str, reached: bool) {
     }
 }
 
-fn is_down(peer_fp: &str) -> bool {
+pub(super) fn is_down(peer_fp: &str) -> bool {
     health()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -224,15 +241,15 @@ fn is_down(peer_fp: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Membership and placement.
 
-struct Members {
-    self_fp: String,
+pub(super) struct Members {
+    pub(super) self_fp: String,
     /// Admitted nodes, this one included.
-    admitted: Vec<String>,
+    pub(super) admitted: Vec<String>,
     /// Admitted peers with an endpoint, which this node can reach.
     reachable: Vec<String>,
 }
 
-fn members() -> VfsResult<Members> {
+pub(super) fn members() -> VfsResult<Members> {
     let (identity, registry) = super::nodes()?
         .ok_or_else(|| VfsError::new(VfsErrorKind::NoCluster, "this node has no cluster"))?;
     Ok(members_of(&identity.node_fp, &registry))
@@ -287,7 +304,7 @@ fn live_placement(entry: &VfsEntry, members: &Members) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Talking to peers.
 
-fn request_peer(peer_fp: &str, request: &Request) -> Result<Response, String> {
+pub(super) fn request_peer(peer_fp: &str, request: &Request) -> Result<Response, String> {
     let result = request_peer_inner(peer_fp, request);
     record_health(peer_fp, result.is_ok());
     result
@@ -450,10 +467,12 @@ pub fn pull_changes(
             stale,
             seen_seq,
             seen_index_id,
+            caps,
         } = response
         else {
             return Ok(None);
         };
+        lock(peer_caps()).insert(peer.to_owned(), caps);
         if reset {
             resets += 1;
             if resets > 1 {
@@ -757,10 +776,51 @@ pub fn sync_once(force: bool) -> SyncReport {
     report
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(super) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Blobs a draining peer asked this node to keep, and when it asked.
+fn takes() -> &'static Mutex<HashMap<String, Instant>> {
+    static TAKES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    TAKES.get_or_init(Mutex::default)
+}
+
+/// Taken blobs not yet fetched; a request lapses after `TAKE_TTL`.
+fn taken() -> HashSet<String> {
+    let mut takes = lock(takes());
+    takes.retain(|_, asked| asked.elapsed() < TAKE_TTL);
+    takes.keys().cloned().collect()
+}
+
+/// `ClusterVfsTake`: queue the live blobs this node lacks for the repair
+/// pass. Returns how many were queued.
+fn take(store: &VfsStore, hashes: &[String]) -> VfsResult<usize> {
+    let index = store.load_index()?;
+    let live: HashMap<&str, &VfsEntry> = index
+        .entries
+        .values()
+        .filter(|entry| !entry.deleted)
+        .map(|entry| (entry.sha256.as_str(), entry))
+        .collect();
+    let mut queued = 0;
+    for hash in hashes {
+        if let Some(entry) = live.get(hash.as_str()) {
+            if !store.has_blob(&entry.sha256, entry.size) {
+                lock(takes()).insert(hash.clone(), Instant::now());
+                queued += 1;
+            }
+        }
+    }
+    Ok(queued)
+}
+
+/// What each peer listed in `caps` on its last change page.
+pub(super) fn peer_caps() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    static CAPS: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+    CAPS.get_or_init(Mutex::default)
 }
 
 fn repair_queue() -> &'static Mutex<RepairQueue> {
@@ -776,11 +836,13 @@ fn repair(
     force: bool,
     report: &mut SyncReport,
 ) {
+    let taken = taken();
     let mut missing: BTreeMap<&str, &VfsEntry> = BTreeMap::new();
     for entry in index.entries.values().filter(|entry| !entry.deleted) {
         if !missing.contains_key(entry.sha256.as_str())
             && !store.has_blob(&entry.sha256, entry.size)
-            && live_placement(entry, members).contains(&members.self_fp)
+            && (taken.contains(&entry.sha256)
+                || live_placement(entry, members).contains(&members.self_fp))
         {
             missing.insert(&entry.sha256, entry);
         }
@@ -788,8 +850,12 @@ fn repair(
     let wanted: Vec<String> = missing.keys().map(|sha| (*sha).to_owned()).collect();
     let due = lock(repair_queue()).due(&wanted, Instant::now(), force, MAX_REPAIRS_PER_PASS);
     for sha in &due {
-        let fetched =
-            fetch_blob(store, missing[sha.as_str()]).is_ok() && store.mark_stand_in(sha).is_ok();
+        // A copy taken for a draining peer is kept, not trimmed later.
+        let fetched = fetch_blob(store, missing[sha.as_str()]).is_ok()
+            && (taken.contains(sha) || store.mark_stand_in(sha).is_ok());
+        if fetched {
+            lock(takes()).remove(sha);
+        }
         lock(repair_queue()).tried(sha, fetched, Instant::now());
         if fetched {
             report.copies_fetched += 1;
@@ -1403,15 +1469,46 @@ mod tests {
             stale: false,
             seen_seq: 0,
             seen_index_id: None,
+            caps: vec![],
         };
         let json = serde_json::to_string(&page).unwrap();
         assert!(
-            !json.contains("stale") && !json.contains("seen_index_id"),
+            !json.contains("stale") && !json.contains("seen_index_id") && !json.contains("caps"),
             "{json}"
         );
         // A page from an older server reads as not stale.
         let older = json.replace(",\"seen_seq\":0", "");
         assert_eq!(serde_json::from_str::<Response>(&older).unwrap(), page);
+    }
+
+    #[test]
+    fn take_queues_only_live_blobs_this_node_lacks_and_pages_offer_it() {
+        let (_root, store) = scratch_store();
+        let missing = "7".repeat(64);
+        store
+            .merge_entries(vec![entry("t/missing.txt", &missing)])
+            .unwrap();
+        let held = store.put("t/held.txt", b"held", 2, "SHA256:w").unwrap();
+        let unknown = "8".repeat(64);
+        let asked = Request::ClusterVfsTake {
+            hashes: vec![missing.clone(), held.sha256.clone(), unknown.clone()],
+        };
+        let Response::ClusterVfsAck { applied, .. } = serve_with(&store, &asked).unwrap() else {
+            panic!()
+        };
+        assert_eq!(applied, 1);
+        assert!(taken().contains(&missing) && !taken().contains(&unknown));
+        let too_many = Request::ClusterVfsTake {
+            hashes: vec![missing; MAX_STAT_HASHES + 1],
+        };
+        assert!(serve_with(&store, &too_many).is_err());
+
+        let Response::ClusterVfsChangesPage { caps, .. } =
+            serve_changes(&store, "SHA256:p", None, u64::MAX, 1).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(caps, [remuda_core::protocol::VFS_CAP_TAKE]);
     }
 
     #[test]

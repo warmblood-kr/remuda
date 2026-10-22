@@ -500,6 +500,50 @@ fn losing_a_holder_makes_the_next_node_take_a_copy() {
     }
 }
 
+/// A body whose one copy goes to `nodes[from]` with every node up, and to
+/// `nodes[to]` once `nodes[from]` is gone.
+fn body_moving(nodes: &[&Node], from: usize, to: usize) -> Vec<u8> {
+    let fingerprints: Vec<String> = nodes.iter().map(|node| node.fingerprint()).collect();
+    let all: Vec<&str> = fingerprints.iter().map(String::as_str).collect();
+    let rest: Vec<&str> = all
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != from)
+        .map(|(_, fp)| *fp)
+        .collect();
+    (0..)
+        .map(|n| format!("drain body {n}").into_bytes())
+        .find(|body| {
+            let sha = sha256_hex(body);
+            remuda_core::vfs::placement(&sha, 1, &all) == [all[from]]
+                && remuda_core::vfs::placement(&sha, 1, &rest) == [all[to]]
+        })
+        .unwrap()
+}
+
+/// `put --replicas 1` of `body` on `node`.
+fn put_one_copy(node: &Node, uri: &str, body: &[u8]) {
+    successful(
+        node.run_with_stdin(&["vfs", "put", "-", uri, "--replicas", "1"], Some(body)),
+        "vfs put --replicas 1",
+    );
+}
+
+#[test]
+fn drain_has_the_next_node_take_what_only_the_leaving_node_holds() {
+    let _serial = live_test_guard();
+    let (a, b, c) = three_nodes();
+    let body = body_moving(&[&a, &b, &c], 2, 1);
+    let sha = sha256_hex(&body);
+    put_one_copy(&c, "remuda:///leaving.txt", &body);
+    assert!(!b.has_blob(&sha));
+
+    let said = successful(c.run(&["vfs", "drain", "--timeout", "30"]), "vfs drain");
+    assert!(said.contains("Safe to leave"), "{said}");
+    assert!(b.has_blob(&sha));
+    assert!(!a.has_blob(&sha));
+}
+
 #[test]
 fn clear_errors_for_wrong_cluster_missing_and_no_cluster() {
     let _serial = live_test_guard();
@@ -666,6 +710,15 @@ fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
     for node in [&a, &c] {
         assert_eq!(kept_conflicts(node), 0);
     }
+
+    // Drain asks only peers that offer "take": the older node is named
+    // instead, and drain exits 75 while its file is short.
+    let body = body_moving(&[&a, &old, &c], 2, 1);
+    put_one_copy(&c, "remuda:///mixed/leaving.txt", &body);
+    let drained = c.run(&["vfs", "drain", "--timeout", "3"]);
+    let said = String::from_utf8_lossy(&drained.stderr);
+    assert_eq!(drained.status.code(), Some(75), "{said}");
+    assert!(said.contains("too old to take copies"), "{said}");
 
     // Deletes cross in both directions.
     successful(c.run(&["vfs", "rm", from_old]), "rm on N+1");
