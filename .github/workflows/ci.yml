@@ -390,11 +390,15 @@ jobs:
         # Revert this line to undo #624; %p separates processes and %b identifies the binary.
         env:
           LLVM_PROFILE_FILE_NAME: "%p-%b.profraw"
+        # A test that SIGKILLs an exiting daemon can truncate its profile; the
+        # script sets such files aside and names them, then the rest merge.
         run: |
+          cargo llvm-cov --workspace --all-targets --no-report
           {
             echo "## Coverage"
             echo '```'
-            cargo llvm-cov --workspace --all-targets --summary-only
+            bash scripts/drop-truncated-profraw.sh
+            cargo llvm-cov report --summary-only
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Profile diagnostics (#624)
