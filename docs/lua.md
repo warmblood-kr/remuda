@@ -197,9 +197,63 @@ mistakes that would stall or bloat the daemon, not against hostile code:
 
 `ATTACH`, `DETACH` (and so `VACUUM INTO`) and PRAGMAs outside a short list
 (`user_version`, `table_info`, `index_list`, `integrity_check`, and a few
-other read-only ones) fail with `denied: ...`, so a handle cannot reach
-another file, the VFS index included, or undo its limits. Other failures
-are `sql: ...`, `io: ...` and, after `close()`, `closed: ...`.
+other read-only ones; it may read `user_version` but not set it) fail with
+`denied: ...`, so a handle cannot reach another file, the VFS index
+included, or undo its limits. Other failures are `sql: ...`, `io: ...` and,
+after `close()`, `closed: ...`.
+
+### Schema migrations
+
+A mod ships its schema as numbered plain-SQL steps and lists them in
+`assets`, like other inert files:
+
+```
+packages/butler/migrations/notes/0001_create.up.sql
+packages/butler/migrations/notes/0001_create.down.sql
+packages/butler/migrations/notes/0002_tags.up.sql    -- no down: irreversible
+```
+
+`remuda.db.open("notes", { migrations = true })` reads
+`migrations/notes/` from the installed mod and applies the steps the
+database does not have yet. A mod may instead pass the steps inline:
+`migrations = { { name = "create", up = "...", down = "..." }, ... }`, where
+entry `i` is step `i`.
+
+- Steps are numbered 1..N with no gaps (`NNNN_name.up.sql`, optional
+  `NNNN_name.down.sql`). An empty file is an error; a step that is meant to
+  do nothing holds an SQL comment.
+- All pending steps run in one transaction, together with the new
+  `user_version`. If a step fails or the daemon dies midway, the database
+  keeps its old schema. Foreign keys are checked before commit.
+- Never edit a step that has shipped. The sha256 of each applied step is
+  stored, and an edited step fails the open with `drift: ...`. Add a new
+  step instead.
+- A step may not use ATTACH, BEGIN/COMMIT/SAVEPOINT, PRAGMAs other than
+  `foreign_key_check`, or the `_remuda_*` tables (`denied: ...`). To change
+  a column in a way `ALTER TABLE` cannot, rebuild the table: create
+  `new_t`, copy the rows, drop `t`, then rename `new_t` to `t`.
+- A database at a newer version than the mod knows fails the open with
+  `too_new: ...`, as does an open without `migrations` on a migrated
+  database. Older code never writes to a schema it does not know.
+- Migrations get 10 s in total. The size limit is the handle's.
+
+Each step's down SQL is stored in the database when the step runs, so a
+step can be undone without the newer mod's files. To go back to an older
+version of a mod:
+
+1. Install the older mod. Its `open` now fails with `too_new`.
+2. Run `remuda db downgrade MOD NAME VERSION`. It prints what it would undo.
+3. Run it again with `--yes`. It writes a private backup,
+   `NAME.db.vN-TIME.bak`, next to the database and then runs the downs in
+   one transaction. A range that holds an irreversible step is refused
+   before anything runs.
+4. Reload the mod.
+
+`remuda db status [MOD]` shows each database's version and steps and
+compares them with the installed files. `remuda db upgrade MOD NAME`
+applies the installed files without waiting for the mod to open the
+database. Like `remuda vfs`, these commands run in the daemon. With no
+daemon running, they fail with one line.
 
 ## JSON values
 
@@ -383,6 +437,14 @@ also runs for each active lifecycle mod during a clean daemon shutdown.
 Failures are logged and cleanup continues; shutdown waits at most two seconds
 for the whole stop pass. A forced daemon termination cannot run Lua stop
 callbacks.
+
+An optional `daemon_reload_ready(state)` lets a mod hold off `remuda reload`
+(Unix) while it is mid-task, such as launching a session. It returns nil when
+a reload is fine now, or a reason. Each reason blocks both `remuda reload
+--check` and `remuda reload` as `blocker: mod NAME: reason`, and the daemon
+keeps serving. A Lua error counts as a reason. Keep it quick: the daemon waits
+at most 2 s for every mod's answer and blocks the reload if it gets none. Mods
+without it never block a reload, and older cores ignore the field.
 
 The runtime registry also covers words added with `remuda.tool`, so an
 extension can document itself when it registers its function:

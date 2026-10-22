@@ -273,6 +273,7 @@ fn call_response(id: Value, response: Response) -> String {
         Response::ClusterRegistryPage { .. }
         | Response::ClusterRegistryAck { .. }
         | Response::ClusterVfsIndexPage { .. }
+        | Response::ClusterVfsChangesPage { .. }
         | Response::ClusterVfsAck { .. }
         | Response::ClusterVfsBlobHave(_)
         | Response::ClusterVfsBlobChunk { .. }
@@ -319,7 +320,7 @@ fn sessions_text(sessions: Vec<remuda_core::SessionSummary>) -> Value {
     let rows: Vec<String> = sessions
         .iter()
         .map(|session| {
-            format!(
+            let line = format!(
                 "{}\t{}x{}\talive={}\tidle={:.0}s\toutput_idle={:.0}s",
                 session.name,
                 session.size.cols(),
@@ -327,7 +328,13 @@ fn sessions_text(sessions: Vec<remuda_core::SessionSummary>) -> Value {
                 session.alive,
                 session.idle.as_secs_f64(),
                 session.output_idle.unwrap_or(session.idle).as_secs_f64()
-            )
+            );
+            if session.unavailable {
+                // A host-backed session whose host did not answer (#713).
+                format!("{line}\tunavailable=true")
+            } else {
+                line
+            }
         })
         .collect();
     tool_text(&rows.join("\n"))

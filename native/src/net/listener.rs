@@ -1146,6 +1146,7 @@ fn authorize_remote_request_with_control(
         Request::ClusterRegistrySync { .. }
             | Request::ClusterRegistryUpdate { .. }
             | Request::ClusterVfsIndexSync { .. }
+            | Request::ClusterVfsChanges { .. }
             | Request::ClusterVfsIndexUpdate { .. }
             | Request::ClusterVfsBlobStat { .. }
             | Request::ClusterVfsBlobGet { .. }
@@ -1299,6 +1300,7 @@ fn dispatch_payload(
             .map_err(|_| io::Error::other("registry acknowledgement encode failed"))
         }
         request @ (Request::ClusterVfsIndexSync { .. }
+        | Request::ClusterVfsChanges { .. }
         | Request::ClusterVfsIndexUpdate { .. }
         | Request::ClusterVfsBlobStat { .. }
         | Request::ClusterVfsBlobGet { .. }) => {
@@ -1307,7 +1309,7 @@ fn dispatch_payload(
                 return serde_json::to_vec(&Response::error(VFS_RATE_LIMITED))
                     .map_err(io::Error::other);
             }
-            let response = cluster::vfs_sync::serve(&request);
+            let response = cluster::vfs_sync::serve(&peer_fp, &request);
             serde_json::to_vec(&response)
                 .map_err(|_| io::Error::other("vfs response encode failed"))
         }

@@ -368,6 +368,33 @@ fn put_on_one_node_reads_on_every_node_and_delete_reaches_all() {
             .is_some_and(|stat| stat["sha256"] == sha256_hex(b"v2"))
     });
 
+    // B saw A's write before its own, so that is no conflict.
+    let stat = a.stat_json("remuda:///butler/guidance/cluster.md").unwrap();
+    assert_eq!(stat["conflicts"], serde_json::json!([]));
+    let listed = successful(a.run(&["vfs", "ls", "--conflicts"]), "ls --conflicts");
+    assert_eq!(listed.trim(), "No conflicts.");
+    let lua = successful(
+        a.run(&[
+            "-e",
+            "return #remuda.vfs.stat('remuda:///butler/guidance/cluster.md').conflicts",
+        ]),
+        "lua conflicts",
+    );
+    assert_eq!(lua.trim(), "0");
+    let settle = a.run(&[
+        "vfs",
+        "resolve-conflict",
+        "remuda:///butler/guidance/cluster.md",
+        "--keep",
+        "winner",
+    ]);
+    assert!(!settle.status.success());
+    assert!(
+        String::from_utf8_lossy(&settle.stderr).contains("no conflict at"),
+        "{}",
+        String::from_utf8_lossy(&settle.stderr)
+    );
+
     // Delete on C reaches A and B.
     successful(
         c.run(&["vfs", "rm", "remuda:///butler/guidance/cluster.md"]),
@@ -588,6 +615,12 @@ fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
         wait_for_body(node, from_new, b"rewritten by N");
     }
 
+    // N writes without a version vector: last write wins as before, and no
+    // newer node reports a conflict for it.
+    for node in [&a, &c] {
+        assert_eq!(kept_conflicts(node), 0);
+    }
+
     // Deletes cross in both directions.
     successful(c.run(&["vfs", "rm", from_old]), "rm on N+1");
     wait_gone(&old, from_old);
@@ -595,6 +628,15 @@ fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
     for node in [&a, &c] {
         wait_gone(node, from_new);
     }
+}
+
+/// Rows in `index.db`'s conflicts table (design step 4); 0 before that step.
+fn kept_conflicts(node: &Node) -> i64 {
+    let index = node.root.join("state/remuda/cluster/vfs/index.db");
+    rusqlite::Connection::open(index)
+        .unwrap()
+        .query_row("SELECT count(*) FROM conflicts", [], |row| row.get(0))
+        .unwrap_or(0)
 }
 
 /// The documented downgrade from `index.db` to a build that reads only
@@ -630,6 +672,83 @@ fn pre_sqlite_downgrade_and_upgrade_again_keep_every_name() {
     let listed = successful(node.run(&["vfs", "ls"]), "ls on N+1");
     assert!(
         listed.contains("kept.txt") && listed.contains("later.txt") && !listed.contains("gone.txt"),
+        "{listed}"
+    );
+}
+
+/// A previous build that knows fewer schema steps refuses a newer `index.db`
+/// with one clear line, and touches nothing.
+#[test]
+#[ignore = "needs REMUDA_COMPAT_PREVIOUS from a build with index.db; run by CI job host-compat-n-plus-one"]
+fn older_build_refuses_a_newer_index_db_cleanly() {
+    let _serial = live_test_guard();
+    let mut node = Node::start();
+    put(&node, "remuda:///kept.txt", b"kept");
+    node.kill_daemon_only();
+    // As if a much later build had added schema steps.
+    let index = node.root.join("state/remuda/cluster/vfs/index.db");
+    rusqlite::Connection::open(&index)
+        .unwrap()
+        .pragma_update(None, "user_version", 99)
+        .unwrap();
+    node.exe = previous();
+    node.spawn_daemon();
+    let output = node.run(&["vfs", "ls"]);
+    assert!(!output.status.success());
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        text.contains("newer than this remuda") && text.contains("upgrade remuda"),
+        "{text}"
+    );
+    let version: i64 = rusqlite::Connection::open(&index)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 99);
+}
+
+/// `remuda vfs index-downgrade` steps index.db back so the previous build
+/// (one or more schema steps behind) reads it; the upgrade after that keeps
+/// it all.
+#[test]
+#[ignore = "needs REMUDA_COMPAT_PREVIOUS from a build with index.db; run by CI job host-compat-n-plus-one"]
+fn older_build_reads_the_index_after_index_downgrade() {
+    let _serial = live_test_guard();
+    let mut node = Node::start();
+    let current = node.exe.clone();
+    put(&node, "remuda:///kept.txt", b"kept");
+    let plan = successful(node.run(&["vfs", "index-downgrade", "1"]), "dry run");
+    assert!(
+        plan.contains("undo schema steps") && plan.contains("2 (change-cursors)"),
+        "{plan}"
+    );
+    let done = successful(
+        node.run(&["vfs", "index-downgrade", "1", "--yes"]),
+        "index-downgrade",
+    );
+    assert!(done.contains("index.db is now at schema 1 (was "), "{done}");
+    // This daemon no longer touches the index, so it cannot upgrade it again.
+    let refused = node.run(&["vfs", "ls"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("stepped back"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    node.kill_daemon_only();
+    node.exe = previous();
+    node.spawn_daemon();
+    let listed = successful(node.run(&["vfs", "ls"]), "ls on N");
+    assert!(listed.contains("kept.txt"), "{listed}");
+    put(&node, "remuda:///from-n.txt", b"written by N");
+
+    node.kill_daemon_only();
+    node.exe = current;
+    node.spawn_daemon();
+    let listed = successful(node.run(&["vfs", "ls"]), "ls on N+1");
+    assert!(
+        listed.contains("kept.txt") && listed.contains("from-n.txt"),
         "{listed}"
     );
 }

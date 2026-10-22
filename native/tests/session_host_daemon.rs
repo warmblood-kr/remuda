@@ -226,19 +226,6 @@ fn a_hosted_session_survives_daemon_sigkill_and_is_rediscovered() {
     std::thread::sleep(Duration::from_millis(500));
     let screen = wait_for(&path, "keeper", "AGAIN:2");
     assert_eq!(screen.matches("AGAIN:2").count(), 1, "sent exactly once");
-    // Routes that still need a local Session refuse clearly.
-    match request(
-        &path,
-        &Request::Sync {
-            name: "keeper".into(),
-            instance_id: None,
-            since: 0,
-            timeout_ms: 0,
-        },
-    ) {
-        Response::Error(message) => assert!(message.contains("not supported yet"), "{message}"),
-        other => panic!("expected a refusal, got {other:?}"),
-    }
 
     // The host dies: the daemon keeps the name and answers Unavailable.
     assert_eq!(unsafe { libc::kill(host, libc::SIGKILL) }, 0);
@@ -252,6 +239,22 @@ fn a_hosted_session_survives_daemon_sigkill_and_is_rediscovered() {
     };
     unavailable(capture(&path, "keeper"));
     unavailable(send_line(&path, "keeper", "echo LOST"));
+    // Listed, not exited, and marked: its size and idle time are unknown.
+    let Response::Sessions(sessions) = request(&path, &Request::List) else {
+        panic!("ls failed");
+    };
+    assert!(sessions[0].unavailable && sessions[0].alive, "{sessions:?}");
+    let listed = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "s", "ls"])
+        .env("REMUDA_RUNTIME_DIR", &root.0)
+        .env("HOME", &root.0)
+        .output()
+        .expect("remuda ls");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed.contains("keeper") && listed.contains("unreachable"),
+        "{listed}"
+    );
     second.sigkill();
 
     // After another restart the entry is still listed, and still Unavailable.
@@ -550,4 +553,58 @@ fn n_plus_one_daemon_reloads_into_the_older_build() {
 fn n_plus_one_older_daemon_is_asked_to_reload() {
     let this = Path::new(env!("CARGO_BIN_EXE_remuda"));
     check_leaves_the_session_alone(&previous(), this, this, false);
+}
+
+/// `remuda upgrade`'s reload across N and N+1: the daemon moves onto the
+/// installed build, or keeps its own and says why; the session lives on.
+fn upgrade_across_builds(daemon_exe: &Path, installed: &Path) {
+    use remuda_native::reload::upgrade::{after_upgrade, AfterUpgrade};
+    let root = Root::new();
+    let path = root.socket();
+    let daemon = Daemon::spawn_exe(&root, daemon_exe, true);
+    new_session(&path, "compat");
+    let outcome = after_upgrade(&path, installed);
+    eprintln!("upgrade: {outcome:?}");
+    let understood = match &outcome {
+        AfterUpgrade::Reloaded(report) => report.starts_with("reloaded: "),
+        AfterUpgrade::Current(_) => true,
+        AfterUpgrade::Kept(why) => {
+            why.contains("predates `remuda reload`")
+                || why.contains("did not start as a reload candidate")
+                || why.contains(" speaks handoff version ")
+                || why.contains("reload without --check is not implemented yet")
+                || why.starts_with("blocked: ")
+        }
+        AfterUpgrade::Failed(_) => false,
+        AfterUpgrade::NoDaemon => false,
+    };
+    assert!(understood, "{outcome:?}");
+    assert_eq!(
+        send_line(&path, "compat", "echo AFTER:$((7*8))"),
+        Response::Ok
+    );
+    wait_for(&path, "compat", "AFTER:56");
+    // Whichever daemon serves now, stop it: it may not be `daemon`'s child.
+    let _ = client::request(
+        &path,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
+    drop(daemon);
+}
+
+#[test]
+#[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS; run by CI job host-compat-n-plus-one"]
+fn n_plus_one_upgrade_moves_an_older_daemon_onto_this_build() {
+    upgrade_across_builds(&previous(), Path::new(env!("CARGO_BIN_EXE_remuda")));
+}
+
+#[test]
+#[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS; run by CI job host-compat-n-plus-one"]
+fn n_plus_one_upgrade_to_the_older_build_moves_this_daemon() {
+    upgrade_across_builds(Path::new(env!("CARGO_BIN_EXE_remuda")), &previous());
 }
