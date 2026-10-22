@@ -528,6 +528,21 @@ fn status(values: &Map<String, Value>, out: &mut Out) -> u8 {
     code
 }
 
+/// Where the stores set aside by leave or a new identity sit, if any.
+fn old_stores_line(report: &StatusReport) -> Option<String> {
+    if report.old_stores.is_empty() {
+        return None;
+    }
+    let bytes = report.old_stores.iter().map(|store| store.bytes).sum();
+    let paths: Vec<&str> = report.old_stores.iter().map(|s| s.path.as_str()).collect();
+    Some(format!(
+        "Old stores: {} set aside by `cluster leave` or `init --new-identity`, {}; delete each once you no longer need it: {}",
+        report.old_stores.len(),
+        bytes_text(bytes),
+        paths.join(", ")
+    ))
+}
+
 /// The text form of `remuda vfs status`.
 fn status_lines(report: &StatusReport) -> Vec<String> {
     use crate::cluster::vfs::{MAX_ENTRIES, MAX_INDEX_ENTRIES};
@@ -593,6 +608,7 @@ fn status_lines(report: &StatusReport) -> Vec<String> {
         "Settings: replicas {}, tombstone-days {}, stale-days {}",
         report.replicas, report.tombstone_days, report.stale_days
     ));
+    lines.extend(old_stores_line(report));
     if let Some(copies) = &report.copies {
         let first: Vec<String> = copies
             .short
@@ -1272,6 +1288,7 @@ mod tests {
             now: 1_000,
             peers: vec![peer("node-a")],
             copies: None,
+            old_stores: Vec::new(),
         }
     }
 
@@ -1285,8 +1302,13 @@ mod tests {
         let mut old = peer("node-c");
         (old.old_build, old.stale, old.caps) = (true, true, None);
         report.peers.extend([down, old]);
+        report.old_stores = vec![crate::cluster::vfs_status::OldStore {
+            path: "/s/cluster.left-20261022/vfs".into(),
+            bytes: 2 * 1024 * 1024,
+        }];
         let text = status_lines(&report).join("\n");
         for want in [
+            "Old stores: 1 set aside by `cluster leave` or `init --new-identity`, 2.0 MiB; delete each once you no longer need it: /s/cluster.left-20261022/vfs",
             "Files: 12 live of 10000; index 15 of 30000 entries (3 deletes remembered)",
             "Conflicts: 2 paths (remuda vfs ls --conflicts)",
             "This node (node-me): 9 copies, 1.5 MiB; 2 copies waiting to retry",

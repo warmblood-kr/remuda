@@ -93,6 +93,44 @@ pub fn left_dir() -> io::Result<PathBuf> {
     Ok(free_left_dir(&state, &today()))
 }
 
+/// Stores set aside in `state` by `forget` or `set_vfs_aside`, with their
+/// size in bytes, oldest name first.
+pub fn old_stores(state: &Path) -> Vec<(PathBuf, u64)> {
+    let Ok(read) = std::fs::read_dir(state) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(PathBuf, u64)> = read
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("cluster.left-")
+        })
+        .map(|entry| entry.path().join("vfs"))
+        .filter(|vfs| vfs.is_dir())
+        .map(|vfs| {
+            let bytes = tree_bytes(&vfs);
+            (vfs, bytes)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+fn tree_bytes(dir: &Path) -> u64 {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    read.flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => tree_bytes(&entry.path()),
+            Ok(kind) if kind.is_file() => entry.metadata().map_or(0, |meta| meta.len()),
+            _ => 0,
+        })
+        .sum()
+}
+
 fn free_left_dir(state: &Path, date: &str) -> PathBuf {
     let base = state.join(format!("cluster.left-{date}"));
     let mut dir = base.clone();
@@ -158,6 +196,20 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_stores_lists_only_set_aside_vfs_folders() {
+        let root = std::env::temp_dir().join(format!("remuda-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cluster/vfs")).unwrap();
+        std::fs::create_dir_all(root.join("cluster.left-20261022/vfs/blobs/ab")).unwrap();
+        std::fs::write(root.join("cluster.left-20261022/vfs/index.db"), [0; 10]).unwrap();
+        std::fs::write(root.join("cluster.left-20261022/vfs/blobs/ab/c"), [0; 5]).unwrap();
+        std::fs::create_dir_all(root.join("cluster.left-20261021")).unwrap();
+        let found = old_stores(&root);
+        assert_eq!(found, vec![(root.join("cluster.left-20261022/vfs"), 15)]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn dates_are_civil() {

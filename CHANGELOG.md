@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `remuda vfs status` names the stores `cluster leave` and `cluster init
+  --new-identity` set aside (`Old stores:`, with their size), so they do
+  not fill the disk unnoticed. `--json` has them as `old_stores`.
 - VFS: a store moved away by `cluster leave` or `init --new-identity` no
   longer gets its settings, sync time or stand-in trims written into a new
   store at the same path; all writes now check the store is still there.
