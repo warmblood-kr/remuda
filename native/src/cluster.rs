@@ -182,7 +182,6 @@ pub fn init_new_identity(left: &Path) -> io::Result<(NodeIdentity, bool)> {
     let dir = identity::prepare_cluster_dir_at(&state_dir)?;
     let _guard = storage::StateLock::acquire(&dir)?;
     identity::load_identity_at(&dir)?;
-    let moved = leave::set_vfs_aside(&dir, left)?;
     join_token::clear_at(&dir)?;
     let _ = control::revoked_notice_at(&dir)?;
     let node = identity::rotate_identity_locked(&dir)?;
@@ -204,6 +203,8 @@ pub fn init_new_identity(left: &Path) -> io::Result<(NodeIdentity, bool)> {
         },
     )?;
     control::clear_revoked_notice_at(&dir)?;
+    // Last, so a sync pass that opens a fresh store already sees no peers.
+    let moved = leave::set_vfs_aside(&dir, left)?;
     storage::write_cluster_init_marker(&state_dir, &node.node_fp)?;
     Ok((node, moved))
 }

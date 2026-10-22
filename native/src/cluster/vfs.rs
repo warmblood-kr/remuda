@@ -318,6 +318,21 @@ pub fn unix_now() -> u64 {
 #[derive(Clone, Debug)]
 pub struct VfsStore {
     root: PathBuf,
+    /// The folder's (device, inode) at open; `still_here` compares it.
+    opened: Option<(u64, u64)>,
+}
+
+fn folder_id(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 impl VfsStore {
@@ -347,6 +362,7 @@ impl VfsStore {
         storage::create_private_directory(&blobs)?;
         Ok(Self {
             root: root.to_path_buf(),
+            opened: folder_id(root),
         })
     }
 
@@ -414,10 +430,10 @@ impl VfsStore {
         vfs_index_db::open(&self.root)
     }
 
-    /// Refuse once `cluster leave` moved the store away, so a pass that
-    /// opened it before never writes a new one in its place.
+    /// Refuse once `cluster leave` or `init --new-identity` moved the store
+    /// away, even if a new store now sits at the same path.
     fn still_here(&self) -> VfsResult<()> {
-        if self.root.is_dir() {
+        if self.root.is_dir() && (self.opened.is_none() || folder_id(&self.root) == self.opened) {
             return Ok(());
         }
         Err(VfsError::new(
@@ -1137,6 +1153,19 @@ mod tests {
         assert_eq!(live.sha256, sha256_hex(b"world"));
         assert_eq!(store.read_blob(&live.sha256).unwrap(), b"world");
         assert!(store.has_blob(&first.sha256, first.size));
+    }
+
+    #[test]
+    fn a_handle_to_a_moved_store_never_writes_the_new_one() {
+        let scratch = Scratch::new();
+        let old = scratch.store();
+        let kept = old.put("kept", b"x", 1, "SHA256:me").unwrap();
+        fs::rename(scratch.0.join("vfs"), scratch.0.join("aside")).unwrap();
+        let fresh = scratch.store();
+        let refused = old.merge_entries(vec![kept]).unwrap_err();
+        assert_eq!(refused.kind, VfsErrorKind::NoCluster);
+        assert!(old.put("late", b"y", 1, "SHA256:me").is_err());
+        assert!(fresh.load_index().unwrap().entries.is_empty());
     }
 
     #[test]
