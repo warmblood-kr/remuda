@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- VFS: `remuda vfs drain [--timeout SECS]` prepares a node to leave (#778).
+  The nodes that will hold its files once it is gone are asked to take a
+  copy, and drain waits until they confirm. Then it says to run `remuda
+  cluster revoke NODE` on another node; it revokes nothing itself. A peer
+  too old to take copies is named, and drain exits 75 while files are short.
+
+- `remuda upgrade` (Unix) checks the reloaded daemon as `remuda reload` does:
+  it answers as the new build, lists every session it took over, and loaded
+  `init.lua`. An `init.lua` that fails only in the new daemon is named and
+  `upgrade` exits 1. Before, it checked only the build.
+
+- VFS: a node that took a copy while a holder was down deletes it again
+  once that holder is back and confirms its copy (#778). Only copies the
+  repair pass fetched are trimmed: files this node wrote, read with `vfs
+  get`, or handed to a tool by `vfs resolve` stay. `remuda vfs sync`
+  reports the copies trimmed.
+
+- VFS: copies that fail to fetch no longer crowd out the rest (#778). A
+  failed copy waits 30 s before the next try, doubling up to an hour, and
+  copies never tried go first. `remuda vfs sync` retries at once and its
+  report counts the copies waiting to retry.
+
+- VFS: `remuda vfs put --min-copies K` waits until K nodes hold the file,
+  this one included (#778). If fewer do within 60 s, it says the write is
+  committed here and still replicating, and exits 75; nothing is rolled
+  back. K is at most the copies wanted (`--replicas`).
+
 - VFS: a node that has not pulled for 30 days (`remuda vfs config
   --stale-days DAYS`) no longer holds deleted files back on its peers
   (#778). When it returns, a peer that forgot deletes in the meantime tells

@@ -11,8 +11,12 @@ pub enum AfterUpgrade {
     NoDaemon,
     /// The daemon already runs the installed build.
     Current(String),
-    /// The daemon now runs the installed build: the reload's report.
+    /// The daemon now runs the installed build: the reload's report and the
+    /// post-check's lines.
     Reloaded(String),
+    /// The reload went through, but the new daemon failed the post-check (an
+    /// `init.lua` it cannot load, a moved session missing): the lines say what.
+    Unhealthy(String),
     /// The daemon kept the old build, and its sessions keep running: why.
     Kept(String),
     /// The reload failed and was rolled back, or the daemon did not answer.
@@ -38,15 +42,20 @@ pub fn after_upgrade(socket: &Path, installed: &Path) -> AfterUpgrade {
         binary: installed.to_string_lossy().into_owned(),
         check: false,
     };
+    let before = super::post_check::config_error_before(socket);
     match crate::client::request(socket, &request) {
         Ok(Response::Value(report)) if report.starts_with("reloaded:") => {
-            match crate::client::request(socket, &Request::Version) {
-                Ok(Response::Value(build)) => {
-                    AfterUpgrade::Reloaded(format!("{report}\ndaemon now {build}"))
-                }
-                other => {
-                    AfterUpgrade::Failed(format!("after the reload the daemon answered {other:?}"))
-                }
+            let checked = super::post_check::post_check(
+                socket,
+                &report,
+                before.as_deref(),
+                super::post_check::CONFIG_DEADLINE,
+            );
+            let text = format!("{report}\n{}", checked.lines.join("\n"));
+            if checked.ok {
+                AfterUpgrade::Reloaded(text)
+            } else {
+                AfterUpgrade::Unhealthy(text)
             }
         }
         // A check found blockers; nothing changed.

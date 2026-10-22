@@ -1150,6 +1150,7 @@ fn authorize_remote_request_with_control(
             | Request::ClusterVfsIndexUpdate { .. }
             | Request::ClusterVfsBlobStat { .. }
             | Request::ClusterVfsBlobGet { .. }
+            | Request::ClusterVfsTake { .. }
     ) {
         return Ok(());
     }
@@ -1303,7 +1304,8 @@ fn dispatch_payload(
         | Request::ClusterVfsChanges { .. }
         | Request::ClusterVfsIndexUpdate { .. }
         | Request::ClusterVfsBlobStat { .. }
-        | Request::ClusterVfsBlobGet { .. }) => {
+        | Request::ClusterVfsBlobGet { .. }
+        | Request::ClusterVfsTake { .. }) => {
             let peer_fp = cluster::encoding::fingerprint(peer_static);
             if !limiter.acquire_vfs_request(&peer_fp) {
                 return serde_json::to_vec(&Response::error(VFS_RATE_LIMITED))

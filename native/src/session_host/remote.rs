@@ -305,6 +305,9 @@ impl HostSession {
         }
     }
     fn teardown_step(&self, stopped: &mut bool) -> Result<bool> {
+        // An act in flight here (say, input that ended the child) collects and
+        // settles its own result first; teardown only resolves orphaned keys.
+        let _serial = self.acts.lock().unwrap_or_else(|e| e.into_inner());
         let index = self.owner.index().map_err(store)?;
         let Some(entry) = index.entries.get(&self.name) else {
             return Ok(true);
@@ -357,16 +360,24 @@ impl HostSession {
             if view.generation > version {
                 return Ok(self.versioned(view));
             }
-            if !self.watch(&mut client, view.generation, until)? {
-                // As an in-process wait does: nothing new and the child gone
-                // is an exit, not a frame.
+            let watched = self.watch(&mut client, view.generation, until)?;
+            if watched == Watched::New {
+                continue;
+            }
+            // As an in-process wait does: nothing new and the child gone is
+            // an exit, not a frame. Output can end (pty EOF) before the host
+            // reaps the child, so an ended view waits for the exit until `until`.
+            loop {
                 if matches!(
                     SessionOperations::inspect(self)?.lifecycle,
                     Lifecycle::Exited(_)
                 ) {
                     return Err(Error::Agent(AgentError::Exited));
                 }
-                return Ok(self.versioned(view));
+                if watched != Watched::Ended || Instant::now() >= until {
+                    return Ok(self.versioned(view));
+                }
+                std::thread::sleep(EXIT_POLL);
             }
         }
     }
@@ -526,13 +537,13 @@ impl HostSession {
         }
     }
     /// Bounded watch on an acknowledged viewport; true when output may differ.
-    fn watch(&self, client: &mut Client, generation: u64, until: Instant) -> Result<bool> {
+    fn watch(&self, client: &mut Client, generation: u64, until: Instant) -> Result<Watched> {
         loop {
             let wait = until
                 .saturating_duration_since(Instant::now())
                 .min(MAX_WATCH);
             if wait.is_zero() {
-                return Ok(false);
+                return Ok(Watched::Quiet);
             }
             match client
                 .request(&Request::WatchAfter {
@@ -547,11 +558,13 @@ impl HostSession {
                     ..
                 } => {
                     if now != generation {
-                        return Ok(true);
+                        return Ok(Watched::New);
                     }
-                    if state != super::api::ViewState::Unchanged {
-                        // Ended/Degraded at the same generation: nothing new arrives.
-                        return Ok(false);
+                    match state {
+                        super::api::ViewState::Unchanged => {}
+                        super::api::ViewState::Ended => return Ok(Watched::Ended),
+                        // Degraded at the same generation: nothing new arrives.
+                        _ => return Ok(Watched::Quiet),
                     }
                 }
                 Response::Error { code } if code == "watch_request_cooldown" => {
@@ -755,6 +768,15 @@ impl SessionOperations for HostSession {
 }
 /// Fastest and slowest generation polls: fast right after output, backing
 /// off while the session is quiet.
+/// Why a host watch stopped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Watched {
+    New,
+    Ended,
+    Quiet,
+}
+/// How often a wait whose output ended checks for the child's exit.
+const EXIT_POLL: Duration = Duration::from_millis(20);
 const GENERATION_POLL: Duration = Duration::from_millis(50);
 const GENERATION_IDLE_POLL: Duration = Duration::from_millis(250);
 
