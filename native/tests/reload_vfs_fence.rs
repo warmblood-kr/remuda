@@ -3,6 +3,9 @@
 //! before it serves; if it dies, the old daemon claims it back and writes.
 #![cfg(unix)]
 
+#[path = "daemon_support/reap.rs"]
+mod reap;
+
 use remuda_native::daemon;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
@@ -91,9 +94,8 @@ impl Root {
 }
 impl Drop for Root {
     fn drop(&mut self) {
-        let _ = Command::new("/usr/bin/pkill")
-            .args(["-KILL", "-f", &self.0.to_string_lossy()])
-            .status();
+        // Also kills the daemon a reload left serving: its argv names no root.
+        reap::kill_processes_under(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
