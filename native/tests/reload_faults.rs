@@ -453,3 +453,69 @@ fn is_daemon_or_candidate(pid: u32) -> bool {
     let args = String::from_utf8_lossy(&ps.stdout);
     args.contains("remuda") && !args.contains("session-host")
 }
+
+/// The old daemon dies mid-handover. Before it sends the listener, the new
+/// daemon has nothing and exits; the hosts outlive both and the next daemon
+/// drives them. After it sends the listener, the new daemon serves anyway.
+#[test]
+fn an_old_daemon_that_dies_mid_handover_leaves_the_sessions_reachable() {
+    for fault in ["old-exits-before-take", "old-exits-after-take"] {
+        let root = Root::new(&fault[10..]);
+        let path = root.socket();
+        let mut old = Daemon::spawn(&root, true, &[("REMUDA_TEST_RELOAD_FAULT", fault)]);
+        new_session(&path, "work");
+        wait_for(&path, "work", "$");
+        assert_eq!(
+            send_line(&path, "work", "echo BEFORE-$((9*9))"),
+            Response::Ok
+        );
+        wait_for(&path, "work", "BEFORE-81");
+        let before = root.lock_pid();
+
+        let out = root.remuda(&["reload"]);
+        let (stdout, stderr) = text(&out);
+        assert!(!stdout.contains("reloaded: "), "{fault}: {stdout}{stderr}");
+        let deadline = Instant::now() + PATIENCE;
+        let status = loop {
+            if let Some(status) = old.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "{fault}: the old daemon lives");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(!status.success(), "{fault}: the fault did not fire");
+        let _next = if fault == "old-exits-before-take" {
+            let deadline = Instant::now() + PATIENCE;
+            while children_of_dead_daemon_alive(&root, before) {
+                assert!(Instant::now() < deadline, "{fault}: a candidate is left");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Some(Daemon::spawn(&root, true, &[]))
+        } else {
+            assert_ne!(root.lock_pid(), before, "{fault}: no new daemon serves");
+            assert!(is_daemon(root.lock_pid()), "{fault}");
+            None
+        };
+        wait_for(&path, "work", "BEFORE-81");
+        assert_eq!(
+            send_line(&path, "work", "echo AFTER-$((6*6))"),
+            Response::Ok,
+            "{fault}"
+        );
+        wait_for(&path, "work", "AFTER-36");
+    }
+}
+
+/// Whether a candidate the dead daemon `parent` started is still running,
+/// now reparented: a remuda process, not a host, whose env names `root`.
+fn children_of_dead_daemon_alive(root: &Root, parent: u32) -> bool {
+    let ps = Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=", "-o", "args="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|line| line.contains("_reload-candidate"))
+        .filter_map(|line| line.split_whitespace().next()?.parse::<u32>().ok())
+        .any(|pid| pid != parent && env_names_root(pid, &root.0))
+}
