@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- VFS: a store moved away by `cluster leave` or `init --new-identity` no
+  longer gets its settings, sync time or stand-in trims written into a new
+  store at the same path; all writes now check the store is still there.
 - Cluster: `remuda cluster init --new-identity` now moves this node's VFS
   store to `cluster.left-YYYYMMDD/vfs` and says so before it asks (#862).
   Before, the old index stayed under the new key, and after a rejoin a file
