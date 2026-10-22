@@ -330,7 +330,7 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
         "rm" => remove(&store, values, out),
         "resolve-conflict" => settle(&store, values, out),
         "sync" => {
-            let report = vfs_sync::sync_once();
+            let report = vfs_sync::sync_once(true);
             say!(out, "{report}");
             0
         }

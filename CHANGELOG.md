@@ -7,6 +7,11 @@
   `init.lua`. An `init.lua` that fails only in the new daemon is named and
   `upgrade` exits 1. Before, it checked only the build.
 
+- VFS: copies that fail to fetch no longer crowd out the rest (#778). A
+  failed copy waits 30 s before the next try, doubling up to an hour, and
+  copies never tried go first. `remuda vfs sync` retries at once and its
+  report counts the copies waiting to retry.
+
 - VFS: `remuda vfs put --min-copies K` waits until K nodes hold the file,
   this one included (#778). If fewer do within 60 s, it says the write is
   committed here and still replicating, and exits 75; nothing is rolled

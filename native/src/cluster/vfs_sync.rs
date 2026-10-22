@@ -3,7 +3,8 @@
 //! Content moves by pull only: a cluster request carries about 64 KB, while
 //! a response may carry 4 MiB.
 
-use super::vfs::{unix_now, VfsError, VfsErrorKind, VfsResult, VfsStore, MAX_BLOB_BYTES};
+use super::vfs::{unix_now, VfsError, VfsErrorKind, VfsIndex, VfsResult, VfsStore, MAX_BLOB_BYTES};
+use super::vfs_repair::RepairQueue;
 use super::{NodeState, Registry};
 use crate::net::cluster_client::{ClientTimeouts, ClusterClient};
 use base64::Engine;
@@ -680,6 +681,7 @@ pub struct SyncReport {
     pub entries_merged: usize,
     pub copies_fetched: usize,
     pub copies_failed: usize,
+    pub copies_waiting: usize,
     pub garbage_removed: usize,
     pub tombstones_removed: usize,
     pub error: Option<String>,
@@ -692,12 +694,13 @@ impl std::fmt::Display for SyncReport {
         }
         write!(
             formatter,
-            "Peers reached {}, unreachable {}; index entries merged {}; copies fetched {}, failed {}; old blobs removed {}, old deletes forgotten {}.",
+            "Peers reached {}, unreachable {}; index entries merged {}; copies fetched {}, failed {}, waiting to retry {}; old blobs removed {}, old deletes forgotten {}.",
             self.peers_reached,
             self.peers_failed,
             self.entries_merged,
             self.copies_fetched,
             self.copies_failed,
+            self.copies_waiting,
             self.garbage_removed,
             self.tombstones_removed
         )
@@ -705,8 +708,8 @@ impl std::fmt::Display for SyncReport {
 }
 
 /// Pull indexes from every reachable peer, then fetch the copies this node
-/// should hold under the current placement.
-pub fn sync_once() -> SyncReport {
+/// should hold under the current placement. `force` skips retry waits.
+pub fn sync_once(force: bool) -> SyncReport {
     let mut report = SyncReport::default();
     let (store, members) = match VfsStore::open_default().and_then(|store| Ok((store, members()?)))
     {
@@ -739,23 +742,7 @@ pub fn sync_once() -> SyncReport {
             return report;
         }
     };
-    let mut attempts = 0;
-    for entry in index.entries.values().filter(|entry| !entry.deleted) {
-        if store.has_blob(&entry.sha256, entry.size) {
-            continue;
-        }
-        if !live_placement(entry, &members).contains(&members.self_fp) {
-            continue;
-        }
-        if attempts >= MAX_REPAIRS_PER_PASS {
-            break;
-        }
-        attempts += 1;
-        match fetch_blob(&store, entry) {
-            Ok(_) => report.copies_fetched += 1,
-            Err(_) => report.copies_failed += 1,
-        }
-    }
+    repair(&store, &members, &index, force, &mut report);
     report.garbage_removed = store.collect_garbage().unwrap_or(0);
     let others: Vec<String> = members
         .admitted
@@ -765,6 +752,48 @@ pub fn sync_once() -> SyncReport {
         .collect();
     report.tombstones_removed = store.collect_tombstones(&others, unix_now()).unwrap_or(0);
     report
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn repair_queue() -> &'static Mutex<RepairQueue> {
+    static QUEUE: OnceLock<Mutex<RepairQueue>> = OnceLock::new();
+    QUEUE.get_or_init(Mutex::default)
+}
+
+/// Fetch the missing copies this node should hold, through the repair queue.
+fn repair(
+    store: &VfsStore,
+    members: &Members,
+    index: &VfsIndex,
+    force: bool,
+    report: &mut SyncReport,
+) {
+    let mut missing: BTreeMap<&str, &VfsEntry> = BTreeMap::new();
+    for entry in index.entries.values().filter(|entry| !entry.deleted) {
+        if !missing.contains_key(entry.sha256.as_str())
+            && !store.has_blob(&entry.sha256, entry.size)
+            && live_placement(entry, members).contains(&members.self_fp)
+        {
+            missing.insert(&entry.sha256, entry);
+        }
+    }
+    let wanted: Vec<String> = missing.keys().map(|sha| (*sha).to_owned()).collect();
+    let due = lock(repair_queue()).due(&wanted, Instant::now(), force, MAX_REPAIRS_PER_PASS);
+    for sha in &due {
+        let fetched = fetch_blob(store, missing[sha.as_str()]).is_ok();
+        lock(repair_queue()).tried(sha, fetched, Instant::now());
+        if fetched {
+            report.copies_fetched += 1;
+        } else {
+            report.copies_failed += 1;
+        }
+    }
+    report.copies_waiting = lock(repair_queue()).waiting(Instant::now());
 }
 
 static PASS_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -784,7 +813,7 @@ pub fn background_pass() {
         .name("remuda-vfs-repair".into())
         .spawn(|| loop {
             PASS_PENDING.store(false, Ordering::Release);
-            let report = sync_once();
+            let report = sync_once(false);
             if report.copies_failed > 0 {
                 eprintln!("remuda: {report}");
             }
