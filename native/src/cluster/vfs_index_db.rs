@@ -16,7 +16,7 @@
 
 use super::storage;
 use super::vfs::{IndexCounts, VfsError, VfsErrorKind, VfsIndex, VfsResult};
-use remuda_core::vfs::VfsEntry;
+use remuda_core::vfs::{VersionVector, VfsConflict, VfsEntry};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -26,7 +26,8 @@ use std::path::Path;
 pub(super) const DB_FILE: &str = "index.db";
 pub(super) const LEGACY_FILE: &str = "index.json";
 const LEGACY_FORMAT: u32 = 1;
-const COLUMNS: &str = "path, sha256, size, replicas, version, writer, deleted, mtime";
+const COLUMNS: &str = "path, sha256, size, replicas, version, writer, deleted, mtime, vv";
+const CONFLICT_COLUMNS: &str = "sha256, size, replicas, version, writer, deleted, mtime, vv";
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct LegacyFile {
@@ -37,6 +38,12 @@ struct LegacyFile {
 /// Open `root/index.db`: run the schema steps, then merge `index.json` if it
 /// changed. A database from before the runner (#791) is adopted at step 1.
 pub(super) fn open(root: &Path) -> VfsResult<Connection> {
+    if HELD.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(VfsError::new(
+            VfsErrorKind::Corrupt,
+            "index.db was stepped back for an older remuda; stop this daemon and start that remuda",
+        ));
+    }
     let mut conn = crate::sqlite::open(root, DB_FILE)?;
     let known = STEPS.len() as i64;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -64,6 +71,13 @@ pub(super) fn open(root: &Path) -> VfsResult<Connection> {
         claim(&mut conn)?;
     }
     Ok(conn)
+}
+
+/// Set by `remuda vfs index-downgrade`: this process must not upgrade again.
+static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn hold_schema() {
+    HELD.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// This daemon's `(socket, token)`, or `None` outside a daemon.
@@ -149,7 +163,8 @@ pub(super) fn claim(conn: &mut Connection) -> VfsResult<()> {
 
 /// The schema, one `(name, up, down)` per step. Never edit a shipped step;
 /// add one. Step 1 has no down: dropping the index loses every name.
-const STEPS: [(&str, &str, Option<&str>); 1] = [(
+const STEPS: [(&str, &str, Option<&str>); 3] = [
+    (
     "entries",
     "CREATE TABLE entries (
          path     TEXT PRIMARY KEY NOT NULL,
@@ -162,7 +177,57 @@ const STEPS: [(&str, &str, Option<&str>); 1] = [(
          mtime    INTEGER NOT NULL
      ) WITHOUT ROWID;",
     None,
-)];
+),
+    // Change cursors (docs/design-778-vfs-delta-sync.md, step 3): every row
+    // change takes the next `seq`; peers pull `seq > cursor`.
+    (
+        "change-cursors",
+        "ALTER TABLE entries ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+         UPDATE entries SET seq = (SELECT count(*) FROM entries e2 WHERE e2.path <= entries.path);
+         CREATE UNIQUE INDEX entries_seq ON entries (seq);
+         CREATE TABLE seq_state (
+             id       INTEGER PRIMARY KEY CHECK (id = 1),
+             next_seq INTEGER NOT NULL,
+             index_id TEXT NOT NULL
+         );
+         INSERT INTO seq_state VALUES (1, (SELECT count(*) + 1 FROM entries), lower(hex(randomblob(16))));
+         CREATE TABLE peers (
+             fp         TEXT PRIMARY KEY NOT NULL,
+             index_id   TEXT,
+             pulled_seq INTEGER NOT NULL DEFAULT 0,
+             acked_seq  INTEGER NOT NULL DEFAULT 0,
+             last_seen  INTEGER
+         ) WITHOUT ROWID;",
+        Some(
+            "DROP TABLE peers;
+             DROP TABLE seq_state;
+             DROP INDEX entries_seq;
+             ALTER TABLE entries DROP COLUMN seq;",
+        ),
+    ),
+    // Version vectors and kept losers (design step 4): `vv` is JSON, '' when
+    // the write came from an older node.
+    (
+        "conflicts",
+        "ALTER TABLE entries ADD COLUMN vv TEXT NOT NULL DEFAULT '';
+         CREATE TABLE conflicts (
+             path     TEXT NOT NULL,
+             sha256   TEXT NOT NULL,
+             size     INTEGER NOT NULL,
+             replicas INTEGER NOT NULL,
+             version  INTEGER NOT NULL,
+             writer   TEXT NOT NULL,
+             deleted  INTEGER NOT NULL,
+             mtime    INTEGER NOT NULL,
+             vv       TEXT NOT NULL,
+             PRIMARY KEY (path, version, writer)
+         ) WITHOUT ROWID;",
+        Some(
+            "DROP TABLE conflicts;
+             ALTER TABLE entries DROP COLUMN vv;",
+        ),
+    ),
+];
 
 fn steps() -> Vec<crate::sqlite_migrate::Step> {
     STEPS
@@ -197,8 +262,12 @@ fn merge_legacy(tx: &Transaction<'_>, root: &Path) -> VfsResult<()> {
         return Ok(());
     }
     for entry in read_legacy(root)?.unwrap_or_default().entries.into_values() {
-        if get(tx, &entry.path)?.is_none_or(|current| entry.supersedes(&current)) {
-            upsert(tx, &entry)?;
+        let next = match get(tx, &entry.path)? {
+            Some(current) => VfsEntry::merged(&current, entry),
+            None => Some(entry),
+        };
+        if let Some(next) = next {
+            upsert(tx, &next)?;
         }
     }
     record_stamp(tx, &stamp)
@@ -270,12 +339,41 @@ pub(super) fn load(conn: &Connection) -> VfsResult<VfsIndex> {
         let entry = entry?;
         index.entries.insert(entry.path.clone(), entry);
     }
+    let mut statement = conn.prepare(&format!(
+        "SELECT path, {CONFLICT_COLUMNS} FROM conflicts ORDER BY path, version DESC, writer DESC"
+    ))?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, conflict_from_row(row, 1)?))
+    })?;
+    for row in rows {
+        let (path, conflict) = row?;
+        if let Some(entry) = index.entries.get_mut(&path) {
+            entry.conflicts.push(conflict);
+        }
+    }
+    for entry in index.entries.values_mut() {
+        entry.normalize_conflicts();
+    }
     Ok(index)
 }
 
 pub(super) fn get(conn: &Connection, path: &str) -> VfsResult<Option<VfsEntry>> {
     let sql = format!("SELECT {COLUMNS} FROM entries WHERE path = ?1");
-    Ok(conn.query_row(&sql, [path], entry_from_row).optional()?)
+    let Some(mut entry) = conn.query_row(&sql, [path], entry_from_row).optional()? else {
+        return Ok(None);
+    };
+    attach_conflicts(conn, &mut entry)?;
+    Ok(Some(entry))
+}
+
+fn attach_conflicts(conn: &Connection, entry: &mut VfsEntry) -> VfsResult<()> {
+    let mut statement = conn.prepare_cached(&format!(
+        "SELECT {CONFLICT_COLUMNS} FROM conflicts WHERE path = ?1"
+    ))?;
+    let conflicts = statement.query_map([&entry.path], |row| conflict_from_row(row, 0))?;
+    entry.conflicts = conflicts.collect::<Result<_, _>>()?;
+    entry.normalize_conflicts();
+    Ok(())
 }
 
 pub(super) fn counts(conn: &Connection) -> VfsResult<IndexCounts> {
@@ -302,17 +400,26 @@ pub(super) fn next_version(conn: &Connection) -> VfsResult<u64> {
     Ok(max.map_or(0, |value| value as u64).saturating_add(1))
 }
 
-/// Hashes that some live entry names.
+/// Hashes that some live entry or kept conflict names.
 pub(super) fn live_hashes(conn: &Connection) -> VfsResult<std::collections::HashSet<String>> {
-    let mut statement = conn.prepare("SELECT DISTINCT sha256 FROM entries WHERE deleted = 0")?;
+    let mut statement = conn.prepare(
+        "SELECT sha256 FROM entries WHERE deleted = 0
+         UNION SELECT sha256 FROM conflicts WHERE deleted = 0",
+    )?;
     let hashes = statement.query_map([], |row| row.get(0))?;
     Ok(hashes.collect::<Result<_, _>>()?)
 }
 
+/// Write `entry` with the next change sequence number.
 pub(super) fn upsert(tx: &Transaction<'_>, entry: &VfsEntry) -> VfsResult<()> {
+    let seq: i64 = tx.query_row(
+        "UPDATE seq_state SET next_seq = next_seq + 1 RETURNING next_seq - 1",
+        [],
+        |row| row.get(0),
+    )?;
     tx.execute(
         &format!(
-            "INSERT OR REPLACE INTO entries ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+            "INSERT OR REPLACE INTO entries ({COLUMNS}, seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
         ),
         params![
             entry.path,
@@ -323,7 +430,128 @@ pub(super) fn upsert(tx: &Transaction<'_>, entry: &VfsEntry) -> VfsResult<()> {
             entry.writer,
             entry.deleted,
             entry.mtime as i64,
+            vv_text(&entry.vv),
+            seq,
         ],
+    )?;
+    tx.execute("DELETE FROM conflicts WHERE path = ?1", [&entry.path])?;
+    let mut insert = tx.prepare_cached(&format!(
+        "INSERT OR REPLACE INTO conflicts (path, {CONFLICT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+    ))?;
+    for conflict in &entry.conflicts {
+        insert.execute(params![
+            entry.path,
+            conflict.sha256,
+            conflict.size as i64,
+            conflict.replicas,
+            conflict.version as i64,
+            conflict.writer,
+            conflict.deleted,
+            conflict.mtime as i64,
+            vv_text(&conflict.vv),
+        ])?;
+    }
+    Ok(())
+}
+
+/// One page of changes after `since`, as `ClusterVfsChanges` answers it.
+#[derive(Debug, Default, PartialEq)]
+pub struct ChangesPage {
+    pub index_id: String,
+    pub entries: Vec<VfsEntry>,
+    /// The highest `seq` in `entries`, or `since` when there are none.
+    pub last_seq: u64,
+    pub more: bool,
+    /// The caller's cursor is not into this index: start again at 0.
+    pub reset: bool,
+}
+
+/// Rows with `seq > since`, oldest change first, at most `limit`.
+pub(super) fn changes(
+    conn: &Connection,
+    known_id: Option<&str>,
+    since: u64,
+    limit: usize,
+) -> VfsResult<ChangesPage> {
+    let (next_seq, index_id): (i64, String) =
+        conn.query_row("SELECT next_seq, index_id FROM seq_state", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+    // Another index (recreated, restored), or a cursor past our last row.
+    let foreign = known_id.is_some_and(|known| known != index_id);
+    if foreign || since >= next_seq as u64 {
+        return Ok(ChangesPage {
+            index_id,
+            last_seq: since,
+            reset: true,
+            ..ChangesPage::default()
+        });
+    }
+    let mut statement = conn.prepare(&format!(
+        "SELECT {COLUMNS}, seq FROM entries WHERE seq > ?1 ORDER BY seq LIMIT ?2"
+    ))?;
+    let mut last_seq = since;
+    let mut entries = Vec::new();
+    let rows = statement.query_map(params![since as i64, limit as i64 + 1], |row| {
+        Ok((entry_from_row(row)?, row.get::<_, i64>(9)?))
+    })?;
+    for row in rows {
+        let (mut entry, seq) = row?;
+        attach_conflicts(conn, &mut entry)?;
+        if entries.len() == limit {
+            return Ok(ChangesPage {
+                index_id,
+                entries,
+                last_seq,
+                more: true,
+                reset: false,
+            });
+        }
+        last_seq = seq as u64;
+        entries.push(entry);
+    }
+    Ok(ChangesPage {
+        index_id,
+        entries,
+        last_seq,
+        more: false,
+        reset: false,
+    })
+}
+
+/// The cursor this node holds into `peer`: `(index_id, pulled_seq)`.
+pub(super) fn cursor(conn: &Connection, peer: &str) -> VfsResult<(Option<String>, u64)> {
+    Ok(conn
+        .query_row(
+            "SELECT index_id, pulled_seq FROM peers WHERE fp = ?1",
+            [peer],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
+        )
+        .optional()?
+        .unwrap_or((None, 0)))
+}
+
+/// Move this node's cursor into `peer`, in the merge's transaction.
+pub(super) fn set_cursor(
+    tx: &Transaction<'_>,
+    peer: &str,
+    index_id: Option<&str>,
+    seq: u64,
+) -> VfsResult<()> {
+    tx.execute(
+        "INSERT INTO peers (fp, index_id, pulled_seq, last_seen) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (fp) DO UPDATE SET index_id = ?2, pulled_seq = ?3, last_seen = ?4",
+        params![peer, index_id, seq as i64, super::vfs::unix_now() as i64],
+    )?;
+    Ok(())
+}
+
+/// Record that `peer` holds every change of ours up to `seq` (step 5's input).
+pub(super) fn set_acked(conn: &Connection, peer: &str, seq: u64) -> VfsResult<()> {
+    conn.execute(
+        "INSERT INTO peers (fp, acked_seq, last_seen) VALUES (?1, ?2, ?3)
+         ON CONFLICT (fp) DO UPDATE SET acked_seq = max(acked_seq, ?2), last_seen = ?3",
+        params![peer, seq as i64, super::vfs::unix_now() as i64],
     )?;
     Ok(())
 }
@@ -338,7 +566,36 @@ fn entry_from_row(row: &Row<'_>) -> rusqlite::Result<VfsEntry> {
         writer: row.get(5)?,
         deleted: row.get(6)?,
         mtime: row.get::<_, i64>(7)? as u64,
+        vv: vv_from_text(&row.get::<_, String>(8)?),
+        conflicts: Vec::new(),
     })
+}
+
+/// A conflict from `CONFLICT_COLUMNS`, starting at column `at`.
+fn conflict_from_row(row: &Row<'_>, at: usize) -> rusqlite::Result<VfsConflict> {
+    Ok(VfsConflict {
+        sha256: row.get(at)?,
+        size: row.get::<_, i64>(at + 1)? as u64,
+        replicas: row.get(at + 2)?,
+        version: row.get::<_, i64>(at + 3)? as u64,
+        writer: row.get(at + 4)?,
+        deleted: row.get(at + 5)?,
+        mtime: row.get::<_, i64>(at + 6)? as u64,
+        vv: vv_from_text(&row.get::<_, String>(at + 7)?),
+    })
+}
+
+fn vv_text(vv: &VersionVector) -> String {
+    if vv.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(vv).unwrap_or_default()
+    }
+}
+
+/// A vector this file wrote; anything else reads as "from an older node".
+fn vv_from_text(text: &str) -> VersionVector {
+    serde_json::from_str(text).unwrap_or_default()
 }
 
 impl From<rusqlite::Error> for VfsError {
@@ -389,6 +646,8 @@ mod tests {
             writer: format!("SHA256:node{}", i % 3),
             deleted,
             mtime: 1_700_000_000 + i as u64,
+            vv: Default::default(),
+            conflicts: Vec::new(),
         }
     }
 
@@ -465,14 +724,21 @@ mod tests {
         let conn = crate::sqlite::open(&root, DB_FILE).unwrap();
         conn.execute_batch(STEPS[0].1).unwrap();
         conn.pragma_update(None, "user_version", 1).unwrap();
-        let tx = conn.unchecked_transaction().unwrap();
-        upsert(&tx, &entry(3, false)).unwrap();
-        tx.commit().unwrap();
+        conn.execute(
+            "INSERT INTO entries (path, sha256, size, replicas, version, writer, deleted, mtime)
+             VALUES ('a', '', 1, 1, 7, 'w', 0, 1)",
+            [],
+        )
+        .unwrap();
         drop(conn);
         let conn = open(&root).unwrap();
         assert_eq!(load(&conn).unwrap().entries.len(), 1);
         let applied = crate::sqlite_migrate::status(&conn).unwrap();
-        assert_eq!(applied.len(), 1);
+        assert_eq!(
+            applied.len(),
+            STEPS.len(),
+            "adopted step 1, then ran the rest"
+        );
         assert_eq!(applied[0].name, "entries");
         assert!(!applied[0].reversible);
     }

@@ -126,7 +126,8 @@ fn new_session(path: &Path, name: &str) {
             command: vec!["/bin/sh".into()],
             size: Size::new(80, 24),
             cwd: Some("/".into()),
-            env: None,
+            // No history file lands in the root after it is removed.
+            env: Some([("HISTFILE".into(), "/dev/null".into())].into()),
         },
     );
     assert_eq!(made, Response::Value(name.into()));
@@ -200,6 +201,11 @@ fn a_reload_hands_over_every_host_and_no_client_sees_the_socket_go() {
     assert!(out.status.success(), "{stdout}{stderr}");
     assert!(stdout.starts_with("reloaded: "), "{stdout}");
     assert!(stdout.contains("\ndaemon now "), "{stdout}");
+    assert!(
+        stdout.contains("\nsessions: all 2 host-backed listed"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\ninit.lua: loaded"), "{stdout}");
     assert!(old.exited(), "the old daemon did not exit cleanly");
 
     std::thread::sleep(Duration::from_millis(200));
@@ -284,8 +290,24 @@ fn still_the_old_daemon(root: &Root, old: &mut Daemon) {
     assert_eq!(send_line(&path, "work", "echo BACK-$((6*7))"), Response::Ok);
     wait_for(&path, "work", "BACK-42");
     new_session(&path, "fresh");
-    let root_name = format!("{}/", root.0.to_string_lossy());
-    let left = reap::processes_naming(&["_reload-candidate", &root_name]);
+    // A candidate is the old daemon's child until it serves, under its verb
+    // or, once it re-executed, as `-s s daemon`. Hosts are children too.
+    let ps = Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=", "-o", "ppid=", "-o", "args="])
+        .output()
+        .unwrap();
+    let old_pid = old.0.id().to_string();
+    let left: Vec<String> = String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|line| {
+            let mut fields = line.split_whitespace();
+            let (_, ppid) = (fields.next(), fields.next());
+            let args = fields.collect::<Vec<_>>().join(" ");
+            ppid == Some(old_pid.as_str())
+                && (args.ends_with(" daemon") || args.contains("_reload-candidate"))
+        })
+        .map(str::to_owned)
+        .collect();
     assert!(left.is_empty(), "candidate left running: {left:?}");
 }
 
@@ -345,6 +367,175 @@ fn a_candidate_that_hangs_after_take_is_killed_at_its_deadline_and_rolled_back()
         started.elapsed()
     );
     still_the_old_daemon(&root, &mut old);
+}
+
+/// The post-check runs on the new daemon after the old one is gone. An
+/// `init.lua` edited into a broken state since the old daemon started fails
+/// it: the reload went through, and the CLI says what broke.
+#[test]
+fn the_post_check_reports_an_init_lua_the_new_daemon_could_not_load() {
+    let root = Root::new("initlua");
+    let path = root.socket();
+    let config = root.0.join("config");
+    std::fs::create_dir_all(config.join("remuda")).unwrap();
+    let init = config.join("remuda").join("init.lua");
+    std::fs::write(&init, "post_check_marker = 'old'\n").unwrap();
+    let config_home = config.to_string_lossy().into_owned();
+    let mut old = Daemon::spawn(
+        &root,
+        true,
+        &[
+            ("REMUDA_TEST_RELOAD_READY_MS", "15000"),
+            ("XDG_CONFIG_HOME", config_home.as_str()),
+        ],
+    );
+    new_session(&path, "one");
+    // The old daemon loaded it: the path is the one the daemon reads.
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let marker = client::request(
+            &path,
+            &Request::Eval {
+                code: "return tostring(post_check_marker)".into(),
+                name: None,
+            },
+        );
+        if matches!(&marker, Ok(Response::Value(v)) if v == "old") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "init.lua never loaded: {marker:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::write(&init, "error('broken since the old daemon started')\n").unwrap();
+
+    let out = root.remuda(&["reload"]);
+    let (stdout, stderr) = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{stdout}{stderr}");
+    assert!(stdout.starts_with("reloaded: "), "{stdout}");
+    assert!(
+        stdout.contains("\nsessions: all 1 host-backed listed"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\ninit.lua failed in the new daemon: ")
+            && stdout.contains("broken since the old daemon started"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("the reload went through"), "{stderr}");
+    let deadline = Instant::now() + PATIENCE;
+    while !old.exited() {
+        assert!(Instant::now() < deadline, "the old daemon never exited");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(send_line(&path, "one", "echo STILL-$((2*4))"), Response::Ok);
+    wait_for(&path, "one", "STILL-8");
+}
+
+/// An `init.lua` that already failed in the old daemon fails the same way in
+/// the new one: the reload made nothing worse, so it is reported, not failed.
+#[test]
+fn an_init_lua_broken_before_the_reload_does_not_fail_it() {
+    let root = Root::new("initold");
+    let path = root.socket();
+    let config = root.0.join("config");
+    std::fs::create_dir_all(config.join("remuda")).unwrap();
+    std::fs::write(
+        config.join("remuda").join("init.lua"),
+        "error('broken all along')\n",
+    )
+    .unwrap();
+    let config_home = config.to_string_lossy().into_owned();
+    let _old = Daemon::spawn(
+        &root,
+        true,
+        &[
+            ("REMUDA_TEST_RELOAD_READY_MS", "15000"),
+            ("XDG_CONFIG_HOME", config_home.as_str()),
+        ],
+    );
+    new_session(&path, "one");
+    let out = root.remuda(&["reload"]);
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("\ninit.lua failed, as it did before the reload: ")
+            && stdout.contains("broken all along"),
+        "{stdout}"
+    );
+}
+
+/// A mod can say "not now": its `daemon_reload_ready` reason blocks both
+/// `reload --check` and `reload`. A mod without the field never blocks.
+#[test]
+fn a_busy_mod_blocks_a_reload_until_it_says_ready() {
+    let root = Root::new("busy");
+    let path = root.socket();
+    let data = root.0.join("data");
+    for (name, ready) in [
+        (
+            "launcher",
+            "daemon_reload_ready = function(state) if state.busy then return 'launching a task' end end,",
+        ),
+        ("plain", ""),
+    ] {
+        let dir = data.join("remuda/mods").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("extension.toml"),
+            format!("name = \"{name}\"\nentry = \"packages/{name}/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("packages").join(name)).unwrap();
+        std::fs::write(
+            dir.join("packages").join(name).join("init.lua"),
+            format!(
+                "return {{ api = 'remuda-module-v1', state_version = 1,\n  initialize = function() return {{}} end,\n  start = function(state) remuda['{name}_state'] = state end,\n  {ready}\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let data_env = data.to_string_lossy().into_owned();
+    let mut old = Daemon::spawn(&root, true, &[("XDG_DATA_HOME", data_env.as_str())]);
+    let eval = |code: &str| {
+        request(
+            &path,
+            &Request::Eval {
+                code: code.into(),
+                name: None,
+            },
+        )
+    };
+    assert_eq!(
+        eval("remuda.exec('launcher'); remuda.exec('plain'); remuda.launcher_state.busy = true; return 'up'"),
+        Response::Value("up".into())
+    );
+
+    let out = root.remuda(&["reload", "--check"]);
+    let (stdout, stderr) = text(&out);
+    assert!(stdout.starts_with("blocked: "), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("\nblocker: mod launcher: launching a task"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("plain"), "{stdout}");
+    let out = root.remuda(&["reload"]);
+    let (stdout, stderr) = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("mod launcher: launching a task"),
+        "{stdout}"
+    );
+    assert_eq!(root.lock_pid(), old.0.id());
+
+    eval("remuda.launcher_state.busy = false");
+    let out = root.remuda(&["reload"]);
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.starts_with("reloaded: "), "{stdout}");
+    assert!(old.exited(), "the old daemon did not exit cleanly");
 }
 
 /// After the handover the old daemon ends what a clean stop ends: a deferred
