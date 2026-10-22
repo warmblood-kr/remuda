@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Cluster: `remuda cluster init --new-identity` now moves this node's VFS
+  store to `cluster.left-YYYYMMDD/vfs` and says so before it asks (#862).
+  Before, the old index stayed under the new key, and after a rejoin a file
+  deleted meanwhile (once its delete record was collected) could come back.
 - Cluster: `remuda cluster leave [--yes]` takes this node out (#778). It asks
   another node to revoke it (`ClusterLeave`); that node first checks that
   every VFS file keeps its copies without the leaver, and records the leave

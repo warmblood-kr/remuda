@@ -114,8 +114,8 @@ remuda cluster leave   # asks first; --yes skips the question
 - **Do not move `vfs/` back to rejoin.** A rejoined node has a new key, so
   the others pull its whole old index, and a file deleted while it was away
   (once its delete record is collected) would come back. The old `vfs/` is
-  for reading files only. `cluster init --new-identity` has this problem
-  today (#862).
+  for reading files only. `cluster init --new-identity` sets `vfs/` aside
+  the same way, to `cluster.left-YYYYMMDD/vfs` (#862).
 
 To do the two halves by hand: `remuda vfs drain` on the node that leaves,
 then `remuda cluster revoke NODE --yes` on another node.
