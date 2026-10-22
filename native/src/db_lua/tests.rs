@@ -27,7 +27,9 @@ fn lua_at(root: &Path) -> Lua {
     let open = lua
         .create_function(
             move |lua, (owner, name, opts): (String, String, Option<Table>)| {
-                open_answer(lua, &root, &owner, &name, limits_from(opts)?)
+                let limits = limits_from(opts.as_ref())?;
+                let migrations = migrations_from(opts.as_ref())?;
+                open_answer(lua, &root, &owner, &name, limits, migrations)
             },
         )
         .unwrap();
@@ -176,16 +178,16 @@ fn a_handle_cannot_reach_other_files_or_undo_its_limits() {
           "PRAGMA journal_mode = DELETE",
           "PRAGMA max_page_count = 999999999",
           "PRAGMA writable_schema = ON",
+          "PRAGMA user_version = 3",
         }) do
           local ok, err = db:exec(sql)
           out[#out + 1] = ok and ("allowed " .. sql) or err:match("^(%a+):")
         end
-        assert(db:exec("PRAGMA user_version = 3"))
         out[#out + 1] = db:query("PRAGMA user_version")[1].user_version
         return table.concat(out, ",")
     "#;
     let got = run(&lua, code);
-    assert_eq!(got, "denied,denied,denied,denied,denied,3");
+    assert_eq!(got, "denied,denied,denied,denied,denied,denied,0");
     assert!(!other.exists(), "a handle wrote {}", other.display());
 }
 
@@ -215,4 +217,90 @@ fn a_closed_handle_answers_closed_and_limits_have_ceilings() {
         .load(r#"open("m", "c", {max_rows = 0})"#)
         .exec()
         .is_err());
+}
+
+const STEPS: &str = r#"
+    local steps = {
+      { name = "create", up = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);",
+        down = "DROP TABLE notes;" },
+      { name = "tags", up = "ALTER TABLE notes ADD COLUMN tag TEXT;",
+        down = "ALTER TABLE notes DROP COLUMN tag;" },
+    }
+"#;
+
+#[test]
+fn open_applies_migrations_and_a_newer_database_refuses_older_code() {
+    let scratch = Scratch::new();
+    let lua = lua_at(&scratch.0);
+    let got = run(
+        &lua,
+        &format!(
+            r#"{STEPS}
+        local db = assert(open("butler", "notes", {{ migrations = steps }}))
+        assert(db:exec("INSERT INTO notes (body, tag) VALUES ('a', 't')") == 1)
+        local version = db:query("PRAGMA user_version")[1].user_version
+        db:close()
+        local old, why_old = open("butler", "notes", {{ migrations = {{ steps[1] }} }})
+        local none, why_none = open("butler", "notes")
+        steps[1].up = steps[1].up .. " -- edited"
+        local edited, why_edited = open("butler", "notes", {{ migrations = steps }})
+        return table.concat({{version, tostring(old), why_old, tostring(none), why_none,
+          tostring(edited), why_edited}}, "|")
+    "#
+        ),
+    );
+    let parts: Vec<&str> = got.split('|').collect();
+    assert_eq!(parts[0], "2");
+    assert_eq!(parts[1], "nil");
+    assert!(
+        parts[2].starts_with("too_new: notes.db is at version 2, this code knows 1"),
+        "{got}"
+    );
+    assert!(parts[4].starts_with("too_new:"), "{got}");
+    assert!(
+        parts[6].starts_with("drift: notes.db step 1 (create)"),
+        "{got}"
+    );
+}
+
+#[test]
+fn a_handle_cannot_write_the_version_or_the_migration_record() {
+    let scratch = Scratch::new();
+    let lua = lua_at(&scratch.0);
+    let got = run(
+        &lua,
+        &format!(
+            r#"{STEPS}
+        local db = assert(open("butler", "notes", {{ migrations = steps }}))
+        local _, version = db:exec("PRAGMA user_version = 7")
+        local _, record = db:exec("DELETE FROM _remuda_migrations")
+        local _, drop = db:batch("DROP TABLE _remuda_migrations")
+        local rows = assert(db:query("SELECT version, name FROM _remuda_migrations ORDER BY version"))
+        return table.concat({{version, record, drop, #rows, rows[2].name}}, "|")
+    "#
+        ),
+    );
+    let parts: Vec<&str> = got.split('|').collect();
+    assert!(
+        parts[..3].iter().all(|part| part.starts_with("denied:")),
+        "{got}"
+    );
+    assert_eq!(&parts[3..], ["2", "tags"]);
+}
+
+#[test]
+fn a_failed_migration_returns_its_reason_and_changes_nothing() {
+    let scratch = Scratch::new();
+    let lua = lua_at(&scratch.0);
+    let got = run(
+        &lua,
+        r#"
+        local bad = { { name = "attach", up = "ATTACH DATABASE 'x.db' AS x;" } }
+        local db, why = open("butler", "notes", { migrations = bad })
+        local again = assert(open("butler", "notes"))
+        return tostring(db) .. "|" .. why .. "|" .. again:query("PRAGMA user_version")[1].user_version
+    "#,
+    );
+    assert!(got.starts_with("nil|denied:"), "{got}");
+    assert!(got.ends_with("|0"), "{got}");
 }

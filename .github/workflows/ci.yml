@@ -149,6 +149,28 @@ jobs:
           cp "$RUNNER_TEMP/base-target/debug/remuda" "$RUNNER_TEMP/base-target/debug/remuda-session-host" "$RUNNER_TEMP/n/"
       - name: N/N+1 in both directions
         run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test session_host_daemon -- --ignored n_plus_one
+      - name: N/N+1 VFS sync across three daemons; N refuses a newer index.db
+        run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live -- --ignored n_plus_one older_build
+
+  vfs-compat-pre-sqlite:
+    # Nodes from before index.db (#778) still run in clusters. Two daemons of
+    # this build and one from the last commit before it must sync both ways,
+    # and the documented downgrade and re-upgrade must keep every name.
+    # Drop this job once no supported build reads only index.json.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build the last commit before index.db
+        run: |
+          git worktree add "$RUNNER_TEMP/pre" df13592f
+          cargo build --manifest-path "$RUNNER_TEMP/pre/Cargo.toml" --bin remuda --target-dir "$RUNNER_TEMP/pre-target"
+          mkdir "$RUNNER_TEMP/n"
+          cp "$RUNNER_TEMP/pre-target/debug/remuda" "$RUNNER_TEMP/n/"
+      - name: Mixed cluster, downgrade and upgrade again
+        run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live -- --ignored n_plus_one pre_sqlite
 
   principles-are-documented:
     # PRINCIPLES.md §2: a gate nobody has watched go red is a claim, not a

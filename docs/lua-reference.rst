@@ -116,6 +116,11 @@ daemon
 
 ``table`` — Facts about the daemon this Lua image runs in.
 
+daemon.reloaded_from
+--------------------
+
+``daemon.reloaded_from() -> pid | nil`` — The pid of the daemon this one took over from in a `remuda reload`, or nil when it started fresh. That daemon may still be finishing its last requests for up to 10 s. A core without it lacks the field, so test remuda.daemon.reloaded_from first.
+
 daemon.socket_publication
 -------------------------
 
@@ -129,7 +134,7 @@ db
 db.open
 -------
 
-``db.open(name [, opts]) -> db | nil, reason`` — Open (creating if needed) database NAME in the running mod's namespace: <state>/remuda/db/MOD/NAME.db. NAME is a plain identifier. opts may set max_bytes (default 64 MiB, at most 1 GiB), timeout_ms per statement (default 1000, at most 10000) and max_rows per query (default 10000, at most 100000). The handle has query(sql, params) -> rows, exec(sql, params) -> changes, batch(sql) -> true, limits() and close(); params is an array of nil, boolean, number or string. Failures return nil and a reason starting with no_mod, io, sql, too_large, timeout, too_many_rows, denied (ATTACH, DETACH and most PRAGMAs) or closed. Outside a mod's own code it returns nil, 'no_mod: ...'.
+``db.open(name [, opts]) -> db | nil, reason`` — Open (creating if needed) database NAME in the running mod's namespace: <state>/remuda/db/MOD/NAME.db. NAME is a plain identifier. opts may set max_bytes (default 64 MiB, at most 1 GiB), timeout_ms per statement (default 1000, at most 10000) and max_rows per query (default 10000, at most 100000). opts.migrations = true applies the mod's migrations/NAME/NNNN_x.up.sql steps (or pass an array of {name, up, down}); see docs/lua.md. The handle has query(sql, params) -> rows, exec(sql, params) -> changes, batch(sql) -> true, limits() and close(); params is an array of nil, boolean, number or string. Failures return nil and a reason starting with no_mod, io, sql, too_large, timeout, too_many_rows, denied (ATTACH, DETACH and most PRAGMAs), migration, too_new, drift, foreign_key or closed. Outside a mod's own code it returns nil, 'no_mod: ...'.
 
 define_key
 ----------
@@ -534,7 +539,7 @@ vfs.rm
 vfs.stat
 --------
 
-``vfs.stat(uri) -> {path, version, sha256, size, mtime, replicas, writer, local, synced_at} | nil, reason`` — Describe a stored file: path, version, sha256, size, mtime, replicas, writer, local (whether this node holds a copy) and synced_at (unix time a peer index was last merged here, or nil). A file known here without a local copy still returns its table, with local = false.
+``vfs.stat(uri) -> {path, version, sha256, size, mtime, replicas, writer, local, synced_at, conflicts} | nil, reason`` — Describe a stored file: path, version, sha256, size, mtime, replicas, writer, local (whether this node holds a copy), synced_at (unix time a peer index was last merged here, or nil) and conflicts (concurrent writes kept beside this one, each {version, writer, sha256, size, deleted, mtime}; the next put or rm settles them). A file known here without a local copy still returns its table, with local = false.
 
 wait_for
 --------
