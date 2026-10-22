@@ -186,6 +186,50 @@ pub fn upgrade(
 ) -> Result<Moved, String> {
     check(steps)?;
     let target = u32::try_from(steps.len()).map_err(|_| "migration: too many steps".to_owned())?;
+    let (from, adopting) = plan(conn, label, steps, target, adopt)?;
+    if from == target && !adopting {
+        return Ok(Moved { from, to: target });
+    }
+    // Plan again under the write lock: another connection may have run the
+    // steps between our read and the lock.
+    let mut moved = Moved { from, to: target };
+    in_run(conn, |tx| {
+        let (from, adopting) = plan(tx, label, steps, target, adopt)?;
+        moved.from = from;
+        if from == target && !adopting {
+            return Ok(());
+        }
+        create_table(tx)?;
+        let start = if adopting { 0 } else { from };
+        for (index, step) in steps.iter().enumerate().skip(start as usize) {
+            let number = index as u32 + 1;
+            if number > from {
+                run_step_sql(tx, &step.up).map_err(|error| {
+                    format!("{error} (in {label} step {number}, {})", step.name)
+                })?;
+            }
+            tx.execute(
+                &format!(
+                    "INSERT INTO {TABLE} (version, name, up_sha256, down_sql, applied_at) VALUES (?1, ?2, ?3, ?4, ?5)"
+                ),
+                params![number, step.name, sha256_hex(&step.up), step.down, unix_now()],
+            )
+            .map_err(sql)?;
+        }
+        set_version(tx, target)
+    })?;
+    Ok(moved)
+}
+
+/// Check the applied steps against `steps`: the applied version, and whether
+/// an unrecorded `user_version` is adopted. Refuses too new, unrecorded or drifted.
+fn plan(
+    conn: &Connection,
+    label: &str,
+    steps: &[Step],
+    target: u32,
+    adopt: bool,
+) -> Result<(u32, bool), String> {
     let from = version(conn)?;
     let recorded = status(conn)?;
     if from > target {
@@ -215,55 +259,34 @@ pub fn upgrade(
             ));
         }
     }
-    if from == target && !adopting {
-        return Ok(Moved { from, to: target });
-    }
-    let start = if adopting { 0 } else { from };
-    in_run(conn, |tx| {
-        create_table(tx)?;
-        for (index, step) in steps.iter().enumerate().skip(start as usize) {
-            let number = index as u32 + 1;
-            if number > from {
-                run_step_sql(tx, &step.up).map_err(|error| {
-                    format!("{error} (in {label} step {number}, {})", step.name)
-                })?;
-            }
-            tx.execute(
-                &format!(
-                    "INSERT INTO {TABLE} (version, name, up_sha256, down_sql, applied_at) VALUES (?1, ?2, ?3, ?4, ?5)"
-                ),
-                params![number, step.name, sha256_hex(&step.up), step.down, unix_now()],
-            )
-            .map_err(sql)?;
-        }
-        set_version(tx, target)
-    })?;
-    Ok(Moved { from, to: target })
+    Ok((from, adopting))
 }
 
 /// Step back to `to` with the stored `down` SQL, newest first, in one run.
 /// Refused before anything runs if a step in the range is irreversible.
 pub fn downgrade(conn: &mut Connection, label: &str, to: u32) -> Result<Moved, String> {
-    let from = version(conn)?;
-    let recorded = status(conn)?;
-    if recorded.len() != from as usize {
-        return Err(format!(
-            "migration: {label} has user_version {from} but {} recorded steps",
-            recorded.len()
-        ));
-    }
-    if to >= from {
-        return Err(format!(
-            "migration: {label} is at version {from}; nothing to undo down to {to}"
-        ));
-    }
-    let downs = planned_downs(conn, to)?;
-    if let Some((number, name, _)) = downs.iter().find(|(_, _, down)| down.is_none()) {
-        return Err(format!(
-            "irreversible: {label} step {number} ({name}) has no down SQL; nothing was changed"
-        ));
-    }
+    let mut moved = Moved { from: 0, to };
+    // Checked under the write lock, so a concurrent run cannot slip in.
     in_run(conn, |tx| {
+        let from = version(tx)?;
+        let recorded = status(tx)?;
+        if recorded.len() != from as usize {
+            return Err(format!(
+                "migration: {label} has user_version {from} but {} recorded steps",
+                recorded.len()
+            ));
+        }
+        if to >= from {
+            return Err(format!(
+                "migration: {label} is at version {from}; nothing to undo down to {to}"
+            ));
+        }
+        let downs = planned_downs(tx, to)?;
+        if let Some((number, name, _)) = downs.iter().find(|(_, _, down)| down.is_none()) {
+            return Err(format!(
+                "irreversible: {label} step {number} ({name}) has no down SQL; nothing was changed"
+            ));
+        }
         for (number, name, down) in &downs {
             let down = down.as_deref().unwrap_or_default();
             run_step_sql(tx, down)
@@ -271,9 +294,10 @@ pub fn downgrade(conn: &mut Connection, label: &str, to: u32) -> Result<Moved, S
             tx.execute(&format!("DELETE FROM {TABLE} WHERE version = ?1"), [number])
                 .map_err(sql)?;
         }
+        moved.from = from;
         set_version(tx, to)
     })?;
-    Ok(Moved { from, to })
+    Ok(moved)
 }
 
 /// The stored downs above `to`, newest first: (version, name, down SQL).

@@ -112,6 +112,9 @@ enum Signal {
     Shutdown(Sender<()>),
 }
 
+const STOPPING: u8 = 1;
+const RELOADED: u8 = 2;
+
 struct Inner {
     entries: Mutex<HashMap<u64, Arc<Entry>>>,
     created: Mutex<Vec<u64>>,
@@ -120,6 +123,7 @@ struct Inner {
     events_rx: Mutex<Receiver<PendingEvent>>,
     secret_events: Mutex<Vec<SecretPromptEvent>>,
     line_events: Mutex<Vec<LinePromptEvent>>,
+    /// 0 while serving, else [`STOPPING`] or [`RELOADED`].
     stopping: AtomicU8,
     marker_token: String,
 }
@@ -304,7 +308,7 @@ impl PendingReplies {
             }
             if let Ok(Signal::Shutdown(ack)) = signal_rx.try_recv() {
                 if cancel_entry(&entry, "shutdown") {
-                    break (Err("daemon stopping".into()), Some(ack));
+                    break (Err(self.stop_message().into()), Some(ack));
                 }
                 if entry.state.status.load(Ordering::SeqCst) == 1 {
                     let completion = result_rx
@@ -312,7 +316,7 @@ impl PendingReplies {
                         .map_err(|_| "deferred reply was abandoned".to_string());
                     break (completion, Some(ack));
                 }
-                break (Err("daemon stopping".into()), Some(ack));
+                break (Err(self.stop_message().into()), Some(ack));
             }
             if client_disconnected() {
                 if cancel_entry(&entry, "client_disconnected") {
@@ -402,7 +406,31 @@ impl PendingReplies {
     }
 
     pub fn shutdown(&self) {
-        if self.0.stopping.swap(1, Ordering::SeqCst) != 0 {
+        self.stop(STOPPING);
+    }
+
+    /// As [`Self::shutdown`], after `remuda reload` handed the socket over:
+    /// the waiting caller is told to ask again, which reaches the new daemon.
+    pub fn reloaded(&self) {
+        self.stop(RELOADED);
+    }
+
+    fn stop_message(&self) -> &'static str {
+        match self.0.stopping.load(Ordering::SeqCst) {
+            RELOADED => {
+                "daemon reloaded into a new build; this reply was lost, run the command again"
+            }
+            _ => "daemon stopping",
+        }
+    }
+
+    fn stop(&self, why: u8) {
+        if self
+            .0
+            .stopping
+            .compare_exchange(0, why, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return;
         }
         let entries = self.0.entries.lock().unwrap_or_else(|p| p.into_inner());

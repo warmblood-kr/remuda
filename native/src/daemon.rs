@@ -79,6 +79,24 @@ fn wait_for_new_requests() {
     }
 }
 
+/// Longest a caller found in no session waits for in-flight `new` requests:
+/// a host-backed start may wait this long for its host to publish.
+#[cfg(not(windows))]
+const STARTING_SESSIONS_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait, bounded, until no `new` request is in flight; `true` when one was.
+#[cfg(not(windows))]
+fn wait_for_starting_sessions() -> bool {
+    if ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst) == 0 {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + STARTING_SESSIONS_WAIT;
+    while ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst) != 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    true
+}
+
 struct SyncPermit;
 
 impl SyncPermit {
@@ -296,6 +314,10 @@ pub(crate) fn socket_publication() -> String {
         .unwrap_or_else(|| "legacy: not recorded".into())
 }
 
+/// The pid of the daemon this one took over from in a reload; unset when
+/// it started fresh. `remuda.daemon.reloaded_from()` reads it.
+pub(crate) static RELOADED_FROM: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
 /// Set once per daemon from `<socket>.daemon-id`; see `daemon_instance_id`.
 static DAEMON_INSTANCE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -366,6 +388,11 @@ fn serve_from(
                 "remuda daemon: rediscovered session hosts: {}",
                 names.join(", ")
             );
+            for name in &names {
+                if let Some(handle) = registry.hosted(name) {
+                    watch_hosted_output(&image, &handle);
+                }
+            }
         }
         Ok(_) => {}
         Err(error) => eprintln!("remuda daemon: session host discovery failed: {error}"),
@@ -1376,6 +1403,16 @@ pub(crate) fn reap_and_notify(registry: &Registry, image: &Image) -> Vec<String>
     for (name, id, instance_id, reason, exit_info) in &dead {
         notify_exited(image, name, id, instance_id, reason, exit_info.as_ref());
     }
+    // A host-backed session's child exits inside its host (#713): stop the
+    // host and retire its entry as a close would, then announce it the same way.
+    let hosted = registry.reap_hosted_with_exit_info();
+    for (name, id, instance_id, reason, exit_info) in &hosted {
+        #[cfg(unix)]
+        image.session_hosts().retire_closed(name);
+        notify_exited(image, name, id, instance_id, reason, exit_info.as_ref());
+    }
+    let mut dead = dead;
+    dead.extend(hosted);
     dead.into_iter().map(|(name, _, _, _, _)| name).collect()
 }
 
@@ -1773,7 +1810,8 @@ fn reload(
             );
         };
         let deadlines = crate::reload::Deadlines::default();
-        let candidate = match crate::reload::start(
+        let busy = mods_busy(image);
+        let mut candidate = match crate::reload::start(
             socket,
             Path::new(binary),
             image.session_hosts(),
@@ -1788,6 +1826,7 @@ fn reload(
                 )
             }
         };
+        candidate.block(busy);
         if check || !candidate.report().blockers.is_empty() {
             let report = candidate.abort();
             return (Response::Value(report.lines().join("\n")), false);
@@ -1814,6 +1853,28 @@ fn reload(
             Response::error("reload is not supported on Windows yet: sessions there have no host"),
             false,
         )
+    }
+}
+
+/// Why mods say a reload must wait: each mod's `daemon_reload_ready`.
+/// A Lua image that cannot answer in time blocks too, saying so.
+#[cfg(unix)]
+fn mods_busy(image: &Image) -> Vec<String> {
+    const ASK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+    let asked = image.submit(
+        "return remuda._daemon_reload_check()",
+        Some("@remuda/reload-check"),
+    );
+    match asked.map(|answer| answer.recv_timeout(ASK_DEADLINE)) {
+        Ok(Ok(Ok(lines))) => lines.lines().map(str::to_string).collect(),
+        // No image, so no mod to ask.
+        Ok(Ok(Err(error))) if error.starts_with("image failed to start") => Vec::new(),
+        Ok(Ok(Err(error))) => vec![format!("mods: the busy check failed: {error}")],
+        Ok(Err(_)) => vec![format!(
+            "mods: the Lua image did not answer the busy check within {} s",
+            ASK_DEADLINE.as_secs()
+        )],
+        Err(error) => vec![format!("mods: {error}")],
     }
 }
 
@@ -1918,7 +1979,13 @@ fn drain_session_hosts(image: &Image) {
 /// covers a grandchild PDEATHSIG alone can't reach (see child_guard.rs).
 /// Only THIS death mode runs any code at all; SIGTERM/SIGKILL run none.
 fn reap_processes_before_exit(image: &Image) {
-    image.shutdown_pending_replies();
+    reap_before_exit(image, false);
+}
+
+/// The same teardown, `reloaded` after a reload handed the socket over.
+/// Host-backed sessions are never touched: they belong to the new daemon.
+fn reap_before_exit(image: &Image, reloaded: bool) {
+    image.finish_pending_replies(reloaded);
     let _ = image.eval(
         "for _, id in ipairs(remuda.processes()) do remuda._process_killpg(id) end",
         Some("@remuda/shutdown-reap"),
@@ -1995,14 +2062,9 @@ fn handle(
 /// answers them with a clear refusal instead of "no such session".
 fn local_only(request: &Request) -> Option<(&'static str, &str)> {
     match request {
-        Request::CaptureStyled { name, .. } => Some(("styled capture", name)),
-        Request::Sync { name, .. } => Some(("sync", name)),
         Request::MouseState { name } => Some(("mouse state", name)),
         Request::Attach { name } | Request::AttachTracked { name } => Some(("attach", name)),
         Request::AttachStatus { name, .. } => Some(("attach status", name)),
-        Request::Input { name, .. } | Request::InputLine { name, .. } => {
-            Some(("sequenced input", name))
-        }
         _ => None,
     }
 }
@@ -2031,6 +2093,14 @@ fn handle_request(
     }
     match request {
         Request::List => {
+            // A session's child runs before `new` registers it, and a
+            // host-backed one (#713) only once its host published, so a
+            // listing from inside a session still starting would miss it.
+            // Resolving the caller lets in-flight starts finish first.
+            #[cfg(not(windows))]
+            if ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst) != 0 {
+                let _ = caller_context(&stream, registry, accepted);
+            }
             if !keep_exited() {
                 reap_and_notify(registry, image);
             }
@@ -2052,9 +2122,14 @@ fn handle_request(
                 {
                     let left = accept::Answering::wait_for_others(1, RELOAD_DRAIN_DEADLINE);
                     if left > 0 {
-                        eprintln!("remuda daemon: reload: {left} request(s) cut at exit");
+                        eprintln!(
+                            "remuda daemon: reload: {left} request(s) still waiting; they are told to ask the new daemon"
+                        );
                     }
                 }
+                // What a clean stop ends: deferred replies still waiting, the
+                // processes Lua started, and the modules (stop hooks run).
+                reap_before_exit(image, true);
                 // The candidate owns the socket now: never unlink it here.
                 anti_entropy.stop_and_join();
                 std::process::exit(0);
@@ -2398,14 +2473,25 @@ fn caller_context(
     #[cfg(not(windows))]
     {
         let _ = accepted;
-        let candidates = registry.live_processes_with_identity();
-        caller_context_from_ancestry(
-            process_ancestry::peer_pid(stream),
-            &candidates,
-            std::process::id(),
-            process_ancestry::parent_pid,
-            registry,
-        )
+        let resolve = || {
+            let candidates = registry.live_processes_with_identity();
+            caller_context_from_ancestry(
+                process_ancestry::peer_pid(stream),
+                &candidates,
+                std::process::id(),
+                process_ancestry::parent_pid,
+                registry,
+            )
+        };
+        let caller = resolve();
+        // A session's child runs before `new` registers it; a host-backed one
+        // (#713) waits for its host to publish first. A caller that early is
+        // in no session yet, so let in-flight starts finish and look again.
+        if !matches!(caller.kind, crate::image::CallerKind::Session) && wait_for_starting_sessions()
+        {
+            return resolve();
+        }
+        caller
     }
 }
 
@@ -3013,7 +3099,17 @@ fn handle_sync(
     timeout_ms: u64,
 ) -> std::io::Result<()> {
     let Some(session) = registry.get(name) else {
-        return reply(stream, &Response::error(format!("no such session: {name}")));
+        return match registry.hosted(name) {
+            Some(handle) => sync_hosted(
+                stream,
+                registry,
+                &handle,
+                expected_instance,
+                since,
+                timeout_ms,
+            ),
+            None => reply(stream, &Response::error(format!("no such session: {name}"))),
+        };
     };
     if expected_instance
         .as_deref()
@@ -3052,6 +3148,77 @@ fn handle_sync(
             snapshot: StyledScreen {
                 rows,
                 bracketed_paste: session.mouse_state().bracketed_paste,
+                wrapped: versioned.snapshot.wrapped,
+                scrollback_len: versioned.snapshot.scrollback_len,
+                scrollback_total: versioned.snapshot.scrollback_total,
+                cursor: versioned.snapshot.cursor,
+            },
+        },
+    )
+}
+
+/// `Sync` for a host-backed session (#713): the same bounded wait and frame.
+/// A handle is bound to one launch, but its name can be closed and launched
+/// again mid-wait, so the expected instance is checked again afterwards.
+fn sync_hosted(
+    stream: &Stream,
+    registry: &Registry,
+    handle: &remuda_core::session_operations::SessionHandle,
+    expected_instance: Option<String>,
+    since: u64,
+    timeout_ms: u64,
+) -> std::io::Result<()> {
+    let instance_id = handle.identity().instance.clone();
+    if expected_instance
+        .as_deref()
+        .is_some_and(|expected| expected != instance_id)
+    {
+        return reply(stream, &Response::WrongInstance);
+    }
+    let _permit = match acquire_sync_permit() {
+        Ok(permit) => permit,
+        Err(response) => return reply(stream, &response),
+    };
+    let timeout = Duration::from_millis(remuda_core::sync::bounded_timeout_ms(timeout_ms));
+    let result = handle.wait_after(since, timeout);
+    // As in-process: a name closed (and perhaps relaunched) during the wait
+    // answers WrongInstance, not the old launch's exit or screen. The host
+    // stops with a closing child, which can wake this wait before or after
+    // the close stops tracking the handle, so the close itself is asked.
+    // A handle reaped after its child exited still answers that exit: an
+    // in-process wait wakes at the exit, before any reap.
+    if expected_instance.is_some() {
+        let name = &handle.identity().name;
+        let replaced = match registry.get(name) {
+            Some(session) => session.instance_id() != instance_id,
+            None => registry
+                .hosted(name)
+                .is_some_and(|current| current.identity().instance != instance_id),
+        };
+        if replaced || registry.hosted_closed(&instance_id) {
+            return reply(stream, &Response::WrongInstance);
+        }
+    }
+    let versioned = match result {
+        Ok(snapshot) => snapshot,
+        Err(error) => return reply(stream, &Response::error(error.to_string())),
+    };
+    let bracketed_paste = handle
+        .inspect()
+        .is_ok_and(|observation| observation.mouse.bracketed_paste);
+    reply(
+        stream,
+        &Response::Sync {
+            instance_id,
+            output_version: versioned.output_version.unwrap_or(0),
+            snapshot: StyledScreen {
+                rows: versioned
+                    .snapshot
+                    .cells
+                    .iter()
+                    .map(|row| collapse_runs(row))
+                    .collect(),
+                bracketed_paste,
                 wrapped: versioned.snapshot.wrapped,
                 scrollback_len: versioned.snapshot.scrollback_len,
                 scrollback_total: versioned.snapshot.scrollback_total,
@@ -3113,33 +3280,49 @@ fn handle_shutdown(
             requester_session_id,
             requester_session_name,
         };
-        shutdown_verdict_with_classifier(false, claims, || {
-            match process_ancestry::peer_pid(&stream) {
-                Ok(Some(peer_pid)) => {
-                    let session_pids = match session_process_ids(registry) {
-                        Ok(pids) => pids,
-                        Err(error) => {
-                            eprintln!("remuda: shutdown {error}; refusing unverifiable requester");
-                            return ShutdownPeer::Error(error);
-                        }
-                    };
-                    let ancestry = process_ancestry::is_self_or_descendant(peer_pid, &session_pids);
-                    if let process_ancestry::Ancestry::Unreadable { pid, ref error } = ancestry {
-                        eprintln!(
+        let classify = || match process_ancestry::peer_pid(&stream) {
+            Ok(Some(peer_pid)) => {
+                let session_pids = match session_process_ids(registry) {
+                    Ok(pids) => pids,
+                    Err(error) => {
+                        eprintln!("remuda: shutdown {error}; refusing unverifiable requester");
+                        return ShutdownPeer::Error(error);
+                    }
+                };
+                let ancestry = process_ancestry::is_self_or_descendant(peer_pid, &session_pids);
+                if let process_ancestry::Ancestry::Unreadable { pid, ref error } = ancestry {
+                    eprintln!(
                             "remuda: shutdown ancestry stopped at unreadable pid {pid} ({error}); refusing unverifiable requester"
                         );
-                    }
-                    ShutdownPeer::Ancestry(ancestry)
                 }
-                Ok(None) => {
-                    eprintln!("remuda: shutdown peer process ID unavailable; refusing unverifiable requester");
-                    ShutdownPeer::Unavailable
-                }
-                Err(error) => {
-                    eprintln!("remuda: shutdown peer process ID unavailable ({error}); refusing unverifiable requester");
-                    ShutdownPeer::Error(error.to_string())
-                }
+                ShutdownPeer::Ancestry(ancestry)
             }
+            Ok(None) => {
+                eprintln!(
+                    "remuda: shutdown peer process ID unavailable; refusing unverifiable requester"
+                );
+                ShutdownPeer::Unavailable
+            }
+            Err(error) => {
+                eprintln!("remuda: shutdown peer process ID unavailable ({error}); refusing unverifiable requester");
+                ShutdownPeer::Error(error.to_string())
+            }
+        };
+        shutdown_verdict_with_classifier(false, claims, || {
+            let peer = classify();
+            // A session's child runs before `new` registers it; a host-backed
+            // one (#713) waits for its host to publish first. A requester that
+            // early is in no session yet, so let in-flight starts finish and
+            // look again, as caller attribution does.
+            #[cfg(not(windows))]
+            if matches!(
+                peer,
+                ShutdownPeer::Ancestry(process_ancestry::Ancestry::Outside)
+            ) && wait_for_starting_sessions()
+            {
+                return classify();
+            }
+            peer
         })
     };
     finish_shutdown_verdict(
@@ -3362,8 +3545,21 @@ struct NewSessionRequest {
     return_instance_id: bool,
 }
 
+/// Feed a host-backed session's output into the same `session_output` hook
+/// an in-process one uses (#713). A host that cannot be watched finishes the
+/// monitor at once, so an exit notice never waits for it.
+#[cfg(unix)]
+fn watch_hosted_output(image: &Image, handle: &remuda_core::session_operations::SessionHandle) {
+    let identity = handle.identity();
+    let notifier = image.session_output_notifier(&identity.name, &identity.id);
+    match handle.wakeup() {
+        Ok(Some(output)) => monitor_session_output(output, notifier),
+        _ => notifier.finish_monitor(),
+    }
+}
+
 /// Opt-in (#713): the session lives in a separate host process that
-/// survives this daemon. No output monitor: hosted wakeups are not wired yet.
+/// survives this daemon.
 #[cfg(unix)]
 fn handle_new_hosted(
     stream: &Stream,
@@ -3372,16 +3568,21 @@ fn handle_new_hosted(
     request: &crate::session_host::hosted::NewHosted<'_>,
     return_instance_id: bool,
 ) -> std::io::Result<()> {
+    // The same refusal an in-process `new` gives, before any host starts.
+    if registry.get(request.name).is_some() || registry.hosted(request.name).is_some() {
+        return reply(
+            stream,
+            &Response::error(format!("name taken: {}", request.name)),
+        );
+    }
     if let Err(error) = image.session_hosts().spawn(registry, request) {
         return reply(stream, &Response::error(error));
     }
     let Some(handle) = registry.hosted(request.name) else {
         return reply(stream, &Response::error("hosted session vanished"));
     };
+    watch_hosted_output(image, &handle);
     let identity = handle.identity();
-    image
-        .session_output_notifier(&identity.name, &identity.id)
-        .finish_monitor();
     let name = identity.name.clone();
     let response = if return_instance_id {
         Response::SessionStarted {
@@ -3565,16 +3766,23 @@ fn input(
         Ok(client_id) => client_id,
         Err(error) => return reply(stream, &Response::error(error)),
     };
-    let result = registry.apply_input_batch(
-        name,
-        remuda_core::input::InputBatch {
-            instance_id,
-            client_id,
-            seq,
-            bytes,
-        },
-    );
+    let batch = remuda_core::input::InputBatch {
+        instance_id,
+        client_id,
+        seq,
+        bytes,
+    };
+    let result = registry
+        .apply_input_batch(name, batch)
+        .or_else(|| registry.apply_hosted_input_batch(name, batch, false, input_clock()));
     reply_input_result(stream, name, result)
+}
+
+/// The rate-budget clock for host-backed sequenced input: one monotonic
+/// origin per daemon, as an in-process session's own clock would be.
+fn input_clock() -> Duration {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    ORIGIN.get_or_init(std::time::Instant::now).elapsed()
 }
 
 fn input_line(
@@ -3586,7 +3794,10 @@ fn input_line(
     if std::str::from_utf8(batch.bytes).is_err() {
         return reply(stream, &Response::error("input line must be UTF-8"));
     }
-    reply_input_result(stream, name, registry.apply_input_line_batch(name, batch))
+    let result = registry
+        .apply_input_line_batch(name, batch)
+        .or_else(|| registry.apply_hosted_input_batch(name, batch, true, input_clock()));
+    reply_input_result(stream, name, result)
 }
 
 fn reply_input_result(
@@ -3702,6 +3913,12 @@ fn spawn(
     // `dumb` and its TUI degrades for a reason nobody can see from inside.
     if std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true) {
         builder.env("TERM", "xterm-256color");
+    }
+    // Same as a host-backed child: the daemon's own switches and
+    // service-manager handles are not the session's.
+    #[cfg(unix)]
+    for key in crate::session_host::hosted::DAEMON_ONLY {
+        builder.env_remove(key);
     }
     if let Some(env) = env {
         for (k, v) in env {
