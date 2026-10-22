@@ -649,7 +649,7 @@ remuda — a pty manager you can attach to
   remuda cluster join             join another node's cluster
   remuda cluster nodes            list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
-  remuda cluster remote [node[/session]] open a node's sessions, or one session
+  remuda cluster remote [node[/session]] a node's session screen, or the cluster tree
   remuda cluster listen [--bind ADDR] [--allow-public] configure the daemon listener
                                   --foreground holds the listener in this terminal
                                   [::] may accept IPv4 too on dual-stack systems
@@ -747,7 +747,7 @@ remuda — terminal orchestration for coding agents
   remuda cluster join             join another node's cluster
   remuda cluster nodes           list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
-  remuda cluster remote [node[/session]] open a node's sessions, or one session
+  remuda cluster remote [node[/session]] a node's session screen, or the cluster tree
   remuda cluster listen [--bind ADDR] [--allow-public] configure the daemon listener
                                   --foreground holds the listener in this terminal
                                   [::] may accept IPv4 too on dual-stack systems
@@ -1009,7 +1009,7 @@ fn cluster_cli_spec() -> remuda_native::cli_parse::Spec {
                 vec![arg("TARGET", "Node name or fingerprint", false, true)],
                 vec![option("yes", None, "Confirm without prompting", false)], "remuda cluster revoke TARGET [--yes]"),
             verb("remote", "Attach to a remote session, or show the remote session picker. Example: remuda cluster remote node/session",
-                vec![arg("TARGET", "Optional NODE (its session picker) or NODE/SESSION target", false, false)], vec![], "remuda cluster remote [NODE[/SESSION]]"),
+                vec![arg("TARGET", "Optional NODE (its session screen) or NODE/SESSION target", false, false)], vec![], "remuda cluster remote [NODE[/SESSION]]"),
             verb("listen", "Manage the cluster listener. Example: remuda cluster listen --bind 127.0.0.1",
                 vec![], vec![
                     option("off", None, "Stop the cluster listener", false),
@@ -2698,6 +2698,11 @@ fn safe_fingerprint_field(value: &str, token: &str) -> String {
 }
 
 fn cluster_remote(server: &str, path: &Path, node: &str, target: Option<&str>) -> ExitCode {
+    if let Some(peer) = target {
+        if let Some(code) = cluster_remote_node_screen(server, path, node, peer) {
+            return code;
+        }
+    }
     match remuda_native::cluster::nodes() {
         Ok(Some((identity, registry))) => {
             let poller = match remuda_native::cluster_remote::RemotePoller::from_registry(
@@ -2733,6 +2738,44 @@ fn cluster_remote(server: &str, path: &Path, node: &str, target: Option<&str>) -
         }),
         Err(error) => fail(format!("cluster remote: {error}")),
     }
+}
+
+/// `cluster remote NODE` shows NODE's session screen, as plain `remuda` does
+/// there. `None` when TARGET is not a whole node (e.g. `node/session`).
+fn cluster_remote_node_screen(
+    server: &str,
+    path: &Path,
+    hostname: &str,
+    target: &str,
+) -> Option<ExitCode> {
+    let (identity, _) = remuda_native::cluster::nodes().ok().flatten()?;
+    let local = target == hostname
+        || target == identity.node_fp
+        || target == remuda_native::cluster::node_label(&identity.node_fp);
+    if local {
+        return Some(with_daemon(
+            server,
+            path,
+            |path| match remuda_native::tui::run(path, server, None) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => fail(format!("cluster remote: {error}")),
+            },
+        ));
+    }
+    remuda_native::cluster::resolve_target(target, None).ok()?;
+    let port = match remuda_native::tui::RemotePort::system(target) {
+        Ok(port) => port,
+        Err(error) => return Some(fail(format!("cluster remote: {target}: {error}"))),
+    };
+    let label = format!("{target} (remote)");
+    Some(with_daemon(
+        server,
+        path,
+        |path| match remuda_native::tui::run_port(path, &port, &label, None) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(format!("cluster remote: {error}")),
+        },
+    ))
 }
 
 fn remote_node_label(os_hostname: impl FnOnce() -> std::io::Result<String>) -> String {
