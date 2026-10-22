@@ -1,5 +1,7 @@
 # What `remuda reload` keeps (#713)
 
+To reload your live daemon, follow [reload-checklist.md](reload-checklist.md).
+
 `remuda reload` (Unix) moves a running daemon onto another build. The old
 daemon hands its socket and its host-backed sessions to the new one, then
 exits. This page says what crosses over and what starts fresh. If anything
