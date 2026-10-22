@@ -318,20 +318,22 @@ pub fn unix_now() -> u64 {
 #[derive(Clone, Debug)]
 pub struct VfsStore {
     root: PathBuf,
-    /// The folder's (device, inode) at open; `still_here` compares it.
+    /// The folder's identity at open; `still_here` compares it.
     opened: Option<(u64, u64)>,
 }
 
+/// (device, inode) on unix; elsewhere the folder's creation time.
 fn folder_id(path: &Path) -> Option<(u64, u64)> {
+    let meta = fs::metadata(path).ok()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        fs::metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
+        Some((meta.dev(), meta.ino()))
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
-        None
+        let born = meta.created().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        Some((born.as_secs(), u64::from(born.subsec_nanos())))
     }
 }
 
