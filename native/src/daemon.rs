@@ -1962,6 +1962,28 @@ fn roll_back(
 #[cfg(unix)]
 const HOST_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(35);
 
+/// How long `stop` waits for host-backed sessions it closes to stop.
+#[cfg(unix)]
+const HOST_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `stop` ends host-backed sessions as it ends in-process ones, unless the
+/// caller keeps them; `reload` is the way to carry them to a new daemon.
+#[cfg(unix)]
+fn close_session_hosts(registry: &Registry, image: &Image) {
+    let (closed, left) = image
+        .session_hosts()
+        .close_all(registry, HOST_CLOSE_DEADLINE);
+    if closed > 0 {
+        eprintln!("remuda daemon: stop closed {closed} host-backed session(s)");
+    }
+    if !left.is_empty() {
+        eprintln!(
+            "remuda daemon: still closing at exit: {}; the next daemon finishes them",
+            left.join(", ")
+        );
+    }
+}
+
 /// Refuse new host-backed work and let admitted work finish (#758). Hosts are
 /// never stopped; what is still running at the deadline stays recoverable.
 #[cfg(unix)]
@@ -3264,6 +3286,7 @@ fn handle_shutdown(
         requester_session_id,
         requester_session_name,
         override_hosted,
+        keep_sessions,
     } = request
     else {
         unreachable!("handle_shutdown only accepts Shutdown requests");
@@ -3335,6 +3358,12 @@ fn handle_shutdown(
             // A session can request this shutdown as soon as its process starts. Let
             // every already-running New handler flush its response before the daemon exits.
             wait_for_new_requests();
+            #[cfg(windows)]
+            let _ = keep_sessions;
+            #[cfg(unix)]
+            if !keep_sessions {
+                close_session_hosts(registry, image);
+            }
             reap_processes_before_exit(image);
             anti_entropy.stop_and_join();
             socket_owner.cleanup();

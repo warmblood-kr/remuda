@@ -32,6 +32,7 @@ fn shutdown(socket: &Path) {
         requester_session_id: None,
         requester_session_name: None,
         override_hosted: true,
+        keep_sessions: false,
     };
     assert!(matches!(
         client::request(socket, &request),
