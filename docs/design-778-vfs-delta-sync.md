@@ -117,4 +117,4 @@ Owner decision: 7-day minimum and 30-day stale horizon, both configurable
 
 - Squashing old migration steps (#851), `remuda cluster leave` (#863), and
   an N/N+1 test of the VFS across `remuda reload`
-  (`n_plus_one_vfs_writes_survive_a_reload_to_n_and_back`).
+  (`vfs_writes_survive_a_reload_to_the_older_build_and_back`).

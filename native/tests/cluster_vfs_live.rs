@@ -777,12 +777,12 @@ fn previous() -> PathBuf {
     exe
 }
 
-/// Whether the previous build's `remuda vfs help` lists `verb`. Help runs
-/// without a daemon; a scratch home keeps it away from real state.
-fn previous_has_vfs_verb(verb: &str) -> bool {
-    let home = std::env::temp_dir().join(format!("cvp{}-{verb}", std::process::id()));
+/// The previous build's help for `args`. Help runs without a daemon; a
+/// scratch home keeps it away from real state.
+fn previous_help(args: &[&str]) -> String {
+    let home = std::env::temp_dir().join(format!("cvp{}-{}", std::process::id(), args.join("-")));
     let output = Command::new(previous())
-        .args(["vfs", "help"])
+        .args(args)
         .env("HOME", &home)
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_CONFIG_HOME", home.join("config"))
@@ -792,7 +792,12 @@ fn previous_has_vfs_verb(verb: &str) -> bool {
         .output()
         .unwrap();
     let _ = std::fs::remove_dir_all(&home);
-    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Whether the previous build's `remuda vfs help` lists `verb`.
+fn previous_has_vfs_verb(verb: &str) -> bool {
+    previous_help(&["vfs", "help"]).lines().any(|line| {
         line.trim_start()
             .strip_prefix(verb)
             .is_some_and(|rest| rest.starts_with(' '))
@@ -922,16 +927,28 @@ fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
     }
 }
 
+/// Whether N has index.db and `remuda reload`; skips the test if not.
+/// Before index.db, N reads index.json; vfs-compat-pre-sqlite covers that.
+fn previous_takes_a_vfs_reload() -> bool {
+    if !previous_has_vfs_verb("export-index") {
+        skip("N has no index.db");
+        return false;
+    }
+    if !previous_help(&["help"]).contains("remuda reload ") {
+        skip("N predates remuda reload (#793)");
+        return false;
+    }
+    true
+}
+
 /// A writer puts files while its daemon reloads into N and back (#778): every
 /// put that succeeded is in the index afterwards and reaches another node.
 /// N may refuse the handoff (another handoff version); that is allowed.
 #[test]
 #[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS; run by CI job host-compat-n-plus-one"]
-fn n_plus_one_vfs_writes_survive_a_reload_to_n_and_back() {
+fn vfs_writes_survive_a_reload_to_the_older_build_and_back() {
     let _serial = live_test_guard();
-    // Before index.db, N reads index.json; vfs-compat-pre-sqlite covers that.
-    if !previous_has_vfs_verb("export-index") {
-        skip("N has no index.db");
+    if !previous_takes_a_vfs_reload() {
         return;
     }
     let (a, b, _c) = three_nodes();
