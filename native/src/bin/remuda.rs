@@ -6502,7 +6502,13 @@ fn list_sessions(path: &Path) -> ExitCode {
         }
         Ok(Response::Sessions(sessions)) => {
             for s in sessions {
-                let state = if s.alive { "live" } else { "dead" };
+                let state = if s.unavailable {
+                    "unreachable"
+                } else if s.alive {
+                    "live"
+                } else {
+                    "dead"
+                };
                 let held = if s.attached { "attached" } else { "" };
                 println!(
                     "{:<20} {:>4}x{:<4} {:<5} idle {:<5} {held}",
@@ -7506,6 +7512,7 @@ mod cluster_call_tests {
             attached: false,
             human_idle: None,
             mouse_tracking: false,
+            unavailable: false,
         }]));
         let Response::Sessions(sessions) = sessions else {
             panic!("expected sanitized sessions");

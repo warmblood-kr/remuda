@@ -20,9 +20,9 @@
 //! `core/clippy.toml` denies outright.
 
 use crate::agent::{AgentError, Cursor, ExitInfo, Result, ScreenSnapshot, Size, StyledCell};
-use crate::input::{InputBatch, InputError, InputOutcome};
+use crate::input::{ExpectedInstanceInputError, InputBatch, InputError, InputOutcome};
 use crate::protocol::Step;
-use crate::session::Session;
+use crate::session::{InputSubmitOutcome, Session};
 use crate::session_operations::{Lifecycle, SessionHandle};
 use core::time::Duration;
 use serde::{Deserialize, Serialize};
@@ -93,6 +93,11 @@ pub struct SessionSummary {
     /// Defaulted for sessions listed by an older daemon.
     #[serde(default)]
     pub mouse_tracking: bool,
+    /// A host-backed session (#713) whose host did not answer: still
+    /// registered and not known to have exited, but every field above except
+    /// its names is unknown. Omitted when false; older listings parse.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub unavailable: bool,
 }
 
 /// A session name from a program's argv[0]: basename, lowercased, anything
@@ -386,6 +391,7 @@ impl Registry {
                 attached: s.is_attached(),
                 human_idle: s.human_idle_for(),
                 mouse_tracking: s.mouse_tracking(),
+                unavailable: false,
             })
             .collect();
         let hosted: Vec<_> = self.hosted_lock().values().map(Arc::clone).collect();
@@ -445,10 +451,9 @@ impl Registry {
             .collect()
     }
 
-    /// Drop host-backed sessions (#713) whose child has exited, with what the
-    /// host saw. Each host is asked outside the lock; an entry is removed
-    /// only if it is still the handle that was asked, so a concurrent close
-    /// or replacement keeps its own notice. An unreachable host is kept.
+    /// Drop host-backed sessions (#713) whose child exited, with what the host
+    /// saw. Hosts are asked outside the lock; only the handle asked is removed,
+    /// so a concurrent close keeps its notice. An unreachable host is kept.
     pub fn reap_hosted_with_exit_info(
         &self,
     ) -> Vec<(String, String, String, &'static str, Option<ExitInfo>)> {
@@ -527,8 +532,24 @@ impl Registry {
     }
 }
 
-/// One host Inspect cut. An unreachable host stays listed as not exited:
-/// the inventory says it is registered; its operations answer Unavailable.
+/// The pre-write checks a fenced input makes on a host-backed session: the
+/// handle is bound to one launch, so its identity is the instance to match.
+fn hosted_instance_ready(
+    handle: &SessionHandle,
+    expected_instance: &str,
+) -> core::result::Result<(), ExpectedInstanceInputError> {
+    if handle.identity().instance != expected_instance {
+        return Err(ExpectedInstanceInputError::WrongInstance);
+    }
+    match handle.inspect() {
+        Ok(observation) if observation.lifecycle == Lifecycle::Running => Ok(()),
+        _ => Err(ExpectedInstanceInputError::NotStarted),
+    }
+}
+
+/// One host Inspect cut. An unreachable host stays listed as not exited and
+/// marked `unavailable`: the inventory says it is registered; its operations
+/// answer Unavailable.
 fn hosted_summary(handle: &SessionHandle) -> SessionSummary {
     let identity = handle.identity();
     let mut summary = SessionSummary {
@@ -543,17 +564,20 @@ fn hosted_summary(handle: &SessionHandle) -> SessionSummary {
         attached: false,
         human_idle: None,
         mouse_tracking: false,
+        unavailable: false,
     };
-    if let Ok(observation) = handle.inspect() {
-        summary.output_version = observation.output_version;
-        summary.alive = observation.lifecycle == Lifecycle::Running;
-        summary.idle = observation.idle;
-        summary.output_idle = Some(observation.output_idle);
-        summary.size = observation.size;
-        summary.attached = observation.attached;
-        summary.human_idle = observation.human_idle;
-        summary.mouse_tracking = observation.mouse.mode != crate::agent::MouseMode::default();
-    }
+    let Ok(observation) = handle.inspect() else {
+        summary.unavailable = true;
+        return summary;
+    };
+    summary.output_version = observation.output_version;
+    summary.alive = observation.lifecycle == Lifecycle::Running;
+    summary.idle = observation.idle;
+    summary.output_idle = Some(observation.output_idle);
+    summary.size = observation.size;
+    summary.attached = observation.attached;
+    summary.human_idle = observation.human_idle;
+    summary.mouse_tracking = observation.mouse.mode != crate::agent::MouseMode::default();
     summary
 }
 
@@ -569,11 +593,84 @@ impl Registry {
     }
 
     pub fn clear_input(&self, name: &str, key: &[u8]) -> Option<Result<Option<String>>> {
-        self.route(name, |s| s.clear_input(key), |h| h.clear_input(key))
+        self.route(
+            name,
+            |s| s.clear_input(key),
+            // Checked here too, so a host-backed session refuses in the same words.
+            |h| {
+                crate::session::check_clear_key(key)?;
+                h.clear_input(key)
+            },
+        )
     }
 
     pub fn feed(&self, name: &str, steps: &[Step]) -> Option<Result<()>> {
         self.route(name, |s| s.feed(steps), |h| h.feed(steps))
+    }
+
+    /// Deliver text as one burst (bracketed paste when the child enabled it).
+    pub fn input_text(&self, name: &str, text: &str) -> Option<Result<()>> {
+        self.route(name, |s| s.input_text(text), |h| h.input_text(text))
+    }
+
+    /// Submit visible composer text that ends with `expect`.
+    pub fn submit(&self, name: &str, expect: &str) -> Option<Result<InputSubmitOutcome>> {
+        self.route(name, |s| s.submit(expect), |h| h.submit(expect))
+    }
+
+    /// Type text, wait `settle`, then submit it, as one act.
+    pub fn type_text(
+        &self,
+        name: &str,
+        text: &str,
+        settle: Duration,
+    ) -> Option<Result<InputSubmitOutcome>> {
+        self.route(
+            name,
+            |s| s.type_text(text, settle),
+            |h| h.type_text(text, settle),
+        )
+    }
+
+    /// `type_text` pinned to one launch; `None` when no session has `name`.
+    pub fn type_text_if_instance(
+        &self,
+        name: &str,
+        expected_instance: &str,
+        text: &str,
+        settle: Duration,
+    ) -> Option<core::result::Result<InputSubmitOutcome, ExpectedInstanceInputError>> {
+        if let Some(session) = self.get(name) {
+            return Some(session.type_text_if_instance(expected_instance, text, settle));
+        }
+        let handle = self.hosted(name)?;
+        Some(
+            hosted_instance_ready(&handle, expected_instance).and_then(|()| {
+                handle
+                    .type_text(text, settle)
+                    .map_err(|_| ExpectedInstanceInputError::OutcomeUncertain)
+            }),
+        )
+    }
+
+    /// Exactly these key bytes, pinned to one launch.
+    pub fn send_key_if_instance(
+        &self,
+        name: &str,
+        expected_instance: &str,
+        bytes: &[u8],
+    ) -> Option<core::result::Result<(), ExpectedInstanceInputError>> {
+        if let Some(session) = self.get(name) {
+            return Some(session.send_key_if_instance(expected_instance, bytes));
+        }
+        let handle = self.hosted(name)?;
+        Some(
+            hosted_instance_ready(&handle, expected_instance).and_then(|()| {
+                handle
+                    .send(bytes)
+                    .map_err(|_| ExpectedInstanceInputError::OutcomeUncertain)
+            }),
+        )
     }
 
     pub fn resize_instance(
@@ -640,8 +737,11 @@ impl Registry {
         name: &str,
         scrollback: usize,
     ) -> Option<Result<crate::agent::VersionedSnapshot>> {
-        self.get(name)
-            .map(|session| session.screen_snapshot_version_at(scrollback))
+        self.route(
+            name,
+            |session| session.screen_snapshot_version_at(scrollback),
+            |handle| handle.snapshot(scrollback),
+        )
     }
 
     pub fn cursor(&self, name: &str) -> Option<Result<Cursor>> {
