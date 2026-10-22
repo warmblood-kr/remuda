@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Unix: the socket lock file (`SOCKET.lock`) never reads empty or half
+  written while a daemon names itself in it, as at start or when a reload
+  hands it over. It now holds the pid padded with newlines to a fixed
+  width; readers that trim are unaffected.
+
 - VFS: `remuda vfs drain [--timeout SECS]` prepares a node to leave (#778).
   The nodes that will hold its files once it is gone are asked to take a
   copy, and drain waits until they confirm. Then it says to run `remuda
