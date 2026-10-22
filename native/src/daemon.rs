@@ -388,6 +388,11 @@ fn serve_from(
                 "remuda daemon: rediscovered session hosts: {}",
                 names.join(", ")
             );
+            for name in &names {
+                if let Some(handle) = registry.hosted(name) {
+                    watch_hosted_output(&image, &handle);
+                }
+            }
         }
         Ok(_) => {}
         Err(error) => eprintln!("remuda daemon: session host discovery failed: {error}"),
@@ -2057,13 +2062,9 @@ fn handle(
 /// answers them with a clear refusal instead of "no such session".
 fn local_only(request: &Request) -> Option<(&'static str, &str)> {
     match request {
-        Request::Sync { name, .. } => Some(("sync", name)),
         Request::MouseState { name } => Some(("mouse state", name)),
         Request::Attach { name } | Request::AttachTracked { name } => Some(("attach", name)),
         Request::AttachStatus { name, .. } => Some(("attach status", name)),
-        Request::Input { name, .. } | Request::InputLine { name, .. } => {
-            Some(("sequenced input", name))
-        }
         _ => None,
     }
 }
@@ -3098,7 +3099,17 @@ fn handle_sync(
     timeout_ms: u64,
 ) -> std::io::Result<()> {
     let Some(session) = registry.get(name) else {
-        return reply(stream, &Response::error(format!("no such session: {name}")));
+        return match registry.hosted(name) {
+            Some(handle) => sync_hosted(
+                stream,
+                registry,
+                &handle,
+                expected_instance,
+                since,
+                timeout_ms,
+            ),
+            None => reply(stream, &Response::error(format!("no such session: {name}"))),
+        };
     };
     if expected_instance
         .as_deref()
@@ -3137,6 +3148,77 @@ fn handle_sync(
             snapshot: StyledScreen {
                 rows,
                 bracketed_paste: session.mouse_state().bracketed_paste,
+                wrapped: versioned.snapshot.wrapped,
+                scrollback_len: versioned.snapshot.scrollback_len,
+                scrollback_total: versioned.snapshot.scrollback_total,
+                cursor: versioned.snapshot.cursor,
+            },
+        },
+    )
+}
+
+/// `Sync` for a host-backed session (#713): the same bounded wait and frame.
+/// A handle is bound to one launch, but its name can be closed and launched
+/// again mid-wait, so the expected instance is checked again afterwards.
+fn sync_hosted(
+    stream: &Stream,
+    registry: &Registry,
+    handle: &remuda_core::session_operations::SessionHandle,
+    expected_instance: Option<String>,
+    since: u64,
+    timeout_ms: u64,
+) -> std::io::Result<()> {
+    let instance_id = handle.identity().instance.clone();
+    if expected_instance
+        .as_deref()
+        .is_some_and(|expected| expected != instance_id)
+    {
+        return reply(stream, &Response::WrongInstance);
+    }
+    let _permit = match acquire_sync_permit() {
+        Ok(permit) => permit,
+        Err(response) => return reply(stream, &response),
+    };
+    let timeout = Duration::from_millis(remuda_core::sync::bounded_timeout_ms(timeout_ms));
+    let result = handle.wait_after(since, timeout);
+    // As in-process: a name closed (and perhaps relaunched) during the wait
+    // answers WrongInstance, not the old launch's exit or screen. The host
+    // stops with a closing child, which can wake this wait before or after
+    // the close stops tracking the handle, so the close itself is asked.
+    // A handle reaped after its child exited still answers that exit: an
+    // in-process wait wakes at the exit, before any reap.
+    if expected_instance.is_some() {
+        let name = &handle.identity().name;
+        let replaced = match registry.get(name) {
+            Some(session) => session.instance_id() != instance_id,
+            None => registry
+                .hosted(name)
+                .is_some_and(|current| current.identity().instance != instance_id),
+        };
+        if replaced || registry.hosted_closed(&instance_id) {
+            return reply(stream, &Response::WrongInstance);
+        }
+    }
+    let versioned = match result {
+        Ok(snapshot) => snapshot,
+        Err(error) => return reply(stream, &Response::error(error.to_string())),
+    };
+    let bracketed_paste = handle
+        .inspect()
+        .is_ok_and(|observation| observation.mouse.bracketed_paste);
+    reply(
+        stream,
+        &Response::Sync {
+            instance_id,
+            output_version: versioned.output_version.unwrap_or(0),
+            snapshot: StyledScreen {
+                rows: versioned
+                    .snapshot
+                    .cells
+                    .iter()
+                    .map(|row| collapse_runs(row))
+                    .collect(),
+                bracketed_paste,
                 wrapped: versioned.snapshot.wrapped,
                 scrollback_len: versioned.snapshot.scrollback_len,
                 scrollback_total: versioned.snapshot.scrollback_total,
@@ -3463,8 +3545,21 @@ struct NewSessionRequest {
     return_instance_id: bool,
 }
 
+/// Feed a host-backed session's output into the same `session_output` hook
+/// an in-process one uses (#713). A host that cannot be watched finishes the
+/// monitor at once, so an exit notice never waits for it.
+#[cfg(unix)]
+fn watch_hosted_output(image: &Image, handle: &remuda_core::session_operations::SessionHandle) {
+    let identity = handle.identity();
+    let notifier = image.session_output_notifier(&identity.name, &identity.id);
+    match handle.wakeup() {
+        Ok(Some(output)) => monitor_session_output(output, notifier),
+        _ => notifier.finish_monitor(),
+    }
+}
+
 /// Opt-in (#713): the session lives in a separate host process that
-/// survives this daemon. No output monitor: hosted wakeups are not wired yet.
+/// survives this daemon.
 #[cfg(unix)]
 fn handle_new_hosted(
     stream: &Stream,
@@ -3486,10 +3581,8 @@ fn handle_new_hosted(
     let Some(handle) = registry.hosted(request.name) else {
         return reply(stream, &Response::error("hosted session vanished"));
     };
+    watch_hosted_output(image, &handle);
     let identity = handle.identity();
-    image
-        .session_output_notifier(&identity.name, &identity.id)
-        .finish_monitor();
     let name = identity.name.clone();
     let response = if return_instance_id {
         Response::SessionStarted {
@@ -3673,16 +3766,23 @@ fn input(
         Ok(client_id) => client_id,
         Err(error) => return reply(stream, &Response::error(error)),
     };
-    let result = registry.apply_input_batch(
-        name,
-        remuda_core::input::InputBatch {
-            instance_id,
-            client_id,
-            seq,
-            bytes,
-        },
-    );
+    let batch = remuda_core::input::InputBatch {
+        instance_id,
+        client_id,
+        seq,
+        bytes,
+    };
+    let result = registry
+        .apply_input_batch(name, batch)
+        .or_else(|| registry.apply_hosted_input_batch(name, batch, false, input_clock()));
     reply_input_result(stream, name, result)
+}
+
+/// The rate-budget clock for host-backed sequenced input: one monotonic
+/// origin per daemon, as an in-process session's own clock would be.
+fn input_clock() -> Duration {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    ORIGIN.get_or_init(std::time::Instant::now).elapsed()
 }
 
 fn input_line(
@@ -3694,7 +3794,10 @@ fn input_line(
     if std::str::from_utf8(batch.bytes).is_err() {
         return reply(stream, &Response::error("input line must be UTF-8"));
     }
-    reply_input_result(stream, name, registry.apply_input_line_batch(name, batch))
+    let result = registry
+        .apply_input_line_batch(name, batch)
+        .or_else(|| registry.apply_hosted_input_batch(name, batch, true, input_clock()));
+    reply_input_result(stream, name, result)
 }
 
 fn reply_input_result(

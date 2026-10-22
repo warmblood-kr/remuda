@@ -349,6 +349,27 @@ impl HostSession {
     }
     /// No listener at the endpoint: the host process is gone. Any other
     /// failure (a slow or busy host) is not proof.
+    fn wait_for_frame(&self, version: u64, timeout: Duration) -> Result<VersionedSnapshot> {
+        let until = Instant::now() + timeout;
+        let mut client = self.viewer()?;
+        loop {
+            let view = self.capture(&mut client, 0)?;
+            if view.generation > version {
+                return Ok(self.versioned(view));
+            }
+            if !self.watch(&mut client, view.generation, until)? {
+                // As an in-process wait does: nothing new and the child gone
+                // is an exit, not a frame.
+                if matches!(
+                    SessionOperations::inspect(self)?.lifecycle,
+                    Lifecycle::Exited(_)
+                ) {
+                    return Err(Error::Agent(AgentError::Exited));
+                }
+                return Ok(self.versioned(view));
+            }
+        }
+    }
     fn host_gone(&self) -> bool {
         match std::os::unix::net::UnixStream::connect(self.endpoint.join("socket")) {
             Ok(_) => false,
@@ -705,20 +726,62 @@ impl SessionOperations for HostSession {
         Ok(self.versioned(self.capture(&mut client, offset)?))
     }
     fn wait_after(&self, version: u64, timeout: Duration) -> Result<VersionedSnapshot> {
-        let until = Instant::now() + timeout;
-        let mut client = self.viewer()?;
-        loop {
-            let view = self.capture(&mut client, 0)?;
-            if view.generation > version || !self.watch(&mut client, view.generation, until)? {
-                return Ok(self.versioned(view));
+        match self.wait_for_frame(version, timeout) {
+            // The child exited and the host stopped with it mid-wait: that is
+            // the exit an in-process wait reports, not a transport fault.
+            Err(Error::Unavailable(Unavailable::Transport)) if self.host_gone() => {
+                Err(Error::Agent(AgentError::Exited))
             }
+            result => result,
         }
     }
+    /// Output wakes from one persistent observer connection that polls the
+    /// host's output generation (Inspect carries it; no screen is copied).
+    /// The wake disconnects once the child stops running or the host goes.
     fn wakeup(&self) -> Result<Option<OutputWakeup>> {
-        Ok(None)
+        let client =
+            Client::open_observer(&self.endpoint, self.identity.clone()).map_err(opened)?;
+        let version = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (signal, wakeup) = OutputWakeup::pair(Arc::clone(&version));
+        std::thread::Builder::new()
+            .name("session-host-output".into())
+            .spawn(move || watch_generation(client, &signal, &version))
+            .map_err(|_| Error::Unavailable(Unavailable::Transport))?;
+        Ok(Some(wakeup))
     }
     fn attach(&self) -> Result<Box<dyn AttachmentOperations + '_>> {
         Err(Error::Unavailable(Unavailable::Unsupported))
+    }
+}
+/// Fastest and slowest generation polls: fast right after output, backing
+/// off while the session is quiet.
+const GENERATION_POLL: Duration = Duration::from_millis(50);
+const GENERATION_IDLE_POLL: Duration = Duration::from_millis(250);
+
+fn watch_generation(
+    mut client: Client,
+    signal: &remuda_core::agent::OutputSignal,
+    version: &std::sync::atomic::AtomicU64,
+) {
+    use std::sync::atomic::Ordering;
+    let mut poll = GENERATION_POLL;
+    while signal.is_connected() {
+        let Ok(Response::Info { info }) = client.request(&Request::Inspect) else {
+            return;
+        };
+        if info.generation > version.load(Ordering::Acquire) {
+            version.store(info.generation, Ordering::Release);
+            if !signal.wake() {
+                return;
+            }
+            poll = GENERATION_POLL;
+        } else {
+            poll = (poll * 2).min(GENERATION_IDLE_POLL);
+        }
+        if !matches!(info.lifecycle, HostLifecycle::Running) {
+            return;
+        }
+        std::thread::sleep(poll);
     }
 }
 fn pauses(act: &InputAct) -> u64 {

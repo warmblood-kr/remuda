@@ -565,6 +565,50 @@ fn n_plus_one_older_daemon_is_asked_to_reload() {
     check_leaves_the_session_alone(&previous(), this, this, false);
 }
 
+#[test]
+fn a_rediscovered_hosted_session_still_wakes_output_hooks() {
+    let root = Root::new();
+    let path = root.socket();
+    let first = Daemon::spawn(&root, true);
+    new_session(&path, "keeper");
+    wait_for(&path, "keeper", "$");
+    first.sigkill();
+
+    let _second = Daemon::spawn(&root, false);
+    let log = root.0.join("output.log");
+    let hook = format!(
+        "remuda.on('session_output', function(name) \
+           local f = assert(io.open('{}', 'a')); f:write(name, '\\n'); f:close() end, {{ group = 'test' }})",
+        log.display()
+    );
+    assert!(matches!(
+        request(
+            &path,
+            &Request::Eval {
+                code: hook,
+                name: None
+            }
+        ),
+        Response::Value(_)
+    ));
+    // Only output after the hook counts: clear what the catch-up wake wrote.
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = std::fs::remove_file(&log);
+    assert_eq!(
+        send_line(&path, "keeper", "echo AFTER:$((2+2))"),
+        Response::Ok
+    );
+    wait_for(&path, "keeper", "AFTER:4");
+    let deadline = Instant::now() + PATIENCE;
+    while !std::fs::read_to_string(&log).is_ok_and(|text| text.contains("keeper")) {
+        assert!(
+            Instant::now() < deadline,
+            "no session_output after rediscovery"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// `remuda upgrade`'s reload across N and N+1: the daemon moves onto the
 /// installed build, or keeps its own and says why; the session lives on.
 fn upgrade_across_builds(daemon_exe: &Path, installed: &Path) {

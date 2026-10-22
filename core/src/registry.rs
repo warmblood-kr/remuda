@@ -20,7 +20,10 @@
 //! `core/clippy.toml` denies outright.
 
 use crate::agent::{AgentError, Cursor, ExitInfo, Result, ScreenSnapshot, Size, StyledCell};
-use crate::input::{ExpectedInstanceInputError, InputBatch, InputError, InputOutcome};
+use crate::input::{
+    ExpectedInstanceInputError, InputBatch, InputDeduplicator, InputError, InputOutcome,
+    InputRateLimiter, MAX_INPUT_BYTES,
+};
 use crate::protocol::Step;
 use crate::session::{InputSubmitOutcome, Session};
 use crate::session_operations::{Lifecycle, SessionHandle};
@@ -123,6 +126,8 @@ pub fn slug(command: &str) -> String {
     }
 }
 
+const CLOSED_HOSTED_KEPT: usize = 256;
+
 #[derive(Default)]
 pub struct Registry {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -132,6 +137,20 @@ pub struct Registry {
     /// Host-backed launches (by instance id) a close has started ending, so a
     /// reaper that sees the child die first still reports "closed".
     closing_hosted: Mutex<std::collections::HashSet<String>>,
+    /// The latest host-backed launches a close ended, newest last and at most
+    /// [`CLOSED_HOSTED_KEPT`], so a Sync that woke as the host stopped can
+    /// tell a close from an exit after the handle is gone.
+    closed_hosted: Mutex<std::collections::VecDeque<String>>,
+    /// Sequenced-input state per host-backed launch, by instance id: the
+    /// duplicate memory and rate budget an in-process Session keeps itself.
+    /// Daemon memory only, so a daemon restart forgets it.
+    hosted_input: Mutex<HashMap<String, Arc<HostedInput>>>,
+}
+
+#[derive(Default)]
+struct HostedInput {
+    dedup: Mutex<InputDeduplicator>,
+    rate: Mutex<InputRateLimiter>,
 }
 
 impl Registry {
@@ -151,6 +170,82 @@ impl Registry {
     ) -> Option<core::result::Result<InputOutcome, InputError>> {
         self.get(name)
             .map(|session| session.apply_input_line_batch(batch))
+    }
+
+    /// `apply_input_batch` (or `apply_input_line_batch`) for a host-backed
+    /// session (#713): in-process checks here, the write as one host act; a
+    /// concurrent batch is told Busy. `None` when no hosted session has `name`.
+    pub fn apply_hosted_input_batch(
+        &self,
+        name: &str,
+        batch: InputBatch<'_>,
+        line: bool,
+        now: Duration,
+    ) -> Option<core::result::Result<InputOutcome, InputError>> {
+        let handle = self.hosted(name)?;
+        Some(self.apply_hosted_batch(&handle, batch, line, now))
+    }
+
+    fn apply_hosted_batch(
+        &self,
+        handle: &SessionHandle,
+        batch: InputBatch<'_>,
+        line: bool,
+        now: Duration,
+    ) -> core::result::Result<InputOutcome, InputError> {
+        let text = if line {
+            let bytes = batch.bytes.strip_suffix(b"\r").unwrap_or(batch.bytes);
+            Some(std::str::from_utf8(bytes).map_err(|_| InputError::Unavailable)?)
+        } else {
+            None
+        };
+        if batch.seq == 0 {
+            return Err(InputError::InvalidSequence);
+        }
+        if batch.bytes.is_empty() || batch.bytes.len() > MAX_INPUT_BYTES {
+            return Err(InputError::InvalidLength);
+        }
+        if batch.instance_id != handle.identity().instance {
+            return Ok(InputOutcome::WrongInstance);
+        }
+        match handle.inspect() {
+            Ok(observation) if observation.lifecycle == Lifecycle::Running => {}
+            Ok(_) => return Ok(InputOutcome::Exited),
+            Err(_) => return Err(InputError::Unavailable),
+        }
+        let state = Arc::clone(
+            self.hosted_input
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(handle.identity().instance.clone())
+                .or_default(),
+        );
+        let Ok(mut dedup) = state.dedup.try_lock() else {
+            return Err(InputError::Busy);
+        };
+        if dedup.lookup(batch.client_id, batch.seq).is_none() {
+            state
+                .rate
+                .lock()
+                .map_err(|_| InputError::Unavailable)?
+                .check_rate(now, batch.bytes.len())?;
+        }
+        Ok(dedup.apply(batch.client_id, batch.seq, || {
+            let written = match text {
+                Some(text) => {
+                    handle
+                        .type_text(text, Duration::ZERO)
+                        .and_then(|outcome| match outcome {
+                            crate::session::InputSubmitOutcome::Late => Err(
+                                crate::session_operations::Error::Agent(AgentError::SubmitPending),
+                            ),
+                            _ => Ok(()),
+                        })
+                }
+                None => handle.send(batch.bytes),
+            };
+            written.map_err(crate::session_operations::Error::into_agent)
+        }))
     }
 
     pub fn new() -> Self {
@@ -218,7 +313,18 @@ impl Registry {
 
     /// Stop tracking a host-backed session; its host is not touched.
     pub fn remove_hosted(&self, name: &str) -> Option<Arc<SessionHandle>> {
-        self.hosted_lock().remove(name)
+        let removed = self.hosted_lock().remove(name);
+        if let Some(handle) = &removed {
+            self.forget_hosted_input(handle);
+        }
+        removed
+    }
+
+    fn forget_hosted_input(&self, handle: &SessionHandle) {
+        self.hosted_input
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&handle.identity().instance);
     }
 
     /// A handle to a live session. Many callers may hold one at once: that is
@@ -493,7 +599,7 @@ impl Registry {
             })
             .collect();
         let mut hosted = self.hosted_lock();
-        exited
+        let reaped: Vec<_> = exited
             .into_iter()
             .filter_map(|(handle, closing, info)| {
                 let identity = handle.identity();
@@ -505,19 +611,42 @@ impl Registry {
                 }
                 hosted.remove(&identity.name);
                 let closed = self.closing_hosted_lock().remove(&identity.instance);
-                Some((
+                let reason = if closing || closed {
+                    "closed"
+                } else {
+                    "exited"
+                };
+                Some((handle, reason, info))
+            })
+            .collect();
+        drop(hosted);
+        reaped
+            .into_iter()
+            .map(|(handle, reason, info)| {
+                // Its sequenced-input memory goes with it, as on close.
+                self.forget_hosted_input(&handle);
+                let identity = handle.identity();
+                (
                     identity.name.clone(),
                     identity.id.clone(),
                     identity.instance.clone(),
-                    if closing || closed {
-                        "closed"
-                    } else {
-                        "exited"
-                    },
+                    reason,
                     info,
-                ))
+                )
             })
             .collect()
+    }
+
+    /// True once a close of the host-backed start `instance` has begun: from
+    /// before its child is ended, and for a while after the close finished.
+    pub fn hosted_closed(&self, instance: &str) -> bool {
+        self.closing_hosted_lock().contains(instance)
+            || self
+                .closed_hosted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|closed| closed == instance)
     }
 
     fn closing_hosted_lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
@@ -835,12 +964,21 @@ impl Registry {
                 .remove(&handle.identity().instance);
             return Some(Err(error.into_agent()));
         }
+        {
+            let mut closed = self.closed_hosted.lock().unwrap_or_else(|e| e.into_inner());
+            if closed.len() == CLOSED_HOSTED_KEPT {
+                closed.pop_front();
+            }
+            closed.push_back(handle.identity().instance.clone());
+        }
         let mut hosted = self.hosted_lock();
         let removed = hosted
             .get(name)
             .is_some_and(|current| Arc::ptr_eq(current, &handle));
         if removed {
             hosted.remove(name);
+            drop(hosted);
+            self.forget_hosted_input(&handle);
         }
         // Lock order: `hosted`, then `closing_hosted`, as in the reaper.
         self.closing_hosted_lock()
