@@ -104,7 +104,9 @@ fn cache(result: &Exit, status: portable_pty::ExitStatus) {
             None
         },
         signal,
-        signal_name: status.signal().map(str::to_owned),
+        // The same "SIGTERM" an in-process session reports, not the
+        // platform's description ("Terminated: 15").
+        signal_name: signal.and_then(crate::pty::signal_name),
     }));
     result.1.notify_all();
 }

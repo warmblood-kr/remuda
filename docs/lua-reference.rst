@@ -116,6 +116,11 @@ daemon
 
 ``table`` — Facts about the daemon this Lua image runs in.
 
+daemon.reloaded_from
+--------------------
+
+``daemon.reloaded_from() -> pid | nil`` — The pid of the daemon this one took over from in a `remuda reload`, or nil when it started fresh. That daemon may still be finishing its last requests for up to 10 s. A core without it lacks the field, so test remuda.daemon.reloaded_from first.
+
 daemon.socket_publication
 -------------------------
 

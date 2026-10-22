@@ -168,8 +168,24 @@ a daemon still running the old code, and the first request whose *shape* changed
 fails. Every command asks the daemon which build it is and prints one line when
 the answer is not its own — but a daemon started before that handshake existed
 cannot answer, so the client names the skew from its own side instead, on the
-request the old code could not read. Either way the cure is one verb, and it takes
-the herd with it:
+request the old code could not read.
+
+On Unix, `remuda upgrade` then reloads the daemon into the new build, and
+`remuda reload` does the same by hand. The running daemon hands its socket and
+its host-backed sessions to the new build, and those sessions keep running.
+If anything goes wrong before the new daemon serves, the old one takes them
+back. A reload refuses, and changes nothing, when it would lose a session:
+an in-process session, or a host the new build cannot drive. It also cannot
+move a daemon older than `remuda reload` itself.
+
+```sh
+remuda reload --check # would a reload keep every session? changes nothing
+remuda reload         # move the daemon onto this build
+remuda upgrade --no-reload   # install only; leave the daemon as it is
+```
+
+Where a reload cannot help (Windows, or the cases above), the cure is one verb,
+and it takes the herd with it:
 
 ```sh
 remuda stop           # names any live session and asks first; -f skips the ask

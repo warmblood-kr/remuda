@@ -5,6 +5,7 @@
 //! aborts (a check) or sends `Take` with its listener and socket lock, and C
 //! claims the hosts and serves in O's place.
 pub mod fds;
+pub mod upgrade;
 
 use crate::session_host::hosted::{Checked, CheckedState, Hosting};
 use serde::{Deserialize, Serialize};
@@ -21,8 +22,10 @@ use std::time::{Duration, Instant};
 pub const HANDOFF: u16 = 2;
 /// C's end of the socketpair.
 pub const CANDIDATE_FD: RawFd = 3;
-/// The hidden CLI verb that runs a candidate.
+/// The hidden CLI verb that runs a candidate. Every build's O sends it.
 pub const CANDIDATE_VERB: &str = "_reload-candidate";
+/// Names the socket of a candidate that re-executed itself as a daemon.
+pub const CANDIDATE_ENV: &str = "REMUDA_RELOAD_CANDIDATE";
 const FRAME_LIMIT: usize = 64 * 1024;
 const HELLO_DEADLINE: Duration = Duration::from_secs(10);
 const READY_DEADLINE: Duration = Duration::from_secs(30);
@@ -141,9 +144,16 @@ impl Default for Deadlines {
 }
 
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// Set once this daemon handed its endpoint over; it only exits after.
+static HANDED_OVER: AtomicBool = AtomicBool::new(false);
 struct InFlight;
 impl InFlight {
     fn take() -> Result<Self, String> {
+        // A request it accepted before pausing can still arrive in the
+        // answer window; another handover would give the socket away twice.
+        if HANDED_OVER.load(Ordering::SeqCst) {
+            return Err("this daemon already handed its socket to a new daemon and is exiting; run the command again to reach the new one".into());
+        }
         IN_FLIGHT
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .map(|_| Self)
@@ -168,6 +178,10 @@ impl Candidate {
     pub(crate) fn report(&self) -> &Report {
         &self.report
     }
+    /// Add blockers found outside the candidate, such as busy mods.
+    pub(crate) fn block(&mut self, reasons: Vec<String>) {
+        self.report.blockers.extend(reasons);
+    }
     /// Tell C to stop and reap it.
     pub(crate) fn abort(mut self) -> Report {
         let _ = write_frame(&mut self.stream, &FromOld::Abort);
@@ -187,14 +201,33 @@ impl Candidate {
         if outcome.is_err() {
             let _ = self.child.kill();
             let _ = self.child.wait();
+        } else {
+            HANDED_OVER.store(true, Ordering::SeqCst);
         }
         // On success C outlives this daemon; nobody reaps it here.
         outcome
     }
     fn hand_over(&mut self, listener: RawFd, lock: RawFd, until: Instant) -> Result<(), String> {
+        let fault = std::env::var(TEST_FAULT).ok();
+        // Tests: O dies just before or just after the handover.
+        if fault.as_deref() == Some("old-exits-before-take") {
+            std::process::exit(1);
+        }
         let bytes = frame(&FromOld::Take).map_err(|e| format!("take: {e}"))?;
-        fds::send(&self.stream, &bytes, &[listener, lock])
-            .map_err(|e| format!("could not hand over the listener: {e}"))?;
+        fds::send(&self.stream, &bytes, &[listener, lock]).map_err(|e| {
+            // C may exit right after its report, before reading `Take`.
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ) {
+                exited(&mut self.child, "take")
+            } else {
+                format!("could not hand over the listener: {e}")
+            }
+        })?;
+        if fault.as_deref() == Some("old-exits-after-take") {
+            std::process::exit(1);
+        }
         match read_frame(&mut self.stream, &mut self.child, until, "serving")? {
             FromCandidate::Serving => Ok(()),
             FromCandidate::Failed { reason } => {
@@ -353,6 +386,34 @@ fn reap(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Re-execute this candidate as `remuda -s NAME daemon`, so `ps` and
+/// `pkill` show the daemon it may become, not the verb. The pid, fd 3 and
+/// stdio stay. Returns only if exec failed; the caller then goes on as is.
+pub fn reexec_as_daemon(socket: &Path) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => return error,
+    };
+    let name = socket
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "default".into());
+    Command::new(exe)
+        .args(["-s", &name, "daemon"])
+        .env(CANDIDATE_ENV, socket)
+        .exec()
+}
+
+/// Whether fd 3 is a socket, as a daemon starting a candidate leaves it.
+/// A stray [`CANDIDATE_ENV`] without one must not write to whatever fd 3 is.
+pub fn handoff_fd_is_socket() -> bool {
+    // SAFETY: fstat only reads into a zeroed buffer.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::fstat(CANDIDATE_FD, &mut stat) } == 0;
+    ok && (stat.st_mode & libc::S_IFMT) == libc::S_IFSOCK
+}
+
 /// C's side: say hello, check every host read-only and report. Claims,
 /// binds and writes nothing unless O then sends `Take`.
 pub fn candidate(socket: &Path) -> Result<(), String> {
@@ -360,6 +421,14 @@ pub fn candidate(socket: &Path) -> Result<(), String> {
     let mut stream = unsafe { UnixStream::from_raw_fd(CANDIDATE_FD) };
     // Sessions this daemon starts must not inherit it.
     set_cloexec(CANDIDATE_FD).map_err(|e| format!("handoff fd: {e}"))?;
+    let fault = std::env::var(TEST_FAULT).ok();
+    // Tests: die at each step before the take.
+    let die_at = |step: &str| {
+        if fault.as_deref() == Some(step) {
+            std::process::exit(1);
+        }
+    };
+    die_at("exit-before-hello");
     write_frame(
         &mut stream,
         &FromCandidate::Hello {
@@ -368,6 +437,7 @@ pub fn candidate(socket: &Path) -> Result<(), String> {
         },
     )
     .map_err(|e| format!("hello: {e}"))?;
+    die_at("exit-in-preflight");
     let report = match Hosting::for_socket(socket).preflight() {
         Ok(checked) => FromCandidate::Ready {
             hosts: checked.into_iter().map(HostView::from).collect(),
@@ -377,6 +447,7 @@ pub fn candidate(socket: &Path) -> Result<(), String> {
         },
     };
     write_frame(&mut stream, &report).map_err(|e| format!("report: {e}"))?;
+    die_at("exit-after-ready");
     // Abort, or O gone: either way this candidate is done.
     match read_word(&stream) {
         Ok((FromOld::Take, fds)) => take(socket, stream, fds),
@@ -387,6 +458,9 @@ pub fn candidate(socket: &Path) -> Result<(), String> {
 /// Become the daemon: adopt O's listener and lock, claim the hosts, serve.
 /// Returns only if that fails before serving, after telling O why.
 fn take(socket: &Path, mut stream: UnixStream, fds: Vec<OwnedFd>) -> Result<(), String> {
+    // O started this process and is alive until we serve.
+    // SAFETY: getppid has no preconditions.
+    let _ = crate::daemon::RELOADED_FROM.set(unsafe { libc::getppid() } as u32);
     let error = match serve_taken(socket, &stream, fds) {
         Ok(()) => return Ok(()),
         Err(error) => error,
@@ -499,17 +573,22 @@ fn read_frame(
         {
             Err(format!("candidate sent no {awaited} in time"))
         }
-        Err(_) => {
-            reap(child);
-            let status = child
-                .try_wait()
-                .ok()
-                .flatten()
-                .map_or_else(|| "unknown status".into(), |status| status.to_string());
-            Err(format!("candidate exited before its {awaited} ({status})"))
-        }
+        Err(_) => Err(exited(child, awaited)),
     }
 }
+
+/// C closed its end: reap it and say what it was waited on for.
+fn exited(child: &mut Child, awaited: &str) -> String {
+    reap(child);
+    let status = child
+        .try_wait()
+        .ok()
+        .flatten()
+        .map_or_else(|| "unknown status".into(), |status| status.to_string());
+    format!("candidate exited before its {awaited} ({status})")
+}
+
+pub mod post_check;
 
 #[cfg(test)]
 mod tests {
