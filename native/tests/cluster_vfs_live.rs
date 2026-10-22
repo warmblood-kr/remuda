@@ -715,14 +715,24 @@ fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
         assert_eq!(kept_conflicts(node), 0);
     }
 
-    // Drain asks only peers that offer "take": the older node is named
-    // instead, and drain exits 75 while its file is short.
+    // Drain asks only peers that offer "take". CI's N is the PR base, so it
+    // may have drain too: then it takes the copy; otherwise it is named and
+    // drain exits 75 while its file is short.
     let body = body_moving(&[&a, &old, &c], 2, 1);
     put_one_copy(&c, "remuda:///mixed/leaving.txt", &body);
-    let drained = c.run(&["vfs", "drain", "--timeout", "3"]);
+    let help = successful(old.run(&["vfs", "help"]), "vfs help on N");
+    let old_takes = help
+        .lines()
+        .any(|line| line.trim_start().starts_with("drain "));
+    let timeout = if old_takes { "30" } else { "3" };
+    let drained = c.run(&["vfs", "drain", "--timeout", timeout]);
     let said = String::from_utf8_lossy(&drained.stderr);
-    assert_eq!(drained.status.code(), Some(75), "{said}");
-    assert!(said.contains("too old to take copies"), "{said}");
+    if old_takes {
+        assert_eq!(drained.status.code(), Some(0), "{said}");
+    } else {
+        assert_eq!(drained.status.code(), Some(75), "{said}");
+        assert!(said.contains("too old to take copies"), "{said}");
+    }
 
     // Deletes cross in both directions.
     successful(c.run(&["vfs", "rm", from_old]), "rm on N+1");
