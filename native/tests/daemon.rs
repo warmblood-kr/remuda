@@ -661,6 +661,7 @@ fn daemon_lock_file_is_private() {
                 requester_session_id: None,
                 requester_session_name: None,
                 override_hosted: false,
+                keep_sessions: false,
             },
         )
         .expect("request shutdown"),
@@ -1222,6 +1223,7 @@ fn concurrent_daemon_starts_serialize_stale_socket_replacement() {
                 requester_session_id: None,
                 requester_session_name: None,
                 override_hosted: false,
+                keep_sessions: false,
             },
         )
         .expect("stop winning daemon"),
@@ -1828,6 +1830,7 @@ fn session_identity_survives_as_a_new_value_after_daemon_restart_and_output_vers
             requester_session_id: None,
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         },
     )
     .expect("stop first daemon");
@@ -1847,6 +1850,7 @@ fn session_identity_survives_as_a_new_value_after_daemon_restart_and_output_vers
             requester_session_id: None,
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         },
     );
     assert!(
@@ -1889,6 +1893,7 @@ fn input_batches_acknowledge_duplicates_and_check_instance_before_deduplication(
             requester_session_id: None,
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         },
     );
     assert!(running.left_on_its_own(), "daemon should stop cleanly");
@@ -1993,6 +1998,7 @@ fn stalled_pty_write_times_out_without_blocking_reads_and_recovers() {
             requester_session_id: None,
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         },
     );
     assert!(
@@ -2882,6 +2888,7 @@ fn stop_daemon(runtime: &Path, socket: &Path, running: &mut spawn::Daemon) {
             requester_session_id: None,
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         },
     );
     assert!(
@@ -3019,6 +3026,7 @@ fn resizing_without_child_output_advances_the_output_version() {
             requester_session_id: None,
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         },
     )
     .expect("stop daemon");
@@ -6130,6 +6138,7 @@ fn assert_session_shutdown_identity_is_refused(path: &Path, daemon_id: u32) {
             requester_session_id: Some(session_id),
             requester_session_name: Some("inside".into()),
             override_hosted: false,
+            keep_sessions: false,
         },
     )
     .expect("raw shutdown response");
@@ -6144,6 +6153,7 @@ fn assert_session_shutdown_identity_is_refused(path: &Path, daemon_id: u32) {
             requester_session_id: Some("stale-session-id".into()),
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         },
     )
     .expect("stale identity response");
@@ -6232,6 +6242,7 @@ fn shutdown_uses_peer_ancestry_when_session_environment_is_stripped() {
             requester_session_id: None,
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         },
     )
     .expect("outside shutdown");
@@ -6256,6 +6267,7 @@ fn raw_shutdown_descendant_helper() {
             requester_session_id: None,
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         },
     )
     .expect("raw descendant shutdown response");
@@ -6277,6 +6289,7 @@ fn raw_shutdown_override_helper() {
             requester_session_id: None,
             requester_session_name: None,
             override_hosted: true,
+            keep_sessions: false,
         },
     )
     .expect("raw hosted override shutdown response");
@@ -6365,6 +6378,7 @@ fn a_session_can_stop_a_different_private_daemon() {
             requester_session_id: None,
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         },
     )
     .expect("stop session daemon");

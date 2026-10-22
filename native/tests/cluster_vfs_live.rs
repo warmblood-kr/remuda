@@ -140,6 +140,7 @@ impl Node {
                 requester_session_id: None,
                 requester_session_name: None,
                 override_hosted: false,
+                keep_sessions: false,
             },
         );
         let deadline = Instant::now() + Duration::from_secs(10);
