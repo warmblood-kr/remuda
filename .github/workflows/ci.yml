@@ -180,8 +180,17 @@ jobs:
           cargo build --manifest-path "$RUNNER_TEMP/old/Cargo.toml" --bins --target-dir "$RUNNER_TEMP/old-target"
           mkdir "$RUNNER_TEMP/n"
           cp "$RUNNER_TEMP/old-target/debug/remuda" "$RUNNER_TEMP/n/"
+          # Session hosting (#759) came later; its step skips an N without it.
+          host="$RUNNER_TEMP/old-target/debug/remuda-session-host"
+          if [ -f "$host" ]; then cp "$host" "$RUNNER_TEMP/n/"; fi
       - name: VFS and db N/N+1 against a week-old N
         run: REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test cluster_vfs_live --test db_cli_live -- --ignored
+      - name: Session host N/N+1 against a week-old N
+        run: |
+          if [ ! -f "$RUNNER_TEMP/n/remuda-session-host" ]; then
+            echo "skipped: N has no remuda-session-host"; exit 0
+          fi
+          REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test session_host_daemon -- --ignored n_plus_one
 
   vfs-compat-pre-sqlite:
     # Nodes from before index.db (#778) still run in clusters. Two daemons of
