@@ -9,7 +9,7 @@ use crate::net::cluster_client::{ClientTimeouts, ClusterClient};
 use base64::Engine;
 use remuda_core::protocol::{Request, Response};
 use remuda_core::vfs::{self as rules, VfsEntry};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -30,13 +30,21 @@ fn b64() -> base64::engine::GeneralPurpose {
 // ---------------------------------------------------------------------------
 // Serving peers (called by the cluster listener for an admitted peer).
 
-/// Answer one VFS request from an authenticated, admitted peer.
-pub fn serve(request: &Request) -> Response {
+/// Answer one VFS request from the authenticated, admitted peer `peer_fp`.
+pub fn serve(peer_fp: &str, request: &Request) -> Response {
     let store = match VfsStore::open_default() {
         Ok(store) => store,
         Err(error) => return Response::error(error.reason()),
     };
-    match serve_with(&store, request) {
+    let answered = match request {
+        Request::ClusterVfsChanges {
+            index_id,
+            since,
+            limit,
+        } => serve_changes(&store, peer_fp, index_id.as_deref(), *since, *limit),
+        request => serve_with(&store, request),
+    };
+    match answered {
         Ok(response) => {
             // New names may place a copy here: fetch it now rather than at
             // the next anti-entropy tick.
@@ -47,6 +55,36 @@ pub fn serve(request: &Request) -> Response {
         }
         Err(error) => Response::error(error.reason()),
     }
+}
+
+/// `ClusterVfsChanges`: rows after the caller's cursor. The cursor also
+/// tells us the caller holds every change of ours up to `since`.
+pub fn serve_changes(
+    store: &VfsStore,
+    peer_fp: &str,
+    index_id: Option<&str>,
+    since: u64,
+    limit: u32,
+) -> VfsResult<Response> {
+    let mut page = store.changes(
+        index_id,
+        since,
+        (limit as usize).clamp(1, INDEX_PAGE_ENTRIES),
+    )?;
+    // Keep a page under the frame byte cap: ask again for half as many rows.
+    while page.entries.len() > 1 && !batch_fits(&page.entries.iter().collect::<Vec<_>>()) {
+        page = store.changes(index_id, since, page.entries.len() / 2)?;
+    }
+    if !page.reset && index_id.is_some() {
+        store.record_ack(peer_fp, since);
+    }
+    Ok(Response::ClusterVfsChangesPage {
+        index_id: page.index_id,
+        entries_json: serde_json::to_string(&page.entries).map_err(std::io::Error::other)?,
+        last_seq: page.last_seq,
+        more: page.more,
+        reset: page.reset,
+    })
 }
 
 pub fn serve_with(store: &VfsStore, request: &Request) -> VfsResult<Response> {
@@ -340,6 +378,91 @@ fn batch_entries(entries: &[VfsEntry]) -> Vec<String> {
     batches
 }
 
+/// Peers that did not answer `ClusterVfsChanges` (older builds), and when.
+/// They get the digest pull, and are asked again after `LEGACY_RETRY`.
+static LEGACY_PEERS: std::sync::Mutex<BTreeMap<String, Instant>> =
+    std::sync::Mutex::new(BTreeMap::new());
+const LEGACY_RETRY: Duration = Duration::from_secs(3600);
+
+/// Pull what `peer` changed since our cursor; fall back to the whole-index
+/// digest pull for a peer that does not know change cursors.
+fn pull(store: &VfsStore, peer: &str) -> Result<usize, String> {
+    let legacy = LEGACY_PEERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(peer)
+        .is_some_and(|since| since.elapsed() < LEGACY_RETRY);
+    if legacy {
+        return pull_index(store, peer);
+    }
+    match pull_changes(store, peer, &mut |request| request_peer(peer, request)) {
+        Ok(Some(merged)) => Ok(merged),
+        Ok(None) | Err(_) => {
+            let merged = pull_index(store, peer)?;
+            LEGACY_PEERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(peer.to_owned(), Instant::now());
+            Ok(merged)
+        }
+    }
+}
+
+/// Page through `peer`'s changes after our cursor, merging each page with
+/// its cursor in one transaction. `Ok(None)`: the peer does not speak it.
+pub fn pull_changes(
+    store: &VfsStore,
+    peer: &str,
+    fetch: &mut dyn FnMut(&Request) -> Result<Response, String>,
+) -> Result<Option<usize>, String> {
+    let mut merged = 0;
+    let mut resets = 0;
+    for _ in 0..(super::vfs::MAX_INDEX_ENTRIES / INDEX_PAGE_ENTRIES + 4) {
+        let (index_id, since) = store.cursor(peer).map_err(|e| e.to_string())?;
+        let response = fetch(&Request::ClusterVfsChanges {
+            index_id,
+            since,
+            limit: INDEX_PAGE_ENTRIES as u32,
+        })?;
+        let Response::ClusterVfsChangesPage {
+            index_id,
+            entries_json,
+            last_seq,
+            more,
+            reset,
+        } = response
+        else {
+            return Ok(None);
+        };
+        if reset {
+            resets += 1;
+            if resets > 1 {
+                return Err("peer reset the change cursor twice".into());
+            }
+            store.reset_cursor(peer).map_err(|e| e.to_string())?;
+            continue;
+        }
+        let entries: Vec<VfsEntry> =
+            serde_json::from_str(&entries_json).map_err(|_| "bad changes page".to_owned())?;
+        let page = super::vfs_index_db::ChangesPage {
+            index_id,
+            entries,
+            last_seq,
+            more,
+            reset,
+        };
+        merged += store
+            .merge_page(peer, &page)
+            .map_err(|e| e.to_string())?
+            .changed
+            .len();
+        if !more {
+            return Ok(Some(merged));
+        }
+    }
+    Err("peer change pages did not end".into())
+}
+
 /// Pull one peer's whole index and merge it. Returns how many entries changed.
 fn pull_index(store: &VfsStore, peer_fp: &str) -> Result<usize, String> {
     let known = store
@@ -547,7 +670,7 @@ pub fn sync_once() -> SyncReport {
         return report;
     }
     for peer in &members.reachable {
-        match pull_index(&store, peer) {
+        match pull(&store, peer) {
             Ok(merged) => {
                 report.peers_reached += 1;
                 report.entries_merged += merged;
@@ -663,6 +786,8 @@ mod tests {
             writer: "SHA256:w".into(),
             deleted: false,
             mtime: 0,
+            vv: Default::default(),
+            conflicts: Vec::new(),
         }
     }
 
@@ -949,5 +1074,151 @@ mod tests {
             .map(|batch| serde_json::from_str::<Vec<VfsEntry>>(batch).unwrap().len())
             .sum();
         assert_eq!(total, 200);
+    }
+
+    /// `fetch` that answers from `server` in this process, counting requests.
+    fn via<'a>(
+        server: &'a VfsStore,
+        calls: &'a std::cell::Cell<usize>,
+    ) -> impl FnMut(&Request) -> Result<Response, String> + 'a {
+        move |request| {
+            calls.set(calls.get() + 1);
+            let Request::ClusterVfsChanges {
+                index_id,
+                since,
+                limit,
+            } = request
+            else {
+                return Err("unexpected request".into());
+            };
+            serve_changes(server, "SHA256:client", index_id.as_deref(), *since, *limit)
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    fn pull_from(client: &VfsStore, server: &VfsStore, peer: &str) -> (usize, usize) {
+        let calls = std::cell::Cell::new(0);
+        let merged = pull_changes(client, peer, &mut via(server, &calls))
+            .unwrap()
+            .unwrap();
+        (merged, calls.get())
+    }
+
+    #[test]
+    fn an_unchanged_peer_costs_one_request_and_one_put_moves_one_row() {
+        let (_a, server) = scratch_store();
+        let (_b, client) = scratch_store();
+        let rows: Vec<VfsEntry> = (0..9_999)
+            .map(|i| entry(&format!("d{}/f{i:05}", i % 50), &format!("{i:064x}")))
+            .collect();
+        server.merge_entries(rows).unwrap();
+        let (merged, calls) = pull_from(&client, &server, "SHA256:server");
+        assert_eq!(merged, 9_999);
+        assert!(calls >= 9_999 / INDEX_PAGE_ENTRIES, "{calls} pages");
+        assert_eq!(client.load_index().unwrap(), server.load_index().unwrap());
+
+        assert_eq!(pull_from(&client, &server, "SHA256:server"), (0, 1));
+        server.put("new.txt", b"new", 2, "SHA256:server").unwrap();
+        assert_eq!(pull_from(&client, &server, "SHA256:server"), (1, 1));
+        server.delete("new.txt", "SHA256:server").unwrap();
+        assert_eq!(pull_from(&client, &server, "SHA256:server"), (1, 1));
+        assert!(client.load_index().unwrap().entries["new.txt"].deleted);
+    }
+
+    #[test]
+    fn merged_rows_relay_to_a_peer_that_never_talks_to_the_writer() {
+        let (_a, a) = scratch_store();
+        let (_b, b) = scratch_store();
+        let (_c, c) = scratch_store();
+        a.put("from-a.txt", b"a", 2, "SHA256:a").unwrap();
+        pull_from(&b, &a, "SHA256:a");
+        assert_eq!(pull_from(&c, &b, "SHA256:b").0, 1);
+        assert!(c.load_index().unwrap().live("from-a.txt").is_some());
+    }
+
+    #[test]
+    fn concurrent_writes_end_as_one_winner_and_one_conflict_on_every_node() {
+        let (_a, a) = scratch_store();
+        let (_b, b) = scratch_store();
+        let (_c, c) = scratch_store();
+        a.put("same.txt", b"from a", 2, "SHA256:a").unwrap();
+        b.put("same.txt", b"from b", 2, "SHA256:b").unwrap();
+        pull_from(&a, &b, "SHA256:b");
+        pull_from(&b, &a, "SHA256:a");
+        // C only talks to B, and still learns about the conflict.
+        pull_from(&c, &b, "SHA256:b");
+        let entries: Vec<VfsEntry> = [&a, &b, &c]
+            .iter()
+            .map(|store| store.load_index().unwrap().entries["same.txt"].clone())
+            .collect();
+        assert_eq!(entries[0], entries[1]);
+        assert_eq!(entries[1], entries[2]);
+        assert_eq!(
+            entries[0].writer, "SHA256:b",
+            "the usual tie-break still wins"
+        );
+        assert_eq!(entries[0].conflicts.len(), 1);
+        assert_eq!(entries[0].conflicts[0].writer, "SHA256:a");
+        // Pulling again changes nothing anywhere.
+        assert_eq!(pull_from(&a, &b, "SHA256:b").0, 0);
+        assert_eq!(pull_from(&c, &b, "SHA256:b").0, 0);
+    }
+
+    #[test]
+    fn a_recreated_peer_index_resets_the_cursor_and_is_pulled_whole() {
+        let (_a, server) = scratch_store();
+        let (_b, client) = scratch_store();
+        server.put("one.txt", b"1", 2, "SHA256:s").unwrap();
+        pull_from(&client, &server, "SHA256:server");
+        // The peer loses its index and starts again with a new index id.
+        let (_c, fresh) = scratch_store();
+        fresh.put("two.txt", b"2", 2, "SHA256:s").unwrap();
+        let (merged, calls) = pull_from(&client, &fresh, "SHA256:server");
+        assert_eq!((merged, calls), (1, 2), "one reset, then the whole index");
+        let index = client.load_index().unwrap();
+        assert!(index.live("one.txt").is_some() && index.live("two.txt").is_some());
+    }
+
+    #[test]
+    fn a_page_that_fails_to_merge_leaves_the_cursor_on_the_last_good_page() {
+        let (_a, server) = scratch_store();
+        let (_b, client) = scratch_store();
+        let rows: Vec<VfsEntry> = (0..600)
+            .map(|i| entry(&format!("f{i:04}"), &format!("{i:064x}")))
+            .collect();
+        server.merge_entries(rows).unwrap();
+        let mut pages = 0;
+        let calls = std::cell::Cell::new(0);
+        let mut inner = via(&server, &calls);
+        let error = pull_changes(&client, "SHA256:server", &mut |request| {
+            pages += 1;
+            let mut response = inner(request)?;
+            if pages == 2 {
+                if let Response::ClusterVfsChangesPage { entries_json, .. } = &mut response {
+                    *entries_json = "not json".into();
+                }
+            }
+            Ok(response)
+        })
+        .unwrap_err();
+        assert_eq!(error, "bad changes page");
+        let (_, cursor) = client.cursor("SHA256:server").unwrap();
+        assert_eq!(
+            client.load_index().unwrap().entries.len(),
+            INDEX_PAGE_ENTRIES
+        );
+        assert!(cursor > 0);
+        // The next pull continues from there and ends with every row.
+        pull_from(&client, &server, "SHA256:server");
+        assert_eq!(client.load_index().unwrap(), server.load_index().unwrap());
+    }
+
+    #[test]
+    fn a_peer_that_does_not_know_change_cursors_is_reported_for_fallback() {
+        let (_b, client) = scratch_store();
+        let answer = pull_changes(&client, "SHA256:old", &mut |_| {
+            Ok(Response::error("invalid cluster request"))
+        });
+        assert_eq!(answer, Ok(None));
     }
 }

@@ -171,6 +171,10 @@ impl Candidate {
     pub(crate) fn report(&self) -> &Report {
         &self.report
     }
+    /// Add blockers found outside the candidate, such as busy mods.
+    pub(crate) fn block(&mut self, reasons: Vec<String>) {
+        self.report.blockers.extend(reasons);
+    }
     /// Tell C to stop and reap it.
     pub(crate) fn abort(mut self) -> Report {
         let _ = write_frame(&mut self.stream, &FromOld::Abort);
@@ -544,6 +548,8 @@ fn read_frame(
         }
     }
 }
+
+pub mod post_check;
 
 #[cfg(test)]
 mod tests {
