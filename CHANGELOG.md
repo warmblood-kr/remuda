@@ -9,6 +9,15 @@
   limited. Input contents are never recorded. The log keeps the last 10,000
   entries and is not replicated. Before, peer actions left no record.
 
+- Lua: a mod can squash its database migrations (#778). One
+  `NNNN_name.base.sql` holds the whole schema as of step NNNN, so the step
+  files up to it can be deleted and the mod stays within its 64 assets. A
+  new database runs the base, then the later steps; an existing one at
+  NNNN or later upgrades as before. One below NNNN fails with `squashed:`
+  and needs an older release of the mod first, unless the mod keeps the
+  step files from there. Older remuda builds refuse a database created from
+  a base without changing it.
+
 - Unix: the socket lock file (`SOCKET.lock`) never reads empty or half
   written while a daemon names itself in it, as at start or when a reload
   hands it over. It now holds the pid padded with newlines to a fixed
