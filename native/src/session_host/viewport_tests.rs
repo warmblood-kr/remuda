@@ -136,3 +136,78 @@ fn fixed_combining_text_retention_is_an_explicit_rendering_profile() {
     assert_eq!(view.cells[0][1].text, " ");
     view.validate().unwrap();
 }
+
+#[test]
+fn a_plain_viewport_stays_within_the_history_older_daemons_accept() {
+    let mut terminal = Terminal::new(3, 8, crate::session_host::terminal::HISTORY_ROWS).unwrap();
+    let lines: String = (0..2500).map(|n| format!("{n}\r\n")).collect();
+    feed(&mut terminal, lines.as_bytes());
+    let deep = terminal.viewport(2000);
+    assert!(deep.history_len >= 2400, "{}", deep.history_len);
+    assert_eq!(deep.offset, 2000);
+    deep.validate().unwrap();
+    let legacy = terminal.viewport(2000).within_legacy_history();
+    assert_eq!(legacy.history_len, 1000);
+    assert!(legacy.offset <= 1000);
+    legacy.validate().unwrap();
+}
+
+#[test]
+fn the_compact_form_round_trips_every_cell_and_is_a_fraction_of_the_size() {
+    let mut terminal = Terminal::new(24, 80, 10).unwrap();
+    feed(
+        &mut terminal,
+        "\x1b[31;1m界e\u{301}\x1b[0mabcdef\x1b[44m blue \x1b[0m\r\n\x1b[7minv\x1b[0m 한글 text\x1b[?2004h"
+            .as_bytes(),
+    );
+    let lines: String = (0..30)
+        .map(|n| format!("line {n} {}\r\n", "x".repeat(60)))
+        .collect();
+    feed(&mut terminal, lines.as_bytes());
+    let view = terminal.viewport(5);
+    let full = view.encode().unwrap();
+    let compact = view.encode_compact().unwrap();
+    assert!(
+        compact.len() * 10 < full.len(),
+        "{} vs {}",
+        compact.len(),
+        full.len()
+    );
+    let back = Viewport::decode(&compact).unwrap();
+    back.validate().unwrap();
+    assert_eq!(back.cells, view.cells);
+    assert_eq!(back.wrapped, view.wrapped);
+    assert_eq!(back.cursor, view.cursor);
+    assert_eq!(back.modes, view.modes);
+    assert_eq!(
+        (
+            back.generation,
+            back.offset,
+            back.history_len,
+            back.history_total
+        ),
+        (
+            view.generation,
+            view.offset,
+            view.history_len,
+            view.history_total
+        )
+    );
+    // The full form still decodes, for hosts without compact-view-v1.
+    assert_eq!(Viewport::decode(&full).unwrap().cells, view.cells);
+}
+
+#[test]
+fn a_compact_row_longer_than_the_screen_is_refused_before_expanding() {
+    let view = terminal_view(Terminal::new(3, 8, 10).unwrap());
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&view.encode_compact().unwrap()).unwrap();
+    value["runs"][0] = serde_json::json!([{ "c": vec!["x"; 9] }]);
+    assert!(Viewport::decode(&serde_json::to_vec(&value).unwrap()).is_err());
+    value["runs"][0] = serde_json::json!([{ "c": vec!["x"; 8], "blink": true }]);
+    assert!(Viewport::decode(&serde_json::to_vec(&value).unwrap()).is_err());
+}
+
+fn terminal_view(mut terminal: Terminal) -> Viewport {
+    terminal.viewport(0)
+}

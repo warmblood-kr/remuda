@@ -5,6 +5,7 @@
 //! aborts (a check) or sends `Take` with its listener and socket lock, and C
 //! claims the hosts and serves in O's place.
 pub mod fds;
+pub mod upgrade;
 
 use crate::session_host::hosted::{Checked, CheckedState, Hosting};
 use serde::{Deserialize, Serialize};
@@ -21,8 +22,10 @@ use std::time::{Duration, Instant};
 pub const HANDOFF: u16 = 2;
 /// C's end of the socketpair.
 pub const CANDIDATE_FD: RawFd = 3;
-/// The hidden CLI verb that runs a candidate.
+/// The hidden CLI verb that runs a candidate. Every build's O sends it.
 pub const CANDIDATE_VERB: &str = "_reload-candidate";
+/// Names the socket of a candidate that re-executed itself as a daemon.
+pub const CANDIDATE_ENV: &str = "REMUDA_RELOAD_CANDIDATE";
 const FRAME_LIMIT: usize = 64 * 1024;
 const HELLO_DEADLINE: Duration = Duration::from_secs(10);
 const READY_DEADLINE: Duration = Duration::from_secs(30);
@@ -167,6 +170,10 @@ pub(crate) struct Candidate {
 impl Candidate {
     pub(crate) fn report(&self) -> &Report {
         &self.report
+    }
+    /// Add blockers found outside the candidate, such as busy mods.
+    pub(crate) fn block(&mut self, reasons: Vec<String>) {
+        self.report.blockers.extend(reasons);
     }
     /// Tell C to stop and reap it.
     pub(crate) fn abort(mut self) -> Report {
@@ -353,6 +360,34 @@ fn reap(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Re-execute this candidate as `remuda -s NAME daemon`, so `ps` and
+/// `pkill` show the daemon it may become, not the verb. The pid, fd 3 and
+/// stdio stay. Returns only if exec failed; the caller then goes on as is.
+pub fn reexec_as_daemon(socket: &Path) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => return error,
+    };
+    let name = socket
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "default".into());
+    Command::new(exe)
+        .args(["-s", &name, "daemon"])
+        .env(CANDIDATE_ENV, socket)
+        .exec()
+}
+
+/// Whether fd 3 is a socket, as a daemon starting a candidate leaves it.
+/// A stray [`CANDIDATE_ENV`] without one must not write to whatever fd 3 is.
+pub fn handoff_fd_is_socket() -> bool {
+    // SAFETY: fstat only reads into a zeroed buffer.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::fstat(CANDIDATE_FD, &mut stat) } == 0;
+    ok && (stat.st_mode & libc::S_IFMT) == libc::S_IFSOCK
+}
+
 /// C's side: say hello, check every host read-only and report. Claims,
 /// binds and writes nothing unless O then sends `Take`.
 pub fn candidate(socket: &Path) -> Result<(), String> {
@@ -387,6 +422,9 @@ pub fn candidate(socket: &Path) -> Result<(), String> {
 /// Become the daemon: adopt O's listener and lock, claim the hosts, serve.
 /// Returns only if that fails before serving, after telling O why.
 fn take(socket: &Path, mut stream: UnixStream, fds: Vec<OwnedFd>) -> Result<(), String> {
+    // O started this process and is alive until we serve.
+    // SAFETY: getppid has no preconditions.
+    let _ = crate::daemon::RELOADED_FROM.set(unsafe { libc::getppid() } as u32);
     let error = match serve_taken(socket, &stream, fds) {
         Ok(()) => return Ok(()),
         Err(error) => error,
@@ -510,6 +548,8 @@ fn read_frame(
         }
     }
 }
+
+pub mod post_check;
 
 #[cfg(test)]
 mod tests {
