@@ -607,7 +607,8 @@ fn leave_is_revoked_by_a_peer_and_rejoins_with_an_empty_store() {
     assert!(said.contains("revoked this node"), "{said}");
     assert!(b.has_blob(&sha));
     let state = c.root.join("state/remuda");
-    assert!(!state.join("cluster").exists());
+    let back = walk(&state.join("cluster"));
+    assert!(back.is_empty(), "cluster folder came back: {back:?}");
     let left = std::fs::read_dir(&state)
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -653,6 +654,23 @@ fn leave_is_revoked_by_a_peer_and_rejoins_with_an_empty_store() {
             "gone.txt came back"
         );
     }
+}
+
+/// Every path under `dir`, `dir` included; empty if it does not exist.
+fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    let mut out = vec![dir.to_path_buf()];
+    for entry in read {
+        let p = entry.unwrap().path();
+        if p.is_dir() {
+            out.extend(walk(&p))
+        } else {
+            out.push(p)
+        }
+    }
+    out
 }
 
 /// Whether `node`'s registry lists `fingerprint` as revoked.

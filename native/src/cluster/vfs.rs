@@ -410,7 +410,20 @@ impl VfsStore {
 
     /// Open the index database (see `vfs_index_db`).
     fn index_db(&self) -> VfsResult<rusqlite::Connection> {
+        self.still_here()?;
         vfs_index_db::open(&self.root)
+    }
+
+    /// Refuse once `cluster leave` moved the store away, so a pass that
+    /// opened it before never writes a new one in its place.
+    fn still_here(&self) -> VfsResult<()> {
+        if self.root.is_dir() {
+            return Ok(());
+        }
+        Err(VfsError::new(
+            VfsErrorKind::NoCluster,
+            "this node left its cluster; run `remuda cluster init` or `remuda cluster join`",
+        ))
     }
 
     pub fn load_index(&self) -> VfsResult<VfsIndex> {
@@ -720,6 +733,7 @@ impl VfsStore {
         let intact = fs::metadata(&path)
             .is_ok_and(|metadata| metadata.is_file() && metadata.len() == bytes.len() as u64);
         if !intact {
+            self.still_here()?;
             if let Some(parent) = path.parent() {
                 storage::create_private_directory(parent)?;
             }
@@ -853,6 +867,7 @@ impl VfsStore {
     /// once this node leaves their placement (design step 6).
     pub fn mark_stand_in(&self, sha256: &str) -> VfsResult<()> {
         let path = self.stand_in_path(sha256)?;
+        self.still_here()?;
         fs::create_dir_all(self.root.join("stand-ins"))?;
         fs::write(path, b"")?;
         Ok(())
