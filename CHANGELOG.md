@@ -7,18 +7,22 @@
   restart is moving this session; try again)". The text before the
   bracket is unchanged.
 
+- Cluster: `remuda cluster remote NODE` now opens NODE's own session screen,
+  the same screen plain `remuda` shows there: its session list on the left
+  and the selected session on the right. Press `m` to write a line for the
+  selected session and Enter to send it whole; `x` closes a session (bound
+  to the instance you saw). Live keys to a remote session are not available
+  yet. The peer is read on a background thread, so a slow or unreachable
+  node never freezes the screen; the footer says `stale Ns` when its screen
+  may be out of date. `cluster remote` with no node, or `NODE/SESSION`,
+  still opens the cluster tree. Naming this machine opens the local screen.
+  A full fingerprint that contains `/` is read as a node.
+
 - `remuda reload` (Unix): the post-check no longer says every session moved
   when a session's host had already died. It names the session ("unreachable
   before the reload too") and does not fail; a host lost during the reload
   still fails it. New tests cover input typed during a reload and the
   cluster listener following the serving daemon.
-
-- Cluster: `remuda cluster remote NODE` now opens that node's session picker,
-  as plain `remuda` does on the node itself: the node's group is expanded and
-  its first live session is highlighted; Enter opens it. Before, a target
-  without `/session` failed with "target must be node/session".
-  `NODE/SESSION` still opens the session directly. A full fingerprint that
-  contains `/` is read as a node.
 
 - Cluster: each node now keeps a local audit log of what peers asked it to
   do, in `cluster/audit.jsonl` in the private cluster state directory. Each
