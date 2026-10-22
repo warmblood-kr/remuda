@@ -7,6 +7,13 @@
   handover could start a second one, giving the socket to two new daemons.
   It now refuses and points to the new daemon.
 
+- After `remuda reload` (Unix), the old daemon ends what `remuda stop` ends,
+  except the sessions and the socket. A deferred reply still waiting is told
+  the daemon reloaded and to run the command again, instead of the daemon
+  hanging up on it. Processes its Lua started are killed instead of running
+  on beside the new daemon's, and modules are stopped. `docs/reload.md` says
+  what a reload keeps and what starts fresh.
+
 - VFS: only the daemon that serves the socket writes the index, also during
   `remuda reload` (#778, #713). The new daemon claims `index.db` just
   before it serves; a rollback gives it back to the old daemon. A write on
