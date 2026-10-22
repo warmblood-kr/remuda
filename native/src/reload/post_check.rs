@@ -60,23 +60,45 @@ pub fn post_check(
             }
         }
     }
-    let moved: Vec<&str> = report
+    // `host NAME: now BUILD; candidate sees BUILD`, or `now unreachable`
+    // for a host that was already gone before the reload.
+    let moved: Vec<(&str, bool)> = report
         .lines()
         .filter_map(|line| line.strip_prefix("host "))
-        .filter_map(|line| line.split_once(':').map(|(name, _)| name))
+        .filter_map(|line| line.split_once(": "))
+        .map(|(name, rest)| (name, rest.starts_with("now unreachable")))
         .collect();
     match crate::client::request(socket, &Request::List) {
         Ok(Response::Sessions(sessions)) => {
-            let missing: Vec<&str> = moved
-                .iter()
-                .copied()
-                .filter(|name| !sessions.iter().any(|s| s.name == *name && s.alive))
-                .collect();
-            if missing.is_empty() {
-                lines.push(format!("sessions: all {} host-backed listed", moved.len()));
-            } else {
+            let reachable = |name: &str| {
+                sessions
+                    .iter()
+                    .any(|s| s.name == name && s.alive && !s.unavailable)
+            };
+            let (gone_before, missing): (Vec<&str>, Vec<&str>) =
+                moved.iter().filter(|(name, _)| !reachable(name)).fold(
+                    (Vec::new(), Vec::new()),
+                    |(mut before, mut missing), &(name, unreachable)| {
+                        if unreachable {
+                            before.push(name);
+                        } else {
+                            missing.push(name);
+                        }
+                        (before, missing)
+                    },
+                );
+            if !missing.is_empty() {
                 ok = false;
                 lines.push(format!("sessions missing or dead: {}", missing.join(", ")));
+            } else if gone_before.is_empty() {
+                lines.push(format!("sessions: all {} host-backed listed", moved.len()));
+            } else {
+                lines.push(format!(
+                    "sessions: {} of {} host-backed reachable; unreachable before the reload too: {}",
+                    moved.len() - gone_before.len(),
+                    moved.len(),
+                    gone_before.join(", ")
+                ));
             }
         }
         other => {

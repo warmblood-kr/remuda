@@ -519,3 +519,146 @@ fn children_of_dead_daemon_alive(root: &Root, parent: u32) -> bool {
         .filter_map(|line| line.split_whitespace().next()?.parse::<u32>().ok())
         .any(|pid| pid != parent && env_names_root(pid, &root.0))
 }
+
+/// Input typed all through a reload is never lost once acknowledged: every
+/// `SendLine` is answered `Ok` (and its line runs) or refused while the old
+/// daemon drains, never dropped or failed some other way. Several typists
+/// keep acts queued, so some are in flight when the drain starts.
+#[test]
+fn input_acknowledged_during_a_reload_is_never_lost() {
+    let root = Root::new("typing");
+    let path = root.socket();
+    let _old = Daemon::spawn(&root, true, &[("REMUDA_TEST_RELOAD_READY_MS", "15000")]);
+    new_session(&path, "work");
+    wait_for(&path, "work", "$");
+    let typed = root.0.join("typed");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let typists: Vec<_> = (0..8)
+        .map(|who| {
+            let (path, typed, stop) = (path.clone(), typed.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let (mut acked, mut refused) = (Vec::new(), Vec::new());
+                let mut n = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    n += 1;
+                    let marker = format!("T-{who}-{n}");
+                    let line = format!("echo {marker} >> {}", typed.display());
+                    let send = Request::SendLine {
+                        name: "work".into(),
+                        text: line,
+                    };
+                    match client::request(&path, &send) {
+                        Ok(Response::Ok) => acked.push(marker),
+                        other => {
+                            refused.push(format!("{other:?}"));
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                }
+                (acked, refused)
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(500));
+    let out = root.remuda(&["reload"]);
+    std::thread::sleep(Duration::from_secs(1));
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (mut acked, mut refused) = (Vec::new(), Vec::new());
+    for typist in typists {
+        let (a, r) = typist.join().unwrap();
+        acked.extend(a);
+        refused.extend(r);
+    }
+    assert!(out.status.success(), "{:?}", text(&out));
+    assert!(!acked.is_empty(), "nothing was acknowledged");
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let seen = std::fs::read_to_string(&typed).unwrap_or_default();
+        let seen: std::collections::HashSet<&str> = seen.lines().collect();
+        let lost: Vec<&String> = acked
+            .iter()
+            .filter(|marker| !seen.contains(marker.as_str()))
+            .collect();
+        if lost.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "acknowledged but never ran: {lost:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The only refusal is the drain's: the owner is moving, send again.
+    for reason in &refused {
+        assert!(
+            reason.contains("session owner unavailable: Recovering"),
+            "{reason}"
+        );
+    }
+}
+
+/// A session whose host died before the reload does not stop the others
+/// from moving: the reload goes through or refuses cleanly, and the live
+/// session answers on whichever daemon serves.
+#[test]
+fn a_dead_session_host_does_not_strand_the_others() {
+    let root = Root::new("deadhost");
+    let path = root.socket();
+    let _old = Daemon::spawn(&root, true, &[("REMUDA_TEST_RELOAD_READY_MS", "15000")]);
+    new_session(&path, "live");
+    new_session(&path, "dead");
+    wait_for(&path, "live", "$");
+    wait_for(&path, "dead", "$");
+    let hosts = host_pids(&root);
+    assert_eq!(hosts.len(), 2, "{hosts:?}");
+    // The `dead` session's host: its shell is the one we ask for its pid.
+    assert_eq!(send_line(&path, "dead", "echo HOSTPID-$PPID"), Response::Ok);
+    wait_for(&path, "dead", "HOSTPID-");
+    let victim = hosts
+        .iter()
+        .copied()
+        .find(|&pid| screen(&path, "dead").contains(&format!("HOSTPID-{pid}")))
+        .unwrap_or_else(|| panic!("no host of {hosts:?} is the dead session's"));
+    // SAFETY: a session host of this root, found just above.
+    unsafe { libc::kill(victim as i32, libc::SIGKILL) };
+    let deadline = Instant::now() + PATIENCE;
+    while alive(victim) {
+        assert!(Instant::now() < deadline, "the host never died");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let out = root.remuda(&["reload"]);
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.starts_with("reloaded: "), "{stdout}");
+    // The post-check names the dead session, not "all listed": it was
+    // unreachable before the reload, so that does not fail the reload.
+    assert!(
+        stdout.contains(
+            "\nsessions: 1 of 2 host-backed reachable; unreachable before the reload too: dead"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(send_line(&path, "live", "echo LIVE-$((3*7))"), Response::Ok);
+    wait_for(&path, "live", "LIVE-21");
+}
+
+fn host_pids(root: &Root) -> Vec<u32> {
+    let ps = Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=", "-o", "args="])
+        .output()
+        .unwrap();
+    let needle = format!("{}/", root.0.display());
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|line| line.contains(&needle) && line.contains("session-host"))
+        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+        .collect()
+}
+
+fn screen(path: &Path, name: &str) -> String {
+    match request(path, &Request::Capture { name: name.into() }) {
+        Response::Screen(screen) => screen,
+        other => panic!("{other:?}"),
+    }
+}

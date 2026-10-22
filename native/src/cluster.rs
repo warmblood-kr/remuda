@@ -1,11 +1,13 @@
 //! Cluster vocabulary composed from identity and membership registry units.
 
+pub mod audit;
 pub mod control;
 pub mod encoding;
 pub mod endpoint;
 pub mod identity;
 pub mod join_line;
 pub mod join_token;
+pub mod leave;
 pub mod listener_config;
 pub mod listener_control;
 pub mod registry;
@@ -15,7 +17,11 @@ pub(crate) mod storage;
 pub mod vfs;
 pub mod vfs_drain;
 mod vfs_index_db;
+pub(crate) use vfs_index_db::{
+    known_steps as index_db_known_steps, schema_on_disk as index_db_schema_on_disk,
+};
 mod vfs_repair;
+pub mod vfs_status;
 pub mod vfs_sync;
 #[cfg(windows)]
 pub(crate) mod windows_security;

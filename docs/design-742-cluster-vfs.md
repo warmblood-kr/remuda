@@ -5,6 +5,8 @@ Each file's content is a sha256-addressed blob kept on several nodes, and names
 are stable `remuda://` URIs. The store is additive: existing per-node paths
 and commands do not change.
 
+For operators: [vfs.md](vfs.md).
+
 ## URIs and paths
 
 ```
@@ -169,8 +171,9 @@ does not touch the store.
 The daemon's existing anti-entropy tick (`cluster/replication.rs`) also runs a
 VFS pass:
 
-1. Pull the index from each admitted peer and merge it. Index digests make an
-   unchanged peer cost one small request.
+1. Pull from each admitted peer the index rows changed since this node's
+   cursor into it, and merge them. An unchanged peer costs one small request.
+   A peer too old for change cursors gets the whole-index digest pull.
 2. Update peer health: a peer that has failed every request for longer than
    the grace period (default 120 s) counts as **down**. A revoked node is gone
    at once.

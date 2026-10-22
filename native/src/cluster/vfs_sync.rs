@@ -230,6 +230,22 @@ fn record_health(peer_fp: &str, reached: bool) {
     }
 }
 
+/// How long `peer_fp` has been down, if it is.
+pub(super) fn down_for(peer_fp: &str) -> Option<Duration> {
+    let since = *lock(health()).get(peer_fp)?;
+    (since.elapsed() >= down_grace()).then(|| since.elapsed())
+}
+
+/// Whether `peer_fp` answered without change cursors (an older build).
+pub(super) fn is_legacy(peer_fp: &str) -> bool {
+    lock(&LEGACY_PEERS).contains_key(peer_fp)
+}
+
+/// Copies the repair queue holds back for a later try.
+pub(super) fn retry_waiting() -> usize {
+    lock(repair_queue()).waiting(Instant::now())
+}
+
 pub(super) fn is_down(peer_fp: &str) -> bool {
     health()
         .lock()
@@ -247,6 +263,18 @@ pub(super) struct Members {
     pub(super) admitted: Vec<String>,
     /// Admitted peers with an endpoint, which this node can reach.
     reachable: Vec<String>,
+}
+
+impl Members {
+    /// The same members with `node` gone, as if it were already revoked.
+    pub(super) fn without(&self, node: &str) -> Members {
+        let keep = |list: &[String]| list.iter().filter(|fp| *fp != node).cloned().collect();
+        Members {
+            self_fp: self.self_fp.clone(),
+            admitted: keep(&self.admitted),
+            reachable: keep(&self.reachable),
+        }
+    }
 }
 
 pub(super) fn members() -> VfsResult<Members> {
@@ -288,7 +316,7 @@ pub fn placement_for(entry: &VfsEntry) -> Vec<String> {
     }
 }
 
-fn live_placement(entry: &VfsEntry, members: &Members) -> Vec<String> {
+pub(super) fn live_placement(entry: &VfsEntry, members: &Members) -> Vec<String> {
     let candidates: Vec<&str> = members
         .admitted
         .iter()
@@ -311,13 +339,22 @@ pub(super) fn request_peer(peer_fp: &str, request: &Request) -> Result<Response,
 }
 
 fn request_peer_inner(peer_fp: &str, request: &Request) -> Result<Response, String> {
+    request_peer_within(peer_fp, request, REQUEST_TIMEOUT)
+}
+
+/// [`request_peer`] with its own answer timeout and no health record.
+pub(super) fn request_peer_within(
+    peer_fp: &str,
+    request: &Request,
+    timeout: Duration,
+) -> Result<Response, String> {
     let material = super::replication::peer_material(peer_fp).map_err(|error| error.to_string())?;
     let client = ClusterClient::with_timeouts(
         Arc::new(crate::SystemWallClock::new()),
         ClientTimeouts {
             connect: Duration::from_secs(3),
-            read: REQUEST_TIMEOUT,
-            total: REQUEST_TIMEOUT,
+            read: timeout,
+            total: timeout,
         },
     );
     for attempt in 0..20 {
@@ -416,6 +453,9 @@ fn batch_entries(entries: &[VfsEntry]) -> Vec<String> {
 static LEGACY_PEERS: std::sync::Mutex<BTreeMap<String, Instant>> =
     std::sync::Mutex::new(BTreeMap::new());
 const LEGACY_RETRY: Duration = Duration::from_secs(3600);
+/// What a listener answers to a request it cannot decode (an older build).
+pub(super) const OLD_BUILD_REFUSALS: [&str; 2] =
+    ["invalid remote request", "invalid cluster request"];
 
 /// Pull what `peer` changed since our cursor; fall back to the whole-index
 /// digest pull for a peer that does not know change cursors.
@@ -430,7 +470,7 @@ fn pull(store: &VfsStore, me: &str, peer: &str) -> Result<usize, String> {
     }
     match pull_changes(store, me, peer, &mut |request| request_peer(peer, request)) {
         Ok(Some(merged)) => Ok(merged),
-        Ok(None) | Err(_) => {
+        Ok(None) => {
             let merged = pull_index(store, peer)?;
             LEGACY_PEERS
                 .lock()
@@ -438,6 +478,9 @@ fn pull(store: &VfsStore, me: &str, peer: &str) -> Result<usize, String> {
                 .insert(peer.to_owned(), Instant::now());
             Ok(merged)
         }
+        // A timeout or a bad page is not an older build: pull the whole
+        // index this once, and ask for changes again next time.
+        Err(_) => pull_index(store, peer),
     }
 }
 
@@ -470,7 +513,12 @@ pub fn pull_changes(
             caps,
         } = response
         else {
-            return Ok(None);
+            return match response {
+                Response::Error(reason) if !OLD_BUILD_REFUSALS.contains(&reason.as_str()) => {
+                    Err(reason)
+                }
+                _ => Ok(None),
+            };
         };
         lock(peer_caps()).insert(peer.to_owned(), caps);
         if reset {
@@ -1626,5 +1674,14 @@ mod tests {
             Ok(Response::error("invalid cluster request"))
         });
         assert_eq!(answer, Ok(None));
+    }
+
+    #[test]
+    fn a_busy_peer_is_an_error_not_an_older_build() {
+        let (_b, client) = scratch_store();
+        let answer = pull_changes(&client, "SHA256:client", "SHA256:busy", &mut |_| {
+            Ok(Response::error("request timed out"))
+        });
+        assert_eq!(answer, Err("request timed out".to_owned()));
     }
 }
