@@ -665,6 +665,21 @@ const SUBMIT_BUDGET: Duration = Duration::from_secs(6);
 /// A clear is refused while the most recent human keystroke is this recent.
 const HUMAN_INPUT_GUARD: Duration = Duration::from_secs(2);
 const MAX_CLEAR_INPUT_KEY_BYTES: usize = 16;
+
+/// The clear keys any backend accepts, refused in the same words everywhere.
+pub fn check_clear_key(key: &[u8]) -> Result<()> {
+    if key.is_empty() || key.len() > MAX_CLEAR_INPUT_KEY_BYTES {
+        return Err(AgentError::Io(
+            "clear key must contain 1 to 16 bytes".into(),
+        ));
+    }
+    if !CLEAR_INPUT_KEYS.contains(&key) {
+        return Err(AgentError::Io(
+            "clear key is not allowlisted; only Ctrl+U (byte 0x15) is supported".into(),
+        ));
+    }
+    Ok(())
+}
 /// Core-owned allowlist: only the verified Ctrl+U clear-line binding is enabled.
 const CLEAR_INPUT_KEYS: &[&[u8]] = &[b"\x15"];
 
@@ -1301,16 +1316,7 @@ impl Session {
     /// untrusted keys, a busy writer, recent human input, or excess clear calls.
     /// Cleared text is `None` when this session cannot identify its composer.
     pub fn clear_input(&self, key: &[u8]) -> Result<Option<String>> {
-        if key.is_empty() || key.len() > MAX_CLEAR_INPUT_KEY_BYTES {
-            return Err(AgentError::Io(
-                "clear key must contain 1 to 16 bytes".into(),
-            ));
-        }
-        if !CLEAR_INPUT_KEYS.contains(&key) {
-            return Err(AgentError::Io(
-                "clear key is not allowlisted; only Ctrl+U (byte 0x15) is supported".into(),
-            ));
-        }
+        check_clear_key(key)?;
         let _held = self.acquire_input_lock()?;
         let _human_gate = self
             .human_gate

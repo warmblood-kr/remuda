@@ -110,6 +110,16 @@ pub fn half_installed(name: &str) -> Option<String> {
     ))
 }
 
+/// The installed mod's package directory, `mods/NAME/packages/NAME`, where
+/// its Lua files and declared assets are. `None` when it is not installed.
+pub fn package_dir(name: &str) -> Result<Option<PathBuf>, String> {
+    if !valid_package_name(name) || name.contains('/') {
+        return Ok(None);
+    }
+    let dir = mods_dir()?.join(name).join("packages").join(name);
+    Ok(dir.is_dir().then_some(dir))
+}
+
 /// Resolve only installed modules. Mods are deliberately independent from the
 /// Remuda binary; there is no embedded compatibility copy.
 pub fn resolve(name: &str) -> Result<Option<PackageSource>, String> {
