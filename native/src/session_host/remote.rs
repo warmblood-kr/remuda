@@ -573,7 +573,9 @@ impl SessionOperations for HostSession {
             HostLifecycle::Exited => Lifecycle::Exited(Some(ExitInfo {
                 exit_code: info.exit_code,
                 signal: info.signal,
-                signal_name: info.signal_name,
+                // Named from the number, as in-process: an older host sent
+                // the platform's description ("Terminated: 15").
+                signal_name: info.signal.and_then(crate::pty::signal_name),
             })),
             // An unavailable host is never reported as an exited session.
             HostLifecycle::Unavailable => return Err(Error::Unavailable(Unavailable::Recovering)),
@@ -584,7 +586,9 @@ impl SessionOperations for HostSession {
             cut: ObservationCut::Host {
                 revision: info.generation,
             },
-            size: Size::for_pane(info.cols, info.rows),
+            // The host's real size: the daemon already floored it, or the
+            // caller opted out of the floor.
+            size: Size::for_viewport(info.cols, info.rows),
             pid: info.pid,
             output_version: Some(info.generation),
             idle: Duration::from_millis(activity.idle_ms),
