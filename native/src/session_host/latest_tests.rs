@@ -280,12 +280,13 @@ fn output_between_generation_sample_and_wait_is_not_lost() {
     let (release, resume) = std::sync::mpsc::sync_channel(1);
     latest.before_sleep = Some(Box::new(move || {
         entered.send(()).unwrap();
-        resume.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Generous: a loaded CI runner can take seconds to reach here.
+        resume.recv_timeout(Duration::from_secs(30)).unwrap();
     }));
     std::thread::scope(|scope| {
         let view = &fixture.host.view;
         let worker = scope.spawn(move || latest.wait(generation, 750, view).unwrap());
-        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        ready.recv_timeout(Duration::from_secs(30)).unwrap();
         fixture.send("emit");
         eventually(|| (fixture.generation() > generation).then_some(()));
         release.send(()).unwrap();
