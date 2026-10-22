@@ -1,6 +1,7 @@
 //! Admission for a daemon's host-backed work (#713, design in #758). Every
 //! act, control call and host start holds a [`Pass`]. A drain closes the gate,
 //! so new work is refused as `Recovering`, then waits for passes still out.
+//! Only a reload that rolls back opens it again.
 //! The next daemon resolves any act left pending by its key, so a drain that
 //! times out loses nothing; it only makes the handover slower.
 use remuda_core::session_operations::{Error, Unavailable};
@@ -41,7 +42,7 @@ impl Gate {
         state.active += 1;
         Ok(Pass(Arc::clone(self)))
     }
-    /// Close the gate for good, then wait up to `deadline` for passes out.
+    /// Close the gate, then wait up to `deadline` for passes out.
     pub fn drain(&self, deadline: Duration) -> Drained {
         let until = Instant::now() + deadline;
         let mut state = self.state();
@@ -58,6 +59,10 @@ impl Gate {
                 .0;
         }
         Drained { left: state.active }
+    }
+    /// Admit work again: a reload that rolled back keeps this daemon.
+    pub fn reopen(&self) {
+        self.state().draining = false;
     }
 }
 
@@ -105,6 +110,15 @@ mod tests {
         assert_eq!(gate.drain(Duration::from_millis(100)), Drained { left: 1 });
         assert!(started.elapsed() >= Duration::from_millis(100));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_reopened_gate_admits_again() {
+        let gate = Arc::new(Gate::default());
+        assert_eq!(gate.drain(Duration::from_millis(1)).left, 0);
+        assert!(gate.enter().is_err());
+        gate.reopen();
+        drop(gate.enter().unwrap());
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 use crate::cli_parse::{self, ArgSpec, OptionSpec, RepeatPolicy, Spec, VerbSpec};
 use crate::cluster::vfs::{VfsError, VfsErrorKind, VfsStore};
+use crate::cluster::vfs_drain::DrainReport;
 use crate::cluster::vfs_sync;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -26,6 +27,8 @@ macro_rules! warn {
 use std::time::Duration;
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Under the CLI's 125 s wait for a vfs answer; drain can simply be rerun.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(100);
 /// `put` stored the file but reached no peer: a temporary failure
 /// (EX_TEMPFAIL from sysexits.h), so scripts can retry or wait.
 const EXIT_TEMPFAIL: u8 = 75;
@@ -61,8 +64,9 @@ fn spec() -> Spec {
             verb("put", "Store a local file (or - for stdin) at a remuda:// URI. Example: remuda vfs put notes.md remuda:///notes.md",
                 vec![arg("SOURCE", "Local file, or - for stdin", true), arg("URI", "remuda://CLUSTER/PATH or remuda:///PATH", true)],
                 vec![option("replicas", Some("N"), "Copies to keep (1-16; default from vfs settings)"),
-                     option("wait", None, "Wait until the copies exist on their nodes")],
-                "remuda vfs put SOURCE URI [--replicas N] [--wait]"),
+                     option("wait", None, "Wait until the copies exist on their nodes"),
+                     option("min-copies", Some("K"), "Wait until K nodes hold it, this one included; exit 75 if not in 60 s")],
+                "remuda vfs put SOURCE URI [--replicas N] [--wait | --min-copies K]"),
             verb("get", "Print a file, or write it to DEST. Example: remuda vfs get remuda:///notes.md notes.md",
                 vec![arg("URI", "remuda:// URI", true), arg("DEST", "Local file; omit or - for stdout", false)],
                 vec![option("local", None, "Do not ask other nodes")],
@@ -74,18 +78,33 @@ fn spec() -> Spec {
                 vec![arg("URI", "remuda:// URI", true)], vec![option("json", None, "Print JSON")],
                 "remuda vfs stat URI [--json]"),
             verb("ls", "List files under a prefix. Example: remuda vfs ls remuda:///butler/",
-                vec![arg("PREFIX", "remuda:// URI prefix; omit for all", false)], vec![option("json", None, "Print JSON")],
-                "remuda vfs ls [PREFIX] [--json]"),
+                vec![arg("PREFIX", "remuda:// URI prefix; omit for all", false)],
+                vec![option("json", None, "Print JSON"),
+                     option("conflicts", None, "Only paths with kept concurrent writes, deleted ones too")],
+                "remuda vfs ls [PREFIX] [--json] [--conflicts]"),
+            verb("resolve-conflict", "Settle a path's conflicts by writing one side again. Example: remuda vfs resolve-conflict remuda:///notes.md --keep winner",
+                vec![arg("URI", "remuda:// URI", true)],
+                vec![OptionSpec { required: true, ..option("keep", Some("WHICH"), "winner, or the VERSION of a conflict from `remuda vfs ls --conflicts`") }],
+                "remuda vfs resolve-conflict URI --keep winner|VERSION"),
             verb("rm", "Delete a file everywhere. Example: remuda vfs rm remuda:///notes.md",
                 vec![arg("URI", "remuda:// URI", true)], vec![], "remuda vfs rm URI"),
             verb("sync", "Pull indexes from peers and repair missing copies now. Example: remuda vfs sync",
                 vec![], vec![], "remuda vfs sync"),
+            verb("drain", "Before this node leaves, have the other nodes take copies of what it holds. Example: remuda vfs drain",
+                vec![], vec![option("timeout", Some("SECS"), "Give up after this long (1-110; default 100); run drain again to go on")],
+                "remuda vfs drain [--timeout SECS]"),
             verb("config", "Show or set the cluster name and default replicas. Example: remuda vfs config --cluster home --replicas 2",
                 vec![], vec![option("cluster", Some("NAME"), "Cluster name used in remuda://NAME/ URIs"),
-                             option("replicas", Some("N"), "Default copies for new files (1-16)")],
-                "remuda vfs config [--cluster NAME] [--replicas N]"),
+                             option("replicas", Some("N"), "Default copies for new files (1-16)"),
+                             option("tombstone-days", Some("DAYS"), "Forget a delete this many days after every node has it (1-3650; default 7)"),
+                             option("stale-days", Some("DAYS"), "Stop waiting for a node that has not pulled for this long (1-3650; default 30)")],
+                "remuda vfs config [--cluster NAME] [--replicas N] [--tombstone-days DAYS] [--stale-days DAYS]"),
             verb("export-index", "Write index.json for an older remuda, before a downgrade. Example: remuda vfs export-index",
                 vec![], vec![], "remuda vfs export-index"),
+            verb("index-downgrade", "Step index.db back to schema VERSION for an older remuda, after a backup. Example: remuda vfs index-downgrade 1 --yes",
+                vec![arg("VERSION", "Schema version the older remuda knows", true)],
+                vec![option("yes", None, "Run it; without this, only print what would be undone")],
+                "remuda vfs index-downgrade VERSION [--yes]"),
             verb("help", "Print help for a vfs command", vec![arg("COMMAND", "vfs command name", false)], vec![], "remuda vfs help [COMMAND]"),
         ],
     }
@@ -315,11 +334,13 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
         "stat" => stat(&store, values, out),
         "ls" => list(&store, values, out),
         "rm" => remove(&store, values, out),
+        "resolve-conflict" => settle(&store, values, out),
         "sync" => {
-            let report = vfs_sync::sync_once();
+            let report = vfs_sync::sync_once(true);
             say!(out, "{report}");
             0
         }
+        "drain" => drain(values, out),
         "config" => config(&store, values, out),
         "export-index" => match store.export_legacy_index() {
             Ok(count) => {
@@ -332,6 +353,18 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
             }
             Err(error) => fail_vfs(out, &verb, &error),
         },
+        "index-downgrade" => {
+            let Ok(to) = value(values, "VERSION").unwrap_or_default().parse::<u32>() else {
+                return fail(out, &verb, "VERSION must be a whole number");
+            };
+            match store.index_downgrade(to, flag(values, "yes")) {
+                Ok(text) => {
+                    say!(out, "{text}");
+                    0
+                }
+                Err(error) => fail_vfs(out, &verb, &error),
+            }
+        }
         _ => unreachable!("vfs verb specification and dispatcher diverged"),
     }
 }
@@ -367,6 +400,16 @@ fn put(store: &VfsStore, values: &Map<String, Value>, bytes: &[u8], out: &mut Ou
             Ok(settings) => settings.default_replicas,
             Err(error) => return fail_vfs(out, "put", &error),
         },
+    };
+    let min_copies = match value(values, "min-copies") {
+        Some(_) if flag(values, "wait") => {
+            return fail(out, "put", "use --wait or --min-copies, not both")
+        }
+        Some(text) => match parse_min_copies(text, replicas) {
+            Ok(min) => Some(min),
+            Err(error) => return fail(out, "put", error),
+        },
+        None => None,
     };
     let writer = match writer() {
         Ok(writer) => writer,
@@ -406,11 +449,113 @@ fn put(store: &VfsStore, values: &Map<String, Value>, bytes: &[u8], out: &mut Ou
         }
         return 0;
     }
+    if let Some(min) = min_copies {
+        return match vfs_sync::wait_for_copies(&entry, min, WAIT_TIMEOUT) {
+            Ok(holders) => {
+                let (said, code) = min_copies_outcome(holders, min);
+                if code == 0 {
+                    say!(out, "{said}");
+                } else {
+                    warn!(out, "remuda: vfs put: {said}");
+                }
+                code
+            }
+            Err(error) => {
+                fail_vfs(out, "put", &error);
+                EXIT_TEMPFAIL
+            }
+        };
+    }
     if outcome.only_here {
         EXIT_TEMPFAIL
     } else {
         0
     }
+}
+
+fn drain(values: &Map<String, Value>, out: &mut Out) -> u8 {
+    let timeout = match value(values, "timeout").map(str::parse::<u64>) {
+        None => DRAIN_TIMEOUT,
+        Some(Ok(secs @ 1..=110)) => Duration::from_secs(secs),
+        Some(_) => return fail(out, "drain", "--timeout must be 1-110 seconds"),
+    };
+    match crate::cluster::vfs_drain::drain(timeout) {
+        Ok(report) => {
+            let (lines, code) = drain_outcome(&report);
+            for line in lines {
+                if code == 0 {
+                    say!(out, "{line}");
+                } else {
+                    warn!(out, "{line}");
+                }
+            }
+            code
+        }
+        Err(error) => fail_vfs(out, "drain", &error),
+    }
+}
+
+/// What drain prints, and its exit code: 0 once no file is short.
+fn drain_outcome(report: &DrainReport) -> (Vec<String>, u8) {
+    if report.short.is_empty() {
+        return (
+            vec![
+                format!(
+                    "All {} files held here have their copies on the other {} nodes.",
+                    report.files, report.remaining
+                ),
+                format!(
+                    "Safe to leave: on another node, run `remuda cluster revoke {}`.",
+                    report.node
+                ),
+            ],
+            0,
+        );
+    }
+    let first: Vec<&str> = report.short.iter().take(5).map(String::as_str).collect();
+    let mut lines = vec![format!(
+        "remuda: vfs drain: {} of {} files still lack copies without this node (first: {}); still copying (exit code {EXIT_TEMPFAIL})",
+        report.short.len(),
+        report.files,
+        first.join(", ")
+    )];
+    if report.remaining == 0 {
+        lines.push(
+            "Next: start or join another node; no other node is up to take the files.".into(),
+        );
+    } else if !report.too_old.is_empty() {
+        lines.push(format!(
+            "Next: upgrade {}; too old to take copies.",
+            report.too_old.join(", ")
+        ));
+    } else {
+        lines.push("Next: run `remuda vfs drain` again; peers are still copying.".into());
+    }
+    (lines, EXIT_TEMPFAIL)
+}
+
+/// `--min-copies K`: 1 up to the copies wanted, since nodes outside the
+/// placement do not keep a copy.
+fn parse_min_copies(text: &str, replicas: u8) -> Result<usize, String> {
+    text.parse::<usize>()
+        .ok()
+        .filter(|min| (1..=usize::from(replicas)).contains(min))
+        .ok_or_else(|| format!("--min-copies must be 1-{replicas} (the copies wanted)"))
+}
+
+/// The line and exit code after waiting for `min` copies. A short count is
+/// not a rollback: the write stands and peers keep copying it.
+fn min_copies_outcome(holders: usize, min: usize) -> (String, u8) {
+    if holders >= min {
+        return (format!("{holders} copies confirmed."), 0);
+    }
+    (
+        format!(
+            "committed here, but only {holders} of {min} copies confirmed in {} s; still replicating (exit code {EXIT_TEMPFAIL})",
+            WAIT_TIMEOUT.as_secs()
+        ),
+        EXIT_TEMPFAIL,
+    )
 }
 
 /// What `put` reports after telling peers about a new entry.
@@ -486,9 +631,17 @@ fn resolve(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
         Ok(uri) => uri,
         Err(error) => return fail_vfs(out, "resolve", &error),
     };
-    match fetch(store, &uri, flag(values, "local"))
-        .and_then(|(entry, _)| store.blob_path(&entry.sha256))
-    {
+    // Unmark first, so a trim cannot delete the path we print; fetch again
+    // if one already did.
+    let local = flag(values, "local");
+    let kept = fetch(store, &uri, local).and_then(|(entry, _)| {
+        store.keep_blob(&entry.sha256)?;
+        if !store.has_blob(&entry.sha256, entry.size) {
+            fetch(store, &uri, local)?;
+        }
+        Ok(entry)
+    });
+    match kept.and_then(|entry| store.blob_path(&entry.sha256)) {
         Ok(path) => {
             say!(out, "{}", path.display());
             0
@@ -507,7 +660,94 @@ fn entry_json(store: &VfsStore, entry: &VfsEntry) -> Value {
         "writer": entry.writer,
         "mtime": entry.mtime,
         "local": store.has_blob(&entry.sha256, entry.size),
+        "deleted": entry.deleted,
+        "conflicts": entry.conflicts.iter().map(|conflict| serde_json::json!({
+            "version": conflict.version,
+            "writer": conflict.writer,
+            "sha256": conflict.sha256,
+            "size": conflict.size,
+            "deleted": conflict.deleted,
+            "mtime": conflict.mtime,
+            "local": !conflict.deleted && store.has_blob(&conflict.sha256, conflict.size),
+        })).collect::<Vec<_>>(),
     })
+}
+
+/// One line per kept concurrent write, under its path.
+fn say_conflicts(out: &mut Out, store: &VfsStore, entry: &VfsEntry) {
+    for conflict in &entry.conflicts {
+        let what = if conflict.deleted {
+            "deleted".to_owned()
+        } else {
+            format!(
+                "{} bytes  {}{}",
+                conflict.size,
+                &conflict.sha256[..12.min(conflict.sha256.len())],
+                if store.has_blob(&conflict.sha256, conflict.size) {
+                    ""
+                } else {
+                    "  (not here)"
+                }
+            )
+        };
+        say!(
+            out,
+            "  conflict v{} by {}  {what}",
+            conflict.version,
+            crate::cluster::node_label(&conflict.writer)
+        );
+    }
+}
+
+fn settle(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
+    let uri = match store.parse_uri(value(values, "URI").unwrap_or_default()) {
+        Ok(uri) => uri,
+        Err(error) => return fail_vfs(out, "resolve-conflict", &error),
+    };
+    let keep = match value(values, "keep").unwrap_or_default() {
+        "winner" => None,
+        text => match text.parse::<u64>() {
+            Ok(version) => Some(version),
+            Err(_) => {
+                return fail(
+                    out,
+                    "resolve-conflict",
+                    "--keep takes winner or a version number",
+                )
+            }
+        },
+    };
+    let writer = match writer() {
+        Ok(writer) => writer,
+        Err(error) => return fail_vfs(out, "resolve-conflict", &error),
+    };
+    // The kept side may live only on another node: copy it here first.
+    if let Some(conflict) = store.load_index().ok().and_then(|index| {
+        let entry = index.entries.get(&uri.path)?;
+        let conflict = entry.conflicts.iter().find(|c| Some(c.version) == keep)?;
+        (!conflict.deleted && !store.has_blob(&conflict.sha256, conflict.size))
+            .then(|| conflict.entry(&uri.path))
+    }) {
+        if let Err(error) = vfs_sync::fetch_blob(store, &conflict) {
+            return fail_vfs(out, "resolve-conflict", &error);
+        }
+    }
+    match store.settle_conflict(&uri.path, keep, &writer) {
+        Ok(entry) => {
+            vfs_sync::push_entries(std::slice::from_ref(&entry));
+            say!(
+                out,
+                "Settled {}: kept {}, now version {}.",
+                uri.path,
+                keep.map_or("the winner".to_owned(), |version| format!(
+                    "version {version}"
+                )),
+                entry.version
+            );
+            0
+        }
+        Err(error) => fail_vfs(out, "resolve-conflict", &error),
+    }
 }
 
 fn stat(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
@@ -559,6 +799,7 @@ fn stat(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    say_conflicts(out, store, entry);
     0
 }
 
@@ -574,13 +815,47 @@ fn list(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
         Ok(index) => index,
         Err(error) => return fail_vfs(out, "ls", &error),
     };
-    let entries = index.list(&prefix);
+    let only_conflicts = flag(values, "conflicts");
+    let entries: Vec<&VfsEntry> = if only_conflicts {
+        index
+            .entries
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&prefix))
+            .map(|(_, entry)| entry)
+            .filter(|entry| !entry.conflicts.is_empty())
+            .collect()
+    } else {
+        index.list(&prefix)
+    };
     if flag(values, "json") {
         let rows: Vec<Value> = entries
             .iter()
             .map(|entry| entry_json(store, entry))
             .collect();
         say!(out, "{}", Value::Array(rows));
+        return 0;
+    }
+    if only_conflicts {
+        if entries.is_empty() {
+            say!(out, "No conflicts.");
+        }
+        for entry in &entries {
+            say!(
+                out,
+                "{}  v{} by {}{}",
+                entry.path,
+                entry.version,
+                crate::cluster::node_label(&entry.writer),
+                if entry.deleted { "  (deleted)" } else { "" }
+            );
+            say_conflicts(out, store, entry);
+        }
+        if !entries.is_empty() {
+            say!(
+                out,
+                "Next: remuda vfs resolve-conflict URI --keep winner|VERSION."
+            );
+        }
         return 0;
     }
     for entry in entries {
@@ -661,6 +936,22 @@ fn config(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
         }
         changed = true;
     }
+    for (key, slot) in [
+        ("tombstone-days", &mut settings.tombstone_days),
+        ("stale-days", &mut settings.stale_days),
+    ] {
+        if let Some(text) = value(values, key) {
+            match text
+                .parse::<u32>()
+                .ok()
+                .filter(|days| (1..=3650).contains(days))
+            {
+                Some(days) => *slot = days,
+                None => return fail(out, "config", format!("--{key} must be 1-3650")),
+            }
+            changed = true;
+        }
+    }
     if changed {
         if let Err(error) = store.save_settings(&settings) {
             return fail_vfs(out, "config", &error);
@@ -668,6 +959,12 @@ fn config(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
     }
     say!(out, "cluster   {}", settings.cluster_name);
     say!(out, "replicas  {}", settings.default_replicas);
+    say!(
+        out,
+        "deletes   forgotten {} days after every node has them; a node away {} days stops holding them",
+        settings.tombstone_days,
+        settings.stale_days
+    );
     say!(out, "store     {}", store.root().display());
     0
 }
@@ -699,6 +996,11 @@ mod tests {
             ["get", "remuda:///n.md", "--local"]
         );
         assert_eq!(forwarded(&["ls", "--json"]), ["ls", "--json"]);
+        assert_eq!(
+            forwarded(&["resolve-conflict", "remuda:///n.md", "--keep", "winner"]),
+            ["resolve-conflict", "remuda:///n.md", "--keep", "winner"]
+        );
+        assert_eq!(forwarded(&["ls", "--conflicts"]), ["ls", "--conflicts"]);
         assert_eq!(
             forwarded(&["config", "--cluster", "home"]),
             ["config", "--cluster", "home"]
@@ -744,6 +1046,51 @@ mod tests {
         assert!(!alone.only_here);
         assert_eq!(alone.told, None);
         assert_eq!(alone.warning, None);
+    }
+
+    #[test]
+    fn min_copies_is_checked_against_the_copies_wanted() {
+        assert_eq!(parse_min_copies("2", 3), Ok(2));
+        assert_eq!(parse_min_copies("3", 3), Ok(3));
+        assert!(parse_min_copies("4", 3).is_err_and(|e| e.contains("1-3")));
+        assert!(parse_min_copies("0", 3).is_err());
+        assert!(parse_min_copies("x", 3).is_err());
+        assert_eq!(
+            forwarded(&["put", "a", "remuda:///n.md", "--min-copies", "2"]),
+            ["put", "-", "remuda:///n.md", "--min-copies", "2"]
+        );
+    }
+
+    #[test]
+    fn too_few_copies_in_time_is_a_temporary_failure_not_a_rollback() {
+        assert_eq!(min_copies_outcome(2, 2), ("2 copies confirmed.".into(), 0));
+        let (said, code) = min_copies_outcome(1, 3);
+        assert_eq!(code, EXIT_TEMPFAIL);
+        assert!(said.starts_with("committed here, but only 1 of 3 copies confirmed"));
+        assert!(said.contains("still replicating"));
+    }
+
+    #[test]
+    fn drain_says_when_it_is_safe_to_leave_and_what_blocks_it() {
+        let mut report = DrainReport {
+            node: "node-abcd".into(),
+            files: 3,
+            remaining: 2,
+            ..DrainReport::default()
+        };
+        let (lines, code) = drain_outcome(&report);
+        assert_eq!(code, 0);
+        assert!(lines[1].contains("remuda cluster revoke node-abcd"));
+
+        report.short = vec!["a.txt".into()];
+        report.too_old = vec!["node-old".into()];
+        let (lines, code) = drain_outcome(&report);
+        assert_eq!(code, EXIT_TEMPFAIL);
+        assert!(lines[0].contains("1 of 3 files") && lines[0].contains("a.txt"));
+        assert!(lines[1].contains("upgrade node-old"));
+
+        report.remaining = 0;
+        assert!(drain_outcome(&report).0[1].contains("no other node is up"));
     }
 
     #[test]

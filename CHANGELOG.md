@@ -9,6 +9,183 @@
   `NODE/SESSION` still opens the session directly. A full fingerprint that
   contains `/` is read as a node.
 
+- Cluster: each node now keeps a local audit log of what peers asked it to
+  do, in `cluster/audit.jsonl` in the private cluster state directory. Each
+  line records when, which peer (by fingerprint), what (input, resize, close,
+  create), which session, and whether it was done, failed, refused or
+  limited. Input contents are never recorded. The log keeps the last 10,000
+  entries and is not replicated. Before, peer actions left no record.
+
+- Lua: a mod can squash its database migrations (#778). One
+  `NNNN_name.base.sql` holds the whole schema as of step NNNN, so the step
+  files up to it can be deleted and the mod stays within its 64 assets. A
+  new database runs the base, then the later steps; an existing one at
+  NNNN or later upgrades as before. One below NNNN fails with `squashed:`
+  and needs an older release of the mod first, unless the mod keeps the
+  step files from there. Older remuda builds refuse a database created from
+  a base without changing it.
+
+- Unix: the socket lock file (`SOCKET.lock`) never reads empty or half
+  written while a daemon names itself in it, as at start or when a reload
+  hands it over. It now holds the pid padded with newlines to a fixed
+  width; readers that trim are unaffected.
+
+- VFS: `remuda vfs drain [--timeout SECS]` prepares a node to leave (#778).
+  The nodes that will hold its files once it is gone are asked to take a
+  copy, and drain waits until they confirm. Then it says to run `remuda
+  cluster revoke NODE` on another node; it revokes nothing itself. A peer
+  too old to take copies is named, and drain exits 75 while files are short.
+
+- `remuda upgrade` (Unix) checks the reloaded daemon as `remuda reload` does:
+  it answers as the new build, lists every session it took over, and loaded
+  `init.lua`. An `init.lua` that fails only in the new daemon is named and
+  `upgrade` exits 1. Before, it checked only the build.
+
+- VFS: a node that took a copy while a holder was down deletes it again
+  once that holder is back and confirms its copy (#778). Only copies the
+  repair pass fetched are trimmed: files this node wrote, read with `vfs
+  get`, or handed to a tool by `vfs resolve` stay. `remuda vfs sync`
+  reports the copies trimmed.
+
+- VFS: copies that fail to fetch no longer crowd out the rest (#778). A
+  failed copy waits 30 s before the next try, doubling up to an hour, and
+  copies never tried go first. `remuda vfs sync` retries at once and its
+  report counts the copies waiting to retry.
+
+- VFS: `remuda vfs put --min-copies K` waits until K nodes hold the file,
+  this one included (#778). If fewer do within 60 s, it says the write is
+  committed here and still replicating, and exits 75; nothing is rolled
+  back. K is at most the copies wanted (`--replicas`).
+
+- VFS: a node that has not pulled for 30 days (`remuda vfs config
+  --stale-days DAYS`) no longer holds deleted files back on its peers
+  (#778). When it returns, a peer that forgot deletes in the meantime tells
+  it so; it keeps only its own writes that peer has not seen, pulls the rest
+  again, and logs one line. Deleted files therefore do not come back.
+  Nodes older than this keep a plain reset and their old rows.
+
+- VFS: deleted files are forgotten at last (#778). A tombstone goes once
+  every other node has pulled it from this one and it is 7 days old
+  (`remuda vfs config --tombstone-days DAYS`). Until then, and for as long
+  as any member never pulls (an older build, a node that is down), it
+  stays. `remuda vfs sync` reports how many were forgotten. A concurrent
+  delete that loses to a write is no longer kept as a conflict.
+
+- SQLite migrations no longer fail when two connections open a database
+  for the first time at once (#778). The one that waited for the write lock
+  now checks the version again and skips steps the other already ran,
+  instead of failing with `table ... already exists`. This hit the VFS
+  index.db in CI. `remuda db downgrade` checks under the lock too.
+
+- `remuda reload` (Unix): fixed a daemon that had just handed over being
+  able to hand over again. A reload request it had accepted just before the
+  handover could start a second one, giving the socket to two new daemons.
+  It now refuses and points to the new daemon.
+
+- VFS: `remuda vfs ls --conflicts` lists paths with kept concurrent writes,
+  `remuda vfs stat` shows them, and `remuda vfs resolve-conflict URI --keep
+  winner|VERSION` settles them by writing the chosen side again (fetched
+  from a peer if needed). Lua `vfs.stat()` gains `conflicts`; the JSON of
+  `stat` and `ls` gains `conflicts` and `deleted` (#778).
+
+- `remuda upgrade` (Unix) now reloads the running daemon into the version it
+  just installed, so host-backed sessions keep running. A daemon that cannot
+  reload keeps its old version and says why: an in-process session blocks it,
+  or it is older than `remuda reload`. `--no-reload` installs only. The notice
+  for a daemon of another build now suggests `remuda reload` instead of
+  `remuda stop`, and `reload` is listed in `remuda --help`.
+
+- `remuda reload` (Unix) now checks the new daemon after the handover: it
+  answers as the target build, lists every host-backed session the reload
+  moved, and loaded `init.lua`. An `init.lua` that fails only in the new
+  daemon, for example one edited since the old daemon started, is named and
+  `reload` exits 1. The reload itself has gone through.
+
+- VFS: two writes to the same path made while nodes could not see each
+  other no longer drop one silently (#778). Each entry carries a version
+  vector (schema step 3). The winner is picked as before, so older nodes
+  agree, but the losing write is kept as a conflict on the entry and its
+  blob is no longer collected. The next write to the path settles every
+  conflict it saw. Writes from older nodes merge as before, with no
+  conflict detection. `remuda vfs index-downgrade 2 --yes` steps back.
+
+- VFS: nodes pull only what a peer changed since they last asked (#778).
+  `index.db` gets a change sequence and a cursor per peer (schema step 2).
+  An unchanged peer costs one request per tick instead of a whole-index
+  digest and a full re-pull whenever anything differs. Merged rows relay to
+  peers that never talk to the writer. Older peers keep the digest pull.
+  To go back to a remuda one schema step older, run `remuda vfs
+  index-downgrade 1 --yes` (it writes a backup), then stop the daemon and
+  start the older remuda.
+
+- After `remuda reload` (Unix), the new daemon shows in `ps` as
+  `remuda -s NAME daemon`, like any other daemon, instead of
+  `remuda _reload-candidate SOCKET`.
+
+- After `remuda reload` (Unix), the old daemon ends what `remuda stop` ends,
+  except the sessions and the socket. A deferred reply still waiting is told
+  the daemon reloaded and to run the command again, instead of the daemon
+  hanging up on it. Processes its Lua started are killed instead of running
+  on beside the new daemon's, and modules are stopped. `docs/reload.md` says
+  what a reload keeps and what starts fresh.
+
+- VFS: only the daemon that serves the socket writes the index, also during
+  `remuda reload` (#778, #713). The new daemon claims `index.db` just
+  before it serves; a rollback gives it back to the old daemon. A write on
+  the replaced daemon fails with `superseded` and a hint to run the command
+  again. Before, both daemons could write while they overlapped.
+
+- `remuda reload` (experimental, Unix) replaces the running daemon with the
+  installed remuda without closing a host-backed session.
+  - The old daemon checks the new build as for `--check`, then hands it the
+    socket and its session hosts.
+  - Clients keep using the same socket throughout; one waiting to be
+    accepted is answered by the new daemon.
+  - If the new daemon fails or stalls before it serves, it is stopped, the
+    old daemon takes everything back and keeps serving, and `reload` exits
+    1.
+  - In-process sessions still block a reload.
+  - A mod can hold off a reload while it is busy: its optional
+    `daemon_reload_ready(state)` returns a reason, shown as a blocker.
+  - Lua: `remuda.daemon.reloaded_from()` returns the pid of the daemon this
+    one took over from, or nil after a fresh start.
+
+- Lua and CLI: schema migrations for mod databases (#778). A mod ships
+  numbered plain-SQL steps (`migrations/NAME/0001_create.up.sql`, an
+  optional `.down.sql`) and opens with `remuda.db.open(name, { migrations =
+  true })`. Pending steps run in one transaction, so a crash leaves the old
+  schema. An edited step (`drift`) or a database newer than the mod
+  (`too_new`) refuses the open. Each step's down SQL is stored in the
+  database, so `remuda db downgrade MOD NAME VERSION --yes` can step back
+  without the newer mod; it writes a private backup first. `remuda db
+  status` and `remuda db upgrade` run in the daemon, like `remuda vfs`. A
+  handle can no longer set `user_version`. The VFS `index.db` now uses the
+  same runner. Its schema is unchanged (version 1), so older builds still
+  open it.
+
+- `remuda reload --check` (experimental, Unix) reports whether the installed
+  remuda could take over the running daemon without losing a session. It
+  starts the new build as a candidate beside the running daemon and checks
+  that it can drive every session host. Then it stops the candidate and
+  changes nothing. In-process sessions, and any host the new build cannot
+  drive, are reported as blockers. `remuda reload` without `--check` is not
+  available yet.
+- Session screen: press `m` on the session list to write a line for the
+  selected session in a line editor at the bottom of the screen. Nothing reaches the
+  session while you type. Enter sends the whole line, with its Return, as one
+  input that the daemon writes without letting other input in between. So a
+  Butler notice or other injected text can no longer land inside a
+  half-typed line and be submitted with it. Esc or Ctrl-\ goes back to the
+  list and keeps the draft for that session; Enter or `i` still attaches
+  with every key sent live, as before. Editing keys are the cluster
+  composer's (`cluster.composer`), including Up/Down history.
+
+- VFS: upgrading again after a downgrade keeps the files the older remuda
+  wrote meanwhile (#778). If `index.json` changed since the last import or
+  `export-index`, the daemon merges it into `index.db` again; per path the
+  higher version wins. Before, the node's index missed those files until a
+  peer synced them back, and a lone node missed them for good.
+
 - Session hosts (experimental, internal): building blocks for `remuda reload`.
   A daemon can claim its session hosts again after another daemon claimed
   them, and every host it has open then refuses the other daemon at once.

@@ -7,11 +7,13 @@ use std::time::{Duration, Instant};
 
 pub const LIST_CONTEXT: &str = "session.list.browse";
 pub const TOGGLE_LIST: &str = "session.toggle_list";
+/// Open the line composer for the selected session.
+pub const COMPOSE: &str = "session.compose";
 
 /// The single native capability catalog. Keys and help belong to Lua.
 fn validate(context: &str, key: &str, action: Option<&str>) -> Result<String, String> {
     let actions: &[&str] = match context {
-        LIST_CONTEXT => &[TOGGLE_LIST],
+        LIST_CONTEXT => &[TOGGLE_LIST, COMPOSE],
         "cluster.tree" => &[
             "cluster.detach",
             "cluster.close",
@@ -469,6 +471,7 @@ mod tests {
     fn keybindings_help_controls_are_rejected_before_committing() {
         lua().load(r#"
             remuda.unbind('session.list.browse', 'l')
+            remuda.unbind('session.list.browse', 'm')
             local before = remuda.keymap_snapshot().generation
             for _, help in ipairs({'bad\0help', 'bad\27help', 'bad\194\128help', 'bad\194\159help'}) do
                 local ok = pcall(remuda.define_key, {context='session.list.browse', key='z', action='session.toggle_list', help=help})
@@ -492,22 +495,23 @@ mod tests {
                         if fail then error('start failed') end
                     end}
             end
+            local function toggle() for _, r in ipairs(remuda.keymap_snapshot().rows) do if r.action == 'session.toggle_list' then return r end end end
             local ok, state, start = remuda._activate_module('guest', declaration('z'))
             assert(ok); start(state)
-            assert(remuda.keymap_snapshot().rows[1].key == 'z')
+            assert(toggle().key == 'z')
             local ok2, state2, start2, rollback = remuda._activate_module('guest', declaration('M-l', true))
             assert(ok2); assert(not pcall(start2, state2)); rollback()
-            assert(remuda.keymap_snapshot().rows[1].key == 'z')
+            assert(toggle().key == 'z')
             local ok3, _, _, undo = remuda._activate_module('guest', {api='remuda-module-v1', state_version=1, initialize=function() return {} end})
-            assert(ok3); assert(remuda.keymap_snapshot().rows[1].key == 'l')
+            assert(ok3); assert(toggle().key == 'l')
             undo()
-            assert(remuda.keymap_snapshot().rows[1].key == 'z')
+            assert(toggle().key == 'z')
             local other_ok, other_state, other_start = remuda._activate_module('other', declaration('M-l'))
             assert(other_ok); assert(not pcall(other_start, other_state))
             remuda.rebind('session.list.browse', 'session.toggle_list', 'M-l')
             local ok4, state4, start4 = remuda._activate_module('guest', declaration('z'))
             assert(ok4); start4(state4)
-            assert(remuda.keymap_snapshot().rows[1].key == 'M-l', 'user override survives mod reload')
+            assert(toggle().key == 'M-l', 'user override survives mod reload')
         "#).exec().unwrap();
     }
 
@@ -516,15 +520,17 @@ mod tests {
         lua()
             .load(
                 r#"
+            local function toggle() for _, r in ipairs(remuda.keymap_snapshot().rows) do if r.action == 'session.toggle_list' then return r end end end
             local before = remuda.keymap_snapshot()
-            assert(before.rows[1].key == 'l')
+            assert(toggle().key == 'l')
             remuda.rebind('session.list.browse', 'session.toggle_list', 'M-l')
             local after = remuda.keymap_snapshot()
-            assert(#after.rows == 1)
-            assert(after.rows[1].key == 'M-l' and after.rows[1].help == 'list')
+            assert(#after.rows == #before.rows)
+            assert(toggle().key == 'M-l' and toggle().help == 'list')
             assert(after.generation > before.generation)
             remuda.unbind('session.list.browse', 'M-l')
-            assert(#remuda.keymap_snapshot().rows == 0)
+            assert(#remuda.keymap_snapshot().rows == #before.rows - 1)
+            assert(toggle() == nil)
         "#,
             )
             .exec()
@@ -544,7 +550,8 @@ mod tests {
             }) do assert(not pcall(remuda.define_key, spec)) end
             assert(not pcall(remuda.rebind, 'session.list.browse', 'session.toggle_list', 'q'))
             assert(remuda.keymap_snapshot().generation == generation)
-            assert(remuda.keymap_snapshot().rows[1].key == 'l')
+            local function toggle() for _, r in ipairs(remuda.keymap_snapshot().rows) do if r.action == 'session.toggle_list' then return r end end end
+            assert(toggle().key == 'l')
         "#).exec().unwrap();
     }
 }
@@ -644,7 +651,7 @@ mod native_tests {
         );
         let wire = lua.load("local s=remuda.keymap_snapshot(); s.rows=remuda.json.array(s.rows); return remuda.json.encode(s)").eval::<String>().unwrap();
         let map = Snapshot::from_json(&wire).unwrap();
-        assert_eq!(map.help(LIST_CONTEXT), "l list");
+        assert_eq!(map.help(LIST_CONTEXT), "m message   l list");
     }
 
     #[test]

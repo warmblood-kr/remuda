@@ -293,17 +293,21 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::RemoveDirAll { .. } => Err(refusal("RemoveDirAll")),
         Request::Version => Err(refusal("Version")),
         Request::SessionHostBuilds => Err(refusal("SessionHostBuilds")),
+        Request::Reload { .. } => Err(refusal("Reload")),
         Request::SocketPublication => Err(refusal("SocketPublication")),
         Request::ClusterRegistrySync { .. } => Err(refusal("ClusterRegistrySync")),
         Request::ClusterRegistryUpdate { .. } => Err(refusal("ClusterRegistryUpdate")),
         Request::ClusterVfsIndexSync { .. } => Err(refusal("ClusterVfsIndexSync")),
+        Request::ClusterVfsChanges { .. } => Err(refusal("ClusterVfsChanges")),
         Request::ClusterVfsIndexUpdate { .. } => Err(refusal("ClusterVfsIndexUpdate")),
         Request::ClusterVfsBlobStat { .. } => Err(refusal("ClusterVfsBlobStat")),
         Request::ClusterVfsBlobGet { .. } => Err(refusal("ClusterVfsBlobGet")),
+        Request::ClusterVfsTake { .. } => Err(refusal("ClusterVfsTake")),
         Request::ClusterListener(_) => Err(refusal("ClusterListener")),
         Request::Shutdown { .. } => Err(refusal("Shutdown")),
         Request::Eval { .. } => Err(refusal("Eval")),
         Request::Vfs { .. } => Err(refusal("Vfs")),
+        Request::Db { .. } => Err(refusal("Db")),
         Request::SecretAnswer { .. } => Err(refusal("SecretAnswer")),
         Request::LineAnswer { .. } => Err(refusal("LineAnswer")),
     }
@@ -569,6 +573,11 @@ mod tests {
                 digest: None,
                 offset: 0,
             },
+            Request::ClusterVfsChanges {
+                index_id: None,
+                since: 0,
+                limit: 1,
+            },
             Request::ClusterVfsIndexUpdate {
                 entries_json: "[]".into(),
             },
@@ -577,12 +586,14 @@ mod tests {
                 sha256: "0".repeat(64),
                 offset: 0,
             },
+            Request::ClusterVfsTake { hashes: vec![] },
             Request::ClusterListener(remuda_core::protocol::ListenerOp::Status),
             Request::Shutdown {
                 requester_daemon_id: None,
                 requester_session_id: None,
                 requester_session_name: None,
                 override_hosted: false,
+                keep_sessions: false,
             },
         ];
         for request in dangerous {

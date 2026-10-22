@@ -755,3 +755,55 @@ fn a_drained_gate_refuses_acts_and_control_before_any_effect_but_reads_go_on() {
     let index = session.owner.index().unwrap();
     assert_eq!(index.entries["synthetic"].streams[0].next, Some(2));
 }
+
+#[test]
+fn teardown_leaves_an_in_flight_act_its_own_result() {
+    let mut fixture = Fixture::new();
+    let session = Arc::new(adapter(&fixture.root));
+    // EOF ends the child's read loop while the act is still in its pause.
+    let acting = {
+        let session = Arc::clone(&session);
+        std::thread::spawn(move || session.feed(&[Step::Burst(vec![4]), Step::Pause(600)]))
+    };
+    eventually("exit published", || {
+        let index = session.owner.index().ok()?;
+        matches!(index.entries["synthetic"].phase, Phase::Exited { .. }).then_some(())
+    });
+    session.teardown(Duration::from_secs(10)).unwrap();
+    let result = acting.join().unwrap();
+    assert!(result.is_ok(), "teardown took the act's result: {result:?}");
+    let host = fixture.host.as_mut().unwrap();
+    eventually("host stopped", || host.0.try_wait().ok().flatten());
+}
+
+#[test]
+fn teardown_waits_while_an_act_is_in_flight() {
+    let mut fixture = Fixture::new();
+    let session = Arc::new(adapter(&fixture.root));
+    session.terminate().unwrap();
+    eventually("exit published", || {
+        let index = session.owner.index().ok()?;
+        matches!(index.entries["synthetic"].phase, Phase::Exited { .. }).then_some(())
+    });
+    // An act in flight holds this lock until it has settled its own result.
+    let in_flight = session.acts.lock().unwrap();
+    let tearing = {
+        let session = Arc::clone(&session);
+        std::thread::spawn(move || session.teardown(Duration::from_secs(10)))
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !tearing.is_finished(),
+        "teardown ran under an act in flight"
+    );
+    assert!(session
+        .owner
+        .index()
+        .unwrap()
+        .entries
+        .contains_key("synthetic"));
+    drop(in_flight);
+    tearing.join().unwrap().unwrap();
+    let host = fixture.host.as_mut().unwrap();
+    eventually("host stopped", || host.0.try_wait().ok().flatten());
+}
