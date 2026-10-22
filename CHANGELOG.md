@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `remuda vfs status` names the stores `cluster leave` and `cluster init
+  --new-identity` set aside (`Old stores:`, with their size), so they do
+  not fill the disk unnoticed. `--json` has them as `old_stores`.
 - Cluster: `remuda cluster init --new-identity` now moves this node's VFS
   store to `cluster.left-YYYYMMDD/vfs` and says so before it asks (#862).
   Before, the old index stayed under the new key, and after a rejoin a file

@@ -49,6 +49,9 @@ Copies: 1230 files complete; 4 short (first: notes.md 1 of 3, …)
   (for up to 30 s). It exits 75 while any file is short, so a script can
   wait for it. Nodes that did not answer in time are named.
 - `--json` prints the same report as JSON.
+- `Old stores:` appears when `cluster leave` or `init --new-identity` set a
+  store aside in `cluster.left-DATE/vfs`. Nothing deletes them; remove a
+  folder yourself once you no longer need its files.
 
 ## Making sure a write has copies: `put --min-copies K`
 
