@@ -1805,7 +1805,8 @@ fn reload(
             );
         };
         let deadlines = crate::reload::Deadlines::default();
-        let candidate = match crate::reload::start(
+        let busy = mods_busy(image);
+        let mut candidate = match crate::reload::start(
             socket,
             Path::new(binary),
             image.session_hosts(),
@@ -1820,6 +1821,7 @@ fn reload(
                 )
             }
         };
+        candidate.block(busy);
         if check || !candidate.report().blockers.is_empty() {
             let report = candidate.abort();
             return (Response::Value(report.lines().join("\n")), false);
@@ -1846,6 +1848,28 @@ fn reload(
             Response::error("reload is not supported on Windows yet: sessions there have no host"),
             false,
         )
+    }
+}
+
+/// Why mods say a reload must wait: each mod's `daemon_reload_ready`.
+/// A Lua image that cannot answer in time blocks too, saying so.
+#[cfg(unix)]
+fn mods_busy(image: &Image) -> Vec<String> {
+    const ASK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+    let asked = image.submit(
+        "return remuda._daemon_reload_check()",
+        Some("@remuda/reload-check"),
+    );
+    match asked.map(|answer| answer.recv_timeout(ASK_DEADLINE)) {
+        Ok(Ok(Ok(lines))) => lines.lines().map(str::to_string).collect(),
+        // No image, so no mod to ask.
+        Ok(Ok(Err(error))) if error.starts_with("image failed to start") => Vec::new(),
+        Ok(Ok(Err(error))) => vec![format!("mods: the busy check failed: {error}")],
+        Ok(Err(_)) => vec![format!(
+            "mods: the Lua image did not answer the busy check within {} s",
+            ASK_DEADLINE.as_secs()
+        )],
+        Err(error) => vec![format!("mods: {error}")],
     }
 }
 
@@ -2115,6 +2139,7 @@ fn handle_request(
         Request::ClusterRegistrySync { .. }
         | Request::ClusterRegistryUpdate { .. }
         | Request::ClusterVfsIndexSync { .. }
+        | Request::ClusterVfsChanges { .. }
         | Request::ClusterVfsIndexUpdate { .. }
         | Request::ClusterVfsBlobStat { .. }
         | Request::ClusterVfsBlobGet { .. } => refuse_cluster_registry(&stream),
