@@ -8,6 +8,15 @@
   daemon, for example one edited since the old daemon started, is named and
   `reload` exits 1. The reload itself has gone through.
 
+- VFS: nodes pull only what a peer changed since they last asked (#778).
+  `index.db` gets a change sequence and a cursor per peer (schema step 2).
+  An unchanged peer costs one request per tick instead of a whole-index
+  digest and a full re-pull whenever anything differs. Merged rows relay to
+  peers that never talk to the writer. Older peers keep the digest pull.
+  To go back to a remuda one schema step older, run `remuda vfs
+  index-downgrade 1 --yes` (it writes a backup), then stop the daemon and
+  start the older remuda.
+
 - After `remuda reload` (Unix), the new daemon shows in `ps` as
   `remuda -s NAME daemon`, like any other daemon, instead of
   `remuda _reload-candidate SOCKET`.
@@ -35,6 +44,8 @@
     old daemon takes everything back and keeps serving, and `reload` exits
     1.
   - In-process sessions still block a reload.
+  - A mod can hold off a reload while it is busy: its optional
+    `daemon_reload_ready(state)` returns a reason, shown as a blocker.
   - Lua: `remuda.daemon.reloaded_from()` returns the pid of the daemon this
     one took over from, or nil after a fresh start.
 
