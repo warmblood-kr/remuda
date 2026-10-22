@@ -126,6 +126,21 @@ jobs:
           fetch-depth: 0
       - run: BUTLER_REPO="$GITHUB_WORKSPACE/remuda-butler" scripts/check-butler-contract.sh
 
+  test-hosted:
+    # The native suite with every new session host-backed (#713), the bar for
+    # making hosting the default. It also fails when the run leaves a session
+    # host alive (leaks use up the machine's pseudo-terminals). Tests of
+    # deliberate differences are skipped by name, with reasons, in
+    # scripts/hosted-suite-known-differences.txt.
+    # `continue-on-error` until the suite is green with hosting on; then this
+    # line goes and the job gates like every other.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh scripts/test-hosted-suite.sh
+
   host-compat-n-plus-one:
     # A reload replaces the daemon while session hosts keep running, so a
     # daemon and a host from adjacent builds must work in both directions.
@@ -419,11 +434,15 @@ jobs:
         # Revert this line to undo #624; %p separates processes and %b identifies the binary.
         env:
           LLVM_PROFILE_FILE_NAME: "%p-%b.profraw"
+        # A test that SIGKILLs an exiting daemon can truncate its profile; the
+        # script sets such files aside and names them, then the rest merge.
         run: |
+          cargo llvm-cov --workspace --all-targets --no-report
           {
             echo "## Coverage"
             echo '```'
-            cargo llvm-cov --workspace --all-targets --summary-only
+            bash scripts/drop-truncated-profraw.sh
+            cargo llvm-cov report --summary-only
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Profile diagnostics (#624)

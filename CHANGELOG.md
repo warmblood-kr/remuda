@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Cluster: `remuda cluster init --new-identity` now moves this node's VFS
+  store to `cluster.left-YYYYMMDD/vfs` and says so before it asks (#862).
+  Before, the old index stayed under the new key, and after a rejoin a file
+  deleted meanwhile (once its delete record was collected) could come back.
+- `remuda reload` (Unix): `reload` and `reload --check` warn when the
+  target build cannot read this node's VFS index (`index.db`), as when
+  going back to an older build. The warning names `remuda vfs
+  index-downgrade`. It never blocks: sessions are unaffected, and the VFS
+  works again after a reload forward.
+
 - Cluster: `remuda cluster leave [--yes]` takes this node out (#778). It asks
   another node to revoke it (`ClusterLeave`); that node first checks that
   every VFS file keeps its copies without the leaver, and records the leave

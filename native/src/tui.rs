@@ -1704,7 +1704,7 @@ mod visual_mode_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch directory");
         let path = crate::daemon::socket_path_in(&dir, "visual-cells");
-        super::serve_in_scratch(&dir, &path);
+        let _hosts = super::serve_in_scratch(&dir, &path);
         let name = "visual-cells";
         let command = vec![
             "sh".into(),
@@ -3903,9 +3903,17 @@ impl Drop for ScratchEnv {
     }
 }
 
-/// Starts a private daemon at `path` and returns once it answers.
+/// Stops the session hosts a test daemon started (#713).
 #[cfg(test)]
-fn serve_in_scratch(dir: &std::path::Path, path: &std::path::Path) {
+#[path = "../tests/daemon_support/hosts.rs"]
+mod test_hosts;
+
+/// Starts a private daemon at `path` and returns once it answers. The guard
+/// stops, on drop, the session hosts started under `dir`: they outlive the
+/// in-process daemon, which itself lives until the test binary exits.
+#[cfg(test)]
+#[must_use = "dropping it stops the daemon's session hosts at once"]
+fn serve_in_scratch(dir: &std::path::Path, path: &std::path::Path) -> test_hosts::HostSweep {
     use remuda_core::protocol::{Request, Response};
     use std::time::{Duration, Instant};
 
@@ -3943,6 +3951,7 @@ fn serve_in_scratch(dir: &std::path::Path, path: &std::path::Path) {
         ),
         "the test daemon read cluster state outside its scratch directory"
     );
+    test_hosts::HostSweep::new(dir)
 }
 
 #[cfg(test)]

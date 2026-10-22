@@ -7,6 +7,8 @@
 // This integration test deliberately exercises the real loopback cluster wire.
 #![allow(clippy::disallowed_types)]
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use remuda_core::protocol::Request;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -211,6 +213,7 @@ impl Node {
 impl Drop for Node {
     fn drop(&mut self) {
         self.kill();
+        hosts::stop_hosts_under(&self.root);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -676,6 +679,52 @@ fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// `cluster init --new-identity` sets the old store aside (#862): after a
+/// rejoin, a file deleted meanwhile, whose tombstone was collected, does not
+/// come back from the old index.
+#[test]
+fn a_new_identity_rejoins_with_an_empty_store() {
+    let _serial = live_test_guard();
+    let (a, b, c) = three_nodes();
+    put(&c, "remuda:///gone.txt", b"deleted while away");
+    wait_for_body(&a, "remuda:///gone.txt", b"deleted while away");
+
+    let said = successful(
+        c.run(&["cluster", "init", "--new-identity", "--yes"]),
+        "cluster init --new-identity",
+    );
+    assert!(said.contains("Old cluster files: "), "{said}");
+    let state = c.root.join("state/remuda");
+    assert!(!state.join("cluster/vfs/index.db").exists());
+    let left = std::fs::read_dir(&state)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.to_string_lossy().contains("cluster.left-"))
+        .expect("old store set aside");
+    assert!(left.join("vfs/index.db").is_file());
+
+    successful(a.run(&["vfs", "rm", "remuda:///gone.txt"]), "vfs rm");
+    wait_gone(&b, "remuda:///gone.txt");
+    for node in [&a, &b] {
+        let index = node.root.join("state/remuda/cluster/vfs/index.db");
+        rusqlite::Connection::open(index)
+            .unwrap()
+            .execute("DELETE FROM entries WHERE path = 'gone.txt'", [])
+            .unwrap();
+    }
+    c.enable_listener();
+    join(&a, &c);
+    put(&a, "remuda:///after.txt", b"written after the rejoin");
+    wait_for_body(&c, "remuda:///after.txt", b"written after the rejoin");
+    thread::sleep(Duration::from_millis(SYNC_INTERVAL_MS * 10));
+    for node in [&a, &b, &c] {
+        assert!(
+            node.stat_json("remuda:///gone.txt").is_none(),
+            "gone.txt came back"
+        );
+    }
 }
 
 /// Whether `node`'s registry lists `fingerprint` as revoked.

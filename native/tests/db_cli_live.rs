@@ -3,6 +3,8 @@
 
 #![cfg(unix)]
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use remuda_core::protocol::Request;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -123,6 +125,7 @@ impl Home {
 impl Drop for Home {
     fn drop(&mut self) {
         self.stop();
+        hosts::stop_hosts_under(&self.root);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }

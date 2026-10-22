@@ -6,6 +6,8 @@
 //! order instead. SFDPOT Charter 2 HIGH-1.
 #![cfg(unix)]
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use remuda_native::daemon;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -15,6 +17,8 @@ struct Daemon {
     child: Child,
     socket: PathBuf,
     log: PathBuf,
+    // Dropped after `Drop::drop` kills the daemon: stops its session hosts (#713).
+    _hosts: hosts::HostSweep,
 }
 
 impl Daemon {
@@ -51,7 +55,12 @@ impl Daemon {
             .spawn()
             .expect("spawn daemon");
         let socket = daemon::socket_path_in(&dir, "s");
-        let daemon = Self { child, socket, log };
+        let daemon = Self {
+            child,
+            socket,
+            log,
+            _hosts: hosts::HostSweep::new(&dir),
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
         while remuda_native::ipc::connect(&daemon.socket).is_err() {
             assert!(

@@ -2,6 +2,8 @@
 //! too old, `exec` activates hosts before guests, `mod remove` refuses while a
 //! dependent is installed. DESIGN §4 "Dependencies, load order, removal".
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -54,6 +56,7 @@ impl Home {
 impl Drop for Home {
     fn drop(&mut self) {
         let _ = self.remuda(&["stop", "-f"]);
+        hosts::stop_hosts_under(&self.0);
         let _ = fs::remove_dir_all(&self.0);
     }
 }
