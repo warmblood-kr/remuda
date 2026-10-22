@@ -98,6 +98,8 @@ fn shutdown() -> Request {
         requester_session_id: None,
         requester_session_name: None,
         override_hosted: false,
+        // The hosts must outlive this stop: the next daemon takes them.
+        keep_sessions: true,
     }
 }
 
