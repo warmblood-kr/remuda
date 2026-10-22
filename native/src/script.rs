@@ -30,10 +30,11 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 110] = [
+pub const BINDINGS: [&str; 111] = [
     "_advice_reattach",
     "_call",
     "_caller_live",
+    "_daemon_reload_check",
     "_descriptors",
     "_dispatch_extension_command",
     "_event_counts",
@@ -443,8 +444,8 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "vfs.stat",
-        "Describe a stored file: path, version, sha256, size, mtime, replicas, writer, local (whether this node holds a copy) and synced_at (unix time a peer index was last merged here, or nil). A file known here without a local copy still returns its table, with local = false.",
-        "vfs.stat(uri) -> {path, version, sha256, size, mtime, replicas, writer, local, synced_at} | nil, reason",
+        "Describe a stored file: path, version, sha256, size, mtime, replicas, writer, local (whether this node holds a copy), synced_at (unix time a peer index was last merged here, or nil) and conflicts (concurrent writes kept beside this one, each {version, writer, sha256, size, deleted, mtime}; the next put or rm settles them). A file known here without a local copy still returns its table, with local = false.",
+        "vfs.stat(uri) -> {path, version, sha256, size, mtime, replicas, writer, local, synced_at, conflicts} | nil, reason",
     ),
     (
         "vfs.read",
@@ -2547,17 +2548,15 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::ClusterRegistryPage { .. }
         | Response::ClusterRegistryAck { .. }
         | Response::ClusterVfsIndexPage { .. }
+        | Response::ClusterVfsChangesPage { .. }
         | Response::ClusterVfsAck { .. }
         | Response::ClusterVfsBlobHave(_)
         | Response::ClusterVfsBlobChunk { .. }
         | Response::ClusterListenerStatus(_) => Err(mlua::Error::runtime(
             "cluster control responses are not exposed to scripts",
         )),
-        Response::PromptSecret { .. } => Err(mlua::Error::runtime(
-            "secret prompts are not supported by this client path",
-        )),
-        Response::PromptLine { .. } => Err(mlua::Error::runtime(
-            "line prompts are not supported by this client path",
+        Response::PromptSecret { .. } | Response::PromptLine { .. } => Err(mlua::Error::runtime(
+            "secret and line prompts are not supported by this client path",
         )),
     }
 }
