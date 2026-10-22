@@ -8,6 +8,14 @@
   daemon, for example one edited since the old daemon started, is named and
   `reload` exits 1. The reload itself has gone through.
 
+- VFS: two writes to the same path made while nodes could not see each
+  other no longer drop one silently (#778). Each entry carries a version
+  vector (schema step 3). The winner is picked as before, so older nodes
+  agree, but the losing write is kept as a conflict on the entry and its
+  blob is no longer collected. The next write to the path settles every
+  conflict it saw. Writes from older nodes merge as before, with no
+  conflict detection. `remuda vfs index-downgrade 2 --yes` steps back.
+
 - VFS: nodes pull only what a peer changed since they last asked (#778).
   `index.db` gets a change sequence and a cursor per peer (schema step 2).
   An unchanged peer costs one request per tick instead of a whole-index
