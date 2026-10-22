@@ -544,8 +544,9 @@ fn reload_check(
     )
 }
 
-/// Whatever either build supports, a reload or its check across N and N+1
-/// leaves the hosted session working, and a refusal says why.
+/// A reload or its check across N and N+1 goes through and keeps the hosted
+/// session. Both builds know reload now, so the only refusal allowed is a
+/// handoff version bump, which says so.
 fn check_leaves_the_session_alone(daemon_exe: &Path, cli: &Path, target: &Path, check: bool) {
     let root = Root::new();
     let path = root.socket();
@@ -553,14 +554,22 @@ fn check_leaves_the_session_alone(daemon_exe: &Path, cli: &Path, target: &Path, 
     new_session(&path, "compat");
     let (code, stdout, stderr) = reload_check(&root, cli, target, check);
     eprintln!("reload (check {check}): exit {code:?}\n{stdout}{stderr}");
-    // Builds that speak different handoff versions refuse each other cleanly.
-    let understood = stdout.starts_with("ready: ")
-        || stdout.starts_with("reloaded: ")
-        || stderr.contains("candidate exited before its hello")
-        || stderr.contains("predates `remuda reload`")
-        || stderr.contains(" speaks handoff version ")
-        || stderr.contains("reload without --check is not implemented yet");
-    assert!(understood, "exit {code:?}\n{stdout}\n{stderr}");
+    if stdout.starts_with("ready: ") || stdout.starts_with("reloaded: ") {
+        // The candidate drives the host the other build started.
+        assert!(stdout.contains("\nhost compat: now "), "{stdout}");
+        assert_eq!(code, Some(0), "{stdout}{stderr}");
+    } else {
+        assert!(
+            stderr.contains(" speaks handoff version "),
+            "exit {code:?}\n{stdout}\n{stderr}"
+        );
+    }
+    if stdout.starts_with("reloaded: ") {
+        assert!(
+            stdout.contains("\nsessions: all 1 host-backed listed"),
+            "{stdout}"
+        );
+    }
     // `remuda stop` would end every session: never the advice here.
     assert!(!stderr.contains("run `remuda stop`"), "{stderr}");
     assert_eq!(
@@ -644,7 +653,8 @@ fn a_rediscovered_hosted_session_still_wakes_output_hooks() {
 }
 
 /// `remuda upgrade`'s reload across N and N+1: the daemon moves onto the
-/// installed build, or keeps its own and says why; the session lives on.
+/// installed build, and the session lives on. Only a handoff version bump
+/// may keep the old daemon.
 fn upgrade_across_builds(daemon_exe: &Path, installed: &Path) {
     use remuda_native::reload::upgrade::{after_upgrade, AfterUpgrade};
     let root = Root::new();
@@ -656,13 +666,7 @@ fn upgrade_across_builds(daemon_exe: &Path, installed: &Path) {
     let understood = match &outcome {
         AfterUpgrade::Reloaded(report) => report.starts_with("reloaded: "),
         AfterUpgrade::Current(_) => true,
-        AfterUpgrade::Kept(why) => {
-            why.contains("predates `remuda reload`")
-                || why.contains("did not start as a reload candidate")
-                || why.contains(" speaks handoff version ")
-                || why.contains("reload without --check is not implemented yet")
-                || why.starts_with("blocked: ")
-        }
+        AfterUpgrade::Kept(why) => why.contains(" speaks handoff version "),
         // A move that left the new daemon failing its post-check is a break.
         AfterUpgrade::Unhealthy(_) | AfterUpgrade::Failed(_) => false,
         AfterUpgrade::NoDaemon => false,
