@@ -13,6 +13,7 @@ pub mod replication;
 mod sealed;
 pub(crate) mod storage;
 pub mod vfs;
+pub mod vfs_drain;
 mod vfs_index_db;
 mod vfs_repair;
 pub mod vfs_sync;

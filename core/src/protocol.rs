@@ -56,6 +56,9 @@ pub const LINE_ANSWER_MAX_BYTES: usize = 1024;
 /// Maximum newline-delimited frame carrying a [`Request::LineAnswer`].
 pub const LINE_ANSWER_MAX_FRAME_BYTES: usize = 8 * 1024;
 
+/// A peer listing this in `caps` serves [`Request::ClusterVfsTake`].
+pub const VFS_CAP_TAKE: &str = "take";
+
 /// Whether a character is an invisible formatting or separator character that
 /// should not be preserved in a prompt label or visible line answer.
 pub fn is_secret_prompt_format_or_separator(ch: char) -> bool {
@@ -357,6 +360,9 @@ pub enum Request {
     ClusterVfsBlobStat { hashes: Vec<String> },
     /// Read one chunk of a blob the peer holds, from `offset`.
     ClusterVfsBlobGet { sha256: String, offset: u64 },
+    /// Ask the peer to pull and keep these blobs: the caller is draining
+    /// before it leaves. Only sent to peers that list `VFS_CAP_TAKE`.
+    ClusterVfsTake { hashes: Vec<String> },
     /// Read or reload the daemon-owned local cluster listener.
     ClusterListener(ListenerOp),
     /// Stop the daemon, so the next command starts a fresh one. The daemon
@@ -544,6 +550,9 @@ pub enum Response {
         seen_seq: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seen_index_id: Option<String>,
+        /// VFS requests this peer serves beyond the base set, e.g. "take".
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        caps: Vec<String>,
     },
     /// Index entries were merged; `applied` counts those that changed state.
     ClusterVfsAck {

@@ -5,6 +5,7 @@
 
 use crate::cli_parse::{self, ArgSpec, OptionSpec, RepeatPolicy, Spec, VerbSpec};
 use crate::cluster::vfs::{VfsError, VfsErrorKind, VfsStore};
+use crate::cluster::vfs_drain::DrainReport;
 use crate::cluster::vfs_sync;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -26,6 +27,8 @@ macro_rules! warn {
 use std::time::Duration;
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Under the CLI's 125 s wait for a vfs answer; drain can simply be rerun.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(100);
 /// `put` stored the file but reached no peer: a temporary failure
 /// (EX_TEMPFAIL from sysexits.h), so scripts can retry or wait.
 const EXIT_TEMPFAIL: u8 = 75;
@@ -87,6 +90,9 @@ fn spec() -> Spec {
                 vec![arg("URI", "remuda:// URI", true)], vec![], "remuda vfs rm URI"),
             verb("sync", "Pull indexes from peers and repair missing copies now. Example: remuda vfs sync",
                 vec![], vec![], "remuda vfs sync"),
+            verb("drain", "Before this node leaves, have the other nodes take copies of what it holds. Example: remuda vfs drain",
+                vec![], vec![option("timeout", Some("SECS"), "Give up after this long (1-110; default 100); run drain again to go on")],
+                "remuda vfs drain [--timeout SECS]"),
             verb("config", "Show or set the cluster name and default replicas. Example: remuda vfs config --cluster home --replicas 2",
                 vec![], vec![option("cluster", Some("NAME"), "Cluster name used in remuda://NAME/ URIs"),
                              option("replicas", Some("N"), "Default copies for new files (1-16)"),
@@ -334,6 +340,7 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
             say!(out, "{report}");
             0
         }
+        "drain" => drain(values, out),
         "config" => config(&store, values, out),
         "export-index" => match store.export_legacy_index() {
             Ok(count) => {
@@ -464,6 +471,67 @@ fn put(store: &VfsStore, values: &Map<String, Value>, bytes: &[u8], out: &mut Ou
     } else {
         0
     }
+}
+
+fn drain(values: &Map<String, Value>, out: &mut Out) -> u8 {
+    let timeout = match value(values, "timeout").map(str::parse::<u64>) {
+        None => DRAIN_TIMEOUT,
+        Some(Ok(secs @ 1..=110)) => Duration::from_secs(secs),
+        Some(_) => return fail(out, "drain", "--timeout must be 1-110 seconds"),
+    };
+    match crate::cluster::vfs_drain::drain(timeout) {
+        Ok(report) => {
+            let (lines, code) = drain_outcome(&report);
+            for line in lines {
+                if code == 0 {
+                    say!(out, "{line}");
+                } else {
+                    warn!(out, "{line}");
+                }
+            }
+            code
+        }
+        Err(error) => fail_vfs(out, "drain", &error),
+    }
+}
+
+/// What drain prints, and its exit code: 0 once no file is short.
+fn drain_outcome(report: &DrainReport) -> (Vec<String>, u8) {
+    if report.short.is_empty() {
+        return (
+            vec![
+                format!(
+                    "All {} files held here have their copies on the other {} nodes.",
+                    report.files, report.remaining
+                ),
+                format!(
+                    "Safe to leave: on another node, run `remuda cluster revoke {}`.",
+                    report.node
+                ),
+            ],
+            0,
+        );
+    }
+    let first: Vec<&str> = report.short.iter().take(5).map(String::as_str).collect();
+    let mut lines = vec![format!(
+        "remuda: vfs drain: {} of {} files still lack copies without this node (first: {}); still copying (exit code {EXIT_TEMPFAIL})",
+        report.short.len(),
+        report.files,
+        first.join(", ")
+    )];
+    if report.remaining == 0 {
+        lines.push(
+            "Next: start or join another node; no other node is up to take the files.".into(),
+        );
+    } else if !report.too_old.is_empty() {
+        lines.push(format!(
+            "Next: upgrade {}; too old to take copies.",
+            report.too_old.join(", ")
+        ));
+    } else {
+        lines.push("Next: run `remuda vfs drain` again; peers are still copying.".into());
+    }
+    (lines, EXIT_TEMPFAIL)
 }
 
 /// `--min-copies K`: 1 up to the copies wanted, since nodes outside the
@@ -1000,6 +1068,29 @@ mod tests {
         assert_eq!(code, EXIT_TEMPFAIL);
         assert!(said.starts_with("committed here, but only 1 of 3 copies confirmed"));
         assert!(said.contains("still replicating"));
+    }
+
+    #[test]
+    fn drain_says_when_it_is_safe_to_leave_and_what_blocks_it() {
+        let mut report = DrainReport {
+            node: "node-abcd".into(),
+            files: 3,
+            remaining: 2,
+            ..DrainReport::default()
+        };
+        let (lines, code) = drain_outcome(&report);
+        assert_eq!(code, 0);
+        assert!(lines[1].contains("remuda cluster revoke node-abcd"));
+
+        report.short = vec!["a.txt".into()];
+        report.too_old = vec!["node-old".into()];
+        let (lines, code) = drain_outcome(&report);
+        assert_eq!(code, EXIT_TEMPFAIL);
+        assert!(lines[0].contains("1 of 3 files") && lines[0].contains("a.txt"));
+        assert!(lines[1].contains("upgrade node-old"));
+
+        report.remaining = 0;
+        assert!(drain_outcome(&report).0[1].contains("no other node is up"));
     }
 
     #[test]
