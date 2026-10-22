@@ -586,7 +586,9 @@ impl SessionOperations for HostSession {
             cut: ObservationCut::Host {
                 revision: info.generation,
             },
-            size: Size::for_pane(info.cols, info.rows),
+            // The host's real size: the daemon already floored it, or the
+            // caller opted out of the floor.
+            size: Size::for_viewport(info.cols, info.rows),
             pid: info.pid,
             output_version: Some(info.generation),
             idle: Duration::from_millis(activity.idle_ms),
