@@ -57,7 +57,10 @@ every update is a reload.
    sessions: all N host-backed listed
    init.lua: loaded
    ```
-   and exits 0.
+   and exits 0. If a session's host had already died before the reload,
+   the sessions line reads `sessions: 1 of 2 host-backed reachable;
+   unreachable before the reload too: NAME`. That session was lost
+   earlier, not by the reload, and the run still exits 0.
 8. While it runs (usually under a second, up to about 10 s if sessions are
    busy), input to a session may be refused with "session owner
    unavailable: Recovering". Send it again. Input that was answered `Ok` is
