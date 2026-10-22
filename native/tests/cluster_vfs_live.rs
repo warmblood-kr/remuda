@@ -11,7 +11,7 @@ use remuda_core::protocol::Request;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -161,7 +161,12 @@ impl Node {
     }
 
     fn run_with_stdin(&self, args: &[&str], stdin: Option<&[u8]>) -> Output {
-        let mut command = Command::new(&self.exe);
+        self.run_exe(&self.exe, args, stdin)
+    }
+
+    /// Run `exe` (this node's or another build's CLI) against this node.
+    fn run_exe(&self, exe: &std::path::Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
+        let mut command = Command::new(exe);
         command.args(["-s", &self.name]).args(args);
         self.env(&mut command);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -915,6 +920,119 @@ fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
     for node in [&a, &c] {
         wait_gone(node, from_new);
     }
+}
+
+/// A writer puts files while its daemon reloads into N and back (#778): every
+/// put that succeeded is in the index afterwards and reaches another node.
+/// N may refuse the handoff (another handoff version); that is allowed.
+#[test]
+#[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS; run by CI job host-compat-n-plus-one"]
+fn n_plus_one_vfs_writes_survive_a_reload_to_n_and_back() {
+    let _serial = live_test_guard();
+    // Before index.db, N reads index.json; vfs-compat-pre-sqlite covers that.
+    if !previous_has_vfs_verb("export-index") {
+        skip("N has no index.db");
+        return;
+    }
+    let (a, b, _c) = three_nodes();
+    let this = a.exe.clone();
+    let old = previous();
+    let stop = AtomicBool::new(false);
+    let (written, refused, tried, reloads) = thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let mut written = Vec::new();
+            let mut refused = Vec::new();
+            let mut tried = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let uri = format!("remuda:///reload/{tried}.txt");
+                let args = ["vfs", "put", "-", &uri];
+                // A CLI refuses a daemon of another build: while N serves,
+                // N's own CLI writes.
+                let puts: Vec<Output> = [&this, &old]
+                    .iter()
+                    .map(|exe| a.run_exe(exe, &args, Some(uri.as_bytes())))
+                    .collect();
+                if puts.iter().any(|put| put.status.success()) {
+                    written.push(uri);
+                } else {
+                    let why: Vec<_> = puts
+                        .iter()
+                        .map(|put| String::from_utf8_lossy(&put.stderr).into_owned())
+                        .collect();
+                    refused.push(why.join(" | "));
+                }
+                tried += 1;
+            }
+            (written, refused, tried)
+        });
+        thread::sleep(Duration::from_millis(300));
+        let mut reloads = Vec::new();
+        for target in [old.clone(), this.clone()] {
+            let out = a.run(&["reload", "--binary", &target.to_string_lossy()]);
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            eprintln!(
+                "reload to {}: {:?}\n{stdout}{stderr}",
+                target.display(),
+                out.status.code()
+            );
+            let moved = stdout.starts_with("reloaded: ");
+            assert!(
+                moved || stderr.contains(" speaks handoff version "),
+                "reload to {}: {stdout}{stderr}",
+                target.display()
+            );
+            reloads.push(moved);
+            thread::sleep(Duration::from_millis(300));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let (written, refused, tried) = writer.join().unwrap();
+        (written, refused, tried, reloads)
+    });
+    eprintln!(
+        "{} of {tried} puts succeeded; reloads moved: {reloads:?}",
+        written.len()
+    );
+    // A put may fail only while the daemon moves, or because N refuses an
+    // index.db at a newer schema than it knows (the documented downgrade).
+    let expected = [
+        "is not this build",
+        "needs the remuda daemon",
+        "newer than this remuda",
+    ];
+    for why in &refused {
+        assert!(
+            expected.iter().any(|known| why.contains(known)),
+            "unexpected put failure: {why}"
+        );
+    }
+    assert!(!written.is_empty());
+    let index = a.root.join("state/remuda/cluster/vfs/index.db");
+    let check: String = rusqlite::Connection::open(index)
+        .unwrap()
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(check, "ok");
+    for uri in &written {
+        let body = uri.as_bytes();
+        assert_eq!(
+            a.stat_json(uri).map(|stat| stat["sha256"].clone()),
+            Some(serde_json::Value::from(sha256_hex(body))),
+            "{uri} was acknowledged but is missing on the node that wrote it"
+        );
+        wait_for_body(&b, uri, body);
+    }
+    // The daemon serving now may not be `a`'s child: stop it by request.
+    let _ = remuda_native::client::request(
+        &a.daemon_path(),
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+            keep_sessions: false,
+        },
+    );
 }
 
 /// Rows in `index.db`'s conflicts table (design step 4); 0 before that step.
