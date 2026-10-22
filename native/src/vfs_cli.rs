@@ -563,9 +563,17 @@ fn resolve(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
         Ok(uri) => uri,
         Err(error) => return fail_vfs(out, "resolve", &error),
     };
-    match fetch(store, &uri, flag(values, "local"))
-        .and_then(|(entry, _)| store.blob_path(&entry.sha256))
-    {
+    // Unmark first, so a trim cannot delete the path we print; fetch again
+    // if one already did.
+    let local = flag(values, "local");
+    let kept = fetch(store, &uri, local).and_then(|(entry, _)| {
+        store.keep_blob(&entry.sha256)?;
+        if !store.has_blob(&entry.sha256, entry.size) {
+            fetch(store, &uri, local)?;
+        }
+        Ok(entry)
+    });
+    match kept.and_then(|entry| store.blob_path(&entry.sha256)) {
         Ok(path) => {
             say!(out, "{}", path.display());
             0

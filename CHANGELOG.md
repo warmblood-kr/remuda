@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- VFS: a node that took a copy while a holder was down deletes it again
+  once that holder is back and confirms its copy (#778). Only copies the
+  repair pass fetched are trimmed: files this node wrote, read with `vfs
+  get`, or handed to a tool by `vfs resolve` stay. `remuda vfs sync`
+  reports the copies trimmed.
+
 - VFS: copies that fail to fetch no longer crowd out the rest (#778). A
   failed copy waits 30 s before the next try, doubling up to an hour, and
   copies never tried go first. `remuda vfs sync` retries at once and its
