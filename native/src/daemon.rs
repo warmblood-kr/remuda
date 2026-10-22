@@ -1380,6 +1380,16 @@ pub(crate) fn reap_and_notify(registry: &Registry, image: &Image) -> Vec<String>
     for (name, id, instance_id, reason, exit_info) in &dead {
         notify_exited(image, name, id, instance_id, reason, exit_info.as_ref());
     }
+    // A host-backed session's child exits inside its host (#713): stop the
+    // host and retire its entry as a close would, then announce it the same way.
+    let hosted = registry.reap_hosted_with_exit_info();
+    for (name, id, instance_id, reason, exit_info) in &hosted {
+        #[cfg(unix)]
+        image.session_hosts().retire_closed(name);
+        notify_exited(image, name, id, instance_id, reason, exit_info.as_ref());
+    }
+    let mut dead = dead;
+    dead.extend(hosted);
     dead.into_iter().map(|(name, _, _, _, _)| name).collect()
 }
 
@@ -1922,7 +1932,13 @@ fn drain_session_hosts(image: &Image) {
 /// covers a grandchild PDEATHSIG alone can't reach (see child_guard.rs).
 /// Only THIS death mode runs any code at all; SIGTERM/SIGKILL run none.
 fn reap_processes_before_exit(image: &Image) {
-    image.shutdown_pending_replies();
+    reap_before_exit(image, false);
+}
+
+/// The same teardown, `reloaded` after a reload handed the socket over.
+/// Host-backed sessions are never touched: they belong to the new daemon.
+fn reap_before_exit(image: &Image, reloaded: bool) {
+    image.finish_pending_replies(reloaded);
     let _ = image.eval(
         "for _, id in ipairs(remuda.processes()) do remuda._process_killpg(id) end",
         Some("@remuda/shutdown-reap"),
@@ -2055,9 +2071,14 @@ fn handle_request(
                 {
                     let left = accept::Answering::wait_for_others(1, RELOAD_DRAIN_DEADLINE);
                     if left > 0 {
-                        eprintln!("remuda daemon: reload: {left} request(s) cut at exit");
+                        eprintln!(
+                            "remuda daemon: reload: {left} request(s) still waiting; they are told to ask the new daemon"
+                        );
                     }
                 }
+                // What a clean stop ends: deferred replies still waiting, the
+                // processes Lua started, and the modules (stop hooks run).
+                reap_before_exit(image, true);
                 // The candidate owns the socket now: never unlink it here.
                 anti_entropy.stop_and_join();
                 std::process::exit(0);
@@ -3712,6 +3733,12 @@ fn spawn(
     // `dumb` and its TUI degrades for a reason nobody can see from inside.
     if std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true) {
         builder.env("TERM", "xterm-256color");
+    }
+    // Same as a host-backed child: the daemon's own switches and
+    // service-manager handles are not the session's.
+    #[cfg(unix)]
+    for key in crate::session_host::hosted::DAEMON_ONLY {
+        builder.env_remove(key);
     }
     if let Some(env) = env {
         for (k, v) in env {
