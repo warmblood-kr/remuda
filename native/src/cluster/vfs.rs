@@ -102,9 +102,18 @@ pub struct VfsSettings {
     /// A tombstone every member has pulled is removed after this many days.
     #[serde(default = "default_tombstone_days")]
     pub tombstone_days: u32,
+    /// A member that has not pulled from here for this long stops holding
+    /// tombstones back, and must rebuild its index when it returns.
+    #[serde(default = "default_stale_days")]
+    pub stale_days: u32,
 }
 
 pub const DEFAULT_TOMBSTONE_DAYS: u32 = 7;
+pub const DEFAULT_STALE_DAYS: u32 = 30;
+
+fn default_stale_days() -> u32 {
+    DEFAULT_STALE_DAYS
+}
 
 fn default_tombstone_days() -> u32 {
     DEFAULT_TOMBSTONE_DAYS
@@ -124,6 +133,7 @@ impl Default for VfsSettings {
             cluster_name: default_cluster_name(),
             default_replicas: default_replicas(),
             tombstone_days: default_tombstone_days(),
+            stale_days: default_stale_days(),
         }
     }
 }
@@ -476,6 +486,10 @@ impl VfsStore {
         limit: usize,
     ) -> VfsResult<vfs_index_db::ChangesPage> {
         vfs_index_db::changes(&self.index_db()?, known_id, since, limit)
+    }
+
+    pub fn index_id(&self) -> VfsResult<String> {
+        vfs_index_db::index_id(&self.index_db()?)
     }
 
     /// This node's cursor into `peer`: its index id and the last seq merged.
@@ -832,17 +846,65 @@ impl VfsStore {
     /// Remove tombstones older than `tombstone_days` that every other member
     /// in `others` has pulled from here (design step 5).
     pub fn collect_tombstones(&self, others: &[String], now: u64) -> VfsResult<usize> {
-        let days = u64::from(self.settings()?.tombstone_days);
+        let settings = self.settings()?;
+        let days = u64::from(settings.tombstone_days);
         let _guard = self.lock()?;
         let mut conn = self.index_db()?;
         let tx = vfs_index_db::immediate(&mut conn)?;
         if !vfs_index_db::may_write(&tx)? {
             return Ok(0);
         }
-        let removed =
-            vfs_index_db::collect_tombstones(&tx, others, now.saturating_sub(days * 86_400))?;
+        let removed = vfs_index_db::collect_tombstones(
+            &tx,
+            others,
+            now.saturating_sub(days * 86_400),
+            self.stale_before(&settings, now),
+        )?;
         tx.commit()?;
         Ok(removed)
+    }
+
+    fn stale_before(&self, settings: &VfsSettings, now: u64) -> u64 {
+        now.saturating_sub(u64::from(settings.stale_days) * 86_400)
+    }
+
+    /// Answer for a pull by `peer` from `since`: `Some((seen_seq,
+    /// seen_index_id))` when it was stale and must rejoin. Notes the pull.
+    pub fn check_puller(
+        &self,
+        peer: &str,
+        since: u64,
+        now: u64,
+    ) -> VfsResult<Option<(u64, Option<String>)>> {
+        let settings = self.settings()?;
+        let conn = self.index_db()?;
+        if !vfs_index_db::may_write(&conn)? {
+            return Ok(None);
+        }
+        let stale = vfs_index_db::is_stale(&conn, peer, since, self.stale_before(&settings, now))?;
+        vfs_index_db::set_seen(&conn, peer, now)?;
+        if !stale {
+            return Ok(None);
+        }
+        let (index_id, seq) = vfs_index_db::cursor(&conn, peer)?;
+        Ok(Some((seq, index_id)))
+    }
+
+    /// A peer said this node was away too long: keep only our own writes
+    /// it has not seen and pull everything else again. Returns rows dropped.
+    pub fn rejoin(&self, me: &str, seen_seq: u64, seen_index_id: Option<&str>) -> VfsResult<usize> {
+        let _guard = self.lock()?;
+        let mut conn = self.index_db()?;
+        let tx = vfs_index_db::write_tx(&mut conn)?;
+        let ours = vfs_index_db::index_id(&tx)?;
+        let keep_after = if seen_index_id == Some(ours.as_str()) {
+            seen_seq
+        } else {
+            0
+        };
+        let dropped = vfs_index_db::rejoin(&tx, me, keep_after)?;
+        tx.commit()?;
+        Ok(dropped)
     }
 
     pub fn collect_garbage_older_than(&self, grace: std::time::Duration) -> VfsResult<usize> {
@@ -1108,6 +1170,7 @@ mod tests {
                 cluster_name: "home".into(),
                 default_replicas: 2,
                 tombstone_days: 7,
+                stale_days: 30,
             })
             .unwrap();
         assert!(store.parse_uri("remuda://home/a").is_ok());
