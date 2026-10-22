@@ -249,6 +249,22 @@ fn a_hosted_session_survives_daemon_sigkill_and_is_rediscovered() {
     };
     unavailable(capture(&path, "keeper"));
     unavailable(send_line(&path, "keeper", "echo LOST"));
+    // Listed, not exited, and marked: its size and idle time are unknown.
+    let Response::Sessions(sessions) = request(&path, &Request::List) else {
+        panic!("ls failed");
+    };
+    assert!(sessions[0].unavailable && sessions[0].alive, "{sessions:?}");
+    let listed = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "s", "ls"])
+        .env("REMUDA_RUNTIME_DIR", &root.0)
+        .env("HOME", &root.0)
+        .output()
+        .expect("remuda ls");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed.contains("keeper") && listed.contains("unreachable"),
+        "{listed}"
+    );
     second.sigkill();
 
     // After another restart the entry is still listed, and still Unavailable.
