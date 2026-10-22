@@ -91,4 +91,8 @@ impl SessionPort for RemotePort {
     fn restartable(&self) -> bool {
         false
     }
+
+    fn accepts_lines(&self) -> bool {
+        false
+    }
 }

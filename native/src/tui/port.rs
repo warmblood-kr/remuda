@@ -43,6 +43,11 @@ pub trait SessionPort {
     fn restartable(&self) -> bool {
         true
     }
+
+    /// False when `m` lines cannot be sent to this node yet; `m` then says so.
+    fn accepts_lines(&self) -> bool {
+        true
+    }
 }
 
 impl SessionPort for Path {
@@ -166,6 +171,7 @@ mod tests {
                     attached: false,
                     human_idle: None,
                     mouse_tracking: false,
+                    unavailable: false,
                 }]),
                 Request::CaptureStyled { .. } => Response::StyledScreen {
                     rows: vec![remuda_core::protocol::collapse_runs(&[
