@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `remuda reload` (Unix): the post-check no longer says every session moved
+  when a session's host had already died. It names the session ("unreachable
+  before the reload too") and does not fail; a host lost during the reload
+  still fails it. New tests cover input typed during a reload and the
+  cluster listener following the serving daemon.
+
 - Unix: the socket lock file (`SOCKET.lock`) never reads empty or half
   written while a daemon names itself in it, as at start or when a reload
   hands it over. It now holds the pid padded with newlines to a fixed
