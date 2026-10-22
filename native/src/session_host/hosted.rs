@@ -31,22 +31,32 @@ pub const OPT_IN: &str = "REMUDA_EXPERIMENTAL_SESSION_HOST";
 const CLIENT: [u8; 16] = *b"remuda-daemon-01";
 const PUBLISH_DEADLINE: Duration = Duration::from_secs(10);
 const TEARDOWN_DEADLINE: Duration = Duration::from_secs(10);
-/// Inherited from the daemon when set; the host clears everything else.
-const INHERITED: &[&str] = &[
-    "PATH",
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "TMPDIR",
-    "TERM",
-    "COLORTERM",
-    "XDG_RUNTIME_DIR",
-    "SSH_AUTH_SOCK",
+/// Left out of every session child's environment, hosted or in-process: the
+/// session-host switch and the daemon's systemd/launchd service handles.
+pub(crate) const DAEMON_ONLY: &[&str] = &[
+    OPT_IN,
+    "NOTIFY_SOCKET",
+    "LISTEN_FDS",
+    "LISTEN_PID",
+    "LISTEN_FDNAMES",
+    "WATCHDOG_USEC",
+    "WATCHDOG_PID",
+    "INVOCATION_ID",
+    "JOURNAL_STREAM",
+    "XPC_SERVICE_NAME",
 ];
+
+/// The daemon's environment a hosted child starts from. Host-internal names
+/// (`REMUDA_SESSION_HOST_*`) and variables that are not UTF-8 are left out:
+/// the launch is UTF-8 JSON and refuses the internal prefix.
+fn inherited() -> HashMap<String, String> {
+    std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(key, _)| {
+            !DAEMON_ONLY.contains(&key.as_str()) && !key.starts_with("REMUDA_SESSION_HOST_")
+        })
+        .collect()
+}
 
 pub fn opted_in() -> bool {
     std::env::var(OPT_IN).is_ok_and(|value| value == "1")
@@ -500,10 +510,7 @@ fn launch(request: &NewHosted<'_>) -> Result<Launch, String> {
             .ok_or("working directory is not UTF-8")?
             .to_owned(),
     };
-    let mut env: HashMap<String, String> = INHERITED
-        .iter()
-        .filter_map(|key| std::env::var(key).ok().map(|value| ((*key).into(), value)))
-        .collect();
+    let mut env = inherited();
     if env.get("TERM").is_none_or(|term| term == "dumb") {
         env.insert("TERM".into(), "xterm-256color".into());
     }
@@ -562,7 +569,7 @@ fn start(
             broken_pipe: false,
         })
         .and_then(|mut stdin| {
-            super::wire::write_frame(&mut stdin, bootstrap).map_err(|e| Unwritten {
+            super::wire::write_bootstrap(&mut stdin, bootstrap).map_err(|e| Unwritten {
                 broken_pipe: e.kind() == io::ErrorKind::BrokenPipe,
                 text: e.to_string(),
             })
