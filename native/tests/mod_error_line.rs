@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -54,6 +56,7 @@ impl ModHome {
 impl Drop for ModHome {
     fn drop(&mut self) {
         let _ = self.remuda(&["stop", "-f", "--yes"]);
+        hosts::stop_hosts_under(&self.0);
         let _ = fs::remove_dir_all(&self.0);
     }
 }

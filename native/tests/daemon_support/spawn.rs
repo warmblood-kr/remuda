@@ -9,6 +9,9 @@ use remuda_native::daemon;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+#[path = "hosts.rs"]
+pub mod hosts;
+
 const PATIENCE: Duration = Duration::from_secs(10);
 /// One readiness probe; `client::request` would wait its full 10 s read
 /// timeout on a socket that accepts but does not answer (#663).
@@ -16,8 +19,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A daemon as its own PROCESS, with its streams pointed at nothing. Inheriting
 /// the harness's stdout would let a leaked daemon hold cargo's pipe open, which
-/// turns any failure below into a hung job instead of a red one.
-pub struct Daemon(pub std::process::Child);
+/// turns any failure below into a hung job instead of a red one. Dropping it
+/// kills the daemon, then stops the session hosts it started under its
+/// runtime directory (#713): a host outlives its daemon by design.
+pub struct Daemon(pub std::process::Child, pub hosts::HostSweep);
 
 /// The one place every spawn helper below route through to build their
 /// `Command`. Defaults `HOME` to a path under the test's own scratch `dir`
@@ -53,7 +58,7 @@ pub fn base_command(dir: &Path) -> std::process::Command {
 pub fn spawn_and_wait(mut cmd: std::process::Command, dir: &Path) -> Daemon {
     let mut child = cmd.spawn().expect("spawn daemon");
     wait_until_served(&mut child, &daemon::socket_path_in(dir, "s"), PATIENCE);
-    Daemon(child)
+    Daemon::adopt(child, dir)
 }
 
 /// Polls until the daemon at `path` answers a request; panics, killing
@@ -77,6 +82,11 @@ pub fn wait_until_served(child: &mut std::process::Child, path: &Path, patience:
 }
 
 impl Daemon {
+    /// Takes over a daemon already spawned with runtime directory `dir`.
+    pub fn adopt(child: std::process::Child, dir: &Path) -> Self {
+        Self(child, hosts::HostSweep::new(dir))
+    }
+
     pub fn spawn(dir: &Path) -> Self {
         spawn_and_wait(base_command(dir), dir)
     }
@@ -112,6 +122,7 @@ impl Daemon {
 }
 
 impl Drop for Daemon {
+    // The `HostSweep` field drops after this body: daemon first, then hosts.
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();

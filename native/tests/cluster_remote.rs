@@ -1,6 +1,8 @@
 #![cfg(unix)]
 #![allow(clippy::disallowed_types)]
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use remuda_core::protocol::{Request, Response};
 use remuda_native::cluster::{encoding, AuthorizedNode, NodeState, Registry, ResolvedTarget};
 use remuda_native::cluster_remote::{
@@ -129,6 +131,7 @@ impl Drop for Node {
     fn drop(&mut self) {
         assert!(self.runtime.starts_with(&self.root));
         self.stop_daemon();
+        hosts::stop_hosts_under(&self.root);
         let _ = fs::remove_dir_all(&self.root);
     }
 }

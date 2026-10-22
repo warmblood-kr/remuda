@@ -1,6 +1,8 @@
 #![cfg(unix)]
 #![allow(clippy::disallowed_types)]
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use std::fs;
 use std::io::{BufRead, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -74,6 +76,7 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         assert!(self.runtime.starts_with(&self.root));
+        hosts::stop_hosts_under(&self.root);
         let _ = fs::remove_dir_all(&self.root);
     }
 }

@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -25,6 +27,7 @@ impl std::ops::Deref for ScratchDir {
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
+        hosts::stop_hosts_under(&self.0);
         let _ = fs::remove_dir_all(&self.0);
     }
 }

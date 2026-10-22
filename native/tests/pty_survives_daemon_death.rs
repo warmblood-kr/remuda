@@ -17,6 +17,9 @@
 //! deliverable.
 
 #[cfg(target_os = "linux")]
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
+#[cfg(target_os = "linux")]
 use remuda_core::protocol::{Request, Response};
 #[cfg(target_os = "linux")]
 use remuda_core::Size;
@@ -39,8 +42,9 @@ fn scratch_dir(tag: &str) -> PathBuf {
 
 /// A daemon as its own PROCESS, with a real pid to SIGKILL — an in-thread
 /// `daemon::serve` would die with the test harness itself, proving nothing.
+/// Dropping it kills the daemon, then its session hosts (#713).
 #[cfg(target_os = "linux")]
-struct Daemon(std::process::Child);
+struct Daemon(std::process::Child, #[allow(dead_code)] hosts::HostSweep);
 
 #[cfg(target_os = "linux")]
 impl Daemon {
@@ -56,7 +60,7 @@ impl Daemon {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn daemon");
-        let daemon = Self(child);
+        let daemon = Self(child, hosts::HostSweep::new(dir));
         let path = daemon::socket_path_in(dir, "s");
         let deadline = Instant::now() + PATIENCE;
         while remuda_native::ipc::connect(&path).is_err() {

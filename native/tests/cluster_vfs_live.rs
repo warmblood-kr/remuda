@@ -7,6 +7,8 @@
 // This integration test deliberately exercises the real loopback cluster wire.
 #![allow(clippy::disallowed_types)]
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use remuda_core::protocol::Request;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -206,6 +208,7 @@ impl Node {
 impl Drop for Node {
     fn drop(&mut self) {
         self.kill();
+        hosts::stop_hosts_under(&self.root);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }

@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,6 +69,7 @@ impl Drop for Scratch {
             .env("HOME", &self.0)
             .env("REMUDA_NO_UPDATE_CHECK", "1")
             .output();
+        hosts::stop_hosts_under(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
