@@ -637,7 +637,8 @@ fn upgrade_across_builds(daemon_exe: &Path, installed: &Path) {
                 || why.contains("reload without --check is not implemented yet")
                 || why.starts_with("blocked: ")
         }
-        AfterUpgrade::Failed(_) => false,
+        // A move that left the new daemon failing its post-check is a break.
+        AfterUpgrade::Unhealthy(_) | AfterUpgrade::Failed(_) => false,
         AfterUpgrade::NoDaemon => false,
     };
     assert!(understood, "{outcome:?}");

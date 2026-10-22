@@ -8,6 +8,11 @@
   cluster revoke NODE` on another node; it revokes nothing itself. A peer
   too old to take copies is named, and drain exits 75 while files are short.
 
+- `remuda upgrade` (Unix) checks the reloaded daemon as `remuda reload` does:
+  it answers as the new build, lists every session it took over, and loaded
+  `init.lua`. An `init.lua` that fails only in the new daemon is named and
+  `upgrade` exits 1. Before, it checked only the build.
+
 - VFS: a node that took a copy while a holder was down deletes it again
   once that holder is back and confirms its copy (#778). Only copies the
   repair pass fetched are trimmed: files this node wrote, read with `vfs
