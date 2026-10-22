@@ -305,6 +305,9 @@ impl HostSession {
         }
     }
     fn teardown_step(&self, stopped: &mut bool) -> Result<bool> {
+        // An act in flight here (say, input that ended the child) collects and
+        // settles its own result first; teardown only resolves orphaned keys.
+        let _serial = self.acts.lock().unwrap_or_else(|e| e.into_inner());
         let index = self.owner.index().map_err(store)?;
         let Some(entry) = index.entries.get(&self.name) else {
             return Ok(true);
