@@ -1,5 +1,5 @@
 //! `remuda reload` under faults (#713): reloads that race, reloads in a
-//! row, and a new daemon that dies after taking over. At every point exactly
+//! row, and a new daemon that dies before or after taking over. At every point exactly
 //! one daemon serves, or none and the next one recovers the hosts.
 #![cfg(unix)]
 
@@ -136,7 +136,8 @@ fn new_session(path: &Path, name: &str) {
             command: vec!["/bin/sh".into()],
             size: Size::new(80, 24),
             cwd: Some("/".into()),
-            env: None,
+            // No history file lands in the root after it is removed.
+            env: Some([("HISTFILE".into(), "/dev/null".into())].into()),
         },
     );
     assert_eq!(made, Response::Value(name.into()));
@@ -387,4 +388,277 @@ fn hosts_outlive_a_new_daemon_that_dies_and_the_next_one_drives_them() {
     wait_for(&path, "work", "BEFORE-16");
     assert_eq!(send_line(&path, "work", "echo NEXT-$((5*5))"), Response::Ok);
     wait_for(&path, "work", "NEXT-25");
+}
+
+/// A new daemon that dies at any step before it takes over changes
+/// nothing: the old daemon keeps the socket, the lock and its sessions, and
+/// is left with no child but its session hosts.
+#[test]
+fn a_new_daemon_that_dies_before_taking_over_leaves_the_old_one_serving() {
+    for fault in ["exit-before-hello", "exit-in-preflight", "exit-after-ready"] {
+        let root = Root::new(&fault[5..]);
+        let path = root.socket();
+        let old = Daemon::spawn(&root, true, &[("REMUDA_TEST_RELOAD_FAULT", fault)]);
+        new_session(&path, "work");
+        wait_for(&path, "work", "$");
+        let before = root.lock_pid();
+
+        let out = root.remuda(&["reload"]);
+        let (stdout, stderr) = text(&out);
+        assert!(!out.status.success(), "{fault}: {stdout}{stderr}");
+        assert!(!stdout.contains("reloaded: "), "{fault}: {stdout}{stderr}");
+        assert_eq!(root.lock_pid(), before, "{fault}: another daemon serves");
+        assert_eq!(
+            send_line(&path, "work", "echo KEPT-$((8*8))"),
+            Response::Ok,
+            "{fault}"
+        );
+        wait_for(&path, "work", "KEPT-64");
+        let deadline = Instant::now() + PATIENCE;
+        while children(old.0.id())
+            .iter()
+            .any(|&pid| is_daemon_or_candidate(pid))
+        {
+            assert!(Instant::now() < deadline, "{fault}: a candidate is left");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            stderr.contains("candidate exited before"),
+            "{fault}: {stderr}"
+        );
+    }
+}
+
+fn children(parent: u32) -> Vec<u32> {
+    let ps = Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=", "-o", "ppid="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let pid = words.next()?.parse().ok()?;
+            (words.next()?.parse::<u32>().ok()? == parent).then_some(pid)
+        })
+        .collect()
+}
+
+/// Any remuda process that is not a session host.
+fn is_daemon_or_candidate(pid: u32) -> bool {
+    let ps = Command::new("/bin/ps")
+        .args(["-o", "args=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let args = String::from_utf8_lossy(&ps.stdout);
+    args.contains("remuda") && !args.contains("session-host")
+}
+
+/// The old daemon dies mid-handover. Before it sends the listener, the new
+/// daemon has nothing and exits; the hosts outlive both and the next daemon
+/// drives them. After it sends the listener, the new daemon serves anyway.
+#[test]
+fn an_old_daemon_that_dies_mid_handover_leaves_the_sessions_reachable() {
+    for fault in ["old-exits-before-take", "old-exits-after-take"] {
+        let root = Root::new(&fault[10..]);
+        let path = root.socket();
+        let mut old = Daemon::spawn(&root, true, &[("REMUDA_TEST_RELOAD_FAULT", fault)]);
+        new_session(&path, "work");
+        wait_for(&path, "work", "$");
+        assert_eq!(
+            send_line(&path, "work", "echo BEFORE-$((9*9))"),
+            Response::Ok
+        );
+        wait_for(&path, "work", "BEFORE-81");
+        let before = root.lock_pid();
+
+        let out = root.remuda(&["reload"]);
+        let (stdout, stderr) = text(&out);
+        assert!(!stdout.contains("reloaded: "), "{fault}: {stdout}{stderr}");
+        let deadline = Instant::now() + PATIENCE;
+        let status = loop {
+            if let Some(status) = old.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "{fault}: the old daemon lives");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(!status.success(), "{fault}: the fault did not fire");
+        let _next = if fault == "old-exits-before-take" {
+            let deadline = Instant::now() + PATIENCE;
+            while children_of_dead_daemon_alive(&root, before) {
+                assert!(Instant::now() < deadline, "{fault}: a candidate is left");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Some(Daemon::spawn(&root, true, &[]))
+        } else {
+            assert_ne!(root.lock_pid(), before, "{fault}: no new daemon serves");
+            assert!(is_daemon(root.lock_pid()), "{fault}");
+            None
+        };
+        wait_for(&path, "work", "BEFORE-81");
+        assert_eq!(
+            send_line(&path, "work", "echo AFTER-$((6*6))"),
+            Response::Ok,
+            "{fault}"
+        );
+        wait_for(&path, "work", "AFTER-36");
+    }
+}
+
+/// Whether a candidate the dead daemon `parent` started is still running,
+/// now reparented: a remuda process, not a host, whose env names `root`.
+fn children_of_dead_daemon_alive(root: &Root, parent: u32) -> bool {
+    let ps = Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=", "-o", "args="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|line| line.contains("_reload-candidate"))
+        .filter_map(|line| line.split_whitespace().next()?.parse::<u32>().ok())
+        .any(|pid| pid != parent && env_names_root(pid, &root.0))
+}
+
+/// Input typed all through a reload is never lost once acknowledged: every
+/// `SendLine` is answered `Ok` (and its line runs) or refused while the old
+/// daemon drains, never dropped or failed some other way. Several typists
+/// keep acts queued, so some are in flight when the drain starts.
+#[test]
+fn input_acknowledged_during_a_reload_is_never_lost() {
+    let root = Root::new("typing");
+    let path = root.socket();
+    let _old = Daemon::spawn(&root, true, &[("REMUDA_TEST_RELOAD_READY_MS", "15000")]);
+    new_session(&path, "work");
+    wait_for(&path, "work", "$");
+    let typed = root.0.join("typed");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let typists: Vec<_> = (0..8)
+        .map(|who| {
+            let (path, typed, stop) = (path.clone(), typed.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let (mut acked, mut refused) = (Vec::new(), Vec::new());
+                let mut n = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    n += 1;
+                    let marker = format!("T-{who}-{n}");
+                    let line = format!("echo {marker} >> {}", typed.display());
+                    let send = Request::SendLine {
+                        name: "work".into(),
+                        text: line,
+                    };
+                    match client::request(&path, &send) {
+                        Ok(Response::Ok) => acked.push(marker),
+                        other => {
+                            refused.push(format!("{other:?}"));
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                }
+                (acked, refused)
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(500));
+    let out = root.remuda(&["reload"]);
+    std::thread::sleep(Duration::from_secs(1));
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (mut acked, mut refused) = (Vec::new(), Vec::new());
+    for typist in typists {
+        let (a, r) = typist.join().unwrap();
+        acked.extend(a);
+        refused.extend(r);
+    }
+    assert!(out.status.success(), "{:?}", text(&out));
+    assert!(!acked.is_empty(), "nothing was acknowledged");
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let seen = std::fs::read_to_string(&typed).unwrap_or_default();
+        let seen: std::collections::HashSet<&str> = seen.lines().collect();
+        let lost: Vec<&String> = acked
+            .iter()
+            .filter(|marker| !seen.contains(marker.as_str()))
+            .collect();
+        if lost.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "acknowledged but never ran: {lost:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The only refusal is the drain's: the owner is moving, send again.
+    for reason in &refused {
+        assert!(
+            reason.contains("session owner unavailable: Recovering"),
+            "{reason}"
+        );
+    }
+}
+
+/// A session whose host died before the reload does not stop the others
+/// from moving: the reload goes through or refuses cleanly, and the live
+/// session answers on whichever daemon serves.
+#[test]
+fn a_dead_session_host_does_not_strand_the_others() {
+    let root = Root::new("deadhost");
+    let path = root.socket();
+    let _old = Daemon::spawn(&root, true, &[("REMUDA_TEST_RELOAD_READY_MS", "15000")]);
+    new_session(&path, "live");
+    new_session(&path, "dead");
+    wait_for(&path, "live", "$");
+    wait_for(&path, "dead", "$");
+    let hosts = host_pids(&root);
+    assert_eq!(hosts.len(), 2, "{hosts:?}");
+    // The `dead` session's host: its shell is the one we ask for its pid.
+    assert_eq!(send_line(&path, "dead", "echo HOSTPID-$PPID"), Response::Ok);
+    wait_for(&path, "dead", "HOSTPID-");
+    let victim = hosts
+        .iter()
+        .copied()
+        .find(|&pid| screen(&path, "dead").contains(&format!("HOSTPID-{pid}")))
+        .unwrap_or_else(|| panic!("no host of {hosts:?} is the dead session's"));
+    // SAFETY: a session host of this root, found just above.
+    unsafe { libc::kill(victim as i32, libc::SIGKILL) };
+    let deadline = Instant::now() + PATIENCE;
+    while alive(victim) {
+        assert!(Instant::now() < deadline, "the host never died");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let out = root.remuda(&["reload"]);
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.starts_with("reloaded: "), "{stdout}");
+    // The post-check names the dead session, not "all listed": it was
+    // unreachable before the reload, so that does not fail the reload.
+    assert!(
+        stdout.contains(
+            "\nsessions: 1 of 2 host-backed reachable; unreachable before the reload too: dead"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(send_line(&path, "live", "echo LIVE-$((3*7))"), Response::Ok);
+    wait_for(&path, "live", "LIVE-21");
+}
+
+fn host_pids(root: &Root) -> Vec<u32> {
+    let ps = Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=", "-o", "args="])
+        .output()
+        .unwrap();
+    let needle = format!("{}/", root.0.display());
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|line| line.contains(&needle) && line.contains("session-host"))
+        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+        .collect()
+}
+
+fn screen(path: &Path, name: &str) -> String {
+    match request(path, &Request::Capture { name: name.into() }) {
+        Response::Screen(screen) => screen,
+        other => panic!("{other:?}"),
+    }
 }

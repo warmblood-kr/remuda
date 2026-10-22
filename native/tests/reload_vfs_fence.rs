@@ -2,6 +2,8 @@
 //! serves the socket writes `index.db`. A candidate claims the index just
 //! before it serves; if it dies, the old daemon claims it back and writes.
 #![cfg(unix)]
+// The listener test probes the cluster port from outside, as a peer would.
+#![allow(clippy::disallowed_types)]
 
 #[path = "daemon_support/reap.rs"]
 mod reap;
@@ -94,7 +96,7 @@ impl Root {
 }
 impl Drop for Root {
     fn drop(&mut self) {
-        // Also kills the daemon a reload left serving: its argv names no root.
+        // By checked pid, never by pattern (see reap.rs).
         reap::kill_processes_under(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
@@ -195,4 +197,79 @@ fn after_a_reload_the_new_daemon_owns_the_index() {
         listed.contains("before.txt") && listed.contains("after.txt"),
         "{listed}"
     );
+}
+
+/// The cluster listener crosses a reload: the old daemon stops it before
+/// the handover and the new one starts it on the same address; a rollback
+/// starts it again in the old daemon.
+#[test]
+fn the_cluster_listener_follows_whichever_daemon_serves() {
+    for fault in [None, Some("exit-before-serving")] {
+        let root = Root::new(if fault.is_some() { "lback" } else { "lmove" });
+        let mut env = vec![("REMUDA_TEST_RELOAD_READY_MS", "15000")];
+        env.extend(fault.map(|fault| ("REMUDA_TEST_RELOAD_FAULT", fault)));
+        let mut old = root.daemon(&env);
+        ok(
+            root.remuda(&["cluster", "init", "--no-listen"], None),
+            "cluster init",
+        );
+        let address = listen(&root);
+
+        let out = root.remuda(&["reload"], None);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        if fault.is_some() {
+            assert_eq!(out.status.code(), Some(1), "{stderr}");
+            assert!(stderr.contains("rolled back"), "{stderr}");
+            assert!(old.try_wait().unwrap().is_none(), "the old daemon exited");
+        } else {
+            assert!(out.status.success(), "{stderr}");
+            let deadline = Instant::now() + PATIENCE;
+            while old.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "the old daemon did not exit");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let deadline = Instant::now() + PATIENCE;
+        while std::net::TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "{fault:?}: nothing listens on {address} after the reload"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = old.kill();
+        let _ = old.wait();
+    }
+}
+
+/// Turn on the cluster listener at a free loopback port; returns it once
+/// it accepts.
+fn listen(root: &Root) -> std::net::SocketAddr {
+    use remuda_native::cluster::listener_config::{self, ListenerBind, ListenerConfig};
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    listener_config::write_at(
+        &root.0.join("state/remuda/cluster"),
+        &ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit(address),
+            allow_public: false,
+        },
+    )
+    .unwrap();
+    remuda_native::client::request(
+        &daemon::socket_path_in(&root.0, "s"),
+        &remuda_core::protocol::Request::ClusterListener(remuda_core::protocol::ListenerOp::Reload),
+    )
+    .unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    while std::net::TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the cluster listener did not start"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    address
 }

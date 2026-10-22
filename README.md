@@ -191,6 +191,12 @@ and it takes the herd with it:
 remuda stop           # names any live session and asks first; -f skips the ask
 ```
 
+`stop` ends host-backed sessions too and says how many end. To keep them,
+`remuda reload` instead, or `remuda stop --keep-sessions`, which stops the
+daemon and leaves host-backed sessions running for the next one (in-process
+sessions still end). A daemon older than this change ignores the flag and
+keeps the old behaviour: its `stop` leaves host-backed sessions running.
+
 The shutdown guard refuses a stop from one of this daemon's sessions and refuses
 when it cannot verify the caller's ancestry. `-f` and `--yes` only skip the
 confirmation prompt. If this is the intended daemon, use the same server and

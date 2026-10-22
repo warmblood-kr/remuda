@@ -5,6 +5,8 @@
 //! checked the same way `remuda.tool`/`remuda.schedule` already are
 //! elsewhere: `Request::Eval` against a real daemon, never a Rust-side type.
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use remuda_core::protocol::{Request, Response};
 use remuda_native::{client, daemon};
 use std::path::{Path, PathBuf};
@@ -33,7 +35,11 @@ fn daemon_at(path: &Path) -> impl Drop {
 
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
+    // Session hosts outlive the daemon (#713); stop the ones under this socket's dir.
     fn drop(&mut self) {
+        if let Some(dir) = self.0.parent() {
+            hosts::stop_hosts_under(dir);
+        }
         let _ = std::fs::remove_file(&self.0);
     }
 }

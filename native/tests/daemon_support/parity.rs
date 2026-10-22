@@ -27,6 +27,7 @@ pub const MODES: [Mode; 2] = [Mode::InProcess, Mode::Hosted];
 pub struct Parity {
     pub mode: Mode,
     root: PathBuf,
+    env: Vec<(String, String)>,
     daemon: Child,
 }
 
@@ -52,29 +53,52 @@ impl Parity {
             .mode(0o700)
             .create(&root)
             .unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
-        command
-            .args(["-s", "s", "daemon"])
-            .env("REMUDA_RUNTIME_DIR", &root)
-            .env("HOME", &root)
-            .env("XDG_STATE_HOME", root.join("state"))
-            // Named either way, so a change of default never changes the mode.
-            .env("REMUDA_EXPERIMENTAL_SESSION_HOST", "0")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        command.envs(env.iter().map(|(key, value)| (key, value)));
-        if mode == Mode::Hosted {
-            command.env("REMUDA_EXPERIMENTAL_SESSION_HOST", "1");
-        }
-        let daemon = command.spawn().expect("spawn daemon");
-        let parity = Self { mode, root, daemon };
+        let daemon = spawn_daemon(mode, &root, env);
+        let parity = Self {
+            mode,
+            root,
+            env: env.to_vec(),
+            daemon,
+        };
+        parity.wait_bound();
+        parity
+    }
+
+    /// Start a fresh daemon in the same root, after this one has stopped.
+    pub fn restart(&mut self) {
+        let _ = self.daemon.wait();
+        self.daemon = spawn_daemon(self.mode, &self.root, &self.env);
+        self.wait_bound();
+    }
+
+    fn wait_bound(&self) {
         let deadline = Instant::now() + PATIENCE;
-        while remuda_native::ipc::connect(&parity.socket()).is_err() {
-            assert!(Instant::now() < deadline, "{mode:?}: daemon never bound");
+        while remuda_native::ipc::connect(&self.socket()).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "{:?}: daemon never bound",
+                self.mode
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
-        parity
+    }
+
+    /// Run the `remuda` CLI against this daemon.
+    pub fn cli(&self, args: &[&str]) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_remuda"))
+            .args(["-s", "s"])
+            .args(args)
+            .env("REMUDA_RUNTIME_DIR", &self.root)
+            .env("HOME", &self.root)
+            .env("XDG_STATE_HOME", self.root.join("state"))
+            .stdin(Stdio::null())
+            .output()
+            .expect("run remuda")
+    }
+
+    /// Session hosts still running under this root.
+    pub fn hosts_running(&self) -> usize {
+        processes_naming(&self.root).len()
     }
 
     pub fn socket(&self) -> PathBuf {
@@ -153,6 +177,25 @@ impl Drop for Parity {
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+fn spawn_daemon(mode: Mode, root: &Path, env: &[(String, String)]) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
+    command
+        .args(["-s", "s", "daemon"])
+        .env("REMUDA_RUNTIME_DIR", root)
+        .env("HOME", root)
+        .env("XDG_STATE_HOME", root.join("state"))
+        // Named either way, so a change of default never changes the mode.
+        .env("REMUDA_EXPERIMENTAL_SESSION_HOST", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.envs(env.iter().map(|(key, value)| (key, value)));
+    if mode == Mode::Hosted {
+        command.env("REMUDA_EXPERIMENTAL_SESSION_HOST", "1");
+    }
+    command.spawn().expect("spawn daemon")
 }
 
 fn processes_naming(root: &Path) -> Vec<i32> {

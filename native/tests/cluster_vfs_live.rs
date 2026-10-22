@@ -7,6 +7,8 @@
 // This integration test deliberately exercises the real loopback cluster wire.
 #![allow(clippy::disallowed_types)]
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use remuda_core::protocol::Request;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -138,6 +140,7 @@ impl Node {
                 requester_session_id: None,
                 requester_session_name: None,
                 override_hosted: false,
+                keep_sessions: false,
             },
         );
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -205,6 +208,7 @@ impl Node {
 impl Drop for Node {
     fn drop(&mut self) {
         self.kill();
+        hosts::stop_hosts_under(&self.root);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -318,6 +322,8 @@ fn put_on_one_node_reads_on_every_node_and_delete_reaches_all() {
         "vfs put",
     );
     assert!(put.contains("2 copies confirmed"), "{put}");
+    let said = put_min_copies(&a, "remuda:///min.md", 3);
+    assert!(said.contains("3 copies confirmed"), "{said}");
 
     // The name reaches every node, and every node can read the content,
     // fetching it from a holder when it has no copy.
@@ -481,6 +487,204 @@ fn losing_a_holder_makes_the_next_node_take_a_copy() {
         "local get on new holder",
     );
     assert_eq!(got.as_bytes(), &body[..]);
+
+    // The lost holder comes back with its copy: the placement is the
+    // original pair again, so the outsider trims its stand-in copy.
+    let back = nodes[lost].as_mut().unwrap();
+    back.spawn_daemon();
+    back.enable_listener();
+    let outsider_node = nodes[outsider].as_ref().unwrap();
+    wait_until(
+        "outsider trims its stand-in copy",
+        Duration::from_secs(20),
+        || !outsider_node.has_blob(&sha),
+    );
+    for holder in [lost, survivor] {
+        assert!(nodes[holder].as_ref().unwrap().has_blob(&sha));
+    }
+}
+
+/// A body whose one copy goes to `nodes[from]` with every node up, and to
+/// `nodes[to]` once `nodes[from]` is gone.
+fn body_moving(nodes: &[&Node], from: usize, to: usize) -> Vec<u8> {
+    let fingerprints: Vec<String> = nodes.iter().map(|node| node.fingerprint()).collect();
+    let all: Vec<&str> = fingerprints.iter().map(String::as_str).collect();
+    let rest: Vec<&str> = all
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != from)
+        .map(|(_, fp)| *fp)
+        .collect();
+    (0..)
+        .map(|n| format!("drain body {n}").into_bytes())
+        .find(|body| {
+            let sha = sha256_hex(body);
+            remuda_core::vfs::placement(&sha, 1, &all) == [all[from]]
+                && remuda_core::vfs::placement(&sha, 1, &rest) == [all[to]]
+        })
+        .unwrap()
+}
+
+/// `put --replicas 1` of `body` on `node`.
+fn put_one_copy(node: &Node, uri: &str, body: &[u8]) {
+    successful(
+        node.run_with_stdin(&["vfs", "put", "-", uri, "--replicas", "1"], Some(body)),
+        "vfs put --replicas 1",
+    );
+}
+
+#[test]
+fn status_reports_files_peers_and_copies() {
+    let _serial = live_test_guard();
+    let (a, b, c) = three_nodes();
+    successful(
+        a.run_with_stdin(
+            &[
+                "vfs",
+                "put",
+                "-",
+                "remuda:///s/one.txt",
+                "--replicas",
+                "3",
+                "--wait",
+            ],
+            Some(b"one"),
+        ),
+        "vfs put",
+    );
+    let said = successful(a.run(&["vfs", "status"]), "vfs status");
+    assert!(said.contains("Files: 1 live of 10000"), "{said}");
+    assert!(said.contains("Conflicts: none"), "{said}");
+    for node in [&b, &c] {
+        let name = remuda_native::cluster::node_label(&node.fingerprint());
+        assert!(
+            said.lines()
+                .any(|line| line.contains(&name) && line.contains(" up")),
+            "{said}"
+        );
+    }
+    let said = successful(a.run(&["vfs", "status", "--copies"]), "vfs status --copies");
+    assert!(said.contains("Copies: 1 files complete"), "{said}");
+    let json = successful(a.run(&["vfs", "status", "--json"]), "vfs status --json");
+    let report: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(report["peers"].as_array().unwrap().len(), 2, "{json}");
+    assert_eq!(report["live"], 1, "{json}");
+}
+
+#[test]
+fn drain_has_the_next_node_take_what_only_the_leaving_node_holds() {
+    let _serial = live_test_guard();
+    let (a, b, c) = three_nodes();
+    let body = body_moving(&[&a, &b, &c], 2, 1);
+    let sha = sha256_hex(&body);
+    put_one_copy(&c, "remuda:///leaving.txt", &body);
+    assert!(!b.has_blob(&sha));
+
+    let said = successful(c.run(&["vfs", "drain", "--timeout", "30"]), "vfs drain");
+    assert!(said.contains("Safe to leave"), "{said}");
+    assert!(b.has_blob(&sha));
+    assert!(!a.has_blob(&sha));
+}
+
+/// `cluster leave` drains, a peer revokes the node and audits it, and the
+/// node rejoins with an empty store: a file deleted meanwhile, whose
+/// tombstone the others collected, does not come back.
+#[test]
+fn leave_is_revoked_by_a_peer_and_rejoins_with_an_empty_store() {
+    let _serial = live_test_guard();
+    let (a, b, c) = three_nodes();
+    let body = body_moving(&[&a, &b, &c], 2, 1);
+    let sha = sha256_hex(&body);
+    put_one_copy(&c, "remuda:///leaving.txt", &body);
+    put(&c, "remuda:///gone.txt", b"deleted while away");
+    wait_for_body(&a, "remuda:///gone.txt", b"deleted while away");
+    wait_until(
+        "peers list the one-copy file",
+        Duration::from_secs(20),
+        || a.stat_json("remuda:///leaving.txt").is_some(),
+    );
+    let leaver = c.fingerprint();
+
+    // b lacks the only copy, so the first ask is refused; drain fixes that.
+    let said = successful(c.run(&["cluster", "leave", "--yes"]), "cluster leave");
+    assert!(said.contains("revoked this node"), "{said}");
+    assert!(b.has_blob(&sha));
+    let state = c.root.join("state/remuda");
+    let back = walk(&state.join("cluster"));
+    assert!(back.is_empty(), "cluster folder came back: {back:?}");
+    let left = std::fs::read_dir(&state)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.to_string_lossy().contains("cluster.left-"))
+        .expect("moved cluster folder");
+    assert!(left.join("vfs/index.db").is_file());
+    assert!(!left.join("identity.key").exists());
+    for node in [&a, &b] {
+        wait_until(
+            "peers see the leaver revoked",
+            Duration::from_secs(20),
+            || revoked(node, &leaver),
+        );
+    }
+    let audited = [&a, &b].iter().any(|node| {
+        std::fs::read_to_string(node.root.join("state/remuda/cluster/audit.jsonl"))
+            .is_ok_and(|log| log.contains(r#""op":"leave""#) && log.contains(&leaver))
+    });
+    assert!(audited, "no peer audited the leave");
+
+    // While c is away, gone.txt is deleted and its tombstone collected.
+    successful(a.run(&["vfs", "rm", "remuda:///gone.txt"]), "vfs rm");
+    wait_gone(&b, "remuda:///gone.txt");
+    for node in [&a, &b] {
+        let index = node.root.join("state/remuda/cluster/vfs/index.db");
+        rusqlite::Connection::open(index)
+            .unwrap()
+            .execute("DELETE FROM entries WHERE path = 'gone.txt'", [])
+            .unwrap();
+    }
+
+    successful(
+        c.run(&["cluster", "init", "--no-listen"]),
+        "cluster init again",
+    );
+    c.enable_listener();
+    join(&a, &c);
+    wait_for_body(&c, "remuda:///leaving.txt", &body);
+    thread::sleep(Duration::from_millis(SYNC_INTERVAL_MS * 10));
+    for node in [&a, &b, &c] {
+        assert!(
+            node.stat_json("remuda:///gone.txt").is_none(),
+            "gone.txt came back"
+        );
+    }
+}
+
+/// Every path under `dir`, `dir` included; empty if it does not exist.
+fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    let mut out = vec![dir.to_path_buf()];
+    for entry in read {
+        let p = entry.unwrap().path();
+        if p.is_dir() {
+            out.extend(walk(&p))
+        } else {
+            out.push(p)
+        }
+    }
+    out
+}
+
+/// Whether `node`'s registry lists `fingerprint` as revoked.
+fn revoked(node: &Node, fingerprint: &str) -> bool {
+    let registry: remuda_native::cluster::Registry = serde_json::from_slice(
+        &std::fs::read(node.root.join("state/remuda/cluster/authorized_nodes.json")).unwrap(),
+    )
+    .unwrap();
+    registry.authorized_nodes.iter().any(|entry| {
+        entry.node_fp == fingerprint && entry.state == remuda_native::cluster::NodeState::Revoked
+    })
 }
 
 #[test]
@@ -495,7 +699,8 @@ fn clear_errors_for_wrong_cluster_missing_and_no_cluster() {
         "{text}"
     );
     let missing = a.run(&["vfs", "get", "remuda:///x"]);
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("no file at x"));
+    let text = String::from_utf8_lossy(&missing.stderr);
+    assert!(text.contains("no file at x"), "{text}");
 
     successful(a.run(&["vfs", "config", "--cluster", "home"]), "vfs config");
     successful(
@@ -538,7 +743,8 @@ fn clear_errors_for_wrong_cluster_missing_and_no_cluster() {
     bare.spawn_daemon();
     let output = bare.run(&["vfs", "ls"]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no cluster"));
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(text.contains("no cluster"), "{text}");
 
     // With no daemon, vfs fails with one line and touches no store (#778).
     bare.kill();
@@ -559,6 +765,8 @@ fn clear_errors_for_wrong_cluster_missing_and_no_cluster() {
 
 /// The previous build's `remuda`. CI sets the directory; there is no default,
 /// so a compat test cannot pass without running the older build.
+// N is the PR's base sha: never assume N lacks a feature that base already
+// merged. Ask N (`vfs help`, change-page caps) and assert per answer.
 fn previous() -> PathBuf {
     let dir = std::env::var_os("REMUDA_COMPAT_PREVIOUS")
         .expect("REMUDA_COMPAT_PREVIOUS names the previous build's binary directory");
@@ -572,6 +780,29 @@ fn put(node: &Node, uri: &str, body: &[u8]) {
         node.run_with_stdin(&["vfs", "put", "-", uri, "--replicas", "2"], Some(body)),
         "vfs put",
     );
+}
+
+/// `put --replicas 3 --min-copies MIN`; returns stdout and stderr.
+fn put_min_copies(node: &Node, uri: &str, min: u8) -> String {
+    let min = min.to_string();
+    let args = [
+        "vfs",
+        "put",
+        "-",
+        uri,
+        "--replicas",
+        "3",
+        "--min-copies",
+        &min,
+    ];
+    let output = node.run_with_stdin(&args, Some(b"three copies"));
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "put --min-copies: {said}");
+    said
 }
 
 fn wait_for_body(node: &Node, uri: &str, body: &[u8]) {
@@ -609,6 +840,10 @@ fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
         wait_for_body(node, from_new, b"written by N+1");
     }
 
+    // --min-copies counts the older node's copy through BlobStat.
+    let said = put_min_copies(&a, "remuda:///mixed/three.txt", 3);
+    assert!(said.contains("3 copies confirmed"), "{said}");
+
     // A newer write on the older node wins on both newer nodes.
     put(&old, from_new, b"rewritten by N");
     for node in [&a, &c] {
@@ -619,6 +854,25 @@ fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
     // newer node reports a conflict for it.
     for node in [&a, &c] {
         assert_eq!(kept_conflicts(node), 0);
+    }
+
+    // Drain asks only peers that offer "take". CI's N is the PR base, so it
+    // may have drain too: then it takes the copy; otherwise it is named and
+    // drain exits 75 while its file is short.
+    let body = body_moving(&[&a, &old, &c], 2, 1);
+    put_one_copy(&c, "remuda:///mixed/leaving.txt", &body);
+    let help = successful(old.run(&["vfs", "help"]), "vfs help on N");
+    let old_takes = help
+        .lines()
+        .any(|line| line.trim_start().starts_with("drain "));
+    let timeout = if old_takes { "30" } else { "3" };
+    let drained = c.run(&["vfs", "drain", "--timeout", timeout]);
+    let said = String::from_utf8_lossy(&drained.stderr);
+    if old_takes {
+        assert_eq!(drained.status.code(), Some(0), "{said}");
+    } else {
+        assert_eq!(drained.status.code(), Some(75), "{said}");
+        assert!(said.contains("too old to take copies"), "{said}");
     }
 
     // Deletes cross in both directions.
