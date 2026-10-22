@@ -289,23 +289,23 @@ fn files_note(owner: &str, name: &str, applied: &[Applied]) -> String {
         Ok(steps) => steps,
         Err(error) => return format!("; files: {error}"),
     };
-    for step in applied {
-        let same = steps.get(step.version as usize - 1).is_some_and(|file| {
-            file.name == step.name && sqlite_migrate::sha256_hex(&file.up) == step.up_sha256
-        });
-        if !same {
-            return format!(
-                "; files: step {} differs from what was applied (drift)",
-                step.version
-            );
-        }
+    if let Some(step) = sqlite_migrate::drifted(&steps, applied) {
+        return format!(
+            "; files: step {} differs from what was applied (drift)",
+            step.version
+        );
     }
-    match steps.len().checked_sub(applied.len()) {
+    let version = applied.last().map_or(0, |step| step.version);
+    match steps.target().checked_sub(version) {
+        _ if version > 0 && version + 1 < steps.first => format!(
+            "; files: steps 1-{} were squashed, so this database needs an older release of the mod first",
+            steps.first - 1
+        ),
         Some(0) => "; files: up to date".into(),
         Some(pending) => format!("; files: {pending} pending"),
         None => format!(
             "; files: only {} steps installed (database is newer)",
-            steps.len()
+            steps.target()
         ),
     }
 }
@@ -334,7 +334,7 @@ fn upgrade(root: &Path, values: &Map<String, Value>, out: &mut Out) -> Result<()
         .join(name);
     let steps = sqlite_migrate::load_dir(&dir)?;
     let label = format!("{owner}/{name}.db");
-    let moved = sqlite_migrate::upgrade(&mut conn, &label, &steps, false)?;
+    let moved = sqlite_migrate::upgrade_set(&mut conn, &label, &steps, false)?;
     if moved.from == moved.to {
         let _ = writeln!(out.stdout, "{label} is already at version {}.", moved.to);
     } else {

@@ -103,8 +103,8 @@ fn open_answer(
     check_identifier("mod", owner, true)?;
     check_identifier("database", name, false)?;
     let steps = match migrations {
-        Migrations::None => Vec::new(),
-        Migrations::Steps(steps) => steps,
+        Migrations::None => sqlite_migrate::StepSet::plain(Vec::new()),
+        Migrations::Steps(steps) => sqlite_migrate::StepSet::plain(steps),
         Migrations::Files => match migration_files(owner, name) {
             Ok(steps) => steps,
             Err(reason) => return failure(lua, reason),
@@ -174,7 +174,7 @@ fn migrations_from(opts: Option<&Table>) -> mlua::Result<Migrations> {
 }
 
 /// The installed mod's `migrations/NAME/` files.
-fn migration_files(owner: &str, name: &str) -> Result<Vec<sqlite_migrate::Step>, String> {
+fn migration_files(owner: &str, name: &str) -> Result<sqlite_migrate::StepSet, String> {
     let dir = crate::packages::package_dir(owner)
         .map_err(|error| format!("migration: {error}"))?
         .ok_or_else(|| {
@@ -221,7 +221,7 @@ fn open_db(
     dir: &Path,
     name: &str,
     limits: Limits,
-    steps: &[sqlite_migrate::Step],
+    steps: &sqlite_migrate::StepSet,
 ) -> Result<Db, String> {
     let file = format!("{name}.db");
     let mut conn = crate::sqlite::open(dir, &file).map_err(|e| format!("io: {e}"))?;
@@ -251,7 +251,7 @@ fn open_db(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) =
         Some(Instant::now() + Duration::from_millis(CEILING.timeout_ms));
-    let migrated = sqlite_migrate::upgrade(&mut conn, &file, steps, false);
+    let migrated = sqlite_migrate::upgrade_set(&mut conn, &file, steps, false);
     *deadline
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
