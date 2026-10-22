@@ -8,6 +8,12 @@
   whether it is up, when it last pulled from here and how many deletes it
   holds back. `--copies` also asks the nodes which copies they hold, lists
   short files, and exits 75 while any file is short.
+- Cluster: `remuda cluster remote NODE` now opens that node's session picker,
+  as plain `remuda` does on the node itself: the node's group is expanded and
+  its first live session is highlighted; Enter opens it. Before, a target
+  without `/session` failed with "target must be node/session".
+  `NODE/SESSION` still opens the session directly. A full fingerprint that
+  contains `/` is read as a node.
 
 - Cluster: each node now keeps a local audit log of what peers asked it to
   do, in `cluster/audit.jsonl` in the private cluster state directory. Each
