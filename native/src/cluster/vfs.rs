@@ -836,6 +836,66 @@ impl VfsStore {
         Ok(out)
     }
 
+    fn stand_in_path(&self, sha256: &str) -> VfsResult<PathBuf> {
+        rules::validate_sha256(sha256)
+            .map_err(|error| VfsError::new(VfsErrorKind::BadUri, error.0))?;
+        Ok(self.root.join("stand-ins").join(sha256))
+    }
+
+    /// Mark a copy the repair pass fetched: only such copies are trimmed
+    /// once this node leaves their placement (design step 6).
+    pub fn mark_stand_in(&self, sha256: &str) -> VfsResult<()> {
+        let path = self.stand_in_path(sha256)?;
+        fs::create_dir_all(self.root.join("stand-ins"))?;
+        fs::write(path, b"")?;
+        Ok(())
+    }
+
+    /// Keep this copy for good: `resolve` handed its path to a tool.
+    pub fn keep_blob(&self, sha256: &str) -> VfsResult<()> {
+        let _guard = self.lock()?;
+        match fs::remove_file(self.stand_in_path(sha256)?) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Hashes of the copies marked as stand-ins.
+    pub fn stand_ins(&self) -> VfsResult<Vec<String>> {
+        let entries = match fs::read_dir(self.root.join("stand-ins")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            if let Some(name) = entry?.file_name().to_str() {
+                if rules::validate_sha256(name).is_ok() {
+                    out.push(name.to_owned());
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Delete a stand-in copy if it is still marked. The caller has seen
+    /// every placement node confirm a copy, so this is never the last one.
+    pub fn trim_stand_in(&self, sha256: &str) -> VfsResult<bool> {
+        let _guard = self.lock()?;
+        let marker = self.stand_in_path(sha256)?;
+        if !marker.is_file() {
+            return Ok(false);
+        }
+        let removed = match fs::remove_file(self.blob_path(sha256)?) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        fs::remove_file(marker)?;
+        Ok(removed)
+    }
+
     /// Remove local blobs that no live entry references and that are older
     /// than `GC_GRACE`. The grace covers a put that wrote its blob but not yet
     /// its entry, and a pull that lands before the index merge.
@@ -926,6 +986,7 @@ impl VfsStore {
                 .and_then(|modified| modified.elapsed().ok())
                 .is_some_and(|age| age >= grace);
             if old_enough && fs::remove_file(&path).is_ok() {
+                let _ = fs::remove_file(self.stand_in_path(&hash)?);
                 removed += 1;
             }
         }
@@ -1158,6 +1219,35 @@ mod tests {
         );
         assert!(!store.blob_present(&old.sha256));
         assert!(store.has_blob(&new.sha256, new.size));
+    }
+
+    #[test]
+    fn only_marked_stand_ins_are_trimmed_and_resolve_unmarks() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        let cached = store.put_blob(b"read cache").unwrap();
+        assert!(!store.trim_stand_in(&cached).unwrap());
+        assert!(store.blob_present(&cached));
+
+        let stand_in = store.put_blob(b"repair copy").unwrap();
+        store.mark_stand_in(&stand_in).unwrap();
+        assert_eq!(store.stand_ins().unwrap(), vec![stand_in.clone()]);
+        store.keep_blob(&stand_in).unwrap();
+        assert!(store.stand_ins().unwrap().is_empty());
+        assert!(!store.trim_stand_in(&stand_in).unwrap());
+
+        store.mark_stand_in(&stand_in).unwrap();
+        assert!(store.trim_stand_in(&stand_in).unwrap());
+        assert!(!store.blob_present(&stand_in));
+        assert!(store.stand_ins().unwrap().is_empty());
+
+        // Blob GC drops the mark with the blob.
+        let garbage = store.put_blob(b"unreferenced").unwrap();
+        store.mark_stand_in(&garbage).unwrap();
+        store
+            .collect_garbage_older_than(std::time::Duration::ZERO)
+            .unwrap();
+        assert!(store.stand_ins().unwrap().is_empty());
     }
 
     #[test]

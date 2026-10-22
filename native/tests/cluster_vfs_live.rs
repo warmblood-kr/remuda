@@ -483,6 +483,21 @@ fn losing_a_holder_makes_the_next_node_take_a_copy() {
         "local get on new holder",
     );
     assert_eq!(got.as_bytes(), &body[..]);
+
+    // The lost holder comes back with its copy: the placement is the
+    // original pair again, so the outsider trims its stand-in copy.
+    let back = nodes[lost].as_mut().unwrap();
+    back.spawn_daemon();
+    back.enable_listener();
+    let outsider_node = nodes[outsider].as_ref().unwrap();
+    wait_until(
+        "outsider trims its stand-in copy",
+        Duration::from_secs(20),
+        || !outsider_node.has_blob(&sha),
+    );
+    for holder in [lost, survivor] {
+        assert!(nodes[holder].as_ref().unwrap().has_blob(&sha));
+    }
 }
 
 #[test]
