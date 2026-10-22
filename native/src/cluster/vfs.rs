@@ -399,6 +399,7 @@ impl VfsStore {
         rules::validate_replicas(settings.default_replicas)
             .map_err(|error| VfsError::new(VfsErrorKind::BadUri, error.0))?;
         let _guard = self.lock()?;
+        self.still_here()?;
         let bytes = serde_json::to_vec_pretty(settings).map_err(io::Error::other)?;
         storage::atomic_write(&self.root.join("vfs.json"), &bytes)?;
         Ok(())
@@ -572,6 +573,7 @@ impl VfsStore {
 
     /// Record that a peer index was merged at `now`.
     pub fn mark_synced(&self, now: u64) -> VfsResult<()> {
+        self.still_here()?;
         storage::atomic_write(&self.root.join("synced_at"), now.to_string().as_bytes())?;
         Ok(())
     }
@@ -923,6 +925,7 @@ impl VfsStore {
     /// every placement node confirm a copy, so this is never the last one.
     pub fn trim_stand_in(&self, sha256: &str) -> VfsResult<bool> {
         let _guard = self.lock()?;
+        self.still_here()?;
         let marker = self.stand_in_path(sha256)?;
         if !marker.is_file() {
             return Ok(false);
@@ -1168,6 +1171,15 @@ mod tests {
         assert_eq!(refused.kind, VfsErrorKind::NoCluster);
         assert!(old.put("late", b"y", 1, "SHA256:me").is_err());
         assert!(fresh.load_index().unwrap().entries.is_empty());
+        let settings = VfsSettings::default();
+        assert!(old.save_settings(&settings).is_err());
+        assert!(!scratch.0.join("vfs/vfs.json").exists());
+        assert!(old.mark_synced(1).is_err());
+        assert_eq!(fresh.synced_at(), None);
+        let blob = fresh.put_blob(b"z").unwrap();
+        fresh.mark_stand_in(&blob).unwrap();
+        assert!(old.trim_stand_in(&blob).is_err());
+        assert!(fresh.blob_present(&blob));
     }
 
     #[test]
