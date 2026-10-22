@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Unix: the socket lock file (`SOCKET.lock`) never reads empty or half
+  written while a daemon names itself in it, as at start or when a reload
+  hands it over. It now holds the pid padded with newlines to a fixed
+  width; readers that trim are unaffected.
+
 - VFS: a node that took a copy while a holder was down deletes it again
   once that holder is back and confirms its copy (#778). Only copies the
   repair pass fetched are trimmed: files this node wrote, read with `vfs
