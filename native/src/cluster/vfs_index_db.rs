@@ -73,6 +73,30 @@ pub(super) fn open(root: &Path) -> VfsResult<Connection> {
     Ok(conn)
 }
 
+/// How many schema steps this build knows: the newest `index.db` it reads.
+pub(crate) fn known_steps() -> u32 {
+    STEPS.len() as u32
+}
+
+/// This node's `index.db` schema, read without creating or migrating
+/// anything; `None` when there is no index (so no VFS to warn about).
+pub(crate) fn schema_on_disk() -> Option<u32> {
+    let path = storage::cluster_state_dir()
+        .ok()?
+        .join("cluster/vfs")
+        .join(DB_FILE);
+    if !path.is_file() {
+        return None;
+    }
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(&path, flags).ok()?;
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .ok()?;
+    u32::try_from(version).ok()
+}
+
 /// Set by `remuda vfs index-downgrade`: this process must not upgrade again.
 static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
