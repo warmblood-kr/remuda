@@ -145,12 +145,11 @@ impl Owned {
         })
     }
     pub fn resize(&self, fence: Fence, rows: u16, cols: u16) -> Result<(), Error> {
-        if rows < 24 || cols < 20 {
-            return Err(Error::Invalid("host resize minimum is 20x24"));
-        }
-        super::terminal::Terminal::validate_geometry(rows, cols, 1000).map_err(Error::Invalid)?;
+        super::terminal::Terminal::validate_geometry(rows, cols, super::terminal::HISTORY_ROWS)
+            .map_err(Error::Invalid)?;
         let token = self.coordinator.lock().unwrap().begin_mutation(fence)?;
-        let result = self.session.resize(Size::for_pane(cols, rows));
+        // The daemon already applied the floor, or the caller opted out of it.
+        let result = self.session.resize(Size::for_viewport(cols, rows));
         self.coordinator.lock().unwrap().finish_mutation(token)?;
         result.map_err(|_| Error::Invalid("host resize failed; inspect health"))
     }
@@ -332,7 +331,20 @@ impl Owned {
             .holds_grant(connection, grant)
     }
     pub fn acquire(&self, connection: ConnectionId) -> Result<Fence, Error> {
-        self.coordinator.lock().unwrap().acquire(connection)
+        self.acquire_writer(connection, None)
+    }
+    pub fn acquire_writer(
+        &self,
+        connection: ConnectionId,
+        writer: Option<super::api::Writer>,
+    ) -> Result<Fence, Error> {
+        self.coordinator
+            .lock()
+            .unwrap()
+            .acquire_writer(connection, writer)
+    }
+    pub fn authorize_writer(&self, fence: Fence) -> Result<(), Error> {
+        self.coordinator.lock().unwrap().authorize_writer(fence)
     }
     pub fn release(&self, fence: Fence) -> Result<(), Error> {
         self.coordinator.lock().unwrap().release(fence)

@@ -44,6 +44,11 @@ pub trait SessionPort {
         true
     }
 
+    /// False when `m` lines cannot be sent to this node yet; `m` then says so.
+    fn accepts_lines(&self) -> bool {
+        true
+    }
+
     /// A request with a bounded wait, for composed lines on this machine.
     fn request_bounded(
         &self,
@@ -211,6 +216,7 @@ mod tests {
                     attached: false,
                     human_idle: None,
                     mouse_tracking: false,
+                    unavailable: false,
                 }]),
                 Request::CaptureStyled { .. } => Response::StyledScreen {
                     rows: vec![remuda_core::protocol::collapse_runs(&[

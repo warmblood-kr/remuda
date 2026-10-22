@@ -34,6 +34,20 @@ if remuda._keymap_factory then
   remuda._keymap_factory, remuda._keymap_validate, remuda._keymap_config_status, remuda._keymap_validate_help = nil, nil, nil, nil
 end
 local module_tool_owners = {}
+
+-- remuda.db (#778): a mod opens only databases in its own namespace. The
+-- native word takes the owner explicitly; only this wrapper may supply it.
+local native_db_open = remuda._db_open
+remuda._db_open = nil
+remuda.db = {}
+function remuda.db.open(name, opts)
+  local owner = current_owner
+  if owner == nil then
+    return nil, "no_mod: remuda.db.open works only in a mod's own code (initialize, commands, start, or its hooks, tools and schedules)"
+  end
+  return native_db_open(owner, name, opts)
+end
+
 local function with_owner(owner, fn, ...)
   local outer = current_owner
   current_owner = owner
@@ -103,6 +117,7 @@ if keymaps then
   register("unbind", "Remove an effective contextual UI binding.", "unbind(context, key) -> nil")
   register("keymap_snapshot", "Effective UI bindings and startup readiness; refresh by reopening the UI.", "keymap_snapshot() -> table")
 end
+register("db.open", "Open (creating if needed) database NAME in the running mod's namespace: <state>/remuda/db/MOD/NAME.db. NAME is a plain identifier. opts may set max_bytes (default 64 MiB, at most 1 GiB), timeout_ms per statement (default 1000, at most 10000) and max_rows per query (default 10000, at most 100000). opts.migrations = true applies the mod's migrations/NAME/NNNN_x.up.sql steps (or pass an array of {name, up, down}); see docs/lua.md. The handle has query(sql, params) -> rows, exec(sql, params) -> changes, batch(sql) -> true, limits() and close(); params is an array of nil, boolean, number or string. Failures return nil and a reason starting with no_mod, io, sql, too_large, timeout, too_many_rows, denied (ATTACH, DETACH and most PRAGMAs), migration, too_new, drift, foreign_key or closed. Outside a mod's own code it returns nil, 'no_mod: ...'.", "db.open(name [, opts]) -> db | nil, reason")
 register("after", "Run a callback once after a delay without blocking the Lua image; cancel with handle:cancel().", "after(seconds, fn) -> handle")
 register("every", "Run a callback periodically without blocking the Lua image; cancel with handle:cancel(). If a callback finishes late, the next tick comes one interval after it ends, so the phase shifts and ticks do not burst to catch up.", "every(seconds, fn) -> handle")
 register("tools", "The `remuda.tool` registry table, keyed by tool name.", "table")
@@ -1353,6 +1368,9 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
   if candidate.source_refresh_ready ~= nil and type(candidate.source_refresh_ready) ~= "function" then
     error("module source_refresh_ready must be a function", 0)
   end
+  if candidate.daemon_reload_ready ~= nil and type(candidate.daemon_reload_ready) ~= "function" then
+    error("module daemon_reload_ready must be a function", 0)
+  end
   local previous = modules[name]
   local state
   if previous == nil then
@@ -1535,6 +1553,7 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
     started = false,
     start_attempted = false,
     source_refresh_ready = candidate.source_refresh_ready and function(state) return with_owner(name, candidate.source_refresh_ready, state) end,
+    daemon_reload_ready = candidate.daemon_reload_ready and function(state) return with_owner(name, candidate.daemon_reload_ready, state) end,
     ready = ready,
     timeout_ms = timeout_ms,
     stopped = false,
@@ -1678,6 +1697,31 @@ function remuda._stop_modules()
     cancel_owner_timers(name)
   end
 end
+
+-- `remuda reload` asks every active mod before it hands the daemon over.
+-- daemon_reload_ready(state) returns nil when a reload is fine now, or a
+-- reason; a mod without it never blocks. One line per mod that says no.
+function remuda._daemon_reload_check()
+  local names = {}
+  for name, module in pairs(modules) do
+    if module.daemon_reload_ready and not module.stopped then
+      names[#names + 1] = name
+    end
+  end
+  table.sort(names)
+  local busy = {}
+  for _, name in ipairs(names) do
+    local module = modules[name]
+    local ok, reason = pcall(module.daemon_reload_ready, module.state)
+    if not ok then
+      busy[#busy + 1] = "mod " .. name .. ": daemon_reload_ready failed: " .. tostring(reason)
+    elseif reason ~= nil then
+      busy[#busy + 1] = "mod " .. name .. ": " .. tostring(reason)
+    end
+  end
+  return table.concat(busy, "\n")
+end
+register("_daemon_reload_check", "Internal: why active mods say a daemon reload must wait, one line each.", "_daemon_reload_check() -> string")
 
 -- The CLI polls this small lifecycle result between Eval requests. Keep the
 -- readiness callback in the declaration table, not as another public remuda

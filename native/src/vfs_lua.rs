@@ -1,6 +1,7 @@
-//! `remuda.vfs`: read-only Lua access to the cluster file store (#742).
-//! Every call answers from this node's index and blob cache and never touches
-//! the network, so it is safe on the daemon's Lua thread.
+//! `remuda.vfs`: Lua access to the cluster file store (#742). Every call
+//! answers from this node's index and blob cache. `put` and `rm` are the only
+//! Lua writers (#778); they tell peers on a background thread, so no call
+//! waits on the network on the daemon's Lua thread.
 
 use crate::cluster::vfs::{VfsError, VfsErrorKind, VfsStore};
 use mlua::{IntoLua, Lua, Table, Value};
@@ -15,8 +16,20 @@ fn entry_table(lua: &Lua, store: &VfsStore, entry: &VfsEntry) -> mlua::Result<Ta
     table.set("mtime", entry.mtime)?;
     table.set("replicas", entry.replicas)?;
     table.set("writer", entry.writer.as_str())?;
-    table.set("local", store.has_blob(&entry.sha256))?;
+    table.set("local", store.has_blob(&entry.sha256, entry.size))?;
     table.set("synced_at", store.synced_at())?;
+    let conflicts = lua.create_table()?;
+    for (position, conflict) in entry.conflicts.iter().enumerate() {
+        let row = lua.create_table()?;
+        row.set("version", conflict.version)?;
+        row.set("writer", conflict.writer.as_str())?;
+        row.set("sha256", conflict.sha256.as_str())?;
+        row.set("size", conflict.size)?;
+        row.set("deleted", conflict.deleted)?;
+        row.set("mtime", conflict.mtime)?;
+        conflicts.set(position + 1, row)?;
+    }
+    table.set("conflicts", conflicts)?;
     Ok(table)
 }
 
@@ -57,6 +70,53 @@ fn list(lua: &Lua, prefix: &str) -> Result<Table, mlua::Result<VfsError>> {
     Ok(rows)
 }
 
+fn writer() -> Result<String, VfsError> {
+    match crate::cluster::nodes()? {
+        Some((identity, _)) => Ok(identity.node_fp),
+        None => Err(VfsError::new(
+            VfsErrorKind::NoCluster,
+            "this node has no cluster",
+        )),
+    }
+}
+
+/// Tell peers about a new entry without waiting for them.
+fn push_in_background(entry: VfsEntry) {
+    std::thread::spawn(move || {
+        crate::cluster::vfs_sync::push_entries(std::slice::from_ref(&entry));
+    });
+}
+
+fn put(
+    lua: &Lua,
+    uri: &str,
+    bytes: &[u8],
+    replicas: Option<u8>,
+) -> Result<Table, mlua::Result<VfsError>> {
+    let store = VfsStore::open_default().map_err(Ok)?;
+    let uri = store.parse_uri(uri).map_err(Ok)?;
+    let replicas = match replicas {
+        Some(replicas) => replicas,
+        None => store.settings().map_err(Ok)?.default_replicas,
+    };
+    let entry = store
+        .put(&uri.path, bytes, replicas, &writer().map_err(Ok)?)
+        .map_err(Ok)?;
+    let table = entry_table(lua, &store, &entry).map_err(Err)?;
+    push_in_background(entry);
+    Ok(table)
+}
+
+fn remove(uri: &str) -> Result<bool, mlua::Result<VfsError>> {
+    let store = VfsStore::open_default().map_err(Ok)?;
+    let uri = store.parse_uri(uri).map_err(Ok)?;
+    let entry = store
+        .delete(&uri.path, &writer().map_err(Ok)?)
+        .map_err(Ok)?;
+    push_in_background(entry);
+    Ok(true)
+}
+
 /// `value, nil` on success; `nil, "code: detail"` on a store failure. Lua
 /// usage errors still raise.
 fn answer<T: IntoLua>(
@@ -83,6 +143,18 @@ pub fn bindings(lua: &Lua) -> mlua::Result<Table> {
     table.set(
         "list",
         lua.create_function(|lua, prefix: String| answer(lua, list(lua, &prefix)))?,
+    )?;
+    table.set(
+        "put",
+        lua.create_function(
+            |lua, (uri, bytes, replicas): (String, mlua::LuaString, Option<u8>)| {
+                answer(lua, put(lua, &uri, &bytes.as_bytes(), replicas))
+            },
+        )?,
+    )?;
+    table.set(
+        "rm",
+        lua.create_function(|lua, uri: String| answer(lua, remove(&uri)))?,
     )?;
     Ok(table)
 }

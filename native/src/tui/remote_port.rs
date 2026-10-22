@@ -343,6 +343,15 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_takes_composed_lines_through_its_writer() {
+        let peer = Arc::new(SlowPeer::default());
+        let port = RemotePort::with_link("peer", peer.clone());
+        assert!(port.accepts_lines());
+        assert_eq!(port.remote_node().as_deref(), Some("peer"));
+        peer.release();
+    }
+
+    #[test]
     fn reads_come_from_the_background_cache() {
         let peer = Arc::new(SlowPeer::default());
         let port = RemotePort::with_link("peer", peer.clone());

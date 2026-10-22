@@ -23,6 +23,9 @@ const CAPS: &[&str] = &[
     super::api::TYPED_VIEW,
     super::api::HUMAN_INPUT,
     super::api::ACTIVITY,
+    super::api::WRITER_FENCE,
+    super::api::DEEP_HISTORY,
+    super::api::COMPACT_VIEW,
 ];
 pub(crate) struct Server {
     endpoint: Arc<Endpoint>,
@@ -161,6 +164,8 @@ impl Server {
             snapshot: None,
             stop_after_reply: false,
             latest: None,
+            deep: false,
+            compact: false,
         };
         loop {
             let bytes = channel.receive()?;
@@ -225,6 +230,10 @@ struct Connection {
     snapshot: Option<Snapshot>,
     stop_after_reply: bool,
     latest: Option<super::latest::Latest>,
+    /// The last viewport asked for the host's full history (`ViewportDeep`).
+    deep: bool,
+    /// ... and wanted its cells as style runs (`ViewportCompact`).
+    compact: bool,
 }
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -260,6 +269,7 @@ impl Connection {
             && matches!(
                 &request,
                 Request::Acquire
+                    | Request::AcquireWriter { .. }
                     | Request::Input { .. }
                     | Request::Resize { .. }
                     | Request::Close
@@ -276,14 +286,8 @@ impl Connection {
                 info.publication = self.server.publication.as_ref().map(|gate| gate.status());
                 Ok(Response::Info { info })
             }
-            Request::Acquire => {
-                if self.role != Role::Control || self.fence.is_some() {
-                    return Err("invalid_control_acquisition".into());
-                }
-                let fence = self.server.host.acquire(self.id).map_err(control_error)?;
-                self.fence = Some(fence);
-                Ok(Response::Granted { epoch: fence.epoch })
-            }
+            Request::Acquire => self.acquire(None),
+            Request::AcquireWriter { writer } => self.acquire(Some(writer)),
             Request::Release => {
                 let fence = self.controller()?;
                 self.server.host.release(fence).map_err(control_error)?;
@@ -326,6 +330,8 @@ impl Connection {
             }
             request @ (Request::Snapshot
             | Request::Viewport { .. }
+            | Request::ViewportDeep { .. }
+            | Request::ViewportCompact { .. }
             | Request::Page { .. }
             | Request::Acknowledge { .. }
             | Request::AcknowledgeViewport { .. }
@@ -333,6 +339,17 @@ impl Connection {
             Request::Stop => self.stop(),
             request => self.human_request(request),
         }
+    }
+    fn acquire(&mut self, writer: Option<super::api::Writer>) -> Result<Response, String> {
+        if self.role != Role::Control || self.fence.is_some() {
+            return Err("invalid_control_acquisition".into());
+        }
+        let host = &self.server.host;
+        let fence = host
+            .acquire_writer(self.id, writer)
+            .map_err(control_error)?;
+        self.fence = Some(fence);
+        Ok(Response::Granted { epoch: fence.epoch })
     }
     fn human(&self) -> Result<(), String> {
         if self.role != Role::Human {
@@ -426,6 +443,9 @@ impl Connection {
     }
     fn stop(&mut self) -> Result<Response, String> {
         let fence = self.controller()?;
+        // Before settlement work; latch_stop still re-checks under the lock.
+        let host = &self.server.host;
+        host.authorize_writer(fence).map_err(control_error)?;
         if self
             .server
             .publication
@@ -495,7 +515,18 @@ impl Connection {
     fn terminal_request(&mut self, request: Request) -> Result<Response, String> {
         match request {
             Request::Snapshot => self.begin_snapshot(None),
-            Request::Viewport { scrollback } => self.begin_snapshot(Some(scrollback)),
+            Request::Viewport { scrollback } => {
+                (self.deep, self.compact) = (false, false);
+                self.begin_snapshot(Some(scrollback))
+            }
+            Request::ViewportDeep { scrollback } => {
+                (self.deep, self.compact) = (true, false);
+                self.begin_snapshot(Some(scrollback))
+            }
+            Request::ViewportCompact { scrollback } => {
+                (self.deep, self.compact) = (true, true);
+                self.begin_snapshot(Some(scrollback))
+            }
             Request::Page { snapshot, index } => self.page(snapshot, index),
             Request::Acknowledge {
                 snapshot,
@@ -546,7 +577,7 @@ impl Connection {
             // Register before capture; no output/ACK/wait handoff gap.
             self.latest = Some(super::latest::Latest::new(&self.server.host.view)?);
         }
-        let permit = self
+        let mut permit = self
             .server
             .snapshots
             .acquire(self.id, Instant::now())
@@ -558,6 +589,7 @@ impl Connection {
             .map_err(|_| "snapshot_id_exhausted")?;
         let (generation, bytes, rows, cols) = self.capture(offset)?;
         let pages = bytes.len().div_ceil(PAGE);
+        permit.charge(pages);
         let response = if offset.is_some() {
             Response::Viewport {
                 identity: self.server.host.identity(),
@@ -596,16 +628,28 @@ impl Connection {
     }
     fn capture(&self, offset: Option<u16>) -> Result<(u64, Vec<u8>, u16, u16), String> {
         if let Some(offset) = offset {
-            let view = self
+            let legacy = super::terminal::LEGACY_HISTORY_ROWS;
+            let offset = if self.deep {
+                offset
+            } else {
+                offset.min(legacy)
+            };
+            let mut view = self
                 .server
                 .host
                 .view
                 .viewport(usize::from(offset))
                 .map_err(|_| "capture_unavailable")?;
+            if !self.deep {
+                view = view.within_legacy_history();
+            }
             // Expensive encoding is outside the parser lock, with an in-write cap.
-            let bytes = view
-                .encode()
-                .map_err(|_| "typed_capture_budget_or_bounds")?;
+            let bytes = if self.compact {
+                view.encode_compact()
+            } else {
+                view.encode()
+            }
+            .map_err(|_| "typed_capture_budget_or_bounds")?;
             Ok((view.generation, bytes, view.rows, view.cols))
         } else {
             let (generation, bytes, (rows, cols)) = self
@@ -651,6 +695,7 @@ fn control_error(error: super::coordinator::Error) -> String {
         Error::Control(Refusal::Busy) => "controller_busy",
         Error::Control(Refusal::Stale) | Error::StaleCompletion => "stale_controller_or_act",
         Error::Control(Refusal::Exhausted) => "host_sequence_exhausted",
+        Error::Control(Refusal::Superseded) => "superseded_writer",
         Error::Invalid(_) => "invalid_or_unavailable_operation",
         Error::Stopping => "host_stopping",
         Error::Retained => "host_raw_retention_pending",
@@ -664,3 +709,6 @@ fn control_error(error: super::coordinator::Error) -> String {
 #[cfg(test)]
 #[path = "human_wire_tests.rs"]
 mod human_wire_tests;
+#[cfg(test)]
+#[path = "writer_fence_tests.rs"]
+mod writer_fence_tests;

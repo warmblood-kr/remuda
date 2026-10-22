@@ -1449,6 +1449,7 @@ mod visual_mode_tests {
                 attached: false,
                 human_idle: None,
                 mouse_tracking: false,
+                unavailable: false,
             }],
             "sh",
             None,
@@ -3057,9 +3058,12 @@ pub fn run_port<P: SessionPort + ?Sized>(
             selection_moved = false;
         }
 
-        if let Some(event) =
-            pump_lines(path, &mut line_sender, &mut line_queue, &mut line_in_flight)
-        {
+        // Only a port that takes lines queues any.
+        let due = path
+            .accepts_lines()
+            .then(|| pump_lines(path, &mut line_sender, &mut line_queue, &mut line_in_flight))
+            .flatten();
+        if let Some(event) = due {
             if let Some(notice) = line_notice(event) {
                 ui.notice = Some(notice);
             }
@@ -3158,21 +3162,44 @@ pub fn run_port<P: SessionPort + ?Sized>(
                 instance_id,
                 bytes,
             } => {
-                let target = crate::cluster_tui::queue::InputTarget {
-                    remote_node: path.remote_node(),
-                    name: name.clone(),
+                let notice = queue_line(
+                    port,
+                    &mut line_sender,
+                    &mut line_queue,
+                    name,
                     instance_id,
-                };
-                match line_sender.enqueue_line(&mut line_queue, target, bytes, Instant::now()) {
-                    Ok(_) => ui.notice = Some(format!("sending line to {name}")),
-                    Err(error) => ui.notice = Some(format!("{name}: {error}")),
-                }
+                    bytes,
+                );
+                ui.notice = Some(notice);
             }
         }
         // Not `painted.clear()`: the frame-vs-`painted` compare in `refresh`
         // already skips the write when a key changed nothing visible — see
         // steps/026. Only the immediate re-check is forced here.
         force_refresh = true;
+    }
+}
+
+/// Queue a composed line for NAME, or refuse it on a port that takes none.
+fn queue_line<P: SessionPort + ?Sized>(
+    port: &P,
+    sender: &mut crate::cluster_tui::sender::InputSender,
+    queue: &mut crate::cluster_tui::queue::InputQueue,
+    name: String,
+    instance_id: String,
+    bytes: Vec<u8>,
+) -> String {
+    if !port.accepts_lines() {
+        return format!("{name}: lines to {} are not available yet", port.label());
+    }
+    let target = crate::cluster_tui::queue::InputTarget {
+        remote_node: port.remote_node(),
+        name: name.clone(),
+        instance_id,
+    };
+    match sender.enqueue_line(queue, target, bytes, Instant::now()) {
+        Ok(_) => format!("sending line to {name}"),
+        Err(error) => format!("{name}: {error}"),
     }
 }
 
@@ -3959,6 +3986,7 @@ mod keybindings_adopter_tests {
             attached: false,
             human_idle: None,
             mouse_tracking: false,
+            unavailable: false,
         }];
         let mut ui = Ui::new(sessions, "sh", None);
         ui.set_keymap(crate::keybindings::Snapshot::from_json(r#"{"generation":2,"ready":true,"rows":[{"context":"session.list.browse","key":"M-l","action":"session.toggle_list","help":"list"}]}"#).unwrap());
@@ -4017,6 +4045,7 @@ mod composer_tests {
             attached: false,
             human_idle: None,
             mouse_tracking: false,
+            unavailable: false,
         }
     }
 
@@ -4158,5 +4187,101 @@ mod composer_tests {
                 if name == "agent" && instance_id == "instance-agent" && bytes == b"hello\r"
         ));
         assert_eq!(line_notice(event.unwrap()).as_deref(), Some("line sent"));
+    }
+
+    /// A node that takes no lines yet, as a cluster peer is until #779.
+    struct NoLinesPort;
+
+    struct NoKeys;
+
+    impl KeyStream for NoKeys {
+        fn keys(&self, _bytes: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SessionPort for NoLinesPort {
+        type Keys = NoKeys;
+
+        fn request(&self, _request: &Request) -> std::io::Result<Response> {
+            panic!("a refused line must never reach the node")
+        }
+
+        fn hold(&self, _name: &str) -> std::io::Result<NoKeys> {
+            Ok(NoKeys)
+        }
+
+        fn probe(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn probe_verdict(&self, _error: &std::io::Error) -> (bool, bool) {
+            (false, false)
+        }
+
+        fn label(&self) -> String {
+            "node peer".into()
+        }
+
+        fn accepts_lines(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_port_that_takes_no_lines_refuses_m_and_queues_nothing() {
+        let mut sender = crate::cluster_tui::sender::InputSender::with_client_id([7; 16]);
+        let mut queue = crate::cluster_tui::queue::InputQueue::default();
+        let notice = queue_line(
+            &NoLinesPort,
+            &mut sender,
+            &mut queue,
+            "agent".into(),
+            "instance-agent".into(),
+            b"hello\r".to_vec(),
+        );
+        assert_eq!(notice, "agent: lines to node peer are not available yet");
+        assert_eq!(queue.items().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_local_line_keeps_its_one_second_bound_when_the_daemon_never_answers() {
+        use interprocess::local_socket::traits::ListenerExt as _;
+        let path = std::env::temp_dir().join(format!(
+            "remuda-tui-line-bound-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = crate::ipc::listen(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let _stream = listener.incoming().next().unwrap().unwrap();
+            std::thread::sleep(Duration::from_secs(4));
+        });
+        let mut sender = crate::cluster_tui::sender::InputSender::with_client_id([7; 16]);
+        let mut queue = crate::cluster_tui::queue::InputQueue::default();
+        let notice = queue_line(
+            path.as_path(),
+            &mut sender,
+            &mut queue,
+            "agent".into(),
+            "instance-agent".into(),
+            b"hello\r".to_vec(),
+        );
+        assert_eq!(notice, "sending line to agent");
+        let started = Instant::now();
+        let event = send_due_line(&mut sender, &mut queue, &path);
+        // INPUT_SEND_TIMEOUT is 1 s; the unbounded default would wait 10 s.
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(event.is_some());
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
     }
 }

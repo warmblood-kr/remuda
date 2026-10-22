@@ -163,6 +163,9 @@ pub struct Observation {
     pub mouse: MouseState,
     pub attached: bool,
     pub closing: bool,
+    /// The build of the session host serving it; `None` for an in-process
+    /// session, which runs the daemon's own build (#713).
+    pub host_build: Option<String>,
 }
 
 /// Implementations retain stable client/sequence/payload context across adapter
@@ -406,6 +409,7 @@ impl SessionOperations for Session {
             mouse: self.mouse_state(),
             attached: self.is_attached(),
             closing: self.is_closing(),
+            host_build: None,
         })
     }
     fn send(&self, bytes: &[u8]) -> Result<()> {

@@ -17,6 +17,7 @@ fn ui_with_mouse_tracking(mouse_tracking: bool) -> Ui {
             attached: false,
             human_idle: None,
             mouse_tracking,
+            unavailable: false,
         }],
         "sh",
         None,

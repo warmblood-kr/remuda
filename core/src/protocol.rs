@@ -56,6 +56,9 @@ pub const LINE_ANSWER_MAX_BYTES: usize = 1024;
 /// Maximum newline-delimited frame carrying a [`Request::LineAnswer`].
 pub const LINE_ANSWER_MAX_FRAME_BYTES: usize = 8 * 1024;
 
+/// A peer listing this in `caps` serves [`Request::ClusterVfsTake`].
+pub const VFS_CAP_TAKE: &str = "take";
+
 /// Whether a character is an invisible formatting or separator character that
 /// should not be preserved in a prompt label or visible line answer.
 pub fn is_secret_prompt_format_or_separator(ch: char) -> bool {
@@ -183,6 +186,15 @@ mod secret_bytes_base64 {
     }
 }
 
+/// One host-backed session and the build of its host.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct HostBuild {
+    pub name: String,
+    /// `None` when the host could not be reached.
+    #[serde(default)]
+    pub build: Option<String>,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Request {
     /// Every session this node holds.
@@ -308,6 +320,14 @@ pub enum Request {
     /// outlives the binary that spawned it, so this is a client's only way to
     /// learn it is talking to yesterday's code before a field mismatch does.
     Version,
+    /// Each host-backed session's host build, as [`Response::SessionHostBuilds`]:
+    /// hosts outlive daemons, so builds can differ (#713). Older daemons
+    /// answer `bad request`.
+    SessionHostBuilds,
+    /// Replace this daemon with one started from `binary`, keeping host-backed
+    /// sessions (#713). Only `check` runs yet: a report in [`Response::Value`],
+    /// or a refusal in [`Response::Error`].
+    Reload { binary: String, check: bool },
     /// How the daemon published its socket, as [`Response::Value`]: `staged`,
     /// or `legacy: <reason>` when it fell back or the operator chose it.
     SocketPublication,
@@ -326,17 +346,28 @@ pub enum Request {
         digest: Option<String>,
         offset: usize,
     },
+    /// Index rows the peer changed after `since` (its change sequence), at
+    /// most `limit` (#778). `index_id` is the peer's index as the caller last
+    /// saw it; a mismatch answers `reset`. Older peers do not know it.
+    ClusterVfsChanges {
+        index_id: Option<String>,
+        since: u64,
+        limit: u32,
+    },
     /// Merge bounded virtual file index entries from an authenticated peer.
     ClusterVfsIndexUpdate { entries_json: String },
     /// Which of these blob hashes the peer holds.
     ClusterVfsBlobStat { hashes: Vec<String> },
     /// Read one chunk of a blob the peer holds, from `offset`.
     ClusterVfsBlobGet { sha256: String, offset: u64 },
+    /// Ask the peer to pull and keep these blobs: the caller is draining
+    /// before it leaves. Only sent to peers that list `VFS_CAP_TAKE`.
+    ClusterVfsTake { hashes: Vec<String> },
     /// Read or reload the daemon-owned local cluster listener.
     ClusterListener(ListenerOp),
-    /// Stop the daemon, so the next command starts a fresh one. The daemon
-    /// refuses a request identifying one of its own sessions unless the
-    /// caller explicitly overrides the hosted-session guard.
+    /// Stop the daemon and its sessions (host-backed ones unless
+    /// `keep_sessions`; older daemons ignore it and keep them). Refused from
+    /// one of its own sessions unless the caller overrides the guard.
     Shutdown {
         #[serde(default)]
         requester_daemon_id: Option<String>,
@@ -346,6 +377,8 @@ pub enum Request {
         requester_session_name: Option<String>,
         #[serde(default)]
         override_hosted: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keep_sessions: bool,
     },
     /// Evaluate Lua in the daemon's long-lived image. Caution: the state this
     /// touches outlives the request — two `Eval`s share globals, and a script,
@@ -357,6 +390,17 @@ pub enum Request {
         /// because only the caller knows where the source came from.
         name: Option<String>,
     },
+    /// Run `remuda vfs ARGS…` in the daemon, which owns the VFS index (#778).
+    /// `input_base64` is `put`'s content, read by the CLI. Answered with
+    /// [`Response::CommandResult`]. Local only: the remote front refuses it.
+    Vfs {
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_base64: Option<String>,
+    },
+    /// Run `remuda db ARGS…` in the daemon, the only opener of mod databases
+    /// (#778). Answered with [`Response::CommandResult`]. Local only.
+    Db { args: Vec<String> },
     /// Answer an outstanding secret prompt on this pending word's connection.
     SecretAnswer {
         id: u32,
@@ -386,6 +430,8 @@ pub enum Step {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Response {
     Sessions(Vec<SessionSummary>),
+    /// Answer to [`Request::SessionHostBuilds`], sorted by name.
+    SessionHostBuilds(Vec<HostBuild>),
     Screen(String),
     /// The session-level clear-line key was written; cleared text is optional
     /// because terminal screens do not generally identify composer contents.
@@ -490,6 +536,25 @@ pub enum Response {
         entries_json: String,
         next_offset: Option<usize>,
         unchanged: bool,
+    },
+    /// Rows after a cursor, oldest change first. `last_seq` is the new cursor.
+    ClusterVfsChangesPage {
+        index_id: String,
+        entries_json: String,
+        last_seq: u64,
+        more: bool,
+        reset: bool,
+        /// With `reset`: the caller missed deletes collected here, so it must
+        /// drop all but its own writes after `seen_seq` (our cursor into it).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stale: bool,
+        #[serde(default)]
+        seen_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seen_index_id: Option<String>,
+        /// VFS requests this peer serves beyond the base set, e.g. "take".
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        caps: Vec<String>,
     },
     /// Index entries were merged; `applied` counts those that changed state.
     ClusterVfsAck {

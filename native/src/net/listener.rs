@@ -139,6 +139,7 @@ struct ListenerState {
     limiter: Arc<RequestLimiter>,
     join_tokens: JoinTokenStore,
     admit_join: JoinAdmitter,
+    audit: Arc<cluster::audit::AuditSink>,
 }
 
 /// Replay and request admission state that must survive auto-listener rebinds.
@@ -447,6 +448,7 @@ pub(crate) fn bind_with_security(
             limiter: Arc::clone(&security.limiter),
             join_tokens,
             admit_join: Arc::new(cluster::admit_join_locked),
+            audit: Arc::new(cluster::audit::AuditSink::default_state_dir()),
         }),
         authorize,
         dispatch,
@@ -1146,9 +1148,11 @@ fn authorize_remote_request_with_control(
         Request::ClusterRegistrySync { .. }
             | Request::ClusterRegistryUpdate { .. }
             | Request::ClusterVfsIndexSync { .. }
+            | Request::ClusterVfsChanges { .. }
             | Request::ClusterVfsIndexUpdate { .. }
             | Request::ClusterVfsBlobStat { .. }
             | Request::ClusterVfsBlobGet { .. }
+            | Request::ClusterVfsTake { .. }
     ) {
         return Ok(());
     }
@@ -1299,15 +1303,17 @@ fn dispatch_payload(
             .map_err(|_| io::Error::other("registry acknowledgement encode failed"))
         }
         request @ (Request::ClusterVfsIndexSync { .. }
+        | Request::ClusterVfsChanges { .. }
         | Request::ClusterVfsIndexUpdate { .. }
         | Request::ClusterVfsBlobStat { .. }
-        | Request::ClusterVfsBlobGet { .. }) => {
+        | Request::ClusterVfsBlobGet { .. }
+        | Request::ClusterVfsTake { .. }) => {
             let peer_fp = cluster::encoding::fingerprint(peer_static);
             if !limiter.acquire_vfs_request(&peer_fp) {
                 return serde_json::to_vec(&Response::error(VFS_RATE_LIMITED))
                     .map_err(io::Error::other);
             }
-            let response = cluster::vfs_sync::serve(&request);
+            let response = cluster::vfs_sync::serve(&peer_fp, &request);
             serde_json::to_vec(&response)
                 .map_err(|_| io::Error::other("vfs response encode failed"))
         }
@@ -1581,18 +1587,29 @@ fn handle_admitted_request(
             return send_encrypted_response(stream, opened, &response);
         }
     };
+    // Session-changing requests are recorded with the authenticated peer,
+    // whatever their outcome. Input bytes are never part of the record.
+    let audited = cluster::audit::action(&request);
+    let audit = |outcome| {
+        if let Some(action) = &audited {
+            state.audit.record(&peer_fp, action, outcome);
+        }
+    };
     if let Err(response) = authorize_remote_request_with_source(&request, &control_source) {
+        audit(cluster::audit::Outcome::Refused);
         let response = serde_json::to_vec(&response).unwrap_or_else(|_| b"null".to_vec());
         return send_encrypted_response(stream, opened, &response);
     }
     if let Request::Input { bytes, .. } | Request::InputLine { bytes, .. } = &request {
         if !state.limiter.allow_remote_input(&peer_fp, bytes.len()) {
+            audit(cluster::audit::Outcome::Limited);
             let response =
                 serde_json::to_vec(&Response::RateLimited).unwrap_or_else(|_| b"null".to_vec());
             return send_encrypted_response(stream, opened, &response);
         }
     }
     let Some(peer_permit) = state.limiter.acquire_peer(&peer_fp) else {
+        audit(cluster::audit::Outcome::Limited);
         return ignore_response_error(write_http_response(
             stream,
             429,
@@ -1620,6 +1637,7 @@ fn handle_admitted_request(
             let _ = reply_tx.send(result);
         });
     if worker.is_err() {
+        audit(cluster::audit::Outcome::Failed);
         let response = encode_error("unable to start request worker");
         return send_encrypted_response(stream, opened, &response);
     }
@@ -1632,9 +1650,12 @@ fn handle_admitted_request(
         }
     };
     if authorize(&opened.peer_static).is_err() {
+        // The write may already have happened; the record says so.
+        audit(cluster::audit::Outcome::Revoked);
         let refused = encode_error("remote node was revoked while the request was held");
         return send_encrypted_response(stream, opened, &refused);
     }
+    audit(cluster::audit::outcome_of_reply(&response));
     send_dispatched_response(stream, opened, &response, &state.limiter, &peer_fp)
 }
 
@@ -2115,6 +2136,7 @@ mod tests {
                 limiter: Arc::new(RequestLimiter::default()),
                 join_tokens,
                 admit_join,
+                audit: Arc::new(cluster::audit::AuditSink::Off),
             });
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = stop.clone();
@@ -2196,6 +2218,7 @@ mod tests {
                 limiter: Arc::new(RequestLimiter::default()),
                 join_tokens,
                 admit_join: Arc::new(cluster::admit_join_locked),
+                audit: Arc::new(cluster::audit::AuditSink::at(&state_dir)),
             });
             let test_state = state.clone();
             let listener = Listener {
@@ -2862,6 +2885,116 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn audited_exchange(
+        setting: &[u8],
+        requests: &[Request],
+    ) -> (Vec<u8>, Vec<cluster::audit::Entry>) {
+        let settings = TestControlSettings::new(setting);
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let server = SocketTestServer::start_production_with_control_source(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Ok(())),
+            Arc::new(|_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap())),
+            settings.source(),
+        );
+        for request in requests {
+            let sealed =
+                sealed_payload_request(&peer, &server, &serde_json::to_vec(request).unwrap());
+            assert_eq!(server.exchange(sealed).0, 200);
+        }
+        let entries = cluster::audit::read_at(&server.state_dir, usize::MAX).unwrap();
+        let raw =
+            std::fs::read(server.state_dir.join(cluster::audit::AUDIT_FILE)).unwrap_or_default();
+        assert!(entries
+            .iter()
+            .all(|entry| entry.peer == cluster::encoding::fingerprint(&peer.public)));
+        (raw, entries)
+    }
+
+    #[cfg(unix)]
+    fn audited_input(bytes: &[u8]) -> Request {
+        Request::Input {
+            name: "session".into(),
+            instance_id: "id".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_writes_are_audited_without_their_contents_and_reads_are_not() {
+        use cluster::audit::{Op, Outcome};
+        let (raw, entries) = audited_exchange(
+            br#"{"allow_remote_control":true}"#,
+            &[
+                Request::List,
+                audited_input(b"secret-typed-text"),
+                Request::ResizeSession {
+                    name: "session".into(),
+                    instance_id: "id".into(),
+                    size: remuda_core::Size::new(80, 24),
+                },
+                Request::Close {
+                    name: "session".into(),
+                    instance_id: Some("id".into()),
+                    confirm: Some(true),
+                },
+            ],
+        );
+        let summary: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.op, entry.session.as_str(), entry.outcome))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (Op::Input, "session", Outcome::Done),
+                (Op::Resize, "session", Outcome::Done),
+                (Op::Close, "session", Outcome::Done),
+            ]
+        );
+        assert!(!String::from_utf8_lossy(&raw).contains("secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refused_peer_writes_are_audited_as_refused() {
+        use cluster::audit::{Op, Outcome};
+        let (_, entries) = audited_exchange(
+            br#"{"allow_remote_control":false}"#,
+            &[
+                audited_input(b"x"),
+                Request::New {
+                    name: Some("new".into()),
+                    command: vec!["sh".into()],
+                    size: remuda_core::Size::new(80, 24),
+                    cwd: None,
+                    env: None,
+                },
+            ],
+        );
+        let summary: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.op, entry.outcome))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (Op::Input, Outcome::Refused),
+                (Op::Create, Outcome::Refused)
+            ]
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn socket_malformed_setting_errors_without_dispatch() {
         let settings = TestControlSettings::new(br#"{"allow_remote_control":no}"#);
@@ -3121,6 +3254,7 @@ mod tests {
             requester_session_id: None,
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         })
         .is_err());
     }

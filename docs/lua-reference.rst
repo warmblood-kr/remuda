@@ -116,10 +116,25 @@ daemon
 
 ``table`` — Facts about the daemon this Lua image runs in.
 
+daemon.reloaded_from
+--------------------
+
+``daemon.reloaded_from() -> pid | nil`` — The pid of the daemon this one took over from in a `remuda reload`, or nil when it started fresh. That daemon may still be finishing its last requests for up to 10 s. A core without it lacks the field, so test remuda.daemon.reloaded_from first.
+
 daemon.socket_publication
 -------------------------
 
 ``daemon.socket_publication() -> {state, reason?}`` — How this daemon published its socket. Returns {state = 'staged'} or {state = 'legacy', reason = text} (it fell back, or the operator set REMUDA_SOCKET_PUBLICATION=legacy). The same answer as the SocketPublication request; a core without remuda.daemon does not have it, so test remuda.daemon first.
+
+db
+--
+
+``table`` — SQLite databases owned by mods. Each mod has its own namespace of databases, private to this user and daemon.
+
+db.open
+-------
+
+``db.open(name [, opts]) -> db | nil, reason`` — Open (creating if needed) database NAME in the running mod's namespace: <state>/remuda/db/MOD/NAME.db. NAME is a plain identifier. opts may set max_bytes (default 64 MiB, at most 1 GiB), timeout_ms per statement (default 1000, at most 10000) and max_rows per query (default 10000, at most 100000). opts.migrations = true applies the mod's migrations/NAME/NNNN_x.up.sql steps (or pass an array of {name, up, down}); see docs/lua.md. The handle has query(sql, params) -> rows, exec(sql, params) -> changes, batch(sql) -> true, limits() and close(); params is an array of nil, boolean, number or string. Failures return nil and a reason starting with no_mod, io, sql, too_large, timeout, too_many_rows, denied (ATTACH, DETACH and most PRAGMAs), migration, too_new, drift, foreign_key or closed. Outside a mod's own code it returns nil, 'no_mod: ...'.
 
 define_key
 ----------
@@ -499,22 +514,32 @@ unbind
 vfs
 ---
 
-``table`` — Read-only access to the cluster file store at remuda:// URIs. Calls answer from this node's index and cached copies and never wait on the network. Failures return nil and a reason starting with a code: no_cluster, not_found, not_local, bad_uri, wrong_cluster, corrupt or io.
+``table`` — Access to the cluster file store at remuda:// URIs. Calls answer from this node's index and cached copies and never wait on the network; put and rm tell peers in the background. Failures return nil and a reason starting with a code: no_cluster, not_found, not_local, bad_uri, wrong_cluster, corrupt, too_large or io.
 
 vfs.list
 --------
 
 ``vfs.list(prefix_uri) -> {stat...} | nil, reason`` — List stored files whose path starts with the prefix in a remuda:// URI (remuda:/// lists everything), as stat tables sorted by path.
 
+vfs.put
+-------
+
+``vfs.put(uri, bytes [, replicas]) -> stat | nil, reason`` — Store bytes at a remuda:// URI on this node and tell peers in the background, like `remuda vfs put`. replicas defaults to the vfs setting. This and vfs.rm are the only ways Lua writes the store; the index database is never opened from Lua.
+
 vfs.read
 --------
 
 ``vfs.read(uri) -> bytes | nil, reason`` — Return the bytes of a stored file from this node's verified copy. Returns nil, 'not_local: ...' when this node has no copy yet.
 
+vfs.rm
+------
+
+``vfs.rm(uri) -> true | nil, reason`` — Delete a stored file everywhere (a tombstone), like `remuda vfs rm`, telling peers in the background.
+
 vfs.stat
 --------
 
-``vfs.stat(uri) -> {path, version, sha256, size, mtime, replicas, writer, local, synced_at} | nil, reason`` — Describe a stored file: path, version, sha256, size, mtime, replicas, writer, local (whether this node holds a copy) and synced_at (unix time a peer index was last merged here, or nil). A file known here without a local copy still returns its table, with local = false.
+``vfs.stat(uri) -> {path, version, sha256, size, mtime, replicas, writer, local, synced_at, conflicts} | nil, reason`` — Describe a stored file: path, version, sha256, size, mtime, replicas, writer, local (whether this node holds a copy), synced_at (unix time a peer index was last merged here, or nil) and conflicts (concurrent writes kept beside this one, each {version, writer, sha256, size, deleted, mtime}; the next put or rm settles them). A file known here without a local copy still returns its table, with local = false.
 
 wait_for
 --------

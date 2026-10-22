@@ -1,9 +1,11 @@
 //! Cluster virtual file store rules (#742): URIs, path validation, replica
-//! placement and the last-writer-wins merge. Pure code, so every node computes
-//! the same answers. Storage and transport live in `remuda-native`.
+//! placement and the last-writer-wins merge, which keeps concurrent losers as
+//! conflicts. Pure code, so every node computes the same answers. Storage and
+//! transport live in `remuda-native`.
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fmt;
 
 pub const SCHEME: &str = "remuda://";
@@ -13,6 +15,17 @@ pub const MAX_CLUSTER_NAME_BYTES: usize = 64;
 pub const DEFAULT_REPLICAS: u8 = 3;
 pub const MAX_REPLICAS: u8 = 16;
 pub const SHA256_HEX_LEN: usize = 64;
+pub const MAX_VV_NODES: usize = 256;
+pub const MAX_CONFLICTS: usize = 16;
+
+/// Per writer node, the highest of its write counters an entry has seen.
+pub type VersionVector = BTreeMap<String, u64>;
+
+/// True when `a` has seen every write that `b` has seen.
+pub fn vv_covers(a: &VersionVector, b: &VersionVector) -> bool {
+    b.iter()
+        .all(|(node, count)| a.get(node).is_some_and(|seen| seen >= count))
+}
 
 /// Why a URI, path or cluster name was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,6 +168,45 @@ pub struct VfsEntry {
     pub deleted: bool,
     #[serde(default)]
     pub mtime: u64,
+    /// Empty from nodes older than step 4 of docs/design-778-vfs-delta-sync.md.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vv: VersionVector,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<VfsConflict>,
+}
+
+/// A write that lost to a concurrent one, kept with its content.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VfsConflict {
+    pub sha256: String,
+    pub size: u64,
+    pub replicas: u8,
+    pub version: u64,
+    pub writer: String,
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub mtime: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vv: VersionVector,
+}
+
+impl VfsConflict {
+    /// The losing write as an entry at `path`.
+    pub fn entry(&self, path: &str) -> VfsEntry {
+        VfsEntry {
+            path: path.to_owned(),
+            sha256: self.sha256.clone(),
+            size: self.size,
+            replicas: self.replicas,
+            version: self.version,
+            writer: self.writer.clone(),
+            deleted: self.deleted,
+            mtime: self.mtime,
+            vv: self.vv.clone(),
+            conflicts: Vec::new(),
+        }
+    }
 }
 
 impl VfsEntry {
@@ -172,7 +224,107 @@ impl VfsEntry {
         if self.writer.is_empty() || self.writer.len() > 128 {
             return Err(error("entry writer must be 1-128 bytes"));
         }
+        if self.vv.len() > MAX_VV_NODES
+            || self
+                .vv
+                .keys()
+                .any(|node| node.is_empty() || node.len() > 128)
+        {
+            return Err(error("entry version vector is malformed"));
+        }
+        if self.conflicts.len() > MAX_CONFLICTS {
+            return Err(error(format!(
+                "an entry keeps at most {MAX_CONFLICTS} conflicts"
+            )));
+        }
+        for conflict in &self.conflicts {
+            conflict.entry(&self.path).validate()?;
+        }
         Ok(())
+    }
+
+    /// This entry as a conflict, without its own conflicts.
+    pub fn as_conflict(&self) -> VfsConflict {
+        VfsConflict {
+            sha256: self.sha256.clone(),
+            size: self.size,
+            replicas: self.replicas,
+            version: self.version,
+            writer: self.writer.clone(),
+            deleted: self.deleted,
+            mtime: self.mtime,
+            vv: self.vv.clone(),
+        }
+    }
+
+    /// The vector for a write by `node` on top of `current`. It covers the
+    /// entry and all its conflicts, so any later write resolves them.
+    pub fn next_vv(current: Option<&Self>, node: &str) -> VersionVector {
+        let mut vv = VersionVector::new();
+        let seen = current.into_iter().flat_map(|current| {
+            std::iter::once(&current.vv).chain(current.conflicts.iter().map(|c| &c.vv))
+        });
+        for other in seen {
+            for (writer, count) in other {
+                let slot = vv.entry(writer.clone()).or_insert(0);
+                *slot = (*slot).max(*count);
+            }
+        }
+        let top = vv.values().copied().max().unwrap_or(0);
+        vv.insert(node.to_owned(), top.saturating_add(1));
+        while vv.len() > MAX_VV_NODES {
+            // Forgetting a writer can only add a conflict, never lose a write.
+            let oldest = vv
+                .iter()
+                .filter(|(writer, _)| writer.as_str() != node)
+                .min_by_key(|(writer, count)| (**count, (*writer).clone()))
+                .map(|(writer, _)| writer.clone());
+            vv.remove(&oldest.unwrap_or_default());
+        }
+        vv
+    }
+
+    /// What to store when `incoming` meets `current`; `None` keeps `current`.
+    /// `merge_order` picks the winner, as on older nodes. A live loser the
+    /// winner's vector does not cover was concurrent: it becomes a conflict.
+    pub fn merged(current: &Self, incoming: Self) -> Option<Self> {
+        let order = incoming.merge_order(current);
+        let (mut winner, loser) = if order == Ordering::Greater {
+            (incoming, current.clone())
+        } else {
+            (current.clone(), incoming)
+        };
+        if order == Ordering::Equal {
+            if winner.vv.is_empty() {
+                winner.vv = loser.vv;
+            }
+            winner.conflicts.extend(loser.conflicts);
+        } else if !winner.vv.is_empty() && !loser.vv.is_empty() {
+            // A losing delete has no content to keep, and its row may already
+            // be collected on nodes that would then report nothing.
+            if !loser.deleted {
+                winner.conflicts.push(loser.as_conflict());
+            }
+            winner.conflicts.extend(loser.conflicts);
+        }
+        winner.normalize_conflicts();
+        (winner != *current).then_some(winner)
+    }
+
+    /// Drop conflicts this entry repeats or has seen; keep the newest few.
+    pub fn normalize_conflicts(&mut self) {
+        let path = self.path.clone();
+        let (version, writer, vv) = (self.version, self.writer.clone(), self.vv.clone());
+        self.conflicts.retain(|conflict| {
+            let same = conflict.version == version && conflict.writer == writer;
+            let seen = !vv.is_empty() && !conflict.vv.is_empty() && vv_covers(&vv, &conflict.vv);
+            !same && !seen
+        });
+        self.conflicts
+            .sort_by(|a, b| b.entry(&path).merge_order(&a.entry(&path)));
+        self.conflicts
+            .dedup_by(|a, b| a.entry(&path).merge_order(&b.entry(&path)) == Ordering::Equal);
+        self.conflicts.truncate(MAX_CONFLICTS);
     }
 
     /// Order used by the merge: the higher `(version, writer)` wins. Equal
@@ -244,6 +396,8 @@ mod tests {
             writer: writer.into(),
             deleted: false,
             mtime: 0,
+            vv: VersionVector::new(),
+            conflicts: Vec::new(),
         }
     }
 
@@ -311,6 +465,115 @@ mod tests {
         assert!(validate_sha256(&"A".repeat(64)).is_err());
         assert!(validate_sha256(&"a".repeat(63)).is_err());
         assert!(validate_sha256("../../../../etc/passwd").is_err());
+    }
+
+    fn write(current: Option<&VfsEntry>, version: u64, writer: &str, sha: char) -> VfsEntry {
+        VfsEntry {
+            vv: VfsEntry::next_vv(current, writer),
+            ..entry(version, writer, sha)
+        }
+    }
+
+    #[test]
+    fn concurrent_writes_keep_the_loser_on_every_node_in_any_order() {
+        let base = write(None, 1, "SHA256:a", 'a');
+        let left = write(Some(&base), 2, "SHA256:a", 'b');
+        let right = write(Some(&base), 2, "SHA256:b", 'c');
+        let one = VfsEntry::merged(&left, right.clone()).unwrap();
+        let other = VfsEntry::merged(&right, left.clone()).unwrap_or(right.clone());
+        assert_eq!(one, other);
+        assert_eq!(one.sha256, right.sha256);
+        assert_eq!(one.conflicts, vec![left.as_conflict()]);
+        // Merging either side again changes nothing.
+        assert!(VfsEntry::merged(&one, left).is_none());
+        assert!(VfsEntry::merged(&one, right).is_none());
+    }
+
+    #[test]
+    fn a_concurrent_delete_that_loses_is_not_kept() {
+        let base = write(None, 1, "SHA256:a", 'a');
+        let removed = VfsEntry {
+            deleted: true,
+            ..write(Some(&base), 2, "SHA256:a", 'a')
+        };
+        let rewritten = write(Some(&base), 2, "SHA256:b", 'c');
+        let merged = VfsEntry::merged(&removed, rewritten.clone()).unwrap();
+        assert_eq!(merged, rewritten);
+        // A delete that wins still keeps the concurrent write's content.
+        let removed_later = VfsEntry {
+            deleted: true,
+            ..write(Some(&base), 3, "SHA256:a", 'a')
+        };
+        let kept = VfsEntry::merged(&rewritten, removed_later).unwrap();
+        assert!(kept.deleted);
+        assert_eq!(kept.conflicts, vec![rewritten.as_conflict()]);
+    }
+
+    #[test]
+    fn a_write_that_saw_the_other_is_not_a_conflict() {
+        let first = write(None, 1, "SHA256:a", 'a');
+        let second = write(Some(&first), 2, "SHA256:b", 'b');
+        assert_eq!(
+            VfsEntry::merged(&first, second.clone()),
+            Some(second.clone())
+        );
+        assert!(VfsEntry::merged(&second, first).is_none());
+    }
+
+    #[test]
+    fn entries_without_a_vector_merge_as_before() {
+        let old = entry(2, "SHA256:old", 'a');
+        let new = write(None, 1, "SHA256:new", 'b');
+        let merged = VfsEntry::merged(&new, old.clone()).unwrap();
+        assert_eq!(merged, old);
+        assert!(VfsEntry::merged(&old, new).is_none());
+    }
+
+    #[test]
+    fn the_next_write_covers_and_clears_every_conflict() {
+        let base = write(None, 1, "SHA256:a", 'a');
+        let left = write(Some(&base), 2, "SHA256:a", 'b');
+        let right = write(Some(&base), 2, "SHA256:b", 'c');
+        let conflicted = VfsEntry::merged(&left, right).unwrap();
+        let resolved = write(Some(&conflicted), 3, "SHA256:a", 'b');
+        let merged = VfsEntry::merged(&conflicted, resolved.clone()).unwrap();
+        assert!(merged.conflicts.is_empty());
+        assert_eq!(merged, resolved);
+    }
+
+    #[test]
+    fn an_entry_relayed_without_its_vector_keeps_the_stored_one() {
+        let base = write(None, 1, "SHA256:a", 'a');
+        let left = write(Some(&base), 2, "SHA256:a", 'b');
+        let right = write(Some(&base), 2, "SHA256:b", 'c');
+        let conflicted = VfsEntry::merged(&left, right.clone()).unwrap();
+        let stripped = VfsEntry {
+            vv: VersionVector::new(),
+            conflicts: Vec::new(),
+            ..right.clone()
+        };
+        assert!(VfsEntry::merged(&conflicted, stripped.clone()).is_none());
+        // And the other way round the vector and conflicts are filled in.
+        assert_eq!(
+            VfsEntry::merged(&stripped, conflicted.clone()),
+            Some(conflicted)
+        );
+    }
+
+    #[test]
+    fn conflicts_are_capped_and_checked() {
+        let mut many = write(None, 100, "SHA256:z", 'f');
+        for version in 0..40 {
+            let mut loser = write(None, version, &format!("SHA256:{version}"), 'a');
+            loser.path.clone_from(&many.path);
+            many.conflicts.push(loser.as_conflict());
+        }
+        many.normalize_conflicts();
+        assert_eq!(many.conflicts.len(), MAX_CONFLICTS);
+        assert_eq!(many.conflicts[0].version, 39);
+        assert!(many.validate().is_ok());
+        many.conflicts[0].sha256 = "bad".into();
+        assert!(many.validate().is_err());
     }
 
     #[test]

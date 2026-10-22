@@ -1,5 +1,6 @@
 //! Cluster vocabulary composed from identity and membership registry units.
 
+pub mod audit;
 pub mod control;
 pub mod encoding;
 pub mod endpoint;
@@ -11,8 +12,11 @@ pub mod listener_control;
 pub mod registry;
 pub mod replication;
 mod sealed;
-mod storage;
+pub(crate) mod storage;
 pub mod vfs;
+pub mod vfs_drain;
+mod vfs_index_db;
+mod vfs_repair;
 pub mod vfs_sync;
 #[cfg(windows)]
 pub(crate) mod windows_security;

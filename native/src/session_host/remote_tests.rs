@@ -377,6 +377,25 @@ fn a_newer_owner_claim_fences_the_old_adapter_before_any_effect() {
     assert_eq!(observed.size, Size::new(80, 24));
 }
 
+/// The store check and the host lease are not atomic; the host closes that gap.
+#[test]
+fn the_host_refuses_an_older_writer_that_already_passed_the_store_check() {
+    let fixture = Fixture::new();
+    let old = adapter(&fixture.root);
+    let new = adapter(&fixture.root);
+    assert!(new.owner.writer().epoch > old.owner.writer().epoch);
+    new.resize(Size::for_pane(100, 30)).unwrap();
+    // As if `old` had passed `current()` just before `new` claimed.
+    let mut client =
+        Client::open_expected(&old.endpoint, Role::Control, old.identity.clone()).unwrap();
+    match client.acquire(old.owner.writer()).unwrap() {
+        Response::Error { code } => assert_eq!(code, "superseded_writer"),
+        _ => panic!("the host granted a superseded writer"),
+    }
+    let size = new.inspect().unwrap().size;
+    assert_eq!((size.cols(), size.rows()), (100, 30));
+}
+
 #[test]
 fn plain_text_skips_wide_continuations_and_joins_wrapped_rows() {
     use remuda_core::agent::{Cursor, StyledCell};
@@ -626,4 +645,165 @@ fn teardown_retires_an_entry_whose_host_was_stopped_before_a_crash() {
         .unwrap()
         .entries
         .contains_key("synthetic"));
+}
+
+#[test]
+fn a_reclaim_fences_a_newer_claimant_at_the_store_and_at_the_host() {
+    use crate::session_host::hosted::Hosting;
+    let fixture = Fixture::new();
+    let registry = remuda_core::Registry::new();
+    let old = Hosting::at(fixture.root.clone());
+    assert_eq!(old.discover(&registry).unwrap(), ["synthetic"]);
+    let ours = registry.hosted("synthetic").unwrap();
+    ours.send_line("old-1").unwrap();
+
+    // A candidate claims: the old daemon is fenced.
+    let candidate = adapter(&fixture.root);
+    candidate.send_line("new-1").unwrap();
+    assert!(matches!(
+        ours.send_line("old-refused"),
+        Err(Error::Unavailable(Unavailable::Recovering))
+    ));
+
+    // Rollback: the old daemon claims again and shows the host.
+    assert_eq!(
+        old.reclaim().unwrap(),
+        [("synthetic".to_owned(), Announced::Fenced)]
+    );
+    // The host refuses the candidate's writer before the old daemon's next
+    // act reaches it, store check or not.
+    let mut raw = Client::open_expected(
+        &candidate.endpoint,
+        Role::Control,
+        candidate.identity.clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        raw.acquire(candidate.owner.writer()).unwrap(),
+        Response::Error { code } if code == "superseded_writer"
+    ));
+    drop(raw);
+    ours.send_line("old-2").unwrap();
+    assert!(matches!(
+        candidate.send_line("new-refused"),
+        Err(Error::Unavailable(Unavailable::Recovering))
+    ));
+    assert_eq!(fixture.effects(), ["old-1", "new-1", "old-2"]);
+}
+
+#[test]
+fn a_preflight_reads_every_host_without_claiming_or_taking_the_lease() {
+    use crate::session_host::hosted::{Checked, CheckedState, Hosting};
+    let mut fixture = Fixture::new();
+    let session = adapter(&fixture.root);
+    let before = session.owner.index().unwrap().fence();
+
+    let checked = Hosting::at(fixture.root.clone()).preflight().unwrap();
+    assert_eq!(
+        checked,
+        [Checked {
+            name: "synthetic".into(),
+            state: CheckedState::Running {
+                build: crate::dist::BUILD_VERSION.into()
+            },
+        }]
+    );
+    // No claim: the existing owner is still the writer and acts at once.
+    assert_eq!(session.owner.index().unwrap().fence(), before);
+    assert!(session.owner.current().unwrap());
+    session.send_line("after-preflight").unwrap();
+    assert_eq!(fixture.effects(), ["after-preflight"]);
+
+    let host = fixture.host.as_mut().unwrap();
+    host.0.kill().unwrap();
+    host.0.wait().unwrap();
+    let checked = Hosting::at(fixture.root.clone()).preflight().unwrap();
+    assert!(
+        matches!(
+            &checked[..],
+            [Checked {
+                state: CheckedState::Unreachable(_),
+                ..
+            }]
+        ),
+        "{checked:?}"
+    );
+}
+
+#[test]
+fn a_drained_gate_refuses_acts_and_control_before_any_effect_but_reads_go_on() {
+    let fixture = Fixture::new();
+    let gate = Arc::new(crate::session_host::gate::Gate::default());
+    let session = adapter(&fixture.root).gated(Arc::clone(&gate));
+    session.send_line("before").unwrap();
+    assert_eq!(fixture.effects(), ["before"]);
+    let size = session.inspect().unwrap().size;
+
+    assert_eq!(gate.drain(Duration::from_secs(1)).left, 0);
+    let refused = |result: remuda_core::session_operations::Result<()>| {
+        matches!(result, Err(Error::Unavailable(Unavailable::Recovering)))
+    };
+    assert!(refused(session.send_line("after")));
+    assert!(refused(session.resize(Size::for_pane(100, 30))));
+    assert!(refused(session.terminate()));
+    // Nothing reached the host: no effect, no resize, no reservation.
+    assert_eq!(fixture.effects(), ["before"]);
+    let seen = session.inspect().unwrap();
+    assert_eq!(seen.lifecycle, Lifecycle::Running);
+    assert_eq!(seen.size, size);
+    assert!(session.screen_text().unwrap().contains("effect:before"));
+    let index = session.owner.index().unwrap();
+    assert_eq!(index.entries["synthetic"].streams[0].next, Some(2));
+}
+
+#[test]
+fn teardown_leaves_an_in_flight_act_its_own_result() {
+    let mut fixture = Fixture::new();
+    let session = Arc::new(adapter(&fixture.root));
+    // EOF ends the child's read loop while the act is still in its pause.
+    let acting = {
+        let session = Arc::clone(&session);
+        std::thread::spawn(move || session.feed(&[Step::Burst(vec![4]), Step::Pause(600)]))
+    };
+    eventually("exit published", || {
+        let index = session.owner.index().ok()?;
+        matches!(index.entries["synthetic"].phase, Phase::Exited { .. }).then_some(())
+    });
+    session.teardown(Duration::from_secs(10)).unwrap();
+    let result = acting.join().unwrap();
+    assert!(result.is_ok(), "teardown took the act's result: {result:?}");
+    let host = fixture.host.as_mut().unwrap();
+    eventually("host stopped", || host.0.try_wait().ok().flatten());
+}
+
+#[test]
+fn teardown_waits_while_an_act_is_in_flight() {
+    let mut fixture = Fixture::new();
+    let session = Arc::new(adapter(&fixture.root));
+    session.terminate().unwrap();
+    eventually("exit published", || {
+        let index = session.owner.index().ok()?;
+        matches!(index.entries["synthetic"].phase, Phase::Exited { .. }).then_some(())
+    });
+    // An act in flight holds this lock until it has settled its own result.
+    let in_flight = session.acts.lock().unwrap();
+    let tearing = {
+        let session = Arc::clone(&session);
+        std::thread::spawn(move || session.teardown(Duration::from_secs(10)))
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !tearing.is_finished(),
+        "teardown ran under an act in flight"
+    );
+    assert!(session
+        .owner
+        .index()
+        .unwrap()
+        .entries
+        .contains_key("synthetic"));
+    drop(in_flight);
+    tearing.join().unwrap().unwrap();
+    let host = fixture.host.as_mut().unwrap();
+    eventually("host stopped", || host.0.try_wait().ok().flatten());
 }

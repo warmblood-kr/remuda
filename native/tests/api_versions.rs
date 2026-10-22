@@ -387,6 +387,7 @@ fn frozen_api_fixtures_v1_through_v8_and_new_v9_v10_v11_surfaces_run() {
                     requester_session_id: None,
                     requester_session_name: None,
                     override_hosted: true,
+                    keep_sessions: false,
                 },
             )
             .unwrap(),
