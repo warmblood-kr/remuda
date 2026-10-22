@@ -32,6 +32,22 @@ pub trait SessionPort {
 
     /// Where the node lives, as shown when it is gone.
     fn label(&self) -> String;
+
+    /// False when the node's Lua cannot be asked for list and window layout;
+    /// the screen then shows plain names and the selected session.
+    fn has_lua(&self) -> bool {
+        true
+    }
+
+    /// True when `r` may restart this node's daemon from here.
+    fn restartable(&self) -> bool {
+        true
+    }
+
+    /// False when `m` lines cannot be sent to this node yet; `m` then says so.
+    fn accepts_lines(&self) -> bool {
+        true
+    }
 }
 
 impl SessionPort for Path {
@@ -132,6 +148,110 @@ mod tests {
         fn label(&self) -> String {
             "fake".into()
         }
+    }
+
+    /// A peer-like node: no Lua, one live session whose screen says "hi".
+    struct NoLuaPort(Mutex<Vec<Request>>);
+
+    impl SessionPort for NoLuaPort {
+        type Keys = FakeKeys;
+
+        fn request(&self, request: &Request) -> io::Result<Response> {
+            self.0.lock().unwrap().push(request.clone());
+            Ok(match request {
+                Request::List => Response::Sessions(vec![remuda_core::SessionSummary {
+                    id: "id".into(),
+                    name: "build".into(),
+                    instance_id: Some("i".into()),
+                    output_version: Some(1),
+                    alive: true,
+                    idle: std::time::Duration::ZERO,
+                    output_idle: None,
+                    size: remuda_core::Size::new(80, 24),
+                    attached: false,
+                    human_idle: None,
+                    mouse_tracking: false,
+                    unavailable: false,
+                }]),
+                Request::CaptureStyled { .. } => Response::StyledScreen {
+                    rows: vec![remuda_core::protocol::collapse_runs(&[
+                        remuda_core::agent::StyledCell {
+                            text: "hi".into(),
+                            ..Default::default()
+                        },
+                    ])],
+                    instance_id: Some("i".into()),
+                    output_version: Some(1),
+                    wrapped: vec![false],
+                    scrollback_len: 0,
+                    scrollback_total: 0,
+                    cursor: remuda_core::agent::Cursor {
+                        row: 0,
+                        col: 0,
+                        visible: false,
+                    },
+                },
+                other => Response::Error(format!("refused {other:?}")),
+            })
+        }
+
+        fn hold(&self, _name: &str) -> io::Result<FakeKeys> {
+            Err(io::Error::other("no keys"))
+        }
+
+        fn probe(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn probe_verdict(&self, _error: &io::Error) -> (bool, bool) {
+            (false, false)
+        }
+
+        fn label(&self) -> String {
+            "node peer".into()
+        }
+
+        fn has_lua(&self) -> bool {
+            false
+        }
+
+        fn restartable(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_node_without_lua_gets_plain_names_and_its_selected_screen() {
+        let port = NoLuaPort(Mutex::new(Vec::new()));
+        let mut ui = super::super::Ui::new(Vec::new(), "sh", None);
+        let mut held = None;
+        let mut painted = String::new();
+        let mut shown = None;
+        super::super::refresh(
+            &port,
+            "peer",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(ui.sessions.len(), 1);
+        assert!(ui.sessions_text.is_empty(), "plain names, no Lua buffer");
+        assert!(
+            matches!(&shown, Some(super::super::ShownTarget::Session(name)) if name == "build")
+        );
+        assert!(painted.contains("build"));
+        assert!(painted.contains("hi"));
+        let sent = port.0.lock().unwrap();
+        assert!(
+            !sent
+                .iter()
+                .any(|request| matches!(request, Request::Eval { .. })),
+            "a peer refuses Eval, so the screen must not ask: {sent:?}"
+        );
     }
 
     #[test]
