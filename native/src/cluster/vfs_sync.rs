@@ -230,6 +230,22 @@ fn record_health(peer_fp: &str, reached: bool) {
     }
 }
 
+/// How long `peer_fp` has been down, if it is.
+pub(super) fn down_for(peer_fp: &str) -> Option<Duration> {
+    let since = *lock(health()).get(peer_fp)?;
+    (since.elapsed() >= down_grace()).then(|| since.elapsed())
+}
+
+/// Whether `peer_fp` answered without change cursors (an older build).
+pub(super) fn is_legacy(peer_fp: &str) -> bool {
+    lock(&LEGACY_PEERS).contains_key(peer_fp)
+}
+
+/// Copies the repair queue holds back for a later try.
+pub(super) fn retry_waiting() -> usize {
+    lock(repair_queue()).waiting(Instant::now())
+}
+
 pub(super) fn is_down(peer_fp: &str) -> bool {
     health()
         .lock()
@@ -288,7 +304,7 @@ pub fn placement_for(entry: &VfsEntry) -> Vec<String> {
     }
 }
 
-fn live_placement(entry: &VfsEntry, members: &Members) -> Vec<String> {
+pub(super) fn live_placement(entry: &VfsEntry, members: &Members) -> Vec<String> {
     let candidates: Vec<&str> = members
         .admitted
         .iter()

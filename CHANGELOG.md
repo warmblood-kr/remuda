@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- VFS: `remuda vfs status [--copies] [--json]` shows the cluster store at a
+  glance (#778): live files and index size against their limits, paths
+  with conflicts, this node's copies and retry backlog, and for each peer
+  whether it is up, when it last pulled from here and how many deletes it
+  holds back. `--copies` also asks the nodes which copies they hold, lists
+  short files, and exits 75 while any file is short.
+
 - Cluster: each node now keeps a local audit log of what peers asked it to
   do, in `cluster/audit.jsonl` in the private cluster state directory. Each
   line records when, which peer (by fingerprint), what (input, resize, close,

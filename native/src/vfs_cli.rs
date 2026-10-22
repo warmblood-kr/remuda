@@ -6,6 +6,7 @@
 use crate::cli_parse::{self, ArgSpec, OptionSpec, RepeatPolicy, Spec, VerbSpec};
 use crate::cluster::vfs::{VfsError, VfsErrorKind, VfsStore};
 use crate::cluster::vfs_drain::DrainReport;
+use crate::cluster::vfs_status::StatusReport;
 use crate::cluster::vfs_sync;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -90,6 +91,10 @@ fn spec() -> Spec {
                 vec![arg("URI", "remuda:// URI", true)], vec![], "remuda vfs rm URI"),
             verb("sync", "Pull indexes from peers and repair missing copies now. Example: remuda vfs sync",
                 vec![], vec![], "remuda vfs sync"),
+            verb("status", "Show files, conflicts, copies here and each peer at a glance. Example: remuda vfs status --copies",
+                vec![], vec![option("copies", None, "Also ask the nodes which copies they hold; exit 75 if a file is short"),
+                             option("json", None, "Print JSON")],
+                "remuda vfs status [--copies] [--json]"),
             verb("drain", "Before this node leaves, have the other nodes take copies of what it holds. Example: remuda vfs drain",
                 vec![], vec![option("timeout", Some("SECS"), "Give up after this long (1-110; default 100); run drain again to go on")],
                 "remuda vfs drain [--timeout SECS]"),
@@ -341,6 +346,7 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
             0
         }
         "drain" => drain(values, out),
+        "status" => status(values, out),
         "config" => config(&store, values, out),
         "export-index" => match store.export_legacy_index() {
             Ok(count) => {
@@ -470,6 +476,151 @@ fn put(store: &VfsStore, values: &Map<String, Value>, bytes: &[u8], out: &mut Ou
         EXIT_TEMPFAIL
     } else {
         0
+    }
+}
+
+/// `--copies` asks peers for at most this long.
+const STATUS_COPIES_DEADLINE: Duration = Duration::from_secs(30);
+
+fn status(values: &Map<String, Value>, out: &mut Out) -> u8 {
+    let copies = flag(values, "copies");
+    let report = match crate::cluster::vfs_status::status(copies, STATUS_COPIES_DEADLINE) {
+        Ok(report) => report,
+        Err(error) => return fail_vfs(out, "status", &error),
+    };
+    let short = report.copies.as_ref().is_some_and(|c| !c.short.is_empty());
+    let code = if short { EXIT_TEMPFAIL } else { 0 };
+    if flag(values, "json") {
+        say!(
+            out,
+            "{}",
+            serde_json::to_string(&report).unwrap_or_default()
+        );
+        return code;
+    }
+    for line in status_lines(&report) {
+        say!(out, "{line}");
+    }
+    code
+}
+
+/// The text form of `remuda vfs status`.
+fn status_lines(report: &StatusReport) -> Vec<String> {
+    use crate::cluster::vfs::{MAX_ENTRIES, MAX_INDEX_ENTRIES};
+    let mut lines = vec![
+        format!(
+            "Files: {} live of {MAX_ENTRIES}; index {} of {MAX_INDEX_ENTRIES} entries ({} deletes remembered)",
+            report.live,
+            report.entries,
+            report.entries.saturating_sub(report.live)
+        ),
+        match report.conflict_paths {
+            0 => "Conflicts: none".to_owned(),
+            n => format!("Conflicts: {n} paths (remuda vfs ls --conflicts)"),
+        },
+        format!(
+            "This node ({}): {} copies, {}; {} copies waiting to retry",
+            report.node,
+            report.local_copies,
+            bytes_text(report.local_bytes),
+            report.retry_waiting
+        ),
+    ];
+    if report.peers.is_empty() {
+        lines.push("Peers: none".to_owned());
+    } else {
+        lines.push("Peers:".to_owned());
+    }
+    for peer in &report.peers {
+        let health = match (peer.down_secs, peer.old_build) {
+            (Some(secs), _) => format!("down {}", duration_text(secs)),
+            (None, true) => "old build".to_owned(),
+            (None, false) => "up".to_owned(),
+        };
+        let pulled = peer
+            .last_pull
+            .map_or("never pulled from here".to_owned(), |at| {
+                format!(
+                    "pulled from here {} ago",
+                    duration_text(report.now.saturating_sub(at))
+                )
+            });
+        let deletes = if peer.stale {
+            format!(
+                "stale (over {} days): no longer holds deletes back",
+                report.stale_days
+            )
+        } else if peer.deletes_unpulled > 0 {
+            format!("holds back {} deletes", peer.deletes_unpulled)
+        } else {
+            String::new()
+        };
+        let caps = match &peer.caps {
+            Some(caps) if !caps.is_empty() => format!("caps: {}", caps.join(",")),
+            _ => String::new(),
+        };
+        let parts: Vec<&str> = [health.as_str(), &pulled, &deletes, &caps]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect();
+        lines.push(format!("  {:<14} {}", peer.node, parts.join("; ")));
+    }
+    lines.push(format!(
+        "Settings: replicas {}, tombstone-days {}, stale-days {}",
+        report.replicas, report.tombstone_days, report.stale_days
+    ));
+    if let Some(copies) = &report.copies {
+        let first: Vec<String> = copies
+            .short
+            .iter()
+            .take(5)
+            .map(|(path, have, want)| format!("{path} {have} of {want}"))
+            .collect();
+        let mut line = format!("Copies: {} files complete", copies.complete);
+        if !copies.short.is_empty() {
+            line.push_str(&format!(
+                "; {} short (first: {})",
+                copies.short.len(),
+                first.join(", ")
+            ));
+        }
+        if copies.no_copy > 0 {
+            line.push_str(&format!("; {} with no confirmed copy", copies.no_copy));
+        }
+        lines.push(line);
+        if !copies.unanswered.is_empty() {
+            lines.push(format!(
+                "Not answered in time: {}",
+                copies.unanswered.join(", ")
+            ));
+        }
+    } else {
+        lines.push("Copies: run `remuda vfs status --copies` to ask the nodes.".to_owned());
+    }
+    lines
+}
+
+fn duration_text(secs: u64) -> String {
+    match secs {
+        0..=119 => format!("{secs}s"),
+        120..=7_199 => format!("{}m", secs / 60),
+        7_200..=172_799 => format!("{}h", secs / 3_600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+fn bytes_text(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -1068,6 +1219,81 @@ mod tests {
         assert_eq!(code, EXIT_TEMPFAIL);
         assert!(said.starts_with("committed here, but only 1 of 3 copies confirmed"));
         assert!(said.contains("still replicating"));
+    }
+
+    fn peer(node: &str) -> crate::cluster::vfs_status::PeerStatus {
+        crate::cluster::vfs_status::PeerStatus {
+            node: node.into(),
+            down_secs: None,
+            last_pull: Some(1_000 - 150),
+            stale: false,
+            old_build: false,
+            caps: Some(vec!["take".into()]),
+            deletes_unpulled: 0,
+        }
+    }
+
+    fn report() -> StatusReport {
+        StatusReport {
+            node: "node-me".into(),
+            live: 12,
+            entries: 15,
+            conflict_paths: 0,
+            local_copies: 9,
+            local_bytes: 3 * 1024 * 1024 / 2,
+            retry_waiting: 2,
+            replicas: 3,
+            tombstone_days: 7,
+            stale_days: 30,
+            now: 1_000,
+            peers: vec![peer("node-a")],
+            copies: None,
+        }
+    }
+
+    #[test]
+    fn status_reports_counts_peers_and_settings() {
+        let mut report = report();
+        report.conflict_paths = 2;
+        let mut down = peer("node-b");
+        (down.down_secs, down.last_pull, down.caps) = (Some(3 * 3_600), None, None);
+        down.deletes_unpulled = 3;
+        let mut old = peer("node-c");
+        (old.old_build, old.stale, old.caps) = (true, true, None);
+        report.peers.extend([down, old]);
+        let text = status_lines(&report).join("\n");
+        for want in [
+            "Files: 12 live of 10000; index 15 of 30000 entries (3 deletes remembered)",
+            "Conflicts: 2 paths (remuda vfs ls --conflicts)",
+            "This node (node-me): 9 copies, 1.5 MiB; 2 copies waiting to retry",
+            "  node-a         up; pulled from here 2m ago; caps: take",
+            "  node-b         down 3h; never pulled from here; holds back 3 deletes",
+            "  node-c         old build; pulled from here 2m ago; stale (over 30 days): no longer holds deletes back",
+            "Settings: replicas 3, tombstone-days 7, stale-days 30",
+            "Copies: run `remuda vfs status --copies` to ask the nodes.",
+        ] {
+            assert!(text.contains(want), "missing {want:?} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn status_copies_name_short_files_and_silent_nodes() {
+        let mut report = report();
+        report.copies = Some(crate::cluster::vfs_status::CopyStatus {
+            complete: 10,
+            short: vec![("a.txt".into(), 1, 3), ("b.txt".into(), 0, 2)],
+            no_copy: 1,
+            unanswered: vec!["node-b".into()],
+        });
+        let text = status_lines(&report).join("\n");
+        assert!(
+            text.contains("Copies: 10 files complete; 2 short (first: a.txt 1 of 3, b.txt 0 of 2); 1 with no confirmed copy"),
+            "{text}"
+        );
+        assert!(text.contains("Not answered in time: node-b"), "{text}");
+        assert_eq!(duration_text(59), "59s");
+        assert_eq!(duration_text(3 * 86_400), "3d");
+        assert_eq!(bytes_text(512), "512 B");
     }
 
     #[test]

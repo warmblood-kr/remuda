@@ -531,6 +531,44 @@ fn put_one_copy(node: &Node, uri: &str, body: &[u8]) {
 }
 
 #[test]
+fn status_reports_files_peers_and_copies() {
+    let _serial = live_test_guard();
+    let (a, b, c) = three_nodes();
+    successful(
+        a.run_with_stdin(
+            &[
+                "vfs",
+                "put",
+                "-",
+                "remuda:///s/one.txt",
+                "--replicas",
+                "3",
+                "--wait",
+            ],
+            Some(b"one"),
+        ),
+        "vfs put",
+    );
+    let said = successful(a.run(&["vfs", "status"]), "vfs status");
+    assert!(said.contains("Files: 1 live of 10000"), "{said}");
+    assert!(said.contains("Conflicts: none"), "{said}");
+    for node in [&b, &c] {
+        let name = remuda_native::cluster::node_label(&node.fingerprint());
+        assert!(
+            said.lines()
+                .any(|line| line.contains(&name) && line.contains(" up")),
+            "{said}"
+        );
+    }
+    let said = successful(a.run(&["vfs", "status", "--copies"]), "vfs status --copies");
+    assert!(said.contains("Copies: 1 files complete"), "{said}");
+    let json = successful(a.run(&["vfs", "status", "--json"]), "vfs status --json");
+    let report: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(report["peers"].as_array().unwrap().len(), 2, "{json}");
+    assert_eq!(report["live"], 1, "{json}");
+}
+
+#[test]
 fn drain_has_the_next_node_take_what_only_the_leaving_node_holds() {
     let _serial = live_test_guard();
     let (a, b, c) = three_nodes();

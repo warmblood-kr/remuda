@@ -109,6 +109,13 @@ pub struct VfsSettings {
 }
 
 pub const DEFAULT_TOMBSTONE_DAYS: u32 = 7;
+
+/// See `VfsStore::index_status`; `pulls` follows the peers asked about.
+pub struct IndexStatus {
+    pub counts: IndexCounts,
+    pub conflict_paths: usize,
+    pub pulls: Vec<(Option<u64>, usize)>,
+}
 pub const DEFAULT_STALE_DAYS: u32 = 30;
 
 fn default_stale_days() -> u32 {
@@ -901,6 +908,22 @@ impl VfsStore {
     /// its entry, and a pull that lands before the index merge.
     pub fn collect_garbage(&self) -> VfsResult<usize> {
         self.collect_garbage_older_than(GC_GRACE)
+    }
+
+    /// Index figures for `remuda vfs status`: counts, conflicted paths, and
+    /// per peer its last pull and the tombstones it has not pulled.
+    pub fn index_status(&self, peers: &[String]) -> VfsResult<IndexStatus> {
+        let conn = self.index_db()?;
+        let counts = vfs_index_db::counts(&conn)?;
+        let mut pulls = Vec::with_capacity(peers.len());
+        for peer in peers {
+            pulls.push(vfs_index_db::peer_pull(&conn, peer)?);
+        }
+        Ok(IndexStatus {
+            counts,
+            conflict_paths: vfs_index_db::conflict_paths(&conn)?,
+            pulls,
+        })
     }
 
     /// Remove tombstones older than `tombstone_days` that every other member

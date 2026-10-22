@@ -17,6 +17,7 @@ pub mod vfs;
 pub mod vfs_drain;
 mod vfs_index_db;
 mod vfs_repair;
+pub mod vfs_status;
 pub mod vfs_sync;
 #[cfg(windows)]
 pub(crate) mod windows_security;
