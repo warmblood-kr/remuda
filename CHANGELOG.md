@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Lua: a mod can squash its database migrations (#778). One
+  `NNNN_name.base.sql` holds the whole schema as of step NNNN, so the step
+  files up to it can be deleted and the mod stays within its 64 assets. A
+  new database runs the base, then the later steps; an existing one at
+  NNNN or later upgrades as before. One below NNNN fails with `squashed:`
+  and needs an older release of the mod first, unless the mod keeps the
+  step files from there. Older remuda builds refuse a database created from
+  a base without changing it.
+
 - VFS: `remuda vfs drain [--timeout SECS]` prepares a node to leave (#778).
   The nodes that will hold its files once it is gone are asked to take a
   copy, and drain waits until they confirm. Then it says to run `remuda

@@ -249,6 +249,26 @@ version of a mod:
    before anything runs.
 4. Reload the mod.
 
+A mod may list at most 64 assets, so a long history needs squashing. Write
+one `NNNN_name.base.sql` holding the whole schema as of step NNNN (2 or
+more), then delete the step files up to NNNN:
+
+```
+packages/butler/migrations/notes/0012_base.base.sql   -- schema as of step 12
+packages/butler/migrations/notes/0013_pins.up.sql
+```
+
+- A new database runs the base and records it as step NNNN, then runs the
+  later steps. It cannot be stepped back below NNNN.
+- A database already at NNNN or later upgrades as before; deleted steps are
+  not checked for drift.
+- A database below NNNN fails the open with `squashed: ...`: open it once
+  with an older release of the mod that still has the steps. To avoid this,
+  keep the last few step files next to the base (step files must then run
+  without gaps from at most NNNN + 1).
+- Older remuda builds refuse a database created from a base before changing
+  it, and refuse `.base.sql` files.
+
 `remuda db status [MOD]` shows each database's version and steps and
 compares them with the installed files. `remuda db upgrade MOD NAME`
 applies the installed files without waiting for the mod to open the

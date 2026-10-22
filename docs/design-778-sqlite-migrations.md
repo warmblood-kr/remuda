@@ -73,6 +73,28 @@ When `open` is called without `migrations` on a database that has applied
 steps, it is refused with `too_new:`. Old code that does not know about the
 schema cannot write to it.
 
+## Squashing
+
+A mod may declare at most 64 assets, so about 30 reversible steps fill it.
+A mod squashes with one `NNNN_slug.base.sql` (NNNN ≥ 2): the whole schema as
+of step NNNN, for a new database. Step files up to NNNN may then be deleted;
+those kept must run without gaps from at most NNNN + 1 to the last step.
+
+- **New database:** run the base, record it at NNNN with no down SQL, then
+  run the later steps. The record then starts at NNNN instead of 1; that is
+  how a base-created database is told apart, with no change to
+  `_remuda_migrations`.
+- **Existing database at v ≥ NNNN:** upgrades as before. Recorded steps whose
+  files are gone are not checked for drift; a base row is checked against
+  the base only while the base keeps its number.
+- **Existing database at 0 < v < NNNN** without the files to reach NNNN:
+  refused with `squashed: … open it once with an older release of the mod`.
+- **Older builds** refuse a base-created database (record count differs
+  from `user_version`) and `.base.sql` files, before changing anything.
+  CI's `host-compat-n-plus-one` job runs that case.
+- The inline Lua form and the compiled VFS index steps have no asset cap and
+  no base.
+
 ## Command line (runs in the daemon, like `remuda vfs`)
 
 - `remuda db status [MOD]`: each database's version, applied steps, which

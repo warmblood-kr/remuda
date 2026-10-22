@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 struct Home {
+    exe: PathBuf,
     root: PathBuf,
     name: String,
     daemon: Option<Child>,
@@ -17,19 +18,22 @@ struct Home {
 
 impl Home {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("dbl{}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("dbl{}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("runtime")).unwrap();
         std::fs::create_dir_all(root.join("home")).unwrap();
         Self {
+            exe: PathBuf::from(env!("CARGO_BIN_EXE_remuda")),
             root,
-            name: format!("db{}", std::process::id()),
+            name: format!("db{}-{id}", std::process::id()),
             daemon: None,
         }
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
+        let mut command = Command::new(&self.exe);
         command
             .args(["-s", &self.name])
             .args(args)
@@ -75,15 +79,7 @@ impl Home {
     }
 
     fn install_mod(&self) {
-        let package = self.root.join("data/remuda/mods/sample/packages/sample");
-        let migrations = package.join("migrations/notes");
-        std::fs::create_dir_all(&migrations).unwrap();
-        std::fs::write(
-            self.root.join("data/remuda/mods/sample/extension.toml"),
-            "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
-        )
-        .unwrap();
-        for (file, sql) in [
+        self.install_mod_with(&[
             ("0001_create.up.sql", "CREATE TABLE n (x TEXT NOT NULL);"),
             ("0001_create.down.sql", "DROP TABLE n;"),
             (
@@ -91,7 +87,21 @@ impl Home {
                 "ALTER TABLE n ADD COLUMN seen INTEGER NOT NULL DEFAULT 0;",
             ),
             ("0002_seen.down.sql", "ALTER TABLE n DROP COLUMN seen;"),
-        ] {
+        ]);
+    }
+
+    /// Install mod `sample` whose start opens `notes` with these files.
+    fn install_mod_with(&self, files: &[(&str, &str)]) {
+        let package = self.root.join("data/remuda/mods/sample/packages/sample");
+        let migrations = package.join("migrations/notes");
+        let _ = std::fs::remove_dir_all(&migrations);
+        std::fs::create_dir_all(&migrations).unwrap();
+        std::fs::write(
+            self.root.join("data/remuda/mods/sample/extension.toml"),
+            "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+        )
+        .unwrap();
+        for (file, sql) in files {
             std::fs::write(migrations.join(file), sql).unwrap();
         }
         std::fs::write(
@@ -184,4 +194,63 @@ fn db_status_downgrade_and_upgrade_run_in_the_daemon() {
 
     let up = ok(home.run(&["db", "upgrade", "sample", "notes"]), "upgrade");
     assert_eq!(up, "sample/notes.db is now at version 2 (was 1).\n");
+}
+
+const SQUASHED: &[(&str, &str)] = &[
+    (
+        "0002_base.base.sql",
+        "CREATE TABLE n (x TEXT NOT NULL, seen INTEGER NOT NULL DEFAULT 0);",
+    ),
+    ("0003_tag.up.sql", "ALTER TABLE n ADD COLUMN tag TEXT;"),
+    ("0003_tag.down.sql", "ALTER TABLE n DROP COLUMN tag;"),
+];
+
+#[test]
+fn a_mod_with_a_base_file_creates_its_database_from_it() {
+    let mut home = Home::new();
+    home.install_mod_with(SQUASHED);
+    home.start();
+    ok(home.run(&["exec", "sample"]), "exec sample");
+    let status = ok(home.run(&["db", "status"]), "db status");
+    assert!(
+        status.starts_with("sample/notes.db  version 3, can step back to 2; files: up to date"),
+        "{status}"
+    );
+    assert!(status.contains("2  base  (irreversible)"), "{status}");
+}
+
+/// The previous release refuses a database created from a base, before it
+/// changes anything (#778). Needs REMUDA_COMPAT_PREVIOUS (a build with `remuda db`).
+#[test]
+#[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS from a build with remuda db; run by CI job host-compat-n-plus-one"]
+fn older_build_refuses_a_base_created_database() {
+    let previous = std::env::var_os("REMUDA_COMPAT_PREVIOUS").expect("REMUDA_COMPAT_PREVIOUS");
+    let mut home = Home::new();
+    home.install_mod_with(SQUASHED);
+    home.start();
+    ok(home.run(&["exec", "sample"]), "exec sample");
+    home.stop();
+    let file = home.root.join("state/remuda/db/sample/notes.db");
+    let before = std::fs::read(&file).unwrap();
+
+    home.exe = PathBuf::from(previous).join("remuda");
+    // Step files the older build can read, so only the record stops it.
+    home.install_mod_with(&[
+        (
+            "0001_create.up.sql",
+            "CREATE TABLE n (x TEXT NOT NULL, seen INTEGER NOT NULL DEFAULT 0);",
+        ),
+        ("0002_seen.up.sql", "SELECT 1;"),
+        ("0003_tag.up.sql", "ALTER TABLE n ADD COLUMN tag TEXT;"),
+    ]);
+    home.start();
+    let output = home.run(&["db", "upgrade", "sample", "notes"]);
+    assert!(!output.status.success());
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        text.contains("changed outside the migration runner"),
+        "{text}"
+    );
+    home.stop();
+    assert_eq!(std::fs::read(&file).unwrap(), before);
 }
