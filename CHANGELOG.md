@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- VFS: deleted files are forgotten at last (#778). A tombstone goes once
+  every other node has pulled it from this one and it is 7 days old
+  (`remuda vfs config --tombstone-days DAYS`). Until then, and for as long
+  as any member never pulls (an older build, a node that is down), it
+  stays. `remuda vfs sync` reports how many were forgotten. A concurrent
+  delete that loses to a write is no longer kept as a conflict.
+
 - SQLite migrations no longer fail when two connections open a database
   for the first time at once (#778). The one that waited for the write lock
   now checks the version again and skips steps the other already ran,

@@ -99,6 +99,15 @@ pub struct VfsSettings {
     pub cluster_name: String,
     #[serde(default = "default_replicas")]
     pub default_replicas: u8,
+    /// A tombstone every member has pulled is removed after this many days.
+    #[serde(default = "default_tombstone_days")]
+    pub tombstone_days: u32,
+}
+
+pub const DEFAULT_TOMBSTONE_DAYS: u32 = 7;
+
+fn default_tombstone_days() -> u32 {
+    DEFAULT_TOMBSTONE_DAYS
 }
 
 fn default_cluster_name() -> String {
@@ -114,6 +123,7 @@ impl Default for VfsSettings {
         Self {
             cluster_name: default_cluster_name(),
             default_replicas: default_replicas(),
+            tombstone_days: default_tombstone_days(),
         }
     }
 }
@@ -819,6 +829,22 @@ impl VfsStore {
         self.collect_garbage_older_than(GC_GRACE)
     }
 
+    /// Remove tombstones older than `tombstone_days` that every other member
+    /// in `others` has pulled from here (design step 5).
+    pub fn collect_tombstones(&self, others: &[String], now: u64) -> VfsResult<usize> {
+        let days = u64::from(self.settings()?.tombstone_days);
+        let _guard = self.lock()?;
+        let mut conn = self.index_db()?;
+        let tx = vfs_index_db::immediate(&mut conn)?;
+        if !vfs_index_db::may_write(&tx)? {
+            return Ok(0);
+        }
+        let removed =
+            vfs_index_db::collect_tombstones(&tx, others, now.saturating_sub(days * 86_400))?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
     pub fn collect_garbage_older_than(&self, grace: std::time::Duration) -> VfsResult<usize> {
         let _guard = self.lock()?;
         let conn = self.index_db()?;
@@ -1081,6 +1107,7 @@ mod tests {
             .save_settings(&VfsSettings {
                 cluster_name: "home".into(),
                 default_replicas: 2,
+                tombstone_days: 7,
             })
             .unwrap();
         assert!(store.parse_uri("remuda://home/a").is_ok());
