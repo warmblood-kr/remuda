@@ -12,3 +12,4 @@ listing_commands_allow_the_reader_to_stop_after_one_line # session names are lim
 selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_restart # hosted sessions survive a daemon restart
 selected_remote_session_with_hangul_text_syncs_within_the_frame_limit # terminals are limited to 65,536 cells
 mouse_off_knob_and_toggle_pass_reports_to_the_child_and_restore_host_modes # attach paints the parsed screen, not the child's raw bytes
+a_pty_sessions_child_dies_with_a_sigkilled_daemon # hosted sessions survive a daemon restart (Linux-only test)
