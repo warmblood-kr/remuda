@@ -18,6 +18,18 @@ fn entry_table(lua: &Lua, store: &VfsStore, entry: &VfsEntry) -> mlua::Result<Ta
     table.set("writer", entry.writer.as_str())?;
     table.set("local", store.has_blob(&entry.sha256, entry.size))?;
     table.set("synced_at", store.synced_at())?;
+    let conflicts = lua.create_table()?;
+    for (position, conflict) in entry.conflicts.iter().enumerate() {
+        let row = lua.create_table()?;
+        row.set("version", conflict.version)?;
+        row.set("writer", conflict.writer.as_str())?;
+        row.set("sha256", conflict.sha256.as_str())?;
+        row.set("size", conflict.size)?;
+        row.set("deleted", conflict.deleted)?;
+        row.set("mtime", conflict.mtime)?;
+        conflicts.set(position + 1, row)?;
+    }
+    table.set("conflicts", conflicts)?;
     Ok(table)
 }
 

@@ -83,6 +83,15 @@ removed yet, so they do not count toward that cap; the whole index, files and
 tombstones together, is capped at 30,000 entries. A delete always fits, since
 it replaces a live entry.
 
+Concurrent writes (#778, design-778-vfs-delta-sync step 4): each entry also
+carries a version vector `vv`. The winner is still picked as above. A loser
+that the winner's vector does not cover was written concurrently, so it is
+kept in the entry's `conflicts` (at most 16), and its blob is kept too.
+`remuda vfs ls --conflicts` lists such paths. The next write to the path
+settles them; `remuda vfs resolve-conflict URI --keep winner|VERSION` writes
+the chosen side again. Writes from older nodes carry no `vv`, so they merge
+with no conflict detection.
+
 ## Replica placement
 
 Each entry stores its replication factor `R` (default 3, `--replicas N`,

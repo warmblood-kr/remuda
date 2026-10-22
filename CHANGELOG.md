@@ -7,6 +7,12 @@
   handover could start a second one, giving the socket to two new daemons.
   It now refuses and points to the new daemon.
 
+- VFS: `remuda vfs ls --conflicts` lists paths with kept concurrent writes,
+  `remuda vfs stat` shows them, and `remuda vfs resolve-conflict URI --keep
+  winner|VERSION` settles them by writing the chosen side again (fetched
+  from a peer if needed). Lua `vfs.stat()` gains `conflicts`; the JSON of
+  `stat` and `ls` gains `conflicts` and `deleted` (#778).
+
 - `remuda upgrade` (Unix) now reloads the running daemon into the version it
   just installed, so host-backed sessions keep running. A daemon that cannot
   reload keeps its old version and says why: an in-process session blocks it,
