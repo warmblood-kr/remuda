@@ -1368,6 +1368,9 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
   if candidate.source_refresh_ready ~= nil and type(candidate.source_refresh_ready) ~= "function" then
     error("module source_refresh_ready must be a function", 0)
   end
+  if candidate.daemon_reload_ready ~= nil and type(candidate.daemon_reload_ready) ~= "function" then
+    error("module daemon_reload_ready must be a function", 0)
+  end
   local previous = modules[name]
   local state
   if previous == nil then
@@ -1550,6 +1553,7 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
     started = false,
     start_attempted = false,
     source_refresh_ready = candidate.source_refresh_ready and function(state) return with_owner(name, candidate.source_refresh_ready, state) end,
+    daemon_reload_ready = candidate.daemon_reload_ready and function(state) return with_owner(name, candidate.daemon_reload_ready, state) end,
     ready = ready,
     timeout_ms = timeout_ms,
     stopped = false,
@@ -1693,6 +1697,31 @@ function remuda._stop_modules()
     cancel_owner_timers(name)
   end
 end
+
+-- `remuda reload` asks every active mod before it hands the daemon over.
+-- daemon_reload_ready(state) returns nil when a reload is fine now, or a
+-- reason; a mod without it never blocks. One line per mod that says no.
+function remuda._daemon_reload_check()
+  local names = {}
+  for name, module in pairs(modules) do
+    if module.daemon_reload_ready and not module.stopped then
+      names[#names + 1] = name
+    end
+  end
+  table.sort(names)
+  local busy = {}
+  for _, name in ipairs(names) do
+    local module = modules[name]
+    local ok, reason = pcall(module.daemon_reload_ready, module.state)
+    if not ok then
+      busy[#busy + 1] = "mod " .. name .. ": daemon_reload_ready failed: " .. tostring(reason)
+    elseif reason ~= nil then
+      busy[#busy + 1] = "mod " .. name .. ": " .. tostring(reason)
+    end
+  end
+  return table.concat(busy, "\n")
+end
+register("_daemon_reload_check", "Internal: why active mods say a daemon reload must wait, one line each.", "_daemon_reload_check() -> string")
 
 -- The CLI polls this small lifecycle result between Eval requests. Keep the
 -- readiness callback in the declaration table, not as another public remuda

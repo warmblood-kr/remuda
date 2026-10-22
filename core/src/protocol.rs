@@ -343,6 +343,14 @@ pub enum Request {
         digest: Option<String>,
         offset: usize,
     },
+    /// Index rows the peer changed after `since` (its change sequence), at
+    /// most `limit` (#778). `index_id` is the peer's index as the caller last
+    /// saw it; a mismatch answers `reset`. Older peers do not know it.
+    ClusterVfsChanges {
+        index_id: Option<String>,
+        since: u64,
+        limit: u32,
+    },
     /// Merge bounded virtual file index entries from an authenticated peer.
     ClusterVfsIndexUpdate { entries_json: String },
     /// Which of these blob hashes the peer holds.
@@ -520,6 +528,14 @@ pub enum Response {
         entries_json: String,
         next_offset: Option<usize>,
         unchanged: bool,
+    },
+    /// Rows after a cursor, oldest change first. `last_seq` is the new cursor.
+    ClusterVfsChangesPage {
+        index_id: String,
+        entries_json: String,
+        last_seq: u64,
+        more: bool,
+        reset: bool,
     },
     /// Index entries were merged; `applied` counts those that changed state.
     ClusterVfsAck {

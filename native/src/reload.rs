@@ -5,6 +5,7 @@
 //! aborts (a check) or sends `Take` with its listener and socket lock, and C
 //! claims the hosts and serves in O's place.
 pub mod fds;
+pub mod upgrade;
 
 use crate::session_host::hosted::{Checked, CheckedState, Hosting};
 use serde::{Deserialize, Serialize};
@@ -176,6 +177,10 @@ pub(crate) struct Candidate {
 impl Candidate {
     pub(crate) fn report(&self) -> &Report {
         &self.report
+    }
+    /// Add blockers found outside the candidate, such as busy mods.
+    pub(crate) fn block(&mut self, reasons: Vec<String>) {
+        self.report.blockers.extend(reasons);
     }
     /// Tell C to stop and reap it.
     pub(crate) fn abort(mut self) -> Report {
@@ -552,6 +557,8 @@ fn read_frame(
         }
     }
 }
+
+pub mod post_check;
 
 #[cfg(test)]
 mod tests {

@@ -619,7 +619,10 @@ fn upgrade_help_flags_explain_channels_and_daemon_lifecycle() {
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.contains("--channel stable|nightly"), "{stdout}");
         assert!(
-            stdout.contains("daemon and its sessions") && stdout.contains("remuda stop"),
+            stdout.contains("reloads the running daemon")
+                && stdout.contains("sessions keep running")
+                && stdout.contains("--no-reload")
+                && stdout.contains("remuda stop"),
             "missing daemon/session behavior: {stdout}"
         );
         assert!(
@@ -726,6 +729,14 @@ fn upgrade_explains_daemon_and_session_lifecycle() {
         stderr.contains("session"),
         "missing session behavior: {stderr}"
     );
+    // No daemon runs here: on Unix nothing needed moving.
+    #[cfg(unix)]
+    assert!(
+        stderr.contains("no session needed moving")
+            && stderr.contains("the next remuda command starts the new version"),
+        "missing daemon/session lifecycle: {stderr}"
+    );
+    #[cfg(windows)]
     assert!(
         stderr.contains("until you run `remuda stop` (that ends those sessions)")
             && stderr.contains("the next remuda command starts the new version"),
@@ -733,9 +744,7 @@ fn upgrade_explains_daemon_and_session_lifecycle() {
     );
     let next = stderr.lines().last().unwrap_or_default();
     assert!(
-        next.starts_with("Next:")
-            && next.contains("remuda stop")
-            && next.contains("remuda --version"),
+        next.starts_with("Next:") && next.contains("remuda --version"),
         "missing concrete next step: {stderr}"
     );
     let _ = std::fs::remove_dir_all(dir);
