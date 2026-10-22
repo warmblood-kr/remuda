@@ -66,8 +66,12 @@ fn output_wakes_hooks_and_expect_in_both_backends() {
                 .map(|line| line["output:sh:".len()..].parse::<u64>().unwrap())
                 .collect::<Vec<_>>()
         };
+        // expect is itself a session_output handler and runs before this
+        // test's hook for the same event, so the log line can lag `matched`.
+        wait_until(mode, "no session_output", Duration::from_secs(5), || {
+            !outputs(&lines(&log)).is_empty()
+        });
         let seen = outputs(&lines(&log));
-        assert!(!seen.is_empty(), "{mode:?}: no session_output");
         assert!(
             seen.windows(2).all(|pair| pair[0] < pair[1]),
             "{mode:?}: {seen:?}"
