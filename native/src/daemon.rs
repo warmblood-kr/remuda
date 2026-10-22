@@ -1380,6 +1380,16 @@ pub(crate) fn reap_and_notify(registry: &Registry, image: &Image) -> Vec<String>
     for (name, id, instance_id, reason, exit_info) in &dead {
         notify_exited(image, name, id, instance_id, reason, exit_info.as_ref());
     }
+    // A host-backed session's child exits inside its host (#713): stop the
+    // host and retire its entry as a close would, then announce it the same way.
+    let hosted = registry.reap_hosted_with_exit_info();
+    for (name, id, instance_id, reason, exit_info) in &hosted {
+        #[cfg(unix)]
+        image.session_hosts().retire_closed(name);
+        notify_exited(image, name, id, instance_id, reason, exit_info.as_ref());
+    }
+    let mut dead = dead;
+    dead.extend(hosted);
     dead.into_iter().map(|(name, _, _, _, _)| name).collect()
 }
 
