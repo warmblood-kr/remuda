@@ -17,7 +17,7 @@
 
 #[cfg(test)]
 use crate::client;
-use crate::client::{Hold, RawMode};
+use crate::client::RawMode;
 use crate::mcp;
 use remuda_core::agent::{Color, Cursor, StyledCell};
 use remuda_core::protocol::{expand_runs, Request, Response};
@@ -35,7 +35,9 @@ use crossterm::event::{
 /// How often an idle herd is relisted, recaptured and redrawn — see
 /// [`should_refresh`]. A key always forces an immediate refresh regardless.
 mod port;
+mod remote_port;
 pub use port::{KeyStream, SessionPort};
+pub use remote_port::RemotePort;
 const TICK: Duration = Duration::from_millis(250);
 const DAEMON_FAILURES_BEFORE_GONE: u8 = 3;
 
@@ -44,6 +46,8 @@ const DAEMON_FAILURES_BEFORE_GONE: u8 = 3;
 /// also be the redraw cadence; see steps/017 for why that was the bug.
 const TICK_TYPING: Duration = Duration::from_millis(40);
 const MAX_ANCHOR_CAPTURES: usize = 3;
+/// A node silent longer than this is marked stale (WezTerm's "tardy" floor).
+const STALE_AFTER: Duration = Duration::from_secs(3);
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -155,6 +159,8 @@ pub struct Ui {
     session_rows: usize,
     /// Visible preview rows, refreshed from the terminal dimensions each frame.
     preview_rows: u16,
+    /// Set while the shown node has not answered lately; its screen may be old.
+    node_stale: Option<Duration>,
     /// Line composer (`m`): keys edit a local draft, never the pty, and Enter
     /// sends one InputLine batch written under the session input lock, so
     /// injected text (a Butler notice) cannot land inside a half-typed line.
@@ -216,6 +222,7 @@ impl Ui {
             sessions_text: Vec::new(),
             session_rows: 1,
             preview_rows: 1,
+            node_stale: None,
             composer: Default::default(),
             compose_target: None,
             compose_drafts: HashMap::new(),
@@ -2608,7 +2615,11 @@ fn footer(ui: &Ui, server: &str, cut: bool, preview_w: u16, cols: u16) -> String
         }
         None => status,
     };
-    let brand = format!("remuda · {server} 🏇");
+    let brand = match ui.node_stale {
+        Some(age) if age == Duration::MAX => format!("remuda · {server} · waiting 🏇"),
+        Some(age) => format!("remuda · {server} · stale {}s 🏇", age.as_secs()),
+        None => format!("remuda · {server} 🏇"),
+    };
     let status_width = visible_width(&status);
     let brand_width = visible_width(&brand);
     if status_width + 3 + brand_width <= cols as usize {
@@ -2646,6 +2657,7 @@ fn refresh<P: SessionPort + ?Sized>(
     selection_moved: bool,
 ) -> std::io::Result<(u16, u16)> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    ui.node_stale = path.staleness().filter(|age| *age > STALE_AFTER);
     ui.preview_rows = rows.saturating_sub(1).max(1);
     ui.preview_width = ui_layout(ui, cols).1;
     if !skip_list {
@@ -2676,17 +2688,7 @@ fn refresh<P: SessionPort + ?Sized>(
         // paying for it there would be the exact per-keystroke IPC cost
         // steps/017/022 exist to avoid.
         if ui.daemon_gone.is_none() {
-            let (list_w, _) = ui_layout(ui, cols);
-            match sessions_buffer_lines(path, list_w, ui.selected, selected_name.as_deref()) {
-                Ok((session_rows, lines, order)) => {
-                    ui.session_rows = session_rows;
-                    ui.sessions_text = lines;
-                    apply_session_order(ui, selected_name.as_deref(), &order);
-                }
-                // Same fallback as the relist: keep whatever was last drawn
-                // rather than blanking the tail column on a transport hiccup.
-                Err(e) => ui.notice = Some(e),
-            }
+            refresh_list_text(path, ui, cols, selected_name.as_deref());
         }
     }
     ui.clamp();
@@ -2773,6 +2775,36 @@ fn refresh<P: SessionPort + ?Sized>(
     Ok((cols, rows))
 }
 
+/// The list column's text: Lua's sessions buffer, or plain names for a node
+/// whose Lua this screen cannot ask (a cluster peer).
+fn refresh_list_text<P: SessionPort + ?Sized>(
+    path: &P,
+    ui: &mut Ui,
+    cols: u16,
+    selected_name: Option<&str>,
+) {
+    if !path.has_lua() {
+        ui.session_rows = 1;
+        ui.sessions_text = if ui.sessions.is_empty() {
+            vec!["no sessions on this node".into()]
+        } else {
+            Vec::new()
+        };
+        return;
+    }
+    let (list_w, _) = ui_layout(ui, cols);
+    match sessions_buffer_lines(path, list_w, ui.selected, selected_name) {
+        Ok((session_rows, lines, order)) => {
+            ui.session_rows = session_rows;
+            ui.sessions_text = lines;
+            apply_session_order(ui, selected_name, &order);
+        }
+        // Same fallback as the relist: keep whatever was last drawn
+        // rather than blanking the tail column on a transport hiccup.
+        Err(e) => ui.notice = Some(e),
+    }
+}
+
 fn sync_shown_session<P: SessionPort + ?Sized>(
     path: &P,
     ui: &mut Ui,
@@ -2780,6 +2812,10 @@ fn sync_shown_session<P: SessionPort + ?Sized>(
     selection_moved: bool,
 ) {
     let selected_name = ui.selected().map(|s| s.name.clone());
+    if !path.has_lua() {
+        *shown = selected_name.map(ShownTarget::Session);
+        return;
+    }
     // `selection_moved` is `true` only for a real Up/Down keypress that
     // actually moved `ui.selected` (see `run()`) — never a session
     // first appearing in the list, `clamp()`, or `follow_focus()`.
@@ -2939,9 +2975,21 @@ pub(crate) fn paste_input(text: &str, bracketed: bool) -> Vec<u8> {
 /// Draw the herd until the user quits. One screen for the whole run: focus
 /// moves between the panes, and the terminal is never handed over, so the
 /// alternate screen is entered exactly once. `notice` is what stderr cannot reach.
-#[allow(clippy::too_many_lines)]
 pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result<()> {
-    let keymap = crate::keybindings::fetch(path, Duration::from_secs(3))
+    run_port(path, path, server, notice)
+}
+
+/// The session screen for PORT's node. LOCAL is this machine's daemon, which
+/// still supplies key bindings and is the only daemon `r` may restart.
+#[allow(clippy::too_many_lines)]
+pub fn run_port<P: SessionPort + ?Sized>(
+    local: &Path,
+    port: &P,
+    server: &str,
+    notice: Option<String>,
+) -> std::io::Result<()> {
+    let path = port;
+    let keymap = crate::keybindings::fetch(local, Duration::from_secs(3))
         .map_err(|error| std::io::Error::other(format!("key bindings unavailable: {error}")))?;
     let _terminal = RawMode::enable()?;
     // Scoped to the herd screen, not `RawMode` itself: `attach` uses `RawMode`
@@ -2962,12 +3010,14 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     let mut painted = String::new();
     // The exclusive hold on the focused session, and the name it was taken on.
     // Its `Drop` is the detach, so letting it fall out of scope is the release.
-    let mut held: Option<(String, Hold)> = None;
+    let mut held: Option<(String, P::Keys)> = None;
     let mut paste_capture = BracketedPasteCapture::new(std::io::stdout());
     // Composed lines wait here until the daemon acknowledges them. Each has a
     // client id and sequence, so a retry is deduplicated, never written twice.
     let mut line_sender = crate::cluster_tui::sender::InputSender::random()?;
     let mut line_queue = crate::cluster_tui::queue::InputQueue::default();
+    // The one remote line in flight; its reply arrives through `take_replies`.
+    let mut line_in_flight: Option<crate::cluster_tui::sender::RemoteStarted> = None;
     // What the window last reported showing — refreshed only on a
     // non-skip_list wake, and reused as-is on a Type-forced one.
     let mut shown: Option<ShownTarget> = None;
@@ -3008,7 +3058,12 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
             selection_moved = false;
         }
 
-        if let Some(event) = send_due_line(&mut line_sender, &mut line_queue, path) {
+        // Only a port that takes lines queues any.
+        let due = path
+            .accepts_lines()
+            .then(|| pump_lines(path, &mut line_sender, &mut line_queue, &mut line_in_flight))
+            .flatten();
+        if let Some(event) = due {
             if let Some(notice) = line_notice(event) {
                 ui.notice = Some(notice);
             }
@@ -3058,7 +3113,10 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
         match action {
             Action::Nothing => {}
             Action::Quit => return Ok(()),
-            Action::Restart => match restart_daemon(path, server) {
+            Action::Restart if !path.restartable() => {
+                ui.notice = Some(format!("restart remuda on {} itself", path.label()));
+            }
+            Action::Restart => match restart_daemon(local, server) {
                 Ok(()) => {
                     ui.daemon_gone = None;
                     ui.consecutive_transport_failures = 0;
@@ -3082,7 +3140,14 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                     Err(_) => {}
                 }
             }
-            Action::Kill(name) => ui.notice = kill(path, &name).err(),
+            Action::Kill(name) => {
+                let instance = ui
+                    .sessions
+                    .iter()
+                    .find(|session| session.name == name)
+                    .and_then(|session| session.instance_id.clone());
+                ui.notice = kill(path, &name, instance).err();
+            }
             Action::Focus(name) => reconcile_hold(path, &mut ui, &mut held, &name),
             Action::Scroll(delta) => {
                 scroll_selected(&mut ui, delta);
@@ -3097,15 +3162,15 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 instance_id,
                 bytes,
             } => {
-                let target = crate::cluster_tui::queue::InputTarget {
-                    remote_node: None,
-                    name: name.clone(),
+                let notice = queue_line(
+                    port,
+                    &mut line_sender,
+                    &mut line_queue,
+                    name,
                     instance_id,
-                };
-                match line_sender.enqueue_line(&mut line_queue, target, bytes, Instant::now()) {
-                    Ok(_) => ui.notice = Some(format!("sending line to {name}")),
-                    Err(error) => ui.notice = Some(format!("{name}: {error}")),
-                }
+                    bytes,
+                );
+                ui.notice = Some(notice);
             }
         }
         // Not `painted.clear()`: the frame-vs-`painted` compare in `refresh`
@@ -3115,18 +3180,69 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     }
 }
 
-fn send_due_line(
+/// Queue a composed line for NAME, or refuse it on a port that takes none.
+fn queue_line<P: SessionPort + ?Sized>(
+    port: &P,
     sender: &mut crate::cluster_tui::sender::InputSender,
     queue: &mut crate::cluster_tui::queue::InputQueue,
-    path: &Path,
+    name: String,
+    instance_id: String,
+    bytes: Vec<u8>,
+) -> String {
+    if !port.accepts_lines() {
+        return format!("{name}: lines to {} are not available yet", port.label());
+    }
+    let target = crate::cluster_tui::queue::InputTarget {
+        remote_node: port.remote_node(),
+        name: name.clone(),
+        instance_id,
+    };
+    match sender.enqueue_line(queue, target, bytes, Instant::now()) {
+        Ok(_) => format!("sending line to {name}"),
+        Err(error) => format!("{name}: {error}"),
+    }
+}
+
+fn send_due_line<P: SessionPort + ?Sized>(
+    sender: &mut crate::cluster_tui::sender::InputSender,
+    queue: &mut crate::cluster_tui::queue::InputQueue,
+    path: &P,
 ) -> Option<crate::cluster_tui::queue::QueueEvent> {
     sender.attempt_due(queue, Instant::now(), |request| {
-        crate::client::request_with_timeout(
-            path,
-            request,
-            crate::cluster_tui::sender::INPUT_SEND_TIMEOUT,
-        )
+        path.request_bounded(request, crate::cluster_tui::sender::INPUT_SEND_TIMEOUT)
     })
+}
+
+/// Move composed lines along: in place for this machine, through the port's
+/// background sender for a peer, one line at a time and in order.
+fn pump_lines<P: SessionPort + ?Sized>(
+    path: &P,
+    sender: &mut crate::cluster_tui::sender::InputSender,
+    queue: &mut crate::cluster_tui::queue::InputQueue,
+    in_flight: &mut Option<crate::cluster_tui::sender::RemoteStarted>,
+) -> Option<crate::cluster_tui::queue::QueueEvent> {
+    if path.remote_node().is_none() {
+        return send_due_line(sender, queue, path);
+    }
+    let now = Instant::now();
+    if let Some(started) = in_flight.take() {
+        let Some(reply) = path.take_replies().into_iter().next() else {
+            *in_flight = Some(started);
+            return None;
+        };
+        return sender.finish_remote(queue, &started, reply, now);
+    }
+    queue.begin_due(now)?;
+    match sender.prepare_remote(queue, now)? {
+        Err(event) => event,
+        Ok(started) => match path.submit(started.request.clone()) {
+            Ok(()) => {
+                *in_flight = Some(started);
+                None
+            }
+            Err(error) => sender.finish_remote(queue, &started, Err(error), now),
+        },
+    }
 }
 
 /// What the footer says about a composed line. A retry stays quiet; an
@@ -3735,11 +3851,17 @@ fn resize<P: SessionPort + ?Sized>(path: &P, name: &str, size: Size) -> Result<(
     }
 }
 
-fn kill<P: SessionPort + ?Sized>(path: &P, name: &str) -> Result<(), String> {
+/// A peer only closes a confirmed close bound to the instance the user saw.
+fn kill<P: SessionPort + ?Sized>(
+    path: &P,
+    name: &str,
+    instance_id: Option<String>,
+) -> Result<(), String> {
+    let remote = path.remote_node().is_some();
     let request = Request::Close {
         name: name.to_string(),
-        instance_id: None,
-        confirm: None,
+        instance_id: if remote { instance_id } else { None },
+        confirm: remote.then_some(true),
     };
     match path.request(&request) {
         Ok(Response::Ok) => Ok(()),
@@ -4065,5 +4187,101 @@ mod composer_tests {
                 if name == "agent" && instance_id == "instance-agent" && bytes == b"hello\r"
         ));
         assert_eq!(line_notice(event.unwrap()).as_deref(), Some("line sent"));
+    }
+
+    /// A node that takes no lines yet, as a cluster peer is until #779.
+    struct NoLinesPort;
+
+    struct NoKeys;
+
+    impl KeyStream for NoKeys {
+        fn keys(&self, _bytes: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SessionPort for NoLinesPort {
+        type Keys = NoKeys;
+
+        fn request(&self, _request: &Request) -> std::io::Result<Response> {
+            panic!("a refused line must never reach the node")
+        }
+
+        fn hold(&self, _name: &str) -> std::io::Result<NoKeys> {
+            Ok(NoKeys)
+        }
+
+        fn probe(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn probe_verdict(&self, _error: &std::io::Error) -> (bool, bool) {
+            (false, false)
+        }
+
+        fn label(&self) -> String {
+            "node peer".into()
+        }
+
+        fn accepts_lines(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_port_that_takes_no_lines_refuses_m_and_queues_nothing() {
+        let mut sender = crate::cluster_tui::sender::InputSender::with_client_id([7; 16]);
+        let mut queue = crate::cluster_tui::queue::InputQueue::default();
+        let notice = queue_line(
+            &NoLinesPort,
+            &mut sender,
+            &mut queue,
+            "agent".into(),
+            "instance-agent".into(),
+            b"hello\r".to_vec(),
+        );
+        assert_eq!(notice, "agent: lines to node peer are not available yet");
+        assert_eq!(queue.items().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_local_line_keeps_its_one_second_bound_when_the_daemon_never_answers() {
+        use interprocess::local_socket::traits::ListenerExt as _;
+        let path = std::env::temp_dir().join(format!(
+            "remuda-tui-line-bound-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = crate::ipc::listen(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let _stream = listener.incoming().next().unwrap().unwrap();
+            std::thread::sleep(Duration::from_secs(4));
+        });
+        let mut sender = crate::cluster_tui::sender::InputSender::with_client_id([7; 16]);
+        let mut queue = crate::cluster_tui::queue::InputQueue::default();
+        let notice = queue_line(
+            path.as_path(),
+            &mut sender,
+            &mut queue,
+            "agent".into(),
+            "instance-agent".into(),
+            b"hello\r".to_vec(),
+        );
+        assert_eq!(notice, "sending line to agent");
+        let started = Instant::now();
+        let event = send_due_line(&mut sender, &mut queue, &path);
+        // INPUT_SEND_TIMEOUT is 1 s; the unbounded default would wait 10 s.
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(event.is_some());
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
     }
 }

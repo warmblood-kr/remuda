@@ -28,6 +28,28 @@ remuda vfs rm remuda:///notes.md               # delete everywhere
 
 Exit 75 is `EX_TEMPFAIL` from `sysexits.h`. Nothing is rolled back.
 
+## Checking health: `remuda vfs status`
+
+```text
+$ remuda vfs status --copies
+Files: 1234 live of 10000; index 1450 of 30000 entries (216 deletes remembered)
+Conflicts: 3 paths (remuda vfs ls --conflicts)
+This node (node-a1b2c3d4): 812 copies, 1.2 GiB; 4 copies waiting to retry
+Peers:
+  node-e5f6a7b8  up; pulled from here 2m ago; caps: take
+  node-c9d0e1f2  down 3h; pulled from here 3h ago; holds back 12 deletes
+Settings: replicas 3, tombstone-days 7, stale-days 30
+Copies: 1230 files complete; 4 short (first: notes.md 1 of 3, …)
+```
+
+- Without `--copies` it reads only what this node knows and answers at
+  once. "Holds back N deletes" counts deletes that peer has not pulled from
+  here yet; until it does, they are remembered.
+- `--copies` also asks each node that should hold a file whether it does
+  (for up to 30 s). It exits 75 while any file is short, so a script can
+  wait for it. Nodes that did not answer in time are named.
+- `--json` prints the same report as JSON.
+
 ## Making sure a write has copies: `put --min-copies K`
 
 By default `put` returns once this node has stored the file and told its
@@ -66,15 +88,37 @@ or `rm` of the path settles its conflicts in the same way. A path keeps at
 most 16 conflicts. Nodes running a remuda from before conflicts (#778) do
 not detect them; their writes merge as last write wins.
 
-## Taking a node out: `drain`, then `revoke`
+## Taking a node out: `remuda cluster leave`
 
-Before a node leaves for good, have the other nodes take a copy of every
-file it holds:
+On the node that leaves for good:
 
 ```sh
-remuda vfs drain                 # on the node that leaves
-remuda cluster revoke NODE --yes # then, on another node
+remuda cluster leave   # asks first; --yes skips the question
 ```
+
+1. It asks another node to revoke this one. That node first checks that
+   every file keeps its copies without this one; if not, it refuses.
+2. On a refusal it runs `remuda vfs drain` (below) and asks again.
+3. Once a node has revoked it, it moves `<state>/remuda/cluster` to
+   `cluster.left-YYYYMMDD` next to it and deletes the node key and
+   membership files there. `vfs/` and `audit.jsonl` stay in that folder.
+
+- **Exit 75, nothing changed:** every node that answered refused (files
+  still short, or too old to revoke a leaving node). Each reason is printed;
+  fix it and run `remuda cluster leave` again.
+- **No other node answered** (or this is the only node): it prints a
+  warning, skips the drain and the revoke, and still moves the folder. Run
+  `remuda cluster revoke NODE` on another node later.
+- After it, `remuda cluster init` or `remuda cluster join` starts again with
+  an empty store, and the store fills from the other nodes.
+- **Do not move `vfs/` back to rejoin.** A rejoined node has a new key, so
+  the others pull its whole old index, and a file deleted while it was away
+  (once its delete record is collected) would come back. The old `vfs/` is
+  for reading files only. `cluster init --new-identity` has this problem
+  today (#862).
+
+To do the two halves by hand: `remuda vfs drain` on the node that leaves,
+then `remuda cluster revoke NODE --yes` on another node.
 
 - `drain` asks each node that will hold a file once this one is gone to
   take a copy, and waits until they confirm. It prints `Safe to leave: on
