@@ -122,6 +122,19 @@ fn forget_at(cluster: &Path, left: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Move `cluster/vfs` alone to `left/vfs`, for a new identity (#862): an old
+/// index under a new key would bring back files deleted meanwhile.
+/// Returns false when there is no store to move.
+pub fn set_vfs_aside(cluster: &Path, left: &Path) -> io::Result<bool> {
+    let vfs = cluster.join("vfs");
+    if vfs.symlink_metadata().is_err() {
+        return Ok(false);
+    }
+    super::storage::create_private_directory(left)?;
+    std::fs::rename(vfs, left.join("vfs"))?;
+    Ok(true)
+}
+
 fn today() -> String {
     let days = super::vfs::unix_now() / 86_400;
     let (year, month, day) = civil_from_days(days as i64);
@@ -173,6 +186,24 @@ mod tests {
         assert!(!left.join("authorized_nodes.json").exists());
         assert!(left.join("audit.jsonl").is_file());
         assert!(left.join("vfs/index.db").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_new_identity_sets_only_the_store_aside() {
+        let root = std::env::temp_dir().join(format!("remuda-aside-{}", std::process::id()));
+        let cluster = root.join("cluster");
+        std::fs::create_dir_all(cluster.join("vfs")).unwrap();
+        std::fs::write(cluster.join("vfs/index.db"), "db").unwrap();
+        std::fs::write(cluster.join("identity.key"), "key").unwrap();
+        let left = root.join("cluster.left-20261022");
+
+        assert!(set_vfs_aside(&cluster, &left).unwrap());
+        assert!(left.join("vfs/index.db").is_file());
+        assert!(!cluster.join("vfs").exists());
+        assert!(cluster.join("identity.key").is_file());
+        assert!(!set_vfs_aside(&cluster, &root.join("other")).unwrap());
+        assert!(!root.join("other").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

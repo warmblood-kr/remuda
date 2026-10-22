@@ -1397,7 +1397,15 @@ fn cluster_init_new_identity(yes: bool) -> ExitCode {
         Ok(prompt) => prompt,
         Err(error) => return fail(format!("cluster init --new-identity: {error}")),
     };
+    let left = match remuda_native::cluster::leave::left_dir() {
+        Ok(left) => left,
+        Err(error) => return fail(format!("cluster init --new-identity: {error}")),
+    };
     eprintln!("{NEW_IDENTITY_WARNING}");
+    eprintln!(
+        "Its cluster files (vfs/) move to {}; the new identity starts with an empty store.",
+        left.join("vfs").display()
+    );
     if prompt {
         match confirm_new_identity() {
             Ok(true) => {}
@@ -1408,11 +1416,17 @@ fn cluster_init_new_identity(yes: bool) -> ExitCode {
             Err(error) => return fail(format!("cluster init --new-identity: {error}")),
         }
     }
-    match remuda_native::cluster::init_new_identity() {
-        Ok(identity) => {
+    match remuda_native::cluster::init_new_identity(&left) {
+        Ok((identity, moved)) => {
             println!("Cluster identity rotated");
             println!("Node: {}", identity.node_name);
             println!("Fingerprint: {}", identity.node_fp);
+            if moved {
+                println!(
+                    "Old cluster files: {} (for reading; do not move them back, or deleted files can return).",
+                    left.join("vfs").display()
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(error) => fail(format!("cluster init --new-identity: {error}")),
