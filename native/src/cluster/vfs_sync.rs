@@ -66,6 +66,18 @@ pub fn serve_changes(
     since: u64,
     limit: u32,
 ) -> VfsResult<Response> {
+    if let Some((seen_seq, seen_index_id)) = store.check_puller(peer_fp, since, unix_now())? {
+        return Ok(Response::ClusterVfsChangesPage {
+            index_id: store.index_id()?,
+            entries_json: "[]".into(),
+            last_seq: 0,
+            more: false,
+            reset: true,
+            stale: true,
+            seen_seq,
+            seen_index_id,
+        });
+    }
     let mut page = store.changes(
         index_id,
         since,
@@ -84,6 +96,9 @@ pub fn serve_changes(
         last_seq: page.last_seq,
         more: page.more,
         reset: page.reset,
+        stale: false,
+        seen_seq: 0,
+        seen_index_id: None,
     })
 }
 
@@ -386,7 +401,7 @@ const LEGACY_RETRY: Duration = Duration::from_secs(3600);
 
 /// Pull what `peer` changed since our cursor; fall back to the whole-index
 /// digest pull for a peer that does not know change cursors.
-fn pull(store: &VfsStore, peer: &str) -> Result<usize, String> {
+fn pull(store: &VfsStore, me: &str, peer: &str) -> Result<usize, String> {
     let legacy = LEGACY_PEERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -395,7 +410,7 @@ fn pull(store: &VfsStore, peer: &str) -> Result<usize, String> {
     if legacy {
         return pull_index(store, peer);
     }
-    match pull_changes(store, peer, &mut |request| request_peer(peer, request)) {
+    match pull_changes(store, me, peer, &mut |request| request_peer(peer, request)) {
         Ok(Some(merged)) => Ok(merged),
         Ok(None) | Err(_) => {
             let merged = pull_index(store, peer)?;
@@ -412,6 +427,7 @@ fn pull(store: &VfsStore, peer: &str) -> Result<usize, String> {
 /// its cursor in one transaction. `Ok(None)`: the peer does not speak it.
 pub fn pull_changes(
     store: &VfsStore,
+    me: &str,
     peer: &str,
     fetch: &mut dyn FnMut(&Request) -> Result<Response, String>,
 ) -> Result<Option<usize>, String> {
@@ -430,6 +446,9 @@ pub fn pull_changes(
             last_seq,
             more,
             reset,
+            stale,
+            seen_seq,
+            seen_index_id,
         } = response
         else {
             return Ok(None);
@@ -439,7 +458,17 @@ pub fn pull_changes(
             if resets > 1 {
                 return Err("peer reset the change cursor twice".into());
             }
-            store.reset_cursor(peer).map_err(|e| e.to_string())?;
+            if stale {
+                let dropped = store
+                    .rejoin(me, seen_seq, seen_index_id.as_deref())
+                    .map_err(|e| e.to_string())?;
+                eprintln!(
+                    "remuda: vfs: {} says this node was away longer than the stale horizon; dropped {dropped} index rows to pull them again",
+                    super::node_label(peer)
+                );
+            } else {
+                store.reset_cursor(peer).map_err(|e| e.to_string())?;
+            }
             continue;
         }
         let entries: Vec<VfsEntry> =
@@ -632,6 +661,7 @@ pub struct SyncReport {
     pub copies_fetched: usize,
     pub copies_failed: usize,
     pub garbage_removed: usize,
+    pub tombstones_removed: usize,
     pub error: Option<String>,
 }
 
@@ -642,13 +672,14 @@ impl std::fmt::Display for SyncReport {
         }
         write!(
             formatter,
-            "Peers reached {}, unreachable {}; index entries merged {}; copies fetched {}, failed {}; old blobs removed {}.",
+            "Peers reached {}, unreachable {}; index entries merged {}; copies fetched {}, failed {}; old blobs removed {}, old deletes forgotten {}.",
             self.peers_reached,
             self.peers_failed,
             self.entries_merged,
             self.copies_fetched,
             self.copies_failed,
-            self.garbage_removed
+            self.garbage_removed,
+            self.tombstones_removed
         )
     }
 }
@@ -670,7 +701,7 @@ pub fn sync_once() -> SyncReport {
         return report;
     }
     for peer in &members.reachable {
-        match pull(&store, peer) {
+        match pull(&store, &members.self_fp, peer) {
             Ok(merged) => {
                 report.peers_reached += 1;
                 report.entries_merged += merged;
@@ -706,6 +737,13 @@ pub fn sync_once() -> SyncReport {
         }
     }
     report.garbage_removed = store.collect_garbage().unwrap_or(0);
+    let others: Vec<String> = members
+        .admitted
+        .iter()
+        .filter(|fp| **fp != members.self_fp)
+        .cloned()
+        .collect();
+    report.tombstones_removed = store.collect_tombstones(&others, unix_now()).unwrap_or(0);
     report
 }
 
@@ -1098,7 +1136,7 @@ mod tests {
 
     fn pull_from(client: &VfsStore, server: &VfsStore, peer: &str) -> (usize, usize) {
         let calls = std::cell::Cell::new(0);
-        let merged = pull_changes(client, peer, &mut via(server, &calls))
+        let merged = pull_changes(client, "SHA256:client", peer, &mut via(server, &calls))
             .unwrap()
             .unwrap();
         (merged, calls.get())
@@ -1165,6 +1203,176 @@ mod tests {
     }
 
     #[test]
+    fn a_delete_is_forgotten_only_after_every_peer_pulled_it_and_it_aged() {
+        let (_a, server) = scratch_store();
+        let (_b, client) = scratch_store();
+        server.put("gone.txt", b"x", 2, "SHA256:s").unwrap();
+        let tombstone = server.delete("gone.txt", "SHA256:s").unwrap();
+        // A later write elsewhere, so the tombstone is not the newest version.
+        server.put("kept.txt", b"y", 2, "SHA256:s").unwrap();
+        let later = tombstone.mtime + 8 * 86_400;
+        let peers = ["SHA256:client".to_owned()];
+        assert_eq!(
+            server.collect_tombstones(&peers, later).unwrap(),
+            0,
+            "not pulled yet"
+        );
+        pull_from(&client, &server, "SHA256:server");
+        assert_eq!(
+            server.collect_tombstones(&peers, later).unwrap(),
+            0,
+            "pulled, not acked"
+        );
+        // The next pull says how far the client got: that is the ack.
+        pull_from(&client, &server, "SHA256:server");
+        assert_eq!(
+            server
+                .collect_tombstones(&peers, tombstone.mtime + 86_400)
+                .unwrap(),
+            0,
+            "too young"
+        );
+        let two = [peers[0].clone(), "SHA256:silent".to_owned()];
+        assert_eq!(
+            server.collect_tombstones(&two, later).unwrap(),
+            0,
+            "a silent member blocks"
+        );
+        assert_eq!(server.collect_tombstones(&peers, later).unwrap(), 1);
+        let index = server.load_index().unwrap();
+        assert!(!index.entries.contains_key("gone.txt"));
+        assert!(index.live("kept.txt").is_some());
+        // The client still has the tombstone; pulling again brings nothing back.
+        assert_eq!(pull_from(&client, &server, "SHA256:server").0, 0);
+        assert!(client.load_index().unwrap().entries["gone.txt"].deleted);
+    }
+
+    #[test]
+    fn a_member_away_past_the_stale_horizon_stops_blocking_and_rebuilds_on_return() {
+        let (_a, server) = scratch_store();
+        let (_b, client) = scratch_store();
+        server.put("gone.txt", b"x", 2, "SHA256:s").unwrap();
+        pull_from(&client, &server, "SHA256:server");
+        // The client's last pull was 40 days ago.
+        let now = unix_now();
+        server
+            .check_puller("SHA256:client", 0, now - 40 * 86_400)
+            .unwrap();
+        server.delete("gone.txt", "SHA256:s").unwrap();
+        server.put("new.txt", b"y", 2, "SHA256:s").unwrap();
+        let peers = ["SHA256:client".to_owned()];
+        assert_eq!(
+            server.collect_tombstones(&peers, now + 8 * 86_400).unwrap(),
+            1
+        );
+        // Meanwhile the client wrote something of its own.
+        client.put("mine.txt", b"m", 2, "SHA256:client").unwrap();
+
+        let calls = std::cell::Cell::new(0);
+        pull_changes(
+            &client,
+            "SHA256:client",
+            "SHA256:server",
+            &mut via(&server, &calls),
+        )
+        .unwrap()
+        .unwrap();
+        let index = client.load_index().unwrap();
+        assert!(
+            !index.entries.contains_key("gone.txt"),
+            "a delete came back"
+        );
+        assert!(index.live("new.txt").is_some());
+        assert!(
+            index.live("mine.txt").is_some(),
+            "its own write was dropped"
+        );
+        // Back in time: the next pull is an ordinary one.
+        assert_eq!(pull_from(&client, &server, "SHA256:server"), (0, 1));
+    }
+
+    #[test]
+    fn change_pages_keep_the_older_wire_shape_unless_stale() {
+        let page = Response::ClusterVfsChangesPage {
+            index_id: "i".into(),
+            entries_json: "[]".into(),
+            last_seq: 3,
+            more: false,
+            reset: false,
+            stale: false,
+            seen_seq: 0,
+            seen_index_id: None,
+        };
+        let json = serde_json::to_string(&page).unwrap();
+        assert!(
+            !json.contains("stale") && !json.contains("seen_index_id"),
+            "{json}"
+        );
+        // A page from an older server reads as not stale.
+        let older = json.replace(",\"seen_seq\":0", "");
+        assert_eq!(serde_json::from_str::<Response>(&older).unwrap(), page);
+    }
+
+    #[test]
+    fn a_member_that_pulled_recently_is_not_stale() {
+        let (_a, server) = scratch_store();
+        let (_b, client) = scratch_store();
+        server.put("a.txt", b"a", 2, "SHA256:s").unwrap();
+        server.delete("a.txt", "SHA256:s").unwrap();
+        server.put("b.txt", b"b", 2, "SHA256:s").unwrap();
+        pull_from(&client, &server, "SHA256:server");
+        pull_from(&client, &server, "SHA256:server");
+        let peers = ["SHA256:client".to_owned()];
+        assert_eq!(
+            server
+                .collect_tombstones(&peers, unix_now() + 8 * 86_400)
+                .unwrap(),
+            1
+        );
+        // It acked past the collected row, so it is never told to rebuild.
+        assert_eq!(
+            server.check_puller("SHA256:client", 0, unix_now()).unwrap(),
+            None
+        );
+        assert_eq!(pull_from(&client, &server, "SHA256:server"), (0, 1));
+    }
+
+    #[test]
+    fn the_newest_version_and_deletes_with_conflicts_are_never_forgotten() {
+        let (_a, store) = scratch_store();
+        store.put("a.txt", b"a", 2, "SHA256:s").unwrap();
+        let newest = store.delete("a.txt", "SHA256:s").unwrap();
+        let later = newest.mtime + 30 * 86_400;
+        assert_eq!(store.collect_tombstones(&[], later).unwrap(), 0);
+        let next = store.put("b.txt", b"b", 2, "SHA256:s").unwrap();
+        assert!(next.version > newest.version, "versions never go back");
+        // A delete that won over a concurrent write keeps that write's content.
+        let concurrent = VfsEntry {
+            path: "c.txt".into(),
+            sha256: store.put_blob(b"theirs").unwrap(),
+            size: 6,
+            replicas: 2,
+            version: 1,
+            writer: "SHA256:t".into(),
+            deleted: false,
+            mtime: 0,
+            vv: VfsEntry::next_vv(None, "SHA256:t"),
+            conflicts: Vec::new(),
+        };
+        store.put("c.txt", b"mine", 2, "SHA256:s").unwrap();
+        store.delete("c.txt", "SHA256:s").unwrap();
+        store.merge_entries(vec![concurrent]).unwrap();
+        store.put("d.txt", b"d", 2, "SHA256:s").unwrap();
+        assert_eq!(
+            store.collect_tombstones(&[], later).unwrap(),
+            1,
+            "only a.txt"
+        );
+        let index = store.load_index().unwrap();
+        assert!(index.entries["c.txt"].deleted && index.entries["c.txt"].conflicts.len() == 1);
+    }
+
+    #[test]
     fn a_recreated_peer_index_resets_the_cursor_and_is_pulled_whole() {
         let (_a, server) = scratch_store();
         let (_b, client) = scratch_store();
@@ -1190,7 +1398,7 @@ mod tests {
         let mut pages = 0;
         let calls = std::cell::Cell::new(0);
         let mut inner = via(&server, &calls);
-        let error = pull_changes(&client, "SHA256:server", &mut |request| {
+        let error = pull_changes(&client, "SHA256:client", "SHA256:server", &mut |request| {
             pages += 1;
             let mut response = inner(request)?;
             if pages == 2 {
@@ -1216,7 +1424,7 @@ mod tests {
     #[test]
     fn a_peer_that_does_not_know_change_cursors_is_reported_for_fallback() {
         let (_b, client) = scratch_store();
-        let answer = pull_changes(&client, "SHA256:old", &mut |_| {
+        let answer = pull_changes(&client, "SHA256:client", "SHA256:old", &mut |_| {
             Ok(Response::error("invalid cluster request"))
         });
         assert_eq!(answer, Ok(None));

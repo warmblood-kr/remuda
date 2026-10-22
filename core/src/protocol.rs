@@ -536,6 +536,14 @@ pub enum Response {
         last_seq: u64,
         more: bool,
         reset: bool,
+        /// With `reset`: the caller missed deletes collected here, so it must
+        /// drop all but its own writes after `seen_seq` (our cursor into it).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stale: bool,
+        #[serde(default)]
+        seen_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seen_index_id: Option<String>,
     },
     /// Index entries were merged; `applied` counts those that changed state.
     ClusterVfsAck {

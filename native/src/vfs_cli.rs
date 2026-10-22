@@ -88,8 +88,10 @@ fn spec() -> Spec {
                 vec![], vec![], "remuda vfs sync"),
             verb("config", "Show or set the cluster name and default replicas. Example: remuda vfs config --cluster home --replicas 2",
                 vec![], vec![option("cluster", Some("NAME"), "Cluster name used in remuda://NAME/ URIs"),
-                             option("replicas", Some("N"), "Default copies for new files (1-16)")],
-                "remuda vfs config [--cluster NAME] [--replicas N]"),
+                             option("replicas", Some("N"), "Default copies for new files (1-16)"),
+                             option("tombstone-days", Some("DAYS"), "Forget a delete this many days after every node has it (1-3650; default 7)"),
+                             option("stale-days", Some("DAYS"), "Stop waiting for a node that has not pulled for this long (1-3650; default 30)")],
+                "remuda vfs config [--cluster NAME] [--replicas N] [--tombstone-days DAYS] [--stale-days DAYS]"),
             verb("export-index", "Write index.json for an older remuda, before a downgrade. Example: remuda vfs export-index",
                 vec![], vec![], "remuda vfs export-index"),
             verb("index-downgrade", "Step index.db back to schema VERSION for an older remuda, after a backup. Example: remuda vfs index-downgrade 1 --yes",
@@ -806,6 +808,22 @@ fn config(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
         }
         changed = true;
     }
+    for (key, slot) in [
+        ("tombstone-days", &mut settings.tombstone_days),
+        ("stale-days", &mut settings.stale_days),
+    ] {
+        if let Some(text) = value(values, key) {
+            match text
+                .parse::<u32>()
+                .ok()
+                .filter(|days| (1..=3650).contains(days))
+            {
+                Some(days) => *slot = days,
+                None => return fail(out, "config", format!("--{key} must be 1-3650")),
+            }
+            changed = true;
+        }
+    }
     if changed {
         if let Err(error) = store.save_settings(&settings) {
             return fail_vfs(out, "config", &error);
@@ -813,6 +831,12 @@ fn config(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
     }
     say!(out, "cluster   {}", settings.cluster_name);
     say!(out, "replicas  {}", settings.default_replicas);
+    say!(
+        out,
+        "deletes   forgotten {} days after every node has them; a node away {} days stops holding them",
+        settings.tombstone_days,
+        settings.stale_days
+    );
     say!(out, "store     {}", store.root().display());
     0
 }
