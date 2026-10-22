@@ -158,6 +158,11 @@ fn default_runtime_dir() -> PathBuf {
     let temp_dir = std::env::temp_dir();
     #[cfg(unix)]
     {
+        // WSL without systemd exports `/run/user/UID` that nothing created;
+        // a non-root user cannot create it either, so skip to the fallback.
+        let euid = unsafe { libc::geteuid() };
+        let xdg_runtime_dir =
+            xdg_runtime_dir.filter(|path| xdg_runtime_dir_usable(Path::new(path), euid));
         let who = std::env::var("USER").unwrap_or_else(|_| "nobody".into());
         runtime_base_for(
             cfg!(target_os = "android"),
@@ -171,6 +176,20 @@ fn default_runtime_dir() -> PathBuf {
         let who = std::env::var("USERNAME").unwrap_or_else(|_| "nobody".into());
         runtime_base_for(false, xdg_runtime_dir.as_deref(), &temp_dir, &who)
     }
+}
+
+/// The XDG Base Directory spec requires `$XDG_RUNTIME_DIR` to be an absolute
+/// path to a directory the user owns, so anything else falls back.
+#[cfg(unix)]
+fn xdg_runtime_dir_usable(path: &Path, euid: libc::uid_t) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    path.is_absolute()
+        && std::fs::metadata(path).is_ok_and(|metadata| {
+            metadata.is_dir()
+                && metadata.uid() == euid
+                && metadata.permissions().mode() & 0o022 == 0
+        })
 }
 
 fn runtime_base_for(
@@ -4443,6 +4462,8 @@ fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::xdg_runtime_dir_usable;
     use super::{
         acquire_sync_permit, attempt_paste_cleanup, auto_listener_addresses,
         auto_listener_ip_changed, drain_queued_attach_input, finish_shutdown_verdict,
@@ -5857,6 +5878,29 @@ mod tests {
             runtime_base_for(false, None, Path::new("/termux/tmp"), "jeongsoo"),
             Path::new("/tmp/remuda-jeongsoo")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_runtime_dir_must_exist_and_belong_to_the_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let euid = unsafe { libc::geteuid() };
+        let root = socket_test_dir("xdg-usable");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(xdg_runtime_dir_usable(&root, euid));
+        assert!(!xdg_runtime_dir_usable(&root.join("missing"), euid));
+        assert!(!xdg_runtime_dir_usable(Path::new("relative"), euid));
+        assert!(!xdg_runtime_dir_usable(Path::new(""), euid));
+        assert!(!xdg_runtime_dir_usable(&root, euid.wrapping_add(1)));
+        let file = root.join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(!xdg_runtime_dir_usable(&file, euid));
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!xdg_runtime_dir_usable(&root, euid));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(unix)]
