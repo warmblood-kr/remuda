@@ -171,7 +171,10 @@ VFS pass:
    the grace period (default 120 s) counts as **down**. A revoked node is gone
    at once.
 3. Repair: for each live entry, compute placement over nodes not down. If this
-   node is in the set and lacks the blob, pull it from any holder.
+   node is in the set and lacks the blob, pull it from any holder. A pass
+   tries at most 256 copies, never-tried ones first. A failed copy waits 30 s
+   before its next try, doubling up to an hour, so unreachable blobs cannot
+   starve the rest. `remuda vfs sync` skips the wait.
 
 When a node is lost, the next-ranked node joins the placement on its next pass
 and pulls a copy, which restores `R` copies. When the lost node comes back,
