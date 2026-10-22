@@ -1,5 +1,5 @@
 //! `remuda reload` under faults (#713): reloads that race, reloads in a
-//! row, and a new daemon that dies after taking over. At every point exactly
+//! row, and a new daemon that dies before or after taking over. At every point exactly
 //! one daemon serves, or none and the next one recovers the hosts.
 #![cfg(unix)]
 
@@ -136,7 +136,8 @@ fn new_session(path: &Path, name: &str) {
             command: vec!["/bin/sh".into()],
             size: Size::new(80, 24),
             cwd: Some("/".into()),
-            env: None,
+            // No history file lands in the root after it is removed.
+            env: Some([("HISTFILE".into(), "/dev/null".into())].into()),
         },
     );
     assert_eq!(made, Response::Value(name.into()));
@@ -387,4 +388,68 @@ fn hosts_outlive_a_new_daemon_that_dies_and_the_next_one_drives_them() {
     wait_for(&path, "work", "BEFORE-16");
     assert_eq!(send_line(&path, "work", "echo NEXT-$((5*5))"), Response::Ok);
     wait_for(&path, "work", "NEXT-25");
+}
+
+/// A new daemon that dies at any step before it takes over changes
+/// nothing: the old daemon keeps the socket, the lock and its sessions, and
+/// is left with no child but its session hosts.
+#[test]
+fn a_new_daemon_that_dies_before_taking_over_leaves_the_old_one_serving() {
+    for fault in ["exit-before-hello", "exit-in-preflight", "exit-after-ready"] {
+        let root = Root::new(&fault[5..]);
+        let path = root.socket();
+        let old = Daemon::spawn(&root, true, &[("REMUDA_TEST_RELOAD_FAULT", fault)]);
+        new_session(&path, "work");
+        wait_for(&path, "work", "$");
+        let before = root.lock_pid();
+
+        let out = root.remuda(&["reload"]);
+        let (stdout, stderr) = text(&out);
+        assert!(!out.status.success(), "{fault}: {stdout}{stderr}");
+        assert!(!stdout.contains("reloaded: "), "{fault}: {stdout}{stderr}");
+        assert_eq!(root.lock_pid(), before, "{fault}: another daemon serves");
+        assert_eq!(
+            send_line(&path, "work", "echo KEPT-$((8*8))"),
+            Response::Ok,
+            "{fault}"
+        );
+        wait_for(&path, "work", "KEPT-64");
+        let deadline = Instant::now() + PATIENCE;
+        while children(old.0.id())
+            .iter()
+            .any(|&pid| is_daemon_or_candidate(pid))
+        {
+            assert!(Instant::now() < deadline, "{fault}: a candidate is left");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            stderr.contains("candidate exited before"),
+            "{fault}: {stderr}"
+        );
+    }
+}
+
+fn children(parent: u32) -> Vec<u32> {
+    let ps = Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=", "-o", "ppid="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let pid = words.next()?.parse().ok()?;
+            (words.next()?.parse::<u32>().ok()? == parent).then_some(pid)
+        })
+        .collect()
+}
+
+/// Any remuda process that is not a session host.
+fn is_daemon_or_candidate(pid: u32) -> bool {
+    let ps = Command::new("/bin/ps")
+        .args(["-o", "args=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let args = String::from_utf8_lossy(&ps.stdout);
+    args.contains("remuda") && !args.contains("session-host")
 }

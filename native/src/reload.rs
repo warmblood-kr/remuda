@@ -209,8 +209,17 @@ impl Candidate {
     }
     fn hand_over(&mut self, listener: RawFd, lock: RawFd, until: Instant) -> Result<(), String> {
         let bytes = frame(&FromOld::Take).map_err(|e| format!("take: {e}"))?;
-        fds::send(&self.stream, &bytes, &[listener, lock])
-            .map_err(|e| format!("could not hand over the listener: {e}"))?;
+        fds::send(&self.stream, &bytes, &[listener, lock]).map_err(|e| {
+            // C may exit right after its report, before reading `Take`.
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ) {
+                exited(&mut self.child, "take")
+            } else {
+                format!("could not hand over the listener: {e}")
+            }
+        })?;
         match read_frame(&mut self.stream, &mut self.child, until, "serving")? {
             FromCandidate::Serving => Ok(()),
             FromCandidate::Failed { reason } => {
@@ -404,6 +413,14 @@ pub fn candidate(socket: &Path) -> Result<(), String> {
     let mut stream = unsafe { UnixStream::from_raw_fd(CANDIDATE_FD) };
     // Sessions this daemon starts must not inherit it.
     set_cloexec(CANDIDATE_FD).map_err(|e| format!("handoff fd: {e}"))?;
+    let fault = std::env::var(TEST_FAULT).ok();
+    // Tests: die at each step before the take.
+    let die_at = |step: &str| {
+        if fault.as_deref() == Some(step) {
+            std::process::exit(1);
+        }
+    };
+    die_at("exit-before-hello");
     write_frame(
         &mut stream,
         &FromCandidate::Hello {
@@ -412,6 +429,7 @@ pub fn candidate(socket: &Path) -> Result<(), String> {
         },
     )
     .map_err(|e| format!("hello: {e}"))?;
+    die_at("exit-in-preflight");
     let report = match Hosting::for_socket(socket).preflight() {
         Ok(checked) => FromCandidate::Ready {
             hosts: checked.into_iter().map(HostView::from).collect(),
@@ -421,6 +439,7 @@ pub fn candidate(socket: &Path) -> Result<(), String> {
         },
     };
     write_frame(&mut stream, &report).map_err(|e| format!("report: {e}"))?;
+    die_at("exit-after-ready");
     // Abort, or O gone: either way this candidate is done.
     match read_word(&stream) {
         Ok((FromOld::Take, fds)) => take(socket, stream, fds),
@@ -546,16 +565,19 @@ fn read_frame(
         {
             Err(format!("candidate sent no {awaited} in time"))
         }
-        Err(_) => {
-            reap(child);
-            let status = child
-                .try_wait()
-                .ok()
-                .flatten()
-                .map_or_else(|| "unknown status".into(), |status| status.to_string());
-            Err(format!("candidate exited before its {awaited} ({status})"))
-        }
+        Err(_) => Err(exited(child, awaited)),
     }
+}
+
+/// C closed its end: reap it and say what it was waited on for.
+fn exited(child: &mut Child, awaited: &str) -> String {
+    reap(child);
+    let status = child
+        .try_wait()
+        .ok()
+        .flatten()
+        .map_or_else(|| "unknown status".into(), |status| status.to_string());
+    format!("candidate exited before its {awaited} ({status})")
 }
 
 pub mod post_check;
