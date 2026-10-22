@@ -62,3 +62,5 @@ After a reload, `remuda reload` and `remuda upgrade` both check the new
 daemon: it answers as the new build, lists every session it took over, and
 loaded `init.lua`. A failed check exits 1 and names what failed. The new
 daemon still serves, since the old one is gone.
+A session whose host had already died before the reload is named, not
+counted as moved, and does not fail the check.

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `remuda reload` (Unix): the post-check no longer says every session moved
+  when a session's host had already died. It names the session ("unreachable
+  before the reload too") and does not fail; a host lost during the reload
+  still fails it. New tests cover input typed during a reload and the
+  cluster listener following the serving daemon.
+
 - Cluster: `remuda cluster remote NODE` now opens that node's session picker,
   as plain `remuda` does on the node itself: the node's group is expanded and
   its first live session is highlighted; Enter opens it. Before, a target
