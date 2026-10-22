@@ -14,7 +14,7 @@ for now:
 | Attach shows the host's parsed screen, not the child's raw bytes | A host keeps typed screens, no raw output stream | bell, window title, OSC 52 clipboard, OSC 8 links and image protocols do not reach the viewer; modes (mouse, paste, cursor keys) do |
 | Terminal size at most 65,536 cells | Host terminal budget | very large terminals (e.g. 300x250) are refused |
 | Sequenced remote input forgets duplicates across a daemon restart | Duplicate memory lives in the daemon, as for an in-process session, which would not survive the restart at all | a retry spanning a restart or reload is not recognised as a duplicate |
-| A session survives the daemon | The point of hosting | sessions are still listed after a daemon restart or reload |
+| A session survives the daemon | The point of hosting | sessions are still listed after a reload, a daemon crash, or `remuda stop --keep-sessions`; a plain `remuda stop` ends them like in-process ones (a daemon older than this leaves them running) |
 | Windows | No host there (#214) | in-process only |
 
 An unreachable host is listed with `unavailable: true` (`remuda ls`:
