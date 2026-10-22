@@ -438,6 +438,14 @@ Failures are logged and cleanup continues; shutdown waits at most two seconds
 for the whole stop pass. A forced daemon termination cannot run Lua stop
 callbacks.
 
+An optional `daemon_reload_ready(state)` lets a mod hold off `remuda reload`
+(Unix) while it is mid-task, such as launching a session. It returns nil when
+a reload is fine now, or a reason. Each reason blocks both `remuda reload
+--check` and `remuda reload` as `blocker: mod NAME: reason`, and the daemon
+keeps serving. A Lua error counts as a reason. Keep it quick: the daemon waits
+at most 2 s for every mod's answer and blocks the reload if it gets none. Mods
+without it never block a reload, and older cores ignore the field.
+
 The runtime registry also covers words added with `remuda.tool`, so an
 extension can document itself when it registers its function:
 

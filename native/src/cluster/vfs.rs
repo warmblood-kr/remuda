@@ -34,6 +34,8 @@ pub enum VfsErrorKind {
     Unreachable,
     Corrupt,
     TooLarge,
+    /// A newer daemon took over this socket's index (`remuda reload`).
+    Superseded,
     Io,
 }
 
@@ -48,6 +50,7 @@ impl VfsErrorKind {
             Self::Unreachable => "unreachable",
             Self::Corrupt => "corrupt",
             Self::TooLarge => "too_large",
+            Self::Superseded => "superseded",
             Self::Io => "io",
         }
     }
@@ -136,20 +139,29 @@ impl VfsIndex {
     }
 
     /// Stable digest of the whole index; equal digests mean equal indexes.
+    /// Vectors and conflicts are left out, so it matches older nodes'.
     pub fn digest(&self) -> String {
-        let entries: Vec<&VfsEntry> = self.entries.values().collect();
+        let entries: Vec<VfsEntry> = self
+            .entries
+            .values()
+            .map(|entry| VfsEntry {
+                vv: Default::default(),
+                conflicts: Vec::new(),
+                ..entry.clone()
+            })
+            .collect();
         let canonical = serde_json::to_vec(&entries).unwrap_or_default();
         hex(&Sha256::digest(&canonical))
     }
 
     /// Merge one entry; returns true if it changed the index.
     pub fn merge(&mut self, incoming: VfsEntry) -> bool {
-        match self.entries.get(&incoming.path) {
-            Some(current) if !incoming.supersedes(current) => false,
-            _ => {
-                self.entries.insert(incoming.path.clone(), incoming);
+        match merge_result(self.entries.get(&incoming.path), incoming) {
+            Some(next) => {
+                self.entries.insert(next.path.clone(), next);
                 true
             }
+            None => false,
         }
     }
 
@@ -166,9 +178,9 @@ impl VfsIndex {
     /// always accepted: it adds nothing.
     pub fn merge_capped(&mut self, incoming: VfsEntry, counts: &mut IndexCounts) -> CappedMerge {
         let current = self.entries.get(&incoming.path);
-        if current.is_some_and(|current| !incoming.supersedes(current)) {
+        let Some(incoming) = merge_result(current, incoming) else {
             return CappedMerge::Unchanged;
-        }
+        };
         let was_live = current.map(|current| !current.deleted);
         let is_new = was_live.is_none();
         let becomes_live = !incoming.deleted && was_live != Some(true);
@@ -200,6 +212,17 @@ impl VfsIndex {
     }
 }
 
+/// `VfsEntry::merged`, or `incoming` itself for a new path.
+fn merge_result(current: Option<&VfsEntry>, mut incoming: VfsEntry) -> Option<VfsEntry> {
+    match current {
+        Some(current) => VfsEntry::merged(current, incoming),
+        None => {
+            incoming.normalize_conflicts();
+            Some(incoming)
+        }
+    }
+}
+
 /// How many live paths and index entries an index holds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IndexCounts {
@@ -222,6 +245,25 @@ pub struct MergeReport {
     /// Newer entries refused because the index is full.
     pub skipped_full: usize,
     pub counts: IndexCounts,
+}
+
+/// Daemon start: this process serves `socket`. Its index writes are refused
+/// once a later daemon on the same socket claims (`claim_writer`, #778).
+pub fn start_writer(socket: &Path) -> io::Result<()> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|_| io::Error::other("randomness unavailable"))?;
+    vfs_index_db::set_writer(&socket.to_string_lossy(), &hex(&random));
+    Ok(())
+}
+
+/// Claim the index for this daemon, if this node has a cluster store.
+pub fn claim_writer() -> VfsResult<()> {
+    vfs_index_db::mark_serving();
+    match VfsStore::open_default() {
+        Ok(store) => store.claim_writer(),
+        Err(error) if error.kind == VfsErrorKind::NoCluster => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -326,6 +368,19 @@ impl VfsStore {
         Ok(uri)
     }
 
+    /// Make this daemon the index writer for its socket (`start_writer`).
+    pub fn claim_writer(&self) -> VfsResult<()> {
+        let _guard = self.lock()?;
+        vfs_index_db::claim(&mut self.index_db()?)
+    }
+
+    /// False once a daemon that replaced this one claimed the index.
+    pub fn writes_here(&self) -> bool {
+        self.index_db()
+            .and_then(|conn| vfs_index_db::may_write(&conn))
+            .unwrap_or(true)
+    }
+
     /// Open the index database (see `vfs_index_db`).
     fn index_db(&self) -> VfsResult<rusqlite::Connection> {
         vfs_index_db::open(&self.root)
@@ -357,23 +412,100 @@ impl VfsStore {
     pub fn merge_entries_report(&self, incoming: Vec<VfsEntry>) -> VfsResult<MergeReport> {
         let _guard = self.lock()?;
         let mut conn = self.index_db()?;
-        let tx = vfs_index_db::immediate(&mut conn)?;
-        let mut report = MergeReport {
-            counts: vfs_index_db::counts(&tx)?,
-            ..MergeReport::default()
-        };
-        for entry in incoming {
-            if entry.validate().is_err() {
-                continue;
-            }
-            match merge_row(&tx, entry.clone(), &mut report.counts)? {
-                CappedMerge::Changed => report.changed.push(entry),
-                CappedMerge::Unchanged => {}
-                CappedMerge::Full => report.skipped_full += 1,
-            }
-        }
+        let tx = vfs_index_db::write_tx(&mut conn)?;
+        let report = merge_into(&tx, incoming)?;
         tx.commit()?;
         Ok(report)
+    }
+
+    /// Step `index.db` back to schema `to` with its stored down SQL, after a
+    /// backup. Without `run`, only say what it would undo. Afterwards this
+    /// daemon stops using the index, so it cannot upgrade it again.
+    pub fn index_downgrade(&self, to: u32, run: bool) -> VfsResult<String> {
+        use crate::sqlite_migrate as migrate;
+        let _guard = self.lock()?;
+        let corrupt = |error: String| VfsError::new(VfsErrorKind::Corrupt, error);
+        let mut conn = crate::sqlite::open(&self.root, vfs_index_db::DB_FILE)?;
+        let from = migrate::version(&conn).map_err(corrupt)?;
+        if to >= from {
+            return Err(corrupt(format!(
+                "index.db is at schema {from}; nothing to undo down to {to}"
+            )));
+        }
+        let plan = migrate::planned_downs(&conn, to).map_err(corrupt)?;
+        if let Some((number, name, _)) = plan.iter().find(|(_, _, down)| down.is_none()) {
+            return Err(corrupt(format!(
+                "index.db step {number} ({name}) cannot be undone; use `remuda vfs export-index` for a remuda older than index.db"
+            )));
+        }
+        let steps: Vec<String> = plan
+            .iter()
+            .map(|(n, name, _)| format!("{n} ({name})"))
+            .collect();
+        if !run {
+            return Ok(format!(
+                "Would back up index.db, then undo schema steps {}. Run again with --yes.",
+                steps.join(", ")
+            ));
+        }
+        let copy = migrate::backup(&conn, &self.root.join(vfs_index_db::DB_FILE), from)
+            .map_err(corrupt)?;
+        migrate::downgrade(&mut conn, "index.db", to).map_err(corrupt)?;
+        vfs_index_db::hold_schema();
+        Ok(format!(
+            "Backed up to {}.\nindex.db is now at schema {to} (was {from}). This daemon no longer uses the VFS: stop it and start the older remuda.",
+            copy.display()
+        ))
+    }
+
+    /// Rows changed after `since`, for a peer's `ClusterVfsChanges`.
+    pub fn changes(
+        &self,
+        known_id: Option<&str>,
+        since: u64,
+        limit: usize,
+    ) -> VfsResult<vfs_index_db::ChangesPage> {
+        vfs_index_db::changes(&self.index_db()?, known_id, since, limit)
+    }
+
+    /// This node's cursor into `peer`: its index id and the last seq merged.
+    pub fn cursor(&self, peer: &str) -> VfsResult<(Option<String>, u64)> {
+        vfs_index_db::cursor(&self.index_db()?, peer)
+    }
+
+    /// Merge one page from `peer` and move the cursor in the same
+    /// transaction, so a crash never skips a row.
+    pub fn merge_page(
+        &self,
+        peer: &str,
+        page: &vfs_index_db::ChangesPage,
+    ) -> VfsResult<MergeReport> {
+        let _guard = self.lock()?;
+        let mut conn = self.index_db()?;
+        let tx = vfs_index_db::write_tx(&mut conn)?;
+        let report = merge_into(&tx, page.entries.clone())?;
+        vfs_index_db::set_cursor(&tx, peer, Some(&page.index_id), page.last_seq)?;
+        tx.commit()?;
+        Ok(report)
+    }
+
+    /// Forget this node's cursor into `peer` (its index was replaced).
+    pub fn reset_cursor(&self, peer: &str) -> VfsResult<()> {
+        let _guard = self.lock()?;
+        let mut conn = self.index_db()?;
+        let tx = vfs_index_db::write_tx(&mut conn)?;
+        vfs_index_db::set_cursor(&tx, peer, None, 0)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record that `peer` holds our changes up to `seq`. Best effort.
+    pub fn record_ack(&self, peer: &str, seq: u64) {
+        if let Ok(conn) = self.index_db() {
+            if vfs_index_db::may_write(&conn).unwrap_or(false) {
+                let _ = vfs_index_db::set_acked(&conn, peer, seq);
+            }
+        }
     }
 
     /// Record that a peer index was merged at `now`.
@@ -394,7 +526,7 @@ impl VfsStore {
         rules::validate_replicas(replicas)
             .map_err(|error| VfsError::new(VfsErrorKind::BadUri, error.0))?;
         let sha256 = self.put_blob(bytes)?;
-        self.write_entry(|version| VfsEntry {
+        self.write_entry(path, |version, current| VfsEntry {
             path: path.to_owned(),
             sha256,
             size: bytes.len() as u64,
@@ -403,6 +535,8 @@ impl VfsStore {
             writer: writer.to_owned(),
             deleted: false,
             mtime: unix_now(),
+            vv: VfsEntry::next_vv(current, writer),
+            conflicts: Vec::new(),
         })
     }
 
@@ -410,7 +544,7 @@ impl VfsStore {
     pub fn delete(&self, path: &str, writer: &str) -> VfsResult<VfsEntry> {
         let _guard = self.lock()?;
         let mut conn = self.index_db()?;
-        let tx = vfs_index_db::immediate(&mut conn)?;
+        let tx = vfs_index_db::write_tx(&mut conn)?;
         let current = vfs_index_db::get(&tx, path)?
             .filter(|entry| !entry.deleted)
             .ok_or_else(|| VfsError::new(VfsErrorKind::NotFound, format!("no file at {path}")))?;
@@ -419,6 +553,8 @@ impl VfsStore {
             version: vfs_index_db::next_version(&tx)?,
             writer: writer.to_owned(),
             mtime: unix_now(),
+            vv: VfsEntry::next_vv(Some(&current), writer),
+            conflicts: Vec::new(),
             ..current
         };
         vfs_index_db::upsert(&tx, &entry)?;
@@ -426,13 +562,70 @@ impl VfsStore {
         Ok(entry)
     }
 
-    fn write_entry(&self, make: impl FnOnce(u64) -> VfsEntry) -> VfsResult<VfsEntry> {
+    /// Write one side of a conflicted path again, which settles every
+    /// conflict on it. `keep` is a conflict's version, or `None` for the winner.
+    pub fn settle_conflict(
+        &self,
+        path: &str,
+        keep: Option<u64>,
+        writer: &str,
+    ) -> VfsResult<VfsEntry> {
+        let index = self.load_index()?;
+        let current = index
+            .entries
+            .get(path)
+            .filter(|entry| !entry.conflicts.is_empty())
+            .ok_or_else(|| {
+                VfsError::new(VfsErrorKind::NotFound, format!("no conflict at {path}"))
+            })?;
+        let chosen = match keep {
+            None => current.as_conflict(),
+            Some(version) => {
+                let mut matching = current.conflicts.iter().filter(|c| c.version == version);
+                match (matching.next(), matching.next()) {
+                    (Some(chosen), None) => chosen.clone(),
+                    (None, _) => {
+                        return Err(VfsError::new(
+                            VfsErrorKind::NotFound,
+                            format!("{path} has no conflict with version {version}"),
+                        ))
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(VfsError::new(
+                            VfsErrorKind::BadUri,
+                            format!("several conflicts on {path} have version {version}; put the content you want instead"),
+                        ))
+                    }
+                }
+            }
+        };
+        if !chosen.deleted && !self.has_blob(&chosen.sha256, chosen.size) {
+            return Err(VfsError::new(
+                VfsErrorKind::NotLocal,
+                format!("version {} of {path} is not on this node", chosen.version),
+            ));
+        }
+        self.write_entry(path, |version, current| VfsEntry {
+            version,
+            writer: writer.to_owned(),
+            mtime: unix_now(),
+            vv: VfsEntry::next_vv(current, writer),
+            ..chosen.entry(path)
+        })
+    }
+
+    fn write_entry(
+        &self,
+        path: &str,
+        make: impl FnOnce(u64, Option<&VfsEntry>) -> VfsEntry,
+    ) -> VfsResult<VfsEntry> {
         let _guard = self.lock()?;
         let mut conn = self.index_db()?;
-        let tx = vfs_index_db::immediate(&mut conn)?;
-        let entry = make(vfs_index_db::next_version(&tx)?);
+        let tx = vfs_index_db::write_tx(&mut conn)?;
+        let current = vfs_index_db::get(&tx, path)?;
+        let entry = make(vfs_index_db::next_version(&tx)?, current.as_ref());
         let mut counts = vfs_index_db::counts(&tx)?;
-        if merge_row(&tx, entry.clone(), &mut counts)? == CappedMerge::Full {
+        if merge_row(&tx, entry.clone(), &mut counts)?.0 == CappedMerge::Full {
             return Err(VfsError::new(
                 VfsErrorKind::TooLarge,
                 if counts.live >= MAX_ENTRIES {
@@ -628,7 +821,11 @@ impl VfsStore {
 
     pub fn collect_garbage_older_than(&self, grace: std::time::Duration) -> VfsResult<usize> {
         let _guard = self.lock()?;
-        let referenced = vfs_index_db::live_hashes(&self.index_db()?)?;
+        let conn = self.index_db()?;
+        if !vfs_index_db::may_write(&conn)? {
+            return Ok(0);
+        }
+        let referenced = vfs_index_db::live_hashes(&conn)?;
         let mut removed = 0;
         for hash in self.local_blobs()? {
             if referenced.contains(hash.as_str()) {
@@ -650,21 +847,43 @@ impl VfsStore {
 
 /// `VfsIndex::merge_capped` on one stored row: the cap rules stay in one place,
 /// and only the row that changed is written.
+fn merge_into(tx: &rusqlite::Transaction<'_>, incoming: Vec<VfsEntry>) -> VfsResult<MergeReport> {
+    let mut report = MergeReport {
+        counts: vfs_index_db::counts(tx)?,
+        ..MergeReport::default()
+    };
+    for entry in incoming {
+        if entry.validate().is_err() {
+            continue;
+        }
+        match merge_row(tx, entry, &mut report.counts)? {
+            (CappedMerge::Changed, Some(stored)) => report.changed.push(stored),
+            (CappedMerge::Full, _) => report.skipped_full += 1,
+            _ => {}
+        }
+    }
+    Ok(report)
+}
+
 fn merge_row(
     tx: &rusqlite::Transaction<'_>,
     incoming: VfsEntry,
     counts: &mut IndexCounts,
-) -> VfsResult<CappedMerge> {
+) -> VfsResult<(CappedMerge, Option<VfsEntry>)> {
     let mut one = VfsIndex::default();
     if let Some(current) = vfs_index_db::get(tx, &incoming.path)? {
         one.entries.insert(current.path.clone(), current);
     }
     let path = incoming.path.clone();
     let outcome = one.merge_capped(incoming, counts);
-    if outcome == CappedMerge::Changed {
-        vfs_index_db::upsert(tx, &one.entries[&path])?;
+    if outcome != CappedMerge::Changed {
+        return Ok((outcome, None));
     }
-    Ok(outcome)
+    let stored = one.entries.remove(&path);
+    if let Some(stored) = &stored {
+        vfs_index_db::upsert(tx, stored)?;
+    }
+    Ok((outcome, stored))
 }
 
 /// A full index stays full, and every peer pull hits it again, so the line
@@ -762,6 +981,8 @@ mod tests {
             writer: "SHA256:peer".into(),
             deleted: false,
             mtime: 0,
+            vv: Default::default(),
+            conflicts: Vec::new(),
         };
         let mut bad = good.clone();
         bad.path = "../escape".into();
@@ -888,6 +1109,8 @@ mod tests {
             writer: "w".into(),
             deleted: false,
             mtime: 0,
+            vv: Default::default(),
+            conflicts: Vec::new(),
         };
         left.merge(entry.clone());
         assert_ne!(left.digest(), right.digest());
@@ -922,6 +1145,8 @@ mod tests {
             writer: "SHA256:peer".into(),
             deleted,
             mtime: 0,
+            vv: Default::default(),
+            conflicts: Vec::new(),
         }
     }
 
@@ -1024,5 +1249,122 @@ mod tests {
             store.put("big", &big, 1, "SHA256:me").unwrap_err().kind,
             VfsErrorKind::TooLarge
         );
+    }
+
+    fn concurrent(store: &VfsStore) -> VfsEntry {
+        store.put("same.txt", b"base", 1, "SHA256:a").unwrap();
+        let base = store.load_index().unwrap().entries["same.txt"].clone();
+        let other = VfsEntry {
+            sha256: store.put_blob(b"theirs").unwrap(),
+            size: 6,
+            version: base.version + 5,
+            writer: "SHA256:b".into(),
+            vv: VfsEntry::next_vv(Some(&base), "SHA256:b"),
+            ..base.clone()
+        };
+        store.put("same.txt", b"mine", 1, "SHA256:a").unwrap();
+        store.merge_entries(vec![other]).unwrap();
+        store.load_index().unwrap().entries["same.txt"].clone()
+    }
+
+    #[test]
+    fn a_kept_conflict_keeps_its_blob_until_a_later_write_resolves_it() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        let merged = concurrent(&store);
+        assert_eq!(merged.writer, "SHA256:b");
+        assert_eq!(merged.conflicts.len(), 1);
+        let mine = merged.conflicts[0].sha256.clone();
+        assert_eq!(store.read_blob(&mine).unwrap(), b"mine");
+        store
+            .collect_garbage_older_than(std::time::Duration::ZERO)
+            .unwrap();
+        assert!(store.blob_present(&mine), "GC removed a conflict's content");
+        store.put("same.txt", b"settled", 1, "SHA256:a").unwrap();
+        assert!(store.load_index().unwrap().entries["same.txt"]
+            .conflicts
+            .is_empty());
+        store
+            .collect_garbage_older_than(std::time::Duration::ZERO)
+            .unwrap();
+        assert!(!store.blob_present(&mine));
+    }
+
+    #[test]
+    fn vectors_and_conflicts_leave_the_digest_as_older_nodes_compute_it() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        concurrent(&store);
+        let index = store.load_index().unwrap();
+        let mut older = index.clone();
+        for entry in older.entries.values_mut() {
+            entry.vv.clear();
+            entry.conflicts.clear();
+        }
+        assert_eq!(index.digest(), older.digest());
+    }
+
+    #[test]
+    fn entries_without_conflicts_keep_the_older_wire_shape() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        let plain = peer_entry("plain".into(), false);
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("vv").is_none() && json.get("conflicts").is_none());
+        // An older node reads a newer entry and drops what it does not know.
+        #[derive(serde::Deserialize)]
+        struct Older {
+            version: u64,
+        }
+        let merged = concurrent(&store);
+        let newer = serde_json::to_string(&merged).unwrap();
+        assert!(newer.contains("\"conflicts\""));
+        let older: Older = serde_json::from_str(&newer).unwrap();
+        assert_eq!(older.version, merged.version);
+    }
+    #[test]
+    fn settling_a_conflict_writes_the_kept_side_again_and_clears_the_rest() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        let merged = concurrent(&store);
+        let lost = merged.conflicts[0].clone();
+        assert_eq!(
+            store
+                .settle_conflict("same.txt", Some(lost.version + 100), "SHA256:a")
+                .unwrap_err()
+                .kind,
+            VfsErrorKind::NotFound
+        );
+        let kept = store
+            .settle_conflict("same.txt", Some(lost.version), "SHA256:a")
+            .unwrap();
+        assert_eq!(
+            (kept.sha256.as_str(), kept.writer.as_str()),
+            (lost.sha256.as_str(), "SHA256:a")
+        );
+        assert!(kept.version > merged.version);
+        let stored = store.load_index().unwrap().entries["same.txt"].clone();
+        assert!(stored.conflicts.is_empty());
+        assert_eq!(store.read_blob(&stored.sha256).unwrap(), b"mine");
+        assert_eq!(
+            store
+                .settle_conflict("same.txt", None, "SHA256:a")
+                .unwrap_err()
+                .kind,
+            VfsErrorKind::NotFound,
+            "nothing left to settle"
+        );
+    }
+
+    #[test]
+    fn keeping_the_winner_keeps_its_content() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        let merged = concurrent(&store);
+        let kept = store.settle_conflict("same.txt", None, "SHA256:a").unwrap();
+        assert_eq!(kept.sha256, merged.sha256);
+        assert!(store.load_index().unwrap().entries["same.txt"]
+            .conflicts
+            .is_empty());
     }
 }

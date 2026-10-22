@@ -2951,6 +2951,7 @@ fn old_json_shapes_parse_with_defaults_for_additive_session_fields() {
         attached: false,
         human_idle: None,
         mouse_tracking: false,
+        unavailable: false,
     };
     let mut old_summary = serde_json::to_value(summary).expect("serialize summary");
     let fields = old_summary.as_object_mut().expect("summary object");

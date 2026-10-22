@@ -5,6 +5,9 @@
 //! newer handoff version, and one that cannot drive a host.
 #![cfg(unix)]
 
+#[path = "daemon_support/reap.rs"]
+mod reap;
+
 use remuda_core::protocol::{Request, Response};
 use remuda_core::Size;
 use remuda_native::{client, daemon};
@@ -66,9 +69,7 @@ impl Root {
 }
 impl Drop for Root {
     fn drop(&mut self) {
-        let _ = Command::new("/usr/bin/pkill")
-            .args(["-KILL", "-f", &self.0.to_string_lossy()])
-            .status();
+        reap::kill_processes_under(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -255,13 +256,10 @@ fn a_hung_candidate_is_stopped_at_its_deadline() {
         "{:?}",
         started.elapsed()
     );
-    let still = Command::new("/usr/bin/pgrep")
-        .args(["-f", &hung.to_string_lossy()])
-        .output()
-        .unwrap();
+    let still = reap::processes_naming(&[&hung.to_string_lossy()]);
     assert!(
-        still.stdout.is_empty(),
-        "the hung candidate was left running"
+        still.is_empty(),
+        "the hung candidate was left running: {still:?}"
     );
 }
 
