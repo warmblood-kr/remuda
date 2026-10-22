@@ -7,6 +7,25 @@
   `init.lua`. An `init.lua` that fails only in the new daemon is named and
   `upgrade` exits 1. Before, it checked only the build.
 
+- VFS: `remuda vfs put --min-copies K` waits until K nodes hold the file,
+  this one included (#778). If fewer do within 60 s, it says the write is
+  committed here and still replicating, and exits 75; nothing is rolled
+  back. K is at most the copies wanted (`--replicas`).
+
+- VFS: a node that has not pulled for 30 days (`remuda vfs config
+  --stale-days DAYS`) no longer holds deleted files back on its peers
+  (#778). When it returns, a peer that forgot deletes in the meantime tells
+  it so; it keeps only its own writes that peer has not seen, pulls the rest
+  again, and logs one line. Deleted files therefore do not come back.
+  Nodes older than this keep a plain reset and their old rows.
+
+- VFS: deleted files are forgotten at last (#778). A tombstone goes once
+  every other node has pulled it from this one and it is 7 days old
+  (`remuda vfs config --tombstone-days DAYS`). Until then, and for as long
+  as any member never pulls (an older build, a node that is down), it
+  stays. `remuda vfs sync` reports how many were forgotten. A concurrent
+  delete that loses to a write is no longer kept as a conflict.
+
 - SQLite migrations no longer fail when two connections open a database
   for the first time at once (#778). The one that waited for the write lock
   now checks the version again and skips steps the other already ran,
