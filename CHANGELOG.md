@@ -8,6 +8,14 @@
   whether it is up, when it last pulled from here and how many deletes it
   holds back. `--copies` also asks the nodes which copies they hold, lists
   short files, and exits 75 while any file is short.
+- VFS: a peer that was busy or timed out is no longer treated as an older
+  build for an hour (whole-index pulls, "old build" in `vfs status`). Only
+  a peer that cannot decode change pulls is.
+- Sessions: input or a command refused while a reload moves a hosted
+  session now says so: "session owner unavailable: Recovering (a reload or
+  restart is moving this session; try again)". The text before the
+  bracket is unchanged.
+
 - Cluster: `remuda cluster remote NODE` now opens NODE's own session screen,
   the same screen plain `remuda` shows there: its session list on the left
   and the selected session on the right. Press `m` to write a line for the
