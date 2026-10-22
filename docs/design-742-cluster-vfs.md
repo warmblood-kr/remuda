@@ -5,6 +5,8 @@ Each file's content is a sha256-addressed blob kept on several nodes, and names
 are stable `remuda://` URIs. The store is additive: existing per-node paths
 and commands do not change.
 
+For operators: [vfs.md](vfs.md).
+
 ## URIs and paths
 
 ```
