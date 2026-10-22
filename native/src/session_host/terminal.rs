@@ -6,7 +6,12 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 const PARSE_BUDGET: usize = 4096;
 const MAX_CELLS: usize = 65_536;
-const MAX_HISTORY_CELLS: usize = 1_000_000;
+/// Scrollback a host keeps, as an in-process session does.
+pub(crate) const HISTORY_ROWS: usize = 10_000;
+/// The history older daemons accept in a viewport; a plain `Viewport` is
+/// clamped to it so they keep working against a newer host.
+pub(crate) const LEGACY_HISTORY_ROWS: u16 = 1000;
+const MAX_HISTORY_CELLS: usize = HISTORY_ROWS * 1000;
 const MAX_QUERIES: usize = 32;
 #[derive(Default)]
 struct Queries {
@@ -177,7 +182,7 @@ fn geometry(rows: u16, cols: u16, history: usize) -> Result<(), &'static str> {
         || rows > 500
         || cols > 1000
         || usize::from(rows) * usize::from(cols) > MAX_CELLS
-        || history > 1000
+        || history > HISTORY_ROWS
         || history
             .checked_mul(usize::from(cols))
             .is_none_or(|cells| cells > MAX_HISTORY_CELLS)

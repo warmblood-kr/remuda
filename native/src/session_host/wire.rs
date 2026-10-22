@@ -5,6 +5,10 @@ use std::io::{self, Read, Write};
 pub(crate) const MAGIC: [u8; 4] = *b"RMHS";
 pub(crate) const MAJOR: u16 = 1;
 pub(crate) const MAX_FRAME: usize = 64 * 1024;
+/// A host's launch arrives as one frame on its stdin, before any RPC. It
+/// carries the whole inherited environment and argv, so it gets its own cap,
+/// sized to hold what an in-process launch accepts (see `entry::validate`).
+pub(crate) const MAX_BOOTSTRAP: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_HELLO: usize = 4096;
 pub(crate) const MAX_INPUT: usize = 8192;
 pub(crate) const MAX_STEPS: usize = 64;
@@ -97,10 +101,19 @@ impl InputAct {
 /// Caller selects a smaller handshake bound before authentication. Runtime
 /// must additionally enforce connection count and read/write deadlines.
 pub(crate) fn read_frame(reader: &mut impl Read, limit: usize) -> io::Result<Vec<u8>> {
+    read_frame_within(reader, limit.min(MAX_FRAME))
+}
+
+/// The one launch frame on a host's stdin, up to [`MAX_BOOTSTRAP`].
+pub(crate) fn read_bootstrap(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+    read_frame_within(reader, MAX_BOOTSTRAP)
+}
+
+fn read_frame_within(reader: &mut impl Read, limit: usize) -> io::Result<Vec<u8>> {
     let mut header = [0; 4];
     reader.read_exact(&mut header)?;
     let len = u32::from_be_bytes(header) as usize;
-    if len == 0 || len > limit.min(MAX_FRAME) {
+    if len == 0 || len > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "host frame length limit",
@@ -112,7 +125,16 @@ pub(crate) fn read_frame(reader: &mut impl Read, limit: usize) -> io::Result<Vec
 }
 
 pub(crate) fn write_frame(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
-    if bytes.is_empty() || bytes.len() > MAX_FRAME {
+    write_frame_within(writer, bytes, MAX_FRAME)
+}
+
+/// Write the launch frame a host reads with [`read_bootstrap`].
+pub(crate) fn write_bootstrap(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    write_frame_within(writer, bytes, MAX_BOOTSTRAP)
+}
+
+fn write_frame_within(writer: &mut impl Write, bytes: &[u8], limit: usize) -> io::Result<()> {
+    if bytes.is_empty() || bytes.len() > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "host frame length limit",

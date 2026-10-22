@@ -32,11 +32,35 @@
   stays. `remuda vfs sync` reports how many were forgotten. A concurrent
   delete that loses to a write is no longer kept as a conflict.
 
+- SQLite migrations no longer fail when two connections open a database
+  for the first time at once (#778). The one that waited for the write lock
+  now checks the version again and skips steps the other already ran,
+  instead of failing with `table ... already exists`. This hit the VFS
+  index.db in CI. `remuda db downgrade` checks under the lock too.
+
+- `remuda reload` (Unix): fixed a daemon that had just handed over being
+  able to hand over again. A reload request it had accepted just before the
+  handover could start a second one, giving the socket to two new daemons.
+  It now refuses and points to the new daemon.
+
 - VFS: `remuda vfs ls --conflicts` lists paths with kept concurrent writes,
   `remuda vfs stat` shows them, and `remuda vfs resolve-conflict URI --keep
   winner|VERSION` settles them by writing the chosen side again (fetched
   from a peer if needed). Lua `vfs.stat()` gains `conflicts`; the JSON of
   `stat` and `ls` gains `conflicts` and `deleted` (#778).
+
+- `remuda upgrade` (Unix) now reloads the running daemon into the version it
+  just installed, so host-backed sessions keep running. A daemon that cannot
+  reload keeps its old version and says why: an in-process session blocks it,
+  or it is older than `remuda reload`. `--no-reload` installs only. The notice
+  for a daemon of another build now suggests `remuda reload` instead of
+  `remuda stop`, and `reload` is listed in `remuda --help`.
+
+- `remuda reload` (Unix) now checks the new daemon after the handover: it
+  answers as the target build, lists every host-backed session the reload
+  moved, and loaded `init.lua`. An `init.lua` that fails only in the new
+  daemon, for example one edited since the old daemon started, is named and
+  `reload` exits 1. The reload itself has gone through.
 
 - VFS: two writes to the same path made while nodes could not see each
   other no longer drop one silently (#778). Each entry carries a version
@@ -55,6 +79,17 @@
   index-downgrade 1 --yes` (it writes a backup), then stop the daemon and
   start the older remuda.
 
+- After `remuda reload` (Unix), the new daemon shows in `ps` as
+  `remuda -s NAME daemon`, like any other daemon, instead of
+  `remuda _reload-candidate SOCKET`.
+
+- After `remuda reload` (Unix), the old daemon ends what `remuda stop` ends,
+  except the sessions and the socket. A deferred reply still waiting is told
+  the daemon reloaded and to run the command again, instead of the daemon
+  hanging up on it. Processes its Lua started are killed instead of running
+  on beside the new daemon's, and modules are stopped. `docs/reload.md` says
+  what a reload keeps and what starts fresh.
+
 - VFS: only the daemon that serves the socket writes the index, also during
   `remuda reload` (#778, #713). The new daemon claims `index.db` just
   before it serves; a rollback gives it back to the old daemon. A write on
@@ -71,6 +106,10 @@
     old daemon takes everything back and keeps serving, and `reload` exits
     1.
   - In-process sessions still block a reload.
+  - A mod can hold off a reload while it is busy: its optional
+    `daemon_reload_ready(state)` returns a reason, shown as a blocker.
+  - Lua: `remuda.daemon.reloaded_from()` returns the pid of the daemon this
+    one took over from, or nil after a fresh start.
 
 - Lua and CLI: schema migrations for mod databases (#778). A mod ships
   numbered plain-SQL steps (`migrations/NAME/0001_create.up.sql`, an
