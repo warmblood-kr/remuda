@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- VFS: a node that has not pulled for 30 days (`remuda vfs config
+  --stale-days DAYS`) no longer holds deleted files back on its peers
+  (#778). When it returns, a peer that forgot deletes in the meantime tells
+  it so; it keeps only its own writes that peer has not seen, pulls the rest
+  again, and logs one line. Deleted files therefore do not come back.
+  Nodes older than this keep a plain reset and their old rows.
+
+- VFS: deleted files are forgotten at last (#778). A tombstone goes once
+  every other node has pulled it from this one and it is 7 days old
+  (`remuda vfs config --tombstone-days DAYS`). Until then, and for as long
+  as any member never pulls (an older build, a node that is down), it
+  stays. `remuda vfs sync` reports how many were forgotten. A concurrent
+  delete that loses to a write is no longer kept as a conflict.
+
+- SQLite migrations no longer fail when two connections open a database
+  for the first time at once (#778). The one that waited for the write lock
+  now checks the version again and skips steps the other already ran,
+  instead of failing with `table ... already exists`. This hit the VFS
+  index.db in CI. `remuda db downgrade` checks under the lock too.
+
 - `remuda reload` (Unix): fixed a daemon that had just handed over being
   able to hand over again. A reload request it had accepted just before the
   handover could start a second one, giving the socket to two new daemons.

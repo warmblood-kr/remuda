@@ -388,6 +388,11 @@ fn serve_from(
                 "remuda daemon: rediscovered session hosts: {}",
                 names.join(", ")
             );
+            for name in &names {
+                if let Some(handle) = registry.hosted(name) {
+                    watch_hosted_output(&image, &handle);
+                }
+            }
         }
         Ok(_) => {}
         Err(error) => eprintln!("remuda daemon: session host discovery failed: {error}"),
@@ -3522,8 +3527,21 @@ struct NewSessionRequest {
     return_instance_id: bool,
 }
 
+/// Feed a host-backed session's output into the same `session_output` hook
+/// an in-process one uses (#713). A host that cannot be watched finishes the
+/// monitor at once, so an exit notice never waits for it.
+#[cfg(unix)]
+fn watch_hosted_output(image: &Image, handle: &remuda_core::session_operations::SessionHandle) {
+    let identity = handle.identity();
+    let notifier = image.session_output_notifier(&identity.name, &identity.id);
+    match handle.wakeup() {
+        Ok(Some(output)) => monitor_session_output(output, notifier),
+        _ => notifier.finish_monitor(),
+    }
+}
+
 /// Opt-in (#713): the session lives in a separate host process that
-/// survives this daemon. No output monitor: hosted wakeups are not wired yet.
+/// survives this daemon.
 #[cfg(unix)]
 fn handle_new_hosted(
     stream: &Stream,
@@ -3545,10 +3563,8 @@ fn handle_new_hosted(
     let Some(handle) = registry.hosted(request.name) else {
         return reply(stream, &Response::error("hosted session vanished"));
     };
+    watch_hosted_output(image, &handle);
     let identity = handle.identity();
-    image
-        .session_output_notifier(&identity.name, &identity.id)
-        .finish_monitor();
     let name = identity.name.clone();
     let response = if return_instance_id {
         Response::SessionStarted {

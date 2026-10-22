@@ -78,9 +78,16 @@ Index entry (one per path, kept on every node):
 Merge rule: last writer wins. The higher `(version, writer)` pair wins. A write
 uses `version = max(local index versions) + 1`, a Lamport clock. Deleting
 writes a tombstone (`deleted: true`) with the same rule, so a delete cannot be
-undone by an older replica. At most 10,000 live files. Tombstones are not
-removed yet, so they do not count toward that cap; the whole index, files and
-tombstones together, is capped at 30,000 entries. A delete always fits, since
+undone by an older replica. At most 10,000 live files. Tombstones do not
+count toward that cap; the whole index, files and tombstones together, is
+capped at 30,000 entries. A tombstone is removed once every other admitted
+member has pulled it from this node (its change cursor is past it) and it is
+`tombstone_days` old (default 7; `remuda vfs config --tombstone-days`). The
+newest version and tombstones with conflicts stay. A member that never pulls,
+such as an older build, keeps every tombstone. A member whose last pull is
+older than `stale_days` (default 30, `--stale-days`) stops holding them back.
+When it pulls again from below a collected tombstone, the answer is a stale
+reset: it drops every row but its own unseen writes and pulls all again. A delete always fits, since
 it replaces a live entry.
 
 Concurrent writes (#778, design-778-vfs-delta-sync step 4): each entry also
