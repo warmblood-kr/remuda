@@ -562,6 +562,58 @@ impl VfsStore {
         Ok(entry)
     }
 
+    /// Write one side of a conflicted path again, which settles every
+    /// conflict on it. `keep` is a conflict's version, or `None` for the winner.
+    pub fn settle_conflict(
+        &self,
+        path: &str,
+        keep: Option<u64>,
+        writer: &str,
+    ) -> VfsResult<VfsEntry> {
+        let index = self.load_index()?;
+        let current = index
+            .entries
+            .get(path)
+            .filter(|entry| !entry.conflicts.is_empty())
+            .ok_or_else(|| {
+                VfsError::new(VfsErrorKind::NotFound, format!("no conflict at {path}"))
+            })?;
+        let chosen = match keep {
+            None => current.as_conflict(),
+            Some(version) => {
+                let mut matching = current.conflicts.iter().filter(|c| c.version == version);
+                match (matching.next(), matching.next()) {
+                    (Some(chosen), None) => chosen.clone(),
+                    (None, _) => {
+                        return Err(VfsError::new(
+                            VfsErrorKind::NotFound,
+                            format!("{path} has no conflict with version {version}"),
+                        ))
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(VfsError::new(
+                            VfsErrorKind::BadUri,
+                            format!("several conflicts on {path} have version {version}; put the content you want instead"),
+                        ))
+                    }
+                }
+            }
+        };
+        if !chosen.deleted && !self.has_blob(&chosen.sha256, chosen.size) {
+            return Err(VfsError::new(
+                VfsErrorKind::NotLocal,
+                format!("version {} of {path} is not on this node", chosen.version),
+            ));
+        }
+        self.write_entry(path, |version, current| VfsEntry {
+            version,
+            writer: writer.to_owned(),
+            mtime: unix_now(),
+            vv: VfsEntry::next_vv(current, writer),
+            ..chosen.entry(path)
+        })
+    }
+
     fn write_entry(
         &self,
         path: &str,
@@ -1269,5 +1321,50 @@ mod tests {
         assert!(newer.contains("\"conflicts\""));
         let older: Older = serde_json::from_str(&newer).unwrap();
         assert_eq!(older.version, merged.version);
+    }
+    #[test]
+    fn settling_a_conflict_writes_the_kept_side_again_and_clears_the_rest() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        let merged = concurrent(&store);
+        let lost = merged.conflicts[0].clone();
+        assert_eq!(
+            store
+                .settle_conflict("same.txt", Some(lost.version + 100), "SHA256:a")
+                .unwrap_err()
+                .kind,
+            VfsErrorKind::NotFound
+        );
+        let kept = store
+            .settle_conflict("same.txt", Some(lost.version), "SHA256:a")
+            .unwrap();
+        assert_eq!(
+            (kept.sha256.as_str(), kept.writer.as_str()),
+            (lost.sha256.as_str(), "SHA256:a")
+        );
+        assert!(kept.version > merged.version);
+        let stored = store.load_index().unwrap().entries["same.txt"].clone();
+        assert!(stored.conflicts.is_empty());
+        assert_eq!(store.read_blob(&stored.sha256).unwrap(), b"mine");
+        assert_eq!(
+            store
+                .settle_conflict("same.txt", None, "SHA256:a")
+                .unwrap_err()
+                .kind,
+            VfsErrorKind::NotFound,
+            "nothing left to settle"
+        );
+    }
+
+    #[test]
+    fn keeping_the_winner_keeps_its_content() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        let merged = concurrent(&store);
+        let kept = store.settle_conflict("same.txt", None, "SHA256:a").unwrap();
+        assert_eq!(kept.sha256, merged.sha256);
+        assert!(store.load_index().unwrap().entries["same.txt"]
+            .conflicts
+            .is_empty());
     }
 }

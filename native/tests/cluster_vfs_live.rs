@@ -368,6 +368,33 @@ fn put_on_one_node_reads_on_every_node_and_delete_reaches_all() {
             .is_some_and(|stat| stat["sha256"] == sha256_hex(b"v2"))
     });
 
+    // B saw A's write before its own, so that is no conflict.
+    let stat = a.stat_json("remuda:///butler/guidance/cluster.md").unwrap();
+    assert_eq!(stat["conflicts"], serde_json::json!([]));
+    let listed = successful(a.run(&["vfs", "ls", "--conflicts"]), "ls --conflicts");
+    assert_eq!(listed.trim(), "No conflicts.");
+    let lua = successful(
+        a.run(&[
+            "-e",
+            "return #remuda.vfs.stat('remuda:///butler/guidance/cluster.md').conflicts",
+        ]),
+        "lua conflicts",
+    );
+    assert_eq!(lua.trim(), "0");
+    let settle = a.run(&[
+        "vfs",
+        "resolve-conflict",
+        "remuda:///butler/guidance/cluster.md",
+        "--keep",
+        "winner",
+    ]);
+    assert!(!settle.status.success());
+    assert!(
+        String::from_utf8_lossy(&settle.stderr).contains("no conflict at"),
+        "{}",
+        String::from_utf8_lossy(&settle.stderr)
+    );
+
     // Delete on C reaches A and B.
     successful(
         c.run(&["vfs", "rm", "remuda:///butler/guidance/cluster.md"]),

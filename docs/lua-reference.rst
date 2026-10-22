@@ -539,7 +539,7 @@ vfs.rm
 vfs.stat
 --------
 
-``vfs.stat(uri) -> {path, version, sha256, size, mtime, replicas, writer, local, synced_at} | nil, reason`` — Describe a stored file: path, version, sha256, size, mtime, replicas, writer, local (whether this node holds a copy) and synced_at (unix time a peer index was last merged here, or nil). A file known here without a local copy still returns its table, with local = false.
+``vfs.stat(uri) -> {path, version, sha256, size, mtime, replicas, writer, local, synced_at, conflicts} | nil, reason`` — Describe a stored file: path, version, sha256, size, mtime, replicas, writer, local (whether this node holds a copy), synced_at (unix time a peer index was last merged here, or nil) and conflicts (concurrent writes kept beside this one, each {version, writer, sha256, size, deleted, mtime}; the next put or rm settles them). A file known here without a local copy still returns its table, with local = false.
 
 wait_for
 --------
