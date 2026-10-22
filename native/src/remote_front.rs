@@ -298,6 +298,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::ClusterRegistrySync { .. } => Err(refusal("ClusterRegistrySync")),
         Request::ClusterRegistryUpdate { .. } => Err(refusal("ClusterRegistryUpdate")),
         Request::ClusterVfsIndexSync { .. } => Err(refusal("ClusterVfsIndexSync")),
+        Request::ClusterVfsChanges { .. } => Err(refusal("ClusterVfsChanges")),
         Request::ClusterVfsIndexUpdate { .. } => Err(refusal("ClusterVfsIndexUpdate")),
         Request::ClusterVfsBlobStat { .. } => Err(refusal("ClusterVfsBlobStat")),
         Request::ClusterVfsBlobGet { .. } => Err(refusal("ClusterVfsBlobGet")),
@@ -570,6 +571,11 @@ mod tests {
             Request::ClusterVfsIndexSync {
                 digest: None,
                 offset: 0,
+            },
+            Request::ClusterVfsChanges {
+                index_id: None,
+                since: 0,
+                limit: 1,
             },
             Request::ClusterVfsIndexUpdate {
                 entries_json: "[]".into(),

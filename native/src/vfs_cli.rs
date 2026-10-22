@@ -86,6 +86,10 @@ fn spec() -> Spec {
                 "remuda vfs config [--cluster NAME] [--replicas N]"),
             verb("export-index", "Write index.json for an older remuda, before a downgrade. Example: remuda vfs export-index",
                 vec![], vec![], "remuda vfs export-index"),
+            verb("index-downgrade", "Step index.db back to schema VERSION for an older remuda, after a backup. Example: remuda vfs index-downgrade 1 --yes",
+                vec![arg("VERSION", "Schema version the older remuda knows", true)],
+                vec![option("yes", None, "Run it; without this, only print what would be undone")],
+                "remuda vfs index-downgrade VERSION [--yes]"),
             verb("help", "Print help for a vfs command", vec![arg("COMMAND", "vfs command name", false)], vec![], "remuda vfs help [COMMAND]"),
         ],
     }
@@ -332,6 +336,18 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
             }
             Err(error) => fail_vfs(out, &verb, &error),
         },
+        "index-downgrade" => {
+            let Ok(to) = value(values, "VERSION").unwrap_or_default().parse::<u32>() else {
+                return fail(out, &verb, "VERSION must be a whole number");
+            };
+            match store.index_downgrade(to, flag(values, "yes")) {
+                Ok(text) => {
+                    say!(out, "{text}");
+                    0
+                }
+                Err(error) => fail_vfs(out, &verb, &error),
+            }
+        }
         _ => unreachable!("vfs verb specification and dispatcher diverged"),
     }
 }
