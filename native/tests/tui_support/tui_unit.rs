@@ -200,6 +200,7 @@ fn row(name: &str, alive: bool, attached: bool) -> SessionSummary {
         attached,
         human_idle: None,
         mouse_tracking: false,
+        unavailable: false,
     }
 }
 

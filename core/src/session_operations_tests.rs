@@ -584,7 +584,7 @@ fn name_routes_reach_a_hosted_handle_and_keep_its_errors() {
         .unwrap();
     assert_eq!(registry.screen_text("fixture").unwrap().unwrap(), "screen");
     assert_eq!(
-        registry.clear_input("fixture", b"k").unwrap().unwrap(),
+        registry.clear_input("fixture", b"\x15").unwrap().unwrap(),
         Some("draft".into())
     );
     assert_eq!(
@@ -594,7 +594,7 @@ fn name_routes_reach_a_hosted_handle_and_keep_its_errors() {
             Call::Send(b"raw".to_vec()),
             Call::Feed(vec![Step::Pause(1)]),
             Call::Resize(Size::new(100, 30)),
-            Call::Clear(b"k".to_vec()),
+            Call::Clear(b"\x15".to_vec()),
         ]
     );
     let listed = registry.list();

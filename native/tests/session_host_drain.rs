@@ -3,6 +3,9 @@
 //! the next daemon takes over without waiting for a lease.
 #![cfg(unix)]
 
+#[path = "daemon_support/reap.rs"]
+mod reap;
+
 use remuda_core::protocol::{Request, Response, Step};
 use remuda_core::Size;
 use remuda_native::{client, daemon};
@@ -36,9 +39,7 @@ impl Root {
 }
 impl Drop for Root {
     fn drop(&mut self) {
-        let _ = Command::new("/usr/bin/pkill")
-            .args(["-KILL", "-f", &self.0.to_string_lossy()])
-            .status();
+        reap::kill_processes_under(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
