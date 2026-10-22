@@ -1058,7 +1058,7 @@ impl SocketLock {
             let mut lock_name = socket.as_os_str().to_os_string();
             lock_name.push(".lock");
             let lock_path = PathBuf::from(lock_name);
-            let mut file = std::fs::OpenOptions::new()
+            let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
                 .read(true)
@@ -1079,11 +1079,7 @@ impl SocketLock {
                 let result =
                     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                 if result == 0 {
-                    use std::io::{Seek, SeekFrom};
-                    file.set_len(0)?;
-                    file.seek(SeekFrom::Start(0))?;
-                    writeln!(file, "{}", std::process::id())?;
-                    file.flush()?;
+                    write_lock_pid(&file, std::process::id())?;
                     break;
                 }
                 let error = std::io::Error::last_os_error();
@@ -1134,13 +1130,30 @@ impl SocketLock {
     #[cfg(unix)]
     fn name_this_process(fd: std::os::fd::RawFd) -> std::io::Result<()> {
         use std::os::fd::FromRawFd;
-        use std::os::unix::fs::FileExt;
         // SAFETY: `fd` is the lock this daemon holds; ManuallyDrop keeps it open.
         let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
-        file.set_len(0)?;
-        file.write_all_at(format!("{}\n", std::process::id()).as_bytes(), 0)
+        write_lock_pid(&file, std::process::id())
     }
 }
+
+/// Name `pid` in the lock file. Readers never see it empty or mixed: the
+/// file is always `LOCK_PID_WIDTH` bytes, the pid padded with newlines, so
+/// one write replaces the whole of it and its length never changes.
+#[cfg(unix)]
+fn write_lock_pid(file: &std::fs::File, pid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let mut text = format!("{pid}\n").into_bytes();
+    text.resize(LOCK_PID_WIDTH, b'\n');
+    file.write_all_at(&text, 0)?;
+    if file.metadata()?.len() != LOCK_PID_WIDTH as u64 {
+        file.set_len(LOCK_PID_WIDTH as u64)?;
+    }
+    Ok(())
+}
+
+/// Room for any `u32` pid and its newline.
+#[cfg(unix)]
+const LOCK_PID_WIDTH: usize = 16;
 
 #[cfg(unix)]
 pub fn prepare_socket_path(socket: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
@@ -1961,6 +1974,28 @@ fn roll_back(
 /// Longest act (30 s plus its pauses) a clean shutdown waits for.
 #[cfg(unix)]
 const HOST_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(35);
+
+/// How long `stop` waits for host-backed sessions it closes to stop.
+#[cfg(unix)]
+const HOST_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `stop` ends host-backed sessions as it ends in-process ones, unless the
+/// caller keeps them; `reload` is the way to carry them to a new daemon.
+#[cfg(unix)]
+fn close_session_hosts(registry: &Registry, image: &Image) {
+    let (closed, left) = image
+        .session_hosts()
+        .close_all(registry, HOST_CLOSE_DEADLINE);
+    if closed > 0 {
+        eprintln!("remuda daemon: stop closed {closed} host-backed session(s)");
+    }
+    if !left.is_empty() {
+        eprintln!(
+            "remuda daemon: still closing at exit: {}; the next daemon finishes them",
+            left.join(", ")
+        );
+    }
+}
 
 /// Refuse new host-backed work and let admitted work finish (#758). Hosts are
 /// never stopped; what is still running at the deadline stays recoverable.
@@ -3264,6 +3299,7 @@ fn handle_shutdown(
         requester_session_id,
         requester_session_name,
         override_hosted,
+        keep_sessions,
     } = request
     else {
         unreachable!("handle_shutdown only accepts Shutdown requests");
@@ -3335,6 +3371,12 @@ fn handle_shutdown(
             // A session can request this shutdown as soon as its process starts. Let
             // every already-running New handler flush its response before the daemon exits.
             wait_for_new_requests();
+            #[cfg(windows)]
+            let _ = keep_sessions;
+            #[cfg(unix)]
+            if !keep_sessions {
+                close_session_hosts(registry, image);
+            }
             reap_processes_before_exit(image);
             anti_entropy.stop_and_join();
             socket_owner.cleanup();
@@ -4444,6 +4486,36 @@ fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// A pid rewritten in the lock file is never seen half written: a
+    /// reader always parses one whole pid (#713 reload_faults flake).
+    #[cfg(unix)]
+    #[test]
+    fn a_rewritten_lock_pid_always_reads_whole() {
+        let path = std::env::temp_dir().join(format!("remuda-lockpid-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        super::write_lock_pid(&file, 7).unwrap();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                for round in 0..20_000u32 {
+                    let pid = if round % 2 == 0 { 1_234_567 } else { 7 };
+                    super::write_lock_pid(&file, pid).unwrap();
+                }
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                matches!(text.trim().parse::<u32>(), Ok(7 | 1_234_567)),
+                "read {text:?}"
+            );
+        }
+        writer.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
     use super::{
         acquire_sync_permit, attempt_paste_cleanup, auto_listener_addresses,
         auto_listener_ip_changed, drain_queued_attach_input, finish_shutdown_verdict,

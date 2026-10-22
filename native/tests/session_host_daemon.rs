@@ -467,6 +467,7 @@ fn an_agent_hosted_by_an_earlier_daemon_cannot_stop_its_replacement() {
             requester_session_id: Some("stale-session-id".into()),
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         },
     );
     assert!(
@@ -482,6 +483,7 @@ fn an_agent_hosted_by_an_earlier_daemon_cannot_stop_its_replacement() {
             requester_session_id: None,
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         },
     );
     assert_eq!(stopped, Response::Ok);
@@ -655,6 +657,7 @@ fn upgrade_across_builds(daemon_exe: &Path, installed: &Path) {
             requester_session_id: None,
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         },
     );
     drop(daemon);

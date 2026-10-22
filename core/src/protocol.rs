@@ -365,9 +365,9 @@ pub enum Request {
     ClusterVfsTake { hashes: Vec<String> },
     /// Read or reload the daemon-owned local cluster listener.
     ClusterListener(ListenerOp),
-    /// Stop the daemon, so the next command starts a fresh one. The daemon
-    /// refuses a request identifying one of its own sessions unless the
-    /// caller explicitly overrides the hosted-session guard.
+    /// Stop the daemon and its sessions (host-backed ones unless
+    /// `keep_sessions`; older daemons ignore it and keep them). Refused from
+    /// one of its own sessions unless the caller overrides the guard.
     Shutdown {
         #[serde(default)]
         requester_daemon_id: Option<String>,
@@ -377,6 +377,8 @@ pub enum Request {
         requester_session_name: Option<String>,
         #[serde(default)]
         override_hosted: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keep_sessions: bool,
     },
     /// Evaluate Lua in the daemon's long-lived image. Caution: the state this
     /// touches outlives the request — two `Eval`s share globals, and a script,
