@@ -38,6 +38,8 @@
     old daemon takes everything back and keeps serving, and `reload` exits
     1.
   - In-process sessions still block a reload.
+  - A mod can hold off a reload while it is busy: its optional
+    `daemon_reload_ready(state)` returns a reason, shown as a blocker.
   - Lua: `remuda.daemon.reloaded_from()` returns the pid of the daemon this
     one took over from, or nil after a fresh start.
 
