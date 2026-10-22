@@ -56,6 +56,9 @@ pub const LINE_ANSWER_MAX_BYTES: usize = 1024;
 /// Maximum newline-delimited frame carrying a [`Request::LineAnswer`].
 pub const LINE_ANSWER_MAX_FRAME_BYTES: usize = 8 * 1024;
 
+/// A peer listing this in `caps` serves [`Request::ClusterVfsTake`].
+pub const VFS_CAP_TAKE: &str = "take";
+
 /// Whether a character is an invisible formatting or separator character that
 /// should not be preserved in a prompt label or visible line answer.
 pub fn is_secret_prompt_format_or_separator(ch: char) -> bool {
@@ -343,12 +346,23 @@ pub enum Request {
         digest: Option<String>,
         offset: usize,
     },
+    /// Index rows the peer changed after `since` (its change sequence), at
+    /// most `limit` (#778). `index_id` is the peer's index as the caller last
+    /// saw it; a mismatch answers `reset`. Older peers do not know it.
+    ClusterVfsChanges {
+        index_id: Option<String>,
+        since: u64,
+        limit: u32,
+    },
     /// Merge bounded virtual file index entries from an authenticated peer.
     ClusterVfsIndexUpdate { entries_json: String },
     /// Which of these blob hashes the peer holds.
     ClusterVfsBlobStat { hashes: Vec<String> },
     /// Read one chunk of a blob the peer holds, from `offset`.
     ClusterVfsBlobGet { sha256: String, offset: u64 },
+    /// Ask the peer to pull and keep these blobs: the caller is draining
+    /// before it leaves. Only sent to peers that list `VFS_CAP_TAKE`.
+    ClusterVfsTake { hashes: Vec<String> },
     /// Read or reload the daemon-owned local cluster listener.
     ClusterListener(ListenerOp),
     /// Stop the daemon, so the next command starts a fresh one. The daemon
@@ -520,6 +534,25 @@ pub enum Response {
         entries_json: String,
         next_offset: Option<usize>,
         unchanged: bool,
+    },
+    /// Rows after a cursor, oldest change first. `last_seq` is the new cursor.
+    ClusterVfsChangesPage {
+        index_id: String,
+        entries_json: String,
+        last_seq: u64,
+        more: bool,
+        reset: bool,
+        /// With `reset`: the caller missed deletes collected here, so it must
+        /// drop all but its own writes after `seen_seq` (our cursor into it).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stale: bool,
+        #[serde(default)]
+        seen_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seen_index_id: Option<String>,
+        /// VFS requests this peer serves beyond the base set, e.g. "take".
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        caps: Vec<String>,
     },
     /// Index entries were merged; `applied` counts those that changed state.
     ClusterVfsAck {

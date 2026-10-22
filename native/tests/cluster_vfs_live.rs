@@ -318,6 +318,8 @@ fn put_on_one_node_reads_on_every_node_and_delete_reaches_all() {
         "vfs put",
     );
     assert!(put.contains("2 copies confirmed"), "{put}");
+    let said = put_min_copies(&a, "remuda:///min.md", 3);
+    assert!(said.contains("3 copies confirmed"), "{said}");
 
     // The name reaches every node, and every node can read the content,
     // fetching it from a holder when it has no copy.
@@ -367,6 +369,33 @@ fn put_on_one_node_reads_on_every_node_and_delete_reaches_all() {
         a.stat_json("remuda:///butler/guidance/cluster.md")
             .is_some_and(|stat| stat["sha256"] == sha256_hex(b"v2"))
     });
+
+    // B saw A's write before its own, so that is no conflict.
+    let stat = a.stat_json("remuda:///butler/guidance/cluster.md").unwrap();
+    assert_eq!(stat["conflicts"], serde_json::json!([]));
+    let listed = successful(a.run(&["vfs", "ls", "--conflicts"]), "ls --conflicts");
+    assert_eq!(listed.trim(), "No conflicts.");
+    let lua = successful(
+        a.run(&[
+            "-e",
+            "return #remuda.vfs.stat('remuda:///butler/guidance/cluster.md').conflicts",
+        ]),
+        "lua conflicts",
+    );
+    assert_eq!(lua.trim(), "0");
+    let settle = a.run(&[
+        "vfs",
+        "resolve-conflict",
+        "remuda:///butler/guidance/cluster.md",
+        "--keep",
+        "winner",
+    ]);
+    assert!(!settle.status.success());
+    assert!(
+        String::from_utf8_lossy(&settle.stderr).contains("no conflict at"),
+        "{}",
+        String::from_utf8_lossy(&settle.stderr)
+    );
 
     // Delete on C reaches A and B.
     successful(
@@ -454,6 +483,65 @@ fn losing_a_holder_makes_the_next_node_take_a_copy() {
         "local get on new holder",
     );
     assert_eq!(got.as_bytes(), &body[..]);
+
+    // The lost holder comes back with its copy: the placement is the
+    // original pair again, so the outsider trims its stand-in copy.
+    let back = nodes[lost].as_mut().unwrap();
+    back.spawn_daemon();
+    back.enable_listener();
+    let outsider_node = nodes[outsider].as_ref().unwrap();
+    wait_until(
+        "outsider trims its stand-in copy",
+        Duration::from_secs(20),
+        || !outsider_node.has_blob(&sha),
+    );
+    for holder in [lost, survivor] {
+        assert!(nodes[holder].as_ref().unwrap().has_blob(&sha));
+    }
+}
+
+/// A body whose one copy goes to `nodes[from]` with every node up, and to
+/// `nodes[to]` once `nodes[from]` is gone.
+fn body_moving(nodes: &[&Node], from: usize, to: usize) -> Vec<u8> {
+    let fingerprints: Vec<String> = nodes.iter().map(|node| node.fingerprint()).collect();
+    let all: Vec<&str> = fingerprints.iter().map(String::as_str).collect();
+    let rest: Vec<&str> = all
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != from)
+        .map(|(_, fp)| *fp)
+        .collect();
+    (0..)
+        .map(|n| format!("drain body {n}").into_bytes())
+        .find(|body| {
+            let sha = sha256_hex(body);
+            remuda_core::vfs::placement(&sha, 1, &all) == [all[from]]
+                && remuda_core::vfs::placement(&sha, 1, &rest) == [all[to]]
+        })
+        .unwrap()
+}
+
+/// `put --replicas 1` of `body` on `node`.
+fn put_one_copy(node: &Node, uri: &str, body: &[u8]) {
+    successful(
+        node.run_with_stdin(&["vfs", "put", "-", uri, "--replicas", "1"], Some(body)),
+        "vfs put --replicas 1",
+    );
+}
+
+#[test]
+fn drain_has_the_next_node_take_what_only_the_leaving_node_holds() {
+    let _serial = live_test_guard();
+    let (a, b, c) = three_nodes();
+    let body = body_moving(&[&a, &b, &c], 2, 1);
+    let sha = sha256_hex(&body);
+    put_one_copy(&c, "remuda:///leaving.txt", &body);
+    assert!(!b.has_blob(&sha));
+
+    let said = successful(c.run(&["vfs", "drain", "--timeout", "30"]), "vfs drain");
+    assert!(said.contains("Safe to leave"), "{said}");
+    assert!(b.has_blob(&sha));
+    assert!(!a.has_blob(&sha));
 }
 
 #[test]
@@ -468,7 +556,8 @@ fn clear_errors_for_wrong_cluster_missing_and_no_cluster() {
         "{text}"
     );
     let missing = a.run(&["vfs", "get", "remuda:///x"]);
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("no file at x"));
+    let text = String::from_utf8_lossy(&missing.stderr);
+    assert!(text.contains("no file at x"), "{text}");
 
     successful(a.run(&["vfs", "config", "--cluster", "home"]), "vfs config");
     successful(
@@ -511,7 +600,8 @@ fn clear_errors_for_wrong_cluster_missing_and_no_cluster() {
     bare.spawn_daemon();
     let output = bare.run(&["vfs", "ls"]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no cluster"));
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(text.contains("no cluster"), "{text}");
 
     // With no daemon, vfs fails with one line and touches no store (#778).
     bare.kill();
@@ -545,6 +635,29 @@ fn put(node: &Node, uri: &str, body: &[u8]) {
         node.run_with_stdin(&["vfs", "put", "-", uri, "--replicas", "2"], Some(body)),
         "vfs put",
     );
+}
+
+/// `put --replicas 3 --min-copies MIN`; returns stdout and stderr.
+fn put_min_copies(node: &Node, uri: &str, min: u8) -> String {
+    let min = min.to_string();
+    let args = [
+        "vfs",
+        "put",
+        "-",
+        uri,
+        "--replicas",
+        "3",
+        "--min-copies",
+        &min,
+    ];
+    let output = node.run_with_stdin(&args, Some(b"three copies"));
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "put --min-copies: {said}");
+    said
 }
 
 fn wait_for_body(node: &Node, uri: &str, body: &[u8]) {
@@ -582,11 +695,30 @@ fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
         wait_for_body(node, from_new, b"written by N+1");
     }
 
+    // --min-copies counts the older node's copy through BlobStat.
+    let said = put_min_copies(&a, "remuda:///mixed/three.txt", 3);
+    assert!(said.contains("3 copies confirmed"), "{said}");
+
     // A newer write on the older node wins on both newer nodes.
     put(&old, from_new, b"rewritten by N");
     for node in [&a, &c] {
         wait_for_body(node, from_new, b"rewritten by N");
     }
+
+    // N writes without a version vector: last write wins as before, and no
+    // newer node reports a conflict for it.
+    for node in [&a, &c] {
+        assert_eq!(kept_conflicts(node), 0);
+    }
+
+    // Drain asks only peers that offer "take": the older node is named
+    // instead, and drain exits 75 while its file is short.
+    let body = body_moving(&[&a, &old, &c], 2, 1);
+    put_one_copy(&c, "remuda:///mixed/leaving.txt", &body);
+    let drained = c.run(&["vfs", "drain", "--timeout", "3"]);
+    let said = String::from_utf8_lossy(&drained.stderr);
+    assert_eq!(drained.status.code(), Some(75), "{said}");
+    assert!(said.contains("too old to take copies"), "{said}");
 
     // Deletes cross in both directions.
     successful(c.run(&["vfs", "rm", from_old]), "rm on N+1");
@@ -595,6 +727,15 @@ fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
     for node in [&a, &c] {
         wait_gone(node, from_new);
     }
+}
+
+/// Rows in `index.db`'s conflicts table (design step 4); 0 before that step.
+fn kept_conflicts(node: &Node) -> i64 {
+    let index = node.root.join("state/remuda/cluster/vfs/index.db");
+    rusqlite::Connection::open(index)
+        .unwrap()
+        .query_row("SELECT count(*) FROM conflicts", [], |row| row.get(0))
+        .unwrap_or(0)
 }
 
 /// The documented downgrade from `index.db` to a build that reads only
@@ -643,11 +784,11 @@ fn older_build_refuses_a_newer_index_db_cleanly() {
     let mut node = Node::start();
     put(&node, "remuda:///kept.txt", b"kept");
     node.kill_daemon_only();
-    // As if this build had added schema step 2.
+    // As if a much later build had added schema steps.
     let index = node.root.join("state/remuda/cluster/vfs/index.db");
     rusqlite::Connection::open(&index)
         .unwrap()
-        .pragma_update(None, "user_version", 2)
+        .pragma_update(None, "user_version", 99)
         .unwrap();
     node.exe = previous();
     node.spawn_daemon();
@@ -662,5 +803,51 @@ fn older_build_refuses_a_newer_index_db_cleanly() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 99);
+}
+
+/// `remuda vfs index-downgrade` steps index.db back so the previous build
+/// (one or more schema steps behind) reads it; the upgrade after that keeps
+/// it all.
+#[test]
+#[ignore = "needs REMUDA_COMPAT_PREVIOUS from a build with index.db; run by CI job host-compat-n-plus-one"]
+fn older_build_reads_the_index_after_index_downgrade() {
+    let _serial = live_test_guard();
+    let mut node = Node::start();
+    let current = node.exe.clone();
+    put(&node, "remuda:///kept.txt", b"kept");
+    let plan = successful(node.run(&["vfs", "index-downgrade", "1"]), "dry run");
+    assert!(
+        plan.contains("undo schema steps") && plan.contains("2 (change-cursors)"),
+        "{plan}"
+    );
+    let done = successful(
+        node.run(&["vfs", "index-downgrade", "1", "--yes"]),
+        "index-downgrade",
+    );
+    assert!(done.contains("index.db is now at schema 1 (was "), "{done}");
+    // This daemon no longer touches the index, so it cannot upgrade it again.
+    let refused = node.run(&["vfs", "ls"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("stepped back"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    node.kill_daemon_only();
+    node.exe = previous();
+    node.spawn_daemon();
+    let listed = successful(node.run(&["vfs", "ls"]), "ls on N");
+    assert!(listed.contains("kept.txt"), "{listed}");
+    put(&node, "remuda:///from-n.txt", b"written by N");
+
+    node.kill_daemon_only();
+    node.exe = current;
+    node.spawn_daemon();
+    let listed = successful(node.run(&["vfs", "ls"]), "ls on N+1");
+    assert!(
+        listed.contains("kept.txt") && listed.contains("from-n.txt"),
+        "{listed}"
+    );
 }

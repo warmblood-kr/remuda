@@ -5,6 +5,9 @@
 //! the handover.
 #![cfg(unix)]
 
+#[path = "daemon_support/reap.rs"]
+mod reap;
+
 use remuda_core::protocol::{Request, Response};
 use remuda_core::Size;
 use remuda_native::{client, daemon, reload};
@@ -61,9 +64,7 @@ impl Root {
 }
 impl Drop for Root {
     fn drop(&mut self) {
-        let _ = Command::new("/usr/bin/pkill")
-            .args(["-KILL", "-f", &self.0.to_string_lossy()])
-            .status();
+        reap::kill_processes_under(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -230,6 +231,27 @@ fn a_candidate_handed_the_endpoint_claims_the_hosts_and_serves() {
     );
     // SAFETY: getsid only reads.
     assert_eq!(unsafe { libc::getsid(pid as i32) }, pid as i32);
+    // `ps` shows the daemon it became, not the candidate verb.
+    let args = Command::new("/bin/ps")
+        .args(["-o", "args=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let args = String::from_utf8_lossy(&args.stdout);
+    assert!(args.trim_end().ends_with(" -s s daemon"), "{args}");
+    // The re-exec's marker is gone from its environment, which every child
+    // it runs (hosts, `process.run`) inherits.
+    let env = request(
+        &path,
+        &Request::Eval {
+            code: r#"return remuda.process.run{argv = {"/usr/bin/env"}}.stdout"#.into(),
+            name: None,
+        },
+    );
+    let Response::Value(env) = env else {
+        panic!("{env:?}");
+    };
+    assert!(env.contains("REMUDA_RUNTIME_DIR="), "{env}");
+    assert!(!env.contains("REMUDA_RELOAD_CANDIDATE"), "{env}");
     // It drives the host the first daemon left: it claimed the inventory.
     assert_eq!(
         request(
@@ -295,4 +317,17 @@ fn a_take_without_both_fds_fails_before_claiming_anything() {
     );
     assert!(started.elapsed() < Duration::from_secs(2));
     let _ = std::io::stderr().flush();
+}
+
+#[test]
+fn a_stray_candidate_marker_without_the_handoff_socket_is_ignored() {
+    let out = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .arg("--version")
+        .env(reload::CANDIDATE_ENV, "/nonexistent.sock")
+        .env("REMUDA_NO_UPDATE_CHECK", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("remuda "));
 }
