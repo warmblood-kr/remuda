@@ -98,3 +98,7 @@ name = "session_host_fixture"
 path = "tests/daemon_support/session_host_fixture.rs"
 test = false
 bench = false
+
+[dev-dependencies]
+# Tests define SQL functions (the migration crash test stops inside a step).
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "functions"] }

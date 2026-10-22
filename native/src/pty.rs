@@ -1855,7 +1855,7 @@ pub(crate) fn signal_number(description: &str) -> Option<i32> {
 }
 
 #[cfg(unix)]
-fn signal_name(signal: i32) -> Option<String> {
+pub(crate) fn signal_name(signal: i32) -> Option<String> {
     let name = match signal {
         libc::SIGHUP => "SIGHUP",
         libc::SIGINT => "SIGINT",
@@ -1878,7 +1878,7 @@ fn signal_name(signal: i32) -> Option<String> {
 }
 
 #[cfg(not(unix))]
-fn signal_name(_: i32) -> Option<String> {
+pub(crate) fn signal_name(_: i32) -> Option<String> {
     None
 }
 

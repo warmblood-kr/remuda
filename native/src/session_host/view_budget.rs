@@ -1,4 +1,7 @@
-//! One snapshot allocation, bounded FIFO turns and capture cooldowns.
+//! One snapshot allocation, bounded FIFO turns and capture cooldowns. The
+//! host-wide cooldown after a snapshot grows with its size, so small typed
+//! views (most captures since compact rows) stay fast while large ones are
+//! still spaced by the full cooldown.
 use super::control::ConnectionId;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -7,6 +10,8 @@ const CONNECTIONS: usize = 16;
 const TURN_TTL: Duration = Duration::from_millis(500);
 const CONNECTION_COOLDOWN: Duration = Duration::from_millis(250);
 const GLOBAL_COOLDOWN: Duration = Duration::from_millis(50);
+/// Host-wide cooldown per snapshot page, up to `GLOBAL_COOLDOWN`.
+const PAGE_COOLDOWN: Duration = Duration::from_millis(1);
 
 pub(crate) struct Budget(Arc<Mutex<State>>);
 struct State {
@@ -19,6 +24,7 @@ pub(crate) struct Lease {
     state: Arc<Mutex<State>>,
     id: ConnectionId,
     released: bool,
+    cooldown: Duration,
 }
 impl Budget {
     pub fn new() -> Self {
@@ -56,6 +62,7 @@ impl Budget {
             state: self.0.clone(),
             id,
             released: false,
+            cooldown: GLOBAL_COOLDOWN,
         })
     }
     /// Caller drops its snapshot lease before forgetting its connection.
@@ -66,6 +73,11 @@ impl Budget {
     }
 }
 impl Lease {
+    /// Sizes the host-wide cooldown to the snapshot this lease holds.
+    pub fn charge(&mut self, pages: usize) {
+        let pages = u32::try_from(pages.max(1)).unwrap_or(u32::MAX);
+        self.cooldown = PAGE_COOLDOWN.saturating_mul(pages).min(GLOBAL_COOLDOWN);
+    }
     fn release(&mut self, now: Instant) {
         if self.released {
             return;
@@ -73,7 +85,7 @@ impl Lease {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.owner == Some(self.id) {
             state.owner = None;
-            state.ready = now + GLOBAL_COOLDOWN;
+            state.ready = now + self.cooldown;
             if let Some((_, ready)) = state.connections.iter_mut().find(|(id, _)| *id == self.id) {
                 *ready = now + CONNECTION_COOLDOWN;
             }
@@ -129,6 +141,25 @@ mod tests {
         }
         assert!(budget.0.lock().unwrap().connections.is_empty());
         assert!(budget.0.lock().unwrap().waiting.is_empty());
+    }
+    #[test]
+    fn the_global_cooldown_follows_the_snapshot_size() {
+        let budget = Budget::new();
+        let now = Instant::now();
+        let mut small = budget.acquire(ConnectionId(1), now).unwrap();
+        small.charge(1);
+        small.release(now);
+        assert!(budget.acquire(ConnectionId(2), now).is_none());
+        let after = now + PAGE_COOLDOWN;
+        let mut large = budget.acquire(ConnectionId(2), after).unwrap();
+        large.charge(10_000);
+        large.release(after);
+        assert!(budget
+            .acquire(ConnectionId(3), after + GLOBAL_COOLDOWN - PAGE_COOLDOWN)
+            .is_none());
+        assert!(budget
+            .acquire(ConnectionId(3), after + GLOBAL_COOLDOWN)
+            .is_some());
     }
     #[test]
     fn connection_and_waiting_storage_refuse_at_fixed_count() {

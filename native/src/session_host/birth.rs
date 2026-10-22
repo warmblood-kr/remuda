@@ -77,7 +77,7 @@ fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
 }
 pub(crate) fn run(endpoint_path: &Path) -> io::Result<()> {
-    let bytes = super::wire::read_frame(&mut io::stdin().lock(), super::wire::MAX_FRAME)?;
+    let bytes = super::wire::read_bootstrap(&mut io::stdin().lock())?;
     let bootstrap: Bootstrap = serde_json::from_slice(&bytes).map_err(invalid)?;
     let launch: Launch = serde_json::from_str(bootstrap.launch.get()).map_err(invalid)?;
     super::entry::validate(&launch)?;
@@ -138,8 +138,13 @@ pub(crate) fn run(endpoint_path: &Path) -> io::Result<()> {
         command.env(key, value);
     }
     let staged = Staged::new(
-        Owned::spawn_reserved(identity, name, command, Size::new(launch.cols, launch.rows))
-            .map_err(invalid)?,
+        Owned::spawn_reserved(
+            identity,
+            name,
+            command,
+            Size::for_viewport(launch.cols, launch.rows),
+        )
+        .map_err(invalid)?,
     );
     #[cfg(test)]
     tests::cut("spawned");

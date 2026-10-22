@@ -220,10 +220,9 @@ pub(super) fn notice(screen: &ScreenSnapshot) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// The mode sequences that move a viewer's terminal from `before` (none: a
-/// terminal in default modes) to `after`, so keys, pastes and
-/// mouse reports reach the child encoded as it asked. Nothing when the host
-/// does not report modes.
+/// Mode sequences moving a viewer's terminal from `before` (none: defaults)
+/// to `after`, so keys, pastes and mouse reports reach the child as it asked.
+/// Nothing when the host does not report modes.
 pub(super) fn modes(before: Option<TerminalModes>, after: Option<TerminalModes>) -> Vec<u8> {
     let Some(after) = after else {
         return Vec::new();
