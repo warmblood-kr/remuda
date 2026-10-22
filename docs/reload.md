@@ -55,3 +55,8 @@ A reload refuses, and leaves the old daemon as it was, when:
 `remuda reload --check` reports these without changing anything.
 `remuda upgrade` runs a reload after installing; a refusal there leaves the
 old daemon serving and says why.
+
+After a reload, `remuda reload` and `remuda upgrade` both check the new
+daemon: it answers as the new build, lists every session it took over, and
+loaded `init.lua`. A failed check exits 1 and names what failed. The new
+daemon still serves, since the old one is gone.

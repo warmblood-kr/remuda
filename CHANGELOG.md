@@ -7,6 +7,11 @@
   hands it over. It now holds the pid padded with newlines to a fixed
   width; readers that trim are unaffected.
 
+- `remuda upgrade` (Unix) checks the reloaded daemon as `remuda reload` does:
+  it answers as the new build, lists every session it took over, and loaded
+  `init.lua`. An `init.lua` that fails only in the new daemon is named and
+  `upgrade` exits 1. Before, it checked only the build.
+
 - VFS: a node that took a copy while a holder was down deletes it again
   once that holder is back and confirms its copy (#778). Only copies the
   repair pass fetched are trimmed: files this node wrote, read with `vfs
