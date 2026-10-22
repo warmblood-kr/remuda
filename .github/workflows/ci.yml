@@ -159,8 +159,8 @@ jobs:
   compat-week-old-main:
     # Users update every few days, not every PR, so they cross several schema
     # steps at once. N is the last main commit at least 7 days old (old
-    # nightly tags are deleted, so they cannot be used). The VFS and db N/N+1
-    # tests ask N what it has and skip what it predates. Non-blocking from
+    # nightly tags are deleted, so they cannot be used). Each step asks N
+    # what it has (vfs, session host, reload) and skips what it predates. Non-blocking from
     # 2026-10-22 while its flake rate is learned; make it blocking after a
     # week of runs.
     runs-on: ubuntu-latest
@@ -176,6 +176,7 @@ jobs:
           sha=$(git rev-list -1 --before='7 days ago' FETCH_HEAD)
           [ -n "$sha" ] || { echo "no main commit is 7 days old"; exit 1; }
           echo "N is $sha ($(git log -1 --format=%ci "$sha"))"
+          echo "N_SHA=$sha" >> "$GITHUB_ENV"
           git worktree add "$RUNNER_TEMP/old" "$sha"
           cargo build --manifest-path "$RUNNER_TEMP/old/Cargo.toml" --bins --target-dir "$RUNNER_TEMP/old-target"
           mkdir "$RUNNER_TEMP/n"
@@ -190,7 +191,14 @@ jobs:
           if [ ! -f "$RUNNER_TEMP/n/remuda-session-host" ]; then
             echo "skipped: N has no remuda-session-host"; exit 0
           fi
-          REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test session_host_daemon -- --ignored n_plus_one
+          # The reload tests need N to have `remuda reload` (#793, 3c140ca1).
+          if git merge-base --is-ancestor 3c140ca1 "$N_SHA"; then
+            filter=n_plus_one
+          else
+            echo "skipped reload tests: N predates remuda reload (3c140ca1)"
+            filter=adopts
+          fi
+          REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test session_host_daemon -- --ignored "$filter"
 
   vfs-compat-pre-sqlite:
     # Nodes from before index.db (#778) still run in clusters. Two daemons of
