@@ -50,6 +50,7 @@ mod tests {
                 attached: false,
                 human_idle: None,
                 mouse_tracking: false,
+                unavailable: false,
             },
             "last output".into(),
             Duration::from_secs(3),
