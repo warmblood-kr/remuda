@@ -623,6 +623,8 @@ fn clear_errors_for_wrong_cluster_missing_and_no_cluster() {
 
 /// The previous build's `remuda`. CI sets the directory; there is no default,
 /// so a compat test cannot pass without running the older build.
+// N is the PR's base sha: never assume N lacks a feature that base already
+// merged. Ask N (`vfs help`, change-page caps) and assert per answer.
 fn previous() -> PathBuf {
     let dir = std::env::var_os("REMUDA_COMPAT_PREVIOUS")
         .expect("REMUDA_COMPAT_PREVIOUS names the previous build's binary directory");
