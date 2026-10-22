@@ -19,6 +19,8 @@ neither `reload` nor `reload --check` said so beforehand.
   up to M; …` and name `remuda vfs index-downgrade M --yes`, or `remuda vfs
   export-index` when M is 0.
 - A target from before the field gets a plain note when `index.db` exists.
+- An `index.db` that exists but cannot be read gets a note too, rather
+  than looking like "no VFS".
 - It is a warning, never a blocker: the check still says `ready:` and the
   reload goes through.
 

@@ -360,8 +360,20 @@ fn compare(
 /// A target that reads fewer `index.db` steps than this node's index leaves
 /// the VFS refusing every call until a reload forward. Warn, never block:
 /// sessions are unaffected and nothing is lost (#778).
-fn index_db_warning(candidate: &str, steps: Option<u32>, on_disk: Option<u32>) -> Option<String> {
-    let on_disk = on_disk?;
+fn index_db_warning(
+    candidate: &str,
+    steps: Option<u32>,
+    on_disk: Result<Option<u32>, String>,
+) -> Option<String> {
+    let on_disk = match on_disk {
+        Ok(on_disk) => on_disk?,
+        Err(error) => {
+            return Some(format!(
+                "could not read the index.db schema ({error}), so it is unknown whether \
+                 {candidate} can read it"
+            ))
+        }
+    };
     let undo = |to: u32| {
         if to == 0 {
             "`remuda vfs export-index` on this build first".to_owned()
@@ -710,10 +722,10 @@ mod tests {
     #[test]
     fn a_target_that_reads_an_older_index_db_is_warned_about_not_blocked() {
         // Nothing to warn about: no index, or the target reads it.
-        assert_eq!(index_db_warning("2+b", Some(3), None), None);
-        assert_eq!(index_db_warning("2+b", Some(3), Some(3)), None);
-        assert_eq!(index_db_warning("2+b", Some(4), Some(3)), None);
-        let older = index_db_warning("2+b", Some(2), Some(3)).unwrap();
+        assert_eq!(index_db_warning("2+b", Some(3), Ok(None)), None);
+        assert_eq!(index_db_warning("2+b", Some(3), Ok(Some(3))), None);
+        assert_eq!(index_db_warning("2+b", Some(4), Ok(Some(3))), None);
+        let older = index_db_warning("2+b", Some(2), Ok(Some(3))).unwrap();
         assert!(
             older.contains("index.db is at schema 3 but 2+b reads up to 2"),
             "{older}"
@@ -723,10 +735,15 @@ mod tests {
             "{older}"
         );
         // Step 1 cannot be undone; a build without index.db needs the export.
-        let none = index_db_warning("2+b", Some(0), Some(1)).unwrap();
+        let none = index_db_warning("2+b", Some(0), Ok(Some(1))).unwrap();
         assert!(none.contains("`remuda vfs export-index`"), "{none}");
         // A target from before the field: say what is known.
-        let silent = index_db_warning("2+b", None, Some(3)).unwrap();
+        let unread = index_db_warning("2+b", Some(3), Err("database is locked".into())).unwrap();
+        assert!(
+            unread.contains("could not read the index.db schema (database is locked)"),
+            "{unread}"
+        );
+        let silent = index_db_warning("2+b", None, Ok(Some(3))).unwrap();
         assert!(
             silent.contains("does not say which index.db schema"),
             "{silent}"
