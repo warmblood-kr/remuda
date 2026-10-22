@@ -10,6 +10,8 @@
 //! new one. Foreign keys are off during a run and checked before commit.
 //! Step SQL runs under an authorizer: no ATTACH, no transaction control, no
 //! PRAGMA but `foreign_key_check`, and no write to `_remuda_*` tables.
+//! A base (`NNNN_slug.base.sql`) creates a new database at step NNNN, so a mod
+//! can delete older step files; its record then starts at NNNN.
 //!
 //! See docs/design-778-sqlite-migrations.md.
 
@@ -30,6 +32,45 @@ pub struct Step {
     pub down: Option<String>,
 }
 
+/// `NNNN_slug.base.sql`: the whole schema as of step `version`. A new
+/// database runs it instead of steps 1..=version, so a mod can delete them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Base {
+    pub version: u32,
+    pub name: String,
+    pub up: String,
+}
+
+/// What a mod ships: an optional base, then steps numbered from `first`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StepSet {
+    pub base: Option<Base>,
+    pub first: u32,
+    pub steps: Vec<Step>,
+}
+
+impl StepSet {
+    pub fn plain(steps: Vec<Step>) -> Self {
+        Self {
+            base: None,
+            first: 1,
+            steps,
+        }
+    }
+
+    pub fn target(&self) -> u32 {
+        match (self.steps.len(), &self.base) {
+            (0, Some(base)) => base.version,
+            (count, _) => self.first + count as u32 - 1,
+        }
+    }
+
+    pub fn step(&self, version: u32) -> Option<&Step> {
+        let index = version.checked_sub(self.first)?;
+        self.steps.get(index as usize)
+    }
+}
+
 /// A recorded step, as `status` reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Applied {
@@ -46,32 +87,68 @@ pub struct Moved {
     pub to: u32,
 }
 
-/// Load `NNNN_slug.up.sql` (and optional `.down.sql`) files from `dir`.
-/// Numbers must run 1..N without gaps; an empty file is an error.
-pub fn load_dir(dir: &Path) -> Result<Vec<Step>, String> {
+/// Load `NNNN_slug.up.sql` (and optional `.down.sql`) files and at most one
+/// `NNNN_slug.base.sql` from `dir`. Up files run without gaps, from 1 or
+/// from at most the base's number + 1; an empty file is an error.
+pub fn load_dir(dir: &Path) -> Result<StepSet, String> {
     let entries = fs::read_dir(dir)
         .map_err(|error| format!("migration: cannot read {}: {error}", dir.display()))?;
     let mut ups = std::collections::BTreeMap::new();
     let mut downs = std::collections::BTreeMap::new();
+    let mut base: Option<Base> = None;
     for entry in entries {
         let entry = entry.map_err(|error| format!("migration: {}: {error}", dir.display()))?;
         let file = entry.file_name().to_string_lossy().into_owned();
-        let (stem, is_up) = if let Some(stem) = file.strip_suffix(".up.sql") {
-            (stem, true)
+        let (stem, kind) = if let Some(stem) = file.strip_suffix(".up.sql") {
+            (stem, Kind::Up)
         } else if let Some(stem) = file.strip_suffix(".down.sql") {
-            (stem, false)
+            (stem, Kind::Down)
+        } else if let Some(stem) = file.strip_suffix(".base.sql") {
+            (stem, Kind::Base)
         } else {
             return Err(format!(
-                "migration: {file} is not NNNN_name.up.sql or .down.sql"
+                "migration: {file} is not NNNN_name.up.sql, .down.sql or .base.sql"
             ));
         };
         let (number, name) = parse_stem(stem)
             .ok_or_else(|| format!("migration: {file} does not start with a number and _"))?;
         let sql = fs::read_to_string(entry.path())
             .map_err(|error| format!("migration: cannot read {file}: {error}"))?;
-        let target = if is_up { &mut ups } else { &mut downs };
+        let target = match kind {
+            Kind::Up => &mut ups,
+            Kind::Down => &mut downs,
+            Kind::Base => {
+                if number < 2 || base.is_some() {
+                    return Err(format!(
+                        "migration: {file}: a mod has at most one base, numbered 2 or more"
+                    ));
+                }
+                if sql.trim().is_empty() {
+                    return Err(format!("migration: {file} is empty"));
+                }
+                let name = name.to_owned();
+                base = Some(Base {
+                    version: number,
+                    name,
+                    up: sql,
+                });
+                continue;
+            }
+        };
         if target.insert(number, (name.to_owned(), sql)).is_some() {
             return Err(format!("migration: step {number} appears twice"));
+        }
+    }
+    let first = ups.keys().next().copied().unwrap_or(1);
+    let base_version = base.as_ref().map_or(0, |base| base.version);
+    if first > base_version + 1 {
+        return Err(format!("migration: step {} is missing", base_version + 1));
+    }
+    if let Some(&last) = ups.keys().next_back() {
+        if last < base_version {
+            return Err(format!(
+                "migration: step {last} is before the base ({base_version})"
+            ));
         }
     }
     let mut steps = Vec::with_capacity(ups.len());
@@ -85,8 +162,9 @@ pub fn load_dir(dir: &Path) -> Result<Vec<Step>, String> {
             Some((_, sql)) => Some(sql),
             None => None,
         };
-        if number as usize != steps.len() + 1 {
-            return Err(format!("migration: step {} is missing", steps.len() + 1));
+        let expected = first + steps.len() as u32;
+        if number != expected {
+            return Err(format!("migration: step {expected} is missing"));
         }
         steps.push(Step { name, up, down });
     }
@@ -95,8 +173,14 @@ pub fn load_dir(dir: &Path) -> Result<Vec<Step>, String> {
             "migration: step {number} has a down file but no up file"
         ));
     }
-    check(&steps)?;
-    Ok(steps)
+    check_from(first, &steps)?;
+    Ok(StepSet { base, first, steps })
+}
+
+enum Kind {
+    Up,
+    Down,
+    Base,
 }
 
 fn parse_stem(stem: &str) -> Option<(u32, &str)> {
@@ -110,9 +194,9 @@ fn parse_stem(stem: &str) -> Option<(u32, &str)> {
 }
 
 /// Reject empty SQL and empty names. An intended no-op holds a comment.
-pub fn check(steps: &[Step]) -> Result<(), String> {
+fn check_from(first: u32, steps: &[Step]) -> Result<(), String> {
     for (index, step) in steps.iter().enumerate() {
-        let number = index + 1;
+        let number = first as usize + index;
         if step.name.is_empty() {
             return Err(format!("migration: step {number} has no name"));
         }
@@ -184,9 +268,21 @@ pub fn upgrade(
     steps: &[Step],
     adopt: bool,
 ) -> Result<Moved, String> {
-    check(steps)?;
-    let target = u32::try_from(steps.len()).map_err(|_| "migration: too many steps".to_owned())?;
-    let (from, adopting) = plan(conn, label, steps, target, adopt)?;
+    u32::try_from(steps.len()).map_err(|_| "migration: too many steps".to_owned())?;
+    upgrade_set(conn, label, &StepSet::plain(steps.to_vec()), adopt)
+}
+
+/// `upgrade` for a set that may start with a base: a new database runs the
+/// base, records it at its number, then runs the later steps.
+pub fn upgrade_set(
+    conn: &mut Connection,
+    label: &str,
+    set: &StepSet,
+    adopt: bool,
+) -> Result<Moved, String> {
+    check_from(set.first, &set.steps)?;
+    let target = set.target();
+    let (from, adopting) = plan(conn, label, set, adopt)?;
     if from == target && !adopting {
         return Ok(Moved { from, to: target });
     }
@@ -194,42 +290,71 @@ pub fn upgrade(
     // steps between our read and the lock.
     let mut moved = Moved { from, to: target };
     in_run(conn, |tx| {
-        let (from, adopting) = plan(tx, label, steps, target, adopt)?;
+        let (from, adopting) = plan(tx, label, set, adopt)?;
         moved.from = from;
         if from == target && !adopting {
             return Ok(());
         }
         create_table(tx)?;
-        let start = if adopting { 0 } else { from };
-        for (index, step) in steps.iter().enumerate().skip(start as usize) {
-            let number = index as u32 + 1;
-            if number > from {
-                run_step_sql(tx, &step.up).map_err(|error| {
-                    format!("{error} (in {label} step {number}, {})", step.name)
-                })?;
+        let mut at = from;
+        if adopting {
+            for number in 1..=from {
+                record(tx, number, wanted(set, label, number)?)?;
             }
-            tx.execute(
-                &format!(
-                    "INSERT INTO {TABLE} (version, name, up_sha256, down_sql, applied_at) VALUES (?1, ?2, ?3, ?4, ?5)"
-                ),
-                params![number, step.name, sha256_hex(&step.up), step.down, unix_now()],
-            )
-            .map_err(sql)?;
+        } else if let (0, Some(base)) = (from, &set.base) {
+            run_step_sql(tx, &base.up).map_err(|error| {
+                format!("{error} (in {label} base {}, {})", base.version, base.name)
+            })?;
+            let step = Step {
+                name: base.name.clone(),
+                up: base.up.clone(),
+                down: None,
+            };
+            record(tx, base.version, &step)?;
+            at = base.version;
+        }
+        for number in at + 1..=target {
+            let step = wanted(set, label, number)?;
+            run_step_sql(tx, &step.up)
+                .map_err(|error| format!("{error} (in {label} step {number}, {})", step.name))?;
+            record(tx, number, step)?;
         }
         set_version(tx, target)
     })?;
     Ok(moved)
 }
 
-/// Check the applied steps against `steps`: the applied version, and whether
-/// an unrecorded `user_version` is adopted. Refuses too new, unrecorded or drifted.
-fn plan(
-    conn: &Connection,
-    label: &str,
-    steps: &[Step],
-    target: u32,
-    adopt: bool,
-) -> Result<(u32, bool), String> {
+fn wanted<'a>(set: &'a StepSet, label: &str, number: u32) -> Result<&'a Step, String> {
+    set.step(number)
+        .ok_or_else(|| squashed(label, number - 1, set))
+}
+
+fn squashed(label: &str, from: u32, set: &StepSet) -> String {
+    let base = set.base.as_ref().map_or(String::new(), |base| {
+        format!(" into {:04}_{}.base.sql", base.version, base.name)
+    });
+    format!(
+        "squashed: {label} is at version {from}, but steps 1-{} were squashed{base}; open it once with an older release of the mod",
+        set.first - 1
+    )
+}
+
+fn record(tx: &Connection, number: u32, step: &Step) -> Result<(), String> {
+    tx.execute(
+        &format!(
+            "INSERT INTO {TABLE} (version, name, up_sha256, down_sql, applied_at) VALUES (?1, ?2, ?3, ?4, ?5)"
+        ),
+        params![number, step.name, sha256_hex(&step.up), step.down, unix_now()],
+    )
+    .map(|_| ())
+    .map_err(sql)
+}
+
+/// Check the applied steps against `set`: the applied version, and whether
+/// an unrecorded `user_version` is adopted. Refuses too new, unrecorded,
+/// drifted, or below a squash.
+fn plan(conn: &Connection, label: &str, set: &StepSet, adopt: bool) -> Result<(u32, bool), String> {
+    let target = set.target();
     let from = version(conn)?;
     let recorded = status(conn)?;
     if from > target {
@@ -238,28 +363,61 @@ fn plan(
         ));
     }
     let adopting = adopt && recorded.is_empty() && from > 0;
-    if !adopting && recorded.len() != from as usize {
+    if !adopting {
+        check_record(label, &recorded, from)?;
+    }
+    if let Some(applied) = drifted(set, &recorded) {
+        return Err(format!(
+            "drift: {label} step {} ({}) changed after it was applied; add a new step instead of editing it",
+            applied.version, applied.name
+        ));
+    }
+    if from > 0 && from + 1 < set.first {
+        return Err(squashed(label, from, set));
+    }
+    Ok((from, adopting))
+}
+
+/// The record runs without gaps up to `from`, from 1 or, for a database
+/// created from a base, from the base's number.
+fn check_record(label: &str, recorded: &[Applied], from: u32) -> Result<(), String> {
+    let first = recorded.first().map_or(from + 1, |applied| applied.version);
+    if from + 1 - first != recorded.len() as u32 || (recorded.is_empty() && from > 0) {
         return Err(format!(
             "migration: {label} has user_version {from} but {} recorded steps; it was changed outside the migration runner",
             recorded.len()
         ));
     }
     for (index, applied) in recorded.iter().enumerate() {
-        if applied.version as usize != index + 1 {
+        if applied.version != first + index as u32 {
             return Err(format!(
                 "migration: {label} is missing the record of step {}",
-                index + 1
-            ));
-        }
-        let step = &steps[index];
-        if step.name != applied.name || sha256_hex(&step.up) != applied.up_sha256 {
-            return Err(format!(
-                "drift: {label} step {} ({}) changed after it was applied; add a new step instead of editing it",
-                applied.version, applied.name
+                first + index as u32
             ));
         }
     }
-    Ok((from, adopting))
+    Ok(())
+}
+
+/// The first recorded step whose shipped file differs. Steps no longer
+/// shipped (squashed) are not checked; a base row is checked against a base.
+pub fn drifted<'a>(set: &StepSet, recorded: &'a [Applied]) -> Option<&'a Applied> {
+    let base_row = recorded
+        .first()
+        .map(|applied| applied.version)
+        .filter(|&v| v > 1);
+    recorded.iter().find(|applied| {
+        let shipped = if base_row == Some(applied.version) {
+            set.base
+                .as_ref()
+                .filter(|base| base.version == applied.version)
+                .map(|base| (&base.name, &base.up))
+        } else {
+            set.step(applied.version).map(|step| (&step.name, &step.up))
+        };
+        shipped
+            .is_some_and(|(name, up)| *name != applied.name || sha256_hex(up) != applied.up_sha256)
+    })
 }
 
 /// Step back to `to` with the stored `down` SQL, newest first, in one run.
@@ -270,12 +428,7 @@ pub fn downgrade(conn: &mut Connection, label: &str, to: u32) -> Result<Moved, S
     in_run(conn, |tx| {
         let from = version(tx)?;
         let recorded = status(tx)?;
-        if recorded.len() != from as usize {
-            return Err(format!(
-                "migration: {label} has user_version {from} but {} recorded steps",
-                recorded.len()
-            ));
-        }
+        check_record(label, &recorded, from)?;
         if to >= from {
             return Err(format!(
                 "migration: {label} is at version {from}; nothing to undo down to {to}"
