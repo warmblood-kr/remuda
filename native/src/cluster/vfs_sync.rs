@@ -265,6 +265,18 @@ pub(super) struct Members {
     reachable: Vec<String>,
 }
 
+impl Members {
+    /// The same members with `node` gone, as if it were already revoked.
+    pub(super) fn without(&self, node: &str) -> Members {
+        let keep = |list: &[String]| list.iter().filter(|fp| *fp != node).cloned().collect();
+        Members {
+            self_fp: self.self_fp.clone(),
+            admitted: keep(&self.admitted),
+            reachable: keep(&self.reachable),
+        }
+    }
+}
+
 pub(super) fn members() -> VfsResult<Members> {
     let (identity, registry) = super::nodes()?
         .ok_or_else(|| VfsError::new(VfsErrorKind::NoCluster, "this node has no cluster"))?;
@@ -327,13 +339,22 @@ pub(super) fn request_peer(peer_fp: &str, request: &Request) -> Result<Response,
 }
 
 fn request_peer_inner(peer_fp: &str, request: &Request) -> Result<Response, String> {
+    request_peer_within(peer_fp, request, REQUEST_TIMEOUT)
+}
+
+/// [`request_peer`] with its own answer timeout and no health record.
+pub(super) fn request_peer_within(
+    peer_fp: &str,
+    request: &Request,
+    timeout: Duration,
+) -> Result<Response, String> {
     let material = super::replication::peer_material(peer_fp).map_err(|error| error.to_string())?;
     let client = ClusterClient::with_timeouts(
         Arc::new(crate::SystemWallClock::new()),
         ClientTimeouts {
             connect: Duration::from_secs(3),
-            read: REQUEST_TIMEOUT,
-            total: REQUEST_TIMEOUT,
+            read: timeout,
+            total: timeout,
         },
     );
     for attempt in 0..20 {

@@ -252,6 +252,30 @@ pub fn run(server: &str, socket: &Path, args: &[&str]) -> ExitCode {
     ExitCode::from(code)
 }
 
+/// Run `remuda vfs drain` in the daemon at `socket` and print what it said;
+/// `remuda cluster leave` uses it. Returns drain's exit code.
+pub fn drain_in_daemon(socket: &Path) -> Result<u8, String> {
+    let timeout = DRAIN_TIMEOUT.as_secs().to_string();
+    let request = Request::Vfs {
+        args: vec!["drain".into(), "--timeout".into(), timeout],
+        input_base64: None,
+    };
+    match crate::client::request(socket, &request) {
+        Ok(Response::CommandResult {
+            exit_code,
+            stdout_base64,
+            stderr_base64,
+        }) => {
+            let _ = std::io::stdout().write_all(&BASE64.decode(stdout_base64).unwrap_or_default());
+            let _ = std::io::stderr().write_all(&BASE64.decode(stderr_base64).unwrap_or_default());
+            Ok(exit_code)
+        }
+        Ok(Response::Error(error)) => Err(error),
+        Ok(other) => Err(format!("unexpected daemon answer: {other:?}")),
+        Err(error) => Err(format!("daemon request failed: {error}")),
+    }
+}
+
 /// `verb` and its parsed `values` as daemon arguments, in spec order. SOURCE
 /// becomes `-` (the content travels as input) and DEST stays with the CLI.
 fn forward(verb: &str, values: &Map<String, Value>) -> Vec<String> {

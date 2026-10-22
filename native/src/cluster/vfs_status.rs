@@ -119,7 +119,11 @@ pub fn status(copies: bool, deadline: Duration) -> VfsResult<StatusReport> {
 }
 
 /// Which placement nodes confirm each live file's blob.
-fn copy_status(store: &VfsStore, members: &Members, deadline: Duration) -> VfsResult<CopyStatus> {
+pub(super) fn copy_status(
+    store: &VfsStore,
+    members: &Members,
+    deadline: Duration,
+) -> VfsResult<CopyStatus> {
     let until = Instant::now() + deadline;
     let self_fp = members.self_fp.as_str();
     let index = store.load_index()?;

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Cluster: `remuda cluster leave [--yes]` takes this node out (#778). It asks
+  another node to revoke it (`ClusterLeave`); that node first checks that
+  every VFS file keeps its copies without the leaver, and records the leave
+  in its audit log. On a refusal it runs `vfs drain` and asks again; while
+  every node refuses it changes nothing and exits 75. Then it moves the
+  cluster folder to `cluster.left-YYYYMMDD` and deletes the key and
+  membership files there, so a rejoin starts with an empty store. With no
+  other node reachable it warns and still leaves.
 - VFS: `remuda vfs status [--copies] [--json]` shows the cluster store at a
   glance (#778): live files and index size against their limits, paths
   with conflicts, this node's copies and retry backlog, and for each peer

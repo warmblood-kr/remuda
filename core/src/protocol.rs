@@ -363,6 +363,9 @@ pub enum Request {
     /// Ask the peer to pull and keep these blobs: the caller is draining
     /// before it leaves. Only sent to peers that list `VFS_CAP_TAKE`.
     ClusterVfsTake { hashes: Vec<String> },
+    /// Revoke the caller, which is leaving the cluster. The peer refuses
+    /// unless every live file keeps its copies without the caller.
+    ClusterLeave,
     /// Read or reload the daemon-owned local cluster listener.
     ClusterListener(ListenerOp),
     /// Stop the daemon and its sessions (host-backed ones unless
