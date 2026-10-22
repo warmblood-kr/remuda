@@ -31,22 +31,32 @@ pub const OPT_IN: &str = "REMUDA_EXPERIMENTAL_SESSION_HOST";
 const CLIENT: [u8; 16] = *b"remuda-daemon-01";
 const PUBLISH_DEADLINE: Duration = Duration::from_secs(10);
 const TEARDOWN_DEADLINE: Duration = Duration::from_secs(10);
-/// Inherited from the daemon when set; the host clears everything else.
-const INHERITED: &[&str] = &[
-    "PATH",
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "TMPDIR",
-    "TERM",
-    "COLORTERM",
-    "XDG_RUNTIME_DIR",
-    "SSH_AUTH_SOCK",
+/// Left out of every session child's environment, hosted or in-process: the
+/// session-host switch and the daemon's systemd/launchd service handles.
+pub(crate) const DAEMON_ONLY: &[&str] = &[
+    OPT_IN,
+    "NOTIFY_SOCKET",
+    "LISTEN_FDS",
+    "LISTEN_PID",
+    "LISTEN_FDNAMES",
+    "WATCHDOG_USEC",
+    "WATCHDOG_PID",
+    "INVOCATION_ID",
+    "JOURNAL_STREAM",
+    "XPC_SERVICE_NAME",
 ];
+
+/// The daemon's environment a hosted child starts from. Host-internal names
+/// (`REMUDA_SESSION_HOST_*`) and variables that are not UTF-8 are left out:
+/// the launch is UTF-8 JSON and refuses the internal prefix.
+fn inherited() -> HashMap<String, String> {
+    std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(key, _)| {
+            !DAEMON_ONLY.contains(&key.as_str()) && !key.starts_with("REMUDA_SESSION_HOST_")
+        })
+        .collect()
+}
 
 pub fn opted_in() -> bool {
     std::env::var(OPT_IN).is_ok_and(|value| value == "1")
@@ -170,7 +180,7 @@ impl Hosting {
         registry
             .register_hosted(handle)
             .map(|_| ())
-            .map_err(|_| format!("session name already in use: {}", request.name))
+            .map_err(|_| format!("name taken: {}", request.name))
     }
 
     /// Claim the inventory again under a newer epoch, then show every open
@@ -320,13 +330,10 @@ impl Hosts {
         // Checked before the durable reservation, which a missing binary
         // would otherwise leave behind under this name.
         let exe = host_executable()?;
-        if self
-            .owner
-            .index()
-            .map_err(|error| format!("session host inventory: {error:?}"))?
-            .entries
-            .contains_key(request.name)
-        {
+        // A name the registry no longer holds can still have an entry while
+        // its closed host is torn down. Wait for that, as a close of an
+        // in-process session frees its name at once.
+        if !self.wait_released(request.name)? {
             return Err(format!(
                 "session name {} is still held by a closing host-backed session",
                 request.name
@@ -341,6 +348,7 @@ impl Hosts {
         let launch_id = random()?;
         let nonce = random()?;
         let endpoint = self.root.join(hex(&random::<8>()?));
+        socket_fits(&endpoint.join("socket"))?;
         let endpoint_text = endpoint
             .to_str()
             .ok_or("session host path is not UTF-8")?
@@ -374,15 +382,11 @@ impl Hosts {
         let exit = start(&exe, &endpoint, &bootstrap)?;
         match self.published(request.name, &exit) {
             Ok(()) => self.open(request.name),
-            Err(Published::Exited) => {
-                // Stop the host and retire the entry, as for a closed session.
-                if let Ok(session) = self.open(request.name) {
-                    let name = request.name.to_owned();
-                    let hosts = self.clone();
-                    std::thread::spawn(move || hosts.teardown(&name, session));
-                }
-                Err("session host child exited at once".into())
-            }
+            // The child already ended. Like an in-process `new` of a short
+            // command, the session still starts: it is registered, its last
+            // screen can be read, and the reaper announces the exit and
+            // retires its host.
+            Err(Published::Exited) => self.open(request.name),
             Err(Published::Late) => Err(
                 "session host did not publish in time; it may still start, and a daemon \
                  restart will rediscover it"
@@ -403,6 +407,26 @@ impl Hosts {
             )),
         }
     }
+    /// True once `name` has no inventory entry, waiting up to the teardown
+    /// deadline for a closing host to retire it.
+    fn wait_released(&self, name: &str) -> Result<bool, String> {
+        let until = Instant::now() + TEARDOWN_DEADLINE;
+        loop {
+            let held = self
+                .owner
+                .index()
+                .map_err(|error| format!("session host inventory: {error:?}"))?
+                .entries
+                .contains_key(name);
+            if !held {
+                return Ok(true);
+            }
+            if Instant::now() >= until {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     fn published(&self, name: &str, exit: &mpsc::Receiver<ExitStatus>) -> Result<(), Published> {
         let until = Instant::now() + PUBLISH_DEADLINE;
         let mut ended = None;
@@ -411,9 +435,16 @@ impl Hosts {
                 .owner
                 .index()
                 .map_err(|error| Published::Store(format!("session host inventory: {error:?}")))?;
-            match index.entries.get(name).map(|entry| entry.phase) {
-                Some(Phase::Registered) => return Ok(()),
-                Some(Phase::Exited { .. }) => return Err(Published::Exited),
+            match index.entries.get(name) {
+                // The host records Registered just before it starts taking
+                // input; wait for that too, so an attach or input sent right
+                // after `new` is not refused as still starting.
+                Some(entry) if entry.phase == Phase::Registered && accepting(entry) => {
+                    return Ok(())
+                }
+                Some(entry) if matches!(entry.phase, Phase::Exited { .. }) => {
+                    return Err(Published::Exited)
+                }
                 _ => {}
             }
             // Checked after reading the index, so a host that published and
@@ -433,6 +464,24 @@ impl Hosts {
                 }
             }
         }
+    }
+}
+/// True once a registered host takes input. A host that cannot be asked
+/// counts as accepting: the request that follows reports what is wrong.
+fn accepting(entry: &Entry) -> bool {
+    use super::api::{PublicationStatus, Request, Response};
+    let Some(birth) = entry.birth.as_ref() else {
+        return true;
+    };
+    let inspected =
+        super::entry::Client::open_observer(Path::new(birth.endpoint()), entry.identity.clone())
+            .and_then(|mut client| client.request(&Request::Inspect));
+    match inspected {
+        Ok(Response::Info { info }) => !matches!(
+            info.publication,
+            Some(PublicationStatus::Starting | PublicationStatus::Unavailable)
+        ),
+        _ => true,
     }
 }
 enum Published {
@@ -457,10 +506,7 @@ fn launch(request: &NewHosted<'_>) -> Result<Launch, String> {
             .ok_or("working directory is not UTF-8")?
             .to_owned(),
     };
-    let mut env: HashMap<String, String> = INHERITED
-        .iter()
-        .filter_map(|key| std::env::var(key).ok().map(|value| ((*key).into(), value)))
-        .collect();
+    let mut env = inherited();
     if env.get("TERM").is_none_or(|term| term == "dumb") {
         env.insert("TERM".into(), "xterm-256color".into());
     }
@@ -519,7 +565,7 @@ fn start(
             broken_pipe: false,
         })
         .and_then(|mut stdin| {
-            super::wire::write_frame(&mut stdin, bootstrap).map_err(|e| Unwritten {
+            super::wire::write_bootstrap(&mut stdin, bootstrap).map_err(|e| Unwritten {
                 broken_pipe: e.kind() == io::ErrorKind::BrokenPipe,
                 text: e.to_string(),
             })
@@ -572,5 +618,35 @@ mod start_tests {
         let status = exit.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(status.code(), Some(super::super::BUILD_MISMATCH));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A host binds its socket 23 bytes deeper than its daemon's, so a runtime
+/// directory the daemon fits in can still be too long for the host. Said
+/// before anything is reserved, instead of the host exiting unexplained.
+fn socket_fits(socket: &Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let len = socket.as_os_str().as_bytes().len();
+    let limit = crate::staged_socket::SOCKET_PATH_LIMIT;
+    if len > limit {
+        return Err(format!(
+            "session host socket path too long ({len} bytes, limit {limit}): {}\nNext: set a shorter REMUDA_RUNTIME_DIR",
+            socket.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod socket_path_tests {
+    #[test]
+    fn a_host_socket_too_long_for_the_kernel_is_refused_with_the_remedy() {
+        let limit = crate::staged_socket::SOCKET_PATH_LIMIT;
+        let fits = format!("/{}", "a".repeat(limit - 1));
+        assert!(super::socket_fits(std::path::Path::new(&fits)).is_ok());
+        let long = format!("/{}", "a".repeat(limit));
+        let error = super::socket_fits(std::path::Path::new(&long)).unwrap_err();
+        assert!(error.contains("socket path too long"), "{error}");
+        assert!(error.contains("REMUDA_RUNTIME_DIR"), "{error}");
     }
 }

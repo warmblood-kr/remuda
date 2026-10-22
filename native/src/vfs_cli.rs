@@ -74,18 +74,29 @@ fn spec() -> Spec {
                 vec![arg("URI", "remuda:// URI", true)], vec![option("json", None, "Print JSON")],
                 "remuda vfs stat URI [--json]"),
             verb("ls", "List files under a prefix. Example: remuda vfs ls remuda:///butler/",
-                vec![arg("PREFIX", "remuda:// URI prefix; omit for all", false)], vec![option("json", None, "Print JSON")],
-                "remuda vfs ls [PREFIX] [--json]"),
+                vec![arg("PREFIX", "remuda:// URI prefix; omit for all", false)],
+                vec![option("json", None, "Print JSON"),
+                     option("conflicts", None, "Only paths with kept concurrent writes, deleted ones too")],
+                "remuda vfs ls [PREFIX] [--json] [--conflicts]"),
+            verb("resolve-conflict", "Settle a path's conflicts by writing one side again. Example: remuda vfs resolve-conflict remuda:///notes.md --keep winner",
+                vec![arg("URI", "remuda:// URI", true)],
+                vec![OptionSpec { required: true, ..option("keep", Some("WHICH"), "winner, or the VERSION of a conflict from `remuda vfs ls --conflicts`") }],
+                "remuda vfs resolve-conflict URI --keep winner|VERSION"),
             verb("rm", "Delete a file everywhere. Example: remuda vfs rm remuda:///notes.md",
                 vec![arg("URI", "remuda:// URI", true)], vec![], "remuda vfs rm URI"),
             verb("sync", "Pull indexes from peers and repair missing copies now. Example: remuda vfs sync",
                 vec![], vec![], "remuda vfs sync"),
             verb("config", "Show or set the cluster name and default replicas. Example: remuda vfs config --cluster home --replicas 2",
                 vec![], vec![option("cluster", Some("NAME"), "Cluster name used in remuda://NAME/ URIs"),
-                             option("replicas", Some("N"), "Default copies for new files (1-16)")],
-                "remuda vfs config [--cluster NAME] [--replicas N]"),
+                             option("replicas", Some("N"), "Default copies for new files (1-16)"),
+                             option("tombstone-days", Some("DAYS"), "Forget a delete this many days after every node has it (1-3650; default 7)")],
+                "remuda vfs config [--cluster NAME] [--replicas N] [--tombstone-days DAYS]"),
             verb("export-index", "Write index.json for an older remuda, before a downgrade. Example: remuda vfs export-index",
                 vec![], vec![], "remuda vfs export-index"),
+            verb("index-downgrade", "Step index.db back to schema VERSION for an older remuda, after a backup. Example: remuda vfs index-downgrade 1 --yes",
+                vec![arg("VERSION", "Schema version the older remuda knows", true)],
+                vec![option("yes", None, "Run it; without this, only print what would be undone")],
+                "remuda vfs index-downgrade VERSION [--yes]"),
             verb("help", "Print help for a vfs command", vec![arg("COMMAND", "vfs command name", false)], vec![], "remuda vfs help [COMMAND]"),
         ],
     }
@@ -315,6 +326,7 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
         "stat" => stat(&store, values, out),
         "ls" => list(&store, values, out),
         "rm" => remove(&store, values, out),
+        "resolve-conflict" => settle(&store, values, out),
         "sync" => {
             let report = vfs_sync::sync_once();
             say!(out, "{report}");
@@ -332,6 +344,18 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
             }
             Err(error) => fail_vfs(out, &verb, &error),
         },
+        "index-downgrade" => {
+            let Ok(to) = value(values, "VERSION").unwrap_or_default().parse::<u32>() else {
+                return fail(out, &verb, "VERSION must be a whole number");
+            };
+            match store.index_downgrade(to, flag(values, "yes")) {
+                Ok(text) => {
+                    say!(out, "{text}");
+                    0
+                }
+                Err(error) => fail_vfs(out, &verb, &error),
+            }
+        }
         _ => unreachable!("vfs verb specification and dispatcher diverged"),
     }
 }
@@ -507,7 +531,94 @@ fn entry_json(store: &VfsStore, entry: &VfsEntry) -> Value {
         "writer": entry.writer,
         "mtime": entry.mtime,
         "local": store.has_blob(&entry.sha256, entry.size),
+        "deleted": entry.deleted,
+        "conflicts": entry.conflicts.iter().map(|conflict| serde_json::json!({
+            "version": conflict.version,
+            "writer": conflict.writer,
+            "sha256": conflict.sha256,
+            "size": conflict.size,
+            "deleted": conflict.deleted,
+            "mtime": conflict.mtime,
+            "local": !conflict.deleted && store.has_blob(&conflict.sha256, conflict.size),
+        })).collect::<Vec<_>>(),
     })
+}
+
+/// One line per kept concurrent write, under its path.
+fn say_conflicts(out: &mut Out, store: &VfsStore, entry: &VfsEntry) {
+    for conflict in &entry.conflicts {
+        let what = if conflict.deleted {
+            "deleted".to_owned()
+        } else {
+            format!(
+                "{} bytes  {}{}",
+                conflict.size,
+                &conflict.sha256[..12.min(conflict.sha256.len())],
+                if store.has_blob(&conflict.sha256, conflict.size) {
+                    ""
+                } else {
+                    "  (not here)"
+                }
+            )
+        };
+        say!(
+            out,
+            "  conflict v{} by {}  {what}",
+            conflict.version,
+            crate::cluster::node_label(&conflict.writer)
+        );
+    }
+}
+
+fn settle(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
+    let uri = match store.parse_uri(value(values, "URI").unwrap_or_default()) {
+        Ok(uri) => uri,
+        Err(error) => return fail_vfs(out, "resolve-conflict", &error),
+    };
+    let keep = match value(values, "keep").unwrap_or_default() {
+        "winner" => None,
+        text => match text.parse::<u64>() {
+            Ok(version) => Some(version),
+            Err(_) => {
+                return fail(
+                    out,
+                    "resolve-conflict",
+                    "--keep takes winner or a version number",
+                )
+            }
+        },
+    };
+    let writer = match writer() {
+        Ok(writer) => writer,
+        Err(error) => return fail_vfs(out, "resolve-conflict", &error),
+    };
+    // The kept side may live only on another node: copy it here first.
+    if let Some(conflict) = store.load_index().ok().and_then(|index| {
+        let entry = index.entries.get(&uri.path)?;
+        let conflict = entry.conflicts.iter().find(|c| Some(c.version) == keep)?;
+        (!conflict.deleted && !store.has_blob(&conflict.sha256, conflict.size))
+            .then(|| conflict.entry(&uri.path))
+    }) {
+        if let Err(error) = vfs_sync::fetch_blob(store, &conflict) {
+            return fail_vfs(out, "resolve-conflict", &error);
+        }
+    }
+    match store.settle_conflict(&uri.path, keep, &writer) {
+        Ok(entry) => {
+            vfs_sync::push_entries(std::slice::from_ref(&entry));
+            say!(
+                out,
+                "Settled {}: kept {}, now version {}.",
+                uri.path,
+                keep.map_or("the winner".to_owned(), |version| format!(
+                    "version {version}"
+                )),
+                entry.version
+            );
+            0
+        }
+        Err(error) => fail_vfs(out, "resolve-conflict", &error),
+    }
 }
 
 fn stat(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
@@ -559,6 +670,7 @@ fn stat(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    say_conflicts(out, store, entry);
     0
 }
 
@@ -574,13 +686,47 @@ fn list(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
         Ok(index) => index,
         Err(error) => return fail_vfs(out, "ls", &error),
     };
-    let entries = index.list(&prefix);
+    let only_conflicts = flag(values, "conflicts");
+    let entries: Vec<&VfsEntry> = if only_conflicts {
+        index
+            .entries
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&prefix))
+            .map(|(_, entry)| entry)
+            .filter(|entry| !entry.conflicts.is_empty())
+            .collect()
+    } else {
+        index.list(&prefix)
+    };
     if flag(values, "json") {
         let rows: Vec<Value> = entries
             .iter()
             .map(|entry| entry_json(store, entry))
             .collect();
         say!(out, "{}", Value::Array(rows));
+        return 0;
+    }
+    if only_conflicts {
+        if entries.is_empty() {
+            say!(out, "No conflicts.");
+        }
+        for entry in &entries {
+            say!(
+                out,
+                "{}  v{} by {}{}",
+                entry.path,
+                entry.version,
+                crate::cluster::node_label(&entry.writer),
+                if entry.deleted { "  (deleted)" } else { "" }
+            );
+            say_conflicts(out, store, entry);
+        }
+        if !entries.is_empty() {
+            say!(
+                out,
+                "Next: remuda vfs resolve-conflict URI --keep winner|VERSION."
+            );
+        }
         return 0;
     }
     for entry in entries {
@@ -661,6 +807,17 @@ fn config(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
         }
         changed = true;
     }
+    if let Some(text) = value(values, "tombstone-days") {
+        match text
+            .parse::<u32>()
+            .ok()
+            .filter(|days| (1..=3650).contains(days))
+        {
+            Some(days) => settings.tombstone_days = days,
+            None => return fail(out, "config", "--tombstone-days must be 1-3650"),
+        }
+        changed = true;
+    }
     if changed {
         if let Err(error) = store.save_settings(&settings) {
             return fail_vfs(out, "config", &error);
@@ -668,6 +825,11 @@ fn config(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
     }
     say!(out, "cluster   {}", settings.cluster_name);
     say!(out, "replicas  {}", settings.default_replicas);
+    say!(
+        out,
+        "tombstones kept {} days after every node has them",
+        settings.tombstone_days
+    );
     say!(out, "store     {}", store.root().display());
     0
 }
@@ -699,6 +861,11 @@ mod tests {
             ["get", "remuda:///n.md", "--local"]
         );
         assert_eq!(forwarded(&["ls", "--json"]), ["ls", "--json"]);
+        assert_eq!(
+            forwarded(&["resolve-conflict", "remuda:///n.md", "--keep", "winner"]),
+            ["resolve-conflict", "remuda:///n.md", "--keep", "winner"]
+        );
+        assert_eq!(forwarded(&["ls", "--conflicts"]), ["ls", "--conflicts"]);
         assert_eq!(
             forwarded(&["config", "--cluster", "home"]),
             ["config", "--cluster", "home"]

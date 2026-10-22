@@ -45,8 +45,9 @@ impl Root {
 }
 impl Drop for Root {
     fn drop(&mut self) {
-        // Only processes whose argv names this unique root: our hosts.
-        for pid in processes_naming(&self.0) {
+        // Only processes whose argv names this unique root: our hosts, and
+        // a daemon that took the socket over in a reload.
+        for pid in processes_under(&self.0) {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
         let _ = std::fs::remove_dir_all(&self.0);
@@ -162,14 +163,21 @@ fn wait_gone(pid: i32) {
     }
 }
 fn processes_naming(root: &Path) -> Vec<i32> {
+    processes_matching(root, "run-reserved")
+}
+fn processes_under(root: &Path) -> Vec<i32> {
+    processes_matching(root, "")
+}
+fn processes_matching(root: &Path, also: &str) -> Vec<i32> {
     let output = Command::new("/bin/ps")
         .args(["-A", "-o", "pid=", "-o", "args="])
         .output()
         .expect("ps");
-    let needle = root.to_string_lossy().into_owned();
+    // The trailing slash keeps root `…-1` from matching `…-10`.
+    let needle = format!("{}/", root.to_string_lossy());
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|line| line.contains(&needle) && line.contains("run-reserved"))
+        .filter(|line| line.contains(&needle) && line.contains(also))
         .filter_map(|line| line.split_whitespace().next()?.parse().ok())
         .collect()
 }
@@ -249,6 +257,22 @@ fn a_hosted_session_survives_daemon_sigkill_and_is_rediscovered() {
     };
     unavailable(capture(&path, "keeper"));
     unavailable(send_line(&path, "keeper", "echo LOST"));
+    // Listed, not exited, and marked: its size and idle time are unknown.
+    let Response::Sessions(sessions) = request(&path, &Request::List) else {
+        panic!("ls failed");
+    };
+    assert!(sessions[0].unavailable && sessions[0].alive, "{sessions:?}");
+    let listed = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "s", "ls"])
+        .env("REMUDA_RUNTIME_DIR", &root.0)
+        .env("HOME", &root.0)
+        .output()
+        .expect("remuda ls");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed.contains("keeper") && listed.contains("unreachable"),
+        "{listed}"
+    );
     second.sigkill();
 
     // After another restart the entry is still listed, and still Unavailable.
@@ -547,4 +571,102 @@ fn n_plus_one_daemon_reloads_into_the_older_build() {
 fn n_plus_one_older_daemon_is_asked_to_reload() {
     let this = Path::new(env!("CARGO_BIN_EXE_remuda"));
     check_leaves_the_session_alone(&previous(), this, this, false);
+}
+
+#[test]
+fn a_rediscovered_hosted_session_still_wakes_output_hooks() {
+    let root = Root::new();
+    let path = root.socket();
+    let first = Daemon::spawn(&root, true);
+    new_session(&path, "keeper");
+    wait_for(&path, "keeper", "$");
+    first.sigkill();
+
+    let _second = Daemon::spawn(&root, false);
+    let log = root.0.join("output.log");
+    let hook = format!(
+        "remuda.on('session_output', function(name) \
+           local f = assert(io.open('{}', 'a')); f:write(name, '\\n'); f:close() end, {{ group = 'test' }})",
+        log.display()
+    );
+    assert!(matches!(
+        request(
+            &path,
+            &Request::Eval {
+                code: hook,
+                name: None
+            }
+        ),
+        Response::Value(_)
+    ));
+    // Only output after the hook counts: clear what the catch-up wake wrote.
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = std::fs::remove_file(&log);
+    assert_eq!(
+        send_line(&path, "keeper", "echo AFTER:$((2+2))"),
+        Response::Ok
+    );
+    wait_for(&path, "keeper", "AFTER:4");
+    let deadline = Instant::now() + PATIENCE;
+    while !std::fs::read_to_string(&log).is_ok_and(|text| text.contains("keeper")) {
+        assert!(
+            Instant::now() < deadline,
+            "no session_output after rediscovery"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `remuda upgrade`'s reload across N and N+1: the daemon moves onto the
+/// installed build, or keeps its own and says why; the session lives on.
+fn upgrade_across_builds(daemon_exe: &Path, installed: &Path) {
+    use remuda_native::reload::upgrade::{after_upgrade, AfterUpgrade};
+    let root = Root::new();
+    let path = root.socket();
+    let daemon = Daemon::spawn_exe(&root, daemon_exe, true);
+    new_session(&path, "compat");
+    let outcome = after_upgrade(&path, installed);
+    eprintln!("upgrade: {outcome:?}");
+    let understood = match &outcome {
+        AfterUpgrade::Reloaded(report) => report.starts_with("reloaded: "),
+        AfterUpgrade::Current(_) => true,
+        AfterUpgrade::Kept(why) => {
+            why.contains("predates `remuda reload`")
+                || why.contains("did not start as a reload candidate")
+                || why.contains(" speaks handoff version ")
+                || why.contains("reload without --check is not implemented yet")
+                || why.starts_with("blocked: ")
+        }
+        AfterUpgrade::Failed(_) => false,
+        AfterUpgrade::NoDaemon => false,
+    };
+    assert!(understood, "{outcome:?}");
+    assert_eq!(
+        send_line(&path, "compat", "echo AFTER:$((7*8))"),
+        Response::Ok
+    );
+    wait_for(&path, "compat", "AFTER:56");
+    // Whichever daemon serves now, stop it: it may not be `daemon`'s child.
+    let _ = client::request(
+        &path,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
+    drop(daemon);
+}
+
+#[test]
+#[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS; run by CI job host-compat-n-plus-one"]
+fn n_plus_one_upgrade_moves_an_older_daemon_onto_this_build() {
+    upgrade_across_builds(&previous(), Path::new(env!("CARGO_BIN_EXE_remuda")));
+}
+
+#[test]
+#[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS; run by CI job host-compat-n-plus-one"]
+fn n_plus_one_upgrade_to_the_older_build_moves_this_daemon() {
+    upgrade_across_builds(Path::new(env!("CARGO_BIN_EXE_remuda")), &previous());
 }

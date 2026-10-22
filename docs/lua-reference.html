@@ -45,6 +45,8 @@
 <p><code>contributions(point) -&gt; {{id, owner, entry}...}</code> — A point's entries as {id, owner, entry} rows, entry a shallow copy, by entry.order then id.</p>
 <h2 id="daemon">daemon</h2>
 <p><code>table</code> — Facts about the daemon this Lua image runs in.</p>
+<h2 id="daemon.reloaded_from">daemon.reloaded_from</h2>
+<p><code>daemon.reloaded_from() -&gt; pid | nil</code> — The pid of the daemon this one took over from in a <span class="title-ref">remuda reload</span>, or nil when it started fresh. That daemon may still be finishing its last requests for up to 10 s. A core without it lacks the field, so test remuda.daemon.reloaded_from first.</p>
 <h2 id="daemon.socket_publication">daemon.socket_publication</h2>
 <p><code>daemon.socket_publication() -&gt; {state, reason?}</code> — How this daemon published its socket. Returns {state = 'staged'} or {state = 'legacy', reason = text} (it fell back, or the operator set REMUDA_SOCKET_PUBLICATION=legacy). The same answer as the SocketPublication request; a core without remuda.daemon does not have it, so test remuda.daemon first.</p>
 <h2 id="db">db</h2>
@@ -212,7 +214,7 @@
 <h2 id="vfs.rm">vfs.rm</h2>
 <p><code>vfs.rm(uri) -&gt; true | nil, reason</code> — Delete a stored file everywhere (a tombstone), like <span class="title-ref">remuda vfs rm</span>, telling peers in the background.</p>
 <h2 id="vfs.stat">vfs.stat</h2>
-<p><code>vfs.stat(uri) -&gt; {path, version, sha256, size, mtime, replicas, writer, local, synced_at} | nil, reason</code> — Describe a stored file: path, version, sha256, size, mtime, replicas, writer, local (whether this node holds a copy) and synced_at (unix time a peer index was last merged here, or nil). A file known here without a local copy still returns its table, with local = false.</p>
+<p><code>vfs.stat(uri) -&gt; {path, version, sha256, size, mtime, replicas, writer, local, synced_at, conflicts} | nil, reason</code> — Describe a stored file: path, version, sha256, size, mtime, replicas, writer, local (whether this node holds a copy), synced_at (unix time a peer index was last merged here, or nil) and conflicts (concurrent writes kept beside this one, each {version, writer, sha256, size, deleted, mtime}; the next put or rm settles them). A file known here without a local copy still returns its table, with local = false.</p>
 <h2 id="wait_for">wait_for</h2>
 <p><code>wait_for(session, pattern, seconds?) -&gt; string</code> — Wait until a session's screen matches a Lua pattern, then answer with that screen. Fails when the deadline passes instead of answering with a screen that does not match. Use it after <span class="title-ref">send</span> rather than guessing a delay.</p>
 <h2 id="window">window</h2>

@@ -5008,6 +5008,7 @@ mod tests {
             attached: false,
             human_idle: None,
             mouse_tracking: false,
+            unavailable: false,
             instance_id: None,
             output_version: None,
         }]
@@ -5024,6 +5025,7 @@ mod tests {
             attached: false,
             human_idle: None,
             mouse_tracking: false,
+            unavailable: false,
             instance_id: Some(format!("instance-{name}")),
             output_version: None,
         }
@@ -5053,6 +5055,7 @@ mod tests {
             attached: false,
             human_idle: None,
             mouse_tracking: false,
+            unavailable: false,
             instance_id: None,
             output_version: None,
         });

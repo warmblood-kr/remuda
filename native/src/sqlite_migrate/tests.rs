@@ -78,6 +78,38 @@ fn upgrade_applies_pending_steps_once_and_records_them() {
     assert!(applied.iter().all(|a| a.reversible));
 }
 
+/// Two first opens race (#778): one read version 0, then waited for the
+/// lock while the other applied every step. It must not run them again.
+#[test]
+fn a_run_that_waited_for_the_lock_plans_again() {
+    let scratch = Scratch::new();
+    let steps = notes();
+    let mut holder = scratch.open();
+    let tx = holder
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    let waiter = {
+        let mut conn = scratch.open();
+        let steps = steps.clone();
+        std::thread::spawn(move || upgrade(&mut conn, "t.db", &steps, false))
+    };
+    // Give the waiter time to read version 0 and block on the lock.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    create_table(&tx).unwrap();
+    for (index, step) in steps.iter().enumerate() {
+        tx.execute_batch(&step.up).unwrap();
+        tx.execute(
+            &format!("INSERT INTO {TABLE} (version, name, up_sha256, down_sql, applied_at) VALUES (?1, ?2, ?3, ?4, 0)"),
+            params![index as u32 + 1, step.name, sha256_hex(&step.up), step.down],
+        )
+        .unwrap();
+    }
+    set_version(&tx, 2).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(waiter.join().unwrap().unwrap(), Moved { from: 2, to: 2 });
+    assert_eq!(tables(&holder), ["notes", "tags"]);
+}
+
 #[test]
 fn older_code_meets_a_newer_schema_and_is_refused() {
     let scratch = Scratch::new();
