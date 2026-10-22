@@ -588,6 +588,12 @@ fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
         wait_for_body(node, from_new, b"rewritten by N");
     }
 
+    // N writes without a version vector: last write wins as before, and no
+    // newer node reports a conflict for it.
+    for node in [&a, &c] {
+        assert_eq!(kept_conflicts(node), 0);
+    }
+
     // Deletes cross in both directions.
     successful(c.run(&["vfs", "rm", from_old]), "rm on N+1");
     wait_gone(&old, from_old);
@@ -595,6 +601,15 @@ fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
     for node in [&a, &c] {
         wait_gone(node, from_new);
     }
+}
+
+/// Rows in `index.db`'s conflicts table (design step 4); 0 before that step.
+fn kept_conflicts(node: &Node) -> i64 {
+    let index = node.root.join("state/remuda/cluster/vfs/index.db");
+    rusqlite::Connection::open(index)
+        .unwrap()
+        .query_row("SELECT count(*) FROM conflicts", [], |row| row.get(0))
+        .unwrap_or(0)
 }
 
 /// The documented downgrade from `index.db` to a build that reads only
@@ -666,7 +681,8 @@ fn older_build_refuses_a_newer_index_db_cleanly() {
 }
 
 /// `remuda vfs index-downgrade` steps index.db back so the previous build
-/// (one schema step behind) reads it; the upgrade after that keeps it all.
+/// (one or more schema steps behind) reads it; the upgrade after that keeps
+/// it all.
 #[test]
 #[ignore = "needs REMUDA_COMPAT_PREVIOUS from a build with index.db; run by CI job host-compat-n-plus-one"]
 fn older_build_reads_the_index_after_index_downgrade() {
@@ -676,17 +692,14 @@ fn older_build_reads_the_index_after_index_downgrade() {
     put(&node, "remuda:///kept.txt", b"kept");
     let plan = successful(node.run(&["vfs", "index-downgrade", "1"]), "dry run");
     assert!(
-        plan.contains("undo schema steps 2 (change-cursors)"),
+        plan.contains("undo schema steps") && plan.contains("2 (change-cursors)"),
         "{plan}"
     );
     let done = successful(
         node.run(&["vfs", "index-downgrade", "1", "--yes"]),
         "index-downgrade",
     );
-    assert!(
-        done.contains("index.db is now at schema 1 (was 2)"),
-        "{done}"
-    );
+    assert!(done.contains("index.db is now at schema 1 (was "), "{done}");
     // This daemon no longer touches the index, so it cannot upgrade it again.
     let refused = node.run(&["vfs", "ls"]);
     assert!(!refused.status.success());
