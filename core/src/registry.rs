@@ -20,9 +20,9 @@
 //! `core/clippy.toml` denies outright.
 
 use crate::agent::{AgentError, Cursor, ExitInfo, Result, ScreenSnapshot, Size, StyledCell};
-use crate::input::{InputBatch, InputError, InputOutcome};
+use crate::input::{ExpectedInstanceInputError, InputBatch, InputError, InputOutcome};
 use crate::protocol::Step;
-use crate::session::Session;
+use crate::session::{InputSubmitOutcome, Session};
 use crate::session_operations::{Lifecycle, SessionHandle};
 use core::time::Duration;
 use serde::{Deserialize, Serialize};
@@ -93,6 +93,11 @@ pub struct SessionSummary {
     /// Defaulted for sessions listed by an older daemon.
     #[serde(default)]
     pub mouse_tracking: bool,
+    /// A host-backed session (#713) whose host did not answer: still
+    /// registered and not known to have exited, but every field above except
+    /// its names is unknown. Omitted when false; older listings parse.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub unavailable: bool,
 }
 
 /// A session name from a program's argv[0]: basename, lowercased, anything
@@ -124,6 +129,9 @@ pub struct Registry {
     /// Host-backed sessions (#713). One name space with `sessions`; lock
     /// order is always `sessions`, then `hosted`.
     hosted: Mutex<HashMap<String, Arc<SessionHandle>>>,
+    /// Host-backed launches (by instance id) a close has started ending, so a
+    /// reaper that sees the child die first still reports "closed".
+    closing_hosted: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Registry {
@@ -225,15 +233,23 @@ impl Registry {
         name: &str,
         instance_id: &str,
     ) -> std::result::Result<(), LiveInstanceError> {
-        let sessions = self.lock();
-        let session = sessions.get(name).ok_or(LiveInstanceError::NotRegistered)?;
-        if session.instance_id() != instance_id {
+        if let Some(session) = self.lock().get(name) {
+            if session.instance_id() != instance_id {
+                return Err(LiveInstanceError::InstanceChanged);
+            }
+            if !session.is_alive() {
+                return Err(LiveInstanceError::NotLive);
+            }
+            return Ok(());
+        }
+        let handle = self.hosted(name).ok_or(LiveInstanceError::NotRegistered)?;
+        if handle.identity().instance != instance_id {
             return Err(LiveInstanceError::InstanceChanged);
         }
-        if !session.is_alive() {
-            return Err(LiveInstanceError::NotLive);
+        match handle.inspect() {
+            Ok(observation) if observation.lifecycle == Lifecycle::Running => Ok(()),
+            _ => Err(LiveInstanceError::NotLive),
         }
-        Ok(())
     }
 
     /// Look up a tracked session identity, legacy or host-backed, without
@@ -293,11 +309,12 @@ impl Registry {
             .collect()
     }
 
-    /// Live process candidates with their launch identity captured together
-    /// under the registry lock. Carry this value through ancestry resolution
-    /// instead of looking the session name up again afterwards.
+    /// Live process candidates with their launch identity, in-process and
+    /// host-backed (#713, child pid asked after the lock; a host that cannot
+    /// answer is left out). Carry this through ancestry resolution.
     pub fn live_processes_with_identity(&self) -> Vec<LiveSessionProcess> {
-        self.lock()
+        let mut live: Vec<LiveSessionProcess> = self
+            .lock()
             .values()
             .filter_map(|session| {
                 session.process_id_if_alive().map(|pid| LiveSessionProcess {
@@ -308,7 +325,22 @@ impl Registry {
                     pid,
                 })
             })
-            .collect()
+            .collect();
+        live.extend(self.hosted_handles().iter().filter_map(|handle| {
+            let observation = handle.inspect().ok()?;
+            if observation.lifecycle != Lifecycle::Running {
+                return None;
+            }
+            let identity = handle.identity();
+            Some(LiveSessionProcess {
+                attribution: SessionAttribution {
+                    name: identity.name.clone(),
+                    instance_id: identity.instance.clone(),
+                },
+                pid: observation.pid?,
+            })
+        }));
+        live
     }
 
     /// The session whose backend holds `pid` as its own. Every listed session
@@ -383,6 +415,7 @@ impl Registry {
                 attached: s.is_attached(),
                 human_idle: s.human_idle_for(),
                 mouse_tracking: s.mouse_tracking(),
+                unavailable: false,
             })
             .collect();
         let hosted: Vec<_> = self.hosted_lock().values().map(Arc::clone).collect();
@@ -442,6 +475,57 @@ impl Registry {
             .collect()
     }
 
+    /// Drop host-backed sessions (#713) whose child exited, with what the host
+    /// saw. Hosts are asked outside the lock; only the handle asked is removed,
+    /// so a concurrent close keeps its notice. An unreachable host is kept.
+    pub fn reap_hosted_with_exit_info(
+        &self,
+    ) -> Vec<(String, String, String, &'static str, Option<ExitInfo>)> {
+        let exited: Vec<_> = self
+            .hosted_handles()
+            .into_iter()
+            .filter_map(|handle| {
+                let observation = handle.inspect().ok()?;
+                match observation.lifecycle {
+                    Lifecycle::Exited(info) => Some((handle, observation.closing, info)),
+                    Lifecycle::Running => None,
+                }
+            })
+            .collect();
+        let mut hosted = self.hosted_lock();
+        exited
+            .into_iter()
+            .filter_map(|(handle, closing, info)| {
+                let identity = handle.identity();
+                let current = hosted
+                    .get(&identity.name)
+                    .is_some_and(|entry| Arc::ptr_eq(entry, &handle));
+                if !current {
+                    return None;
+                }
+                hosted.remove(&identity.name);
+                let closed = self.closing_hosted_lock().remove(&identity.instance);
+                Some((
+                    identity.name.clone(),
+                    identity.id.clone(),
+                    identity.instance.clone(),
+                    if closing || closed {
+                        "closed"
+                    } else {
+                        "exited"
+                    },
+                    info,
+                ))
+            })
+            .collect()
+    }
+
+    fn closing_hosted_lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
+        self.closing_hosted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A panic under this lock cannot leave the map half-updated — an entry is
     /// either inserted or it is not — so the contents stay meaningful and
     /// recovering beats poisoning every later call.
@@ -472,8 +556,24 @@ impl Registry {
     }
 }
 
-/// One host Inspect cut. An unreachable host stays listed as not exited:
-/// the inventory says it is registered; its operations answer Unavailable.
+/// The pre-write checks a fenced input makes on a host-backed session: the
+/// handle is bound to one launch, so its identity is the instance to match.
+fn hosted_instance_ready(
+    handle: &SessionHandle,
+    expected_instance: &str,
+) -> core::result::Result<(), ExpectedInstanceInputError> {
+    if handle.identity().instance != expected_instance {
+        return Err(ExpectedInstanceInputError::WrongInstance);
+    }
+    match handle.inspect() {
+        Ok(observation) if observation.lifecycle == Lifecycle::Running => Ok(()),
+        _ => Err(ExpectedInstanceInputError::NotStarted),
+    }
+}
+
+/// One host Inspect cut. An unreachable host stays listed as not exited and
+/// marked `unavailable`: the inventory says it is registered; its operations
+/// answer Unavailable.
 fn hosted_summary(handle: &SessionHandle) -> SessionSummary {
     let identity = handle.identity();
     let mut summary = SessionSummary {
@@ -488,17 +588,20 @@ fn hosted_summary(handle: &SessionHandle) -> SessionSummary {
         attached: false,
         human_idle: None,
         mouse_tracking: false,
+        unavailable: false,
     };
-    if let Ok(observation) = handle.inspect() {
-        summary.output_version = observation.output_version;
-        summary.alive = observation.lifecycle == Lifecycle::Running;
-        summary.idle = observation.idle;
-        summary.output_idle = Some(observation.output_idle);
-        summary.size = observation.size;
-        summary.attached = observation.attached;
-        summary.human_idle = observation.human_idle;
-        summary.mouse_tracking = observation.mouse.mode != crate::agent::MouseMode::default();
-    }
+    let Ok(observation) = handle.inspect() else {
+        summary.unavailable = true;
+        return summary;
+    };
+    summary.output_version = observation.output_version;
+    summary.alive = observation.lifecycle == Lifecycle::Running;
+    summary.idle = observation.idle;
+    summary.output_idle = Some(observation.output_idle);
+    summary.size = observation.size;
+    summary.attached = observation.attached;
+    summary.human_idle = observation.human_idle;
+    summary.mouse_tracking = observation.mouse.mode != crate::agent::MouseMode::default();
     summary
 }
 
@@ -514,11 +617,84 @@ impl Registry {
     }
 
     pub fn clear_input(&self, name: &str, key: &[u8]) -> Option<Result<Option<String>>> {
-        self.route(name, |s| s.clear_input(key), |h| h.clear_input(key))
+        self.route(
+            name,
+            |s| s.clear_input(key),
+            // Checked here too, so a host-backed session refuses in the same words.
+            |h| {
+                crate::session::check_clear_key(key)?;
+                h.clear_input(key)
+            },
+        )
     }
 
     pub fn feed(&self, name: &str, steps: &[Step]) -> Option<Result<()>> {
         self.route(name, |s| s.feed(steps), |h| h.feed(steps))
+    }
+
+    /// Deliver text as one burst (bracketed paste when the child enabled it).
+    pub fn input_text(&self, name: &str, text: &str) -> Option<Result<()>> {
+        self.route(name, |s| s.input_text(text), |h| h.input_text(text))
+    }
+
+    /// Submit visible composer text that ends with `expect`.
+    pub fn submit(&self, name: &str, expect: &str) -> Option<Result<InputSubmitOutcome>> {
+        self.route(name, |s| s.submit(expect), |h| h.submit(expect))
+    }
+
+    /// Type text, wait `settle`, then submit it, as one act.
+    pub fn type_text(
+        &self,
+        name: &str,
+        text: &str,
+        settle: Duration,
+    ) -> Option<Result<InputSubmitOutcome>> {
+        self.route(
+            name,
+            |s| s.type_text(text, settle),
+            |h| h.type_text(text, settle),
+        )
+    }
+
+    /// `type_text` pinned to one launch; `None` when no session has `name`.
+    pub fn type_text_if_instance(
+        &self,
+        name: &str,
+        expected_instance: &str,
+        text: &str,
+        settle: Duration,
+    ) -> Option<core::result::Result<InputSubmitOutcome, ExpectedInstanceInputError>> {
+        if let Some(session) = self.get(name) {
+            return Some(session.type_text_if_instance(expected_instance, text, settle));
+        }
+        let handle = self.hosted(name)?;
+        Some(
+            hosted_instance_ready(&handle, expected_instance).and_then(|()| {
+                handle
+                    .type_text(text, settle)
+                    .map_err(|_| ExpectedInstanceInputError::OutcomeUncertain)
+            }),
+        )
+    }
+
+    /// Exactly these key bytes, pinned to one launch.
+    pub fn send_key_if_instance(
+        &self,
+        name: &str,
+        expected_instance: &str,
+        bytes: &[u8],
+    ) -> Option<core::result::Result<(), ExpectedInstanceInputError>> {
+        if let Some(session) = self.get(name) {
+            return Some(session.send_key_if_instance(expected_instance, bytes));
+        }
+        let handle = self.hosted(name)?;
+        Some(
+            hosted_instance_ready(&handle, expected_instance).and_then(|()| {
+                handle
+                    .send(bytes)
+                    .map_err(|_| ExpectedInstanceInputError::OutcomeUncertain)
+            }),
+        )
     }
 
     pub fn resize_instance(
@@ -585,8 +761,11 @@ impl Registry {
         name: &str,
         scrollback: usize,
     ) -> Option<Result<crate::agent::VersionedSnapshot>> {
-        self.get(name)
-            .map(|session| session.screen_snapshot_version_at(scrollback))
+        self.route(
+            name,
+            |session| session.screen_snapshot_version_at(scrollback),
+            |handle| handle.snapshot(scrollback),
+        )
     }
 
     pub fn cursor(&self, name: &str) -> Option<Result<Cursor>> {
@@ -649,7 +828,11 @@ impl Registry {
                 "session restarted; close was refused".into(),
             )));
         }
+        self.closing_hosted_lock()
+            .insert(handle.identity().instance.clone());
         if let Err(error) = handle.terminate() {
+            self.closing_hosted_lock()
+                .remove(&handle.identity().instance);
             return Some(Err(error.into_agent()));
         }
         let mut hosted = self.hosted_lock();
@@ -659,6 +842,9 @@ impl Registry {
         if removed {
             hosted.remove(name);
         }
+        // Lock order: `hosted`, then `closing_hosted`, as in the reaper.
+        self.closing_hosted_lock()
+            .remove(&handle.identity().instance);
         Some(Ok(removed))
     }
 }
