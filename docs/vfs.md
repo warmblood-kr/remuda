@@ -186,3 +186,6 @@ come back.
   Then start the older remuda.
 - To a build from before SQLite: run `remuda vfs export-index`, stop the
   daemon, then start the older remuda.
+
+The #778 owner checklist, [vfs-owner-checklist.md](vfs-owner-checklist.md),
+walks through a downgrade and back on a scratch node.
