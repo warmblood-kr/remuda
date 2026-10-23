@@ -1208,6 +1208,40 @@ fn begin_attach(path: &Path, name: &str) -> std::io::Result<(Stream, Option<u64>
     }
 }
 
+/// What the daemon says about a session whose attach stream just ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Aftermath {
+    /// Listed and running: the daemon went away under the attach (#713).
+    Running,
+    /// Not listed, or listed as exited.
+    Ended,
+    /// No daemon answers: it died, or a reload is still handing over.
+    NoDaemon,
+}
+
+/// Asked, not assumed: a host-backed session outlives a reload or a crash.
+pub fn aftermath(path: &Path, name: &str) -> Aftermath {
+    match request(path, &Request::List) {
+        Ok(Response::Sessions(sessions))
+            if sessions
+                .iter()
+                .any(|s| s.name == name && s.alive && !s.unavailable) =>
+        {
+            Aftermath::Running
+        }
+        Ok(_) => Aftermath::Ended,
+        Err(_) => Aftermath::NoDaemon,
+    }
+}
+
+fn end_notice(path: &Path, name: &str) -> String {
+    match aftermath(path, name) {
+        Aftermath::Running => format!("the daemon went away; {name} is still running"),
+        Aftermath::Ended => format!("{name} ended"),
+        Aftermath::NoDaemon => "lost the daemon".into(),
+    }
+}
+
 fn was_taken_over(path: &Path, name: &str, generation: Option<u64>) -> bool {
     generation.is_some_and(|generation| {
         matches!(
@@ -1498,7 +1532,11 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
     } else {
         // The key thread remains alive until one key releases the user's
         // terminal after the session exits.
-        let _ = write!(stdout, "\r\n[remuda] {name} ended — press any key\r\n");
+        let _ = write!(
+            stdout,
+            "\r\n[remuda] {} — press any key\r\n",
+            end_notice(path, name)
+        );
         let _ = stdout.flush();
         Left::Exited
     };

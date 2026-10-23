@@ -5369,7 +5369,16 @@ fn ride_with_mouse(path: &Path, name: &str, mouse: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Left::Exited) => {
-            eprintln!("remuda: {name} exited — {}", fate(path, name));
+            use remuda_native::client::{aftermath, Aftermath};
+            match aftermath(path, name) {
+                Aftermath::Running => eprintln!(
+                    "remuda: the daemon went away (a reload or a restart); {name} is still running, `remuda attach {name}` to go back"
+                ),
+                Aftermath::NoDaemon => eprintln!(
+                    "remuda: lost the daemon; if {name} is host-backed it is still running, and `remuda attach {name}` finds it again"
+                ),
+                Aftermath::Ended => eprintln!("remuda: {name} exited — {}", fate(path, name)),
+            }
             eprintln!("remuda: you are back in your own shell");
             ExitCode::SUCCESS
         }
