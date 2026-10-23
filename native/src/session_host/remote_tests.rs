@@ -807,3 +807,97 @@ fn teardown_waits_while_an_act_is_in_flight() {
     let host = fixture.host.as_mut().unwrap();
     eventually("host stopped", || host.0.try_wait().ok().flatten());
 }
+
+/// Grant a raw Human client, write one line, wait for it to land, and drop
+/// the client without retiring it: a viewer taken over or cut off mid-write.
+fn abandon_one_write(session: &HostSession, line: &str) {
+    use crate::session_host::human::Raw;
+    let mut client = Client::open_human(&session.endpoint, session.identity.clone()).unwrap();
+    let human = match client.request(&Request::Inspect).unwrap() {
+        Response::Info { info } => info.human.expect("host has human counters"),
+        other => panic!("inspect: {other:?}"),
+    };
+    let grant = match client
+        .request(&Request::HumanGrant {
+            request: [3; 16],
+            expected: human.high_water,
+            recovery_secret: [4; 32],
+        })
+        .unwrap()
+    {
+        Response::HumanGranted { grant, .. } => grant,
+        other => panic!("grant: {other:?}"),
+    };
+    let bytes = format!("{line}\n").into_bytes();
+    let sequence = human.last_raw + 1;
+    let admitted = client
+        .request(&Request::HumanInput {
+            grant,
+            sequence,
+            bytes: bytes.clone(),
+        })
+        .unwrap();
+    assert!(
+        matches!(admitted, Response::RawOutcome { .. }),
+        "{admitted:?}"
+    );
+    eventually("abandoned write settled", || {
+        matches!(
+            client
+                .request(&Request::RecoverRaw {
+                    grant,
+                    sequence,
+                    bytes: bytes.clone(),
+                })
+                .ok()?,
+            Response::RawOutcome {
+                state: Raw::Complete(_)
+            }
+        )
+        .then_some(())
+    });
+}
+
+#[test]
+fn input_a_gone_viewer_left_does_not_wedge_the_next_attach() {
+    let mut fixture = Fixture::new();
+    let session = Arc::new(adapter(&fixture.root));
+    abandon_one_write(&session, "abandoned");
+    // More writes than the host's raw window holds, from a new attach.
+    let writes = crate::session_host::human::MAX_RAW + 44;
+    let (done, finished) = std::sync::mpsc::channel();
+    let writer = Arc::clone(&session);
+    std::thread::spawn(move || {
+        let attachment = writer.attach().unwrap();
+        let result = (0..writes).try_for_each(|n| {
+            attachment.write_raw(format!("b{n}\n").as_bytes(), &|| false, Arc::new(|| {}))
+        });
+        let _ = done.send(result);
+    });
+    let result = finished
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the new attach's writes wedged");
+    assert!(result.is_ok(), "{result:?}");
+    eventually("every write landed", || {
+        let effects = fixture.effects();
+        (0..writes)
+            .all(|n| effects.contains(&format!("b{n}")))
+            .then_some(())
+    });
+    eventually("closed", || session.terminate().ok());
+    session.teardown(Duration::from_secs(10)).unwrap();
+    let host = fixture.host.as_mut().unwrap();
+    eventually("host stopped", || host.0.try_wait().ok().flatten());
+}
+
+#[test]
+fn teardown_retires_input_a_gone_viewer_left() {
+    let mut fixture = Fixture::new();
+    let session = adapter(&fixture.root);
+    abandon_one_write(&session, "abandoned");
+    eventually("closed", || session.terminate().ok());
+    // The host's Stop refuses while raw input is unretired.
+    session.teardown(Duration::from_secs(10)).unwrap();
+    let host = fixture.host.as_mut().unwrap();
+    eventually("host stopped", || host.0.try_wait().ok().flatten());
+}

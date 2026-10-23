@@ -341,6 +341,8 @@ impl HostSession {
         // the store still refuses Retire unless the exit is settled.
         if !*stopped && !self.host_gone() {
             let mut client = self.controller()?;
+            // Stop refuses while raw input is unretired; a gone viewer's is ours.
+            discard_abandoned(&mut client);
             match client.request(&Request::Stop).map_err(transport)? {
                 Response::Ok => *stopped = true,
                 Response::Error { code } => return Err(refused(&code)),
@@ -439,6 +441,15 @@ impl HostSession {
             Ok(_) => Announced::Unreachable("unexpected host acquire reply".into()),
             Err(error) => Announced::Unreachable(error.to_string()),
         }
+    }
+    /// Retire raw input that grants no longer current left unacknowledged
+    /// (a viewer taken over or cut off mid-write); it blocks later grants.
+    pub fn discard_abandoned_raw(&self) -> Result<u64> {
+        let _pass = self.gate.enter()?;
+        let mut client = self.controller()?;
+        let discarded = discard_abandoned(&mut client);
+        let _ = client.request(&Request::Release);
+        Ok(discarded)
     }
     fn control(&self, request: Request) -> Result<()> {
         let _pass = self.gate.enter()?;
@@ -771,6 +782,7 @@ impl SessionOperations for HostSession {
     }
     fn attach(&self) -> Result<Box<dyn AttachmentOperations + '_>> {
         Ok(Box::new(super::attachment::HostAttachment::open(
+            self,
             &self.endpoint,
             self.identity.clone(),
             SessionOperations::identity(self),
@@ -881,6 +893,42 @@ fn code_error(code: ErrorCode) -> Error {
         ErrorCode::Invalid => return Error::Protocol("host refused invalid input"),
         ErrorCode::ResultTooLarge => return Error::Protocol("host result exceeded its budget"),
     })
+}
+/// As a controller: discard each leading run of completed raw input that
+/// belongs to a grant no longer current. Stops at a live grant's input, a
+/// write still pending, or any refusal. Returns how many entries went.
+fn discard_abandoned(client: &mut Client) -> u64 {
+    let mut discarded = 0;
+    loop {
+        let last = match client.request(&Request::Inspect) {
+            Ok(Response::Info { info }) => match info.human {
+                Some(human) => human.last_raw,
+                None => return discarded,
+            },
+            _ => return discarded,
+        };
+        // At most MAX_RAW entries are unretired, so the run starts in this window.
+        let window = last.saturating_sub(super::human::MAX_RAW as u64 - 1).max(1);
+        let mut run = None;
+        for end in window..=last {
+            match client.request(&Request::RawCut { last: end }) {
+                Ok(Response::RawCut { cut }) => run = Some(cut),
+                Ok(Response::Retired {
+                    state: super::human::Retire::Forgotten,
+                }) => {}
+                _ => break,
+            }
+        }
+        let Some(cut) = run else {
+            return discarded;
+        };
+        match client.request(&Request::DiscardRaw { cut }) {
+            Ok(Response::Retired {
+                state: super::human::Retire::Retired,
+            }) => discarded += cut.last - cut.first + 1,
+            _ => return discarded,
+        }
+    }
 }
 fn refused(code: &str) -> Error {
     match code {
