@@ -4572,7 +4572,9 @@ fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
     let dir = scratch_dir("attach-mouse-forward");
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
-    let script = "stty raw -echo; printf '\\033[?1000h\\033[?1006h\\033[?2004h'; dd bs=1 count=12 2>/dev/null | od -An -tx1; printf '\\nmouse-forwarded\\n'";
+    // The child stays up after it prints: an attach that sees its session end
+    // lists sessions, and listing reaps an exited one before `capture` (#713).
+    let script = "stty raw -echo; printf '\\033[?1000h\\033[?1006h\\033[?2004h'; dd bs=1 count=12 2>/dev/null | od -An -tx1; printf '\\nmouse-forwarded\\n'; sleep 30";
     let created = client::request(
         &path,
         &Request::New {
