@@ -110,6 +110,10 @@ impl Human {
     pub fn high_water(&self) -> u64 {
         self.high_water
     }
+    /// The last raw sequence reserved by any grant; the next one is this + 1.
+    pub fn last_raw(&self) -> u64 {
+        self.next_raw
+    }
     /// The latest exact request answers evidence only; it never transfers a
     /// grant. Any other request must name the current high-water.
     pub fn grant(
