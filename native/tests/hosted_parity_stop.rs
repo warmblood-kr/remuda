@@ -168,6 +168,3 @@ fn autostart_after_a_crash_names_the_sessions_it_found() {
         }
     }
 }
-        }
-    }
-}
