@@ -872,13 +872,16 @@ fn session_input_returns_to_live_view_without_swallowing_the_key() {
     assert_eq!(ui.scrollback["a"].offset, 0);
 }
 
+// The streaming previews below sleep 30 s after their output and close their
+// session at the end: the session must outlive the test on a slow runner, where
+// a host-backed capture costs a few times an in-process one (#713).
 #[test]
 fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     let path = scratch_socket("preview-follow-after-wheel");
     let _daemon = daemon_at(&path);
     let command = streaming_command(
-        "i=0; while [ $i -lt 200 ]; do printf 'newest-%03d\\n' $i; i=$((i + 1)); sleep 0.02; done; sleep 3",
-        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 200; $i++) { Write-Output ('newest-{0:D3}' -f $i); Start-Sleep -Milliseconds 20 }; Start-Sleep -Seconds 3",
+        "i=0; while [ $i -lt 200 ]; do printf 'newest-%03d\\n' $i; i=$((i + 1)); sleep 0.02; done; sleep 30",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 200; $i++) { Write-Output ('newest-{0:D3}' -f $i); Start-Sleep -Milliseconds 20 }; Start-Sleep -Seconds 30",
     );
     let response = client::request(
         &path,
@@ -963,8 +966,8 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
     let path = scratch_socket("preview-content-anchor");
     let _daemon = daemon_at(&path);
     let command = streaming_command(
-        "i=0; while [ $i -lt 70 ]; do printf 'row-%02d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 3",
-        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 70; $i++) { Write-Output ('row-{0:D2}' -f $i); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 3",
+        "i=0; while [ $i -lt 70 ]; do printf 'row-%02d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 30",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 70; $i++) { Write-Output ('row-{0:D2}' -f $i); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 30",
     );
     let response = client::request(
         &path,
@@ -1047,8 +1050,8 @@ fn real_preview_keeps_content_anchored_after_wheel_down_enters_settle() {
     let path = scratch_socket("preview-settle-content-anchor");
     let _daemon = daemon_at(&path);
     let command = streaming_command(
-        "i=0; while [ $i -lt 90 ]; do printf 'settle-%03d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 2",
-        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 90; $i++) { Write-Output ('settle-{0:D3}' -f $i); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 2",
+        "i=0; while [ $i -lt 90 ]; do printf 'settle-%03d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 30",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 90; $i++) { Write-Output ('settle-{0:D3}' -f $i); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 30",
     );
     let response = client::request(
         &path,
@@ -1128,8 +1131,8 @@ fn real_preview_keeps_content_anchored_after_scrollback_reaches_its_cap() {
     let path = scratch_socket("preview-content-anchor-at-cap");
     let _daemon = daemon_at(&path);
     let command = streaming_command(
-        "i=0; while [ $i -lt 10100 ]; do printf 'row-%05d\\n' $i; i=$((i + 1)); done; j=0; while [ $j -lt 30 ]; do printf 'tail-%02d\\n' $j; j=$((j + 1)); sleep 0.1; done; sleep 3",
-        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 10100; $i++) { Write-Output ('row-{0:D5}' -f $i) }; for ($j=0; $j -lt 30; $j++) { Write-Output ('tail-{0:D2}' -f $j); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 3",
+        "i=0; while [ $i -lt 10100 ]; do printf 'row-%05d\\n' $i; i=$((i + 1)); done; j=0; while [ $j -lt 30 ]; do printf 'tail-%02d\\n' $j; j=$((j + 1)); sleep 0.1; done; sleep 30",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 10100; $i++) { Write-Output ('row-{0:D5}' -f $i) }; for ($j=0; $j -lt 30; $j++) { Write-Output ('tail-{0:D2}' -f $j); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 30",
     );
     let response = client::request(
         &path,
