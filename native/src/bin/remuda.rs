@@ -2819,6 +2819,11 @@ fn describe_cluster_error(
                     "cluster join: cannot reach {address} ({reason}).\nNext: on the inviting machine, check `remuda cluster listen` is running on that address."
                 );
             }
+            if detail == remuda_native::net::join::JOIN_RATE_LIMITED {
+                return format!(
+                    "cluster join: {detail}.\nNext: wait a minute, then run the same join command again; the invitation was not used."
+                );
+            }
             if detail == remuda_native::net::join::JOIN_CLOCK_SKEW {
                 return format!(
                     "cluster join: {detail}.\nNext: turn on automatic time sync on both machines, then run the same join command again; the invitation was not used."
@@ -3900,6 +3905,34 @@ mod cluster_cli_tests {
         let warning = render_join_listener_unexpected_on("127.0.0.1:7441".parse().unwrap());
         assert!(warning.contains("listener remains on at 127.0.0.1:7441"));
         assert!(warning.contains("Next: run `remuda cluster listen --off`"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restored_join_listener_is_not_restored_again() {
+        let environment = ForegroundListenerLockEnvironment::new();
+        let saved = ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Auto,
+            allow_public: false,
+        };
+        remuda_native::cluster::listener_config::write(&saved).unwrap();
+        let daemon_path = environment.root.join("missing-daemon.sock");
+        let mut guard = JoinListenerRestoreGuard::new(&daemon_path, Some(saved.clone()));
+        // The outbound-only fallback restored already; a later failure or Ctrl-C
+        // must neither touch the saved config nor warn.
+        guard.armed = false;
+        guard.restored = true;
+        assert_eq!(restore_join_listener(&mut guard), None);
+        drop(guard);
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            Some(saved)
+        );
+        assert!(
+            !daemon_path.exists(),
+            "restore unexpectedly started a daemon"
+        );
     }
 
     #[cfg(unix)]
@@ -8824,6 +8857,24 @@ mod tests {
                 std::io::Error::new(std::io::ErrorKind::PermissionDenied, "join was refused"),
                 ClusterErrorContext::Address(issuer_addr),
                 "the invitation was refused (join lines work once and expire after 10 minutes).",
+            ),
+            (
+                "join",
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    remuda_native::net::join::JOIN_CLOCK_SKEW,
+                ),
+                ClusterErrorContext::Address(issuer_addr),
+                "turn on automatic time sync on both machines, then run the same join command again; the invitation was not used.",
+            ),
+            (
+                "join",
+                std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    remuda_native::net::join::JOIN_RATE_LIMITED,
+                ),
+                ClusterErrorContext::Address(issuer_addr),
+                "wait a minute, then run the same join command again; the invitation was not used.",
             ),
             (
                 "listen",

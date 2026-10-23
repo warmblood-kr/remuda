@@ -73,6 +73,9 @@ pub fn join(
 pub const JOIN_CLOCK_SKEW: &str =
     "the inviting machine rejected the request as stale: the two clocks differ by more than 60 seconds";
 
+/// Text of the error for a join the issuer turned away for load or rate limits.
+pub const JOIN_RATE_LIMITED: &str = "the inviting machine is busy or rate-limiting join attempts";
+
 /// Map the issuer's HTTP status line. Statuses the listener sends before it
 /// looks at the token (409 stale frame, 429 rate limit) leave the token unused.
 fn check_join_status(status_line: &str) -> io::Result<()> {
@@ -83,10 +86,7 @@ fn check_join_status(status_line: &str) -> io::Result<()> {
             io::ErrorKind::PermissionDenied,
             JOIN_CLOCK_SKEW,
         )),
-        "429" => Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "too many join attempts from this address; wait a minute",
-        )),
+        "429" => Err(io::Error::new(io::ErrorKind::WouldBlock, JOIN_RATE_LIMITED)),
         _ => Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "join was refused",
@@ -157,6 +157,7 @@ mod tests {
         assert_eq!(stale.to_string(), JOIN_CLOCK_SKEW);
         let limited = check_join_status("HTTP/1.1 429 Too Many Requests").unwrap_err();
         assert_eq!(limited.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(limited.to_string(), JOIN_RATE_LIMITED);
         for refused in [
             "HTTP/1.1 403 Forbidden",
             "HTTP/1.1 503 Service Unavailable",

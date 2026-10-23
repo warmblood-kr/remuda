@@ -334,9 +334,13 @@ fn invitation_command_args(output: &Output) -> (String, String) {
         .strip_prefix("remuda cluster join '")
         .and_then(|command| command.strip_suffix('\''))
         .expect("invite command is fully quoted");
-    let (fingerprint, line) = Some(command)
-        .map(|line| (line.split(' ').nth(2).unwrap_or_default(), line))
-        .expect("invite command has fingerprint and line arguments");
+    let (fingerprint, line) = (
+        command
+            .split(' ')
+            .nth(2)
+            .expect("join line carries the issuer fingerprint"),
+        command,
+    );
     (fingerprint.to_owned(), line.to_owned())
 }
 
