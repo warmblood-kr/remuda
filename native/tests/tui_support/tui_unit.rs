@@ -921,19 +921,33 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     }
     assert!(ui.scrollback["stream"].offset >= 30);
 
+    let mut trail = Vec::new();
     for _ in 0..60 {
         assert_eq!(
             ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24),
             Action::Scroll(-3)
         );
         scroll_selected(&mut ui, -3);
-        capture_preview(&path, &mut ui, "stream").expect("capture while returning live");
-        if ui.scrollback["stream"].offset == 0 {
+        let started = Instant::now();
+        if let Err(error) = capture_preview(&path, &mut ui, "stream") {
+            panic!("capture while returning live: {error}; offset/rows/total/ms: {trail:?}");
+        }
+        let state = ui.scrollback["stream"];
+        trail.push((
+            state.offset,
+            state.history_rows,
+            state.history_total,
+            started.elapsed().as_millis(),
+        ));
+        if state.offset == 0 {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(ui.scrollback["stream"].offset, 0);
+    assert_eq!(
+        ui.scrollback["stream"].offset, 0,
+        "offset/rows/total/ms per step: {trail:?}"
+    );
 
     let last_frame = std::cell::RefCell::new(String::new());
     wait_for_output(
@@ -1012,20 +1026,30 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
     // offset that the next frame corrects (see `capture_anchored`), so keep
     // polling until one capture is exact instead of asserting on the first.
     let last = std::cell::RefCell::new(String::new());
+    let started = Instant::now();
     wait_for_output(
         || {
-            let (cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("capture output");
+            let (cells, _, _) = capture_preview(&path, &mut ui, "stream").unwrap_or_else(|error| {
+                panic!(
+                    "capture output after {:?}: {error}; last capture: {}",
+                    started.elapsed(),
+                    last.borrow()
+                )
+            });
             let state = ui.scrollback["stream"];
+            let expected = (3 + state.history_rows).saturating_sub(anchor_history);
+            *last.borrow_mut() = format!(
+                "offset {} (expected {expected}), rows {} (anchor {anchor_history}), \
+                 total {}, content moved: {}",
+                state.offset,
+                state.history_rows,
+                state.history_total,
+                terminal_rows_text(&cells) != anchor_text
+            );
             if state.history_rows < anchor_history + 3 {
                 return None;
             }
-            let expected = 3 + (state.history_rows - anchor_history);
             let exact = state.offset == expected && terminal_rows_text(&cells) == anchor_text;
-            *last.borrow_mut() = format!(
-                "offset {} (expected {expected}), content moved: {}",
-                state.offset,
-                terminal_rows_text(&cells) != anchor_text
-            );
             exact.then_some(())
         },
         || {
