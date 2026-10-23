@@ -6670,9 +6670,6 @@ fn daemon_start_error(path: &Path, stderr_path: &Path, offset: u64, separator: &
     format!("daemon did not come up at {} — {said}", path.display())
 }
 
-/// Spawn ourselves as the daemon and wait for the socket to answer. Wait on a
-/// successful *connect*, not on the file existing, and pass `-s <server>`
-/// through — a bare `remuda daemon` re-derives `"default"` and never matches.
 /// A daemon that was just started lists only what it found again: sessions
 /// whose hosts outlived the earlier daemon (#713).
 fn found_sessions(path: &Path) -> Vec<String> {
@@ -6698,6 +6695,9 @@ fn started_notice(server: &str, found: &[String]) -> String {
     }
 }
 
+/// Spawn ourselves as the daemon and wait for the socket to answer. Wait on a
+/// successful *connect*, not on the file existing, and pass `-s <server>`
+/// through — a bare `remuda daemon` re-derives `"default"` and never matches.
 fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
     daemon::prepare_socket_path(path, Some(&daemon::runtime_dir()))
