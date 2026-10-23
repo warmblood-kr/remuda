@@ -302,6 +302,8 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::ClusterVfsIndexUpdate { .. } => Err(refusal("ClusterVfsIndexUpdate")),
         Request::ClusterVfsBlobStat { .. } => Err(refusal("ClusterVfsBlobStat")),
         Request::ClusterVfsBlobGet { .. } => Err(refusal("ClusterVfsBlobGet")),
+        Request::ClusterVfsTake { .. } => Err(refusal("ClusterVfsTake")),
+        Request::ClusterLeave => Err(refusal("ClusterLeave")),
         Request::ClusterListener(_) => Err(refusal("ClusterListener")),
         Request::Shutdown { .. } => Err(refusal("Shutdown")),
         Request::Eval { .. } => Err(refusal("Eval")),
@@ -585,12 +587,15 @@ mod tests {
                 sha256: "0".repeat(64),
                 offset: 0,
             },
+            Request::ClusterVfsTake { hashes: vec![] },
+            Request::ClusterLeave,
             Request::ClusterListener(remuda_core::protocol::ListenerOp::Status),
             Request::Shutdown {
                 requester_daemon_id: None,
                 requester_session_id: None,
                 requester_session_name: None,
                 override_hosted: false,
+                keep_sessions: false,
             },
         ];
         for request in dangerous {

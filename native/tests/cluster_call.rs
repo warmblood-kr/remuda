@@ -1,6 +1,8 @@
 #![cfg(unix)]
 #![allow(clippy::disallowed_types)]
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use remuda_native::cluster::{encoding, AuthorizedNode, NodeState, Registry};
 use std::fs;
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -104,6 +106,7 @@ impl Drop for Node {
         assert!(self.runtime.starts_with(&self.root));
         let _ = self.daemon.kill();
         let _ = self.daemon.wait();
+        hosts::stop_hosts_under(&self.root);
         let _ = fs::remove_dir_all(&self.root);
     }
 }

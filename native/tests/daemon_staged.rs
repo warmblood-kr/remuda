@@ -32,6 +32,7 @@ fn shutdown(socket: &Path) {
         requester_session_id: None,
         requester_session_name: None,
         override_hosted: true,
+        keep_sessions: false,
     };
     assert!(matches!(
         client::request(socket, &request),
@@ -127,8 +128,8 @@ fn a_non_socket_at_the_path_is_refused_and_preserved() {
 fn concurrent_starts_leave_exactly_one_serving_daemon() {
     let dir = short_dir("race");
     let socket = daemon::socket_path_in(&dir, "s");
-    let mut first = Daemon(spawn::base_command(&dir).spawn().unwrap());
-    let mut second = Daemon(spawn::base_command(&dir).spawn().unwrap());
+    let mut first = Daemon::adopt(spawn::base_command(&dir).spawn().unwrap(), &dir);
+    let mut second = Daemon::adopt(spawn::base_command(&dir).spawn().unwrap(), &dir);
     let deadline = Instant::now() + Duration::from_secs(10);
     // One exits with the "already listening" refusal; the other serves.
     while first.0.try_wait().unwrap().is_none() && second.0.try_wait().unwrap().is_none() {

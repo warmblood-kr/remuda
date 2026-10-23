@@ -646,3 +646,18 @@ fn a_hosted_session_id_names_its_session_for_the_shutdown_guard() {
     assert_eq!(handles.len(), 1);
     assert_eq!(handles[0].identity().name, "fixture");
 }
+
+#[test]
+fn a_recovering_refusal_says_to_try_again() {
+    let text = Error::Unavailable(Unavailable::Recovering).to_string();
+    // Callers match on this prefix; keep it.
+    assert!(
+        text.starts_with("session owner unavailable: Recovering"),
+        "{text}"
+    );
+    assert!(text.contains("try again"), "{text}");
+    assert_eq!(
+        Error::Unavailable(Unavailable::Transport).to_string(),
+        "session owner unavailable: Transport"
+    );
+}

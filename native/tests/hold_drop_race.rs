@@ -27,6 +27,9 @@ use std::time::{Duration, Instant};
 
 const PATIENCE: Duration = Duration::from_secs(10);
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
+
 fn scratch_dir(tag: &str) -> PathBuf {
     let root = if cfg!(unix) {
         PathBuf::from("/tmp")
@@ -44,7 +47,11 @@ fn scratch(tag: &str) -> PathBuf {
 
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
+    // Session hosts outlive the daemon (#713); stop the ones under this socket's dir.
     fn drop(&mut self) {
+        if let Some(dir) = self.0.parent() {
+            hosts::stop_hosts_under(dir);
+        }
         let _ = std::fs::remove_file(&self.0);
     }
 }
@@ -65,7 +72,8 @@ fn daemon_at(path: &Path) -> impl Drop {
 
 /// A daemon as its own OS process — the real shape (`bin/remuda.rs`'s
 /// `start_daemon`), copied from `tests/daemon.rs`'s own `Daemon`.
-struct Daemon(std::process::Child);
+/// Dropping it kills the daemon, then its session hosts (#713).
+struct Daemon(std::process::Child, #[allow(dead_code)] hosts::HostSweep);
 
 impl Daemon {
     fn spawn(dir: &Path) -> Self {
@@ -80,7 +88,7 @@ impl Daemon {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn daemon");
-        let daemon = Self(child);
+        let daemon = Self(child, hosts::HostSweep::new(dir));
         let path = daemon::socket_path_in(dir, "s");
         let deadline = Instant::now() + PATIENCE;
         while remuda_native::ipc::connect(&path).is_err() {

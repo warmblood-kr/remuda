@@ -1,6 +1,10 @@
 //! A session client keeps using the runtime directory chosen by its daemon.
 
 #[cfg(unix)]
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
+
+#[cfg(unix)]
 mod unix {
     use remuda_core::protocol::{Request, Response};
     use remuda_core::Size;
@@ -43,7 +47,10 @@ mod unix {
     }
 
     impl Drop for Scratch {
+        // Declared before the daemon, so dropped after it: stops the session
+        // hosts it left (#713), then removes the directory.
         fn drop(&mut self) {
+            super::hosts::stop_hosts_under(&self.0);
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }

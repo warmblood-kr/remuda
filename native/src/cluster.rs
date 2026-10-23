@@ -1,11 +1,13 @@
 //! Cluster vocabulary composed from identity and membership registry units.
 
+pub mod audit;
 pub mod control;
 pub mod encoding;
 pub mod endpoint;
 pub mod identity;
 pub mod join_line;
 pub mod join_token;
+pub mod leave;
 pub mod listener_config;
 pub mod listener_control;
 pub mod registry;
@@ -13,7 +15,13 @@ pub mod replication;
 mod sealed;
 pub(crate) mod storage;
 pub mod vfs;
+pub mod vfs_drain;
 mod vfs_index_db;
+pub(crate) use vfs_index_db::{
+    known_steps as index_db_known_steps, schema_on_disk as index_db_schema_on_disk,
+};
+mod vfs_repair;
+pub mod vfs_status;
 pub mod vfs_sync;
 #[cfg(windows)]
 pub(crate) mod windows_security;
@@ -171,8 +179,8 @@ fn add_self_to_registry_at(dir: &Path, node: &NodeIdentity) -> io::Result<()> {
 }
 
 /// Replace the local identity and reset membership to the new local node only.
-/// The caller must confirm this disruptive operation in the CLI.
-pub fn init_new_identity() -> io::Result<NodeIdentity> {
+/// The VFS store moves to `left` first (#862). The CLI confirms this first.
+pub fn init_new_identity(left: &Path) -> io::Result<(NodeIdentity, bool)> {
     let state_dir = storage::cluster_state_dir()?;
     let dir = identity::prepare_cluster_dir_at(&state_dir)?;
     let _guard = storage::StateLock::acquire(&dir)?;
@@ -198,8 +206,10 @@ pub fn init_new_identity() -> io::Result<NodeIdentity> {
         },
     )?;
     control::clear_revoked_notice_at(&dir)?;
+    // Last, so a sync pass that opens a fresh store already sees no peers.
+    let moved = leave::set_vfs_aside(&dir, left)?;
     storage::write_cluster_init_marker(&state_dir, &node.node_fp)?;
-    Ok(node)
+    Ok((node, moved))
 }
 
 /// Re-encrypt any plaintext credentials left by a remuda older than #746,

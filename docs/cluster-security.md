@@ -126,6 +126,23 @@ outcome as possibly delivered. The fixed one-second budget window can allow up
 to 2×256 KiB across a window boundary. Identical retries are charged again at
 the listener, while the daemon deduplicates them to prevent repeated writes.
 
+## Audit log
+
+The listener records every session-changing request from an admitted peer in
+`cluster/audit.jsonl` under the private cluster directory (mode 0600, opened
+without following symlinks; owner-only ACL on Windows). One JSON line per
+request: time in Unix milliseconds, the authenticated peer fingerprint, the
+operation (`input`, `resize`, `close`, `create`), the session name and
+instance id when sent, and the outcome (`done`, `failed`, `refused`, `limited`,
+`revoked`). Reads (List, Sync, capture) are not recorded. Input bytes are never
+recorded, not even their length. The file keeps the most recent 10,000
+entries; once 1,000 more have been appended it is trimmed in one atomic
+rewrite. The log is local and never replicated.
+
+Recording is best effort: if the file cannot be written, the listener reports
+it once on stderr and still serves the request. `revoked` means the peer was
+revoked while its request was held, so the write may already have happened.
+
 ## Response chunking (v2)
 
 A Noise message is capped at 65,535 bytes, so a v1 response (one handshake

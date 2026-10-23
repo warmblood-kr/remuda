@@ -1,5 +1,7 @@
 //! End-to-end coverage for the cluster tree's read-only local IPC path.
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use remuda_core::protocol::{Request, Response};
 use remuda_core::Size;
@@ -102,6 +104,7 @@ impl Drop for PrivateDaemon {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        hosts::stop_hosts_under(&self.runtime);
         let _ = std::fs::remove_dir_all(&self.runtime);
     }
 }

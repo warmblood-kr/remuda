@@ -45,8 +45,9 @@ impl Root {
 }
 impl Drop for Root {
     fn drop(&mut self) {
-        // Only processes whose argv names this unique root: our hosts.
-        for pid in processes_naming(&self.0) {
+        // Only processes whose argv names this unique root: our hosts, and
+        // a daemon that took the socket over in a reload.
+        for pid in processes_under(&self.0) {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
         let _ = std::fs::remove_dir_all(&self.0);
@@ -162,14 +163,21 @@ fn wait_gone(pid: i32) {
     }
 }
 fn processes_naming(root: &Path) -> Vec<i32> {
+    processes_matching(root, "run-reserved")
+}
+fn processes_under(root: &Path) -> Vec<i32> {
+    processes_matching(root, "")
+}
+fn processes_matching(root: &Path, also: &str) -> Vec<i32> {
     let output = Command::new("/bin/ps")
         .args(["-A", "-o", "pid=", "-o", "args="])
         .output()
         .expect("ps");
-    let needle = root.to_string_lossy().into_owned();
+    // The trailing slash keeps root `…-1` from matching `…-10`.
+    let needle = format!("{}/", root.to_string_lossy());
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|line| line.contains(&needle) && line.contains("run-reserved"))
+        .filter(|line| line.contains(&needle) && line.contains(also))
         .filter_map(|line| line.split_whitespace().next()?.parse().ok())
         .collect()
 }
@@ -351,9 +359,33 @@ fn previous() -> PathBuf {
     }
     dir.join("remuda")
 }
+/// Whether N hosts sessions at all: builds before #759 ignore the opt-in,
+/// keep sessions in-process and never create a host inventory.
+fn previous_hosts() -> bool {
+    let root = Root::new();
+    let daemon = Daemon::spawn_exe(&root, &previous(), true);
+    new_session(&root.socket(), "probe");
+    let hosts = root.hosts().exists();
+    drop(daemon);
+    hosts
+}
+
+/// Skip a test N cannot take part in. A job that must run everything sets
+/// REMUDA_COMPAT_NO_SKIP, so a skip there fails instead.
+fn skip(reason: &str) {
+    assert!(
+        std::env::var_os("REMUDA_COMPAT_NO_SKIP").is_none(),
+        "REMUDA_COMPAT_NO_SKIP is set but {reason}"
+    );
+    eprintln!("skipped: {reason}");
+}
+
 /// One daemon creates a hosted session and dies; the other adopts its
 /// inventory and host, then sends input and closes through it.
 fn hand_over(first: &Path, second: &Path) {
+    if !previous_hosts() {
+        return skip("N predates daemon hosting (#759)");
+    }
     let root = Root::new();
     let path = root.socket();
     let creator = Daemon::spawn_exe(&root, first, true);
@@ -449,6 +481,7 @@ fn an_agent_hosted_by_an_earlier_daemon_cannot_stop_its_replacement() {
             requester_session_id: Some("stale-session-id".into()),
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         },
     );
     assert!(
@@ -464,6 +497,7 @@ fn an_agent_hosted_by_an_earlier_daemon_cannot_stop_its_replacement() {
             requester_session_id: None,
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         },
     );
     assert_eq!(stopped, Response::Ok);
@@ -500,8 +534,9 @@ fn reload_check(
     )
 }
 
-/// Whatever either build supports, a reload or its check across N and N+1
-/// leaves the hosted session working, and a refusal says why.
+/// A reload or its check across N and N+1 goes through and keeps the hosted
+/// session. Both builds know reload now, so the only refusal allowed is a
+/// handoff version bump, which says so.
 fn check_leaves_the_session_alone(daemon_exe: &Path, cli: &Path, target: &Path, check: bool) {
     let root = Root::new();
     let path = root.socket();
@@ -509,14 +544,22 @@ fn check_leaves_the_session_alone(daemon_exe: &Path, cli: &Path, target: &Path, 
     new_session(&path, "compat");
     let (code, stdout, stderr) = reload_check(&root, cli, target, check);
     eprintln!("reload (check {check}): exit {code:?}\n{stdout}{stderr}");
-    // Builds that speak different handoff versions refuse each other cleanly.
-    let understood = stdout.starts_with("ready: ")
-        || stdout.starts_with("reloaded: ")
-        || stderr.contains("candidate exited before its hello")
-        || stderr.contains("predates `remuda reload`")
-        || stderr.contains(" speaks handoff version ")
-        || stderr.contains("reload without --check is not implemented yet");
-    assert!(understood, "exit {code:?}\n{stdout}\n{stderr}");
+    if stdout.starts_with("ready: ") || stdout.starts_with("reloaded: ") {
+        // The candidate drives the host the other build started.
+        assert!(stdout.contains("\nhost compat: now "), "{stdout}");
+        assert_eq!(code, Some(0), "{stdout}{stderr}");
+    } else {
+        assert!(
+            stderr.contains(" speaks handoff version "),
+            "exit {code:?}\n{stdout}\n{stderr}"
+        );
+    }
+    if stdout.starts_with("reloaded: ") {
+        assert!(
+            stdout.contains("\nsessions: all 1 host-backed listed"),
+            "{stdout}"
+        );
+    }
     // `remuda stop` would end every session: never the advice here.
     assert!(!stderr.contains("run `remuda stop`"), "{stderr}");
     assert_eq!(
@@ -555,8 +598,53 @@ fn n_plus_one_older_daemon_is_asked_to_reload() {
     check_leaves_the_session_alone(&previous(), this, this, false);
 }
 
+#[test]
+fn a_rediscovered_hosted_session_still_wakes_output_hooks() {
+    let root = Root::new();
+    let path = root.socket();
+    let first = Daemon::spawn(&root, true);
+    new_session(&path, "keeper");
+    wait_for(&path, "keeper", "$");
+    first.sigkill();
+
+    let _second = Daemon::spawn(&root, false);
+    let log = root.0.join("output.log");
+    let hook = format!(
+        "remuda.on('session_output', function(name) \
+           local f = assert(io.open('{}', 'a')); f:write(name, '\\n'); f:close() end, {{ group = 'test' }})",
+        log.display()
+    );
+    assert!(matches!(
+        request(
+            &path,
+            &Request::Eval {
+                code: hook,
+                name: None
+            }
+        ),
+        Response::Value(_)
+    ));
+    // Only output after the hook counts: clear what the catch-up wake wrote.
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = std::fs::remove_file(&log);
+    assert_eq!(
+        send_line(&path, "keeper", "echo AFTER:$((2+2))"),
+        Response::Ok
+    );
+    wait_for(&path, "keeper", "AFTER:4");
+    let deadline = Instant::now() + PATIENCE;
+    while !std::fs::read_to_string(&log).is_ok_and(|text| text.contains("keeper")) {
+        assert!(
+            Instant::now() < deadline,
+            "no session_output after rediscovery"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// `remuda upgrade`'s reload across N and N+1: the daemon moves onto the
-/// installed build, or keeps its own and says why; the session lives on.
+/// installed build, and the session lives on. Only a handoff version bump
+/// may keep the old daemon.
 fn upgrade_across_builds(daemon_exe: &Path, installed: &Path) {
     use remuda_native::reload::upgrade::{after_upgrade, AfterUpgrade};
     let root = Root::new();
@@ -568,14 +656,9 @@ fn upgrade_across_builds(daemon_exe: &Path, installed: &Path) {
     let understood = match &outcome {
         AfterUpgrade::Reloaded(report) => report.starts_with("reloaded: "),
         AfterUpgrade::Current(_) => true,
-        AfterUpgrade::Kept(why) => {
-            why.contains("predates `remuda reload`")
-                || why.contains("did not start as a reload candidate")
-                || why.contains(" speaks handoff version ")
-                || why.contains("reload without --check is not implemented yet")
-                || why.starts_with("blocked: ")
-        }
-        AfterUpgrade::Failed(_) => false,
+        AfterUpgrade::Kept(why) => why.contains(" speaks handoff version "),
+        // A move that left the new daemon failing its post-check is a break.
+        AfterUpgrade::Unhealthy(_) | AfterUpgrade::Failed(_) => false,
         AfterUpgrade::NoDaemon => false,
     };
     assert!(understood, "{outcome:?}");
@@ -592,6 +675,7 @@ fn upgrade_across_builds(daemon_exe: &Path, installed: &Path) {
             requester_session_id: None,
             requester_session_name: None,
             override_hosted: false,
+            keep_sessions: false,
         },
     );
     drop(daemon);

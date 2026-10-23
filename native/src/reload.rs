@@ -40,6 +40,9 @@ pub enum FromCandidate {
     Hello {
         handoff: u16,
         build: String,
+        /// Schema steps of `index.db` C reads; absent from older builds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index_db_steps: Option<u32>,
     },
     Ready {
         hosts: Vec<HostView>,
@@ -88,6 +91,8 @@ pub struct Report {
     pub candidate: String,
     pub hosts: Vec<(HostView, HostView)>,
     pub blockers: Vec<String>,
+    /// Printed, but a reload still goes ahead.
+    pub warnings: Vec<String>,
 }
 impl Report {
     /// Lines for the CLI: verdict first.
@@ -104,6 +109,7 @@ impl Report {
             )
         }];
         lines.extend(self.blockers.iter().map(|b| format!("blocker: {b}")));
+        lines.extend(self.warnings.iter().map(|w| format!("warning: {w}")));
         for (old, new) in &self.hosts {
             let seen = |view: &HostView| match (&view.build, &view.problem) {
                 (Some(build), _) => build.clone(),
@@ -208,9 +214,26 @@ impl Candidate {
         outcome
     }
     fn hand_over(&mut self, listener: RawFd, lock: RawFd, until: Instant) -> Result<(), String> {
+        let fault = std::env::var(TEST_FAULT).ok();
+        // Tests: O dies just before or just after the handover.
+        if fault.as_deref() == Some("old-exits-before-take") {
+            std::process::exit(1);
+        }
         let bytes = frame(&FromOld::Take).map_err(|e| format!("take: {e}"))?;
-        fds::send(&self.stream, &bytes, &[listener, lock])
-            .map_err(|e| format!("could not hand over the listener: {e}"))?;
+        fds::send(&self.stream, &bytes, &[listener, lock]).map_err(|e| {
+            // C may exit right after its report, before reading `Take`.
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ) {
+                exited(&mut self.child, "take")
+            } else {
+                format!("could not hand over the listener: {e}")
+            }
+        })?;
+        if fault.as_deref() == Some("old-exits-after-take") {
+            std::process::exit(1);
+        }
         match read_frame(&mut self.stream, &mut self.child, until, "serving")? {
             FromCandidate::Serving => Ok(()),
             FromCandidate::Failed { reason } => {
@@ -245,12 +268,18 @@ pub(crate) fn start(
         .collect();
     let (mut stream, mut child) = spawn(socket, binary)?;
     match converse(&mut stream, &mut child, deadlines) {
-        Ok((candidate, theirs)) => Ok(Candidate {
-            stream,
-            child,
-            report: compare(candidate, ours, theirs, legacy),
-            _one: one,
-        }),
+        Ok((candidate, steps, theirs)) => {
+            let warning =
+                index_db_warning(&candidate, steps, crate::cluster::index_db_schema_on_disk());
+            let mut report = compare(candidate, ours, theirs, legacy);
+            report.warnings.extend(warning);
+            Ok(Candidate {
+                stream,
+                child,
+                report,
+                _one: one,
+            })
+        }
         Err(error) => {
             let _ = write_frame(&mut stream, &FromOld::Abort);
             drop(stream);
@@ -264,11 +293,15 @@ fn converse(
     stream: &mut UnixStream,
     child: &mut Child,
     deadlines: Deadlines,
-) -> Result<(String, Vec<HostView>), String> {
+) -> Result<(String, Option<u32>, Vec<HostView>), String> {
     let started = Instant::now();
-    let build = match read_frame(stream, child, started + deadlines.hello, "hello")? {
-        FromCandidate::Hello { handoff, build } if handoff == HANDOFF => build,
-        FromCandidate::Hello { handoff, build } => {
+    let (build, steps) = match read_frame(stream, child, started + deadlines.hello, "hello")? {
+        FromCandidate::Hello {
+            handoff,
+            build,
+            index_db_steps,
+        } if handoff == HANDOFF => (build, index_db_steps),
+        FromCandidate::Hello { handoff, build, .. } => {
             return Err(format!(
                 "candidate {build} speaks handoff version {handoff}, this daemon {HANDOFF}"
             ))
@@ -276,7 +309,7 @@ fn converse(
         other => return Err(format!("candidate sent {other:?} before its hello")),
     };
     match read_frame(stream, child, started + deadlines.ready, "ready")? {
-        FromCandidate::Ready { hosts } => Ok((build, hosts)),
+        FromCandidate::Ready { hosts } => Ok((build, steps, hosts)),
         FromCandidate::Failed { reason } => Err(format!("candidate {build} failed: {reason}")),
         other => Err(format!("candidate {build} sent {other:?} instead of ready")),
     }
@@ -320,6 +353,48 @@ fn compare(
         candidate,
         hosts,
         blockers,
+        warnings: Vec::new(),
+    }
+}
+
+/// A target that reads fewer `index.db` steps than this node's index leaves
+/// the VFS refusing every call until a reload forward. Warn, never block:
+/// sessions are unaffected and nothing is lost (#778).
+fn index_db_warning(
+    candidate: &str,
+    steps: Option<u32>,
+    on_disk: Result<Option<u32>, String>,
+) -> Option<String> {
+    let on_disk = match on_disk {
+        Ok(on_disk) => on_disk?,
+        Err(error) => {
+            return Some(format!(
+                "could not read the index.db schema ({error}), so it is unknown whether \
+                 {candidate} can read it"
+            ))
+        }
+    };
+    let undo = |to: u32| {
+        if to == 0 {
+            "`remuda vfs export-index` on this build first".to_owned()
+        } else {
+            format!("`remuda vfs index-downgrade {to} --yes` on this build first")
+        }
+    };
+    match steps {
+        Some(known) if known >= on_disk => None,
+        Some(known) => Some(format!(
+            "index.db is at schema {on_disk} but {candidate} reads up to {known}; after the \
+             reload the VFS refuses every call until you reload forward again. To keep the \
+             VFS working on {candidate}, run {}",
+            undo(known)
+        )),
+        None => Some(format!(
+            "{candidate} does not say which index.db schema it reads (index.db is at schema \
+             {on_disk}). If it reads less, the VFS refuses every call after the reload until \
+             you reload forward again; `remuda vfs index-downgrade VERSION --yes` on this \
+             build first avoids that"
+        )),
     }
 }
 
@@ -404,14 +479,24 @@ pub fn candidate(socket: &Path) -> Result<(), String> {
     let mut stream = unsafe { UnixStream::from_raw_fd(CANDIDATE_FD) };
     // Sessions this daemon starts must not inherit it.
     set_cloexec(CANDIDATE_FD).map_err(|e| format!("handoff fd: {e}"))?;
+    let fault = std::env::var(TEST_FAULT).ok();
+    // Tests: die at each step before the take.
+    let die_at = |step: &str| {
+        if fault.as_deref() == Some(step) {
+            std::process::exit(1);
+        }
+    };
+    die_at("exit-before-hello");
     write_frame(
         &mut stream,
         &FromCandidate::Hello {
             handoff: HANDOFF,
             build: crate::dist::BUILD_VERSION.into(),
+            index_db_steps: Some(crate::cluster::index_db_known_steps()),
         },
     )
     .map_err(|e| format!("hello: {e}"))?;
+    die_at("exit-in-preflight");
     let report = match Hosting::for_socket(socket).preflight() {
         Ok(checked) => FromCandidate::Ready {
             hosts: checked.into_iter().map(HostView::from).collect(),
@@ -421,6 +506,7 @@ pub fn candidate(socket: &Path) -> Result<(), String> {
         },
     };
     write_frame(&mut stream, &report).map_err(|e| format!("report: {e}"))?;
+    die_at("exit-after-ready");
     // Abort, or O gone: either way this candidate is done.
     match read_word(&stream) {
         Ok((FromOld::Take, fds)) => take(socket, stream, fds),
@@ -546,16 +632,19 @@ fn read_frame(
         {
             Err(format!("candidate sent no {awaited} in time"))
         }
-        Err(_) => {
-            reap(child);
-            let status = child
-                .try_wait()
-                .ok()
-                .flatten()
-                .map_or_else(|| "unknown status".into(), |status| status.to_string());
-            Err(format!("candidate exited before its {awaited} ({status})"))
-        }
+        Err(_) => Err(exited(child, awaited)),
     }
+}
+
+/// C closed its end: reap it and say what it was waited on for.
+fn exited(child: &mut Child, awaited: &str) -> String {
+    reap(child);
+    let status = child
+        .try_wait()
+        .ok()
+        .flatten()
+        .map_or_else(|| "unknown status".into(), |status| status.to_string());
+    format!("candidate exited before its {awaited} ({status})")
 }
 
 pub mod post_check;
@@ -627,6 +716,78 @@ mod tests {
                 "ready: a reload into 2+b would keep every host",
                 "host a: now 1+a; candidate sees 1+a"
             ]
+        );
+    }
+
+    #[test]
+    fn a_target_that_reads_an_older_index_db_is_warned_about_not_blocked() {
+        // Nothing to warn about: no index, or the target reads it.
+        assert_eq!(index_db_warning("2+b", Some(3), Ok(None)), None);
+        assert_eq!(index_db_warning("2+b", Some(3), Ok(Some(3))), None);
+        assert_eq!(index_db_warning("2+b", Some(4), Ok(Some(3))), None);
+        let older = index_db_warning("2+b", Some(2), Ok(Some(3))).unwrap();
+        assert!(
+            older.contains("index.db is at schema 3 but 2+b reads up to 2"),
+            "{older}"
+        );
+        assert!(
+            older.contains("`remuda vfs index-downgrade 2 --yes`"),
+            "{older}"
+        );
+        // Step 1 cannot be undone; a build without index.db needs the export.
+        let none = index_db_warning("2+b", Some(0), Ok(Some(1))).unwrap();
+        assert!(none.contains("`remuda vfs export-index`"), "{none}");
+        // A target from before the field: say what is known.
+        let unread = index_db_warning("2+b", Some(3), Err("database is locked".into())).unwrap();
+        assert!(
+            unread.contains("could not read the index.db schema (database is locked)"),
+            "{unread}"
+        );
+        let silent = index_db_warning("2+b", None, Ok(Some(3))).unwrap();
+        assert!(
+            silent.contains("does not say which index.db schema"),
+            "{silent}"
+        );
+        assert!(silent.contains("index-downgrade"), "{silent}");
+        let mut report = compare("2+b".into(), Vec::new(), Vec::new(), &[]);
+        report.warnings.push(older.clone());
+        assert_eq!(
+            report.lines(),
+            vec![
+                "ready: a reload into 2+b would keep every host".to_owned(),
+                format!("warning: {older}")
+            ]
+        );
+    }
+
+    #[test]
+    fn the_hello_field_is_add_only() {
+        // An older candidate's hello has no index_db_steps.
+        let old: FromCandidate =
+            serde_json::from_str(r#"{"kind":"Hello","handoff":1,"build":"1+a"}"#).unwrap();
+        assert!(matches!(
+            old,
+            FromCandidate::Hello {
+                index_db_steps: None,
+                ..
+            }
+        ));
+        // An older daemon's shape still reads the new hello.
+        #[derive(Deserialize)]
+        #[serde(tag = "kind")]
+        #[allow(dead_code)]
+        enum OldFromCandidate {
+            Hello { handoff: u16, build: String },
+        }
+        let new = serde_json::to_string(&FromCandidate::Hello {
+            handoff: HANDOFF,
+            build: "2+b".into(),
+            index_db_steps: Some(3),
+        })
+        .unwrap();
+        assert!(
+            serde_json::from_str::<OldFromCandidate>(&new).is_ok(),
+            "{new}"
         );
     }
 
