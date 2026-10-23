@@ -93,6 +93,44 @@ pub fn left_dir() -> io::Result<PathBuf> {
     Ok(free_left_dir(&state, &today()))
 }
 
+/// Stores set aside in `state` by `forget` or `set_vfs_aside`, with their
+/// size in bytes, oldest name first.
+pub fn old_stores(state: &Path) -> Vec<(PathBuf, u64)> {
+    let Ok(read) = std::fs::read_dir(state) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(PathBuf, u64)> = read
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("cluster.left-")
+        })
+        .map(|entry| entry.path().join("vfs"))
+        .filter(|vfs| vfs.is_dir())
+        .map(|vfs| {
+            let bytes = tree_bytes(&vfs);
+            (vfs, bytes)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+fn tree_bytes(dir: &Path) -> u64 {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    read.flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => tree_bytes(&entry.path()),
+            Ok(kind) if kind.is_file() => entry.metadata().map_or(0, |meta| meta.len()),
+            _ => 0,
+        })
+        .sum()
+}
+
 fn free_left_dir(state: &Path, date: &str) -> PathBuf {
     let base = state.join(format!("cluster.left-{date}"));
     let mut dir = base.clone();
@@ -122,6 +160,19 @@ fn forget_at(cluster: &Path, left: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Move `cluster/vfs` alone to `left/vfs`, for a new identity (#862): an old
+/// index under a new key would bring back files deleted meanwhile.
+/// Returns false when there is no store to move.
+pub fn set_vfs_aside(cluster: &Path, left: &Path) -> io::Result<bool> {
+    let vfs = cluster.join("vfs");
+    if vfs.symlink_metadata().is_err() {
+        return Ok(false);
+    }
+    super::storage::create_private_directory(left)?;
+    std::fs::rename(vfs, left.join("vfs"))?;
+    Ok(true)
+}
+
 fn today() -> String {
     let days = super::vfs::unix_now() / 86_400;
     let (year, month, day) = civil_from_days(days as i64);
@@ -145,6 +196,20 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_stores_lists_only_set_aside_vfs_folders() {
+        let root = std::env::temp_dir().join(format!("remuda-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cluster/vfs")).unwrap();
+        std::fs::create_dir_all(root.join("cluster.left-20261022/vfs/blobs/ab")).unwrap();
+        std::fs::write(root.join("cluster.left-20261022/vfs/index.db"), [0; 10]).unwrap();
+        std::fs::write(root.join("cluster.left-20261022/vfs/blobs/ab/c"), [0; 5]).unwrap();
+        std::fs::create_dir_all(root.join("cluster.left-20261021")).unwrap();
+        let found = old_stores(&root);
+        assert_eq!(found, vec![(root.join("cluster.left-20261022/vfs"), 15)]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn dates_are_civil() {
@@ -173,6 +238,24 @@ mod tests {
         assert!(!left.join("authorized_nodes.json").exists());
         assert!(left.join("audit.jsonl").is_file());
         assert!(left.join("vfs/index.db").is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_new_identity_sets_only_the_store_aside() {
+        let root = std::env::temp_dir().join(format!("remuda-aside-{}", std::process::id()));
+        let cluster = root.join("cluster");
+        std::fs::create_dir_all(cluster.join("vfs")).unwrap();
+        std::fs::write(cluster.join("vfs/index.db"), "db").unwrap();
+        std::fs::write(cluster.join("identity.key"), "key").unwrap();
+        let left = root.join("cluster.left-20261022");
+
+        assert!(set_vfs_aside(&cluster, &left).unwrap());
+        assert!(left.join("vfs/index.db").is_file());
+        assert!(!cluster.join("vfs").exists());
+        assert!(cluster.join("identity.key").is_file());
+        assert!(!set_vfs_aside(&cluster, &root.join("other")).unwrap());
+        assert!(!root.join("other").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -179,8 +179,8 @@ fn add_self_to_registry_at(dir: &Path, node: &NodeIdentity) -> io::Result<()> {
 }
 
 /// Replace the local identity and reset membership to the new local node only.
-/// The caller must confirm this disruptive operation in the CLI.
-pub fn init_new_identity() -> io::Result<NodeIdentity> {
+/// The VFS store moves to `left` first (#862). The CLI confirms this first.
+pub fn init_new_identity(left: &Path) -> io::Result<(NodeIdentity, bool)> {
     let state_dir = storage::cluster_state_dir()?;
     let dir = identity::prepare_cluster_dir_at(&state_dir)?;
     let _guard = storage::StateLock::acquire(&dir)?;
@@ -206,8 +206,10 @@ pub fn init_new_identity() -> io::Result<NodeIdentity> {
         },
     )?;
     control::clear_revoked_notice_at(&dir)?;
+    // Last, so a sync pass that opens a fresh store already sees no peers.
+    let moved = leave::set_vfs_aside(&dir, left)?;
     storage::write_cluster_init_marker(&state_dir, &node.node_fp)?;
-    Ok(node)
+    Ok((node, moved))
 }
 
 /// Re-encrypt any plaintext credentials left by a remuda older than #746,

@@ -318,6 +318,23 @@ pub fn unix_now() -> u64 {
 #[derive(Clone, Debug)]
 pub struct VfsStore {
     root: PathBuf,
+    /// The folder's identity at open; `still_here` compares it.
+    opened: Option<(u64, u64)>,
+}
+
+/// (device, inode) on unix; elsewhere the folder's creation time.
+fn folder_id(path: &Path) -> Option<(u64, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let born = meta.created().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        Some((born.as_secs(), u64::from(born.subsec_nanos())))
+    }
 }
 
 impl VfsStore {
@@ -347,6 +364,7 @@ impl VfsStore {
         storage::create_private_directory(&blobs)?;
         Ok(Self {
             root: root.to_path_buf(),
+            opened: folder_id(root),
         })
     }
 
@@ -381,6 +399,7 @@ impl VfsStore {
         rules::validate_replicas(settings.default_replicas)
             .map_err(|error| VfsError::new(VfsErrorKind::BadUri, error.0))?;
         let _guard = self.lock()?;
+        self.still_here()?;
         let bytes = serde_json::to_vec_pretty(settings).map_err(io::Error::other)?;
         storage::atomic_write(&self.root.join("vfs.json"), &bytes)?;
         Ok(())
@@ -414,10 +433,10 @@ impl VfsStore {
         vfs_index_db::open(&self.root)
     }
 
-    /// Refuse once `cluster leave` moved the store away, so a pass that
-    /// opened it before never writes a new one in its place.
+    /// Refuse once `cluster leave` or `init --new-identity` moved the store
+    /// away, even if a new store now sits at the same path.
     fn still_here(&self) -> VfsResult<()> {
-        if self.root.is_dir() {
+        if self.root.is_dir() && (self.opened.is_none() || folder_id(&self.root) == self.opened) {
             return Ok(());
         }
         Err(VfsError::new(
@@ -554,6 +573,7 @@ impl VfsStore {
 
     /// Record that a peer index was merged at `now`.
     pub fn mark_synced(&self, now: u64) -> VfsResult<()> {
+        self.still_here()?;
         storage::atomic_write(&self.root.join("synced_at"), now.to_string().as_bytes())?;
         Ok(())
     }
@@ -905,6 +925,7 @@ impl VfsStore {
     /// every placement node confirm a copy, so this is never the last one.
     pub fn trim_stand_in(&self, sha256: &str) -> VfsResult<bool> {
         let _guard = self.lock()?;
+        self.still_here()?;
         let marker = self.stand_in_path(sha256)?;
         if !marker.is_file() {
             return Ok(false);
@@ -1137,6 +1158,28 @@ mod tests {
         assert_eq!(live.sha256, sha256_hex(b"world"));
         assert_eq!(store.read_blob(&live.sha256).unwrap(), b"world");
         assert!(store.has_blob(&first.sha256, first.size));
+    }
+
+    #[test]
+    fn a_handle_to_a_moved_store_never_writes_the_new_one() {
+        let scratch = Scratch::new();
+        let old = scratch.store();
+        let kept = old.put("kept", b"x", 1, "SHA256:me").unwrap();
+        fs::rename(scratch.0.join("vfs"), scratch.0.join("aside")).unwrap();
+        let fresh = scratch.store();
+        let refused = old.merge_entries(vec![kept]).unwrap_err();
+        assert_eq!(refused.kind, VfsErrorKind::NoCluster);
+        assert!(old.put("late", b"y", 1, "SHA256:me").is_err());
+        assert!(fresh.load_index().unwrap().entries.is_empty());
+        let settings = VfsSettings::default();
+        assert!(old.save_settings(&settings).is_err());
+        assert!(!scratch.0.join("vfs/vfs.json").exists());
+        assert!(old.mark_synced(1).is_err());
+        assert_eq!(fresh.synced_at(), None);
+        let blob = fresh.put_blob(b"z").unwrap();
+        fresh.mark_stand_in(&blob).unwrap();
+        assert!(old.trim_stand_in(&blob).is_err());
+        assert!(fresh.blob_present(&blob));
     }
 
     #[test]

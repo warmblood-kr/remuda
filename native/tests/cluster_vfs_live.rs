@@ -13,7 +13,7 @@ use remuda_core::protocol::Request;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -163,7 +163,12 @@ impl Node {
     }
 
     fn run_with_stdin(&self, args: &[&str], stdin: Option<&[u8]>) -> Output {
-        let mut command = Command::new(&self.exe);
+        self.run_exe(&self.exe, args, stdin)
+    }
+
+    /// Run `exe` (this node's or another build's CLI) against this node.
+    fn run_exe(&self, exe: &std::path::Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
+        let mut command = Command::new(exe);
         command.args(["-s", &self.name]).args(args);
         self.env(&mut command);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -676,6 +681,52 @@ fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
     out
 }
 
+/// `cluster init --new-identity` sets the old store aside (#862): after a
+/// rejoin, a file deleted meanwhile, whose tombstone was collected, does not
+/// come back from the old index.
+#[test]
+fn a_new_identity_rejoins_with_an_empty_store() {
+    let _serial = live_test_guard();
+    let (a, b, c) = three_nodes();
+    put(&c, "remuda:///gone.txt", b"deleted while away");
+    wait_for_body(&a, "remuda:///gone.txt", b"deleted while away");
+
+    let said = successful(
+        c.run(&["cluster", "init", "--new-identity", "--yes"]),
+        "cluster init --new-identity",
+    );
+    assert!(said.contains("Old cluster files: "), "{said}");
+    let state = c.root.join("state/remuda");
+    assert!(!state.join("cluster/vfs/index.db").exists());
+    let left = std::fs::read_dir(&state)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.to_string_lossy().contains("cluster.left-"))
+        .expect("old store set aside");
+    assert!(left.join("vfs/index.db").is_file());
+
+    successful(a.run(&["vfs", "rm", "remuda:///gone.txt"]), "vfs rm");
+    wait_gone(&b, "remuda:///gone.txt");
+    for node in [&a, &b] {
+        let index = node.root.join("state/remuda/cluster/vfs/index.db");
+        rusqlite::Connection::open(index)
+            .unwrap()
+            .execute("DELETE FROM entries WHERE path = 'gone.txt'", [])
+            .unwrap();
+    }
+    c.enable_listener();
+    join(&a, &c);
+    put(&a, "remuda:///after.txt", b"written after the rejoin");
+    wait_for_body(&c, "remuda:///after.txt", b"written after the rejoin");
+    thread::sleep(Duration::from_millis(SYNC_INTERVAL_MS * 10));
+    for node in [&a, &b, &c] {
+        assert!(
+            node.stat_json("remuda:///gone.txt").is_none(),
+            "gone.txt came back"
+        );
+    }
+}
+
 /// Whether `node`'s registry lists `fingerprint` as revoked.
 fn revoked(node: &Node, fingerprint: &str) -> bool {
     let registry: remuda_native::cluster::Registry = serde_json::from_slice(
@@ -775,6 +826,43 @@ fn previous() -> PathBuf {
     exe
 }
 
+/// The previous build's help for `args`. Help runs without a daemon; a
+/// scratch home keeps it away from real state.
+fn previous_help(args: &[&str]) -> String {
+    let home = std::env::temp_dir().join(format!("cvp{}-{}", std::process::id(), args.join("-")));
+    let output = Command::new(previous())
+        .args(args)
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("REMUDA_RUNTIME_DIR", home.join("runtime"))
+        .env("REMUDA_NO_UPDATE_CHECK", "1")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&home);
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Whether the previous build's `remuda vfs help` lists `verb`.
+fn previous_has_vfs_verb(verb: &str) -> bool {
+    previous_help(&["vfs", "help"]).lines().any(|line| {
+        line.trim_start()
+            .strip_prefix(verb)
+            .is_some_and(|rest| rest.starts_with(' '))
+    })
+}
+
+/// Skip a compat test whose N predates what it tests. Jobs whose N must have
+/// everything set REMUDA_COMPAT_NO_SKIP, so a skip there fails instead.
+fn skip(reason: &str) {
+    assert!(
+        std::env::var_os("REMUDA_COMPAT_NO_SKIP").is_none(),
+        "REMUDA_COMPAT_NO_SKIP is set but {reason}"
+    );
+    eprintln!("skipped: {reason}");
+}
+
 fn put(node: &Node, uri: &str, body: &[u8]) {
     successful(
         node.run_with_stdin(&["vfs", "put", "-", uri, "--replicas", "2"], Some(body)),
@@ -825,6 +913,10 @@ fn wait_gone(node: &Node, uri: &str) {
 #[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS; run by CI jobs host-compat-n-plus-one and vfs-compat-pre-sqlite"]
 fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
     let _serial = live_test_guard();
+    if !previous_has_vfs_verb("put") {
+        skip("N has no vfs");
+        return;
+    }
     let (a, old, c) = joined(Node::start(), Node::start_exe(previous()), Node::start());
     let (from_old, from_new) = (
         "remuda:///mixed/from-old.txt",
@@ -884,6 +976,131 @@ fn n_plus_one_vfs_three_daemons_of_two_builds_sync() {
     }
 }
 
+/// Whether N has index.db and `remuda reload`; skips the test if not.
+/// Before index.db, N reads index.json; vfs-compat-pre-sqlite covers that.
+fn previous_takes_a_vfs_reload() -> bool {
+    if !previous_has_vfs_verb("export-index") {
+        skip("N has no index.db");
+        return false;
+    }
+    if !previous_help(&["help"]).contains("remuda reload ") {
+        skip("N predates remuda reload (#793)");
+        return false;
+    }
+    true
+}
+
+/// A writer puts files while its daemon reloads into N and back (#778): every
+/// put that succeeded is in the index afterwards and reaches another node.
+/// N may refuse the handoff (another handoff version); that is allowed.
+#[test]
+#[ignore = "N/N+1: needs REMUDA_COMPAT_PREVIOUS; run by CI job host-compat-n-plus-one"]
+fn vfs_writes_survive_a_reload_to_the_older_build_and_back() {
+    let _serial = live_test_guard();
+    if !previous_takes_a_vfs_reload() {
+        return;
+    }
+    let (a, b, _c) = three_nodes();
+    let this = a.exe.clone();
+    let old = previous();
+    let stop = AtomicBool::new(false);
+    let (written, refused, tried, reloads) = thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let mut written = Vec::new();
+            let mut refused = Vec::new();
+            let mut tried = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let uri = format!("remuda:///reload/{tried}.txt");
+                let args = ["vfs", "put", "-", &uri];
+                // A CLI refuses a daemon of another build: while N serves,
+                // N's own CLI writes.
+                let puts: Vec<Output> = [&this, &old]
+                    .iter()
+                    .map(|exe| a.run_exe(exe, &args, Some(uri.as_bytes())))
+                    .collect();
+                if puts.iter().any(|put| put.status.success()) {
+                    written.push(uri);
+                } else {
+                    let why: Vec<_> = puts
+                        .iter()
+                        .map(|put| String::from_utf8_lossy(&put.stderr).into_owned())
+                        .collect();
+                    refused.push(why.join(" | "));
+                }
+                tried += 1;
+            }
+            (written, refused, tried)
+        });
+        thread::sleep(Duration::from_millis(300));
+        let mut reloads = Vec::new();
+        for target in [old.clone(), this.clone()] {
+            let out = a.run(&["reload", "--binary", &target.to_string_lossy()]);
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            eprintln!(
+                "reload to {}: {:?}\n{stdout}{stderr}",
+                target.display(),
+                out.status.code()
+            );
+            let moved = stdout.starts_with("reloaded: ");
+            assert!(
+                moved || stderr.contains(" speaks handoff version "),
+                "reload to {}: {stdout}{stderr}",
+                target.display()
+            );
+            reloads.push(moved);
+            thread::sleep(Duration::from_millis(300));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let (written, refused, tried) = writer.join().unwrap();
+        (written, refused, tried, reloads)
+    });
+    eprintln!(
+        "{} of {tried} puts succeeded; reloads moved: {reloads:?}",
+        written.len()
+    );
+    // A put may fail only while the daemon moves, or because N refuses an
+    // index.db at a newer schema than it knows (the documented downgrade).
+    let expected = [
+        "is not this build",
+        "needs the remuda daemon",
+        "newer than this remuda",
+    ];
+    for why in &refused {
+        assert!(
+            expected.iter().any(|known| why.contains(known)),
+            "unexpected put failure: {why}"
+        );
+    }
+    assert!(!written.is_empty());
+    let index = a.root.join("state/remuda/cluster/vfs/index.db");
+    let check: String = rusqlite::Connection::open(index)
+        .unwrap()
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(check, "ok");
+    for uri in &written {
+        let body = uri.as_bytes();
+        assert_eq!(
+            a.stat_json(uri).map(|stat| stat["sha256"].clone()),
+            Some(serde_json::Value::from(sha256_hex(body))),
+            "{uri} was acknowledged but is missing on the node that wrote it"
+        );
+        wait_for_body(&b, uri, body);
+    }
+    // The daemon serving now may not be `a`'s child: stop it by request.
+    let _ = remuda_native::client::request(
+        &a.daemon_path(),
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+            keep_sessions: false,
+        },
+    );
+}
+
 /// Rows in `index.db`'s conflicts table (design step 4); 0 before that step.
 fn kept_conflicts(node: &Node) -> i64 {
     let index = node.root.join("state/remuda/cluster/vfs/index.db");
@@ -899,6 +1116,15 @@ fn kept_conflicts(node: &Node) -> i64 {
 #[ignore = "needs REMUDA_COMPAT_PREVIOUS from before index.db; run by CI job vfs-compat-pre-sqlite"]
 fn pre_sqlite_downgrade_and_upgrade_again_keep_every_name() {
     let _serial = live_test_guard();
+    // Only an N from before index.db reads index.json; export-index came with it.
+    if !previous_has_vfs_verb("put") {
+        skip("N has no vfs");
+        return;
+    }
+    if previous_has_vfs_verb("export-index") {
+        skip("N already has index.db");
+        return;
+    }
     let mut node = Node::start();
     let current = node.exe.clone();
     put(&node, "remuda:///gone.txt", b"deleted under N+1");
@@ -936,6 +1162,10 @@ fn pre_sqlite_downgrade_and_upgrade_again_keep_every_name() {
 #[ignore = "needs REMUDA_COMPAT_PREVIOUS from a build with index.db; run by CI job host-compat-n-plus-one"]
 fn older_build_refuses_a_newer_index_db_cleanly() {
     let _serial = live_test_guard();
+    if !previous_has_vfs_verb("export-index") {
+        skip("N has no index.db");
+        return;
+    }
     let mut node = Node::start();
     put(&node, "remuda:///kept.txt", b"kept");
     node.kill_daemon_only();
@@ -968,6 +1198,10 @@ fn older_build_refuses_a_newer_index_db_cleanly() {
 #[ignore = "needs REMUDA_COMPAT_PREVIOUS from a build with index.db; run by CI job host-compat-n-plus-one"]
 fn older_build_reads_the_index_after_index_downgrade() {
     let _serial = live_test_guard();
+    if !previous_has_vfs_verb("export-index") {
+        skip("N has no index.db");
+        return;
+    }
     let mut node = Node::start();
     let current = node.exe.clone();
     put(&node, "remuda:///kept.txt", b"kept");

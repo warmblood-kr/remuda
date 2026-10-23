@@ -49,6 +49,9 @@ Copies: 1230 files complete; 4 short (first: notes.md 1 of 3, …)
   (for up to 30 s). It exits 75 while any file is short, so a script can
   wait for it. Nodes that did not answer in time are named.
 - `--json` prints the same report as JSON.
+- `Old stores:` appears when `cluster leave` or `init --new-identity` set a
+  store aside in `cluster.left-DATE/vfs`. Nothing deletes them; remove a
+  folder yourself once you no longer need its files.
 
 ## Making sure a write has copies: `put --min-copies K`
 
@@ -114,8 +117,8 @@ remuda cluster leave   # asks first; --yes skips the question
 - **Do not move `vfs/` back to rejoin.** A rejoined node has a new key, so
   the others pull its whole old index, and a file deleted while it was away
   (once its delete record is collected) would come back. The old `vfs/` is
-  for reading files only. `cluster init --new-identity` has this problem
-  today (#862).
+  for reading files only. `cluster init --new-identity` sets `vfs/` aside
+  the same way, to `cluster.left-YYYYMMDD/vfs` (#862).
 
 To do the two halves by hand: `remuda vfs drain` on the node that leaves,
 then `remuda cluster revoke NODE --yes` on another node.
@@ -186,3 +189,6 @@ come back.
   Then start the older remuda.
 - To a build from before SQLite: run `remuda vfs export-index`, stop the
   daemon, then start the older remuda.
+
+The #778 owner checklist, [vfs-owner-checklist.md](vfs-owner-checklist.md),
+walks through a downgrade and back on a scratch node.

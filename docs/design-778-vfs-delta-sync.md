@@ -113,7 +113,8 @@ Owner decision: 7-day minimum and 30-day stale horizon, both configurable
   confirms every placement without it, and audits it. The leaver then moves
   its cluster folder to `cluster.left-DATE`, so a rejoin starts empty.
 
-## Not done
+## Follow-ups built
 
-- Squashing old migration steps (mods ship at most 64 asset files).
-- An N/N+1 test of the VFS across `remuda reload`.
+- Squashing old migration steps (#851), `remuda cluster leave` (#863), and
+  an N/N+1 test of the VFS across `remuda reload`
+  (`vfs_writes_survive_a_reload_to_the_older_build_and_back`).

@@ -58,6 +58,27 @@ pub struct StatusReport {
     pub now: u64,
     pub peers: Vec<PeerStatus>,
     pub copies: Option<CopyStatus>,
+    /// Stores `cluster leave` or `init --new-identity` set aside.
+    pub old_stores: Vec<OldStore>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OldStore {
+    pub path: String,
+    pub bytes: u64,
+}
+
+fn old_stores() -> Vec<OldStore> {
+    let Ok(state) = super::storage::cluster_state_dir() else {
+        return Vec::new();
+    };
+    super::leave::old_stores(&state)
+        .into_iter()
+        .map(|(path, bytes)| OldStore {
+            path: path.display().to_string(),
+            bytes,
+        })
+        .collect()
 }
 
 /// Build the report; with `copies`, ask placement nodes until `deadline`.
@@ -115,6 +136,7 @@ pub fn status(copies: bool, deadline: Duration) -> VfsResult<StatusReport> {
         now,
         peers: peer_rows,
         copies,
+        old_stores: old_stores(),
     })
 }
 
