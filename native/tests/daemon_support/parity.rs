@@ -71,6 +71,12 @@ impl Parity {
         self.wait_bound();
     }
 
+    /// SIGTERM this daemon and wait for it to exit.
+    pub fn terminate_daemon(&mut self) {
+        unsafe { libc::kill(self.daemon.id() as i32, libc::SIGTERM) };
+        let _ = self.daemon.wait();
+    }
+
     fn wait_bound(&self) {
         let deadline = Instant::now() + PATIENCE;
         while remuda_native::ipc::connect(&self.socket()).is_err() {

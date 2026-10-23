@@ -1611,6 +1611,8 @@ fn serve_unix(
                             _ => "SIGHUP",
                         };
                         let _ = writeln!(std::io::stderr(), "remuda daemon: {name}, shutting down");
+                        #[cfg(unix)]
+                        finish_closed_hosts(&image);
                         reap_processes_before_exit(&image);
                         anti_entropy.stop_and_join();
                         socket_owner.cleanup();
@@ -1994,6 +1996,21 @@ fn close_session_hosts(registry: &Registry, image: &Image) {
             "remuda daemon: still closing at exit: {}; the next daemon finishes them",
             left.join(", ")
         );
+    }
+}
+
+/// How long a signal shutdown waits for hosts of sessions already closed.
+#[cfg(unix)]
+const HOST_RETIRE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A signal ends the daemon, not its host-backed sessions. But a session a
+/// `close` already ended still has its host waiting for the daemon's Stop;
+/// let that teardown finish, or the host outlives the close (#713).
+#[cfg(unix)]
+fn finish_closed_hosts(image: &Image) {
+    let left = image.session_hosts().finish_retiring(HOST_RETIRE_DEADLINE);
+    if left > 0 {
+        eprintln!("remuda daemon: exiting with {left} closed host(s) still stopping; the next daemon finishes them");
     }
 }
 

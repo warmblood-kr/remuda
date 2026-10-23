@@ -112,3 +112,27 @@ fn stop_keep_sessions_keeps_only_host_backed_ones() {
         }
     }
 }
+
+/// `close` returns before the host has stopped; a SIGTERM right after must
+/// not leave that host running until some later daemon starts.
+#[test]
+fn sigterm_right_after_close_leaves_no_host_running() {
+    for mode in MODES {
+        let mut daemon = Parity::start(mode);
+        let child = sleeper(&daemon);
+        daemon
+            .eval("remuda.session.close('keeper')")
+            .unwrap_or_else(|error| panic!("{mode:?}: close: {error}"));
+        daemon.terminate_daemon();
+        let deadline = Instant::now() + PATIENCE;
+        while alive(child) || daemon.hosts_running() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "{mode:?}: after close + SIGTERM: child alive {}, hosts {}",
+                alive(child),
+                daemon.hosts_running()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}

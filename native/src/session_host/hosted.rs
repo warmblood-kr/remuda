@@ -21,7 +21,7 @@ use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Daemon environment switch; anything but "1" keeps the default path.
@@ -68,6 +68,8 @@ pub struct Hosting {
     root: PathBuf,
     hosts: Mutex<Option<Arc<Hosts>>>,
     gate: Arc<Gate>,
+    /// Teardowns of closed sessions still running off the request thread.
+    retiring: Arc<(Mutex<usize>, Condvar)>,
 }
 struct Hosts {
     owner: Arc<Owner>,
@@ -93,6 +95,7 @@ impl Hosting {
             root: socket.with_file_name(name),
             hosts: Mutex::new(None),
             gate: Arc::default(),
+            retiring: Arc::default(),
         }
     }
     /// Hosting over an existing private directory, for tests.
@@ -102,6 +105,7 @@ impl Hosting {
             root,
             hosts: Mutex::new(None),
             gate: Arc::default(),
+            retiring: Arc::default(),
         }
     }
     fn hosts(&self, create: bool) -> io::Result<Option<Arc<Hosts>>> {
@@ -286,8 +290,27 @@ impl Hosting {
             .cloned();
         if let Some(session) = session {
             let name = name.to_owned();
-            std::thread::spawn(move || hosts.teardown(&name, session));
+            let retiring = Arc::clone(&self.retiring);
+            *retiring.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            std::thread::spawn(move || {
+                hosts.teardown(&name, session);
+                let (count, done) = &*retiring;
+                *count.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+                done.notify_all();
+            });
         }
+    }
+
+    /// Before a daemon exits on a signal: wait up to `deadline` for the hosts
+    /// of sessions already closed to stop, so none outlives its close. Hosts
+    /// of live sessions are not touched. Returns how many were still stopping.
+    pub fn finish_retiring(&self, deadline: Duration) -> usize {
+        let (count, done) = &*self.retiring;
+        let count = count.lock().unwrap_or_else(|e| e.into_inner());
+        let (count, _) = done
+            .wait_timeout_while(count, deadline, |count| *count > 0)
+            .unwrap_or_else(|e| e.into_inner());
+        *count
     }
 }
 
