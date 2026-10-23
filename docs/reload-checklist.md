@@ -69,6 +69,9 @@ every update is a reload.
    busy), input to a session may be refused with "session owner
    unavailable: Recovering". Send it again. Input that was answered `Ok` is
    never lost.
+   A terminal attached to a session drops out, because attach goes through
+   the daemon. The session keeps running: run `remuda attach NAME` again.
+   The line it prints on the way out may say the session ended; it did not.
 9. If it exits 1:
    - With "reload failed and was rolled back": nothing changed. The old
      daemon still serves every session. The message says why.
@@ -83,6 +86,13 @@ drives it; CI checks this on every change against the previous build. New
 sessions get the new build's host. A session moves onto the new host build
 only when you start it again.
 
+Typing into a session with `remuda attach` needs a host that takes attach
+input (#808). A session whose host is older shows its screen, but typing
+prints "read-only view: this session's host is too old to accept input",
+and no key reaches it. `remuda send` still works. Start the session again
+to type into it. The first reload after upgrading from a build without
+attach input leaves every running session like this.
+
 ## What starts fresh
 
 Lua state lives in the daemon, so the new daemon starts it again from
@@ -93,7 +103,8 @@ again. Processes started from Lua (`remuda.process`) are stopped.
 ## If something goes wrong
 
 - **The new daemon died after taking over.** Your sessions keep running in
-  their hosts. Any `remuda` command (for example `remuda ls`) starts a
-  daemon that finds them again.
+  their hosts. A command that starts a daemon (for example `remuda -e 'return 1'`
+  or `remuda run`) starts one that finds them again. `remuda ls` does not
+  start one; it says no daemon is running.
 - **Do not use `remuda stop` to update.** It ends host-backed sessions too.
   `remuda stop --keep-sessions` leaves them running for the next daemon.
