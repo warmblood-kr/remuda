@@ -112,3 +112,50 @@ fn stop_keep_sessions_keeps_only_host_backed_ones() {
         }
     }
 }
+
+/// Hold a tracked attach open, as a human terminal does.
+fn attach(daemon: &Parity, name: &str) -> remuda_native::ipc::Stream {
+    use std::io::{BufRead, BufReader, Write};
+    let mut stream = remuda_native::ipc::connect(&daemon.socket()).expect("connect");
+    let mut line = serde_json::to_string(&Request::AttachTracked { name: name.into() }).unwrap();
+    line.push('\n');
+    stream.write_all(line.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    let mut reader =
+        BufReader::new(remuda_native::ipc::TryClone::try_clone(&stream).expect("clone"));
+    let mut ack = String::new();
+    reader.read_line(&mut ack).unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<Response>(&ack),
+            Ok(Response::AttachStarted { .. })
+        ),
+        "{:?}: attach refused: {ack}",
+        daemon.mode
+    );
+    stream
+}
+
+/// The host refuses Close while a human holds a grant; stop must still end
+/// the session, not leave its host and child running for the next daemon.
+#[test]
+fn stop_ends_a_session_a_human_is_attached_to() {
+    for mode in MODES {
+        let mut daemon = Parity::start(mode);
+        let child = sleeper(&daemon);
+        let _attached = attach(&daemon, "keeper");
+        stop(&daemon, false);
+        let deadline = Instant::now() + PATIENCE;
+        while alive(child) {
+            assert!(Instant::now() < deadline, "{mode:?}: child outlived stop");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let deadline = Instant::now() + PATIENCE;
+        while daemon.hosts_running() > 0 {
+            assert!(Instant::now() < deadline, "{mode:?}: a host outlived stop");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        daemon.restart();
+        assert!(names(&daemon).is_empty(), "{mode:?}: {:?}", names(&daemon));
+    }
+}

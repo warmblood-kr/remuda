@@ -250,9 +250,19 @@ impl Hosting {
             .iter()
             .map(|(name, session)| (name.clone(), session.clone()))
             .collect();
+        // A human attached, or detaching a moment ago, makes the host refuse
+        // Close; stop ends that session anyway, as it ends an in-process one.
         let closed = open
             .iter()
-            .filter(|(name, _)| matches!(registry.close(name), Some(Ok(true))))
+            .filter(|(name, session)| match registry.close(name) {
+                Some(Ok(true)) => true,
+                // Retry even when nothing was revoked: a detach may have
+                // released the grant between the refusal and the revoke.
+                Some(Err(_)) if session.revoke_human().is_ok() => {
+                    matches!(registry.close(name), Some(Ok(true)))
+                }
+                _ => false,
+            })
             .count();
         let waits: Vec<_> = open
             .into_iter()
