@@ -113,7 +113,9 @@ fn anchor_capture_stops_retrying_when_output_never_quiets() {
     assert_eq!(rows, 10_000);
     assert_eq!(total, 10_056);
     assert_eq!(offset, 40);
-    assert_eq!(anchor_total, 10_044);
+    // Offset 40 was chosen from total 10_050; the 6 rows after it are the
+    // drift the next frame still owes.
+    assert_eq!(anchor_total, 10_050);
 
     let mut next_offsets = Vec::new();
     let (_, _, _, next_offset, _) = capture_anchored(offset, anchor_total, |requested| {
@@ -122,8 +124,30 @@ fn anchor_capture_stops_retrying_when_output_never_quiets() {
         Ok(((), 10_000, total))
     })
     .expect("the next frame catches up to output seen during capped retries");
-    assert_eq!(next_offsets, [40, 56]);
-    assert_eq!(next_offset, 56);
+    // Back on the content first shown: offset 28 at 10_038 is 28 + 22 here.
+    assert_eq!(next_offsets, [40, 50]);
+    assert_eq!(next_offset, 50);
+}
+
+/// Capped retries on every frame (a slow capture under steady output) must
+/// not let the offset run ahead of the output: CI's hosted runs climbed to
+/// the top of history while the wheel scrolled down (#713).
+#[test]
+fn capped_anchor_retries_on_every_frame_keep_the_content_anchored() {
+    let (mut offset, mut anchor_total, mut total) = (28, 10_038, 10_038);
+    for _ in 0..20 {
+        let (_, _, _, next, next_total) = capture_anchored(offset, anchor_total, |requested| {
+            total += 6;
+            Ok((requested, 10_000, total))
+        })
+        .expect("bounded capture");
+        offset = next;
+        anchor_total = next_total;
+    }
+    // 20 frames of 3 captures each saw 360 new rows; the shown offset was
+    // chosen one capture (6 rows) before the last one.
+    assert_eq!(offset, 28 + 360 - 6);
+    assert_eq!(anchor_total, total - 6);
 }
 
 /// The regression steps/017 guards: an idle *list*-focused herd must not
@@ -872,16 +896,13 @@ fn session_input_returns_to_live_view_without_swallowing_the_key() {
     assert_eq!(ui.scrollback["a"].offset, 0);
 }
 
-// The streaming previews below sleep 30 s after their output and close their
-// session at the end: the session must outlive the test on a slow runner, where
-// a host-backed capture costs a few times an in-process one (#713).
 #[test]
 fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     let path = scratch_socket("preview-follow-after-wheel");
     let _daemon = daemon_at(&path);
     let command = streaming_command(
-        "i=0; while [ $i -lt 200 ]; do printf 'newest-%03d\\n' $i; i=$((i + 1)); sleep 0.02; done; sleep 30",
-        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 200; $i++) { Write-Output ('newest-{0:D3}' -f $i); Start-Sleep -Milliseconds 20 }; Start-Sleep -Seconds 30",
+        "i=0; while [ $i -lt 200 ]; do printf 'newest-%03d\\n' $i; i=$((i + 1)); sleep 0.02; done; sleep 3",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 200; $i++) { Write-Output ('newest-{0:D3}' -f $i); Start-Sleep -Milliseconds 20 }; Start-Sleep -Seconds 3",
     );
     let response = client::request(
         &path,
@@ -980,8 +1001,8 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
     let path = scratch_socket("preview-content-anchor");
     let _daemon = daemon_at(&path);
     let command = streaming_command(
-        "i=0; while [ $i -lt 70 ]; do printf 'row-%02d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 30",
-        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 70; $i++) { Write-Output ('row-{0:D2}' -f $i); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 30",
+        "i=0; while [ $i -lt 70 ]; do printf 'row-%02d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 3",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 70; $i++) { Write-Output ('row-{0:D2}' -f $i); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 3",
     );
     let response = client::request(
         &path,
@@ -1074,8 +1095,8 @@ fn real_preview_keeps_content_anchored_after_wheel_down_enters_settle() {
     let path = scratch_socket("preview-settle-content-anchor");
     let _daemon = daemon_at(&path);
     let command = streaming_command(
-        "i=0; while [ $i -lt 90 ]; do printf 'settle-%03d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 30",
-        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 90; $i++) { Write-Output ('settle-{0:D3}' -f $i); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 30",
+        "i=0; while [ $i -lt 90 ]; do printf 'settle-%03d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 2",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 90; $i++) { Write-Output ('settle-{0:D3}' -f $i); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 2",
     );
     let response = client::request(
         &path,
@@ -1155,8 +1176,8 @@ fn real_preview_keeps_content_anchored_after_scrollback_reaches_its_cap() {
     let path = scratch_socket("preview-content-anchor-at-cap");
     let _daemon = daemon_at(&path);
     let command = streaming_command(
-        "i=0; while [ $i -lt 10100 ]; do printf 'row-%05d\\n' $i; i=$((i + 1)); done; j=0; while [ $j -lt 30 ]; do printf 'tail-%02d\\n' $j; j=$((j + 1)); sleep 0.1; done; sleep 30",
-        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 10100; $i++) { Write-Output ('row-{0:D5}' -f $i) }; for ($j=0; $j -lt 30; $j++) { Write-Output ('tail-{0:D2}' -f $j); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 30",
+        "i=0; while [ $i -lt 10100 ]; do printf 'row-%05d\\n' $i; i=$((i + 1)); done; j=0; while [ $j -lt 30 ]; do printf 'tail-%02d\\n' $j; j=$((j + 1)); sleep 0.1; done; sleep 3",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 10100; $i++) { Write-Output ('row-{0:D5}' -f $i) }; for ($j=0; $j -lt 30; $j++) { Write-Output ('tail-{0:D2}' -f $j); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 3",
     );
     let response = client::request(
         &path,
