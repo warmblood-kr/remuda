@@ -24,6 +24,8 @@ const MAX_REPAIRS_PER_PASS: usize = 256;
 const TAKE_TTL: Duration = Duration::from_secs(60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_DOWN_GRACE: Duration = Duration::from_secs(120);
+/// Refusal for a VFS request from a node this one no longer admits.
+const NOT_A_MEMBER: &str = "this node no longer admits the caller";
 
 fn b64() -> base64::engine::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
@@ -38,13 +40,29 @@ pub fn serve(peer_fp: &str, request: &Request) -> Response {
         Ok(store) => store,
         Err(error) => return Response::error(error.reason()),
     };
+    // Membership is read after the store opens, so a store that
+    // `init --new-identity` just replaced is never filled by an old peer.
+    serve_member(&store, members(), peer_fp, request)
+}
+
+fn serve_member(
+    store: &VfsStore,
+    members: VfsResult<Members>,
+    peer_fp: &str,
+    request: &Request,
+) -> Response {
+    match members {
+        Ok(members) if members.admitted.iter().any(|fp| fp == peer_fp) => {}
+        Ok(_) => return Response::error(NOT_A_MEMBER),
+        Err(error) => return Response::error(error.reason()),
+    }
     let answered = match request {
         Request::ClusterVfsChanges {
             index_id,
             since,
             limit,
-        } => serve_changes(&store, peer_fp, index_id.as_deref(), *since, *limit),
-        request => serve_with(&store, request),
+        } => serve_changes(store, peer_fp, index_id.as_deref(), *since, *limit),
+        request => serve_with(store, request),
     };
     match answered {
         Ok(response) => {
@@ -1042,6 +1060,45 @@ mod tests {
             vv: Default::default(),
             conflicts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_peer_this_node_no_longer_admits_cannot_fill_its_store() {
+        let (root, store) = scratch_store();
+        let update = Request::ClusterVfsIndexUpdate {
+            entries_json: serde_json::to_string(&[entry("old.txt", &"a".repeat(64))]).unwrap(),
+        };
+        let alone = Registry {
+            authorized_nodes: vec![],
+        };
+        let refused = serve_member(
+            &store,
+            Ok(members_of("SHA256:new", &alone)),
+            "SHA256:old",
+            &update,
+        );
+        assert_eq!(refused, Response::error(NOT_A_MEMBER));
+        assert!(store.load_index().unwrap().entries.is_empty());
+
+        let both = Registry {
+            authorized_nodes: vec![node("SHA256:old", NodeState::Admitted, None)],
+        };
+        // A read-only request: an applied update would start a sync pass.
+        let read = Request::ClusterVfsIndexSync {
+            digest: None,
+            offset: 0,
+        };
+        let served = serve_member(
+            &store,
+            Ok(members_of("SHA256:new", &both)),
+            "SHA256:old",
+            &read,
+        );
+        assert!(
+            matches!(served, Response::ClusterVfsIndexPage { .. }),
+            "{served:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

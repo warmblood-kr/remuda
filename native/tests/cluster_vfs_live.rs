@@ -681,6 +681,14 @@ fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
     out
 }
 
+/// Rows in an index.db's `entries`; 0 when the file or the table is not there yet.
+fn entry_count(index: &std::path::Path) -> i64 {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+    rusqlite::Connection::open_with_flags(index, flags)
+        .and_then(|db| db.query_row("SELECT count(*) FROM entries", [], |row| row.get(0)))
+        .unwrap_or(0)
+}
+
 /// `cluster init --new-identity` sets the old store aside (#862): after a
 /// rejoin, a file deleted meanwhile, whose tombstone was collected, does not
 /// come back from the old index.
@@ -697,7 +705,8 @@ fn a_new_identity_rejoins_with_an_empty_store() {
     );
     assert!(said.contains("Old cluster files: "), "{said}");
     let state = c.root.join("state/remuda");
-    assert!(!state.join("cluster/vfs/index.db").exists());
+    // The daemon's next sync pass may already have opened a fresh, empty store.
+    assert_eq!(entry_count(&state.join("cluster/vfs/index.db")), 0);
     let left = std::fs::read_dir(&state)
         .unwrap()
         .map(|entry| entry.unwrap().path())

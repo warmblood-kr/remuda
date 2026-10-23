@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- VFS: a peer request accepted just before `cluster init --new-identity`
+  can no longer write the old cluster's entries into the new, empty store;
+  membership is now checked after the store opens.
 - `remuda vfs status` names the stores `cluster leave` and `cluster init
   --new-identity` set aside (`Old stores:`, with their size), so they do
   not fill the disk unnoticed. `--json` has them as `old_stores`.
