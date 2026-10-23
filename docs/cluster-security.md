@@ -230,3 +230,28 @@ source prefixes plus a member whose pre-auth read exceeds 250 ms can still
 evict that member, which retries. IPv4 prefixes are /32, so an exposed public
 listener would make that residual internet-reachable; auto mode never binds
 the wildcard. Joins still require the one-time token described in #332.
+
+### Joining (#876)
+
+A join line pins the issuer key by its fingerprint, which the decoder checks.
+A separate FINGERPRINT argument copied from the same `invite` output adds no
+independent check, so the printed command omits it; the joiner's terminal
+prompt shows the fingerprint for comparison with `remuda cluster` on the
+inviter. `--yes` skips that prompt for scripts and trusts the line as
+delivered: anyone who controls the channel the line travels over can make the
+joiner join their own cluster, which grants that cluster remote control by
+default. Deliver lines over a private channel, or pass an independently
+checked FINGERPRINT instead. The token stays single use and expires after 10
+minutes either way. Shell words are rejoined before strict decoding, so an
+unquoted line (or cmd.exe's literal quote characters) parses to the same
+canonical line; the token is never echoed in parse errors.
+
+Without `--bind`, the joiner listens on the source address its routing table
+picks toward the issuer when that address is RFC 1918 or ULA and differs from
+the default-route choice, and saves it as an explicit bind. This never binds an
+address automatic mode would refuse. If no private address exists, the join
+continues as an outbound-only client: the saved listener config is restored,
+no endpoint is advertised, and the node syncs by its own pulls. A join frame
+rejected as outside the 60-second replay window is reported as clock skew; the
+listener rejects it before the token is checked, so the same line can be
+retried.

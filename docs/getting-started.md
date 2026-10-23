@@ -172,9 +172,10 @@ You should see:
 ```text
 Invitation for one machine, valid 10 minutes. Run this on the other machine:
 
-  remuda cluster join 'SHA256:...' 'remuda-join-v1 ...'
+  remuda cluster join 'remuda-join-v1 ...'
 
-Fingerprint of this machine: SHA256:... (the other machine must show the same one)
+The other machine will ask you to confirm this machine's fingerprint: SHA256:...
+In a script, add --yes to skip that prompt.
 
 Next: after it joins, run `remuda cluster nodes` here to see it.
 ```
@@ -190,12 +191,20 @@ address yourself:
 `--bind VPN_IP_OF_B` to the join line on B. The port is optional
 (`IP:PORT`); the default is 7441.
 
-Run that `remuda cluster join` line on B. The first argument is A's
-fingerprint: the join refuses if A's key does not match it. If you sent the
-line over a channel you do not fully trust, first check that it matches the
-`Fingerprint:` line `remuda cluster` prints on A. (If you run `remuda cluster
-join` with only the `remuda-join-v1` line, it shows A's fingerprint and asks
-`Continue? [y/N]`; type `y` only if it matches A.)
+On B, `remuda cluster join` listens on the private interface that routes to A,
+even when that is not the default route (for example a VPN adapter at home), so
+A can reach B afterwards. If B has no private address at all, it joins as an
+outbound-only client: it still syncs by connecting out, but other machines
+cannot connect to it until you run `remuda cluster listen --bind IP`.
+
+Run that `remuda cluster join` line on B. The quotes are optional, so the same
+line works in bash, zsh, PowerShell and cmd.exe. B shows A's fingerprint and asks
+`Continue? [y/N]`; type `y` only if it matches the `Fingerprint:` line
+`remuda cluster` prints on A. In a script (no terminal), add `--yes`: that
+trusts the line itself, so only use it when the line came over a private
+channel. The older form with A's fingerprint as the first argument still works.
+If the join reports that the clocks differ by more than 60 seconds, turn on
+automatic time sync on both machines and run the same line again.
 
 You should see:
 
