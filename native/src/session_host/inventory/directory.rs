@@ -7,6 +7,10 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::Path;
 
+/// Reads of a replaced inventory: 4 at once, then 1-16 ms apart (about 200 ms).
+#[cfg(unix)]
+const READ_ATTEMPTS: u32 = 18;
+
 pub(super) struct Directory {
     #[cfg(unix)]
     handle: File,
@@ -47,12 +51,18 @@ impl Directory {
         #[cfg(unix)]
         {
             // A concurrent rename may unlink the file between open and fstat;
-            // reopen the new cut instead of misreporting a link mismatch.
-            for _ in 0..8 {
+            // reopen the new cut instead of misreporting a link mismatch. Busy
+            // writers can replace it repeatedly, so attempts back off briefly.
+            for attempt in 0..READ_ATTEMPTS {
                 let file = self.open_relative(c"inventory.json", libc::O_RDONLY)?;
                 // One fstat snapshot: a second one could observe a later rename.
                 let metadata = file.metadata()?;
                 if metadata.nlink() == 0 {
+                    if attempt >= 4 {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            1 << (attempt - 4).min(4),
+                        ));
+                    }
                     continue;
                 }
                 private_metadata(&metadata)?;

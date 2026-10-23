@@ -311,3 +311,100 @@ fn a_candidate_that_cannot_drive_a_host_blocks_the_reload() {
         ]
     );
 }
+
+/// This node's VFS index at `version`, as a newer build would leave it.
+fn index_db_at(root: &Root, version: u32) {
+    let dir = root.0.join("state/remuda/cluster/vfs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let conn = rusqlite::Connection::open(dir.join("index.db")).unwrap();
+    conn.pragma_update(None, "user_version", version).unwrap();
+}
+
+#[test]
+fn a_target_that_reads_an_older_index_db_is_warned_about() {
+    let root = Root::new("idx");
+    let path = root.socket();
+    let _daemon = Daemon::spawn(&root, true);
+    new_session(&path, "one");
+    let build = build(&path);
+    index_db_at(&root, 3);
+    let older = root.candidate(
+        "older-remuda",
+        &[
+            r#"{"kind":"Hello","handoff":2,"build":"1.0.0+older","index_db_steps":2}"#,
+            &format!(
+                r#"{{"kind":"Ready","hosts":[{{"name":"one","build":"{build}","problem":null}}]}}"#
+            ),
+        ],
+        "exec sleep 60",
+    );
+    let out = root.remuda(&["reload", "--check", "--binary", &older.to_string_lossy()]);
+    let (stdout, stderr) = text(&out);
+    // A warning, not a blocker: the check still says ready.
+    assert!(out.status.success(), "{stdout}{stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[0],
+        "ready: a reload into 1.0.0+older would keep every host"
+    );
+    assert!(
+        lines.iter().any(|l| l
+            .starts_with("warning: index.db is at schema 3 but 1.0.0+older reads up to 2;")
+            && l.contains("`remuda vfs index-downgrade 2 --yes`")),
+        "{stdout}"
+    );
+
+    // A target from before the field: a plain note, still not a blocker.
+    let silent = root.candidate(
+        "silent-remuda",
+        &[
+            r#"{"kind":"Hello","handoff":2,"build":"1.0.0+silent"}"#,
+            &format!(
+                r#"{{"kind":"Ready","hosts":[{{"name":"one","build":"{build}","problem":null}}]}}"#
+            ),
+        ],
+        "exec sleep 60",
+    );
+    let out = root.remuda(&["reload", "--check", "--binary", &silent.to_string_lossy()]);
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("warning: 1.0.0+silent does not say which index.db schema it reads (index.db is at schema 3)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_reload_warns_about_an_unreadable_index_db_and_still_goes_through() {
+    let root = Root::new("idxr");
+    let path = root.socket();
+    let _daemon = Daemon::spawn(&root, true);
+    new_session(&path, "one");
+    // Newer than any build knows: this build is the "older" target here.
+    index_db_at(&root, 1000);
+    let check = root.remuda(&["reload", "--check"]);
+    let (stdout, stderr) = text(&check);
+    assert!(check.status.success(), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("warning: index.db is at schema 1000 but ")
+            && stdout.contains(" reads up to "),
+        "{stdout}"
+    );
+    let out = root.remuda(&["reload"]);
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.starts_with("reloaded: "), "{stdout}");
+    assert!(
+        stdout.contains("warning: index.db is at schema 1000 but "),
+        "{stdout}"
+    );
+    let sent = client::request(
+        &path,
+        &Request::SendLine {
+            name: "one".into(),
+            text: "echo still".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(sent, Response::Ok);
+}

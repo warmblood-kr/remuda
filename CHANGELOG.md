@@ -2,6 +2,109 @@
 
 ## Unreleased
 
+- `remuda vfs status` names the stores `cluster leave` and `cluster init
+  --new-identity` set aside (`Old stores:`, with their size), so they do
+  not fill the disk unnoticed. `--json` has them as `old_stores`.
+- VFS: a store moved away by `cluster leave` or `init --new-identity` no
+  longer gets its settings, sync time or stand-in trims written into a new
+  store at the same path; all writes now check the store is still there.
+- Cluster: `remuda cluster init --new-identity` now moves this node's VFS
+  store to `cluster.left-YYYYMMDD/vfs` and says so before it asks (#862).
+  Before, the old index stayed under the new key, and after a rejoin a file
+  deleted meanwhile (once its delete record was collected) could come back.
+- `remuda reload` (Unix): `reload` and `reload --check` warn when the
+  target build cannot read this node's VFS index (`index.db`), as when
+  going back to an older build. The warning names `remuda vfs
+  index-downgrade`. It never blocks: sessions are unaffected, and the VFS
+  works again after a reload forward.
+
+- Cluster: `remuda cluster leave [--yes]` takes this node out (#778). It asks
+  another node to revoke it (`ClusterLeave`); that node first checks that
+  every VFS file keeps its copies without the leaver, and records the leave
+  in its audit log. On a refusal it runs `vfs drain` and asks again; while
+  every node refuses it changes nothing and exits 75. Then it moves the
+  cluster folder to `cluster.left-YYYYMMDD` and deletes the key and
+  membership files there, so a rejoin starts with an empty store. With no
+  other node reachable it warns and still leaves.
+- VFS: `remuda vfs status [--copies] [--json]` shows the cluster store at a
+  glance (#778): live files and index size against their limits, paths
+  with conflicts, this node's copies and retry backlog, and for each peer
+  whether it is up, when it last pulled from here and how many deletes it
+  holds back. `--copies` also asks the nodes which copies they hold, lists
+  short files, and exits 75 while any file is short.
+- VFS: a peer that was busy or timed out is no longer treated as an older
+  build for an hour (whole-index pulls, "old build" in `vfs status`). Only
+  a peer that cannot decode change pulls is.
+- Sessions: input or a command refused while a reload moves a hosted
+  session now says so: "session owner unavailable: Recovering (a reload or
+  restart is moving this session; try again)". The text before the
+  bracket is unchanged.
+
+- Cluster: `remuda cluster remote NODE` now opens NODE's own session screen,
+  the same screen plain `remuda` shows there: its session list on the left
+  and the selected session on the right. Press `m` to write a line for the
+  selected session and Enter to send it whole; `x` closes a session (bound
+  to the instance you saw). Live keys to a remote session are not available
+  yet. The peer is read on a background thread, so a slow or unreachable
+  node never freezes the screen; the footer says `stale Ns` when its screen
+  may be out of date. `cluster remote` with no node, or `NODE/SESSION`,
+  still opens the cluster tree. Naming this machine opens the local screen.
+  A full fingerprint that contains `/` is read as a node.
+
+- `remuda reload` (Unix): the post-check no longer says every session moved
+  when a session's host had already died. It names the session ("unreachable
+  before the reload too") and does not fail; a host lost during the reload
+  still fails it. New tests cover input typed during a reload and the
+  cluster listener following the serving daemon.
+
+- Cluster: each node now keeps a local audit log of what peers asked it to
+  do, in `cluster/audit.jsonl` in the private cluster state directory. Each
+  line records when, which peer (by fingerprint), what (input, resize, close,
+  create), which session, and whether it was done, failed, refused or
+  limited. Input contents are never recorded. The log keeps the last 10,000
+  entries and is not replicated. Before, peer actions left no record.
+
+- Lua: a mod can squash its database migrations (#778). One
+  `NNNN_name.base.sql` holds the whole schema as of step NNNN, so the step
+  files up to it can be deleted and the mod stays within its 64 assets. A
+  new database runs the base, then the later steps; an existing one at
+  NNNN or later upgrades as before. One below NNNN fails with `squashed:`
+  and needs an older release of the mod first, unless the mod keeps the
+  step files from there. Older remuda builds refuse a database created from
+  a base without changing it.
+
+- Unix: the socket lock file (`SOCKET.lock`) never reads empty or half
+  written while a daemon names itself in it, as at start or when a reload
+  hands it over. It now holds the pid padded with newlines to a fixed
+  width; readers that trim are unaffected.
+
+- VFS: `remuda vfs drain [--timeout SECS]` prepares a node to leave (#778).
+  The nodes that will hold its files once it is gone are asked to take a
+  copy, and drain waits until they confirm. Then it says to run `remuda
+  cluster revoke NODE` on another node; it revokes nothing itself. A peer
+  too old to take copies is named, and drain exits 75 while files are short.
+
+- `remuda upgrade` (Unix) checks the reloaded daemon as `remuda reload` does:
+  it answers as the new build, lists every session it took over, and loaded
+  `init.lua`. An `init.lua` that fails only in the new daemon is named and
+  `upgrade` exits 1. Before, it checked only the build.
+
+- VFS: a node that took a copy while a holder was down deletes it again
+  once that holder is back and confirms its copy (#778). Only copies the
+  repair pass fetched are trimmed: files this node wrote, read with `vfs
+  get`, or handed to a tool by `vfs resolve` stay. `remuda vfs sync`
+  reports the copies trimmed.
+
+- VFS: copies that fail to fetch no longer crowd out the rest (#778). A
+  failed copy waits 30 s before the next try, doubling up to an hour, and
+  copies never tried go first. `remuda vfs sync` retries at once and its
+  report counts the copies waiting to retry.
+
+- VFS: `remuda vfs put --min-copies K` waits until K nodes hold the file,
+  this one included (#778). If fewer do within 60 s, it says the write is
+  committed here and still replicating, and exits 75; nothing is rolled
+  back. K is at most the copies wanted (`--replicas`).
+
 - VFS: a node that has not pulled for 30 days (`remuda vfs config
   --stale-days DAYS`) no longer holds deleted files back on its peers
   (#778). When it returns, a peer that forgot deletes in the meantime tells

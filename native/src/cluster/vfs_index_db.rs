@@ -73,6 +73,31 @@ pub(super) fn open(root: &Path) -> VfsResult<Connection> {
     Ok(conn)
 }
 
+/// How many schema steps this build knows: the newest `index.db` it reads.
+pub(crate) fn known_steps() -> u32 {
+    STEPS.len() as u32
+}
+
+/// This node's `index.db` schema, read without creating or migrating
+/// anything. `Ok(None)` when there is no index, so no VFS to warn about.
+pub(crate) fn schema_on_disk() -> Result<Option<u32>, String> {
+    let Ok(dir) = storage::cluster_state_dir() else {
+        return Ok(None);
+    };
+    let path = dir.join("cluster/vfs").join(DB_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let version: i64 = Connection::open_with_flags(&path, flags)
+        .and_then(|conn| conn.query_row("PRAGMA user_version", [], |row| row.get(0)))
+        .map_err(|e| e.to_string())?;
+    u32::try_from(version)
+        .map(Some)
+        .map_err(|_| format!("user_version {version} is not a step number"))
+}
+
 /// Set by `remuda vfs index-downgrade`: this process must not upgrade again.
 static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -386,6 +411,36 @@ pub(super) fn counts(conn: &Connection) -> VfsResult<IndexCounts> {
         live: usize::try_from(live).unwrap_or(usize::MAX),
         total: usize::try_from(total).unwrap_or(usize::MAX),
     })
+}
+
+/// Paths that have kept conflicts.
+pub(super) fn conflict_paths(conn: &Connection) -> VfsResult<usize> {
+    let count: i64 = conn.query_row("SELECT count(DISTINCT path) FROM conflicts", [], |row| {
+        row.get(0)
+    })?;
+    Ok(usize::try_from(count).unwrap_or(usize::MAX))
+}
+
+/// When `peer` last pulled from here, and how many tombstones it has not
+/// pulled yet (every one if it never pulled).
+pub(super) fn peer_pull(conn: &Connection, peer: &str) -> VfsResult<(Option<u64>, usize)> {
+    let row: Option<(i64, Option<i64>)> = conn
+        .query_row(
+            "SELECT acked_seq, last_seen FROM peers WHERE fp = ?1",
+            [peer],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (acked, seen) = row.unwrap_or((0, None));
+    let unpulled: i64 = conn.query_row(
+        "SELECT count(*) FROM entries WHERE deleted = 1 AND seq > ?1",
+        [acked],
+        |row| row.get(0),
+    )?;
+    Ok((
+        seen.map(|seen| seen as u64),
+        usize::try_from(unpulled).unwrap_or(usize::MAX),
+    ))
 }
 
 /// One past the highest version, as `VfsIndex::next_version`. A negative
@@ -760,6 +815,31 @@ mod tests {
         .unwrap();
         fs::write(root.join(LEGACY_FILE), &bytes).unwrap();
         bytes
+    }
+
+    #[test]
+    fn index_status_counts_conflicts_and_deletes_a_peer_has_not_pulled() {
+        let scratch = Scratch::new();
+        let store = VfsStore::open_at(&scratch.root()).unwrap();
+        store
+            .merge_entries((0..6).map(|i| entry(i, i < 3)).collect())
+            .unwrap();
+        let conn = open(&scratch.root()).unwrap();
+        // Never pulled: every delete waits for it.
+        assert_eq!(peer_pull(&conn, "SHA256:peer").unwrap(), (None, 3));
+        let second_delete: i64 = conn
+            .query_row(
+                "SELECT seq FROM entries WHERE deleted = 1 ORDER BY seq LIMIT 1 OFFSET 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        set_seen(&conn, "SHA256:peer", 1_234).unwrap();
+        set_acked(&conn, "SHA256:peer", second_delete as u64).unwrap();
+        assert_eq!(peer_pull(&conn, "SHA256:peer").unwrap(), (Some(1_234), 1));
+        let status = store.index_status(&["SHA256:peer".into()]).unwrap();
+        assert_eq!((status.counts.live, status.counts.total), (3, 6));
+        assert_eq!(status.conflict_paths, 0);
     }
 
     #[test]

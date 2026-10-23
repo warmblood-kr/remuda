@@ -109,6 +109,13 @@ pub struct VfsSettings {
 }
 
 pub const DEFAULT_TOMBSTONE_DAYS: u32 = 7;
+
+/// See `VfsStore::index_status`; `pulls` follows the peers asked about.
+pub struct IndexStatus {
+    pub counts: IndexCounts,
+    pub conflict_paths: usize,
+    pub pulls: Vec<(Option<u64>, usize)>,
+}
 pub const DEFAULT_STALE_DAYS: u32 = 30;
 
 fn default_stale_days() -> u32 {
@@ -311,6 +318,23 @@ pub fn unix_now() -> u64 {
 #[derive(Clone, Debug)]
 pub struct VfsStore {
     root: PathBuf,
+    /// The folder's identity at open; `still_here` compares it.
+    opened: Option<(u64, u64)>,
+}
+
+/// (device, inode) on unix; elsewhere the folder's creation time.
+fn folder_id(path: &Path) -> Option<(u64, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let born = meta.created().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        Some((born.as_secs(), u64::from(born.subsec_nanos())))
+    }
 }
 
 impl VfsStore {
@@ -340,6 +364,7 @@ impl VfsStore {
         storage::create_private_directory(&blobs)?;
         Ok(Self {
             root: root.to_path_buf(),
+            opened: folder_id(root),
         })
     }
 
@@ -374,6 +399,7 @@ impl VfsStore {
         rules::validate_replicas(settings.default_replicas)
             .map_err(|error| VfsError::new(VfsErrorKind::BadUri, error.0))?;
         let _guard = self.lock()?;
+        self.still_here()?;
         let bytes = serde_json::to_vec_pretty(settings).map_err(io::Error::other)?;
         storage::atomic_write(&self.root.join("vfs.json"), &bytes)?;
         Ok(())
@@ -403,7 +429,20 @@ impl VfsStore {
 
     /// Open the index database (see `vfs_index_db`).
     fn index_db(&self) -> VfsResult<rusqlite::Connection> {
+        self.still_here()?;
         vfs_index_db::open(&self.root)
+    }
+
+    /// Refuse once `cluster leave` or `init --new-identity` moved the store
+    /// away, even if a new store now sits at the same path.
+    fn still_here(&self) -> VfsResult<()> {
+        if self.root.is_dir() && (self.opened.is_none() || folder_id(&self.root) == self.opened) {
+            return Ok(());
+        }
+        Err(VfsError::new(
+            VfsErrorKind::NoCluster,
+            "this node left its cluster; run `remuda cluster init` or `remuda cluster join`",
+        ))
     }
 
     pub fn load_index(&self) -> VfsResult<VfsIndex> {
@@ -534,6 +573,7 @@ impl VfsStore {
 
     /// Record that a peer index was merged at `now`.
     pub fn mark_synced(&self, now: u64) -> VfsResult<()> {
+        self.still_here()?;
         storage::atomic_write(&self.root.join("synced_at"), now.to_string().as_bytes())?;
         Ok(())
     }
@@ -713,6 +753,7 @@ impl VfsStore {
         let intact = fs::metadata(&path)
             .is_ok_and(|metadata| metadata.is_file() && metadata.len() == bytes.len() as u64);
         if !intact {
+            self.still_here()?;
             if let Some(parent) = path.parent() {
                 storage::create_private_directory(parent)?;
             }
@@ -836,11 +877,89 @@ impl VfsStore {
         Ok(out)
     }
 
+    fn stand_in_path(&self, sha256: &str) -> VfsResult<PathBuf> {
+        rules::validate_sha256(sha256)
+            .map_err(|error| VfsError::new(VfsErrorKind::BadUri, error.0))?;
+        Ok(self.root.join("stand-ins").join(sha256))
+    }
+
+    /// Mark a copy the repair pass fetched: only such copies are trimmed
+    /// once this node leaves their placement (design step 6).
+    pub fn mark_stand_in(&self, sha256: &str) -> VfsResult<()> {
+        let path = self.stand_in_path(sha256)?;
+        self.still_here()?;
+        fs::create_dir_all(self.root.join("stand-ins"))?;
+        fs::write(path, b"")?;
+        Ok(())
+    }
+
+    /// Keep this copy for good: `resolve` handed its path to a tool.
+    pub fn keep_blob(&self, sha256: &str) -> VfsResult<()> {
+        let _guard = self.lock()?;
+        match fs::remove_file(self.stand_in_path(sha256)?) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Hashes of the copies marked as stand-ins.
+    pub fn stand_ins(&self) -> VfsResult<Vec<String>> {
+        let entries = match fs::read_dir(self.root.join("stand-ins")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            if let Some(name) = entry?.file_name().to_str() {
+                if rules::validate_sha256(name).is_ok() {
+                    out.push(name.to_owned());
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Delete a stand-in copy if it is still marked. The caller has seen
+    /// every placement node confirm a copy, so this is never the last one.
+    pub fn trim_stand_in(&self, sha256: &str) -> VfsResult<bool> {
+        let _guard = self.lock()?;
+        self.still_here()?;
+        let marker = self.stand_in_path(sha256)?;
+        if !marker.is_file() {
+            return Ok(false);
+        }
+        let removed = match fs::remove_file(self.blob_path(sha256)?) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        fs::remove_file(marker)?;
+        Ok(removed)
+    }
+
     /// Remove local blobs that no live entry references and that are older
     /// than `GC_GRACE`. The grace covers a put that wrote its blob but not yet
     /// its entry, and a pull that lands before the index merge.
     pub fn collect_garbage(&self) -> VfsResult<usize> {
         self.collect_garbage_older_than(GC_GRACE)
+    }
+
+    /// Index figures for `remuda vfs status`: counts, conflicted paths, and
+    /// per peer its last pull and the tombstones it has not pulled.
+    pub fn index_status(&self, peers: &[String]) -> VfsResult<IndexStatus> {
+        let conn = self.index_db()?;
+        let counts = vfs_index_db::counts(&conn)?;
+        let mut pulls = Vec::with_capacity(peers.len());
+        for peer in peers {
+            pulls.push(vfs_index_db::peer_pull(&conn, peer)?);
+        }
+        Ok(IndexStatus {
+            counts,
+            conflict_paths: vfs_index_db::conflict_paths(&conn)?,
+            pulls,
+        })
     }
 
     /// Remove tombstones older than `tombstone_days` that every other member
@@ -926,6 +1045,7 @@ impl VfsStore {
                 .and_then(|modified| modified.elapsed().ok())
                 .is_some_and(|age| age >= grace);
             if old_enough && fs::remove_file(&path).is_ok() {
+                let _ = fs::remove_file(self.stand_in_path(&hash)?);
                 removed += 1;
             }
         }
@@ -1038,6 +1158,28 @@ mod tests {
         assert_eq!(live.sha256, sha256_hex(b"world"));
         assert_eq!(store.read_blob(&live.sha256).unwrap(), b"world");
         assert!(store.has_blob(&first.sha256, first.size));
+    }
+
+    #[test]
+    fn a_handle_to_a_moved_store_never_writes_the_new_one() {
+        let scratch = Scratch::new();
+        let old = scratch.store();
+        let kept = old.put("kept", b"x", 1, "SHA256:me").unwrap();
+        fs::rename(scratch.0.join("vfs"), scratch.0.join("aside")).unwrap();
+        let fresh = scratch.store();
+        let refused = old.merge_entries(vec![kept]).unwrap_err();
+        assert_eq!(refused.kind, VfsErrorKind::NoCluster);
+        assert!(old.put("late", b"y", 1, "SHA256:me").is_err());
+        assert!(fresh.load_index().unwrap().entries.is_empty());
+        let settings = VfsSettings::default();
+        assert!(old.save_settings(&settings).is_err());
+        assert!(!scratch.0.join("vfs/vfs.json").exists());
+        assert!(old.mark_synced(1).is_err());
+        assert_eq!(fresh.synced_at(), None);
+        let blob = fresh.put_blob(b"z").unwrap();
+        fresh.mark_stand_in(&blob).unwrap();
+        assert!(old.trim_stand_in(&blob).is_err());
+        assert!(fresh.blob_present(&blob));
     }
 
     #[test]
@@ -1158,6 +1300,35 @@ mod tests {
         );
         assert!(!store.blob_present(&old.sha256));
         assert!(store.has_blob(&new.sha256, new.size));
+    }
+
+    #[test]
+    fn only_marked_stand_ins_are_trimmed_and_resolve_unmarks() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        let cached = store.put_blob(b"read cache").unwrap();
+        assert!(!store.trim_stand_in(&cached).unwrap());
+        assert!(store.blob_present(&cached));
+
+        let stand_in = store.put_blob(b"repair copy").unwrap();
+        store.mark_stand_in(&stand_in).unwrap();
+        assert_eq!(store.stand_ins().unwrap(), vec![stand_in.clone()]);
+        store.keep_blob(&stand_in).unwrap();
+        assert!(store.stand_ins().unwrap().is_empty());
+        assert!(!store.trim_stand_in(&stand_in).unwrap());
+
+        store.mark_stand_in(&stand_in).unwrap();
+        assert!(store.trim_stand_in(&stand_in).unwrap());
+        assert!(!store.blob_present(&stand_in));
+        assert!(store.stand_ins().unwrap().is_empty());
+
+        // Blob GC drops the mark with the blob.
+        let garbage = store.put_blob(b"unreferenced").unwrap();
+        store.mark_stand_in(&garbage).unwrap();
+        store
+            .collect_garbage_older_than(std::time::Duration::ZERO)
+            .unwrap();
+        assert!(store.stand_ins().unwrap().is_empty());
     }
 
     #[test]

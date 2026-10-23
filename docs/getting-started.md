@@ -239,6 +239,7 @@ You should see three rows in state `admitted`; `*` marks this machine
 machine can type into and close every session, so join only machines you
 trust. To turn remote control off: `remuda cluster control off`.
 [cluster-demo.md](cluster-demo.md) also covers remote input and revoke.
+[vfs.md](vfs.md) covers files shared across the cluster (`remuda vfs`).
 
 ## 6. When something goes wrong
 

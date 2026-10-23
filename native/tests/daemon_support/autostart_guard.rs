@@ -1,5 +1,7 @@
 //! Cleanup for daemons autostarted by a fixture's private runtime directory.
 
+#[path = "hosts.rs"]
+mod hosts;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -59,6 +61,7 @@ impl Drop for AutostartDaemonGuard {
         {
             std::thread::sleep(Duration::from_millis(20));
         }
+        hosts::stop_hosts_under(&self.runtime);
         let _ = std::fs::remove_dir_all(&self.runtime);
     }
 }
