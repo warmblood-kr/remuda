@@ -440,11 +440,9 @@ impl HostSession {
             Err(error) => Announced::Unreachable(error.to_string()),
         }
     }
-    /// For `stop`: end the grant of a human attached (or still detaching), so
-    /// the host accepts Close, which it refuses while a human holds a grant.
-    /// The newest grant is the high-water; revoking a released one is a no-op.
-    /// Returns whether a grant was revoked. A host without human counters
-    /// never granted one.
+    /// For `stop`: revoke the newest human grant (the high-water), so the host
+    /// accepts Close, which it refuses while a human holds one. Revoking a
+    /// released grant is a no-op; a host without human counters never granted.
     pub fn revoke_human(&self) -> Result<bool> {
         let _pass = self.gate.enter()?;
         let mut client = self.controller()?;
