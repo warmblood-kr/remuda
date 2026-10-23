@@ -76,6 +76,7 @@ impl Remote {
     }
     fn frame(&self) -> VersionedSnapshot {
         VersionedSnapshot {
+            modes: None,
             instance_id: Some(if self.shared.changed_instance.load(Ordering::SeqCst) {
                 "replacement".into()
             } else {
@@ -127,6 +128,7 @@ impl SessionOperations for Remote {
             attached: self.shared.active.load(Ordering::SeqCst) != 0,
             closing: false,
             host_build: Some("test-host".into()),
+            attach_generation: None,
         })
     }
     fn recover(&self, key: &RequestIdentity) -> Result<Recovery> {

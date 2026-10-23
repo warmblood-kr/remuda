@@ -4,8 +4,8 @@
 //! the host ledger by its original key, so a lost reply is recovered, never
 //! replayed. Results are retained up to a bound, then retired as Forgotten.
 //! Expected identity and endpoint come only from the private inventory.
-//! The opt-in daemon path (`hosted`) registers it; attach and legacy raw
-//! batches are refused as Unsupported for now.
+//! The opt-in daemon path (`hosted`) registers it; attach is a Human-role
+//! grant (see `attachment`); legacy raw batches are refused as Unsupported.
 use super::api::{Identity as HostIdentity, Lifecycle as HostLifecycle, Request, Response, Role};
 use super::entry::Client;
 use super::inventory::disk::Error as StoreError;
@@ -530,7 +530,13 @@ impl HostSession {
         }
     }
     fn versioned(&self, view: Viewport) -> VersionedSnapshot {
+        let modes = remuda_core::agent::TerminalModes {
+            mouse: view.modes.mouse,
+            application_cursor: view.modes.application_cursor,
+            application_keypad: view.modes.application_keypad,
+        };
         VersionedSnapshot {
+            modes: Some(modes),
             output_version: Some(view.generation),
             instance_id: Some(self.identity.instance.clone()),
             snapshot: view.into_screen(),
@@ -632,6 +638,7 @@ impl SessionOperations for HostSession {
             attached: activity.attached,
             closing: activity.closing,
             host_build: Some(info.host_build),
+            attach_generation: info.human.map(|human| human.high_water),
         })
     }
     fn recover(&self, request: &RequestIdentity) -> Result<Recovery> {
@@ -763,7 +770,12 @@ impl SessionOperations for HostSession {
         Ok(Some(wakeup))
     }
     fn attach(&self) -> Result<Box<dyn AttachmentOperations + '_>> {
-        Err(Error::Unavailable(Unavailable::Unsupported))
+        Ok(Box::new(super::attachment::HostAttachment::open(
+            &self.endpoint,
+            self.identity.clone(),
+            SessionOperations::identity(self),
+            Arc::clone(&self.gate),
+        )?))
     }
 }
 /// Fastest and slowest generation polls: fast right after output, backing

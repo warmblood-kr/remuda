@@ -1020,6 +1020,7 @@ fn start_listener(
 
 #[cfg(unix)]
 mod accept;
+mod hosted_attach;
 #[cfg(unix)]
 mod instance_id;
 #[cfg(unix)]
@@ -2093,17 +2094,6 @@ fn handle(
     )
 }
 
-/// Requests that still need a local Session (#713): a host-backed session
-/// answers them with a clear refusal instead of "no such session".
-fn local_only(request: &Request) -> Option<(&'static str, &str)> {
-    match request {
-        Request::MouseState { name } => Some(("mouse state", name)),
-        Request::Attach { name } | Request::AttachTracked { name } => Some(("attach", name)),
-        Request::AttachStatus { name, .. } => Some(("attach status", name)),
-        _ => None,
-    }
-}
-
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn handle_request(
     stream: Stream,
@@ -2116,16 +2106,6 @@ fn handle_request(
     request: Request,
     accepted: std::time::SystemTime,
 ) -> std::io::Result<()> {
-    if let Some((operation, name)) = local_only(&request) {
-        if registry.hosted(name).is_some() {
-            return reply(
-                &stream,
-                &Response::error(format!(
-                    "{operation} is not supported yet for host-backed session {name}"
-                )),
-            );
-        }
-    }
     match request {
         Request::List => {
             // A session's child runs before `new` registers it, and a
@@ -3278,12 +3258,23 @@ fn attach_status(
     name: &str,
     generation: u64,
 ) -> std::io::Result<()> {
-    let response = registry.get(name).map_or_else(
-        || Response::error(format!("no such session: {name}")),
-        |session| Response::AttachStatus {
+    let response = match (registry.get(name), registry.hosted(name)) {
+        (Some(session), _) => Response::AttachStatus {
             taken_over: session.was_attachment_taken_over(generation),
         },
-    );
+        // A host reports its newest grant; a read-only view (0) is never
+        // displaced, and a live session is the only one that can be.
+        (None, Some(handle)) => Response::AttachStatus {
+            taken_over: generation > 0
+                && handle.inspect().is_ok_and(|observation| {
+                    observation.lifecycle == remuda_core::session_operations::Lifecycle::Running
+                        && observation
+                            .attach_generation
+                            .is_some_and(|newest| newest > generation)
+                }),
+        },
+        (None, None) => Response::error(format!("no such session: {name}")),
+    };
     reply(stream, &response)
 }
 
@@ -3875,7 +3866,16 @@ fn mouse_state(stream: &Stream, registry: &Registry, name: &str) -> std::io::Res
     respond(
         stream,
         name,
-        registry.get(name).map(|session| Ok(session.mouse_state())),
+        match registry.get(name) {
+            Some(session) => Some(Ok(session.mouse_state())),
+            // A host reports its child's mouse modes with every Inspect (#713).
+            None => registry.hosted(name).map(|handle| {
+                handle
+                    .inspect()
+                    .map(|observation| observation.mouse)
+                    .map_err(remuda_core::session_operations::Error::into_agent)
+            }),
+        },
         Response::MouseState,
     )
 }
@@ -4054,6 +4054,9 @@ fn attach(
     tracked: bool,
 ) -> std::io::Result<()> {
     let Some(session) = registry.get(name) else {
+        if let Some(handle) = registry.hosted(name) {
+            return hosted_attach::serve(stream, reader, &handle, tracked);
+        }
         return reply(
             &stream,
             &Response::error(format!("no such session: {name}")),
@@ -4838,6 +4841,7 @@ mod tests {
                 attached: false,
                 closing: false,
                 host_build: Some("test-host".into()),
+                attach_generation: None,
             })
         };
         let pids = super::hosted_child_pids([

@@ -401,6 +401,18 @@ pub struct VersionedSnapshot {
     pub snapshot: ScreenSnapshot,
     pub output_version: Option<u64>,
     pub instance_id: Option<String>,
+    /// The input modes the child set, read with the same screen. `None` when
+    /// the backend does not report them.
+    pub modes: Option<TerminalModes>,
+}
+
+/// Terminal modes a child sets that change what a viewer's terminal must
+/// send: mouse reports, bracketed paste, cursor and keypad key encodings.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct TerminalModes {
+    pub mouse: MouseState,
+    pub application_cursor: bool,
+    pub application_keypad: bool,
 }
 
 /// A live agent process: a screen we can read, a keyboard we can type on.
@@ -516,6 +528,7 @@ pub trait AgentProcess: Send {
                 scrollback_total,
             },
             output_version: self.output_version(),
+            modes: None,
             instance_id: None,
         })
     }
