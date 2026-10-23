@@ -318,8 +318,8 @@ fn invite_command_args(output: &str) -> (&str, &str) {
         .strip_prefix("remuda cluster join '")
         .and_then(|command| command.strip_suffix('\''))
         .expect("shell-quoted join command");
-    let (fingerprint, line) = command
-        .split_once("' '")
+    let (fingerprint, line) = Some(command)
+        .map(|line| (line.split(' ').nth(2).unwrap_or_default(), line))
         .expect("separate fingerprint and join line");
     assert!(!fingerprint.contains('\''));
     assert!(!line.contains('\''));

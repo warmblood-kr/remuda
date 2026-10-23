@@ -238,8 +238,8 @@ fn invite_args(output: &str) -> (String, String) {
         .and_then(|command| command.strip_suffix('\''))
         .expect("shell-quoted join command")
         .to_owned();
-    let (fingerprint, line) = command.split_once("' '").unwrap();
-    (fingerprint.to_owned(), line.to_owned())
+    let fingerprint = command.split(' ').nth(2).unwrap_or_default().to_owned();
+    (fingerprint, command)
 }
 
 fn join(issuer: &Node, joiner: &Node) {
