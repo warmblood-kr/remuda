@@ -6,7 +6,7 @@
 //! the daemon's attach then stays read-only.
 use super::api::{HumanCounters, Identity as HostIdentity, Request, Response};
 use super::entry::Client;
-use super::human::Raw;
+use super::human::{Raw, Retire};
 use super::result::Delivery;
 use remuda_core::agent::{AgentError, OutputWakeup};
 use remuda_core::session_operations::{AttachmentOperations, Error, Identity, Result, Unavailable};
@@ -18,10 +18,13 @@ use std::time::{Duration, Instant};
 /// How long one write may take to settle before it is reported uncertain.
 const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 const SETTLE_POLL: Duration = Duration::from_millis(1);
+/// Between tries while the host's raw window is full.
+const BUSY_POLL: Duration = Duration::from_millis(20);
 /// Grant races (another viewer granted between Inspect and grant) retried.
 const GRANT_ATTEMPTS: usize = 3;
 
-pub(crate) struct HostAttachment {
+pub(crate) struct HostAttachment<'a> {
+    session: &'a super::remote::HostSession,
     identity: Identity,
     grant: u64,
     client: Mutex<Client>,
@@ -30,8 +33,9 @@ pub(crate) struct HostAttachment {
     gate: Arc<super::gate::Gate>,
 }
 
-impl HostAttachment {
+impl<'a> HostAttachment<'a> {
     pub fn open(
+        session: &'a super::remote::HostSession,
         endpoint: &Path,
         host: HostIdentity,
         identity: Identity,
@@ -51,7 +55,11 @@ impl HostAttachment {
                 .map_err(transport)?;
             match response {
                 Response::HumanGranted { grant, .. } => {
+                    // Earlier grants are inactive now; their leftovers would
+                    // block this grant's writes. Best effort: a write retries.
+                    let _ = session.discard_abandoned_raw();
                     return Ok(Self {
+                        session,
                         identity,
                         grant,
                         client: Mutex::new(client),
@@ -74,10 +82,16 @@ impl HostAttachment {
 
     /// Write one chunk as the next raw sequence, wait for it to settle, then
     /// retire it.
-    fn write_chunk(&self, client: &mut Client, bytes: &[u8]) -> Result<()> {
+    fn write_chunk(
+        &self,
+        client: &mut Client,
+        bytes: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
         let mut last_raw = self.last_raw.lock().unwrap_or_else(|e| e.into_inner());
         let mut sequence = *last_raw + 1;
         let mut resynced = false;
+        let until = Instant::now() + SETTLE_DEADLINE;
         let state = loop {
             let state = raw(client.request(&Request::HumanInput {
                 grant: self.grant,
@@ -90,12 +104,23 @@ impl HostAttachment {
                     resynced = true;
                     sequence = counters(client)?.last_raw + 1;
                 }
-                Raw::Busy => std::thread::sleep(SETTLE_POLL),
+                // The host's raw window is full: free what gone grants left,
+                // but never wait past the deadline or a detach.
+                Raw::Busy if cancelled() => return Err(Error::Agent(AgentError::Attached)),
+                Raw::Busy if Instant::now() >= until => {
+                    return Err(Error::Agent(AgentError::Io(
+                        "the session's host is not taking input".into(),
+                    )))
+                }
+                Raw::Busy => {
+                    let _ = self.session.discard_abandoned_raw();
+                    std::thread::sleep(BUSY_POLL);
+                }
                 state => break state,
             }
         };
         let delivery = match state {
-            Raw::New | Raw::Pending => self.settle(client, sequence, bytes)?,
+            Raw::New | Raw::Pending => self.settle(client, sequence, bytes, cancelled)?,
             Raw::Complete(delivery) => delivery,
             Raw::Stale => {
                 self.displaced.store(true, Ordering::SeqCst);
@@ -106,7 +131,10 @@ impl HostAttachment {
             }
         };
         *last_raw = sequence;
-        retire(client, sequence);
+        // A gone grant's leftovers ahead of ours make our cut conflict.
+        if !retire(client, sequence) && self.session.discard_abandoned_raw().is_ok() {
+            retire(client, sequence);
+        }
         match delivery {
             Delivery::Written => Ok(()),
             Delivery::Rejected => Err(Error::Agent(AgentError::Io(
@@ -118,7 +146,14 @@ impl HostAttachment {
         }
     }
 
-    fn settle(&self, client: &mut Client, sequence: u64, bytes: &[u8]) -> Result<Delivery> {
+    /// A detach stops the wait; what it leaves unretired a later grant discards.
+    fn settle(
+        &self,
+        client: &mut Client,
+        sequence: u64,
+        bytes: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Delivery> {
         let until = Instant::now() + SETTLE_DEADLINE;
         loop {
             match raw(client.request(&Request::RecoverRaw {
@@ -127,6 +162,7 @@ impl HostAttachment {
                 bytes: bytes.to_vec(),
             }))? {
                 Raw::Complete(delivery) => return Ok(delivery),
+                Raw::Pending if cancelled() => return Err(Error::Agent(AgentError::Attached)),
                 Raw::Pending if Instant::now() < until => std::thread::sleep(SETTLE_POLL),
                 Raw::Pending => {
                     return Err(Error::Agent(AgentError::Io(
@@ -139,7 +175,7 @@ impl HostAttachment {
     }
 }
 
-impl AttachmentOperations for HostAttachment {
+impl AttachmentOperations for HostAttachment<'_> {
     fn identity(&self) -> Identity {
         self.identity.clone()
     }
@@ -173,7 +209,7 @@ impl AttachmentOperations for HostAttachment {
                 break;
             }
             on_start();
-            self.write_chunk(&mut client, chunk)?;
+            self.write_chunk(&mut client, chunk, cancelled)?;
         }
         Ok(())
     }
@@ -187,10 +223,16 @@ impl AttachmentOperations for HostAttachment {
 }
 
 /// Best effort: a cut that cannot retire now is retired by a later one.
-fn retire(client: &mut Client, last: u64) {
-    if let Ok(Response::RawCut { cut }) = client.request(&Request::RawCut { last }) {
-        let _ = client.request(&Request::AcknowledgeRaw { cut });
-    }
+fn retire(client: &mut Client, last: u64) -> bool {
+    let Ok(Response::RawCut { cut }) = client.request(&Request::RawCut { last }) else {
+        return false;
+    };
+    matches!(
+        client.request(&Request::AcknowledgeRaw { cut }),
+        Ok(Response::Retired {
+            state: Retire::Retired | Retire::Forgotten
+        })
+    )
 }
 
 fn counters(client: &mut Client) -> Result<HumanCounters> {
