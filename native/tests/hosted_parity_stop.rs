@@ -112,3 +112,35 @@ fn stop_keep_sessions_keeps_only_host_backed_ones() {
         }
     }
 }
+
+/// After a crash, the command that starts the next daemon says what that
+/// daemon found: host-backed sessions outlive it, in-process ones do not.
+#[test]
+fn autostart_after_a_crash_names_the_sessions_it_found() {
+    for mode in MODES {
+        let mut daemon = Parity::start(mode);
+        let child = sleeper(&daemon);
+        daemon.kill_daemon();
+        let out = daemon.cli(&["-e", "return 1"]);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let survived = alive(child);
+        let _ = daemon.cli(&["stop", "-f"]);
+        assert!(out.status.success(), "{mode:?}: {stderr}");
+        match mode {
+            Mode::Hosted => {
+                assert!(survived, "hosted: child ended with the daemon");
+                assert!(
+                    stderr.contains(
+                        "none was running; it found 1 host-backed session(s) still running: keeper"
+                    ),
+                    "hosted: notice: {stderr}"
+                );
+            }
+            Mode::InProcess => assert!(
+                stderr
+                    .contains("none was running (sessions of an earlier daemon, if any, are gone)"),
+                "in-process: notice: {stderr}"
+            ),
+        }
+    }
+}
