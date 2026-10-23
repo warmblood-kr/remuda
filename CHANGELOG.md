@@ -24,6 +24,9 @@
   back. Garbage collection removes the mark with the blob.
 ## Unreleased
 
+- VFS: a peer request accepted just before `cluster init --new-identity`
+  can no longer write the old cluster's entries into the new, empty store;
+  membership is now checked after the store opens.
 - Claude Code (macOS, Linux, opt-in): a separate `remuda-channel` MCP entry runs
   `remuda _claude_channel`, a stdio bridge that negotiates the legacy MCP era,
   waits for `notifications/initialized`, and delivers one
