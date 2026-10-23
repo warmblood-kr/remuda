@@ -238,7 +238,11 @@ fn invite_args(output: &str) -> (String, String) {
         .and_then(|command| command.strip_suffix('\''))
         .expect("shell-quoted join command")
         .to_owned();
-    let fingerprint = command.split(' ').nth(2).expect("line carries the fingerprint").to_owned();
+    let fingerprint = command
+        .split(' ')
+        .nth(2)
+        .expect("line carries the fingerprint")
+        .to_owned();
     (fingerprint, command)
 }
 
