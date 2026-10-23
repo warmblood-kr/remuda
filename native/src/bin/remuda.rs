@@ -6670,6 +6670,31 @@ fn daemon_start_error(path: &Path, stderr_path: &Path, offset: u64, separator: &
     format!("daemon did not come up at {} — {said}", path.display())
 }
 
+/// A daemon that was just started lists only what it found again: sessions
+/// whose hosts outlived the earlier daemon (#713).
+fn found_sessions(path: &Path) -> Vec<String> {
+    match remuda_native::client::request(path, &Request::List) {
+        Ok(Response::Sessions(sessions)) => sessions.into_iter().map(|s| s.name).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The line an autostart prints. Host-backed sessions survive a daemon that
+/// died, so it names the ones found instead of calling them gone.
+fn started_notice(server: &str, found: &[String]) -> String {
+    if found.is_empty() {
+        format!(
+            "remuda: started a daemon for {server:?}: none was running (sessions of an earlier daemon, if any, are gone)"
+        )
+    } else {
+        format!(
+            "remuda: started a daemon for {server:?}: none was running; it found {} host-backed session(s) still running: {} (in-process sessions of an earlier daemon, if any, are gone)",
+            found.len(),
+            found.join(", ")
+        )
+    }
+}
+
 /// Spawn ourselves as the daemon and wait for the socket to answer. Wait on a
 /// successful *connect*, not on the file existing, and pass `-s <server>`
 /// through — a bare `remuda daemon` re-derives `"default"` and never matches.
@@ -6778,9 +6803,7 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
         if remuda_native::ipc::connect(path).is_ok() {
             // "remuda should always come up in daemon mode" — it already did.
             // What was missing was the line saying so.
-            eprintln!(
-                "remuda: started a daemon for {server:?}: none was running (sessions of an earlier daemon, if any, are gone)"
-            );
+            eprintln!("{}", started_notice(server, &found_sessions(path)));
             return Ok(());
         }
         // If it has already exited, waiting out the deadline only delays the
