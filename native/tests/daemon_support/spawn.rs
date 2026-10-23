@@ -91,6 +91,14 @@ impl Daemon {
         spawn_and_wait(base_command(dir), dir)
     }
 
+    /// Like `spawn`, with sessions kept in the daemon whatever the default:
+    /// for tests of behaviour host-backed sessions deliberately lack.
+    pub fn spawn_in_process(dir: &Path) -> Self {
+        let mut cmd = base_command(dir);
+        cmd.env("REMUDA_EXPERIMENTAL_SESSION_HOST", "0");
+        spawn_and_wait(cmd, dir)
+    }
+
     /// Like `spawn`, but for the birth-environment-poisoning
     /// scenario itself: a daemon born with `HOME` pinned to a caller-chosen
     /// directory (overriding `base_command`'s default) and NEITHER

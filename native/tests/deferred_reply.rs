@@ -20,9 +20,22 @@ fn pending_handle_count_is_bounded_and_overflow_fails_immediately() {
     ));
 }
 
-#[allow(clippy::too_many_lines)] // The fixture is one Lua module used by the integration cases below.
 fn fixture(
     tag: &str,
+) -> (
+    std::path::PathBuf,
+    impl Fn(&[&str]) -> Output,
+    AutostartDaemonGuard,
+) {
+    fixture_with_mode(tag, None)
+}
+
+/// `mode` names the session backend for the autostarted daemon ("0" keeps
+/// sessions in process); `None` takes the default.
+#[allow(clippy::too_many_lines)] // The fixture is one Lua module used by the integration cases below.
+fn fixture_with_mode(
+    tag: &str,
+    mode: Option<&'static str>,
 ) -> (
     std::path::PathBuf,
     impl Fn(&[&str]) -> Output,
@@ -204,15 +217,18 @@ end)
     .unwrap();
     let run_dir = dir.clone();
     let run = move |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_remuda"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
+        command
             .args(["-s", "s"])
             .args(args)
             .env("REMUDA_RUNTIME_DIR", &run_dir)
             .env("XDG_DATA_HOME", run_dir.join("data"))
             .env("XDG_CACHE_HOME", run_dir.join("cache"))
-            .env("HOME", &run_dir)
-            .output()
-            .expect("run remuda")
+            .env("HOME", &run_dir);
+        if let Some(mode) = mode {
+            command.env("REMUDA_EXPERIMENTAL_SESSION_HOST", mode);
+        }
+        command.output().expect("run remuda")
     };
     (dir, run, daemon_guard)
 }
@@ -848,7 +864,8 @@ fn session_secret_prompt_tag_replaces_brackets_in_the_session_name() {
 fn session_secret_prompt_tag_caps_the_session_name_at_64_chars() {
     use remuda_native::daemon;
 
-    let (dir, remuda, _daemon_guard) = fixture("secret_session_tag_cap");
+    // In-process behaviour: hosted session names are limited to 64 bytes.
+    let (dir, remuda, _daemon_guard) = fixture_with_mode("secret_session_tag_cap", Some("0"));
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),

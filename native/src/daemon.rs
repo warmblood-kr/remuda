@@ -3672,7 +3672,7 @@ fn handle_new(
     session_env.insert("REMUDA_SESSION_ID".into(), session_id.clone());
     session_env.insert("REMUDA_SESSION_NAME".into(), name.clone());
     #[cfg(unix)]
-    if crate::session_host::hosted::opted_in() {
+    if crate::session_host::hosted::hosting() {
         return handle_new_hosted(
             &stream,
             registry,

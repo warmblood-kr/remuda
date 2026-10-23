@@ -3,3 +3,7 @@
 # its startup migration would rewrite the real identity (#746). Windows uses
 # LOCALAPPDATA, which tests set per command.
 XDG_STATE_HOME = { value = "target/test-state", force = true, relative = true }
+# Short temporary paths for tests: a session host's socket sits 23 bytes
+# below its daemon's (`<socket>.hosts/<id>/socket`), and macOS's default
+# TMPDIR (/var/folders/...) leaves too little of the 104-byte sun_path.
+TMPDIR = { value = "/tmp", force = true }

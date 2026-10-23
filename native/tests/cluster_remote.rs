@@ -30,10 +30,22 @@ struct Node {
     public: Vec<u8>,
     private: Vec<u8>,
     daemon: Child,
+    /// The session backend named to the daemon; `None` takes the default.
+    mode: Option<&'static str>,
 }
 
 impl Node {
     fn start(label: &str) -> Self {
+        Self::start_with_mode(label, None)
+    }
+
+    /// Sessions kept in the daemon whatever the default: for behaviour
+    /// host-backed sessions deliberately lack.
+    fn start_in_process(label: &str) -> Self {
+        Self::start_with_mode(label, Some("0"))
+    }
+
+    fn start_with_mode(label: &str, mode: Option<&'static str>) -> Self {
         let serial = NEXT.fetch_add(1, Ordering::Relaxed);
         // The default macOS TMPDIR (/var/folders/...) leaves too little of the
         // 104-byte sun_path for runtime/remuda/<node>.sock.
@@ -50,7 +62,7 @@ impl Node {
             fs::create_dir_all(dir).unwrap();
         }
         let name = format!("{label}-{serial}");
-        let daemon = spawn_daemon(&name, &runtime, &root, &state);
+        let daemon = spawn_daemon(&name, &runtime, &root, &state, mode);
         let mut node = Self {
             root,
             runtime,
@@ -59,6 +71,7 @@ impl Node {
             public: Vec::new(),
             private: Vec::new(),
             daemon,
+            mode,
         };
         node.wait_ready();
         let init = node
@@ -122,7 +135,13 @@ impl Node {
 
     fn restart_daemon(&mut self) {
         self.stop_daemon();
-        self.daemon = spawn_daemon(&self.name, &self.runtime, &self.root, &self.state);
+        self.daemon = spawn_daemon(
+            &self.name,
+            &self.runtime,
+            &self.root,
+            &self.state,
+            self.mode,
+        );
         self.wait_ready();
     }
 }
@@ -136,8 +155,18 @@ impl Drop for Node {
     }
 }
 
-fn spawn_daemon(name: &str, runtime: &Path, root: &Path, state: &Path) -> Child {
-    command(name, runtime, root, state, &root.join("home"))
+fn spawn_daemon(
+    name: &str,
+    runtime: &Path,
+    root: &Path,
+    state: &Path,
+    mode: Option<&str>,
+) -> Child {
+    let mut command = command(name, runtime, root, state, &root.join("home"));
+    if let Some(mode) = mode {
+        command.env("REMUDA_EXPERIMENTAL_SESSION_HOST", mode);
+    }
+    command
         .args(["daemon"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -990,8 +1019,9 @@ fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_res
     const BEFORE_DOWN: &str = "REMOTE_BEFORE_DOWN";
     const AFTER_RECONNECT: &str = "REMOTE_AFTER_RECONNECT";
 
-    let client_node = Node::start("remote-client");
-    let mut server_node = Node::start("remote-server");
+    // In-process behaviour: hosted sessions survive a daemon restart.
+    let client_node = Node::start_in_process("remote-client");
+    let mut server_node = Node::start_in_process("remote-server");
     admit_pair(&client_node, &server_node);
     let listener = Listener::start(&server_node);
     let marker_before_down = server_node.root.join("emit-before-down");
@@ -1115,8 +1145,9 @@ fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_res
 #[test]
 fn selected_remote_session_with_hangul_text_syncs_within_the_frame_limit() {
     const HANGUL: &str = "안녕하세요 한글 패널 내용";
-    let client_node = Node::start("hangul-client");
-    let server_node = Node::start("hangul-server");
+    // In-process behaviour: hosted terminals are limited to 65,536 cells.
+    let client_node = Node::start_in_process("hangul-client");
+    let server_node = Node::start_in_process("hangul-server");
     admit_pair(&client_node, &server_node);
     let listener = Listener::start(&server_node);
     server_node.start_session(&format!("printf '{HANGUL}\\n'; sleep 600"));

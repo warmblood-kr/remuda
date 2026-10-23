@@ -24,8 +24,19 @@ pub(super) fn choose(
     probe: impl Fn(&Path) -> Option<String>,
 ) -> Result<PathBuf, String> {
     let plain = daemon.with_file_name(format!("{HOST}{}", std::env::consts::EXE_SUFFIX));
+    // A daemon inside a test binary runs from cargo's `deps` directory; the
+    // host is built one level up. Its build is still checked like any other.
+    let cargo_test = daemon
+        .parent()
+        .filter(|dir| dir.file_name().is_some_and(|name| name == "deps"))
+        .and_then(Path::parent)
+        .map(|dir| dir.join(plain.file_name().unwrap_or_default()));
     let mut seen = Vec::new();
-    for candidate in versioned(daemon, build).into_iter().chain([plain.clone()]) {
+    for candidate in versioned(daemon, build)
+        .into_iter()
+        .chain([plain.clone()])
+        .chain(cargo_test)
+    {
         if !candidate.is_file() {
             continue;
         }
@@ -224,6 +235,20 @@ mod tests {
             std::env::consts::EXE_SUFFIX
         );
         assert_eq!(versioned, Path::new(&want));
+    }
+
+    #[test]
+    fn a_daemon_in_a_cargo_test_binary_finds_the_host_one_level_up() {
+        let dir = tempdir();
+        std::fs::create_dir(dir.path().join("deps")).unwrap();
+        let daemon = dir.path().join("deps/daemon-0123");
+        script(&dir.path().join(HOST), "echo 1+a");
+        assert_eq!(
+            choose(&daemon, "1+a", probe_uncached).unwrap(),
+            dir.path().join(HOST)
+        );
+        let refused = choose(&daemon, "0+old", probe_uncached).unwrap_err();
+        assert!(refused.contains("is build 1+a"), "{refused}");
     }
 
     #[test]
