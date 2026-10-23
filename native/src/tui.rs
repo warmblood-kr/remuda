@@ -3407,8 +3407,9 @@ fn capture_anchored<T>(
             // The captured cells use `requested`, while `total` may already
             // include output that arrived after that offset was chosen. Store
             // the total that corresponds to the captured offset so the next
-            // frame accounts for that missed drift exactly once.
-            let anchor_total = total.saturating_sub(requested.saturating_sub(base_offset));
+            // frame accounts for that missed drift exactly once: only the
+            // drift `requested` has not absorbed, `anchored - requested`.
+            let anchor_total = total.saturating_sub(anchored.saturating_sub(requested));
             return Ok((value, rows, total, requested, anchor_total));
         }
         requested = anchored;
