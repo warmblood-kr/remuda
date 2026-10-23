@@ -1,6 +1,8 @@
 #![cfg(unix)]
 #![allow(clippy::disallowed_types)]
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use std::fs;
 use std::io::{BufRead, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -74,6 +76,7 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         assert!(self.runtime.starts_with(&self.root));
+        hosts::stop_hosts_under(&self.root);
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -502,7 +505,7 @@ fn cluster_help_output_is_routed_and_discloses_listener_controls() {
     let cases = [
         (
             &["cluster", "--help"][..],
-"Usage: remuda cluster <COMMAND>\n\nCommands:\n  init       Create this node identity and listen on a private LAN address by default (port 7441). Example: remuda cluster init --no-listen\n  invite     Create an invitation for another node. Example: remuda cluster invite\n  join       Join using a quoted invitation line; a fingerprint is needed when stdin is not a terminal. Example: remuda cluster join 'remuda-join-v1 …'\n  nodes      List the nodes known to this cluster. Example: remuda cluster nodes\n  advertise  Refresh this node's endpoint from its running listener without restarting it\n  alias      Set or clear a cluster-wide display alias for a node. Example: remuda cluster alias node-abcd1234 macbook\n  control    Enable or disable remote control. Example: remuda cluster control off\n  revoke     Revoke a node or fingerprint; prompt before revoking unless --yes is used. Example: remuda cluster revoke node-abcd1234\n  remote     Attach to a remote session, or show the remote session picker. Example: remuda cluster remote node/session\n  listen     Manage the cluster listener. Example: remuda cluster listen --bind 127.0.0.1\n  call       Call a remote node API. Example: remuda cluster call node-abcd1234 list --addr 192.0.2.1\n  help       Print help for a cluster command\n"
+"Usage: remuda cluster <COMMAND>\n\nCommands:\n  init       Create this node identity and listen on a private LAN address by default (port 7441). Example: remuda cluster init --no-listen\n  invite     Create an invitation for another node. Example: remuda cluster invite\n  join       Join using a quoted invitation line; a fingerprint is needed when stdin is not a terminal. Example: remuda cluster join 'remuda-join-v1 …'\n  nodes      List the nodes known to this cluster. Example: remuda cluster nodes\n  advertise  Refresh this node's endpoint from its running listener without restarting it\n  alias      Set or clear a cluster-wide display alias for a node. Example: remuda cluster alias node-abcd1234 macbook\n  control    Enable or disable remote control. Example: remuda cluster control off\n  revoke     Revoke a node or fingerprint; prompt before revoking unless --yes is used. Example: remuda cluster revoke node-abcd1234\n  leave      Leave the cluster: copy files to other nodes, have one of them revoke this node, then forget its membership. Example: remuda cluster leave\n  remote     Attach to a remote session, or show the remote session picker. Example: remuda cluster remote node/session\n  listen     Manage the cluster listener. Example: remuda cluster listen --bind 127.0.0.1\n  call       Call a remote node API. Example: remuda cluster call node-abcd1234 list --addr 192.0.2.1\n  help       Print help for a cluster command\n"
         ),
         (
             &["cluster", "init", "--help"][..],

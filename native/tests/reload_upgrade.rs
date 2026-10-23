@@ -35,6 +35,10 @@ impl Root {
     fn socket(&self) -> PathBuf {
         daemon::socket_path_in(&self.0, "s")
     }
+    /// The daemons' `XDG_CONFIG_HOME`: `remuda/init.lua` under it is theirs.
+    fn config(&self) -> PathBuf {
+        self.0.join("config")
+    }
     /// A daemon of this build; `hosted` opts new sessions into hosts.
     fn daemon(&self, hosted: bool) -> Reaped {
         self.daemon_with(hosted, None)
@@ -47,6 +51,7 @@ impl Root {
             .env("REMUDA_RUNTIME_DIR", &self.0)
             .env("HOME", &self.0)
             .env("XDG_STATE_HOME", self.0.join("state"))
+            .env("XDG_CONFIG_HOME", self.config())
             .env("REMUDA_NO_UPDATE_CHECK", "1")
             .env(
                 "REMUDA_EXPERIMENTAL_SESSION_HOST",
@@ -210,7 +215,49 @@ fn a_daemon_on_another_build_is_reloaded_and_its_hosted_session_survives() {
     };
     assert!(report.starts_with("reloaded: "), "{report}");
     assert!(report.contains("\ndaemon now "), "{report}");
+    assert!(
+        report.contains("\nsessions: all 1 host-backed listed"),
+        "{report}"
+    );
     assert_ne!(lock_pid(&root), before, "another daemon serves now");
+    session_answers(&path, "work", "AFTER");
+}
+
+/// The reload checks the new daemon as `remuda reload` does: an `init.lua`
+/// broken since the old daemon started fails it, though the daemon moved.
+#[test]
+fn a_new_daemon_that_cannot_load_init_lua_is_reported_after_the_upgrade() {
+    let root = Root::new("initlua");
+    let path = root.socket();
+    let init = root.config().join("remuda/init.lua");
+    std::fs::create_dir_all(init.parent().unwrap()).unwrap();
+    std::fs::write(&init, "upgrade_marker = 'old'\n").unwrap();
+    let _daemon = root.daemon(true);
+    new_session(&path, "work");
+    let deadline = Instant::now() + PATIENCE;
+    let ask = Request::Eval {
+        code: "return tostring(upgrade_marker)".into(),
+        name: None,
+    };
+    while request(&path, &ask) != Response::Value("old".into()) {
+        assert!(Instant::now() < deadline, "init.lua never loaded");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::write(&init, "error('broken since the old daemon started')\n").unwrap();
+    let before = lock_pid(&root);
+    let installed = root.installed("9.9.9", &format!("exec '{THIS}' \"$@\""));
+
+    let outcome = after_upgrade(&path, &installed);
+    let AfterUpgrade::Unhealthy(report) = &outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(report.starts_with("reloaded: "), "{report}");
+    assert!(
+        report.contains("\ninit.lua failed in the new daemon: ")
+            && report.contains("broken since the old daemon started"),
+        "{report}"
+    );
+    assert_ne!(lock_pid(&root), before, "the reload went through");
     session_answers(&path, "work", "AFTER");
 }
 

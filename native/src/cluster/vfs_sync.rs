@@ -3,13 +3,14 @@
 //! Content moves by pull only: a cluster request carries about 64 KB, while
 //! a response may carry 4 MiB.
 
-use super::vfs::{unix_now, VfsError, VfsErrorKind, VfsResult, VfsStore, MAX_BLOB_BYTES};
+use super::vfs::{unix_now, VfsError, VfsErrorKind, VfsIndex, VfsResult, VfsStore, MAX_BLOB_BYTES};
+use super::vfs_repair::RepairQueue;
 use super::{NodeState, Registry};
 use crate::net::cluster_client::{ClientTimeouts, ClusterClient};
 use base64::Engine;
 use remuda_core::protocol::{Request, Response};
 use remuda_core::vfs::{self as rules, VfsEntry};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ pub const MAX_UPDATE_JSON_BYTES: usize = 48 * 1024;
 pub const MAX_STAT_HASHES: usize = 64;
 pub const BLOB_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_REPAIRS_PER_PASS: usize = 256;
+const TAKE_TTL: Duration = Duration::from_secs(60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_DOWN_GRACE: Duration = Duration::from_secs(120);
 
@@ -66,6 +68,19 @@ pub fn serve_changes(
     since: u64,
     limit: u32,
 ) -> VfsResult<Response> {
+    if let Some((seen_seq, seen_index_id)) = store.check_puller(peer_fp, since, unix_now())? {
+        return Ok(Response::ClusterVfsChangesPage {
+            index_id: store.index_id()?,
+            entries_json: "[]".into(),
+            last_seq: 0,
+            more: false,
+            reset: true,
+            stale: true,
+            seen_seq,
+            seen_index_id,
+            caps: caps(),
+        });
+    }
     let mut page = store.changes(
         index_id,
         since,
@@ -84,7 +99,16 @@ pub fn serve_changes(
         last_seq: page.last_seq,
         more: page.more,
         reset: page.reset,
+        stale: false,
+        seen_seq: 0,
+        seen_index_id: None,
+        caps: caps(),
     })
+}
+
+/// Requests beyond the base set that this build serves, sent with each page.
+fn caps() -> Vec<String> {
+    vec![remuda_core::protocol::VFS_CAP_TAKE.to_owned()]
 }
 
 pub fn serve_with(store: &VfsStore, request: &Request) -> VfsResult<Response> {
@@ -133,6 +157,15 @@ pub fn serve_with(store: &VfsStore, request: &Request) -> VfsResult<Response> {
             Ok(Response::ClusterVfsAck {
                 digest: store.load_index()?.digest(),
                 applied: changed.len(),
+            })
+        }
+        Request::ClusterVfsTake { hashes } => {
+            if hashes.len() > MAX_STAT_HASHES {
+                return Err(VfsError::new(VfsErrorKind::TooLarge, "too many hashes"));
+            }
+            Ok(Response::ClusterVfsAck {
+                digest: String::new(),
+                applied: take(store, hashes)?,
             })
         }
         Request::ClusterVfsBlobStat { hashes } => {
@@ -197,7 +230,23 @@ fn record_health(peer_fp: &str, reached: bool) {
     }
 }
 
-fn is_down(peer_fp: &str) -> bool {
+/// How long `peer_fp` has been down, if it is.
+pub(super) fn down_for(peer_fp: &str) -> Option<Duration> {
+    let since = *lock(health()).get(peer_fp)?;
+    (since.elapsed() >= down_grace()).then(|| since.elapsed())
+}
+
+/// Whether `peer_fp` answered without change cursors (an older build).
+pub(super) fn is_legacy(peer_fp: &str) -> bool {
+    lock(&LEGACY_PEERS).contains_key(peer_fp)
+}
+
+/// Copies the repair queue holds back for a later try.
+pub(super) fn retry_waiting() -> usize {
+    lock(repair_queue()).waiting(Instant::now())
+}
+
+pub(super) fn is_down(peer_fp: &str) -> bool {
     health()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -208,15 +257,27 @@ fn is_down(peer_fp: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Membership and placement.
 
-struct Members {
-    self_fp: String,
+pub(super) struct Members {
+    pub(super) self_fp: String,
     /// Admitted nodes, this one included.
-    admitted: Vec<String>,
+    pub(super) admitted: Vec<String>,
     /// Admitted peers with an endpoint, which this node can reach.
     reachable: Vec<String>,
 }
 
-fn members() -> VfsResult<Members> {
+impl Members {
+    /// The same members with `node` gone, as if it were already revoked.
+    pub(super) fn without(&self, node: &str) -> Members {
+        let keep = |list: &[String]| list.iter().filter(|fp| *fp != node).cloned().collect();
+        Members {
+            self_fp: self.self_fp.clone(),
+            admitted: keep(&self.admitted),
+            reachable: keep(&self.reachable),
+        }
+    }
+}
+
+pub(super) fn members() -> VfsResult<Members> {
     let (identity, registry) = super::nodes()?
         .ok_or_else(|| VfsError::new(VfsErrorKind::NoCluster, "this node has no cluster"))?;
     Ok(members_of(&identity.node_fp, &registry))
@@ -255,7 +316,7 @@ pub fn placement_for(entry: &VfsEntry) -> Vec<String> {
     }
 }
 
-fn live_placement(entry: &VfsEntry, members: &Members) -> Vec<String> {
+pub(super) fn live_placement(entry: &VfsEntry, members: &Members) -> Vec<String> {
     let candidates: Vec<&str> = members
         .admitted
         .iter()
@@ -271,20 +332,29 @@ fn live_placement(entry: &VfsEntry, members: &Members) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Talking to peers.
 
-fn request_peer(peer_fp: &str, request: &Request) -> Result<Response, String> {
+pub(super) fn request_peer(peer_fp: &str, request: &Request) -> Result<Response, String> {
     let result = request_peer_inner(peer_fp, request);
     record_health(peer_fp, result.is_ok());
     result
 }
 
 fn request_peer_inner(peer_fp: &str, request: &Request) -> Result<Response, String> {
+    request_peer_within(peer_fp, request, REQUEST_TIMEOUT)
+}
+
+/// [`request_peer`] with its own answer timeout and no health record.
+pub(super) fn request_peer_within(
+    peer_fp: &str,
+    request: &Request,
+    timeout: Duration,
+) -> Result<Response, String> {
     let material = super::replication::peer_material(peer_fp).map_err(|error| error.to_string())?;
     let client = ClusterClient::with_timeouts(
         Arc::new(crate::SystemWallClock::new()),
         ClientTimeouts {
             connect: Duration::from_secs(3),
-            read: REQUEST_TIMEOUT,
-            total: REQUEST_TIMEOUT,
+            read: timeout,
+            total: timeout,
         },
     );
     for attempt in 0..20 {
@@ -383,10 +453,13 @@ fn batch_entries(entries: &[VfsEntry]) -> Vec<String> {
 static LEGACY_PEERS: std::sync::Mutex<BTreeMap<String, Instant>> =
     std::sync::Mutex::new(BTreeMap::new());
 const LEGACY_RETRY: Duration = Duration::from_secs(3600);
+/// What a listener answers to a request it cannot decode (an older build).
+pub(super) const OLD_BUILD_REFUSALS: [&str; 2] =
+    ["invalid remote request", "invalid cluster request"];
 
 /// Pull what `peer` changed since our cursor; fall back to the whole-index
 /// digest pull for a peer that does not know change cursors.
-fn pull(store: &VfsStore, peer: &str) -> Result<usize, String> {
+fn pull(store: &VfsStore, me: &str, peer: &str) -> Result<usize, String> {
     let legacy = LEGACY_PEERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -395,9 +468,9 @@ fn pull(store: &VfsStore, peer: &str) -> Result<usize, String> {
     if legacy {
         return pull_index(store, peer);
     }
-    match pull_changes(store, peer, &mut |request| request_peer(peer, request)) {
+    match pull_changes(store, me, peer, &mut |request| request_peer(peer, request)) {
         Ok(Some(merged)) => Ok(merged),
-        Ok(None) | Err(_) => {
+        Ok(None) => {
             let merged = pull_index(store, peer)?;
             LEGACY_PEERS
                 .lock()
@@ -405,6 +478,9 @@ fn pull(store: &VfsStore, peer: &str) -> Result<usize, String> {
                 .insert(peer.to_owned(), Instant::now());
             Ok(merged)
         }
+        // A timeout or a bad page is not an older build: pull the whole
+        // index this once, and ask for changes again next time.
+        Err(_) => pull_index(store, peer),
     }
 }
 
@@ -412,6 +488,7 @@ fn pull(store: &VfsStore, peer: &str) -> Result<usize, String> {
 /// its cursor in one transaction. `Ok(None)`: the peer does not speak it.
 pub fn pull_changes(
     store: &VfsStore,
+    me: &str,
     peer: &str,
     fetch: &mut dyn FnMut(&Request) -> Result<Response, String>,
 ) -> Result<Option<usize>, String> {
@@ -430,16 +507,36 @@ pub fn pull_changes(
             last_seq,
             more,
             reset,
+            stale,
+            seen_seq,
+            seen_index_id,
+            caps,
         } = response
         else {
-            return Ok(None);
+            return match response {
+                Response::Error(reason) if !OLD_BUILD_REFUSALS.contains(&reason.as_str()) => {
+                    Err(reason)
+                }
+                _ => Ok(None),
+            };
         };
+        lock(peer_caps()).insert(peer.to_owned(), caps);
         if reset {
             resets += 1;
             if resets > 1 {
                 return Err("peer reset the change cursor twice".into());
             }
-            store.reset_cursor(peer).map_err(|e| e.to_string())?;
+            if stale {
+                let dropped = store
+                    .rejoin(me, seen_seq, seen_index_id.as_deref())
+                    .map_err(|e| e.to_string())?;
+                eprintln!(
+                    "remuda: vfs: {} says this node was away longer than the stale horizon; dropped {dropped} index rows to pull them again",
+                    super::node_label(peer)
+                );
+            } else {
+                store.reset_cursor(peer).map_err(|e| e.to_string())?;
+            }
             continue;
         }
         let entries: Vec<VfsEntry> =
@@ -593,18 +690,7 @@ pub fn wait_for_replicas(entry: &VfsEntry, timeout: Duration) -> VfsResult<usize
     loop {
         let members = members()?;
         let wanted = live_placement(entry, &members);
-        let mut holders = 0;
-        for node in &wanted {
-            let has = if *node == members.self_fp {
-                store.has_blob(&entry.sha256, entry.size)
-            } else {
-                matches!(
-                    request_peer(node, &Request::ClusterVfsBlobStat { hashes: vec![entry.sha256.clone()] }),
-                    Ok(Response::ClusterVfsBlobHave(have)) if have.first() == Some(&true)
-                )
-            };
-            holders += usize::from(has);
-        }
+        let holders = count_holders(&store, &members.self_fp, entry, &wanted);
         if holders >= wanted.len() {
             return Ok(holders);
         }
@@ -621,6 +707,37 @@ pub fn wait_for_replicas(entry: &VfsEntry, timeout: Duration) -> VfsResult<usize
     }
 }
 
+/// How many of `nodes` hold the entry's blob, asking peers by `BlobStat`.
+fn count_holders(store: &VfsStore, self_fp: &str, entry: &VfsEntry, nodes: &[String]) -> usize {
+    let has = |node: &String| {
+        if node == self_fp {
+            return store.has_blob(&entry.sha256, entry.size);
+        }
+        matches!(
+            request_peer(node, &Request::ClusterVfsBlobStat { hashes: vec![entry.sha256.clone()] }),
+            Ok(Response::ClusterVfsBlobHave(have)) if have.first() == Some(&true)
+        )
+    };
+    nodes.iter().filter(|node| has(node)).count()
+}
+
+/// Poll until `min` nodes hold the entry's blob, this one included, or
+/// `timeout` passes. Returns the last count; the caller compares it to `min`.
+pub fn wait_for_copies(entry: &VfsEntry, min: usize, timeout: Duration) -> VfsResult<usize> {
+    let deadline = Instant::now() + timeout;
+    let store = VfsStore::open_default()?;
+    loop {
+        let members = members()?;
+        let mut nodes = vec![members.self_fp.clone()];
+        nodes.extend(members.reachable.iter().cloned());
+        let holders = count_holders(&store, &members.self_fp, entry, &nodes);
+        if holders >= min || Instant::now() >= deadline {
+            return Ok(holders);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The repair pass.
 
@@ -631,7 +748,10 @@ pub struct SyncReport {
     pub entries_merged: usize,
     pub copies_fetched: usize,
     pub copies_failed: usize,
+    pub copies_waiting: usize,
+    pub copies_trimmed: usize,
     pub garbage_removed: usize,
+    pub tombstones_removed: usize,
     pub error: Option<String>,
 }
 
@@ -642,20 +762,23 @@ impl std::fmt::Display for SyncReport {
         }
         write!(
             formatter,
-            "Peers reached {}, unreachable {}; index entries merged {}; copies fetched {}, failed {}; old blobs removed {}.",
+            "Peers reached {}, unreachable {}; index entries merged {}; copies fetched {}, failed {}, waiting to retry {}, trimmed {}; old blobs removed {}, old deletes forgotten {}.",
             self.peers_reached,
             self.peers_failed,
             self.entries_merged,
             self.copies_fetched,
             self.copies_failed,
-            self.garbage_removed
+            self.copies_waiting,
+            self.copies_trimmed,
+            self.garbage_removed,
+            self.tombstones_removed
         )
     }
 }
 
 /// Pull indexes from every reachable peer, then fetch the copies this node
-/// should hold under the current placement.
-pub fn sync_once() -> SyncReport {
+/// should hold under the current placement. `force` skips retry waits.
+pub fn sync_once(force: bool) -> SyncReport {
     let mut report = SyncReport::default();
     let (store, members) = match VfsStore::open_default().and_then(|store| Ok((store, members()?)))
     {
@@ -670,7 +793,7 @@ pub fn sync_once() -> SyncReport {
         return report;
     }
     for peer in &members.reachable {
-        match pull(&store, peer) {
+        match pull(&store, &members.self_fp, peer) {
             Ok(merged) => {
                 report.peers_reached += 1;
                 report.entries_merged += merged;
@@ -688,25 +811,155 @@ pub fn sync_once() -> SyncReport {
             return report;
         }
     };
-    let mut attempts = 0;
-    for entry in index.entries.values().filter(|entry| !entry.deleted) {
-        if store.has_blob(&entry.sha256, entry.size) {
-            continue;
-        }
-        if !live_placement(entry, &members).contains(&members.self_fp) {
-            continue;
-        }
-        if attempts >= MAX_REPAIRS_PER_PASS {
-            break;
-        }
-        attempts += 1;
-        match fetch_blob(&store, entry) {
-            Ok(_) => report.copies_fetched += 1,
-            Err(_) => report.copies_failed += 1,
+    repair(&store, &members, &index, force, &mut report);
+    report.copies_trimmed = trim(&store, &members, &index);
+    report.garbage_removed = store.collect_garbage().unwrap_or(0);
+    let others: Vec<String> = members
+        .admitted
+        .iter()
+        .filter(|fp| **fp != members.self_fp)
+        .cloned()
+        .collect();
+    report.tombstones_removed = store.collect_tombstones(&others, unix_now()).unwrap_or(0);
+    report
+}
+
+pub(super) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Blobs a draining peer asked this node to keep, and when it asked.
+fn takes() -> &'static Mutex<HashMap<String, Instant>> {
+    static TAKES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    TAKES.get_or_init(Mutex::default)
+}
+
+/// Taken blobs not yet fetched; a request lapses after `TAKE_TTL`.
+fn taken() -> HashSet<String> {
+    let mut takes = lock(takes());
+    takes.retain(|_, asked| asked.elapsed() < TAKE_TTL);
+    takes.keys().cloned().collect()
+}
+
+/// `ClusterVfsTake`: queue the live blobs this node lacks for the repair
+/// pass. Returns how many were queued.
+fn take(store: &VfsStore, hashes: &[String]) -> VfsResult<usize> {
+    let index = store.load_index()?;
+    let live: HashMap<&str, &VfsEntry> = index
+        .entries
+        .values()
+        .filter(|entry| !entry.deleted)
+        .map(|entry| (entry.sha256.as_str(), entry))
+        .collect();
+    let mut queued = 0;
+    for hash in hashes {
+        if let Some(entry) = live.get(hash.as_str()) {
+            if !store.has_blob(&entry.sha256, entry.size) {
+                lock(takes()).insert(hash.clone(), Instant::now());
+                queued += 1;
+            }
         }
     }
-    report.garbage_removed = store.collect_garbage().unwrap_or(0);
-    report
+    Ok(queued)
+}
+
+/// What each peer listed in `caps` on its last change page.
+pub(super) fn peer_caps() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    static CAPS: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+    CAPS.get_or_init(Mutex::default)
+}
+
+fn repair_queue() -> &'static Mutex<RepairQueue> {
+    static QUEUE: OnceLock<Mutex<RepairQueue>> = OnceLock::new();
+    QUEUE.get_or_init(Mutex::default)
+}
+
+/// Fetch the missing copies this node should hold, through the repair queue.
+fn repair(
+    store: &VfsStore,
+    members: &Members,
+    index: &VfsIndex,
+    force: bool,
+    report: &mut SyncReport,
+) {
+    let taken = taken();
+    let mut missing: BTreeMap<&str, &VfsEntry> = BTreeMap::new();
+    for entry in index.entries.values().filter(|entry| !entry.deleted) {
+        if !missing.contains_key(entry.sha256.as_str())
+            && !store.has_blob(&entry.sha256, entry.size)
+            && (taken.contains(&entry.sha256)
+                || live_placement(entry, members).contains(&members.self_fp))
+        {
+            missing.insert(&entry.sha256, entry);
+        }
+    }
+    let wanted: Vec<String> = missing.keys().map(|sha| (*sha).to_owned()).collect();
+    let due = lock(repair_queue()).due(&wanted, Instant::now(), force, MAX_REPAIRS_PER_PASS);
+    for sha in &due {
+        // A copy taken for a draining peer is kept, not trimmed later.
+        let fetched = fetch_blob(store, missing[sha.as_str()]).is_ok()
+            && (taken.contains(sha) || store.mark_stand_in(sha).is_ok());
+        if fetched {
+            lock(takes()).remove(sha);
+        }
+        lock(repair_queue()).tried(sha, fetched, Instant::now());
+        if fetched {
+            report.copies_fetched += 1;
+        } else {
+            report.copies_failed += 1;
+        }
+    }
+    report.copies_waiting = lock(repair_queue()).waiting(Instant::now());
+}
+
+/// Delete stand-in copies this node no longer places, once every placement
+/// node confirms a copy. Writer copies and kept conflicts stay.
+fn trim(store: &VfsStore, members: &Members, index: &VfsIndex) -> usize {
+    let Ok(marked) = store.stand_ins() else {
+        return 0;
+    };
+    let mut users: HashMap<&str, Vec<&VfsEntry>> = HashMap::new();
+    let mut pinned: HashSet<&str> = HashSet::new();
+    for entry in index.entries.values() {
+        pinned.extend(
+            entry
+                .conflicts
+                .iter()
+                .map(|conflict| conflict.sha256.as_str()),
+        );
+        if entry.deleted {
+            continue;
+        }
+        if entry.writer == members.self_fp {
+            pinned.insert(&entry.sha256);
+        }
+        users.entry(&entry.sha256).or_default().push(entry);
+    }
+    let mut trimmed = 0;
+    for sha in &marked {
+        let Some(entries) = users.get(sha.as_str()) else {
+            continue; // unreferenced: blob GC removes it with its mark
+        };
+        if pinned.contains(sha.as_str()) {
+            continue;
+        }
+        let mut holders = BTreeSet::new();
+        for entry in entries {
+            holders.extend(live_placement(entry, members));
+        }
+        if holders.is_empty() || holders.contains(&members.self_fp) {
+            continue;
+        }
+        let holders: Vec<String> = holders.into_iter().collect();
+        if count_holders(store, &members.self_fp, entries[0], &holders) == holders.len()
+            && store.trim_stand_in(sha).unwrap_or(false)
+        {
+            trimmed += 1;
+        }
+    }
+    trimmed
 }
 
 static PASS_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -726,7 +979,7 @@ pub fn background_pass() {
         .name("remuda-vfs-repair".into())
         .spawn(|| loop {
             PASS_PENDING.store(false, Ordering::Release);
-            let report = sync_once();
+            let report = sync_once(false);
             if report.copies_failed > 0 {
                 eprintln!("remuda: {report}");
             }
@@ -1098,7 +1351,7 @@ mod tests {
 
     fn pull_from(client: &VfsStore, server: &VfsStore, peer: &str) -> (usize, usize) {
         let calls = std::cell::Cell::new(0);
-        let merged = pull_changes(client, peer, &mut via(server, &calls))
+        let merged = pull_changes(client, "SHA256:client", peer, &mut via(server, &calls))
             .unwrap()
             .unwrap();
         (merged, calls.get())
@@ -1165,6 +1418,207 @@ mod tests {
     }
 
     #[test]
+    fn a_delete_is_forgotten_only_after_every_peer_pulled_it_and_it_aged() {
+        let (_a, server) = scratch_store();
+        let (_b, client) = scratch_store();
+        server.put("gone.txt", b"x", 2, "SHA256:s").unwrap();
+        let tombstone = server.delete("gone.txt", "SHA256:s").unwrap();
+        // A later write elsewhere, so the tombstone is not the newest version.
+        server.put("kept.txt", b"y", 2, "SHA256:s").unwrap();
+        let later = tombstone.mtime + 8 * 86_400;
+        let peers = ["SHA256:client".to_owned()];
+        assert_eq!(
+            server.collect_tombstones(&peers, later).unwrap(),
+            0,
+            "not pulled yet"
+        );
+        pull_from(&client, &server, "SHA256:server");
+        assert_eq!(
+            server.collect_tombstones(&peers, later).unwrap(),
+            0,
+            "pulled, not acked"
+        );
+        // The next pull says how far the client got: that is the ack.
+        pull_from(&client, &server, "SHA256:server");
+        assert_eq!(
+            server
+                .collect_tombstones(&peers, tombstone.mtime + 86_400)
+                .unwrap(),
+            0,
+            "too young"
+        );
+        let two = [peers[0].clone(), "SHA256:silent".to_owned()];
+        assert_eq!(
+            server.collect_tombstones(&two, later).unwrap(),
+            0,
+            "a silent member blocks"
+        );
+        assert_eq!(server.collect_tombstones(&peers, later).unwrap(), 1);
+        let index = server.load_index().unwrap();
+        assert!(!index.entries.contains_key("gone.txt"));
+        assert!(index.live("kept.txt").is_some());
+        // The client still has the tombstone; pulling again brings nothing back.
+        assert_eq!(pull_from(&client, &server, "SHA256:server").0, 0);
+        assert!(client.load_index().unwrap().entries["gone.txt"].deleted);
+    }
+
+    #[test]
+    fn a_member_away_past_the_stale_horizon_stops_blocking_and_rebuilds_on_return() {
+        let (_a, server) = scratch_store();
+        let (_b, client) = scratch_store();
+        server.put("gone.txt", b"x", 2, "SHA256:s").unwrap();
+        pull_from(&client, &server, "SHA256:server");
+        // The client's last pull was 40 days ago.
+        let now = unix_now();
+        server
+            .check_puller("SHA256:client", 0, now - 40 * 86_400)
+            .unwrap();
+        server.delete("gone.txt", "SHA256:s").unwrap();
+        server.put("new.txt", b"y", 2, "SHA256:s").unwrap();
+        let peers = ["SHA256:client".to_owned()];
+        assert_eq!(
+            server.collect_tombstones(&peers, now + 8 * 86_400).unwrap(),
+            1
+        );
+        // Meanwhile the client wrote something of its own.
+        client.put("mine.txt", b"m", 2, "SHA256:client").unwrap();
+
+        let calls = std::cell::Cell::new(0);
+        pull_changes(
+            &client,
+            "SHA256:client",
+            "SHA256:server",
+            &mut via(&server, &calls),
+        )
+        .unwrap()
+        .unwrap();
+        let index = client.load_index().unwrap();
+        assert!(
+            !index.entries.contains_key("gone.txt"),
+            "a delete came back"
+        );
+        assert!(index.live("new.txt").is_some());
+        assert!(
+            index.live("mine.txt").is_some(),
+            "its own write was dropped"
+        );
+        // Back in time: the next pull is an ordinary one.
+        assert_eq!(pull_from(&client, &server, "SHA256:server"), (0, 1));
+    }
+
+    #[test]
+    fn change_pages_keep_the_older_wire_shape_unless_stale() {
+        let page = Response::ClusterVfsChangesPage {
+            index_id: "i".into(),
+            entries_json: "[]".into(),
+            last_seq: 3,
+            more: false,
+            reset: false,
+            stale: false,
+            seen_seq: 0,
+            seen_index_id: None,
+            caps: vec![],
+        };
+        let json = serde_json::to_string(&page).unwrap();
+        assert!(
+            !json.contains("stale") && !json.contains("seen_index_id") && !json.contains("caps"),
+            "{json}"
+        );
+        // A page from an older server reads as not stale.
+        let older = json.replace(",\"seen_seq\":0", "");
+        assert_eq!(serde_json::from_str::<Response>(&older).unwrap(), page);
+    }
+
+    #[test]
+    fn take_queues_only_live_blobs_this_node_lacks_and_pages_offer_it() {
+        let (_root, store) = scratch_store();
+        let missing = "7".repeat(64);
+        store
+            .merge_entries(vec![entry("t/missing.txt", &missing)])
+            .unwrap();
+        let held = store.put("t/held.txt", b"held", 2, "SHA256:w").unwrap();
+        let unknown = "8".repeat(64);
+        let asked = Request::ClusterVfsTake {
+            hashes: vec![missing.clone(), held.sha256.clone(), unknown.clone()],
+        };
+        let Response::ClusterVfsAck { applied, .. } = serve_with(&store, &asked).unwrap() else {
+            panic!()
+        };
+        assert_eq!(applied, 1);
+        assert!(taken().contains(&missing) && !taken().contains(&unknown));
+        let too_many = Request::ClusterVfsTake {
+            hashes: vec![missing; MAX_STAT_HASHES + 1],
+        };
+        assert!(serve_with(&store, &too_many).is_err());
+
+        let Response::ClusterVfsChangesPage { caps, .. } =
+            serve_changes(&store, "SHA256:p", None, u64::MAX, 1).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(caps, [remuda_core::protocol::VFS_CAP_TAKE]);
+    }
+
+    #[test]
+    fn a_member_that_pulled_recently_is_not_stale() {
+        let (_a, server) = scratch_store();
+        let (_b, client) = scratch_store();
+        server.put("a.txt", b"a", 2, "SHA256:s").unwrap();
+        server.delete("a.txt", "SHA256:s").unwrap();
+        server.put("b.txt", b"b", 2, "SHA256:s").unwrap();
+        pull_from(&client, &server, "SHA256:server");
+        pull_from(&client, &server, "SHA256:server");
+        let peers = ["SHA256:client".to_owned()];
+        assert_eq!(
+            server
+                .collect_tombstones(&peers, unix_now() + 8 * 86_400)
+                .unwrap(),
+            1
+        );
+        // It acked past the collected row, so it is never told to rebuild.
+        assert_eq!(
+            server.check_puller("SHA256:client", 0, unix_now()).unwrap(),
+            None
+        );
+        assert_eq!(pull_from(&client, &server, "SHA256:server"), (0, 1));
+    }
+
+    #[test]
+    fn the_newest_version_and_deletes_with_conflicts_are_never_forgotten() {
+        let (_a, store) = scratch_store();
+        store.put("a.txt", b"a", 2, "SHA256:s").unwrap();
+        let newest = store.delete("a.txt", "SHA256:s").unwrap();
+        let later = newest.mtime + 30 * 86_400;
+        assert_eq!(store.collect_tombstones(&[], later).unwrap(), 0);
+        let next = store.put("b.txt", b"b", 2, "SHA256:s").unwrap();
+        assert!(next.version > newest.version, "versions never go back");
+        // A delete that won over a concurrent write keeps that write's content.
+        let concurrent = VfsEntry {
+            path: "c.txt".into(),
+            sha256: store.put_blob(b"theirs").unwrap(),
+            size: 6,
+            replicas: 2,
+            version: 1,
+            writer: "SHA256:t".into(),
+            deleted: false,
+            mtime: 0,
+            vv: VfsEntry::next_vv(None, "SHA256:t"),
+            conflicts: Vec::new(),
+        };
+        store.put("c.txt", b"mine", 2, "SHA256:s").unwrap();
+        store.delete("c.txt", "SHA256:s").unwrap();
+        store.merge_entries(vec![concurrent]).unwrap();
+        store.put("d.txt", b"d", 2, "SHA256:s").unwrap();
+        assert_eq!(
+            store.collect_tombstones(&[], later).unwrap(),
+            1,
+            "only a.txt"
+        );
+        let index = store.load_index().unwrap();
+        assert!(index.entries["c.txt"].deleted && index.entries["c.txt"].conflicts.len() == 1);
+    }
+
+    #[test]
     fn a_recreated_peer_index_resets_the_cursor_and_is_pulled_whole() {
         let (_a, server) = scratch_store();
         let (_b, client) = scratch_store();
@@ -1190,7 +1644,7 @@ mod tests {
         let mut pages = 0;
         let calls = std::cell::Cell::new(0);
         let mut inner = via(&server, &calls);
-        let error = pull_changes(&client, "SHA256:server", &mut |request| {
+        let error = pull_changes(&client, "SHA256:client", "SHA256:server", &mut |request| {
             pages += 1;
             let mut response = inner(request)?;
             if pages == 2 {
@@ -1216,9 +1670,18 @@ mod tests {
     #[test]
     fn a_peer_that_does_not_know_change_cursors_is_reported_for_fallback() {
         let (_b, client) = scratch_store();
-        let answer = pull_changes(&client, "SHA256:old", &mut |_| {
+        let answer = pull_changes(&client, "SHA256:client", "SHA256:old", &mut |_| {
             Ok(Response::error("invalid cluster request"))
         });
         assert_eq!(answer, Ok(None));
+    }
+
+    #[test]
+    fn a_busy_peer_is_an_error_not_an_older_build() {
+        let (_b, client) = scratch_store();
+        let answer = pull_changes(&client, "SHA256:client", "SHA256:busy", &mut |_| {
+            Ok(Response::error("request timed out"))
+        });
+        assert_eq!(answer, Err("request timed out".to_owned()));
     }
 }

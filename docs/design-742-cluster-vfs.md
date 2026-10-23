@@ -5,6 +5,8 @@ Each file's content is a sha256-addressed blob kept on several nodes, and names
 are stable `remuda://` URIs. The store is additive: existing per-node paths
 and commands do not change.
 
+For operators: [vfs.md](vfs.md).
+
 ## URIs and paths
 
 ```
@@ -78,9 +80,16 @@ Index entry (one per path, kept on every node):
 Merge rule: last writer wins. The higher `(version, writer)` pair wins. A write
 uses `version = max(local index versions) + 1`, a Lamport clock. Deleting
 writes a tombstone (`deleted: true`) with the same rule, so a delete cannot be
-undone by an older replica. At most 10,000 live files. Tombstones are not
-removed yet, so they do not count toward that cap; the whole index, files and
-tombstones together, is capped at 30,000 entries. A delete always fits, since
+undone by an older replica. At most 10,000 live files. Tombstones do not
+count toward that cap; the whole index, files and tombstones together, is
+capped at 30,000 entries. A tombstone is removed once every other admitted
+member has pulled it from this node (its change cursor is past it) and it is
+`tombstone_days` old (default 7; `remuda vfs config --tombstone-days`). The
+newest version and tombstones with conflicts stay. A member that never pulls,
+such as an older build, keeps every tombstone. A member whose last pull is
+older than `stale_days` (default 30, `--stale-days`) stops holding them back.
+When it pulls again from below a collected tombstone, the answer is a stale
+reset: it drops every row but its own unseen writes and pulls all again. A delete always fits, since
 it replaces a live entry.
 
 Concurrent writes (#778, design-778-vfs-delta-sync step 4): each entry also
@@ -115,6 +124,10 @@ limit.
 | `ClusterVfsIndexUpdate {entries_json}` | ack and index digest |
 | `ClusterVfsBlobStat {hashes}` | which of ≤ 64 hashes this node holds |
 | `ClusterVfsBlobGet {sha256, offset}` | ≤ 1 MiB chunk, total size |
+| `ClusterVfsTake {hashes}` | ack; this node pulls and keeps those of ≤ 64 live blobs it lacks |
+
+Change pages list `caps`: the requests beyond this table's base set that the
+peer serves. `ClusterVfsTake` is sent only to a peer listing `take`.
 
 Index pull uses change cursors (#778): every row change takes the next
 `seq` (merged rows too, so changes relay), and a node keeps a cursor per peer
@@ -143,6 +156,9 @@ does not touch the store.
   `R` placement nodes report the blob through `BlobStat`. When the node
   knows peers but reached none of them, put says the file is stored on this
   node only and exits 75 (EX_TEMPFAIL); the `Told N of M peers` line stays.
+  `--min-copies K` (1 to R) waits instead until K nodes hold the blob, this
+  one included. If fewer do within 60 s, put says the write is committed
+  here and still replicating, and exits 75. Nothing is rolled back.
 - **get / resolve**: read the local blob if present. Otherwise ask the
   placement nodes in order, then any other admitted peer, and verify the hash.
   `resolve` keeps the blob locally and prints its file path for tools that
@@ -155,18 +171,32 @@ does not touch the store.
 The daemon's existing anti-entropy tick (`cluster/replication.rs`) also runs a
 VFS pass:
 
-1. Pull the index from each admitted peer and merge it. Index digests make an
-   unchanged peer cost one small request.
+1. Pull from each admitted peer the index rows changed since this node's
+   cursor into it, and merge them. An unchanged peer costs one small request.
+   A peer too old for change cursors gets the whole-index digest pull.
 2. Update peer health: a peer that has failed every request for longer than
    the grace period (default 120 s) counts as **down**. A revoked node is gone
    at once.
 3. Repair: for each live entry, compute placement over nodes not down. If this
-   node is in the set and lacks the blob, pull it from any holder.
+   node is in the set and lacks the blob, pull it from any holder. A pass
+   tries at most 256 copies, never-tried ones first. A failed copy waits 30 s
+   before its next try, doubling up to an hour, so unreachable blobs cannot
+   starve the rest. `remuda vfs sync` skips the wait.
 
 When a node is lost, the next-ranked node joins the placement on its next pass
 and pulls a copy, which restores `R` copies. When the lost node comes back,
-placement returns to the original set. The extra copy stays (a correct state);
-trimming copies is future work.
+placement returns to the original set. A copy the repair pass fetched is
+marked as a stand-in (`vfs/stand-ins/<sha256>`). Once this node is outside
+the placement again and every placement node confirms a copy by `BlobStat`,
+the pass deletes it. Copies this node wrote, kept conflicts, and copies read
+with `get` stay; `resolve` clears the mark, since a tool may hold the path.
+
+Before a node leaves, `remuda vfs drain` works out, for each blob it holds,
+the placement without itself, and asks each placement node that lacks it to
+take it (`ClusterVfsTake`). It repeats until every such node confirms by
+`BlobStat`, or `--timeout` passes (exit 75). A peer too old to take copies is
+named. Drain revokes nothing: it then says to run `remuda cluster revoke`
+on another node. Taken copies are not stand-ins and are never trimmed.
 
 The writer always keeps its own copy, even outside the placement. GC removes a
 blob that no live entry references and whose file is older than 24 h. The age

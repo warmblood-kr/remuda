@@ -236,6 +236,37 @@ impl Hosting {
         self.gate.drain(deadline)
     }
 
+    /// For `stop`: close every host-backed session, then wait up to
+    /// `deadline` for each host to stop. Returns how many were closed and the
+    /// names still closing at the deadline (the next daemon finishes those).
+    pub fn close_all(&self, registry: &Registry, deadline: Duration) -> (usize, Vec<String>) {
+        let Ok(Some(hosts)) = self.hosts(false) else {
+            return (0, Vec::new());
+        };
+        let open: Vec<_> = hosts
+            .open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(name, session)| (name.clone(), session.clone()))
+            .collect();
+        let closed = open
+            .iter()
+            .filter(|(name, _)| matches!(registry.close(name), Some(Ok(true))))
+            .count();
+        let waits: Vec<_> = open
+            .into_iter()
+            .map(|(name, session)| {
+                std::thread::spawn(move || session.teardown(deadline).err().map(|_| name))
+            })
+            .collect();
+        let left = waits
+            .into_iter()
+            .filter_map(|wait| wait.join().ok().flatten())
+            .collect();
+        (closed, left)
+    }
+
     /// Admit host-backed work again after a drain, for a reload rolled back.
     pub fn reopen(&self) {
         self.gate.reopen();

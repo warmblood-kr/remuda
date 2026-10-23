@@ -82,6 +82,11 @@ impl From<InputError> for Error {
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            // Most often a reload's drain. Keep the prefix: callers match it.
+            Self::Unavailable(Unavailable::Recovering) => f.write_str(
+                "session owner unavailable: Recovering (a reload or restart is moving \
+                 this session; try again)",
+            ),
             Self::Unavailable(reason) => write!(f, "session owner unavailable: {reason:?}"),
             Self::Indeterminate(_) => {
                 f.write_str("input outcome unknown; recover the original request before retry")

@@ -3,6 +3,8 @@
 //! re-encrypts a plaintext identity left by an older remuda.
 #![cfg(unix)]
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use remuda_native::cluster::encoding;
 use remuda_native::cluster::identity::load_keypair_at;
 use std::fs;
@@ -105,6 +107,7 @@ impl Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
+        hosts::stop_hosts_under(&self.root);
         let _ = fs::remove_dir_all(&self.root);
     }
 }

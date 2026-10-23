@@ -285,7 +285,7 @@ impl VfsEntry {
     }
 
     /// What to store when `incoming` meets `current`; `None` keeps `current`.
-    /// `merge_order` picks the winner, as on older nodes. A loser that the
+    /// `merge_order` picks the winner, as on older nodes. A live loser the
     /// winner's vector does not cover was concurrent: it becomes a conflict.
     pub fn merged(current: &Self, incoming: Self) -> Option<Self> {
         let order = incoming.merge_order(current);
@@ -300,7 +300,11 @@ impl VfsEntry {
             }
             winner.conflicts.extend(loser.conflicts);
         } else if !winner.vv.is_empty() && !loser.vv.is_empty() {
-            winner.conflicts.push(loser.as_conflict());
+            // A losing delete has no content to keep, and its row may already
+            // be collected on nodes that would then report nothing.
+            if !loser.deleted {
+                winner.conflicts.push(loser.as_conflict());
+            }
             winner.conflicts.extend(loser.conflicts);
         }
         winner.normalize_conflicts();
@@ -483,6 +487,26 @@ mod tests {
         // Merging either side again changes nothing.
         assert!(VfsEntry::merged(&one, left).is_none());
         assert!(VfsEntry::merged(&one, right).is_none());
+    }
+
+    #[test]
+    fn a_concurrent_delete_that_loses_is_not_kept() {
+        let base = write(None, 1, "SHA256:a", 'a');
+        let removed = VfsEntry {
+            deleted: true,
+            ..write(Some(&base), 2, "SHA256:a", 'a')
+        };
+        let rewritten = write(Some(&base), 2, "SHA256:b", 'c');
+        let merged = VfsEntry::merged(&removed, rewritten.clone()).unwrap();
+        assert_eq!(merged, rewritten);
+        // A delete that wins still keeps the concurrent write's content.
+        let removed_later = VfsEntry {
+            deleted: true,
+            ..write(Some(&base), 3, "SHA256:a", 'a')
+        };
+        let kept = VfsEntry::merged(&rewritten, removed_later).unwrap();
+        assert!(kept.deleted);
+        assert_eq!(kept.conflicts, vec![rewritten.as_conflict()]);
     }
 
     #[test]

@@ -73,6 +73,31 @@ pub(super) fn open(root: &Path) -> VfsResult<Connection> {
     Ok(conn)
 }
 
+/// How many schema steps this build knows: the newest `index.db` it reads.
+pub(crate) fn known_steps() -> u32 {
+    STEPS.len() as u32
+}
+
+/// This node's `index.db` schema, read without creating or migrating
+/// anything. `Ok(None)` when there is no index, so no VFS to warn about.
+pub(crate) fn schema_on_disk() -> Result<Option<u32>, String> {
+    let Ok(dir) = storage::cluster_state_dir() else {
+        return Ok(None);
+    };
+    let path = dir.join("cluster/vfs").join(DB_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let version: i64 = Connection::open_with_flags(&path, flags)
+        .and_then(|conn| conn.query_row("PRAGMA user_version", [], |row| row.get(0)))
+        .map_err(|e| e.to_string())?;
+    u32::try_from(version)
+        .map(Some)
+        .map_err(|_| format!("user_version {version} is not a step number"))
+}
+
 /// Set by `remuda vfs index-downgrade`: this process must not upgrade again.
 static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -388,6 +413,36 @@ pub(super) fn counts(conn: &Connection) -> VfsResult<IndexCounts> {
     })
 }
 
+/// Paths that have kept conflicts.
+pub(super) fn conflict_paths(conn: &Connection) -> VfsResult<usize> {
+    let count: i64 = conn.query_row("SELECT count(DISTINCT path) FROM conflicts", [], |row| {
+        row.get(0)
+    })?;
+    Ok(usize::try_from(count).unwrap_or(usize::MAX))
+}
+
+/// When `peer` last pulled from here, and how many tombstones it has not
+/// pulled yet (every one if it never pulled).
+pub(super) fn peer_pull(conn: &Connection, peer: &str) -> VfsResult<(Option<u64>, usize)> {
+    let row: Option<(i64, Option<i64>)> = conn
+        .query_row(
+            "SELECT acked_seq, last_seen FROM peers WHERE fp = ?1",
+            [peer],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (acked, seen) = row.unwrap_or((0, None));
+    let unpulled: i64 = conn.query_row(
+        "SELECT count(*) FROM entries WHERE deleted = 1 AND seq > ?1",
+        [acked],
+        |row| row.get(0),
+    )?;
+    Ok((
+        seen.map(|seen| seen as u64),
+        usize::try_from(unpulled).unwrap_or(usize::MAX),
+    ))
+}
+
 /// One past the highest version, as `VfsIndex::next_version`. A negative
 /// stored value is a `u64` of 2^63 or more, so it outranks every other.
 pub(super) fn next_version(conn: &Connection) -> VfsResult<u64> {
@@ -408,6 +463,106 @@ pub(super) fn live_hashes(conn: &Connection) -> VfsResult<std::collections::Hash
     )?;
     let hashes = statement.query_map([], |row| row.get(0))?;
     Ok(hashes.collect::<Result<_, _>>()?)
+}
+
+/// Delete tombstones written before `before` whose `seq` every peer in
+/// `others` has acked, except peers whose last pull is before `stale_before`.
+/// Rows with conflicts stay, and so does the highest version.
+pub(super) fn collect_tombstones(
+    tx: &Transaction<'_>,
+    others: &[String],
+    before: u64,
+    stale_before: u64,
+) -> VfsResult<usize> {
+    let mut acked = i64::MAX;
+    for peer in others {
+        let row: Option<(i64, Option<i64>)> = tx
+            .query_row(
+                "SELECT acked_seq, last_seen FROM peers WHERE fp = ?1",
+                [peer],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match row {
+            Some((_, Some(seen))) if (seen as u64) < stale_before => {}
+            Some((seq, _)) => acked = acked.min(seq),
+            None => acked = 0,
+        }
+    }
+    let top = next_version(tx)?.wrapping_sub(1) as i64;
+    const WHERE: &str = "deleted = 1 AND seq <= ?1 AND mtime < ?2 AND version != ?3
+           AND NOT EXISTS (SELECT 1 FROM conflicts WHERE conflicts.path = entries.path)";
+    let args = params![acked, before as i64, top];
+    let highest: Option<i64> = tx.query_row(
+        &format!("SELECT max(seq) FROM entries WHERE {WHERE}"),
+        args,
+        |row| row.get(0),
+    )?;
+    let removed = tx.execute(&format!("DELETE FROM entries WHERE {WHERE}"), args)?;
+    if let Some(highest) = highest {
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('gc_seq', ?1)
+             ON CONFLICT (key) DO UPDATE SET value = max(CAST(value AS INTEGER), ?1)",
+            [highest],
+        )?;
+    }
+    Ok(removed)
+}
+
+/// True when `peer` last pulled before `stale_before` and asks from below
+/// a collected tombstone, so it may hold names deleted everywhere else.
+pub(super) fn is_stale(
+    conn: &Connection,
+    peer: &str,
+    since: u64,
+    stale_before: u64,
+) -> VfsResult<bool> {
+    let gc_seq: Option<i64> = conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'gc_seq'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let seen: Option<Option<i64>> = conn
+        .query_row("SELECT last_seen FROM peers WHERE fp = ?1", [peer], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    Ok(match (gc_seq, seen.flatten()) {
+        (Some(gc_seq), Some(seen)) => since < gc_seq as u64 && (seen as u64) < stale_before,
+        _ => false,
+    })
+}
+
+/// Note that `peer` pulled from this node at `now`.
+pub(super) fn set_seen(conn: &Connection, peer: &str, now: u64) -> VfsResult<()> {
+    conn.execute(
+        "INSERT INTO peers (fp, last_seen) VALUES (?1, ?2)
+         ON CONFLICT (fp) DO UPDATE SET last_seen = ?2",
+        params![peer, now as i64],
+    )?;
+    Ok(())
+}
+
+/// Keep only `me`'s writes after `keep_after` and forget every cursor, so
+/// the next pulls rebuild the index from peers that collected deletes.
+pub(super) fn rejoin(tx: &Transaction<'_>, me: &str, keep_after: u64) -> VfsResult<usize> {
+    let dropped = tx.execute(
+        "DELETE FROM entries WHERE NOT (writer = ?1 AND seq > ?2)",
+        params![me, keep_after as i64],
+    )?;
+    tx.execute(
+        "DELETE FROM conflicts WHERE path NOT IN (SELECT path FROM entries)",
+        [],
+    )?;
+    tx.execute("UPDATE peers SET index_id = NULL, pulled_seq = 0", [])?;
+    Ok(dropped)
+}
+
+/// This index's id, as peers see it in change pages.
+pub(super) fn index_id(conn: &Connection) -> VfsResult<String> {
+    Ok(conn.query_row("SELECT index_id FROM seq_state", [], |row| row.get(0))?)
 }
 
 /// Write `entry` with the next change sequence number.
@@ -539,9 +694,9 @@ pub(super) fn set_cursor(
     seq: u64,
 ) -> VfsResult<()> {
     tx.execute(
-        "INSERT INTO peers (fp, index_id, pulled_seq, last_seen) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT (fp) DO UPDATE SET index_id = ?2, pulled_seq = ?3, last_seen = ?4",
-        params![peer, index_id, seq as i64, super::vfs::unix_now() as i64],
+        "INSERT INTO peers (fp, index_id, pulled_seq) VALUES (?1, ?2, ?3)
+         ON CONFLICT (fp) DO UPDATE SET index_id = ?2, pulled_seq = ?3",
+        params![peer, index_id, seq as i64],
     )?;
     Ok(())
 }
@@ -549,9 +704,9 @@ pub(super) fn set_cursor(
 /// Record that `peer` holds every change of ours up to `seq` (step 5's input).
 pub(super) fn set_acked(conn: &Connection, peer: &str, seq: u64) -> VfsResult<()> {
     conn.execute(
-        "INSERT INTO peers (fp, acked_seq, last_seen) VALUES (?1, ?2, ?3)
-         ON CONFLICT (fp) DO UPDATE SET acked_seq = max(acked_seq, ?2), last_seen = ?3",
-        params![peer, seq as i64, super::vfs::unix_now() as i64],
+        "INSERT INTO peers (fp, acked_seq) VALUES (?1, ?2)
+         ON CONFLICT (fp) DO UPDATE SET acked_seq = max(acked_seq, ?2)",
+        params![peer, seq as i64],
     )?;
     Ok(())
 }
@@ -660,6 +815,31 @@ mod tests {
         .unwrap();
         fs::write(root.join(LEGACY_FILE), &bytes).unwrap();
         bytes
+    }
+
+    #[test]
+    fn index_status_counts_conflicts_and_deletes_a_peer_has_not_pulled() {
+        let scratch = Scratch::new();
+        let store = VfsStore::open_at(&scratch.root()).unwrap();
+        store
+            .merge_entries((0..6).map(|i| entry(i, i < 3)).collect())
+            .unwrap();
+        let conn = open(&scratch.root()).unwrap();
+        // Never pulled: every delete waits for it.
+        assert_eq!(peer_pull(&conn, "SHA256:peer").unwrap(), (None, 3));
+        let second_delete: i64 = conn
+            .query_row(
+                "SELECT seq FROM entries WHERE deleted = 1 ORDER BY seq LIMIT 1 OFFSET 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        set_seen(&conn, "SHA256:peer", 1_234).unwrap();
+        set_acked(&conn, "SHA256:peer", second_delete as u64).unwrap();
+        assert_eq!(peer_pull(&conn, "SHA256:peer").unwrap(), (Some(1_234), 1));
+        let status = store.index_status(&["SHA256:peer".into()]).unwrap();
+        assert_eq!((status.counts.live, status.counts.total), (3, 6));
+        assert_eq!(status.conflict_paths, 0);
     }
 
     #[test]

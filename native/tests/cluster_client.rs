@@ -1,6 +1,8 @@
 #![cfg(unix)]
 #![allow(clippy::disallowed_types)] // Loopback sockets are test-only fixtures for the network boundary.
 
+#[path = "daemon_support/hosts.rs"]
+mod hosts;
 use remuda_core::clock::ManualWallClock;
 use remuda_core::protocol::{Request, Response};
 use remuda_native::cluster::{encoding, AuthorizedNode, NodeState, Registry};
@@ -97,6 +99,7 @@ impl Drop for PrivateNode {
         );
         let _ = self.daemon.kill();
         let _ = self.daemon.wait();
+        hosts::stop_hosts_under(&self.root);
         let _ = fs::remove_dir_all(&self.root);
     }
 }
