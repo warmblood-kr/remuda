@@ -1211,7 +1211,8 @@ fn begin_attach(path: &Path, name: &str) -> std::io::Result<(Stream, Option<u64>
 /// What the daemon says about a session whose attach stream just ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Aftermath {
-    /// Listed and running: the daemon went away under the attach (#713).
+    /// Listed and running: the attach ended under a live session, say by a
+    /// reload or an input failure (#713).
     Running,
     /// Not listed, or listed as exited.
     Ended,
@@ -1236,7 +1237,7 @@ pub fn aftermath(path: &Path, name: &str) -> Aftermath {
 
 fn end_notice(path: &Path, name: &str) -> String {
     match aftermath(path, name) {
-        Aftermath::Running => format!("the daemon went away; {name} is still running"),
+        Aftermath::Running => format!("the attach ended; {name} is still running"),
         Aftermath::Ended => format!("{name} ended"),
         Aftermath::NoDaemon => "lost the daemon".into(),
     }
