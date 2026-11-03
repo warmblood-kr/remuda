@@ -39,7 +39,9 @@ fn user(src: &str, m: &Model) -> Composition {
 #[test]
 fn default_handles_a_thousand_sessions_without_target_loss() {
     let m = model(1000);
-    let c = Composer::with_sources(DEFAULT, None).compose(&m).unwrap();
+    let c = Composer::with_sources(DEFAULT, None)
+        .compose_fixture(&m)
+        .unwrap();
     assert_eq!(c.source, ComposeSource::Default);
     assert_eq!(c.targets(), (2..1002).collect::<Vec<_>>());
 }

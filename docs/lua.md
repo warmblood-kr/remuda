@@ -705,7 +705,7 @@ replacing them with arbitrary text.
 | Limit | Value |
 | --- | --- |
 | Lua VM memory | 16 MiB |
-| Composition instructions / checked deadline | 50 million / 500 ms |
+| Composition instructions / checked deadline | 50 million / 100 ms |
 | Source-load instructions / checked deadline | 20 million / 250 ms per source |
 | Configuration / output size | 1 MiB each |
 | Rows / spans per row / bytes per text span | 4,096 / 32 / 1,024 |

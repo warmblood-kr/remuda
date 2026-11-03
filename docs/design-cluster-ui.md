@@ -65,7 +65,7 @@ invalid hierarchy/styles atomically. Strip controls/bidi; grapheme clipping.
 Caps: 4096 rows; 32 spans/row; 1024 bytes/span; 65,536 total spans; 32,768
 decoded tables; 1 MiB output/config; 16 MiB/VM. Charge cumulative decode caps
 before copying. Bounded regular-file config read, Unix nonblocking open.
-Load: 20M instructions/250ms per source. Compose: 50M/500ms per attempt;
+Load: 20M instructions/250ms per source. Compose: 50M/100ms per attempt;
 hooks every 10k instructions, decode checks every 256 tables. Flash measured
 1000 sessions on macOS arm64: release load/compose 0.666/14.10ms; debug
 1.375/90.15ms. Observations are not latency guarantees; bounded native work
