@@ -43,8 +43,9 @@ pub const MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 pub const COMPOSE_INSTRUCTIONS: u64 = 50_000_000;
 /// Instruction ceiling for loading the embedded default and user config.
 pub const LOAD_INSTRUCTIONS: u64 = 20_000_000;
-/// Wall-clock backstop for one `compose` call.
-pub const COMPOSE_WALL_MS: u64 = 100;
+/// Wall-clock backstop for one `compose` call. Debug and instrumented builds
+/// need several times the release cost for a 1000-session fixture.
+pub const COMPOSE_WALL_MS: u64 = 500;
 /// Wall-clock backstop for loading one source.
 pub const LOAD_WALL_MS: u64 = 250;
 /// How long a failed composition keeps using the fallback before retrying.
