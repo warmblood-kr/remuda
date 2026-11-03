@@ -7,6 +7,7 @@ use crate::cluster_remote::{
     RemoteSelection as RemotePollSelection, RemoteSessionSnapshot, RemoteSnapshot, RemoteSource,
     RemoteState,
 };
+use crate::cluster_ui::{self, Composer, Composition, GroupKind, Model, Surface, Viewport};
 use close_request::confirmed_close;
 use composer::{ComposerAction, LineComposer};
 use confirm::{Confirmation, Decision};
@@ -18,9 +19,11 @@ use remuda_core::clock::Clock;
 use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
 use sender::InputSender;
-use std::collections::{HashSet, VecDeque};
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -142,6 +145,25 @@ pub struct ClusterUi {
     resize_in_flight: bool,
     remote_input_in_flight: bool,
     remote_control_disabled: HashSet<String>,
+    /// Frontend-local composition. `None` in unit tests, which exercise the
+    /// native emergency renderer.
+    frontend: RefCell<Option<Composer>>,
+    compose_cache: RefCell<Option<Rc<ComposeCache>>>,
+    compose_retry_at: Cell<Option<Duration>>,
+    compose_diagnostic: RefCell<Option<String>>,
+}
+
+struct ComposeCache {
+    key: String,
+    composition: Rc<Composition>,
+    viewport: Viewport,
+    order: Vec<TreeSelection>,
+}
+
+struct BuiltModel {
+    model: Model,
+    routes: HashMap<u32, TreeSelection>,
+    route_key: String,
 }
 
 struct PaneResize {
@@ -271,7 +293,15 @@ impl ClusterUi {
             resize_in_flight: false,
             remote_input_in_flight: false,
             remote_control_disabled: HashSet::new(),
+            frontend: RefCell::new(None),
+            compose_cache: RefCell::new(None),
+            compose_retry_at: Cell::new(None),
+            compose_diagnostic: RefCell::new(None),
         }
+    }
+
+    fn invalidate_composition(&self) {
+        *self.compose_cache.borrow_mut() = None;
     }
 
     fn is_redraw(&self, event: &crossterm::event::Event) -> bool {
@@ -285,11 +315,278 @@ impl ClusterUi {
         self.keymap = keymap;
     }
 
+    /// Attach the frontend-local composer. Absent, the unit-tested native
+    /// renderer below is the emergency path.
+    pub fn set_composer(&mut self, composer: Composer) {
+        *self.frontend.borrow_mut() = Some(composer);
+        *self.compose_cache.borrow_mut() = None;
+        self.compose_retry_at.set(None);
+        *self.compose_diagnostic.borrow_mut() = None;
+    }
+
+    /// The validated composition for these terminal dimensions, with the
+    /// token -> tree-selection order and authoritative status text.
+    fn composition(&self, width: usize, height: usize, now: Duration) -> Option<Rc<ComposeCache>> {
+        if self.remote_keys_mode.is_some() {
+            return None;
+        }
+        let built = self.build_model(width, height, now)?;
+        let key = format!("{}\0{}", built.model.fingerprint(), built.route_key);
+        if let Some(cache) = self.compose_cache.borrow().as_ref() {
+            if cache.key == key {
+                return Some(cache.clone());
+            }
+        }
+        if let Some(retry_at) = self.compose_retry_at.get() {
+            if now < retry_at {
+                return None;
+            }
+        }
+        let frontend = self.frontend.borrow();
+        let composer = frontend.as_ref()?;
+        match composer.compose(&built.model) {
+            Ok(composition) => {
+                let order = composition
+                    .targets()
+                    .into_iter()
+                    .filter_map(|token| built.routes.get(&token).cloned())
+                    .collect();
+                let diagnostic = composition.diagnostic.clone();
+                let cache = Rc::new(ComposeCache {
+                    key,
+                    composition: Rc::new(composition),
+                    viewport: built.model.viewport,
+                    order,
+                });
+                *self.compose_cache.borrow_mut() = Some(cache.clone());
+                self.compose_retry_at.set(None);
+                *self.compose_diagnostic.borrow_mut() = diagnostic;
+                Some(cache)
+            }
+            Err(error) => {
+                self.compose_retry_at.set(Some(
+                    now + Duration::from_millis(cluster_ui::FAILURE_BACKOFF_MS),
+                ));
+                *self.compose_diagnostic.borrow_mut() = Some(error.message);
+                None
+            }
+        }
+    }
+
+    fn build_model(&self, width: usize, height: usize, now: Duration) -> Option<BuiltModel> {
+        let viewport = self.composition_viewport(width, height, now);
+        let mut model = Model::new(Surface::Cluster, viewport);
+        model.searching = self.query.is_some();
+        model.attention_only = self.attention_only;
+        model.all_empty = !cluster_tree_has_sessions(&self.sessions, &self.remote_snapshot);
+        model.counts = Some(cluster_ui::Counts {
+            reachable: 1 + self
+                .remote_snapshot
+                .nodes
+                .iter()
+                .filter(|node| node.state == RemoteState::Reachable)
+                .count(),
+            total: self.remote_snapshot.nodes.len() + 1,
+        });
+        let mut next_token = 1u32;
+        let mut routes = HashMap::new();
+        let mut statuses = Vec::new();
+        let mut selected_token = None;
+        model.groups.push(self.build_local_group(
+            now,
+            &mut next_token,
+            &mut routes,
+            &mut statuses,
+            &mut selected_token,
+        ));
+        let query = self.query.clone().unwrap_or_default();
+        for node in &self.remote_snapshot.nodes {
+            if let Some(group) = self.build_remote_group(
+                node,
+                &query,
+                &mut next_token,
+                &mut routes,
+                &mut statuses,
+                &mut selected_token,
+            ) {
+                model.groups.push(group);
+            }
+        }
+        model.statuses = statuses;
+        model.selected = selected_token;
+        let route_key = routing_key(&routes, &self.sessions);
+        Some(BuiltModel {
+            model,
+            routes,
+            route_key,
+        })
+    }
+
+    fn composition_viewport(&self, width: usize, height: usize, now: Duration) -> Viewport {
+        let notices = self.active_notice_lines(now, width).len();
+        let queue = self.visible_queue().rev().take(3).count();
+        let footer = self.footer_row_count(width);
+        let body_rows = height.saturating_sub(notices + queue + footer);
+        Viewport::new(
+            u16::try_from(width).unwrap_or(u16::MAX),
+            u16::try_from(height).unwrap_or(u16::MAX),
+            u16::try_from(body_rows).unwrap_or(u16::MAX),
+        )
+        .with_preview_chrome(1)
+    }
+
+    fn build_local_group(
+        &self,
+        now: Duration,
+        next_token: &mut u32,
+        routes: &mut HashMap<u32, TreeSelection>,
+        statuses: &mut Vec<(u32, String)>,
+        selected_token: &mut Option<u32>,
+    ) -> cluster_ui::Group {
+        let id = *next_token;
+        *next_token = next_token.saturating_add(1);
+        let mut local = cluster_ui::Group {
+            id,
+            kind: GroupKind::Local,
+            selected: false,
+            expanded: self.expanded,
+            label: safe_label(&self.node),
+            state: None,
+            age_seconds: Some(age_seconds(now, self.synced_at)),
+            pending: 0,
+            status_cells: 0,
+            sessions: Vec::new(),
+        };
+        for index in self.visible_sessions() {
+            let session = &self.sessions[index];
+            let session_id = *next_token;
+            *next_token = next_token.saturating_add(1);
+            let status = session_status(
+                render_badge(if session.alive {
+                    Badge::Live
+                } else {
+                    Badge::Ended
+                }),
+                self.pending_count(session),
+            );
+            statuses.push((session_id, status.clone()));
+            local.sessions.push(cluster_ui::SessionEntry {
+                id: session_id,
+                label: safe_label(&session.name),
+                selected: index == self.selected,
+                alive: session.alive,
+                pending: self.pending_count(session),
+                status_cells: cells(&status),
+            });
+            routes.insert(session_id, TreeSelection::LocalSession(index));
+            if index == self.selected {
+                *selected_token = Some(session_id);
+            }
+        }
+        local
+    }
+
+    fn build_remote_group(
+        &self,
+        node: &RemoteNodeSnapshot,
+        query: &str,
+        next_token: &mut u32,
+        routes: &mut HashMap<u32, TreeSelection>,
+        statuses: &mut Vec<(u32, String)>,
+        selected_token: &mut Option<u32>,
+    ) -> Option<cluster_ui::Group> {
+        let node_matches = query.is_empty() || matches_query(query, &node.name);
+        let visible_sessions = node
+            .sessions
+            .iter()
+            .filter(|session| self.remote_session_visible(node, session, query))
+            .collect::<Vec<_>>();
+        let node_attention = node.state != RemoteState::Reachable;
+        if (self.attention_only && !node_attention && visible_sessions.is_empty())
+            || (!node_matches && visible_sessions.is_empty())
+        {
+            return None;
+        }
+        let id = *next_token;
+        *next_token = next_token.saturating_add(1);
+        let status = format!(
+            "· {}",
+            remote_state_label(node.state, node.last_sync_age, node.last_error.as_deref())
+        );
+        statuses.push((id, status.clone()));
+        let expanded = self.remote_expanded.contains(&node.registry_key);
+        let mut group = cluster_ui::Group {
+            id,
+            kind: GroupKind::Node,
+            selected: self.remote_selected
+                == Some(RemoteSelection::Node(node.registry_key.clone())),
+            expanded,
+            label: safe_label(&node.name),
+            state: Some(node_state(node.state)),
+            age_seconds: node.last_sync_age.map(|age| age.as_secs()),
+            pending: 0,
+            status_cells: cells(&status),
+            sessions: Vec::new(),
+        };
+        routes.insert(id, TreeSelection::RemoteNode(node.registry_key.clone()));
+        if group.selected {
+            *selected_token = Some(id);
+        }
+        if !expanded {
+            return Some(group);
+        }
+        for session in visible_sessions {
+            let session_id = *next_token;
+            *next_token = next_token.saturating_add(1);
+            let pending = self.remote_pending_count(node, session);
+            let status = format!(
+                "{}{}",
+                session_status(
+                    render_badge(if session.alive {
+                        Badge::Live
+                    } else {
+                        Badge::Ended
+                    }),
+                    pending
+                ),
+                session_error_suffix(session.last_error.as_deref())
+            );
+            statuses.push((session_id, status.clone()));
+            group.pending += pending;
+            group.sessions.push(cluster_ui::SessionEntry {
+                id: session_id,
+                label: safe_label(&session.name),
+                selected: self.remote_selected
+                    == Some(RemoteSelection::Session {
+                        node: node.registry_key.clone(),
+                        name: session.name.clone(),
+                        instance_id: session.instance_id.clone(),
+                    }),
+                alive: session.alive,
+                pending,
+                status_cells: cells(&status),
+            });
+            routes.insert(
+                session_id,
+                TreeSelection::RemoteSession {
+                    node: node.registry_key.clone(),
+                    name: session.name.clone(),
+                    instance_id: session.instance_id.clone(),
+                },
+            );
+            if group.sessions.last().is_some_and(|entry| entry.selected) {
+                *selected_token = Some(session_id);
+            }
+        }
+        Some(group)
+    }
+
     pub fn sync_completed(&mut self, at: Duration) {
         self.synced_at = at;
     }
 
     fn remote_synced(&mut self, source: &dyn RemoteSource) {
+        self.invalidate_composition();
         let selected = self.remote_selected.clone();
         let active = self.remote_active.clone();
         self.remote_snapshot = source.snapshot();
@@ -414,6 +711,9 @@ impl ClusterUi {
     }
 
     fn visible_tree_rows(&self) -> Vec<TreeSelection> {
+        if let Some(cache) = self.compose_cache.borrow().as_ref() {
+            return cache.order.clone();
+        }
         let mut rows = Vec::new();
         if self.expanded {
             rows.extend(
@@ -466,11 +766,10 @@ impl ClusterUi {
     }
 
     fn sessions_synced(&mut self, sessions: Vec<SessionSummary>, at: Duration) {
+        self.invalidate_composition();
         let previous = self.sessions.get(self.active).cloned();
-        let selected = self
-            .sessions
-            .get(self.selected)
-            .map(|session| (session.name.clone(), session.instance_id.clone()));
+        let selected = self.sessions.get(self.selected).cloned();
+        let active = self.sessions.get(self.active).cloned();
         if self.ended.is_none() {
             if let Some(previous) = previous {
                 let same_start = sessions.iter().any(|session| {
@@ -513,14 +812,33 @@ impl ClusterUi {
             self.sessions.push(summary);
             let ended_index = self.sessions.len() - 1;
             self.selected = selected
-                .and_then(|(name, instance_id)| {
-                    self.sessions.iter().position(|session| {
-                        session.name == name && session.instance_id == instance_id
-                    })
+                .as_ref()
+                .and_then(|selected| {
+                    self.sessions
+                        .iter()
+                        .position(|session| same_session_start(session, selected))
                 })
                 .unwrap_or(ended_index);
             self.active = ended_index;
         } else {
+            if let Some(selected) = &selected {
+                if let Some(index) = self
+                    .sessions
+                    .iter()
+                    .position(|session| same_session_start(session, selected))
+                {
+                    self.selected = index;
+                }
+            }
+            if let Some(active) = &active {
+                if let Some(index) = self
+                    .sessions
+                    .iter()
+                    .position(|session| same_session_start(session, active))
+                {
+                    self.active = index;
+                }
+            }
             self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
             self.active = self.active.min(self.sessions.len().saturating_sub(1));
         }
@@ -703,44 +1021,10 @@ impl ClusterUi {
             return self.render_remote_keys_mode(width, height);
         }
         let now = clock.now();
-        if width >= SPLIT_MIN_COLS {
-            return self.render_split(width, height, screen, now);
+        if let Some(cache) = self.composition(width, height, now) {
+            return self.render_composed(width, height, screen, now, &cache);
         }
-        let mut frame = self.tree_lines(width, now);
-        let tree_start = 2;
-        let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
-        let divider = "─".repeat(width);
-        let queue_rows: Vec<&PendingBatch> = self.visible_queue().rev().take(3).collect();
-        let notice_lines = self.active_notice_lines(now, width);
-        let footer_rows = self.footer_row_count(width);
-        let tree_capacity = height.saturating_sub(
-            tree_start + 2 + queue_rows.len() + notice_lines.len() + footer_rows + 1,
-        );
-        let tree_rows = frame.len().saturating_sub(tree_start);
-        if tree_rows > tree_capacity {
-            let kept = tree_capacity.saturating_sub(1);
-            frame.truncate(tree_start + kept);
-            if tree_capacity > 0 {
-                frame.push("… more".into());
-            }
-        }
-        frame.push(divider);
-        frame.push(pane_header);
-        let reserved = frame.len() + queue_rows.len() + notice_lines.len() + footer_rows;
-        let screen_rows = height.saturating_sub(reserved);
-        frame.extend(
-            visible_remote_pane_lines(&pane_body, self.remote_active.is_some(), screen_rows)
-                .into_iter()
-                .map(str::to_string),
-        );
-        frame.extend(notice_lines);
-        frame.extend(queue_rows.into_iter().rev().map(queue_line));
-        self.append_footer(&mut frame, width);
-        frame
-            .into_iter()
-            .map(|line| truncate(&line, width))
-            .collect::<Vec<_>>()
-            .join("\n")
+        self.render_native(width, height, screen, now)
     }
 
     /// Cluster header, local node and remote nodes as one virtual tree (first 2 rows are the header).
@@ -809,6 +1093,18 @@ impl ClusterUi {
         let (cols, rows) = normalized_terminal_size(cols, rows);
         let width = usize::from(cols);
         let height = usize::from(rows);
+        if let Some(cache) = self.composition(width, height, now) {
+            let viewport = cache.viewport;
+            let (pane_cols, pane_rows) = (
+                cache.composition.layout.preview_width(&viewport).max(1),
+                cache
+                    .composition
+                    .layout
+                    .preview_body_height(&viewport)
+                    .max(1),
+            );
+            return remuda_core::Size::for_viewport(pane_cols, pane_rows);
+        }
         let footer = self.footer_row_count(width);
         let notices = self.active_notice_lines(now, width).len();
         let queue = self.visible_queue().rev().take(3).count();
@@ -991,6 +1287,126 @@ impl ClusterUi {
         });
     }
 
+    fn render_composed(
+        &self,
+        width: usize,
+        height: usize,
+        screen: &str,
+        now: Duration,
+        cache: &ComposeCache,
+    ) -> String {
+        let viewport = cache.viewport;
+        let body_rows = usize::from(viewport.body_rows);
+        if body_rows == 0 {
+            return self.render_native(width, height, screen, now);
+        }
+        let geometry = &cache.composition.layout;
+        let list_width = match geometry.axis {
+            cluster_ui::Axis::Horizontal => usize::from(geometry.list_cells),
+            cluster_ui::Axis::Vertical => width,
+        };
+        let list_height = usize::from(geometry.list_rows(&viewport));
+        let rows = cache.composition.flattened_rows();
+        let left = cluster_ui::render_rows(
+            &rows,
+            list_width,
+            list_height,
+            usize::from(viewport.gutter_cells),
+        );
+        let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
+        let preview_width = usize::from(geometry.preview_width(&viewport));
+        let preview_body_rows = usize::from(geometry.preview_body_height(&viewport));
+        let header = ellipsize(&pane_header, preview_width);
+        let mut right = vec![header];
+        right.extend(
+            visible_remote_pane_lines(&pane_body, self.remote_active.is_some(), preview_body_rows)
+                .into_iter()
+                .map(str::to_string),
+        );
+        let notices = self.active_notice_lines(now, width);
+        let queue: Vec<String> = self
+            .visible_queue()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(queue_line)
+            .collect();
+        let mut frame = Vec::with_capacity(height);
+        match geometry.axis {
+            cluster_ui::Axis::Horizontal => {
+                for row in 0..body_rows {
+                    let l = left.get(row).map_or("", String::as_str);
+                    let r = right.get(row).map_or("", String::as_str);
+                    frame.push(format!(
+                        "{}{divider}{r}",
+                        pad_to(&truncate(l, list_width), list_width),
+                        divider = geometry.divider
+                    ));
+                }
+            }
+            cluster_ui::Axis::Vertical => {
+                for row in 0..list_height {
+                    frame.push(left.get(row).cloned().unwrap_or_default());
+                }
+                frame.push(geometry.divider.clone().repeat(width));
+                frame.extend(right);
+            }
+        }
+        frame.extend(notices);
+        frame.extend(queue);
+        self.append_footer(&mut frame, width);
+        frame
+            .into_iter()
+            .map(|line| truncate(&line, width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The historical native renderer. This is the emergency roster when the
+    /// embedded default itself cannot compose; unit tests exercise it directly.
+    fn render_native(&self, width: usize, height: usize, screen: &str, now: Duration) -> String {
+        if width >= SPLIT_MIN_COLS {
+            return self.render_split(width, height, screen, now);
+        }
+        let mut frame = self.tree_lines(width, now);
+        let tree_start = 2;
+        let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
+        let divider = "─".repeat(width);
+        let queue_rows: Vec<&PendingBatch> = self.visible_queue().rev().take(3).collect();
+        let notice_lines = self.active_notice_lines(now, width);
+        let footer_rows = self.footer_row_count(width);
+        let tree_capacity = height.saturating_sub(
+            tree_start + 2 + queue_rows.len() + notice_lines.len() + footer_rows + 1,
+        );
+        let tree_rows = frame.len().saturating_sub(tree_start);
+        if tree_rows > tree_capacity {
+            let kept = tree_capacity.saturating_sub(1);
+            frame.truncate(tree_start + kept);
+            if tree_capacity > 0 {
+                frame.push("… more".into());
+            }
+        }
+        frame.push(divider);
+        frame.push(pane_header);
+        let reserved = frame.len() + queue_rows.len() + notice_lines.len() + footer_rows;
+        let screen_rows = height.saturating_sub(reserved);
+        frame.extend(
+            visible_remote_pane_lines(&pane_body, self.remote_active.is_some(), screen_rows)
+                .into_iter()
+                .map(str::to_string),
+        );
+        frame.extend(notice_lines);
+        frame.extend(queue_rows.into_iter().rev().map(queue_line));
+        self.append_footer(&mut frame, width);
+        frame
+            .into_iter()
+            .map(|line| truncate(&line, width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Wide layout: tree in a left column, selected pane on the right, footer full width.
     fn render_split(&self, width: usize, height: usize, screen: &str, now: Duration) -> String {
         let left_w = self.tree_width(width, now);
@@ -1151,6 +1567,9 @@ impl ClusterUi {
         ));
         if let Some(diagnostic) = &self.keymap.diagnostic {
             lines.extend(wrap_help(&format!("keymap config: {diagnostic}"), width));
+        }
+        if let Some(diagnostic) = self.compose_diagnostic.borrow().clone() {
+            lines.extend(wrap_help(&format!("cluster ui: {diagnostic}"), width));
         }
         frame.extend(lines);
     }
@@ -1372,17 +1791,20 @@ impl ClusterUi {
             Some("cluster.search") => self.query = Some(String::new()),
             Some("cluster.attention") => {
                 self.attention_only = !self.attention_only;
+                self.invalidate_composition();
                 self.select_first_visible();
             }
             Some("cluster.remote.keys") => self.enter_remote_keys_mode(now),
             Some("cluster.search.clear") => {
                 self.query = None;
+                self.invalidate_composition();
                 self.select_first_visible();
             }
             Some("cluster.search.delete") => {
                 if let Some(query) = self.query.as_mut() {
                     query.pop();
                 }
+                self.invalidate_composition();
                 self.select_first_visible();
             }
             Some("cluster.up") => self.move_selection(false),
@@ -1398,6 +1820,9 @@ impl ClusterUi {
                     (self.query.as_mut(), event.code)
                 {
                     query.push(ch);
+                }
+                if self.query.is_some() {
+                    self.invalidate_composition();
                     self.select_first_visible();
                 }
             }
@@ -2077,6 +2502,7 @@ impl ClusterUi {
     }
 
     fn collapse_tree_selection(&mut self) {
+        self.invalidate_composition();
         match self.current_tree_selection() {
             TreeSelection::LocalSession(_) => self.expanded = false,
             TreeSelection::RemoteNode(node) => {
@@ -2090,6 +2516,7 @@ impl ClusterUi {
     }
 
     fn expand_tree_selection(&mut self) {
+        self.invalidate_composition();
         match self.current_tree_selection() {
             TreeSelection::LocalSession(_) => self.expanded = true,
             TreeSelection::RemoteNode(node) => {
@@ -2613,6 +3040,73 @@ impl RemoteSource for EmptyRemoteSource {
     }
 }
 
+fn same_session_start(candidate: &SessionSummary, previous: &SessionSummary) -> bool {
+    if !candidate.id.is_empty() && !previous.id.is_empty() {
+        candidate.id == previous.id && candidate.instance_id == previous.instance_id
+    } else {
+        candidate.name == previous.name && candidate.instance_id == previous.instance_id
+    }
+}
+
+fn safe_label(text: &str) -> String {
+    crate::text::strip_terminal_controls(text)
+        .chars()
+        .take(256)
+        .collect()
+}
+
+fn cells(text: &str) -> u16 {
+    u16::try_from(cluster_ui::text_width(text)).unwrap_or(u16::MAX)
+}
+
+fn routing_key(routes: &HashMap<u32, TreeSelection>, sessions: &[SessionSummary]) -> String {
+    let mut tokens: Vec<u32> = routes.keys().copied().collect();
+    tokens.sort_unstable();
+    let mut key = String::new();
+    for token in tokens {
+        if let Some(route) = routes.get(&token) {
+            key.push_str(&token.to_string());
+            key.push('=');
+            key.push_str(&route_key_of(route, sessions));
+            key.push(';');
+        }
+    }
+    key
+}
+
+fn route_key_of(route: &TreeSelection, sessions: &[SessionSummary]) -> String {
+    match route {
+        TreeSelection::LocalSession(index) => {
+            let session = sessions.get(*index);
+            let id = session.map_or("", |session| session.id.as_str());
+            let name = session.map_or("", |session| session.name.as_str());
+            let instance = session
+                .and_then(|session| session.instance_id.as_deref())
+                .unwrap_or("");
+            if id.is_empty() {
+                format!("l:{name}\u{1f}{instance}")
+            } else {
+                format!("l:{id}\u{1f}{instance}")
+            }
+        }
+        TreeSelection::RemoteNode(key) => format!("n:{key}"),
+        TreeSelection::RemoteSession {
+            node,
+            name,
+            instance_id,
+        } => format!("s:{node}\u{1f}{name}\u{1f}{instance_id}"),
+    }
+}
+
+fn node_state(state: RemoteState) -> cluster_ui::NodeState {
+    match state {
+        RemoteState::Reachable => cluster_ui::NodeState::Reachable,
+        RemoteState::Stale => cluster_ui::NodeState::Stale,
+        RemoteState::Reconnecting => cluster_ui::NodeState::Reconnecting,
+        RemoteState::Unreachable => cluster_ui::NodeState::Unreachable,
+    }
+}
+
 fn truncate(text: &str, width: usize) -> String {
     let mut used = 0;
     let mut out = String::new();
@@ -2983,6 +3477,7 @@ pub fn read_frame(
     ui.set_keymap(
         crate::keybindings::fetch(path, Duration::from_secs(3)).map_err(io::Error::other)?,
     );
+    ui.set_composer(crate::cluster_ui::Composer::system());
     ui.select_target(target)?;
     let body = match ui.sessions.get(ui.active) {
         Some(session) => {
@@ -3066,6 +3561,7 @@ fn run_loop(
     ui.set_keymap(
         crate::keybindings::fetch(path, Duration::from_secs(3)).map_err(io::Error::other)?,
     );
+    ui.set_composer(crate::cluster_ui::Composer::system());
     ui.remote_input_enabled = remote_calls.is_some();
     ui.remote_synced(remote_source);
     select_target_with_remote_wait(&mut ui, target, remote_source, Duration::from_secs(5))?;
@@ -3220,8 +3716,9 @@ mod tests {
     use super::queue::{InputTarget, QueueEvent, QueueState, SendOutcome, MAX_IO_RETRIES};
     use super::{
         is_attention, normalized_terminal_size, present, remote_state_label, render_badge,
-        resize_requires_full_repaint, select_target_with_remote_wait, terminal_frame,
+        resize_requires_full_repaint, route_key_of, select_target_with_remote_wait, terminal_frame,
         AttentionSignals, Badge, ClusterUi, RemoteInputTransport, RemoteSelection, RemoteSource,
+        TreeSelection,
     };
     use crate::cluster_remote::{
         RemoteNodeSnapshot, RemoteSessionSnapshot, RemoteSnapshot, RemoteState,
@@ -5093,6 +5590,156 @@ mod tests {
             unavailable: false,
             instance_id: Some(format!("instance-{name}")),
             output_version: None,
+        }
+    }
+
+    #[test]
+    fn local_route_key_tracks_identity_not_position_or_label() {
+        let first = session("dev", true);
+        let mut replaced = first.clone();
+        replaced.instance_id = Some("instance-dev-2".into());
+        let mut renamed = first.clone();
+        renamed.id = "session-other".into();
+        let route = TreeSelection::LocalSession(0);
+        let original = route_key_of(&route, std::slice::from_ref(&first));
+        assert_ne!(
+            original,
+            route_key_of(&route, std::slice::from_ref(&replaced))
+        );
+        assert_ne!(
+            original,
+            route_key_of(&route, std::slice::from_ref(&renamed))
+        );
+        let mut same_label = first.clone();
+        same_label.name = "renamed".into();
+        assert_eq!(
+            original,
+            route_key_of(&route, std::slice::from_ref(&same_label))
+        );
+    }
+
+    #[test]
+    fn embedded_composition_matches_native_in_filtered_and_empty_states() {
+        enum Scenario {
+            Unreachable,
+            Query,
+            Attention,
+            Empty,
+        }
+        let clock = ManualClock::new();
+        for scenario in [
+            Scenario::Unreachable,
+            Scenario::Query,
+            Scenario::Attention,
+            Scenario::Empty,
+        ] {
+            for (cols, rows) in [(100u16, 24u16), (40, 24)] {
+                let mut ui = make_ui("studio", sessions(), clock.now());
+                match scenario {
+                    Scenario::Unreachable => {
+                        let source = FakeRemoteSource(Mutex::new(remote_snapshot(
+                            RemoteState::Unreachable,
+                            Duration::from_secs(12),
+                            None,
+                        )));
+                        ui.remote_synced(&source);
+                        ui.remote_expanded.insert("fp-laptop".into());
+                    }
+                    Scenario::Query => {
+                        ui.query = Some("build".into());
+                        ui.remote_expanded.insert("fp-laptop".into());
+                    }
+                    Scenario::Attention => ui.attention_only = true,
+                    Scenario::Empty => {
+                        ui.sessions.clear();
+                        let mut snapshot =
+                            remote_snapshot(RemoteState::Reachable, Duration::ZERO, None);
+                        snapshot.nodes[0].sessions.clear();
+                        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+                    }
+                }
+                ui.set_composer(crate::cluster_ui::Composer::embedded());
+                let composed = ui.render(cols, rows, "", &clock);
+                assert_default_composition(&ui);
+                *ui.frontend.borrow_mut() = None;
+                *ui.compose_cache.borrow_mut() = None;
+                *ui.compose_diagnostic.borrow_mut() = None;
+                let native = ui.render(cols, rows, "", &clock);
+                assert_eq!(composed, native, "{cols}x{rows}");
+            }
+        }
+    }
+
+    fn assert_default_composition(ui: &ClusterUi) {
+        let cache = ui.compose_cache.borrow();
+        let cache = cache.as_ref().expect("Lua composition must not fall back");
+        assert_eq!(
+            cache.composition.source,
+            crate::cluster_ui::ComposeSource::Default
+        );
+        assert!(cache.composition.diagnostic.is_none());
+    }
+
+    #[test]
+    fn composed_pane_size_matches_the_rendered_preview() {
+        let clock = ManualClock::new();
+        for (cols, rows) in [(100u16, 24u16), (60, 24), (40, 24)] {
+            let mut ui = selected_remote_ui(&clock, remote_screen_rows(120));
+            ui.remote_expanded.insert("fp-laptop".into());
+            ui.set_composer(crate::cluster_ui::Composer::embedded());
+            let size = ui.pane_size(cols, rows, clock.now());
+            let frame = ui.render(cols, rows, "", &clock);
+            assert_eq!(
+                frame
+                    .lines()
+                    .filter(|line| line.contains("body-row-"))
+                    .count(),
+                usize::from(size.rows()),
+                "{cols}x{rows}"
+            );
+            if cols >= 60 {
+                let (left, right) = frame.lines().next().unwrap().split_once('│').unwrap();
+                assert_eq!(
+                    usize::from(size.cols()),
+                    usize::from(cols) - unicode_width::UnicodeWidthStr::width(left) - 1
+                );
+                assert!(unicode_width::UnicodeWidthStr::width(right) <= usize::from(size.cols()));
+            } else {
+                assert_eq!(size.cols(), cols);
+            }
+        }
+    }
+
+    #[test]
+    fn embedded_composition_matches_native_for_remote_rows_and_pane() {
+        let clock = ManualClock::new();
+        for (cols, rows) in [(100u16, 24u16), (60, 24), (59, 24), (40, 24)] {
+            let mut ui = selected_remote_ui(&clock, remote_screen_rows(120));
+            ui.remote_expanded.insert("fp-laptop".into());
+            ui.set_composer(crate::cluster_ui::Composer::embedded());
+            let composed = ui.render(cols, rows, "", &clock);
+            assert_default_composition(&ui);
+            *ui.frontend.borrow_mut() = None;
+            *ui.compose_cache.borrow_mut() = None;
+            *ui.compose_diagnostic.borrow_mut() = None;
+            let native = ui.render(cols, rows, "", &clock);
+            assert_eq!(composed, native, "{cols}x{rows}");
+        }
+    }
+
+    #[test]
+    fn embedded_composition_matches_the_native_emergency_frame() {
+        let clock = ManualClock::new();
+        for (cols, rows) in [(100u16, 24u16), (60, 24), (59, 24), (40, 24)] {
+            let mut ui = make_ui("studio", sessions(), clock.now());
+            ui.set_composer(crate::cluster_ui::Composer::embedded());
+            let composed = ui.render(cols, rows, "", &clock);
+            assert_default_composition(&ui);
+            *ui.frontend.borrow_mut() = None;
+            *ui.compose_cache.borrow_mut() = None;
+            *ui.compose_diagnostic.borrow_mut() = None;
+            let native = ui.render(cols, rows, "", &clock);
+            assert_eq!(composed, native, "{cols}x{rows}");
         }
     }
 

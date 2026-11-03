@@ -12,6 +12,7 @@ pub mod client;
 pub mod cluster;
 pub mod cluster_remote;
 pub mod cluster_tui;
+pub mod cluster_ui;
 pub mod cmd_arguments;
 #[doc(hidden)]
 pub mod codex_observer;

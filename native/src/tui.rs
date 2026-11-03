@@ -34,6 +34,7 @@ use crossterm::event::{
 
 /// How often an idle herd is relisted, recaptured and redrawn — see
 /// [`should_refresh`]. A key always forces an immediate refresh regardless.
+mod peer_geometry;
 mod port;
 mod remote_port;
 pub use port::{KeyStream, SessionPort};
@@ -169,6 +170,53 @@ pub struct Ui {
     compose_target: Option<(String, String)>,
     /// Unsent drafts of other sessions, kept when the composer moves away.
     compose_drafts: HashMap<String, String>,
+    /// Frontend-local composition for a whole-node peer list. Local herd path
+    /// (`has_lua`) never uses this.
+    frontend: Option<FrontendUi>,
+    frontend_rows: Option<Vec<String>>,
+    frontend_targets: Vec<Option<usize>>,
+    frontend_layout: Option<crate::cluster_ui::Geometry>,
+    frontend_diagnostic: Option<String>,
+    frontend_preferred_list_cells: Option<u16>,
+    /// Terminal the last peer composition was built for. A Type-forced wake
+    /// skips the remote relist, but a resize still needs local recomposition.
+    frontend_dims: Option<(u16, u16)>,
+    /// Source order of the peer catalog (daemon order), separate from the
+    /// presentation order Lua may reorder. Updated only by a successful list.
+    peer_catalog: Vec<PeerRoute>,
+    /// One prepared split for the whole-node peer frame. Prepared from the
+    /// current viewport and the validated layout before resize/capture/paint,
+    /// so every consumer reads the same rectangles.
+    peer: Option<PreparedPeer>,
+}
+
+/// Private token route: local id + instance. Wire names never reach Lua, and
+/// identity-based selection/cache keys compare exactly this pair.
+type PeerRoute = (String, Option<String>);
+
+/// The frame the peer rects were resolved for; a caller with other dimensions
+/// resolves again instead of reusing it.
+#[derive(Clone, Copy)]
+struct PreparedPeer {
+    cols: u16,
+    rows: u16,
+    list_visible: bool,
+    geometry: peer_geometry::PeerGeometry,
+}
+
+struct FrontendUi {
+    composer: crate::cluster_ui::Composer,
+    cache: Option<FrontendCache>,
+    retry_at: Option<std::time::Instant>,
+}
+
+struct FrontendCache {
+    key: String,
+    layout: crate::cluster_ui::Geometry,
+    rows: Vec<String>,
+    targets: Vec<Option<usize>>,
+    order: Vec<(String, Option<String>)>,
+    diagnostic: Option<String>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -226,6 +274,15 @@ impl Ui {
             composer: Default::default(),
             compose_target: None,
             compose_drafts: HashMap::new(),
+            frontend: None,
+            frontend_rows: None,
+            frontend_targets: Vec::new(),
+            frontend_layout: None,
+            frontend_diagnostic: None,
+            frontend_preferred_list_cells: None,
+            frontend_dims: None,
+            peer_catalog: Vec::new(),
+            peer: None,
         }
     }
 
@@ -304,6 +361,81 @@ impl Ui {
         self.keymap = keymap;
     }
 
+    /// Enable frontend-local composition for a whole-node peer list. The
+    /// local herd keeps its daemon-supplied `*sessions*` buffer and never
+    /// calls this.
+    pub fn set_frontend_composer(&mut self, composer: crate::cluster_ui::Composer) {
+        self.frontend = Some(FrontendUi {
+            composer,
+            cache: None,
+            retry_at: None,
+        });
+    }
+
+    /// The viewport the peer rects resolve against: the last row is the footer,
+    /// and the peer list has no native chrome or cursor gutter.
+    fn peer_viewport(cols: u16, rows: u16) -> crate::cluster_ui::Viewport {
+        crate::cluster_ui::Viewport::new(cols, rows, rows.saturating_sub(1))
+            .with_preview_chrome(0)
+            .with_gutter(0)
+    }
+
+    /// The one split for this terminal. Only a composed peer list has one; the
+    /// local herd keeps its historical horizontal frame. A direct caller with
+    /// different dimensions gets a fresh resolve rather than a stale rect.
+    fn peer_frame(&self, cols: u16, rows: u16) -> Option<peer_geometry::PeerGeometry> {
+        let layout = self.frontend_layout.as_ref()?;
+        if let Some(prepared) = self.peer {
+            if prepared.cols == cols
+                && prepared.rows == rows
+                && prepared.list_visible == self.list_visible
+            {
+                return Some(prepared.geometry);
+            }
+        }
+        Some(peer_geometry::resolve(
+            Self::peer_viewport(cols, rows),
+            layout,
+            self.list_visible,
+        ))
+    }
+
+    /// Publish the frame's sizes from the prepared split. Called after
+    /// composition and before resize/capture/paint, so the preview height,
+    /// capture request and history page all agree with the rectangles.
+    fn prepare_frame_sizes(&mut self, cols: u16, rows: u16) {
+        if let Some(frame) = self.prepare_peer_frame(cols, rows) {
+            self.preview_rows = frame.preview.h.max(1);
+            self.preview_width = frame.preview.w;
+            if frame.stale {
+                self.frontend_diagnostic =
+                    Some("cluster ui: layout no longer fits; recomposing".into());
+                if let Some(frontend) = self.frontend.as_mut() {
+                    frontend.cache = None;
+                }
+            }
+        } else {
+            self.preview_rows = rows.saturating_sub(1).max(1);
+            self.preview_width = ui_layout(self, cols).1;
+        }
+    }
+
+    /// Resolve and cache before resize, capture and paint. `stale` on the
+    /// result means the validated layout no longer fits this terminal; the
+    /// caller must recompose rather than paint a different split.
+    fn prepare_peer_frame(&mut self, cols: u16, rows: u16) -> Option<peer_geometry::PeerGeometry> {
+        let layout = self.frontend_layout.as_ref()?;
+        let geometry =
+            peer_geometry::resolve(Self::peer_viewport(cols, rows), layout, self.list_visible);
+        self.peer = Some(PreparedPeer {
+            cols,
+            rows,
+            list_visible: self.list_visible,
+            geometry,
+        });
+        Some(geometry)
+    }
+
     pub fn selected(&self) -> Option<&SessionSummary> {
         self.sessions.get(self.selected)
     }
@@ -323,13 +455,32 @@ impl Ui {
         let Some(first) = self.list_first_visible else {
             return;
         };
-        let visible = (self.preview_rows as usize / self.session_rows).max(1);
-        let max_first = self.sessions.len().saturating_sub(visible);
+        let (visible, total, selected_row) = if let Some(rows) = &self.frontend_rows {
+            // The composed list may have headings and multirow blocks, so the
+            // selection's ROW is what the viewport follows, not its index.
+            let visible = self
+                .peer
+                .and_then(|prepared| prepared.geometry.list)
+                .map_or(1, |list| usize::from(list.h).max(1));
+            let selected_row = self
+                .frontend_targets
+                .iter()
+                .position(|target| *target == Some(self.selected))
+                .unwrap_or(0);
+            (visible, rows.len(), selected_row)
+        } else {
+            (
+                (self.preview_rows as usize / self.session_rows).max(1),
+                self.sessions.len(),
+                self.selected,
+            )
+        };
+        let max_first = total.saturating_sub(visible);
         let mut first = first.min(max_first);
-        if self.selected < first {
-            first = self.selected;
-        } else if self.selected >= first.saturating_add(visible) {
-            first = self.selected.saturating_sub(visible - 1);
+        if selected_row < first {
+            first = selected_row;
+        } else if selected_row >= first.saturating_add(visible) {
+            first = selected_row.saturating_sub(visible - 1);
         }
         self.list_first_visible = Some(first.min(max_first));
     }
@@ -357,16 +508,112 @@ impl Ui {
         action
     }
 
-    /// A press in the list column switches to that row's session, even if
-    /// another one already has focus. A press in the session pane forwards
-    /// as a real click to the child instead. See steps/030.
+    /// A list press selects that row; a preview press reaches the child. The
+    /// peer list uses the frame's prepared rects, the local herd its fixed
+    /// columns, so paint, caret and hit tests cannot disagree. See steps/030.
     pub fn on_mouse(&mut self, event: MouseEvent, cols: u16, rows: u16) -> Action {
-        if self.daemon_gone.is_some() {
+        if self.daemon_gone.is_some() || self.mode != Mode::Browse {
             return Action::Nothing;
         }
-        if self.mode != Mode::Browse {
+        match self.peer_frame(cols, rows) {
+            Some(frame) => self.on_mouse_peer(event, cols, rows, frame),
+            None => self.on_mouse_legacy(event, cols, rows),
+        }
+    }
+
+    /// Peer hit tests: zero-based `event` cells against the prepared rects,
+    /// then translated to the leaf's own 1-based local coordinates.
+    fn on_mouse_peer(
+        &mut self,
+        event: MouseEvent,
+        cols: u16,
+        rows: u16,
+        frame: peer_geometry::PeerGeometry,
+    ) -> Action {
+        let (x, y) = (event.column, event.row);
+        if self.dragging_divider {
+            match event.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(list) = frame.list {
+                        let (cells, limit) = match frame.axis {
+                            crate::cluster_ui::Axis::Horizontal => (x.saturating_sub(list.x), cols),
+                            crate::cluster_ui::Axis::Vertical => {
+                                (y.saturating_sub(list.y), rows.saturating_sub(1))
+                            }
+                        };
+                        self.set_preferred_list_cells(cells, limit);
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => self.dragging_divider = false,
+                _ => {}
+            }
             return Action::Nothing;
         }
+        if let Some(list) = frame.list {
+            if list.contains(x, y) {
+                let row = y.saturating_sub(list.y).saturating_add(1);
+                match event.kind {
+                    MouseEventKind::ScrollUp => {
+                        self.scroll_list(-1, list.h);
+                        return Action::Nothing;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.scroll_list(1, list.h);
+                        return Action::Nothing;
+                    }
+                    _ => {}
+                }
+                return self.click_list_row(event.kind, row, list.h);
+            }
+        }
+        if let Some(divider) = frame.divider {
+            if divider.contains(x, y) {
+                if let MouseEventKind::Down(MouseButton::Left) = event.kind {
+                    self.dragging_divider = true;
+                }
+                return Action::Nothing;
+            }
+        }
+        let preview = frame.preview;
+        if !preview.contains(x, y) {
+            return Action::Nothing;
+        }
+        let pane_row = y.saturating_sub(preview.y).saturating_add(1);
+        let pane_col = x.saturating_sub(preview.x).saturating_add(1);
+        if matches!(
+            event.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            let up = matches!(event.kind, MouseEventKind::ScrollUp);
+            if self.focus == Focus::Session || event.modifiers.contains(KeyModifiers::SHIFT) {
+                return self.wheel_session(
+                    if up { "wheel-up" } else { "wheel-down" },
+                    pane_row,
+                    pane_col,
+                    preview.h,
+                );
+            }
+            return if up {
+                Action::Scroll(3)
+            } else {
+                Action::Scroll(-3)
+            };
+        }
+        if (self.visual || event.modifiers.contains(KeyModifiers::SHIFT))
+            && matches!(
+                event.kind,
+                MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::Drag(MouseButton::Left)
+                    | MouseEventKind::Up(MouseButton::Left)
+            )
+        {
+            return self.select_session_text(event.kind, pane_row, pane_col, preview.h);
+        }
+        self.click_session_pane(event.kind, pane_row, pane_col, preview.h, preview.w)
+    }
+
+    /// The local herd path, unchanged: fixed horizontal columns, no composition.
+    fn on_mouse_legacy(&mut self, event: MouseEvent, cols: u16, rows: u16) -> Action {
         let (list_w, preview_w) = ui_layout(self, cols);
         let body = rows.saturating_sub(1);
         // crossterm's column/row are 0-based; frame rows are 1-based, so both
@@ -467,6 +714,13 @@ impl Ui {
     }
 
     fn scroll_list(&mut self, delta: isize, body: u16) {
+        if let Some(rows) = &self.frontend_rows {
+            let visible = (body as usize).max(1);
+            let current = list_viewport(self, body) as isize;
+            let max_first = rows.len().saturating_sub(visible) as isize;
+            self.list_first_visible = Some((current + delta).clamp(0, max_first.max(0)) as usize);
+            return;
+        }
         let visible = (body as usize / self.session_rows).max(1);
         let max_first = self.sessions.len().saturating_sub(visible);
         let first = list_viewport(self, body);
@@ -551,6 +805,20 @@ impl Ui {
             return Action::Nothing;
         }
         let viewport = list_viewport(self, body);
+        if self.frontend_rows.is_some() {
+            let absolute = (row - 1) as usize + viewport;
+            let Some(Some(index)) = self.frontend_targets.get(absolute).copied() else {
+                return Action::Nothing;
+            };
+            if index >= self.sessions.len() {
+                return Action::Nothing;
+            }
+            self.list_first_visible = Some(viewport);
+            self.selected = index;
+            self.pan = 0;
+            self.focus_session();
+            return Action::Nothing;
+        }
         let index = ((row - 1) as usize / self.session_rows) + viewport;
         if index >= self.sessions.len() {
             return Action::Nothing;
@@ -1152,6 +1420,14 @@ impl Ui {
         let max = usable.saturating_sub(16).max(16).min(usable);
         self.list_width = Some(width.clamp(16.min(max), max));
     }
+
+    /// A divider drag asks Lua for this many list cells (columns for the
+    /// horizontal axis, rows for the vertical one). `limit` is the axis length;
+    /// the divider and at least one preview cell must still fit.
+    fn set_preferred_list_cells(&mut self, cells: u16, limit: u16) {
+        let max = limit.saturating_sub(2).max(1);
+        self.frontend_preferred_list_cells = Some(cells.max(1).min(max));
+    }
 }
 
 /// Ctrl-\, the key `remuda attach` already detaches by. ⚠ Also true of Ctrl-4:
@@ -1208,6 +1484,8 @@ pub fn layout(term_cols: u16, widest: u16) -> (u16, u16) {
     (list, usable - list)
 }
 
+/// Local-herd columns only. A composed peer frame resolves its own rectangles
+/// in [`Ui::peer_frame`]; the two policies never mix.
 fn ui_layout(ui: &Ui, term_cols: u16) -> (u16, u16) {
     if !ui.list_visible {
         return (0, term_cols);
@@ -2032,6 +2310,9 @@ fn fit(text: &str, width: u16) -> String {
 /// The whole frame as one string of text and ANSI cursor moves. Pure on
 /// purpose: this is the part a test can read without owning a terminal.
 pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> String {
+    if let Some(frame) = ui.peer_frame(cols, rows) {
+        return render_peer(ui, screen, server, cols, rows, &frame);
+    }
     let (list_w, preview_w) = ui_layout(ui, cols);
     let body = rows.saturating_sub(1);
     // The border, and the only thing on screen that is always saying where the
@@ -2056,11 +2337,7 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
         out.push_str(&format!("\x1b[{};1H", row + 1));
         // Start list rows at the top now that the pane header moved to the footer.
         if ui.list_visible {
-            let left = list_row(
-                ui,
-                row as usize + list_viewport(ui, body) * ui.session_rows,
-                list_w,
-            );
+            let left = list_row(ui, list_absolute_row(ui, body, row as usize), list_w);
             out.push_str(&fit(&left, list_w));
         }
         out.push_str(divider);
@@ -2070,6 +2347,80 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
 
     out.push_str(&format!("\x1b[{};1H", rows));
     out.push_str(&footer(ui, server, cut, preview_w, cols));
+    out
+}
+
+/// The divider run for one frame row (horizontal: one glyph; vertical: the
+/// whole row). Lua owns the glyph; focus stays visible by reversing it.
+fn peer_divider_run(ui: &Ui, frame: &peer_geometry::PeerGeometry, glyph: &str) -> String {
+    let run = match frame.axis {
+        crate::cluster_ui::Axis::Horizontal => glyph.to_string(),
+        crate::cluster_ui::Axis::Vertical => glyph.repeat(usize::from(
+            frame.divider.map_or(1, |divider| divider.w.max(1)),
+        )),
+    };
+    if ui.focus == Focus::Session {
+        format!("\x1b[7m{run}\x1b[0m")
+    } else {
+        run
+    }
+}
+
+fn peer_divider_glyph(ui: &Ui) -> &str {
+    ui.frontend_layout
+        .as_ref()
+        .map_or("│", |geometry| geometry.divider.as_str())
+}
+
+/// Paint one composed peer frame from its rects. The list, divider and preview
+/// are addressed at their own origins, so both axes share this loop.
+fn render_peer(
+    ui: &Ui,
+    screen: &str,
+    server: &str,
+    cols: u16,
+    rows: u16,
+    frame: &peer_geometry::PeerGeometry,
+) -> String {
+    let body_h = rows.saturating_sub(1);
+    let (mut lines, cut) = crop(screen, frame.preview.w, frame.preview.h, ui.pan);
+    if let Some(indicator) = scrollback_indicator(ui) {
+        if let Some(first) = lines.first_mut() {
+            *first = indicator;
+        }
+    }
+    let glyph = peer_divider_glyph(ui);
+    let mut out = String::from("\x1b[H\x1b[2J");
+    for y in 0..body_h {
+        out.push_str(&format!("\x1b[{};1H", y + 1));
+        if let Some(list) = frame.list {
+            if y >= list.y && y < list.y.saturating_add(list.h) {
+                if list.x > 0 {
+                    out.push_str(&format!("\x1b[{};{}H", y + 1, list.x + 1));
+                }
+                let local = usize::from(y.saturating_sub(list.y));
+                let row = list_row(ui, list_absolute_row(ui, list.h, local), list.w);
+                out.push_str(&fit(&row, list.w));
+            }
+        }
+        if let Some(divider) = frame.divider {
+            if y >= divider.y && y < divider.y.saturating_add(divider.h) {
+                out.push_str(&format!("\x1b[{};{}H", y + 1, divider.x + 1));
+                out.push_str(&peer_divider_run(ui, frame, glyph));
+            }
+        }
+        if y >= frame.preview.y && y < frame.preview.y.saturating_add(frame.preview.h) {
+            if frame.preview.x > 0 {
+                out.push_str(&format!("\x1b[{};{}H", y + 1, frame.preview.x + 1));
+            }
+            let line = lines
+                .get(usize::from(y.saturating_sub(frame.preview.y)))
+                .map_or("", String::as_str);
+            out.push_str(&fit(line, frame.preview.w));
+        }
+    }
+    out.push_str(&format!("\x1b[{};1H", rows));
+    out.push_str(&footer(ui, server, cut, frame.preview.w, cols));
     out
 }
 
@@ -2297,16 +2648,14 @@ fn fit_styled(line: &str, width: u16) -> String {
     out
 }
 
-/// The session's own cursor on the real screen, 1-based `(row, col)` for
-/// `\x1b[{row};{col}H`. `None` hides the caret: the child asked for that, or
-/// it's scrolled/panned out of the pane's current crop. See steps/027.
+/// The session cursor in 1-based terminal cells, mapped into the preview rect;
+/// `None` hides it (the child hid it, or it is outside the current crop).
+/// `preview` is the same rect paint used, so caret and cells cannot disagree.
 fn locate_cursor(
     cells: &[Vec<StyledCell>],
     cursor: Cursor,
     pan: u16,
-    preview_w: u16,
-    body: u16,
-    list_w: u16,
+    preview: peer_geometry::Rect,
     preserve_history: bool,
 ) -> Option<(u16, u16)> {
     if !cursor.visible {
@@ -2315,22 +2664,16 @@ fn locate_cursor(
     let mut viewport = Viewport::bottom_anchored_at(
         cells.len(),
         pan,
-        preview_w,
-        body,
+        preview.w,
+        preview.h,
         preview_anchor_row(cells, cursor.row),
     );
-    viewport.row_offset = preview_row_offset(cells, cursor, body, preserve_history);
+    viewport.row_offset = preview_row_offset(cells, cursor, preview.h, preserve_history);
     let (panel_row, panel_col) =
         viewport.map_cursor(cells, cursor.row as usize, cursor.col as usize)?;
-    // Convert pane-local coordinates to 1-based terminal coordinates, adding
-    // the list and divider widths when the preview shares the screen.
     Some((
-        panel_row + 1,
-        if list_w == 0 {
-            panel_col + 1
-        } else {
-            list_w + panel_col + 2
-        },
+        preview.y.saturating_add(panel_row).saturating_add(1),
+        preview.x.saturating_add(panel_col).saturating_add(1),
     ))
 }
 
@@ -2345,6 +2688,9 @@ pub fn render_styled(
     cols: u16,
     rows: u16,
 ) -> String {
+    if let Some(frame) = ui.peer_frame(cols, rows) {
+        return render_peer_styled(ui, cells, cursor, server, cols, rows, &frame);
+    }
     let (list_w, preview_w) = ui_layout(ui, cols);
     let body = rows.saturating_sub(1);
     let divider = if ui.list_visible && list_w < cols {
@@ -2354,6 +2700,12 @@ pub fn render_styled(
         }
     } else {
         ""
+    };
+    let preview = peer_geometry::Rect {
+        x: if list_w == 0 { 0 } else { list_w + 1 },
+        y: 0,
+        w: preview_w,
+        h: body,
     };
 
     let selected = cells_with_selection(ui, cells);
@@ -2368,26 +2720,14 @@ pub fn render_styled(
             *first = indicator;
         }
     }
-    let caret = locate_cursor(
-        cells,
-        cursor,
-        ui.pan,
-        preview_w,
-        body,
-        list_w,
-        preserve_history,
-    );
+    let caret = locate_cursor(cells, cursor, ui.pan, preview, preserve_history);
     // Hide before moving the terminal cursor around the frame. The final
     // caret state below is the only place that makes it visible again.
     let mut out = String::from("\x1b[?2026h\x1b[?25l\x1b[H");
     for row in 0..body {
         out.push_str(&format!("\x1b[{};1H\x1b[K", row + 1));
         if ui.list_visible {
-            let left = list_row(
-                ui,
-                row as usize + list_viewport(ui, body) * ui.session_rows,
-                list_w,
-            );
+            let left = list_row(ui, list_absolute_row(ui, body, row as usize), list_w);
             out.push_str(&fit(&left, list_w));
         }
         out.push_str(divider);
@@ -2401,6 +2741,78 @@ pub fn render_styled(
     // to fewer rows is the only way stale content can survive past here. Must
     // happen BEFORE the caret move below, or `\x1b[J` erases from the caret's
     // new position instead of the footer's.
+    out.push_str("\x1b[J");
+    match caret.filter(|_| ui.composing().is_none()) {
+        Some((row, col)) => out.push_str(&format!("\x1b[{row};{col}H\x1b[?25h")),
+        None => out.push_str("\x1b[?25l"),
+    }
+    out.push_str("\x1b[?2026l");
+    out
+}
+
+/// Styled paint for one composed peer frame: the same rects `render` uses,
+/// with per-row clears, real preview colour and the child's caret.
+fn render_peer_styled(
+    ui: &Ui,
+    cells: &[Vec<StyledCell>],
+    cursor: Cursor,
+    server: &str,
+    cols: u16,
+    rows: u16,
+    frame: &peer_geometry::PeerGeometry,
+) -> String {
+    let body_h = rows.saturating_sub(1);
+    let selected = cells_with_selection(ui, cells);
+    let preserve_history = ui
+        .selected()
+        .and_then(|session| ui.scrollback.get(&session.name))
+        .is_some_and(|state| state.offset > 0);
+    let row_offset = preview_row_offset(cells, cursor, frame.preview.h, preserve_history);
+    let (mut lines, cut) = crop_styled_at_offset(
+        &selected,
+        frame.preview.w,
+        frame.preview.h,
+        ui.pan,
+        row_offset,
+    );
+    if let Some(indicator) = scrollback_indicator(ui) {
+        if let Some(first) = lines.first_mut() {
+            *first = indicator;
+        }
+    }
+    let caret = locate_cursor(cells, cursor, ui.pan, frame.preview, preserve_history);
+    let glyph = peer_divider_glyph(ui);
+    let mut out = String::from("\x1b[?2026h\x1b[?25l\x1b[H");
+    for y in 0..body_h {
+        out.push_str(&format!("\x1b[{};1H\x1b[K", y + 1));
+        if let Some(list) = frame.list {
+            if y >= list.y && y < list.y.saturating_add(list.h) {
+                if list.x > 0 {
+                    out.push_str(&format!("\x1b[{};{}H", y + 1, list.x + 1));
+                }
+                let local = usize::from(y.saturating_sub(list.y));
+                let row = list_row(ui, list_absolute_row(ui, list.h, local), list.w);
+                out.push_str(&fit(&row, list.w));
+            }
+        }
+        if let Some(divider) = frame.divider {
+            if y >= divider.y && y < divider.y.saturating_add(divider.h) {
+                out.push_str(&format!("\x1b[{};{}H", y + 1, divider.x + 1));
+                out.push_str(&peer_divider_run(ui, frame, glyph));
+            }
+        }
+        if y >= frame.preview.y && y < frame.preview.y.saturating_add(frame.preview.h) {
+            if frame.preview.x > 0 {
+                out.push_str(&format!("\x1b[{};{}H", y + 1, frame.preview.x + 1));
+            }
+            let line = lines
+                .get(usize::from(y.saturating_sub(frame.preview.y)))
+                .map_or("", String::as_str);
+            out.push_str(&fit_styled(line, frame.preview.w));
+        }
+    }
+    out.push_str(&format!("\x1b[{};1H\x1b[K", rows));
+    out.push_str(&footer(ui, server, cut, frame.preview.w, cols));
     out.push_str("\x1b[J");
     match caret.filter(|_| ui.composing().is_none()) {
         Some((row, col)) => out.push_str(&format!("\x1b[{row};{col}H\x1b[?25h")),
@@ -2465,7 +2877,46 @@ fn widest(ui: &Ui) -> u16 {
 
 /// The first session shown in the list, based on Lua's rows-per-session
 /// contract rather than a native presentation policy.
+fn list_absolute_row(ui: &Ui, body: u16, row: usize) -> usize {
+    let first = list_viewport(ui, body);
+    if ui.frontend_rows.is_some() {
+        row + first
+    } else {
+        row + first * ui.session_rows
+    }
+}
+
 fn list_viewport(ui: &Ui, body: u16) -> usize {
+    if let Some(rows) = &ui.frontend_rows {
+        let visible = body as usize;
+        if visible == 0 {
+            return 0;
+        }
+        let selected_row = ui
+            .frontend_targets
+            .iter()
+            .position(|target| *target == Some(ui.selected))
+            .unwrap_or(0);
+        let max_first = rows.len().saturating_sub(visible);
+        let follows_selection = selected_row
+            .saturating_sub(visible.saturating_sub(1))
+            .min(max_first);
+        let Some(first) = ui.list_first_visible.map(|first| first.min(max_first)) else {
+            return follows_selection;
+        };
+        if ui.focus == Focus::Session
+            || (selected_row >= first && selected_row < first.saturating_add(visible))
+        {
+            first
+        } else {
+            follows_selection
+        }
+    } else {
+        list_viewport_sessions(ui, body)
+    }
+}
+
+fn list_viewport_sessions(ui: &Ui, body: u16) -> usize {
     let visible = body as usize / ui.session_rows;
     if visible == 0 {
         return 0;
@@ -2489,6 +2940,11 @@ fn list_viewport(ui: &Ui, body: u16) -> usize {
 /// out of the column floor so the child lays out to the visible width; the
 /// ordinary `Size::new` path keeps its 80-column safety floor.
 pub fn pane_size(ui: &Ui, cols: u16, rows: u16) -> Size {
+    if let Some(frame) = ui.peer_frame(cols, rows) {
+        // The pane lays out to the visible leaf: a composed split may be
+        // shorter or narrower than the 80x24 default floor.
+        return Size::for_viewport(frame.preview.w, frame.preview.h);
+    }
     let (_, preview_w) = ui_layout(ui, cols);
     Size::for_pane(preview_w, rows.saturating_sub(1))
 }
@@ -2499,6 +2955,9 @@ pub fn pane_size(ui: &Ui, cols: u16, rows: u16) -> Size {
 // Lua owns the content, spacing, and colour of every list row.  The cursor is
 // intentionally still per-viewer state, never buffer content.
 fn list_row(ui: &Ui, row: usize, width: u16) -> String {
+    if let Some(rows) = &ui.frontend_rows {
+        return rows.get(row).cloned().unwrap_or_default();
+    }
     if ui.sessions.is_empty() {
         // The empty herd says what it is and what to do about it. It does not
         // open a prompt on its own, and it never starts anything by itself.
@@ -2605,6 +3064,16 @@ fn footer(ui: &Ui, server: &str, cut: bool, preview_w: u16, cols: u16) -> String
             None => format!("↑↓/jk select   ⏎ enter   n new   x kill   {binding_help}   q quit"),
         },
     };
+    let status = match &ui.frontend_diagnostic {
+        Some(diagnostic) => {
+            let diagnostic: String = diagnostic
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            format!("cluster ui: {diagnostic} · {status}")
+        }
+        None => status,
+    };
     let status = match &ui.keymap.diagnostic {
         Some(diagnostic) => {
             let diagnostic: String = diagnostic
@@ -2640,31 +3109,24 @@ fn should_refresh(forced: bool, since_last: Duration, tick: Duration) -> bool {
     forced || since_last >= tick
 }
 
-/// The one expensive act of a frame: relist the herd, take or release the
-/// focus hold, capture the focused screen and repaint if that changed
-/// anything. `skip_list` skips the relist for a `Type`-forced wake. See steps/022.
-// ponytail: 8 plain params over clippy's 7 rather than a bundling struct
-// only `refresh` would ever construct — split out if a 9th ever shows up.
-#[allow(clippy::too_many_arguments)]
-fn refresh<P: SessionPort + ?Sized>(
+/// Relist the herd and refresh the local Lua buffer unless a Type-forced wake
+/// explicitly skipped it. A composed peer list restores the SAME (id,
+/// instance) it had before the relist, never the old index or a name match.
+fn relist_and_refresh_text<P: SessionPort + ?Sized>(
     path: &P,
-    server: &str,
     ui: &mut Ui,
-    held: &mut Option<(String, P::Keys)>,
-    painted: &mut String,
-    shown: &mut Option<ShownTarget>,
+    cols: u16,
     skip_list: bool,
-    selection_moved: bool,
-) -> std::io::Result<(u16, u16)> {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    ui.node_stale = path.staleness().filter(|age| *age > STALE_AFTER);
-    ui.preview_rows = rows.saturating_sub(1).max(1);
-    ui.preview_width = ui_layout(ui, cols).1;
+) {
+    let peer = ui.frontend.is_some();
     if !skip_list {
         // The buffer is allowed to reorder the herd. Keep the identity, not
         // the old numeric position, so a refresh cannot move a cursor (or an
         // attached pane) onto its new neighbour.
         let selected_name = ui.selected().map(|session| session.name.clone());
+        // A composed peer list is presentation-reordered: restore the SAME
+        // (id, instance) after a relist, never the old index or a name match.
+        let selected_identity = peer.then(|| ui.selected().map(session_identity)).flatten();
         match list(path) {
             Ok(sessions) => {
                 if ui.daemon_gone.take().is_some() {
@@ -2672,6 +3134,21 @@ fn refresh<P: SessionPort + ?Sized>(
                 }
                 ui.consecutive_transport_failures = 0;
                 ui.sessions = sessions;
+                if peer {
+                    ui.selected = selected_identity
+                        .as_ref()
+                        .and_then(|wanted| {
+                            ui.sessions
+                                .iter()
+                                .position(|session| session_identity(session) == *wanted)
+                        })
+                        .unwrap_or(0);
+                    ui.peer_catalog = ui.sessions.iter().map(session_identity).collect();
+                    // A composer bound to a session that vanished or was
+                    // replaced (same name, new instance) is cancelled, never
+                    // retargeted by name.
+                    cancel_missing_compose_target(ui);
+                }
             }
             // Keep the last known herd rather than blanking it: a transport
             // failure is not a report that every session vanished. See steps/021.
@@ -2691,6 +3168,35 @@ fn refresh<P: SessionPort + ?Sized>(
             refresh_list_text(path, ui, cols, selected_name.as_deref());
         }
     }
+}
+
+/// The one expensive act of a frame: relist the herd, take or release the
+/// focus hold, capture the focused screen and repaint if that changed
+/// anything. `skip_list` skips the relist for a `Type`-forced wake. See steps/022.
+// ponytail: 8 plain params over clippy's 7 rather than a bundling struct
+// only `refresh` would ever construct — split out if a 9th ever shows up.
+#[allow(clippy::too_many_arguments)]
+fn refresh<P: SessionPort + ?Sized>(
+    path: &P,
+    server: &str,
+    ui: &mut Ui,
+    held: &mut Option<(String, P::Keys)>,
+    painted: &mut String,
+    shown: &mut Option<ShownTarget>,
+    skip_list: bool,
+    selection_moved: bool,
+) -> std::io::Result<(u16, u16)> {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    ui.node_stale = path.staleness().filter(|age| *age > STALE_AFTER);
+    ui.preview_rows = rows.saturating_sub(1).max(1);
+    relist_and_refresh_text(path, ui, cols, skip_list);
+    // The peer composition is local (no remote call). A Type-forced wake may
+    // skip the relist, but a resize must still recompose before this frame's
+    // resize/capture/paint rather than paint the emergency fullscreen.
+    if !skip_list || ui.frontend_dims != Some((cols, rows)) {
+        refresh_peer_composition(ui, cols, rows);
+    }
+    ui.prepare_frame_sizes(cols, rows);
     ui.clamp();
     ui.follow_focus(held.as_ref().map(|(name, _)| name.as_str()));
     // Dropping the hold is the detach, and this is the only place it
@@ -2775,8 +3281,283 @@ fn refresh<P: SessionPort + ?Sized>(
     Ok((cols, rows))
 }
 
-/// The list column's text: Lua's sessions buffer, or plain names for a node
-/// whose Lua this screen cannot ask (a cluster peer).
+/// Rebuild the peer list through the frontend composer. Only the whole-node
+/// RemotePort path enables it; the local herd keeps its daemon buffer.
+fn refresh_peer_composition(ui: &mut Ui, cols: u16, rows: u16) {
+    let Some(mut frontend) = ui.frontend.take() else {
+        return;
+    };
+    ui.frontend_dims = Some((cols, rows));
+    if ui.peer_catalog.is_empty() {
+        // First composition before any successful relist: the initial herd is
+        // the source order.
+        ui.peer_catalog = ui.sessions.iter().map(session_identity).collect();
+    }
+    if !ui.list_visible {
+        ui.frontend = Some(frontend);
+        return;
+    }
+    let selected = ui.selected().map(session_identity);
+    let (model, routes, key) = peer_composition_input(ui, cols, rows, selected.as_ref());
+
+    if let Some(cache) = frontend.cache.as_ref() {
+        if cache.key == key {
+            apply_peer_composition(ui, cache);
+            ui.frontend = Some(frontend);
+            return;
+        }
+    }
+    if frontend
+        .retry_at
+        .is_some_and(|at| std::time::Instant::now() < at)
+    {
+        ui.frontend_rows = None;
+        ui.frontend_layout = None;
+        ui.frontend_targets.clear();
+        ui.peer = None;
+        ui.frontend = Some(frontend);
+        return;
+    }
+
+    match frontend.composer.compose(&model) {
+        Ok(composition) => {
+            let rows = composition.flattened_rows();
+            let geometry = composition.layout.clone();
+            // Render at the physical viewport width and let the painter's
+            // `fit` cut each row to the list rect, so a clipped row keeps the
+            // baseline's one-cell `→` marker (the tree clips silently).
+            let rendered = crate::cluster_ui::render_rows(
+                &rows,
+                usize::from(cols),
+                rows.len(),
+                usize::from(model.viewport.gutter_cells),
+            );
+            let order = apply_peer_order(ui, &composition, &routes, selected.as_ref());
+            let targets = peer_targets(ui, &rows, &routes);
+            let cache = FrontendCache {
+                key,
+                layout: geometry.clone(),
+                rows: rendered.clone(),
+                targets: targets.clone(),
+                order,
+                diagnostic: composition.diagnostic.clone(),
+            };
+            ui.frontend_rows = Some(rendered);
+            ui.frontend_targets = targets;
+            ui.frontend_layout = Some(geometry);
+            ui.frontend_diagnostic = composition.diagnostic.clone();
+            ui.peer = None;
+            frontend.cache = Some(cache);
+            frontend.retry_at = None;
+        }
+        Err(error) => {
+            ui.frontend_rows = None;
+            ui.frontend_layout = None;
+            ui.frontend_targets.clear();
+            ui.peer = None;
+            ui.frontend_diagnostic = Some(error.message.clone());
+            frontend.retry_at = Some(
+                std::time::Instant::now()
+                    + std::time::Duration::from_millis(crate::cluster_ui::FAILURE_BACKOFF_MS),
+            );
+        }
+    }
+    ui.frontend = Some(frontend);
+}
+
+/// The peer model, private token routes and cache key for one composition.
+/// The model follows source catalog (daemon) order, never presentation order,
+/// so a failed relist or repeated resize cannot oscillate.
+fn peer_composition_input(
+    ui: &Ui,
+    cols: u16,
+    rows: u16,
+    selected: Option<&PeerRoute>,
+) -> (crate::cluster_ui::Model, HashMap<u32, PeerRoute>, String) {
+    let mut model = crate::cluster_ui::Model::new(
+        crate::cluster_ui::Surface::Peer,
+        Ui::peer_viewport(cols, rows),
+    );
+    model.all_empty = ui.sessions.is_empty();
+    model.preferred_list_cells = ui.frontend_preferred_list_cells;
+    let by_identity: HashMap<PeerRoute, &SessionSummary> = ui
+        .sessions
+        .iter()
+        .map(|session| (session_identity(session), session))
+        .collect();
+    let mut seen: std::collections::HashSet<PeerRoute> =
+        std::collections::HashSet::with_capacity(ui.peer_catalog.len());
+    let mut catalog: Vec<&SessionSummary> = Vec::with_capacity(ui.sessions.len());
+    for identity in &ui.peer_catalog {
+        if let Some(session) = by_identity.get(identity) {
+            seen.insert(identity.clone());
+            catalog.push(session);
+        }
+    }
+    // A session not yet in the catalog (should only be a not-yet-relisted
+    // newcomer) still has to compose, so it is appended in presentation order.
+    for session in &ui.sessions {
+        if !seen.contains(&session_identity(session)) {
+            catalog.push(session);
+        }
+    }
+    let mut group = crate::cluster_ui::Group {
+        id: 1,
+        kind: crate::cluster_ui::GroupKind::Peer,
+        selected: false,
+        expanded: true,
+        label: String::new(),
+        state: None,
+        age_seconds: None,
+        pending: 0,
+        status_cells: 0,
+        sessions: Vec::new(),
+    };
+    let mut routes: HashMap<u32, PeerRoute> = HashMap::new();
+    for (position, session) in catalog.iter().enumerate() {
+        let id = u32::try_from(position + 2).unwrap_or(u32::MAX);
+        let identity = session_identity(session);
+        // The peer list's baseline kept names only; status truth stays in the
+        // session pane/footer. The structural status slot is still required by
+        // the schema, so substitute an explicit empty string and zero cells.
+        model.statuses.push((id, String::new()));
+        group.sessions.push(crate::cluster_ui::SessionEntry {
+            id,
+            label: session.name.chars().take(256).collect(),
+            selected: selected == Some(&identity),
+            alive: session.alive,
+            pending: 0,
+            status_cells: 0,
+        });
+        if selected == Some(&identity) {
+            model.selected = Some(id);
+        }
+        routes.insert(id, identity);
+    }
+    model.groups.push(group);
+    let mut route_tokens: Vec<u32> = routes.keys().copied().collect();
+    route_tokens.sort_unstable();
+    let mut route_key = String::new();
+    for token in route_tokens {
+        if let Some((id, instance)) = routes.get(&token) {
+            route_key.push_str(&token.to_string());
+            route_key.push('=');
+            route_key.push_str(id);
+            route_key.push('\u{1f}');
+            route_key.push_str(instance.as_deref().unwrap_or(""));
+            route_key.push(';');
+        }
+    }
+    let key = format!("{}\0{route_key}", model.fingerprint());
+    (model, routes, key)
+}
+
+/// Cancel a composed line whose bound (name, instance) is no longer present.
+/// A same-named replacement is a different session and must not inherit it.
+fn cancel_missing_compose_target(ui: &mut Ui) {
+    let Some((name, instance)) = ui.compose_target.clone() else {
+        return;
+    };
+    let present = ui.sessions.iter().any(|session| {
+        session.name == name && session.instance_id.as_deref() == Some(instance.as_str())
+    });
+    if !present {
+        ui.compose_target = None;
+        ui.focus = Focus::List;
+        ui.composer.clear();
+    }
+}
+
+fn session_identity(session: &SessionSummary) -> (String, Option<String>) {
+    let id = if session.id.is_empty() {
+        format!("name:{}", session.name)
+    } else {
+        session.id.clone()
+    };
+    (id, session.instance_id.clone())
+}
+
+fn apply_peer_order(
+    ui: &mut Ui,
+    composition: &crate::cluster_ui::Composition,
+    routes: &HashMap<u32, PeerRoute>,
+    selected: Option<&PeerRoute>,
+) -> Vec<(String, Option<String>)> {
+    let mut remaining = std::mem::take(&mut ui.sessions);
+    let mut ordered = Vec::with_capacity(remaining.len());
+    let mut order = Vec::new();
+    for token in composition.targets() {
+        let Some(identity) = routes.get(&token) else {
+            continue;
+        };
+        if let Some(index) = remaining
+            .iter()
+            .position(|session| session_identity(session) == *identity)
+        {
+            ordered.push(remaining.remove(index));
+            order.push(identity.clone());
+        }
+    }
+    ordered.extend(remaining);
+    ui.sessions = ordered;
+    ui.selected = selected
+        .and_then(|selected| {
+            ui.sessions
+                .iter()
+                .position(|session| session_identity(session) == *selected)
+        })
+        .unwrap_or(0);
+    order
+}
+
+fn peer_targets(
+    ui: &Ui,
+    rows: &[crate::cluster_ui::Row],
+    routes: &HashMap<u32, PeerRoute>,
+) -> Vec<Option<usize>> {
+    rows.iter()
+        .map(|row| {
+            row.target
+                .and_then(|token| routes.get(&token))
+                .and_then(|identity| {
+                    ui.sessions
+                        .iter()
+                        .position(|session| session_identity(session) == *identity)
+                })
+        })
+        .collect()
+}
+
+fn apply_peer_composition(ui: &mut Ui, cache: &FrontendCache) {
+    let selected = ui.selected().map(session_identity);
+    let mut remaining = std::mem::take(&mut ui.sessions);
+    let mut ordered = Vec::with_capacity(remaining.len());
+    for identity in &cache.order {
+        if let Some(index) = remaining
+            .iter()
+            .position(|session| session_identity(session) == *identity)
+        {
+            ordered.push(remaining.remove(index));
+        }
+    }
+    ordered.extend(remaining);
+    ui.sessions = ordered;
+    ui.selected = selected
+        .and_then(|selected| {
+            ui.sessions
+                .iter()
+                .position(|session| session_identity(session) == selected)
+        })
+        .unwrap_or(0);
+    ui.frontend_rows = Some(cache.rows.clone());
+    ui.frontend_targets = cache.targets.clone();
+    ui.frontend_layout = Some(cache.layout.clone());
+    ui.frontend_diagnostic = cache.diagnostic.clone();
+    // The layout may have changed under the same dimensions; never let a
+    // previously prepared rect outlive the layout it came from.
+    ui.peer = None;
+}
+
 fn refresh_list_text<P: SessionPort + ?Sized>(
     path: &P,
     ui: &mut Ui,
@@ -3007,6 +3788,9 @@ pub fn run_port<P: SessionPort + ?Sized>(
     // failure if nothing else already explains why nothing works.
     let mut ui = Ui::new(sessions, &shell, notice.or(list_err));
     ui.set_keymap(keymap);
+    if port.remote_node().is_some() {
+        ui.set_frontend_composer(crate::cluster_ui::Composer::system());
+    }
     let mut painted = String::new();
     // The exclusive hold on the focused session, and the name it was taken on.
     // Its `Drop` is the detach, so letting it fall out of scope is the release.
@@ -4165,6 +4949,151 @@ mod composer_tests {
     }
 
     #[test]
+    fn peer_vertical_translates_the_caret_and_mouse_regions() {
+        let mut ui = ui();
+        let custom = crate::cluster_ui::Composer::with_sources(
+            crate::cluster_ui::default_source(),
+            Some((
+                "cluster-ui.lua",
+                r#"
+                local base = compose
+                function compose(model)
+                  local result = base(model)
+                  result.layout = { axis = "vertical", list_cells = 6, divider = "-" }
+                  return result
+                end
+                "#,
+            )),
+        );
+        ui.set_frontend_composer(custom);
+        super::refresh_peer_composition(&mut ui, 80, 24);
+        let cells = vec![vec![remuda_core::agent::StyledCell {
+            text: "x".into(),
+            ..Default::default()
+        }]];
+        let cursor = Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        };
+        let frame = render_styled(&ui, &cells, cursor, "node", 80, 24);
+        assert!(
+            frame.contains("\x1b[8;1H\x1b[?25h"),
+            "caret must start below the divider row"
+        );
+        let action = ui.on_mouse(
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 0,
+                row: 1,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            80,
+            24,
+        );
+        assert!(matches!(action, Action::Nothing));
+        assert_eq!(ui.selected, 1);
+        let action = ui.on_mouse(
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 0,
+                row: 6,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            80,
+            24,
+        );
+        assert!(matches!(action, Action::Nothing), "divider is not a target");
+    }
+
+    #[test]
+    fn peer_vertical_renders_list_above_preview_and_resizes_the_preview() {
+        let mut ui = ui();
+        let custom = crate::cluster_ui::Composer::with_sources(
+            crate::cluster_ui::default_source(),
+            Some((
+                "cluster-ui.lua",
+                r#"
+                local base = compose
+                function compose(model)
+                  local result = base(model)
+                  result.layout = { axis = "vertical", list_cells = 6, divider = "-" }
+                  return result
+                end
+                "#,
+            )),
+        );
+        ui.set_frontend_composer(custom);
+        super::refresh_peer_composition(&mut ui, 80, 24);
+        let frame = render(&ui, "preview-line", "node", 80, 24);
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(frame.as_bytes());
+        let text = parser.screen().contents();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[6].trim_end(),
+            "-".repeat(80),
+            "Lua's divider must paint, not a hardcoded one: {:?}",
+            lines[6]
+        );
+        assert!(lines[7].contains("preview-line"), "{}", lines[7]);
+        let size = pane_size(&ui, 80, 24);
+        assert_eq!(size.cols(), 80);
+        assert_eq!(size.rows(), 24 - 1 - 6 - 1);
+    }
+
+    #[test]
+    fn peer_composition_renders_reorders_and_maps_click_rows() {
+        let mut first_ui = ui();
+        first_ui.set_frontend_composer(crate::cluster_ui::Composer::embedded());
+        super::refresh_peer_composition(&mut first_ui, 100, 24);
+        let rows = first_ui.frontend_rows.as_ref().expect("peer rows");
+        assert!(rows.iter().any(|row| row.contains("agent")));
+        assert!(rows.iter().any(|row| row.contains("shell")));
+        assert!(first_ui.frontend_layout.is_some());
+        assert_eq!(first_ui.sessions[0].name, "agent");
+
+        let targets = first_ui.frontend_targets.clone();
+        assert_eq!(targets.len(), rows.len());
+        assert!(targets.iter().any(Option::is_some));
+
+        let custom = crate::cluster_ui::Composer::with_sources(
+            crate::cluster_ui::default_source(),
+            Some((
+                "cluster-ui.lua",
+                r#"
+                function compose(model)
+                  local group = model.groups[1]
+                  local sessions = {}
+                  for i = #group.sessions, 1, -1 do
+                    local session = group.sessions[i]
+                    sessions[#sessions + 1] = {
+                      id = session.id,
+                      rows = { { spans = { { text = session.label, fg = { index = 5 } }, { field = "status" } } } },
+                    }
+                  end
+                  return {
+                    version = 1, title = {}, empty = {},
+                    groups = { { id = group.id, rows = {}, sessions = sessions } },
+                    layout = { axis = "horizontal", list_cells = 24, divider = "|" },
+                  }
+                end
+                "#,
+            )),
+        );
+        let mut custom_ui = ui();
+        custom_ui.set_frontend_composer(custom);
+        super::refresh_peer_composition(&mut custom_ui, 100, 24);
+        assert_eq!(
+            custom_ui.sessions[0].name, "gone",
+            "Lua order, not herd order"
+        );
+        assert_eq!(custom_ui.sessions[2].name, "agent");
+        assert_eq!(custom_ui.frontend_layout.as_ref().unwrap().list_cells, 24);
+        assert_eq!(custom_ui.frontend_layout.as_ref().unwrap().divider, "|");
+    }
+
+    #[test]
     fn footer_shows_the_draft_and_the_target() {
         let mut ui = ui();
         press(&mut ui, KeyCode::Char('m'));
@@ -4293,5 +5222,905 @@ mod composer_tests {
         assert!(event.is_some());
         server.join().unwrap();
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod peer_geometry_tests {
+    use super::*;
+    use crate::cluster_ui::{default_source, Axis, Composer};
+
+    fn summary(name: &str, alive: bool) -> SessionSummary {
+        SessionSummary {
+            id: format!("id-{name}"),
+            name: name.into(),
+            instance_id: Some(format!("instance-{name}")),
+            output_version: Some(0),
+            alive,
+            idle: Duration::ZERO,
+            output_idle: Some(Duration::ZERO),
+            size: Size::new(80, 24),
+            attached: false,
+            human_idle: None,
+            mouse_tracking: false,
+            unavailable: false,
+        }
+    }
+
+    fn peer_ui() -> Ui {
+        Ui::new(
+            vec![
+                summary("agent", true),
+                summary("shell", true),
+                summary("gone", false),
+            ],
+            "sh",
+            None,
+        )
+    }
+
+    fn custom(source: &str) -> Composer {
+        Composer::with_sources(default_source(), Some(("cluster-ui.lua", source)))
+    }
+
+    const QA_VERTICAL: &str = r#"
+local base = compose
+function compose(model)
+  local result = base(model)
+  local sessions = result.groups[1].sessions
+  sessions[1], sessions[2] = sessions[2], sessions[1]
+  sessions[1].rows[1].spans = {
+    { text = "custom", fg = { rgb = { r = 12, g = 34, b = 56 } }, bg = { index = 200 }, reverse = true },
+    { field = "status" },
+  }
+  result.layout = {
+    axis = "vertical",
+    list_cells = model.preferred_list_cells or 5,
+    divider = "-",
+  }
+  return result
+end
+"#;
+
+    fn plain_row(row: &str) -> String {
+        let mut out = String::new();
+        let mut chars = row.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if next.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            out.push(c);
+        }
+        out.trim_end().to_string()
+    }
+
+    fn screen(frame: &str, cols: u16, rows: u16) -> Vec<String> {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(frame.as_bytes());
+        parser
+            .screen()
+            .contents()
+            .lines()
+            .map(|line| line.trim_end().to_string())
+            .collect()
+    }
+
+    fn click(x: u16, y: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn one_cell() -> Vec<Vec<StyledCell>> {
+        vec![vec![StyledCell {
+            text: "x".into(),
+            ..StyledCell::default()
+        }]]
+    }
+
+    fn visible_cursor() -> Cursor {
+        Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        }
+    }
+
+    #[test]
+    fn default_peer_keeps_herd_order_plain_names_and_empty_status() {
+        let mut ui = peer_ui();
+        ui.set_frontend_composer(Composer::embedded());
+        super::refresh_peer_composition(&mut ui, 80, 24);
+
+        assert_eq!(
+            ui.sessions
+                .iter()
+                .map(|session| session.name.as_str())
+                .collect::<Vec<_>>(),
+            ["agent", "shell", "gone"],
+            "daemon order, not sorted"
+        );
+        let rows: Vec<String> = ui
+            .frontend_rows
+            .as_ref()
+            .expect("peer rows")
+            .iter()
+            .map(|row| plain_row(row))
+            .collect();
+        assert_eq!(rows, ["agent", "shell", "gone"]);
+        for row in &rows {
+            assert!(!row.contains("live"), "{row:?}");
+            assert!(!row.contains("ended"), "{row:?}");
+        }
+
+        let frame = render(&ui, "", "node", 80, 24);
+        assert!(
+            frame.contains("\x1b[7magent"),
+            "selection stays reverse video"
+        );
+    }
+
+    #[test]
+    fn default_peer_matches_baseline_cells_at_common_widths() {
+        for cols in [120u16, 80, 60, 59, 40] {
+            let mut ui = peer_ui();
+            ui.set_frontend_composer(Composer::embedded());
+            super::refresh_peer_composition(&mut ui, cols, 24);
+            let geometry = ui.frontend_layout.as_ref().expect("layout").clone();
+            assert_eq!(geometry.list_cells, 16, "auto list width at {cols}");
+            assert_eq!(geometry.axis, Axis::Horizontal);
+            assert_eq!(
+                ui.sessions
+                    .iter()
+                    .map(|session| session.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["agent", "shell", "gone"]
+            );
+            let size = pane_size(&ui, cols, 24);
+            assert_eq!(size.cols(), cols - 17, "preview width at {cols}");
+            assert_eq!(size.rows(), 23);
+
+            let lines = screen(&render(&ui, "", "node", cols, 24), cols, 24);
+            for (line, name) in lines.iter().zip(["agent", "shell", "gone"]) {
+                assert!(line.contains(name), "{cols}: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn custom_axis_colour_order_and_divider_change_painting_and_resize() {
+        let mut ui = peer_ui();
+        ui.set_frontend_composer(custom(QA_VERTICAL));
+        super::refresh_peer_composition(&mut ui, 80, 24);
+        assert_eq!(ui.sessions[0].name, "shell", "Lua order drives navigation");
+        let geometry = ui.frontend_layout.as_ref().expect("layout").clone();
+        assert_eq!(geometry.axis, Axis::Vertical);
+        assert_eq!(geometry.list_cells, 5);
+        assert_eq!(geometry.divider, "-");
+
+        let frame = render(&ui, "preview-line", "node", 80, 24);
+        assert!(frame.contains("38;2;12;34;56;"), "truecolor survives");
+        assert!(frame.contains("48;5;200m"), "indexed background survives");
+        let lines = screen(&frame, 80, 24);
+        assert_eq!(lines[0], "custom");
+        assert_eq!(lines[5], "-".repeat(80), "Lua divider paints");
+        assert!(lines[6].contains("preview-line"));
+        assert_eq!(pane_size(&ui, 80, 24).rows(), 24 - 1 - 5 - 1);
+
+        // Resize re-resolves ONE geometry: divider row stays, preview shrinks.
+        super::refresh_peer_composition(&mut ui, 80, 30);
+        let lines = screen(&render(&ui, "preview-line", "node", 80, 30), 80, 30);
+        assert_eq!(lines[5], "-".repeat(80));
+        assert!(lines[6].contains("preview-line"));
+        assert_eq!(pane_size(&ui, 80, 30).rows(), 30 - 1 - 5 - 1);
+    }
+
+    #[test]
+    fn vertical_caret_uses_the_preview_origin_after_resize() {
+        let mut ui = peer_ui();
+        ui.set_frontend_composer(custom(QA_VERTICAL));
+        super::refresh_peer_composition(&mut ui, 80, 24);
+        let cells = one_cell();
+        // list 5 + divider 1 => preview origin y=6; zero-based 6 is row 7.
+        let frame = render_styled(&ui, &cells, visible_cursor(), "node", 80, 24);
+        assert!(frame.contains("\x1b[7;1H\x1b[?25h"), "{frame:?}");
+
+        super::refresh_peer_composition(&mut ui, 80, 30);
+        let frame = render_styled(&ui, &cells, visible_cursor(), "node", 80, 30);
+        assert!(frame.contains("\x1b[7;1H\x1b[?25h"), "origin is stable");
+    }
+
+    #[test]
+    fn vertical_mouse_uses_rect_containment_and_row_drag() {
+        let mut ui = peer_ui();
+        ui.set_frontend_composer(custom(QA_VERTICAL));
+        super::refresh_peer_composition(&mut ui, 80, 24);
+
+        // Row 1 (zero-based) is the second list row -> second Lua target.
+        assert_eq!(ui.on_mouse(click(0, 1), 80, 24), Action::Nothing);
+        assert_eq!(ui.selected, 1);
+
+        // The divider belongs to neither leaf; a press starts a drag.
+        assert_eq!(ui.on_mouse(click(0, 5), 80, 24), Action::Nothing);
+        assert!(ui.dragging_divider);
+        ui.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 0,
+                row: 9,
+                modifiers: KeyModifiers::NONE,
+            },
+            80,
+            24,
+        );
+        assert_eq!(ui.frontend_preferred_list_cells, Some(9));
+        super::refresh_peer_composition(&mut ui, 80, 24);
+        assert_eq!(ui.frontend_layout.as_ref().unwrap().list_cells, 9);
+        let frame = ui.peer_frame(80, 24).expect("peer frame");
+        assert_eq!(frame.list.map(|list| list.h), Some(9));
+
+        // A preview press is never a list press.
+        let before = ui.selected;
+        ui.on_mouse(click(40, 10), 80, 24);
+        assert_eq!(ui.selected, before);
+    }
+
+    #[test]
+    fn vertical_history_and_page_delta_follow_the_preview_height() {
+        let mut ui = peer_ui();
+        ui.set_frontend_composer(custom(QA_VERTICAL));
+        super::refresh_peer_composition(&mut ui, 80, 24);
+        ui.prepare_frame_sizes(80, 24);
+        assert_eq!(ui.preview_rows, 24 - 1 - 5 - 1);
+        assert_eq!(ui.preview_width, 80);
+        assert_eq!(ui.preview_page_delta(), (24 - 1 - 5 - 1 - 1) as i16);
+    }
+
+    #[test]
+    fn keys_mode_restores_the_split_from_a_fullscreen_preview() {
+        let mut ui = peer_ui();
+        ui.set_frontend_composer(custom(QA_VERTICAL));
+        super::refresh_peer_composition(&mut ui, 80, 24);
+        ui.list_visible = false;
+        super::refresh_peer_composition(&mut ui, 80, 24);
+        let frame = ui.peer_frame(80, 24).expect("peer frame");
+        assert!(frame.list.is_none() && frame.divider.is_none());
+        assert_eq!(
+            (
+                frame.preview.x,
+                frame.preview.y,
+                frame.preview.w,
+                frame.preview.h
+            ),
+            (0, 0, 80, 23)
+        );
+        assert!(!frame.stale, "keys mode is intentional, not a stale layout");
+        assert_eq!(pane_size(&ui, 80, 24).rows(), 23);
+
+        ui.list_visible = true;
+        super::refresh_peer_composition(&mut ui, 80, 24);
+        let frame = ui.peer_frame(80, 24).expect("peer frame");
+        assert_eq!(frame.list.map(|list| list.h), Some(5));
+    }
+
+    #[test]
+    fn horizontal_custom_divider_paints_and_reverses_with_session_focus() {
+        let mut ui = peer_ui();
+        ui.set_frontend_composer(custom(
+            r#"
+            local base = compose
+            function compose(model)
+              local result = base(model)
+              result.layout = { axis = "horizontal", list_cells = 20, divider = "|" }
+              return result
+            end
+            "#,
+        ));
+        super::refresh_peer_composition(&mut ui, 80, 24);
+        let frame = ui.peer_frame(80, 24).expect("peer frame");
+        assert_eq!(
+            frame.divider,
+            Some(peer_geometry::Rect {
+                x: 20,
+                y: 0,
+                w: 1,
+                h: 23
+            })
+        );
+        assert_eq!(
+            frame.preview,
+            peer_geometry::Rect {
+                x: 21,
+                y: 0,
+                w: 59,
+                h: 23
+            }
+        );
+        let plain = render(&ui, "", "node", 80, 24);
+        let lines = screen(&plain, 80, 24);
+        for line in lines.iter().take(23) {
+            assert_eq!(line.chars().nth(20), Some('|'), "{line:?}");
+        }
+        ui.focus = Focus::Session;
+        let focused = render(&ui, "", "node", 80, 24);
+        assert!(
+            focused.contains("\x1b[7m|\x1b[0m"),
+            "divider keeps focus visible"
+        );
+    }
+
+    #[test]
+    fn empty_peer_keeps_the_baseline_blank_line_and_indented_hint() {
+        let mut ui = Ui::new(Vec::new(), "sh", None);
+        ui.set_frontend_composer(Composer::embedded());
+        super::refresh_peer_composition(&mut ui, 80, 24);
+        let rows: Vec<String> = ui
+            .frontend_rows
+            .clone()
+            .expect("peer rows")
+            .iter()
+            .map(|row| plain_row(row))
+            .collect();
+        assert_eq!(rows.first().map(String::as_str), Some(""));
+        assert_eq!(
+            rows.get(1).map(String::as_str),
+            Some("  no sessions on this node")
+        );
+        let lines = screen(&render(&ui, "", "node", 80, 24), 80, 24);
+        let divider_x = ui
+            .frontend_layout
+            .as_ref()
+            .map(|layout| usize::from(layout.list_cells))
+            .expect("layout");
+        assert!(
+            lines[0][..divider_x].trim().is_empty(),
+            "blank first list row: {:?}",
+            lines[0]
+        );
+        assert!(lines[1].starts_with("  no sessions on this node"));
+    }
+
+    #[test]
+    fn vertical_preview_crops_history_to_the_preview_height() {
+        let mut ui = peer_ui();
+        ui.set_frontend_composer(custom(QA_VERTICAL));
+        super::refresh_peer_composition(&mut ui, 80, 24);
+        let screen_text: String = (0..30).map(|n| format!("line{n}\n")).collect();
+        let lines = screen(&render(&ui, &screen_text, "node", 80, 24), 80, 24);
+        // body 23, list 5, divider 1 => preview rows 6..23 show the LAST 17.
+        assert!(lines[6].contains("line13"), "{:?}", lines[6]);
+        assert!(lines[22].contains("line29"), "{:?}", lines[22]);
+        assert!(
+            !lines.iter().any(|line| line.contains("line12")),
+            "cropped away"
+        );
+    }
+
+    #[test]
+    fn vertical_preview_click_forwards_child_coordinates() {
+        let mut ui = peer_ui();
+        ui.set_frontend_composer(custom(QA_VERTICAL));
+        super::refresh_peer_composition(&mut ui, 80, 24);
+        ui.focus = Focus::Session;
+        // Preview local (x=4, y=0) is pane (5, 1). The 24-row session shows
+        // its last 17 rows, so the child row is (24 - 17) + 1 = 8.
+        let expected = remuda_core::keys::mouse("left", 5, 8).unwrap();
+        assert_eq!(
+            ui.on_mouse(click(4, 6), 80, 24),
+            Action::Type(expected),
+            "click must use the preview rect, not the full terminal"
+        );
+    }
+
+    #[test]
+    fn a_tiny_terminal_never_panics_and_never_underflows() {
+        for (cols, rows) in [(1u16, 1u16), (2, 2), (3, 4)] {
+            let mut ui = peer_ui();
+            ui.set_frontend_composer(custom(QA_VERTICAL));
+            super::refresh_peer_composition(&mut ui, cols, rows);
+            let _ = screen(&render(&ui, "x", "node", cols, rows), cols, rows);
+            let _ = render_styled(&ui, &one_cell(), visible_cursor(), "node", cols, rows);
+            assert!(pane_size(&ui, cols, rows).cols() >= 1);
+            assert!(pane_size(&ui, cols, rows).rows() >= 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod peer_state_tests {
+    use super::*;
+    use crate::cluster_ui::{default_source, Composer};
+    use std::cell::RefCell;
+
+    struct NoKeys;
+
+    impl KeyStream for NoKeys {
+        fn keys(&self, _bytes: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A whole-node port that answers List from a script and records calls.
+    struct FakePort {
+        lists: RefCell<Vec<Vec<SessionSummary>>>,
+        list_calls: RefCell<usize>,
+        resizes: RefCell<Vec<(u16, u16)>>,
+    }
+
+    impl FakePort {
+        fn new(mut lists: Vec<Vec<SessionSummary>>) -> Self {
+            assert!(!lists.is_empty());
+            Self {
+                lists: RefCell::new(std::mem::take(&mut lists)),
+                list_calls: RefCell::new(0),
+                resizes: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn list_calls(&self) -> usize {
+            *self.list_calls.borrow()
+        }
+    }
+
+    impl SessionPort for FakePort {
+        type Keys = NoKeys;
+
+        fn request(&self, request: &Request) -> std::io::Result<Response> {
+            match request {
+                Request::List => {
+                    *self.list_calls.borrow_mut() += 1;
+                    let mut lists = self.lists.borrow_mut();
+                    let sessions = if lists.len() > 1 {
+                        lists.remove(0)
+                    } else {
+                        lists[0].clone()
+                    };
+                    Ok(Response::Sessions(sessions))
+                }
+                Request::CaptureStyled { .. } => Ok(Response::StyledScreen {
+                    rows: Vec::new(),
+                    instance_id: None,
+                    output_version: None,
+                    wrapped: Vec::new(),
+                    scrollback_len: 0,
+                    scrollback_total: 0,
+                    cursor: Cursor {
+                        row: 0,
+                        col: 0,
+                        visible: false,
+                    },
+                }),
+                Request::Resize { size, .. } | Request::ResizeSession { size, .. } => {
+                    self.resizes.borrow_mut().push((size.cols(), size.rows()));
+                    Ok(Response::Ok)
+                }
+                other => Ok(Response::Error(format!("unexpected {other:?}"))),
+            }
+        }
+
+        fn hold(&self, _name: &str) -> std::io::Result<NoKeys> {
+            Ok(NoKeys)
+        }
+
+        fn probe(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn probe_verdict(&self, _error: &std::io::Error) -> (bool, bool) {
+            (false, false)
+        }
+
+        fn label(&self) -> String {
+            "node peer".into()
+        }
+
+        fn has_lua(&self) -> bool {
+            false
+        }
+
+        fn remote_node(&self) -> Option<String> {
+            Some("node".into())
+        }
+    }
+
+    fn summary_with(name: &str, instance: &str, alive: bool) -> SessionSummary {
+        SessionSummary {
+            id: format!("id-{name}"),
+            name: name.into(),
+            instance_id: Some(instance.into()),
+            output_version: Some(0),
+            alive,
+            idle: Duration::ZERO,
+            output_idle: Some(Duration::ZERO),
+            size: Size::new(80, 24),
+            attached: false,
+            human_idle: None,
+            mouse_tracking: false,
+            unavailable: false,
+        }
+    }
+
+    fn herd() -> Vec<SessionSummary> {
+        vec![
+            summary_with("agent", "instance-agent", true),
+            summary_with("shell", "instance-shell", true),
+            summary_with("gone", "instance-gone", false),
+        ]
+    }
+
+    fn swap_composer() -> Composer {
+        Composer::with_sources(
+            default_source(),
+            Some((
+                "cluster-ui.lua",
+                r#"
+                local base = compose
+                function compose(model)
+                  local result = base(model)
+                  local sessions = result.groups[1].sessions
+                  sessions[1], sessions[2] = sessions[2], sessions[1]
+                  return result
+                end
+                "#,
+            )),
+        )
+    }
+
+    fn ui_with(composer: Composer, sessions: Vec<SessionSummary>) -> Ui {
+        let mut ui = Ui::new(sessions, "sh", None);
+        ui.set_frontend_composer(composer);
+        ui
+    }
+
+    fn identity(of: Option<&SessionSummary>) -> Option<PeerRoute> {
+        of.map(session_identity)
+    }
+
+    fn refresh_once(port: &FakePort, ui: &mut Ui, skip_list: bool) -> (u16, u16) {
+        let mut held = None;
+        let mut painted = String::new();
+        let mut shown = None;
+        super::refresh(
+            port,
+            "node",
+            ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            skip_list,
+            false,
+        )
+        .expect("refresh")
+    }
+
+    #[test]
+    fn relist_restores_the_same_identity_after_a_custom_reorder() {
+        let port = FakePort::new(vec![herd(), herd()]);
+        let mut ui = ui_with(swap_composer(), herd());
+        refresh_once(&port, &mut ui, false);
+
+        assert_eq!(
+            ui.sessions
+                .iter()
+                .map(|session| session.name.as_str())
+                .collect::<Vec<_>>(),
+            ["shell", "agent", "gone"],
+            "Lua order is the presentation"
+        );
+        let before = identity(ui.selected()).expect("a selected identity");
+        assert_eq!(before.0, "id-agent");
+
+        // The relist comes back in daemon order. The selection must stay the
+        // SAME (id, instance), not the same index or name.
+        refresh_once(&port, &mut ui, false);
+        assert_eq!(port.list_calls(), 2);
+        let after = identity(ui.selected()).expect("a selected identity");
+        assert_eq!(after, before, "selection followed identity across relist");
+        assert_eq!(ui.sessions[ui.selected].name, "agent");
+        assert_eq!(
+            ui.sessions
+                .iter()
+                .map(|session| session.name.as_str())
+                .collect::<Vec<_>>(),
+            ["shell", "agent", "gone"],
+            "custom order is re-applied deterministically"
+        );
+    }
+
+    #[test]
+    fn repeated_composition_without_a_fresh_list_does_not_oscillate() {
+        let mut ui = ui_with(swap_composer(), herd());
+        super::refresh_peer_composition(&mut ui, 80, 24);
+        let first_rows = ui.frontend_rows.clone();
+        let first_order: Vec<String> = ui.sessions.iter().map(|s| s.name.clone()).collect();
+        assert_eq!(first_order, ["shell", "agent", "gone"]);
+
+        // No relist: compose several times from the SAME source catalog.
+        for _ in 0..3 {
+            super::refresh_peer_composition(&mut ui, 80, 24);
+            assert_eq!(ui.frontend_rows, first_rows);
+            assert_eq!(
+                ui.sessions
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect::<Vec<_>>(),
+                first_order
+            );
+        }
+    }
+
+    #[test]
+    fn type_wake_recomposes_peer_for_new_dimensions_without_a_remote_call() {
+        let port = FakePort::new(vec![herd()]);
+        let mut ui = ui_with(Composer::embedded(), herd());
+        // Composition was built for another terminal; a Type wake must still
+        // redo the local composition before this frame's resize/capture.
+        ui.frontend_dims = Some((1, 1));
+        let (cols, rows) = refresh_once(&port, &mut ui, true);
+
+        assert_eq!(port.list_calls(), 0, "a Type wake must not relist");
+        let frame = ui.peer_frame(cols, rows).expect("peer frame");
+        assert_eq!(
+            (
+                pane_size(&ui, cols, rows).cols(),
+                pane_size(&ui, cols, rows).rows()
+            ),
+            (frame.preview.w, frame.preview.h),
+            "Type-wake resize target follows the prepared rect"
+        );
+        assert_eq!(ui.frontend_dims, Some((cols, rows)));
+        assert!(ui.frontend_layout.is_some(), "layout recomposed locally");
+        assert!(
+            ui.frontend_diagnostic.is_none(),
+            "no emergency fallback: {:?}",
+            ui.frontend_diagnostic
+        );
+    }
+
+    #[test]
+    fn normal_refresh_resizes_the_pane_to_the_prepared_preview() {
+        let port = FakePort::new(vec![herd()]);
+        let mut ui = ui_with(Composer::embedded(), herd());
+        ui.focus = Focus::Session;
+        let mut held = Some(("agent".to_string(), NoKeys));
+        let mut painted = String::new();
+        let mut shown = None;
+        let (cols, rows) = super::refresh(
+            &port,
+            "node",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+            false,
+        )
+        .expect("refresh");
+        assert_eq!(port.list_calls(), 1);
+        let frame = ui.peer_frame(cols, rows).expect("peer frame");
+        assert_eq!(
+            port.resizes.borrow().last().copied(),
+            Some((frame.preview.w, frame.preview.h)),
+            "ResizeSession follows the prepared preview rect"
+        );
+    }
+
+    #[test]
+    fn replaced_instance_cancels_the_bound_composer() {
+        let replaced = vec![
+            summary_with("agent", "instance-agent-2", true),
+            summary_with("shell", "instance-shell", true),
+            summary_with("gone", "instance-gone", false),
+        ];
+        let port = FakePort::new(vec![herd(), replaced]);
+        let mut ui = ui_with(Composer::embedded(), herd());
+        refresh_once(&port, &mut ui, false);
+        ui.compose_target = Some(("agent".into(), "instance-agent".into()));
+        ui.focus = Focus::Session;
+
+        refresh_once(&port, &mut ui, false);
+        assert_eq!(ui.compose_target, None, "same name, new instance != target");
+        assert_eq!(ui.focus, Focus::List);
+        assert_eq!(
+            ui.selected()
+                .and_then(|session| session.instance_id.as_deref()),
+            Some("instance-agent-2"),
+            "selection falls to the surviving roster, never the old instance"
+        );
+        assert_ne!(
+            identity(ui.selected()).unwrap().1.as_deref(),
+            Some("instance-agent")
+        );
+    }
+}
+
+#[cfg(test)]
+mod peer_parity_tests {
+    use super::*;
+    use crate::cluster_ui::Composer;
+
+    fn summary(name: &str, alive: bool) -> SessionSummary {
+        SessionSummary {
+            id: format!("id-{name}"),
+            name: name.into(),
+            instance_id: Some(format!("instance-{name}")),
+            output_version: Some(0),
+            alive,
+            idle: Duration::ZERO,
+            output_idle: Some(Duration::ZERO),
+            size: Size::new(80, 24),
+            attached: false,
+            human_idle: None,
+            mouse_tracking: false,
+            unavailable: false,
+        }
+    }
+
+    fn herd() -> Vec<SessionSummary> {
+        vec![
+            summary("agent", true),
+            summary("shell", true),
+            summary("gone", false),
+        ]
+    }
+
+    type Cell = (
+        String,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        vt100::Color,
+        vt100::Color,
+    );
+
+    /// Every cell of the frame as the terminal would receive it: text plus the
+    /// attributes the baseline peer list actually used (inverse for selection).
+    fn frame_cells(frame: &str, cols: u16, rows: u16) -> Vec<Vec<Cell>> {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(frame.as_bytes());
+        (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        let cell = parser.screen().cell(row, col).expect("cell");
+                        (
+                            cell.contents().to_string(),
+                            cell.inverse(),
+                            cell.bold(),
+                            cell.dim(),
+                            cell.italic(),
+                            cell.underline(),
+                            cell.fgcolor(),
+                            cell.bgcolor(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn assert_same_cells(lua: &str, native: &str, cols: u16, rows: u16, context: &str) {
+        let lua = frame_cells(lua, cols, rows);
+        let native = frame_cells(native, cols, rows);
+        for row in 0..usize::from(rows) {
+            for col in 0..usize::from(cols) {
+                assert_eq!(
+                    lua[row][col], native[row][col],
+                    "{context}: cell ({row},{col}) differs"
+                );
+            }
+        }
+    }
+
+    fn native_peer(sessions: Vec<SessionSummary>, sessions_text: Vec<String>) -> Ui {
+        let mut ui = Ui::new(sessions, "sh", None);
+        ui.sessions_text = sessions_text;
+        ui
+    }
+
+    fn lua_peer(sessions: Vec<SessionSummary>) -> Ui {
+        let mut ui = Ui::new(sessions, "sh", None);
+        ui.set_frontend_composer(Composer::embedded());
+        ui
+    }
+
+    /// Normal fixture: the Lua default must reproduce the native fallback cell
+    /// for cell (text, padding, reverse selection) at every common width.
+    #[test]
+    fn default_peer_reproduces_native_cells_and_styles() {
+        for &(cols, rows) in &[(120u16, 24u16), (80, 24), (60, 24), (59, 24), (40, 24)] {
+            let native = native_peer(herd(), Vec::new());
+            let mut frontend = lua_peer(herd());
+            super::refresh_peer_composition(&mut frontend, cols, rows);
+            frontend.prepare_frame_sizes(cols, rows);
+
+            // The parity comparison is only meaningful when the embedded
+            // default actually composed (not the emergency roster).
+            assert!(
+                frontend
+                    .frontend
+                    .as_ref()
+                    .and_then(|frontend| frontend.cache.as_ref())
+                    .is_some(),
+                "composition cache at {cols}x{rows}"
+            );
+            assert!(frontend.frontend_rows.is_some());
+            assert_eq!(
+                frontend.frontend_diagnostic, None,
+                "no emergency diagnostic at {cols}x{rows}"
+            );
+            let layout = frontend.frontend_layout.clone().expect("layout");
+            assert_eq!(layout.list_cells, 16, "auto list width at {cols}");
+
+            let native_frame = render(&native, "", "node", cols, rows);
+            let lua_frame = render(&frontend, "", "node", cols, rows);
+            assert_same_cells(
+                &lua_frame,
+                &native_frame,
+                cols,
+                rows,
+                &format!("{cols}x{rows}"),
+            );
+
+            // Baseline reverse covers the name only; padding stays plain, and
+            // the cell-by-cell equality above already proves both frames do it.
+            let selected = frame_cells(&lua_frame, cols, rows);
+            assert!((0..5).all(|col| selected[0][col].1), "name is reverse");
+            assert!((5..16).all(|col| !selected[0][col].1), "padding is plain");
+        }
+    }
+
+    /// Empty fixture: baseline measured the UNINDENTED hint (23 cells -> 25
+    /// wanted), clamped by the same usable-16 rule (23 at 40 cols); the
+    /// two-space indent is painted, not measured.
+    #[test]
+    fn default_empty_peer_reproduces_native_cells_and_width() {
+        for cols in [80u16, 40] {
+            let rows = 24u16;
+            let native = native_peer(Vec::new(), vec!["no sessions on this node".into()]);
+            let expected_list = ui_layout(&native, cols).0;
+            eprintln!(
+                "EMPTY {cols}: native_list={expected_list} text_w={}",
+                crate::cluster_ui::text_width("no sessions on this node")
+            );
+            let mut frontend = lua_peer(Vec::new());
+            super::refresh_peer_composition(&mut frontend, cols, rows);
+            frontend.prepare_frame_sizes(cols, rows);
+
+            assert!(frontend.frontend_rows.is_some());
+            assert_eq!(frontend.frontend_diagnostic, None);
+            let layout = frontend.frontend_layout.clone().expect("layout");
+            assert_eq!(
+                layout.list_cells, expected_list,
+                "empty-state list width at {cols}"
+            );
+            assert_eq!(
+                frontend.peer_frame(cols, rows).unwrap().divider.unwrap().x,
+                expected_list
+            );
+
+            let native_frame = render(&native, "", "node", cols, rows);
+            let lua_frame = render(&frontend, "", "node", cols, rows);
+            eprintln!(
+                "NATIVE-ROW1 {:?}",
+                native_frame
+                    .split('\x1b')
+                    .find(|part| part.contains("no sessions"))
+            );
+            assert_same_cells(&lua_frame, &native_frame, cols, rows, "empty");
+        }
     }
 }

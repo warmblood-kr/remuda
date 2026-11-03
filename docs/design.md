@@ -14,6 +14,24 @@ siblings), the same split `PRINCIPLES.md` draws between policy and host.
 Building that vocabulary in Rust would mean rebuilding and redeploying every
 time it grows; building it in Lua means a new word costs neither.
 
+## Remote UI composition
+
+The cluster frontend uses local Lua to compose its node/session list and
+choose the list/preview split. Lua owns row layout, ordering, colors and
+panel sizing. Rust supplies sanitized display data and opaque target tokens,
+validates the returned rows and geometry, and renders terminal cells. The
+same resolved geometry determines the preview's capture and resize viewport.
+Selection and actions retain their native node/session-instance identities;
+display labels and Lua row positions never become remote addresses.
+
+This composer runs in a restricted frontend VM, separate from the daemon
+image. Its dedicated local configuration is loaded when the UI opens. It
+cannot request remote evaluation, send input, open files or contact peers.
+The embedded Lua composer provides defaults and recovery after invalid user
+composition. Remote authentication, operation permissions, retries and
+confirmation remain Rust responsibilities. See [Lua UI composition](lua.md)
+for configuration and the rendering contract.
+
 ## One registry for every word
 
 A word is any name a script can call on the `remuda` table or reach through
