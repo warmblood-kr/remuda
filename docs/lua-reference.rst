@@ -14,7 +14,7 @@ advice_member
 advise
 ------
 
-``advise(path, how, fn, opts) -> nil`` — Wrap the function at a `remuda.*` path. `how`: around|before|after|override|filter_args|filter_return|before_while|before_until. `opts`: `id` (required; same id replaces), `depth` (-100 outermost).
+``advise(path, how, fn, opts) -> nil`` — Wrap the function at a `remuda.*` path. `how`: around\|before\|after\|override\|filter_args\|filter_return\|before_while\|before_until. `opts`: `id` (required; same id replaces), `depth` (-100 outermost).
 
 after
 -----

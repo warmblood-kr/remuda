@@ -1102,6 +1102,30 @@ fn registry_documentation_formats_are_live_and_structured() {
 }
 
 #[test]
+fn registry_rst_escapes_description_pipes() {
+    let dir = scratch("registry-rst-pipes");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path, &dir);
+    let rst = match client::request(
+        &path,
+        &Request::Eval {
+            code: "return remuda._registry_dump('rst')".into(),
+            name: None,
+        },
+    ) {
+        Ok(Response::Value(value)) => value,
+        other => panic!("RST documentation evaluation failed: {other:?}"),
+    };
+    // A bare `|word|` is an RST substitution reference; pandoc would replace
+    // the advice kinds with a broken link instead of printing them.
+    let escaped = concat!(
+        "around\\|before\\|after\\|override\\|",
+        "filter_args\\|filter_return\\|before_while\\|before_until"
+    );
+    assert!(rst.contains(escaped), "advice kinds must be escaped in RST");
+}
+
+#[test]
 fn every_frozen_api_version_still_runs() {
     // `tests/api/vN.lua` is a script written against version N of the Lua API,
     // and it is frozen: widening the surface means adding `v2.lua`, never

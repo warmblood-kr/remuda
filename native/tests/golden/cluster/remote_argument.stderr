@@ -1,1 +1,1 @@
-remuda: cluster remote: <PLATFORM_ERROR>
+remuda: cluster remote: no cluster node matches not-a-target

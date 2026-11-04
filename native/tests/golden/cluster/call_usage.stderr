@@ -6,7 +6,7 @@ Call a remote node API. Example: remuda cluster call <NODE> list --addr 192.0.2.
 Usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] [--json]
 
 Arguments:
-  <NODE>     Remote node name or fingerprint
+  <NODE>     Remote node id, alias or fingerprint
   <ACTION>   list or capture
   [SESSION]  Session to capture; required for capture
 

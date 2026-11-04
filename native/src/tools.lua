@@ -2402,7 +2402,10 @@ local function registry_rst(rows)
     lines[#lines + 1] = row.name
     lines[#lines + 1] = string.rep("-", #row.name)
     lines[#lines + 1] = ""
-    lines[#lines + 1] = "``" .. row.signature .. "`` — " .. row.description
+    -- A bare |word| is an RST substitution reference; escape description pipes
+    -- so a list like around|before|after renders as text, not a missing link.
+    local description = row.description:gsub("|", "\\|")
+    lines[#lines + 1] = "``" .. row.signature .. "`` — " .. description
     lines[#lines + 1] = ""
   end
   return table.concat(lines, "\n")
