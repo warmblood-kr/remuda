@@ -17,7 +17,7 @@ availability whenever the origin was down. Copying a file in is one command.
 | Storage | immutable blobs named by sha256, in the private cluster directory, 0600 |
 | Replication | placement over admitted, non-down nodes; 3 by default, 1–16 per file |
 | Write durability | `put` returns once this node stored it and told peers; `--wait` / `--min-copies K` wait for copies (exit 75 if short) |
-| Offline node | a reader needs one holder up; repair pulls a copy to the next ranked node when a holder is gone |
+| Offline node | a reader needs a holder it can reach, whose index entry it already has; repair pulls a copy to the next ranked node when a holder is gone, after the down grace |
 | Concurrent writes | both survive; every node picks the same winner; up to 16 conflicts per path, `resolve-conflict` settles |
 | Delete | a tombstone travels with the index; GC forgets it after `--tombstone-days` once every node has it |
 | Membership change | `drain` before `leave`, `revoke`, old stores set aside |
@@ -29,9 +29,19 @@ availability whenever the origin was down. Copying a file in is one command.
 
 These are design limits, not bugs to file:
 
-1. **Availability of a file whose holders are all down.** Replication covers
-   node loss, not a partition that isolates every holder. There is no fallback
-   and no "eventually" promise; `status --copies` names the short files.
+1. **Availability of a file whose holders are all down or unreachable.**
+   Replication covers node loss, not a partition that isolates every holder,
+   and three replicas is a *target*: `put` returns before peers have copied, so
+   durability is only as good as the copies confirmed so far. There is no
+   fallback and no "eventually" promise; `status --copies` names short files.
+
+1b. **Guidance is worse than a CLI read, on purpose.** `remuda.vfs.read` from
+   Lua answers from this node's index and cached bytes and never fetches over
+   the network. A freshly joined node therefore reports the cluster guidance
+   layer as unavailable even while every holder is healthy, until something
+   copies the file there (`remuda vfs get`). Nothing tracks the source, reloads
+   on change, or detects a partition. A node that must show guidance needs a
+   prefetch step, and this is not something the store fixes for it.
 2. **Per-path permission.** Any admitted node may read, write and delete
    anything. The cluster channel is mutually authenticated (Noise), but there
    is no ACL inside it.
@@ -43,39 +53,55 @@ These are design limits, not bugs to file:
 6. **Per-tenant quota.** 10,000 live files / 30,000 index entries per cluster.
 7. **Content freshness against the outside world.** A managed file never
    notices that its source changed on disk; publishing again is a new version.
+8. **A coherent snapshot of a directory.** Files are independent entries; a
+   publish that is half done looks half done, and there is no history, rollback
+   or backup semantics.
+9. **Author identity.** A verified hash proves integrity, not who wrote it. The
+   cluster channel authenticates admitted peers; it says nothing about who
+   produced an artifact.
+10. **Isolation from other processes of the same user.** 0600 protects against
+    other accounts, not against another process running as the same user.
+11. **Membership changes are best effort on one side.** `drain` proves custody
+    at the moment it asks; `leave` proceeds after a warning when no peer
+    answers. A plan that must not lose data has to check `status --copies`
+    itself, not trust that a leave ran.
 
 ## The smallest layer worth adding
 
 Everything needed to publish and read is shipped except one thing: **a page is
-usually several files**. `vfs put` takes one file, so publishing an artifact
-directory is a shell loop with no summary, no partial-failure story and no way
-to make the whole tree appear at once.
+usually several files**, and `vfs put` takes one. A shell loop works but has no
+summary, no preflight and no way to tell a reader whether the tree is complete.
 
-`remuda vfs put --recursive DIR remuda:///PREFIX/` closes that gap with no wire
-change and no new storage:
+`remuda vfs publish DIR remuda:///PREFIX/ --release NAME` is a *nontransactional
+uploader with a final pointer*, not an atomic directory publish:
 
-- walks `DIR`, regular files only (symlinks are skipped and named), refuses to
-  cross a mount? no — keeps it simple: skips symlinks;
-- stores each file under `PREFIX/<relative path>`, one `put` request per file,
-  so the daemon contract is unchanged;
-- stops at 500 files or 64 MiB each and says so rather than half-doing it;
-- prints `Published N files (X MiB) to remuda:///PREFIX/; M failed`, lists the
-  failures, and exits 75 if any file was stored only here (same meaning as
-  `put`);
-- does not delete: a removed source file leaves a stale managed file until
-  `vfs rm`, because "the directory changed" is not evidence about the cluster.
+1. Preflight: regular files only (symlinks skipped and named), at most 500
+   files, each at most 64 MiB, and no existing file at the destination under
+   the same release name (a release is immutable; publish a new name instead).
+2. Upload each file to `PREFIX/NAME/<relative path>`, one `put` request per
+   file, `--min-copies` honoured per file.
+3. If every file is in and has the confirmed copies asked for, write the small
+   entry file `PREFIX/NAME/CURRENT` **last**. A viewer that is pointed at
+   `PREFIX/NAME/` therefore never sees a half-uploaded page as current.
+4. Say exactly what happened: `Published N files (X MiB) as NAME; M failed`,
+   list failures, exit 1 for a hard failure (nothing usable was published) and
+   75 for "uploaded but under-replicated" — the same meaning `put` already has.
 
-That is the whole addition: a publisher, not a new consistency model.
+What it deliberately does not do: delete a previous release (it stays until
+`vfs rm`), roll back a partial upload, or guarantee that the final pointer has
+reached every node by the time the command exits. The pointer propagates the
+way every other write does. A manifest with reader enforcement would make the
+guarantee stronger; it is not worth the reader-side changes yet.
 
 ## Staged plan
 
 1. **Now (shipped):** store, replication, conflicts, tombstones, `vfs serve`,
    `vfs release`.
-2. **Next (small, this design):** `vfs put --recursive` + a `vfs ls --tree`
-   that sorts by path, so an artifact directory is publishable and reviewable
-   in two commands.
+2. **Next (small, this design):** `vfs publish` as above. A `vfs ls` that
+   groups by path is nice to have and deferred.
 3. **Operational:** publish the cluster guidance file the owner approves
-   (`remuda:///butler/guidance/cluster.md`) — no code.
+   (`remuda:///butler/guidance/cluster.md`) — no code — and give each node a
+   prefetch step, because a Lua guidance read never fetches (see 1b).
 4. **Only if the owner needs it:** read-only membership (a node that can read
    but not write) and per-path ACLs. Both are wire and index changes; neither
    is promised here.
