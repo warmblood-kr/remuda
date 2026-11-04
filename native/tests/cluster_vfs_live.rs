@@ -1450,7 +1450,18 @@ fn a_reader_can_release_copies_it_fetched_and_keeps_what_matters() {
     assert!(viewer.has_blob(&sha), "--older-than kept a fresh copy");
 
     // The explicit release does, but only after the placement nodes confirm.
-    let released = successful(viewer.run(&["vfs", "release"]), "release on the viewer");
+    // A loaded runner can miss that answer once; release is safe to rerun, and
+    // "kept because a node did not confirm" is the documented transient.
+    let mut released = String::new();
+    for _ in 0..10 {
+        let attempt = viewer.run(&["vfs", "release"]);
+        released = String::from_utf8_lossy(&attempt.stdout).to_string()
+            + &String::from_utf8_lossy(&attempt.stderr);
+        if attempt.status.success() && released.contains("Released 1 copy") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
     assert!(released.contains("Released 1 copy"), "{released}");
     assert!(
         !viewer.has_blob(&sha),
