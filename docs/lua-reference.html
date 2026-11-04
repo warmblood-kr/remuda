@@ -168,7 +168,7 @@
 <h2 id="send">send</h2>
 <p><code>send(name, text) -&gt; nil</code> — Deliver a line of text to a session, with Enter appended.</p>
 <h2 id="session">session</h2>
-<p><code>session(name) -&gt; handle; table {list, new, close, attach, resize}</code> — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach and resize.</p>
+<p><code>session(name) -&gt; handle; table {list, new, close, attach, resize, set_display}</code> — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach and resize.</p>
 <h2 id="session.attach">session.attach</h2>
 <p><code>session.attach(name) -&gt; nil</code> — Enter raw mode on a session.</p>
 <h2 id="session.close">session.close</h2>
@@ -179,6 +179,8 @@
 <p><code>session.new(name?, argv?, cwd?, env?) -&gt; name, instance_id</code> — Start a session and return its name and registered instance_id.</p>
 <h2 id="session.resize">session.resize</h2>
 <p><code>session.resize(name, cols, rows) -&gt; true | nil, err</code> — Resize a session's terminal (cols 20..1000, rows 24..500).</p>
+<h2 id="session.set_display">session.set_display</h2>
+<p><code>session.set_display(name, instance_id, facts_or_nil) -&gt; true</code> — Publish bounded informational facts to local and authenticated remote List readers for an exact live instance. Trusted local Lua only; nil clears; expires after 10 seconds; returns true or raises.</p>
 <h2 id="storage">storage</h2>
 <p><code>table</code> — Namespace for resolving per-user config, data, state and cache directories.</p>
 <h2 id="storage.dir">storage.dir</h2>

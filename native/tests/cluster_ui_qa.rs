@@ -1,6 +1,41 @@
 //! Independent acceptance probes through the public frontend composer seam.
 use remuda_native::cluster_ui::*;
 const DEFAULT: &str = include_str!("../src/cluster_ui.lua");
+
+#[test]
+fn enrichment_keeps_selected_name_and_operational_state_at_real_list_widths() {
+    for cols in [40, 60, 80, 120] {
+        let mut m = model(1);
+        m.viewport.cols = cols;
+        let session = &mut m.groups[0].sessions[0];
+        session.label = "build".into();
+        session.pending = 3;
+        session.status_cells = text_width("live · pending input 3") as u16;
+        session.display = Some(DisplayFacts {
+            provider: "butler".into(),
+            alias: None,
+            leader: Some("team-leader".into()),
+            kind: Some("codex".into()),
+            model: Some("a-long-configured-model-name".into()),
+            context_percent: Some(42),
+            context_used: None,
+            context_window: None,
+        });
+        let c = Composer::embedded().compose(&m).unwrap();
+        let width = match c.layout.axis {
+            Axis::Horizontal => usize::from(c.layout.list_cells),
+            Axis::Vertical => usize::from(cols),
+        };
+        let out = render_row(&c.groups[0].sessions[0].rows[0], width, 1);
+        assert!(out.starts_with('>'), "selection lost at {cols}: {out:?}");
+        assert!(out.contains("bui"), "name lost at {cols}: {out:?}");
+        assert!(
+            out.contains("live"),
+            "canonical state lost at {cols}: {out:?}"
+        );
+        assert_eq!(c.targets(), vec![2]);
+    }
+}
 fn model(n: usize) -> Model {
     let mut m = Model::new(Surface::Cluster, Viewport::new(80, 24, 22));
     m.counts = Some(Counts {
@@ -20,6 +55,7 @@ fn model(n: usize) -> Model {
         status_cells: 20,
         sessions: (0..n)
             .map(|i| SessionEntry {
+                display: None,
                 id: i as u32 + 2,
                 label: format!("会話{i}"),
                 selected: i == 0,
@@ -369,7 +405,7 @@ fn default_long_labels_keep_operational_status_visible() {
         for label in ["x".repeat(80), "会話".repeat(40)] {
             let mut m = model(1);
             m.viewport.cols = cols;
-            m.groups[0].sessions[0].label = label;
+            m.groups[0].sessions[0].label = label.clone();
             m.groups[0].sessions[0].pending = 3;
             m.groups[0].sessions[0].status_cells = text_width("live · pending input 3") as u16;
             let c = Composer::with_sources(DEFAULT, None).compose(&m).unwrap();
@@ -383,9 +419,15 @@ fn default_long_labels_keep_operational_status_visible() {
             // Check content through SGR; plain default status text is contiguous.
             assert!(out.contains("live"), "live hidden at {cols}: {out:?}");
             assert!(
-                out.contains("pending input 3"),
-                "pending hidden at {cols}: {out:?}"
+                out.contains(label.chars().next().unwrap()),
+                "name hidden at {cols}: {out:?}"
             );
+            if width >= 1 + 12 + text_width("live · pending input 3") {
+                assert!(
+                    out.contains("pending input 3"),
+                    "fitting status hidden at {cols}: {out:?}"
+                );
+            }
         }
     }
 }

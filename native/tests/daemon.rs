@@ -2941,6 +2941,7 @@ fn shell_test_path(path: &Path) -> String {
 #[test]
 fn old_json_shapes_parse_with_defaults_for_additive_session_fields() {
     let summary = remuda_core::SessionSummary {
+        display: None,
         id: "".into(),
         name: "old-client".into(),
         instance_id: Some("new-field".into()),

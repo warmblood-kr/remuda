@@ -184,6 +184,7 @@ pub struct Ui {
     /// Source order of the peer catalog (daemon order), separate from the
     /// presentation order Lua may reorder. Updated only by a successful list.
     peer_catalog: Vec<PeerRoute>,
+    display_deadlines: HashMap<PeerRoute, Instant>,
     /// One prepared split for the whole-node peer frame. Prepared from the
     /// current viewport and the validated layout before resize/capture/paint,
     /// so every consumer reads the same rectangles.
@@ -282,6 +283,7 @@ impl Ui {
             frontend_preferred_list_cells: None,
             frontend_dims: None,
             peer_catalog: Vec::new(),
+            display_deadlines: HashMap::new(),
             peer: None,
         }
     }
@@ -1716,6 +1718,7 @@ mod visual_mode_tests {
     fn ui() -> Ui {
         let mut ui = Ui::new(
             vec![SessionSummary {
+                display: None,
                 id: String::new(),
                 name: "agent".into(),
                 instance_id: Some("test-agent".into()),
@@ -3127,8 +3130,29 @@ fn relist_and_refresh_text<P: SessionPort + ?Sized>(
         // A composed peer list is presentation-reordered: restore the SAME
         // (id, instance) after a relist, never the old index or a name match.
         let selected_identity = peer.then(|| ui.selected().map(session_identity)).flatten();
+        let display_request_started = Instant::now();
         match list(path) {
             Ok(sessions) => {
+                if peer {
+                    ui.display_deadlines = sessions
+                        .iter()
+                        .filter_map(|session| {
+                            let display = session.display.as_ref()?;
+                            let instance = session.instance_id.as_ref()?;
+                            (!instance.is_empty() && session.alive && !session.unavailable).then(
+                                || {
+                                    (
+                                        session_identity(session),
+                                        display_request_started
+                                            + Duration::from_millis(
+                                                display.valid_for_ms.min(10_000),
+                                            ),
+                                    )
+                                },
+                            )
+                        })
+                        .collect();
+                }
                 if ui.daemon_gone.take().is_some() {
                     ui.notice = None;
                 }
@@ -3193,7 +3217,8 @@ fn refresh<P: SessionPort + ?Sized>(
     // The peer composition is local (no remote call). A Type-forced wake may
     // skip the relist, but a resize must still recompose before this frame's
     // resize/capture/paint rather than paint the emergency fullscreen.
-    if !skip_list || ui.frontend_dims != Some((cols, rows)) {
+    let display_expired = expire_peer_displays(ui, Instant::now());
+    if !skip_list || display_expired || ui.frontend_dims != Some((cols, rows)) {
         refresh_peer_composition(ui, cols, rows);
     }
     ui.prepare_frame_sizes(cols, rows);
@@ -3368,6 +3393,22 @@ fn refresh_peer_composition(ui: &mut Ui, cols: u16, rows: u16) {
 /// The peer model, private token routes and cache key for one composition.
 /// The model follows source catalog (daemon) order, never presentation order,
 /// so a failed relist or repeated resize cannot oscillate.
+fn expire_peer_displays(ui: &mut Ui, now: Instant) -> bool {
+    let mut changed = false;
+    for session in &mut ui.sessions {
+        let key = session_identity(session);
+        if ui
+            .display_deadlines
+            .get(&key)
+            .is_none_or(|deadline| now >= *deadline)
+        {
+            changed |= session.display.take().is_some();
+            ui.display_deadlines.remove(&key);
+        }
+    }
+    changed
+}
+
 fn peer_composition_input(
     ui: &Ui,
     cols: u16,
@@ -3424,6 +3465,11 @@ fn peer_composition_input(
         group.sessions.push(crate::cluster_ui::SessionEntry {
             id,
             label: session.name.chars().take(256).collect(),
+            display: ui
+                .display_deadlines
+                .get(&identity)
+                .filter(|deadline| Instant::now() < **deadline)
+                .and_then(|_| crate::cluster_ui::display_facts(session.display.as_ref())),
             selected: selected == Some(&identity),
             alive: session.alive,
             pending: 0,
@@ -4769,6 +4815,7 @@ mod keybindings_adopter_tests {
 
     fn remapped() -> Ui {
         let sessions = vec![SessionSummary {
+            display: None,
             id: "synthetic".into(),
             name: "test".into(),
             instance_id: Some("synthetic-instance".into()),
@@ -4828,6 +4875,7 @@ mod composer_tests {
 
     fn summary(name: &str, alive: bool) -> SessionSummary {
         SessionSummary {
+            display: None,
             id: format!("id-{name}"),
             name: name.into(),
             instance_id: Some(format!("instance-{name}")),
@@ -5232,6 +5280,7 @@ mod peer_geometry_tests {
 
     fn summary(name: &str, alive: bool) -> SessionSummary {
         SessionSummary {
+            display: None,
             id: format!("id-{name}"),
             name: name.into(),
             instance_id: Some(format!("instance-{name}")),
@@ -5736,6 +5785,7 @@ mod peer_state_tests {
 
     fn summary_with(name: &str, instance: &str, alive: bool) -> SessionSummary {
         SessionSummary {
+            display: None,
             id: format!("id-{name}"),
             name: name.into(),
             instance_id: Some(instance.into()),
@@ -5952,6 +6002,7 @@ mod peer_parity_tests {
 
     fn summary(name: &str, alive: bool) -> SessionSummary {
         SessionSummary {
+            display: None,
             id: format!("id-{name}"),
             name: name.into(),
             instance_id: Some(format!("instance-{name}")),

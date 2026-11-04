@@ -26,6 +26,7 @@ pub mod keys;
 pub mod protocol;
 pub mod registry;
 pub mod session;
+pub mod session_display;
 pub mod session_operations;
 pub mod sync;
 pub mod vfs;
@@ -34,3 +35,4 @@ pub use agent::{AgentError, AgentProcess, Cursor, ExitInfo, ScriptedAgent, Size}
 pub use clock::{Clock, ManualClock, ManualWallClock, WallClock};
 pub use registry::{Registry, SessionSummary};
 pub use session::{InputSubmitOutcome, Session, DEFAULT_INPUT_SETTLE};
+pub use session_display::SessionDisplay;

@@ -424,7 +424,7 @@ send
 session
 -------
 
-``session(name) -> handle; table {list, new, close, attach, resize}`` — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach and resize.
+``session(name) -> handle; table {list, new, close, attach, resize, set_display}`` — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach and resize.
 
 session.attach
 --------------
@@ -450,6 +450,11 @@ session.resize
 --------------
 
 ``session.resize(name, cols, rows) -> true | nil, err`` — Resize a session's terminal (cols 20..1000, rows 24..500).
+
+session.set_display
+-------------------
+
+``session.set_display(name, instance_id, facts_or_nil) -> true`` — Publish bounded informational facts to local and authenticated remote List readers for an exact live instance. Trusted local Lua only; nil clears; expires after 10 seconds; returns true or raises.
 
 storage
 -------

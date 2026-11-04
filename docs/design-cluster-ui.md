@@ -80,3 +80,11 @@ axis/extent affect paint AND resize; tiny/max/CJK; filter/expand/keys; identity
 replacement/collisions; hostile schema/budgets/fallback; offline/input regressions;
 both routes, unchanged herd/security. Peer vertical: caret/mouse/drag/history/
 resize/capture.
+
+## Optional provider enrichment
+
+Session rows may include `session.display` with approved optional provider facts.
+The default `decorate_session(session, spans)` adds leader/kind/model/context
+annotations. See [session display](design-session-display.md) for publication,
+node ownership, compatibility, privacy and expiry. Rust follows the selected
+rendered row when the composed roster exceeds its physical list height.

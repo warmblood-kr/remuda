@@ -30,7 +30,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 111] = [
+pub const BINDINGS: [&str; 112] = [
     "_advice_reattach",
     "_call",
     "_caller_live",
@@ -65,6 +65,7 @@ pub const BINDINGS: [&str; 111] = [
     "_run_schedule",
     "_schedule_fire_counts",
     "_session_resize",
+    "_session_set_display",
     "_sync_window_shown",
     "_take_due_schedules",
     "advice_list",
@@ -147,6 +148,11 @@ pub const BINDINGS: [&str; 111] = [
 /// name, about, signature — one row per Rust-bound word. `tools.lua` adds its
 /// own rows for the words it defines in pure Lua, into the same table.
 const WORDS: &[(&str, &str, &str)] = &[
+    (
+        "_session_set_display",
+        "Publish optional public display facts for an exact live instance from trusted local Lua; true or error.",
+        "_session_set_display(name, instance_id, facts_or_nil) -> true",
+    ),
     (
         "_input_instance_bound_version",
         "Capability version for the native expected-instance-bound full-text and key provider. Consumers must check this and both provider functions before use.",
@@ -1171,6 +1177,7 @@ pub(crate) fn bindings(
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
     let input_registry = registry.clone();
+    crate::session_display::install(lua, &table, registry.clone())?;
     fail_binding(lua, &table, image.clone())?;
     pending_bindings(lua, &table, image.pending_replies(), Rc::clone(&caller))?;
     timer_bindings(lua, &table, timers)?;
@@ -2637,6 +2644,7 @@ mod binding_tests {
                     }
                 }
                 Request::List => Response::Sessions(vec![SessionSummary {
+                    display: None,
                     id: "replacement-session".into(),
                     name: "worker".into(),
                     instance_id: Some(

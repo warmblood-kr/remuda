@@ -622,10 +622,10 @@ fn write_status(status: &str, model: &str, used: &str, window: &str) {
         (Ok(used), Ok(window)) if window > 0 => (used * 100 / window).to_string(),
         _ => "?".into(),
     };
-    let _ = std::fs::write(
-        status,
-        format!("MODEL:{model} CTX:{used} CTXWIN:{window} CTXPCT:{percent}\n"),
-    );
+    let payload = format!("MODEL:{model} CTX:{used} CTXWIN:{window} CTXPCT:{percent}\n");
+    if std::fs::write(status, &payload).is_ok() {
+        let _ = remuda_native::session_display::write_observation(status, payload.trim_end());
+    }
 }
 
 fn fail(error: impl std::fmt::Display) -> ExitCode {

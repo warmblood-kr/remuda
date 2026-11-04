@@ -1800,14 +1800,44 @@ fn bounded_response_payload(payload: &[u8], chunked: bool) -> std::borrow::Cow<'
     if payload.len() <= cap {
         return payload.into();
     }
+    // Metadata is optional. Shed every SessionSummary display before treating
+    // an enriched listing as oversized, keeping every base summary intact.
+    if let Some(base) = shed_session_displays(payload) {
+        if base.len() <= cap {
+            return base.into();
+        }
+        return oversized_response(cap, chunked).into();
+    }
     match trim_blank_screen_tails(payload) {
         Some(trimmed) if trimmed.len() <= cap => trimmed.into(),
-        _ if chunked => encode_error(&format!("cluster response exceeds {cap} bytes")).into(),
-        _ => encode_error(
+        _ => oversized_response(cap, chunked).into(),
+    }
+}
+
+fn oversized_response(cap: usize, chunked: bool) -> Vec<u8> {
+    if chunked {
+        encode_error(&format!("cluster response exceeds {cap} bytes"))
+    } else {
+        encode_error(
             "cluster response exceeds the Noise frame limit; upgrade the requesting node to read it",
         )
-        .into(),
     }
+}
+
+/// Drop only `display` facts from a Sessions response. Every base summary and
+/// its identity stay intact; this is not a row/session cap.
+fn shed_session_displays(payload: &[u8]) -> Option<Vec<u8>> {
+    let mut response: Response = serde_json::from_slice(payload).ok()?;
+    let Response::Sessions(sessions) = &mut response else {
+        return None;
+    };
+    if !sessions.iter().any(|session| session.display.is_some()) {
+        return None;
+    }
+    for session in sessions {
+        session.display = None;
+    }
+    serde_json::to_vec(&response).ok()
 }
 
 /// Only for an oversized screen (#589): a wide pane's trailing default-style
@@ -4047,6 +4077,113 @@ mod tests {
             assert_eq!(payload[0] == b'x', accepted, "payload size {size}");
             assert!(payload.len() <= frame::MAX_RESPONSE_PAYLOAD);
         }
+    }
+
+    fn display_facts() -> remuda_core::session_display::SessionDisplay {
+        remuda_core::session_display::SessionDisplay {
+            version: 1,
+            provider: "butler".into(),
+            member_id: None,
+            leader_id: None,
+            alias: Some("worker".into()),
+            leader: None,
+            kind: Some("opencode".into()),
+            model: Some("model".into()),
+            context_percent: Some(42),
+            context_used: Some(42_000),
+            context_window: Some(100_000),
+            valid_for_ms: 10_000,
+        }
+    }
+
+    /// Three summaries, all enriched; only the last name is padded. ASCII
+    /// padding grows the serialized document by exactly its own length.
+    fn sessions_response(enriched: bool, pad: usize) -> Response {
+        let mut sessions = (0..3)
+            .map(|index| remuda_core::SessionSummary {
+                id: format!("id-{index}"),
+                name: format!("name-{index}"),
+                instance_id: Some(format!("instance-{index}")),
+                output_version: None,
+                alive: true,
+                idle: Duration::ZERO,
+                output_idle: None,
+                size: remuda_core::Size::new(80, 24),
+                attached: false,
+                human_idle: None,
+                mouse_tracking: false,
+                unavailable: false,
+                display: enriched.then(display_facts),
+            })
+            .collect::<Vec<_>>();
+        sessions[2].name.push_str(&"x".repeat(pad));
+        Response::Sessions(sessions)
+    }
+
+    fn sessions_payload(enriched: bool, target_len: usize) -> Vec<u8> {
+        let base = serde_json::to_vec(&sessions_response(enriched, 0)).unwrap();
+        let pad = target_len.checked_sub(base.len()).expect("target > base");
+        let payload = serde_json::to_vec(&sessions_response(enriched, pad)).unwrap();
+        assert_eq!(payload.len(), target_len);
+        payload
+    }
+
+    fn assert_sessions_cap_boundary(cap: usize, chunked: bool) {
+        // Exact cap is accepted unchanged, including every display fact.
+        let exact = sessions_payload(true, cap);
+        let kept = bounded_response_payload(&exact, chunked);
+        assert_eq!(&*kept, exact.as_slice());
+        let Response::Sessions(kept) = serde_json::from_slice(&kept).unwrap() else {
+            panic!("exact-cap sessions became an error");
+        };
+        assert_eq!(kept.len(), 3);
+        assert!(kept.iter().all(|session| session.display.is_some()));
+
+        // One byte over sheds metadata only; every base summary survives.
+        let over = sessions_payload(true, cap + 1);
+        let shed = bounded_response_payload(&over, chunked);
+        assert!(shed.len() <= cap);
+        let Response::Sessions(original) = serde_json::from_slice(&over).unwrap() else {
+            panic!("fixture is not sessions");
+        };
+        let Response::Sessions(after) = serde_json::from_slice(&shed).unwrap() else {
+            panic!("shed sessions became an error");
+        };
+        assert_eq!(after.len(), original.len());
+        for (before, after) in original.iter().zip(&after) {
+            assert_eq!(after.id, before.id);
+            assert_eq!(after.name, before.name);
+            assert_eq!(after.instance_id, before.instance_id);
+            assert!(before.display.is_some());
+            assert!(after.display.is_none());
+        }
+
+        // If the base listing alone is over, keep the existing explicit error.
+        let base_over = sessions_payload(false, cap + 1);
+        let error: Response =
+            serde_json::from_slice(&bounded_response_payload(&base_over, chunked))
+                .expect("error response is valid JSON");
+        let Response::Error(message) = error else {
+            panic!("base over cap did not produce an error");
+        };
+        if chunked {
+            assert_eq!(message, format!("cluster response exceeds {cap} bytes"));
+        } else {
+            assert_eq!(
+                message,
+                "cluster response exceeds the Noise frame limit; upgrade the requesting node to read it"
+            );
+        }
+    }
+
+    #[test]
+    fn enriched_sessions_shed_display_at_the_v1_frame_cap() {
+        assert_sessions_cap_boundary(frame::MAX_RESPONSE_PAYLOAD, false);
+    }
+
+    #[test]
+    fn enriched_sessions_shed_display_at_the_v2_frame_cap() {
+        assert_sessions_cap_boundary(frame::MAX_RESPONSE_TOTAL, true);
     }
 
     #[cfg(unix)]

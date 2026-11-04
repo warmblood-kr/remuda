@@ -40,6 +40,8 @@ pub struct RemoteSessionSnapshot {
     pub bracketed_paste: bool,
     pub screen: Option<ScreenSnapshot>,
     pub last_error: Option<String>,
+    pub display: Option<remuda_core::session_display::SessionDisplay>,
+    pub display_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -404,7 +406,20 @@ impl RemoteNode {
                 .last_sync
                 .map(|last| now.saturating_duration_since(last)),
             last_error: self.last_error.clone(),
-            sessions: self.sessions.clone(),
+            sessions: self
+                .sessions
+                .iter()
+                .cloned()
+                .map(|mut session| {
+                    if session
+                        .display_deadline
+                        .is_none_or(|deadline| now >= deadline)
+                    {
+                        session.display = None;
+                    }
+                    session
+                })
+                .collect(),
         }
     }
 }
@@ -600,6 +615,8 @@ fn selected_snapshot(
             output_version,
             snapshot,
         } if synced => Ok(RemoteSessionSnapshot {
+            display: None,
+            display_deadline: None,
             name: display_name(&session.name),
             wire_name: session.name.clone(),
             instance_id,
@@ -625,6 +642,8 @@ fn selected_snapshot(
                 })?;
             let bracketed_paste = prior.is_some_and(|prior| prior.bracketed_paste);
             Ok(RemoteSessionSnapshot {
+                display: None,
+                display_deadline: None,
                 name: display_name(&session.name),
                 wire_name: session.name.clone(),
                 instance_id,
@@ -666,13 +685,15 @@ impl RemoteTransport for ClusterRemoteTransport {
         previous: &[RemoteSessionSnapshot],
     ) -> io::Result<RemotePoll> {
         let resolved = (self.resolve)(target)?;
+        let started = Instant::now();
         let sessions = self.list_sessions(&resolved)?;
-        Ok(poll_listed_sessions(
-            sessions,
-            selected_session,
-            previous,
-            |session, prior| self.selected_session_snapshot(&resolved, session, prior),
-        ))
+        let displays = listed_displays(&sessions, started);
+        let mut poll =
+            poll_listed_sessions(sessions, selected_session, previous, |session, prior| {
+                self.selected_session_snapshot(&resolved, session, prior)
+            });
+        apply_listed_displays(&mut poll.sessions, &displays, Instant::now());
+        Ok(poll)
     }
 
     /// One Sync for the selected session. Overload, errors and timeouts fail
@@ -703,6 +724,50 @@ impl RemoteTransport for ClusterRemoteTransport {
                 })
                 .collect()
         }))
+    }
+}
+
+type ListedDisplays = BTreeMap<(String, String), (remuda_core::SessionDisplay, Instant)>;
+
+fn listed_displays(sessions: &[remuda_core::SessionSummary], started: Instant) -> ListedDisplays {
+    sessions
+        .iter()
+        .filter_map(|session| {
+            let instance = session.instance_id.as_ref().filter(|id| !id.is_empty())?;
+            let display = session.display.as_ref()?;
+            (session.alive
+                && !session.unavailable
+                && display.valid_for_ms > 0
+                && display.validate().is_ok())
+            .then(|| {
+                (
+                    (session.name.clone(), instance.clone()),
+                    (
+                        display.clone(),
+                        started + Duration::from_millis(display.valid_for_ms.min(10_000)),
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
+fn apply_listed_displays(
+    sessions: &mut [RemoteSessionSnapshot],
+    displays: &ListedDisplays,
+    now: Instant,
+) {
+    for session in sessions {
+        session.display = None;
+        session.display_deadline = None;
+        if let Some((display, deadline)) =
+            displays.get(&(session.wire_name.clone(), session.instance_id.clone()))
+        {
+            if session.alive && now < *deadline {
+                session.display = Some(display.clone());
+                session.display_deadline = Some(*deadline);
+            }
+        }
     }
 }
 
@@ -817,6 +882,8 @@ fn unpolled_session_snapshot(
         .map(|old| old.instance_id.clone())
         .or_else(|| listed_instance_id(&session))?;
     Some(RemoteSessionSnapshot {
+        display: None,
+        display_deadline: None,
         name: display_name(&session.name),
         wire_name,
         instance_id,
@@ -1190,6 +1257,64 @@ impl Drop for RemoteWorkerPermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listed_display_uses_wire_instance_and_request_start_not_response_time() {
+        let started = Instant::now();
+        let mut listed = summary("same-name", "instance-1");
+        listed.instance_id = Some("instance-1".into());
+        listed.display = Some(
+            serde_json::from_str(
+                r#"{"version":1,"provider":"butler","kind":"codex","valid_for_ms":1000}"#,
+            )
+            .unwrap(),
+        );
+        let displays = listed_displays(&[listed.clone()], started);
+        let mut snapshots = vec![session("same-name", "screen")];
+        apply_listed_displays(&mut snapshots, &displays, started);
+        assert!(snapshots[0].display.is_some());
+        snapshots[0].instance_id = "new-instance".into();
+        apply_listed_displays(&mut snapshots, &displays, started);
+        assert!(snapshots[0].display.is_none());
+        snapshots[0].instance_id = "instance-1".into();
+        apply_listed_displays(&mut snapshots, &displays, started + Duration::from_secs(1));
+        assert!(
+            snapshots[0].display.is_none(),
+            "delayed reply cannot renew deadline"
+        );
+        listed.instance_id = None;
+        assert!(
+            listed_displays(&[listed], started).is_empty(),
+            "legacy identity cannot bind"
+        );
+    }
+
+    #[test]
+    fn display_deadline_expires_independently_of_node_sync_and_cached_replay() {
+        let started = Instant::now();
+        let display: remuda_core::SessionDisplay = serde_json::from_str(
+            r#"{"version":1,"provider":"butler","kind":"codex","valid_for_ms":1000}"#,
+        )
+        .unwrap();
+        let mut listed = session("same-name", "screen");
+        listed.display = Some(display);
+        listed.display_deadline = Some(started + Duration::from_secs(1));
+        let mut node = RemoteNode::new("peer", started);
+        node.poll_succeeded(vec![listed.clone()], started);
+        assert!(node.snapshot_at(started).sessions[0].display.is_some());
+        // Replayed snapshots and a fresh Sync must retain the original expiry.
+        node.poll_succeeded(vec![listed], started + Duration::from_secs(2));
+        assert_eq!(node.state, RemoteState::Reachable);
+        assert!(
+            node.snapshot_at(started + Duration::from_secs(2)).sessions[0]
+                .display
+                .is_none()
+        );
+        assert_eq!(
+            node.snapshot_at(started + Duration::from_secs(2)).sessions[0].wire_name,
+            "same-name"
+        );
+    }
     use remuda_core::agent::{Color, Cursor, StyledCell};
     use std::collections::HashMap;
     use std::sync::Condvar;
@@ -1220,6 +1345,8 @@ mod tests {
 
     fn session(name: &str, text: &str) -> RemoteSessionSnapshot {
         RemoteSessionSnapshot {
+            display: None,
+            display_deadline: None,
             name: name.into(),
             wire_name: name.into(),
             instance_id: "instance-1".into(),
@@ -1291,6 +1418,7 @@ mod tests {
     fn same_name_new_instance_does_not_inherit_the_old_screen() {
         let old = session("build", "old frame");
         let listed = remuda_core::registry::SessionSummary {
+            display: None,
             id: "new-id".into(),
             name: "build".into(),
             instance_id: Some("new-instance".into()),
@@ -1315,6 +1443,7 @@ mod tests {
     fn selected_sync_error_keeps_the_fresh_list_and_marks_only_that_session() {
         let prior = session("build", "last good frame");
         let listed = remuda_core::registry::SessionSummary {
+            display: None,
             id: "session-build".into(),
             name: "build".into(),
             instance_id: Some(prior.instance_id.clone()),
@@ -1890,6 +2019,7 @@ mod tests {
 
     fn summary(name: &str, id: &str) -> remuda_core::registry::SessionSummary {
         remuda_core::registry::SessionSummary {
+            display: None,
             id: id.into(),
             name: name.into(),
             instance_id: None,

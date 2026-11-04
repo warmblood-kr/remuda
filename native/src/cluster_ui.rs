@@ -13,7 +13,7 @@ mod render;
 mod schema;
 
 pub use geometry::{resolve_geometry, Axis, Geometry, GeometryError, Layout};
-pub use render::{render_row, render_rows};
+pub use render::{render_row, render_rows, row_window, RowWindow};
 pub use schema::{validate, ComposeError};
 
 use serde::Serialize;
@@ -147,6 +147,52 @@ pub struct SessionEntry {
     pub pending: usize,
     /// Display width of the status Rust appends after this row.
     pub status_cells: u16,
+    pub display: Option<DisplayFacts>,
+}
+
+/// Approved display facts only: no durable IDs, routes, paths or lifetimes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DisplayFacts {
+    pub provider: String,
+    pub alias: Option<String>,
+    pub leader: Option<String>,
+    pub kind: Option<String>,
+    pub model: Option<String>,
+    pub context_percent: Option<u16>,
+    pub context_used: Option<u64>,
+    pub context_window: Option<u64>,
+}
+
+pub fn display_facts(
+    display: Option<&remuda_core::session_display::SessionDisplay>,
+) -> Option<DisplayFacts> {
+    let display = display?;
+    // The wire decoder validates too; native fakes and local callers must obey
+    // the same boundary before facts enter the restricted composition VM.
+    if display.version != 1 || display.provider != "butler" || display.valid_for_ms == 0 {
+        return None;
+    }
+    let clean = |text: &Option<String>| {
+        text.as_ref().map(|s| {
+            crate::text::strip_terminal_controls(s)
+                .chars()
+                .filter(|c| {
+                    !c.is_control() && !matches!(*c as u32, 0x202a..=0x202e | 0x2066..=0x2069)
+                })
+                .take(128)
+                .collect()
+        })
+    };
+    Some(DisplayFacts {
+        provider: "butler".into(),
+        alias: clean(&display.alias),
+        leader: clean(&display.leader),
+        kind: clean(&display.kind),
+        model: clean(&display.model),
+        context_percent: display.context_percent.filter(|p| *p <= 100),
+        context_used: display.context_used,
+        context_window: display.context_window,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -751,6 +797,71 @@ pub fn fit_text(text: &str, cells: usize) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn approved_display_facts_decorate_both_surfaces_without_exposing_identity() {
+        let display: remuda_core::SessionDisplay = serde_json::from_str(
+            r#"{
+            "version":1,"provider":"butler","member_id":"private-member",
+            "leader_id":"private-leader","leader":"team","kind":"codex",
+            "model":"gpt-example","context_percent":42,"valid_for_ms":10000
+        }"#,
+        )
+        .unwrap();
+        for surface in [Surface::Cluster, Surface::Peer] {
+            let mut model = model();
+            model.surface = surface;
+            model.groups[0].sessions[0].display = display_facts(Some(&display));
+            let serialized = serde_json::to_string(&model).unwrap();
+            assert!(!serialized.contains("private-member"));
+            assert!(!serialized.contains("private-leader"));
+            assert!(!serialized.contains("valid_for_ms"));
+            let composer = Composer::embedded();
+            let composition = composer.compose(&model).unwrap();
+            let rendered = render_rows(&composition.flattened_rows(), 140, 24, 1).join("\n");
+            assert!(rendered.contains("← team"), "{rendered}");
+            assert!(rendered.contains("gpt-example"), "{rendered}");
+            assert!(rendered.contains("42% ctx"), "{rendered}");
+            assert_eq!(composition.targets(), vec![2]);
+        }
+    }
+
+    #[test]
+    fn a_custom_decorator_sees_only_optional_display_facts() {
+        let composer = Composer::with_sources(
+            DEFAULT_SOURCE,
+            Some((
+                "decorator-test",
+                r#"
+            function decorate_session(session, spans)
+              if session.display then
+                spans[#spans+1] = {text=" [" .. session.display.kind .. "]"}
+              end
+              return spans
+            end
+        "#,
+            )),
+        );
+        let mut model = model();
+        assert!(composer.compose(&model).is_ok());
+        model.groups[0].sessions[0].display = Some(DisplayFacts {
+            provider: "butler".into(),
+            kind: Some("codex".into()),
+            alias: None,
+            leader: None,
+            model: None,
+            context_percent: None,
+            context_used: None,
+            context_window: None,
+        });
+        let composition = composer.compose(&model).unwrap();
+        let rendered = render_rows(&composition.flattened_rows(), 80, 24, 1).join("\n");
+        assert!(rendered.contains("[codex]"));
+        assert!(
+            rendered.contains("live"),
+            "canonical status survives decoration"
+        );
+    }
+
     fn viewport() -> Viewport {
         Viewport::new(100, 24, 22).with_preview_chrome(1)
     }
@@ -773,6 +884,7 @@ mod tests {
             pending: 0,
             status_cells: 27,
             sessions: vec![SessionEntry {
+                display: None,
                 id: 2,
                 label: "dev".into(),
                 selected: true,
