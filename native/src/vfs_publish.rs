@@ -283,6 +283,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlink_is_named_not_followed() {
         let root = scratch("link");
