@@ -1098,7 +1098,13 @@ fn registry_documentation_formats_are_live_and_structured() {
         .iter()
         .any(|entry| entry["name"] == "tools"));
     assert!(eval("return remuda._registry_dump('markdown')").starts_with("# Remuda Lua runtime"));
-    assert!(eval("return remuda._registry_dump('rst')").starts_with("Remuda Lua runtime"));
+    let rst = eval("return remuda._registry_dump('rst')");
+    assert!(rst.starts_with("Remuda Lua runtime"));
+    // A bare `|word|` is an RST substitution reference; pandoc would replace
+    // the advice kinds with a broken link instead of printing them.
+    assert!(rst.contains(
+        "around\\|before\\|after\\|override\\|filter_args\\|filter_return\\|before_while\\|before_until"
+    ));
 }
 
 #[test]
