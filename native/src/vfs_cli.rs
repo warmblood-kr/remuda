@@ -473,18 +473,27 @@ fn upload_release(
     uploaded
 }
 
+/// Everything a finished upload needs to write its marker and pointer.
+struct Finished<'a> {
+    socket: &'a Path,
+    prefix: &'a str,
+    base: &'a str,
+    release: &'a str,
+    plan: &'a crate::vfs_publish::Plan,
+    min_copies: Option<&'a str>,
+}
+
 /// Write the completion marker, then the optional `CURRENT` pointer. Called
 /// only when every file is in.
-fn finish_release(
-    socket: &Path,
-    prefix: &str,
-    base: &str,
-    release: &str,
-    plan: &crate::vfs_publish::Plan,
-    min_copies: Option<&str>,
-    pointer: bool,
-    out: &mut Out,
-) -> u8 {
+fn finish_release(finished: Finished<'_>, pointer: bool, out: &mut Out) -> u8 {
+    let Finished {
+        socket,
+        prefix,
+        base,
+        release,
+        plan,
+        min_copies,
+    } = finished;
     use crate::vfs_publish;
     let marker = format!(
         "release {release}\nfiles {}\nbytes {}\n",
@@ -624,12 +633,14 @@ fn publish(socket: &Path, values: &Map<String, Value>) -> ExitCode {
         return finish(out, code);
     }
     let code = finish_release(
-        socket,
-        &prefix,
-        &base,
-        &release,
-        &plan,
-        min_copies,
+        Finished {
+            socket,
+            prefix: &prefix,
+            base: &base,
+            release: &release,
+            plan: &plan,
+            min_copies,
+        },
         flag(values, "pointer"),
         &mut out,
     );
