@@ -88,6 +88,27 @@ The code is the same one Lua sees (`not_found`, `too_large`, `no_cluster`,
 answers `too_large` from the index without reading the file. This is what
 `serve` calls; a script that shells out to `get` should use it instead.
 
+## Giving back copies a node fetched: `remuda vfs release`
+
+`get`, `read` and `resolve` keep the copy on the node that read it, so a node
+that only looks at files slowly holds a copy of everything it opened. `release`
+gives those back:
+
+```sh
+remuda vfs release --dry-run     # what would go, and why the rest stays
+remuda vfs release
+```
+
+It removes a copy only when this node owes no copy of it (placement does not
+name this node), this node did not write it, it is not a conflict's content,
+and every node that should hold it has confirmed one. The last copy is never
+removed: if no other node can take it, the copy stays and the command says so.
+Exit 0 either way; the counts are in the output and in `--json`.
+
+`--older-than SECS` keeps copies fetched more recently than that; the default
+is 0. Releasing is not a delete: the file stays in the store and any node can
+fetch it again.
+
 ## Checking health: `remuda vfs status`
 
 ```text

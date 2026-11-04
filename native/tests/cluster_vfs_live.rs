@@ -1367,3 +1367,93 @@ fn a_viewer_node_renders_a_cluster_page_for_a_browser() {
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("--allow-remote"));
 }
+
+#[test]
+fn a_reader_can_release_copies_it_fetched_and_keeps_what_matters() {
+    let _serial = live_test_guard();
+    let (a, b, c) = three_nodes();
+    successful(
+        a.run_with_stdin(
+            &[
+                "vfs",
+                "put",
+                "-",
+                "remuda:///design/read-only.html",
+                "--replicas",
+                "1",
+            ],
+            Some(b"<h1>view</h1>"),
+        ),
+        "put the page",
+    );
+    let sha = a.stat_json("remuda:///design/read-only.html").unwrap()["sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let viewer = match (b.has_blob(&sha), c.has_blob(&sha)) {
+        (false, _) => &b,
+        (true, false) => &c,
+        (true, true) => panic!("replicas 1 still landed a copy on both non-writers"),
+    };
+
+    // Reading pulls the blob onto a node that is not placed on it.
+    successful(
+        viewer.run(&["vfs", "get", "remuda:///design/read-only.html"]),
+        "get on the viewer",
+    );
+    assert!(
+        viewer.has_blob(&sha),
+        "a read leaves its copy behind (issue #887)"
+    );
+
+    // Today nothing releases it: a full sync pass trims only repair stand-ins.
+    let synced = successful(viewer.run(&["vfs", "sync"]), "sync on the viewer");
+    assert!(synced.contains("trimmed 0"), "{synced}");
+    assert!(
+        viewer.has_blob(&sha),
+        "sync alone does not release a read copy"
+    );
+
+    // `--older-than` keeps a copy that was just fetched.
+    let kept = successful(
+        viewer.run(&["vfs", "release", "--older-than", "3600"]),
+        "release with a grace",
+    );
+    assert!(kept.contains("too new 1"), "{kept}");
+    assert!(viewer.has_blob(&sha), "--older-than kept a fresh copy");
+
+    // The explicit release does, but only after the placement nodes confirm.
+    let released = successful(viewer.run(&["vfs", "release"]), "release on the viewer");
+    assert!(released.contains("Released 1 copy"), "{released}");
+    assert!(
+        !viewer.has_blob(&sha),
+        "release removes a copy nobody needs here"
+    );
+
+    // A copy this node wrote is never released, even with no placement binding.
+    let written = a.run(&["vfs", "ls", "remuda:///design/"]);
+    assert!(successful(written, "ls").contains("read-only.html"));
+    assert!(a.has_blob(&sha), "the writer keeps its own copy");
+
+    // And with every placement node down, release refuses to remove the last one.
+    let lone = three_nodes();
+    successful(
+        lone.0.run_with_stdin(
+            &["vfs", "put", "-", "remuda:///only.html", "--replicas", "1"],
+            Some(b"only"),
+        ),
+        "put only.html",
+    );
+    let only = lone.0.stat_json("remuda:///only.html").unwrap()["sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let holder = if lone.1.has_blob(&only) {
+        &lone.1
+    } else {
+        &lone.2
+    };
+    holder.kill_daemon_only();
+    let refused = holder.run(&["vfs", "release"]);
+    assert!(!refused.status.success() || !holder.has_blob(&only));
+}

@@ -939,6 +939,21 @@ impl VfsStore {
         Ok(removed)
     }
 
+    /// Delete a copy this node is not responsible for keeping. The caller has
+    /// checked that every placement node already holds one (#887); the index
+    /// is left alone.
+    pub fn release_blob(&self, sha256: &str) -> VfsResult<bool> {
+        let _guard = self.lock()?;
+        self.still_here()?;
+        let removed = match fs::remove_file(self.blob_path(sha256)?) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        let _ = fs::remove_file(self.stand_in_path(sha256)?);
+        Ok(removed)
+    }
+
     /// Remove local blobs that no live entry references and that are older
     /// than `GC_GRACE`. The grace covers a put that wrote its blob but not yet
     /// its entry, and a pull that lands before the index merge.

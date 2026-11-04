@@ -99,6 +99,11 @@ fn spec() -> Spec {
                 "remuda vfs resolve-conflict URI --keep winner|VERSION"),
             verb("rm", "Delete a file everywhere. Example: remuda vfs rm remuda:///notes.md",
                 vec![arg("URI", "remuda:// URI", true)], vec![], "remuda vfs rm URI"),
+            verb("release", "Give back copies this node fetched to read and does not need to keep. Example: remuda vfs release --dry-run",
+                vec![], vec![option("dry-run", None, "Count what would go without deleting anything"),
+                             option("older-than", Some("SECS"), "Keep copies fetched more recently than this (default 0, no grace)"),
+                             option("json", None, "Print JSON")],
+                "remuda vfs release [--dry-run] [--older-than SECS] [--json]"),
             verb("sync", "Pull indexes from peers and repair missing copies now. Example: remuda vfs sync",
                 vec![], vec![], "remuda vfs sync"),
             verb("status", "Show files, conflicts, copies here and each peer at a glance. Example: remuda vfs status --copies",
@@ -396,6 +401,7 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
             "serve",
             "runs in the CLI process, not the daemon; run `remuda vfs serve` there",
         ),
+        "release" => release(values, out),
         "sync" => {
             let report = vfs_sync::sync_once(true);
             say!(out, "{report}");
@@ -533,6 +539,67 @@ fn put(store: &VfsStore, values: &Map<String, Value>, bytes: &[u8], out: &mut Ou
     } else {
         0
     }
+}
+
+fn release(values: &Map<String, Value>, out: &mut Out) -> u8 {
+    let dry_run = flag(values, "dry-run");
+    let older_than = match value(values, "older-than") {
+        Some(text) => match text.parse::<u64>() {
+            Ok(seconds) => std::time::Duration::from_secs(seconds),
+            Err(_) => return fail(out, "release", "--older-than must be whole seconds"),
+        },
+        None => crate::cluster::vfs_release::DEFAULT_OLDER_THAN,
+    };
+    let report = match crate::cluster::vfs_release::release(dry_run, older_than) {
+        Ok(report) => report,
+        Err(error) => return fail_vfs(out, "release", &error),
+    };
+    if flag(values, "json") {
+        say!(
+            out,
+            "{}",
+            serde_json::to_string(&report).unwrap_or_default()
+        );
+        return 0;
+    }
+    let verb = if dry_run { "Would release" } else { "Released" };
+    let kept =
+        report.placed + report.written + report.recent + report.last_copy + report.unconfirmed;
+    let breakdown = format!(
+        "placed here {}, written here {}, too new {}, only copy {}, unconfirmed {}",
+        report.placed, report.written, report.recent, report.last_copy, report.unconfirmed
+    );
+    if report.removed == 0 {
+        say!(
+            out,
+            "Nothing to release: kept {kept} copies this node needs ({breakdown})."
+        );
+    } else {
+        say!(
+            out,
+            "{verb} {} cop{}, {}; kept {kept} ({breakdown}).",
+            report.removed,
+            if report.removed == 1 { "y" } else { "ies" },
+            bytes_text(report.bytes)
+        );
+    }
+    if report.unconfirmed > 0 {
+        say!(
+            out,
+            "Next: {} kept because a node that should hold {} did not confirm a copy; try `remuda vfs status --copies`.",
+            report.unconfirmed,
+            if report.unconfirmed == 1 { "it" } else { "them" }
+        );
+    }
+    if report.last_copy > 0 {
+        say!(
+            out,
+            "Next: {} kept because no other node is placed on {}, so releasing would leave no copy.",
+            report.last_copy,
+            if report.last_copy == 1 { "it" } else { "them" }
+        );
+    }
+    0
 }
 
 /// `--copies` asks peers for at most this long.

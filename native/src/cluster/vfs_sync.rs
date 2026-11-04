@@ -708,7 +708,12 @@ pub fn wait_for_replicas(entry: &VfsEntry, timeout: Duration) -> VfsResult<usize
 }
 
 /// How many of `nodes` hold the entry's blob, asking peers by `BlobStat`.
-fn count_holders(store: &VfsStore, self_fp: &str, entry: &VfsEntry, nodes: &[String]) -> usize {
+pub(super) fn count_holders(
+    store: &VfsStore,
+    self_fp: &str,
+    entry: &VfsEntry,
+    nodes: &[String],
+) -> usize {
     let has = |node: &String| {
         if node == self_fp {
             return store.has_blob(&entry.sha256, entry.size);
