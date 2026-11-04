@@ -158,11 +158,8 @@ impl DaemonSource {
         }
     }
 
-    /// Refuse to start against a daemon that does not have `vfs read`: every
-    /// request would answer 500 with a confusing message. One probe at startup
-    /// turns that into one clear line.
-    /// `--max-bytes 0` means an existing file answers `too_large` from the
-    /// index, so the probe never moves a blob, whatever the name happens to be.
+    /// Fail early against a daemon without `vfs read`. `--max-bytes 0` keeps
+    /// the probe from moving a blob whatever the path happens to be.
     pub fn probe(&self) -> Result<(), String> {
         let args = [
             "read".to_owned(),
@@ -736,11 +733,8 @@ impl Response {
     }
 }
 
-/// The security headers every answer carries. An HTML or SVG answer also gets a
-/// policy built for the exact origin this viewer listens on.
-/// The sources a page may load from: the bound origin, plus the `localhost`
-/// name the browser may have used instead. Without both, a page opened at
-/// `localhost:PORT` would have its own stylesheet blocked by the policy.
+/// The bound origin plus `localhost:PORT`, so a page opened either way can
+/// load its own assets under the policy.
 fn sources(origin: &str) -> String {
     let authority = origin.trim_start_matches("http://");
     match authority.rsplit_once(':') {
@@ -751,6 +745,8 @@ fn sources(origin: &str) -> String {
     }
 }
 
+/// The security headers every answer carries; an HTML or SVG answer also gets
+/// a policy naming the origin this viewer listens on.
 fn harden(response: Response, origin: &str, allow_scripts: bool) -> Response {
     let active = response
         .headers
