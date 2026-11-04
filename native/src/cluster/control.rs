@@ -43,6 +43,14 @@ pub fn node_aliases() -> io::Result<BTreeMap<String, String>> {
     Ok(merged_aliases(&registry, settings_at(&dir)?.node_aliases))
 }
 
+/// Merged aliases for an already-loaded registry; callers hold the state lock.
+pub(super) fn node_aliases_with(
+    registry: &super::Registry,
+) -> io::Result<BTreeMap<String, String>> {
+    let dir = super::storage::cluster_state_dir()?.join("cluster");
+    Ok(merged_aliases(registry, settings_at(&dir)?.node_aliases))
+}
+
 fn merged_aliases(
     registry: &super::Registry,
     mut aliases: BTreeMap<String, String>,

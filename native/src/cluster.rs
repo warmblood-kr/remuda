@@ -1,5 +1,6 @@
 //! Cluster vocabulary composed from identity and membership registry units.
 
+pub mod addressing;
 pub mod audit;
 pub mod control;
 pub mod encoding;
@@ -32,6 +33,7 @@ pub use replication::{
     push_now, push_now_excluding, push_now_with_revoked_target, registry_changed, PeerPushResult,
 };
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
@@ -481,6 +483,43 @@ pub fn nodes() -> io::Result<Option<(NodeIdentity, Registry)>> {
     };
     let registry = registry::load_registry_at(&dir)?;
     Ok(Some((node, registry)))
+}
+
+/// One consistent read of identity, membership and merged display aliases.
+pub struct ClusterSnapshot {
+    pub identity: NodeIdentity,
+    pub registry: Registry,
+    pub aliases: BTreeMap<String, String>,
+}
+
+impl ClusterSnapshot {
+    /// Admitted and revoked membership entries, in registry order.
+    pub fn entries(&self) -> &[AuthorizedNode] {
+        &self.registry.authorized_nodes
+    }
+}
+
+/// Load a snapshot under the cluster state lock, or `None` before init.
+pub fn snapshot() -> io::Result<Option<ClusterSnapshot>> {
+    let dir = storage::cluster_state_dir()?.join("cluster");
+    match std::fs::symlink_metadata(&dir) {
+        Ok(_) => storage::verify_directory(&dir)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let _guard = storage::StateLock::acquire(&dir)?;
+    let identity = match identity::load_identity_at(&dir) {
+        Ok(node) => node,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let registry = registry::load_registry_at(&dir)?;
+    let aliases = control::node_aliases_with(&registry)?;
+    Ok(Some(ClusterSnapshot {
+        identity,
+        registry,
+        aliases,
+    }))
 }
 
 /// Resolve an exact fingerprint or deterministic node label in a registry.

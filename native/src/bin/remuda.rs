@@ -1006,17 +1006,17 @@ fn cluster_cli_spec() -> remuda_native::cli_parse::Spec {
             verb("nodes", "List the nodes known to this cluster. Example: remuda cluster nodes", vec![], vec![], "remuda cluster nodes"),
             verb("advertise", "Refresh this node's endpoint from its running listener without restarting it", vec![], vec![], "remuda cluster advertise"),
             verb("alias", "Set or clear a cluster-wide display alias for a node. Example: remuda cluster alias node-abcd1234 macbook",
-                vec![arg("TARGET", "Node name or fingerprint", false, true), arg("ALIAS", "Local display alias; omit when using --clear", false, false)],
+                vec![arg("TARGET", "Node id, alias or fingerprint", false, true), arg("ALIAS", "Local display alias; omit when using --clear", false, false)],
                 vec![option("clear", None, "Clear the cluster-wide display alias", false)], "remuda cluster alias TARGET ALIAS | alias TARGET --clear"),
             verb("control", "Enable or disable remote control. Example: remuda cluster control off",
                 vec![arg("MODE", "on or off", false, true)], vec![], "remuda cluster control on|off"),
             verb("revoke", "Revoke a node or fingerprint; prompt before revoking unless --yes is used. Example: remuda cluster revoke node-abcd1234",
-                vec![arg("TARGET", "Node name or fingerprint", false, true)],
+                vec![arg("TARGET", "Node id, alias or fingerprint", false, true)],
                 vec![option("yes", None, "Confirm without prompting", false)], "remuda cluster revoke TARGET [--yes]"),
             verb("leave", "Leave the cluster: copy files to other nodes, have one of them revoke this node, then forget its membership. Example: remuda cluster leave",
                 vec![], vec![option("yes", None, "Confirm without prompting", false)], "remuda cluster leave [--yes]"),
             verb("remote", "Attach to a remote session, or show the remote session picker. Example: remuda cluster remote node/session",
-                vec![arg("TARGET", "Optional NODE (its session screen) or NODE/SESSION target", false, false)], vec![], "remuda cluster remote [NODE[/SESSION]]"),
+                vec![arg("TARGET", "Optional NODE or NODE/SESSION; node may be an id or alias", false, false)], vec![], "remuda cluster remote [NODE[/SESSION]]"),
             verb("listen", "Manage the cluster listener. Example: remuda cluster listen --bind 127.0.0.1",
                 vec![], vec![
                     option("off", None, "Stop the cluster listener", false),
@@ -1025,7 +1025,7 @@ fn cluster_cli_spec() -> remuda_native::cli_parse::Spec {
                     option("foreground", None, "Run listener in the foreground", false),
                 ], "remuda cluster listen [--bind IP[:PORT] [--allow-public] [--foreground] | --off]"),
             verb("call", "Call a remote node API. Example: remuda cluster call node-abcd1234 list --addr 192.0.2.1",
-                vec![arg("NODE", "Remote node name or fingerprint", false, true), arg("ACTION", "list or capture", false, true), arg("SESSION", "Session to capture; required for capture", false, false)],
+                vec![arg("NODE", "Remote node id, alias or fingerprint", false, true), arg("ACTION", "list or capture", false, true), arg("SESSION", "Session to capture; required for capture", false, false)],
                 vec![option("addr", Some("IP[:PORT]"), &port, true), option("json", None, "Print list results as JSON", false)],
                 "remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] [--json]"),
             verb("help", "Print help for a cluster command", vec![arg("COMMAND", "Cluster command name", false, false)], vec![], "remuda cluster help [COMMAND]"),
@@ -1324,16 +1324,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         },
         ClusterCommand::Revoke { target, yes } => cluster_revoke(&target, yes),
         ClusterCommand::Leave { yes } => cluster_leave(path, yes),
-        ClusterCommand::Alias { target, alias } => {
-            match remuda_native::cluster::control::set_node_alias(&target, alias.as_deref()) {
-                Ok(pushes) => {
-                    println!("Node alias updated and shared with the cluster.");
-                    report_cluster_push_results(pushes);
-                    ExitCode::SUCCESS
-                }
-                Err(error) => fail(format!("cluster alias: {error}")),
-            }
-        }
+        ClusterCommand::Alias { target, alias } => cluster_alias(&target, alias.as_deref()),
         ClusterCommand::Control(enabled) => {
             match remuda_native::cluster::control::set_enabled(enabled) {
                 Ok(()) => {
@@ -2723,16 +2714,56 @@ fn safe_fingerprint_field(value: &str, token: &str) -> String {
 }
 
 fn cluster_remote(server: &str, path: &Path, node: &str, target: Option<&str>) -> ExitCode {
-    if let Some(peer) = target {
-        if let Some(code) = cluster_remote_node_screen(server, path, node, peer) {
-            return code;
+    let snapshot = match remuda_native::cluster::snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return fail(format!("cluster remote: {error}")),
+    };
+    // Canonicalize user text once, before any UI, peer choice or action.
+    let canonical = match (target, snapshot.as_ref()) {
+        (Some(target), Some(snapshot)) => {
+            match remuda_native::cluster::addressing::canonicalize_remote_target(
+                target, snapshot, node,
+            ) {
+                Ok(address) => Some(address),
+                Err(error) => return fail(format!("cluster remote: {error}")),
+            }
+        }
+        _ => None,
+    };
+    if let Some(address) = canonical.as_ref().filter(|address| address.peer) {
+        // Transport policy before the tree waits: admitted, endpoint, pinned key.
+        if let Err(error) = remuda_native::cluster::resolve_target(&address.node_fp, None) {
+            let missing_endpoint = error.kind() == std::io::ErrorKind::InvalidInput
+                && snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.node_fp == address.node_fp)
+                        .is_some_and(|entry| entry.endpoint.is_none())
+                });
+            if missing_endpoint {
+                return fail(format!(
+                    "cluster remote: node {} has no registry endpoint; run `remuda cluster advertise` on that node",
+                    address.node_fp
+                ));
+            }
+            return fail(format!("cluster remote: {error}"));
         }
     }
-    match remuda_native::cluster::nodes() {
-        Ok(Some((identity, registry))) => {
+    if let Some(target) = canonical
+        .as_ref()
+        .filter(|address| address.session.is_none())
+    {
+        return cluster_remote_node_screen(server, path, target);
+    }
+    let target = canonical
+        .as_ref()
+        .map_or_else(|| target.map(str::to_owned), |address| Some(address.text()));
+    match snapshot {
+        Some(snapshot) => {
             let poller = match remuda_native::cluster_remote::RemotePoller::from_registry(
-                &registry,
-                &identity.node_fp,
+                &snapshot.registry,
+                &snapshot.identity.node_fp,
             ) {
                 Ok(poller) => poller,
                 Err(error) => return fail(format!("cluster remote: {error}")),
@@ -2746,7 +2777,7 @@ fn cluster_remote(server: &str, path: &Path, node: &str, target: Option<&str>) -
                 match remuda_native::cluster_tui::run_with_remote_selection(
                     path,
                     node,
-                    target,
+                    target.as_deref(),
                     source.as_ref(),
                     &selection,
                 ) {
@@ -2755,52 +2786,41 @@ fn cluster_remote(server: &str, path: &Path, node: &str, target: Option<&str>) -
                 }
             })
         }
-        Ok(None) => with_daemon(server, path, |path| {
-            match remuda_native::cluster_tui::run(path, node, target) {
+        None => with_daemon(server, path, |path| {
+            match remuda_native::cluster_tui::run(path, node, target.as_deref()) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => fail(format!("cluster remote: {error}")),
             }
         }),
-        Err(error) => fail(format!("cluster remote: {error}")),
     }
 }
 
 /// `cluster remote NODE` shows NODE's session screen, as plain `remuda` does
-/// there. `None` when TARGET is not a whole node (e.g. `node/session`).
+/// there. Only whole-node targets reach this path.
 fn cluster_remote_node_screen(
     server: &str,
     path: &Path,
-    hostname: &str,
-    target: &str,
-) -> Option<ExitCode> {
-    let (identity, _) = remuda_native::cluster::nodes().ok().flatten()?;
-    let local = target == hostname
-        || target == identity.node_fp
-        || target == remuda_native::cluster::node_label(&identity.node_fp);
-    if local {
-        return Some(with_daemon(
-            server,
-            path,
-            |path| match remuda_native::tui::run(path, server, None) {
+    target: &remuda_native::cluster::addressing::RemoteTargetAddress,
+) -> ExitCode {
+    if !target.peer {
+        return with_daemon(server, path, |path| {
+            match remuda_native::tui::run(path, server, None) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => fail(format!("cluster remote: {error}")),
-            },
-        ));
+            }
+        });
     }
-    remuda_native::cluster::resolve_target(target, None).ok()?;
-    let port = match remuda_native::tui::RemotePort::system(target) {
+    let port = match remuda_native::tui::RemotePort::system(&target.node_fp) {
         Ok(port) => port,
-        Err(error) => return Some(fail(format!("cluster remote: {target}: {error}"))),
+        Err(error) => return fail(format!("cluster remote: {}: {error}", target.node_fp)),
     };
-    let label = format!("{target} (remote)");
-    Some(with_daemon(
-        server,
-        path,
-        |path| match remuda_native::tui::run_port(path, &port, &label, None) {
+    let label = format!("{} (remote)", target.node_fp);
+    with_daemon(server, path, |path| {
+        match remuda_native::tui::run_port(path, &port, &label, None) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(format!("cluster remote: {error}")),
-        },
-    ))
+        }
+    })
 }
 
 fn remote_node_label(os_hostname: impl FnOnce() -> std::io::Result<String>) -> String {
@@ -2835,18 +2855,17 @@ fn cluster_call(
 ) -> ExitCode {
     use remuda_core::protocol::{expand_runs, Response};
     use remuda_native::net::cluster_client::{ClientError, ClusterClient};
-    let resolved = match remuda_native::cluster::resolve_target(target, Some(address)) {
+    let selector = match remuda_native::cluster::snapshot() {
+        Ok(Some(snapshot)) => match snapshot.resolve_user_target(target) {
+            Ok(entry) => entry.node_fp.clone(),
+            Err(error) => return cluster_call_failure(error),
+        },
+        Ok(None) => target.to_owned(),
+        Err(error) => return cluster_call_failure(error),
+    };
+    let resolved = match remuda_native::cluster::resolve_target(&selector, Some(address)) {
         Ok(resolved) => resolved,
-        Err(error) => {
-            let code = match error.kind() {
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => 4,
-                std::io::ErrorKind::InvalidInput => 2,
-                std::io::ErrorKind::InvalidData => 5,
-                _ => 1,
-            };
-            eprintln!("cluster call: {error}");
-            return ExitCode::from(code);
-        }
+        Err(error) => return cluster_call_failure(error),
     };
     let private_key = match remuda_native::cluster::identity::load_static_private_key() {
         Ok(key) => key,
@@ -2926,6 +2945,17 @@ fn cluster_call(
             ExitCode::from(5)
         }
     }
+}
+
+fn cluster_call_failure(error: std::io::Error) -> ExitCode {
+    let code = match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => 4,
+        std::io::ErrorKind::InvalidInput => 2,
+        std::io::ErrorKind::InvalidData => 5,
+        _ => 1,
+    };
+    eprintln!("cluster call: {error}");
+    ExitCode::from(code)
 }
 
 fn sanitize_peer_response(
@@ -3073,17 +3103,36 @@ fn confirm_leave(prompt: bool) -> std::io::Result<bool> {
     Ok(confirmation_answer_is_yes(&answer))
 }
 
-fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
-    let (identity, registry) = match remuda_native::cluster::nodes() {
-        Ok(Some(nodes)) => nodes,
-        Ok(None) => return fail("cluster is not initialized; run `remuda cluster init`"),
-        Err(error) => return fail(format!("cluster nodes: {error}")),
+fn cluster_alias(target: &str, alias: Option<&str>) -> ExitCode {
+    let fingerprint = match remuda_native::cluster::snapshot() {
+        Ok(Some(snapshot)) => match snapshot.resolve_user_target(target) {
+            Ok(entry) => entry.node_fp.clone(),
+            Err(error) => return fail(format!("cluster alias: {error}")),
+        },
+        Ok(None) => target.to_owned(),
+        Err(error) => return fail(format!("cluster alias: {error}")),
     };
-    let entry = match remuda_native::cluster::resolve_node(&registry.authorized_nodes, target) {
+    match remuda_native::cluster::control::set_node_alias(&fingerprint, alias) {
+        Ok(pushes) => {
+            println!("Node alias updated and shared with the cluster.");
+            report_cluster_push_results(pushes);
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(format!("cluster alias: {error}")),
+    }
+}
+
+fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
+    let snapshot = match remuda_native::cluster::snapshot() {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return fail("cluster is not initialized; run `remuda cluster init`"),
+        Err(error) => return fail(format!("cluster revoke: {error}")),
+    };
+    let entry = match snapshot.resolve_user_target(target) {
         Ok(entry) => entry,
         Err(error) => return fail(format!("cluster revoke: {error}")),
     };
-    if entry.node_fp == identity.node_fp {
+    if entry.node_fp == snapshot.identity.node_fp {
         return fail("cluster revoke: cannot revoke self");
     }
     if entry.state == remuda_native::cluster::NodeState::Revoked {

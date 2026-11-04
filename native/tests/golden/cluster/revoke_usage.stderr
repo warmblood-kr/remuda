@@ -6,7 +6,7 @@ Revoke a node or fingerprint; prompt before revoking unless --yes is used. Examp
 Usage: remuda cluster revoke TARGET [--yes]
 
 Arguments:
-  <TARGET>  Node name or fingerprint
+  <TARGET>  Node id, alias or fingerprint
 
 Options:
   -h, --help  Print help

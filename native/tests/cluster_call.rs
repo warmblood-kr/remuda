@@ -311,6 +311,116 @@ fn cluster_call_lists_and_captures_through_the_black_box_cli() {
     assert!(parsed.get("Sessions").is_some());
 }
 
+fn install_legacy_alias(client: &Node, fingerprint: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = client.state.join("remuda/cluster/settings.json");
+    fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "allow_remote_control": true,
+            "node_aliases": { (fingerprint): "legacy-workstation" },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn assert_remote_failure(client: &Node, target: &str, expected: &str) {
+    let remote = client
+        .command()
+        .args(["cluster", "remote", target])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&remote.stderr);
+    assert!(!remote.status.success(), "remote target: {remote:?}");
+    assert!(stderr.contains(expected), "{remote:?}");
+    if expected == "revoked" {
+        assert!(!stderr.contains("no registry endpoint"), "{remote:?}");
+    }
+}
+
+#[test]
+fn cluster_alias_addressing_survives_rename_clear_and_revoke() {
+    let client = Node::start("alias-client");
+    let server = Node::start("alias-server");
+    admit_pair(&client, &server);
+    let (_listener, addr) = listener(&server);
+    let fingerprint = server.fingerprint();
+    let node_id = remuda_native::cluster::node_label(&fingerprint);
+    let address = addr.to_string();
+    let run = |args: &[&str]| client.command().args(args).output().unwrap();
+    let call = |target: &str| run(&["cluster", "call", target, "list", "--addr", &address]);
+
+    install_legacy_alias(&client, &fingerprint);
+    let legacy = call("legacy-workstation");
+    assert!(legacy.status.success(), "legacy alias failed: {legacy:?}");
+    let assigned = run(&["cluster", "alias", &fingerprint, "workstation"]);
+    assert!(assigned.status.success(), "assign failed: {assigned:?}");
+    let old = call("legacy-workstation");
+    assert_eq!(
+        old.status.code(),
+        Some(4),
+        "superseded legacy alias: {old:?}"
+    );
+    for target in ["workstation", node_id.as_str(), fingerprint.as_str()] {
+        let listed = call(target);
+        assert!(listed.status.success(), "list {target} failed: {listed:?}");
+    }
+    for target in ["workstation", "workstation/proof"] {
+        assert_remote_failure(&client, target, "no registry endpoint");
+    }
+
+    let local_fp = client.fingerprint();
+    let collision = run(&["cluster", "alias", &local_fp, "workstation"]);
+    assert!(
+        collision.status.success(),
+        "duplicate assignment: {collision:?}"
+    );
+    let ambiguous = call("workstation");
+    assert_eq!(
+        ambiguous.status.code(),
+        Some(2),
+        "ambiguous call: {ambiguous:?}"
+    );
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("ambiguous"));
+    for args in [
+        vec!["cluster", "remote", "workstation"],
+        vec!["cluster", "remote", "workstation/proof"],
+        vec!["cluster", "revoke", "workstation", "--yes"],
+        vec!["cluster", "alias", "workstation", "renamed"],
+    ] {
+        let rejected = run(&args);
+        assert!(
+            !rejected.status.success(),
+            "ambiguous mutation: {rejected:?}"
+        );
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("ambiguous"));
+    }
+    let cleared = run(&["cluster", "alias", &local_fp, "--clear"]);
+    assert!(cleared.status.success(), "clear collision: {cleared:?}");
+
+    let renamed = run(&["cluster", "alias", "workstation", "작업실"]);
+    assert!(renamed.status.success(), "rename failed: {renamed:?}");
+    let old = call("workstation");
+    assert_eq!(old.status.code(), Some(4), "old alias: {old:?}");
+    let cleared = run(&["cluster", "alias", "작업실", "--clear"]);
+    assert!(cleared.status.success(), "clear failed: {cleared:?}");
+    let old = call("작업실");
+    assert_eq!(old.status.code(), Some(4), "cleared alias: {old:?}");
+
+    let assigned = run(&["cluster", "alias", &node_id, "workstation"]);
+    assert!(assigned.status.success(), "reassign failed: {assigned:?}");
+    let revoked = run(&["cluster", "revoke", "workstation", "--yes"]);
+    assert!(revoked.status.success(), "revoke failed: {revoked:?}");
+    let listed = call("workstation");
+    assert_eq!(listed.status.code(), Some(4), "revoked alias: {listed:?}");
+    assert!(String::from_utf8_lossy(&listed.stderr).contains("revoked"));
+    for target in ["workstation", "workstation/proof"] {
+        assert_remote_failure(&client, target, "revoked");
+    }
+}
+
 #[test]
 fn remote_close_uses_the_local_control_gate_and_daemon_instance_check() {
     use remuda_core::protocol::{Request, Response};
