@@ -9,6 +9,9 @@
 //!
 //! Design: `docs/design-vfs-serve.md`. The defaults treat stored HTML as
 //! untrusted: no script, an opaque origin, and one path prefix.
+//! Raw TCP lives here for the same reason it lives in `net/`: this module is
+//! the audited place that owns the listener and its framing.
+#![allow(clippy::disallowed_types)]
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
