@@ -75,6 +75,13 @@ fn spec() -> Spec {
             verb("resolve", "Keep a copy on this node and print its local path. Example: remuda vfs resolve remuda:///notes.md",
                 vec![arg("URI", "remuda:// URI", true)], vec![option("local", None, "Do not ask other nodes")],
                 "remuda vfs resolve URI [--local]"),
+            verb("publish", "Upload a directory as one release and mark it complete last. Example: remuda vfs publish site remuda:///design --release 2026-11-04",
+                vec![arg("DIR", "Local directory to upload", true), arg("PREFIX", "remuda:// URI prefix to publish into", true)],
+                vec![OptionSpec { required: true, ..option("release", Some("NAME"), "Release name; one path component, never reused once complete") },
+                     option("dry-run", None, "Show what would be uploaded, then stop"),
+                     option("min-copies", Some("K"), "Wait for K copies of each file and of the completion marker"),
+                     option("pointer", None, "After the marker, point PREFIX/CURRENT at this release")],
+                "remuda vfs publish DIR PREFIX --release NAME [--dry-run] [--min-copies K] [--pointer]"),
             verb("stat", "Show one file's version, hash, size and copies. Example: remuda vfs stat remuda:///notes.md",
                 vec![arg("URI", "remuda:// URI", true)], vec![option("json", None, "Print JSON")],
                 "remuda vfs stat URI [--json]"),
@@ -213,6 +220,11 @@ pub fn run(server: &str, socket: &Path, args: &[&str]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    if verb == "publish" {
+        // One `put` per file, so the loop lives here and the daemon only sees
+        // the request it already knows.
+        return publish(socket, &values);
+    }
     let mut input = None;
     if verb == "put" {
         let source = value(&values, "SOURCE").unwrap_or_default();
@@ -329,6 +341,301 @@ fn finish_fail(verb: &str, error: impl std::fmt::Display) -> ExitCode {
     finish(out, code)
 }
 
+/// The cluster path a `remuda://` prefix names. Empty is the whole store.
+fn publish_prefix(text: &str) -> Result<String, String> {
+    let rest = text
+        .strip_prefix(rules::SCHEME)
+        .ok_or_else(|| format!("PREFIX must be a remuda:// URI, not {text:?}"))?;
+    let (cluster, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if !cluster.is_empty() {
+        return Err(format!(
+            "publish into this cluster with remuda:///PATH, not remuda://{cluster}/PATH"
+        ));
+    }
+    let path = path.trim_matches('/');
+    if !path.is_empty() {
+        rules::validate_path(path).map_err(|error| format!("PREFIX {text:?}: {error}"))?;
+    }
+    Ok(path.to_owned())
+}
+
+/// One `Request::Vfs` on its own connection. Returns the command's exit code,
+/// stdout and a one-line stderr.
+fn daemon_call(
+    socket: &Path,
+    args: Vec<String>,
+    input: Option<Vec<u8>>,
+) -> Result<(u8, Vec<u8>, String), String> {
+    let request = Request::Vfs {
+        args,
+        input_base64: input.map(|bytes| BASE64.encode(bytes)),
+    };
+    match crate::client::request(socket, &request) {
+        Ok(Response::CommandResult {
+            exit_code,
+            stdout_base64,
+            stderr_base64,
+        }) => Ok((
+            exit_code,
+            BASE64.decode(stdout_base64).unwrap_or_default(),
+            String::from_utf8_lossy(&BASE64.decode(stderr_base64).unwrap_or_default())
+                .trim()
+                .to_owned(),
+        )),
+        Ok(Response::Error(error)) => Err(error),
+        Ok(other) => Err(format!("unexpected daemon answer: {other:?}")),
+        Err(error) => Err(format!("daemon request failed: {error}")),
+    }
+}
+
+/// Refuse to publish over a release that already has files. Cooperative only: a
+/// partitioned index can hide one from this node.
+fn destination_is_empty(socket: &Path, base: &str, release: &str) -> Result<(), String> {
+    let rows = daemon_call(
+        socket,
+        vec![
+            "ls".to_owned(),
+            format!("remuda:///{base}/"),
+            "--json".to_owned(),
+        ],
+        None,
+    )?;
+    match rows {
+        (0, stdout, _) => {
+            let rows: Value = serde_json::from_slice(&stdout).unwrap_or_default();
+            if rows.as_array().is_some_and(|rows| !rows.is_empty()) {
+                return Err(format!(
+                    "{release} already has files at remuda:///{base}/; publish a new --release name"
+                ));
+            }
+            Ok(())
+        }
+        (_, _, stderr) => Err(format!("cannot check the destination: {stderr}")),
+    }
+}
+
+/// One file uploaded and how many bytes it took.
+struct Uploaded {
+    files: usize,
+    bytes: u64,
+    failure: Option<(String, u8)>,
+}
+
+/// Upload every planned file, stopping at the first hard failure or shortage so
+/// the caller can tell a reader exactly what is and is not in the store.
+fn upload_release(
+    socket: &Path,
+    base: &str,
+    plan: &crate::vfs_publish::Plan,
+    min_copies: Option<&str>,
+) -> Uploaded {
+    use crate::vfs_publish;
+    let mut uploaded = Uploaded {
+        files: 0,
+        bytes: 0,
+        failure: None,
+    };
+    for file in &plan.files {
+        let bytes = match vfs_publish::read_verified(file) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                uploaded.failure = Some((error, 1));
+                return uploaded;
+            }
+        };
+        let mut args = vec![
+            "put".to_owned(),
+            "-".to_owned(),
+            format!("remuda:///{base}/{}", file.relative),
+        ];
+        if let Some(k) = min_copies {
+            args.extend(["--min-copies".to_owned(), k.to_owned()]);
+        }
+        match daemon_call(socket, args, Some(bytes)) {
+            Ok((0, _, _)) => {
+                uploaded.files += 1;
+                uploaded.bytes = uploaded.bytes.saturating_add(file.size);
+            }
+            Ok((code, _, stderr)) if code == EXIT_TEMPFAIL => {
+                uploaded.failure = Some((format!("{}: {stderr}", file.relative), EXIT_TEMPFAIL));
+                return uploaded;
+            }
+            Ok((_, _, stderr)) => {
+                uploaded.failure = Some((format!("{}: {stderr}", file.relative), 1));
+                return uploaded;
+            }
+            Err(error) => {
+                uploaded.failure = Some((format!("{}: {error}", file.relative), 1));
+                return uploaded;
+            }
+        }
+    }
+    uploaded
+}
+
+/// Write the completion marker, then the optional `CURRENT` pointer. Called
+/// only when every file is in.
+fn finish_release(
+    socket: &Path,
+    prefix: &str,
+    base: &str,
+    release: &str,
+    plan: &crate::vfs_publish::Plan,
+    min_copies: Option<&str>,
+    pointer: bool,
+    out: &mut Out,
+) -> u8 {
+    use crate::vfs_publish;
+    let marker = format!(
+        "release {release}\nfiles {}\nbytes {}\n",
+        plan.files.len(),
+        plan.bytes
+    );
+    let mut args = vec![
+        "put".to_owned(),
+        "-".to_owned(),
+        format!("remuda:///{base}/COMPLETE"),
+    ];
+    if let Some(k) = min_copies {
+        args.extend(["--min-copies".to_owned(), k.to_owned()]);
+    }
+    match daemon_call(socket, args, Some(marker.into_bytes())) {
+        Ok((0, _, _)) => {}
+        Ok((code, _, stderr)) => {
+            warn!(out, "remuda: publish incomplete: every file is in remuda:///{base}/, but COMPLETE was not written: {stderr}");
+            return if code == EXIT_TEMPFAIL {
+                EXIT_TEMPFAIL
+            } else {
+                1
+            };
+        }
+        Err(error) => {
+            warn!(out, "remuda: publish incomplete: every file is in remuda:///{base}/, but COMPLETE was not written: {error}");
+            return 1;
+        }
+    }
+    say!(
+        out,
+        "Published {} files ({}) as {release} to remuda:///{base}/.",
+        plan.files.len(),
+        vfs_publish::bytes_text(plan.bytes)
+    );
+    for skipped in &plan.skipped {
+        say!(out, "  skipped (not a regular file): {skipped}");
+    }
+    if pointer {
+        let mut args = vec![
+            "put".to_owned(),
+            "-".to_owned(),
+            format!(
+                "remuda:///{}/CURRENT",
+                if prefix.is_empty() { "" } else { prefix }
+            ),
+        ];
+        if let Some(k) = min_copies {
+            args.extend(["--min-copies".to_owned(), k.to_owned()]);
+        }
+        if let Err(error) = daemon_call(socket, args, Some(release.as_bytes().to_vec())) {
+            warn!(
+                out,
+                "remuda: publish: the release is complete, but CURRENT was not written: {error}"
+            );
+            return 1;
+        }
+        say!(
+            out,
+            "  CURRENT names {release}; a viewer can open /CURRENT."
+        );
+    }
+    say!(
+        out,
+        "  Read it with `remuda vfs serve --root {}`.",
+        if prefix.is_empty() { release } else { prefix }
+    );
+    0
+}
+
+/// `remuda vfs publish`: one ordinary `put` per file, then a completion marker.
+/// The loop lives in the CLI so the daemon contract does not change.
+fn publish(socket: &Path, values: &Map<String, Value>) -> ExitCode {
+    use crate::vfs_publish;
+    let dir = Path::new(value(values, "DIR").unwrap_or_default());
+    let prefix = match publish_prefix(value(values, "PREFIX").unwrap_or_default()) {
+        Ok(prefix) => prefix,
+        Err(error) => return finish_fail("publish", error),
+    };
+    let release = value(values, "release").unwrap_or_default().to_owned();
+    let plan = match vfs_publish::plan(dir, &release) {
+        Ok(plan) => plan,
+        Err(error) => return finish_fail("publish", error.detail),
+    };
+    if let Err(error) = vfs_publish::check_budget(&plan, dir) {
+        return finish_fail("publish", error.detail);
+    }
+    let base = if prefix.is_empty() {
+        release.clone()
+    } else {
+        format!("{prefix}/{release}")
+    };
+    let mut out = Out::default();
+    if let Err(error) = destination_is_empty(socket, &base, &release) {
+        return finish_fail("publish", error);
+    }
+    if flag(values, "dry-run") {
+        for file in plan.files.iter().take(20) {
+            say!(
+                out,
+                "  {:<48} {}",
+                file.relative,
+                vfs_publish::bytes_text(file.size)
+            );
+        }
+        if plan.files.len() > 20 {
+            say!(out, "  ... and {} more", plan.files.len() - 20);
+        }
+        say!(
+            out,
+            "Would publish {} files ({}) as {release} to remuda:///{base}/.",
+            plan.files.len(),
+            vfs_publish::bytes_text(plan.bytes)
+        );
+        for skipped in &plan.skipped {
+            say!(out, "  skipped (not a regular file): {skipped}");
+        }
+        return finish(out, 0);
+    }
+    let min_copies = value(values, "min-copies");
+    let uploaded = upload_release(socket, &base, &plan, min_copies);
+    if let Some((detail, code)) = uploaded.failure {
+        let remaining = plan.files.len().saturating_sub(uploaded.files + 1);
+        warn!(
+            out,
+            "remuda: publish incomplete: {} of {} files are in remuda:///{base}/, {remaining} not attempted.",
+            uploaded.files,
+            plan.files.len()
+        );
+        warn!(out, "  failed: {detail}");
+        warn!(
+            out,
+            "  COMPLETE was not written, so this release is not finished; {} was uploaded.",
+            vfs_publish::bytes_text(uploaded.bytes)
+        );
+        warn!(out, "Next: fix the source, then publish a new --release name; `remuda vfs ls remuda:///{base}/` shows what is there.");
+        return finish(out, code);
+    }
+    let code = finish_release(
+        socket,
+        &prefix,
+        &base,
+        &release,
+        &plan,
+        min_copies,
+        flag(values, "pointer"),
+        &mut out,
+    );
+    finish(out, code)
+}
+
 /// The daemon's half of [`Request::Vfs`]: run the command against this
 /// node's store and answer with what it printed.
 pub fn serve_request(args: &[String], input_base64: Option<&str>) -> Response {
@@ -369,6 +676,11 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
             say!(out, "{report}");
             0
         }
+        "publish" => fail(
+            out,
+            "publish",
+            "runs in the CLI process, not the daemon; run `remuda vfs publish` there",
+        ),
         "drain" => drain(values, out),
         "status" => status(values, out),
         "config" => config(&store, values, out),

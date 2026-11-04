@@ -1,5 +1,12 @@
 # Changelog
 
+- VFS: `remuda vfs publish DIR remuda:///PREFIX --release NAME [--dry-run]
+  [--min-copies K] [--pointer]` uploads a directory as one release, one
+  ordinary `put` per file, and writes `PREFIX/NAME/COMPLETE` last so an
+  unfinished release is distinguishable from a finished one. `--pointer` also
+  writes `PREFIX/CURRENT`. Bounded at 500 files, 32 MiB each and 1 GiB, with a
+  free-space reserve; a symlink is skipped and named, and a source that changes
+  mid-run aborts instead of publishing a mix.
 ## Unreleased
 
 - `remuda vfs status` names the stores `cluster leave` and `cluster init

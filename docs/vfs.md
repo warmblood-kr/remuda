@@ -28,6 +28,39 @@ remuda vfs rm remuda:///notes.md               # delete everywhere
 
 Exit 75 is `EX_TEMPFAIL` from `sysexits.h`. Nothing is rolled back.
 
+## Publishing a directory: `remuda vfs publish`
+
+A page is usually several files. `publish` uploads a directory as one named
+release and marks it complete only after every file is in:
+
+```sh
+remuda vfs publish site remuda:///design --release 2026-11-04
+# Published 12 files (1.4 MiB) as 2026-11-04 to remuda:///design/2026-11-04/.
+```
+
+- Regular files only; a symlink is skipped and named, never followed. At most
+  500 files, 32 MiB each and 1 GiB per release, and publishing stops if the
+  machine lacks room for the source plus a 256 MiB reserve.
+- Each file is one ordinary `put` to `PREFIX/NAME/<relative path>`, so
+  `--replicas` settings and `--min-copies K` behave exactly as they do for one
+  file.
+- `PREFIX/NAME/COMPLETE` is written **last**, and only if every file arrived.
+  A release with no `COMPLETE` is unfinished: its files are there, but the
+  release is not. `--pointer` also writes `PREFIX/CURRENT` with the release
+  name after the marker, so a viewer has one stable path to open.
+- A name that already has files is refused, so a release is not overwritten.
+  That check is cooperative: a partitioned node can hide a release from it.
+- `--dry-run` prints the plan and writes nothing.
+- A source file that changes between the plan and the upload aborts the run
+  rather than publishing a mix; open files and quit your editor first.
+
+Exit codes: 0 done; 1 a file failed or the source changed, or the completion
+marker could not be written; 75 every file is in but a copy is still missing,
+or the marker reached no peer. Either non-zero code means the release is
+**incomplete** and `COMPLETE` was not written. Fix the cause and publish a
+**new** `--release` name; the old prefix keeps the files it received (`remuda
+vfs ls remuda:///design/NAME/` shows them).
+
 ## Checking health: `remuda vfs status`
 
 ```text
