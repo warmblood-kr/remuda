@@ -87,15 +87,23 @@ bytes it returns, so the tag names exactly what the browser got.
 The bridge renders cluster content in a browser, so the defaults treat a stored
 page as untrusted:
 
-- `Content-Security-Policy: sandbox` on HTML and SVG. Links, stylesheets and
-  images work; script does not run, and the page gets an opaque origin, so it
-  cannot read another file even by `fetch`. The policy also names the exact
-  bridge origin for `img-src`/`style-src`, and sets `connect-src 'none'`,
-  `object-src 'none'`, `base-uri 'none'` and `form-action 'none'`, so rendered
-  content cannot call the network even with a resource load. `--allow-scripts`
-  drops the sandbox for artifacts the operator wrote and trusts; it then
-  allows same-origin script and still no network, but the page can read every
-  file under the bridge.
+- `Content-Security-Policy: sandbox` on every response. On a document — HTML,
+  SVG, XML and XHTML, since a browser parses all four — it gives an opaque
+  origin, no script, and no way to read another file. The policy names the
+  exact bridge origin for `img-src`/`style-src`, and sets `connect-src 'none'`,
+  `object-src 'none'`, `base-uri 'none'`, `form-action 'none'` and
+  `worker-src 'none'`, so rendered content cannot call the network. Serving a
+  policy on non-document types costs nothing and closes the "open it directly
+  as an unpoliced document" hole that `application/xml` used to be.
+- `--allow-scripts` drops the sandbox for artifacts the operator wrote and
+  trusts. The page then runs as the loopback origin: it can read every file
+  under the bridge and put what it reads into an outbound navigation.
+  `connect-src` never covered navigation, so the docs say that instead of
+  claiming no network. Workers stay disabled either way: a worker runs outside
+  the document's `connect-src`.
+- **Loopback is not private.** Another OS account on the machine can find the
+  port and read the served tree with no daemon credentials. `--root` is the
+  scope an operator should be willing to show them.
 - `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
   `Referrer-Policy: no-referrer`,
   `Cross-Origin-Resource-Policy: same-origin`,
