@@ -75,6 +75,16 @@ fn spec() -> Spec {
             verb("resolve", "Keep a copy on this node and print its local path. Example: remuda vfs resolve remuda:///notes.md",
                 vec![arg("URI", "remuda:// URI", true)], vec![option("local", None, "Do not ask other nodes")],
                 "remuda vfs resolve URI [--local]"),
+            verb("read", "Read a file as one JSON envelope for tools. Example: remuda vfs read remuda:///notes.md --max-bytes 1000",
+                vec![arg("URI", "remuda:// URI", true)],
+                vec![option("max-bytes", Some("N"), "Answer too_large without reading when the file is bigger than N bytes")],
+                "remuda vfs read URI [--max-bytes N]"),
+            verb("serve", "Render the store in a browser over a read-only loopback HTTP port. Example: remuda vfs serve --root design",
+                vec![], vec![option("addr", Some("ADDR:PORT"), "Loopback address to listen on (default 127.0.0.1:0, an ephemeral port)"),
+                             option("root", Some("PATH"), "Cluster path to publish (default /, the whole store)"),
+                             option("allow-scripts", None, "Let stored HTML run its own script, same origin only; off by default"),
+                             option("allow-remote", None, "Permit a non-loopback --addr; publishes cluster files to the network")],
+                "remuda vfs serve [--addr ADDR:PORT] [--root PATH] [--allow-scripts] [--allow-remote]"),
             verb("stat", "Show one file's version, hash, size and copies. Example: remuda vfs stat remuda:///notes.md",
                 vec![arg("URI", "remuda:// URI", true)], vec![option("json", None, "Print JSON")],
                 "remuda vfs stat URI [--json]"),
@@ -212,6 +222,17 @@ pub fn run(server: &str, socket: &Path, args: &[&str]) -> ExitCode {
             "remuda: vfs {verb} needs the remuda daemon, and none is running for {server:?}; start it with `remuda run ...` or `remuda -e 1`, then retry"
         );
         return ExitCode::FAILURE;
+    }
+    if verb == "serve" {
+        // The one verb that does not run in the daemon: it binds a port in this
+        // process and asks the daemon over Request::Vfs for each request.
+        return crate::vfs_serve::run(
+            socket,
+            value(&values, "addr").unwrap_or("127.0.0.1:0"),
+            value(&values, "root").unwrap_or("/"),
+            flag(&values, "allow-scripts"),
+            flag(&values, "allow-remote"),
+        );
     }
     let mut input = None;
     if verb == "put" {
@@ -351,6 +372,11 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
         Ok(parsed) => parsed,
         Err(code) => return code,
     };
+    // `read` answers an envelope even when the store cannot open, so a tool can
+    // tell `no_cluster` from `io` without parsing English.
+    if verb == "read" {
+        return read(&values, out);
+    }
     let values = &values;
     let store = match VfsStore::open_default() {
         Ok(store) => store,
@@ -364,6 +390,12 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
         "ls" => list(&store, values, out),
         "rm" => remove(&store, values, out),
         "resolve-conflict" => settle(&store, values, out),
+        "read" => unreachable!("read is answered before the store opens"),
+        "serve" => fail(
+            out,
+            "serve",
+            "runs in the CLI process, not the daemon; run `remuda vfs serve` there",
+        ),
         "sync" => {
             let report = vfs_sync::sync_once(true);
             say!(out, "{report}");
@@ -802,6 +834,104 @@ fn fetch(
         }
         Err(error) => Err(error),
     }
+}
+
+/// `read`: one JSON envelope, always on stdout, so a tool (the browser bridge)
+/// gets a stable code instead of stderr text. Exit 0 means the envelope is
+/// there, including `ok: false`; only a transport failure is exit 1.
+fn read(values: &Map<String, Value>, out: &mut Out) -> u8 {
+    let store = match VfsStore::open_default() {
+        Ok(store) => store,
+        Err(error) => return read_envelope(out, &error),
+    };
+    let uri = match store.parse_uri(value(values, "URI").unwrap_or_default()) {
+        Ok(uri) => uri,
+        Err(error) => return read_envelope(out, &error),
+    };
+    let max = match value(values, "max-bytes") {
+        Some(text) => match text.parse::<u64>() {
+            Ok(max) => max,
+            Err(_) => return fail(out, "read", "--max-bytes must be whole bytes"),
+        },
+        None => u64::MAX,
+    };
+    let index = match store.load_index() {
+        Ok(index) => index,
+        Err(error) => return read_envelope(out, &error),
+    };
+    let Some(entry) = index.live(&uri.path) else {
+        say!(
+            out,
+            "{}",
+            serde_json::json!({
+                "ok": false,
+                "code": "not_found",
+                "detail": format!("no file at {}", uri.path),
+            })
+        );
+        return 0;
+    };
+    if entry.size > max {
+        // Answer before the blob moves: the caller's limit exists to keep a
+        // viewer from paying for a file it will refuse.
+        say!(
+            out,
+            "{}",
+            serde_json::json!({
+                "ok": false,
+                "code": "too_large",
+                "size": entry.size,
+                "detail": format!("{} bytes is over the {max} byte limit", entry.size),
+            })
+        );
+        return 0;
+    }
+    match fetch(&store, &uri, false) {
+        // The index snapshot above and the fetch below are two reads; a write
+        // in between may have made the file larger. Check what arrived too.
+        Ok((_, bytes)) if bytes.len() as u64 > max => {
+            say!(
+                out,
+                "{}",
+                serde_json::json!({
+                    "ok": false,
+                    "code": "too_large",
+                    "size": bytes.len(),
+                    "detail": format!("{} bytes is over the {max} byte limit", bytes.len()),
+                })
+            );
+            0
+        }
+        Ok((entry, bytes)) => {
+            say!(
+                out,
+                "{}",
+                serde_json::json!({
+                    "ok": true,
+                    "path": entry.path,
+                    "version": entry.version,
+                    "sha256": entry.sha256,
+                    "size": bytes.len(),
+                    "content": BASE64.encode(&bytes),
+                })
+            );
+            0
+        }
+        Err(error) => read_envelope(out, &error),
+    }
+}
+
+fn read_envelope(out: &mut Out, error: &VfsError) -> u8 {
+    say!(
+        out,
+        "{}",
+        serde_json::json!({
+            "ok": false,
+            "code": error.kind.code(),
+            "detail": error.detail,
+        })
+    );
+    0
 }
 
 fn get(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {

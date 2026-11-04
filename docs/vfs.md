@@ -6,8 +6,10 @@ write. Each file has a `remuda://` URI. Its content is kept on several nodes
 an operator needs day to day. The design and the wire format are in
 [design-742-cluster-vfs.md](design-742-cluster-vfs.md).
 
-Every `remuda vfs` command runs in the daemon. With no daemon running, it
-prints one line saying the daemon is needed and exits 1. It never starts a
+Every `remuda vfs` command runs in the daemon, except `serve`, which runs in
+the CLI process and asks the daemon for each request (see [Reading in a
+browser](#reading-in-a-browser-remuda-vfs-serve)). With no daemon running, any
+of them prints one line saying the daemon is needed and exits 1. None starts a
 daemon on its own.
 
 ```sh
@@ -27,6 +29,54 @@ remuda vfs rm remuda:///notes.md               # delete everywhere
 | 75 | done here, but not yet everywhere: wait or run it again (see below) |
 
 Exit 75 is `EX_TEMPFAIL` from `sysexits.h`. Nothing is rolled back.
+
+## Reading in a browser: `remuda vfs serve`
+
+```sh
+remuda vfs serve --root design
+# Serving remuda:///design at http://127.0.0.1:53412/ (read-only; scripts blocked)
+```
+
+Open the printed URL. Every file under the prefix is a page; a directory is a
+listing with links, so a design artifact that loads `site.css`, an image or a
+second page renders with its assets. `--root` defaults to `/` (the whole
+store). `--addr` defaults to `127.0.0.1:0`: loopback on a free port.
+
+The bridge is read-only: `GET` and `HEAD` only, no cookies, no upload, nothing
+written back to the store. Stored HTML is treated as untrusted by default:
+`Content-Security-Policy: sandbox` gives it an opaque origin and no script, so
+links, stylesheets and images work but a page cannot call the network or read
+another file. `--allow-scripts` drops that guard for artifacts you wrote and
+trust; a page then runs as that loopback origin, which means it can read every
+file under the bridge. Use it on a prefix you would show to anyone.
+
+- A non-loopback `--addr` is refused unless you also pass `--allow-remote`.
+  That flag publishes cluster files to the network, so it is asked for twice on
+  purpose.
+- Paths are percent-decoded once and then checked by the same rules as `put`.
+  `..`, `.`, NUL and control characters are refused; the prefix is a component
+  boundary, so `--root design` never lists `design-private`.
+- Files up to 32 MiB are served. A larger file answers `413`; reading it needs
+  `remuda vfs get`.
+- `ETag` is the file's sha256, so a reload after a cluster write is cheap. The
+  `X-Remuda-Version` response header says which version was served.
+- The port has no authentication. Keep it on loopback; one viewer is one
+  process, and Ctrl-C closes it.
+
+## For tools: `remuda vfs read`
+
+`remuda vfs read URI [--max-bytes N]` prints one JSON envelope and exits 0
+whenever it produced one:
+
+```json
+{"ok": true, "path": "design/index.html", "version": 4, "sha256": "…", "size": 12, "content": "…base64…"}
+{"ok": false, "code": "not_found", "detail": "no file at design/index.html"}
+```
+
+The code is the same one Lua sees (`not_found`, `too_large`, `no_cluster`,
+`unreachable`, `corrupt`, `wrong_cluster`, `bad_uri`, `io`). `--max-bytes`
+answers `too_large` from the index without reading the file. This is what
+`serve` calls; a script that shells out to `get` should use it instead.
 
 ## Checking health: `remuda vfs status`
 
