@@ -1368,6 +1368,22 @@ fn a_viewer_node_renders_a_cluster_page_for_a_browser() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("--allow-remote"));
 }
 
+/// A loaded runner can miss the custody answer once. Release is safe to rerun,
+/// and "kept because a node did not confirm" is the documented transient.
+fn release_until_released(node: &Node) -> String {
+    let mut last = String::new();
+    for _ in 0..10 {
+        let attempt = node.run(&["vfs", "release"]);
+        last = String::from_utf8_lossy(&attempt.stdout).to_string()
+            + &String::from_utf8_lossy(&attempt.stderr);
+        if attempt.status.success() && last.contains("Released 1 copy") {
+            return last;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    last
+}
+
 #[test]
 fn a_reader_can_release_copies_it_fetched_and_keeps_what_matters() {
     let _serial = live_test_guard();
@@ -1450,18 +1466,7 @@ fn a_reader_can_release_copies_it_fetched_and_keeps_what_matters() {
     assert!(viewer.has_blob(&sha), "--older-than kept a fresh copy");
 
     // The explicit release does, but only after the placement nodes confirm.
-    // A loaded runner can miss that answer once; release is safe to rerun, and
-    // "kept because a node did not confirm" is the documented transient.
-    let mut released = String::new();
-    for _ in 0..10 {
-        let attempt = viewer.run(&["vfs", "release"]);
-        released = String::from_utf8_lossy(&attempt.stdout).to_string()
-            + &String::from_utf8_lossy(&attempt.stderr);
-        if attempt.status.success() && released.contains("Released 1 copy") {
-            break;
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
+    let released = release_until_released(viewer);
     assert!(released.contains("Released 1 copy"), "{released}");
     assert!(
         !viewer.has_blob(&sha),
@@ -1475,24 +1480,40 @@ fn a_reader_can_release_copies_it_fetched_and_keeps_what_matters() {
         "{kept_by_writer}"
     );
     assert!(a.has_blob(&sha), "the writer keeps its own copy");
+}
 
-    // With every other node down, the reader is the only place left: the copy
-    // stays and release says so rather than leaving the cluster with none.
+#[test]
+fn release_keeps_the_last_copy_when_every_peer_is_down() {
+    let _serial = live_test_guard();
+    let (a, b, c) = three_nodes();
     successful(
-        viewer.run(&["vfs", "get", "remuda:///design/read-only.html"]),
-        "get again on the viewer",
+        a.run_with_stdin(
+            &["vfs", "put", "-", "remuda:///only.html", "--replicas", "1"],
+            Some(b"only"),
+        ),
+        "put the page",
     );
-    assert!(viewer.has_blob(&sha));
+    let sha = a.stat_json("remuda:///only.html").unwrap()["sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Fetch on a node that does not hold it, then take every other node away:
+    // the reader is suddenly the only place the bytes exist.
+    let viewer = [&b, &c]
+        .into_iter()
+        .find(|node| !node.has_blob(&sha))
+        .expect("one non-writer lacks the copy");
+    successful(viewer.run(&["vfs", "get", "remuda:///only.html"]), "get");
     for peer in [&a, if std::ptr::eq(viewer, &b) { &c } else { &b }] {
         peer.kill_daemon_only();
     }
     // Placement counts a peer as gone only after the down grace (600 ms here),
     // so wait for the viewer to become the only node placement could name.
     thread::sleep(Duration::from_millis(1200));
-    let last = successful(viewer.run(&["vfs", "release"]), "release with peers down");
+    let refused = successful(viewer.run(&["vfs", "release"]), "release with peers down");
     assert!(
-        last.contains("placed here 1") || last.contains("only copy 1"),
-        "{last}"
+        refused.contains("placed here 1") || refused.contains("only copy 1"),
+        "{refused}"
     );
     assert!(viewer.has_blob(&sha), "release keeps the last copy");
 }
