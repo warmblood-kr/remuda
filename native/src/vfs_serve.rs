@@ -638,20 +638,6 @@ pub fn content_type(path: &str) -> &'static str {
     }
 }
 
-/// Types a browser parses as a *document*. XML counts: XHTML namespace parsing
-/// runs script, and `nosniff` does not turn that off.
-fn is_active(content_type: &str) -> bool {
-    [
-        "text/html",
-        "image/svg+xml",
-        "application/xhtml+xml",
-        "application/xml",
-        "text/xml",
-    ]
-    .iter()
-    .any(|prefix| content_type.starts_with(prefix))
-}
-
 fn html_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for character in text.chars() {
