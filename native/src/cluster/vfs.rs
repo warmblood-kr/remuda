@@ -939,12 +939,37 @@ impl VfsStore {
         Ok(removed)
     }
 
-    /// Delete a copy this node is not responsible for keeping. The caller has
-    /// checked that every placement node already holds one (#887); the index
-    /// is left alone.
-    pub fn release_blob(&self, sha256: &str) -> VfsResult<bool> {
+    /// Delete a copy this node does not owe, after re-checking under the index
+    /// lock that nothing since the caller's scan pinned it (#887).
+    pub fn release_blob_if_unneeded(&self, sha256: &str, self_fp: &str) -> VfsResult<bool> {
         let _guard = self.lock()?;
         self.still_here()?;
+        let index = self.load_index()?;
+        let members = crate::cluster::vfs_sync::members()?;
+        let named = index
+            .entries
+            .values()
+            .filter(|entry| entry.sha256 == sha256)
+            .collect::<Vec<_>>();
+        if named.is_empty() {
+            // Unreferenced: garbage collection owns that, not release.
+            return Ok(false);
+        }
+        let pinned = named.iter().any(|entry| {
+            entry.writer == self_fp
+                || entry
+                    .conflicts
+                    .iter()
+                    .any(|conflict| !conflict.deleted && conflict.sha256 == sha256)
+        });
+        let placed = named.iter().any(|entry| {
+            crate::cluster::vfs_sync::live_placement(entry, &members)
+                .iter()
+                .any(|node| node == self_fp)
+        });
+        if pinned || placed {
+            return Ok(false);
+        }
         let removed = match fs::remove_file(self.blob_path(sha256)?) {
             Ok(()) => true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,

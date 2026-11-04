@@ -1390,11 +1390,38 @@ fn a_reader_can_release_copies_it_fetched_and_keeps_what_matters() {
         .as_str()
         .unwrap()
         .to_owned();
-    let viewer = match (b.has_blob(&sha), c.has_blob(&sha)) {
-        (false, _) => &b,
-        (true, false) => &c,
-        (true, true) => panic!("replicas 1 still landed a copy on both non-writers"),
-    };
+    // The viewer must be a node placement does not name, or release would be
+    // right to keep its copy and this test would prove nothing.
+    let stat = successful(
+        a.run(&["vfs", "stat", "remuda:///design/read-only.html"]),
+        "stat",
+    );
+    let placed = stat
+        .lines()
+        .find(|line| line.starts_with("placed on "))
+        .unwrap_or_else(|| panic!("no placement line in {stat}"));
+    let label = |node: &Node| remuda_native::cluster::node_label(&node.fingerprint());
+    let viewer = [&b, &c]
+        .into_iter()
+        .find(|node| !placed.contains(&label(node)))
+        .unwrap_or_else(|| panic!("no node outside placement: {stat}"));
+    assert!(
+        !viewer.has_blob(&sha),
+        "the viewer should not hold a copy yet"
+    );
+
+    // Wait for the node placement names to take its own copy, so "unconfirmed"
+    // below means a real disagreement rather than a repair pass that has not
+    // run yet.
+    let owner = [&a, &b, &c]
+        .into_iter()
+        .find(|node| placed.contains(&label(node)))
+        .unwrap_or_else(|| panic!("no placement node among the three: {stat}"));
+    wait_until(
+        "the placement node fetches its copy",
+        Duration::from_secs(20),
+        || owner.has_blob(&sha),
+    );
 
     // Reading pulls the blob onto a node that is not placed on it.
     successful(
@@ -1430,30 +1457,31 @@ fn a_reader_can_release_copies_it_fetched_and_keeps_what_matters() {
         "release removes a copy nobody needs here"
     );
 
-    // A copy this node wrote is never released, even with no placement binding.
-    let written = a.run(&["vfs", "ls", "remuda:///design/"]);
-    assert!(successful(written, "ls").contains("read-only.html"));
+    // The writer never releases its own copy, and says why.
+    let kept_by_writer = successful(a.run(&["vfs", "release"]), "release on the writer");
+    assert!(
+        kept_by_writer.contains("written here 1"),
+        "{kept_by_writer}"
+    );
     assert!(a.has_blob(&sha), "the writer keeps its own copy");
 
-    // And with every placement node down, release refuses to remove the last one.
-    let lone = three_nodes();
+    // With every other node down, the reader is the only place left: the copy
+    // stays and release says so rather than leaving the cluster with none.
     successful(
-        lone.0.run_with_stdin(
-            &["vfs", "put", "-", "remuda:///only.html", "--replicas", "1"],
-            Some(b"only"),
-        ),
-        "put only.html",
+        viewer.run(&["vfs", "get", "remuda:///design/read-only.html"]),
+        "get again on the viewer",
     );
-    let only = lone.0.stat_json("remuda:///only.html").unwrap()["sha256"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let holder = if lone.1.has_blob(&only) {
-        &lone.1
-    } else {
-        &lone.2
-    };
-    holder.kill_daemon_only();
-    let refused = holder.run(&["vfs", "release"]);
-    assert!(!refused.status.success() || !holder.has_blob(&only));
+    assert!(viewer.has_blob(&sha));
+    for peer in [&a, if std::ptr::eq(viewer, &b) { &c } else { &b }] {
+        peer.kill_daemon_only();
+    }
+    // Placement counts a peer as gone only after the down grace (600 ms here),
+    // so wait for the viewer to become the only node placement could name.
+    thread::sleep(Duration::from_millis(1200));
+    let last = successful(viewer.run(&["vfs", "release"]), "release with peers down");
+    assert!(
+        last.contains("placed here 1") || last.contains("only copy 1"),
+        "{last}"
+    );
+    assert!(viewer.has_blob(&sha), "release keeps the last copy");
 }

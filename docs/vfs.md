@@ -105,9 +105,11 @@ and every node that should hold it has confirmed one. The last copy is never
 removed: if no other node can take it, the copy stays and the command says so.
 Exit 0 either way; the counts are in the output and in `--json`.
 
-`--older-than SECS` keeps copies fetched more recently than that; the default
-is 0. Releasing is not a delete: the file stays in the store and any node can
-fetch it again.
+`--older-than SECS` keeps blob files younger than that (it is the file's age,
+not the last read); the default is 0. Custody is a peer's answer that it holds
+a file of that size, so release trusts admitted peers to be honest about that.
+Releasing is not a delete: the file stays in the store and any node can fetch
+it again.
 
 ## Checking health: `remuda vfs status`
 

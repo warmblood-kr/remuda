@@ -78,7 +78,9 @@ pub fn release(dry_run: bool, older_than: Duration) -> VfsResult<ReleaseReport> 
             report.unconfirmed += 1;
             continue;
         }
-        if dry_run || store.release_blob(&sha)? {
+        // The store re-checks the local pins under the index lock; peer
+        // custody is the check above, as observed a moment ago.
+        if dry_run || store.release_blob_if_unneeded(&sha, &members.self_fp)? {
             report.removed += 1;
             report.bytes = report.bytes.saturating_add(entry.size);
         }
@@ -95,8 +97,12 @@ fn group_by_blob<'a>(
     let mut users: HashMap<&str, Vec<&VfsEntry>> = HashMap::new();
     let mut pinned: HashSet<&str> = HashSet::new();
     for entry in index.entries.values() {
-        if payload(&entry.conflicts) {
-            pinned.insert(&entry.sha256);
+        // A kept conflict's own content, not the winner's: pinning the winner
+        // left a losing hash releasable (#887 review).
+        for conflict in &entry.conflicts {
+            if !conflict.deleted {
+                pinned.insert(&conflict.sha256);
+            }
         }
         if entry.writer == self_fp {
             pinned.insert(&entry.sha256);
@@ -106,11 +112,6 @@ fn group_by_blob<'a>(
         }
     }
     (users, pinned)
-}
-
-/// True when any conflict still has content worth keeping.
-fn payload(conflicts: &[remuda_core::vfs::VfsConflict]) -> bool {
-    conflicts.iter().any(|conflict| !conflict.deleted)
 }
 
 /// Every node that should hold this content, as this node sees the cluster.
