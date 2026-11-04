@@ -46,9 +46,15 @@ The bridge is read-only: `GET` and `HEAD` only, no cookies, no upload, nothing
 written back to the store. Stored HTML is treated as untrusted by default:
 `Content-Security-Policy: sandbox` gives it an opaque origin and no script, so
 links, stylesheets and images work but a page cannot call the network or read
-another file. `--allow-scripts` drops that guard for artifacts you wrote and
-trust; a page then runs as that loopback origin, which means it can read every
-file under the bridge. Use it on a prefix you would show to anyone.
+another file. The same policy covers XML and XHTML documents (a browser parses
+those as documents and can run their script) and every other type, so no file
+is served as an unpoliced document.
+
+`--allow-scripts` drops that guard for artifacts you wrote and trust. The page
+then runs as the loopback origin: it can read every file under the bridge, and
+it can put what it reads into an outbound navigation. Workers stay disabled,
+because a worker would bypass the page's `connect-src` and could send bytes
+anywhere. Treat a served tree as readable by anyone who can run code in it.
 
 - A non-loopback `--addr` is refused unless you also pass `--allow-remote`.
   That flag publishes cluster files to the network, so it is asked for twice on
@@ -60,8 +66,12 @@ file under the bridge. Use it on a prefix you would show to anyone.
   `remuda vfs get`.
 - `ETag` is the file's sha256, so a reload after a cluster write is cheap. The
   `X-Remuda-Version` response header says which version was served.
-- The port has no authentication. Keep it on loopback; one viewer is one
-  process, and Ctrl-C closes it.
+- The port has no authentication, and loopback is not private: **another OS
+  account on the same machine can find the port and read the served tree**, with
+  no daemon credentials. That is the documented consequence of "keep it on
+  loopback"; run it on a machine and account where that is acceptable, and
+  `--root` only what you would show them. One viewer is one process, and Ctrl-C
+  closes it.
 
 ## For tools: `remuda vfs read`
 

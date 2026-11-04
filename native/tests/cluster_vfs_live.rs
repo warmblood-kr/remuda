@@ -1342,7 +1342,9 @@ fn a_viewer_node_renders_a_cluster_page_for_a_browser() {
 
     let css = http_get(addr, "/site.css");
     assert!(css.starts_with("HTTP/1.1 200 OK\r\n"), "{css}");
-    assert!(!css.contains("Content-Security-Policy"), "{css}");
+    // The policy rides on every answer, so no stored type can be opened as an
+    // unpoliced document.
+    assert!(css.contains("Content-Security-Policy: sandbox;"), "{css}");
     assert!(css.ends_with("h1{color:red}"), "{css}");
 
     let listing = http_get(addr, "/");

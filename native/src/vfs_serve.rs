@@ -619,6 +619,7 @@ pub fn content_type(path: &str) -> &'static str {
         Some("js" | "mjs") => "text/javascript; charset=utf-8",
         Some("json") => "application/json; charset=utf-8",
         Some("txt" | "md" | "rst" | "csv" | "log") => "text/plain; charset=utf-8",
+        Some("xhtml") => "application/xhtml+xml; charset=utf-8",
         Some("xml") => "application/xml; charset=utf-8",
         Some("svg") => "image/svg+xml; charset=utf-8",
         Some("png") => "image/png",
@@ -637,8 +638,18 @@ pub fn content_type(path: &str) -> &'static str {
     }
 }
 
+/// Types a browser parses as a *document*. XML counts: XHTML namespace parsing
+/// runs script, and `nosniff` does not turn that off.
 fn is_active(content_type: &str) -> bool {
-    content_type.starts_with("text/html") || content_type.starts_with("image/svg+xml")
+    [
+        "text/html",
+        "image/svg+xml",
+        "application/xhtml+xml",
+        "application/xml",
+        "text/xml",
+    ]
+    .iter()
+    .any(|prefix| content_type.starts_with(prefix))
 }
 
 fn html_escape(text: &str) -> String {
@@ -748,13 +759,10 @@ fn sources(origin: &str) -> String {
     }
 }
 
-/// The security headers every answer carries; an HTML or SVG answer also gets
-/// a policy naming the origin this viewer listens on.
+/// The security headers every answer carries. The policy names the origin this
+/// viewer listens on; a subresource ignores it, a document opened directly does
+/// not.
 fn harden(response: Response, origin: &str, allow_scripts: bool) -> Response {
-    let active = response
-        .headers
-        .iter()
-        .any(|(name, value)| name == "Content-Type" && is_active(value));
     let response = response
         .with_header("X-Content-Type-Options", "nosniff")
         .with_header("X-Frame-Options", "DENY")
@@ -764,22 +772,20 @@ fn harden(response: Response, origin: &str, allow_scripts: bool) -> Response {
         .with_header("Cross-Origin-Resource-Policy", "cross-origin")
         .with_header("Cross-Origin-Opener-Policy", "same-origin")
         .with_header("Cache-Control", "no-cache");
-    if !active {
-        return response;
-    }
     let sources = sources(origin);
     let policy = if allow_scripts {
         format!(
             "default-src {sources}; img-src {sources} data:; style-src {sources} 'unsafe-inline'; \
-             font-src {sources}; script-src {sources}; connect-src 'none'; object-src 'none'; \
-             base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+             font-src {sources}; script-src {sources}; worker-src 'none'; child-src 'none'; \
+             connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; \
+             frame-ancestors 'none'"
         )
     } else {
         format!(
             "sandbox; default-src {sources}; img-src {sources} data:; \
              style-src {sources} 'unsafe-inline'; font-src {sources}; connect-src 'none'; \
              object-src 'none'; base-uri 'none'; form-action 'none'; \
-             frame-ancestors 'none'; script-src 'none'"
+             frame-ancestors 'none'; script-src 'none'; worker-src 'none'; child-src 'none'"
         )
     };
     response.with_header("Content-Security-Policy", policy)
@@ -1083,7 +1089,14 @@ fn claimed_method(buffer: &[u8]) -> Method {
 fn read_head(stream: &mut TcpStream) -> Result<Head, Refused> {
     let mut buffer = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
+    let deadline = std::time::Instant::now() + IO_TIMEOUT;
     loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(Refused {
+                method: claimed_method(&buffer),
+                bad: BadRequest::new(408, "Request Timeout", "head not read in time"),
+            });
+        }
         let read = stream.read(&mut chunk).map_err(|_| Refused {
             method: claimed_method(&buffer),
             bad: BadRequest::new(408, "Request Timeout", "request head not read"),
@@ -1366,11 +1379,43 @@ mod tests {
         assert!(policy.contains("connect-src 'none'"));
         assert!(policy.contains("script-src 'none'"));
 
+        // Every answer carries a policy: a subresource ignores it, but a .xml
+        // or .xhtml opened directly is a document that would otherwise run.
         let css = handle(&fake, &config, ORIGIN, &get("/a.css"));
-        assert_eq!(header(&css, "Content-Security-Policy"), None);
+        assert!(header(&css, "Content-Security-Policy")
+            .unwrap_or_default()
+            .starts_with("sandbox;"));
         assert_eq!(header(&css, "X-Content-Type-Options"), Some("nosniff"));
         assert_eq!(header(&css, "Cache-Control"), Some("no-cache"));
         assert_eq!(header(&css, "X-Frame-Options"), Some("DENY"));
+    }
+
+    #[test]
+    fn an_xml_document_is_sandboxed_too() {
+        // XHTML namespace parsing runs script, so .xml must not be the hole in
+        // the default policy.
+        let fake = Fake::new(&[(
+            "a.xml",
+            1,
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"/>",
+        )]);
+        let config = Config::new("", false).unwrap();
+        let response = handle(&fake, &config, ORIGIN, &get("/a.xml"));
+        let policy = header(&response, "Content-Security-Policy").unwrap_or_default();
+        assert!(policy.starts_with("sandbox;"), "{policy}");
+        assert!(policy.contains("script-src 'none'"), "{policy}");
+    }
+
+    #[test]
+    fn trusted_mode_still_forbids_workers() {
+        let config = Config::new("", true).unwrap();
+        let fake = Fake::new(&[("a.html", 1, b"hi")]);
+        let response = handle(&fake, &config, ORIGIN, &get("/a.html"));
+        let policy = header(&response, "Content-Security-Policy").unwrap();
+        // A worker runs outside the document's connect-src, so it would restore
+        // the network the policy is meant to remove.
+        assert!(policy.contains("worker-src 'none'"), "{policy}");
+        assert!(policy.contains("child-src 'none'"), "{policy}");
     }
 
     #[test]
