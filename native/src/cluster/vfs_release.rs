@@ -65,7 +65,7 @@ pub fn release(dry_run: bool, older_than: Duration) -> VfsResult<ReleaseReport> 
             report.last_copy += 1;
             continue;
         }
-        if placement.iter().any(|node| *node == members.self_fp) {
+        if placement.contains(&members.self_fp) {
             report.placed += 1;
             continue;
         }
@@ -119,7 +119,7 @@ fn placement_of(entries: &[&VfsEntry], members: &vfs_sync::Members) -> Vec<Strin
     let mut placement: Vec<String> = Vec::new();
     for entry in entries {
         for node in vfs_sync::live_placement(entry, members) {
-            if !placement.iter().any(|known| *known == node) {
+            if !placement.contains(&node) {
                 placement.push(node);
             }
         }

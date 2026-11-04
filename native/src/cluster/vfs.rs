@@ -963,9 +963,7 @@ impl VfsStore {
                     .any(|conflict| !conflict.deleted && conflict.sha256 == sha256)
         });
         let placed = named.iter().any(|entry| {
-            crate::cluster::vfs_sync::live_placement(entry, &members)
-                .iter()
-                .any(|node| node == self_fp)
+            crate::cluster::vfs_sync::live_placement(entry, &members).contains(&self_fp.to_owned())
         });
         if pinned || placed {
             return Ok(false);
