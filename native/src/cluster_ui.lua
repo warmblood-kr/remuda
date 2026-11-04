@@ -71,25 +71,37 @@ local function session_status_style(alive)
   return { fg = COLORS.red }
 end
 
+-- A frontend decorator may add presentation to the approved facts. Rust still
+-- validates exact targets, canonical status slots, bounds and geometry.
+function decorate_session(session, spans)
+  local facts = session.display
+  if not facts then return spans end
+  local parts = {}
+  if facts.leader then parts[#parts + 1] = "← " .. facts.leader end
+  if facts.kind then parts[#parts + 1] = facts.kind end
+  if facts.model then parts[#parts + 1] = facts.model end
+  if facts.context_percent then parts[#parts + 1] = tostring(facts.context_percent) .. "% ctx" end
+  if #parts > 0 then spans[#spans + 1] = plain(" · " .. table.concat(parts, " · ")) end
+  return spans
+end
+
 local function session_spans(surface, session)
   local label = span(session.label, selected_style(surface, session.selected))
+  local decorated = decorate_session(session, { label })
   if surface == "cluster" then
     -- Four spaces after Rust's one-cell cursor gutter match the old tree's
     -- five-column session prefix; leave the name aligned at column 12.
-    return {
-      plain("    "),
-      label,
-      plain(pad("", 12 - width(session.label))),
-      plain(" "),
-      status(session_status_style(session.alive)),
-    }
+    local spans = { plain("    ") }
+    for _, item in ipairs(decorated) do spans[#spans + 1] = item end
+    spans[#spans + 1] = plain(pad("", 12 - width(session.label)))
+    spans[#spans + 1] = plain(" ")
+    spans[#spans + 1] = status(session_status_style(session.alive))
+    return spans
   end
   -- The peer list keeps its baseline plain name and reverse selection; the
   -- canonical status slot is structurally present but its text is empty.
-  return {
-    label,
-    status(),
-  }
+  decorated[#decorated + 1] = status()
+  return decorated
 end
 
 local function group_spans(group)

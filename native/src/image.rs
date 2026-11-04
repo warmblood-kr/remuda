@@ -853,7 +853,9 @@ fn process_job(
             }
             JobKind::StopModules => {
                 *caller.borrow_mut() = CallerContext::default();
-                budget.run(lua, || script::stop_modules(lua).map(|()| String::new()))
+                let result = budget.run(lua, || script::stop_modules(lua).map(|()| String::new()));
+                crate::session_display::dispose(lua);
+                result
             }
             JobKind::RunSchedules { now } => {
                 *caller.borrow_mut() = CallerContext::default();

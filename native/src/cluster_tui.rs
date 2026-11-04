@@ -473,6 +473,16 @@ impl ClusterUi {
             local.sessions.push(cluster_ui::SessionEntry {
                 id: session_id,
                 label: safe_label(&session.name),
+                display: session
+                    .display
+                    .as_ref()
+                    .filter(|display| {
+                        session.alive
+                            && !session.unavailable
+                            && now.saturating_sub(self.synced_at).as_millis()
+                                < u128::from(display.valid_for_ms)
+                    })
+                    .and_then(|display| cluster_ui::display_facts(Some(display))),
                 selected: index == self.selected,
                 alive: session.alive,
                 pending: self.pending_count(session),
@@ -556,6 +566,10 @@ impl ClusterUi {
             group.sessions.push(cluster_ui::SessionEntry {
                 id: session_id,
                 label: safe_label(&session.name),
+                display: session
+                    .display_deadline
+                    .filter(|deadline| Instant::now() < *deadline)
+                    .and_then(|_| cluster_ui::display_facts(session.display.as_ref())),
                 selected: self.remote_selected
                     == Some(RemoteSelection::Session {
                         node: node.registry_key.clone(),
@@ -1370,24 +1384,14 @@ impl ClusterUi {
         if width >= SPLIT_MIN_COLS {
             return self.render_split(width, height, screen, now);
         }
-        let mut frame = self.tree_lines(width, now);
-        let tree_start = 2;
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
         let divider = "─".repeat(width);
         let queue_rows: Vec<&PendingBatch> = self.visible_queue().rev().take(3).collect();
         let notice_lines = self.active_notice_lines(now, width);
         let footer_rows = self.footer_row_count(width);
-        let tree_capacity = height.saturating_sub(
-            tree_start + 2 + queue_rows.len() + notice_lines.len() + footer_rows + 1,
-        );
-        let tree_rows = frame.len().saturating_sub(tree_start);
-        if tree_rows > tree_capacity {
-            let kept = tree_capacity.saturating_sub(1);
-            frame.truncate(tree_start + kept);
-            if tree_capacity > 0 {
-                frame.push("… more".into());
-            }
-        }
+        let list_capacity =
+            height.saturating_sub(queue_rows.len() + notice_lines.len() + footer_rows + 3);
+        let mut frame = scrolled_tree(self.tree_lines(width, now), list_capacity);
         frame.push(divider);
         frame.push(pane_header);
         let reserved = frame.len() + queue_rows.len() + notice_lines.len() + footer_rows;
@@ -1432,11 +1436,7 @@ impl ClusterUi {
                 .into_iter()
                 .map(str::to_string),
         );
-        let mut left = self.tree_lines(left_w, now);
-        if left.len() > body_rows {
-            left.truncate(body_rows - 1);
-            left.push("… more".into());
-        }
+        let left = scrolled_tree(self.tree_lines(left_w, now), body_rows);
         let mut frame: Vec<String> = (0..body_rows)
             .map(|row| {
                 let l = truncate(left.get(row).map_or("", String::as_str), left_w);
@@ -3141,6 +3141,24 @@ fn pad_to(text: &str, width: usize) -> String {
     format!("{text}{}", " ".repeat(width.saturating_sub(w)))
 }
 
+/// The native tree marks its selected row with a leading `>`; scrolling uses
+/// that row, not the session index, so headers, groups and multirow blocks do
+/// not skew the window.
+fn selected_tree_line(lines: &[String]) -> Option<usize> {
+    lines.iter().position(|line| line.starts_with('>'))
+}
+
+/// Apply the same selection-following window the composed renderer uses.
+fn scrolled_tree(lines: Vec<String>, capacity: usize) -> Vec<String> {
+    let selected = selected_tree_line(&lines);
+    let window = cluster_ui::row_window(lines.len(), capacity, selected);
+    let mut out: Vec<String> = lines[window.start..window.end].to_vec();
+    if window.more {
+        out.push("… more".into());
+    }
+    out
+}
+
 fn tree_label_line(prefix: &str, label: &str, status: &str, pad_to: usize, width: usize) -> String {
     let available = width
         .saturating_sub(UnicodeWidthStr::width(prefix) + 1 + crate::tui::visible_width(status));
@@ -3316,14 +3334,30 @@ fn session_status(status: &str, pending_count: usize) -> String {
 }
 
 fn list(path: &Path) -> io::Result<Vec<SessionSummary>> {
+    let started = Instant::now();
     match client::request_with_timeout(path, &Request::List, UI_REQUEST_TIMEOUT)
         .map_err(io::Error::other)?
     {
-        Response::Sessions(sessions) => Ok(sessions),
+        Response::Sessions(mut sessions) => {
+            age_list_displays(&mut sessions, started.elapsed());
+            Ok(sessions)
+        }
         Response::Error(error) => Err(io::Error::other(error)),
         other => Err(io::Error::other(format!(
             "unexpected List response: {other:?}"
         ))),
+    }
+}
+
+fn age_list_displays(sessions: &mut [SessionSummary], elapsed: Duration) {
+    let elapsed = elapsed
+        .as_nanos()
+        .div_ceil(1_000_000)
+        .min(u128::from(u64::MAX)) as u64;
+    for session in sessions {
+        if let Some(display) = &mut session.display {
+            display.valid_for_ms = display.valid_for_ms.min(10_000).saturating_sub(elapsed);
+        }
     }
 }
 
@@ -3783,6 +3817,35 @@ mod tests {
         let mut ui = ClusterUi::new(node, sessions, at);
         ui.set_keymap(crate::keybindings::test_snapshot(""));
         ui
+    }
+
+    #[test]
+    fn local_display_counts_rpc_latency_before_render_age() {
+        for (valid, elapsed, remaining) in [
+            (10, 1, 9),
+            (1, 1, 0),
+            (1, 2, 0),
+            (10_001, 1, 9_999),
+            (10_000, 10_001, 0),
+        ] {
+            let mut sessions = vec![serde_json::from_str::<SessionSummary>(
+                r#"{
+              "name":"work","alive":true,"idle":{"secs":0,"nanos":0},
+              "size":{"cols":80,"rows":24},"attached":false,
+              "display":{"version":1,"provider":"butler","valid_for_ms":10000}
+            }"#,
+            )
+            .unwrap()];
+            sessions[0].display.as_mut().unwrap().valid_for_ms = valid;
+            super::age_list_displays(&mut sessions, Duration::from_millis(elapsed));
+            assert_eq!(
+                sessions[0].display.as_ref().unwrap().valid_for_ms,
+                remaining
+            );
+            if remaining == 0 {
+                assert!(crate::cluster_ui::display_facts(sessions[0].display.as_ref()).is_none());
+            }
+        }
     }
 
     #[test]
@@ -4722,6 +4785,8 @@ mod tests {
                 last_sync_age: Some(age),
                 last_error: None,
                 sessions: vec![RemoteSessionSnapshot {
+                    display: None,
+                    display_deadline: None,
                     name: "build".into(),
                     wire_name: "build".into(),
                     instance_id: "remote-instance".into(),
@@ -5561,6 +5626,7 @@ mod tests {
 
     fn sessions() -> Vec<SessionSummary> {
         vec![SessionSummary {
+            display: None,
             id: "session-dev".into(),
             name: "dev".into(),
             alive: true,
@@ -5578,6 +5644,7 @@ mod tests {
 
     fn session(name: &str, alive: bool) -> SessionSummary {
         SessionSummary {
+            display: None,
             id: format!("session-{name}"),
             name: name.into(),
             alive,
@@ -5743,6 +5810,147 @@ mod tests {
         }
     }
 
+    fn named_sessions(count: usize) -> Vec<SessionSummary> {
+        (0..count)
+            .map(|index| session(&format!("s{index:02}"), true))
+            .collect()
+    }
+
+    fn native_only(ui: &mut ClusterUi, cols: u16, rows: u16, clock: &dyn Clock) -> String {
+        *ui.frontend.borrow_mut() = None;
+        *ui.compose_cache.borrow_mut() = None;
+        *ui.compose_diagnostic.borrow_mut() = None;
+        ui.render_text(cols, rows, "", clock)
+    }
+
+    #[test]
+    fn keyboard_selection_follows_the_viewport_through_resize() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", named_sessions(24), clock.now());
+        for _ in 0..23 {
+            ui.key(crossterm::event::KeyCode::Down);
+        }
+        assert_eq!(ui.selected, 23);
+        for (cols, rows) in [(100u16, 24u16), (40, 12), (60, 10)] {
+            ui.set_composer(crate::cluster_ui::Composer::embedded());
+            let composed = ui.render_text(cols, rows, "", &clock);
+            assert!(
+                composed.lines().any(|line| line.contains(">    s23")),
+                "{cols}x{rows}: {composed}"
+            );
+            assert!(
+                !composed.contains("… more"),
+                "{cols}x{rows}: the selection was replaced: {composed}"
+            );
+            // Vertical compositions with an empty preview legitimately use one
+            // fewer row; the bound the frame must keep is the viewport.
+            assert!(composed.lines().count() <= usize::from(rows));
+            let native = native_only(&mut ui, cols, rows, &clock);
+            assert_eq!(composed, native, "{cols}x{rows}");
+        }
+    }
+
+    #[test]
+    fn one_row_leaf_renders_the_selected_target() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", named_sessions(10), clock.now());
+        for _ in 0..9 {
+            ui.key(crossterm::event::KeyCode::Down);
+        }
+        let rows = u16::try_from(ui.footer_row_count(40) + 4).unwrap();
+        ui.set_composer(crate::cluster_ui::Composer::embedded());
+        let composed = ui.render_text(40, rows, "", &clock);
+        let list_rows = {
+            let cache = ui.compose_cache.borrow();
+            let cache = cache.as_ref().expect("composition");
+            cache.composition.layout.list_rows(&cache.viewport)
+        };
+        assert_eq!(list_rows, 1, "{composed}");
+        assert!(
+            composed.lines().any(|line| line.contains(">    s09")),
+            "{composed}"
+        );
+        assert!(!composed.contains("… more"), "{composed}");
+        let native = native_only(&mut ui, 40, rows, &clock);
+        assert_eq!(composed, native);
+    }
+
+    #[test]
+    fn filter_selects_a_visible_row_and_resize_keeps_it_in_view() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", named_sessions(24), clock.now());
+        ui.key(crossterm::event::KeyCode::Char('/'));
+        for ch in "s2".chars() {
+            ui.key(crossterm::event::KeyCode::Char(ch));
+        }
+        assert_eq!(ui.query.as_deref(), Some("s2"));
+        for (cols, rows) in [(40u16, 12u16), (100, 24)] {
+            let frame = ui.render_text(cols, rows, "", &clock);
+            let selected = ui
+                .visible_sessions()
+                .into_iter()
+                .find(|index| *index == ui.selected)
+                .expect("filtered selection is visible");
+            let name = &ui.sessions[selected].name;
+            assert!(
+                frame
+                    .lines()
+                    .any(|line| line.contains(&format!(">    {name}"))),
+                "{cols}x{rows}: {frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_reordered_multirow_rows_keep_the_selected_first_row_visible() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", named_sessions(10), clock.now());
+        ui.selected = 5;
+        ui.active = 5;
+        let composer = crate::cluster_ui::Composer::with_sources(
+            crate::cluster_ui::default_source(),
+            Some((
+                "cluster-ui.lua",
+                r#"
+                local base = compose
+                function compose(model)
+                  local result = base(model)
+                  for _, group in ipairs(result.groups) do
+                    local reversed = {}
+                    for index = #group.sessions, 1, -1 do
+                      local session = group.sessions[index]
+                      session.rows[#session.rows + 1] = {
+                        spans = { { text = "    body-" .. session.id } },
+                      }
+                      reversed[#reversed + 1] = session
+                    end
+                    group.sessions = reversed
+                  end
+                  return result
+                end
+                "#,
+            )),
+        );
+        ui.set_composer(composer);
+        let rows = u16::try_from(ui.footer_row_count(40) + 7).unwrap();
+        let frame = ui.render_text(40, rows, "", &clock);
+        let (composed_rows, targets) = {
+            let cache = ui.compose_cache.borrow();
+            let cache = cache.as_ref().expect("composition");
+            (
+                cache.composition.flattened_rows().len(),
+                cache.composition.targets().len(),
+            )
+        };
+        assert_eq!(composed_rows, 22);
+        assert_eq!(targets, 10);
+        assert!(
+            frame.lines().any(|line| line.contains(">    s05")),
+            "{frame}"
+        );
+        assert!(!frame.contains("… more"), "{frame}");
+    }
+
     #[test]
     fn local_node_is_expanded_and_tree_header_names_selected_target() {
         let clock = ManualClock::new();
@@ -5758,6 +5966,7 @@ mod tests {
     fn arrows_move_the_tree_cursor_and_enter_selects_the_session() {
         let mut sessions = sessions();
         sessions.push(SessionSummary {
+            display: None,
             id: "session-shell".into(),
             name: "shell".into(),
             alive: true,

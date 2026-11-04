@@ -26,6 +26,7 @@ use crate::input::{
 };
 use crate::protocol::Step;
 use crate::session::{InputSubmitOutcome, Session};
+use crate::session_display::{DisplayCache, SessionDisplay};
 use crate::session_operations::{Lifecycle, SessionHandle};
 use core::time::Duration;
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,13 @@ pub struct SessionSummary {
     /// its names is unknown. Omitted when false; older listings parse.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub unavailable: bool,
+    /// Optional informational facts, never routing or authorization.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::session_display::deserialize_optional_display"
+    )]
+    pub display: Option<SessionDisplay>,
 }
 
 /// A session name from a program's argv[0]: basename, lowercased, anything
@@ -131,6 +139,7 @@ const CLOSED_HOSTED_KEPT: usize = 256;
 #[derive(Default)]
 pub struct Registry {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    display: Mutex<DisplayCache>,
     /// Host-backed sessions (#713). One name space with `sessions`; lock
     /// order is always `sessions`, then `hosted`.
     hosted: Mutex<HashMap<String, Arc<SessionHandle>>>,
@@ -252,6 +261,98 @@ impl Registry {
         Self::default()
     }
 
+    /// Without an injected clock, display publication is disabled.
+    pub fn with_display_clock(clock: Arc<dyn crate::Clock>) -> Self {
+        Self {
+            display: Mutex::new(DisplayCache {
+                clock: Some(clock),
+                ..DisplayCache::default()
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// Start a new publisher image; old callbacks can no longer write or clear.
+    pub fn begin_display_generation(&self) -> u64 {
+        let mut cache = self.display.lock().unwrap_or_else(|p| p.into_inner());
+        cache.generation = cache
+            .generation
+            .checked_add(1)
+            .expect("display generation exhausted");
+        cache.entries.clear();
+        cache.generation
+    }
+
+    pub fn clear_session_displays_for(
+        &self,
+        generation: u64,
+    ) -> core::result::Result<(), &'static str> {
+        let mut cache = self.display.lock().unwrap_or_else(|p| p.into_inner());
+        if generation == 0 || cache.generation != generation {
+            return Err("disposed display generation");
+        }
+        cache.entries.clear();
+        cache.generation = cache
+            .generation
+            .checked_add(1)
+            .expect("display generation exhausted");
+        Ok(())
+    }
+
+    /// Full replacement (or nil clear), fenced by image and exact live instance.
+    /// Host/process inspection precedes cache locking; registration is rechecked
+    /// under the namespace locks before mutation.
+    pub fn set_session_display_for(
+        &self,
+        generation: u64,
+        name: &str,
+        instance_id: &str,
+        display: Option<SessionDisplay>,
+    ) -> core::result::Result<(), &'static str> {
+        if instance_id.is_empty() {
+            return Err("missing session instance");
+        }
+        if let Some(value) = &display {
+            value.validate()?;
+        }
+        let local = self.get(name);
+        let hosted = if local.is_none() {
+            self.hosted(name)
+        } else {
+            None
+        };
+        if let Some(session) = &local {
+            if session.instance_id() != instance_id || !session.is_alive() || session.is_closing() {
+                return Err("session is not the live instance");
+            }
+        } else if let Some(handle) = &hosted {
+            if handle.identity().instance != instance_id {
+                return Err("session instance changed");
+            }
+            let observation = handle.inspect().map_err(|_| "session unavailable")?;
+            if observation.lifecycle != Lifecycle::Running || observation.closing {
+                return Err("session is not live");
+            }
+        } else {
+            return Err("session not registered");
+        }
+        let sessions = self.lock();
+        let handles = self.hosted_lock();
+        let closing = self.closing_hosted_lock();
+        let current = local.as_ref().is_some_and(|old| {
+            sessions
+                .get(name)
+                .is_some_and(|s| Arc::ptr_eq(s, old) && !s.is_closing())
+        }) || hosted.as_ref().is_some_and(|old| {
+            handles.get(name).is_some_and(|s| Arc::ptr_eq(s, old)) && !closing.contains(instance_id)
+        });
+        if !current {
+            return Err("session instance changed or closing");
+        }
+        let mut cache = self.display.lock().unwrap_or_else(|p| p.into_inner());
+        cache.replace(generation, name, instance_id, display)
+    }
+
     /// Take ownership of a session and hand back a shared handle. Caution: a
     /// name already in use is refused, and the session comes back in `Err`
     /// **unregistered** — replacing would strand a live pty.
@@ -320,7 +421,16 @@ impl Registry {
         removed
     }
 
+    fn forget_display(&self, instance: &str) {
+        self.display
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entries
+            .remove(instance);
+    }
+
     fn forget_hosted_input(&self, handle: &SessionHandle) {
+        self.forget_display(&handle.identity().instance);
         self.hosted_input
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -506,35 +616,96 @@ impl Registry {
     /// A snapshot of every session, sorted by name so callers can diff two
     /// listings without sorting first.
     pub fn list(&self) -> Vec<SessionSummary> {
-        let mut out: Vec<_> = self
-            .lock()
-            .values()
-            .map(|s| SessionSummary {
-                id: s.id().to_string(),
-                name: s.name().to_string(),
-                instance_id: Some(s.instance_id().to_string()),
-                output_version: s.output_version(),
-                alive: s.is_alive(),
-                idle: s.idle_for(),
-                output_idle: Some(s.output_idle_for()),
-                size: s.size(),
-                attached: s.is_attached(),
-                human_idle: s.human_idle_for(),
-                mouse_tracking: s.mouse_tracking(),
-                unavailable: false,
+        let locals: Vec<_> = self.lock().values().map(Arc::clone).collect();
+        let hosted: Vec<_> = self.hosted_lock().values().map(Arc::clone).collect();
+        let mut excluded = std::collections::HashSet::new();
+        let mut out: Vec<_> = locals
+            .iter()
+            .map(|s| {
+                if s.is_closing() {
+                    excluded.insert(s.instance_id().to_owned());
+                }
+                local_summary(s)
             })
             .collect();
-        let hosted: Vec<_> = self.hosted_lock().values().map(Arc::clone).collect();
-        out.extend(hosted.iter().map(|handle| hosted_summary(handle)));
+        for handle in &hosted {
+            let (summary, closing) = hosted_summary(handle);
+            if closing {
+                excluded.insert(handle.identity().instance.clone());
+            }
+            out.push(summary);
+        }
+        for summary in &out {
+            if !summary.alive || summary.unavailable {
+                if let Some(instance) = &summary.instance_id {
+                    excluded.insert(instance.clone());
+                }
+            }
+        }
+        self.join_session_displays(&mut out, &excluded);
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    fn join_session_displays(
+        &self,
+        out: &mut [SessionSummary],
+        excluded: &std::collections::HashSet<String>,
+    ) {
+        // No host/process operations below: only identity/atomic-closing checks.
+        let sessions = self.lock();
+        let handles = self.hosted_lock();
+        let closing = self.closing_hosted_lock();
+        let mut cache = self.display.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(clock) = cache.clock.as_ref().map(Arc::clone) {
+            let now = clock.now();
+            cache.prune(now);
+            cache.entries.retain(|instance, entry| {
+                if excluded.contains(instance) {
+                    return false;
+                }
+                sessions
+                    .get(&entry.name)
+                    .is_some_and(|s| s.instance_id() == instance && !s.is_closing())
+                    || handles.get(&entry.name).is_some_and(|s| {
+                        s.identity().instance == *instance && !closing.contains(instance)
+                    })
+            });
+            for summary in out {
+                if !summary.alive || summary.unavailable {
+                    continue;
+                }
+                let Some(instance) = summary.instance_id.as_deref().filter(|id| !id.is_empty())
+                else {
+                    continue;
+                };
+                if excluded.contains(instance) || closing.contains(instance) {
+                    continue;
+                }
+                if let Some(entry) = cache
+                    .entries
+                    .get(instance)
+                    .filter(|entry| entry.name == summary.name)
+                {
+                    let mut value = entry.value.clone();
+                    value.valid_for_ms = entry.expires.saturating_sub(now).as_millis() as u64;
+                    if value.valid_for_ms > 0 {
+                        summary.display = Some(value);
+                    }
+                }
+            }
+        }
     }
 
     /// Stop tracking a session. The process is not killed — any handle already
     /// taken keeps working, which is what makes this safe to call on a viewer's
     /// behalf.
     pub fn remove(&self, name: &str) -> Option<Arc<Session>> {
-        self.lock().remove(name)
+        let removed = self.lock().remove(name);
+        if let Some(session) = &removed {
+            self.forget_display(session.instance_id());
+        }
+        removed
     }
 
     /// Drop every session whose process has exited, returning their names.
@@ -567,8 +738,9 @@ impl Registry {
                 )
             })
             .collect();
-        for (name, _, _, _, _) in &dead {
+        for (name, _, instance, _, _) in &dead {
             sessions.remove(name);
+            self.forget_display(instance);
         }
         drop(sessions);
         dead.into_iter()
@@ -700,10 +872,29 @@ fn hosted_instance_ready(
     }
 }
 
+/// Snapshot the ordinary process before acquiring the display cache.
+fn local_summary(s: &Session) -> SessionSummary {
+    SessionSummary {
+        id: s.id().to_string(),
+        name: s.name().to_string(),
+        instance_id: Some(s.instance_id().to_string()),
+        output_version: s.output_version(),
+        alive: s.is_alive(),
+        idle: s.idle_for(),
+        output_idle: Some(s.output_idle_for()),
+        size: s.size(),
+        attached: s.is_attached(),
+        human_idle: s.human_idle_for(),
+        mouse_tracking: s.mouse_tracking(),
+        unavailable: false,
+        display: None,
+    }
+}
+
 /// One host Inspect cut. An unreachable host stays listed as not exited and
 /// marked `unavailable`: the inventory says it is registered; its operations
 /// answer Unavailable.
-fn hosted_summary(handle: &SessionHandle) -> SessionSummary {
+fn hosted_summary(handle: &SessionHandle) -> (SessionSummary, bool) {
     let identity = handle.identity();
     let mut summary = SessionSummary {
         id: identity.id.clone(),
@@ -718,10 +909,11 @@ fn hosted_summary(handle: &SessionHandle) -> SessionSummary {
         human_idle: None,
         mouse_tracking: false,
         unavailable: false,
+        display: None,
     };
     let Ok(observation) = handle.inspect() else {
         summary.unavailable = true;
-        return summary;
+        return (summary, true);
     };
     summary.output_version = observation.output_version;
     summary.alive = observation.lifecycle == Lifecycle::Running;
@@ -731,7 +923,7 @@ fn hosted_summary(handle: &SessionHandle) -> SessionSummary {
     summary.attached = observation.attached;
     summary.human_idle = observation.human_idle;
     summary.mouse_tracking = observation.mouse.mode != crate::agent::MouseMode::default();
-    summary
+    (summary, observation.closing)
 }
 
 /// Name-addressed sugar over `get` plus a session method — the shape a remote
@@ -945,6 +1137,7 @@ impl Registry {
             session.clear_closing();
             return Some(Err(error));
         }
+        self.forget_display(instance_id);
         Some(Ok(sessions.remove(name).is_some()))
     }
 
@@ -1144,5 +1337,423 @@ mod attribution_tests {
                 .instance_id,
             second.instance_id()
         );
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+    use crate::session_display::*;
+    use crate::session_operations::SessionHandle;
+    use crate::{ManualClock, Registry, ScriptedAgent, Session};
+
+    fn display() -> SessionDisplay {
+        SessionDisplay {
+            version: 1,
+            provider: "butler".into(),
+            member_id: None,
+            leader_id: None,
+            alias: Some("worker".into()),
+            leader: Some("lead".into()),
+            kind: Some("codex".into()),
+            model: None,
+            context_percent: Some(50),
+            context_used: Some(50),
+            context_window: Some(100),
+            valid_for_ms: 0,
+        }
+    }
+    fn session(clock: Arc<ManualClock>) -> Session {
+        Session::new_with_id(
+            "work",
+            "stable-id",
+            Box::new(ScriptedAgent::new(vec![])),
+            clock,
+        )
+    }
+    fn fixture(hosted: bool) -> (Registry, Arc<ManualClock>, Arc<Session>, u64) {
+        let clock = Arc::new(ManualClock::new());
+        let registry = Registry::with_display_clock(clock.clone());
+        let process = Arc::new(session(clock.clone()));
+        if hosted {
+            registry
+                .register_hosted(SessionHandle::local(process.clone()))
+                .ok()
+                .unwrap();
+        } else {
+            // Use the same start for ordinary and hosted-map coverage.
+            let process = registry.register(session(clock.clone())).ok().unwrap();
+            let generation = registry.begin_display_generation();
+            return (registry, clock, process, generation);
+        }
+        let generation = registry.begin_display_generation();
+        (registry, clock, process, generation)
+    }
+    #[test]
+    fn ttl_is_native_remaining_and_full_replace_clear_is_instance_fenced() {
+        for hosted in [false, true] {
+            let (registry, clock, process, generation) = fixture(hosted);
+            let instance = process.instance_id();
+            registry
+                .set_session_display_for(generation, "work", instance, Some(display()))
+                .unwrap();
+            assert_eq!(
+                registry.list()[0].display.as_ref().unwrap().valid_for_ms,
+                10_000
+            );
+            clock.advance(Duration::from_millis(2500));
+            assert_eq!(
+                registry.list()[0].display.as_ref().unwrap().valid_for_ms,
+                7500
+            );
+            assert!(registry
+                .set_session_display_for(generation, "work", "wrong", None)
+                .is_err());
+            let mut replacement = display();
+            replacement.leader = None;
+            registry
+                .set_session_display_for(generation, "work", instance, Some(replacement))
+                .unwrap();
+            assert_eq!(registry.list()[0].display.as_ref().unwrap().leader, None);
+            registry
+                .set_session_display_for(generation, "work", instance, None)
+                .unwrap();
+            assert!(registry.list()[0].display.is_none());
+            registry
+                .set_session_display_for(generation, "work", instance, Some(display()))
+                .unwrap();
+            clock.advance(DISPLAY_TTL);
+            assert!(registry.list()[0].display.is_none());
+        }
+    }
+    #[test]
+    fn old_generation_cannot_publish_or_clear_new_publication() {
+        let (registry, _, process, old) = fixture(false);
+        registry
+            .set_session_display_for(old, "work", process.instance_id(), Some(display()))
+            .unwrap();
+        let new = registry.begin_display_generation();
+        assert!(registry.list()[0].display.is_none());
+        registry
+            .set_session_display_for(new, "work", process.instance_id(), Some(display()))
+            .unwrap();
+        assert!(registry.clear_session_displays_for(old).is_err());
+        assert!(registry
+            .set_session_display_for(old, "work", process.instance_id(), None)
+            .is_err());
+        assert!(registry
+            .set_session_display_for(old, "work", process.instance_id(), Some(display()))
+            .is_err());
+        assert!(registry.list()[0].display.is_some());
+    }
+    #[test]
+    fn disposed_generation_cannot_republish_without_a_new_begin() {
+        let (registry, _, process, generation) = fixture(false);
+        registry
+            .set_session_display_for(generation, "work", process.instance_id(), Some(display()))
+            .unwrap();
+        registry.clear_session_displays_for(generation).unwrap();
+        assert!(registry.list()[0].display.is_none());
+        assert!(registry
+            .set_session_display_for(generation, "work", process.instance_id(), Some(display()))
+            .is_err());
+        assert!(registry.clear_session_displays_for(generation).is_err());
+    }
+    #[test]
+    fn replacement_and_exit_never_inherit_display() {
+        for hosted in [false, true] {
+            let (registry, clock, old, generation) = fixture(hosted);
+            registry
+                .set_session_display_for(generation, "work", old.instance_id(), Some(display()))
+                .unwrap();
+            if hosted {
+                registry.remove_hosted("work");
+            } else {
+                registry.remove("work");
+            }
+            clock.advance(Duration::from_millis(1));
+            let replacement = registry.register(session(clock)).ok().unwrap();
+            assert_ne!(old.instance_id(), replacement.instance_id());
+            assert!(registry
+                .set_session_display_for(generation, "work", old.instance_id(), Some(display()))
+                .is_err());
+            assert!(registry.list()[0].display.is_none());
+            registry
+                .set_session_display_for(
+                    generation,
+                    "work",
+                    replacement.instance_id(),
+                    Some(display()),
+                )
+                .unwrap();
+            replacement.terminate().unwrap();
+            assert!(registry.list()[0].display.is_none());
+            assert!(registry
+                .set_session_display_for(
+                    generation,
+                    "work",
+                    replacement.instance_id(),
+                    Some(display())
+                )
+                .is_err());
+        }
+    }
+    #[test]
+    fn default_registry_fails_closed_without_clock() {
+        let registry = Registry::new();
+        let process = registry
+            .register(session(Arc::new(ManualClock::new())))
+            .ok()
+            .unwrap();
+        let generation = registry.begin_display_generation();
+        assert_eq!(
+            registry.set_session_display_for(
+                generation,
+                "work",
+                process.instance_id(),
+                Some(display())
+            ),
+            Err("display clock unavailable")
+        );
+    }
+    #[test]
+    fn validation_rejects_controls_overflow_and_inconsistent_usage() {
+        let mut value = display();
+        for bad in ["\u{1b}]0;secret", "line\nnext", "\u{202e}spoof", "\u{009b}"] {
+            value.alias = Some(bad.into());
+            assert!(value.validate().is_err());
+        }
+        value = display();
+        value.alias = Some("é".repeat(65));
+        assert!(value.validate().is_err());
+        value = display();
+        value.context_percent = Some(101);
+        assert!(value.validate().is_err());
+        value = display();
+        value.context_window = Some(0);
+        assert!(value.validate().is_err());
+        value = display();
+        value.context_used = Some(u64::MAX);
+        assert!(value.validate().is_err());
+        value = display();
+        value.provider = "unknown".into();
+        assert!(value.validate().is_err());
+        value = display();
+        value.version = 2;
+        assert!(value.validate().is_err());
+        value = display();
+        let quoted = "\"".repeat(128);
+        value.member_id = Some(quoted.clone());
+        value.leader_id = Some(quoted.clone());
+        value.alias = Some(quoted);
+        assert!(value.validate().is_err());
+    }
+    #[test]
+    fn overflow_does_not_evict_live_entries_or_allow_old_generation_clear() {
+        let (registry, _, process, generation) = fixture(false);
+        let mut cache = registry.display.lock().unwrap_or_else(|p| p.into_inner());
+        for n in 0..MAX_SESSION_DISPLAYS {
+            cache.entries.insert(
+                format!("instance-{n}"),
+                CachedDisplay {
+                    name: format!("work-{n}"),
+                    value: display(),
+                    expires: DISPLAY_TTL,
+                },
+            );
+        }
+        drop(cache);
+        assert_eq!(
+            registry.set_session_display_for(
+                generation,
+                "work",
+                process.instance_id(),
+                Some(display())
+            ),
+            Err("display cache full")
+        );
+        assert_eq!(
+            registry
+                .display
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entries
+                .len(),
+            MAX_SESSION_DISPLAYS
+        );
+    }
+}
+
+#[cfg(test)]
+mod display_host_tests {
+    use super::*;
+    use crate::agent::{OutputWakeup, VersionedSnapshot};
+    use crate::input::{InputBatch, InputOutcome};
+    use crate::session::InputSubmitOutcome;
+    use crate::session_display::SessionDisplay;
+    use crate::session_operations::Result;
+    use crate::session_operations::*;
+    use crate::{ManualClock, ScriptedAgent};
+    use std::sync::{
+        atomic::{AtomicU8, Ordering},
+        Weak,
+    };
+    struct Host {
+        registry: Weak<Registry>,
+        process: Arc<Session>,
+        mode: AtomicU8,
+    }
+    #[allow(unused_variables)]
+    impl SessionOperations for Host {
+        fn identity(&self) -> Identity {
+            Identity {
+                host: Some([1; 16]),
+                id: "id".into(),
+                name: "work".into(),
+                instance: self.process.instance_id().into(),
+            }
+        }
+        fn input_owner(&self) -> Option<[u8; 16]> {
+            Some([2; 16])
+        }
+        fn inspect(&self) -> Result<Observation> {
+            // A reentrant host callback can acquire the display cache: it is
+            // never held across publication or List's host inspection.
+            assert!(self.registry.upgrade().unwrap().display.try_lock().is_ok());
+            let mode = self.mode.load(Ordering::SeqCst);
+            if mode == 1 {
+                return Err(Error::Unavailable(Unavailable::Transport));
+            }
+            let mut observation = SessionOperations::inspect(self.process.as_ref())?;
+            observation.identity = self.identity();
+            observation.cut = ObservationCut::Host { revision: 1 };
+            observation.closing = mode == 2;
+            if mode == 3 {
+                observation.lifecycle = Lifecycle::Exited(None);
+            }
+            if mode == 4 {
+                observation.identity.instance = "replacement".into();
+            }
+            Ok(observation)
+        }
+        fn recover(&self, request: &RequestIdentity) -> Result<Recovery> {
+            panic!("unused display test operation")
+        }
+        fn send(&self, bytes: &[u8]) -> Result<()> {
+            panic!("unused display test operation")
+        }
+        fn send_line(&self, text: &str) -> Result<()> {
+            panic!("unused display test operation")
+        }
+        fn input_text(&self, text: &str) -> Result<()> {
+            panic!("unused display test operation")
+        }
+        fn type_text(&self, text: &str, settle: Duration) -> Result<InputSubmitOutcome> {
+            panic!("unused display test operation")
+        }
+        fn submit(&self, expect: &str) -> Result<InputSubmitOutcome> {
+            panic!("unused display test operation")
+        }
+        fn clear_input(&self, key: &[u8]) -> Result<Option<String>> {
+            panic!("unused display test operation")
+        }
+        fn feed(&self, steps: &[Step]) -> Result<()> {
+            panic!("unused display test operation")
+        }
+        fn apply_input_batch(&self, batch: InputBatch<'_>) -> Result<InputOutcome> {
+            panic!("unused display test operation")
+        }
+        fn resize(&self, size: Size) -> Result<()> {
+            panic!("unused display test operation")
+        }
+        fn terminate(&self) -> Result<()> {
+            panic!("unused display test operation")
+        }
+        fn screen_text(&self) -> Result<String> {
+            panic!("unused display test operation")
+        }
+        fn snapshot(&self, scrollback: usize) -> Result<VersionedSnapshot> {
+            panic!("unused display test operation")
+        }
+        fn wait_after(&self, version: u64, timeout: Duration) -> Result<VersionedSnapshot> {
+            panic!("unused display test operation")
+        }
+        fn wakeup(&self) -> Result<Option<OutputWakeup>> {
+            panic!("unused display test operation")
+        }
+        fn attach(&self) -> Result<Box<dyn AttachmentOperations + '_>> {
+            panic!("unused display test operation")
+        }
+    }
+    fn value() -> SessionDisplay {
+        SessionDisplay {
+            version: 1,
+            provider: "butler".into(),
+            member_id: None,
+            leader_id: None,
+            alias: None,
+            leader: None,
+            kind: None,
+            model: None,
+            context_percent: None,
+            context_used: None,
+            context_window: None,
+            valid_for_ms: 0,
+        }
+    }
+    #[test]
+    fn hosted_unavailable_closing_exited_and_changed_identity_suppress_publication_and_join() {
+        for mode in [1, 2, 3, 4] {
+            let clock = Arc::new(ManualClock::new());
+            let registry = Arc::new(Registry::with_display_clock(clock.clone()));
+            let process = Arc::new(Session::new_with_id(
+                "work",
+                "id",
+                Box::new(ScriptedAgent::new(vec![])),
+                clock,
+            ));
+            let host = Arc::new(Host {
+                registry: Arc::downgrade(&registry),
+                process: process.clone(),
+                mode: AtomicU8::new(0),
+            });
+            registry
+                .register_hosted(SessionHandle::hosted(host.clone()).unwrap())
+                .ok()
+                .unwrap();
+            let generation = registry.begin_display_generation();
+            registry
+                .set_session_display_for(generation, "work", process.instance_id(), Some(value()))
+                .unwrap();
+            assert!(registry.list()[0].display.is_some());
+            host.mode.store(mode, Ordering::SeqCst);
+            assert!(registry
+                .set_session_display_for(generation, "work", process.instance_id(), Some(value()))
+                .is_err());
+            assert!(registry.list()[0].display.is_none());
+        }
+    }
+    #[test]
+    fn closing_local_session_is_excluded_on_both_paths() {
+        let clock = Arc::new(ManualClock::new());
+        let registry = Registry::with_display_clock(clock.clone());
+        let process = registry
+            .register(Session::new_with_id(
+                "work",
+                "id",
+                Box::new(ScriptedAgent::new(vec![])),
+                clock,
+            ))
+            .ok()
+            .unwrap();
+        let generation = registry.begin_display_generation();
+        registry
+            .set_session_display_for(generation, "work", process.instance_id(), Some(value()))
+            .unwrap();
+        process.mark_closing();
+        assert!(registry
+            .set_session_display_for(generation, "work", process.instance_id(), Some(value()))
+            .is_err());
+        assert!(registry.list()[0].display.is_none());
     }
 }

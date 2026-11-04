@@ -39,6 +39,7 @@ mod tests {
     fn ended_state_keeps_the_last_frame_and_session_identity() {
         let state = EndedState::from_capture(
             SessionSummary {
+                display: None,
                 id: "dev-id".into(),
                 name: "dev".into(),
                 instance_id: Some("instance-1".into()),

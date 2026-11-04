@@ -372,7 +372,7 @@ fn serve_from(
     let anti_entropy = Arc::new(AntiEntropyTask::start()?);
     let listener_task = Arc::new(DaemonListenerControl::new(ListenerTask::start(path)));
 
-    let registry = Arc::new(Registry::new());
+    let registry = Arc::new(Registry::with_display_clock(Arc::new(SystemClock::new())));
     // The image starts with the daemon and lives exactly as long (step 007).
     // It is started *after* the bind, so the `remuda` table it binds points at
     // a socket that is already accepting — the interpreter's first call cannot

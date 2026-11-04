@@ -7826,6 +7826,7 @@ mod cluster_call_tests {
     #[test]
     fn cluster_call_strips_osc52_and_osc0_from_peer_text() {
         let sessions = sanitize_peer_response(Response::Sessions(vec![SessionSummary {
+            display: None,
             id: "id\u{1b}]52;c;clipboard\u{7}".into(),
             name: "name\u{1b}]0;peer title\u{7}".into(),
             instance_id: None,

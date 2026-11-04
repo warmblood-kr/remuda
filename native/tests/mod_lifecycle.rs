@@ -62,6 +62,54 @@ fn read_value(image: &Image, code: &str) -> String {
 }
 
 #[test]
+fn failing_module_stop_disposes_session_display_and_fences_captured_publisher() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+    fs::write(&manifest, "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n").unwrap();
+    write_entry(
+        &home.entry(),
+        r#"return {
+      api = "remuda-module-v1", state_version = 1,
+      initialize = function() return {} end,
+      stop = function() error("deliberate stop failure") end,
+    }"#,
+    );
+    let clock = Arc::new(remuda_core::ManualClock::new());
+    let registry = Arc::new(Registry::with_display_clock(clock.clone()));
+    let session = registry
+        .register(remuda_core::Session::new(
+            "work",
+            Box::new(remuda_core::ScriptedAgent::new(vec![])),
+            clock,
+        ))
+        .unwrap();
+    let image = Image::spawn(
+        Path::new("/tmp/session-display-stop.sock"),
+        registry.clone(),
+        Arc::new(Counters::default()),
+    );
+    read_value(
+        &image,
+        "remuda.exec('sample'); publish = remuda.session.set_display",
+    );
+    let publish = format!(
+        "return publish('work','{}',{{version=1,provider='butler',kind='codex'}})",
+        session.instance_id()
+    );
+    assert_eq!(read_value(&image, &publish), "true");
+    assert!(registry.list()[0].display.is_some());
+    image.stop_modules_bounded();
+    // Queue a read so even a bounded-stop timeout must complete its job first.
+    read_value(&image, "return true");
+    assert!(registry.list()[0].display.is_none());
+    assert!(
+        image.eval(&publish, None).is_err(),
+        "captured old callback republished"
+    );
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "one scenario; PR #104 reshapes this file"

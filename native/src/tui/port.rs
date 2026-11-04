@@ -205,6 +205,7 @@ mod tests {
             self.0.lock().unwrap().push(request.clone());
             Ok(match request {
                 Request::List => Response::Sessions(vec![remuda_core::SessionSummary {
+                    display: None,
                     id: "id".into(),
                     name: "build".into(),
                     instance_id: Some("i".into()),

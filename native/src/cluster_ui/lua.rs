@@ -423,6 +423,10 @@ fn model_table(lua: &Lua, model: &Model) -> mlua::Result<Table> {
             row.set("alive", session.alive)?;
             row.set("pending", session.pending)?;
             row.set("status_cells", session.status_cells)?;
+            if let Some(display) = &session.display {
+                row.set("display", display_table(lua, display)?)?;
+            }
+
             row.set(
                 "status",
                 statuses
@@ -730,4 +734,17 @@ fn array(table: &Table, name: &str, cap: usize, decode: &mut Decode) -> Result<V
     }
     decode.tick()?;
     Ok(out)
+}
+
+fn display_table(lua: &Lua, display: &super::DisplayFacts) -> mlua::Result<Table> {
+    let facts = lua.create_table()?;
+    facts.set("provider", display.provider.as_str())?;
+    facts.set("alias", display.alias.as_deref())?;
+    facts.set("leader", display.leader.as_deref())?;
+    facts.set("kind", display.kind.as_deref())?;
+    facts.set("model", display.model.as_deref())?;
+    facts.set("context_percent", display.context_percent)?;
+    facts.set("context_used", display.context_used)?;
+    facts.set("context_window", display.context_window)?;
+    Ok(facts)
 }

@@ -213,6 +213,7 @@ fn refresh_waits_for_the_slow_tick_when_nothing_forced_it() {
 
 fn row(name: &str, alive: bool, attached: bool) -> SessionSummary {
     SessionSummary {
+        display: None,
         id: String::new(),
         name: name.into(),
         instance_id: Some("test-session".into()),
