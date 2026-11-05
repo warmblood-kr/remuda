@@ -9,6 +9,18 @@
   mid-run aborts instead of publishing a mix.
 ## Unreleased
 
+- VFS: `remuda vfs serve [--addr ADDR:PORT] [--root PATH] [--allow-scripts]
+  [--allow-remote]` renders the store in a browser over a read-only loopback
+  port, so a stored HTML artifact loads its own stylesheet, images and pages.
+  Stored HTML and SVG are sandboxed (opaque origin, no script, no network) and
+  only one path prefix is published; a non-loopback address needs
+  `--allow-remote`. The server runs in the CLI process and asks the daemon for
+  each request, so the store still has one writer. It needs a daemon of the
+  same build and says so instead of failing per request.
+- VFS: `remuda vfs read URI [--max-bytes N]` answers one JSON envelope with
+  the entry and its bytes, or a stable code (`not_found`, `too_large`, ...).
+  It is the machine-readable read `vfs serve` uses; it never prints English
+  on a store error.
 - `remuda vfs status` names the stores `cluster leave` and `cluster init
   --new-identity` set aside (`Old stores:`, with their size), so they do
   not fill the disk unnoticed. `--json` has them as `old_stores`.
