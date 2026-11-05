@@ -458,6 +458,19 @@ struct Uploaded {
 
 /// Upload every planned file, stopping at the first hard failure or shortage so
 /// the caller can tell a reader exactly what is and is not in the store.
+/// The daemon arguments for one file of a release.
+fn put_args(base: &str, relative: &str, min_copies: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "put".to_owned(),
+        "-".to_owned(),
+        format!("remuda:///{base}/{relative}"),
+    ];
+    if let Some(k) = min_copies {
+        args.extend(["--min-copies".to_owned(), k.to_owned()]);
+    }
+    args
+}
+
 fn upload_release(
     socket: &Path,
     base: &str,
@@ -466,6 +479,7 @@ fn upload_release(
 ) -> Uploaded {
     upload_release_with(
         &|args, input| daemon_call(socket, args, input),
+        &crate::vfs_publish::read_verified,
         base,
         plan,
         min_copies,
@@ -476,15 +490,19 @@ fn upload_release(
 type DaemonCall<'a> =
     dyn Fn(Vec<String>, Option<Vec<u8>>) -> Result<(u8, Vec<u8>, String), String> + 'a;
 
+/// One planned file's verified bytes; injected so a read refusal is tested
+/// without touching a disk.
+type VerifiedRead<'a> = dyn Fn(&crate::vfs_publish::Planned) -> Result<Vec<u8>, String> + 'a;
+
 /// The upload loop with its daemon call injected, so the accounting rules are
 /// tested without a socket.
 fn upload_release_with(
     call: &DaemonCall<'_>,
+    verify: &VerifiedRead<'_>,
     base: &str,
     plan: &crate::vfs_publish::Plan,
     min_copies: Option<&str>,
 ) -> Uploaded {
-    use crate::vfs_publish;
     let mut uploaded = Uploaded {
         files: 0,
         bytes: 0,
@@ -492,22 +510,14 @@ fn upload_release_with(
         failure: None,
     };
     for file in &plan.files {
-        let bytes = match vfs_publish::read_verified(file) {
+        let bytes = match verify(file) {
             Ok(bytes) => bytes,
             Err(error) => {
                 uploaded.failure = Some((error, 1));
                 return uploaded;
             }
         };
-        let mut args = vec![
-            "put".to_owned(),
-            "-".to_owned(),
-            format!("remuda:///{base}/{}", file.relative),
-        ];
-        if let Some(k) = min_copies {
-            args.extend(["--min-copies".to_owned(), k.to_owned()]);
-        }
-        match call(args, Some(bytes)) {
+        match call(put_args(base, &file.relative, min_copies), Some(bytes)) {
             Ok((code, _, stderr)) => match put_result(code) {
                 Put::Done => {
                     uploaded.files += 1;
@@ -558,8 +568,8 @@ fn marker_words(error: &MarkerError) -> (&'static str, &str) {
     }
 }
 
-fn put_marker(
-    socket: &Path,
+fn put_marker_with(
+    call: &DaemonCall<'_>,
     uri: String,
     bytes: Vec<u8>,
     min_copies: Option<&str>,
@@ -568,7 +578,7 @@ fn put_marker(
     if let Some(k) = min_copies {
         args.extend(["--min-copies".to_owned(), k.to_owned()]);
     }
-    match daemon_call(socket, args, Some(bytes)) {
+    match call(args, Some(bytes)) {
         Ok((code, _, stderr)) => match put_result(code) {
             Put::Failed => Err(MarkerError::Refused(stderr)),
             other => Ok(other),
@@ -578,15 +588,19 @@ fn put_marker(
 }
 
 /// Write `COMPLETE` last. `Err(exit)` means it is not there at all.
-fn write_complete(finished: &Finished<'_>, out: &mut Out) -> Result<Put, u8> {
+fn write_complete_with(
+    call: &DaemonCall<'_>,
+    finished: &Finished<'_>,
+    out: &mut Out,
+) -> Result<Put, u8> {
     let body = format!(
         "release {}\nfiles {}\nbytes {}\n",
         finished.release,
         finished.plan.files.len(),
         finished.plan.bytes
     );
-    match put_marker(
-        finished.socket,
+    match put_marker_with(
+        call,
         format!("remuda:///{}/COMPLETE", finished.base),
         body.into_bytes(),
         finished.min_copies,
@@ -604,14 +618,18 @@ fn write_complete(finished: &Finished<'_>, out: &mut Out) -> Result<Put, u8> {
 }
 
 /// Write `PREFIX/CURRENT`. `Err(exit)` means it is missing.
-fn write_pointer(finished: &Finished<'_>, out: &mut Out) -> Result<Put, u8> {
+fn write_pointer_with(
+    call: &DaemonCall<'_>,
+    finished: &Finished<'_>,
+    out: &mut Out,
+) -> Result<Put, u8> {
     let prefix = if finished.prefix.is_empty() {
         String::new()
     } else {
         format!("{}/", finished.prefix)
     };
-    match put_marker(
-        finished.socket,
+    match put_marker_with(
+        call,
         format!("remuda:///{prefix}CURRENT"),
         finished.release.as_bytes().to_vec(),
         finished.min_copies,
@@ -668,7 +686,19 @@ fn say_pointer_and_reader(finished: &Finished<'_>, out: &mut Out) {
 }
 
 fn finish_release(finished: Finished<'_>, pointer: bool, out: &mut Out) -> u8 {
-    let marker = match write_complete(&finished, out) {
+    let socket = finished.socket;
+    finish_with(
+        &|args, input| daemon_call(socket, args, input),
+        finished,
+        pointer,
+        out,
+    )
+}
+
+/// The marker stage with its daemon call injected, so COMPLETE/CURRENT
+/// sequencing and each outcome are tested without a socket.
+fn finish_with(call: &DaemonCall<'_>, finished: Finished<'_>, pointer: bool, out: &mut Out) -> u8 {
+    let marker = match write_complete_with(call, &finished, out) {
         Ok(put) => put,
         Err(code) => return code,
     };
@@ -689,7 +719,7 @@ fn finish_release(finished: Finished<'_>, pointer: bool, out: &mut Out) -> u8 {
         0
     };
     if pointer {
-        match write_pointer(&finished, out) {
+        match write_pointer_with(call, &finished, out) {
             Ok(Put::Short) => {
                 warn!(
                     out,
@@ -1766,6 +1796,111 @@ mod tests {
         );
     }
 
+    fn finish_with_call(call: &DaemonCall<'_>, pointer: bool) -> (u8, String) {
+        let base = "design/v1".to_string();
+        let prefix = "design".to_string();
+        let release = "v1".to_string();
+        let plan = crate::vfs_publish::Plan {
+            files: Vec::new(),
+            bytes: 0,
+            skipped: Vec::new(),
+        };
+        let mut out = Out::default();
+        let finished = Finished {
+            socket: Path::new("/x"),
+            prefix: &prefix,
+            base: &base,
+            release: &release,
+            plan: &plan,
+            min_copies: None,
+        };
+        let code = finish_with(call, finished, pointer, &mut out);
+        (code, String::from_utf8_lossy(&out.stderr).to_string())
+    }
+
+    #[test]
+    fn a_refused_complete_does_not_touch_current() {
+        use std::cell::RefCell;
+        let seen = RefCell::new(Vec::new());
+        let call = |args: Vec<String>, _input: Option<Vec<u8>>| {
+            seen.borrow_mut().push(args[2].clone());
+            Ok((1, Vec::new(), "bad path".to_string()))
+        };
+        let (code, error) = finish_with_call(&call, true);
+        assert_eq!(code, 1);
+        assert_eq!(seen.borrow().len(), 1, "CURRENT must not follow");
+        assert!(seen.borrow()[0].ends_with("/COMPLETE"));
+        assert!(error.contains("COMPLETE was not written"), "{error}");
+        assert!(!error.contains("CURRENT"), "{error}");
+    }
+
+    #[test]
+    fn an_unconfirmed_complete_says_unknown_and_asks_for_a_check() {
+        use std::cell::RefCell;
+        let seen = RefCell::new(Vec::new());
+        let call = |args: Vec<String>, _input: Option<Vec<u8>>| {
+            seen.borrow_mut().push(args[2].clone());
+            Err("timed out".to_string())
+        };
+        let (code, error) = finish_with_call(&call, true);
+        assert_eq!(code, 1);
+        assert_eq!(seen.borrow().len(), 1);
+        assert!(error.contains("could not be confirmed"), "{error}");
+        assert!(error.contains("vfs stat"), "{error}");
+    }
+
+    #[test]
+    fn a_short_complete_still_writes_current_and_exits_75() {
+        use std::cell::RefCell;
+        let seen = RefCell::new(Vec::new());
+        let call = |args: Vec<String>, _input: Option<Vec<u8>>| {
+            let uri = args[2].clone();
+            let short = uri.ends_with("/COMPLETE");
+            seen.borrow_mut().push(uri);
+            Ok((if short { 75 } else { 0 }, Vec::new(), "short".to_string()))
+        };
+        let (code, error) = finish_with_call(&call, true);
+        assert_eq!(code, EXIT_TEMPFAIL);
+        assert_eq!(seen.borrow().len(), 2, "CURRENT follows a written marker");
+        assert!(error.contains("COMPLETE is written here"), "{error}");
+    }
+
+    #[test]
+    fn a_short_current_exits_75_after_both_writes() {
+        use std::cell::RefCell;
+        let seen = RefCell::new(Vec::new());
+        let call = |args: Vec<String>, _input: Option<Vec<u8>>| {
+            let uri = args[2].clone();
+            let short = uri.ends_with("/CURRENT");
+            seen.borrow_mut().push(uri);
+            Ok((if short { 75 } else { 0 }, Vec::new(), "short".to_string()))
+        };
+        let (code, error) = finish_with_call(&call, true);
+        assert_eq!(code, EXIT_TEMPFAIL);
+        assert_eq!(seen.borrow().len(), 2);
+        assert!(error.contains("CURRENT is written here"), "{error}");
+    }
+
+    #[test]
+    fn a_refused_current_is_a_failure_after_complete() {
+        use std::cell::RefCell;
+        let seen = RefCell::new(Vec::new());
+        let call = |args: Vec<String>, _input: Option<Vec<u8>>| {
+            let uri = args[2].clone();
+            let current = uri.ends_with("/CURRENT");
+            seen.borrow_mut().push(uri);
+            if current {
+                Ok((1, Vec::new(), "bad pointer".to_string()))
+            } else {
+                Ok((0, Vec::new(), String::new()))
+            }
+        };
+        let (code, error) = finish_with_call(&call, true);
+        assert_eq!(code, 1);
+        assert_eq!(seen.borrow().len(), 2);
+        assert!(error.contains("CURRENT was not written"), "{error}");
+    }
+
     #[test]
     fn a_marker_failure_says_whether_it_is_certain() {
         let refusal = MarkerError::Refused("bad path".into());
@@ -1796,10 +1931,78 @@ mod tests {
     }
 
     #[test]
+    fn a_read_refusal_stops_before_any_put() {
+        use std::cell::Cell;
+        let (dir, plan) = plan_of(&["a.txt", "b.txt"]);
+        let calls = Cell::new(0);
+        let call = |_args: Vec<String>, _input: Option<Vec<u8>>| {
+            calls.set(calls.get() + 1);
+            Ok((0, Vec::new(), String::new()))
+        };
+        let refuse = |_file: &crate::vfs_publish::Planned| Err("changed".to_string());
+        let uploaded = upload_release_with(&call, &refuse, "design/v1", &plan, None);
+        assert_eq!(uploaded.files, 0);
+        assert_eq!(calls.get(), 0, "no put may run after a read refusal");
+        assert!(uploaded.failure.is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_read_refusal_after_one_file_keeps_that_count() {
+        use std::cell::Cell;
+        let (dir, plan) = plan_of(&["a.txt", "b.txt"]);
+        let reads = Cell::new(0);
+        let calls = Cell::new(0);
+        let verify = |_file: &crate::vfs_publish::Planned| {
+            let n = reads.get();
+            reads.set(n + 1);
+            if n == 0 {
+                Ok(b"x".to_vec())
+            } else {
+                Err("changed".to_string())
+            }
+        };
+        let call = |_args: Vec<String>, _input: Option<Vec<u8>>| {
+            calls.set(calls.get() + 1);
+            Ok((0, Vec::new(), String::new()))
+        };
+        let uploaded = upload_release_with(&call, &verify, "design/v1", &plan, None);
+        assert_eq!(uploaded.files, 1);
+        assert_eq!(uploaded.bytes, 1);
+        assert_eq!(calls.get(), 1);
+        assert!(uploaded.failure.is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn put_args_name_the_file_and_optional_copies() {
+        assert_eq!(
+            put_args("design/v1", "a/b.html", None),
+            ["put", "-", "remuda:///design/v1/a/b.html"]
+        );
+        assert_eq!(
+            put_args("design/v1", "a.html", Some("2")),
+            [
+                "put",
+                "-",
+                "remuda:///design/v1/a.html",
+                "--min-copies",
+                "2"
+            ]
+        );
+    }
+
+    #[test]
     fn a_failed_first_put_is_not_counted_as_uploaded() {
         let (dir, plan) = plan_of(&["a.txt", "b.txt"]);
         let call = |_args: Vec<String>, _input: Option<Vec<u8>>| Err("gone".to_string());
-        let uploaded = upload_release_with(&call, "design/v1", &plan, None);
+        let uploaded = upload_release_with(
+            &call,
+            &crate::vfs_publish::read_verified,
+            "design/v1",
+            &plan,
+            None,
+        );
         assert_eq!(uploaded.files, 0);
         assert_eq!(uploaded.bytes, 0);
         assert!(uploaded.failure.is_some());
@@ -1820,7 +2023,13 @@ mod tests {
                 Ok((0, Vec::new(), String::new()))
             }
         };
-        let uploaded = upload_release_with(&call, "design/v1", &plan, None);
+        let uploaded = upload_release_with(
+            &call,
+            &crate::vfs_publish::read_verified,
+            "design/v1",
+            &plan,
+            None,
+        );
         assert_eq!(uploaded.files, 2);
         assert_eq!(uploaded.short, 1);
         assert!(uploaded.failure.is_none());

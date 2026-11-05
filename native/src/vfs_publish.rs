@@ -172,27 +172,33 @@ fn same_file(opened: &std::fs::Metadata, named: &std::fs::Metadata) -> bool {
 }
 
 /// Refuse a plan that cannot be staged on this machine.
-pub fn check_budget(plan: &Plan, dir: &Path) -> Result<(), Refused> {
-    if plan.bytes > MAX_RELEASE_BYTES {
-        return Err(refused(format!(
-            "{} is {}; a release may be at most {}",
-            dir.display(),
-            bytes_text(plan.bytes),
+/// Why a plan cannot be staged, given the free bytes of the source's disk.
+/// Pure, so the cap, the exact reserve boundary and an unknown disk are tests.
+fn budget_refusal(bytes: u64, free: Option<u64>, dir: &str) -> Option<String> {
+    if bytes > MAX_RELEASE_BYTES {
+        return Some(format!(
+            "{dir} is {}; a release may be at most {}",
+            bytes_text(bytes),
             bytes_text(MAX_RELEASE_BYTES)
-        )));
+        ));
     }
-    if let Some(free) = free_bytes(dir) {
-        if free < plan.bytes.saturating_add(FREE_RESERVE) {
-            return Err(refused(format!(
-                "{} is {} and only {} is free on that filesystem; publishing needs the source plus {} (the store's own disk is the daemon's)",
-                dir.display(),
-                bytes_text(plan.bytes),
-                bytes_text(free),
-                bytes_text(FREE_RESERVE)
-            )));
-        }
+    match free {
+        Some(free) if free < bytes.saturating_add(FREE_RESERVE) => Some(format!(
+            "{dir} is {} and only {} is free on that filesystem; publishing needs the source plus {} (the store's own disk is the daemon's)",
+            bytes_text(bytes),
+            bytes_text(free),
+            bytes_text(FREE_RESERVE)
+        )),
+        _ => None,
     }
-    Ok(())
+}
+
+/// Refuse a plan that cannot be staged on this machine.
+pub fn check_budget(plan: &Plan, dir: &Path) -> Result<(), Refused> {
+    match budget_refusal(plan.bytes, free_bytes(dir), &dir.display().to_string()) {
+        Some(detail) => Err(refused(detail)),
+        None => Ok(()),
+    }
 }
 
 /// One file to upload.
@@ -551,6 +557,20 @@ mod tests {
         };
         let error = check_budget(&plan, std::env::temp_dir().as_path()).unwrap_err();
         assert!(error.detail.contains("at most"), "{}", error.detail);
+    }
+
+    #[test]
+    fn the_budget_refuses_over_the_cap_and_under_the_reserve() {
+        let over = budget_refusal(MAX_RELEASE_BYTES + 1, Some(u64::MAX), "site").unwrap();
+        assert!(over.contains("at most"), "{over}");
+        let bytes = 1024u64;
+        let short = budget_refusal(bytes, Some(bytes + FREE_RESERVE - 1), "site").unwrap();
+        assert!(short.contains("only"), "{short}");
+        assert!(budget_refusal(bytes, Some(bytes + FREE_RESERVE), "site").is_none());
+        assert!(
+            budget_refusal(bytes, None, "site").is_none(),
+            "a platform that cannot say free space must not block"
+        );
     }
 
     #[test]
