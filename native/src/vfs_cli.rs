@@ -618,20 +618,30 @@ fn release_lines(report: &crate::cluster::vfs_release::ReleaseReport) -> Vec<Str
     lines
 }
 
-fn release(values: &Map<String, Value>, out: &mut Out) -> u8 {
-    let dry_run = flag(values, "dry-run");
+/// The three release options, parsed once so the refusal is testable.
+fn release_options(
+    values: &Map<String, Value>,
+) -> Result<(bool, std::time::Duration, bool), String> {
     let older_than = match value(values, "older-than") {
-        Some(text) => match text.parse::<u64>() {
-            Ok(seconds) => std::time::Duration::from_secs(seconds),
-            Err(_) => return fail(out, "release", "--older-than must be whole seconds"),
-        },
+        Some(text) => text
+            .parse::<u64>()
+            .map(std::time::Duration::from_secs)
+            .map_err(|_| "--older-than must be whole seconds".to_owned())?,
         None => crate::cluster::vfs_release::DEFAULT_OLDER_THAN,
     };
-    let report = match crate::cluster::vfs_release::release(
-        dry_run,
+    Ok((
+        flag(values, "dry-run"),
         older_than,
         flag(values, "include-resolved"),
-    ) {
+    ))
+}
+
+fn release(values: &Map<String, Value>, out: &mut Out) -> u8 {
+    let (dry_run, older_than, include_resolved) = match release_options(values) {
+        Ok(options) => options,
+        Err(detail) => return fail(out, "release", &detail),
+    };
+    let report = match crate::cluster::vfs_release::release(dry_run, older_than, include_resolved) {
         Ok(report) => report,
         Err(error) => return fail_vfs(out, "release", &error),
     };
@@ -1575,6 +1585,28 @@ mod tests {
         assert_eq!(json["version"], Value::from(7));
         assert_eq!(json["size"], Value::from(3));
         assert_eq!(json["content"], Value::String("YWJj".to_owned()));
+    }
+
+    #[test]
+    fn release_options_default_and_refuse_bad_seconds() {
+        let values = Map::new();
+        let (dry, older, include) = release_options(&values).unwrap();
+        assert!(!dry);
+        assert!(older.is_zero(), "no --older-than means no age floor");
+        assert!(!include);
+
+        let mut values = Map::new();
+        values.insert("dry-run".into(), Value::Bool(true));
+        values.insert("include-resolved".into(), Value::Bool(true));
+        values.insert("older-than".into(), Value::String("60".into()));
+        let (dry, older, include) = release_options(&values).unwrap();
+        assert!(dry && include);
+        assert_eq!(older, std::time::Duration::from_secs(60));
+
+        values.insert("older-than".into(), Value::String("x".into()));
+        assert!(release_options(&values)
+            .unwrap_err()
+            .contains("whole seconds"));
     }
 
     #[test]
