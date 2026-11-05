@@ -6,6 +6,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use super::opencode_adopt::{self, AdoptedManifest};
 use super::opencode_tui::{
     fixed_conversation, generation_for, generation_matches, loopback_endpoint, process_identity,
     ProcessIdentity,
@@ -84,19 +85,81 @@ pub fn run(args: &[&str]) -> ExitCode {
     if binding_missing(Path::new(&request.binding)) {
         return emit("definitely_not_written", "binding_missing");
     }
-    let manifest = match load_manifest(&request.binding) {
-        Ok(manifest) => manifest,
+    let binding = match load_binding(&request.binding) {
+        Ok(binding) => binding,
         Err(reason) => return emit("definitely_not_written", reason),
     };
-    if let Err(reason) = validate_manifest(&request, &manifest) {
-        return emit("definitely_not_written", reason);
+    let (outcome, reason) = deliver_binding(&request, binding);
+    emit(outcome, reason)
+}
+
+enum Binding {
+    Owned(Manifest),
+    Adopted(AdoptedManifest),
+}
+
+/// The manifest protocol selects one complete strict schema. Reading the tag
+/// first does not weaken either parser: the selected struct still denies
+/// unknown fields and validates every owned/adopted field.
+fn load_binding(path: &str) -> Result<Binding, &'static str> {
+    let data = read_binding(path)?;
+    match protocol_of(&data).as_deref() {
+        Some("opencode-http-v1") => serde_json::from_slice(&data)
+            .map(Binding::Owned)
+            .map_err(|_| "invalid_binding"),
+        Some(opencode_adopt::PROTOCOL) => serde_json::from_slice(&data)
+            .map(Binding::Adopted)
+            .map_err(|_| "invalid_binding"),
+        _ => Err("invalid_binding"),
     }
-    if let Err(reason) = check_processes(&manifest, process_identity) {
-        return emit("definitely_not_written", reason);
+}
+
+#[derive(Deserialize)]
+struct ProtocolTag {
+    protocol: String,
+}
+
+fn protocol_of(data: &[u8]) -> Option<String> {
+    serde_json::from_slice::<ProtocolTag>(data)
+        .ok()
+        .map(|tag| tag.protocol)
+}
+
+fn deliver_binding(request: &Request, binding: Binding) -> (&'static str, &'static str) {
+    match binding {
+        Binding::Owned(manifest) => deliver_owned(request, &manifest),
+        Binding::Adopted(manifest) => deliver_adopted_checked(request, &manifest),
     }
-    match deliver(&request, &manifest) {
-        Ok((outcome, reason)) => emit(outcome, reason),
-        Err(reason) => emit("uncertain", reason),
+}
+
+fn deliver_owned(request: &Request, manifest: &Manifest) -> (&'static str, &'static str) {
+    if let Err(reason) = validate_manifest(request, manifest) {
+        return ("definitely_not_written", reason);
+    }
+    if let Err(reason) = check_processes(manifest, process_identity) {
+        return ("definitely_not_written", reason);
+    }
+    match deliver(request, manifest) {
+        Ok(outcome) => outcome,
+        Err(reason) => ("uncertain", reason),
+    }
+}
+
+fn deliver_adopted_checked(
+    request: &Request,
+    manifest: &AdoptedManifest,
+) -> (&'static str, &'static str) {
+    if let Err(reason) =
+        opencode_adopt::validate_manifest(&request.nonce, &request.session, manifest)
+    {
+        return ("definitely_not_written", reason);
+    }
+    if let Err(reason) = opencode_adopt::check_process(manifest, process_identity) {
+        return ("definitely_not_written", reason);
+    }
+    match deliver_adopted(request, manifest) {
+        Ok(outcome) => outcome,
+        Err(reason) => ("uncertain", reason),
     }
 }
 
@@ -176,7 +239,7 @@ fn validate_request(request: &Request) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn is_token(value: &str) -> bool {
+pub(crate) fn is_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value
@@ -187,7 +250,7 @@ fn is_token(value: &str) -> bool {
 /// Read the manifest through a pinned parent descriptor: owner/mode are checked
 /// once, then the leaf opens relative to it with `O_NOFOLLOW|O_NONBLOCK`, so a
 /// swapped parent, symlink leaf or FIFO cannot redirect or block this read.
-fn load_manifest(path: &str) -> Result<Manifest, &'static str> {
+fn read_binding(path: &str) -> Result<Vec<u8>, &'static str> {
     let path = Path::new(path);
     let parent = path
         .parent()
@@ -198,10 +261,17 @@ fn load_manifest(path: &str) -> Result<Manifest, &'static str> {
         .and_then(|name| name.to_str())
         .ok_or("invalid_binding")?;
     let directory = PrivateDir::open(parent).map_err(|_| "invalid_binding")?;
-    let data = directory
+    directory
         .read_limited(name, MAX_STDIN)
-        .map_err(|_| "invalid_binding")?;
-    serde_json::from_slice(&data).map_err(|_| "invalid_binding")
+        .map_err(|_| "invalid_binding")
+}
+
+#[cfg(test)]
+fn load_manifest(path: &str) -> Result<Manifest, &'static str> {
+    match load_binding(path)? {
+        Binding::Owned(manifest) => Ok(manifest),
+        Binding::Adopted(_) => Err("invalid_binding"),
+    }
 }
 
 fn validate_manifest(request: &Request, manifest: &Manifest) -> Result<(), &'static str> {
@@ -244,6 +314,34 @@ where
     Ok(())
 }
 
+struct Target<'a> {
+    endpoint: &'a str,
+    conversation: &'a str,
+    server_pid: u32,
+    server_version: &'a str,
+    password: &'a str,
+}
+
+fn owned_target(manifest: &Manifest) -> Target<'_> {
+    Target {
+        endpoint: &manifest.endpoint,
+        conversation: &manifest.conversation,
+        server_pid: manifest.server_pid,
+        server_version: &manifest.server_version,
+        password: &manifest.auth.password,
+    }
+}
+
+fn adopted_target(manifest: &AdoptedManifest) -> Target<'_> {
+    Target {
+        endpoint: &manifest.endpoint,
+        conversation: &manifest.conversation,
+        server_pid: manifest.server_pid,
+        server_version: &manifest.server_version,
+        password: &manifest.auth.password,
+    }
+}
+
 fn deliver(
     request: &Request,
     manifest: &Manifest,
@@ -256,29 +354,57 @@ fn deliver(
 fn deliver_with<F>(
     request: &Request,
     manifest: &Manifest,
+    http: F,
+) -> Result<(&'static str, &'static str), &'static str>
+where
+    F: FnMut(&str, String, &str, String) -> Result<remuda_native::net::HttpResponse, String>,
+{
+    deliver_target_with(request, &owned_target(manifest), http)
+}
+
+fn deliver_adopted(
+    request: &Request,
+    manifest: &AdoptedManifest,
+) -> Result<(&'static str, &'static str), &'static str> {
+    deliver_adopted_with(request, manifest, |method, url, auth, body| {
+        http(method, url, auth, body)
+    })
+}
+
+fn deliver_adopted_with<F>(
+    request: &Request,
+    manifest: &AdoptedManifest,
+    http: F,
+) -> Result<(&'static str, &'static str), &'static str>
+where
+    F: FnMut(&str, String, &str, String) -> Result<remuda_native::net::HttpResponse, String>,
+{
+    deliver_target_with(request, &adopted_target(manifest), http)
+}
+
+fn deliver_target_with<F>(
+    request: &Request,
+    target: &Target<'_>,
     mut http: F,
 ) -> Result<(&'static str, &'static str), &'static str>
 where
     F: FnMut(&str, String, &str, String) -> Result<remuda_native::net::HttpResponse, String>,
 {
-    let auth = basic(&manifest.auth.password);
+    let auth = basic(target.password);
     let info = http(
         "GET",
-        manifest.endpoint.clone() + "/api/info",
+        target.endpoint.to_string() + "/api/info",
         &auth,
         String::new(),
     )
     .map_err(|_| "server_unverified")?;
-    if info.status != 200 || !server_identity(&info.body, manifest) {
+    if info.status != 200 || !server_identity(&info.body, target) {
         return Ok(("definitely_not_written", "server_identity"));
     }
-    let target = format!(
-        "{}/api/session/{}",
-        manifest.endpoint, manifest.conversation
-    );
+    let url = format!("{}/api/session/{}", target.endpoint, target.conversation);
     let response =
-        http("GET", target.clone(), &auth, String::new()).map_err(|_| "target_unverified")?;
-    if !target_matches(&response, &manifest.conversation) {
+        http("GET", url.clone(), &auth, String::new()).map_err(|_| "target_unverified")?;
+    if !target_matches(&response, target.conversation) {
         return match response.status {
             401 | 403 => Ok(("definitely_not_written", "auth")),
             404 => Ok(("definitely_not_written", "target_missing")),
@@ -292,28 +418,20 @@ where
         "resume": true,
     })
     .to_string();
-    let response = http("POST", target + "/prompt", &auth, body).map_err(|_| "transport")?;
-    Ok(classify_response(
-        &response,
-        request,
-        &manifest.conversation,
-    ))
+    let response = http("POST", url + "/prompt", &auth, body).map_err(|_| "transport")?;
+    Ok(classify_response(&response, request, target.conversation))
 }
 
-fn server_identity(body: &[u8], manifest: &Manifest) -> bool {
+fn server_identity(body: &[u8], target: &Target<'_>) -> bool {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return false;
     };
-    value.get("pid").and_then(serde_json::Value::as_u64) == Some(manifest.server_pid as u64)
-        && value.get("version").and_then(serde_json::Value::as_str)
-            == Some(manifest.server_version.as_str())
+    value.get("pid").and_then(serde_json::Value::as_u64) == Some(target.server_pid as u64)
+        && value.get("version").and_then(serde_json::Value::as_str) == Some(target.server_version)
         && value
             .get("urls")
             .and_then(serde_json::Value::as_array)
-            .is_some_and(|urls| {
-                urls.iter()
-                    .any(|url| url.as_str() == Some(&manifest.endpoint))
-            })
+            .is_some_and(|urls| urls.iter().any(|url| url.as_str() == Some(target.endpoint)))
 }
 
 fn target_matches(response: &remuda_native::net::HttpResponse, conversation: &str) -> bool {
@@ -366,12 +484,12 @@ fn prompt_receipt(body: &[u8], request: &Request, conversation: &str) -> bool {
             == Some(request.text.as_str())
 }
 
-fn basic(password: &str) -> String {
+pub(crate) fn basic(password: &str) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(format!("opencode:{password}"));
     format!("Basic {encoded}")
 }
 
-fn http(
+pub(crate) fn http(
     method: &str,
     url: String,
     auth: &str,
@@ -701,6 +819,107 @@ mod tests {
             load_manifest(oversized.to_str().expect("utf8")),
             Err("invalid_binding")
         ));
+    }
+
+    fn adopted_manifest() -> AdoptedManifest {
+        AdoptedManifest {
+            schema: opencode_adopt::SCHEMA,
+            protocol: opencode_adopt::PROTOCOL.into(),
+            nonce: "n".into(),
+            session: "s".into(),
+            server_pid: 22,
+            server_version: "2.2.5".into(),
+            generation: opencode_adopt::adopted_generation(200),
+            endpoint: "http://127.0.0.1:1".into(),
+            conversation: CONVERSATION.into(),
+            auth: opencode_adopt::AdoptAuth {
+                scheme: "basic".into(),
+                user: "opencode".into(),
+                password: "p".into(),
+            },
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn protocol_selects_one_strict_schema() {
+        let path = temp_path();
+        let adopted = serde_json::to_vec(&adopted_manifest()).expect("adopted json");
+        std::fs::write(&path, &adopted).expect("write adopted");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("0600");
+        assert!(matches!(
+            load_binding(path.to_str().expect("utf8")),
+            Ok(Binding::Adopted(_))
+        ));
+
+        let owned = path.with_extension("owned");
+        std::fs::write(&owned, manifest_text()).expect("write owned");
+        std::fs::set_permissions(&owned, std::fs::Permissions::from_mode(0o600)).expect("0600");
+        assert!(matches!(
+            load_binding(owned.to_str().expect("utf8")),
+            Ok(Binding::Owned(_))
+        ));
+
+        // The adopted parser must not silently accept owned wrapper fields.
+        let mut widened = adopted_manifest();
+        let mut value = serde_json::to_value(&widened).expect("json");
+        value["wrapper_pid"] = json!(11);
+        let extra = path.with_extension("extra");
+        std::fs::write(&extra, value.to_string()).expect("write extra");
+        std::fs::set_permissions(&extra, std::fs::Permissions::from_mode(0o600)).expect("0600");
+        assert!(matches!(
+            load_binding(extra.to_str().expect("utf8")),
+            Err("invalid_binding")
+        ));
+
+        // A tag-only edit cannot turn an owned manifest into an adopted one.
+        let mut mixed_value: serde_json::Value =
+            serde_json::from_slice(&manifest_text()).expect("owned json");
+        mixed_value["protocol"] = json!("opencode-http-adopt-v1");
+        let mixed = path.with_extension("mixed");
+        std::fs::write(&mixed, mixed_value.to_string()).expect("write mixed");
+        std::fs::set_permissions(&mixed, std::fs::Permissions::from_mode(0o600)).expect("0600");
+        assert!(matches!(
+            load_binding(mixed.to_str().expect("utf8")),
+            Err("invalid_binding")
+        ));
+
+        let unknown = path.with_extension("unknown");
+        std::fs::write(&unknown, br#"{"protocol":"other"}"#).expect("write unknown");
+        std::fs::set_permissions(&unknown, std::fs::Permissions::from_mode(0o600)).expect("0600");
+        assert!(matches!(
+            load_binding(unknown.to_str().expect("utf8")),
+            Err("invalid_binding")
+        ));
+    }
+
+    #[test]
+    fn adopted_delivery_reuses_the_exact_receipt_and_target_rules() {
+        let request = request();
+        let manifest = adopted_manifest();
+        let mut responses = vec![response(200, INFO_OK), target_ok(), receipt(200)];
+        let outcome =
+            deliver_adopted_with(&request, &manifest, |_, _, _, _| Ok(responses.remove(0)));
+        assert_eq!(outcome, Ok(("accepted_queue", "")));
+
+        let mut responses = vec![response(200, INFO_OK), response(404, "{}")];
+        let outcome =
+            deliver_adopted_with(&request, &manifest, |_, _, _, _| Ok(responses.remove(0)));
+        assert_eq!(outcome, Ok(("definitely_not_written", "target_missing")));
+
+        let mut responses = vec![response(401, "{}")];
+        let outcome =
+            deliver_adopted_with(&request, &manifest, |_, _, _, _| Ok(responses.remove(0)));
+        assert_eq!(outcome, Ok(("definitely_not_written", "server_identity")));
+    }
+
+    #[test]
+    fn adopted_binding_is_checked_before_any_request() {
+        let request = request();
+        let mut manifest = adopted_manifest();
+        manifest.nonce = "other".into();
+        let outcome = deliver_adopted_checked(&request, &manifest);
+        assert_eq!(outcome, ("definitely_not_written", "invalid_binding"));
     }
 
     #[test]

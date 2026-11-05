@@ -127,7 +127,7 @@ const UNSUPPORTED: &str = "OpenCode native binding requires macOS or Linux";
 /// The wrapper can only claim a native binding where it can read a process's
 /// start time and parent: libproc on macOS, `/proc` on Linux. Any other Unix
 /// (or Windows) advertises false and keeps the unbound PTY.
-fn platform_supported() -> bool {
+pub(crate) fn platform_supported() -> bool {
     cfg!(any(target_os = "macos", target_os = "linux"))
 }
 
