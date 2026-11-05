@@ -106,6 +106,12 @@ fn spec() -> Spec {
                 "remuda vfs resolve-conflict URI --keep winner|VERSION"),
             verb("rm", "Delete a file everywhere. Example: remuda vfs rm remuda:///notes.md",
                 vec![arg("URI", "remuda:// URI", true)], vec![], "remuda vfs rm URI"),
+            verb("release", "Give back copies this node fetched to read and does not need to keep. Example: remuda vfs release --dry-run",
+                vec![], vec![option("dry-run", None, "Count what would go without deleting anything"),
+                             option("older-than", Some("SECS"), "Keep copies fetched more recently than this (default 0, no grace)"),
+                             option("include-resolved", None, "Also give back copies `vfs resolve` pinned for a tool"),
+                             option("json", None, "Print JSON")],
+                "remuda vfs release [--dry-run] [--older-than SECS] [--json]"),
             verb("sync", "Pull indexes from peers and repair missing copies now. Example: remuda vfs sync",
                 vec![], vec![], "remuda vfs sync"),
             verb("status", "Show files, conflicts, copies here and each peer at a glance. Example: remuda vfs status --copies",
@@ -933,6 +939,7 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
             "serve",
             "runs in the CLI process, not the daemon; run `remuda vfs serve` there",
         ),
+        "release" => release(values, out),
         "sync" => {
             let report = vfs_sync::sync_once(true);
             say!(out, "{report}");
@@ -1075,6 +1082,124 @@ fn put(store: &VfsStore, values: &Map<String, Value>, bytes: &[u8], out: &mut Ou
     } else {
         0
     }
+}
+
+/// What `vfs release` prints, one rule per line. Pure, so the wording and the
+/// counts it derives are tested without a store.
+fn kept_total(report: &crate::cluster::vfs_release::ReleaseReport) -> usize {
+    report.placed
+        + report.written
+        + report.resolved
+        + report.recent
+        + report.last_copy
+        + report.unconfirmed
+}
+
+/// The one-line sum of what stayed, in the order the report lists it.
+fn release_breakdown(report: &crate::cluster::vfs_release::ReleaseReport) -> String {
+    format!(
+        "placed here {}, written here {}, resolved {}, too new {}, only copy {}, unconfirmed {}",
+        report.placed,
+        report.written,
+        report.resolved,
+        report.recent,
+        report.last_copy,
+        report.unconfirmed
+    )
+}
+
+/// Why a copy stayed, one line per reason that applies.
+fn release_reasons(report: &crate::cluster::vfs_release::ReleaseReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    if report.unconfirmed > 0 {
+        lines.push(format!(
+            "Next: {} kept because a node that should hold {} did not confirm a copy; try `remuda vfs status --copies`.",
+            report.unconfirmed,
+            if report.unconfirmed == 1 { "it" } else { "them" }
+        ));
+    }
+    if report.resolved > 0 {
+        lines.push(format!(
+            "Next: {} kept because `vfs resolve` pinned {}, so a tool may hold the path; add --include-resolved to give it back.",
+            report.resolved,
+            if report.resolved == 1 { "it" } else { "them" }
+        ));
+    }
+    if report.last_copy > 0 {
+        lines.push(format!(
+            "Next: {} kept because no other node is placed on {}, so releasing would leave no copy.",
+            report.last_copy,
+            if report.last_copy == 1 { "it" } else { "them" }
+        ));
+    }
+    lines
+}
+
+/// What `vfs release` prints, one rule per line. Pure, so the wording and the
+/// counts it derives are tested without a store.
+fn release_lines(report: &crate::cluster::vfs_release::ReleaseReport) -> Vec<String> {
+    let kept = kept_total(report);
+    let breakdown = release_breakdown(report);
+    let headline = if report.removed == 0 {
+        format!("Nothing to release: kept {kept} copies this node needs ({breakdown}).")
+    } else {
+        format!(
+            "{} {} cop{}, {}; kept {kept} ({breakdown}).",
+            if report.dry_run {
+                "Would release"
+            } else {
+                "Released"
+            },
+            report.removed,
+            if report.removed == 1 { "y" } else { "ies" },
+            bytes_text(report.bytes)
+        )
+    };
+    let mut lines = vec![headline];
+    lines.extend(release_reasons(report));
+    lines
+}
+
+/// The three release options, parsed once so the refusal is testable.
+fn release_options(
+    values: &Map<String, Value>,
+) -> Result<(bool, std::time::Duration, bool), String> {
+    let older_than = match value(values, "older-than") {
+        Some(text) => text
+            .parse::<u64>()
+            .map(std::time::Duration::from_secs)
+            .map_err(|_| "--older-than must be whole seconds".to_owned())?,
+        None => crate::cluster::vfs_release::DEFAULT_OLDER_THAN,
+    };
+    Ok((
+        flag(values, "dry-run"),
+        older_than,
+        flag(values, "include-resolved"),
+    ))
+}
+
+fn release(values: &Map<String, Value>, out: &mut Out) -> u8 {
+    let (dry_run, older_than, include_resolved) = match release_options(values) {
+        Ok(options) => options,
+        Err(detail) => return fail(out, "release", &detail),
+    };
+    let report = match crate::cluster::vfs_release::release(dry_run, older_than, include_resolved) {
+        Ok(report) => report,
+        Err(error) => return fail_vfs(out, "release", &error),
+    };
+    if flag(values, "json") {
+        say!(
+            out,
+            "{}",
+            serde_json::to_string(&report).unwrap_or_default()
+        );
+        return 0;
+    }
+    for line in release_lines(&report) {
+        say!(out, "{line}");
+    }
+
+    0
 }
 
 /// `--copies` asks peers for at most this long.
@@ -1936,6 +2061,14 @@ mod tests {
         }
     }
 
+    fn release_report(removed: usize, bytes: u64) -> crate::cluster::vfs_release::ReleaseReport {
+        crate::cluster::vfs_release::ReleaseReport {
+            removed,
+            bytes,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn a_dry_run_report_names_the_release_and_the_skips() {
         let mut out = Out::default();
@@ -2334,6 +2467,73 @@ mod tests {
         assert_eq!(json["version"], Value::from(7));
         assert_eq!(json["size"], Value::from(3));
         assert_eq!(json["content"], Value::String("YWJj".to_owned()));
+    }
+
+    #[test]
+    fn release_options_default_and_refuse_bad_seconds() {
+        let values = Map::new();
+        let (dry, older, include) = release_options(&values).unwrap();
+        assert!(!dry);
+        assert!(older.is_zero(), "no --older-than means no age floor");
+        assert!(!include);
+
+        let mut values = Map::new();
+        values.insert("dry-run".into(), Value::Bool(true));
+        values.insert("include-resolved".into(), Value::Bool(true));
+        values.insert("older-than".into(), Value::String("60".into()));
+        let (dry, older, include) = release_options(&values).unwrap();
+        assert!(dry && include);
+        assert_eq!(older, std::time::Duration::from_secs(60));
+
+        values.insert("older-than".into(), Value::String("x".into()));
+        assert!(release_options(&values)
+            .unwrap_err()
+            .contains("whole seconds"));
+    }
+
+    #[test]
+    fn release_says_nothing_to_do_with_the_reasons_kept() {
+        let mut kept = release_report(0, 0);
+        kept.placed = 2;
+        kept.written = 1;
+        let lines = release_lines(&kept);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with("Nothing to release: kept 3 copies"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("placed here 2"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn release_reports_what_it_freed_and_each_follow_up() {
+        let mut freed = release_report(1, 1536);
+        freed.resolved = 1;
+        freed.unconfirmed = 1;
+        freed.last_copy = 1;
+        let lines = release_lines(&freed);
+        assert!(
+            lines[0].starts_with("Released 1 copy, 1.5 KiB"),
+            "{}",
+            lines[0]
+        );
+        let all = lines.join("\n");
+        assert!(all.contains("--include-resolved"), "{all}");
+        assert!(all.contains("status --copies"), "{all}");
+        assert!(all.contains("no other node is placed"), "{all}");
+    }
+
+    #[test]
+    fn a_dry_run_says_would_release() {
+        let mut dry = release_report(2, 2048);
+        dry.dry_run = true;
+        let lines = release_lines(&dry);
+        assert!(
+            lines[0].starts_with("Would release 2 copies"),
+            "{}",
+            lines[0]
+        );
     }
 
     #[test]

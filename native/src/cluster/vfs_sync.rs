@@ -277,6 +277,16 @@ impl Members {
     }
 }
 
+/// A fixed membership, so placement rules are tested without a registry.
+#[cfg(test)]
+pub(super) fn members_for_test(self_fp: &str, admitted: &[&str], reachable: &[&str]) -> Members {
+    Members {
+        self_fp: self_fp.to_owned(),
+        admitted: admitted.iter().map(|fp| (*fp).to_owned()).collect(),
+        reachable: reachable.iter().map(|fp| (*fp).to_owned()).collect(),
+    }
+}
+
 pub(super) fn members() -> VfsResult<Members> {
     let (identity, registry) = super::nodes()?
         .ok_or_else(|| VfsError::new(VfsErrorKind::NoCluster, "this node has no cluster"))?;
@@ -708,7 +718,12 @@ pub fn wait_for_replicas(entry: &VfsEntry, timeout: Duration) -> VfsResult<usize
 }
 
 /// How many of `nodes` hold the entry's blob, asking peers by `BlobStat`.
-fn count_holders(store: &VfsStore, self_fp: &str, entry: &VfsEntry, nodes: &[String]) -> usize {
+pub(super) fn count_holders(
+    store: &VfsStore,
+    self_fp: &str,
+    entry: &VfsEntry,
+    nodes: &[String],
+) -> usize {
     let has = |node: &String| {
         if node == self_fp {
             return store.has_blob(&entry.sha256, entry.size);

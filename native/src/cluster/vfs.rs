@@ -877,6 +877,12 @@ impl VfsStore {
         Ok(out)
     }
 
+    fn kept_path(&self, sha256: &str) -> VfsResult<PathBuf> {
+        rules::validate_sha256(sha256)
+            .map_err(|error| VfsError::new(VfsErrorKind::BadUri, error.0))?;
+        Ok(self.root.join("kept").join(sha256))
+    }
+
     fn stand_in_path(&self, sha256: &str) -> VfsResult<PathBuf> {
         rules::validate_sha256(sha256)
             .map_err(|error| VfsError::new(VfsErrorKind::BadUri, error.0))?;
@@ -894,12 +900,35 @@ impl VfsStore {
     }
 
     /// Keep this copy for good: `resolve` handed its path to a tool.
+    /// A kept copy: `resolve` handed its path to a tool, so release and trim
+    /// must leave it alone until someone says otherwise.
     pub fn keep_blob(&self, sha256: &str) -> VfsResult<()> {
         let _guard = self.lock()?;
+        self.still_here()?;
         match fs::remove_file(self.stand_in_path(sha256)?) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error.into()),
-            _ => Ok(()),
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
         }
+        fs::create_dir_all(self.root.join("kept"))?;
+        fs::write(self.kept_path(sha256)?, b"")?;
+        Ok(())
+    }
+
+    /// Drop the kept mark, so a later `release` may give the copy back.
+    pub fn unkeep_blob(&self, sha256: &str) -> VfsResult<bool> {
+        let _guard = self.lock()?;
+        self.still_here()?;
+        match fs::remove_file(self.kept_path(sha256)?) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn is_kept(&self, sha256: &str) -> bool {
+        self.kept_path(sha256)
+            .map(|path| path.is_file())
+            .unwrap_or(false)
     }
 
     /// Hashes of the copies marked as stand-ins.
@@ -935,7 +964,37 @@ impl VfsStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(error.into()),
         };
-        fs::remove_file(marker)?;
+        let _ = fs::remove_file(self.stand_in_path(sha256)?);
+        Ok(removed)
+    }
+
+    /// Delete a copy this node does not owe, after re-checking under the index
+    /// lock that nothing since the caller's scan pinned it (#887).
+    pub fn release_blob_if_unneeded(&self, sha256: &str, self_fp: &str) -> VfsResult<bool> {
+        let _guard = self.lock()?;
+        self.still_here()?;
+        let index = self.load_index()?;
+        let members = crate::cluster::vfs_sync::members()?;
+        // Any entry may reference this content, as its winner or as a kept
+        // conflict, so scan all of them under the lock: a conflict added since
+        // the caller's scan must still pin the blob.
+        let placed = index
+            .entries
+            .values()
+            .filter(|entry| entry.sha256 == sha256)
+            .any(|entry| {
+                crate::cluster::vfs_sync::live_placement(entry, &members)
+                    .contains(&self_fp.to_owned())
+            });
+        if still_owed(&index, sha256, self_fp, placed, self.is_kept(sha256)) {
+            return Ok(false);
+        }
+        let removed = match fs::remove_file(self.blob_path(sha256)?) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        let _ = fs::remove_file(self.stand_in_path(sha256)?);
         Ok(removed)
     }
 
@@ -1044,12 +1103,73 @@ impl VfsStore {
                 .ok()
                 .and_then(|modified| modified.elapsed().ok())
                 .is_some_and(|age| age >= grace);
-            if old_enough && fs::remove_file(&path).is_ok() {
-                let _ = fs::remove_file(self.stand_in_path(&hash)?);
+            if old_enough
+                && drop_blob_and_markers(
+                    &path,
+                    &self.stand_in_path(&hash)?,
+                    &self.kept_path(&hash)?,
+                )
+            {
                 removed += 1;
             }
         }
         Ok(removed)
+    }
+}
+
+/// Whether the locked snapshot says this node still owes the copy: another
+/// entry pins it, placement names this node, or `resolve` kept it. Pure, so the
+/// rule is tested without a cluster or a lock.
+fn still_owed(index: &VfsIndex, sha256: &str, self_fp: &str, placed: bool, kept: bool) -> bool {
+    // Unreferenced content belongs to garbage collection, pinned content to its
+    // writer or a kept conflict. `placed` is the placement snapshot taken by
+    // the caller under the lock.
+    custody(index, sha256, self_fp) != Custody::Free || placed || kept
+}
+
+/// Delete a blob and the markers that describe it. The markers go only with
+/// the blob, so a failed unlink cannot leave a copy without its pin.
+fn drop_blob_and_markers(blob: &Path, stand_in: &Path, kept: &Path) -> bool {
+    if fs::remove_file(blob).is_err() {
+        return false;
+    }
+    let _ = fs::remove_file(stand_in);
+    let _ = fs::remove_file(kept);
+    true
+}
+
+/// Whether the index still owes this content. Pure over one snapshot, so the
+/// conflict and writer rules are tested without a cluster.
+#[derive(Debug, PartialEq, Eq)]
+enum Custody {
+    Unreferenced,
+    Pinned,
+    Free,
+}
+
+fn custody(index: &VfsIndex, sha256: &str, self_fp: &str) -> Custody {
+    let mut referenced = false;
+    let mut pinned = false;
+    for entry in index.entries.values() {
+        if entry.sha256 == sha256 {
+            referenced = true;
+            if entry.writer == self_fp {
+                pinned = true;
+            }
+        }
+        if entry
+            .conflicts
+            .iter()
+            .any(|conflict| !conflict.deleted && conflict.sha256 == sha256)
+        {
+            referenced = true;
+            pinned = true;
+        }
+    }
+    match (referenced, pinned) {
+        (false, _) => Custody::Unreferenced,
+        (true, true) => Custody::Pinned,
+        (true, false) => Custody::Free,
     }
 }
 
@@ -1144,6 +1264,156 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn entry(path: &str, sha: &str, writer: &str) -> VfsEntry {
+        VfsEntry {
+            path: path.to_owned(),
+            sha256: sha.to_owned(),
+            size: 1,
+            replicas: 1,
+            version: 1,
+            writer: writer.to_owned(),
+            deleted: false,
+            mtime: 0,
+            vv: Default::default(),
+            conflicts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn custody_pins_what_this_node_wrote_and_freeises_what_it_only_holds() {
+        let mut index = VfsIndex::default();
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        index
+            .entries
+            .insert("a".into(), entry("a", &a, "SHA256:me"));
+        index
+            .entries
+            .insert("b".into(), entry("b", &b, "SHA256:them"));
+        assert_eq!(custody(&index, &a, "SHA256:me"), Custody::Pinned);
+        assert_eq!(custody(&index, &b, "SHA256:me"), Custody::Free);
+        assert_eq!(
+            custody(&index, &"c".repeat(64), "SHA256:me"),
+            Custody::Unreferenced
+        );
+    }
+
+    #[test]
+    fn custody_pins_a_conflicts_content_even_under_another_winner() {
+        let mut index = VfsIndex::default();
+        let mut winner = entry("a", &"a".repeat(64), "SHA256:them");
+        winner.conflicts.push(remuda_core::vfs::VfsConflict {
+            sha256: "c".repeat(64),
+            size: 1,
+            replicas: 1,
+            version: 1,
+            writer: "SHA256:them".into(),
+            deleted: false,
+            vv: Default::default(),
+            mtime: 0,
+        });
+        index.entries.insert("a".into(), winner);
+        assert_eq!(
+            custody(&index, &"c".repeat(64), "SHA256:me"),
+            Custody::Pinned
+        );
+    }
+
+    #[test]
+    fn the_locked_snapshot_owes_a_copy_only_for_a_real_reason() {
+        let sha = "a".repeat(64);
+        let phash = "b".repeat(64);
+        let me = "SHA256:me";
+
+        let mut index = VfsIndex::default();
+        assert!(still_owed(&index, &sha, me, false, false), "GC owns it");
+
+        index.entries.insert("a".into(), entry("a", &sha, me));
+        assert!(still_owed(&index, &sha, me, false, false), "own write");
+
+        let mut theirs = entry("a", &sha, "SHA256:them");
+        theirs.conflicts.push(remuda_core::vfs::VfsConflict {
+            sha256: phash.clone(),
+            size: 1,
+            replicas: 1,
+            version: 1,
+            writer: "SHA256:them".into(),
+            deleted: false,
+            vv: Default::default(),
+            mtime: 0,
+        });
+        index.entries.insert("a".into(), theirs);
+        assert!(
+            still_owed(&index, &phash, me, false, false),
+            "kept conflict content"
+        );
+        assert!(
+            !still_owed(&index, &sha, me, false, false),
+            "a peer's copy this node does not hold is free"
+        );
+        assert!(
+            still_owed(&index, &sha, me, false, true),
+            "resolve pinned it"
+        );
+        assert!(
+            still_owed(&index, &sha, me, true, false),
+            "placement still names this node"
+        );
+    }
+
+    #[test]
+    fn keeping_a_copy_is_idempotent_and_unkeeping_reports_what_it_found() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        let sha = store.put_blob(b"keep me").unwrap();
+        store.mark_stand_in(&sha).unwrap();
+        assert!(store.stand_ins().unwrap().contains(&sha));
+        assert!(!store.is_kept(&sha));
+        store.keep_blob(&sha).unwrap();
+        store.keep_blob(&sha).unwrap();
+        assert!(store.is_kept(&sha));
+        assert!(
+            !store.stand_ins().unwrap().contains(&sha),
+            "a kept copy is no longer a stand-in"
+        );
+        assert!(store.unkeep_blob(&sha).unwrap());
+        assert!(!store.is_kept(&sha));
+        assert!(!store.unkeep_blob(&sha).unwrap());
+    }
+
+    #[test]
+    fn garbage_collection_takes_the_markers_with_the_blob() {
+        let scratch = Scratch::new();
+        let root = scratch.0.join("vfs");
+        fs::create_dir_all(root.join("blobs")).unwrap();
+        fs::create_dir_all(root.join("kept")).unwrap();
+        fs::create_dir_all(root.join("stand-ins")).unwrap();
+        let blob = root.join("blobs").join("a");
+        let kept = root.join("kept").join("a");
+        let stand_in = root.join("stand-ins").join("a");
+        for path in [&blob, &kept, &stand_in] {
+            fs::write(path, b"").unwrap();
+        }
+        assert!(drop_blob_and_markers(&blob, &stand_in, &kept));
+        assert!(!blob.exists() && !kept.exists() && !stand_in.exists());
+
+        // A blob that is already gone reports failure and keeps its markers:
+        // the caller did not free this content, so its pin must survive.
+        fs::write(&kept, b"").unwrap();
+        assert!(!drop_blob_and_markers(&blob, &stand_in, &kept));
+        assert!(kept.exists());
+    }
+
+    #[test]
+    fn a_kept_mark_refuses_a_hash_that_is_not_one() {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        assert_eq!(
+            store.keep_blob("../x").unwrap_err().kind,
+            VfsErrorKind::BadUri
+        );
+        assert!(!store.is_kept("../x"));
     }
 
     #[test]

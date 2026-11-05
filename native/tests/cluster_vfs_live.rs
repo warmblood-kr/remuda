@@ -1480,3 +1480,219 @@ fn a_viewer_node_renders_a_cluster_page_for_a_browser() {
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("--allow-remote"));
 }
+
+/// A loaded runner can miss the custody answer once. Release is safe to rerun,
+/// and "kept because a node did not confirm" is the documented transient.
+fn release_until_released(node: &Node, extra: &[&str]) -> String {
+    let mut last = String::new();
+    for _ in 0..10 {
+        let mut args = vec!["vfs", "release"];
+        args.extend_from_slice(extra);
+        let attempt = node.run(&args);
+        last = String::from_utf8_lossy(&attempt.stdout).to_string()
+            + &String::from_utf8_lossy(&attempt.stderr);
+        if attempt.status.success() && last.contains("Released 1 copy") {
+            return last;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    last
+}
+
+#[test]
+fn a_reader_can_release_copies_it_fetched_and_keeps_what_matters() {
+    let _serial = live_test_guard();
+    let (a, b, c) = three_nodes();
+    successful(
+        a.run_with_stdin(
+            &[
+                "vfs",
+                "put",
+                "-",
+                "remuda:///design/read-only.html",
+                "--replicas",
+                "1",
+            ],
+            Some(b"<h1>view</h1>"),
+        ),
+        "put the page",
+    );
+    let sha = a.stat_json("remuda:///design/read-only.html").unwrap()["sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The viewer must be a node placement does not name, or release would be
+    // right to keep its copy and this test would prove nothing.
+    let stat = successful(
+        a.run(&["vfs", "stat", "remuda:///design/read-only.html"]),
+        "stat",
+    );
+    let placed = stat
+        .lines()
+        .find(|line| line.starts_with("placed on "))
+        .unwrap_or_else(|| panic!("no placement line in {stat}"));
+    let label = |node: &Node| remuda_native::cluster::node_label(&node.fingerprint());
+    let viewer = [&b, &c]
+        .into_iter()
+        .find(|node| !placed.contains(&label(node)))
+        .unwrap_or_else(|| panic!("no node outside placement: {stat}"));
+    assert!(
+        !viewer.has_blob(&sha),
+        "the viewer should not hold a copy yet"
+    );
+
+    // Wait for the node placement names to take its own copy, so "unconfirmed"
+    // below means a real disagreement rather than a repair pass that has not
+    // run yet.
+    let owner = [&a, &b, &c]
+        .into_iter()
+        .find(|node| placed.contains(&label(node)))
+        .unwrap_or_else(|| panic!("no placement node among the three: {stat}"));
+    wait_until(
+        "the placement node fetches its copy",
+        Duration::from_secs(20),
+        || owner.has_blob(&sha),
+    );
+
+    // Reading pulls the blob onto a node that is not placed on it.
+    successful(
+        viewer.run(&["vfs", "get", "remuda:///design/read-only.html"]),
+        "get on the viewer",
+    );
+    assert!(
+        viewer.has_blob(&sha),
+        "a read leaves its copy behind (issue #887)"
+    );
+
+    // Today nothing releases it: a full sync pass trims only repair stand-ins.
+    let synced = successful(viewer.run(&["vfs", "sync"]), "sync on the viewer");
+    assert!(synced.contains("trimmed 0"), "{synced}");
+    assert!(
+        viewer.has_blob(&sha),
+        "sync alone does not release a read copy"
+    );
+
+    // `--older-than` keeps a copy that was just fetched.
+    let kept = successful(
+        viewer.run(&["vfs", "release", "--older-than", "3600"]),
+        "release with a grace",
+    );
+    assert!(kept.contains("too new 1"), "{kept}");
+    assert!(viewer.has_blob(&sha), "--older-than kept a fresh copy");
+
+    // The explicit release does, but only after the placement nodes confirm.
+    let released = release_until_released(viewer, &[]);
+    assert!(released.contains("Released 1 copy"), "{released}");
+    assert!(
+        !viewer.has_blob(&sha),
+        "release removes a copy nobody needs here"
+    );
+
+    // The writer never releases its own copy, and says why.
+    let kept_by_writer = successful(a.run(&["vfs", "release"]), "release on the writer");
+    assert!(
+        kept_by_writer.contains("written here 1"),
+        "{kept_by_writer}"
+    );
+    assert!(a.has_blob(&sha), "the writer keeps its own copy");
+}
+
+#[test]
+fn a_resolved_copy_is_kept_until_release_asks_for_it() {
+    let _serial = live_test_guard();
+    let (a, b, c) = three_nodes();
+    successful(
+        a.run_with_stdin(
+            &[
+                "vfs",
+                "put",
+                "-",
+                "remuda:///pinned.html",
+                "--replicas",
+                "1",
+            ],
+            Some(b"<h1>pinned</h1>"),
+        ),
+        "put the page",
+    );
+    let sha = a.stat_json("remuda:///pinned.html").unwrap()["sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let stat = successful(a.run(&["vfs", "stat", "remuda:///pinned.html"]), "stat");
+    let placed = stat
+        .lines()
+        .find(|line| line.starts_with("placed on "))
+        .unwrap_or_else(|| panic!("no placement line in {stat}"));
+    let label = |node: &Node| remuda_native::cluster::node_label(&node.fingerprint());
+    let viewer = [&b, &c]
+        .into_iter()
+        .find(|node| !placed.contains(&label(node)))
+        .unwrap_or_else(|| panic!("no node outside placement: {stat}"));
+
+    // `resolve` hands a tool a path, so the copy is pinned.
+    successful(
+        viewer.run(&["vfs", "resolve", "remuda:///pinned.html"]),
+        "resolve",
+    );
+    let pinned = successful(viewer.run(&["vfs", "release"]), "release a pinned copy");
+    assert!(pinned.contains("resolved 1"), "{pinned}");
+    assert!(viewer.has_blob(&sha), "a pinned copy stays");
+
+    // A dry run must change nothing: not the blob, and not the pin either.
+    let dry = successful(
+        viewer.run(&["vfs", "release", "--dry-run", "--include-resolved"]),
+        "dry-run over a pinned copy",
+    );
+    assert!(dry.contains("Would release 1 copy"), "{dry}");
+    assert!(viewer.has_blob(&sha), "a dry run deletes nothing");
+    let still_pinned = successful(viewer.run(&["vfs", "release"]), "release after a dry run");
+    assert!(still_pinned.contains("resolved 1"), "{still_pinned}");
+
+    // Only an explicit request gives it back.
+    let given_back = release_until_released(viewer, &["--include-resolved"]);
+    assert!(given_back.contains("Released 1 copy"), "{given_back}");
+    assert!(!viewer.has_blob(&sha), "the pin was released on request");
+}
+
+#[test]
+fn release_keeps_the_only_copy_when_every_peer_is_down() {
+    let _serial = live_test_guard();
+    let (a, b, c) = three_nodes();
+    successful(
+        a.run_with_stdin(
+            &["vfs", "put", "-", "remuda:///only.html", "--replicas", "1"],
+            Some(b"only"),
+        ),
+        "put the page",
+    );
+    let sha = a.stat_json("remuda:///only.html").unwrap()["sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Fetch on a node that does not hold it, then take every other node away:
+    // the reader is suddenly the only place the bytes exist.
+    let viewer = [&b, &c]
+        .into_iter()
+        .find(|node| !node.has_blob(&sha))
+        .expect("one non-writer lacks the copy");
+    successful(viewer.run(&["vfs", "get", "remuda:///only.html"]), "get");
+    for peer in [&a, if std::ptr::eq(viewer, &b) { &c } else { &b }] {
+        peer.kill_daemon_only();
+    }
+    // Placement counts a peer as gone only after the down grace (600 ms here),
+    // so wait for the viewer to become the only node placement could name.
+    thread::sleep(Duration::from_millis(1200));
+    let refused = successful(viewer.run(&["vfs", "release"]), "release with peers down");
+    // The reason depends on how fast the dead peers are counted as gone: this
+    // node can be the only placement, or a node that should hold a copy may
+    // simply not answer. Both keep the blob, which is the property under test.
+    assert!(refused.contains("Nothing to release"), "{refused}");
+    assert!(
+        refused.contains("placed here 1")
+            || refused.contains("only copy 1")
+            || refused.contains("unconfirmed 1"),
+        "{refused}"
+    );
+    assert!(viewer.has_blob(&sha), "release keeps the only copy");
+}
