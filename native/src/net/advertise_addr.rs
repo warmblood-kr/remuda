@@ -67,13 +67,127 @@ fn address_from_candidate(candidate: Option<IpAddr>) -> Result<SocketAddr, NoLan
     }
 }
 
+/// Return the local source address the routing table picks toward `destination`.
+/// Connecting a UDP socket sends no packet; it only resolves the route.
+pub fn route_source_toward(destination: SocketAddr) -> Option<IpAddr> {
+    let unspecified: SocketAddr = match destination {
+        SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let socket = UdpSocket::bind(unspecified).ok()?;
+    socket.connect(destination).ok()?;
+    socket.local_addr().ok().map(|address| address.ip())
+}
+
+/// Listener address for a node that is joining through `issuer`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinListenerChoice {
+    /// Keep automatic selection: it already picks the interface toward the issuer.
+    Auto,
+    /// Bind the interface that routes to the issuer, e.g. a VPN adapter that
+    /// is not the default route.
+    Toward(SocketAddr),
+}
+
+/// Choose the joiner's listener from the route source toward the issuer and
+/// the automatic choice. Only auto-eligible addresses are used, so this never
+/// widens exposure beyond private ranges.
+pub fn join_listener_choice(
+    route_source: Option<IpAddr>,
+    auto: Result<SocketAddr, NoLanAddr>,
+) -> JoinListenerChoice {
+    match route_source {
+        Some(source)
+            if is_auto_eligible(source) && auto.map(|address| address.ip()) != Ok(source) =>
+        {
+            JoinListenerChoice::Toward(SocketAddr::new(source, CLUSTER_DEFAULT_PORT))
+        }
+        _ => JoinListenerChoice::Auto,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        address_from_candidate, auto_advertise_addr, is_auto_eligible, is_private_lan, NoLanAddr,
+        address_from_candidate, auto_advertise_addr, is_auto_eligible, is_private_lan,
+        join_listener_choice, route_source_toward, JoinListenerChoice, NoLanAddr,
         CLUSTER_DEFAULT_PORT,
     };
     use std::net::{IpAddr, SocketAddr};
+
+    fn auto(address: &str) -> Result<SocketAddr, NoLanAddr> {
+        Ok(address.parse().unwrap())
+    }
+
+    fn no_lan(candidate: Option<&str>) -> Result<SocketAddr, NoLanAddr> {
+        Err(NoLanAddr {
+            candidate: candidate.map(|address| address.parse().unwrap()),
+        })
+    }
+
+    #[test]
+    fn join_listener_binds_the_vpn_interface_when_the_default_route_is_elsewhere() {
+        // Home laptop: default route is home Wi-Fi, the issuer is reached via the VPN adapter.
+        assert_eq!(
+            join_listener_choice(Some("10.8.0.5".parse().unwrap()), auto("192.168.0.20:7441")),
+            JoinListenerChoice::Toward("10.8.0.5:7441".parse().unwrap())
+        );
+        // Default route is not private at all (Windows with a public or CGNAT route).
+        assert_eq!(
+            join_listener_choice(
+                Some("172.20.1.9".parse().unwrap()),
+                no_lan(Some("203.0.113.7"))
+            ),
+            JoinListenerChoice::Toward("172.20.1.9:7441".parse().unwrap())
+        );
+        assert_eq!(
+            join_listener_choice(Some("fd00::5".parse().unwrap()), no_lan(None)),
+            JoinListenerChoice::Toward("[fd00::5]:7441".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn join_listener_keeps_auto_when_routes_agree_or_the_source_is_not_bindable() {
+        // Same subnet: the issuer route and the default route share an interface.
+        assert_eq!(
+            join_listener_choice(
+                Some("192.168.0.20".parse().unwrap()),
+                auto("192.168.0.20:7441")
+            ),
+            JoinListenerChoice::Auto
+        );
+        // Loopback test issuers, CGNAT, link-local, public and unknown sources never widen exposure.
+        for source in [
+            "127.0.0.1",
+            "100.64.0.9",
+            "169.254.3.4",
+            "203.0.113.7",
+            "::1",
+        ] {
+            assert_eq!(
+                join_listener_choice(Some(source.parse().unwrap()), auto("192.168.0.20:7441")),
+                JoinListenerChoice::Auto,
+                "{source}"
+            );
+            assert_eq!(
+                join_listener_choice(Some(source.parse().unwrap()), no_lan(None)),
+                JoinListenerChoice::Auto,
+                "{source}"
+            );
+        }
+        assert_eq!(
+            join_listener_choice(None, auto("192.168.0.20:7441")),
+            JoinListenerChoice::Auto
+        );
+    }
+
+    #[test]
+    fn route_source_toward_loopback_is_loopback() {
+        assert_eq!(
+            route_source_toward("127.0.0.1:7441".parse().unwrap()),
+            Some("127.0.0.1".parse().unwrap())
+        );
+    }
 
     #[test]
     fn auto_classifier_excludes_cgnat_and_checks_boundaries() {

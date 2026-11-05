@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Cluster join is easier (#876, first part). `remuda cluster invite` prints
+  `remuda cluster join 'remuda-join-v1 …'` without a separate fingerprint;
+  quotes are optional, so the same line works in cmd.exe. Without a terminal,
+  add `--yes` (it trusts the line as delivered); the old `FINGERPRINT 'line'`
+  form still works. A joiner now listens on the private interface that routes
+  to the inviter (e.g. a VPN adapter), joins as an outbound-only client when it
+  has no private address, and reports a clock difference over 60 seconds.
+
 - `remuda vfs status` names the stores `cluster leave` and `cluster init
   --new-identity` set aside (`Old stores:`, with their size), so they do
   not fill the disk unnoticed. `--json` has them as `old_stores`.

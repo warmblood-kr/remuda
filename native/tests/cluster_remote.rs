@@ -881,9 +881,11 @@ fn driver_hosted_remote_tui_capture_shows_live_output_with_trailing_blanks() {
         .strip_prefix("remuda cluster join '")
         .and_then(|command| command.strip_suffix('\''))
         .expect("shell-quoted join command");
-    let (fingerprint, join_line) = join_command
-        .split_once("' '")
-        .expect("separate fingerprint and join line");
+    let join_line = join_command;
+    let fingerprint = join_line
+        .split(' ')
+        .nth(2)
+        .expect("line carries the fingerprint");
     assert!(!fingerprint.contains('\''));
     assert!(!join_line.contains('\''));
     let join = server_node

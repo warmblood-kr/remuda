@@ -6,7 +6,7 @@ use std::io;
 use std::net::SocketAddr;
 use zeroize::Zeroizing;
 
-const JOIN_LINE_VERSION: &str = "remuda-join-v1";
+pub const JOIN_LINE_VERSION: &str = "remuda-join-v1";
 const MAX_JOIN_LINE_SIZE: usize = 256;
 
 /// An invitation naming the issuer endpoint, pinned Noise key, and bearer token.

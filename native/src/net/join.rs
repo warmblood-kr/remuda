@@ -52,16 +52,7 @@ pub fn join(
         .position(|bytes| bytes == b"\r\n\r\n")
         .ok_or_else(invalid_join_response)?;
     let header = std::str::from_utf8(&response[..split]).map_err(io::Error::other)?;
-    if !header
-        .lines()
-        .next()
-        .is_some_and(|line| line.contains(" 200 "))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "join was refused",
-        ));
-    }
+    check_join_status(header.lines().next().unwrap_or_default())?;
     let opened = super::frame::open_response(sealed, &response[split + 4..])?;
     check_join_response(&opened)?;
     crate::cluster::record_join_success_local(
@@ -75,6 +66,32 @@ pub fn join(
         initiator_private,
     )?;
     Ok(())
+}
+
+/// Text of the error for a join frame the issuer rejected as outside its
+/// replay window. A join frame is fresh, so this means the clocks disagree.
+pub const JOIN_CLOCK_SKEW: &str =
+    "the inviting machine rejected the request as stale: the two clocks differ by more than 60 seconds";
+
+/// Text of the error for a join the issuer turned away for load or rate limits.
+pub const JOIN_RATE_LIMITED: &str = "the inviting machine is busy or rate-limiting join attempts";
+
+/// Map the issuer's HTTP status line. Statuses the listener sends before it
+/// looks at the token (409 stale frame, 429 rate limit) leave the token unused.
+fn check_join_status(status_line: &str) -> io::Result<()> {
+    let code = status_line.split(' ').nth(1).unwrap_or_default();
+    match code {
+        "200" => Ok(()),
+        "409" => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            JOIN_CLOCK_SKEW,
+        )),
+        "429" => Err(io::Error::new(io::ErrorKind::WouldBlock, JOIN_RATE_LIMITED)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "join was refused",
+        )),
+    }
 }
 
 fn check_join_response(opened: &[u8]) -> io::Result<()> {
@@ -130,6 +147,26 @@ mod tests {
             response
         );
         assert!(read_join_response(Cursor::new(vec![b'x'; MAX_JOIN_RESPONSE_BYTES + 1])).is_err());
+    }
+
+    #[test]
+    fn join_status_names_clock_skew_and_rate_limits() {
+        assert!(check_join_status("HTTP/1.1 200 OK").is_ok());
+        let stale = check_join_status("HTTP/1.1 409 Conflict").unwrap_err();
+        assert_eq!(stale.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(stale.to_string(), JOIN_CLOCK_SKEW);
+        let limited = check_join_status("HTTP/1.1 429 Too Many Requests").unwrap_err();
+        assert_eq!(limited.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(limited.to_string(), JOIN_RATE_LIMITED);
+        for refused in [
+            "HTTP/1.1 403 Forbidden",
+            "HTTP/1.1 503 Service Unavailable",
+            "",
+            "garbage",
+        ] {
+            let error = check_join_status(refused).unwrap_err();
+            assert_eq!(error.to_string(), "join was refused", "{refused}");
+        }
     }
 
     #[test]

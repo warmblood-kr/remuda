@@ -334,8 +334,8 @@ fn quoted_join_line_unknown_word_does_not_echo_its_token() {
     assert_eq!(out.status.code(), Some(1));
     assert!(!stderr.contains(token), "diagnostic echoed secret material");
     assert!(
-        stderr.contains("that looks like a join line; run: remuda cluster join [FINGERPRINT]")
-            && stderr.contains("FINGERPRINT required when not on a terminal"),
+        stderr.contains("that looks like a join line; run: remuda cluster join 'remuda-join-v1")
+            && stderr.contains("add --yes when not on a terminal"),
         "missing join-line hint"
     );
     let _ = std::fs::remove_dir_all(dir);
@@ -351,7 +351,7 @@ fn cluster_unknown_join_line_does_not_echo_its_token() {
     assert_eq!(out.status.code(), Some(2));
     assert!(!stderr.contains(token), "diagnostic echoed secret material");
     assert!(
-        stderr.contains("that looks like a join line; run: remuda cluster join FINGERPRINT"),
+        stderr.contains("that looks like a join line; run: remuda cluster join 'remuda-join-v1"),
         "missing cluster join-line hint: {stderr}"
     );
     let _ = std::fs::remove_dir_all(dir);

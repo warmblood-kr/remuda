@@ -650,6 +650,17 @@ fn anti_entropy_interval() -> Duration {
     Duration::from_secs(60 + u64::from(std::process::id() % 11))
 }
 
+/// Debug builds only: `REMUDA_TEST_NO_LAN=1` makes automatic listener
+/// selection find no private address, so tests can reach the outbound-only
+/// join path on a machine that has one.
+fn auto_address_detector() -> AutoAddressDetector {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("REMUDA_TEST_NO_LAN").is_some_and(|value| value == "1") {
+        return Arc::new(|| Err(crate::net::advertise_addr::NoLanAddr { candidate: None }));
+    }
+    Arc::new(crate::net::advertise_addr::auto_advertise_addr)
+}
+
 const LISTENER_HOST_LOCK_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct ListenerTask {
@@ -668,7 +679,7 @@ impl ListenerTask {
         Self::start_with_retry_interval_and_detector(
             daemon_path,
             retry_interval,
-            Arc::new(crate::net::advertise_addr::auto_advertise_addr),
+            auto_address_detector(),
         )
     }
 

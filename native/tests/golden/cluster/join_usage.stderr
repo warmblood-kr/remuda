@@ -1,14 +1,15 @@
-remuda: cluster join: quote the whole join line (it contains spaces); FINGERPRINT is optional on a terminal: remuda cluster join [FINGERPRINT] 'remuda-join-v1 …'
-Join using a quoted invitation line; a fingerprint is needed when stdin is not a terminal. Example: remuda cluster join 'remuda-join-v1 …'
+remuda: cluster join: expected the invitation line printed by `remuda cluster invite`: remuda cluster join 'remuda-join-v1 …' (quotes optional; add --yes when stdin is not a terminal)
+Join using the invitation line from `remuda cluster invite`; quotes are optional. Example: remuda cluster join 'remuda-join-v1 …'
 
-Usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' [--bind IP[:PORT]]
+Usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' [--yes] [--bind IP[:PORT]]
 
 Arguments:
-  [FINGERPRINT]  Optional fingerprint for non-terminal use
-  [JOIN_LINE]    Quoted join line
+  [FINGERPRINT]  Optional pinned fingerprint (the line already carries it)
+  [JOIN_LINE]    Invitation line; quotes are optional
 
 Options:
   -h, --help              Print help
       --bind <IP[:PORT]>  Address; omitted port defaults to 7441
+      --yes               Join without the confirmation prompt (needed when stdin is not a terminal)
 
-Next: remuda cluster join [FINGERPRINT] 'JOIN_LINE' [--bind IP[:PORT]]
+Next: remuda cluster join [FINGERPRINT] 'JOIN_LINE' [--yes] [--bind IP[:PORT]]

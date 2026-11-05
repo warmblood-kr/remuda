@@ -318,7 +318,7 @@ fn invitation_join_line(output: &Output) -> String {
         .expect("invite prints its join command");
     command
         .split('\'')
-        .nth(3)
+        .nth(1)
         .expect("join line is shell quoted")
         .to_owned()
 }
@@ -334,9 +334,13 @@ fn invitation_command_args(output: &Output) -> (String, String) {
         .strip_prefix("remuda cluster join '")
         .and_then(|command| command.strip_suffix('\''))
         .expect("invite command is fully quoted");
-    let (fingerprint, line) = command
-        .split_once("' '")
-        .expect("invite command has fingerprint and line arguments");
+    let (fingerprint, line) = (
+        command
+            .split(' ')
+            .nth(2)
+            .expect("join line carries the issuer fingerprint"),
+        command,
+    );
     (fingerprint.to_owned(), line.to_owned())
 }
 
@@ -505,7 +509,7 @@ fn cluster_help_output_is_routed_and_discloses_listener_controls() {
     let cases = [
         (
             &["cluster", "--help"][..],
-"Usage: remuda cluster <COMMAND>\n\nCommands:\n  init       Create this node identity and listen on a private LAN address by default (port 7441). Example: remuda cluster init --no-listen\n  invite     Create an invitation for another node. Example: remuda cluster invite\n  join       Join using a quoted invitation line; a fingerprint is needed when stdin is not a terminal. Example: remuda cluster join 'remuda-join-v1 …'\n  nodes      List the nodes known to this cluster. Example: remuda cluster nodes\n  advertise  Refresh this node's endpoint from its running listener without restarting it\n  alias      Set or clear a cluster-wide display alias for a node. Example: remuda cluster alias node-abcd1234 macbook\n  control    Enable or disable remote control. Example: remuda cluster control off\n  revoke     Revoke a node or fingerprint; prompt before revoking unless --yes is used. Example: remuda cluster revoke node-abcd1234\n  leave      Leave the cluster: copy files to other nodes, have one of them revoke this node, then forget its membership. Example: remuda cluster leave\n  remote     Attach to a remote session, or show the remote session picker. Example: remuda cluster remote node/session\n  listen     Manage the cluster listener. Example: remuda cluster listen --bind 127.0.0.1\n  call       Call a remote node API. Example: remuda cluster call node-abcd1234 list --addr 192.0.2.1\n  help       Print help for a cluster command\n"
+"Usage: remuda cluster <COMMAND>\n\nCommands:\n  init       Create this node identity and listen on a private LAN address by default (port 7441). Example: remuda cluster init --no-listen\n  invite     Create an invitation for another node. Example: remuda cluster invite\n  join       Join using the invitation line from `remuda cluster invite`; quotes are optional. Example: remuda cluster join 'remuda-join-v1 …'\n  nodes      List the nodes known to this cluster. Example: remuda cluster nodes\n  advertise  Refresh this node's endpoint from its running listener without restarting it\n  alias      Set or clear a cluster-wide display alias for a node. Example: remuda cluster alias node-abcd1234 macbook\n  control    Enable or disable remote control. Example: remuda cluster control off\n  revoke     Revoke a node or fingerprint; prompt before revoking unless --yes is used. Example: remuda cluster revoke node-abcd1234\n  leave      Leave the cluster: copy files to other nodes, have one of them revoke this node, then forget its membership. Example: remuda cluster leave\n  remote     Attach to a remote session, or show the remote session picker. Example: remuda cluster remote node/session\n  listen     Manage the cluster listener. Example: remuda cluster listen --bind 127.0.0.1\n  call       Call a remote node API. Example: remuda cluster call node-abcd1234 list --addr 192.0.2.1\n  help       Print help for a cluster command\n"
         ),
         (
             &["cluster", "init", "--help"][..],
@@ -2085,4 +2089,144 @@ fn d4_failed_join_keeps_a_preexisting_listener_on() {
         },
         "failed join stopped a listener that was already on"
     );
+}
+
+fn start_daemon_without_lan(scratch: &Scratch) -> TrackedChild {
+    let child = scratch
+        .command(&["daemon"])
+        .env("REMUDA_TEST_NO_LAN", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start isolated daemon without a LAN address");
+    let mut daemon = TrackedChild(child);
+    let socket = remuda_native::daemon::socket_path_in(&scratch.runtime, &scratch.name);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while remuda_native::client::request(&socket, &remuda_core::protocol::Request::List).is_err() {
+        if let Some(status) = daemon.0.try_wait().expect("check isolated daemon") {
+            panic!("isolated daemon exited before ready: {status}");
+        }
+        assert!(Instant::now() < deadline, "isolated daemon did not bind");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    daemon
+}
+
+fn invite_on_loopback(inviter: &Scratch) -> String {
+    let initialized = inviter.run(&["cluster", "init", "--no-listen"]);
+    assert!(
+        initialized.status.success(),
+        "inviter init failed: {initialized:?}"
+    );
+    let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve inviter port");
+    let address = reservation.local_addr().expect("read reserved address");
+    drop(reservation);
+    let invite = inviter.run(&["cluster", "invite", "--bind", &address.to_string()]);
+    assert!(invite.status.success(), "invite failed: {invite:?}");
+    let stdout = String::from_utf8_lossy(&invite.stdout);
+    let command = stdout
+        .lines()
+        .find(|line| line.starts_with("  remuda cluster join "))
+        .expect("invite prints its join command")
+        .trim();
+    assert_eq!(
+        command.matches('\'').count(),
+        2,
+        "one quoted argument, no separate fingerprint: {command}"
+    );
+    invitation_join_line(&invite)
+}
+
+#[test]
+fn unquoted_join_words_with_yes_join_without_a_terminal() {
+    let inviter = Scratch::new();
+    let _inviter_daemon = start_daemon(&inviter);
+    let join_line = invite_on_loopback(&inviter);
+    let fingerprint = join_line.split(' ').nth(2).expect("fingerprint field");
+
+    let joiner = Scratch::new();
+    let _joiner_daemon = start_daemon(&joiner);
+    let initialized = joiner.run(&["cluster", "init", "--no-listen"]);
+    assert!(initialized.status.success(), "{initialized:?}");
+
+    // Without a terminal and without --yes, nothing is sent and the line stays valid.
+    let mut args = vec!["cluster", "join"];
+    args.extend(join_line.split(' '));
+    let refused = joiner.run(&args);
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("add --yes"), "{stderr}");
+
+    // The five words exactly as cmd.exe passes '…': quote characters attached.
+    let words: Vec<String> = join_line.split(' ').map(str::to_owned).collect();
+    let mut args: Vec<String> = vec!["cluster".into(), "join".into()];
+    args.push(format!("'{}", words[0]));
+    args.extend(words[1..4].iter().cloned());
+    args.push(format!("{}'", words[4]));
+    args.push("--yes".into());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let joined = joiner.run(&args);
+    let stdout = String::from_utf8_lossy(&joined.stdout);
+    let stderr = String::from_utf8_lossy(&joined.stderr);
+    assert!(joined.status.success(), "join failed: {joined:?}");
+    assert!(stdout.contains("Joined "), "{stdout}");
+    assert!(stderr.contains("confirmed by --yes"), "{stderr}");
+    assert!(stderr.contains(fingerprint), "{stderr}");
+    let token = words[4].as_str();
+    assert!(!stdout.contains(token) && !stderr.contains(token));
+
+    let nodes = joiner.run(&["cluster", "nodes"]);
+    let label = remuda_native::cluster::node_label(fingerprint);
+    assert!(
+        String::from_utf8_lossy(&nodes.stdout).contains(&label),
+        "{nodes:?}"
+    );
+}
+
+#[test]
+fn join_without_a_private_lan_address_continues_as_an_outbound_only_client() {
+    use remuda_native::cluster::listener_config::{self, ListenerBind, ListenerConfig};
+
+    let inviter = Scratch::new();
+    let _inviter_daemon = start_daemon(&inviter);
+    let join_line = invite_on_loopback(&inviter);
+
+    let joiner = Scratch::new();
+    let _joiner_daemon = start_daemon_without_lan(&joiner);
+    let initialized = joiner.run(&["cluster", "init", "--no-listen"]);
+    assert!(initialized.status.success(), "{initialized:?}");
+    // The saved choice is automatic selection, which finds no private address.
+    let state = joiner.root.join("state/remuda/cluster");
+    let automatic = ListenerConfig {
+        enabled: true,
+        bind: ListenerBind::Auto,
+        allow_public: false,
+    };
+    listener_config::write_at(&state, &automatic).expect("save automatic listener");
+
+    let joined = joiner.run(&["cluster", "join", &join_line, "--yes"]);
+    let stdout = String::from_utf8_lossy(&joined.stdout);
+    assert!(joined.status.success(), "join failed: {joined:?}");
+    assert!(stdout.contains("Joined "), "{stdout}");
+    assert!(stdout.contains("outbound-only client"), "{stdout}");
+    assert!(!stdout.contains("--no-listen"), "{stdout}");
+
+    // The saved listener choice is unchanged, and no endpoint was advertised.
+    assert_eq!(
+        listener_config::read_at(&state).expect("read listener config"),
+        Some(automatic)
+    );
+    let key = remuda_native::cluster::identity::load_keypair_at(&state).expect("identity");
+    let own_fp = remuda_native::cluster::encoding::fingerprint(&key[32..]);
+    let registry: remuda_native::cluster::Registry = serde_json::from_slice(
+        &fs::read(state.join("authorized_nodes.json")).expect("joined registry"),
+    )
+    .expect("decode joined registry");
+    let own = registry
+        .authorized_nodes
+        .iter()
+        .find(|entry| entry.node_fp == own_fp)
+        .expect("own registry entry");
+    assert_eq!(own.endpoint, None);
 }
