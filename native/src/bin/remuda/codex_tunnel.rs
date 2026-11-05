@@ -3,8 +3,8 @@
 //! The TUI connects to our downstream socket; we connect to the app-server and
 //! forward every byte unchanged. A separate bounded observer inspects the first
 //! `thread/start` request and its single exact response, so only the launch's own
-//! initial thread can be pinned. A parser failure disables the observer only;
-//! forwarding and the TUI continue.
+//! initial thread can be pinned. Raw forwarding continues through any parser
+//! failure, but that failure freezes publication in both directions.
 
 #![allow(dead_code)]
 
@@ -17,6 +17,7 @@ mod imp {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     const MAX_HEADERS: usize = 8 * 1024;
     const MAX_FRAME: u64 = 4 * 1024 * 1024;
@@ -38,6 +39,7 @@ mod imp {
         downstream: PathBuf,
         downstream_id: (u64, u64),
         state: Arc<Mutex<State>>,
+        capture: Arc<Mutex<Capture>>,
     }
 
     impl Tunnel {
@@ -45,11 +47,32 @@ mod imp {
             &self.downstream
         }
 
+        /// Close publication first, then remove the binding and the downstream
+        /// socket, so nothing can be published after cleanup returns.
         pub(crate) fn cleanup(&self) {
-            let taken = self.state.lock().ok().and_then(|mut state| {
+            if let Ok(mut state) = self.state.lock() {
                 state.closing = true;
-                state.published.take()
-            });
+            }
+            // An adopt that passed the fence publishes inline on its own
+            // thread. Wait for it so the binding cannot reappear after we
+            // remove it; the wait is bounded because adopt itself is bounded.
+            let deadline = Instant::now() + Duration::from_secs(6);
+            loop {
+                let publishing = self
+                    .capture
+                    .lock()
+                    .map(|capture| capture.publishing)
+                    .unwrap_or(false);
+                if !publishing || Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let taken = self
+                .state
+                .lock()
+                .ok()
+                .and_then(|mut state| state.published.take());
             if let Some(published) = taken {
                 published.remove();
             }
@@ -95,7 +118,9 @@ mod imp {
             }
         }
 
-        /// Consume bytes for inspection only. Never blocks or affects forwarding.
+        /// Consume bytes for inspection only. It never reads the network or
+        /// waits on a peer, but publication runs inline when a complete
+        /// response arrives.
         fn feed(&mut self, bytes: &[u8]) {
             if self.disabled {
                 return;
@@ -104,7 +129,7 @@ mod imp {
                 self.buffer.extend_from_slice(bytes);
                 let Some(end) = header_end(&self.buffer) else {
                     if self.buffer.len() > MAX_HEADERS {
-                        self.disabled = true;
+                        self.fail();
                     }
                     return;
                 };
@@ -126,10 +151,20 @@ mod imp {
                     }
                     Ok(None) => return,
                     Err(()) => {
-                        self.disabled = true;
+                        self.fail();
                         return;
                     }
                 }
+            }
+        }
+
+        /// A parse failure ends authority, not just observation: bytes already
+        /// seen in the other direction could otherwise publish a request we can
+        /// no longer correlate.
+        fn fail(&mut self) {
+            self.disabled = true;
+            if let Ok(mut capture) = self.capture.lock() {
+                capture.failed = true;
             }
         }
     }
@@ -207,6 +242,7 @@ mod imp {
             downstream,
             downstream_id,
             state,
+            capture,
         })
     }
 
@@ -608,14 +644,90 @@ mod imp {
             assert_eq!(root_thread(&error), None);
         }
 
+        fn text_frame(text: &str, masked: bool) -> Vec<u8> {
+            let payload = text.as_bytes();
+            let mask = [7u8, 11, 13, 17];
+            let mut frame = vec![0x81];
+            let mask_bit = if masked { 0x80 } else { 0 };
+            if payload.len() < 126 {
+                frame.push(mask_bit | payload.len() as u8);
+            } else {
+                assert!(payload.len() <= u16::MAX as usize);
+                frame.push(mask_bit | 126);
+                frame.extend((payload.len() as u16).to_be_bytes());
+            }
+            if masked {
+                frame.extend(mask);
+                frame.extend(
+                    payload
+                        .iter()
+                        .enumerate()
+                        .map(|(index, byte)| byte ^ mask[index % 4]),
+                );
+            } else {
+                frame.extend(payload);
+            }
+            frame
+        }
+
+        fn max_plus_one_frame(masked: bool) -> Vec<u8> {
+            let mut frame = vec![0x81, if masked { 0xFF } else { 0x7F }];
+            frame.extend((super::MAX_FRAME + 1).to_be_bytes());
+            frame.extend([1, 2, 3, 4]);
+            frame
+        }
+
         #[test]
         fn the_observer_forwards_through_a_parse_failure() {
-            let mut observer = Observer::new(Direction::Response, capture());
+            let capture = capture();
+            let mut observer = Observer::new(Direction::Response, capture.clone());
             observer.feed(b"HTTP/1.1 101 Switching Protocols\r\n\r\n");
-            // A fragmented/RSV frame disables observation, not forwarding.
+            // A fragmented/RSV frame freezes observation, not forwarding.
             observer.feed(&[0xF1, 0x80, 1, 2, 3, 4]);
             assert!(observer.disabled);
+            assert!(capture.lock().expect("capture").failed);
             observer.feed(b"anything");
+        }
+
+        #[test]
+        fn a_request_parse_failure_after_the_id_blocks_publication() {
+            let capture = capture();
+            let mut requests = Observer::new(Direction::Request, capture.clone());
+            requests.feed(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+            requests.feed(&text_frame(
+                r#"{"id":"startup-thread-start","method":"thread/start"}"#,
+                true,
+            ));
+            assert_eq!(
+                capture.lock().expect("capture").request_id,
+                Some(json!("startup-thread-start"))
+            );
+            // An oversize request frame hides any later request, so the first
+            // id can no longer be correlated with the response stream.
+            requests.feed(&max_plus_one_frame(true));
+            assert!(requests.disabled);
+            assert!(capture.lock().expect("capture").failed);
+
+            let mut responses = Observer::new(Direction::Response, capture.clone());
+            responses.feed(b"HTTP/1.1 101 Switching Protocols\r\n\r\n");
+            let ok = response(json!({
+                "id": A, "sessionId": A, "ephemeral": false,
+                "forkedFromId": null, "parentThreadId": null
+            }));
+            responses.feed(&text_frame(&ok.to_string(), false));
+            let capture = capture.lock().expect("capture");
+            assert!(!capture.publishing);
+            assert!(capture.failed);
+            assert!(capture.state.lock().expect("state").published.is_none());
+        }
+
+        #[test]
+        fn a_header_overflow_latches_unavailable() {
+            let capture = capture();
+            let mut observer = Observer::new(Direction::Request, capture.clone());
+            observer.feed(&vec![b'x'; super::MAX_HEADERS + 1]);
+            assert!(observer.disabled);
+            assert!(capture.lock().expect("capture").failed);
         }
     }
 }

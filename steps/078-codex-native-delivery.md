@@ -35,7 +35,9 @@ not used.
   tunnel: the TUI connects downstream, bytes are forwarded unchanged, and only
   the first `thread/start` request plus its single exact-id response are
   inspected. The captured root thread is published through the same adoption
-  preflight. Nonce/session come from the parent environment; later `/new`
+  preflight. The nonce comes from `REMUDA_BUTLER_BINDING_NONCE` and the session
+  is the core-assigned `REMUDA_SESSION_ID` of the actual session row (no alias
+  variable); later `/new`
   requests do not retarget A. Capture failure keeps forwarding but publishes
   nothing.
 - Only macOS is advertised until Linux is measured.
@@ -60,7 +62,7 @@ not used.
 
 ```text
 $ cargo test -q -p remuda-native --bin remuda
-test result: ok. 185 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s
+test result: ok. 188 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
 
 $ cargo clippy -q -p remuda-native --bin remuda -- -D warnings
 (no output)
@@ -145,9 +147,15 @@ before bind and is removed only by its created inode; the request id is register
 request bytes reach the app-server; raw chunk forwarding continues when the
 bounded observer rejects a frame; EOF before publication latches unavailable;
 request ids must be strings; method-bearing or mixed result/error envelopes are
-not responses. Regressions cover second bootstrap request, non-string id,
-error/non-root response, method-bearing matching id, and forwarding through a
-parse failure.
+not responses. A header, frame, UTF-8, RSV or oversize failure in either
+observer now latches the shared authority as failed while raw forwarding
+continues, so an id seen before the failure cannot publish from the other
+direction. Cleanup sets the closing fence first, waits briefly for an adopt
+already past the fence, removes the binding and the 0600 downstream socket,
+and only then stops the app-server. Regressions cover second bootstrap request,
+non-string id, error/non-root response, method-bearing matching id, header
+overflow, forwarding through a parse failure, and request-id-then-corrupt-frame
+followed by a valid matching response publishing nothing.
 
 Kernel peer fixture for a direct spawn: connected peer PID/start equals the
 spawned child, uid equals euid, resolved socket is 0600. Two spawns with the

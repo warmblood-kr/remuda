@@ -22,19 +22,30 @@ fn publish_config(
     if !cfg!(target_os = "macos") {
         return Err("unsupported_platform");
     }
-    if !std::path::Path::new(path).is_absolute() {
-        return Err("binding_env");
-    }
     let nonce = std::env::var("REMUDA_BUTLER_BINDING_NONCE").map_err(|_| "binding_env")?;
-    let session = std::env::var("REMUDA_BUTLER_SESSION").map_err(|_| "binding_env")?;
-    if !super::codex_native::valid_token(&nonce) || !super::codex_native::valid_token(&session) {
+    // The session is the core-assigned id of the shell's actual session row,
+    // the same value the OpenCode launcher uses. There is no alias variable.
+    let session = std::env::var("REMUDA_SESSION_ID").map_err(|_| "binding_env")?;
+    publish_with(path, nonce, session).map(Some)
+}
+
+#[cfg(unix)]
+fn publish_with(
+    path: &str,
+    nonce: String,
+    session: String,
+) -> Result<super::codex_tunnel::Publish, &'static str> {
+    if !std::path::Path::new(path).is_absolute()
+        || !super::codex_native::valid_token(&nonce)
+        || !super::codex_native::valid_token(&session)
+    {
         return Err("binding_env");
     }
-    Ok(Some(super::codex_tunnel::Publish {
+    Ok(super::codex_tunnel::Publish {
         binding: path.into(),
         nonce,
         session,
-    }))
+    })
 }
 
 #[cfg(not(unix))]
@@ -225,7 +236,7 @@ fn serve_tui(
         Ok(publish) => publish,
         Err(_) => {
             eprintln!(
-                "remuda: --binding needs a private REMUDA_BUTLER_BINDING_NONCE and REMUDA_BUTLER_SESSION"
+                "remuda: --binding needs a private REMUDA_BUTLER_BINDING_NONCE and REMUDA_SESSION_ID"
             );
             return ExitCode::FAILURE;
         }
@@ -275,11 +286,11 @@ fn serve_tui(
     let mut parent_watch = match start_parent_watch(server.id()) {
         Ok(watch) => Some(watch),
         Err(error) => {
-            finish_app_server(&mut server, None);
             #[cfg(unix)]
             if let Some(tunnel) = tunnel.as_ref() {
                 tunnel.cleanup();
             }
+            finish_app_server(&mut server, None);
             let _ = std::fs::remove_file(&socket);
             #[cfg(unix)]
             drop_runtime(&runtime);
@@ -290,11 +301,11 @@ fn serve_tui(
     let mut parent_watch: Option<Child> = None;
 
     if !wait_for_socket(&socket) {
-        finish_app_server(&mut server, parent_watch.take());
         #[cfg(unix)]
         if let Some(tunnel) = tunnel.as_ref() {
             tunnel.cleanup();
         }
+        finish_app_server(&mut server, parent_watch.take());
         let _ = std::fs::remove_file(&socket);
         #[cfg(unix)]
         drop_runtime(&runtime);
@@ -307,11 +318,13 @@ fn serve_tui(
     #[cfg(not(unix))]
     std::thread::spawn(move || monitor(&monitor_socket, &monitor_status));
     let result = Command::new("codex").args(&client_args).status();
-    finish_app_server(&mut server, parent_watch.take());
+    // Fence publication and remove the bridge before the app-server dies, so a
+    // binding cannot outlive the socket it points at.
     #[cfg(unix)]
     if let Some(tunnel) = tunnel.as_ref() {
         tunnel.cleanup();
     }
+    finish_app_server(&mut server, parent_watch.take());
     let _ = std::fs::remove_file(&socket);
     #[cfg(unix)]
     drop_runtime(&runtime);
@@ -842,6 +855,27 @@ mod tests {
 
     fn status_path(test: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("remuda-codex-{test}-{}", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_published_session_is_the_core_assigned_id() {
+        let publish = publish_with(
+            "/tmp/x/manifest.json",
+            "nonce-1".into(),
+            "01a1aba5-session".into(),
+        )
+        .expect("publish");
+        assert_eq!(publish.nonce, "nonce-1");
+        assert_eq!(publish.session, "01a1aba5-session");
+        assert_eq!(
+            publish.binding,
+            std::path::Path::new("/tmp/x/manifest.json")
+        );
+        // Relative binding paths and unusable tokens stay binding_env errors.
+        assert!(publish_with("manifest.json", "n".into(), "s".into()).is_err());
+        assert!(publish_with("/tmp/x/manifest.json", String::new(), "s".into()).is_err());
+        assert!(publish_with("/tmp/x/manifest.json", "n".into(), String::new()).is_err());
     }
 
     #[test]
