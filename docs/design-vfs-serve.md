@@ -57,7 +57,8 @@ other verbs.
 
 Paths are percent-decoded once, then checked by the same rules as `remuda
 vfs put` (`remuda_core::vfs`): no `.`/`..` component, no `\`, no NUL or control
-characters, 1024 bytes at most. A path that fails those rules is `404`; it is
+characters, 1024 bytes at most. A path that fails those rules is `404`; a
+malformed percent escape or a raw control byte in the target is `400`. It is
 never normalised and never reaches the store. `..` after decoding is a
 traversal attempt, not a directory.
 
