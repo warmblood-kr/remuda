@@ -62,7 +62,7 @@ not used.
 
 ```text
 $ cargo test -q -p remuda-native --bin remuda
-test result: ok. 191 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+test result: ok. 193 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
 
 $ cargo clippy -q -p remuda-native --bin remuda -- -D warnings
 (no output)
@@ -159,8 +159,10 @@ app-server. Regressions cover second bootstrap request,
 non-string id, error/non-root response, method-bearing matching id, header
 overflow, forwarding through a parse failure, and request-id-then-corrupt-frame
 followed by a valid matching response publishing nothing, early EOF then
-reconnect, a reused bootstrap id, and cleanup without an in-flight adopt
-returning immediately.
+reconnect, a reused bootstrap id, cleanup without an in-flight adopt returning
+immediately, and an injected completion seam: a fake created manifest+pin is
+removed when failure is latched while the attempt is in flight, and a clean
+completion stores the publication and cleans up under one second.
 
 Kernel peer fixture for a direct spawn: connected peer PID/start equals the
 spawned child, uid equals euid, resolved socket is 0600. Two spawns with the

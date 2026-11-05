@@ -754,6 +754,22 @@ pub(crate) fn adopt(request: &AdoptRequest) -> Result<Published, &'static str> {
     })
 }
 
+/// Test-only stand-in for a completed adopt: two real created files that
+/// `remove` can delete.
+#[cfg(all(test, unix))]
+pub(crate) fn fake_published(dir: &std::path::Path) -> Published {
+    let write = |file: &mut std::fs::File| {
+        std::io::Write::write_all(file, b"{}").map_err(|_| "invalid_pin")
+    };
+    let manifest = store_pin_with(&dir.join("manifest.json"), write).expect("manifest");
+    let pin = store_pin_with(&dir.join("pin.json"), write).expect("pin");
+    Published {
+        generation: "fake".into(),
+        manifest,
+        pin,
+    }
+}
+
 #[cfg(not(unix))]
 pub(crate) fn adopt(_request: &AdoptRequest) -> Result<Published, &'static str> {
     Err("unsupported_platform")

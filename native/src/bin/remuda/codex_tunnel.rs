@@ -456,12 +456,18 @@ mod imp {
             socket: upstream.to_string_lossy().into_owned(),
             thread,
         };
-        let result = codex_native::adopt(&request);
-        // Both terminal outcomes release the in-flight marker, and the
-        // authority flag is re-checked under the same lock that observers use
-        // to latch a failure, so a request parse failure during adopt cannot
-        // be followed by publication.
-        let Ok(mut capture) = capture.lock() else {
+        settle_publication(capture, &state, codex_native::adopt(&request));
+    }
+
+    /// Release the in-flight marker on both outcomes; a success re-checks the
+    /// authority flag under the observer lock so a raced failure removes the
+    /// created files instead of retaining a binding.
+    fn settle_publication(
+        shared: &Arc<Mutex<Capture>>,
+        state: &Arc<Mutex<State>>,
+        result: Result<codex_native::Published, &'static str>,
+    ) {
+        let Ok(mut capture) = shared.lock() else {
             if let Ok(published) = result {
                 published.remove();
             }
@@ -594,6 +600,48 @@ mod imp {
             let started = Instant::now();
             tunnel.cleanup();
             assert!(started.elapsed() < Duration::from_secs(1));
+            let _ = std::fs::remove_dir_all(&runtime);
+        }
+
+        #[test]
+        fn a_parse_failure_racing_adopt_removes_the_created_files() {
+            let runtime = runtime_dir().expect("runtime");
+            let capture = capture();
+            let state = capture.lock().expect("capture").state.clone();
+            capture.lock().expect("capture").publishing = true;
+            let published = codex_native::fake_published(&runtime);
+            assert!(runtime.join("manifest.json").exists());
+            // The request observer latches failure while adopt is in flight.
+            capture.lock().expect("capture").failed = true;
+            settle_publication(&capture, &state, Ok(published));
+            assert!(!runtime.join("manifest.json").exists());
+            assert!(!runtime.join("pin.json").exists());
+            assert!(state.lock().expect("state").published.is_none());
+            assert!(!capture.lock().expect("capture").publishing);
+            let _ = std::fs::remove_dir_all(&runtime);
+        }
+
+        #[test]
+        fn a_completed_publication_is_stored_and_cleanup_is_immediate() {
+            let runtime = runtime_dir().expect("runtime");
+            let capture = capture();
+            let state = capture.lock().expect("capture").state.clone();
+            capture.lock().expect("capture").publishing = true;
+            let published = codex_native::fake_published(&runtime);
+            settle_publication(&capture, &state, Ok(published));
+            assert!(state.lock().expect("state").published.is_some());
+            assert!(!capture.lock().expect("capture").publishing);
+            let tunnel = Tunnel {
+                downstream: runtime.join("tui.sock"),
+                downstream_id: (0, 0),
+                state,
+                capture,
+            };
+            let started = Instant::now();
+            tunnel.cleanup();
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(!runtime.join("manifest.json").exists());
+            assert!(!runtime.join("pin.json").exists());
             let _ = std::fs::remove_dir_all(&runtime);
         }
 
