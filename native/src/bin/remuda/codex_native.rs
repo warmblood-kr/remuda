@@ -1003,6 +1003,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_withdrawn_authority_publishes_nothing() {
         let request = AdoptRequest {
