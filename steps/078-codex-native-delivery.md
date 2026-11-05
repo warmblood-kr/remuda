@@ -104,6 +104,12 @@ measurement, so this is still not exactly-once. The add count was not
 packet-sniffed because the helper connects directly to the upstream; the helper
 has exactly one add call site, no retry path, and one turn completed.
 
+A second bounded run repeated `adopted` + `accepted_queue` (generation
+`50cc8135...`) and then SIGKILLed the pty TUI: the spawned app-server stayed
+alive (`SERVER_AFTER_TUI_EXIT alive`). TUI exit alone does not stop the server;
+the launcher must own stopping its spawned app-server/tunnel. The helper kills
+nothing. Artifacts: `spike-codex-tunnel/evidence/2026-11-05/`.
+
 Kernel peer fixture for a direct spawn: connected peer PID/start equals the
 spawned child, uid equals euid, resolved socket is 0600. Two spawns with the
 same advertised path produced the same target hash with a new inode and start;
