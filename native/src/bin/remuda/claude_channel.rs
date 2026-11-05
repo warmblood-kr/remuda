@@ -497,10 +497,16 @@ fn write_line<W: Write>(writer: &mut W, line: &str) -> WriteOutcome {
 
 /// The private ingress record. The capability secret is in a separate 0600
 /// file; this record never carries it.
+#[cfg(target_os = "macos")]
+const MAX_SOCKET_PATH: usize = 103;
+#[cfg(not(target_os = "macos"))]
+const MAX_SOCKET_PATH: usize = 107;
+
 struct Published {
     listener: Option<std::os::unix::net::UnixListener>,
     socket_path: PathBuf,
     socket_id: FileId,
+    socket_dir: Option<(PathBuf, FileId)>,
     manifest: CreatedFile,
     capability: CreatedFile,
     bridge: CreatedFile,
@@ -512,6 +518,9 @@ impl Published {
     fn cleanup(mut self) {
         drop(self.listener.take());
         remove_if_id(&self.socket_path, self.socket_id);
+        if let Some((directory, id)) = self.socket_dir.take() {
+            remove_dir_if_id(&directory, id);
+        }
         self.manifest.remove();
         self.capability.remove();
         self.bridge.remove();
@@ -524,24 +533,89 @@ struct FileId {
     ino: u64,
 }
 
+fn socket_path_fits(path: &Path) -> bool {
+    path.as_os_str().len() <= MAX_SOCKET_PATH
+}
+
+/// The socket stays beside the manifest when that path fits `sockaddr_un`.
+/// A long data-home gets a short owned 0700 runtime directory instead; the
+/// manifest records the exact endpoint and the cleanup is inode-fenced.
+fn socket_directory(binding_dir: &Path) -> Result<(PathBuf, Option<(PathBuf, FileId)>), String> {
+    let preferred = binding_dir.join("ingress.sock");
+    if socket_path_fits(&preferred) {
+        return Ok((binding_dir.to_path_buf(), None));
+    }
+    let name = format!(
+        "remuda-claude-{}-{}",
+        unsafe { libc::geteuid() },
+        random_hex(8)?
+    );
+    let mut base = None;
+    for candidate in [std::env::temp_dir(), PathBuf::from("/tmp")] {
+        let Ok(candidate) = candidate.canonicalize() else {
+            continue;
+        };
+        if socket_path_fits(&candidate.join(&name).join("ingress.sock")) {
+            base = Some(candidate);
+            break;
+        }
+    }
+    let base = base.ok_or("no short private runtime directory fits the ingress socket")?;
+    let path = base.join(&name);
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&path)
+        .map_err(|error| format!("cannot create runtime socket directory: {error}"))?;
+    let id = match file_id(&path) {
+        Ok(id) => id,
+        Err(error) => {
+            let _ = std::fs::remove_dir(&path);
+            return Err(error);
+        }
+    };
+    if PrivateDir::open(&path).is_err() {
+        let _ = std::fs::remove_dir(&path);
+        return Err("runtime socket directory is not a private directory".into());
+    }
+    Ok((path.clone(), Some((path, id))))
+}
+
+fn cleanup_socket_dir(directory: &Option<(PathBuf, FileId)>) {
+    if let Some((path, id)) = directory {
+        remove_dir_if_id(path, *id);
+    }
+}
+
 fn publish(config: &Config, protocol_version: &str) -> Result<Published, String> {
     let directory = PrivateDir::open(&config.binding_dir)?;
     let transport_id = random_hex(16)?;
     let capability = random_hex(32)?;
-    let socket_path = config.binding_dir.join("ingress.sock");
+    let (socket_dir, socket_dir_id) = socket_directory(&config.binding_dir)?;
+    let socket_path = socket_dir.join("ingress.sock");
     let capability_path = config.binding_dir.join("capability");
-    reject_existing(&socket_path)?;
+    if let Err(error) = reject_existing(&socket_path) {
+        cleanup_socket_dir(&socket_dir_id);
+        return Err(error);
+    }
 
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path)
-        .map_err(|error| format!("cannot bind ingress socket: {error}"))?;
+    let listener = match std::os::unix::net::UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            cleanup_socket_dir(&socket_dir_id);
+            return Err(format!("cannot bind ingress socket: {error}"));
+        }
+    };
     if let Err(error) = set_mode(&socket_path, 0o600) {
         let _ = std::fs::remove_file(&socket_path);
+        cleanup_socket_dir(&socket_dir_id);
         return Err(error);
     }
     let socket_id = match file_id(&socket_path) {
         Ok(id) => id,
         Err(error) => {
             let _ = std::fs::remove_file(&socket_path);
+            cleanup_socket_dir(&socket_dir_id);
             return Err(error);
         }
     };
@@ -550,6 +624,7 @@ fn publish(config: &Config, protocol_version: &str) -> Result<Published, String>
         Ok(file) => file,
         Err(error) => {
             remove_if_id(&socket_path, socket_id);
+            cleanup_socket_dir(&socket_dir_id);
             return Err(error);
         }
     };
@@ -558,6 +633,7 @@ fn publish(config: &Config, protocol_version: &str) -> Result<Published, String>
         Some(identity) => identity,
         None => {
             remove_if_id(&socket_path, socket_id);
+            cleanup_socket_dir(&socket_dir_id);
             capability_file.remove();
             return Err("cannot read the bridge process identity".into());
         }
@@ -582,6 +658,7 @@ fn publish(config: &Config, protocol_version: &str) -> Result<Published, String>
         Ok(file) => file,
         Err(error) => {
             remove_if_id(&socket_path, socket_id);
+            cleanup_socket_dir(&socket_dir_id);
             capability_file.remove();
             return Err(error);
         }
@@ -598,6 +675,7 @@ fn publish(config: &Config, protocol_version: &str) -> Result<Published, String>
         Ok(file) => file,
         Err(error) => {
             remove_if_id(&socket_path, socket_id);
+            cleanup_socket_dir(&socket_dir_id);
             capability_file.remove();
             manifest_file.remove();
             return Err(error);
@@ -608,6 +686,7 @@ fn publish(config: &Config, protocol_version: &str) -> Result<Published, String>
         listener: Some(listener),
         socket_path,
         socket_id,
+        socket_dir: socket_dir_id,
         manifest: manifest_file,
         capability: capability_file,
         bridge: bridge_file,
@@ -625,8 +704,21 @@ fn reject_existing(path: &Path) -> Result<(), String> {
 }
 
 fn create_file(directory: &PrivateDir, name: &str, bytes: &[u8]) -> Result<CreatedFile, String> {
-    // Write the full leaf under a temporary name, then publish the final name
-    // with one rename. A reader never sees a created-but-empty manifest.
+    create_file_with(directory, name, bytes, || {})
+}
+
+fn create_file_with<F>(
+    directory: &PrivateDir,
+    name: &str,
+    bytes: &[u8],
+    before_publish: F,
+) -> Result<CreatedFile, String>
+where
+    F: FnOnce(),
+{
+    // Stage the full leaf under a temporary name, then publish the final name
+    // with one atomic no-replace link. A reader never sees a created-but-empty
+    // manifest, and a concurrent first generation is never overwritten.
     let suffix = random_hex(8).unwrap_or_else(|_| std::process::id().to_string());
     let temp = format!(".{name}.tmp.{suffix}");
     let (mut file, id) = directory
@@ -638,21 +730,12 @@ fn create_file(directory: &PrivateDir, name: &str, bytes: &[u8]) -> Result<Creat
         return Err(format!("cannot write {name}: {error}"));
     }
     drop(file);
-    match directory.leaf_absent(name) {
-        Ok(true) => {}
-        Ok(false) => {
-            staged.remove();
-            return Err(format!("{name} already exists"));
-        }
-        Err(error) => {
-            staged.remove();
-            return Err(error);
-        }
-    }
-    if let Err(error) = directory.rename(&temp, name) {
+    before_publish();
+    if let Err(error) = directory.link_new(&temp, name) {
         staged.remove();
         return Err(error);
     }
+    staged.remove();
     let published = CreatedFile::new(directory.clone(), name.to_string(), id);
     if let Err(error) = directory.sync() {
         published.remove();
@@ -693,6 +776,16 @@ fn remove_if_id(path: &Path, expected: FileId) {
     use std::os::unix::fs::MetadataExt;
     if metadata.dev() == expected.dev && metadata.ino() == expected.ino {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+fn remove_dir_if_id(path: &Path, expected: FileId) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.dev() == expected.dev && metadata.ino() == expected.ino {
+        let _ = std::fs::remove_dir(path);
     }
 }
 
@@ -1214,7 +1307,8 @@ fn validate_channel_manifest(
         || manifest.bridge_started_us == 0
         || !is_hex(&manifest.transport_id, 32)
         || !socket_path.is_absolute()
-        || socket_path.parent() != Some(parent)
+        || socket_path.file_name().is_none()
+        || !socket_parent_is_private(socket_path)
         || !capability.is_absolute()
         || capability.parent() != Some(parent)
         || capability.file_name().is_none()
@@ -1222,6 +1316,24 @@ fn validate_channel_manifest(
         return Err("invalid_binding");
     }
     Ok(())
+}
+
+/// The endpoint may live beside the manifest or in a short owned runtime
+/// directory; either way the parent must be a real 0700 directory of this user.
+fn socket_parent_is_private(socket_path: &Path) -> bool {
+    let Some(parent) = socket_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return false;
+    };
+    let Ok(metadata) = std::fs::symlink_metadata(parent) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    PrivateDir::open(parent).is_ok()
 }
 
 fn is_hex(value: &str, length: usize) -> bool {
@@ -1235,7 +1347,8 @@ fn checked_socket(manifest: &ChannelManifest) -> Result<&str, &'static str> {
         .strip_prefix("unix://")
         .ok_or("invalid_binding")?;
     let metadata = std::fs::symlink_metadata(socket).map_err(|_| "invalid_binding")?;
-    if !socket_is_private(&metadata)
+    if !socket_parent_is_private(Path::new(socket))
+        || !socket_is_private(&metadata)
         || metadata.dev() != manifest.socket_dev
         || metadata.ino() != manifest.socket_ino
     {
@@ -1668,6 +1781,126 @@ mod tests {
     }
 
     #[test]
+    fn socket_path_length_limit_is_explicit() {
+        assert!(socket_path_fits(Path::new("/tmp/remuda/ingress.sock")));
+        let exact = "y".repeat(MAX_SOCKET_PATH);
+        assert!(socket_path_fits(Path::new(&exact)));
+        let long = "x".repeat(MAX_SOCKET_PATH + 1);
+        assert!(!socket_path_fits(Path::new(&long)));
+    }
+
+    #[test]
+    fn publish_uses_a_short_private_socket_dir_for_a_long_binding_path() {
+        let base = private_dir();
+        let binding = base.join("b".repeat(80));
+        std::fs::create_dir(&binding).expect("long binding dir");
+        std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700");
+        assert!(!socket_path_fits(&binding.join("ingress.sock")));
+
+        let published = publish(&config(&binding), "2025-06-18").expect("publish");
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(binding.join("channel.json")).unwrap()).unwrap();
+        let endpoint = manifest["endpoint"].as_str().unwrap();
+        let socket = Path::new(endpoint.strip_prefix("unix://").unwrap());
+        assert!(socket_path_fits(socket));
+        assert_ne!(socket.parent(), Some(binding.as_path()));
+        let socket_dir = socket.parent().unwrap();
+        assert_eq!(
+            std::fs::metadata(socket_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(binding.join("capability").exists());
+
+        let request = notice_request(&binding, "msg_01");
+        let loaded = load_channel_manifest(&request.binding).expect("manifest");
+        validate_channel_manifest(&request, &loaded).expect("private runtime socket dir accepted");
+
+        let socket_dir = socket_dir.to_path_buf();
+        published.cleanup();
+        assert!(!binding.join("channel.json").exists());
+        assert!(!socket.exists());
+        assert!(!socket_dir.exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn helper_rejects_a_shared_or_symlinked_socket_directory() {
+        use std::os::unix::net::UnixListener;
+
+        let base = private_dir();
+        let short = PathBuf::from(format!(
+            "/tmp/rcs-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&short).expect("short socket root");
+        let shared = short.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 0755");
+        let shared_socket = shared.join("ingress.sock");
+        let shared_listener = UnixListener::bind(&shared_socket).unwrap();
+        set_mode(&shared_socket, 0o600).unwrap();
+        let shared_id = file_id(&shared_socket).unwrap();
+        let capability_path = base.join("capability");
+        std::fs::write(&capability_path, b"abcd").unwrap();
+        set_mode(&capability_path, 0o600).unwrap();
+        let identity = process_identity(std::process::id()).unwrap();
+        let manifest = ChannelManifest {
+            schema: 1,
+            protocol: PROTOCOL.into(),
+            nonce: "nonce".into(),
+            session: "session".into(),
+            endpoint: format!("unix://{}", shared_socket.display()),
+            bridge_pid: std::process::id(),
+            bridge_started_us: identity.started_us,
+            socket_dev: shared_id.dev,
+            socket_ino: shared_id.ino,
+            transport_id: "0123456789abcdef0123456789abcdef".into(),
+            protocol_version: SUPPORTED_PROTOCOL_VERSION.into(),
+            state: "mcp_initialized".into(),
+            capability_file: capability_path.to_string_lossy().into(),
+        };
+        let request = notice_request(&base, "msg_01");
+        assert_eq!(
+            validate_channel_manifest(&request, &manifest),
+            Err("invalid_binding")
+        );
+        assert_eq!(
+            deliver_notice(&request, &manifest),
+            Delivery::DefinitelyNotWritten("invalid_binding")
+        );
+        drop(shared_listener);
+
+        let private_socket_dir = short.join("private-socket");
+        std::fs::create_dir(&private_socket_dir).unwrap();
+        std::fs::set_permissions(&private_socket_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700");
+        let private_socket = private_socket_dir.join("ingress.sock");
+        let private_listener = UnixListener::bind(&private_socket).unwrap();
+        set_mode(&private_socket, 0o600).unwrap();
+        let private_id = file_id(&private_socket).unwrap();
+        let link = short.join("socket-link");
+        std::os::unix::fs::symlink(&private_socket_dir, &link).unwrap();
+        let mut linked = manifest.clone();
+        linked.endpoint = format!("unix://{}", link.join("ingress.sock").display());
+        linked.socket_dev = private_id.dev;
+        linked.socket_ino = private_id.ino;
+        assert_eq!(
+            validate_channel_manifest(&request, &linked),
+            Err("invalid_binding")
+        );
+        assert_eq!(
+            deliver_notice(&request, &linked),
+            Delivery::DefinitelyNotWritten("invalid_binding")
+        );
+        drop(private_listener);
+        let _ = std::fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(short);
+    }
+
+    #[test]
     fn stdio_initialize_then_ingress_emits_one_channel_notification() {
         use std::os::unix::net::UnixStream;
 
@@ -1952,6 +2185,32 @@ mod tests {
             );
         }
         first.cleanup();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn publication_never_replaces_a_concurrent_first_generation() {
+        let dir = private_dir();
+        let directory = PrivateDir::open(&dir).expect("private dir");
+        let target = dir.join("channel.json");
+        let result = create_file_with(&directory, "channel.json", b"ours", || {
+            std::fs::write(&target, b"theirs").expect("concurrent first generation");
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600");
+        });
+        assert!(
+            result.is_err(),
+            "publication replaced a concurrent first generation"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"theirs");
+        assert!(
+            !std::fs::read_dir(&dir).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp.")),
+            "a temporary leaf was left behind"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

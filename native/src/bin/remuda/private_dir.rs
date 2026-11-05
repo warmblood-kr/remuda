@@ -290,10 +290,9 @@ mod imp {
             }
         }
 
-        /// Rename one leaf inside the pinned directory. Both names are
-        /// relative to the same descriptor, so a swapped parent cannot
-        /// redirect the publication.
-        pub fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+        /// Publish `from` as `to` without replacing an existing leaf. Unlike
+        /// `rename`, a concurrent first generation makes this fail with EEXIST.
+        pub fn link_new(&self, from: &str, to: &str) -> Result<(), String> {
             if !valid_leaf(from) || !valid_leaf(to) {
                 return Err("binding file name must be one path component".into());
             }
@@ -303,20 +302,23 @@ mod imp {
                 CString::new(to).map_err(|_| "binding path contains a NUL byte".to_string())?;
             // SAFETY: both names are NUL terminated and relative to `self.fd`.
             if unsafe {
-                libc::renameat(
+                libc::linkat(
                     self.fd.as_raw_fd(),
                     from.as_ptr(),
                     self.fd.as_raw_fd(),
                     to.as_ptr(),
+                    0,
                 )
             } == 0
             {
                 Ok(())
             } else {
-                Err(format!(
-                    "cannot publish binding manifest: {}",
-                    io::Error::last_os_error()
-                ))
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    Err("binding leaf already exists".into())
+                } else {
+                    Err(format!("cannot publish binding manifest: {error}"))
+                }
             }
         }
 
@@ -557,7 +559,7 @@ mod unsupported {
             Err("OpenCode native binding requires macOS or Linux".into())
         }
 
-        pub fn rename(&self, _from: &str, _to: &str) -> Result<(), String> {
+        pub fn link_new(&self, _from: &str, _to: &str) -> Result<(), String> {
             Err("OpenCode native binding requires macOS or Linux".into())
         }
 

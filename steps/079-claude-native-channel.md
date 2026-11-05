@@ -36,9 +36,14 @@ clients, the PTY fallback and the completed guidance work must stay unchanged.
   dedup/release, duplicate startup preservation, replacement preservation,
   symlinked/replaced claims dir, claim fsync failure, and EOF return with a
   blocked writer or a full reply queue.
+- A long (>103-byte) binding path publishes the endpoint in a short owned 0700
+  runtime socket directory while the capability and manifest stay in the
+  binding directory. The helper accepts that exact recorded endpoint, and
+  cleanup removes only the owned runtime directory.
 - `_claude_notice` tests cover `binding_missing` versus `invalid_binding`, the
-  exact manifest shape, stale bridge/socket, malformed ACK, duplicate claim,
-  and an end-to-end stdio + ingress delivery.
+  exact manifest shape, stale bridge/socket, a shared or symlinked socket
+  parent, malformed ACK, duplicate claim, and an end-to-end stdio + ingress
+  delivery.
 - `cargo test`, `cargo clippy`, `cargo fmt --check` and the repository comment,
   step and principle checks pass.
 
@@ -46,19 +51,19 @@ clients, the PTY fallback and the completed guidance work must stay unchanged.
 
 ```text
 cargo test -p remuda-native --bin remuda claude_channel
-test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 155 filtered out; finished in 0.15s
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 155 filtered out; finished in 0.18s
 
 cargo test -p remuda-native --bin remuda
-test result: ok. 186 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
+test result: ok. 190 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
 
 cargo clippy -p remuda-native --bin remuda --tests
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.67s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.83s
 
 cargo fmt --all -- --check
 fmt exit: 0
 
 python3 scripts/check-comments.py
-ok — 1882 doc comment(s) within cap (item 3, module 20)
+ok — 1884 doc comment(s) within cap (item 3, module 20)
 
 python3 scripts/check-steps.py
 ok — 78 step(s), each with before, desired, expected and captured actual
