@@ -30,6 +30,59 @@ remuda vfs rm remuda:///notes.md               # delete everywhere
 
 Exit 75 is `EX_TEMPFAIL` from `sysexits.h`. Nothing is rolled back.
 
+## Publishing a directory: `remuda vfs publish`
+
+A page is usually several files. `publish` uploads a directory as one named
+release and marks it complete only after every file is in:
+
+```sh
+remuda vfs publish site remuda:///design --release 2026-11-04
+# Published 12 files (1.4 MiB) as 2026-11-04 to remuda:///design/2026-11-04/.
+```
+
+- Regular files only; a symlink is skipped and named, never followed. At most
+  500 files, 32 MiB each and 1 GiB per release, and publishing stops if the
+  machine lacks room for the source plus a 256 MiB reserve.
+- Each file is one ordinary `put` to `PREFIX/NAME/<relative path>`, so
+  `--replicas` settings and `--min-copies K` behave exactly as they do for one
+  file.
+- `PREFIX/NAME/COMPLETE` is written **last**, and only if every file arrived.
+  A release with no `COMPLETE` is unfinished: its files are there, but the
+  release is not. `--pointer` also writes `PREFIX/CURRENT` with the release
+  name after the marker, so a viewer has one stable path to open.
+- A name that already has files is refused, so a release is not overwritten.
+  That check is cooperative: a partitioned node can hide a release from it.
+- `--dry-run` prints the plan and writes nothing.
+- A source file that changes between the plan and the upload aborts the run
+  rather than publishing a mix; open files and quit your editor first. Unix
+  catches a *replacement* by file identity, but a same-inode rewrite with size
+  and mtime restored is not detectable from metadata on any platform, and
+  elsewhere a same-size rewrite can pass: publish assumes a quiet source. A
+  link swapped in after the plan, at the file or any parent, changes the
+  resolved path and is refused while it stays in place; a swap restored before
+  the final check is only detectable with Unix identity.
+
+Exit codes: 0 done; 1 a file failed, the source changed, `COMPLETE` could not
+be written, or `--pointer` could not write `CURRENT` — the message says which,
+so a 1 alone does not prove `COMPLETE` is absent. Fix the cause and publish a
+**new** `--release` name (the old prefix keeps the files it received; `remuda
+vfs ls remuda:///design/NAME/` shows them). When the message says the marker
+could not be confirmed, check `remuda vfs stat remuda:///design/NAME/COMPLETE`;
+if it is there the release is usable. With `--pointer`, also `remuda vfs get
+remuda:///design/CURRENT` and confirm its value names your release, since an
+older pointer can already exist. If the marker is missing, publish a new name.
+
+75 means everything was written
+here but the copies wanted are not all there yet: `COMPLETE` exists on this
+node and the release is usable, so wait for the peers rather than republishing.
+A file `put` that returns 75 does not stop the run — its bytes are here — so
+publish finishes the release and reports 75 at the end.
+
+`CURRENT` is written only after `COMPLETE`, and it is a plain file: `remuda vfs
+get remuda:///design/CURRENT` prints the release name. `vfs serve` does not
+resolve it, so open `/NAME/` explicitly. The free-space reserve is checked on
+the filesystem holding `DIR`; the store's own disk belongs to the daemon.
+
 ## Reading in a browser: `remuda vfs serve`
 
 ```sh

@@ -55,6 +55,7 @@ pub mod tick;
 pub mod tui;
 pub mod vfs_cli;
 mod vfs_lua;
+pub mod vfs_publish;
 pub mod vfs_serve;
 pub(crate) mod windows_security;
 

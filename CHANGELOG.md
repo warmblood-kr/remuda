@@ -1,5 +1,12 @@
 # Changelog
 
+- VFS: `remuda vfs publish DIR remuda:///PREFIX --release NAME [--dry-run]
+  [--min-copies K] [--pointer]` uploads a directory as one release, one
+  ordinary `put` per file, and writes `PREFIX/NAME/COMPLETE` last so an
+  unfinished release is distinguishable from a finished one. `--pointer` also
+  writes `PREFIX/CURRENT`. Bounded at 500 files, 32 MiB each and 1 GiB, with a
+  free-space reserve; a symlink is skipped and named, and a source that changes
+  mid-run aborts instead of publishing a mix.
 - VFS: `remuda vfs release [--dry-run] [--older-than SECS] [--json]` gives
   back copies this node fetched to read and is not placed on (#887). It never
   removes the last copy: a copy goes only when every node placement names has

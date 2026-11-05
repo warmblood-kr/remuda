@@ -1241,6 +1241,119 @@ fn older_build_reads_the_index_after_index_downgrade() {
     );
 }
 
+#[test]
+fn publish_uploads_a_tree_and_marks_it_complete_last() {
+    let _serial = live_test_guard();
+    let (a, b, _c) = three_nodes();
+    let root = std::env::temp_dir().join(format!("vfs-publish-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("index.html"), b"<h1>q3</h1>").unwrap();
+    std::fs::write(root.join("sub/style.css"), b"h1{color:red}").unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", root.join("secret")).unwrap();
+
+    // Dry run writes nothing at all.
+    let dry = successful(
+        a.run(&[
+            "vfs",
+            "publish",
+            root.to_str().unwrap(),
+            "remuda:///design",
+            "--release",
+            "v1",
+            "--dry-run",
+        ]),
+        "publish --dry-run",
+    );
+    assert!(dry.contains("Would publish 2 files"), "{dry}");
+    assert!(
+        dry.contains("skipped (not a regular file): secret"),
+        "{dry}"
+    );
+    let empty = a.stat_json("remuda:///design/v1/index.html");
+    assert!(empty.is_none(), "a dry run must not write");
+
+    let published = successful(
+        a.run(&[
+            "vfs",
+            "publish",
+            root.to_str().unwrap(),
+            "remuda:///design",
+            "--release",
+            "v1",
+            "--pointer",
+        ]),
+        "publish v1",
+    );
+    assert!(published.contains("Published 2 files"), "{published}");
+    assert!(published.contains("as v1"), "{published}");
+
+    // Every file landed, and the marker was written after them.
+    assert!(a.stat_json("remuda:///design/v1/index.html").is_some());
+    assert!(a.stat_json("remuda:///design/v1/sub/style.css").is_some());
+    let marker = successful(
+        a.run(&["vfs", "get", "remuda:///design/v1/COMPLETE"]),
+        "get COMPLETE",
+    );
+    assert!(marker.contains("release v1"), "{marker}");
+    assert!(marker.contains("files 2"), "{marker}");
+    let pointer = successful(
+        a.run(&["vfs", "get", "remuda:///design/CURRENT"]),
+        "get CURRENT",
+    );
+    assert_eq!(pointer, "v1");
+
+    // A reader on another node can fetch the tree.
+    wait_until("b sees the release", Duration::from_secs(20), || {
+        b.stat_json("remuda:///design/v1/COMPLETE").is_some()
+    });
+    let page = successful(
+        b.run(&["vfs", "get", "remuda:///design/v1/index.html"]),
+        "get on b",
+    );
+    assert_eq!(page, "<h1>q3</h1>");
+
+    // A published release is not overwritten; a new name is required.
+    let again = a.run(&[
+        "vfs",
+        "publish",
+        root.to_str().unwrap(),
+        "remuda:///design",
+        "--release",
+        "v1",
+    ]);
+    assert!(!again.status.success(), "a second v1 must be refused");
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("already has files"),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+
+    // v2 can take the pointer.
+    let v2 = successful(
+        a.run(&[
+            "vfs",
+            "publish",
+            root.to_str().unwrap(),
+            "remuda:///design",
+            "--release",
+            "v2",
+            "--pointer",
+        ]),
+        "publish v2",
+    );
+    assert!(v2.contains("Published 2 files"), "{v2}");
+    assert_eq!(
+        successful(
+            a.run(&["vfs", "get", "remuda:///design/CURRENT"]),
+            "get CURRENT again"
+        ),
+        "v2"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// One `GET` on a fresh connection; the bridge always closes after one.
 fn http_get(addr: SocketAddr, target: &str) -> String {
     use std::io::{Read, Write};

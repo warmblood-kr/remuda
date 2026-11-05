@@ -34,8 +34,8 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(100);
 /// (EX_TEMPFAIL from sysexits.h), so scripts can retry or wait.
 const EXIT_TEMPFAIL: u8 = 75;
 
-fn spec() -> Spec {
-    let option = |long: &str, value: Option<&str>, help: &str| OptionSpec {
+fn option(long: &str, value: Option<&str>, help: &str) -> OptionSpec {
+    OptionSpec {
         long: long.into(),
         short: None,
         value: value.map(str::to_owned),
@@ -43,21 +43,36 @@ fn spec() -> Spec {
         global: false,
         required: false,
         repeat_policy: RepeatPolicy::Reject,
-    };
-    let arg = |name: &str, help: &str, required: bool| ArgSpec {
+    }
+}
+
+fn arg(name: &str, help: &str, required: bool) -> ArgSpec {
+    ArgSpec {
         name: name.into(),
         help: help.into(),
         multiple: false,
         required,
-    };
-    let verb = |name: &str, about: &str, args, options, next: &str| VerbSpec {
+    }
+}
+
+fn verb(
+    name: &str,
+    about: &str,
+    args: Vec<ArgSpec>,
+    options: Vec<OptionSpec>,
+    next: &str,
+) -> VerbSpec {
+    VerbSpec {
         name: name.into(),
         about: about.into(),
         usage: next.strip_prefix("remuda vfs ").map(str::to_owned),
         args,
         options,
         next: next.into(),
-    };
+    }
+}
+
+fn spec() -> Spec {
     Spec {
         name: "remuda vfs".into(),
         options: vec![],
@@ -75,6 +90,13 @@ fn spec() -> Spec {
             verb("resolve", "Keep a copy on this node and print its local path. Example: remuda vfs resolve remuda:///notes.md",
                 vec![arg("URI", "remuda:// URI", true)], vec![option("local", None, "Do not ask other nodes")],
                 "remuda vfs resolve URI [--local]"),
+            verb("publish", "Upload a directory as one release and mark it complete last. Example: remuda vfs publish site remuda:///design --release 2026-11-04",
+                vec![arg("DIR", "Local directory to upload", true), arg("PREFIX", "remuda:// URI prefix to publish into", true)],
+                vec![OptionSpec { required: true, ..option("release", Some("NAME"), "Release name; one path component, never reused once complete") },
+                     option("dry-run", None, "Show what would be uploaded, then stop"),
+                     option("min-copies", Some("K"), "Wait for K copies of each file and of the completion marker"),
+                     option("pointer", None, "After the marker, point PREFIX/CURRENT at this release")],
+                "remuda vfs publish DIR PREFIX --release NAME [--dry-run] [--min-copies K] [--pointer]"),
             verb("read", "Read a file as one JSON envelope for tools. Example: remuda vfs read remuda:///notes.md --max-bytes 1000",
                 vec![arg("URI", "remuda:// URI", true)],
                 vec![option("max-bytes", Some("N"), "Answer too_large without reading when the file is bigger than N bytes")],
@@ -229,6 +251,11 @@ pub fn run(server: &str, socket: &Path, args: &[&str]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    if verb == "publish" {
+        // One `put` per file, so the loop lives here and the daemon only sees
+        // the request it already knows.
+        return publish(socket, &values);
+    }
     if verb == "serve" {
         // The one verb that does not run in the daemon: it binds a port in this
         // process and asks the daemon over Request::Vfs for each request.
@@ -356,6 +383,531 @@ fn finish_fail(verb: &str, error: impl std::fmt::Display) -> ExitCode {
     finish(out, code)
 }
 
+/// The cluster path a `remuda://` prefix names. Empty is the whole store.
+fn publish_prefix(text: &str) -> Result<String, String> {
+    let rest = text
+        .strip_prefix(rules::SCHEME)
+        .ok_or_else(|| format!("PREFIX must be a remuda:// URI, not {text:?}"))?;
+    let (cluster, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if !cluster.is_empty() {
+        return Err(format!(
+            "publish into this cluster with remuda:///PATH, not remuda://{cluster}/PATH"
+        ));
+    }
+    let path = path.trim_matches('/');
+    if !path.is_empty() {
+        rules::validate_path(path).map_err(|error| format!("PREFIX {text:?}: {error}"))?;
+    }
+    Ok(path.to_owned())
+}
+
+/// One `Request::Vfs` on its own connection. Returns the command's exit code,
+/// stdout and a one-line stderr.
+fn daemon_call(
+    socket: &Path,
+    args: Vec<String>,
+    input: Option<Vec<u8>>,
+) -> Result<(u8, Vec<u8>, String), String> {
+    let request = Request::Vfs {
+        args,
+        input_base64: input.map(|bytes| BASE64.encode(bytes)),
+    };
+    decode_answer(crate::client::request(socket, &request))
+}
+
+/// Turn the daemon's reply into (exit, stdout, one-line stderr). Pure, so the
+/// base64 and unexpected-variant rules are tested without a socket.
+fn decode_answer(reply: std::io::Result<Response>) -> Result<(u8, Vec<u8>, String), String> {
+    match reply {
+        Ok(Response::CommandResult {
+            exit_code,
+            stdout_base64,
+            stderr_base64,
+        }) => Ok((
+            exit_code,
+            BASE64.decode(stdout_base64).unwrap_or_default(),
+            String::from_utf8_lossy(&BASE64.decode(stderr_base64).unwrap_or_default())
+                .trim()
+                .to_owned(),
+        )),
+        Ok(Response::Error(error)) => Err(error),
+        Ok(other) => Err(format!("unexpected daemon answer: {other:?}")),
+        Err(error) => Err(format!("daemon request failed: {error}")),
+    }
+}
+
+/// Refuse to publish over a release that already has files. Cooperative only: a
+/// partitioned index can hide one from this node.
+fn destination_is_empty(socket: &Path, base: &str, release: &str) -> Result<(), String> {
+    let rows = daemon_call(
+        socket,
+        vec![
+            "ls".to_owned(),
+            format!("remuda:///{base}/"),
+            "--json".to_owned(),
+        ],
+        None,
+    )?;
+    match rows {
+        (0, stdout, _) => destination_answer(&stdout, base, release),
+        (_, _, stderr) => Err(format!("cannot check the destination: {stderr}")),
+    }
+}
+
+/// Only an empty JSON array means the release name is free. Malformed output is
+/// refused: treating it as empty would publish over an existing release.
+fn destination_answer(stdout: &[u8], base: &str, release: &str) -> Result<(), String> {
+    match serde_json::from_slice::<Value>(stdout)
+        .ok()
+        .as_ref()
+        .and_then(Value::as_array)
+    {
+        Some(rows) if rows.is_empty() => Ok(()),
+        Some(_) => Err(format!(
+            "{release} already has files at remuda:///{base}/; publish a new --release name"
+        )),
+        None => Err(format!("cannot read the listing for remuda:///{base}/")),
+    }
+}
+
+/// What one `put` means for a publish: written and replicated, written here
+/// but short of the copies wanted, or not written at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Put {
+    Done,
+    Short,
+    Failed,
+}
+
+fn put_result(code: u8) -> Put {
+    if code == 0 {
+        Put::Done
+    } else if code == EXIT_TEMPFAIL {
+        Put::Short
+    } else {
+        Put::Failed
+    }
+}
+
+/// One file uploaded and how many bytes it took.
+struct Uploaded {
+    files: usize,
+    bytes: u64,
+    /// Files that are here but under-replicated; the release can still finish.
+    short: usize,
+    failure: Option<(String, u8)>,
+}
+
+/// Upload every planned file, stopping at the first hard failure or shortage so
+/// the caller can tell a reader exactly what is and is not in the store.
+/// The daemon arguments for one file of a release.
+fn put_args(base: &str, relative: &str, min_copies: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "put".to_owned(),
+        "-".to_owned(),
+        format!("remuda:///{base}/{relative}"),
+    ];
+    if let Some(k) = min_copies {
+        args.extend(["--min-copies".to_owned(), k.to_owned()]);
+    }
+    args
+}
+
+fn upload_release(
+    socket: &Path,
+    base: &str,
+    plan: &crate::vfs_publish::Plan,
+    min_copies: Option<&str>,
+) -> Uploaded {
+    upload_release_with(
+        &|args, input| daemon_call(socket, args, input),
+        &crate::vfs_publish::read_verified,
+        base,
+        plan,
+        min_copies,
+    )
+}
+
+/// One daemon call: args, optional input, and (exit, stdout, stderr).
+type DaemonCall<'a> =
+    dyn Fn(Vec<String>, Option<Vec<u8>>) -> Result<(u8, Vec<u8>, String), String> + 'a;
+
+/// One planned file's verified bytes; injected so a read refusal is tested
+/// without touching a disk.
+type VerifiedRead<'a> = dyn Fn(&crate::vfs_publish::Planned) -> Result<Vec<u8>, String> + 'a;
+
+/// The upload loop with its daemon call injected, so the accounting rules are
+/// tested without a socket.
+fn upload_release_with(
+    call: &DaemonCall<'_>,
+    verify: &VerifiedRead<'_>,
+    base: &str,
+    plan: &crate::vfs_publish::Plan,
+    min_copies: Option<&str>,
+) -> Uploaded {
+    let mut uploaded = Uploaded {
+        files: 0,
+        bytes: 0,
+        short: 0,
+        failure: None,
+    };
+    for file in &plan.files {
+        let bytes = match verify(file) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                uploaded.failure = Some((error, 1));
+                return uploaded;
+            }
+        };
+        match call(put_args(base, &file.relative, min_copies), Some(bytes)) {
+            Ok((code, _, stderr)) => match put_result(code) {
+                Put::Done => {
+                    uploaded.files += 1;
+                    uploaded.bytes = uploaded.bytes.saturating_add(file.size);
+                }
+                Put::Short => {
+                    uploaded.files += 1;
+                    uploaded.bytes = uploaded.bytes.saturating_add(file.size);
+                    uploaded.short += 1;
+                }
+                Put::Failed => {
+                    uploaded.failure = Some((format!("{}: {stderr}", file.relative), 1));
+                    return uploaded;
+                }
+            },
+            Err(error) => {
+                uploaded.failure = Some((format!("{}: {error}", file.relative), 1));
+                return uploaded;
+            }
+        }
+    }
+    uploaded
+}
+
+/// Everything a finished upload needs to write its marker and pointer.
+struct Finished<'a> {
+    socket: &'a Path,
+    prefix: &'a str,
+    base: &'a str,
+    release: &'a str,
+    plan: &'a crate::vfs_publish::Plan,
+    min_copies: Option<&'a str>,
+}
+
+/// Put one small marker. `Ok(Put::Short)` still means its bytes are in.
+/// Why a marker is not in the store: refused (an answer) or unconfirmed (no
+/// answer, so nobody can say what happened).
+enum MarkerError {
+    Refused(String),
+    Unconfirmed(String),
+}
+
+/// How to word a marker that did not land.
+fn marker_words(error: &MarkerError) -> (&'static str, &str) {
+    match error {
+        MarkerError::Refused(detail) => ("was not written", detail),
+        MarkerError::Unconfirmed(detail) => ("could not be confirmed", detail),
+    }
+}
+
+fn put_marker_with(
+    call: &DaemonCall<'_>,
+    uri: String,
+    bytes: Vec<u8>,
+    min_copies: Option<&str>,
+) -> Result<Put, MarkerError> {
+    let mut args = vec!["put".to_owned(), "-".to_owned(), uri];
+    if let Some(k) = min_copies {
+        args.extend(["--min-copies".to_owned(), k.to_owned()]);
+    }
+    match call(args, Some(bytes)) {
+        Ok((code, _, stderr)) => match put_result(code) {
+            Put::Failed => Err(MarkerError::Refused(stderr)),
+            other => Ok(other),
+        },
+        Err(error) => Err(MarkerError::Unconfirmed(error)),
+    }
+}
+
+/// Write `COMPLETE` last. `Err(exit)` means it is not known to be there; the
+/// message says whether the daemon refused it or the answer was lost.
+fn write_complete_with(
+    call: &DaemonCall<'_>,
+    finished: &Finished<'_>,
+    out: &mut Out,
+) -> Result<Put, u8> {
+    let body = format!(
+        "release {}\nfiles {}\nbytes {}\n",
+        finished.release,
+        finished.plan.files.len(),
+        finished.plan.bytes
+    );
+    match put_marker_with(
+        call,
+        format!("remuda:///{}/COMPLETE", finished.base),
+        body.into_bytes(),
+        finished.min_copies,
+    ) {
+        Err(error) => {
+            let (what, detail) = marker_words(&error);
+            warn!(out, "remuda: publish incomplete: every file is in remuda:///{}/, but COMPLETE {what}: {detail}", finished.base);
+            if matches!(error, MarkerError::Unconfirmed(_)) {
+                warn!(out, "Next: check `remuda vfs stat remuda:///{}/COMPLETE`; if it is missing, publish a new --release name.", finished.base);
+            }
+            Err(1)
+        }
+        Ok(put) => Ok(put),
+    }
+}
+
+/// Write `PREFIX/CURRENT`. `Err(exit)` means it is not known to be there; the
+/// message says whether it was refused or unconfirmed.
+fn write_pointer_with(
+    call: &DaemonCall<'_>,
+    finished: &Finished<'_>,
+    out: &mut Out,
+) -> Result<Put, u8> {
+    let prefix = if finished.prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", finished.prefix)
+    };
+    match put_marker_with(
+        call,
+        format!("remuda:///{prefix}CURRENT"),
+        finished.release.as_bytes().to_vec(),
+        finished.min_copies,
+    ) {
+        Err(error) => {
+            let (what, detail) = marker_words(&error);
+            warn!(
+                out,
+                "remuda: publish: the release is complete, but CURRENT {what}: {detail}"
+            );
+            if matches!(error, MarkerError::Unconfirmed(_)) {
+                warn!(out, "Next: check `remuda vfs stat remuda:///{prefix}CURRENT`; if it is missing, publish a new --release name.");
+            }
+            Err(1)
+        }
+        Ok(put) => Ok(put),
+    }
+}
+
+fn say_published(finished: &Finished<'_>, out: &mut Out) {
+    say!(
+        out,
+        "Published {} files ({}) as {release} to remuda:///{base}/.",
+        finished.plan.files.len(),
+        crate::vfs_publish::bytes_text(finished.plan.bytes),
+        release = finished.release,
+        base = finished.base
+    );
+    for skipped in &finished.plan.skipped {
+        say!(out, "  skipped (not a regular file): {skipped}");
+    }
+}
+
+fn say_pointer_and_reader(finished: &Finished<'_>, out: &mut Out) {
+    let prefix = if finished.prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", finished.prefix)
+    };
+    say!(
+        out,
+        "  CURRENT names {}; `remuda vfs get remuda:///{prefix}CURRENT` shows it (the bridge does not resolve it).",
+        finished.release
+    );
+    say!(
+        out,
+        "  Read it with `remuda vfs serve --root {}`.",
+        if finished.prefix.is_empty() {
+            finished.release
+        } else {
+            finished.prefix
+        }
+    );
+}
+
+fn finish_release(finished: Finished<'_>, pointer: bool, out: &mut Out) -> u8 {
+    let socket = finished.socket;
+    finish_with(
+        &|args, input| daemon_call(socket, args, input),
+        finished,
+        pointer,
+        out,
+    )
+}
+
+/// The marker stage with its daemon call injected, so COMPLETE/CURRENT
+/// sequencing and each outcome are tested without a socket.
+fn finish_with(call: &DaemonCall<'_>, finished: Finished<'_>, pointer: bool, out: &mut Out) -> u8 {
+    let marker = match write_complete_with(call, &finished, out) {
+        Ok(put) => put,
+        Err(code) => return code,
+    };
+    if marker == Put::Short {
+        warn!(
+            out,
+            "remuda: publish: COMPLETE is written here but not yet on the copies wanted."
+        );
+        warn!(
+            out,
+            "Next: wait for the peers, or check `remuda vfs status --copies`."
+        );
+    }
+    say_published(&finished, out);
+    let mut code = if marker == Put::Short {
+        EXIT_TEMPFAIL
+    } else {
+        0
+    };
+    if pointer {
+        match write_pointer_with(call, &finished, out) {
+            Ok(Put::Short) => {
+                warn!(
+                    out,
+                    "remuda: publish: CURRENT is written here but not yet on the copies wanted."
+                );
+                code = EXIT_TEMPFAIL;
+            }
+            Ok(_) => {}
+            Err(exit) => return exit,
+        }
+        say_pointer_and_reader(&finished, out);
+    } else {
+        say!(
+            out,
+            "  Read it with `remuda vfs serve --root {}`.",
+            if finished.prefix.is_empty() {
+                finished.release
+            } else {
+                finished.prefix
+            }
+        );
+    }
+    code
+}
+
+/// What publish learned before the first byte moves.
+struct Prepared {
+    prefix: String,
+    base: String,
+    release: String,
+    plan: crate::vfs_publish::Plan,
+}
+
+/// Parse, plan, budget and destination checks. Nothing is uploaded here.
+fn prepare(socket: &Path, values: &Map<String, Value>) -> Result<Prepared, String> {
+    use crate::vfs_publish;
+    let dir = Path::new(value(values, "DIR").unwrap_or_default());
+    let prefix = publish_prefix(value(values, "PREFIX").unwrap_or_default())?;
+    let release = value(values, "release").unwrap_or_default().to_owned();
+    let plan = vfs_publish::plan(dir, &release).map_err(|error| error.detail)?;
+    vfs_publish::check_budget(&plan, dir).map_err(|error| error.detail)?;
+    let base = if prefix.is_empty() {
+        release.clone()
+    } else {
+        format!("{prefix}/{release}")
+    };
+    destination_is_empty(socket, &base, &release)?;
+    Ok(Prepared {
+        prefix,
+        base,
+        release,
+        plan,
+    })
+}
+
+/// The dry-run report: what would go, and what is skipped.
+fn say_plan(prepared: &Prepared, out: &mut Out) {
+    use crate::vfs_publish;
+    for file in prepared.plan.files.iter().take(20) {
+        say!(
+            out,
+            "  {:<48} {}",
+            file.relative,
+            vfs_publish::bytes_text(file.size)
+        );
+    }
+    if prepared.plan.files.len() > 20 {
+        say!(out, "  ... and {} more", prepared.plan.files.len() - 20);
+    }
+    say!(
+        out,
+        "Would publish {} files ({}) as {} to remuda:///{}/.",
+        prepared.plan.files.len(),
+        vfs_publish::bytes_text(prepared.plan.bytes),
+        prepared.release,
+        prepared.base
+    );
+    for skipped in &prepared.plan.skipped {
+        say!(out, "  skipped (not a regular file): {skipped}");
+    }
+}
+
+/// Say exactly where an upload stopped, and that no marker exists.
+fn say_upload_failure(prepared: &Prepared, uploaded: &Uploaded, detail: &str, out: &mut Out) {
+    use crate::vfs_publish;
+    let remaining = prepared.plan.files.len().saturating_sub(uploaded.files + 1);
+    warn!(
+        out,
+        "remuda: publish incomplete: {} of {} files are in remuda:///{}/; 1 failed and {remaining} were not attempted.",
+        uploaded.files,
+        prepared.plan.files.len(),
+        prepared.base
+    );
+    warn!(out, "  failed: {detail}");
+    warn!(
+        out,
+        "  COMPLETE was not written, so this release is not finished; {} was uploaded.",
+        vfs_publish::bytes_text(uploaded.bytes)
+    );
+    warn!(out, "Next: fix the source, then publish a new --release name; `remuda vfs ls remuda:///{}/` shows what is there.", prepared.base);
+}
+
+/// `remuda vfs publish`: one ordinary `put` per file, then a completion marker.
+/// The loop lives in the CLI so the daemon contract does not change.
+fn publish(socket: &Path, values: &Map<String, Value>) -> ExitCode {
+    let prepared = match prepare(socket, values) {
+        Ok(prepared) => prepared,
+        Err(error) => return finish_fail("publish", error),
+    };
+    let mut out = Out::default();
+    if flag(values, "dry-run") {
+        say_plan(&prepared, &mut out);
+        return finish(out, 0);
+    }
+    let min_copies = value(values, "min-copies");
+    let uploaded = upload_release(socket, &prepared.base, &prepared.plan, min_copies);
+    if let Some((detail, code)) = uploaded.failure.as_ref() {
+        say_upload_failure(&prepared, &uploaded, detail, &mut out);
+        return finish(out, *code);
+    }
+    let code = finish_release(
+        Finished {
+            socket,
+            prefix: &prepared.prefix,
+            base: &prepared.base,
+            release: &prepared.release,
+            plan: &prepared.plan,
+            min_copies,
+        },
+        flag(values, "pointer"),
+        &mut out,
+    );
+    if uploaded.short > 0 && code == 0 {
+        warn!(
+            out,
+            "remuda: publish: {} of {} files are here but short of the copies wanted; COMPLETE is written.",
+            uploaded.short,
+            prepared.plan.files.len()
+        );
+        return finish(out, EXIT_TEMPFAIL);
+    }
+    finish(out, code)
+}
+
 /// The daemon's half of [`Request::Vfs`]: run the command against this
 /// node's store and answer with what it printed.
 pub fn serve_request(args: &[String], input_base64: Option<&str>) -> Response {
@@ -408,6 +960,11 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
             say!(out, "{report}");
             0
         }
+        "publish" => fail(
+            out,
+            "publish",
+            "runs in the CLI process, not the daemon; run `remuda vfs publish` there",
+        ),
         "drain" => drain(values, out),
         "status" => status(values, out),
         "config" => config(&store, values, out),
@@ -1480,6 +2037,30 @@ mod tests {
         assert!(usage("").contains("resolve"));
     }
 
+    fn prepared(names: &[&str]) -> Prepared {
+        let files: Vec<_> = names
+            .iter()
+            .map(|name| crate::vfs_publish::Planned {
+                source: std::path::PathBuf::from("/x"),
+                relative: (*name).into(),
+                size: 1024,
+                modified: None,
+                identity: None,
+                canonical: std::path::PathBuf::from("/x"),
+            })
+            .collect();
+        Prepared {
+            prefix: "design".into(),
+            base: "design/v1".into(),
+            release: "v1".into(),
+            plan: crate::vfs_publish::Plan {
+                bytes: files.len() as u64 * 1024,
+                files,
+                skipped: vec!["link".into()],
+            },
+        }
+    }
+
     fn one_entry() -> VfsEntry {
         VfsEntry {
             path: "a/b.html".to_owned(),
@@ -1501,6 +2082,322 @@ mod tests {
             bytes,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_dry_run_report_names_the_release_and_the_skips() {
+        let mut out = Out::default();
+        say_plan(&prepared(&["a.html"]), &mut out);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("Would publish 1 files (1.0 KiB) as v1 to remuda:///design/v1/."),
+            "{text}"
+        );
+        assert!(
+            text.contains("skipped (not a regular file): link"),
+            "{text}"
+        );
+    }
+
+    fn finish_with_call(call: &DaemonCall<'_>, pointer: bool) -> (u8, String) {
+        let base = "design/v1".to_string();
+        let prefix = "design".to_string();
+        let release = "v1".to_string();
+        let plan = crate::vfs_publish::Plan {
+            files: Vec::new(),
+            bytes: 0,
+            skipped: Vec::new(),
+        };
+        let mut out = Out::default();
+        let finished = Finished {
+            socket: Path::new("/x"),
+            prefix: &prefix,
+            base: &base,
+            release: &release,
+            plan: &plan,
+            min_copies: None,
+        };
+        let code = finish_with(call, finished, pointer, &mut out);
+        (code, String::from_utf8_lossy(&out.stderr).to_string())
+    }
+
+    #[test]
+    fn a_refused_complete_does_not_touch_current() {
+        use std::cell::RefCell;
+        let seen = RefCell::new(Vec::new());
+        let call = |args: Vec<String>, _input: Option<Vec<u8>>| {
+            seen.borrow_mut().push(args[2].clone());
+            Ok((1, Vec::new(), "bad path".to_string()))
+        };
+        let (code, error) = finish_with_call(&call, true);
+        assert_eq!(code, 1);
+        assert_eq!(seen.borrow().len(), 1, "CURRENT must not follow");
+        assert!(seen.borrow()[0].ends_with("/COMPLETE"));
+        assert!(error.contains("COMPLETE was not written"), "{error}");
+        assert!(!error.contains("CURRENT"), "{error}");
+    }
+
+    #[test]
+    fn an_unconfirmed_complete_says_unknown_and_asks_for_a_check() {
+        use std::cell::RefCell;
+        let seen = RefCell::new(Vec::new());
+        let call = |args: Vec<String>, _input: Option<Vec<u8>>| {
+            seen.borrow_mut().push(args[2].clone());
+            Err("timed out".to_string())
+        };
+        let (code, error) = finish_with_call(&call, true);
+        assert_eq!(code, 1);
+        assert_eq!(seen.borrow().len(), 1);
+        assert!(error.contains("could not be confirmed"), "{error}");
+        assert!(error.contains("vfs stat"), "{error}");
+    }
+
+    #[test]
+    fn a_short_complete_still_writes_current_and_exits_75() {
+        use std::cell::RefCell;
+        let seen = RefCell::new(Vec::new());
+        let call = |args: Vec<String>, _input: Option<Vec<u8>>| {
+            let uri = args[2].clone();
+            let short = uri.ends_with("/COMPLETE");
+            seen.borrow_mut().push(uri);
+            Ok((if short { 75 } else { 0 }, Vec::new(), "short".to_string()))
+        };
+        let (code, error) = finish_with_call(&call, true);
+        assert_eq!(code, EXIT_TEMPFAIL);
+        assert_eq!(seen.borrow().len(), 2, "CURRENT follows a written marker");
+        assert!(error.contains("COMPLETE is written here"), "{error}");
+    }
+
+    #[test]
+    fn a_short_current_exits_75_after_both_writes() {
+        use std::cell::RefCell;
+        let seen = RefCell::new(Vec::new());
+        let call = |args: Vec<String>, _input: Option<Vec<u8>>| {
+            let uri = args[2].clone();
+            let short = uri.ends_with("/CURRENT");
+            seen.borrow_mut().push(uri);
+            Ok((if short { 75 } else { 0 }, Vec::new(), "short".to_string()))
+        };
+        let (code, error) = finish_with_call(&call, true);
+        assert_eq!(code, EXIT_TEMPFAIL);
+        assert_eq!(seen.borrow().len(), 2);
+        assert!(error.contains("CURRENT is written here"), "{error}");
+    }
+
+    #[test]
+    fn a_refused_current_is_a_failure_after_complete() {
+        use std::cell::RefCell;
+        let seen = RefCell::new(Vec::new());
+        let call = |args: Vec<String>, _input: Option<Vec<u8>>| {
+            let uri = args[2].clone();
+            let current = uri.ends_with("/CURRENT");
+            seen.borrow_mut().push(uri);
+            if current {
+                Ok((1, Vec::new(), "bad pointer".to_string()))
+            } else {
+                Ok((0, Vec::new(), String::new()))
+            }
+        };
+        let (code, error) = finish_with_call(&call, true);
+        assert_eq!(code, 1);
+        assert_eq!(seen.borrow().len(), 2);
+        assert!(error.contains("CURRENT was not written"), "{error}");
+    }
+
+    #[test]
+    fn a_marker_failure_says_whether_it_is_certain() {
+        let refusal = MarkerError::Refused("bad path".into());
+        let refused = marker_words(&refusal);
+        assert_eq!(refused.0, "was not written");
+        assert_eq!(refused.1, "bad path");
+        let timeout = MarkerError::Unconfirmed("timed out".into());
+        let unknown = marker_words(&timeout);
+        assert_eq!(unknown.0, "could not be confirmed");
+        assert_eq!(unknown.1, "timed out");
+    }
+
+    fn plain_plan(names: &[&str]) -> crate::vfs_publish::Plan {
+        let files: Vec<_> = names
+            .iter()
+            .map(|name| crate::vfs_publish::Planned {
+                source: std::path::PathBuf::from("/x"),
+                relative: (*name).into(),
+                size: 1,
+                modified: None,
+                identity: None,
+                canonical: std::path::PathBuf::from("/x"),
+            })
+            .collect();
+        crate::vfs_publish::Plan {
+            bytes: files.len() as u64,
+            files,
+            skipped: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_read_refusal_stops_before_any_put() {
+        use std::cell::Cell;
+        let plan = plain_plan(&["a.txt", "b.txt"]);
+        let calls = Cell::new(0);
+        let call = |_args: Vec<String>, _input: Option<Vec<u8>>| {
+            calls.set(calls.get() + 1);
+            Ok((0, Vec::new(), String::new()))
+        };
+        let refuse = |_file: &crate::vfs_publish::Planned| Err("changed".to_string());
+        let uploaded = upload_release_with(&call, &refuse, "design/v1", &plan, None);
+        assert_eq!(uploaded.files, 0);
+        assert_eq!(calls.get(), 0, "no put may run after a read refusal");
+        assert!(uploaded.failure.is_some());
+    }
+
+    #[test]
+    fn a_read_refusal_after_one_file_keeps_that_count() {
+        use std::cell::Cell;
+        let plan = plain_plan(&["a.txt", "b.txt"]);
+        let reads = Cell::new(0);
+        let calls = Cell::new(0);
+        let verify = |_file: &crate::vfs_publish::Planned| {
+            let n = reads.get();
+            reads.set(n + 1);
+            if n == 0 {
+                Ok(b"x".to_vec())
+            } else {
+                Err("changed".to_string())
+            }
+        };
+        let call = |_args: Vec<String>, _input: Option<Vec<u8>>| {
+            calls.set(calls.get() + 1);
+            Ok((0, Vec::new(), String::new()))
+        };
+        let uploaded = upload_release_with(&call, &verify, "design/v1", &plan, None);
+        assert_eq!(uploaded.files, 1);
+        assert_eq!(uploaded.bytes, 1);
+        assert_eq!(calls.get(), 1);
+        assert!(uploaded.failure.is_some());
+    }
+
+    #[test]
+    fn put_args_name_the_file_and_optional_copies() {
+        assert_eq!(
+            put_args("design/v1", "a/b.html", None),
+            ["put", "-", "remuda:///design/v1/a/b.html"]
+        );
+        assert_eq!(
+            put_args("design/v1", "a.html", Some("2")),
+            [
+                "put",
+                "-",
+                "remuda:///design/v1/a.html",
+                "--min-copies",
+                "2"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_first_put_is_not_counted_as_uploaded() {
+        let plan = plain_plan(&["a.txt", "b.txt"]);
+        let call = |_args: Vec<String>, _input: Option<Vec<u8>>| Err("gone".to_string());
+        let verify = |_file: &crate::vfs_publish::Planned| Ok(b"x".to_vec());
+        let uploaded = upload_release_with(&call, &verify, "design/v1", &plan, None);
+        assert_eq!(uploaded.files, 0);
+        assert_eq!(uploaded.bytes, 0);
+        assert!(uploaded.failure.is_some());
+    }
+
+    #[test]
+    fn a_short_put_counts_and_the_upload_continues() {
+        use std::cell::Cell;
+        let plan = plain_plan(&["a.txt", "b.txt"]);
+        let calls = Cell::new(0);
+        let call = |_args: Vec<String>, _input: Option<Vec<u8>>| {
+            let n = calls.get();
+            calls.set(n + 1);
+            if n == 0 {
+                Ok((EXIT_TEMPFAIL, Vec::new(), "short".to_string()))
+            } else {
+                Ok((0, Vec::new(), String::new()))
+            }
+        };
+        let verify = |_file: &crate::vfs_publish::Planned| Ok(b"x".to_vec());
+        let uploaded = upload_release_with(&call, &verify, "design/v1", &plan, None);
+        assert_eq!(uploaded.files, 2);
+        assert_eq!(uploaded.short, 1);
+        assert!(uploaded.failure.is_none());
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn a_stopped_upload_counts_only_the_files_that_arrived() {
+        let prepared = prepared(&["a.html", "b.html"]);
+        let uploaded = Uploaded {
+            files: 0,
+            bytes: 0,
+            short: 0,
+            failure: None,
+        };
+        let mut out = Out::default();
+        say_upload_failure(&prepared, &uploaded, "b.html: nope", &mut out);
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(text.contains("0 of 2 files are in"), "{text}");
+        assert!(text.contains("1 failed and 1 were not attempted"), "{text}");
+        assert!(text.contains("COMPLETE was not written"), "{text}");
+    }
+
+    #[test]
+    fn a_put_code_means_done_short_or_failed() {
+        assert_eq!(put_result(0), Put::Done);
+        assert_eq!(put_result(EXIT_TEMPFAIL), Put::Short);
+        assert_eq!(put_result(1), Put::Failed);
+        assert_eq!(put_result(2), Put::Failed);
+    }
+
+    #[test]
+    fn a_daemon_answer_keeps_its_exit_code_and_decodes_text() {
+        let reply = Ok(Response::CommandResult {
+            exit_code: 75,
+            stdout_base64: BASE64.encode(b"ok\n"),
+            stderr_base64: BASE64.encode(b"short copies\n"),
+        });
+        let (code, stdout, stderr) = decode_answer(reply).unwrap();
+        assert_eq!(code, 75);
+        assert_eq!(stdout, b"ok\n");
+        assert_eq!(stderr, "short copies");
+        assert_eq!(
+            decode_answer(Ok(Response::Error("nope".into()))).unwrap_err(),
+            "nope"
+        );
+        assert!(decode_answer(Ok(Response::Ok))
+            .unwrap_err()
+            .contains("unexpected daemon answer"));
+        let io_error = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "gone");
+        assert!(decode_answer(Err(io_error))
+            .unwrap_err()
+            .contains("daemon request failed"));
+    }
+
+    #[test]
+    fn a_destination_is_empty_only_for_an_empty_json_array() {
+        assert!(destination_answer(b"[]", "design", "v1").is_ok());
+        assert!(destination_answer(b"[{\"path\":\"a\"}]", "design", "v1")
+            .unwrap_err()
+            .contains("already has files"));
+        assert!(destination_answer(b"not json", "design", "v1")
+            .unwrap_err()
+            .contains("cannot read the listing"));
+        assert!(destination_answer(b"{}", "design", "v1")
+            .unwrap_err()
+            .contains("cannot read the listing"));
+    }
+
+    #[test]
+    fn a_publish_prefix_must_name_this_cluster() {
+        assert_eq!(publish_prefix("remuda:///design").unwrap(), "design");
+        assert_eq!(publish_prefix("remuda:///").unwrap(), "");
+        assert!(publish_prefix("remuda://home/design").is_err());
+        assert!(publish_prefix("/design").is_err());
+        assert!(publish_prefix("remuda:///a/../b").is_err());
     }
 
     #[test]
