@@ -902,9 +902,7 @@ fn read(values: &Map<String, Value>, out: &mut Out) -> u8 {
         );
         return 0;
     };
-    let value = read_body(entry, max, || {
-        fetch(&store, &uri, false).map(|(_, bytes)| bytes)
-    });
+    let value = read_body(entry, max, || fetch(&store, &uri, false));
     say!(out, "{value}");
     0
 }
@@ -915,7 +913,7 @@ fn read(values: &Map<String, Value>, out: &mut Out) -> u8 {
 fn read_body(
     entry: &VfsEntry,
     max: u64,
-    fetch: impl FnOnce() -> Result<Vec<u8>, VfsError>,
+    fetch: impl FnOnce() -> Result<(VfsEntry, Vec<u8>), VfsError>,
 ) -> Value {
     if entry.size > max {
         // Answer before the blob moves: a viewer should not pay for a file it
@@ -923,8 +921,10 @@ fn read_body(
         return too_large_envelope(entry.size, max);
     }
     match fetch() {
-        Ok(bytes) if bytes.len() as u64 > max => too_large_envelope(bytes.len() as u64, max),
-        Ok(bytes) => content_envelope(entry, &bytes),
+        // The index snapshot and the fetch are two reads; a write in between
+        // can change the entry, so the fetched entry names the bytes.
+        Ok((_, bytes)) if bytes.len() as u64 > max => too_large_envelope(bytes.len() as u64, max),
+        Ok((fetched, bytes)) => content_envelope(&fetched, &bytes),
         Err(error) => error_envelope(&error),
     }
 }
@@ -1400,7 +1400,7 @@ mod tests {
         let called = Cell::new(false);
         let json = read_body(&entry, 1, || {
             called.set(true);
-            Ok(b"abc".to_vec())
+            Ok((one_entry(), b"abc".to_vec()))
         });
         assert_eq!(json["code"], Value::String("too_large".to_owned()));
         assert!(!called.get(), "the fetch must not run past the limit");
@@ -1409,9 +1409,21 @@ mod tests {
     #[test]
     fn a_blob_that_grew_past_the_limit_is_refused_after_the_fetch() {
         let entry = one_entry();
-        let json = read_body(&entry, 3, || Ok(b"abcd".to_vec()));
+        let json = read_body(&entry, 3, || Ok((one_entry(), b"abcd".to_vec())));
         assert_eq!(json["code"], Value::String("too_large".to_owned()));
         assert_eq!(json["size"], Value::from(4));
+    }
+
+    #[test]
+    fn a_fetch_after_an_overwrite_names_the_fetched_entry() {
+        let snapshot = one_entry();
+        let mut fetched = one_entry();
+        fetched.sha256 = "b".repeat(64);
+        fetched.version = 9;
+        let json = read_body(&snapshot, 10, || Ok((fetched, b"xyz".to_vec())));
+        assert_eq!(json["sha256"], Value::String("b".repeat(64)));
+        assert_eq!(json["version"], Value::from(9));
+        assert_eq!(json["content"], Value::String("eHl6".to_owned()));
     }
 
     #[test]
