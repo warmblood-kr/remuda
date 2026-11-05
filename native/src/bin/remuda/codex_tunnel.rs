@@ -134,26 +134,52 @@ mod imp {
         }
     }
 
-    /// Bind the downstream listener and start forwarding in the background.
-    pub(crate) fn start(upstream: &Path, publish: Publish) -> std::io::Result<Tunnel> {
-        let parent = upstream
-            .parent()
-            .ok_or_else(|| std::io::Error::other("app-server socket has no parent"))?;
-        let metadata = std::fs::metadata(parent)?;
+    fn random_token() -> std::io::Result<String> {
+        let mut bytes = [0u8; 16];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    /// A short, fresh, owner-only runtime directory, independent of TMPDIR.
+    pub(crate) fn runtime_dir() -> std::io::Result<PathBuf> {
+        let dir = Path::new("/tmp").join(format!(
+            "remuda-codex-{}-{}",
+            std::process::id(),
+            random_token()?
+        ));
+        std::fs::create_dir(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        let metadata = std::fs::symlink_metadata(&dir)?;
         // SAFETY: geteuid has no preconditions and cannot fail.
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        if !metadata.file_type().is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+        {
+            let _ = std::fs::remove_dir(&dir);
             return Err(std::io::Error::other(
-                "app-server socket directory is not private to this user",
+                "runtime directory is not private to this user",
             ));
         }
-        let token = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let downstream = parent.join(format!(
-            "remuda-codex-{}-{token}.tui.sock",
-            std::process::id()
-        ));
+        Ok(dir)
+    }
+
+    /// Bind the downstream listener and start forwarding in the background.
+    pub(crate) fn start(
+        upstream: &Path,
+        runtime_dir: &Path,
+        publish: Publish,
+    ) -> std::io::Result<Tunnel> {
+        let metadata = std::fs::symlink_metadata(runtime_dir)?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if !metadata.file_type().is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(std::io::Error::other(
+                "runtime directory is not private to this user",
+            ));
+        }
+        let downstream = runtime_dir.join("tui.sock");
         let listener = UnixListener::bind(&downstream)?;
         std::fs::set_permissions(&downstream, std::fs::Permissions::from_mode(0o600))?;
         let bound = std::fs::symlink_metadata(&downstream)?;
@@ -474,6 +500,36 @@ mod imp {
         }
 
         #[test]
+        fn runtime_directories_are_fresh_and_private() {
+            let first = runtime_dir().expect("first");
+            let second = runtime_dir().expect("second");
+            assert_ne!(first, second);
+            for dir in [&first, &second] {
+                let metadata = std::fs::symlink_metadata(dir).expect("stat");
+                assert!(metadata.is_dir());
+                assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+                assert_eq!(metadata.mode() & 0o077, 0);
+            }
+            let _ = std::fs::remove_dir(&first);
+            let _ = std::fs::remove_dir(&second);
+        }
+
+        #[test]
+        fn start_refuses_a_shared_runtime_directory() {
+            let dir = std::env::temp_dir().join(format!("remuda-shared-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir(&dir).expect("dir");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("0755");
+            let publish = Publish {
+                binding: PathBuf::from("/tmp/x/manifest.json"),
+                nonce: "n".into(),
+                session: "s".into(),
+            };
+            assert!(start(Path::new("/tmp/x.sock"), &dir, publish).is_err());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
         fn a_second_bootstrap_request_latches_unavailable() {
             let capture = capture();
             request_event(r#"{"id":"a","method":"thread/start"}"#, &capture);
@@ -565,7 +621,7 @@ mod imp {
 }
 
 #[cfg(unix)]
-pub(crate) use imp::{start, Publish};
+pub(crate) use imp::{runtime_dir, start, Publish, Tunnel};
 
 #[cfg(not(unix))]
 mod unsupported {
@@ -597,10 +653,18 @@ mod unsupported {
         pub(crate) fn cleanup(&self) {}
     }
 
-    pub(crate) fn start(_upstream: &Path, _publish: Publish) -> std::io::Result<Tunnel> {
+    pub(crate) fn runtime_dir() -> std::io::Result<PathBuf> {
+        Err(std::io::Error::other("Codex native binding requires Unix"))
+    }
+
+    pub(crate) fn start(
+        _upstream: &Path,
+        _runtime_dir: &Path,
+        _publish: Publish,
+    ) -> std::io::Result<Tunnel> {
         Err(std::io::Error::other("Codex native binding requires Unix"))
     }
 }
 
 #[cfg(not(unix))]
-pub(crate) use unsupported::{start, Publish};
+pub(crate) use unsupported::{runtime_dir, start, Publish, Tunnel};

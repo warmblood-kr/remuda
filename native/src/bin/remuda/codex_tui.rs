@@ -140,6 +140,72 @@ pub fn run(args: &[&str]) -> ExitCode {
     serve_tui(status, model, config, binding)
 }
 
+#[cfg(unix)]
+fn drop_runtime(runtime: &Option<std::path::PathBuf>) {
+    if let Some(dir) = runtime {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+struct Launched {
+    socket: std::path::PathBuf,
+    server_address: String,
+    client_address: String,
+    #[cfg(unix)]
+    tunnel: Option<super::codex_tunnel::Tunnel>,
+    #[cfg(unix)]
+    runtime: Option<std::path::PathBuf>,
+}
+
+#[cfg(unix)]
+fn endpoint(publish: Option<super::codex_tunnel::Publish>) -> Result<Launched, ExitCode> {
+    let runtime = if publish.is_some() {
+        Some(super::codex_tunnel::runtime_dir().map_err(fail)?)
+    } else {
+        None
+    };
+    let socket = match &runtime {
+        Some(dir) => dir.join("app.sock"),
+        None => std::env::temp_dir().join(format!("remuda-codex-{}.sock", std::process::id())),
+    };
+    let server_address = format!("unix://{}", socket.display());
+    let tunnel = match publish {
+        Some(publish) => Some(
+            super::codex_tunnel::start(
+                &socket,
+                runtime.as_ref().expect("runtime with binding"),
+                publish,
+            )
+            .map_err(|error| {
+                drop_runtime(&runtime);
+                fail(error)
+            })?,
+        ),
+        None => None,
+    };
+    let client_address = match tunnel.as_ref() {
+        Some(tunnel) => format!("unix://{}", tunnel.downstream().display()),
+        None => server_address.clone(),
+    };
+    Ok(Launched {
+        socket,
+        server_address,
+        client_address,
+        tunnel,
+        runtime,
+    })
+}
+
+#[cfg(not(unix))]
+fn endpoint(_publish: Option<()>) -> Result<Launched, ExitCode> {
+    let socket = std::env::temp_dir().join(format!("remuda-codex-{}.sock", std::process::id()));
+    Ok(Launched {
+        server_address: format!("unix://{}", socket.display()),
+        client_address: format!("unix://{}", socket.display()),
+        socket,
+    })
+}
+
 fn serve_tui(
     status: String,
     model: Option<String>,
@@ -163,26 +229,23 @@ fn serve_tui(
     };
     #[cfg(not(unix))]
     let _ = &binding;
-    let socket = std::env::temp_dir().join(format!("remuda-codex-{}.sock", std::process::id()));
-    let address = format!("unix://{}", socket.display());
-    #[cfg(unix)]
-    let tunnel = match publish {
-        Some(publish) => match super::codex_tunnel::start(&socket, publish) {
-            Ok(tunnel) => Some(tunnel),
-            Err(error) => return fail(error),
-        },
-        None => None,
+    let Launched {
+        socket,
+        server_address,
+        client_address,
+        tunnel,
+        runtime,
+    } = match endpoint(publish) {
+        Ok(launched) => launched,
+        Err(code) => return code,
     };
-    #[cfg(unix)]
-    let client_address = match tunnel.as_ref() {
-        Some(tunnel) => format!("unix://{}", tunnel.downstream().display()),
-        None => address.clone(),
-    };
-    #[cfg(not(unix))]
-    let client_address = address.clone();
     let config_refs = config.iter().map(String::as_str).collect::<Vec<_>>();
-    let (server_args, client_args) =
-        codex_args(&address, &client_address, model.as_deref(), &config_refs);
+    let (server_args, client_args) = codex_args(
+        &server_address,
+        &client_address,
+        model.as_deref(),
+        &config_refs,
+    );
     let mut server_command = Command::new("codex");
     server_command
         .args(&server_args)
@@ -200,6 +263,8 @@ fn serve_tui(
             if let Some(tunnel) = tunnel.as_ref() {
                 tunnel.cleanup();
             }
+            #[cfg(unix)]
+            drop_runtime(&runtime);
             return fail(error);
         }
     };
@@ -212,6 +277,9 @@ fn serve_tui(
             if let Some(tunnel) = tunnel.as_ref() {
                 tunnel.cleanup();
             }
+            let _ = std::fs::remove_file(&socket);
+            #[cfg(unix)]
+            drop_runtime(&runtime);
             return fail(error);
         }
     };
@@ -224,6 +292,9 @@ fn serve_tui(
         if let Some(tunnel) = tunnel.as_ref() {
             tunnel.cleanup();
         }
+        let _ = std::fs::remove_file(&socket);
+        #[cfg(unix)]
+        drop_runtime(&runtime);
         return fail("Codex app-server did not bind its local socket");
     }
     let monitor_socket = socket.clone();
@@ -238,7 +309,9 @@ fn serve_tui(
     if let Some(tunnel) = tunnel.as_ref() {
         tunnel.cleanup();
     }
-    let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(&socket);
+    #[cfg(unix)]
+    drop_runtime(&runtime);
     match result {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
