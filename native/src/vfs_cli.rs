@@ -836,6 +836,43 @@ fn fetch(
     }
 }
 
+/// The caller's `--max-bytes`, absent meaning no limit. Pure, so the parse
+/// refusal is tested without a daemon or a store.
+fn read_limit(values: &Map<String, Value>) -> Result<Option<u64>, String> {
+    match value(values, "max-bytes") {
+        Some(text) => text
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| "--max-bytes must be whole bytes".to_owned()),
+        None => Ok(None),
+    }
+}
+
+fn read_error(code: &str, detail: String) -> Value {
+    serde_json::json!({ "ok": false, "code": code, "detail": detail })
+}
+
+/// A refusal that carries the size, so a viewer can say why it is over.
+fn too_large_envelope(size: u64, max: u64) -> Value {
+    serde_json::json!({
+        "ok": false,
+        "code": "too_large",
+        "size": size,
+        "detail": format!("{size} bytes is over the {max} byte limit"),
+    })
+}
+
+fn content_envelope(entry: &VfsEntry, bytes: &[u8]) -> Value {
+    serde_json::json!({
+        "ok": true,
+        "path": entry.path,
+        "version": entry.version,
+        "sha256": entry.sha256,
+        "size": bytes.len(),
+        "content": BASE64.encode(bytes),
+    })
+}
+
 /// `read`: one JSON envelope, always on stdout, so a tool (the browser bridge)
 /// gets a stable code instead of stderr text. Exit 0 means the envelope is
 /// there, including `ok: false`; only a transport failure is exit 1.
@@ -848,12 +885,10 @@ fn read(values: &Map<String, Value>, out: &mut Out) -> u8 {
         Ok(uri) => uri,
         Err(error) => return read_envelope(out, &error),
     };
-    let max = match value(values, "max-bytes") {
-        Some(text) => match text.parse::<u64>() {
-            Ok(max) => max,
-            Err(_) => return fail(out, "read", "--max-bytes must be whole bytes"),
-        },
-        None => u64::MAX,
+    let max = match read_limit(values) {
+        Ok(Some(max)) => max,
+        Ok(None) => u64::MAX,
+        Err(detail) => return fail(out, "read", &detail),
     };
     let index = match store.load_index() {
         Ok(index) => index,
@@ -863,58 +898,25 @@ fn read(values: &Map<String, Value>, out: &mut Out) -> u8 {
         say!(
             out,
             "{}",
-            serde_json::json!({
-                "ok": false,
-                "code": "not_found",
-                "detail": format!("no file at {}", uri.path),
-            })
+            read_error("not_found", format!("no file at {}", uri.path))
         );
         return 0;
     };
     if entry.size > max {
         // Answer before the blob moves: the caller's limit exists to keep a
         // viewer from paying for a file it will refuse.
-        say!(
-            out,
-            "{}",
-            serde_json::json!({
-                "ok": false,
-                "code": "too_large",
-                "size": entry.size,
-                "detail": format!("{} bytes is over the {max} byte limit", entry.size),
-            })
-        );
+        say!(out, "{}", too_large_envelope(entry.size, max));
         return 0;
     }
     match fetch(&store, &uri, false) {
         // The index snapshot above and the fetch below are two reads; a write
         // in between may have made the file larger. Check what arrived too.
         Ok((_, bytes)) if bytes.len() as u64 > max => {
-            say!(
-                out,
-                "{}",
-                serde_json::json!({
-                    "ok": false,
-                    "code": "too_large",
-                    "size": bytes.len(),
-                    "detail": format!("{} bytes is over the {max} byte limit", bytes.len()),
-                })
-            );
+            say!(out, "{}", too_large_envelope(bytes.len() as u64, max));
             0
         }
         Ok((entry, bytes)) => {
-            say!(
-                out,
-                "{}",
-                serde_json::json!({
-                    "ok": true,
-                    "path": entry.path,
-                    "version": entry.version,
-                    "sha256": entry.sha256,
-                    "size": bytes.len(),
-                    "content": BASE64.encode(&bytes),
-                })
-            );
+            say!(out, "{}", content_envelope(&entry, &bytes));
             0
         }
         Err(error) => read_envelope(out, &error),
@@ -1345,6 +1347,63 @@ mod tests {
             assert!(usage(&verb.name).contains("Usage"), "{}", verb.name);
         }
         assert!(usage("").contains("resolve"));
+    }
+
+    fn one_entry() -> VfsEntry {
+        VfsEntry {
+            path: "a/b.html".to_owned(),
+            sha256: "a".repeat(64),
+            size: 3,
+            replicas: 1,
+            version: 7,
+            writer: "node-a".to_owned(),
+            deleted: false,
+            mtime: 0,
+            vv: Default::default(),
+            conflicts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_read_limit_is_absent_or_whole_bytes() {
+        let mut values = Map::new();
+        assert_eq!(read_limit(&values).unwrap(), None);
+        values.insert("max-bytes".to_owned(), Value::String("10".to_owned()));
+        assert_eq!(read_limit(&values).unwrap(), Some(10));
+        values.insert("max-bytes".to_owned(), Value::String("ten".to_owned()));
+        assert!(read_limit(&values).unwrap_err().contains("whole bytes"));
+    }
+
+    #[test]
+    fn a_read_envelope_keeps_its_code_and_exits_zero() {
+        let mut out = Out::default();
+        let error = VfsError::new(VfsErrorKind::NotFound, "no file at /a");
+        assert_eq!(read_envelope(&mut out, &error), 0);
+        let json: Value =
+            serde_json::from_slice(&out.stdout).expect("the envelope is one JSON object");
+        assert_eq!(json["ok"], Value::Bool(false));
+        assert_eq!(json["code"], Value::String("not_found".to_owned()));
+        assert_eq!(json["detail"], Value::String("no file at /a".to_owned()));
+        assert!(out.stderr.is_empty());
+    }
+
+    #[test]
+    fn a_large_file_is_refused_with_its_size_before_reading_it() {
+        let json = too_large_envelope(2048, 1024);
+        assert_eq!(json["code"], Value::String("too_large".to_owned()));
+        assert_eq!(json["size"], Value::from(2048));
+        assert!(json["detail"].as_str().unwrap().contains("1024"));
+    }
+
+    #[test]
+    fn a_read_envelope_names_the_file_and_base64s_the_bytes() {
+        let entry = one_entry();
+        let json = content_envelope(&entry, b"abc");
+        assert_eq!(json["ok"], Value::Bool(true));
+        assert_eq!(json["path"], Value::String("a/b.html".to_owned()));
+        assert_eq!(json["version"], Value::from(7));
+        assert_eq!(json["size"], Value::from(3));
+        assert_eq!(json["content"], Value::String("YWJj".to_owned()));
     }
 
     #[test]

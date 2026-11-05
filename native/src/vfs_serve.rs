@@ -382,35 +382,31 @@ fn too_large(detail: &str) -> BadRequest {
 }
 
 /// `METHOD SP /path SP HTTP/1.x`, and nothing else.
-fn parse_request_line(line: &str) -> Result<(Method, &str, &str), BadRequest> {
-    let mut parts = line.split(' ');
-    let (Some(method), Some(target), Some(version), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return Err(BadRequest::new(
-            400,
-            "Bad Request",
-            "malformed request line",
-        ));
-    };
-    let method = match method {
-        "GET" => Method::Get,
-        "HEAD" => Method::Head,
-        _ => {
-            return Err(BadRequest::new(
-                405,
-                "Method Not Allowed",
-                "only GET and HEAD are served",
-            ))
-        }
-    };
-    if version != "HTTP/1.1" && version != "HTTP/1.0" {
-        return Err(BadRequest::new(
+fn parse_method(text: &str) -> Result<Method, BadRequest> {
+    match text {
+        "GET" => Ok(Method::Get),
+        "HEAD" => Ok(Method::Head),
+        _ => Err(BadRequest::new(
+            405,
+            "Method Not Allowed",
+            "only GET and HEAD are served",
+        )),
+    }
+}
+
+fn check_version(version: &str) -> Result<(), BadRequest> {
+    if version == "HTTP/1.1" || version == "HTTP/1.0" {
+        Ok(())
+    } else {
+        Err(BadRequest::new(
             505,
             "HTTP Version Not Supported",
             "use HTTP/1.1",
-        ));
+        ))
     }
+}
+
+fn check_target(target: &str) -> Result<(), BadRequest> {
     if !target.starts_with('/') {
         // Absolute-form proxies, authority-form and `*` are never ours.
         return Err(BadRequest::new(400, "Bad Request", "target must be a path"));
@@ -428,43 +424,29 @@ fn parse_request_line(line: &str) -> Result<(Method, &str, &str), BadRequest> {
             "bad character in target",
         ));
     }
+    Ok(())
+}
+
+fn parse_request_line(line: &str) -> Result<(Method, &str, &str), BadRequest> {
+    let mut parts = line.split(' ');
+    let (Some(method), Some(target), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(BadRequest::new(
+            400,
+            "Bad Request",
+            "malformed request line",
+        ));
+    };
+    let method = parse_method(method)?;
+    check_version(version)?;
+    check_target(target)?;
     Ok((method, target, version))
 }
 
-/// The three headers the bridge acts on, and the two it refuses.
-#[derive(Default)]
-struct RawHeaders {
-    host: Option<String>,
-    if_none_match: Option<String>,
-    content_length: Option<u64>,
-    chunked: bool,
-}
-
-impl RawHeaders {
-    fn has_body(&self) -> bool {
-        // `Some(0)` is no body; anything else, and any chunked body, is refused.
-        self.content_length.is_some_and(|length| length != 0) || self.chunked
-    }
-}
-
-fn parse_headers<'a>(lines: impl Iterator<Item = &'a str>) -> Result<RawHeaders, BadRequest> {
-    let mut raw = RawHeaders::default();
-    let mut count = 0;
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        count += 1;
-        if count > MAX_HEADERS {
-            return Err(too_large("too many headers"));
-        }
-        parse_header_line(line, &mut raw)?;
-    }
-    Ok(raw)
-}
-
-/// One `name: value` line into `raw`. Unknown names are ignored, not refused.
-fn parse_header_line(line: &str, raw: &mut RawHeaders) -> Result<(), BadRequest> {
+/// Split `name: value` and reject bytes HTTP's grammar does not allow. Pure,
+/// so the two refusals are tested without a connection.
+fn header_field(line: &str) -> Result<(&str, &str), BadRequest> {
     let (name, value) = line
         .split_once(':')
         .ok_or_else(|| BadRequest::new(400, "Bad Request", "header without a colon"))?;
@@ -478,6 +460,12 @@ fn parse_header_line(line: &str, raw: &mut RawHeaders) -> Result<(), BadRequest>
     {
         return Err(BadRequest::new(400, "Bad Request", "bad header value"));
     }
+    Ok((name, value))
+}
+
+/// Keep only the headers the bridge acts on, refusing duplicates of the two
+/// that would change routing. Split from parsing so each refusal is one test.
+fn store_header(raw: &mut RawHeaders, name: &str, value: &str) -> Result<(), BadRequest> {
     match name.to_ascii_lowercase().as_str() {
         "host" => {
             if raw.host.is_some() {
@@ -520,6 +508,43 @@ fn parse_header_line(line: &str, raw: &mut RawHeaders) -> Result<(), BadRequest>
         _ => {}
     }
     Ok(())
+}
+
+fn parse_header_line(line: &str, raw: &mut RawHeaders) -> Result<(), BadRequest> {
+    let (name, value) = header_field(line)?;
+    store_header(raw, name, value)
+}
+
+/// The three headers the bridge acts on, and the two it refuses.
+#[derive(Default)]
+struct RawHeaders {
+    host: Option<String>,
+    if_none_match: Option<String>,
+    content_length: Option<u64>,
+    chunked: bool,
+}
+
+impl RawHeaders {
+    fn has_body(&self) -> bool {
+        // `Some(0)` is no body; anything else, and any chunked body, is refused.
+        self.content_length.is_some_and(|length| length != 0) || self.chunked
+    }
+}
+
+fn parse_headers<'a>(lines: impl Iterator<Item = &'a str>) -> Result<RawHeaders, BadRequest> {
+    let mut raw = RawHeaders::default();
+    let mut count = 0;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        count += 1;
+        if count > MAX_HEADERS {
+            return Err(too_large("too many headers"));
+        }
+        parse_header_line(line, &mut raw)?;
+    }
+    Ok(raw)
 }
 
 /// One request path, decoded and checked against the cluster path rules.
@@ -1139,6 +1164,20 @@ pub fn origin_of(addr: SocketAddr) -> String {
     format!("http://{addr}")
 }
 
+/// Parse `--addr` and refuse a public bind unless the operator asked for it.
+/// Pure, so the policy is one test per branch.
+fn bind_address(addr: &str, allow_remote: bool) -> Result<SocketAddr, String> {
+    let requested: SocketAddr = addr
+        .parse()
+        .map_err(|error| format!("--addr {addr:?} is not ADDRESS:PORT ({error})"))?;
+    if !requested.ip().is_loopback() && !allow_remote {
+        return Err(format!(
+            "{requested} is not a loopback address; add --allow-remote if you really mean to publish cluster files to the network"
+        ));
+    }
+    Ok(requested)
+}
+
 /// `remuda vfs serve` from the CLI. Returns the process exit code.
 pub fn run(
     socket: &Path,
@@ -1155,19 +1194,13 @@ pub fn run(
             return ExitCode::FAILURE;
         }
     };
-    let requested: SocketAddr = match addr.parse() {
+    let requested = match bind_address(addr, allow_remote) {
         Ok(addr) => addr,
-        Err(error) => {
-            eprintln!("remuda: vfs serve: --addr {addr:?} is not ADDRESS:PORT ({error})");
+        Err(detail) => {
+            eprintln!("remuda: vfs serve: {detail}");
             return ExitCode::FAILURE;
         }
     };
-    if !requested.ip().is_loopback() && !allow_remote {
-        eprintln!(
-            "remuda: vfs serve: {requested} is not a loopback address; add --allow-remote if you really mean to publish cluster files to the network"
-        );
-        return ExitCode::FAILURE;
-    }
     let source = DaemonSource::new(socket.to_path_buf());
     if let Err(detail) = source.probe() {
         eprintln!("remuda: vfs serve: the daemon did not answer `remuda vfs read`: {detail}");
@@ -1649,6 +1682,135 @@ mod tests {
         let wire = String::from_utf8_lossy(&response.to_bytes(head.method)).to_string();
         assert!(wire.contains("Allow: GET, HEAD"), "{wire}");
         let _ = (&fake, &config);
+    }
+
+    #[test]
+    fn a_bind_is_loopback_unless_remote_is_allowed() {
+        assert_eq!(
+            bind_address("127.0.0.1:8080", false).unwrap(),
+            "127.0.0.1:8080".parse().unwrap()
+        );
+        assert!(bind_address("0.0.0.0:8080", false)
+            .unwrap_err()
+            .contains("--allow-remote"));
+        assert_eq!(
+            bind_address("0.0.0.0:8080", true).unwrap(),
+            "0.0.0.0:8080".parse().unwrap()
+        );
+        assert!(bind_address("nope", false).unwrap_err().contains("ADDRESS"));
+    }
+
+    #[test]
+    fn only_get_and_head_reach_a_target() {
+        assert_eq!(parse_method("GET").unwrap(), Method::Get);
+        assert_eq!(parse_method("HEAD").unwrap(), Method::Head);
+        assert_eq!(parse_method("POST").unwrap_err().status, 405);
+        assert_eq!(parse_method("get").unwrap_err().status, 405);
+    }
+
+    #[test]
+    fn only_http_10_and_11_are_spoken() {
+        assert!(check_version("HTTP/1.1").is_ok());
+        assert!(check_version("HTTP/1.0").is_ok());
+        assert_eq!(check_version("HTTP/2").unwrap_err().status, 505);
+        assert_eq!(check_version("").unwrap_err().status, 505);
+    }
+
+    #[test]
+    fn a_target_must_be_a_bare_path_without_controls() {
+        assert!(check_target("/a/b").is_ok());
+        assert_eq!(check_target("/a#b").unwrap_err().status, 400);
+        assert_eq!(check_target("/a\nb").unwrap_err().status, 400);
+        assert_eq!(check_target("/a\u{7f}").unwrap_err().status, 400);
+        assert_eq!(check_target("http://h/a").unwrap_err().status, 400);
+        assert_eq!(check_target("*").unwrap_err().status, 400);
+        let long = format!("/{}", "a".repeat(MAX_TARGET_BYTES));
+        assert_eq!(check_target(&long).unwrap_err().status, 414);
+    }
+
+    #[test]
+    fn a_header_line_splits_and_rejects_bad_names_and_values() {
+        assert_eq!(header_field("Host: a:1").unwrap(), ("Host", "a:1"));
+        assert_eq!(header_field("Host:   a  ").unwrap(), ("Host", "a"));
+        assert_eq!(header_field("nocolon").unwrap_err().status, 400);
+        assert_eq!(header_field(": v").unwrap_err().status, 400);
+        assert_eq!(header_field("bad name: v").unwrap_err().status, 400);
+        assert_eq!(header_field("Host: a\rb").unwrap_err().status, 400);
+    }
+
+    #[test]
+    fn only_routing_headers_are_kept_and_duplicates_refused() {
+        let mut raw = RawHeaders::default();
+        assert!(store_header(&mut raw, "Host", "a:1").is_ok());
+        assert!(store_header(&mut raw, "X-Other", "ignored").is_ok());
+        assert_eq!(raw.host.as_deref(), Some("a:1"));
+        assert!(store_header(&mut raw, "host", "b:2").is_err());
+        assert!(store_header(&mut raw, "Host", "").is_err());
+        let mut raw = RawHeaders::default();
+        assert!(store_header(&mut raw, "Content-Length", "0").is_ok());
+        assert_eq!(raw.content_length, Some(0));
+        assert!(!raw.has_body());
+        assert!(store_header(&mut raw, "Content-Length", "+0").is_err());
+        let mut raw = RawHeaders::default();
+        assert!(store_header(&mut raw, "Transfer-Encoding", "chunked").is_ok());
+        assert!(raw.has_body());
+    }
+
+    #[test]
+    fn every_store_code_maps_to_one_kind_and_unknown_falls_back_to_io() {
+        assert_eq!(Kind::from_code("not_found"), Kind::NotFound);
+        assert_eq!(Kind::from_code("too_large"), Kind::TooLarge);
+        assert_eq!(Kind::from_code("no_cluster"), Kind::NoCluster);
+        assert_eq!(Kind::from_code("not_local"), Kind::Unreachable);
+        assert_eq!(Kind::from_code("unreachable"), Kind::Unreachable);
+        assert_eq!(Kind::from_code("corrupt"), Kind::Corrupt);
+        assert_eq!(Kind::from_code("wrong_cluster"), Kind::WrongCluster);
+        assert_eq!(Kind::from_code("bad_uri"), Kind::BadUri);
+        assert_eq!(Kind::from_code(""), Kind::Io);
+        assert_eq!(Kind::from_code("something_new"), Kind::Io);
+    }
+
+    #[test]
+    fn an_entry_decodes_from_the_store_json_or_reads_as_empty() {
+        let full = serde_json::json!({
+            "path": "a/b.html", "version": 7, "sha256": "a".repeat(64), "size": 12
+        });
+        let meta = meta_from(&full);
+        assert_eq!(meta.path, "a/b.html");
+        assert_eq!(meta.version, 7);
+        assert_eq!(meta.size, 12);
+        let empty = meta_from(&serde_json::json!({}));
+        assert_eq!(empty.path, "");
+        assert_eq!(empty.version, 0);
+    }
+
+    #[test]
+    fn a_head_method_is_read_from_the_raw_prefix() {
+        assert_eq!(claimed_method(b"HEAD /a HTTP/1.1"), Method::Head);
+        assert_eq!(claimed_method(b"GET /a HTTP/1.1"), Method::Get);
+        assert_eq!(claimed_method(b"POS"), Method::Get);
+    }
+
+    #[test]
+    fn the_head_terminator_is_found_at_its_offset() {
+        // The offset points at the blank line that ends the head, not past it.
+        assert_eq!(find_head_end(b"GET / HTTP/1.1\r\n\r\nbody"), Some(14));
+        assert_eq!(find_head_end(b"GET / HTTP/1.1\r\n"), None);
+    }
+
+    #[test]
+    fn an_ipv6_origin_keeps_its_brackets() {
+        let addr: SocketAddr = "[::1]:8080".parse().unwrap();
+        assert_eq!(origin_of(addr), "http://[::1]:8080");
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(origin_of(addr), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn sizes_read_as_bytes_kib_and_mib() {
+        assert_eq!(bytes_text(1), "1 B");
+        assert_eq!(bytes_text(1024), "1.0 KiB");
+        assert_eq!(bytes_text(2 * 1024 * 1024), "2.0 MiB");
     }
 
     #[test]
