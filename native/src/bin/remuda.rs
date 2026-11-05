@@ -48,8 +48,14 @@ extern "C" fn record_join_interrupt(signal: libc::c_int) {
     JOIN_INTERRUPTED.store(true, Ordering::Release);
 }
 
+#[path = "remuda/agent_notice.rs"]
+mod agent_notice;
 #[path = "remuda/codex_tui.rs"]
 mod codex_tui;
+#[path = "remuda/opencode_tui.rs"]
+mod opencode_tui;
+#[path = "remuda/private_dir.rs"]
+mod private_dir;
 
 fn main() -> ExitCode {
     // A reload candidate that re-executed itself to look like the daemon.
@@ -114,7 +120,7 @@ fn starts_interactive_client(args: &[String]) -> bool {
     };
     match command_args.first().copied() {
         None => true,
-        Some("daemon" | "run" | "attach" | "_codex_tui") => true,
+        Some("daemon" | "run" | "attach" | "_codex_tui" | "_opencode_tui") => true,
         Some("cluster") => command_args.get(1).is_some_and(|verb| *verb == "remote"),
         _ => false,
     }
@@ -199,6 +205,9 @@ fn dispatch_cli_command(
         "version" | "--version" | "-V" => version_command(server, path, rest),
         "_codex_tui" => codex_tui::run(rest),
         "_codex_watch" => run_codex_watch_cli(rest),
+        "_opencode_tui" => opencode_tui::run(rest),
+        "_agent_notice" => agent_notice::run(rest),
+        "_opencode_watch" => run_opencode_watch_cli(rest),
         "upgrade" => run_upgrade(path, rest),
         "daemon" => match ensure_no_args("daemon", rest) {
             Err(code) => code,
@@ -274,6 +283,13 @@ fn run_codex_watch(parent_pid: &str, process_group: &str) -> ExitCode {
     match (parent_pid.parse::<i32>(), process_group.parse::<i32>()) {
         (Ok(parent_pid), Ok(process_group)) => codex_tui::watch_parent(parent_pid, process_group),
         _ => fail("invalid Codex app-server watch parameters"),
+    }
+}
+
+fn run_opencode_watch(parent_pid: &str, server_pid: &str) -> ExitCode {
+    match (parent_pid.parse::<i32>(), server_pid.parse::<i32>()) {
+        (Ok(parent_pid), Ok(server_pid)) => opencode_tui::watch_parent(parent_pid, server_pid),
+        _ => fail("invalid OpenCode server watch parameters"),
     }
 }
 
@@ -570,6 +586,44 @@ fn run_codex_watch_cli(args: &[&str]) -> ExitCode {
             .unwrap_or_default(),
         values
             .get("PROCESS_GROUP")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+    )
+}
+
+fn run_opencode_watch_cli(args: &[&str]) -> ExitCode {
+    use remuda_native::cli_parse::ArgSpec;
+    let spec = simple_cli_spec(
+        "_opencode_watch",
+        "Internal OpenCode server watcher",
+        vec![
+            ArgSpec {
+                name: "PARENT_PID".into(),
+                help: "Parent process ID".into(),
+                multiple: false,
+                required: true,
+            },
+            ArgSpec {
+                name: "SERVER_PID".into(),
+                help: "Server process group ID".into(),
+                multiple: false,
+                required: true,
+            },
+        ],
+        vec![],
+        "remuda _opencode_watch PARENT_PID SERVER_PID",
+    );
+    let values = match parse_top_level_cli(&spec, "_opencode_watch", args) {
+        Ok(values) => values,
+        Err(code) => return code,
+    };
+    run_opencode_watch(
+        values
+            .get("PARENT_PID")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+        values
+            .get("SERVER_PID")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default(),
     )
