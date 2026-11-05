@@ -346,7 +346,11 @@ mod tests {
     fn request() -> AdoptRequest {
         AdoptRequest {
             version: 1,
-            binding: "/private/tmp/adopt-test/manifest.json".into(),
+            binding: std::env::temp_dir()
+                .join("adopt-test")
+                .join("manifest.json")
+                .to_string_lossy()
+                .into_owned(),
             nonce: "nonce".into(),
             session: "session".into(),
             endpoint: ENDPOINT.into(),
