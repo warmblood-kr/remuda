@@ -473,17 +473,19 @@ mod tests {
         let root = scratch("replaced");
         std::fs::write(root.join("a.txt"), b"aaa").unwrap();
         let plan = plan(&root, "v1").unwrap();
-        // Same size and the same mtime, but a new inode: only the preflight
-        // identity can tell this apart from the file we planned.
+        // Same size and the same mtime, but a different inode: rename a file
+        // that existed next to it. Creating a fresh file can reuse the inode.
         let mtime = plan.files[0].modified.unwrap();
-        std::fs::remove_file(root.join("a.txt")).unwrap();
-        std::fs::write(root.join("a.txt"), b"bbb").unwrap();
+        let replacement = root.join("replacement.txt");
+        std::fs::write(&replacement, b"bbb").unwrap();
         std::fs::File::options()
             .write(true)
-            .open(root.join("a.txt"))
+            .open(&replacement)
             .unwrap()
             .set_modified(mtime)
             .unwrap();
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        std::fs::rename(&replacement, root.join("a.txt")).unwrap();
         let error = read_verified(&plan.files[0]).unwrap_err();
         assert!(error.contains("replaced"), "{error}");
         std::fs::remove_dir_all(root).unwrap();
