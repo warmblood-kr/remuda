@@ -1,0 +1,16 @@
+{
+  "id": 2,
+  "result": {
+    "queuedSubmission": {
+      "id": "01a1ab85-df59-7932-89f9-2d833cbede45",
+      "input": [
+        {
+          "type": "text",
+          "text": "queue probe",
+          "text_elements": []
+        }
+      ],
+      "clientUserMessageId": "probe-1"
+    }
+  }
+}

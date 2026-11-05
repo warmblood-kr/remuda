@@ -53,8 +53,12 @@ mod agent_notice;
 #[cfg(unix)]
 #[path = "remuda/claude_channel.rs"]
 mod claude_channel;
+#[path = "remuda/codex_native.rs"]
+mod codex_native;
 #[path = "remuda/codex_tui.rs"]
 mod codex_tui;
+#[path = "remuda/codex_tunnel.rs"]
+mod codex_tunnel;
 #[path = "remuda/opencode_adopt.rs"]
 mod opencode_adopt;
 #[path = "remuda/opencode_tui.rs"]
@@ -206,6 +210,8 @@ fn dispatch_native_verb(verb: &str, rest: &[&str]) -> Option<ExitCode> {
             ExitCode::SUCCESS
         }
         "_agent_notice" => agent_notice::run(rest),
+        "_codex_notice" => codex_native::run(rest),
+        "_codex_adopt" => codex_native::run_adopt(rest),
         "_opencode_watch" => run_opencode_watch_cli(rest),
         _ => return None,
     })

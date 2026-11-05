@@ -1,0 +1,50 @@
+{
+  "id": 10,
+  "result": {
+    "thread": {
+      "id": "01a1ab85-c9f8-7881-88cc-227ce902256c",
+      "environments": [
+        {
+          "environmentId": "local",
+          "cwd": "/tmp/fixture-capture/work",
+          "runtimeWorkspaceRoots": [
+            "/tmp/fixture-capture/work"
+          ]
+        }
+      ],
+      "extra": null,
+      "sessionId": "01a1ab85-c9f8-7881-88cc-227ce902256c",
+      "forkedFromId": null,
+      "parentThreadId": null,
+      "preview": "",
+      "ephemeral": false,
+      "section": null,
+      "sectionEnteredAt": null,
+      "projectId": null,
+      "historyMode": "paginated",
+      "modelProvider": "localprobe",
+      "model": "gpt-6.1-sol",
+      "reasoningEffort": null,
+      "createdAt": 1793879034,
+      "updatedAt": 1793879039,
+      "recencyAt": 1793879039,
+      "status": {
+        "type": "idle"
+      },
+      "path": "/tmp/fixture-capture/home/sessions/2026/11/05/rollout-2026-11-05T20-43-54-01a1ab85-c9f8-7881-88cc-227ce902256c.jsonl",
+      "cwd": "/tmp/fixture-capture/work",
+      "cliVersion": "0.166.0",
+      "originator": "codex-tui",
+      "source": "vscode",
+      "canAcceptDirectInput": true,
+      "threadSource": "user",
+      "agentNickname": null,
+      "agentRole": null,
+      "gitInfo": null,
+      "name": null,
+      "daybreakEnabled": null,
+      "turns": []
+    },
+    "readState": null
+  }
+}

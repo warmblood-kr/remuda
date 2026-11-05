@@ -10,6 +10,49 @@ use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
+/// One launcher-owned binding publication. Nonce/session come from the
+/// parent, never from argv; the endpoint and thread are captured by the tunnel.
+#[cfg(unix)]
+fn publish_config(
+    binding: Option<&str>,
+) -> Result<Option<super::codex_tunnel::Publish>, &'static str> {
+    let Some(path) = binding else {
+        return Ok(None);
+    };
+    if !cfg!(target_os = "macos") {
+        return Err("unsupported_platform");
+    }
+    let nonce = std::env::var("REMUDA_BUTLER_BINDING_NONCE").map_err(|_| "binding_env")?;
+    // The session is the core-assigned id of the shell's actual session row,
+    // the same value the OpenCode launcher uses. There is no alias variable.
+    let session = std::env::var("REMUDA_SESSION_ID").map_err(|_| "binding_env")?;
+    publish_with(path, nonce, session).map(Some)
+}
+
+#[cfg(unix)]
+fn publish_with(
+    path: &str,
+    nonce: String,
+    session: String,
+) -> Result<super::codex_tunnel::Publish, &'static str> {
+    if !std::path::Path::new(path).is_absolute()
+        || !super::codex_native::valid_token(&nonce)
+        || !super::codex_native::valid_token(&session)
+    {
+        return Err("binding_env");
+    }
+    Ok(super::codex_tunnel::Publish {
+        binding: path.into(),
+        nonce,
+        session,
+    })
+}
+
+#[cfg(not(unix))]
+fn publish_config(_binding: Option<&str>) -> Result<Option<()>, &'static str> {
+    Ok(None)
+}
+
 /// Butler probes `--help` for `-c KEY=VALUE` to learn whether this core can
 /// pass config overrides through, so that substring is a contract.
 fn cli_spec() -> remuda_native::cli_parse::Spec {
@@ -22,10 +65,11 @@ fn cli_spec() -> remuda_native::cli_parse::Spec {
             about: "Run the Codex terminal interface with session status reporting. Example: remuda _codex_tui --status /tmp/status.json --model gpt-5".into(),
             usage: None,
             args: vec![],
-            next: "remuda _codex_tui --status PATH [--model MODEL] [-c KEY=VALUE]…".into(),
+            next: "remuda _codex_tui --status PATH [--model MODEL] [--binding DIR] [-c KEY=VALUE]…".into(),
             options: vec![
                 OptionSpec { long: "status".into(), short: None, value: Some("PATH".into()), help: "Status file updated while Codex runs".into(), global: false, required: true, repeat_policy: Default::default() },
                 OptionSpec { long: "model".into(), short: None, value: Some("MODEL".into()), help: "Model used by the Codex client (default: Codex configuration)".into(), global: false, required: false, repeat_policy: Default::default() },
+                OptionSpec { long: "binding".into(), short: None, value: Some("DIR".into()), help: "Publish the owned Codex binding into this private directory".into(), global: false, required: false, repeat_policy: Default::default() },
                 OptionSpec { long: "config".into(), short: Some('c'), value: Some("KEY=VALUE".into()), help: "App-server configuration override; may be repeated".into(), global: false, required: false, repeat_policy: RepeatPolicy::Append },
             ],
         }],
@@ -39,14 +83,20 @@ fn parse_report(args: &[&str]) -> remuda_native::cli_parse::Report {
     remuda_native::cli_parse::parse(&cli_spec(), &words)
 }
 
+#[derive(Debug, PartialEq)]
+struct TuiArgs {
+    status: String,
+    model: Option<String>,
+    config: Vec<String>,
+    binding: Option<String>,
+}
+
 #[cfg(test)]
-fn parse_args(args: &[&str]) -> Option<(String, Option<String>, Vec<String>)> {
+fn parse_args(args: &[&str]) -> Option<TuiArgs> {
     parse_report_args(parse_report(args))
 }
 
-fn parse_report_args(
-    report: remuda_native::cli_parse::Report,
-) -> Option<(String, Option<String>, Vec<String>)> {
+fn parse_report_args(report: remuda_native::cli_parse::Report) -> Option<TuiArgs> {
     if !report.ok {
         return None;
     }
@@ -65,7 +115,17 @@ fn parse_report_args(
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect();
-    Some((status, model, config))
+    let binding = report
+        .values
+        .get("binding")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Some(TuiArgs {
+        status,
+        model,
+        config,
+        binding,
+    })
 }
 
 pub fn run(args: &[&str]) -> ExitCode {
@@ -82,18 +142,132 @@ pub fn run(args: &[&str]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let Some((status, model, config)) = parse_report_args(report) else {
+    let Some(TuiArgs {
+        status,
+        model,
+        config,
+        binding,
+    }) = parse_report_args(report)
+    else {
         unreachable!("successful parser report has required values")
     };
+    serve_tui(status, model, config, binding)
+}
+
+#[cfg(not(unix))]
+fn unsupported_publish(binding: &Option<String>) -> Option<()> {
+    let _ = binding;
+    None
+}
+
+#[cfg(unix)]
+fn drop_runtime(runtime: &Option<std::path::PathBuf>) {
+    if let Some(dir) = runtime {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+struct Launched {
+    socket: std::path::PathBuf,
+    server_address: String,
+    client_address: String,
+    #[cfg(unix)]
+    tunnel: Option<super::codex_tunnel::Tunnel>,
+    #[cfg(unix)]
+    runtime: Option<std::path::PathBuf>,
+}
+
+#[cfg(unix)]
+fn endpoint(publish: Option<super::codex_tunnel::Publish>) -> Result<Launched, ExitCode> {
+    let runtime = if publish.is_some() {
+        Some(super::codex_tunnel::runtime_dir().map_err(fail)?)
+    } else {
+        None
+    };
+    let socket = match &runtime {
+        Some(dir) => dir.join("app.sock"),
+        None => std::env::temp_dir().join(format!("remuda-codex-{}.sock", std::process::id())),
+    };
+    let server_address = format!("unix://{}", socket.display());
+    let tunnel = match publish {
+        Some(publish) => Some(
+            super::codex_tunnel::start(
+                &socket,
+                runtime.as_ref().expect("runtime with binding"),
+                publish,
+            )
+            .map_err(|error| {
+                drop_runtime(&runtime);
+                fail(error)
+            })?,
+        ),
+        None => None,
+    };
+    let client_address = match tunnel.as_ref() {
+        Some(tunnel) => format!("unix://{}", tunnel.downstream().display()),
+        None => server_address.clone(),
+    };
+    Ok(Launched {
+        socket,
+        server_address,
+        client_address,
+        tunnel,
+        runtime,
+    })
+}
+
+#[cfg(not(unix))]
+fn endpoint(_publish: Option<()>) -> Result<Launched, ExitCode> {
+    let socket = std::env::temp_dir().join(format!("remuda-codex-{}.sock", std::process::id()));
+    Ok(Launched {
+        server_address: format!("unix://{}", socket.display()),
+        client_address: format!("unix://{}", socket.display()),
+        socket,
+    })
+}
+
+fn serve_tui(
+    status: String,
+    model: Option<String>,
+    config: Vec<String>,
+    binding: Option<String>,
+) -> ExitCode {
     // The selected model is useful status even before the first prompt. The
     // app-server does not announce a thread (or its model) until a thread is
     // started, so waiting for `thread/started` leaves the caller showing its
     // previous/default model while the new TUI is idle.
     seed_status(&status, model.as_deref());
-    let socket = std::env::temp_dir().join(format!("remuda-codex-{}.sock", std::process::id()));
-    let address = format!("unix://{}", socket.display());
+    #[cfg(unix)]
+    let publish = match publish_config(binding.as_deref()) {
+        Ok(publish) => publish,
+        Err(_) => {
+            eprintln!(
+                "remuda: --binding needs a private REMUDA_BUTLER_BINDING_NONCE and REMUDA_SESSION_ID"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    #[cfg(not(unix))]
+    let publish = unsupported_publish(&binding);
+    let Launched {
+        socket,
+        server_address,
+        client_address,
+        #[cfg(unix)]
+        tunnel,
+        #[cfg(unix)]
+        runtime,
+    } = match endpoint(publish) {
+        Ok(launched) => launched,
+        Err(code) => return code,
+    };
     let config_refs = config.iter().map(String::as_str).collect::<Vec<_>>();
-    let (server_args, client_args) = codex_args(&address, model.as_deref(), &config_refs);
+    let (server_args, client_args) = codex_args(
+        &server_address,
+        &client_address,
+        model.as_deref(),
+        &config_refs,
+    );
     let mut server_command = Command::new("codex");
     server_command
         .args(&server_args)
@@ -106,13 +280,28 @@ pub fn run(args: &[&str]) -> ExitCode {
     remuda_native::child_guard::harden(&mut server_command);
     let mut server = match server_command.spawn() {
         Ok(child) => child,
-        Err(error) => return fail(error),
+        Err(error) => {
+            #[cfg(unix)]
+            if let Some(tunnel) = tunnel.as_ref() {
+                tunnel.cleanup();
+            }
+            #[cfg(unix)]
+            drop_runtime(&runtime);
+            return fail(error);
+        }
     };
     #[cfg(unix)]
     let mut parent_watch = match start_parent_watch(server.id()) {
         Ok(watch) => Some(watch),
         Err(error) => {
+            #[cfg(unix)]
+            if let Some(tunnel) = tunnel.as_ref() {
+                tunnel.cleanup();
+            }
             finish_app_server(&mut server, None);
+            let _ = std::fs::remove_file(&socket);
+            #[cfg(unix)]
+            drop_runtime(&runtime);
             return fail(error);
         }
     };
@@ -120,15 +309,33 @@ pub fn run(args: &[&str]) -> ExitCode {
     let mut parent_watch: Option<Child> = None;
 
     if !wait_for_socket(&socket) {
+        #[cfg(unix)]
+        if let Some(tunnel) = tunnel.as_ref() {
+            tunnel.cleanup();
+        }
         finish_app_server(&mut server, parent_watch.take());
+        let _ = std::fs::remove_file(&socket);
+        #[cfg(unix)]
+        drop_runtime(&runtime);
         return fail("Codex app-server did not bind its local socket");
     }
     let monitor_socket = socket.clone();
     let monitor_status = status.to_string();
+    #[cfg(unix)]
+    std::thread::spawn(move || monitor(&monitor_socket, &monitor_status));
+    #[cfg(not(unix))]
     std::thread::spawn(move || monitor(&monitor_socket, &monitor_status));
     let result = Command::new("codex").args(&client_args).status();
+    // Fence publication and remove the bridge before the app-server dies, so a
+    // binding cannot outlive the socket it points at.
+    #[cfg(unix)]
+    if let Some(tunnel) = tunnel.as_ref() {
+        tunnel.cleanup();
+    }
     finish_app_server(&mut server, parent_watch.take());
-    let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(&socket);
+    #[cfg(unix)]
+    drop_runtime(&runtime);
     match result {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
@@ -214,9 +421,22 @@ fn seed_status(status: &str, model: Option<&str>) {
 /// Argv for the app-server and the TUI client.  A chosen model goes to both:
 /// the server's config default and the client's thread override.  Config
 /// overrides go to the server alone, verbatim, after the model's.
-fn codex_args(address: &str, model: Option<&str>, config: &[&str]) -> (Vec<String>, Vec<String>) {
-    let mut server = vec!["app-server".into(), "--listen".into(), address.into()];
-    let mut client = vec!["--remote".into(), address.into(), "--approve-for-me".into()];
+fn codex_args(
+    server_address: &str,
+    client_address: &str,
+    model: Option<&str>,
+    config: &[&str],
+) -> (Vec<String>, Vec<String>) {
+    let mut server = vec![
+        "app-server".into(),
+        "--listen".into(),
+        server_address.into(),
+    ];
+    let mut client = vec![
+        "--remote".into(),
+        client_address.into(),
+        "--approve-for-me".into(),
+    ];
     if let Some(model) = model {
         server.extend(["-c".into(), format!("model={model:?}")]);
         client.extend(["-m".into(), model.into()]);
@@ -330,7 +550,7 @@ fn monitor_with_key(socket: &std::path::Path, status: &str, key: Option<&str>) {
 #[cfg(unix)]
 /// ponytail: this small client supports local UDS handshakes and unfragmented
 /// text frames only; it negotiates no extensions and does not reassemble fragments.
-fn websocket_handshake(
+pub(crate) fn websocket_handshake(
     mut stream: UnixStream,
     supplied_key: Option<&str>,
 ) -> std::io::Result<UnixStream> {
@@ -409,7 +629,7 @@ fn read_http_headers(stream: &mut UnixStream) -> std::io::Result<String> {
 }
 
 #[cfg(unix)]
-fn websocket_send_text(stream: &mut UnixStream, text: &str) -> std::io::Result<()> {
+pub(crate) fn websocket_send_text(stream: &mut UnixStream, text: &str) -> std::io::Result<()> {
     let payload = text.as_bytes();
     let mut header = vec![0x81];
     match payload.len() {
@@ -434,7 +654,7 @@ fn websocket_send_text(stream: &mut UnixStream, text: &str) -> std::io::Result<(
 }
 
 #[cfg(unix)]
-fn websocket_read_text(stream: &mut UnixStream) -> std::io::Result<Option<String>> {
+pub(crate) fn websocket_read_text(stream: &mut UnixStream) -> std::io::Result<Option<String>> {
     const MAX_MESSAGE: u64 = 4 * 1024 * 1024;
     loop {
         let mut header = [0; 2];
@@ -521,7 +741,7 @@ fn websocket_send_control(
 }
 
 #[cfg(unix)]
-fn sha1(input: &[u8]) -> [u8; 20] {
+pub(crate) fn sha1(input: &[u8]) -> [u8; 20] {
     let mut data = input.to_vec();
     let bit_len = (data.len() as u64).wrapping_mul(8);
     data.push(0x80);
@@ -645,10 +865,31 @@ mod tests {
         std::env::temp_dir().join(format!("remuda-codex-{test}-{}", std::process::id()))
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn the_published_session_is_the_core_assigned_id() {
+        let publish = publish_with(
+            "/tmp/x/manifest.json",
+            "nonce-1".into(),
+            "01a1aba5-session".into(),
+        )
+        .expect("publish");
+        assert_eq!(publish.nonce, "nonce-1");
+        assert_eq!(publish.session, "01a1aba5-session");
+        assert_eq!(
+            publish.binding,
+            std::path::Path::new("/tmp/x/manifest.json")
+        );
+        // Relative binding paths and unusable tokens stay binding_env errors.
+        assert!(publish_with("manifest.json", "n".into(), "s".into()).is_err());
+        assert!(publish_with("/tmp/x/manifest.json", String::new(), "s".into()).is_err());
+        assert!(publish_with("/tmp/x/manifest.json", "n".into(), String::new()).is_err());
+    }
+
     #[test]
     fn model_reaches_both_the_app_server_and_the_client() {
         assert_eq!(
-            codex_args("unix://s", None, &[]),
+            codex_args("unix://s", "unix://s", None, &[]),
             (
                 vec!["app-server".into(), "--listen".into(), "unix://s".into()],
                 vec![
@@ -658,7 +899,7 @@ mod tests {
                 ],
             )
         );
-        let (server, client) = codex_args("unix://s", Some("gpt-5.5"), &[]);
+        let (server, client) = codex_args("unix://s", "unix://s", Some("gpt-5.5"), &[]);
         assert_eq!(server[3..], ["-c", "model=\"gpt-5.5\""]);
         assert_eq!(client[3..], ["-m", "gpt-5.5"]);
     }
@@ -666,26 +907,43 @@ mod tests {
     #[test]
     fn config_overrides_reach_only_the_app_server_after_the_model() {
         let config = ["a=1", r#"b={x="y"}"#];
-        let (server, client) = codex_args("unix://s", Some("gpt-5.5"), &config);
+        let (server, client) = codex_args("unix://s", "unix://s", Some("gpt-5.5"), &config);
         assert_eq!(
             server[3..],
             ["-c", "model=\"gpt-5.5\"", "-c", "a=1", "-c", r#"b={x="y"}"#]
         );
-        assert_eq!(client, codex_args("unix://s", Some("gpt-5.5"), &[]).1);
-        let (server, client) = codex_args("unix://s", None, &config);
+        assert_eq!(
+            client,
+            codex_args("unix://s", "unix://s", Some("gpt-5.5"), &[]).1
+        );
+        let (server, client) = codex_args("unix://s", "unix://s", None, &config);
         assert_eq!(server[3..], ["-c", "a=1", "-c", r#"b={x="y"}"#]);
-        assert_eq!(client, codex_args("unix://s", None, &[]).1);
+        assert_eq!(client, codex_args("unix://s", "unix://s", None, &[]).1);
+    }
+
+    fn tui_args(
+        status: &str,
+        model: Option<&str>,
+        config: Vec<&str>,
+        binding: Option<&str>,
+    ) -> TuiArgs {
+        TuiArgs {
+            status: status.into(),
+            model: model.map(str::to_owned),
+            config: config.into_iter().map(str::to_owned).collect(),
+            binding: binding.map(str::to_owned),
+        }
     }
 
     #[test]
     fn arguments_parse_status_then_model_then_config_overrides() {
         assert_eq!(
             parse_args(&["--status", "p"]),
-            Some(("p".into(), None, vec![]))
+            Some(tui_args("p", None, vec![], None))
         );
         assert_eq!(
             parse_args(&["--status", "p", "--model", "m"]),
-            Some(("p".into(), Some("m".into()), vec![]))
+            Some(tui_args("p", Some("m"), vec![], None))
         );
         assert_eq!(
             parse_args(&[
@@ -698,15 +956,11 @@ mod tests {
                 "-c",
                 "b=--model"
             ]),
-            Some((
-                "p".into(),
-                Some("m".into()),
-                vec!["a=1".into(), "b=--model".into()]
-            ))
+            Some(tui_args("p", Some("m"), vec!["a=1", "b=--model"], None))
         );
         assert_eq!(
             parse_args(&["--status", "p", "-c", "a=1"]),
-            Some(("p".into(), None, vec!["a=1".into()]))
+            Some(tui_args("p", None, vec!["a=1"], None))
         );
     }
 
@@ -726,7 +980,7 @@ mod tests {
         }
         assert_eq!(
             parse_args(&["--status", "p", "-c", "a=1", "--model", "m"]),
-            Some(("p".into(), Some("m".into()), vec!["a=1".into()]))
+            Some(tui_args("p", Some("m"), vec!["a=1"], None))
         );
     }
 
