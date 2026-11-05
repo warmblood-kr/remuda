@@ -40,11 +40,9 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
     }
 }
 
-/// Read one planned file exactly once, without following a symlink and without
-/// trusting the preflight: the descriptor must still hold the same size,
-/// modification time and regular-file type after the read.
-pub fn read_verified(file: &Planned) -> Result<Vec<u8>, String> {
-    use std::io::Read;
+/// Open without following a final link, then prove the descriptor is the
+/// file the plan saw. No bytes are read yet.
+fn open_planned(file: &Planned) -> Result<std::fs::File, String> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -53,7 +51,7 @@ pub fn read_verified(file: &Planned) -> Result<Vec<u8>, String> {
         // A link swapped in after preflight must not be followed.
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut handle = options
+    let handle = options
         .open(&file.source)
         .map_err(|error| open_error(&file.relative, error))?;
     let before = handle
@@ -73,8 +71,15 @@ pub fn read_verified(file: &Planned) -> Result<Vec<u8>, String> {
             file.relative
         ));
     }
+    Ok(handle)
+}
+
+/// Read one planned file's bytes and check that the descriptor did not change
+/// under the read. The name is checked separately, after this.
+fn read_planned(handle: &mut std::fs::File, file: &Planned) -> Result<Vec<u8>, String> {
+    use std::io::Read;
     let mut bytes = Vec::with_capacity(file.size.min(1 << 20) as usize);
-    (&mut handle)
+    handle
         .take(file.size.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|error| format!("cannot read {}: {error}", file.relative))?;
@@ -90,21 +95,37 @@ pub fn read_verified(file: &Planned) -> Result<Vec<u8>, String> {
             file.relative
         ));
     }
-    // The descriptor is stable; the name is not. A symlink swapped in after
-    // preflight is refused here even on platforms without O_NOFOLLOW, because
-    // `symlink_metadata` does not follow it and the bytes are never uploaded.
+    Ok(bytes)
+}
+
+/// The descriptor is stable; the name is not. A link swapped in after
+/// preflight is refused here even without O_NOFOLLOW, because
+/// `symlink_metadata` does not follow it and the bytes are never uploaded.
+fn check_named(file: &Planned) -> Result<(), String> {
+    let resolved = std::fs::metadata(&file.source)
+        .map_err(|error| format!("cannot read {}: {error}", file.relative))?;
     let named = std::fs::symlink_metadata(&file.source)
         .map_err(|error| format!("cannot read {}: {error}", file.relative))?;
     if !named.is_file()
         || named.len() != file.size
         || named.modified().ok() != file.modified
-        || !same_file(&after, &named)
+        || !same_file(&resolved, &named)
     {
         return Err(format!(
             "{} was replaced while it was read; publish again",
             file.relative
         ));
     }
+    Ok(())
+}
+
+/// Read one planned file exactly once, without following a symlink and without
+/// trusting the preflight: the descriptor must still hold the same size,
+/// modification time and regular-file type after the read.
+pub fn read_verified(file: &Planned) -> Result<Vec<u8>, String> {
+    let mut handle = open_planned(file)?;
+    let bytes = read_planned(&mut handle, file)?;
+    check_named(file)?;
     Ok(bytes)
 }
 
@@ -336,6 +357,51 @@ mod tests {
         let root = scratch("free");
         assert!(free_bytes(&root).is_some_and(|bytes| bytes > 0));
         assert_eq!(free_bytes(&root.join("missing")), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn two_names_are_one_file_only_when_identity_matches() {
+        let root = scratch("identity");
+        std::fs::write(root.join("a"), b"a").unwrap();
+        std::fs::write(root.join("b"), b"a").unwrap();
+        let a = std::fs::metadata(root.join("a")).unwrap();
+        let b = std::fs::metadata(root.join("b")).unwrap();
+        assert!(same_file(&a, &a));
+        #[cfg(unix)]
+        assert!(!same_file(&a, &b));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_loop_at_open_is_reported_as_a_link() {
+        #[cfg(unix)]
+        {
+            let error = std::io::Error::from_raw_os_error(libc::ELOOP);
+            assert!(open_error("a.txt", error).contains("is now a link"));
+        }
+        let missing = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        assert!(open_error("a.txt", missing).contains("cannot open a.txt"));
+    }
+
+    #[test]
+    fn the_file_count_cap_is_checked_at_plan_time() {
+        let root = scratch("many");
+        for i in 0..=MAX_FILES {
+            std::fs::write(root.join(format!("f{i}")), b"").unwrap();
+        }
+        let error = plan(&root, "v1").unwrap_err();
+        assert!(error.detail.contains("may hold 500"), "{}", error.detail);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_per_file_size_cap_is_checked_at_plan_time() {
+        let root = scratch("big");
+        let file = std::fs::File::create(root.join("big")).unwrap();
+        file.set_len(MAX_FILE_BYTES + 1).unwrap();
+        let error = plan(&root, "v1").unwrap_err();
+        assert!(error.detail.contains("may be at most"), "{}", error.detail);
         std::fs::remove_dir_all(root).unwrap();
     }
 
