@@ -706,6 +706,7 @@ pub(crate) fn adopt(request: &AdoptRequest) -> Result<Published, &'static str> {
 /// Final publication gate. `allowed` runs before any network I/O; `commit`
 /// holds authority across the local binding-file creation only, never across
 /// the endpoint preflight.
+#[cfg(unix)]
 pub(crate) trait Fence {
     fn allowed(&self) -> bool;
 
@@ -715,8 +716,10 @@ pub(crate) trait Fence {
     ) -> Result<Published, &'static str>;
 }
 
+#[cfg(unix)]
 struct Unfenced;
 
+#[cfg(unix)]
 impl Fence for Unfenced {
     fn allowed(&self) -> bool {
         true
@@ -732,6 +735,7 @@ impl Fence for Unfenced {
 
 /// Adopt, then commit the binding through `fence`. Preflight stays outside any
 /// forwarding lock; only the final file publication is fenced.
+#[cfg(unix)]
 pub(crate) fn adopt_fenced(
     request: &AdoptRequest,
     fence: &dyn Fence,

@@ -154,6 +154,12 @@ pub fn run(args: &[&str]) -> ExitCode {
     serve_tui(status, model, config, binding)
 }
 
+#[cfg(not(unix))]
+fn unsupported_publish(binding: &Option<String>) -> Option<()> {
+    let _ = binding;
+    None
+}
+
 #[cfg(unix)]
 fn drop_runtime(runtime: &Option<std::path::PathBuf>) {
     if let Some(dir) = runtime {
@@ -242,12 +248,14 @@ fn serve_tui(
         }
     };
     #[cfg(not(unix))]
-    let _ = &binding;
+    let publish = unsupported_publish(&binding);
     let Launched {
         socket,
         server_address,
         client_address,
+        #[cfg(unix)]
         tunnel,
+        #[cfg(unix)]
         runtime,
     } = match endpoint(publish) {
         Ok(launched) => launched,
