@@ -63,6 +63,8 @@ not be written — the release is **incomplete**, fix the cause and publish a
 vfs ls remuda:///design/NAME/` shows them). 75 means everything was written
 here but the copies wanted are not all there yet: `COMPLETE` exists on this
 node and the release is usable, so wait for the peers rather than republishing.
+A file `put` that returns 75 does not stop the run — its bytes are here — so
+publish finishes the release and reports 75 at the end.
 
 `CURRENT` is written only after `COMPLETE`, and it is a plain file: `remuda vfs
 get remuda:///design/CURRENT` prints the release name. `vfs serve` does not

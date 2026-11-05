@@ -65,6 +65,14 @@ pub fn read_verified(file: &Planned) -> Result<Vec<u8>, String> {
             file.relative
         ));
     }
+    // Size and mtime can be preserved by a replacement; the preflight identity
+    // cannot. `None` means this platform has no identity to compare.
+    if file.identity.is_some() && identity_of(&before) != file.identity {
+        return Err(format!(
+            "{} was replaced after preflight; publish again",
+            file.relative
+        ));
+    }
     let mut bytes = Vec::with_capacity(file.size.min(1 << 20) as usize);
     (&mut handle)
         .take(file.size.saturating_add(1))
@@ -98,6 +106,20 @@ pub fn read_verified(file: &Planned) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(bytes)
+}
+
+/// The platform's file identity, when it has one.
+fn identity_of(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
 }
 
 /// Say a swapped-in link as what it is instead of an errno.
@@ -157,6 +179,9 @@ pub struct Planned {
     pub size: u64,
     /// Taken at preflight so a source that moves under us is noticed.
     pub modified: Option<SystemTime>,
+    /// Device and inode at preflight, so a replacement with the same size and
+    /// mtime is still refused. `None` where the platform does not expose it.
+    pub identity: Option<(u64, u64)>,
 }
 
 /// What `publish` should say before it uploads anything.
@@ -263,6 +288,7 @@ fn walk(dir: &Path, prefix: &str, plan: &mut Plan) -> Result<(), Refused> {
                 relative,
                 size: metadata.len(),
                 modified: metadata.modified().ok(),
+                identity: identity_of(&metadata),
             });
         } else {
             // A symlink is not followed: publishing a link would copy whatever
@@ -377,15 +403,44 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn an_in_place_replacement_is_refused_by_file_identity() {
+    fn a_file_replaced_after_the_plan_is_refused_by_identity() {
         let root = scratch("replaced");
         std::fs::write(root.join("a.txt"), b"aaa").unwrap();
         let plan = plan(&root, "v1").unwrap();
-        // Same size and mtime can be faked by a fast rewrite; dev+ino cannot.
+        // Same size and the same mtime, but a new inode: only the preflight
+        // identity can tell this apart from the file we planned.
+        let mtime = plan.files[0].modified.unwrap();
+        std::fs::remove_file(root.join("a.txt")).unwrap();
         std::fs::write(root.join("a.txt"), b"bbb").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(root.join("a.txt"))
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let error = read_verified(&plan.files[0]).unwrap_err();
+        assert!(error.contains("replaced"), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ancestor_swapped_for_a_link_is_refused_before_the_bytes_leave() {
+        let root = scratch("ancestor");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::write(root.join("dir/a.txt"), b"aaa").unwrap();
+        let plan = plan(&root, "v1").unwrap();
+        // Replace the parent with a link to a different tree holding a
+        // same-size file. The final component's post-stat alone cannot see
+        // this; the preflight identity can.
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("a.txt"), b"bbb").unwrap();
+        std::fs::rename(root.join("dir"), root.join("dir-real")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("dir")).unwrap();
         let error = read_verified(&plan.files[0]).unwrap_err();
         assert!(
-            error.contains("changed") || error.contains("replaced"),
+            error.contains("changed") || error.contains("replaced") || error.contains("link"),
             "{error}"
         );
         std::fs::remove_dir_all(root).unwrap();

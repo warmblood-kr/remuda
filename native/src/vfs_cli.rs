@@ -428,10 +428,31 @@ fn destination_answer(stdout: &[u8], base: &str, release: &str) -> Result<(), St
     }
 }
 
+/// What one `put` means for a publish: written and replicated, written here
+/// but short of the copies wanted, or not written at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Put {
+    Done,
+    Short,
+    Failed,
+}
+
+fn put_result(code: u8) -> Put {
+    if code == 0 {
+        Put::Done
+    } else if code == EXIT_TEMPFAIL {
+        Put::Short
+    } else {
+        Put::Failed
+    }
+}
+
 /// One file uploaded and how many bytes it took.
 struct Uploaded {
     files: usize,
     bytes: u64,
+    /// Files that are here but under-replicated; the release can still finish.
+    short: usize,
     failure: Option<(String, u8)>,
 }
 
@@ -447,6 +468,7 @@ fn upload_release(
     let mut uploaded = Uploaded {
         files: 0,
         bytes: 0,
+        short: 0,
         failure: None,
     };
     for file in &plan.files {
@@ -466,17 +488,17 @@ fn upload_release(
             args.extend(["--min-copies".to_owned(), k.to_owned()]);
         }
         match daemon_call(socket, args, Some(bytes)) {
-            Ok((0, _, _)) => {
+            Ok((code, _, stderr)) => {
                 uploaded.files += 1;
                 uploaded.bytes = uploaded.bytes.saturating_add(file.size);
-            }
-            Ok((code, _, stderr)) if code == EXIT_TEMPFAIL => {
-                uploaded.failure = Some((format!("{}: {stderr}", file.relative), EXIT_TEMPFAIL));
-                return uploaded;
-            }
-            Ok((_, _, stderr)) => {
-                uploaded.failure = Some((format!("{}: {stderr}", file.relative), 1));
-                return uploaded;
+                match put_result(code) {
+                    Put::Done => {}
+                    Put::Short => uploaded.short += 1,
+                    Put::Failed => {
+                        uploaded.failure = Some((format!("{}: {stderr}", file.relative), 1));
+                        return uploaded;
+                    }
+                }
             }
             Err(error) => {
                 uploaded.failure = Some((format!("{}: {error}", file.relative), 1));
@@ -499,83 +521,154 @@ struct Finished<'a> {
 
 /// Write the completion marker, then the optional `CURRENT` pointer. Called
 /// only when every file is in.
-fn finish_release(finished: Finished<'_>, pointer: bool, out: &mut Out) -> u8 {
-    let Finished {
-        socket,
-        prefix,
-        base,
-        release,
-        plan,
-        min_copies,
-    } = finished;
-    use crate::vfs_publish;
-    let marker = format!(
-        "release {release}\nfiles {}\nbytes {}\n",
-        plan.files.len(),
-        plan.bytes
-    );
-    let mut args = vec![
-        "put".to_owned(),
-        "-".to_owned(),
-        format!("remuda:///{base}/COMPLETE"),
-    ];
+/// Put one small marker. `Ok(Put::Short)` still means its bytes are in.
+fn put_marker(
+    socket: &Path,
+    uri: String,
+    bytes: Vec<u8>,
+    min_copies: Option<&str>,
+) -> Result<Put, String> {
+    let mut args = vec!["put".to_owned(), "-".to_owned(), uri];
     if let Some(k) = min_copies {
         args.extend(["--min-copies".to_owned(), k.to_owned()]);
     }
-    match daemon_call(socket, args, Some(marker.into_bytes())) {
-        Ok((0, _, _)) => {}
-        Ok((code, _, stderr)) => {
-            warn!(out, "remuda: publish incomplete: every file is in remuda:///{base}/, but COMPLETE was not written: {stderr}");
-            return if code == EXIT_TEMPFAIL {
-                EXIT_TEMPFAIL
-            } else {
-                1
-            };
-        }
-        Err(error) => {
-            warn!(out, "remuda: publish incomplete: every file is in remuda:///{base}/, but COMPLETE was not written: {error}");
-            return 1;
-        }
+    match daemon_call(socket, args, Some(bytes)) {
+        Ok((code, _, stderr)) => match put_result(code) {
+            Put::Failed => Err(stderr),
+            other => Ok(other),
+        },
+        Err(error) => Err(error),
     }
+}
+
+/// Write `COMPLETE` last. `Err(exit)` means it is not there at all.
+fn write_complete(finished: &Finished<'_>, out: &mut Out) -> Result<Put, u8> {
+    let body = format!(
+        "release {}\nfiles {}\nbytes {}\n",
+        finished.release,
+        finished.plan.files.len(),
+        finished.plan.bytes
+    );
+    match put_marker(
+        finished.socket,
+        format!("remuda:///{}/COMPLETE", finished.base),
+        body.into_bytes(),
+        finished.min_copies,
+    ) {
+        Err(detail) => {
+            warn!(out, "remuda: publish incomplete: every file is in remuda:///{}/, but COMPLETE was not written: {detail}", finished.base);
+            Err(1)
+        }
+        Ok(put) => Ok(put),
+    }
+}
+
+/// Write `PREFIX/CURRENT`. `Err(exit)` means it is missing.
+fn write_pointer(finished: &Finished<'_>, out: &mut Out) -> Result<Put, u8> {
+    let prefix = if finished.prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", finished.prefix)
+    };
+    match put_marker(
+        finished.socket,
+        format!("remuda:///{prefix}CURRENT"),
+        finished.release.as_bytes().to_vec(),
+        finished.min_copies,
+    ) {
+        Ok(Put::Failed) | Err(_) => {
+            warn!(
+                out,
+                "remuda: publish: the release is complete, but CURRENT was not written."
+            );
+            Err(1)
+        }
+        Ok(put) => Ok(put),
+    }
+}
+
+fn say_published(finished: &Finished<'_>, out: &mut Out) {
     say!(
         out,
         "Published {} files ({}) as {release} to remuda:///{base}/.",
-        plan.files.len(),
-        vfs_publish::bytes_text(plan.bytes)
+        finished.plan.files.len(),
+        crate::vfs_publish::bytes_text(finished.plan.bytes),
+        release = finished.release,
+        base = finished.base
     );
-    for skipped in &plan.skipped {
+    for skipped in &finished.plan.skipped {
         say!(out, "  skipped (not a regular file): {skipped}");
     }
-    if pointer {
-        let mut args = vec![
-            "put".to_owned(),
-            "-".to_owned(),
-            format!(
-                "remuda:///{}/CURRENT",
-                if prefix.is_empty() { "" } else { prefix }
-            ),
-        ];
-        if let Some(k) = min_copies {
-            args.extend(["--min-copies".to_owned(), k.to_owned()]);
-        }
-        if let Err(error) = daemon_call(socket, args, Some(release.as_bytes().to_vec())) {
-            warn!(
-                out,
-                "remuda: publish: the release is complete, but CURRENT was not written: {error}"
-            );
-            return 1;
-        }
-        say!(
-            out,
-            "  CURRENT names {release}; a viewer can open /CURRENT."
-        );
-    }
+}
+
+fn say_pointer_and_reader(finished: &Finished<'_>, out: &mut Out) {
+    let prefix = if finished.prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", finished.prefix)
+    };
+    say!(
+        out,
+        "  CURRENT names {}; `remuda vfs get remuda:///{prefix}CURRENT` shows it (the bridge does not resolve it).",
+        finished.release
+    );
     say!(
         out,
         "  Read it with `remuda vfs serve --root {}`.",
-        if prefix.is_empty() { release } else { prefix }
+        if finished.prefix.is_empty() {
+            finished.release
+        } else {
+            finished.prefix
+        }
     );
-    0
+}
+
+fn finish_release(finished: Finished<'_>, pointer: bool, out: &mut Out) -> u8 {
+    let marker = match write_complete(&finished, out) {
+        Ok(put) => put,
+        Err(code) => return code,
+    };
+    if marker == Put::Short {
+        warn!(
+            out,
+            "remuda: publish: COMPLETE is written here but not yet on the copies wanted."
+        );
+        warn!(
+            out,
+            "Next: wait for the peers, or check `remuda vfs status --copies`."
+        );
+    }
+    say_published(&finished, out);
+    let mut code = if marker == Put::Short {
+        EXIT_TEMPFAIL
+    } else {
+        0
+    };
+    if pointer {
+        match write_pointer(&finished, out) {
+            Ok(Put::Short) => {
+                warn!(
+                    out,
+                    "remuda: publish: CURRENT is written here but not yet on the copies wanted."
+                );
+                code = EXIT_TEMPFAIL;
+            }
+            Ok(_) => {}
+            Err(exit) => return exit,
+        }
+        say_pointer_and_reader(&finished, out);
+    } else {
+        say!(
+            out,
+            "  Read it with `remuda vfs serve --root {}`.",
+            if finished.prefix.is_empty() {
+                finished.release
+            } else {
+                finished.prefix
+            }
+        );
+    }
+    code
 }
 
 /// `remuda vfs publish`: one ordinary `put` per file, then a completion marker.
@@ -658,6 +751,15 @@ fn publish(socket: &Path, values: &Map<String, Value>) -> ExitCode {
         flag(values, "pointer"),
         &mut out,
     );
+    if uploaded.short > 0 && code == 0 {
+        warn!(
+            out,
+            "remuda: publish: {} of {} files are here but short of the copies wanted; COMPLETE is written.",
+            uploaded.short,
+            plan.files.len()
+        );
+        return finish(out, EXIT_TEMPFAIL);
+    }
     finish(out, code)
 }
 
@@ -1552,6 +1654,14 @@ mod tests {
             assert!(usage(&verb.name).contains("Usage"), "{}", verb.name);
         }
         assert!(usage("").contains("resolve"));
+    }
+
+    #[test]
+    fn a_put_code_means_done_short_or_failed() {
+        assert_eq!(put_result(0), Put::Done);
+        assert_eq!(put_result(EXIT_TEMPFAIL), Put::Short);
+        assert_eq!(put_result(1), Put::Failed);
+        assert_eq!(put_result(2), Put::Failed);
     }
 
     #[test]
