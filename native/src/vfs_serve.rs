@@ -186,9 +186,27 @@ impl DaemonSource {
     /// arrives as a stable code instead of stderr text.
     fn envelope(&self, args: &[String]) -> Result<Value, StoreError> {
         let stdout = self.command(args)?;
-        serde_json::from_slice(&stdout)
-            .map_err(|error| StoreError::new(Kind::Io, format!("unreadable vfs answer: {error}")))
+        decode_envelope(&stdout)
     }
+}
+
+/// One JSON object from `vfs read`; anything else is a daemon we cannot trust
+/// to answer.
+fn decode_envelope(stdout: &[u8]) -> Result<Value, StoreError> {
+    serde_json::from_slice(stdout)
+        .map_err(|error| StoreError::new(Kind::Io, format!("unreadable vfs answer: {error}")))
+}
+
+/// The content of a successful `vfs read` envelope.
+fn content_from(value: &Value) -> Result<Content, StoreError> {
+    let bytes = value["content"]
+        .as_str()
+        .and_then(|text| BASE64.decode(text).ok())
+        .ok_or_else(|| StoreError::new(Kind::Corrupt, "vfs read carried no content"))?;
+    Ok(Content {
+        meta: meta_from(value),
+        bytes,
+    })
 }
 
 impl Source for DaemonSource {
@@ -203,12 +221,7 @@ impl Source for DaemonSource {
         if !value["ok"].as_bool().unwrap_or(false) {
             return Ok(Err(Kind::from_code(value["code"].as_str().unwrap_or(""))));
         }
-        let meta = meta_from(&value);
-        let bytes = value["content"]
-            .as_str()
-            .and_then(|text| BASE64.decode(text).ok())
-            .ok_or_else(|| StoreError::new(Kind::Corrupt, "vfs read carried no content"))?;
-        Ok(Ok(Content { meta, bytes }))
+        Ok(Ok(content_from(&value)?))
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<Meta>, StoreError> {
@@ -1101,6 +1114,7 @@ fn host_allowed(host: &str, origin: &str) -> bool {
 
 /// A refused head, and the method it claimed, so a `HEAD` error still answers
 /// without a body.
+#[derive(Debug)]
 struct Refused {
     method: Method,
     bad: BadRequest,
@@ -1119,17 +1133,27 @@ fn claimed_method(buffer: &[u8]) -> Method {
 /// Read up to the blank line. One request per connection, so anything after it
 /// is ignored and the connection closes.
 fn read_head(stream: &mut TcpStream) -> Result<Head, Refused> {
+    read_head_with(stream, &std::time::Instant::now, IO_TIMEOUT)
+}
+
+/// Read one head from any reader under an injected clock, so fragmentation,
+/// size and timeout are tested without a socket.
+fn read_head_with(
+    reader: &mut impl Read,
+    now: &dyn Fn() -> std::time::Instant,
+    timeout: Duration,
+) -> Result<Head, Refused> {
     let mut buffer = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
-    let deadline = std::time::Instant::now() + IO_TIMEOUT;
+    let deadline = now() + timeout;
     loop {
-        if std::time::Instant::now() >= deadline {
+        if now() >= deadline {
             return Err(Refused {
                 method: claimed_method(&buffer),
                 bad: BadRequest::new(408, "Request Timeout", "head not read in time"),
             });
         }
-        let read = stream.read(&mut chunk).map_err(|_| Refused {
+        let read = reader.read(&mut chunk).map_err(|_| Refused {
             method: claimed_method(&buffer),
             bad: BadRequest::new(408, "Request Timeout", "request head not read"),
         })?;
@@ -1700,6 +1724,74 @@ mod tests {
         assert!(bind_address("nope", false).unwrap_err().contains("ADDRESS"));
     }
 
+    /// A reader that hands out one byte per call, to exercise fragmentation.
+    struct Trickle {
+        bytes: Vec<u8>,
+        at: usize,
+    }
+
+    impl Trickle {
+        fn new(bytes: &[u8]) -> Self {
+            Self {
+                bytes: bytes.to_vec(),
+                at: 0,
+            }
+        }
+    }
+
+    impl Read for Trickle {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.at >= self.bytes.len() || out.is_empty() {
+                return Ok(0);
+            }
+            out[0] = self.bytes[self.at];
+            self.at += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn a_fragmented_head_is_reassembled() {
+        let mut reader = Trickle::new(b"GET /a?b=1 HTTP/1.1\r\nHost: h\r\n\r\n");
+        let head = read_head_with(&mut reader, &std::time::Instant::now, IO_TIMEOUT).unwrap();
+        assert_eq!(head.method, Method::Get);
+        assert_eq!(head.target, "/a?b=1");
+        assert_eq!(head.host.as_deref(), Some("h"));
+    }
+
+    #[test]
+    fn a_head_that_never_ends_is_too_large() {
+        let mut reader = Trickle::new(&vec![b'A'; MAX_HEAD_BYTES + 1]);
+        let error = read_head_with(&mut reader, &std::time::Instant::now, IO_TIMEOUT).unwrap_err();
+        assert_eq!(error.bad.status, 431, "headers, not a body, are too large");
+    }
+
+    #[test]
+    fn a_slow_head_times_out() {
+        use std::cell::Cell;
+        let start = std::time::Instant::now();
+        let calls = Cell::new(0);
+        let now = || {
+            let n = calls.get();
+            calls.set(n + 1);
+            if n < 2 {
+                start
+            } else {
+                start + IO_TIMEOUT + Duration::from_secs(1)
+            }
+        };
+        let mut reader = Trickle::new(b"GET / HTTP/1.1\r\n");
+        let error = read_head_with(&mut reader, &now, IO_TIMEOUT).unwrap_err();
+        assert_eq!(error.bad.status, 408);
+    }
+
+    #[test]
+    fn a_closed_connection_before_a_head_is_a_bad_request() {
+        let mut reader = Trickle::new(b"");
+        let error = read_head_with(&mut reader, &std::time::Instant::now, IO_TIMEOUT).unwrap_err();
+        assert_eq!(error.bad.status, 400);
+    }
+
     #[test]
     fn only_get_and_head_reach_a_target() {
         assert_eq!(parse_method("GET").unwrap(), Method::Get);
@@ -1782,6 +1874,30 @@ mod tests {
         let empty = meta_from(&serde_json::json!({}));
         assert_eq!(empty.path, "");
         assert_eq!(empty.version, 0);
+    }
+
+    #[test]
+    fn a_broken_answer_is_an_io_error_not_an_empty_store() {
+        let error = decode_envelope(b"not json").unwrap_err();
+        assert_eq!(error.kind, Kind::Io);
+        assert!(error.detail.contains("unreadable vfs answer"));
+        assert_eq!(
+            decode_envelope(b"{\"ok\":true}").unwrap()["ok"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn a_read_without_content_is_corrupt() {
+        let ok = serde_json::json!({
+            "ok": true, "path": "a/b.html", "version": 7, "sha256": "a", "size": 3,
+            "content": "YWJj"
+        });
+        let content = content_from(&ok).unwrap();
+        assert_eq!(content.bytes, b"abc");
+        assert_eq!(content.meta.path, "a/b.html");
+        let error = content_from(&serde_json::json!({"ok": true})).unwrap_err();
+        assert_eq!(error.kind, Kind::Corrupt);
     }
 
     #[test]

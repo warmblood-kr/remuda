@@ -902,37 +902,43 @@ fn read(values: &Map<String, Value>, out: &mut Out) -> u8 {
         );
         return 0;
     };
+    let value = read_body(entry, max, || {
+        fetch(&store, &uri, false).map(|(_, bytes)| bytes)
+    });
+    say!(out, "{value}");
+    0
+}
+
+/// The envelope for one entry, with the fetch injected. The index snapshot and
+/// the fetch are two reads, so a write in between can make the file larger;
+/// check the size both before and after moving the blob.
+fn read_body(
+    entry: &VfsEntry,
+    max: u64,
+    fetch: impl FnOnce() -> Result<Vec<u8>, VfsError>,
+) -> Value {
     if entry.size > max {
-        // Answer before the blob moves: the caller's limit exists to keep a
-        // viewer from paying for a file it will refuse.
-        say!(out, "{}", too_large_envelope(entry.size, max));
-        return 0;
+        // Answer before the blob moves: a viewer should not pay for a file it
+        // will refuse.
+        return too_large_envelope(entry.size, max);
     }
-    match fetch(&store, &uri, false) {
-        // The index snapshot above and the fetch below are two reads; a write
-        // in between may have made the file larger. Check what arrived too.
-        Ok((_, bytes)) if bytes.len() as u64 > max => {
-            say!(out, "{}", too_large_envelope(bytes.len() as u64, max));
-            0
-        }
-        Ok((entry, bytes)) => {
-            say!(out, "{}", content_envelope(&entry, &bytes));
-            0
-        }
-        Err(error) => read_envelope(out, &error),
+    match fetch() {
+        Ok(bytes) if bytes.len() as u64 > max => too_large_envelope(bytes.len() as u64, max),
+        Ok(bytes) => content_envelope(entry, &bytes),
+        Err(error) => error_envelope(&error),
     }
 }
 
+fn error_envelope(error: &VfsError) -> Value {
+    serde_json::json!({
+        "ok": false,
+        "code": error.kind.code(),
+        "detail": error.detail,
+    })
+}
+
 fn read_envelope(out: &mut Out, error: &VfsError) -> u8 {
-    say!(
-        out,
-        "{}",
-        serde_json::json!({
-            "ok": false,
-            "code": error.kind.code(),
-            "detail": error.detail,
-        })
-    );
+    say!(out, "{}", error_envelope(error));
     0
 }
 
@@ -1385,6 +1391,36 @@ mod tests {
         assert_eq!(json["code"], Value::String("not_found".to_owned()));
         assert_eq!(json["detail"], Value::String("no file at /a".to_owned()));
         assert!(out.stderr.is_empty());
+    }
+
+    #[test]
+    fn a_limit_is_answered_before_the_blob_moves() {
+        use std::cell::Cell;
+        let entry = one_entry();
+        let called = Cell::new(false);
+        let json = read_body(&entry, 1, || {
+            called.set(true);
+            Ok(b"abc".to_vec())
+        });
+        assert_eq!(json["code"], Value::String("too_large".to_owned()));
+        assert!(!called.get(), "the fetch must not run past the limit");
+    }
+
+    #[test]
+    fn a_blob_that_grew_past_the_limit_is_refused_after_the_fetch() {
+        let entry = one_entry();
+        let json = read_body(&entry, 3, || Ok(b"abcd".to_vec()));
+        assert_eq!(json["code"], Value::String("too_large".to_owned()));
+        assert_eq!(json["size"], Value::from(4));
+    }
+
+    #[test]
+    fn a_fetch_error_keeps_the_stable_envelope() {
+        let entry = one_entry();
+        let error = VfsError::new(VfsErrorKind::Unreachable, "no holder");
+        let json = read_body(&entry, 10, || Err(error));
+        assert_eq!(json["code"], Value::String("unreachable".to_owned()));
+        assert_eq!(json["ok"], Value::Bool(false));
     }
 
     #[test]
