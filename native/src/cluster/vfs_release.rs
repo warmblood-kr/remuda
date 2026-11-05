@@ -73,19 +73,28 @@ pub struct Facts<'a> {
     pub holders: usize,
 }
 
-/// The decision, in the order the reasons are checked.
-pub fn verdict(facts: &Facts<'_>) -> Verdict {
+/// The reasons that need no disk or network. `None` means the age and holder
+/// probes decide, so a pinned or placed copy never pays for them.
+pub fn early_verdict(facts: &Facts<'_>) -> Option<Verdict> {
     if facts.pinned {
-        return Verdict::Written;
+        return Some(Verdict::Written);
     }
     if facts.kept && !facts.include_resolved {
-        return Verdict::Resolved;
+        return Some(Verdict::Resolved);
     }
     if facts.placement.is_empty() {
-        return Verdict::LastCopy;
+        return Some(Verdict::LastCopy);
     }
     if facts.placement.iter().any(|node| node == facts.self_fp) {
-        return Verdict::Placed;
+        return Some(Verdict::Placed);
+    }
+    None
+}
+
+/// The decision, in the order the reasons are checked.
+pub fn verdict(facts: &Facts<'_>) -> Verdict {
+    if let Some(verdict) = early_verdict(facts) {
+        return verdict;
     }
     if facts.recent {
         return Verdict::Recent;
@@ -94,6 +103,69 @@ pub fn verdict(facts: &Facts<'_>) -> Verdict {
         return Verdict::Unconfirmed;
     }
     Verdict::Release
+}
+
+/// One copy's inputs, so the decision keeps a single argument.
+struct Decision<'a> {
+    store: &'a VfsStore,
+    members: &'a vfs_sync::Members,
+    sha: &'a str,
+    entries: &'a [&'a VfsEntry],
+    pinned: &'a HashSet<&'a str>,
+    older_than: Duration,
+    include_resolved: bool,
+}
+
+/// Decide one copy, probing age and holders only when the cheap reasons do not
+/// decide. Returns the verdict and whether a resolve pin must be dropped.
+fn decide(decision: &Decision<'_>) -> VfsResult<(Verdict, bool)> {
+    let placement = placement_of(decision.entries, decision.members);
+    let kept = decision.store.is_kept(decision.sha);
+    let cheap = Facts {
+        pinned: decision.pinned.contains(decision.sha),
+        kept,
+        include_resolved: decision.include_resolved,
+        placement: &placement,
+        self_fp: &decision.members.self_fp,
+        // Filled only if the cheap reasons do not decide.
+        recent: false,
+        holders: placement.len(),
+    };
+    if let Some(verdict) = early_verdict(&cheap) {
+        return Ok((verdict, false));
+    }
+    let facts = Facts {
+        recent: too_new(decision.store, decision.sha, decision.older_than)?,
+        holders: vfs_sync::count_holders(
+            decision.store,
+            &decision.members.self_fp,
+            decision.entries[0],
+            &placement,
+        ),
+        ..cheap
+    };
+    Ok((verdict(&facts), kept))
+}
+
+/// Drop the pin and the blob, counting what actually went.
+fn commit(
+    store: &VfsStore,
+    self_fp: &str,
+    sha: &str,
+    kept: bool,
+    entry: &VfsEntry,
+    report: &mut ReleaseReport,
+) -> VfsResult<()> {
+    if kept {
+        store.unkeep_blob(sha)?;
+    }
+    // The store re-checks the local pins under the index lock; peer custody is
+    // the check above, as observed a moment ago.
+    if store.release_blob_if_unneeded(sha, self_fp)? {
+        report.removed += 1;
+        report.bytes = report.bytes.saturating_add(entry.size);
+    }
+    Ok(())
 }
 
 /// Release this node's unnecessary copies. `dry_run` counts without deleting;
@@ -116,49 +188,51 @@ pub fn release(
         let Some(entries) = users.get(sha.as_str()) else {
             continue;
         };
-        let placement = placement_of(entries, &members);
-        let entry = entries[0];
-        let kept = store.is_kept(&sha);
-        let facts = Facts {
-            pinned: pinned.contains(sha.as_str()),
-            kept,
+        let decision = Decision {
+            store: &store,
+            members: &members,
+            sha: &sha,
+            entries,
+            pinned: &pinned,
+            older_than,
             include_resolved,
-            placement: &placement,
-            self_fp: &members.self_fp,
-            recent: too_new(&store, &sha, older_than)?,
-            holders: if placement.is_empty() {
-                0
-            } else {
-                vfs_sync::count_holders(&store, &members.self_fp, entry, &placement)
-            },
         };
-        match verdict(&facts) {
-            Verdict::Written => report.written += 1,
-            Verdict::Resolved => report.resolved += 1,
-            Verdict::Placed => report.placed += 1,
-            Verdict::LastCopy => report.last_copy += 1,
-            Verdict::Recent => report.recent += 1,
-            Verdict::Unconfirmed => report.unconfirmed += 1,
-            Verdict::Release => {
+        match decide(&decision)? {
+            (Verdict::Release, kept) => {
                 if dry_run {
                     // A dry run changes nothing, pins included.
                     report.removed += 1;
-                    report.bytes = report.bytes.saturating_add(entry.size);
-                    continue;
-                }
-                if kept {
-                    store.unkeep_blob(&sha)?;
-                }
-                // The store re-checks the local pins under the index lock;
-                // peer custody is the check above, as observed a moment ago.
-                if store.release_blob_if_unneeded(&sha, &members.self_fp)? {
-                    report.removed += 1;
-                    report.bytes = report.bytes.saturating_add(entry.size);
+                    report.bytes = report.bytes.saturating_add(entries[0].size);
+                } else {
+                    commit(
+                        &store,
+                        &members.self_fp,
+                        &sha,
+                        kept,
+                        entries[0],
+                        &mut report,
+                    )?;
                 }
             }
+            (kept, _) => report.count(kept),
         }
     }
     Ok(report)
+}
+
+impl ReleaseReport {
+    /// Count a copy the decision keeps, one bucket per reason.
+    fn count(&mut self, verdict: Verdict) {
+        match verdict {
+            Verdict::Written => self.written += 1,
+            Verdict::Resolved => self.resolved += 1,
+            Verdict::Placed => self.placed += 1,
+            Verdict::LastCopy => self.last_copy += 1,
+            Verdict::Recent => self.recent += 1,
+            Verdict::Unconfirmed => self.unconfirmed += 1,
+            Verdict::Release => {}
+        }
+    }
 }
 
 /// Live entries by content hash, plus the hashes release must never touch: the
@@ -293,6 +367,50 @@ mod tests {
         assert_eq!(verdict(&value), Verdict::Unconfirmed);
         value.holders = 1;
         assert_eq!(verdict(&value), Verdict::Release);
+    }
+
+    #[test]
+    fn the_cheap_reasons_decide_without_a_probe() {
+        let none: Vec<String> = Vec::new();
+        let mut value = facts(&none, "me");
+        value.pinned = true;
+        assert_eq!(early_verdict(&value), Some(Verdict::Written));
+        value.pinned = false;
+        value.kept = true;
+        assert_eq!(early_verdict(&value), Some(Verdict::Resolved));
+        value.kept = false;
+        assert_eq!(early_verdict(&value), Some(Verdict::LastCopy));
+        let placed = vec!["me".to_string()];
+        assert_eq!(early_verdict(&facts(&placed, "me")), Some(Verdict::Placed));
+    }
+
+    #[test]
+    fn only_a_free_copy_asks_for_age_and_holders() {
+        let placed = vec!["other".to_string()];
+        assert_eq!(early_verdict(&facts(&placed, "me")), None);
+    }
+
+    #[test]
+    fn counting_a_kept_copy_lands_in_its_own_bucket() {
+        let mut report = ReleaseReport::default();
+        for verdict in [
+            Verdict::Written,
+            Verdict::Resolved,
+            Verdict::Placed,
+            Verdict::LastCopy,
+            Verdict::Recent,
+            Verdict::Unconfirmed,
+            Verdict::Release,
+        ] {
+            report.count(verdict);
+        }
+        assert_eq!(report.written, 1);
+        assert_eq!(report.resolved, 1);
+        assert_eq!(report.placed, 1);
+        assert_eq!(report.last_copy, 1);
+        assert_eq!(report.recent, 1);
+        assert_eq!(report.unconfirmed, 1);
+        assert_eq!(report.removed, 0, "a kept copy is never counted as removed");
     }
 
     #[test]
