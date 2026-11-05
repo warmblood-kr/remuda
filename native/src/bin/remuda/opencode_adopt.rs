@@ -35,10 +35,9 @@ pub(crate) struct AdoptAuth {
     pub(crate) password: String,
 }
 
-/// A separately tagged binding for a session that was already running before
-/// adoption. It deliberately has no wrapper pid, ancestry or instance: the
-/// owner declaration is the endpoint/A authority, and the local server process
-/// start is corroboration only.
+/// A separately tagged binding for an already-running session: owner-declared
+/// endpoint/A, local server start corroboration only, and no wrapper pid,
+/// ancestry or instance.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AdoptedManifest {
@@ -113,12 +112,9 @@ pub(crate) fn adopted_endpoint(value: &str) -> bool {
     valid_port && loopback_endpoint(value)
 }
 
-/// The upstream Session.ID schema only requires the `ses` prefix; its default
-/// generator emits `ses_` + 12 lowercase hex + 14 base62, and the owned wrapper
-/// deliberately creates `ses_` + 32 hex. Both are real server sessions, so the
-/// adopted validator accepts the bounded URL-safe subset and relies on the
-/// exact credentialed GET of A for target proof instead of inventing a narrower
-/// upstream rule.
+/// Accept the bounded URL-safe `ses_` subset used by real default and explicit
+/// ids; target proof comes from the exact credentialed GET of A, not a narrower
+/// invented upstream rule.
 pub(crate) fn adoptable_conversation(value: &str) -> bool {
     value.len() <= 128
         && value.strip_prefix("ses_").is_some_and(|id| {
