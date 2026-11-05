@@ -978,7 +978,15 @@ impl VfsStore {
         // Any entry may reference this content, as its winner or as a kept
         // conflict, so scan all of them under the lock: a conflict added since
         // the caller's scan must still pin the blob.
-        if still_owed(&index, sha256, self_fp, &members, self.is_kept(sha256)) {
+        let placed = index
+            .entries
+            .values()
+            .filter(|entry| entry.sha256 == sha256)
+            .any(|entry| {
+                crate::cluster::vfs_sync::live_placement(entry, &members)
+                    .contains(&self_fp.to_owned())
+            });
+        if still_owed(&index, sha256, self_fp, placed, self.is_kept(sha256)) {
             return Ok(false);
         }
         let removed = match fs::remove_file(self.blob_path(sha256)?) {
@@ -1112,26 +1120,11 @@ impl VfsStore {
 /// Whether the locked snapshot says this node still owes the copy: another
 /// entry pins it, placement names this node, or `resolve` kept it. Pure, so the
 /// rule is tested without a cluster or a lock.
-fn still_owed(
-    index: &VfsIndex,
-    sha256: &str,
-    self_fp: &str,
-    members: &crate::cluster::vfs_sync::Members,
-    kept: bool,
-) -> bool {
-    if custody(index, sha256, self_fp) != Custody::Free {
-        // Unreferenced content belongs to garbage collection, pinned content
-        // to its writer or a kept conflict.
-        return true;
-    }
-    let placed = index
-        .entries
-        .values()
-        .filter(|entry| entry.sha256 == sha256)
-        .any(|entry| {
-            crate::cluster::vfs_sync::live_placement(entry, members).contains(&self_fp.to_owned())
-        });
-    placed || kept
+fn still_owed(index: &VfsIndex, sha256: &str, self_fp: &str, placed: bool, kept: bool) -> bool {
+    // Unreferenced content belongs to garbage collection, pinned content to its
+    // writer or a kept conflict. `placed` is the placement snapshot taken by
+    // the caller under the lock.
+    custody(index, sha256, self_fp) != Custody::Free || placed || kept
 }
 
 /// Delete a blob and the markers that describe it. The markers go only with
@@ -1329,23 +1322,15 @@ mod tests {
 
     #[test]
     fn the_locked_snapshot_owes_a_copy_only_for_a_real_reason() {
-        let members = crate::cluster::vfs_sync::members_for_test("SHA256:me", &["other"], &[]);
         let sha = "a".repeat(64);
         let phash = "b".repeat(64);
+        let me = "SHA256:me";
 
         let mut index = VfsIndex::default();
-        assert!(
-            still_owed(&index, &sha, "me", &members, false),
-            "GC owns it"
-        );
+        assert!(still_owed(&index, &sha, me, false, false), "GC owns it");
 
-        index
-            .entries
-            .insert("a".into(), entry("a", &sha, "SHA256:me"));
-        assert!(
-            still_owed(&index, &sha, "SHA256:me", &members, false),
-            "own write"
-        );
+        index.entries.insert("a".into(), entry("a", &sha, me));
+        assert!(still_owed(&index, &sha, me, false, false), "own write");
 
         let mut theirs = entry("a", &sha, "SHA256:them");
         theirs.conflicts.push(remuda_core::vfs::VfsConflict {
@@ -1360,31 +1345,21 @@ mod tests {
         });
         index.entries.insert("a".into(), theirs);
         assert!(
-            still_owed(&index, &phash, "SHA256:me", &members, false),
+            still_owed(&index, &phash, me, false, false),
             "kept conflict content"
         );
         assert!(
-            !still_owed(&index, &sha, "SHA256:me", &members, false),
+            !still_owed(&index, &sha, me, false, false),
             "a peer's copy this node does not hold is free"
         );
         assert!(
-            still_owed(&index, &sha, "SHA256:me", &members, true),
+            still_owed(&index, &sha, me, false, true),
             "resolve pinned it"
         );
-    }
-
-    #[test]
-    fn placement_that_names_this_node_still_owes_the_copy() {
-        let mut index = VfsIndex::default();
-        let sha = "a".repeat(64);
-        index
-            .entries
-            .insert("a".into(), entry("a", &sha, "SHA256:them"));
-        // 16 replicas over two admitted nodes names both, this one included.
-        index.entries.get_mut("a").unwrap().replicas = 16;
-        let members =
-            crate::cluster::vfs_sync::members_for_test("SHA256:me", &["SHA256:me", "other"], &[]);
-        assert!(still_owed(&index, &sha, "SHA256:me", &members, false));
+        assert!(
+            still_owed(&index, &sha, me, true, false),
+            "placement still names this node"
+        );
     }
 
     #[test]
