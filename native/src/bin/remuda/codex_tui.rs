@@ -330,7 +330,7 @@ fn monitor_with_key(socket: &std::path::Path, status: &str, key: Option<&str>) {
 #[cfg(unix)]
 /// ponytail: this small client supports local UDS handshakes and unfragmented
 /// text frames only; it negotiates no extensions and does not reassemble fragments.
-fn websocket_handshake(
+pub(crate) fn websocket_handshake(
     mut stream: UnixStream,
     supplied_key: Option<&str>,
 ) -> std::io::Result<UnixStream> {
@@ -409,7 +409,7 @@ fn read_http_headers(stream: &mut UnixStream) -> std::io::Result<String> {
 }
 
 #[cfg(unix)]
-fn websocket_send_text(stream: &mut UnixStream, text: &str) -> std::io::Result<()> {
+pub(crate) fn websocket_send_text(stream: &mut UnixStream, text: &str) -> std::io::Result<()> {
     let payload = text.as_bytes();
     let mut header = vec![0x81];
     match payload.len() {
@@ -434,7 +434,7 @@ fn websocket_send_text(stream: &mut UnixStream, text: &str) -> std::io::Result<(
 }
 
 #[cfg(unix)]
-fn websocket_read_text(stream: &mut UnixStream) -> std::io::Result<Option<String>> {
+pub(crate) fn websocket_read_text(stream: &mut UnixStream) -> std::io::Result<Option<String>> {
     const MAX_MESSAGE: u64 = 4 * 1024 * 1024;
     loop {
         let mut header = [0; 2];
@@ -521,7 +521,7 @@ fn websocket_send_control(
 }
 
 #[cfg(unix)]
-fn sha1(input: &[u8]) -> [u8; 20] {
+pub(crate) fn sha1(input: &[u8]) -> [u8; 20] {
     let mut data = input.to_vec();
     let bit_len = (data.len() as u64).wrapping_mul(8);
     data.push(0x80);
