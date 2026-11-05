@@ -587,7 +587,8 @@ fn put_marker_with(
     }
 }
 
-/// Write `COMPLETE` last. `Err(exit)` means it is not there at all.
+/// Write `COMPLETE` last. `Err(exit)` means it is not known to be there; the
+/// message says whether the daemon refused it or the answer was lost.
 fn write_complete_with(
     call: &DaemonCall<'_>,
     finished: &Finished<'_>,
@@ -617,7 +618,8 @@ fn write_complete_with(
     }
 }
 
-/// Write `PREFIX/CURRENT`. `Err(exit)` means it is missing.
+/// Write `PREFIX/CURRENT`. `Err(exit)` means it is not known to be there; the
+/// message says whether it was refused or unconfirmed.
 fn write_pointer_with(
     call: &DaemonCall<'_>,
     finished: &Finished<'_>,
@@ -1913,27 +1915,29 @@ mod tests {
         assert_eq!(unknown.1, "timed out");
     }
 
-    fn plan_of(names: &[&str]) -> (std::path::PathBuf, crate::vfs_publish::Plan) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "vfs-upload-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        for name in names {
-            std::fs::write(dir.join(name), b"x").unwrap();
+    fn plain_plan(names: &[&str]) -> crate::vfs_publish::Plan {
+        let files: Vec<_> = names
+            .iter()
+            .map(|name| crate::vfs_publish::Planned {
+                source: std::path::PathBuf::from("/x"),
+                relative: (*name).into(),
+                size: 1,
+                modified: None,
+                identity: None,
+                canonical: std::path::PathBuf::from("/x"),
+            })
+            .collect();
+        crate::vfs_publish::Plan {
+            bytes: files.len() as u64,
+            files,
+            skipped: Vec::new(),
         }
-        let plan = crate::vfs_publish::plan(&dir, "v1").unwrap();
-        (dir, plan)
     }
 
     #[test]
     fn a_read_refusal_stops_before_any_put() {
         use std::cell::Cell;
-        let (dir, plan) = plan_of(&["a.txt", "b.txt"]);
+        let plan = plain_plan(&["a.txt", "b.txt"]);
         let calls = Cell::new(0);
         let call = |_args: Vec<String>, _input: Option<Vec<u8>>| {
             calls.set(calls.get() + 1);
@@ -1944,13 +1948,12 @@ mod tests {
         assert_eq!(uploaded.files, 0);
         assert_eq!(calls.get(), 0, "no put may run after a read refusal");
         assert!(uploaded.failure.is_some());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn a_read_refusal_after_one_file_keeps_that_count() {
         use std::cell::Cell;
-        let (dir, plan) = plan_of(&["a.txt", "b.txt"]);
+        let plan = plain_plan(&["a.txt", "b.txt"]);
         let reads = Cell::new(0);
         let calls = Cell::new(0);
         let verify = |_file: &crate::vfs_publish::Planned| {
@@ -1971,7 +1974,6 @@ mod tests {
         assert_eq!(uploaded.bytes, 1);
         assert_eq!(calls.get(), 1);
         assert!(uploaded.failure.is_some());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1994,25 +1996,19 @@ mod tests {
 
     #[test]
     fn a_failed_first_put_is_not_counted_as_uploaded() {
-        let (dir, plan) = plan_of(&["a.txt", "b.txt"]);
+        let plan = plain_plan(&["a.txt", "b.txt"]);
         let call = |_args: Vec<String>, _input: Option<Vec<u8>>| Err("gone".to_string());
-        let uploaded = upload_release_with(
-            &call,
-            &crate::vfs_publish::read_verified,
-            "design/v1",
-            &plan,
-            None,
-        );
+        let verify = |_file: &crate::vfs_publish::Planned| Ok(b"x".to_vec());
+        let uploaded = upload_release_with(&call, &verify, "design/v1", &plan, None);
         assert_eq!(uploaded.files, 0);
         assert_eq!(uploaded.bytes, 0);
         assert!(uploaded.failure.is_some());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn a_short_put_counts_and_the_upload_continues() {
         use std::cell::Cell;
-        let (dir, plan) = plan_of(&["a.txt", "b.txt"]);
+        let plan = plain_plan(&["a.txt", "b.txt"]);
         let calls = Cell::new(0);
         let call = |_args: Vec<String>, _input: Option<Vec<u8>>| {
             let n = calls.get();
@@ -2023,18 +2019,12 @@ mod tests {
                 Ok((0, Vec::new(), String::new()))
             }
         };
-        let uploaded = upload_release_with(
-            &call,
-            &crate::vfs_publish::read_verified,
-            "design/v1",
-            &plan,
-            None,
-        );
+        let verify = |_file: &crate::vfs_publish::Planned| Ok(b"x".to_vec());
+        let uploaded = upload_release_with(&call, &verify, "design/v1", &plan, None);
         assert_eq!(uploaded.files, 2);
         assert_eq!(uploaded.short, 1);
         assert!(uploaded.failure.is_none());
         assert_eq!(calls.get(), 2);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
