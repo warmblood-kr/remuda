@@ -91,10 +91,11 @@ uploader with a final pointer*, not an atomic directory publish:
    byte is here but the copies wanted are not (a file `put` that returns 75
    counts as uploaded and does not stop the run) — the same 75 `put` uses. A
    transport failure leaves the marker's state unknown, not proven absent, and
-   the message says so. Recovery is to check `vfs stat` for `COMPLETE` (and
-   `CURRENT`); a release that already has files is refused by the destination
-   check, so a name that did upload is continued only by inspecting it, and a
-   genuinely missing marker means publishing a new `--release` name.
+   the message says so. Recovery is to check `vfs stat` for `COMPLETE`, then
+   `vfs get` `CURRENT` and confirm its value names the intended release (an
+   existing pointer can be an older one). A release that already has files is
+   refused by the destination check, so a genuinely missing marker means
+   publishing a new `--release` name.
 
 What it deliberately does not do: delete a previous release (it stays until
 `vfs rm`), roll back a partial upload, guarantee that `COMPLETE` or `CURRENT`
