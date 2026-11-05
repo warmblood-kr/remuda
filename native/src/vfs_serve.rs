@@ -458,62 +458,68 @@ fn parse_headers<'a>(lines: impl Iterator<Item = &'a str>) -> Result<RawHeaders,
         if count > MAX_HEADERS {
             return Err(too_large("too many headers"));
         }
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| BadRequest::new(400, "Bad Request", "header without a colon"))?;
-        if name.is_empty() || !name.bytes().all(is_token_byte) {
-            return Err(BadRequest::new(400, "Bad Request", "bad header name"));
-        }
-        let value = value.trim_matches(' ');
-        if value
-            .bytes()
-            .any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
-        {
-            return Err(BadRequest::new(400, "Bad Request", "bad header value"));
-        }
-        match name.to_ascii_lowercase().as_str() {
-            "host" => {
-                if raw.host.is_some() {
-                    return Err(BadRequest::new(400, "Bad Request", "two Host headers"));
-                }
-                if value.is_empty() {
-                    return Err(BadRequest::new(400, "Bad Request", "empty Host"));
-                }
-                raw.host = Some(value.to_owned());
-            }
-            "if-none-match" => {
-                if raw.if_none_match.is_some() {
-                    return Err(BadRequest::new(
-                        400,
-                        "Bad Request",
-                        "two If-None-Match headers",
-                    ));
-                }
-                raw.if_none_match = Some(value.to_owned());
-            }
-            "content-length" => {
-                if raw.content_length.is_some() {
-                    return Err(BadRequest::new(
-                        400,
-                        "Bad Request",
-                        "two Content-Length headers",
-                    ));
-                }
-                // HTTP's grammar is digits only: `+0` and ` 0` are not lengths.
-                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                    return Err(BadRequest::new(400, "Bad Request", "bad Content-Length"));
-                }
-                raw.content_length = Some(
-                    value
-                        .parse::<u64>()
-                        .map_err(|_| BadRequest::new(400, "Bad Request", "bad Content-Length"))?,
-                );
-            }
-            "transfer-encoding" => raw.chunked = true,
-            _ => {}
-        }
+        parse_header_line(line, &mut raw)?;
     }
     Ok(raw)
+}
+
+/// One `name: value` line into `raw`. Unknown names are ignored, not refused.
+fn parse_header_line(line: &str, raw: &mut RawHeaders) -> Result<(), BadRequest> {
+    let (name, value) = line
+        .split_once(':')
+        .ok_or_else(|| BadRequest::new(400, "Bad Request", "header without a colon"))?;
+    if name.is_empty() || !name.bytes().all(is_token_byte) {
+        return Err(BadRequest::new(400, "Bad Request", "bad header name"));
+    }
+    let value = value.trim_matches(' ');
+    if value
+        .bytes()
+        .any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
+    {
+        return Err(BadRequest::new(400, "Bad Request", "bad header value"));
+    }
+    match name.to_ascii_lowercase().as_str() {
+        "host" => {
+            if raw.host.is_some() {
+                return Err(BadRequest::new(400, "Bad Request", "two Host headers"));
+            }
+            if value.is_empty() {
+                return Err(BadRequest::new(400, "Bad Request", "empty Host"));
+            }
+            raw.host = Some(value.to_owned());
+        }
+        "if-none-match" => {
+            if raw.if_none_match.is_some() {
+                return Err(BadRequest::new(
+                    400,
+                    "Bad Request",
+                    "two If-None-Match headers",
+                ));
+            }
+            raw.if_none_match = Some(value.to_owned());
+        }
+        "content-length" => {
+            if raw.content_length.is_some() {
+                return Err(BadRequest::new(
+                    400,
+                    "Bad Request",
+                    "two Content-Length headers",
+                ));
+            }
+            // HTTP's grammar is digits only: `+0` and ` 0` are not lengths.
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(BadRequest::new(400, "Bad Request", "bad Content-Length"));
+            }
+            raw.content_length = Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| BadRequest::new(400, "Bad Request", "bad Content-Length"))?,
+            );
+        }
+        "transfer-encoding" => raw.chunked = true,
+        _ => {}
+    }
+    Ok(())
 }
 
 /// One request path, decoded and checked against the cluster path rules.
@@ -860,7 +866,9 @@ fn serve_content(content: Content, head: &Head) -> Response {
 }
 
 /// Render one directory: subdirectories first, then files, each with a link.
-fn render_listing(request_path: &str, config: &Config, prefix: &str, entries: &[Meta]) -> String {
+/// The two groups a listing shows, each sorted: subdirectories by name, then
+/// files by path. Pure, so its rules are tested without a store.
+fn group_listing<'a>(prefix: &str, entries: &'a [Meta]) -> (Vec<String>, Vec<&'a Meta>) {
     let mut directories: Vec<String> = Vec::new();
     let mut files: Vec<&Meta> = Vec::new();
     for entry in entries {
@@ -881,7 +889,11 @@ fn render_listing(request_path: &str, config: &Config, prefix: &str, entries: &[
     }
     directories.sort();
     files.sort_by(|left, right| left.path.cmp(&right.path));
+    (directories, files)
+}
 
+fn render_listing(request_path: &str, config: &Config, prefix: &str, entries: &[Meta]) -> String {
+    let (directories, files) = group_listing(prefix, entries);
     let base = if request_path.is_empty() {
         "/".to_owned()
     } else {
@@ -914,19 +926,26 @@ fn render_listing(request_path: &str, config: &Config, prefix: &str, entries: &[
         ));
     }
     body.push_str("<table>\n");
-    for directory in &directories {
-        body.push_str(&format!(
+    body.push_str(&render_rows(&base, prefix, &directories, &files));
+    body.push_str("</table>\n");
+    body
+}
+
+fn render_rows(base: &str, prefix: &str, directories: &[String], files: &[&Meta]) -> String {
+    let mut rows = String::new();
+    for directory in directories {
+        rows.push_str(&format!(
             "<tr><td><a href=\"{}{}/\">{}/</a></td><td></td></tr>\n",
             base,
             href_path(directory),
             html_escape(directory)
         ));
     }
-    for file in &files {
+    for file in files {
         let Some(name) = file.path.strip_prefix(prefix) else {
             continue;
         };
-        body.push_str(&format!(
+        rows.push_str(&format!(
             "<tr><td><a href=\"{}{}\">{}</a></td><td><code>{}</code></td><td><code>v{}</code></td></tr>\n",
             base,
             href_path(name),
@@ -935,8 +954,7 @@ fn render_listing(request_path: &str, config: &Config, prefix: &str, entries: &[
             file.version
         ));
     }
-    body.push_str("</table>\n");
-    body
+    rows
 }
 
 fn parent_href(path: &str) -> String {
@@ -1468,6 +1486,53 @@ mod tests {
     }
 
     #[test]
+    fn a_listing_groups_directories_once_and_sorts_both_groups() {
+        let entries = vec![
+            Meta {
+                path: "d/b.txt".into(),
+                version: 1,
+                sha256: "a".repeat(64),
+                size: 1,
+            },
+            Meta {
+                path: "d/a.txt".into(),
+                version: 1,
+                sha256: "a".repeat(64),
+                size: 1,
+            },
+            Meta {
+                path: "d/sub/x.css".into(),
+                version: 1,
+                sha256: "a".repeat(64),
+                size: 1,
+            },
+            Meta {
+                path: "d/sub2/y.css".into(),
+                version: 1,
+                sha256: "a".repeat(64),
+                size: 1,
+            },
+        ];
+        let (directories, files) = group_listing("d/", &entries);
+        assert_eq!(directories, ["sub", "sub2"]);
+        let names: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(names, ["d/a.txt", "d/b.txt"]);
+    }
+
+    #[test]
+    fn a_listing_ignores_entries_outside_its_prefix() {
+        let entries = vec![Meta {
+            path: "other/x".into(),
+            version: 1,
+            sha256: "a".repeat(64),
+            size: 1,
+        }];
+        let (directories, files) = group_listing("d/", &entries);
+        assert!(directories.is_empty());
+        assert!(files.is_empty());
+    }
+
+    #[test]
     fn a_listing_escapes_names_it_did_not_write() {
         let fake = Fake::new(&[("<script>.txt", 1, b"no")]);
         let config = Config::new("", false).unwrap();
@@ -1510,6 +1575,15 @@ mod tests {
         let wire = String::from_utf8_lossy(&response.to_bytes(Method::Head)).to_string();
         assert!(wire.contains("Content-Length: 5"), "{wire}");
         assert!(wire.ends_with("\r\n\r\n"), "no body after the head: {wire}");
+    }
+
+    #[test]
+    fn an_unknown_header_is_ignored_and_a_known_one_is_kept() {
+        let mut raw = RawHeaders::default();
+        parse_header_line("X-Anything: yes", &mut raw).unwrap();
+        parse_header_line("Host: 127.0.0.1:9", &mut raw).unwrap();
+        assert_eq!(raw.host.as_deref(), Some("127.0.0.1:9"));
+        assert!(!raw.has_body());
     }
 
     #[test]
