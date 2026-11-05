@@ -55,6 +55,8 @@ mod agent_notice;
 mod claude_channel;
 #[path = "remuda/codex_tui.rs"]
 mod codex_tui;
+#[path = "remuda/opencode_adopt.rs"]
+mod opencode_adopt;
 #[path = "remuda/opencode_tui.rs"]
 mod opencode_tui;
 #[path = "remuda/private_dir.rs"]
@@ -185,6 +187,7 @@ fn dispatch_native_verb(verb: &str, rest: &[&str]) -> Option<ExitCode> {
     Some(match verb {
         "_codex_tui" => codex_tui::run(rest),
         "_codex_watch" => run_codex_watch_cli(rest),
+        "_opencode_adopt" => opencode_adopt::run(rest),
         "_opencode_tui" => opencode_tui::run(rest),
         #[cfg(unix)]
         "_claude_channel" => claude_channel::run(rest),
