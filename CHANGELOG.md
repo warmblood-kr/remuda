@@ -1,5 +1,15 @@
 # Changelog
 
+- VFS: `remuda vfs release [--dry-run] [--older-than SECS] [--json]` gives
+  back copies this node fetched to read and is not placed on (#887). It never
+  removes the last copy: a copy goes only when every node placement names has
+  confirmed one, and an unreachable node keeps its copy here. `sync` still
+  trims only repair stand-ins; releasing read copies is now an explicit step,
+  so a viewer node no longer mirrors the whole store.
+- VFS: a copy `remuda vfs resolve` pins is marked `kept/` and `remuda vfs
+  release` leaves it alone, so the path `resolve` printed stays valid. The
+  report counts them as `resolved`; `release --include-resolved` gives them
+  back. Garbage collection removes the mark with the blob.
 ## Unreleased
 
 - VFS: `remuda vfs serve [--addr ADDR:PORT] [--root PATH] [--allow-scripts]

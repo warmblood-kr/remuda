@@ -18,6 +18,7 @@ pub(crate) mod storage;
 pub mod vfs;
 pub mod vfs_drain;
 mod vfs_index_db;
+pub mod vfs_release;
 pub(crate) use vfs_index_db::{
     known_steps as index_db_known_steps, schema_on_disk as index_db_schema_on_disk,
 };
