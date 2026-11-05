@@ -727,6 +727,9 @@ impl Response {
         if self.status != 304 {
             head.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
         }
+        if self.status == 405 {
+            head.push_str("Allow: GET, HEAD\r\n");
+        }
         for (name, value) in &self.headers {
             head.push_str(&format!("{name}: {value}\r\n"));
         }
@@ -1629,6 +1632,23 @@ mod tests {
         assert!(loopback.contains("http://127.0.0.1:9"));
         assert!(loopback.contains("http://localhost:9"));
         assert_eq!(sources("http://10.0.0.2:9"), "http://10.0.0.2:9");
+    }
+
+    #[test]
+    fn a_method_refusal_says_what_is_allowed() {
+        let fake = Fake::new(&[("a.html", 1, b"x")]);
+        let config = Config::new("", false).unwrap();
+        let mut head = get("/a.html");
+        head.method = Method::Get;
+        // The parser refuses POST, so ask the responder for a 405 directly.
+        let response = harden(
+            Response::text(405, "Method Not Allowed", "only GET and HEAD are served"),
+            ORIGIN,
+            false,
+        );
+        let wire = String::from_utf8_lossy(&response.to_bytes(head.method)).to_string();
+        assert!(wire.contains("Allow: GET, HEAD"), "{wire}");
+        let _ = (&fake, &config);
     }
 
     #[test]

@@ -57,7 +57,7 @@ other verbs.
 
 Paths are percent-decoded once, then checked by the same rules as `remuda
 vfs put` (`remuda_core::vfs`): no `.`/`..` component, no `\`, no NUL or control
-characters, 1024 bytes at most. A path that fails those rules is `400`; it is
+characters, 1024 bytes at most. A path that fails those rules is `404`; it is
 never normalised and never reaches the store. `..` after decoding is a
 traversal attempt, not a directory.
 
@@ -70,8 +70,8 @@ An `ETag` is the entry's `sha256`. `If-None-Match` that matches answers `304`
 with no body, so a reload after a cluster write is cheap and a viewer can tell
 the file changed.
 
-The body comes from a new machine-readable `remuda vfs read --json`, not from
-`get`: one call returns the chosen entry and its bytes, so a `stat` followed by
+The body comes from a new machine-readable `remuda vfs read`, which always
+prints a JSON envelope, not from `get`: one call returns the chosen entry and its bytes, so a `stat` followed by
 a `get` cannot race a concurrent write, and a failure arrives as the same code
 Lua sees (`not_found`, `too_large`, `no_cluster`, `unreachable`, `corrupt`,
 `wrong_cluster`, `bad_uri`, `io`) instead of English on stderr. The bridge
@@ -106,7 +106,8 @@ page as untrusted:
   scope an operator should be willing to show them.
 - `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
   `Referrer-Policy: no-referrer`,
-  `Cross-Origin-Resource-Policy: same-origin`,
+  `Cross-Origin-Resource-Policy: cross-origin` (a sandboxed page must load its
+  own CSS and images),
   `Cross-Origin-Opener-Policy: same-origin`.
 - No cookies, no `Set-Cookie`, no CORS headers, no request logging of query
   strings.
