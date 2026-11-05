@@ -19,6 +19,9 @@ fn publish_config(
     let Some(path) = binding else {
         return Ok(None);
     };
+    if !cfg!(target_os = "macos") {
+        return Err("unsupported_platform");
+    }
     if !std::path::Path::new(path).is_absolute() {
         return Err("binding_env");
     }
