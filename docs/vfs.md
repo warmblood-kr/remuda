@@ -52,7 +52,10 @@ remuda vfs publish site remuda:///design --release 2026-11-04
   That check is cooperative: a partitioned node can hide a release from it.
 - `--dry-run` prints the plan and writes nothing.
 - A source file that changes between the plan and the upload aborts the run
-  rather than publishing a mix; open files and quit your editor first.
+  rather than publishing a mix; open files and quit your editor first. Unix
+  catches an in-place rewrite by file identity; elsewhere the check is type,
+  size and mtime. A link swapped in after the plan is refused on every
+  platform.
 
 Exit codes: 0 done; 1 a file failed, the source changed, or `COMPLETE` could
 not be written — the release is **incomplete**, fix the cause and publish a

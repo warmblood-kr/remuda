@@ -55,7 +55,7 @@ pub fn read_verified(file: &Planned) -> Result<Vec<u8>, String> {
     }
     let mut handle = options
         .open(&file.source)
-        .map_err(|error| format!("cannot open {}: {error}", file.relative))?;
+        .map_err(|error| open_error(&file.relative, error))?;
     let before = handle
         .metadata()
         .map_err(|error| format!("cannot read {}: {error}", file.relative))?;
@@ -82,7 +82,46 @@ pub fn read_verified(file: &Planned) -> Result<Vec<u8>, String> {
             file.relative
         ));
     }
+    // The descriptor is stable; the name is not. A symlink swapped in after
+    // preflight is refused here even on platforms without O_NOFOLLOW, because
+    // `symlink_metadata` does not follow it and the bytes are never uploaded.
+    let named = std::fs::symlink_metadata(&file.source)
+        .map_err(|error| format!("cannot read {}: {error}", file.relative))?;
+    if !named.is_file()
+        || named.len() != file.size
+        || named.modified().ok() != file.modified
+        || !same_file(&after, &named)
+    {
+        return Err(format!(
+            "{} was replaced while it was read; publish again",
+            file.relative
+        ));
+    }
     Ok(bytes)
+}
+
+/// Say a swapped-in link as what it is instead of an errno.
+fn open_error(relative: &str, error: std::io::Error) -> String {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return format!("{relative} is now a link; publish again");
+    }
+    format!("cannot open {relative}: {error}")
+}
+
+/// Whether the open descriptor and the name still point at one file. Unix has
+/// the identity; other platforms rely on type, size and mtime above.
+fn same_file(opened: &std::fs::Metadata, named: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        opened.dev() == named.dev() && opened.ino() == named.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (opened, named);
+        true
+    }
 }
 
 /// Refuse a plan that cannot be staged on this machine.
@@ -336,12 +375,13 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
-    fn a_replaced_file_is_refused_at_read_time() {
+    fn an_in_place_replacement_is_refused_by_file_identity() {
         let root = scratch("replaced");
         std::fs::write(root.join("a.txt"), b"aaa").unwrap();
         let plan = plan(&root, "v1").unwrap();
-        // Same size and mtime are not enough: replacing the path must be seen.
+        // Same size and mtime can be faked by a fast rewrite; dev+ino cannot.
         std::fs::write(root.join("a.txt"), b"bbb").unwrap();
         let error = read_verified(&plan.files[0]).unwrap_err();
         assert!(
@@ -349,6 +389,25 @@ mod tests {
             "{error}"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_swapped_in_after_preflight_is_never_followed() {
+        let root = scratch("swapped");
+        std::fs::write(root.join("a.txt"), b"aaa").unwrap();
+        let plan = plan(&root, "v1").unwrap();
+        let outside = root.parent().unwrap().join("outside-secret.txt");
+        std::fs::write(&outside, b"secret").unwrap();
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("a.txt")).unwrap();
+        let error = read_verified(&plan.files[0]).unwrap_err();
+        assert!(
+            error.contains("link") || error.contains("changed") || error.contains("replaced"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        let _ = std::fs::remove_file(outside);
     }
 
     #[test]
