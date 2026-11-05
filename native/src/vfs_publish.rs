@@ -265,6 +265,15 @@ mod tests {
         root
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn free_space_is_read_for_a_real_directory_only() {
+        let root = scratch("free");
+        assert!(free_bytes(&root).is_some_and(|bytes| bytes > 0));
+        assert_eq!(free_bytes(&root.join("missing")), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn a_plain_tree_plans_every_file_in_order() {
         let root = scratch("plain");

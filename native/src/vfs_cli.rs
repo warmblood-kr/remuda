@@ -370,7 +370,13 @@ fn daemon_call(
         args,
         input_base64: input.map(|bytes| BASE64.encode(bytes)),
     };
-    match crate::client::request(socket, &request) {
+    decode_answer(crate::client::request(socket, &request))
+}
+
+/// Turn the daemon's reply into (exit, stdout, one-line stderr). Pure, so the
+/// base64 and unexpected-variant rules are tested without a socket.
+fn decode_answer(reply: std::io::Result<Response>) -> Result<(u8, Vec<u8>, String), String> {
+    match reply {
         Ok(Response::CommandResult {
             exit_code,
             stdout_base64,
@@ -401,16 +407,24 @@ fn destination_is_empty(socket: &Path, base: &str, release: &str) -> Result<(), 
         None,
     )?;
     match rows {
-        (0, stdout, _) => {
-            let rows: Value = serde_json::from_slice(&stdout).unwrap_or_default();
-            if rows.as_array().is_some_and(|rows| !rows.is_empty()) {
-                return Err(format!(
-                    "{release} already has files at remuda:///{base}/; publish a new --release name"
-                ));
-            }
-            Ok(())
-        }
+        (0, stdout, _) => destination_answer(&stdout, base, release),
         (_, _, stderr) => Err(format!("cannot check the destination: {stderr}")),
+    }
+}
+
+/// Only an empty JSON array means the release name is free. Malformed output is
+/// refused: treating it as empty would publish over an existing release.
+fn destination_answer(stdout: &[u8], base: &str, release: &str) -> Result<(), String> {
+    match serde_json::from_slice::<Value>(stdout)
+        .ok()
+        .as_ref()
+        .and_then(Value::as_array)
+    {
+        Some(rows) if rows.is_empty() => Ok(()),
+        Some(_) => Err(format!(
+            "{release} already has files at remuda:///{base}/; publish a new --release name"
+        )),
+        None => Err(format!("cannot read the listing for remuda:///{base}/")),
     }
 }
 
@@ -1538,6 +1552,44 @@ mod tests {
             assert!(usage(&verb.name).contains("Usage"), "{}", verb.name);
         }
         assert!(usage("").contains("resolve"));
+    }
+
+    #[test]
+    fn a_daemon_answer_keeps_its_exit_code_and_decodes_text() {
+        let reply = Ok(Response::CommandResult {
+            exit_code: 75,
+            stdout_base64: BASE64.encode(b"ok\n"),
+            stderr_base64: BASE64.encode(b"short copies\n"),
+        });
+        let (code, stdout, stderr) = decode_answer(reply).unwrap();
+        assert_eq!(code, 75);
+        assert_eq!(stdout, b"ok\n");
+        assert_eq!(stderr, "short copies");
+        assert_eq!(
+            decode_answer(Ok(Response::Error("nope".into()))).unwrap_err(),
+            "nope"
+        );
+        assert!(decode_answer(Ok(Response::Ok))
+            .unwrap_err()
+            .contains("unexpected daemon answer"));
+        let io_error = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "gone");
+        assert!(decode_answer(Err(io_error))
+            .unwrap_err()
+            .contains("daemon request failed"));
+    }
+
+    #[test]
+    fn a_destination_is_empty_only_for_an_empty_json_array() {
+        assert!(destination_answer(b"[]", "design", "v1").is_ok());
+        assert!(destination_answer(b"[{\"path\":\"a\"}]", "design", "v1")
+            .unwrap_err()
+            .contains("already has files"));
+        assert!(destination_answer(b"not json", "design", "v1")
+            .unwrap_err()
+            .contains("cannot read the listing"));
+        assert!(destination_answer(b"{}", "design", "v1")
+            .unwrap_err()
+            .contains("cannot read the listing"));
     }
 
     #[test]
