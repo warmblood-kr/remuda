@@ -200,6 +200,15 @@ fn placement_of(entries: &[&VfsEntry], members: &vfs_sync::Members) -> Vec<Strin
     placement
 }
 
+/// The rule half of `too_new`: an age we cannot read counts as new, so an
+/// unknown copy is kept rather than released.
+fn is_too_new(age: Option<Duration>, older_than: Duration) -> bool {
+    if older_than.is_zero() {
+        return false;
+    }
+    age.map(|age| age < older_than).unwrap_or(true)
+}
+
 fn too_new(store: &VfsStore, sha: &str, older_than: Duration) -> VfsResult<bool> {
     if older_than.is_zero() {
         return Ok(false);
@@ -207,10 +216,7 @@ fn too_new(store: &VfsStore, sha: &str, older_than: Duration) -> VfsResult<bool>
     let modified = std::fs::metadata(store.blob_path(sha)?)
         .and_then(|metadata| metadata.modified())
         .map_err(VfsError::from)?;
-    Ok(modified
-        .elapsed()
-        .map(|age| age < older_than)
-        .unwrap_or(true))
+    Ok(is_too_new(modified.elapsed().ok(), older_than))
 }
 
 /// The cluster has no node that could take this copy, so say why rather than
@@ -287,6 +293,88 @@ mod tests {
         assert_eq!(verdict(&value), Verdict::Unconfirmed);
         value.holders = 1;
         assert_eq!(verdict(&value), Verdict::Release);
+    }
+
+    #[test]
+    fn an_unreadable_age_is_treated_as_new() {
+        assert!(!is_too_new(Some(Duration::ZERO), Duration::ZERO));
+        assert!(!is_too_new(None, Duration::ZERO));
+        let hour = Duration::from_secs(3600);
+        assert!(is_too_new(Some(hour / 2), hour));
+        assert!(!is_too_new(Some(hour), hour));
+        assert!(!is_too_new(Some(hour * 2), hour));
+        assert!(is_too_new(None, hour), "an unknown age must not release");
+    }
+
+    fn entry(path: &str, sha: &str, writer: &str, replicas: u8) -> VfsEntry {
+        VfsEntry {
+            path: path.to_owned(),
+            sha256: sha.to_owned(),
+            size: 10,
+            replicas,
+            version: 1,
+            writer: writer.to_owned(),
+            deleted: false,
+            mtime: 0,
+            vv: Default::default(),
+            conflicts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn grouping_keeps_live_winners_and_pins_conflict_content() {
+        let mut index = crate::cluster::vfs::VfsIndex::default();
+        let winner = entry("a", &"a".repeat(64), "SHA256:them", 1);
+        let mut conflicted = winner.clone();
+        conflicted.path = "b".into();
+        conflicted.conflicts.push(remuda_core::vfs::VfsConflict {
+            sha256: "c".repeat(64),
+            size: 9,
+            replicas: 1,
+            version: 1,
+            writer: "SHA256:them".into(),
+            deleted: false,
+            vv: Default::default(),
+            mtime: 0,
+        });
+        index.entries.insert("a".into(), winner);
+        index.entries.insert("b".into(), conflicted);
+        let mut deleted = entry("gone", &"d".repeat(64), "SHA256:them", 1);
+        deleted.deleted = true;
+        index.entries.insert("gone".into(), deleted);
+        index.entries.insert(
+            "mine".into(),
+            entry("mine", &"e".repeat(64), "SHA256:me", 1),
+        );
+        let (users, pinned) = group_by_blob(&index, "SHA256:me");
+        assert_eq!(users[&*"a".repeat(64)].len(), 2, "both live winners group");
+        assert!(
+            !users.contains_key(&*"d".repeat(64)),
+            "a tombstone is not a user"
+        );
+        assert!(
+            pinned.contains(&*"c".repeat(64)),
+            "a conflict's content is pinned"
+        );
+        assert!(
+            pinned.contains(&*"e".repeat(64)),
+            "a copy this node wrote is pinned"
+        );
+        assert!(!pinned.contains(&*"a".repeat(64)));
+    }
+
+    #[test]
+    fn placement_unions_every_winners_nodes_without_repeats() {
+        let members = vfs_sync::members_for_test("me", &["me", "n2", "n3", "n4"], &[]);
+        let sha = "a".repeat(64);
+        let one = entry("a", &sha, "SHA256:them", 1);
+        let two = entry("b", &sha, "SHA256:them", 2);
+        let placement = placement_of(&[&one, &two], &members);
+        assert_eq!(placement.len(), 2, "{placement:?}");
+        let mut unique = placement.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), placement.len());
     }
 
     #[test]
