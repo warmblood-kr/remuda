@@ -75,6 +75,16 @@ fn spec() -> Spec {
             verb("resolve", "Keep a copy on this node and print its local path. Example: remuda vfs resolve remuda:///notes.md",
                 vec![arg("URI", "remuda:// URI", true)], vec![option("local", None, "Do not ask other nodes")],
                 "remuda vfs resolve URI [--local]"),
+            verb("read", "Read a file as one JSON envelope for tools. Example: remuda vfs read remuda:///notes.md --max-bytes 1000",
+                vec![arg("URI", "remuda:// URI", true)],
+                vec![option("max-bytes", Some("N"), "Answer too_large without reading when the file is bigger than N bytes")],
+                "remuda vfs read URI [--max-bytes N]"),
+            verb("serve", "Render the store in a browser over a read-only loopback HTTP port. Example: remuda vfs serve --root design",
+                vec![], vec![option("addr", Some("ADDR:PORT"), "Loopback address to listen on (default 127.0.0.1:0, an ephemeral port)"),
+                             option("root", Some("PATH"), "Cluster path to publish (default /, the whole store)"),
+                             option("allow-scripts", None, "Let stored HTML run its own script, same origin only; off by default"),
+                             option("allow-remote", None, "Permit a non-loopback --addr; publishes cluster files to the network")],
+                "remuda vfs serve [--addr ADDR:PORT] [--root PATH] [--allow-scripts] [--allow-remote]"),
             verb("stat", "Show one file's version, hash, size and copies. Example: remuda vfs stat remuda:///notes.md",
                 vec![arg("URI", "remuda:// URI", true)], vec![option("json", None, "Print JSON")],
                 "remuda vfs stat URI [--json]"),
@@ -212,6 +222,17 @@ pub fn run(server: &str, socket: &Path, args: &[&str]) -> ExitCode {
             "remuda: vfs {verb} needs the remuda daemon, and none is running for {server:?}; start it with `remuda run ...` or `remuda -e 1`, then retry"
         );
         return ExitCode::FAILURE;
+    }
+    if verb == "serve" {
+        // The one verb that does not run in the daemon: it binds a port in this
+        // process and asks the daemon over Request::Vfs for each request.
+        return crate::vfs_serve::run(
+            socket,
+            value(&values, "addr").unwrap_or("127.0.0.1:0"),
+            value(&values, "root").unwrap_or("/"),
+            flag(&values, "allow-scripts"),
+            flag(&values, "allow-remote"),
+        );
     }
     let mut input = None;
     if verb == "put" {
@@ -351,6 +372,11 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
         Ok(parsed) => parsed,
         Err(code) => return code,
     };
+    // `read` answers an envelope even when the store cannot open, so a tool can
+    // tell `no_cluster` from `io` without parsing English.
+    if verb == "read" {
+        return read(&values, out);
+    }
     let values = &values;
     let store = match VfsStore::open_default() {
         Ok(store) => store,
@@ -364,6 +390,12 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
         "ls" => list(&store, values, out),
         "rm" => remove(&store, values, out),
         "resolve-conflict" => settle(&store, values, out),
+        "read" => unreachable!("read is answered before the store opens"),
+        "serve" => fail(
+            out,
+            "serve",
+            "runs in the CLI process, not the daemon; run `remuda vfs serve` there",
+        ),
         "sync" => {
             let report = vfs_sync::sync_once(true);
             say!(out, "{report}");
@@ -804,6 +836,112 @@ fn fetch(
     }
 }
 
+/// The caller's `--max-bytes`, absent meaning no limit. Pure, so the parse
+/// refusal is tested without a daemon or a store.
+fn read_limit(values: &Map<String, Value>) -> Result<Option<u64>, String> {
+    match value(values, "max-bytes") {
+        Some(text) => text
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| "--max-bytes must be whole bytes".to_owned()),
+        None => Ok(None),
+    }
+}
+
+fn read_error(code: &str, detail: String) -> Value {
+    serde_json::json!({ "ok": false, "code": code, "detail": detail })
+}
+
+/// A refusal that carries the size, so a viewer can say why it is over.
+fn too_large_envelope(size: u64, max: u64) -> Value {
+    serde_json::json!({
+        "ok": false,
+        "code": "too_large",
+        "size": size,
+        "detail": format!("{size} bytes is over the {max} byte limit"),
+    })
+}
+
+fn content_envelope(entry: &VfsEntry, bytes: &[u8]) -> Value {
+    serde_json::json!({
+        "ok": true,
+        "path": entry.path,
+        "version": entry.version,
+        "sha256": entry.sha256,
+        "size": bytes.len(),
+        "content": BASE64.encode(bytes),
+    })
+}
+
+/// `read`: one JSON envelope, always on stdout, so a tool (the browser bridge)
+/// gets a stable code instead of stderr text. Exit 0 means the envelope is
+/// there, including `ok: false`; only a transport failure is exit 1.
+fn read(values: &Map<String, Value>, out: &mut Out) -> u8 {
+    let store = match VfsStore::open_default() {
+        Ok(store) => store,
+        Err(error) => return read_envelope(out, &error),
+    };
+    let uri = match store.parse_uri(value(values, "URI").unwrap_or_default()) {
+        Ok(uri) => uri,
+        Err(error) => return read_envelope(out, &error),
+    };
+    let max = match read_limit(values) {
+        Ok(Some(max)) => max,
+        Ok(None) => u64::MAX,
+        Err(detail) => return fail(out, "read", &detail),
+    };
+    let index = match store.load_index() {
+        Ok(index) => index,
+        Err(error) => return read_envelope(out, &error),
+    };
+    let Some(entry) = index.live(&uri.path) else {
+        say!(
+            out,
+            "{}",
+            read_error("not_found", format!("no file at {}", uri.path))
+        );
+        return 0;
+    };
+    let value = read_body(entry, max, || fetch(&store, &uri, false));
+    say!(out, "{value}");
+    0
+}
+
+/// The envelope for one entry, with the fetch injected. The index snapshot and
+/// the fetch are two reads, so a write in between can make the file larger;
+/// check the size both before and after moving the blob.
+fn read_body(
+    entry: &VfsEntry,
+    max: u64,
+    fetch: impl FnOnce() -> Result<(VfsEntry, Vec<u8>), VfsError>,
+) -> Value {
+    if entry.size > max {
+        // Answer before the blob moves: a viewer should not pay for a file it
+        // will refuse.
+        return too_large_envelope(entry.size, max);
+    }
+    match fetch() {
+        // The index snapshot and the fetch are two reads; a write in between
+        // can change the entry, so the fetched entry names the bytes.
+        Ok((_, bytes)) if bytes.len() as u64 > max => too_large_envelope(bytes.len() as u64, max),
+        Ok((fetched, bytes)) => content_envelope(&fetched, &bytes),
+        Err(error) => error_envelope(&error),
+    }
+}
+
+fn error_envelope(error: &VfsError) -> Value {
+    serde_json::json!({
+        "ok": false,
+        "code": error.kind.code(),
+        "detail": error.detail,
+    })
+}
+
+fn read_envelope(out: &mut Out, error: &VfsError) -> u8 {
+    say!(out, "{}", error_envelope(error));
+    0
+}
+
 fn get(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
     let uri = match store.parse_uri(value(values, "URI").unwrap_or_default()) {
         Ok(uri) => uri,
@@ -1215,6 +1353,105 @@ mod tests {
             assert!(usage(&verb.name).contains("Usage"), "{}", verb.name);
         }
         assert!(usage("").contains("resolve"));
+    }
+
+    fn one_entry() -> VfsEntry {
+        VfsEntry {
+            path: "a/b.html".to_owned(),
+            sha256: "a".repeat(64),
+            size: 3,
+            replicas: 1,
+            version: 7,
+            writer: "node-a".to_owned(),
+            deleted: false,
+            mtime: 0,
+            vv: Default::default(),
+            conflicts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_read_limit_is_absent_or_whole_bytes() {
+        let mut values = Map::new();
+        assert_eq!(read_limit(&values).unwrap(), None);
+        values.insert("max-bytes".to_owned(), Value::String("10".to_owned()));
+        assert_eq!(read_limit(&values).unwrap(), Some(10));
+        values.insert("max-bytes".to_owned(), Value::String("ten".to_owned()));
+        assert!(read_limit(&values).unwrap_err().contains("whole bytes"));
+    }
+
+    #[test]
+    fn a_read_envelope_keeps_its_code_and_exits_zero() {
+        let mut out = Out::default();
+        let error = VfsError::new(VfsErrorKind::NotFound, "no file at /a");
+        assert_eq!(read_envelope(&mut out, &error), 0);
+        let json: Value =
+            serde_json::from_slice(&out.stdout).expect("the envelope is one JSON object");
+        assert_eq!(json["ok"], Value::Bool(false));
+        assert_eq!(json["code"], Value::String("not_found".to_owned()));
+        assert_eq!(json["detail"], Value::String("no file at /a".to_owned()));
+        assert!(out.stderr.is_empty());
+    }
+
+    #[test]
+    fn a_limit_is_answered_before_the_blob_moves() {
+        use std::cell::Cell;
+        let entry = one_entry();
+        let called = Cell::new(false);
+        let json = read_body(&entry, 1, || {
+            called.set(true);
+            Ok((one_entry(), b"abc".to_vec()))
+        });
+        assert_eq!(json["code"], Value::String("too_large".to_owned()));
+        assert!(!called.get(), "the fetch must not run past the limit");
+    }
+
+    #[test]
+    fn a_blob_that_grew_past_the_limit_is_refused_after_the_fetch() {
+        let entry = one_entry();
+        let json = read_body(&entry, 3, || Ok((one_entry(), b"abcd".to_vec())));
+        assert_eq!(json["code"], Value::String("too_large".to_owned()));
+        assert_eq!(json["size"], Value::from(4));
+    }
+
+    #[test]
+    fn a_fetch_after_an_overwrite_names_the_fetched_entry() {
+        let snapshot = one_entry();
+        let mut fetched = one_entry();
+        fetched.sha256 = "b".repeat(64);
+        fetched.version = 9;
+        let json = read_body(&snapshot, 10, || Ok((fetched, b"xyz".to_vec())));
+        assert_eq!(json["sha256"], Value::String("b".repeat(64)));
+        assert_eq!(json["version"], Value::from(9));
+        assert_eq!(json["content"], Value::String("eHl6".to_owned()));
+    }
+
+    #[test]
+    fn a_fetch_error_keeps_the_stable_envelope() {
+        let entry = one_entry();
+        let error = VfsError::new(VfsErrorKind::Unreachable, "no holder");
+        let json = read_body(&entry, 10, || Err(error));
+        assert_eq!(json["code"], Value::String("unreachable".to_owned()));
+        assert_eq!(json["ok"], Value::Bool(false));
+    }
+
+    #[test]
+    fn a_large_file_is_refused_with_its_size_before_reading_it() {
+        let json = too_large_envelope(2048, 1024);
+        assert_eq!(json["code"], Value::String("too_large".to_owned()));
+        assert_eq!(json["size"], Value::from(2048));
+        assert!(json["detail"].as_str().unwrap().contains("1024"));
+    }
+
+    #[test]
+    fn a_read_envelope_names_the_file_and_base64s_the_bytes() {
+        let entry = one_entry();
+        let json = content_envelope(&entry, b"abc");
+        assert_eq!(json["ok"], Value::Bool(true));
+        assert_eq!(json["path"], Value::String("a/b.html".to_owned()));
+        assert_eq!(json["version"], Value::from(7));
+        assert_eq!(json["size"], Value::from(3));
+        assert_eq!(json["content"], Value::String("YWJj".to_owned()));
     }
 
     #[test]

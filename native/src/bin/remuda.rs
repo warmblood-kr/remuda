@@ -655,6 +655,8 @@ remuda — a pty manager you can attach to
                                   --foreground holds the listener in this terminal
                                   [::] may accept IPv4 too on dual-stack systems
   remuda vfs put|get|ls|stat|rm|resolve  cluster file store at remuda:// URIs
+  remuda vfs serve [--root PATH]  read-only browser view of the store on a
+                                  loopback port; scripts blocked by default
   remuda db status|upgrade|downgrade  schema migrations of mod databases
   remuda doc [--format F]        print live Lua documentation (rst by default)
   remuda -e <code>              evaluate one chunk in that same image
@@ -754,6 +756,8 @@ remuda — terminal orchestration for coding agents
                                   --foreground holds the listener in this terminal
                                   [::] may accept IPv4 too on dual-stack systems
   remuda vfs put|get|ls|stat|rm|resolve  cluster file store at remuda:// URIs
+  remuda vfs serve [--root PATH]  read-only browser view of the store on a
+                                  loopback port; scripts blocked by default
   remuda db status|upgrade|downgrade  schema migrations of mod databases
 
   remuda doc | repl | -e CODE    use the persistent Lua runtime

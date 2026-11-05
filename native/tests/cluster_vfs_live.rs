@@ -1240,3 +1240,130 @@ fn older_build_reads_the_index_after_index_downgrade() {
         "{listed}"
     );
 }
+
+/// One `GET` on a fresh connection; the bridge always closes after one.
+fn http_get(addr: SocketAddr, target: &str) -> String {
+    use std::io::{Read, Write};
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {target} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).unwrap();
+    reply
+}
+
+#[test]
+fn a_viewer_node_renders_a_cluster_page_for_a_browser() {
+    let _serial = live_test_guard();
+    let (a, b, c) = three_nodes();
+    let page =
+        b"<!doctype html><title>design</title><link rel=stylesheet href=site.css><h1>q3</h1>";
+    // One copy: the writer keeps its own, so at least one node has no blob and
+    // the bridge has to ask a peer for it.
+    successful(
+        a.run_with_stdin(
+            &[
+                "vfs",
+                "put",
+                "-",
+                "remuda:///design/index.html",
+                "--replicas",
+                "1",
+            ],
+            Some(page),
+        ),
+        "put the page",
+    );
+    successful(
+        a.run_with_stdin(
+            &[
+                "vfs",
+                "put",
+                "-",
+                "remuda:///design/site.css",
+                "--replicas",
+                "1",
+            ],
+            Some(b"h1{color:red}"),
+        ),
+        "put the stylesheet",
+    );
+    let sha = a.stat_json("remuda:///design/index.html").unwrap()["sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let viewer = match (b.has_blob(&sha), c.has_blob(&sha)) {
+        (false, _) => &b,
+        (true, false) => &c,
+        (true, true) => panic!("replicas 1 still landed a copy on both non-writers"),
+    };
+
+    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+    let mut command = Command::new(&viewer.exe);
+    command.args([
+        "-s",
+        &viewer.name,
+        "vfs",
+        "serve",
+        "--addr",
+        &addr.to_string(),
+        "--root",
+        "design",
+    ]);
+    viewer.env(&mut command);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_err() {
+        assert!(Instant::now() < deadline, "the bridge did not listen");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let html = http_get(addr, "/index.html");
+    assert!(html.starts_with("HTTP/1.1 200 OK\r\n"), "{html}");
+    assert!(html.contains("Content-Security-Policy: sandbox;"), "{html}");
+    assert!(
+        html.contains("Content-Type: text/html; charset=utf-8"),
+        "{html}"
+    );
+    assert!(html.ends_with(std::str::from_utf8(page).unwrap()), "{html}");
+
+    let css = http_get(addr, "/site.css");
+    assert!(css.starts_with("HTTP/1.1 200 OK\r\n"), "{css}");
+    // The policy rides on every answer, so no stored type can be opened as an
+    // unpoliced document.
+    assert!(css.contains("Content-Security-Policy: sandbox;"), "{css}");
+    assert!(css.ends_with("h1{color:red}"), "{css}");
+
+    let listing = http_get(addr, "/");
+    assert!(listing.contains("index.html"), "{listing}");
+    assert!(listing.contains("site.css"), "{listing}");
+
+    for target in ["/../secret.txt", "/index.html%00", "/nope.html"] {
+        let refused = http_get(addr, target);
+        assert!(
+            refused.starts_with("HTTP/1.1 404") || refused.starts_with("HTTP/1.1 400"),
+            "{target}: {refused}"
+        );
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // A non-loopback bind is refused without an explicit opt-in.
+    let refused = b.run(&["vfs", "serve", "--addr", "0.0.0.0:0"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--allow-remote"));
+}
