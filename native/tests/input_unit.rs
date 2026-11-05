@@ -24,6 +24,17 @@ fn daemon_at(path: &Path, dir: &Path) -> spawn::Daemon {
     spawn::spawn_and_wait(command, dir)
 }
 
+/// Like `daemon_at`, with sessions kept in the daemon whatever the default:
+/// hosted input acts are limited to 8 KiB.
+fn daemon_in_process(path: &Path, dir: &Path) -> spawn::Daemon {
+    debug_assert_eq!(path, daemon::socket_path_in(dir, "s"));
+    let mut command = spawn::base_command(dir);
+    command
+        .env("REMUDA_SUPPRESS_DEPRECATIONS", "1")
+        .env("REMUDA_EXPERIMENTAL_SESSION_HOST", "0");
+    spawn::spawn_and_wait(command, dir)
+}
+
 fn capture(path: &Path, name: &str) -> String {
     match client::request(path, &Request::Capture { name: name.into() }) {
         Ok(Response::Screen(text)) => text,
@@ -382,7 +393,7 @@ fn wait_text_then_return(socket: &Path, name: &str) {
 fn type_text_delivers_and_submits_when_the_child_drains_slowly() {
     let dir = scratch("slow-drain");
     let socket = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&socket, &dir);
+    let _daemon = daemon_in_process(&socket, &dir);
     start_slow_drain(&socket, &dir, "slow-drain");
 
     script::run_source(
@@ -405,7 +416,7 @@ fn type_text_delivers_and_submits_when_the_child_drains_slowly() {
 fn send_line_reports_pending_when_the_child_drains_slowly() {
     let dir = scratch("slow-send");
     let socket = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&socket, &dir);
+    let _daemon = daemon_in_process(&socket, &dir);
     start_slow_drain(&socket, &dir, "slow-send");
 
     let response = client::request(

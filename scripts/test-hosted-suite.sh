@@ -39,10 +39,10 @@ if [ -n "$before" ]; then
     exit 2
 fi
 cargo build --bins || exit 2
-# Test binaries look for the host next to themselves. Remove first: on macOS,
-# copying over an existing binary keeps a stale signature and it is killed.
+# A daemon inside a test binary finds the host one level above deps/. An old
+# copy in deps/ (earlier versions of this script made one) would be chosen
+# first, so remove it.
 rm -f "$TEST_HOST"
-cp "$HOST" "$TEST_HOST" || exit 2
 
 # Short base: a Unix socket path must fit in sun_path (104 bytes on macOS).
 run=$(mktemp -d /tmp/rh.XXXXXX)
