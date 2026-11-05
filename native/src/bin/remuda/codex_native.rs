@@ -700,10 +700,23 @@ fn preflight(
 
 #[cfg(unix)]
 pub(crate) fn adopt(request: &AdoptRequest) -> Result<Published, &'static str> {
+    adopt_guarded(request, || true)
+}
+
+/// Adopt only while `permitted` still authorizes publication. The guard runs
+/// immediately before each binding file is created and again before the result
+/// is returned, so a launcher can withdraw authority during preflight.
+pub(crate) fn adopt_guarded(
+    request: &AdoptRequest,
+    permitted: impl Fn() -> bool,
+) -> Result<Published, &'static str> {
     let binding = Path::new(&request.binding);
     let pin_file = pin_path(binding);
     if std::fs::symlink_metadata(&pin_file).is_ok() || std::fs::symlink_metadata(binding).is_ok() {
         return Err("already_adopted");
+    }
+    if !permitted() {
+        return Err("authority_lost");
     }
     let socket = Path::new(&request.socket);
     let (stream, live) = connect_endpoint(socket)?;
@@ -723,7 +736,14 @@ pub(crate) fn adopt(request: &AdoptRequest) -> Result<Published, &'static str> {
         live,
     );
     // Pin first, so a manifest never points at a missing pin.
+    if !permitted() {
+        return Err("authority_lost");
+    }
     let created = store_pin(&pin_file, &pin)?;
+    if !permitted() {
+        created.remove();
+        return Err("authority_lost");
+    }
     let manifest = Manifest {
         schema: PIN_SCHEMA,
         protocol: PROTOCOL.into(),
@@ -747,11 +767,16 @@ pub(crate) fn adopt(request: &AdoptRequest) -> Result<Published, &'static str> {
             return Err(reason);
         }
     };
-    Ok(Published {
+    let published = Published {
         generation: pin.generation,
         manifest,
         pin: created,
-    })
+    };
+    if !permitted() {
+        published.remove();
+        return Err("authority_lost");
+    }
+    Ok(published)
 }
 
 /// Test-only stand-in for a completed adopt: two real created files that
@@ -943,6 +968,10 @@ mod tests {
 
     const THREAD: &str = "01a1ab7b-7f46-73f0-a024-10063f94f0c3";
 
+    fn codex_native_binding_absent(binding: &str) -> bool {
+        !pin_path(std::path::Path::new(binding)).exists()
+    }
+
     fn live() -> LiveIdentity {
         LiveIdentity {
             uid: 501,
@@ -951,6 +980,24 @@ mod tests {
             dev: 16_777_220,
             ino: 1_234_567,
         }
+    }
+
+    #[test]
+    fn a_withdrawn_authority_publishes_nothing() {
+        let request = AdoptRequest {
+            version: 1,
+            binding: format!("/tmp/remuda-guard-{}/manifest.json", std::process::id()),
+            nonce: "n".into(),
+            session: "s".into(),
+            socket: format!("/tmp/remuda-guard-{}/missing.sock", std::process::id()),
+            thread: THREAD.into(),
+        };
+        assert!(matches!(
+            adopt_guarded(&request, || false),
+            Err("authority_lost")
+        ));
+        assert!(!std::path::Path::new(&request.binding).exists());
+        assert!(codex_native_binding_absent(&request.binding));
     }
 
     #[test]

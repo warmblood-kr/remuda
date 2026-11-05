@@ -456,7 +456,18 @@ mod imp {
             socket: upstream.to_string_lossy().into_owned(),
             thread,
         };
-        settle_publication(capture, &state, codex_native::adopt(&request));
+        settle_publication(
+            capture,
+            &state,
+            codex_native::adopt_guarded(&request, || publication_permitted(capture, &state)),
+        );
+    }
+
+    /// Current authority: no observed failure and no cleanup fence.
+    fn publication_permitted(shared: &Arc<Mutex<Capture>>, state: &Arc<Mutex<State>>) -> bool {
+        let capture = shared.lock().ok();
+        let state = state.lock().ok();
+        matches!((capture, state), (Some(capture), Some(state)) if !capture.failed && !state.closing)
     }
 
     /// Release the in-flight marker on both outcomes; a success re-checks the
@@ -601,6 +612,18 @@ mod imp {
             tunnel.cleanup();
             assert!(started.elapsed() < Duration::from_secs(1));
             let _ = std::fs::remove_dir_all(&runtime);
+        }
+
+        #[test]
+        fn a_failure_or_cleanup_fence_withdraws_authority() {
+            let capture = capture();
+            let state = capture.lock().expect("capture").state.clone();
+            assert!(publication_permitted(&capture, &state));
+            capture.lock().expect("capture").failed = true;
+            assert!(!publication_permitted(&capture, &state));
+            capture.lock().expect("capture").failed = false;
+            state.lock().expect("state").closing = true;
+            assert!(!publication_permitted(&capture, &state));
         }
 
         #[test]
