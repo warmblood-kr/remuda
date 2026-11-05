@@ -95,3 +95,30 @@ Focused unit coverage added in this step:
   an unchanged generation still sends exactly one correlated POST.
 - Owned-schema, canonical-notice, owned process-generation and delivery
   regressions remain in the same 176-test binary above.
+
+Bounded disposable runtime probe (real installed OpenCode 2.2.5; original
+server and original TUI started before adoption; private loopback mock; no
+production account, input or credential; private root removed and all owned
+pids confirmed gone):
+
+```text
+session A (default generator): ses_e543a3368ffe1Hhcoeq7zBDS4b
+_opencode_adopt positive:      {"outcome":"adopted","generation":"65f86fca3f39a"}
+manifest mode:                 0600
+first notice:                  {"outcome":"accepted_queue"}
+second notice:                 {"outcome":"accepted_queue"}
+stale-generation notice:       {"outcome":"definitely_not_written","reason":"stale_binding"}
+bad-auth adoption:             {"outcome":"unavailable","reason":"auth"}
+wrong-target adoption:         {"outcome":"unavailable","reason":"target_missing"}
+30/30 checks passed
+```
+
+The probe confirmed: TUI/server pids and start times unchanged across adoption
+and both notices; both notices rendered in the original TUI and landed in fixed
+A; an unrelated session B created on the same server after adoption received
+neither notice (fixed-target evidence, not a UI-navigation proof); a typed
+draft was still in the composer and was submitted exactly once only by the
+probe's later explicit Enter, not by adoption/notice; bad auth, wrong target
+and stale generation published no manifest and produced zero model POSTs and
+zero renders. The helper never held the TUI pty: all pty writes were the probe's
+draft and explicit Enter. Credentials stayed out of helper stdout/stderr.
