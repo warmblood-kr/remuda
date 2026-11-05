@@ -102,8 +102,10 @@ production account, input or credential; private root removed and all owned
 pids confirmed gone):
 
 ```text
-session A (default generator): ses_e543a3368ffe1Hhcoeq7zBDS4b
-_opencode_adopt positive:      {"outcome":"adopted","generation":"65f86fca3f39a"}
+source HEAD / binary:          53dbc89a9d71 / sha256 db5c06347290354a27074baa430643203ea32dc883db84d0b57dbbfa9f34a2fc
+server/tui pid+start:          76589 / 76591, both Thu Nov  5 21:57:46 2026
+session A (default generator): ses_e54369466ffeyZWgTIpc4FZR0b
+_opencode_adopt positive:      {"outcome":"adopted","generation":"65f870ac8f9d2"}
 manifest mode:                 0600
 first notice:                  {"outcome":"accepted_queue"}
 second notice:                 {"outcome":"accepted_queue"}
@@ -122,3 +124,20 @@ probe's later explicit Enter, not by adoption/notice; bad auth, wrong target
 and stale generation published no manifest and produced zero model POSTs and
 zero renders. The helper never held the TUI pty: all pty writes were the probe's
 draft and explicit Enter. Credentials stayed out of helper stdout/stderr.
+
+## Durability and identity limits
+
+- Publication is `O_EXCL` 0600 create plus write/fsync of the file, matching
+  the owned wrapper. It is not a rename-based atomic full-file publish and does
+  not fsync the parent directory. A concurrent reader can observe a transient
+  partial leaf, which the strict parser refuses as `invalid_binding`; crash
+  durability of the directory entry is not claimed.
+- Explicit owner declaration authorizes the endpoint/A association. Local
+  pid/start is corroboration, not kernel TCP peer identity, remote PID proof or
+  historical TUI identity. Fresh Butler row.id/opaque instance/nonce owns
+  managed fencing. Same-UID races remain out of scope for this helper.
+
+Rebase note: after #892 merged to main, `389bffc2..8f1f0293` and
+`origin/main..HEAD` are patch-identical (`git range-diff` reports `=` for all
+seven commits), so the preserved probe binary corresponds to the same code even
+though its recorded pre-rebase commit hash differs.
