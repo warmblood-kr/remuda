@@ -456,23 +456,36 @@ mod imp {
             socket: upstream.to_string_lossy().into_owned(),
             thread,
         };
-        match codex_native::adopt(&request) {
+        let result = codex_native::adopt(&request);
+        // Both terminal outcomes release the in-flight marker, and the
+        // authority flag is re-checked under the same lock that observers use
+        // to latch a failure, so a request parse failure during adopt cannot
+        // be followed by publication.
+        let Ok(mut capture) = capture.lock() else {
+            if let Ok(published) = result {
+                published.remove();
+            }
+            return;
+        };
+        capture.publishing = false;
+        match result {
             Ok(published) => {
-                if let Ok(mut state) = state.lock() {
-                    if state.closing {
-                        drop(state);
+                if capture.failed {
+                    drop(capture);
+                    published.remove();
+                    return;
+                }
+                match state.lock() {
+                    Ok(mut state) if !state.closing => state.published = Some(published),
+                    _ => {
+                        drop(capture);
                         published.remove();
-                    } else {
-                        state.published = Some(published);
                     }
                 }
             }
             Err(reason) => {
                 eprintln!("remuda: Codex binding not published: {reason}");
-                if let Ok(mut capture) = capture.lock() {
-                    capture.publishing = false;
-                    capture.failed = true;
-                }
+                capture.failed = true;
             }
         }
     }
@@ -566,10 +579,81 @@ mod imp {
         }
 
         #[test]
+        fn cleanup_without_an_inflight_adopt_returns_quickly() {
+            let runtime = runtime_dir().expect("runtime");
+            let tunnel = start(
+                &runtime.join("app.sock"),
+                &runtime,
+                Publish {
+                    binding: runtime.join("manifest.json"),
+                    nonce: "n".into(),
+                    session: "s".into(),
+                },
+            )
+            .expect("tunnel");
+            let started = Instant::now();
+            tunnel.cleanup();
+            assert!(started.elapsed() < Duration::from_secs(1));
+            let _ = std::fs::remove_dir_all(&runtime);
+        }
+
+        #[test]
+        fn a_reconnect_after_an_early_eof_cannot_publish() {
+            let runtime = runtime_dir().expect("runtime");
+            let upstream = runtime.join("app.sock");
+            let upstream_listener = UnixListener::bind(&upstream).expect("upstream");
+            let tunnel = start(
+                &upstream,
+                &runtime,
+                Publish {
+                    binding: runtime.join("manifest.json"),
+                    nonce: "n".into(),
+                    session: "s".into(),
+                },
+            )
+            .expect("tunnel");
+            {
+                let mut first = UnixStream::connect(tunnel.downstream()).expect("first");
+                let (_server, _) = upstream_listener.accept().expect("accept");
+                first
+                    .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                    .expect("handshake");
+            }
+            // The first connection ended before any response, so the tunnel
+            // must close its listener and refuse a replacement connection
+            // instead of publishing from a later stream.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline && !tunnel.capture.lock().expect("capture").failed {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(tunnel.capture.lock().expect("capture").failed);
+            loop {
+                match UnixStream::connect(tunnel.downstream()) {
+                    Err(_) => break,
+                    Ok(_) if Instant::now() >= deadline => {
+                        panic!("tunnel accepted a replacement connection")
+                    }
+                    Ok(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            assert!(tunnel.state.lock().expect("state").published.is_none());
+            tunnel.cleanup();
+            let _ = std::fs::remove_dir_all(&runtime);
+        }
+
+        #[test]
         fn a_second_bootstrap_request_latches_unavailable() {
             let capture = capture();
             request_event(r#"{"id":"a","method":"thread/start"}"#, &capture);
             request_event(r#"{"id":"b","method":"thread/start"}"#, &capture);
+            assert!(capture.lock().expect("capture").failed);
+        }
+
+        #[test]
+        fn a_reused_bootstrap_id_latches_unavailable() {
+            let capture = capture();
+            request_event(r#"{"id":"a","method":"thread/start"}"#, &capture);
+            request_event(r#"{"id":"a","method":"thread/start"}"#, &capture);
             assert!(capture.lock().expect("capture").failed);
         }
 

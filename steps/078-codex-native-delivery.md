@@ -62,7 +62,7 @@ not used.
 
 ```text
 $ cargo test -q -p remuda-native --bin remuda
-test result: ok. 188 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
+test result: ok. 191 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
 
 $ cargo clippy -q -p remuda-native --bin remuda -- -D warnings
 (no output)
@@ -150,12 +150,17 @@ request ids must be strings; method-bearing or mixed result/error envelopes are
 not responses. A header, frame, UTF-8, RSV or oversize failure in either
 observer now latches the shared authority as failed while raw forwarding
 continues, so an id seen before the failure cannot publish from the other
-direction. Cleanup sets the closing fence first, waits briefly for an adopt
-already past the fence, removes the binding and the 0600 downstream socket,
-and only then stops the app-server. Regressions cover second bootstrap request,
+direction. Both terminal adopt outcomes clear the in-flight marker; the success
+path re-checks the authority flag under the observer lock before storing the
+publication, so a parse failure during adopt removes the created files. Cleanup
+sets the closing fence first, waits only while an adopt is genuinely in flight,
+removes the binding and the 0600 downstream socket, and only then stops the
+app-server. Regressions cover second bootstrap request,
 non-string id, error/non-root response, method-bearing matching id, header
 overflow, forwarding through a parse failure, and request-id-then-corrupt-frame
-followed by a valid matching response publishing nothing.
+followed by a valid matching response publishing nothing, early EOF then
+reconnect, a reused bootstrap id, and cleanup without an in-flight adopt
+returning immediately.
 
 Kernel peer fixture for a direct spawn: connected peer PID/start equals the
 spawned child, uid equals euid, resolved socket is 0600. Two spawns with the
