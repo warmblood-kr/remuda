@@ -522,11 +522,9 @@ struct Finished<'a> {
     min_copies: Option<&'a str>,
 }
 
-/// Write the completion marker, then the optional `CURRENT` pointer. Called
-/// only when every file is in.
 /// Put one small marker. `Ok(Put::Short)` still means its bytes are in.
-/// Why a marker is not in the store: the daemon refused it, or the request
-/// failed before an answer, in which case nobody can say what happened.
+/// Why a marker is not in the store: refused (an answer) or unconfirmed (no
+/// answer, so nobody can say what happened).
 enum MarkerError {
     Refused(String),
     Unconfirmed(String),
