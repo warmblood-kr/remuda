@@ -75,8 +75,11 @@ fn open_planned(file: &Planned) -> Result<std::fs::File, String> {
 }
 
 /// Read one planned file's bytes and check that the descriptor did not change
-/// under the read. The name is checked separately, after this.
-fn read_planned(handle: &mut std::fs::File, file: &Planned) -> Result<Vec<u8>, String> {
+/// under the read. Returns the descriptor's metadata for the name check.
+fn read_planned(
+    handle: &mut std::fs::File,
+    file: &Planned,
+) -> Result<(Vec<u8>, std::fs::Metadata), String> {
     use std::io::Read;
     let mut bytes = Vec::with_capacity(file.size.min(1 << 20) as usize);
     handle
@@ -95,21 +98,22 @@ fn read_planned(handle: &mut std::fs::File, file: &Planned) -> Result<Vec<u8>, S
             file.relative
         ));
     }
-    Ok(bytes)
+    Ok((bytes, after))
 }
 
 /// The descriptor is stable; the name is not. A link swapped in after
 /// preflight is refused here even without O_NOFOLLOW, because
 /// `symlink_metadata` does not follow it and the bytes are never uploaded.
-fn check_named(file: &Planned) -> Result<(), String> {
-    let resolved = std::fs::metadata(&file.source)
-        .map_err(|error| format!("cannot read {}: {error}", file.relative))?;
+fn check_named(file: &Planned, opened: &std::fs::Metadata) -> Result<(), String> {
     let named = std::fs::symlink_metadata(&file.source)
+        .map_err(|error| format!("cannot read {}: {error}", file.relative))?;
+    let canonical = std::fs::canonicalize(&file.source)
         .map_err(|error| format!("cannot read {}: {error}", file.relative))?;
     if !named.is_file()
         || named.len() != file.size
         || named.modified().ok() != file.modified
-        || !same_file(&resolved, &named)
+        || !same_file(opened, &named)
+        || canonical != file.canonical
     {
         return Err(format!(
             "{} was replaced while it was read; publish again",
@@ -124,8 +128,8 @@ fn check_named(file: &Planned) -> Result<(), String> {
 /// modification time and regular-file type after the read.
 pub fn read_verified(file: &Planned) -> Result<Vec<u8>, String> {
     let mut handle = open_planned(file)?;
-    let bytes = read_planned(&mut handle, file)?;
-    check_named(file)?;
+    let (bytes, after) = read_planned(&mut handle, file)?;
+    check_named(file, &after)?;
     Ok(bytes)
 }
 
@@ -203,6 +207,9 @@ pub struct Planned {
     /// Device and inode at preflight, so a replacement with the same size and
     /// mtime is still refused. `None` where the platform does not expose it.
     pub identity: Option<(u64, u64)>,
+    /// The resolved path at preflight; a swapped ancestor changes it even on
+    /// platforms without a file identity.
+    pub canonical: PathBuf,
 }
 
 /// What `publish` should say before it uploads anything.
@@ -304,12 +311,15 @@ fn walk(dir: &Path, prefix: &str, plan: &mut Plan) -> Result<(), Refused> {
                 )));
             }
             plan.bytes = plan.bytes.saturating_add(metadata.len());
+            let canonical = std::fs::canonicalize(&path)
+                .map_err(|error| refused(format!("cannot resolve {}: {error}", path.display())))?;
             plan.files.push(Planned {
                 source: path,
                 relative,
                 size: metadata.len(),
                 modified: metadata.modified().ok(),
                 identity: identity_of(&metadata),
+                canonical,
             });
         } else {
             // A symlink is not followed: publishing a link would copy whatever

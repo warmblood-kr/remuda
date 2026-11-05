@@ -488,18 +488,21 @@ fn upload_release(
             args.extend(["--min-copies".to_owned(), k.to_owned()]);
         }
         match daemon_call(socket, args, Some(bytes)) {
-            Ok((code, _, stderr)) => {
-                uploaded.files += 1;
-                uploaded.bytes = uploaded.bytes.saturating_add(file.size);
-                match put_result(code) {
-                    Put::Done => {}
-                    Put::Short => uploaded.short += 1,
-                    Put::Failed => {
-                        uploaded.failure = Some((format!("{}: {stderr}", file.relative), 1));
-                        return uploaded;
-                    }
+            Ok((code, _, stderr)) => match put_result(code) {
+                Put::Done => {
+                    uploaded.files += 1;
+                    uploaded.bytes = uploaded.bytes.saturating_add(file.size);
                 }
-            }
+                Put::Short => {
+                    uploaded.files += 1;
+                    uploaded.bytes = uploaded.bytes.saturating_add(file.size);
+                    uploaded.short += 1;
+                }
+                Put::Failed => {
+                    uploaded.failure = Some((format!("{}: {stderr}", file.relative), 1));
+                    return uploaded;
+                }
+            },
             Err(error) => {
                 uploaded.failure = Some((format!("{}: {error}", file.relative), 1));
                 return uploaded;
@@ -734,7 +737,7 @@ fn say_upload_failure(prepared: &Prepared, uploaded: &Uploaded, detail: &str, ou
     let remaining = prepared.plan.files.len().saturating_sub(uploaded.files + 1);
     warn!(
         out,
-        "remuda: publish incomplete: {} of {} files are in remuda:///{}/, {remaining} not attempted.",
+        "remuda: publish incomplete: {} of {} files are in remuda:///{}/; 1 failed and {remaining} were not attempted.",
         uploaded.files,
         prepared.plan.files.len(),
         prepared.base
@@ -1683,21 +1686,26 @@ mod tests {
         assert!(usage("").contains("resolve"));
     }
 
-    fn prepared(name: &str) -> Prepared {
+    fn prepared(names: &[&str]) -> Prepared {
+        let files: Vec<_> = names
+            .iter()
+            .map(|name| crate::vfs_publish::Planned {
+                source: std::path::PathBuf::from("/x"),
+                relative: (*name).into(),
+                size: 1024,
+                modified: None,
+                identity: None,
+                canonical: std::path::PathBuf::from("/x"),
+            })
+            .collect();
         Prepared {
             prefix: "design".into(),
             base: "design/v1".into(),
             release: "v1".into(),
             plan: crate::vfs_publish::Plan {
-                files: vec![crate::vfs_publish::Planned {
-                    source: std::path::PathBuf::from("/x"),
-                    relative: name.into(),
-                    size: 1024,
-                    modified: None,
-                    identity: None,
-                }],
+                bytes: files.len() as u64 * 1024,
+                files,
                 skipped: vec!["link".into()],
-                bytes: 1024,
             },
         }
     }
@@ -1705,7 +1713,7 @@ mod tests {
     #[test]
     fn a_dry_run_report_names_the_release_and_the_skips() {
         let mut out = Out::default();
-        say_plan(&prepared("a.html"), &mut out);
+        say_plan(&prepared(&["a.html"]), &mut out);
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(
             text.contains("Would publish 1 files (1.0 KiB) as v1 to remuda:///design/v1/."),
@@ -1715,6 +1723,23 @@ mod tests {
             text.contains("skipped (not a regular file): link"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_stopped_upload_counts_only_the_files_that_arrived() {
+        let prepared = prepared(&["a.html", "b.html"]);
+        let uploaded = Uploaded {
+            files: 0,
+            bytes: 0,
+            short: 0,
+            failure: None,
+        };
+        let mut out = Out::default();
+        say_upload_failure(&prepared, &uploaded, "b.html: nope", &mut out);
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(text.contains("0 of 2 files are in"), "{text}");
+        assert!(text.contains("1 failed and 1 were not attempted"), "{text}");
+        assert!(text.contains("COMPLETE was not written"), "{text}");
     }
 
     #[test]
