@@ -53,19 +53,24 @@ remuda vfs publish site remuda:///design --release 2026-11-04
 - `--dry-run` prints the plan and writes nothing.
 - A source file that changes between the plan and the upload aborts the run
   rather than publishing a mix; open files and quit your editor first. Unix
-  catches an in-place rewrite by file identity; elsewhere the check is type,
-  size and mtime, so a same-size rewrite at the same path can pass. A link
-  swapped in after the plan, at the file or any parent, changes the resolved
-  path and is refused on every platform while it stays in place; a swap that is
-  restored before the final check is only detectable with Unix file identity.
+  catches a *replacement* by file identity, but a same-inode rewrite with size
+  and mtime restored is not detectable from metadata on any platform, and
+  elsewhere a same-size rewrite can pass: publish assumes a quiet source. A
+  link swapped in after the plan, at the file or any parent, changes the
+  resolved path and is refused while it stays in place; a swap restored before
+  the final check is only detectable with Unix identity.
 
 Exit codes: 0 done; 1 a file failed, the source changed, `COMPLETE` could not
 be written, or `--pointer` could not write `CURRENT` — the message says which,
 so a 1 alone does not prove `COMPLETE` is absent. Fix the cause and publish a
 **new** `--release` name (the old prefix keeps the files it received; `remuda
 vfs ls remuda:///design/NAME/` shows them). When the message says the marker
-could not be confirmed, check `remuda vfs stat remuda:///design/NAME/COMPLETE`
-first: if it is there, the release is usable; if not, publish a new name. 75 means everything was written
+could not be confirmed, check `remuda vfs stat remuda:///design/NAME/COMPLETE`;
+if it is there the release is usable. With `--pointer`, also `remuda vfs get
+remuda:///design/CURRENT` and confirm its value names your release, since an
+older pointer can already exist. If the marker is missing, publish a new name.
+
+75 means everything was written
 here but the copies wanted are not all there yet: `COMPLETE` exists on this
 node and the release is usable, so wait for the peers rather than republishing.
 A file `put` that returns 75 does not stop the run — its bytes are here — so
