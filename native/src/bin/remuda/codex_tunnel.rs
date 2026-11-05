@@ -310,6 +310,51 @@ mod imp {
             json!({"id": "startup-thread-start", "result": {"thread": thread}})
         }
 
+        fn capture() -> Arc<Mutex<Capture>> {
+            Arc::new(Mutex::new(Capture {
+                request_id: None,
+                failed: false,
+                publishing: false,
+                publish: Publish {
+                    binding: PathBuf::from("/tmp/x/manifest.json"),
+                    nonce: "n".into(),
+                    session: "s".into(),
+                },
+                upstream: PathBuf::from("/tmp/x.sock"),
+                state: Arc::new(Mutex::new(State::default())),
+            }))
+        }
+
+        #[test]
+        fn a_second_bootstrap_request_latches_unavailable() {
+            let capture = capture();
+            request_event(r#"{"id":"a","method":"thread/start"}"#, &capture);
+            request_event(r#"{"id":"b","method":"thread/start"}"#, &capture);
+            assert!(capture.lock().expect("capture").failed);
+        }
+
+        #[test]
+        fn an_error_response_latches_unavailable() {
+            let capture = capture();
+            request_event(r#"{"id":"a","method":"thread/start"}"#, &capture);
+            response_event(r#"{"id":"a","error":{"code":-1}}"#, &capture);
+            assert!(capture.lock().expect("capture").failed);
+        }
+
+        #[test]
+        fn a_non_root_response_latches_unavailable() {
+            let capture = capture();
+            request_event(
+                r#"{"id":"startup-thread-start","method":"thread/start"}"#,
+                &capture,
+            );
+            let response = response(json!({
+                "id": A, "sessionId": A, "ephemeral": true
+            }));
+            response_event(&response.to_string(), &capture);
+            assert!(capture.lock().expect("capture").failed);
+        }
+
         #[test]
         fn root_thread_accepts_only_the_root_non_ephemeral_shape() {
             let ok = response(json!({
