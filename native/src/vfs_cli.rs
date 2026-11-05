@@ -525,22 +525,37 @@ struct Finished<'a> {
 /// Write the completion marker, then the optional `CURRENT` pointer. Called
 /// only when every file is in.
 /// Put one small marker. `Ok(Put::Short)` still means its bytes are in.
+/// Why a marker is not in the store: the daemon refused it, or the request
+/// failed before an answer, in which case nobody can say what happened.
+enum MarkerError {
+    Refused(String),
+    Unconfirmed(String),
+}
+
+/// How to word a marker that did not land.
+fn marker_words(error: &MarkerError) -> (&'static str, &str) {
+    match error {
+        MarkerError::Refused(detail) => ("was not written", detail),
+        MarkerError::Unconfirmed(detail) => ("could not be confirmed", detail),
+    }
+}
+
 fn put_marker(
     socket: &Path,
     uri: String,
     bytes: Vec<u8>,
     min_copies: Option<&str>,
-) -> Result<Put, String> {
+) -> Result<Put, MarkerError> {
     let mut args = vec!["put".to_owned(), "-".to_owned(), uri];
     if let Some(k) = min_copies {
         args.extend(["--min-copies".to_owned(), k.to_owned()]);
     }
     match daemon_call(socket, args, Some(bytes)) {
         Ok((code, _, stderr)) => match put_result(code) {
-            Put::Failed => Err(stderr),
+            Put::Failed => Err(MarkerError::Refused(stderr)),
             other => Ok(other),
         },
-        Err(error) => Err(error),
+        Err(error) => Err(MarkerError::Unconfirmed(error)),
     }
 }
 
@@ -558,8 +573,12 @@ fn write_complete(finished: &Finished<'_>, out: &mut Out) -> Result<Put, u8> {
         body.into_bytes(),
         finished.min_copies,
     ) {
-        Err(detail) => {
-            warn!(out, "remuda: publish incomplete: every file is in remuda:///{}/, but COMPLETE was not written: {detail}", finished.base);
+        Err(error) => {
+            let (what, detail) = marker_words(&error);
+            warn!(out, "remuda: publish incomplete: every file is in remuda:///{}/, but COMPLETE {what}: {detail}", finished.base);
+            if matches!(error, MarkerError::Unconfirmed(_)) {
+                warn!(out, "Next: retry the same publish; a repeated put is safe.");
+            }
             Err(1)
         }
         Ok(put) => Ok(put),
@@ -1723,6 +1742,18 @@ mod tests {
             text.contains("skipped (not a regular file): link"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_marker_failure_says_whether_it_is_certain() {
+        let refusal = MarkerError::Refused("bad path".into());
+        let refused = marker_words(&refusal);
+        assert_eq!(refused.0, "was not written");
+        assert_eq!(refused.1, "bad path");
+        let timeout = MarkerError::Unconfirmed("timed out".into());
+        let unknown = marker_words(&timeout);
+        assert_eq!(unknown.0, "could not be confirmed");
+        assert_eq!(unknown.1, "timed out");
     }
 
     #[test]

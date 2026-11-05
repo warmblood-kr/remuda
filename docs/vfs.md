@@ -58,10 +58,12 @@ remuda vfs publish site remuda:///design --release 2026-11-04
   swapped in after the plan, at the file or any parent, changes the resolved
   path and is refused on every platform.
 
-Exit codes: 0 done; 1 a file failed, the source changed, or `COMPLETE` could
-not be written — the release is **incomplete**, fix the cause and publish a
+Exit codes: 0 done; 1 a file failed, the source changed, `COMPLETE` could not
+be written, or `--pointer` could not write `CURRENT` — the message says which,
+so a 1 alone does not prove `COMPLETE` is absent. Fix the cause and publish a
 **new** `--release` name (the old prefix keeps the files it received; `remuda
-vfs ls remuda:///design/NAME/` shows them). 75 means everything was written
+vfs ls remuda:///design/NAME/` shows them), or retry the same one when the
+message says the marker could not be confirmed. 75 means everything was written
 here but the copies wanted are not all there yet: `COMPLETE` exists on this
 node and the release is usable, so wait for the peers rather than republishing.
 A file `put` that returns 75 does not stop the run — its bytes are here — so
