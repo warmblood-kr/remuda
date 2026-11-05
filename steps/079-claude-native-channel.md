@@ -72,7 +72,26 @@ python3 scripts/check-principles.py
 ok — 14 principles, every named mechanism exists (32 CI jobs, 11 denied paths, 3245 test fns seen)
 ```
 
-No real custom-Claude opt-in prompt or channel gate was encountered in this
-slice; the account hold and the interactive development-channel confirmation
-remain unverified and do not block this opt-in server/helper implementation.
-No production install, reload, merge or rollout was performed.
+The authorized local-development TUI retry used an explicit disposable cwd.
+It captured and answered the workspace-trust prompt only for that isolated
+directory, then captured and answered the actual development-channel
+confirmation (`1. I am using this for local development`) for this test only.
+One actual `_claude_notice` returned `uncertain` and the same TUI rendered:
+
+```text
+← remuda-channel: Butler message tui01 arrived. Read it: MCP butler_inbox (or…
+```
+
+The account hold message appeared after the inbound; no model reply was waited
+for. The observed `no MCP server configured` status line contradicted the live
+manifest and inbound; its cause is not established. Correlation: session
+`claude-tui-20261105` (instance id
+`0000000000008a0318e5270869ddec80-0000000000000046`), bridge PID/start
+`71425`/`1793882964198619`, recorded parent PID/start
+`71181`/`1793882943659065`. After exit the stale helper returned exactly
+`{"outcome":"definitely_not_written","reason":"bridge_gone"}`. The abrupt
+group-kill left the binding and runtime directory behind; that cleanup leak is
+an unresolved lifecycle gate, distinct from the proven graceful EOF cleanup.
+No shared-root deletion or replay was performed. Full prompts and evidence are
+in `docs/evidence/2026-11-05/claude-channel-smoke.md`. No production install,
+reload, merge or rollout was performed.
