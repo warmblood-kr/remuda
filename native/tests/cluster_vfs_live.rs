@@ -1543,7 +1543,7 @@ fn a_resolved_copy_is_kept_until_release_asks_for_it() {
 }
 
 #[test]
-fn release_keeps_the_last_copy_when_every_peer_is_down() {
+fn release_keeps_the_only_copy_when_every_peer_is_down() {
     let _serial = live_test_guard();
     let (a, b, c) = three_nodes();
     successful(
@@ -1571,9 +1571,15 @@ fn release_keeps_the_last_copy_when_every_peer_is_down() {
     // so wait for the viewer to become the only node placement could name.
     thread::sleep(Duration::from_millis(1200));
     let refused = successful(viewer.run(&["vfs", "release"]), "release with peers down");
+    // The reason depends on how fast the dead peers are counted as gone: this
+    // node can be the only placement, or a node that should hold a copy may
+    // simply not answer. Both keep the blob, which is the property under test.
+    assert!(refused.contains("Nothing to release"), "{refused}");
     assert!(
-        refused.contains("placed here 1") || refused.contains("only copy 1"),
+        refused.contains("placed here 1")
+            || refused.contains("only copy 1")
+            || refused.contains("unconfirmed 1"),
         "{refused}"
     );
-    assert!(viewer.has_blob(&sha), "release keeps the last copy");
+    assert!(viewer.has_blob(&sha), "release keeps the only copy");
 }
