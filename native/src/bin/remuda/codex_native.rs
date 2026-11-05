@@ -1245,10 +1245,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn sample_socket() -> String {
+        std::env::temp_dir()
+            .join("remuda-codex-sample.sock")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn sample_request() -> Request {
         Request {
             version: 1,
-            binding: "/private/tmp/remuda-binding/manifest.json".into(),
+            binding: std::env::temp_dir()
+                .join("remuda-binding/manifest.json")
+                .to_string_lossy()
+                .into_owned(),
             nonce: "nonce-1".into(),
             session: "session-1".into(),
             instance: "instance-1".into(),
@@ -1265,8 +1275,8 @@ mod tests {
             nonce: "nonce-1".into(),
             session: "session-1".into(),
             mode: MODE_ADD_ONLY.into(),
-            generation: generation(live(), Path::new("/tmp/codex.sock"), THREAD),
-            socket: "/tmp/codex.sock".into(),
+            generation: generation(live(), Path::new(&sample_socket()), THREAD),
+            socket: sample_socket(),
             thread: THREAD.into(),
         }
     }
@@ -1328,7 +1338,7 @@ mod tests {
     fn the_manifest_alone_names_the_endpoint_and_mode() {
         let request = sample_request();
         let pin = pin_for(
-            Path::new("/tmp/codex.sock"),
+            Path::new(&sample_socket()),
             "nonce-1",
             "session-1",
             THREAD,
@@ -1338,7 +1348,10 @@ mod tests {
         assert!(validate_manifest(&request, &manifest, &pin).is_ok());
 
         let mut swapped = manifest.clone();
-        swapped.socket = "/tmp/other.sock".into();
+        swapped.socket = std::env::temp_dir()
+            .join("remuda-codex-other.sock")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             validate_manifest(&request, &swapped, &pin),
             Err("invalid_binding")
