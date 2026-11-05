@@ -36,13 +36,73 @@ pub struct ReleaseReport {
     pub recent: usize,
     /// Kept: placement is empty from here, so it may be the last copy.
     pub last_copy: usize,
+    /// Kept: `resolve` handed this copy's path to a tool.
+    pub resolved: usize,
     /// Kept: a placement node did not confirm a copy.
     pub unconfirmed: usize,
 }
 
+/// Why one local copy stays, or that it may go. The whole rule is this enum
+/// and [`verdict`], so each reason has a unit test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// This node wrote it, or it is a kept conflict's content.
+    Written,
+    /// `resolve` handed the path to a tool.
+    Resolved,
+    /// Placement names this node, so it owes a copy.
+    Placed,
+    /// No other node could take it: possibly the last copy.
+    LastCopy,
+    /// Younger than `--older-than`.
+    Recent,
+    /// A placement node did not confirm a copy.
+    Unconfirmed,
+    /// Nothing needs it here.
+    Release,
+}
+
+/// The facts one decision needs. No store, no clock, no network.
+pub struct Facts<'a> {
+    pub pinned: bool,
+    pub kept: bool,
+    pub include_resolved: bool,
+    pub placement: &'a [String],
+    pub self_fp: &'a str,
+    pub recent: bool,
+    pub holders: usize,
+}
+
+/// The decision, in the order the reasons are checked.
+pub fn verdict(facts: &Facts<'_>) -> Verdict {
+    if facts.pinned {
+        return Verdict::Written;
+    }
+    if facts.kept && !facts.include_resolved {
+        return Verdict::Resolved;
+    }
+    if facts.placement.is_empty() {
+        return Verdict::LastCopy;
+    }
+    if facts.placement.iter().any(|node| node == facts.self_fp) {
+        return Verdict::Placed;
+    }
+    if facts.recent {
+        return Verdict::Recent;
+    }
+    if facts.holders < facts.placement.len() {
+        return Verdict::Unconfirmed;
+    }
+    Verdict::Release
+}
+
 /// Release this node's unnecessary copies. `dry_run` counts without deleting;
 /// `older_than` keeps copies younger than that.
-pub fn release(dry_run: bool, older_than: Duration) -> VfsResult<ReleaseReport> {
+pub fn release(
+    dry_run: bool,
+    older_than: Duration,
+    include_resolved: bool,
+) -> VfsResult<ReleaseReport> {
     let store = VfsStore::open_default()?;
     let members = vfs_sync::members()?;
     let index = store.load_index()?;
@@ -56,33 +116,46 @@ pub fn release(dry_run: bool, older_than: Duration) -> VfsResult<ReleaseReport> 
         let Some(entries) = users.get(sha.as_str()) else {
             continue;
         };
-        if pinned.contains(sha.as_str()) {
-            report.written += 1;
-            continue;
-        }
         let placement = placement_of(entries, &members);
-        if placement.is_empty() {
-            report.last_copy += 1;
-            continue;
-        }
-        if placement.contains(&members.self_fp) {
-            report.placed += 1;
-            continue;
-        }
-        if too_new(&store, &sha, older_than)? {
-            report.recent += 1;
-            continue;
-        }
         let entry = entries[0];
-        if vfs_sync::count_holders(&store, &members.self_fp, entry, &placement) < placement.len() {
-            report.unconfirmed += 1;
-            continue;
-        }
-        // The store re-checks the local pins under the index lock; peer
-        // custody is the check above, as observed a moment ago.
-        if dry_run || store.release_blob_if_unneeded(&sha, &members.self_fp)? {
-            report.removed += 1;
-            report.bytes = report.bytes.saturating_add(entry.size);
+        let kept = store.is_kept(&sha);
+        let facts = Facts {
+            pinned: pinned.contains(sha.as_str()),
+            kept,
+            include_resolved,
+            placement: &placement,
+            self_fp: &members.self_fp,
+            recent: too_new(&store, &sha, older_than)?,
+            holders: if placement.is_empty() {
+                0
+            } else {
+                vfs_sync::count_holders(&store, &members.self_fp, entry, &placement)
+            },
+        };
+        match verdict(&facts) {
+            Verdict::Written => report.written += 1,
+            Verdict::Resolved => report.resolved += 1,
+            Verdict::Placed => report.placed += 1,
+            Verdict::LastCopy => report.last_copy += 1,
+            Verdict::Recent => report.recent += 1,
+            Verdict::Unconfirmed => report.unconfirmed += 1,
+            Verdict::Release => {
+                if dry_run {
+                    // A dry run changes nothing, pins included.
+                    report.removed += 1;
+                    report.bytes = report.bytes.saturating_add(entry.size);
+                    continue;
+                }
+                if kept {
+                    store.unkeep_blob(&sha)?;
+                }
+                // The store re-checks the local pins under the index lock;
+                // peer custody is the check above, as observed a moment ago.
+                if store.release_blob_if_unneeded(&sha, &members.self_fp)? {
+                    report.removed += 1;
+                    report.bytes = report.bytes.saturating_add(entry.size);
+                }
+            }
         }
     }
     Ok(report)
@@ -159,6 +232,61 @@ mod tests {
         assert_eq!(report.removed, 0);
         assert!(!report.dry_run);
         assert!(DEFAULT_OLDER_THAN.is_zero());
+    }
+
+    fn facts<'a>(placement: &'a [String], self_fp: &'a str) -> Facts<'a> {
+        Facts {
+            pinned: false,
+            kept: false,
+            include_resolved: false,
+            placement,
+            self_fp,
+            recent: false,
+            holders: placement.len(),
+        }
+    }
+
+    #[test]
+    fn a_copy_this_node_wrote_or_a_conflict_kept_is_never_released() {
+        let none: Vec<String> = Vec::new();
+        let mut value = facts(&none, "me");
+        value.pinned = true;
+        assert_eq!(verdict(&value), Verdict::Written);
+    }
+
+    #[test]
+    fn a_resolved_copy_stays_until_the_operator_asks() {
+        let none: Vec<String> = Vec::new();
+        let mut value = facts(&none, "me");
+        value.kept = true;
+        assert_eq!(verdict(&value), Verdict::Resolved);
+        value.include_resolved = true;
+        assert_eq!(verdict(&value), Verdict::LastCopy);
+    }
+
+    #[test]
+    fn an_empty_placement_means_it_might_be_the_last_copy() {
+        let none: Vec<String> = Vec::new();
+        assert_eq!(verdict(&facts(&none, "me")), Verdict::LastCopy);
+    }
+
+    #[test]
+    fn a_placement_that_names_this_node_keeps_the_copy_here() {
+        let placed = vec!["other".to_string(), "me".to_string()];
+        assert_eq!(verdict(&facts(&placed, "me")), Verdict::Placed);
+    }
+
+    #[test]
+    fn a_recent_copy_and_an_unconfirmed_one_each_stay_for_their_own_reason() {
+        let placed = vec!["other".to_string()];
+        let mut value = facts(&placed, "me");
+        value.recent = true;
+        assert_eq!(verdict(&value), Verdict::Recent);
+        value.recent = false;
+        value.holders = 0;
+        assert_eq!(verdict(&value), Verdict::Unconfirmed);
+        value.holders = 1;
+        assert_eq!(verdict(&value), Verdict::Release);
     }
 
     #[test]

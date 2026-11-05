@@ -877,6 +877,12 @@ impl VfsStore {
         Ok(out)
     }
 
+    fn kept_path(&self, sha256: &str) -> VfsResult<PathBuf> {
+        rules::validate_sha256(sha256)
+            .map_err(|error| VfsError::new(VfsErrorKind::BadUri, error.0))?;
+        Ok(self.root.join("kept").join(sha256))
+    }
+
     fn stand_in_path(&self, sha256: &str) -> VfsResult<PathBuf> {
         rules::validate_sha256(sha256)
             .map_err(|error| VfsError::new(VfsErrorKind::BadUri, error.0))?;
@@ -894,12 +900,35 @@ impl VfsStore {
     }
 
     /// Keep this copy for good: `resolve` handed its path to a tool.
+    /// A kept copy: `resolve` handed its path to a tool, so release and trim
+    /// must leave it alone until someone says otherwise.
     pub fn keep_blob(&self, sha256: &str) -> VfsResult<()> {
         let _guard = self.lock()?;
+        self.still_here()?;
         match fs::remove_file(self.stand_in_path(sha256)?) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error.into()),
-            _ => Ok(()),
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
         }
+        fs::create_dir_all(self.root.join("kept"))?;
+        fs::write(self.kept_path(sha256)?, b"")?;
+        Ok(())
+    }
+
+    /// Drop the kept mark, so a later `release` may give the copy back.
+    pub fn unkeep_blob(&self, sha256: &str) -> VfsResult<bool> {
+        let _guard = self.lock()?;
+        self.still_here()?;
+        match fs::remove_file(self.kept_path(sha256)?) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn is_kept(&self, sha256: &str) -> bool {
+        self.kept_path(sha256)
+            .map(|path| path.is_file())
+            .unwrap_or(false)
     }
 
     /// Hashes of the copies marked as stand-ins.
@@ -935,7 +964,7 @@ impl VfsStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(error.into()),
         };
-        fs::remove_file(marker)?;
+        let _ = fs::remove_file(self.stand_in_path(sha256)?);
         Ok(removed)
     }
 
@@ -946,26 +975,37 @@ impl VfsStore {
         self.still_here()?;
         let index = self.load_index()?;
         let members = crate::cluster::vfs_sync::members()?;
-        let named = index
-            .entries
-            .values()
-            .filter(|entry| entry.sha256 == sha256)
-            .collect::<Vec<_>>();
-        if named.is_empty() {
+        // Any entry may reference this content, as its winner or as a kept
+        // conflict, so scan all of them under the lock: a conflict added since
+        // the caller's scan must still pin the blob.
+        let mut referenced = false;
+        let mut pinned = false;
+        let mut entries = Vec::new();
+        for entry in index.entries.values() {
+            if entry.sha256 == sha256 {
+                referenced = true;
+                entries.push(entry);
+                if entry.writer == self_fp {
+                    pinned = true;
+                }
+            }
+            if entry
+                .conflicts
+                .iter()
+                .any(|conflict| !conflict.deleted && conflict.sha256 == sha256)
+            {
+                referenced = true;
+                pinned = true;
+            }
+        }
+        if !referenced {
             // Unreferenced: garbage collection owns that, not release.
             return Ok(false);
         }
-        let pinned = named.iter().any(|entry| {
-            entry.writer == self_fp
-                || entry
-                    .conflicts
-                    .iter()
-                    .any(|conflict| !conflict.deleted && conflict.sha256 == sha256)
-        });
-        let placed = named.iter().any(|entry| {
+        let placed = entries.iter().any(|entry| {
             crate::cluster::vfs_sync::live_placement(entry, &members).contains(&self_fp.to_owned())
         });
-        if pinned || placed {
+        if pinned || placed || self.is_kept(sha256) {
             return Ok(false);
         }
         let removed = match fs::remove_file(self.blob_path(sha256)?) {
@@ -1084,6 +1124,7 @@ impl VfsStore {
                 .is_some_and(|age| age >= grace);
             if old_enough && fs::remove_file(&path).is_ok() {
                 let _ = fs::remove_file(self.stand_in_path(&hash)?);
+                let _ = fs::remove_file(self.kept_path(&hash)?);
                 removed += 1;
             }
         }

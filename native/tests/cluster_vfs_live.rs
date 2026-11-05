@@ -1370,10 +1370,12 @@ fn a_viewer_node_renders_a_cluster_page_for_a_browser() {
 
 /// A loaded runner can miss the custody answer once. Release is safe to rerun,
 /// and "kept because a node did not confirm" is the documented transient.
-fn release_until_released(node: &Node) -> String {
+fn release_until_released(node: &Node, extra: &[&str]) -> String {
     let mut last = String::new();
     for _ in 0..10 {
-        let attempt = node.run(&["vfs", "release"]);
+        let mut args = vec!["vfs", "release"];
+        args.extend_from_slice(extra);
+        let attempt = node.run(&args);
         last = String::from_utf8_lossy(&attempt.stdout).to_string()
             + &String::from_utf8_lossy(&attempt.stderr);
         if attempt.status.success() && last.contains("Released 1 copy") {
@@ -1466,7 +1468,7 @@ fn a_reader_can_release_copies_it_fetched_and_keeps_what_matters() {
     assert!(viewer.has_blob(&sha), "--older-than kept a fresh copy");
 
     // The explicit release does, but only after the placement nodes confirm.
-    let released = release_until_released(viewer);
+    let released = release_until_released(viewer, &[]);
     assert!(released.contains("Released 1 copy"), "{released}");
     assert!(
         !viewer.has_blob(&sha),
@@ -1480,6 +1482,64 @@ fn a_reader_can_release_copies_it_fetched_and_keeps_what_matters() {
         "{kept_by_writer}"
     );
     assert!(a.has_blob(&sha), "the writer keeps its own copy");
+}
+
+#[test]
+fn a_resolved_copy_is_kept_until_release_asks_for_it() {
+    let _serial = live_test_guard();
+    let (a, b, c) = three_nodes();
+    successful(
+        a.run_with_stdin(
+            &[
+                "vfs",
+                "put",
+                "-",
+                "remuda:///pinned.html",
+                "--replicas",
+                "1",
+            ],
+            Some(b"<h1>pinned</h1>"),
+        ),
+        "put the page",
+    );
+    let sha = a.stat_json("remuda:///pinned.html").unwrap()["sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let stat = successful(a.run(&["vfs", "stat", "remuda:///pinned.html"]), "stat");
+    let placed = stat
+        .lines()
+        .find(|line| line.starts_with("placed on "))
+        .unwrap_or_else(|| panic!("no placement line in {stat}"));
+    let label = |node: &Node| remuda_native::cluster::node_label(&node.fingerprint());
+    let viewer = [&b, &c]
+        .into_iter()
+        .find(|node| !placed.contains(&label(node)))
+        .unwrap_or_else(|| panic!("no node outside placement: {stat}"));
+
+    // `resolve` hands a tool a path, so the copy is pinned.
+    successful(
+        viewer.run(&["vfs", "resolve", "remuda:///pinned.html"]),
+        "resolve",
+    );
+    let pinned = successful(viewer.run(&["vfs", "release"]), "release a pinned copy");
+    assert!(pinned.contains("resolved 1"), "{pinned}");
+    assert!(viewer.has_blob(&sha), "a pinned copy stays");
+
+    // A dry run must change nothing: not the blob, and not the pin either.
+    let dry = successful(
+        viewer.run(&["vfs", "release", "--dry-run", "--include-resolved"]),
+        "dry-run over a pinned copy",
+    );
+    assert!(dry.contains("Would release 1 copy"), "{dry}");
+    assert!(viewer.has_blob(&sha), "a dry run deletes nothing");
+    let still_pinned = successful(viewer.run(&["vfs", "release"]), "release after a dry run");
+    assert!(still_pinned.contains("resolved 1"), "{still_pinned}");
+
+    // Only an explicit request gives it back.
+    let given_back = release_until_released(viewer, &["--include-resolved"]);
+    assert!(given_back.contains("Released 1 copy"), "{given_back}");
+    assert!(!viewer.has_blob(&sha), "the pin was released on request");
 }
 
 #[test]

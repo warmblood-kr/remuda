@@ -111,6 +111,15 @@ a file of that size, so release trusts admitted peers to be honest about that.
 Releasing is not a delete: the file stays in the store and any node can fetch
 it again.
 
+A copy `remuda vfs resolve` handed to a tool is **pinned** and is not released:
+`resolve` promises that path stays valid. The report counts those as `resolved`,
+and `--include-resolved` gives them back when you know the tool is done.
+
+```sh
+remuda vfs resolve remuda:///butler/guidance/cluster.md   # pin a copy on this node
+remuda vfs release --include-resolved                     # give pinned copies back
+```
+
 ## Checking health: `remuda vfs status`
 
 ```text
