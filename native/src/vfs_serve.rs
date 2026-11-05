@@ -209,6 +209,17 @@ fn content_from(value: &Value) -> Result<Content, StoreError> {
     })
 }
 
+/// The daemon request for one page: recursive, because the bridge groups the
+/// descendants per page itself.
+fn list_args(prefix: &str) -> Vec<String> {
+    vec![
+        "ls".to_owned(),
+        format!("remuda:///{prefix}"),
+        "-R".to_owned(),
+        "--json".to_owned(),
+    ]
+}
+
 impl Source for DaemonSource {
     fn read(&self, path: &str, max_bytes: u64) -> Result<Result<Content, Kind>, StoreError> {
         let args = vec![
@@ -225,12 +236,7 @@ impl Source for DaemonSource {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<Meta>, StoreError> {
-        let args = vec![
-            "ls".to_owned(),
-            format!("remuda:///{prefix}"),
-            "--json".to_owned(),
-        ];
-        let stdout = self.command(&args)?;
+        let stdout = self.command(&list_args(prefix))?;
         let rows: Value = serde_json::from_slice(&stdout).map_err(|error| {
             StoreError::new(Kind::Io, format!("unreadable vfs listing: {error}"))
         })?;
@@ -1272,6 +1278,12 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bridge_asks_for_every_descendant_of_a_page() {
+        assert_eq!(list_args("a/"), ["ls", "remuda:///a/", "-R", "--json"]);
+        assert_eq!(list_args(""), ["ls", "remuda:///", "-R", "--json"]);
+    }
 
     struct Fake {
         files: Vec<(Meta, Vec<u8>)>,

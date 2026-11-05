@@ -15,7 +15,7 @@ daemon on its own.
 ```sh
 remuda vfs put notes.md remuda:///notes.md     # this cluster
 remuda vfs get remuda:///notes.md              # print it
-remuda vfs ls remuda:///                       # list
+remuda vfs ls remuda:///                       # immediate children
 remuda vfs stat remuda:///notes.md             # version, size, copies
 remuda vfs rm remuda:///notes.md               # delete everywhere
 ```
@@ -29,6 +29,38 @@ remuda vfs rm remuda:///notes.md               # delete everywhere
 | 75 | done here, but not yet everywhere: wait or run it again (see below) |
 
 Exit 75 is `EX_TEMPFAIL` from `sysexits.h`. Nothing is rolled back.
+
+## Listing: `remuda vfs ls`
+
+`ls` shows one directory's immediate children. A subdirectory prints as `a/`,
+a file as its name in that directory:
+
+```sh
+remuda vfs ls remuda:///design/2026-11-05/
+#          assets/
+#       1229  v3      d9298a10d1b0  index.html
+```
+
+`-R` (or `--recursive`) lists every descendant file with its full path, which
+is what `ls` did before the flag existed:
+
+```sh
+remuda vfs ls -R remuda:///design/2026-11-05/
+#   …  design/2026-11-05/assets/site.css
+#   …  design/2026-11-05/index.html
+```
+
+The trailing slash is optional: `ls remuda:///a` and `ls remuda:///a/` list the
+same children, unless a file is named exactly `a`; then the form without the
+slash shows that file and the form with it shows the children. `ls` on a file
+path shows that file. Directories are not stored objects: they exist only as
+the prefixes of stored files, so an empty directory cannot exist.
+
+`--json` file rows keep every field they had and add `"kind": "file"`; a
+directory row is `{"kind": "dir", "path": "a/"}` with the full cluster path.
+A script that expected every row to be a file must check `kind` or pass `-R`,
+which returns only files. `--conflicts` stays recursive but now stops at the
+prefix's components: `ls --conflicts remuda:///a` no longer includes `a2/`.
 
 ## Publishing a directory: `remuda vfs publish`
 
