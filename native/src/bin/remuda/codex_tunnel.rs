@@ -456,11 +456,58 @@ mod imp {
             socket: upstream.to_string_lossy().into_owned(),
             thread,
         };
+        #[cfg(test)]
+        let publication = Publication {
+            capture,
+            state: &state,
+            pause: std::cell::RefCell::new(None),
+        };
+        #[cfg(not(test))]
+        let publication = Publication {
+            capture,
+            state: &state,
+        };
         settle_publication(
             capture,
             &state,
-            codex_native::adopt_guarded(&request, || publication_permitted(capture, &state)),
+            codex_native::adopt_fenced(&request, &publication),
         );
+    }
+
+    /// The final publication fence. Preflight runs before this; only the local
+    /// binding files are created while the authority locks are held.
+    struct Publication<'a> {
+        capture: &'a Arc<Mutex<Capture>>,
+        state: &'a Arc<Mutex<State>>,
+        #[cfg(test)]
+        pause: std::cell::RefCell<Option<Box<dyn FnOnce()>>>,
+    }
+
+    impl codex_native::Fence for Publication<'_> {
+        fn allowed(&self) -> bool {
+            publication_permitted(self.capture, self.state)
+        }
+
+        fn commit(
+            &self,
+            write: &mut dyn FnMut() -> Result<codex_native::Published, &'static str>,
+        ) -> Result<codex_native::Published, &'static str> {
+            // Test hook: deterministic pause immediately before the guarded
+            // commit so a failure can be latched first.
+            #[cfg(test)]
+            {
+                let paused = self.pause.borrow_mut().take();
+                if let Some(pause) = paused {
+                    pause();
+                }
+            }
+            let capture = self.capture.lock().map_err(|_| "authority_lost")?;
+            let state = self.state.lock().map_err(|_| "authority_lost")?;
+            if capture.failed || state.closing {
+                return Err("authority_lost");
+            }
+            write()
+        }
     }
 
     /// Current authority: no observed failure and no cleanup fence.
@@ -611,6 +658,58 @@ mod imp {
             let started = Instant::now();
             tunnel.cleanup();
             assert!(started.elapsed() < Duration::from_secs(1));
+            let _ = std::fs::remove_dir_all(&runtime);
+        }
+
+        #[test]
+        fn a_paused_commit_after_failure_creates_no_binding() {
+            let runtime = runtime_dir().expect("runtime");
+            let capture = capture();
+            let state = capture.lock().expect("capture").state.clone();
+            capture.lock().expect("capture").publishing = true;
+            let paused_capture = capture.clone();
+            let publication = Publication {
+                capture: &capture,
+                state: &state,
+                pause: std::cell::RefCell::new(Some(Box::new(move || {
+                    // The request observer latches failure while the attempt
+                    // waits just before the guarded commit.
+                    paused_capture.lock().expect("capture").failed = true;
+                }))),
+            };
+            let mut wrote = false;
+            let result = codex_native::Fence::commit(&publication, &mut || {
+                wrote = true;
+                Ok(codex_native::fake_published(&runtime))
+            });
+            assert!(matches!(result, Err("authority_lost")));
+            assert!(!wrote);
+            assert!(!runtime.join("manifest.json").exists());
+            assert!(!runtime.join("pin.json").exists());
+            assert!(state.lock().expect("state").published.is_none());
+            let _ = std::fs::remove_dir_all(&runtime);
+        }
+
+        #[test]
+        fn a_clean_fenced_commit_publishes_once() {
+            let runtime = runtime_dir().expect("runtime");
+            let capture = capture();
+            let state = capture.lock().expect("capture").state.clone();
+            capture.lock().expect("capture").publishing = true;
+            let publication = Publication {
+                capture: &capture,
+                state: &state,
+                pause: std::cell::RefCell::new(None),
+            };
+            let mut writes = 0;
+            let published = codex_native::Fence::commit(&publication, &mut || {
+                writes += 1;
+                Ok(codex_native::fake_published(&runtime))
+            })
+            .expect("commit");
+            assert_eq!(writes, 1);
+            assert!(runtime.join("manifest.json").exists());
+            published.remove();
             let _ = std::fs::remove_dir_all(&runtime);
         }
 

@@ -62,7 +62,7 @@ not used.
 
 ```text
 $ cargo test -q -p remuda-native --bin remuda
-test result: ok. 195 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+test result: ok. 197 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
 
 $ cargo clippy -q -p remuda-native --bin remuda -- -D warnings
 (no output)
@@ -162,11 +162,13 @@ followed by a valid matching response publishing nothing, early EOF then
 reconnect, a reused bootstrap id, cleanup without an in-flight adopt returning
 immediately, and an injected completion seam: a fake created manifest+pin is
 removed when failure is latched while the attempt is in flight, and a clean
-completion stores the publication and cleans up under one second. Adoption
-takes a launcher authority predicate and re-checks it before the entry, each
-binding file creation and the return, so publication itself is withdrawn when
-authority is already lost; the completion seam still handles a failure that
-lands during preflight.
+completion stores the publication and cleans up under one second. Adoption is
+split into bounded network preflight and a final `Fence::commit`: the launcher
+checks authority before I/O, then holds the capture->state locks across the
+local pin+manifest creation only, so a failure or closing fence that lands
+before the commit produces no binding. A pause hook before the guarded commit
+latches failure first and proves no manifest, no store and no write; a clean
+commit writes once.
 
 Kernel peer fixture for a direct spawn: connected peer PID/start equals the
 spawned child, uid equals euid, resolved socket is 0600. Two spawns with the

@@ -700,22 +700,48 @@ fn preflight(
 
 #[cfg(unix)]
 pub(crate) fn adopt(request: &AdoptRequest) -> Result<Published, &'static str> {
-    adopt_guarded(request, || true)
+    adopt_fenced(request, &Unfenced)
 }
 
-/// Adopt only while `permitted` still authorizes publication. The guard runs
-/// immediately before each binding file is created and again before the result
-/// is returned, so a launcher can withdraw authority during preflight.
-pub(crate) fn adopt_guarded(
+/// Final publication gate. `allowed` runs before any network I/O; `commit`
+/// holds authority across the local binding-file creation only, never across
+/// the endpoint preflight.
+pub(crate) trait Fence {
+    fn allowed(&self) -> bool;
+
+    fn commit(
+        &self,
+        write: &mut dyn FnMut() -> Result<Published, &'static str>,
+    ) -> Result<Published, &'static str>;
+}
+
+struct Unfenced;
+
+impl Fence for Unfenced {
+    fn allowed(&self) -> bool {
+        true
+    }
+
+    fn commit(
+        &self,
+        write: &mut dyn FnMut() -> Result<Published, &'static str>,
+    ) -> Result<Published, &'static str> {
+        write()
+    }
+}
+
+/// Adopt, then commit the binding through `fence`. Preflight stays outside any
+/// forwarding lock; only the final file publication is fenced.
+pub(crate) fn adopt_fenced(
     request: &AdoptRequest,
-    permitted: impl Fn() -> bool,
+    fence: &dyn Fence,
 ) -> Result<Published, &'static str> {
     let binding = Path::new(&request.binding);
     let pin_file = pin_path(binding);
     if std::fs::symlink_metadata(&pin_file).is_ok() || std::fs::symlink_metadata(binding).is_ok() {
         return Err("already_adopted");
     }
-    if !permitted() {
+    if !fence.allowed() {
         return Err("authority_lost");
     }
     let socket = Path::new(&request.socket);
@@ -735,15 +761,6 @@ pub(crate) fn adopt_guarded(
         &request.thread,
         live,
     );
-    // Pin first, so a manifest never points at a missing pin.
-    if !permitted() {
-        return Err("authority_lost");
-    }
-    let created = store_pin(&pin_file, &pin)?;
-    if !permitted() {
-        created.remove();
-        return Err("authority_lost");
-    }
     let manifest = Manifest {
         schema: PIN_SCHEMA,
         protocol: PROTOCOL.into(),
@@ -755,28 +772,28 @@ pub(crate) fn adopt_guarded(
         thread: pin.thread.clone(),
     };
     let text = serde_json::to_vec(&manifest).map_err(|_| "invalid_binding")?;
-    let written = store_pin_with(binding, |file| {
-        std::io::Write::write_all(file, &text)
-            .and_then(|()| file.sync_all())
-            .map_err(|_| "invalid_binding")
-    });
-    let manifest = match written {
-        Ok(manifest) => manifest,
-        Err(reason) => {
-            created.remove();
-            return Err(reason);
-        }
+    let mut publish = || {
+        // Pin first, so a manifest never points at a missing pin.
+        let created = store_pin(&pin_file, &pin)?;
+        let written = store_pin_with(binding, |file| {
+            std::io::Write::write_all(file, &text)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| "invalid_binding")
+        });
+        let manifest = match written {
+            Ok(manifest) => manifest,
+            Err(reason) => {
+                created.remove();
+                return Err(reason);
+            }
+        };
+        Ok(Published {
+            generation: pin.generation.clone(),
+            manifest,
+            pin: created,
+        })
     };
-    let published = Published {
-        generation: pin.generation,
-        manifest,
-        pin: created,
-    };
-    if !permitted() {
-        published.remove();
-        return Err("authority_lost");
-    }
-    Ok(published)
+    fence.commit(&mut publish)
 }
 
 /// Test-only stand-in for a completed adopt: two real created files that
@@ -992,8 +1009,20 @@ mod tests {
             socket: format!("/tmp/remuda-guard-{}/missing.sock", std::process::id()),
             thread: THREAD.into(),
         };
+        struct Deny;
+        impl Fence for Deny {
+            fn allowed(&self) -> bool {
+                false
+            }
+            fn commit(
+                &self,
+                _write: &mut dyn FnMut() -> Result<Published, &'static str>,
+            ) -> Result<Published, &'static str> {
+                panic!("denied fence must not commit");
+            }
+        }
         assert!(matches!(
-            adopt_guarded(&request, || false),
+            adopt_fenced(&request, &Deny),
             Err("authority_lost")
         ));
         assert!(!std::path::Path::new(&request.binding).exists());
