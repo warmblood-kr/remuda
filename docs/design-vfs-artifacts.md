@@ -22,8 +22,6 @@ availability whenever the origin was down. Copying a file in is one command.
 | Delete | a tombstone travels with the index; GC forgets it after `--tombstone-days` once every node has it |
 | Membership change | `drain` before `leave`, `revoke`, old stores set aside |
 | Integrity | a blob is verified against its digest before it is served or replicated |
-| Browser read | #886: loopback HTTP bridge, sandboxed HTML/XML/SVG, one prefix |
-| Disk | #887: `vfs release` returns copies a node only read |
 
 ## What this does **not** guarantee
 
@@ -88,9 +86,13 @@ uploader with a final pointer*, not an atomic directory publish:
    the marker. It is a plain file, not a redirect: `vfs serve` does not resolve
    it, so a viewer opens `/NAME/` explicitly.
 5. Say exactly what happened: `Published N files (X MiB) as NAME`, list
-   failures, exit 1 when the marker is absent and 75 when every byte is here
-   but the copies wanted are not (a file `put` that returns 75 counts as
-   uploaded and does not stop the run) — the same 75 `put` uses.
+   failures, exit 1 when the release cannot be called complete (a file failed,
+   `COMPLETE` was refused, or a requested `CURRENT` failed), and 75 when every
+   byte is here but the copies wanted are not (a file `put` that returns 75
+   counts as uploaded and does not stop the run) — the same 75 `put` uses. A
+   transport failure leaves the marker's state unknown, not proven absent, and
+   the message says so; retrying the same `--release` is safe because every
+   `put` is idempotent.
 
 What it deliberately does not do: delete a previous release (it stays until
 `vfs rm`), roll back a partial upload, guarantee that `COMPLETE` or `CURRENT`
