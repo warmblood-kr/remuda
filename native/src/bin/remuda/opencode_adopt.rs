@@ -690,6 +690,53 @@ mod tests {
     }
 
     #[test]
+    fn request_deserialization_denies_unknown_and_widened_auth_fields() {
+        let value = serde_json::to_value(adoption_request_value()).expect("json");
+        assert!(serde_json::from_value::<AdoptRequest>(value.clone()).is_ok());
+        let mut extra = value.clone();
+        extra["token"] = json!("widened");
+        assert!(serde_json::from_value::<AdoptRequest>(extra).is_err());
+        let mut auth_extra = value;
+        auth_extra["auth"]["scheme_extra"] = json!("widened");
+        assert!(serde_json::from_value::<AdoptRequest>(auth_extra).is_err());
+    }
+
+    fn adoption_request_value() -> serde_json::Value {
+        json!({
+            "version": 1,
+            "binding": "/private/tmp/adopt-test/manifest.json",
+            "nonce": "nonce",
+            "session": "session",
+            "endpoint": ENDPOINT,
+            "conversation": CONVERSATION,
+            "auth": {"scheme": "basic", "user": "opencode", "password": "secret"},
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_between_adoption_gets_publishes_nothing() {
+        let dir = scratch();
+        let mut request = request();
+        request.binding = dir.join("manifest.json").to_string_lossy().into_owned();
+        let identity_calls = std::cell::Cell::new(0_u32);
+        let identity = |_pid: u32| {
+            let call = identity_calls.get();
+            identity_calls.set(call + 1);
+            Some(ProcessIdentity {
+                parent: 999,
+                started_us: if call == 0 { 200 } else { 201 },
+            })
+        };
+        assert_eq!(
+            adopt_with(&request, scripted(vec![info_ok(), target_ok()]), identity),
+            Err("stale_binding")
+        );
+        assert!(!dir.join("manifest.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn manifest_never_claims_an_instance_or_wrapper() {
         let value = serde_json::to_value(manifest()).expect("json");
         assert!(value.get("instance").is_none());

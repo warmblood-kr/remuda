@@ -33,8 +33,9 @@ usable, and starting `serve`/ACP is not adoption.
   `opencode-http-v1` schema unchanged. The manifest protocol selects one strict
   schema; the adopted parser also rejects unknown fields. For an adopted
   binding it rechecks nonce/session, the exact endpoint, the local server
-  pid/start generation, then the same `/api/info` identity and exact GET of A
-  before one `delivery=queue,resume=true` POST. `accepted_queue` needs the exact
+  pid/start generation, then the same `/api/info` identity and exact GET of A,
+  rechecks the generation at the last boundary immediately before one
+  `delivery=queue,resume=true` POST. `accepted_queue` needs the exact
   receipt; ambiguity is `uncertain`; nothing is retried.
 - Refusals are typed and happen before any POST: wrong auth, wrong node,
   missing/mismatched target, stale/recycled generation, invalid binding. The
@@ -64,8 +65,8 @@ usable, and starting `serve`/ACP is not adoption.
 
 ```text
 $ cargo test -p remuda-native --bin remuda
-running 172 tests
-test result: ok. 172 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+running 174 tests
+test result: ok. 174 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 $ cargo clippy -p remuda-native --bin remuda -- -D warnings
 Finished
@@ -82,11 +83,15 @@ Focused unit coverage added in this step:
   `ses_e54f46499ffeglY6MpLaInY8Tt`-shaped ids and synthetic 32-hex, process-start
   generation and staleness, strict request/manifest rejection, adoption with
   scripted HTTP, wrong auth/node/target publishing nothing, GET-only/no-retry,
-  preexisting binding refused before any request, failed write removing only
-  its own partial inode, and no wrapper/instance fields.
+  preexisting binding refused before any request, stale-between-adoption-GETs
+  publishing nothing, unknown request/nested-auth fields refused by direct
+  deserialization, failed write removing only its own partial inode, and no
+  wrapper/instance fields.
 - `agent_notice::tests`: protocol selects one strict schema; a tag-only edit
   cannot turn an owned manifest into an adopted one and extra wrapper fields
   are refused; adopted delivery reuses the exact target and receipt rules;
-  adopted validation happens before any HTTP request.
+  adopted validation happens before any HTTP request, and an injected
+  last-pre-POST fence refuses `server_gone`/`stale_binding` with zero POST while
+  an unchanged generation still sends exactly one correlated POST.
 - Owned-schema, canonical-notice, owned process-generation and delivery
-  regressions remain in the same 172-test binary above.
+  regressions remain in the same 174-test binary above.

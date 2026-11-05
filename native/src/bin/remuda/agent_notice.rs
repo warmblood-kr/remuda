@@ -149,15 +149,28 @@ fn deliver_adopted_checked(
     request: &Request,
     manifest: &AdoptedManifest,
 ) -> (&'static str, &'static str) {
+    deliver_adopted_checked_with(request, manifest, http, process_identity)
+}
+
+fn deliver_adopted_checked_with<F, I>(
+    request: &Request,
+    manifest: &AdoptedManifest,
+    http: F,
+    identity: I,
+) -> (&'static str, &'static str)
+where
+    F: FnMut(&str, String, &str, String) -> Result<remuda_native::net::HttpResponse, String>,
+    I: Fn(u32) -> Option<ProcessIdentity>,
+{
     if let Err(reason) =
         opencode_adopt::validate_manifest(&request.nonce, &request.session, manifest)
     {
         return ("definitely_not_written", reason);
     }
-    if let Err(reason) = opencode_adopt::check_process(manifest, process_identity) {
+    if let Err(reason) = opencode_adopt::check_process(manifest, &identity) {
         return ("definitely_not_written", reason);
     }
-    match deliver_adopted(request, manifest) {
+    match deliver_adopted_with(request, manifest, http, identity) {
         Ok(outcome) => outcome,
         Err(reason) => ("uncertain", reason),
     }
@@ -359,36 +372,32 @@ fn deliver_with<F>(
 where
     F: FnMut(&str, String, &str, String) -> Result<remuda_native::net::HttpResponse, String>,
 {
-    deliver_target_with(request, &owned_target(manifest), http)
+    deliver_target_with(request, &owned_target(manifest), http, || Ok(()))
 }
 
-fn deliver_adopted(
-    request: &Request,
-    manifest: &AdoptedManifest,
-) -> Result<(&'static str, &'static str), &'static str> {
-    deliver_adopted_with(request, manifest, |method, url, auth, body| {
-        http(method, url, auth, body)
-    })
-}
-
-fn deliver_adopted_with<F>(
+fn deliver_adopted_with<F, I>(
     request: &Request,
     manifest: &AdoptedManifest,
     http: F,
+    identity: I,
 ) -> Result<(&'static str, &'static str), &'static str>
 where
     F: FnMut(&str, String, &str, String) -> Result<remuda_native::net::HttpResponse, String>,
+    I: Fn(u32) -> Option<ProcessIdentity>,
 {
-    deliver_target_with(request, &adopted_target(manifest), http)
+    let pre_post = || opencode_adopt::check_process(manifest, &identity);
+    deliver_target_with(request, &adopted_target(manifest), http, pre_post)
 }
 
-fn deliver_target_with<F>(
+fn deliver_target_with<F, G>(
     request: &Request,
     target: &Target<'_>,
     mut http: F,
+    mut pre_post: G,
 ) -> Result<(&'static str, &'static str), &'static str>
 where
     F: FnMut(&str, String, &str, String) -> Result<remuda_native::net::HttpResponse, String>,
+    G: FnMut() -> Result<(), &'static str>,
 {
     let auth = basic(target.password);
     let info = http(
@@ -410,6 +419,11 @@ where
             404 => Ok(("definitely_not_written", "target_missing")),
             _ => Err("target_unverified"),
         };
+    }
+    // The GETs can block while the local server is replaced. Recheck the
+    // adopted server generation at the last boundary before the one POST.
+    if let Err(reason) = pre_post() {
+        return Ok(("definitely_not_written", reason));
     }
     let body = json!({
         "id": request.request_id,
@@ -821,6 +835,13 @@ mod tests {
         ));
     }
 
+    fn adopted_live(_pid: u32) -> Option<ProcessIdentity> {
+        Some(ProcessIdentity {
+            parent: 999,
+            started_us: 200,
+        })
+    }
+
     fn adopted_manifest() -> AdoptedManifest {
         AdoptedManifest {
             schema: opencode_adopt::SCHEMA,
@@ -861,7 +882,7 @@ mod tests {
         ));
 
         // The adopted parser must not silently accept owned wrapper fields.
-        let mut widened = adopted_manifest();
+        let widened = adopted_manifest();
         let mut value = serde_json::to_value(&widened).expect("json");
         value["wrapper_pid"] = json!(11);
         let extra = path.with_extension("extra");
@@ -898,18 +919,30 @@ mod tests {
         let request = request();
         let manifest = adopted_manifest();
         let mut responses = vec![response(200, INFO_OK), target_ok(), receipt(200)];
-        let outcome =
-            deliver_adopted_with(&request, &manifest, |_, _, _, _| Ok(responses.remove(0)));
+        let outcome = deliver_adopted_with(
+            &request,
+            &manifest,
+            |_, _, _, _| Ok(responses.remove(0)),
+            adopted_live,
+        );
         assert_eq!(outcome, Ok(("accepted_queue", "")));
 
         let mut responses = vec![response(200, INFO_OK), response(404, "{}")];
-        let outcome =
-            deliver_adopted_with(&request, &manifest, |_, _, _, _| Ok(responses.remove(0)));
+        let outcome = deliver_adopted_with(
+            &request,
+            &manifest,
+            |_, _, _, _| Ok(responses.remove(0)),
+            adopted_live,
+        );
         assert_eq!(outcome, Ok(("definitely_not_written", "target_missing")));
 
         let mut responses = vec![response(401, "{}")];
-        let outcome =
-            deliver_adopted_with(&request, &manifest, |_, _, _, _| Ok(responses.remove(0)));
+        let outcome = deliver_adopted_with(
+            &request,
+            &manifest,
+            |_, _, _, _| Ok(responses.remove(0)),
+            adopted_live,
+        );
         assert_eq!(outcome, Ok(("definitely_not_written", "server_identity")));
     }
 
