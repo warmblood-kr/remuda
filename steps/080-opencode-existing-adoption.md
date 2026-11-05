@@ -102,7 +102,7 @@ production account, input or credential; private root removed and all owned
 pids confirmed gone):
 
 ```text
-source HEAD / binary:          53dbc89a9d71 / sha256 db5c06347290354a27074baa430643203ea32dc883db84d0b57dbbfa9f34a2fc
+source HEAD / binary:          pre-rebase 53dbc89a9d71 / sha256 db5c06347290354a27074baa430643203ea32dc883db84d0b57dbbfa9f34a2fc
 server/tui pid+start:          76589 / 76591, both Thu Nov  5 21:57:46 2026
 session A (default generator): ses_e54369466ffeyZWgTIpc4FZR0b
 _opencode_adopt positive:      {"outcome":"adopted","generation":"65f870ac8f9d2"}
@@ -137,7 +137,8 @@ draft and explicit Enter. Credentials stayed out of helper stdout/stderr.
   historical TUI identity. Fresh Butler row.id/opaque instance/nonce owns
   managed fencing. Same-UID races remain out of scope for this helper.
 
-Rebase note: after #892 merged to main, `389bffc2..8f1f0293` and
-`origin/main..HEAD` are patch-identical (`git range-diff` reports `=` for all
-seven commits), so the preserved probe binary corresponds to the same code even
-though its recorded pre-rebase commit hash differs.
+Rebase note: after #892 and #895 merged, the adoption series was rebased onto
+main. `git range-diff 37076671..68a37375 origin/main..HEAD` reports `=` for the
+six adoption-logic commits; only the feature commit moved its hidden-verb arm to
+main's `dispatch_native_verb`. Adopted logic is unchanged, so the preserved
+probe binary still corresponds to it.
