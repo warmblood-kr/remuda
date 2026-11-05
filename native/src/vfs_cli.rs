@@ -4,7 +4,7 @@
 //! (`Request::Vfs`). With no daemon running, it fails with one line.
 
 use crate::cli_parse::{self, ArgSpec, OptionSpec, RepeatPolicy, Spec, VerbSpec};
-use crate::cluster::vfs::{VfsError, VfsErrorKind, VfsStore};
+use crate::cluster::vfs::{Children, VfsError, VfsErrorKind, VfsIndex, VfsStore};
 use crate::cluster::vfs_drain::DrainReport;
 use crate::cluster::vfs_status::StatusReport;
 use crate::cluster::vfs_sync;
@@ -43,6 +43,14 @@ fn option(long: &str, value: Option<&str>, help: &str) -> OptionSpec {
         global: false,
         required: false,
         repeat_policy: RepeatPolicy::Reject,
+    }
+}
+
+/// A valueless option with a one-letter short form (`-R`).
+fn flag_option(long: &str, short: char, help: &str) -> OptionSpec {
+    OptionSpec {
+        short: Some(short),
+        ..option(long, None, help)
     }
 }
 
@@ -110,11 +118,12 @@ fn spec() -> Spec {
             verb("stat", "Show one file's version, hash, size and copies. Example: remuda vfs stat remuda:///notes.md",
                 vec![arg("URI", "remuda:// URI", true)], vec![option("json", None, "Print JSON")],
                 "remuda vfs stat URI [--json]"),
-            verb("ls", "List files under a prefix. Example: remuda vfs ls remuda:///butler/",
-                vec![arg("PREFIX", "remuda:// URI prefix; omit for all", false)],
-                vec![option("json", None, "Print JSON"),
-                     option("conflicts", None, "Only paths with kept concurrent writes, deleted ones too")],
-                "remuda vfs ls [PREFIX] [--json] [--conflicts]"),
+            verb("ls", "List a directory's immediate children. Example: remuda vfs ls remuda:///butler/",
+                vec![arg("PREFIX", "remuda:// URI prefix; omit for the store root", false)],
+                vec![flag_option("recursive", 'R', "List every descendant file, not just the immediate children"),
+                     option("json", None, "Print JSON"),
+                     option("conflicts", None, "Paths with kept concurrent writes under PREFIX; deleted ones too")],
+                "remuda vfs ls [PREFIX] [-R] [--json] [--conflicts]"),
             verb("resolve-conflict", "Settle a path's conflicts by writing one side again. Example: remuda vfs resolve-conflict remuda:///notes.md --keep winner",
                 vec![arg("URI", "remuda:// URI", true)],
                 vec![OptionSpec { required: true, ..option("keep", Some("WHICH"), "winner, or the VERSION of a conflict from `remuda vfs ls --conflicts`") }],
@@ -195,6 +204,17 @@ fn fail_vfs(out: &mut Out, verb: &str, error: &VfsError) -> u8 {
         warn!(out, "Next: {next}.");
     }
     1
+}
+
+/// `result`, or print it as a vfs failure; every one of those exits 1.
+fn or_fail<T>(out: &mut Out, verb: &str, result: Result<T, VfsError>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            fail_vfs(out, verb, &error);
+            None
+        }
+    }
 }
 
 /// What a vfs command printed and its exit code. The daemon fills it; the
@@ -436,18 +456,20 @@ fn decode_answer(reply: std::io::Result<Response>) -> Result<(u8, Vec<u8>, Strin
     }
 }
 
+/// The daemon request that proves a release prefix has no files at any depth.
+fn destination_args(base: &str) -> Vec<String> {
+    vec![
+        "ls".to_owned(),
+        format!("remuda:///{base}/"),
+        "-R".to_owned(),
+        "--json".to_owned(),
+    ]
+}
+
 /// Refuse to publish over a release that already has files. Cooperative only: a
 /// partitioned index can hide one from this node.
 fn destination_is_empty(socket: &Path, base: &str, release: &str) -> Result<(), String> {
-    let rows = daemon_call(
-        socket,
-        vec![
-            "ls".to_owned(),
-            format!("remuda:///{base}/"),
-            "--json".to_owned(),
-        ],
-        None,
-    )?;
+    let rows = daemon_call(socket, destination_args(base), None)?;
     match rows {
         (0, stdout, _) => destination_answer(&stdout, base, release),
         (_, _, stderr) => Err(format!("cannot check the destination: {stderr}")),
@@ -1661,8 +1683,9 @@ fn resolve(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
     }
 }
 
-fn entry_json(store: &VfsStore, entry: &VfsEntry) -> Value {
+fn entry_json(entry: &VfsEntry, local: impl Fn(&str, u64) -> bool) -> Value {
     serde_json::json!({
+        "kind": "file",
         "path": entry.path,
         "version": entry.version,
         "sha256": entry.sha256,
@@ -1670,17 +1693,25 @@ fn entry_json(store: &VfsStore, entry: &VfsEntry) -> Value {
         "replicas": entry.replicas,
         "writer": entry.writer,
         "mtime": entry.mtime,
-        "local": store.has_blob(&entry.sha256, entry.size),
+        "local": local(&entry.sha256, entry.size),
         "deleted": entry.deleted,
-        "conflicts": entry.conflicts.iter().map(|conflict| serde_json::json!({
-            "version": conflict.version,
-            "writer": conflict.writer,
-            "sha256": conflict.sha256,
-            "size": conflict.size,
-            "deleted": conflict.deleted,
-            "mtime": conflict.mtime,
-            "local": !conflict.deleted && store.has_blob(&conflict.sha256, conflict.size),
-        })).collect::<Vec<_>>(),
+        "conflicts": entry
+            .conflicts
+            .iter()
+            .map(|conflict| conflict_json(conflict, &local))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn conflict_json(conflict: &rules::VfsConflict, local: &impl Fn(&str, u64) -> bool) -> Value {
+    serde_json::json!({
+        "version": conflict.version,
+        "writer": conflict.writer,
+        "sha256": conflict.sha256,
+        "size": conflict.size,
+        "deleted": conflict.deleted,
+        "mtime": conflict.mtime,
+        "local": !conflict.deleted && local(&conflict.sha256, conflict.size),
     })
 }
 
@@ -1778,7 +1809,11 @@ fn stat(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
         );
     };
     if flag(values, "json") {
-        say!(out, "{}", entry_json(store, entry));
+        say!(
+            out,
+            "{}",
+            entry_json(entry, |sha, size| store.has_blob(sha, size))
+        );
         return 0;
     }
     let holders = vfs_sync::placement_for(entry);
@@ -1814,77 +1849,197 @@ fn stat(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
     0
 }
 
-fn list(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
-    let prefix = match value(values, "PREFIX") {
-        None => String::new(),
-        Some(text) => match list_prefix(store, text) {
-            Ok(prefix) => prefix,
-            Err(error) => return fail_vfs(out, "ls", &error),
-        },
-    };
-    let index = match store.load_index() {
-        Ok(index) => index,
-        Err(error) => return fail_vfs(out, "ls", &error),
-    };
-    let only_conflicts = flag(values, "conflicts");
-    let entries: Vec<&VfsEntry> = if only_conflicts {
-        index
-            .entries
-            .range(prefix.clone()..)
-            .take_while(|(path, _)| path.starts_with(&prefix))
-            .map(|(_, entry)| entry)
-            .filter(|entry| !entry.conflicts.is_empty())
-            .collect()
-    } else {
-        index.list(&prefix)
-    };
-    if flag(values, "json") {
-        let rows: Vec<Value> = entries
-            .iter()
-            .map(|entry| entry_json(store, entry))
-            .collect();
-        say!(out, "{}", Value::Array(rows));
-        return 0;
+/// An `ls` prefix: its cluster path, and whether it was written as a directory.
+struct Prefix {
+    path: String,
+    directory: bool,
+}
+
+impl Prefix {
+    /// The directory form: empty for the root, otherwise ending in `/`.
+    fn dir(&self) -> String {
+        directory_path(&self.path)
     }
-    if only_conflicts {
-        if entries.is_empty() {
-            say!(out, "No conflicts.");
+}
+
+fn directory_path(path: &str) -> String {
+    if path.is_empty() || path.ends_with('/') {
+        path.to_owned()
+    } else {
+        format!("{path}/")
+    }
+}
+
+fn prefix(store: &VfsStore, text: Option<&str>) -> Result<Prefix, VfsError> {
+    let path = match text {
+        None => String::new(),
+        Some(text) => list_prefix(store, text)?,
+    };
+    Ok(Prefix {
+        directory: path.is_empty() || path.ends_with('/'),
+        path,
+    })
+}
+
+/// What a prefix names: a live file exactly, or a directory.
+enum Scope<'a> {
+    File(&'a VfsEntry),
+    Dir(String),
+}
+
+fn scope<'a>(index: &'a VfsIndex, prefix: &Prefix) -> Scope<'a> {
+    if !prefix.directory {
+        if let Some(entry) = index.live(&prefix.path) {
+            return Scope::File(entry);
         }
-        for entry in &entries {
-            say!(
-                out,
-                "{}  v{} by {}{}",
-                entry.path,
-                entry.version,
-                crate::cluster::node_label(&entry.writer),
-                if entry.deleted { "  (deleted)" } else { "" }
-            );
-            say_conflicts(out, store, entry);
-        }
-        if !entries.is_empty() {
-            say!(
-                out,
-                "Next: remuda vfs resolve-conflict URI --keep winner|VERSION."
-            );
-        }
+    }
+    Scope::Dir(prefix.dir())
+}
+
+fn list(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
+    let Some(prefix) = or_fail(out, "ls", prefix(store, value(values, "PREFIX"))) else {
+        return 1;
+    };
+    let Some(index) = or_fail(out, "ls", store.load_index()) else {
+        return 1;
+    };
+    let json = flag(values, "json");
+    if flag(values, "conflicts") {
+        return list_conflicts(store, &index, &prefix.path, json, out);
+    }
+    match scope(&index, &prefix) {
+        Scope::File(entry) => file_rows(store, out, json, std::slice::from_ref(&entry), None),
+        Scope::Dir(dir) => list_dir(store, out, json, &dir, flag(values, "recursive"), &index),
+    }
+}
+
+fn list_dir(
+    store: &VfsStore,
+    out: &mut Out,
+    json: bool,
+    dir: &str,
+    recursive: bool,
+    index: &VfsIndex,
+) -> u8 {
+    if recursive {
+        return file_rows(store, out, json, &index.list(dir), None);
+    }
+    let children = index.children(dir);
+    children_rows(store, out, json, dir, &children)
+}
+
+fn entry_rows(store: &VfsStore, entries: &[&VfsEntry]) -> Vec<Value> {
+    entries
+        .iter()
+        .map(|entry| entry_json(entry, |sha, size| store.has_blob(sha, size)))
+        .collect()
+}
+
+fn file_rows(
+    store: &VfsStore,
+    out: &mut Out,
+    json: bool,
+    entries: &[&VfsEntry],
+    prefix: Option<&str>,
+) -> u8 {
+    if json {
+        say!(out, "{}", Value::Array(entry_rows(store, entries)));
         return 0;
     }
     for entry in entries {
-        say!(
-            out,
-            "{:>10}  v{:<5} {}  {}{}",
-            entry.size,
-            entry.version,
-            &entry.sha256[..12],
-            entry.path,
-            if store.has_blob(&entry.sha256, entry.size) {
-                ""
-            } else {
-                "  (not here)"
-            }
-        );
+        say_child_file(store, out, prefix, entry);
     }
     0
+}
+
+fn say_child_file(store: &VfsStore, out: &mut Out, prefix: Option<&str>, entry: &VfsEntry) {
+    let name = match prefix {
+        Some(prefix) => entry.path.strip_prefix(prefix).unwrap_or(&entry.path),
+        None => &entry.path,
+    };
+    say_file(out, name, entry, store.has_blob(&entry.sha256, entry.size));
+}
+
+fn child_rows(store: &VfsStore, dir: &str, children: &Children<'_>) -> Vec<Value> {
+    let mut rows: Vec<Value> = children
+        .dirs
+        .iter()
+        .map(|name| dir_json(dir, name))
+        .collect();
+    rows.extend(entry_rows(store, &children.files));
+    rows
+}
+
+fn children_rows(
+    store: &VfsStore,
+    out: &mut Out,
+    json: bool,
+    dir: &str,
+    children: &Children<'_>,
+) -> u8 {
+    if json {
+        say!(out, "{}", Value::Array(child_rows(store, dir, children)));
+        return 0;
+    }
+    for name in &children.dirs {
+        say!(out, "{:>10}  {}/", "", name);
+    }
+    file_rows(store, out, false, &children.files, Some(dir))
+}
+
+fn say_file(out: &mut Out, name: &str, entry: &VfsEntry, local: bool) {
+    say!(
+        out,
+        "{:>10}  v{:<5} {}  {}{}",
+        entry.size,
+        entry.version,
+        &entry.sha256[..12],
+        name,
+        if local { "" } else { "  (not here)" }
+    );
+}
+
+fn dir_json(dir: &str, name: &str) -> Value {
+    serde_json::json!({"kind": "dir", "path": format!("{dir}{name}/")})
+}
+
+/// Conflicts stay recursive, but only at or below `prefix`'s components.
+fn list_conflicts(
+    store: &VfsStore,
+    index: &VfsIndex,
+    prefix: &str,
+    json: bool,
+    out: &mut Out,
+) -> u8 {
+    let entries = index.conflicts(prefix);
+    if json {
+        say!(out, "{}", Value::Array(entry_rows(store, &entries)));
+        return 0;
+    }
+    if entries.is_empty() {
+        say!(out, "No conflicts.");
+        return 0;
+    }
+    for entry in entries {
+        say_conflict_entry(store, out, entry);
+    }
+    say!(
+        out,
+        "Next: remuda vfs resolve-conflict URI --keep winner|VERSION."
+    );
+    0
+}
+
+fn say_conflict_entry(store: &VfsStore, out: &mut Out, entry: &VfsEntry) {
+    say!(
+        out,
+        "{}  v{} by {}{}",
+        entry.path,
+        entry.version,
+        crate::cluster::node_label(&entry.writer),
+        if entry.deleted { "  (deleted)" } else { "" }
+    );
+    say_conflicts(out, store, entry);
 }
 
 /// A listing prefix is a URI whose path may end in `/` (or be empty).
@@ -2019,6 +2174,27 @@ mod tests {
     }
 
     #[test]
+    fn recursive_listing_is_forwarded_as_its_long_option() {
+        assert_eq!(
+            forwarded(&["ls", "-R", "--json"]),
+            ["ls", "--recursive", "--json"]
+        );
+        assert_eq!(forwarded(&["ls", "--recursive"]), ["ls", "--recursive"]);
+    }
+
+    #[test]
+    fn a_release_probe_lists_the_whole_prefix() {
+        assert_eq!(
+            destination_args("design/v1"),
+            ["ls", "remuda:///design/v1/", "-R", "--json"]
+        );
+        assert_eq!(
+            destination_args("design"),
+            ["ls", "remuda:///design/", "-R", "--json"]
+        );
+    }
+
+    #[test]
     fn help_and_parse_errors_need_no_daemon() {
         let mut out = Out::default();
         assert_eq!(parse(&["help"], &mut out).unwrap_err(), 0);
@@ -2073,6 +2249,86 @@ mod tests {
             mtime: 0,
             vv: Default::default(),
             conflicts: Vec::new(),
+        }
+    }
+
+    fn one_entry_named(path: &str) -> VfsEntry {
+        VfsEntry {
+            path: path.to_owned(),
+            ..one_entry()
+        }
+    }
+
+    #[test]
+    fn a_listing_prefix_without_a_slash_names_its_children_directory() {
+        assert_eq!(directory_path(""), "");
+        assert_eq!(directory_path("a"), "a/");
+        assert_eq!(directory_path("a/"), "a/");
+    }
+
+    #[test]
+    fn a_plain_prefix_is_a_file_when_that_file_is_live() {
+        let mut index = VfsIndex::default();
+        index.entries.insert("a".into(), one_entry_named("a"));
+        index
+            .entries
+            .insert("a/b.html".into(), one_entry_named("a/b.html"));
+        let prefix = Prefix {
+            path: "a".into(),
+            directory: false,
+        };
+        assert!(matches!(scope(&index, &prefix), Scope::File(_)));
+        let directory = Prefix {
+            path: "a/".into(),
+            directory: true,
+        };
+        assert!(matches!(scope(&index, &directory), Scope::Dir(path) if path == "a/"));
+    }
+
+    #[test]
+    fn a_tombstoned_name_is_an_empty_directory_not_a_file() {
+        let mut index = VfsIndex::default();
+        let mut gone = one_entry_named("gone.md");
+        gone.deleted = true;
+        index.entries.insert("gone.md".into(), gone);
+        let prefix = Prefix {
+            path: "gone.md".into(),
+            directory: false,
+        };
+        assert!(matches!(scope(&index, &prefix), Scope::Dir(path) if path == "gone.md/"));
+        assert!(index.children("gone.md/").files.is_empty());
+    }
+
+    #[test]
+    fn a_directory_row_names_its_full_cluster_path() {
+        assert_eq!(
+            dir_json("a/", "b"),
+            serde_json::json!({"kind": "dir", "path": "a/b/"})
+        );
+        assert_eq!(
+            dir_json("", "a"),
+            serde_json::json!({"kind": "dir", "path": "a/"})
+        );
+    }
+
+    #[test]
+    fn a_file_row_keeps_every_field_and_names_its_kind() {
+        let row = entry_json(&one_entry(), |_, _| false);
+        assert_eq!(row["kind"], "file");
+        assert_eq!(row["path"], "a/b.html");
+        assert_eq!(row["local"], false);
+        for field in [
+            "version",
+            "sha256",
+            "size",
+            "replicas",
+            "writer",
+            "mtime",
+            "local",
+            "deleted",
+            "conflicts",
+        ] {
+            assert!(row.get(field).is_some(), "missing {field}");
         }
     }
 

@@ -237,6 +237,79 @@ impl VfsIndex {
             .filter(|entry| !entry.deleted)
             .collect()
     }
+
+    /// Immediate children of a directory prefix, which ends in `/` or is empty.
+    pub fn children(&self, prefix: &str) -> Children<'_> {
+        let mut out = Children::default();
+        let scan = self
+            .entries
+            .range(prefix.to_owned()..)
+            .take_while(|(path, _)| path.starts_with(prefix));
+        for (path, entry) in scan {
+            match child_of(prefix, path, entry) {
+                Some(Child::Dir(dir)) => push_dir(&mut out.dirs, dir),
+                Some(Child::File(entry)) => out.files.push(entry),
+                None => {}
+            }
+        }
+        out.dirs.sort();
+        out.files.sort_by(|left, right| left.path.cmp(&right.path));
+        out
+    }
+
+    /// Entries at or below `prefix` that kept a concurrent write.
+    pub fn conflicts(&self, prefix: &str) -> Vec<&VfsEntry> {
+        self.entries
+            .range(prefix.to_owned()..)
+            .take_while(|(path, _)| path.starts_with(prefix))
+            .map(|(_, entry)| entry)
+            .filter(|entry| under(prefix, &entry.path) && !entry.conflicts.is_empty())
+            .collect()
+    }
+}
+
+/// One row of a one-level listing.
+#[derive(Debug, PartialEq)]
+pub enum Child<'a> {
+    Dir(&'a str),
+    File(&'a VfsEntry),
+}
+
+/// A directory's immediate children: subdirectory names, then files.
+#[derive(Debug, Default)]
+pub struct Children<'a> {
+    pub dirs: Vec<String>,
+    pub files: Vec<&'a VfsEntry>,
+}
+
+/// Where `path` sits when only `prefix`'s children are listed.
+pub fn child_of<'a>(prefix: &str, path: &'a str, entry: &'a VfsEntry) -> Option<Child<'a>> {
+    if entry.deleted || (!prefix.is_empty() && !prefix.ends_with('/')) {
+        return None;
+    }
+    let rest = path.strip_prefix(prefix)?;
+    if rest.is_empty() {
+        return None;
+    }
+    match rest.split_once('/') {
+        Some((dir, _)) => Some(Child::Dir(dir)),
+        None => Some(Child::File(entry)),
+    }
+}
+
+/// True when `path` is `prefix` itself or lies below it across a `/`.
+pub fn under(prefix: &str, path: &str) -> bool {
+    prefix.is_empty()
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn push_dir(dirs: &mut Vec<String>, dir: &str) {
+    if !dirs.iter().any(|known| known == dir) {
+        dirs.push(dir.to_owned());
+    }
 }
 
 /// `VfsEntry::merged`, or `incoming` itself for a new path.
@@ -1537,6 +1610,58 @@ mod tests {
             store.verify_blob(&hash).unwrap_err().kind,
             VfsErrorKind::NotLocal
         );
+    }
+
+    #[test]
+    fn children_are_one_level_and_a_prefix_does_not_reach_a_longer_name() {
+        let mut index = VfsIndex::default();
+        let sha = "a".repeat(64);
+        for path in ["a/hello.txt", "a/sub/two.md", "a2/other.md"] {
+            index
+                .entries
+                .insert(path.into(), entry(path, &sha, "SHA256:me"));
+        }
+        let children = index.children("a/");
+        assert_eq!(children.dirs, vec!["sub"]);
+        let files: Vec<&str> = children.files.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(files, vec!["a/hello.txt"]);
+        assert!(index.children("a").dirs.is_empty(), "a is not a directory");
+        assert!(index.children("a").files.is_empty());
+    }
+
+    #[test]
+    fn a_tombstone_is_not_a_child_and_still_counts_for_conflicts() {
+        let mut index = VfsIndex::default();
+        let sha = "b".repeat(64);
+        let mut gone = entry("a/gone", &sha, "SHA256:me");
+        gone.deleted = true;
+        gone.conflicts.push(rules::VfsConflict {
+            sha256: sha.clone(),
+            size: 1,
+            replicas: 1,
+            version: 1,
+            writer: "SHA256:them".into(),
+            deleted: false,
+            mtime: 0,
+            vv: Default::default(),
+        });
+        index.entries.insert("a/gone".into(), gone);
+        assert!(index.children("a/").files.is_empty());
+        let conflicts: Vec<&str> = index
+            .conflicts("a")
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(conflicts, vec!["a/gone"]);
+    }
+
+    #[test]
+    fn under_stops_at_components_and_accepts_the_prefix_itself() {
+        assert!(under("", "anything"));
+        assert!(under("a", "a"));
+        assert!(under("a", "a/x"));
+        assert!(!under("a", "a2/x"));
+        assert!(!under("a/", "a"));
     }
 
     #[test]

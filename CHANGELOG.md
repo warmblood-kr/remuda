@@ -1,5 +1,10 @@
 # Changelog
 
+- VFS: `remuda vfs ls` now lists a directory's immediate children: a
+  subdirectory prints as `a/`, a file as its name. `-R`/`--recursive` gives the
+  old full-path recursive listing. A prefix without a trailing slash no longer
+  matches a longer name (`a` no longer lists `a2/`). `--json` rows carry
+  `"kind": "file" | "dir"`; directory rows are `{"kind":"dir","path":"a/"}`.
 - VFS: `remuda vfs publish DIR remuda:///PREFIX --release NAME [--dry-run]
   [--min-copies K] [--pointer]` uploads a directory as one release, one
   ordinary `put` per file, and writes `PREFIX/NAME/COMPLETE` last so an

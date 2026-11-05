@@ -362,9 +362,8 @@ fn put_on_one_node_reads_on_every_node_and_delete_reaches_all() {
     );
     assert!(missing.starts_with("not_found:"), "{missing}");
 
-    // Listing by prefix.
-    let listed = successful(b.run(&["vfs", "ls", "remuda:///butler/"]), "vfs ls");
-    assert!(listed.contains("butler/guidance/cluster.md"), "{listed}");
+    // Listing by prefix: immediate children, then every descendant with -R.
+    assert_listed_by_depth(&b);
 
     // A newer write from another node wins everywhere.
     successful(
@@ -536,6 +535,62 @@ fn put_one_copy(node: &Node, uri: &str, body: &[u8]) {
         node.run_with_stdin(&["vfs", "put", "-", uri, "--replicas", "1"], Some(body)),
         "vfs put --replicas 1",
     );
+}
+
+/// The default listing shows one level; `-R` shows every descendant.
+fn assert_listed_by_depth(node: &Node) {
+    let listed = successful(node.run(&["vfs", "ls", "remuda:///butler/"]), "vfs ls");
+    assert!(listed.contains("guidance/"), "{listed}");
+    let recursive = successful(
+        node.run(&["vfs", "ls", "-R", "remuda:///butler/"]),
+        "vfs ls -R",
+    );
+    assert!(
+        recursive.contains("butler/guidance/cluster.md"),
+        "{recursive}"
+    );
+}
+
+#[test]
+fn ls_lists_immediate_children_and_recursion_is_opt_in() {
+    let _serial = live_test_guard();
+    let (a, b, _c) = three_nodes();
+    put_one_copy(&a, "remuda:///tree/hello.txt", b"hello");
+    put_one_copy(&a, "remuda:///tree/sub/two.md", b"two");
+    put_one_copy(&a, "remuda:///tree2/other.md", b"other");
+    wait_until("tree entries reach peer", Duration::from_secs(10), || {
+        b.stat_json("remuda:///tree/sub/two.md").is_some()
+            && b.stat_json("remuda:///tree2/other.md").is_some()
+    });
+
+    let listed = successful(b.run(&["vfs", "ls", "remuda:///tree/"]), "vfs ls");
+    assert!(listed.contains("sub/"), "{listed}");
+    assert!(listed.contains("hello.txt"), "{listed}");
+    assert!(!listed.contains("two.md"), "{listed}");
+
+    let no_slash = successful(b.run(&["vfs", "ls", "remuda:///tree"]), "vfs ls");
+    assert!(!no_slash.contains("other.md"), "{no_slash}");
+    assert!(!no_slash.contains("tree2"), "{no_slash}");
+
+    let recursive = successful(b.run(&["vfs", "ls", "-R", "remuda:///tree/"]), "vfs ls -R");
+    assert!(recursive.contains("sub/two.md"), "{recursive}");
+    assert!(recursive.contains("hello.txt"), "{recursive}");
+
+    let json = successful(
+        b.run(&["vfs", "ls", "--json", "remuda:///tree/"]),
+        "vfs ls --json",
+    );
+    assert!(json.contains("\"kind\":\"dir\""), "{json}");
+    assert!(json.contains("\"path\":\"tree/sub/\""), "{json}");
+    assert!(json.contains("\"kind\":\"file\""), "{json}");
+    assert!(json.contains("\"path\":\"tree/hello.txt\""), "{json}");
+    assert!(!json.contains("two.md"), "{json}");
+
+    let file = successful(
+        b.run(&["vfs", "ls", "remuda:///tree/hello.txt"]),
+        "vfs ls file",
+    );
+    assert!(file.contains("hello.txt"), "{file}");
 }
 
 #[test]
