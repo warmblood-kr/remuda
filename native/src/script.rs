@@ -2490,6 +2490,7 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
             let rows = lua.create_table()?;
             for (index, session) in list.into_iter().enumerate() {
                 let row = lua.create_table()?;
+                row.set("id", session.id)?;
                 row.set("name", session.name)?;
                 row.set("instance_id", session.instance_id.as_deref())?;
                 row.set("alive", session.alive)?;

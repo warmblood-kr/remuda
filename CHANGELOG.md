@@ -24,6 +24,15 @@
   back. Garbage collection removes the mark with the blob.
 ## Unreleased
 
+- Butler/OpenCode (macOS, Linux): a session can be launched bound to one
+  private loopback OpenCode server and a fixed conversation, so an automatic
+  notice is delivered through the server as a queued prompt instead of being
+  typed into the PTY. The binding is a 0600 manifest in a pinned private
+  directory and delivery answers a typed outcome (`accepted_queue`,
+  `definitely_not_written`, `uncertain`); a dead or stale binding is refused,
+  never redirected. Other platforms keep the PTY path.
+- `remuda.ls()` rows include the session `id` alongside `instance_id`, so a
+  script can name the durable session without a second lookup.
 - VFS: `remuda vfs serve [--addr ADDR:PORT] [--root PATH] [--allow-scripts]
   [--allow-remote]` renders the store in a browser over a read-only loopback
   port, so a stored HTML artifact loads its own stylesheet, images and pages.
