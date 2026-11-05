@@ -76,29 +76,33 @@ summary, no preflight and no way to tell a reader whether the tree is complete.
 uploader with a final pointer*, not an atomic directory publish:
 
 1. Preflight: regular files only (symlinks skipped and named), at most 500
-   files, each at most 64 MiB, and no existing file at the destination under
-   the same release name (a release is immutable; publish a new name instead).
+   files, 32 MiB each and 1 GiB per release, a free-space reserve on the
+   source's filesystem, and no existing file at the destination under the same
+   release name (a release is immutable; publish a new name instead).
 2. Upload each file to `PREFIX/NAME/<relative path>`, one `put` request per
    file, `--min-copies` honoured per file.
-3. If every file is in and has the confirmed copies asked for, write the small
-   entry file `PREFIX/NAME/CURRENT` **last**. A viewer that is pointed at
-   `PREFIX/NAME/` therefore never sees a half-uploaded page as current.
-4. Say exactly what happened: `Published N files (X MiB) as NAME; M failed`,
-   list failures, exit 1 for a hard failure (nothing usable was published) and
-   75 for "uploaded but under-replicated" — the same meaning `put` already has.
+3. If every file is in, write the completion marker `PREFIX/NAME/COMPLETE`
+   **last**. A missing marker is what makes an unfinished release legible; a
+   viewer that is pointed at `PREFIX/NAME/` can check it.
+4. With `--pointer`, write `PREFIX/CURRENT` (content: the release name) after
+   the marker. It is a plain file, not a redirect: `vfs serve` does not resolve
+   it, so a viewer opens `/NAME/` explicitly.
+5. Say exactly what happened: `Published N files (X MiB) as NAME`, list
+   failures, exit 1 when the marker is absent and 75 when everything is written
+   here but the wanted copies are not there yet — the same 75 `put` uses.
 
 What it deliberately does not do: delete a previous release (it stays until
-`vfs rm`), roll back a partial upload, or guarantee that the final pointer has
-reached every node by the time the command exits. The pointer propagates the
-way every other write does. A manifest with reader enforcement would make the
-guarantee stronger; it is not worth the reader-side changes yet.
+`vfs rm`), roll back a partial upload, guarantee that `COMPLETE` or `CURRENT`
+has reached every node when the command exits, or make an in-place update
+atomic. A manifest with reader enforcement would make the guarantee stronger;
+it is not worth the reader-side changes yet.
 
 ## Staged plan
 
-1. **Now (shipped):** store, replication, conflicts, tombstones, `vfs serve`,
-   `vfs release`.
-2. **Next (small, this design):** `vfs publish` as above. A `vfs ls` that
-   groups by path is nice to have and deferred.
+1. **Shipped to main:** store, replication, conflicts, tombstones. **Open PRs:**
+   `vfs serve` (#886), `vfs release` (#887/#888).
+2. **Built on this design (PR #891, not merged):** `vfs publish` as above. A
+   `vfs ls` that groups by path is nice to have and deferred.
 3. **Operational:** publish the cluster guidance file the owner approves
    (`remuda:///butler/guidance/cluster.md`) — no code — and give each node a
    prefetch step, because a Lua guidance read never fetches (see 1b).
