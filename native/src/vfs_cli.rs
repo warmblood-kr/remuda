@@ -1907,84 +1907,93 @@ fn list(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
     if flag(values, "conflicts") {
         return list_conflicts(store, &index, &prefix.path, json, out);
     }
+    let local = |sha: &str, size: u64| store.has_blob(sha, size);
     match scope(&index, &prefix) {
-        Scope::File(entry) => file_rows(store, out, json, std::slice::from_ref(&entry), None),
-        Scope::Dir(dir) => list_dir(store, out, json, &dir, flag(values, "recursive"), &index),
+        Scope::File(entry) => file_rows(out, json, &[entry], None, &local),
+        Scope::Dir(dir) => list_dir(out, json, &dir, flag(values, "recursive"), &index, &local),
     }
 }
 
 fn list_dir(
-    store: &VfsStore,
     out: &mut Out,
     json: bool,
     dir: &str,
     recursive: bool,
     index: &VfsIndex,
+    local: &impl Fn(&str, u64) -> bool,
 ) -> u8 {
     if recursive {
-        return file_rows(store, out, json, &index.list(dir), None);
+        return file_rows(out, json, &index.list(dir), None, local);
     }
-    let children = index.children(dir);
-    children_rows(store, out, json, dir, &children)
+    children_rows(out, json, dir, &index.children(dir), local)
 }
 
-fn entry_rows(store: &VfsStore, entries: &[&VfsEntry]) -> Vec<Value> {
+fn entry_rows(entries: &[&VfsEntry], local: &impl Fn(&str, u64) -> bool) -> Vec<Value> {
     entries
         .iter()
-        .map(|entry| entry_json(entry, |sha, size| store.has_blob(sha, size)))
+        .map(|entry| entry_json(entry, local))
         .collect()
 }
 
 fn file_rows(
-    store: &VfsStore,
     out: &mut Out,
     json: bool,
     entries: &[&VfsEntry],
     prefix: Option<&str>,
+    local: &impl Fn(&str, u64) -> bool,
 ) -> u8 {
     if json {
-        say!(out, "{}", Value::Array(entry_rows(store, entries)));
+        say!(out, "{}", Value::Array(entry_rows(entries, local)));
         return 0;
     }
     for entry in entries {
-        say_child_file(store, out, prefix, entry);
+        say_child_file(out, prefix, entry, local);
     }
     0
 }
 
-fn say_child_file(store: &VfsStore, out: &mut Out, prefix: Option<&str>, entry: &VfsEntry) {
+fn say_child_file(
+    out: &mut Out,
+    prefix: Option<&str>,
+    entry: &VfsEntry,
+    local: &impl Fn(&str, u64) -> bool,
+) {
     let name = match prefix {
         Some(prefix) => entry.path.strip_prefix(prefix).unwrap_or(&entry.path),
         None => &entry.path,
     };
-    say_file(out, name, entry, store.has_blob(&entry.sha256, entry.size));
+    say_file(out, name, entry, local(&entry.sha256, entry.size));
 }
 
-fn child_rows(store: &VfsStore, dir: &str, children: &Children<'_>) -> Vec<Value> {
+fn child_rows(
+    dir: &str,
+    children: &Children<'_>,
+    local: &impl Fn(&str, u64) -> bool,
+) -> Vec<Value> {
     let mut rows: Vec<Value> = children
         .dirs
         .iter()
         .map(|name| dir_json(dir, name))
         .collect();
-    rows.extend(entry_rows(store, &children.files));
+    rows.extend(entry_rows(&children.files, local));
     rows
 }
 
 fn children_rows(
-    store: &VfsStore,
     out: &mut Out,
     json: bool,
     dir: &str,
     children: &Children<'_>,
+    local: &impl Fn(&str, u64) -> bool,
 ) -> u8 {
     if json {
-        say!(out, "{}", Value::Array(child_rows(store, dir, children)));
+        say!(out, "{}", Value::Array(child_rows(dir, children, local)));
         return 0;
     }
     for name in &children.dirs {
         say!(out, "{:>10}  {}/", "", name);
     }
-    file_rows(store, out, false, &children.files, Some(dir))
+    file_rows(out, false, &children.files, Some(dir), local)
 }
 
 fn say_file(out: &mut Out, name: &str, entry: &VfsEntry, local: bool) {
@@ -2013,9 +2022,22 @@ fn list_conflicts(
 ) -> u8 {
     let entries = index.conflicts(prefix);
     if json {
-        say!(out, "{}", Value::Array(entry_rows(store, &entries)));
+        let local = |sha: &str, size: u64| store.has_blob(sha, size);
+        say!(
+            out,
+            "{}",
+            Value::Array(conflict_rows(index, prefix, &local))
+        );
         return 0;
     }
+    say_conflict_report(store, out, &entries)
+}
+
+fn conflict_rows(index: &VfsIndex, prefix: &str, local: &impl Fn(&str, u64) -> bool) -> Vec<Value> {
+    entry_rows(&index.conflicts(prefix), local)
+}
+
+fn say_conflict_report(store: &VfsStore, out: &mut Out, entries: &[&VfsEntry]) -> u8 {
     if entries.is_empty() {
         say!(out, "No conflicts.");
         return 0;
@@ -2309,6 +2331,114 @@ mod tests {
             dir_json("", "a"),
             serde_json::json!({"kind": "dir", "path": "a/"})
         );
+    }
+
+    fn a_conflict(sha: &str) -> rules::VfsConflict {
+        rules::VfsConflict {
+            sha256: sha.to_owned(),
+            size: 2,
+            replicas: 1,
+            version: 4,
+            writer: "SHA256:them".into(),
+            deleted: false,
+            mtime: 9,
+            vv: Default::default(),
+        }
+    }
+
+    #[test]
+    fn conflict_json_probes_local_bytes_only_for_a_live_side() {
+        use std::cell::Cell;
+        let sha = "b".repeat(64);
+        let calls = Cell::new(0);
+        let row = conflict_json(&a_conflict(&sha), &|probed, size| {
+            calls.set(calls.get() + 1);
+            probed == sha && size == 2
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(row["local"], true);
+        assert_eq!(row["version"], 4);
+        assert_eq!(row["writer"], "SHA256:them");
+        assert_eq!(row["size"], 2);
+        assert_eq!(row["deleted"], false);
+
+        let calls = Cell::new(0);
+        let mut gone = a_conflict(&sha);
+        gone.deleted = true;
+        let row = conflict_json(&gone, &|_, _| {
+            calls.set(calls.get() + 1);
+            true
+        });
+        assert_eq!(calls.get(), 0, "a deleted side has no local bytes");
+        assert_eq!(row["local"], false);
+    }
+
+    #[test]
+    fn a_slash_prefix_still_finds_conflicts_below_it() {
+        let mut index = VfsIndex::default();
+        let sha = "d".repeat(64);
+        let mut gone = one_entry_named("a/gone");
+        gone.deleted = true;
+        gone.conflicts.push(a_conflict(&sha));
+        index.entries.insert("a/gone".into(), gone);
+        let mut other = one_entry_named("a2/other");
+        other.conflicts.push(a_conflict(&sha));
+        index.entries.insert("a2/other".into(), other);
+
+        let rows = conflict_rows(&index, "a/", &|_, _| false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["path"], "a/gone");
+        assert_eq!(conflict_rows(&index, "a", &|_, _| false).len(), 1);
+        assert_eq!(
+            conflict_rows(&index, "a/", &|_, _| false)[0]["deleted"],
+            true
+        );
+    }
+
+    #[test]
+    fn a_children_report_puts_directories_first() {
+        let file = one_entry_named("a/hello.txt");
+        let children = Children {
+            dirs: vec!["sub".into()],
+            files: vec![&file],
+        };
+        let mut out = Out::default();
+        assert_eq!(
+            children_rows(&mut out, false, "a/", &children, &|_, _| true),
+            0
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0].trim(), "sub/");
+        assert!(lines[1].ends_with("hello.txt"), "{text}");
+        assert!(!text.contains("a/hello.txt"), "{text}");
+    }
+
+    #[test]
+    fn a_recursive_row_keeps_the_full_path_and_notes_a_missing_copy() {
+        let file = one_entry_named("a/hello.txt");
+        let mut out = Out::default();
+        assert_eq!(file_rows(&mut out, false, &[&file], None, &|_, _| false), 0);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("a/hello.txt"), "{text}");
+        assert!(text.contains("(not here)"), "{text}");
+    }
+
+    #[test]
+    fn child_rows_carry_the_full_directory_path() {
+        let file = one_entry_named("a/hello.txt");
+        let children = Children {
+            dirs: vec!["sub".into()],
+            files: vec![&file],
+        };
+        let rows = child_rows("a/", &children, &|_, _| false);
+        assert_eq!(
+            rows[0],
+            serde_json::json!({"kind": "dir", "path": "a/sub/"})
+        );
+        assert_eq!(rows[1]["path"], "a/hello.txt");
+        assert_eq!(rows[1]["kind"], "file");
+        assert_eq!(rows[1]["local"], false);
     }
 
     #[test]

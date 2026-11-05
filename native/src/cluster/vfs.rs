@@ -252,8 +252,7 @@ impl VfsIndex {
                 None => {}
             }
         }
-        out.dirs.sort();
-        out.files.sort_by(|left, right| left.path.cmp(&right.path));
+        sort_children(&mut out);
         out
     }
 
@@ -298,12 +297,26 @@ pub fn child_of<'a>(prefix: &str, path: &'a str, entry: &'a VfsEntry) -> Option<
 }
 
 /// True when `path` is `prefix` itself or lies below it across a `/`.
+/// A prefix written as a directory (`a/`) matches descendants only, never
+/// the file `a`.
 pub fn under(prefix: &str, path: &str) -> bool {
-    prefix.is_empty()
-        || path == prefix
-        || path
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.starts_with('/'))
+    if prefix.is_empty() {
+        return true;
+    }
+    let directory = prefix.ends_with('/');
+    let prefix = prefix.trim_end_matches('/');
+    if path == prefix {
+        return !directory;
+    }
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn sort_children(children: &mut Children<'_>) {
+    children.dirs.sort();
+    children
+        .files
+        .sort_by(|left, right| left.path.cmp(&right.path));
 }
 
 fn push_dir(dirs: &mut Vec<String>, dir: &str) {
@@ -1660,8 +1673,52 @@ mod tests {
         assert!(under("", "anything"));
         assert!(under("a", "a"));
         assert!(under("a", "a/x"));
+        assert!(under("a/", "a/x"));
+        assert!(under("a/", "a/sub/x"));
         assert!(!under("a", "a2/x"));
-        assert!(!under("a/", "a"));
+        assert!(!under("a/", "a2/x"));
+        assert!(!under("a/", "a"), "a/ names the directory, not the file a");
+    }
+
+    #[test]
+    fn children_sort_and_name_each_directory_once() {
+        let mut index = VfsIndex::default();
+        let sha = "c".repeat(64);
+        for path in ["a/zeta.txt", "a/alpha.txt", "a/two/b", "a/one/c", "a/two/d"] {
+            index
+                .entries
+                .insert(path.into(), entry(path, &sha, "SHA256:me"));
+        }
+        let children = index.children("a/");
+        assert_eq!(children.dirs, vec!["one", "two"]);
+        let files: Vec<&str> = children.files.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(files, vec!["a/alpha.txt", "a/zeta.txt"]);
+    }
+
+    #[test]
+    fn sorting_and_deduplication_are_their_own_rules() {
+        let (last, first) = (
+            entry("x/z", &"d".repeat(64), "SHA256:me"),
+            entry("x/a", &"e".repeat(64), "SHA256:me"),
+        );
+        let mut children = Children {
+            dirs: vec!["z".into(), "a".into()],
+            files: vec![&last, &first],
+        };
+        sort_children(&mut children);
+        assert_eq!(children.dirs, vec!["a", "z"]);
+        assert_eq!(
+            children
+                .files
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x/a", "x/z"]
+        );
+        let mut dirs = Vec::new();
+        push_dir(&mut dirs, "a");
+        push_dir(&mut dirs, "a");
+        assert_eq!(dirs, vec!["a"]);
     }
 
     #[test]
