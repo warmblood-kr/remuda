@@ -137,6 +137,15 @@ pub fn run(args: &[&str]) -> ExitCode {
     else {
         unreachable!("successful parser report has required values")
     };
+    serve_tui(status, model, config, binding)
+}
+
+fn serve_tui(
+    status: String,
+    model: Option<String>,
+    config: Vec<String>,
+    binding: Option<String>,
+) -> ExitCode {
     // The selected model is useful status even before the first prompt. The
     // app-server does not announce a thread (or its model) until a thread is
     // started, so waiting for `thread/started` leaves the caller showing its
@@ -166,7 +175,7 @@ pub fn run(args: &[&str]) -> ExitCode {
     };
     #[cfg(unix)]
     let client_address = match tunnel.as_ref() {
-        Some(tunnel) => format!("unix://{}", tunnel.downstream.display()),
+        Some(tunnel) => format!("unix://{}", tunnel.downstream().display()),
         None => address.clone(),
     };
     #[cfg(not(unix))]
@@ -186,13 +195,23 @@ pub fn run(args: &[&str]) -> ExitCode {
     remuda_native::child_guard::harden(&mut server_command);
     let mut server = match server_command.spawn() {
         Ok(child) => child,
-        Err(error) => return fail(error),
+        Err(error) => {
+            #[cfg(unix)]
+            if let Some(tunnel) = tunnel.as_ref() {
+                tunnel.cleanup();
+            }
+            return fail(error);
+        }
     };
     #[cfg(unix)]
     let mut parent_watch = match start_parent_watch(server.id()) {
         Ok(watch) => Some(watch),
         Err(error) => {
             finish_app_server(&mut server, None);
+            #[cfg(unix)]
+            if let Some(tunnel) = tunnel.as_ref() {
+                tunnel.cleanup();
+            }
             return fail(error);
         }
     };
@@ -201,6 +220,10 @@ pub fn run(args: &[&str]) -> ExitCode {
 
     if !wait_for_socket(&socket) {
         finish_app_server(&mut server, parent_watch.take());
+        #[cfg(unix)]
+        if let Some(tunnel) = tunnel.as_ref() {
+            tunnel.cleanup();
+        }
         return fail("Codex app-server did not bind its local socket");
     }
     let monitor_socket = socket.clone();

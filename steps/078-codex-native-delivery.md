@@ -60,7 +60,7 @@ not used.
 
 ```text
 $ cargo test -q -p remuda-native --bin remuda
-test result: ok. 177 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+test result: ok. 183 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
 
 $ cargo clippy -q -p remuda-native --bin remuda -- -D warnings
 (no output)
@@ -117,7 +117,7 @@ the launcher must own stopping its spawned app-server/tunnel. The helper kills
 nothing. Artifacts: `spike-codex-tunnel/evidence/2026-11-05/`.
 
 Owning tunnel on the real launcher (`--binding <manifest file>`), pinned binary
-`sha256 7ebfb5f7...`:
+`sha256 e2dcdb75...`:
 
 ```text
 AUTO_BINDING True
@@ -137,6 +137,16 @@ a second startup request (`temporary-structured-...`) was observed and ignored,
 so only the first startup thread was bound. Normal exit removed the downstream
 socket, binding files and app-server. Adversarial reconnect/ID-reuse and Linux
 are not measured.
+
+Tunnel hardening after independent review: downstream binds only in a
+user-private 0700 directory, is chmod 0600, is never removed before bind and is
+removed only by its created inode; the request id is registered before the
+request bytes reach the app-server; raw chunk forwarding continues when the
+bounded observer rejects a frame; EOF before publication latches unavailable;
+request ids must be strings; method-bearing or mixed result/error envelopes are
+not responses. Regressions cover second bootstrap request, non-string id,
+error/non-root response, method-bearing matching id, and forwarding through a
+parse failure.
 
 Kernel peer fixture for a direct spawn: connected peer PID/start equals the
 spawned child, uid equals euid, resolved socket is 0600. Two spawns with the
