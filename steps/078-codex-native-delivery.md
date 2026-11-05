@@ -31,8 +31,14 @@ not used.
 - A genuinely absent publication leaf under a valid private parent is
   `definitely_not_written/binding_missing`; a missing/invalid parent,
   malformed, wrong-owner or dangling leaf stays `invalid_binding`.
-- Only macOS is advertised until Linux is measured. Helpers only: no
-  owning-launch wiring.
+- `remuda _codex_tui --binding FILE` (optional) starts the owning raw UDS
+  tunnel: the TUI connects downstream, bytes are forwarded unchanged, and only
+  the first `thread/start` request plus its single exact-id response are
+  inspected. The captured root thread is published through the same adoption
+  preflight. Nonce/session come from the parent environment; later `/new`
+  requests do not retarget A. Capture failure keeps forwarding but publishes
+  nothing.
+- Only macOS is advertised until Linux is measured.
 
 ## Expected
 
@@ -54,7 +60,7 @@ not used.
 
 ```text
 $ cargo test -q -p remuda-native --bin remuda
-test result: ok. 176 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s
+test result: ok. 177 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
 
 $ cargo clippy -q -p remuda-native --bin remuda -- -D warnings
 (no output)
@@ -109,6 +115,28 @@ A second bounded run repeated `adopted` + `accepted_queue` (generation
 alive (`SERVER_AFTER_TUI_EXIT alive`). TUI exit alone does not stop the server;
 the launcher must own stopping its spawned app-server/tunnel. The helper kills
 nothing. Artifacts: `spike-codex-tunnel/evidence/2026-11-05/`.
+
+Owning tunnel on the real launcher (`--binding <manifest file>`), pinned binary
+`sha256 7ebfb5f7...`:
+
+```text
+AUTO_BINDING True
+NOTICE {"outcome": "accepted_queue"}
+QUEUE_ACK_IN_TUI True
+DRAFT_PRESERVED True
+EXIT_MODE normal
+LAUNCHER_SOCKET_GONE True
+BINDING_FILES_GONE True
+APP_SERVER_GONE True
+PROVIDER_POSTS 2
+```
+
+The binding was published from the captured first `thread/start` response with
+no external adopt. The TUI uses string request ids (`startup-thread-start-...`);
+a second startup request (`temporary-structured-...`) was observed and ignored,
+so only the first startup thread was bound. Normal exit removed the downstream
+socket, binding files and app-server. Adversarial reconnect/ID-reuse and Linux
+are not measured.
 
 Kernel peer fixture for a direct spawn: connected peer PID/start equals the
 spawned child, uid equals euid, resolved socket is 0600. Two spawns with the

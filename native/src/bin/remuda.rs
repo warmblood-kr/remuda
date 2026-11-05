@@ -57,6 +57,8 @@ mod claude_channel;
 mod codex_native;
 #[path = "remuda/codex_tui.rs"]
 mod codex_tui;
+#[path = "remuda/codex_tunnel.rs"]
+mod codex_tunnel;
 #[path = "remuda/opencode_adopt.rs"]
 mod opencode_adopt;
 #[path = "remuda/opencode_tui.rs"]

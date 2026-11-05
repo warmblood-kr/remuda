@@ -76,6 +76,21 @@ impl Outcome {
     }
 }
 
+/// A successfully published binding. Removal is inode-based, so a replacement
+/// at either name survives.
+pub(crate) struct Published {
+    pub generation: String,
+    manifest: super::private_dir::CreatedFile,
+    pin: super::private_dir::CreatedFile,
+}
+
+impl Published {
+    pub(crate) fn remove(self) {
+        self.manifest.remove();
+        self.pin.remove();
+    }
+}
+
 pub(crate) fn version_supported(version: &str) -> bool {
     version == PINNED_VERSION
 }
@@ -377,6 +392,10 @@ pub(crate) struct Manifest {
     pub thread: String,
 }
 
+pub(crate) fn valid_token(value: &str) -> bool {
+    token(value)
+}
+
 fn token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -560,7 +579,10 @@ pub(crate) fn run_adopt(args: &[&str]) -> ExitCode {
         return emit_status("unavailable", reason);
     }
     match adopt(&request) {
-        Ok(generation) => emit_fields(json!({"outcome": "adopted", "generation": generation})),
+        Ok(published) => emit_fields(json!({
+            "outcome": "adopted",
+            "generation": published.generation
+        })),
         Err(reason) => emit_status("unavailable", reason),
     }
 }
@@ -677,7 +699,7 @@ fn preflight(
 }
 
 #[cfg(unix)]
-fn adopt(request: &AdoptRequest) -> Result<String, &'static str> {
+pub(crate) fn adopt(request: &AdoptRequest) -> Result<Published, &'static str> {
     let binding = Path::new(&request.binding);
     let pin_file = pin_path(binding);
     if std::fs::symlink_metadata(&pin_file).is_ok() || std::fs::symlink_metadata(binding).is_ok() {
@@ -718,15 +740,22 @@ fn adopt(request: &AdoptRequest) -> Result<String, &'static str> {
             .and_then(|()| file.sync_all())
             .map_err(|_| "invalid_binding")
     });
-    if written.is_err() {
-        created.remove();
-        return Err("invalid_binding");
-    }
-    Ok(pin.generation)
+    let manifest = match written {
+        Ok(manifest) => manifest,
+        Err(reason) => {
+            created.remove();
+            return Err(reason);
+        }
+    };
+    Ok(Published {
+        generation: pin.generation,
+        manifest,
+        pin: created,
+    })
 }
 
 #[cfg(not(unix))]
-fn adopt(_request: &AdoptRequest) -> Result<String, &'static str> {
+pub(crate) fn adopt(_request: &AdoptRequest) -> Result<Published, &'static str> {
     Err("unsupported_platform")
 }
 
@@ -1414,7 +1443,8 @@ mod tests {
         };
         assert!(validate_adopt(&request).is_ok());
 
-        let generation = adopt(&request).expect("adopt");
+        let published = adopt(&request).expect("adopt");
+        let generation = published.generation.clone();
         assert_eq!(generation.len(), 64);
         let methods = server.join().expect("server");
         assert!(methods.iter().any(|method| method == "initialize"));
@@ -1437,6 +1467,11 @@ mod tests {
                 .generation,
             generation
         );
+
+        // Identity-based removal takes only the published inodes.
+        published.remove();
+        assert!(!binding.exists());
+        assert!(!dir.join("pin.json").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
