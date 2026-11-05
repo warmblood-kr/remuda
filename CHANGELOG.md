@@ -31,7 +31,10 @@
   `remuda _claude_notice` reads the frozen notice request and the strict
   `claude-channel-v1` manifest, checks the socket/bridge/peer identity, and
   answers typed JSON; any possible emission is `uncertain` with no retry. The
-  ordinary `remuda mcp` entry and PTY path are unchanged.
+  recorded session is the inherited core `REMUDA_SESSION_ID` (the durable row
+  id), not a prelaunch alias; a standalone test may set
+  `REMUDA_CLAUDE_SESSION`. The ordinary `remuda mcp` entry and PTY path are
+  unchanged.
 - Butler/OpenCode (macOS, Linux): a session can be launched bound to one
   private loopback OpenCode server and a fixed conversation, so an automatic
   notice is delivered through the server as a queued prompt instead of being

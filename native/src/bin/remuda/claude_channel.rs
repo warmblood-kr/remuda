@@ -54,7 +54,9 @@ pub fn run(args: &[&str]) -> std::process::ExitCode {
     if args.iter().any(|arg| *arg == "--help" || *arg == "-h") {
         println!(
             "remuda _claude_channel\nRun the opt-in Claude channel MCP server on stdin/stdout.\n\
-             The binding directory, nonce and session come from the owned child environment."
+             The binding directory and nonce come from the owned child environment. The\n\
+             session is the inherited core REMUDA_SESSION_ID; standalone tests may set\n\
+             REMUDA_CLAUDE_SESSION."
         );
         return std::process::ExitCode::SUCCESS;
     }
@@ -93,11 +95,20 @@ fn owned_environment() -> Result<(PathBuf, String, String), String> {
         .ok()
         .filter(|value| !value.is_empty())
         .ok_or("REMUDA_BUTLER_BINDING_NONCE is required")?;
-    let session = std::env::var("REMUDA_BUTLER_SESSION")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .ok_or("REMUDA_BUTLER_SESSION is required")?;
+    let session = session_from_env(|key| std::env::var(key).ok())
+        .ok_or("REMUDA_SESSION_ID is required (standalone tests may set REMUDA_CLAUDE_SESSION)")?;
     Ok((PathBuf::from(dir), nonce, session))
+}
+
+/// Managed launches inherit the canonical core session id. The alias is only an
+/// explicit standalone-test fallback and is never required.
+fn session_from_env<F>(get: F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get("REMUDA_SESSION_ID")
+        .filter(|value| !value.is_empty())
+        .or_else(|| get("REMUDA_CLAUDE_SESSION").filter(|value| !value.is_empty()))
 }
 
 /// Serve one channel over the given stdio streams. Public for the unit and
@@ -1578,6 +1589,26 @@ mod tests {
 
     fn canonical(ids: &[String]) -> String {
         super::super::agent_notice::canonical_notice(ids)
+    }
+
+    #[test]
+    fn managed_session_id_wins_over_the_standalone_fallback() {
+        let get = |key: &str| match key {
+            "REMUDA_SESSION_ID" => Some("core-row-id".to_string()),
+            "REMUDA_CLAUDE_SESSION" => Some("alias".to_string()),
+            _ => None,
+        };
+        assert_eq!(session_from_env(get).as_deref(), Some("core-row-id"));
+    }
+
+    #[test]
+    fn standalone_session_fallback_is_optional_and_explicit() {
+        let fallback =
+            |key: &str| (key == "REMUDA_CLAUDE_SESSION").then(|| "standalone".to_string());
+        assert_eq!(session_from_env(fallback).as_deref(), Some("standalone"));
+        assert_eq!(session_from_env(|_| None), None);
+        let empty = |key: &str| (key == "REMUDA_SESSION_ID").then(String::new);
+        assert_eq!(session_from_env(empty), None);
     }
 
     fn config(dir: &Path) -> Config {

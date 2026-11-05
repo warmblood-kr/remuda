@@ -23,6 +23,11 @@ clients, the PTY fallback and the completed guidance work must stay unchanged.
   strict manifest and capability through `PrivateDir`, checks the socket
   fingerprint, bridge PID+start and connected peer, then sends the private
   ingress request and returns typed JSON.
+- The manifest records the canonical core session: `REMUDA_SESSION_ID` (the
+  durable row id) inherited by the MCP child, never a prelaunch alias.
+  `REMUDA_CLAUDE_SESSION` is an explicit standalone-test fallback only; a
+  regression test pins that the core id wins and that the alias is not
+  required.
 - Any possible emission is `uncertain`/`channel_emitted_unconfirmed`. Only a
   bridge-proven zero notification byte is `definitely_not_written`. No retry,
   no PTY fallback, no tools, no receipt tool, no permission relay.
@@ -51,10 +56,10 @@ clients, the PTY fallback and the completed guidance work must stay unchanged.
 
 ```text
 cargo test -p remuda-native --bin remuda claude_channel
-test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 155 filtered out; finished in 0.18s
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 155 filtered out; finished in 0.16s
 
 cargo test -p remuda-native --bin remuda
-test result: ok. 190 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+test result: ok. 192 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
 
 cargo clippy -p remuda-native --bin remuda --tests
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.83s
@@ -63,13 +68,13 @@ cargo fmt --all -- --check
 fmt exit: 0
 
 python3 scripts/check-comments.py
-ok — 1884 doc comment(s) within cap (item 3, module 20)
+ok — 1985 doc comment(s) within cap (item 3, module 20)
 
 python3 scripts/check-steps.py
 ok — 78 step(s), each with before, desired, expected and captured actual
 
 python3 scripts/check-principles.py
-ok — 14 principles, every named mechanism exists (32 CI jobs, 11 denied paths, 3245 test fns seen)
+ok — 14 principles, every named mechanism exists (32 CI jobs, 11 denied paths, 3363 test fns seen)
 ```
 
 The authorized local-development TUI retry used an explicit disposable cwd.
