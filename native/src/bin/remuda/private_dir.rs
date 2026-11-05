@@ -50,6 +50,26 @@ mod imp {
         id: EntryId,
     }
 
+    /// Why a private leaf could not be created. `AlreadyExists` is separate
+    /// from every other refusal so a caller can tell a duplicate from a
+    /// permission or I/O failure without matching on an error string.
+    #[derive(Debug)]
+    pub enum CreateError {
+        AlreadyExists,
+        Refused(String),
+    }
+
+    impl std::fmt::Display for CreateError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::AlreadyExists => {
+                    write!(formatter, "cannot create binding manifest: File exists")
+                }
+                Self::Refused(reason) => write!(formatter, "{reason}"),
+            }
+        }
+    }
+
     fn euid() -> u32 {
         // SAFETY: geteuid has no preconditions and cannot fail.
         unsafe { libc::geteuid() }
@@ -154,10 +174,13 @@ mod imp {
         }
 
         /// Create a new leaf with mode 0600. `O_EXCL` means a preexisting file
-        /// is never truncated, adopted or removed.
-        pub fn create_new(&self, name: &str) -> Result<(File, EntryId), String> {
+        /// is never truncated, adopted or removed. A duplicate is reported as
+        /// `CreateError::AlreadyExists`, never as an error string.
+        pub fn create_new_checked(&self, name: &str) -> Result<(File, EntryId), CreateError> {
             if !valid_leaf(name) {
-                return Err("binding file name must be one path component".into());
+                return Err(CreateError::Refused(
+                    "binding file name must be one path component".into(),
+                ));
             }
             let file = open_at(
                 self.fd.as_raw_fd(),
@@ -165,14 +188,28 @@ mod imp {
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0o600,
             )
-            .map_err(|error| format!("cannot create binding manifest: {error}"))?;
-            let metadata = file
-                .metadata()
-                .map_err(|error| format!("cannot inspect binding manifest: {error}"))?;
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    CreateError::AlreadyExists
+                } else {
+                    CreateError::Refused(format!("cannot create binding manifest: {error}"))
+                }
+            })?;
+            let metadata = file.metadata().map_err(|error| {
+                CreateError::Refused(format!("cannot inspect binding manifest: {error}"))
+            })?;
             if !metadata.is_file() || metadata.uid() != euid() || metadata.mode() & 0o077 != 0 {
-                return Err("binding manifest is not a private regular file".into());
+                return Err(CreateError::Refused(
+                    "binding manifest is not a private regular file".into(),
+                ));
             }
             Ok((file, entry_id(&metadata)))
+        }
+
+        /// String-returning form kept for existing callers.
+        pub fn create_new(&self, name: &str) -> Result<(File, EntryId), String> {
+            self.create_new_checked(name)
+                .map_err(|error| error.to_string())
         }
 
         /// Open an existing leaf without following a symlink or blocking on a
@@ -196,6 +233,93 @@ mod imp {
                 return Err("binding manifest is not a private regular file".into());
             }
             Ok((file, entry_id(&metadata)))
+        }
+
+        /// Read one private leaf with a hard bound on the opened descriptor.
+        /// The metadata length is a fast rejection; the take bound and the
+        /// post-read length decide, so a growing or swiped file cannot exceed it.
+        pub fn read_limited(&self, name: &str, max: u64) -> Result<Vec<u8>, String> {
+            let (mut file, _id) = self.open_existing(name)?;
+            let metadata = file
+                .metadata()
+                .map_err(|error| format!("cannot inspect binding manifest: {error}"))?;
+            if metadata.len() > max {
+                return Err("binding manifest is too large".into());
+            }
+            let mut data = Vec::new();
+            let mut bounded = io::Read::take(&mut file, max + 1);
+            io::Read::read_to_end(&mut bounded, &mut data)
+                .map_err(|error| format!("cannot read binding manifest: {error}"))?;
+            if data.len() as u64 > max {
+                return Err("binding manifest is too large".into());
+            }
+            Ok(data)
+        }
+
+        /// True only when `openat` on the opened parent reports ENOENT for
+        /// this leaf. A missing/invalid parent is decided by `open` first; a
+        /// dangling symlink or wrong-owner leaf is not "absent".
+        pub fn leaf_absent(&self, name: &str) -> Result<bool, String> {
+            if !valid_leaf(name) {
+                return Err("binding file name must be one path component".into());
+            }
+            match open_at(
+                self.fd.as_raw_fd(),
+                name,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                0,
+            ) {
+                Ok(_) => Ok(false),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+                Err(error) => Err(format!("cannot open binding manifest: {error}")),
+            }
+        }
+
+        /// Sync the pinned directory descriptor. A new directory entry is only
+        /// durable after this succeeds; an unsupported directory sync fails
+        /// closed instead of pretending the reservation is durable.
+        pub fn sync(&self) -> Result<(), String> {
+            // SAFETY: `fd` is an open directory descriptor owned by `self`.
+            if unsafe { libc::fsync(self.fd.as_raw_fd()) } == 0 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "cannot sync private directory: {}",
+                    io::Error::last_os_error()
+                ))
+            }
+        }
+
+        /// Publish `from` as `to` without replacing an existing leaf. Unlike
+        /// `rename`, a concurrent first generation makes this fail with EEXIST.
+        pub fn link_new(&self, from: &str, to: &str) -> Result<(), String> {
+            if !valid_leaf(from) || !valid_leaf(to) {
+                return Err("binding file name must be one path component".into());
+            }
+            let from =
+                CString::new(from).map_err(|_| "binding path contains a NUL byte".to_string())?;
+            let to =
+                CString::new(to).map_err(|_| "binding path contains a NUL byte".to_string())?;
+            // SAFETY: both names are NUL terminated and relative to `self.fd`.
+            if unsafe {
+                libc::linkat(
+                    self.fd.as_raw_fd(),
+                    from.as_ptr(),
+                    self.fd.as_raw_fd(),
+                    to.as_ptr(),
+                    0,
+                )
+            } == 0
+            {
+                Ok(())
+            } else {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    Err("binding leaf already exists".into())
+                } else {
+                    Err(format!("cannot publish binding manifest: {error}"))
+                }
+            }
         }
 
         /// Remove `name` only while it is still the inode this invocation
@@ -361,7 +485,7 @@ mod imp {
 }
 
 #[cfg(unix)]
-pub use imp::{CreatedFile, PrivateDir};
+pub use imp::{CreateError, CreatedFile, PrivateDir};
 
 #[cfg(not(unix))]
 mod unsupported {
@@ -372,6 +496,23 @@ mod unsupported {
     pub struct EntryId {
         pub dev: u64,
         pub ino: u64,
+    }
+
+    #[derive(Debug)]
+    pub enum CreateError {
+        AlreadyExists,
+        Refused(String),
+    }
+
+    impl std::fmt::Display for CreateError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::AlreadyExists => {
+                    write!(formatter, "cannot create binding manifest: File exists")
+                }
+                Self::Refused(reason) => write!(formatter, "{reason}"),
+            }
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -392,11 +533,33 @@ mod unsupported {
             &self.path
         }
 
+        pub fn create_new_checked(&self, _name: &str) -> Result<(File, EntryId), CreateError> {
+            Err(CreateError::Refused(
+                "OpenCode native binding requires macOS or Linux".into(),
+            ))
+        }
+
         pub fn create_new(&self, _name: &str) -> Result<(File, EntryId), String> {
             Err("OpenCode native binding requires macOS or Linux".into())
         }
 
         pub fn open_existing(&self, _name: &str) -> Result<(File, EntryId), String> {
+            Err("OpenCode native binding requires macOS or Linux".into())
+        }
+
+        pub fn read_limited(&self, _name: &str, _max: u64) -> Result<Vec<u8>, String> {
+            Err("OpenCode native binding requires macOS or Linux".into())
+        }
+
+        pub fn leaf_absent(&self, _name: &str) -> Result<bool, String> {
+            Err("OpenCode native binding requires macOS or Linux".into())
+        }
+
+        pub fn sync(&self) -> Result<(), String> {
+            Err("OpenCode native binding requires macOS or Linux".into())
+        }
+
+        pub fn link_new(&self, _from: &str, _to: &str) -> Result<(), String> {
             Err("OpenCode native binding requires macOS or Linux".into())
         }
 
@@ -415,4 +578,4 @@ mod unsupported {
 }
 
 #[cfg(not(unix))]
-pub use unsupported::{CreatedFile, PrivateDir};
+pub use unsupported::{CreateError, CreatedFile, PrivateDir};

@@ -1,7 +1,7 @@
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::json;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -78,6 +78,12 @@ pub fn run(args: &[&str]) -> ExitCode {
     if let Err(reason) = validate_request(&request) {
         return emit("definitely_not_written", reason);
     }
+    // No publication leaf exists under a valid private parent: a proven
+    // pre-write state. Butler decides from its own provenance whether this is
+    // startup-pending or a vanished binding; the filesystem cannot.
+    if binding_missing(Path::new(&request.binding)) {
+        return emit("definitely_not_written", "binding_missing");
+    }
     let manifest = match load_manifest(&request.binding) {
         Ok(manifest) => manifest,
         Err(reason) => return emit("definitely_not_written", reason),
@@ -98,7 +104,26 @@ fn platform_supported() -> bool {
     cfg!(unix)
 }
 
-fn canonical_notice(ids: &[String]) -> String {
+/// Missing only when a valid private parent opens and `openat` says ENOENT
+/// for the leaf. A missing/invalid parent, dangling symlink or wrong-owner
+/// leaf is not missing; prior publication is Butler provenance, not proof.
+pub(crate) fn binding_missing(path: &Path) -> bool {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return false;
+    };
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Ok(directory) = PrivateDir::open(parent) else {
+        return false;
+    };
+    matches!(directory.leaf_absent(name), Ok(true))
+}
+
+pub(crate) fn canonical_notice(ids: &[String]) -> String {
     if ids.len() == 1 {
         format!("Butler message {} arrived. Read it: {INBOX_HINT}", ids[0])
     } else {
@@ -109,7 +134,7 @@ fn canonical_notice(ids: &[String]) -> String {
     }
 }
 
-fn read_stdin() -> Result<String, &'static str> {
+pub(crate) fn read_stdin() -> Result<String, &'static str> {
     let mut data = Vec::new();
     std::io::stdin()
         .take(MAX_STDIN + 1)
@@ -173,22 +198,9 @@ fn load_manifest(path: &str) -> Result<Manifest, &'static str> {
         .and_then(|name| name.to_str())
         .ok_or("invalid_binding")?;
     let directory = PrivateDir::open(parent).map_err(|_| "invalid_binding")?;
-    let (mut file, _id) = directory
-        .open_existing(name)
+    let data = directory
+        .read_limited(name, MAX_STDIN)
         .map_err(|_| "invalid_binding")?;
-    let metadata = file.metadata().map_err(|_| "invalid_binding")?;
-    if metadata.len() > MAX_STDIN {
-        return Err("invalid_binding");
-    }
-    let mut data = Vec::new();
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| "invalid_binding")?;
-    file.take(MAX_STDIN + 1)
-        .read_to_end(&mut data)
-        .map_err(|_| "invalid_binding")?;
-    if data.len() as u64 > MAX_STDIN {
-        return Err("invalid_binding");
-    }
     serde_json::from_slice(&data).map_err(|_| "invalid_binding")
 }
 
@@ -439,6 +451,43 @@ mod tests {
                 password: "p".into(),
             },
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binding_missing_needs_a_valid_private_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("remuda-binding-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir(&base).expect("base");
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).expect("0700");
+        let good = base.join("good");
+        std::fs::create_dir(&good).expect("good");
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o700)).expect("0700");
+        let bad_parent = base.join("bad");
+        std::fs::create_dir(&bad_parent).expect("bad");
+        std::fs::set_permissions(&bad_parent, std::fs::Permissions::from_mode(0o755))
+            .expect("0755");
+
+        let present = good.join("manifest.json");
+        std::fs::write(&present, b"{}").expect("write");
+        std::fs::set_permissions(&present, std::fs::Permissions::from_mode(0o600)).expect("0600");
+        assert!(!binding_missing(&present));
+
+        // Absent leaf under a valid 0700 parent is the only missing case.
+        assert!(binding_missing(&good.join("absent.json")));
+
+        // A missing or wrong-mode parent is not publication-missing.
+        assert!(!binding_missing(&base.join("no-such-dir/manifest.json")));
+        assert!(!binding_missing(&bad_parent.join("absent.json")));
+
+        // A dangling symlink leaf is not "absent"; load_manifest must refuse it.
+        std::os::unix::fs::symlink(good.join("nowhere"), good.join("dangling.json"))
+            .expect("symlink");
+        assert!(!binding_missing(&good.join("dangling.json")));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn manifest_text() -> Vec<u8> {
