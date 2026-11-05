@@ -464,6 +464,26 @@ fn upload_release(
     plan: &crate::vfs_publish::Plan,
     min_copies: Option<&str>,
 ) -> Uploaded {
+    upload_release_with(
+        &|args, input| daemon_call(socket, args, input),
+        base,
+        plan,
+        min_copies,
+    )
+}
+
+/// One daemon call: args, optional input, and (exit, stdout, stderr).
+type DaemonCall<'a> =
+    dyn Fn(Vec<String>, Option<Vec<u8>>) -> Result<(u8, Vec<u8>, String), String> + 'a;
+
+/// The upload loop with its daemon call injected, so the accounting rules are
+/// tested without a socket.
+fn upload_release_with(
+    call: &DaemonCall<'_>,
+    base: &str,
+    plan: &crate::vfs_publish::Plan,
+    min_copies: Option<&str>,
+) -> Uploaded {
     use crate::vfs_publish;
     let mut uploaded = Uploaded {
         files: 0,
@@ -487,7 +507,7 @@ fn upload_release(
         if let Some(k) = min_copies {
             args.extend(["--min-copies".to_owned(), k.to_owned()]);
         }
-        match daemon_call(socket, args, Some(bytes)) {
+        match call(args, Some(bytes)) {
             Ok((code, _, stderr)) => match put_result(code) {
                 Put::Done => {
                     uploaded.files += 1;
@@ -575,7 +595,7 @@ fn write_complete(finished: &Finished<'_>, out: &mut Out) -> Result<Put, u8> {
             let (what, detail) = marker_words(&error);
             warn!(out, "remuda: publish incomplete: every file is in remuda:///{}/, but COMPLETE {what}: {detail}", finished.base);
             if matches!(error, MarkerError::Unconfirmed(_)) {
-                warn!(out, "Next: retry the same publish; a repeated put is safe.");
+                warn!(out, "Next: check `remuda vfs stat remuda:///{}/COMPLETE`; if it is missing, publish a new --release name.", finished.base);
             }
             Err(1)
         }
@@ -596,11 +616,15 @@ fn write_pointer(finished: &Finished<'_>, out: &mut Out) -> Result<Put, u8> {
         finished.release.as_bytes().to_vec(),
         finished.min_copies,
     ) {
-        Ok(Put::Failed) | Err(_) => {
+        Err(error) => {
+            let (what, detail) = marker_words(&error);
             warn!(
                 out,
-                "remuda: publish: the release is complete, but CURRENT was not written."
+                "remuda: publish: the release is complete, but CURRENT {what}: {detail}"
             );
+            if matches!(error, MarkerError::Unconfirmed(_)) {
+                warn!(out, "Next: check `remuda vfs stat remuda:///{prefix}CURRENT`; if it is missing, publish a new --release name.");
+            }
             Err(1)
         }
         Ok(put) => Ok(put),
@@ -1752,6 +1776,56 @@ mod tests {
         let unknown = marker_words(&timeout);
         assert_eq!(unknown.0, "could not be confirmed");
         assert_eq!(unknown.1, "timed out");
+    }
+
+    fn plan_of(names: &[&str]) -> (std::path::PathBuf, crate::vfs_publish::Plan) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "vfs-upload-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in names {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let plan = crate::vfs_publish::plan(&dir, "v1").unwrap();
+        (dir, plan)
+    }
+
+    #[test]
+    fn a_failed_first_put_is_not_counted_as_uploaded() {
+        let (dir, plan) = plan_of(&["a.txt", "b.txt"]);
+        let call = |_args: Vec<String>, _input: Option<Vec<u8>>| Err("gone".to_string());
+        let uploaded = upload_release_with(&call, "design/v1", &plan, None);
+        assert_eq!(uploaded.files, 0);
+        assert_eq!(uploaded.bytes, 0);
+        assert!(uploaded.failure.is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_short_put_counts_and_the_upload_continues() {
+        use std::cell::Cell;
+        let (dir, plan) = plan_of(&["a.txt", "b.txt"]);
+        let calls = Cell::new(0);
+        let call = |_args: Vec<String>, _input: Option<Vec<u8>>| {
+            let n = calls.get();
+            calls.set(n + 1);
+            if n == 0 {
+                Ok((EXIT_TEMPFAIL, Vec::new(), "short".to_string()))
+            } else {
+                Ok((0, Vec::new(), String::new()))
+            }
+        };
+        let uploaded = upload_release_with(&call, "design/v1", &plan, None);
+        assert_eq!(uploaded.files, 2);
+        assert_eq!(uploaded.short, 1);
+        assert!(uploaded.failure.is_none());
+        assert_eq!(calls.get(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
