@@ -88,8 +88,9 @@ uploader with a final pointer*, not an atomic directory publish:
    the marker. It is a plain file, not a redirect: `vfs serve` does not resolve
    it, so a viewer opens `/NAME/` explicitly.
 5. Say exactly what happened: `Published N files (X MiB) as NAME`, list
-   failures, exit 1 when the marker is absent and 75 when everything is written
-   here but the wanted copies are not there yet — the same 75 `put` uses.
+   failures, exit 1 when the marker is absent and 75 when every byte is here
+   but the copies wanted are not (a file `put` that returns 75 counts as
+   uploaded and does not stop the run) — the same 75 `put` uses.
 
 What it deliberately does not do: delete a previous release (it stays until
 `vfs rm`), roll back a partial upload, guarantee that `COMPLETE` or `CURRENT`
