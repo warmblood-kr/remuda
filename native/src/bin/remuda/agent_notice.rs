@@ -947,6 +947,63 @@ mod tests {
     }
 
     #[test]
+    fn adopted_pre_post_fence_blocks_a_server_that_changed_during_gets() {
+        for (after_start, reason) in [(None, "server_gone"), (Some(201), "stale_binding")] {
+            let request = request();
+            let manifest = adopted_manifest();
+            let identity_calls = std::cell::Cell::new(0_u32);
+            let identity = |_pid: u32| {
+                let call = identity_calls.get();
+                identity_calls.set(call + 1);
+                if call == 0 {
+                    adopted_live(22)
+                } else {
+                    after_start.map(|started_us| ProcessIdentity {
+                        parent: 999,
+                        started_us,
+                    })
+                }
+            };
+            let mut responses = vec![response(200, INFO_OK), target_ok()];
+            let mut posts = 0;
+            let outcome = deliver_adopted_checked_with(
+                &request,
+                &manifest,
+                |method, _, _, _| {
+                    if method == "POST" {
+                        posts += 1;
+                    }
+                    Ok(responses.remove(0))
+                },
+                identity,
+            );
+            assert_eq!(outcome, ("definitely_not_written", reason));
+            assert_eq!(posts, 0);
+        }
+    }
+
+    #[test]
+    fn adopted_unchanged_generation_still_sends_exactly_one_post() {
+        let request = request();
+        let manifest = adopted_manifest();
+        let mut responses = vec![response(200, INFO_OK), target_ok(), receipt(200)];
+        let mut posts = 0;
+        let outcome = deliver_adopted_checked_with(
+            &request,
+            &manifest,
+            |method, _, _, _| {
+                if method == "POST" {
+                    posts += 1;
+                }
+                Ok(responses.remove(0))
+            },
+            adopted_live,
+        );
+        assert_eq!(outcome, ("accepted_queue", ""));
+        assert_eq!(posts, 1);
+    }
+
+    #[test]
     fn adopted_binding_is_checked_before_any_request() {
         let request = request();
         let mut manifest = adopted_manifest();

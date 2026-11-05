@@ -65,8 +65,8 @@ usable, and starting `serve`/ACP is not adoption.
 
 ```text
 $ cargo test -p remuda-native --bin remuda
-running 174 tests
-test result: ok. 174 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+running 176 tests
+test result: ok. 176 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 $ cargo clippy -p remuda-native --bin remuda -- -D warnings
 Finished
@@ -94,4 +94,4 @@ Focused unit coverage added in this step:
   last-pre-POST fence refuses `server_gone`/`stale_binding` with zero POST while
   an unchanged generation still sends exactly one correlated POST.
 - Owned-schema, canonical-notice, owned process-generation and delivery
-  regressions remain in the same 174-test binary above.
+  regressions remain in the same 176-test binary above.
