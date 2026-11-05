@@ -198,6 +198,46 @@ mod imp {
             Ok((file, entry_id(&metadata)))
         }
 
+        /// Read one private leaf with a hard bound on the opened descriptor.
+        /// The metadata length is a fast rejection; the take bound and the
+        /// post-read length decide, so a growing or swiped file cannot exceed it.
+        pub fn read_limited(&self, name: &str, max: u64) -> Result<Vec<u8>, String> {
+            let (mut file, _id) = self.open_existing(name)?;
+            let metadata = file
+                .metadata()
+                .map_err(|error| format!("cannot inspect binding manifest: {error}"))?;
+            if metadata.len() > max {
+                return Err("binding manifest is too large".into());
+            }
+            let mut data = Vec::new();
+            let mut bounded = io::Read::take(&mut file, max + 1);
+            io::Read::read_to_end(&mut bounded, &mut data)
+                .map_err(|error| format!("cannot read binding manifest: {error}"))?;
+            if data.len() as u64 > max {
+                return Err("binding manifest is too large".into());
+            }
+            Ok(data)
+        }
+
+        /// True only when `openat` on the opened parent reports ENOENT for
+        /// this leaf. A missing/invalid parent is decided by `open` first; a
+        /// dangling symlink or wrong-owner leaf is not "absent".
+        pub fn leaf_absent(&self, name: &str) -> Result<bool, String> {
+            if !valid_leaf(name) {
+                return Err("binding file name must be one path component".into());
+            }
+            match open_at(
+                self.fd.as_raw_fd(),
+                name,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                0,
+            ) {
+                Ok(_) => Ok(false),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+                Err(error) => Err(format!("cannot open binding manifest: {error}")),
+            }
+        }
+
         /// Remove `name` only while it is still the inode this invocation
         /// created. A replacement (or a preexisting file) is left alone.
         pub fn remove_if_matches(&self, name: &str, id: EntryId) -> bool {
@@ -397,6 +437,14 @@ mod unsupported {
         }
 
         pub fn open_existing(&self, _name: &str) -> Result<(File, EntryId), String> {
+            Err("OpenCode native binding requires macOS or Linux".into())
+        }
+
+        pub fn read_limited(&self, _name: &str, _max: u64) -> Result<Vec<u8>, String> {
+            Err("OpenCode native binding requires macOS or Linux".into())
+        }
+
+        pub fn leaf_absent(&self, _name: &str) -> Result<bool, String> {
             Err("OpenCode native binding requires macOS or Linux".into())
         }
 
