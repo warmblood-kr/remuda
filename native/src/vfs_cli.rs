@@ -544,14 +544,18 @@ fn put(store: &VfsStore, values: &Map<String, Value>, bytes: &[u8], out: &mut Ou
 
 /// What `vfs release` prints, one rule per line. Pure, so the wording and the
 /// counts it derives are tested without a store.
-fn release_lines(report: &crate::cluster::vfs_release::ReleaseReport) -> Vec<String> {
-    let kept = report.placed
+fn kept_total(report: &crate::cluster::vfs_release::ReleaseReport) -> usize {
+    report.placed
         + report.written
         + report.resolved
         + report.recent
         + report.last_copy
-        + report.unconfirmed;
-    let breakdown = format!(
+        + report.unconfirmed
+}
+
+/// The one-line sum of what stayed, in the order the report lists it.
+fn release_breakdown(report: &crate::cluster::vfs_release::ReleaseReport) -> String {
+    format!(
         "placed here {}, written here {}, resolved {}, too new {}, only copy {}, unconfirmed {}",
         report.placed,
         report.written,
@@ -559,22 +563,12 @@ fn release_lines(report: &crate::cluster::vfs_release::ReleaseReport) -> Vec<Str
         report.recent,
         report.last_copy,
         report.unconfirmed
-    );
-    let mut lines = vec![if report.removed == 0 {
-        format!("Nothing to release: kept {kept} copies this node needs ({breakdown}).")
-    } else {
-        format!(
-            "{} {} cop{}, {}; kept {kept} ({breakdown}).",
-            if report.dry_run {
-                "Would release"
-            } else {
-                "Released"
-            },
-            report.removed,
-            if report.removed == 1 { "y" } else { "ies" },
-            bytes_text(report.bytes)
-        )
-    }];
+    )
+}
+
+/// Why a copy stayed, one line per reason that applies.
+fn release_reasons(report: &crate::cluster::vfs_release::ReleaseReport) -> Vec<String> {
+    let mut lines = Vec::new();
     if report.unconfirmed > 0 {
         lines.push(format!(
             "Next: {} kept because a node that should hold {} did not confirm a copy; try `remuda vfs status --copies`.",
@@ -596,6 +590,31 @@ fn release_lines(report: &crate::cluster::vfs_release::ReleaseReport) -> Vec<Str
             if report.last_copy == 1 { "it" } else { "them" }
         ));
     }
+    lines
+}
+
+/// What `vfs release` prints, one rule per line. Pure, so the wording and the
+/// counts it derives are tested without a store.
+fn release_lines(report: &crate::cluster::vfs_release::ReleaseReport) -> Vec<String> {
+    let kept = kept_total(report);
+    let breakdown = release_breakdown(report);
+    let headline = if report.removed == 0 {
+        format!("Nothing to release: kept {kept} copies this node needs ({breakdown}).")
+    } else {
+        format!(
+            "{} {} cop{}, {}; kept {kept} ({breakdown}).",
+            if report.dry_run {
+                "Would release"
+            } else {
+                "Released"
+            },
+            report.removed,
+            if report.removed == 1 { "y" } else { "ies" },
+            bytes_text(report.bytes)
+        )
+    };
+    let mut lines = vec![headline];
+    lines.extend(release_reasons(report));
     lines
 }
 
