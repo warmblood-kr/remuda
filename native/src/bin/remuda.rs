@@ -18,6 +18,7 @@
 //! require it to be running already. `-s` names one. See `USAGE`.
 
 use remuda_core::protocol::{Request, Response};
+use remuda_core::registry::SessionSummary;
 use remuda_native::client::Left;
 use remuda_native::cluster::listener_config::{ListenerBind, ListenerConfig};
 use remuda_native::net::advertise_addr::CLUSTER_DEFAULT_PORT;
@@ -261,10 +262,7 @@ fn dispatch_cli_command(
         },
         "stop" => stop(server, path, rest),
         "reload" => reload_command(server, path, rest),
-        "ls" => match ensure_no_args("ls", rest) {
-            Err(code) => code,
-            Ok(()) => with_existing_daemon(server, path, list_sessions),
-        },
+        "ls" => ls_command(server, path, rest),
         "resize" => resize_command(server, path, rest),
         "run" => run_session(server, path, rest),
         "send" => send_command(server, path, rest),
@@ -353,6 +351,33 @@ fn ensure_no_args(verb: &str, args: &[&str]) -> Result<(), ExitCode> {
         args,
     )
     .map(|_| ())
+}
+
+fn ls_cli_spec() -> remuda_native::cli_parse::Spec {
+    simple_cli_spec(
+        "ls",
+        "List sessions for the selected server. Example: remuda ls",
+        vec![],
+        vec![remuda_native::cli_parse::OptionSpec {
+            long: "json".into(),
+            short: None,
+            value: None,
+            help: "Print the session list as JSON".into(),
+            global: false,
+            required: false,
+            repeat_policy: Default::default(),
+        }],
+        "remuda ls [--json]",
+    )
+}
+
+fn ls_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    let values = match parse_top_level_cli(&ls_cli_spec(), "ls", args) {
+        Ok(values) => values,
+        Err(code) => return code,
+    };
+    let json = cli_flag(&values, "json");
+    with_existing_daemon(server, path, |path| list_sessions(path, json))
 }
 
 fn version_cli_spec() -> remuda_native::cli_parse::Spec {
@@ -6968,35 +6993,51 @@ fn open_unix_daemon_log(path: &Path) -> std::io::Result<fs::File> {
 
 /// The three-line list a person reads; also what `remuda ls` was inlining
 /// before `main` grew past clippy's line budget with `close` added.
-fn list_sessions(path: &Path) -> ExitCode {
+fn list_sessions(path: &Path, json: bool) -> ExitCode {
     match remuda_native::client::request(path, &Request::List) {
+        Ok(Response::Sessions(sessions)) if json => match sessions_json(&sessions) {
+            Ok(text) => {
+                println!("{text}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(format!("ls: {error}")),
+        },
         Ok(Response::Sessions(sessions)) if sessions.is_empty() => {
             println!("no sessions");
             ExitCode::SUCCESS
         }
         Ok(Response::Sessions(sessions)) => {
-            for s in sessions {
-                let state = if s.unavailable {
-                    "unreachable"
-                } else if s.alive {
-                    "live"
-                } else {
-                    "dead"
-                };
-                let held = if s.attached { "attached" } else { "" };
-                println!(
-                    "{:<20} {:>4}x{:<4} {:<5} idle {:<5} {held}",
-                    s.name,
-                    s.size.cols(),
-                    s.size.rows(),
-                    state,
-                    format!("{}s", s.idle.as_secs()),
-                );
+            for session in &sessions {
+                println!("{}", session_line(session));
             }
             ExitCode::SUCCESS
         }
         other => fail(describe(other)),
     }
+}
+
+/// The wire objects unchanged: no wrapper, projection, reordering or ANSI.
+fn sessions_json(sessions: &[SessionSummary]) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(sessions)
+}
+
+fn session_line(session: &SessionSummary) -> String {
+    let state = if session.unavailable {
+        "unreachable"
+    } else if session.alive {
+        "live"
+    } else {
+        "dead"
+    };
+    let held = if session.attached { "attached" } else { "" };
+    format!(
+        "{:<20} {:>4}x{:<4} {:<5} idle {:<5} {held}",
+        session.name,
+        session.size.cols(),
+        session.size.rows(),
+        state,
+        format!("{}s", session.idle.as_secs()),
+    )
 }
 
 fn resize_session(path: &Path, name: &str, cols: &str, rows: &str) -> ExitCode {
@@ -8536,6 +8577,75 @@ fn print_lines(n: &str, delay_ms: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remuda_core::agent::Size;
+
+    fn session_summary(id: &str, name: &str, instance: Option<&str>) -> SessionSummary {
+        SessionSummary {
+            id: id.into(),
+            name: name.into(),
+            instance_id: instance.map(str::to_owned),
+            output_version: None,
+            alive: true,
+            idle: Duration::from_secs(3),
+            output_idle: None,
+            size: Size::new(80, 24),
+            attached: false,
+            human_idle: None,
+            mouse_tracking: false,
+            unavailable: false,
+        }
+    }
+
+    #[test]
+    fn ls_json_flag_is_optional_and_unambiguous() {
+        use remuda_native::cli_parse::parse;
+        let allowed = parse(&ls_cli_spec(), &["ls", "--json"]);
+        assert!(allowed.ok);
+        assert_eq!(allowed.values.get("json"), Some(&serde_json::json!(true)));
+        assert!(parse(&ls_cli_spec(), &["ls"]).ok);
+        for words in [
+            &["ls", "--json", "--json"][..],
+            &["ls", "--json=1"][..],
+            &["ls", "extra"][..],
+        ] {
+            assert!(!parse(&ls_cli_spec(), words).ok, "{words:?}");
+        }
+        assert_eq!(
+            parse(&ls_cli_spec(), &["ls", "--help"]).kind.as_deref(),
+            Some("help")
+        );
+    }
+
+    #[test]
+    fn ls_json_is_a_plain_array_of_the_wire_objects() {
+        let sessions = [
+            session_summary("id-1", "one", Some("instance-1")),
+            session_summary("", "legacy", None),
+        ];
+        let text = sessions_json(&sessions).expect("json");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("parse");
+        let rows = parsed.as_array().expect("array");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["id"], "id-1");
+        assert_eq!(rows[0]["name"], "one");
+        assert_eq!(rows[0]["instance_id"], "instance-1");
+        assert!(rows[1].get("instance_id").is_none());
+        assert_eq!(rows[1]["id"], "");
+        assert_eq!(rows[1]["name"], "legacy");
+        assert!(!text.contains('\u{1b}'));
+        assert_eq!(sessions_json(&[]).expect("empty"), "[]");
+    }
+
+    #[test]
+    fn the_human_ls_line_is_unchanged() {
+        assert_eq!(
+            session_line(&session_summary("id-1", "shell", Some("i"))),
+            "shell                  80x24   live  idle 3s    "
+        );
+        let mut attached = session_summary("id-1", "shell", Some("i"));
+        attached.attached = true;
+        assert!(session_line(&attached).ends_with("attached"));
+    }
 
     #[test]
     fn managed_agent_suppresses_update_notice_for_butler_and_any_verb() {
