@@ -2030,20 +2030,26 @@ fn list_conflicts(
         );
         return 0;
     }
-    say_conflict_report(store, out, &entries)
+    say_conflict_report(&entries, out, |out, entry| {
+        say_conflict_entry(store, out, entry)
+    })
 }
 
 fn conflict_rows(index: &VfsIndex, prefix: &str, local: &impl Fn(&str, u64) -> bool) -> Vec<Value> {
     entry_rows(&index.conflicts(prefix), local)
 }
 
-fn say_conflict_report(store: &VfsStore, out: &mut Out, entries: &[&VfsEntry]) -> u8 {
+fn say_conflict_report(
+    entries: &[&VfsEntry],
+    out: &mut Out,
+    say_entry: impl Fn(&mut Out, &VfsEntry),
+) -> u8 {
     if entries.is_empty() {
         say!(out, "No conflicts.");
         return 0;
     }
     for entry in entries {
-        say_conflict_entry(store, out, entry);
+        say_entry(out, entry);
     }
     say!(
         out,
@@ -2446,20 +2452,63 @@ mod tests {
         let row = entry_json(&one_entry(), |_, _| false);
         assert_eq!(row["kind"], "file");
         assert_eq!(row["path"], "a/b.html");
+        assert_eq!(row["version"], serde_json::json!(7));
+        assert_eq!(row["sha256"], serde_json::json!("a".repeat(64)));
+        assert_eq!(row["size"], serde_json::json!(3));
+        assert_eq!(row["replicas"], serde_json::json!(1));
+        assert_eq!(row["writer"], "node-a");
+        assert_eq!(row["mtime"], serde_json::json!(0));
         assert_eq!(row["local"], false);
-        for field in [
-            "version",
-            "sha256",
-            "size",
-            "replicas",
-            "writer",
-            "mtime",
-            "local",
-            "deleted",
-            "conflicts",
-        ] {
-            assert!(row.get(field).is_some(), "missing {field}");
+        assert_eq!(row["deleted"], serde_json::json!(false));
+        assert_eq!(row["conflicts"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn list_dir_dispatches_on_the_recursive_flag() {
+        let mut index = VfsIndex::default();
+        for path in ["a/hello.txt", "a/sub/two.md"] {
+            index.entries.insert(path.into(), one_entry_named(path));
         }
+        let mut out = Out::default();
+        assert_eq!(
+            list_dir(&mut out, false, "a/", false, &index, &|_, _| true),
+            0
+        );
+        let shallow = String::from_utf8_lossy(&out.stdout);
+        assert!(shallow.contains("sub/"), "{shallow}");
+        assert!(shallow.contains("hello.txt"), "{shallow}");
+        assert!(!shallow.contains("two.md"), "{shallow}");
+
+        let mut out = Out::default();
+        assert_eq!(
+            list_dir(&mut out, false, "a/", true, &index, &|_, _| true),
+            0
+        );
+        let deep = String::from_utf8_lossy(&out.stdout);
+        assert!(deep.contains("a/sub/two.md"), "{deep}");
+        assert!(deep.contains("a/hello.txt"), "{deep}");
+    }
+
+    #[test]
+    fn a_conflict_report_says_none_or_rows_then_advice() {
+        let mut out = Out::default();
+        assert_eq!(
+            say_conflict_report(&[], &mut out, |_, _| panic!("no row for none")),
+            0
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "No conflicts.");
+
+        let file = one_entry_named("a/x");
+        let mut out = Out::default();
+        assert_eq!(
+            say_conflict_report(&[&file], &mut out, |out, entry| {
+                say!(out, "row {}", entry.path);
+            }),
+            0
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.starts_with("row a/x"), "{text}");
+        assert!(text.contains("resolve-conflict"), "{text}");
     }
 
     fn release_report(removed: usize, bytes: u64) -> crate::cluster::vfs_release::ReleaseReport {
