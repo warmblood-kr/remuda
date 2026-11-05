@@ -54,12 +54,17 @@ remuda vfs publish site remuda:///design --release 2026-11-04
 - A source file that changes between the plan and the upload aborts the run
   rather than publishing a mix; open files and quit your editor first.
 
-Exit codes: 0 done; 1 a file failed or the source changed, or the completion
-marker could not be written; 75 every file is in but a copy is still missing,
-or the marker reached no peer. Either non-zero code means the release is
-**incomplete** and `COMPLETE` was not written. Fix the cause and publish a
-**new** `--release` name; the old prefix keeps the files it received (`remuda
-vfs ls remuda:///design/NAME/` shows them).
+Exit codes: 0 done; 1 a file failed, the source changed, or `COMPLETE` could
+not be written — the release is **incomplete**, fix the cause and publish a
+**new** `--release` name (the old prefix keeps the files it received; `remuda
+vfs ls remuda:///design/NAME/` shows them). 75 means everything was written
+here but the copies wanted are not all there yet: `COMPLETE` exists on this
+node and the release is usable, so wait for the peers rather than republishing.
+
+`CURRENT` is written only after `COMPLETE`, and it is a plain file: `remuda vfs
+get remuda:///design/CURRENT` prints the release name. `vfs serve` does not
+resolve it, so open `/NAME/` explicitly. The free-space reserve is checked on
+the filesystem holding `DIR`; the store's own disk belongs to the daemon.
 
 ## Checking health: `remuda vfs status`
 

@@ -1541,6 +1541,15 @@ mod tests {
     }
 
     #[test]
+    fn a_publish_prefix_must_name_this_cluster() {
+        assert_eq!(publish_prefix("remuda:///design").unwrap(), "design");
+        assert_eq!(publish_prefix("remuda:///").unwrap(), "");
+        assert!(publish_prefix("remuda://home/design").is_err());
+        assert!(publish_prefix("/design").is_err());
+        assert!(publish_prefix("remuda:///a/../b").is_err());
+    }
+
+    #[test]
     fn put_with_no_peer_reached_is_a_temporary_failure() {
         let none = push_outcome(4, 0);
         assert!(none.only_here);

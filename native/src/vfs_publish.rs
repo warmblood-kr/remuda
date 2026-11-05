@@ -98,7 +98,7 @@ pub fn check_budget(plan: &Plan, dir: &Path) -> Result<(), Refused> {
     if let Some(free) = free_bytes(dir) {
         if free < plan.bytes.saturating_add(FREE_RESERVE) {
             return Err(refused(format!(
-                "{} is {} and only {} is free; publishing needs room for the source plus {}",
+                "{} is {} and only {} is free on that filesystem; publishing needs the source plus {} (the store's own disk is the daemon's)",
                 dir.display(),
                 bytes_text(plan.bytes),
                 bytes_text(free),
@@ -325,6 +325,38 @@ mod tests {
             error.detail
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_replaced_file_is_refused_at_read_time() {
+        let root = scratch("replaced");
+        std::fs::write(root.join("a.txt"), b"aaa").unwrap();
+        let plan = plan(&root, "v1").unwrap();
+        // Same size and mtime are not enough: replacing the path must be seen.
+        std::fs::write(root.join("a.txt"), b"bbb").unwrap();
+        let error = read_verified(&plan.files[0]).unwrap_err();
+        assert!(
+            error.contains("changed") || error.contains("replaced"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_release_over_the_size_cap_is_refused_before_upload() {
+        let plan = Plan {
+            bytes: MAX_RELEASE_BYTES + 1,
+            ..Plan::default()
+        };
+        let error = check_budget(&plan, std::env::temp_dir().as_path()).unwrap_err();
+        assert!(error.detail.contains("at most"), "{}", error.detail);
+    }
+
+    #[test]
+    fn sizes_read_as_bytes_kib_and_mib() {
+        assert_eq!(bytes_text(1), "1 B");
+        assert_eq!(bytes_text(1024), "1.0 KiB");
+        assert_eq!(bytes_text(3 * 1024 * 1024), "3.0 MiB");
     }
 
     #[test]
