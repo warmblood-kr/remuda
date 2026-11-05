@@ -34,8 +34,8 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(100);
 /// (EX_TEMPFAIL from sysexits.h), so scripts can retry or wait.
 const EXIT_TEMPFAIL: u8 = 75;
 
-fn spec() -> Spec {
-    let option = |long: &str, value: Option<&str>, help: &str| OptionSpec {
+fn option(long: &str, value: Option<&str>, help: &str) -> OptionSpec {
+    OptionSpec {
         long: long.into(),
         short: None,
         value: value.map(str::to_owned),
@@ -43,21 +43,36 @@ fn spec() -> Spec {
         global: false,
         required: false,
         repeat_policy: RepeatPolicy::Reject,
-    };
-    let arg = |name: &str, help: &str, required: bool| ArgSpec {
+    }
+}
+
+fn arg(name: &str, help: &str, required: bool) -> ArgSpec {
+    ArgSpec {
         name: name.into(),
         help: help.into(),
         multiple: false,
         required,
-    };
-    let verb = |name: &str, about: &str, args, options, next: &str| VerbSpec {
+    }
+}
+
+fn verb(
+    name: &str,
+    about: &str,
+    args: Vec<ArgSpec>,
+    options: Vec<OptionSpec>,
+    next: &str,
+) -> VerbSpec {
+    VerbSpec {
         name: name.into(),
         about: about.into(),
         usage: next.strip_prefix("remuda vfs ").map(str::to_owned),
         args,
         options,
         next: next.into(),
-    };
+    }
+}
+
+fn spec() -> Spec {
     Spec {
         name: "remuda vfs".into(),
         options: vec![],
