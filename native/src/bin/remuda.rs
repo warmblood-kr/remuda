@@ -50,6 +50,9 @@ extern "C" fn record_join_interrupt(signal: libc::c_int) {
 
 #[path = "remuda/agent_notice.rs"]
 mod agent_notice;
+#[cfg(unix)]
+#[path = "remuda/claude_channel.rs"]
+mod claude_channel;
 #[path = "remuda/codex_tui.rs"]
 mod codex_tui;
 #[path = "remuda/opencode_tui.rs"]
@@ -120,7 +123,9 @@ fn starts_interactive_client(args: &[String]) -> bool {
     };
     match command_args.first().copied() {
         None => true,
-        Some("daemon" | "run" | "attach" | "_codex_tui" | "_opencode_tui") => true,
+        Some("daemon" | "run" | "attach" | "_codex_tui" | "_opencode_tui" | "_claude_channel") => {
+            true
+        }
         Some("cluster") => command_args.get(1).is_some_and(|verb| *verb == "remote"),
         _ => false,
     }
@@ -173,6 +178,36 @@ fn run_cli(args: Vec<String>) -> ExitCode {
     dispatch_cli_command(server, &path, skew, &argv, stdin_enabled, eval_code)
 }
 
+/// Hidden native verbs are not user-facing CLI commands. One role function
+/// keeps the top-level dispatcher small and lets each protocol add a verb
+/// without growing the public command match.
+fn dispatch_native_verb(verb: &str, rest: &[&str]) -> Option<ExitCode> {
+    Some(match verb {
+        "_codex_tui" => codex_tui::run(rest),
+        "_codex_watch" => run_codex_watch_cli(rest),
+        "_opencode_tui" => opencode_tui::run(rest),
+        #[cfg(unix)]
+        "_claude_channel" => claude_channel::run(rest),
+        #[cfg(not(unix))]
+        "_claude_channel" => {
+            eprintln!("remuda: Claude channel requires macOS or Linux");
+            ExitCode::FAILURE
+        }
+        #[cfg(unix)]
+        "_claude_notice" => claude_channel::run_notice(rest),
+        #[cfg(not(unix))]
+        "_claude_notice" => {
+            println!(
+                "{{\"outcome\":\"definitely_not_written\",\"reason\":\"unsupported_platform\"}}"
+            );
+            ExitCode::SUCCESS
+        }
+        "_agent_notice" => agent_notice::run(rest),
+        "_opencode_watch" => run_opencode_watch_cli(rest),
+        _ => return None,
+    })
+}
+
 fn dispatch_cli_command(
     server: &str,
     path: &Path,
@@ -188,6 +223,9 @@ fn dispatch_cli_command(
         .split_first()
         .map(|(command, rest)| (*command, rest))
         .unwrap_or(("", &[]));
+    if let Some(code) = dispatch_native_verb(command, rest) {
+        return code;
+    }
     match command {
         "" if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
             with_daemon(server, path, |path| {
@@ -203,11 +241,6 @@ fn dispatch_cli_command(
             Ok(()) => help_command(),
         },
         "version" | "--version" | "-V" => version_command(server, path, rest),
-        "_codex_tui" => codex_tui::run(rest),
-        "_codex_watch" => run_codex_watch_cli(rest),
-        "_opencode_tui" => opencode_tui::run(rest),
-        "_agent_notice" => agent_notice::run(rest),
-        "_opencode_watch" => run_opencode_watch_cli(rest),
         "upgrade" => run_upgrade(path, rest),
         "daemon" => match ensure_no_args("daemon", rest) {
             Err(code) => code,
