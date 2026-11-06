@@ -300,7 +300,7 @@ fn exercise_session_exit_payload(path: &std::path::Path) {
 }
 
 #[test]
-fn frozen_api_fixtures_and_new_v13_surface_run() {
+fn frozen_api_fixtures_and_new_v13_v14_surface_run() {
     for (version, source) in [
         ("v1", include_str!("api/v1.lua")),
         ("v2", include_str!("api/v2.lua")),
@@ -314,6 +314,7 @@ fn frozen_api_fixtures_and_new_v13_surface_run() {
         ("v10", include_str!("api/v10.lua")),
         ("v11", include_str!("api/v11.lua")),
         ("v13", include_str!("api/v13.lua")),
+        ("v14", include_str!("api/v14.lua")),
     ] {
         let dir = scratch(version);
         let path = daemon::socket_path_in(&dir, "s");

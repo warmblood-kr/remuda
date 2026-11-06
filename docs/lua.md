@@ -61,6 +61,31 @@ The `dim` field preserves terminal dim styling, which can identify placeholder
 or suggestion text. Cursor position and styled spans are observations only;
 mods interpret them according to the prompt or terminal application they know.
 
+## Cluster discovery
+
+`remuda.cluster.nodes()` lists admitted nodes from this node's local registry:
+
+```lua
+local nodes, reason = remuda.cluster.nodes()
+if nodes == nil then
+  print(reason) -- no_cluster, or cluster_state_unreadable
+end
+for _, node in ipairs(nodes or {}) do
+  print(node.id, node.alias, node.fingerprint, node.state, node.self)
+end
+```
+
+`id` is the deterministic node id, `fingerprint` is the exact authentication
+identity for disambiguation, `alias` is optional display metadata, and `self`
+marks this node. Revoked nodes are omitted. The call reads the local registry
+only: it never contacts a peer and exposes no endpoint, key, credential, or
+remote control response. Returning `nil, "cluster_state_unreadable"` is
+deliberately different from an empty list.
+
+Remote session capture and input are not exposed to Lua yet. They remain in the
+native cluster UI and the read-only `cluster call` path while their target and
+authorization contract is settled.
+
 ## Generate the reference
 
 ```sh

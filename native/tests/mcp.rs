@@ -194,6 +194,60 @@ fn a_tool_call_moves_a_real_session() {
 }
 
 #[test]
+fn an_explicit_node_is_never_a_silent_local_fallback() {
+    let dir = scratch("node");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    let empty = call(&path, "capture", json!({"session": "build", "node": ""}));
+    assert_eq!(
+        empty["result"]["isError"], true,
+        "an empty node must be an error: {empty}"
+    );
+    assert!(
+        text_of(&empty).contains("must not be empty"),
+        "the error names the empty node: {empty}"
+    );
+
+    for node in [serde_json::Value::Null, json!(1), json!({})] {
+        let result = call(&path, "capture", json!({"session": "build", "node": node}));
+        assert_eq!(
+            result["result"]["isError"], true,
+            "a non-string node must be an error: {result}"
+        );
+        assert!(
+            text_of(&result).contains("node"),
+            "the error names the node: {result}"
+        );
+    }
+    let unknown = call(
+        &path,
+        "capture",
+        json!({"session": "build", "node": "missing"}),
+    );
+    assert_eq!(
+        unknown["result"]["isError"], true,
+        "an unknown node must not fall back locally: {unknown}"
+    );
+
+    // Remote send is deliberately not enabled before receiver-side pane
+    // protection exists; a node argument must not fall back to local input.
+    let send = call(
+        &path,
+        "send",
+        json!({"session": "build", "text": "x", "node": "peer"}),
+    );
+    assert_eq!(
+        send["result"]["isError"], true,
+        "remote send must refuse rather than sending locally: {send}"
+    );
+    assert!(
+        text_of(&send).contains("remote send is not available yet"),
+        "the refusal states the limitation: {send}"
+    );
+}
+
+#[test]
 fn a_refusal_is_an_error_not_an_empty_success() {
     // The shell failure this rules out: `$(remuda -e ...capture...)` is "" and the
     // caller proceeds over a session that was never created. A model does worse

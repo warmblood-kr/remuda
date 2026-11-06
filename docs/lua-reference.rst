@@ -101,6 +101,16 @@ close
 
 ``close(name) -> nil`` — Deprecated alias for `remuda.session.close`.
 
+cluster
+-------
+
+``table`` — Read-only discovery of this node's cluster membership. It reads the local registry only, never contacts a peer, and exposes no endpoint, key, credential or remote control response.
+
+cluster.nodes
+-------------
+
+``cluster.nodes() -> { {id, alias, fingerprint, state, self}, ... } | nil, reason`` — List admitted cluster nodes as {id, alias, fingerprint, state, self} tables. id is the deterministic node id, fingerprint is the exact authentication identity for disambiguation, alias is optional display metadata, and self marks this node. Revoked nodes are omitted. Returns nil, 'no_cluster' before init, or nil, 'cluster_state_unreadable' when the local registry cannot be read; it never turns that failure into an empty list.
+
 contribute
 ----------
 
