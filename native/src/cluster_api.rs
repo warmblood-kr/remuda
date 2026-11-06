@@ -186,15 +186,26 @@ fn resolve_name(
     self_name: Option<&str>,
     target: &str,
 ) -> Result<NameResolution, String> {
-    if self_name == Some(target) {
-        return Ok(NameResolution::Local);
-    }
-    let entry = cluster::addressing::resolve_user_target(entries, aliases, target)
-        .map_err(|error| sanitize(format!("cluster: {error}")))?;
+    let entry = match cluster::addressing::resolve_user_target(entries, aliases, target) {
+        Ok(entry) => entry,
+        // A hostname that is not an admitted node's fingerprint/label/alias is
+        // still this node's local name.
+        Err(error) if self_name == Some(target) && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(NameResolution::Local);
+        }
+        Err(error) => return Err(sanitize(format!("cluster: {error}"))),
+    };
     if entry.state != NodeState::Admitted {
         return Err(format!(
             "cluster node {} is revoked",
             cluster::node_label(&entry.node_fp)
+        ));
+    }
+    // The registry wins. A peer alias or label equal to this node's hostname
+    // must not silently route the screen to the wrong node.
+    if self_name == Some(target) && entry.node_fp != self_fingerprint {
+        return Err(format!(
+            "cluster: node {target} is ambiguous: it is both this node's hostname and another admitted node; use the fingerprint"
         ));
     }
     if entry.node_fp == self_fingerprint {
@@ -239,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn this_nodes_hostname_is_local_without_consulting_aliases() {
+    fn this_nodes_hostname_is_local_only_when_no_admitted_node_uses_it() {
         let entries = [entry("SHA256:self", NodeState::Admitted)];
         assert_eq!(
             resolve_name(
@@ -251,6 +262,33 @@ mod tests {
             ),
             Ok(NameResolution::Local)
         );
+
+        let peer = [entry("SHA256:peer", NodeState::Admitted)];
+        let aliases = BTreeMap::from([("SHA256:peer".to_owned(), "studio-host".to_owned())]);
+        let error = resolve_name(
+            &peer,
+            &aliases,
+            "SHA256:self",
+            Some("studio-host"),
+            "studio-host",
+        )
+        .unwrap_err();
+        assert!(error.contains("ambiguous"), "{error}");
+    }
+
+    #[test]
+    fn a_hostname_collision_does_not_hide_a_revoked_peer() {
+        let entries = [entry("SHA256:old", NodeState::Revoked)];
+        let aliases = BTreeMap::from([("SHA256:old".to_owned(), "studio-host".to_owned())]);
+        let error = resolve_name(
+            &entries,
+            &aliases,
+            "SHA256:self",
+            Some("studio-host"),
+            "studio-host",
+        )
+        .unwrap_err();
+        assert!(error.contains("revoked"), "{error}");
     }
 
     #[test]
