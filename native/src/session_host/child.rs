@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub(crate) struct HostChild {
     terminal: Arc<Mutex<Terminal>>,
@@ -125,7 +125,6 @@ impl HostChild {
         let end = Arc::new(AtomicU8::new(0));
         let fault = Arc::new(AtomicBool::new(false));
         let (queries, replies) = sync_channel::<Vec<u8>>(32);
-        let (status_queries, status_replies) = sync_channel::<Vec<u8>>(32);
         let reply_fault = Arc::clone(&fault);
         let cursor_writer = Arc::clone(&writer);
         std::thread::spawn(move || {
@@ -142,26 +141,6 @@ impl HostChild {
                 }
             }
         });
-        let status_writer = Arc::clone(&writer);
-        std::thread::spawn(move || {
-            let mut last = Instant::now() - Duration::from_secs(1);
-            while let Ok(reply) = status_replies.recv() {
-                // Optional OSC traffic must never block cursor or user input.
-                // Coalesce by age and drop when the writer is busy.
-                if last.elapsed() < Duration::from_millis(100) {
-                    continue;
-                }
-                if let Ok(mut writer) = status_writer.try_lock() {
-                    if writer
-                        .write_all(&reply)
-                        .and_then(|()| writer.flush())
-                        .is_ok()
-                    {
-                        last = Instant::now();
-                    }
-                }
-            }
-        });
         let reader = pair.master.try_clone_reader().map_err(io)?;
         let child = pair.slave.spawn_command(command).map_err(io)?;
         drop(pair.slave);
@@ -175,7 +154,7 @@ impl HostChild {
             end: Arc::clone(&end),
             fault: Arc::clone(&fault),
         };
-        std::thread::spawn(move || drain(reader, context, queries, status_queries));
+        std::thread::spawn(move || drain(reader, context, queries));
         Ok(Self {
             terminal,
             writer: input,
@@ -213,7 +192,6 @@ fn drain(
     mut reader: Box<dyn Read + Send>,
     context: Reader,
     queries: std::sync::mpsc::SyncSender<Vec<u8>>,
-    status_queries: std::sync::mpsc::SyncSender<Vec<u8>>,
 ) {
     let mut bytes = [0; 8192];
     loop {
@@ -238,13 +216,6 @@ fn drain(
                         {
                             context.fault.store(true, Ordering::Release);
                         }
-                    }
-                    if terminal.take_program_query()
-                        && status_queries
-                            .try_send(crate::program_status::QUERY_REPLY.to_vec())
-                            .is_err()
-                    {
-                        terminal.note_status_reply_dropped();
                     }
                     context
                         .version

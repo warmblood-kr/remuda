@@ -447,72 +447,10 @@ const DSR_REPLY_RETRY_LIMIT: usize = 50;
 const DSR_REPLY_RETRY_DELAY: Duration = Duration::from_millis(10);
 const SCROLLBACK_ROWS: usize = 10_000;
 const SCROLLBACK_PROBE_CHUNK: usize = 512;
-const PROGRAM_STATUS_REPLY: &[u8] =
-    b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\";
-
-/// The two bounded reply lanes. A full or closed lane drops its reply without
-/// blocking the PTY reader or the other lane.
-struct ReplySlots {
-    cursor: SyncSender<Vec<u8>>,
-    status: SyncSender<Vec<u8>>,
-}
-
 /// Query prefixes partially received in an earlier read.
 #[derive(Default)]
 struct ReaderCarry {
     cursor: Vec<u8>,
-}
-
-/// Keep the daemon the only OSC 7501 responder. Attached raw viewers still get
-/// ordinary output, but a forwarded query would let a physical terminal answer
-/// too, injecting a second reply into the child.
-#[derive(Default)]
-struct StatusQueryFilter {
-    held: Vec<u8>,
-}
-
-const STATUS_OSC_PREFIX: &[u8] = b"\x1b]7501;";
-const STATUS_OSC_MAX: usize = 4096;
-
-impl StatusQueryFilter {
-    fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
-        let mut input = Vec::with_capacity(self.held.len() + bytes.len());
-        input.extend_from_slice(&self.held);
-        input.extend_from_slice(bytes);
-        self.held.clear();
-        let mut out = Vec::with_capacity(input.len());
-        let mut i = 0;
-        while i < input.len() {
-            if input[i] == 0x1b {
-                let rest = &input[i..];
-                if STATUS_OSC_PREFIX.starts_with(rest) {
-                    self.held.extend_from_slice(rest);
-                    break;
-                }
-                if rest.starts_with(STATUS_OSC_PREFIX) {
-                    let mut end = i + STATUS_OSC_PREFIX.len();
-                    while end < input.len()
-                        && input[end] != 7
-                        && !(input[end] == 0x1b && end + 1 < input.len() && input[end + 1] == b'\\')
-                    {
-                        end += 1;
-                    }
-                    if end >= input.len() {
-                        if input.len() - i > STATUS_OSC_MAX {
-                            break;
-                        }
-                        self.held.extend_from_slice(&input[i..]);
-                        break;
-                    }
-                    i = if input[end] == 7 { end + 1 } else { end + 2 };
-                    continue;
-                }
-            }
-            out.push(input[i]);
-            i += 1;
-        }
-        out
-    }
 }
 
 /// vt100 callbacks that retain only the bounded typed status.
@@ -524,12 +462,6 @@ struct StatusCallbacks {
 impl vt100::Callbacks for StatusCallbacks {
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
         self.tracker.observe(params);
-    }
-}
-
-impl StatusCallbacks {
-    fn take_query(&mut self) -> bool {
-        self.tracker.take_query()
     }
 }
 
@@ -662,18 +594,8 @@ impl PtyAgent {
         )));
         let watchers: Watchers = Arc::new(Mutex::new(Vec::new()));
         let reader_closed = Arc::new(AtomicBool::new(false));
-        let pending_cursor_replies = spawn_reply_worker(
-            Arc::clone(&writer),
-            Arc::clone(&reader_closed),
-            "cursor",
-            false,
-        );
-        let pending_status_replies = spawn_reply_worker(
-            Arc::clone(&writer),
-            Arc::clone(&reader_closed),
-            "program status",
-            true,
-        );
+        let pending_cursor_replies =
+            spawn_reply_worker(Arc::clone(&writer), Arc::clone(&reader_closed), "cursor");
         let scrollback_total = Arc::new(AtomicUsize::new(0));
         let output_version = Arc::new(AtomicU64::new(0));
         spawn_reader(
@@ -683,10 +605,7 @@ impl PtyAgent {
             Arc::clone(&reader_closed),
             Arc::clone(&scrollback_total),
             Arc::clone(&output_version),
-            ReplySlots {
-                cursor: pending_cursor_replies,
-                status: pending_status_replies,
-            },
+            pending_cursor_replies,
         );
 
         Ok(Self {
@@ -718,12 +637,11 @@ fn spawn_reader(
     reader_closed: Arc<AtomicBool>,
     scrollback_total: Arc<AtomicUsize>,
     output_version: Arc<AtomicU64>,
-    replies: ReplySlots,
+    pending_cursor_replies: SyncSender<Vec<u8>>,
 ) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         let mut carry = ReaderCarry::default();
-        let mut attach_filter = StatusQueryFilter::default();
         while let Ok(n) = reader.read(&mut buf) {
             if n == 0 {
                 break;
@@ -734,14 +652,13 @@ fn spawn_reader(
                 &screen,
                 &scrollback_total,
                 &output_version,
-                &replies,
+                &pending_cursor_replies,
             ) {
                 break;
             }
-            let visible = attach_filter.feed(&buf[..n]);
             if let Ok(mut watchers) = watchers.lock() {
                 watchers.retain(|watcher| match watcher {
-                    Watcher::Bytes(sender) => sender.send(visible.clone()).is_ok(),
+                    Watcher::Bytes(sender) => sender.send(buf[..n].to_vec()).is_ok(),
                     Watcher::Wake(signal) => signal.wake(),
                 });
             }
@@ -766,7 +683,7 @@ fn process_reader_chunk(
     screen: &Arc<Mutex<vt100::Parser<StatusCallbacks>>>,
     scrollback_total: &AtomicUsize,
     output_version: &AtomicU64,
-    replies: &ReplySlots,
+    pending_cursor_replies: &SyncSender<Vec<u8>>,
 ) -> bool {
     let mut cursor_window = Vec::with_capacity(carry.cursor.len() + bytes.len());
     cursor_window.extend_from_slice(&carry.cursor);
@@ -780,25 +697,21 @@ fn process_reader_chunk(
         .cursor
         .extend_from_slice(&cursor_window[cursor_window.len() - cursor_tail..]);
 
-    let (at, status_query) = match screen.lock() {
+    let at = match screen.lock() {
         Ok(mut parser) => {
             let size = parser.screen().size();
             let at = guard_parser(&mut parser, "output", size, |parser| {
                 process_output(parser, bytes, scrollback_total)
             })
             .unwrap_or((1, 1));
-            let query = parser.callbacks_mut().take_query();
             output_version.fetch_add(1, Ordering::SeqCst);
-            (at, query)
+            at
         }
         // Poisoned: the grid can no longer be trusted.
         Err(_) => return false,
     };
     if asked {
-        answer_cursor_query(&replies.cursor, at);
-    }
-    if status_query {
-        answer_status_query(&replies.status);
+        answer_cursor_query(pending_cursor_replies, at);
     }
     true
 }
@@ -882,29 +795,10 @@ fn spawn_reply_worker(
     writer: SharedWriter,
     reader_closed: Arc<AtomicBool>,
     what: &'static str,
-    optional: bool,
 ) -> SyncSender<Vec<u8>> {
     let (pending, replies) = sync_channel::<Vec<u8>>(1);
     std::thread::spawn(move || {
-        let mut last_optional = Instant::now() - Duration::from_secs(1);
         while let Ok(reply) = replies.recv() {
-            if optional {
-                // An optional OSC reply must never hold the writer or compete
-                // with cursor/input; drop when busy or too soon after the last.
-                if last_optional.elapsed() < Duration::from_millis(100) {
-                    continue;
-                }
-                if let Ok(mut writer) = writer.try_lock() {
-                    if writer
-                        .write_all(&reply)
-                        .and_then(|()| writer.flush())
-                        .is_ok()
-                    {
-                        last_optional = Instant::now();
-                    }
-                }
-                continue;
-            }
             let mut sent = false;
             for _ in 0..DSR_REPLY_RETRY_LIMIT {
                 if reader_closed.load(Ordering::Acquire) {
@@ -946,10 +840,6 @@ fn spawn_reply_worker(
 /// Enqueue one cursor reply without blocking the PTY reader thread.
 fn answer_cursor_query(pending: &SyncSender<Vec<u8>>, (row, col): (u16, u16)) {
     enqueue_reply(pending, format!("\x1b[{row};{col}R").into_bytes(), "cursor");
-}
-
-fn answer_status_query(pending: &SyncSender<Vec<u8>>) {
-    enqueue_reply(pending, PROGRAM_STATUS_REPLY.to_vec(), "program status");
 }
 
 fn enqueue_reply(pending: &SyncSender<Vec<u8>>, reply: Vec<u8>, what: &'static str) {
@@ -1847,7 +1737,6 @@ mod input_writer_tests {
     #[test]
     fn parser_panic_resets_the_grid_instead_of_poisoning_the_screen_lock() {
         let (pending, _replies) = sync_channel(1);
-        let (pending_status, _status_replies) = sync_channel(1);
         let screen = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
             24,
             80,
@@ -1864,10 +1753,7 @@ mod input_writer_tests {
                 &screen,
                 &scrollback_total,
                 &output_version,
-                &ReplySlots {
-                    cursor: pending.clone(),
-                    status: pending_status.clone(),
-                },
+                &pending.clone(),
             )
         };
         assert!(feed("\x1b[1;79H가".as_bytes()));
@@ -1886,8 +1772,7 @@ mod input_writer_tests {
         let writer: SharedWriter =
             Arc::new(Mutex::new(Box::new(CaptureWrites(Arc::clone(&captured)))));
         let reader_closed = Arc::new(AtomicBool::new(false));
-        let pending = spawn_reply_worker(Arc::clone(&writer), reader_closed, "cursor", false);
-        let (pending_status, _status_replies) = sync_channel(1);
+        let pending = spawn_reply_worker(Arc::clone(&writer), reader_closed, "cursor");
         let screen = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
             24,
             80,
@@ -1905,10 +1790,7 @@ mod input_writer_tests {
             &screen,
             &scrollback_total,
             &output_version,
-            &ReplySlots {
-                cursor: pending.clone(),
-                status: pending_status.clone()
-            },
+            &pending.clone(),
         ));
         assert!(started.elapsed() < Duration::from_millis(100));
         assert!(captured.lock().unwrap().is_empty());
@@ -1918,10 +1800,7 @@ mod input_writer_tests {
             &screen,
             &scrollback_total,
             &output_version,
-            &ReplySlots {
-                cursor: pending.clone(),
-                status: pending_status.clone()
-            },
+            &pending.clone(),
         ));
         assert_eq!(output_version.load(Ordering::SeqCst), 2);
         drop(guard);
@@ -1943,8 +1822,7 @@ mod input_writer_tests {
         let output_version = AtomicU64::new(0);
         let mut carry = ReaderCarry::default();
         let reader_closed = Arc::new(AtomicBool::new(false));
-        let pending = spawn_reply_worker(Arc::clone(&writer), reader_closed, "cursor", false);
-        let (pending_status, _status_replies) = sync_channel(1);
+        let pending = spawn_reply_worker(Arc::clone(&writer), reader_closed, "cursor");
 
         for chunk in [b"\x1b[".as_slice(), b"6n"] {
             assert!(process_reader_chunk(
@@ -1953,17 +1831,14 @@ mod input_writer_tests {
                 &screen,
                 &scrollback_total,
                 &output_version,
-                &ReplySlots {
-                    cursor: pending.clone(),
-                    status: pending_status.clone()
-                },
+                &pending.clone(),
             ));
         }
         wait_for_captured(&captured, b"\x1b[1;1R");
     }
 
     #[test]
-    fn program_status_is_typed_and_a_query_reply_uses_its_own_slot() {
+    fn program_status_is_typed_and_a_query_is_inert() {
         let mut parser =
             vt100::Parser::new_with_callbacks(24, 80, SCROLLBACK_ROWS, StatusCallbacks::default());
         let scrollback_total = AtomicUsize::new(0);
@@ -1982,106 +1857,17 @@ mod input_writer_tests {
             remuda_core::agent::ProgramState::Working
         );
         assert_eq!(observed.status.app.as_deref(), Some("codex"));
-        process_output(&mut parser, b"unrelated output", &scrollback_total);
-        assert!(
-            parser.callbacks().tracker.observation().is_some(),
-            "ordinary output does not erase the report"
-        );
-
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let writer: SharedWriter =
-            Arc::new(Mutex::new(Box::new(CaptureWrites(Arc::clone(&captured)))));
-        let reader_closed = Arc::new(AtomicBool::new(false));
-        let pending_cursor = spawn_reply_worker(
-            Arc::clone(&writer),
-            Arc::clone(&reader_closed),
-            "cursor",
-            false,
-        );
-        let pending_status =
-            spawn_reply_worker(Arc::clone(&writer), reader_closed, "program status", true);
-        let (_cursor_tx, cursor_rx) = sync_channel::<Vec<u8>>(1);
-        let screen = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
-            24,
-            80,
-            SCROLLBACK_ROWS,
-            StatusCallbacks::default(),
-        )));
-        let output_version = AtomicU64::new(0);
-        let mut carry = ReaderCarry::default();
-        for chunk in [b"\x1b]75".as_slice(), b"01;?\x07"] {
-            assert!(process_reader_chunk(
-                chunk,
-                &mut carry,
-                &screen,
-                &scrollback_total,
-                &output_version,
-                &ReplySlots {
-                    cursor: pending_cursor.clone(),
-                    status: pending_status.clone()
-                },
-            ));
-        }
-        wait_for_captured(&captured, PROGRAM_STATUS_REPLY);
-        assert!(
-            cursor_rx.try_recv().is_err(),
-            "a program-status reply must not consume the cursor slot"
-        );
-    }
-
-    #[test]
-    fn attached_viewers_do_not_see_status_queries() {
-        let mut filter = StatusQueryFilter::default();
-        assert_eq!(filter.feed(b"a\x1b]75"), b"a");
-        assert_eq!(filter.feed(b"01;?\x07b"), b"b");
-        assert_eq!(filter.feed(b"\x1b]0;title\x07c"), b"\x1b]0;title\x07c");
-        let mut unterminated = StatusQueryFilter::default();
-        assert!(unterminated.feed(b"\x1b]7501;?").is_empty());
-        assert!(unterminated
-            .feed(&vec![b'x'; STATUS_OSC_MAX + 1])
-            .is_empty());
-    }
-
-    #[test]
-    fn capability_response_and_unterminated_query_are_not_answered() {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let writer: SharedWriter =
-            Arc::new(Mutex::new(Box::new(CaptureWrites(Arc::clone(&captured)))));
-        let reader_closed = Arc::new(AtomicBool::new(false));
-        let pending_cursor = spawn_reply_worker(
-            Arc::clone(&writer),
-            Arc::clone(&reader_closed),
-            "cursor",
-            false,
-        );
-        let pending_status =
-            spawn_reply_worker(Arc::clone(&writer), reader_closed, "program status", true);
-        let screen = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
-            24,
-            80,
-            SCROLLBACK_ROWS,
-            StatusCallbacks::default(),
-        )));
-        let scrollback_total = AtomicUsize::new(0);
-        let output_version = AtomicU64::new(0);
-        let mut carry = ReaderCarry::default();
-        for chunk in [b"\x1b]7501;?:states=idle\x07".as_slice(), b"\x1b]7501;?"] {
-            assert!(process_reader_chunk(
-                chunk,
-                &mut carry,
-                &screen,
-                &scrollback_total,
-                &output_version,
-                &ReplySlots {
-                    cursor: pending_cursor.clone(),
-                    status: pending_status.clone()
-                },
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(
-            captured.lock().unwrap().is_empty(),
-            "only a complete query may be answered"
+        // This phase observes reports only. A feature query must neither
+        // overwrite the typed status nor make the reader emit a reply.
+        process_output(&mut parser, b"\x1b]7501;?\x07", &scrollback_total);
+        let observed = parser
+            .callbacks()
+            .tracker
+            .observation()
+            .expect("query leaves the last report");
+        assert_eq!(
+            observed.status.state,
+            remuda_core::agent::ProgramState::Working
         );
     }
 

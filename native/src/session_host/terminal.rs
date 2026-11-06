@@ -153,16 +153,8 @@ impl Terminal {
     pub fn take_query(&mut self) -> Option<(u16, u16)> {
         self.parser.callbacks_mut().positions.pop_front()
     }
-    /// One pending OSC 7501 feature query, coalesced by the tracker.
-    pub fn take_program_query(&mut self) -> bool {
-        self.parser.callbacks_mut().status.take_query()
-    }
     pub fn program_status(&self) -> Option<remuda_core::agent::ProgramStatusObservation> {
         self.parser.callbacks().status.observation()
-    }
-    /// A dropped optional OSC reply is degraded, not a backend fault.
-    pub fn note_status_reply_dropped(&mut self) {
-        self.strings.unsupported = self.strings.unsupported.saturating_add(1);
     }
     /// Runtime must expose these explicit unsupported/degraded counters;
     /// overflowing terminal replies cannot be reported as a healthy session.
@@ -239,11 +231,9 @@ mod tests {
         }
     }
     #[test]
-    fn program_status_is_recorded_and_queries_are_coalesced() {
+    fn program_status_is_recorded_and_a_query_is_inert() {
         let mut terminal = Terminal::new(24, 80, 10).unwrap();
         feed(&mut terminal, b"\x1b]7501;?\x1b\\\x1b]7501;?\x07");
-        assert!(terminal.take_program_query());
-        assert!(!terminal.take_program_query(), "queries coalesce");
         assert!(terminal.program_status().is_none());
 
         feed(

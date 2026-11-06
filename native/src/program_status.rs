@@ -18,17 +18,11 @@ const MAX_TITLE_DECODED: usize = 192;
 const MAX_MESSAGE_ENCODED: usize = 2732;
 const MAX_MESSAGE_DECODED: usize = 2048;
 
-/// The fixed capability reply. It advertises only state/kind values Remuda
-/// stores and never reflects bytes from the querying program.
-pub(crate) const QUERY_REPLY: &[u8] =
-    b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\";
-
-/// One terminal's last status and the query latch.
+/// One terminal's last typed status. Queries are observed and ignored.
 #[derive(Default)]
 pub(crate) struct Tracker {
     status: Option<ProgramStatus>,
     updated_at: Option<Instant>,
-    query_pending: bool,
 }
 
 impl Tracker {
@@ -42,12 +36,8 @@ impl Tracker {
         let Ok(payload) = std::str::from_utf8(payload) else {
             return;
         };
-        // Exact `?` is a feature query. Anything else starting with `?` is a
-        // capability response; never answer it, or two terminals can loop.
-        if payload == "?" {
-            self.query_pending = true;
-            return;
-        }
+        // This phase observes reports but does not answer the feature query,
+        // so both `?` and a capability response are inert.
         if payload.starts_with('?') {
             return;
         }
@@ -62,11 +52,6 @@ impl Tracker {
                 self.updated_at = Some(Instant::now());
             }
         }
-    }
-
-    /// Take one pending feature query without repeating it.
-    pub fn take_query(&mut self) -> bool {
-        std::mem::take(&mut self.query_pending)
     }
 
     pub fn observation(&self) -> Option<ProgramStatusObservation> {
@@ -286,17 +271,6 @@ mod tests {
         );
         observe(&mut status, "state=clear");
         assert!(status.observation().is_none(), "explicit clear removes it");
-    }
-
-    #[test]
-    fn query_and_capability_response_do_not_toggle_each_other() {
-        let mut status = Tracker::default();
-        observe(&mut status, "?");
-        assert!(status.take_query());
-        assert!(!status.take_query(), "one query, one reply");
-        observe(&mut status, "?:states=idle,working");
-        assert!(!status.take_query(), "a capability response is not a query");
-        assert!(status.observation().is_none());
     }
 
     #[test]
