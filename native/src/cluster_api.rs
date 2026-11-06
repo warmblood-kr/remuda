@@ -161,10 +161,10 @@ fn remote_error(fingerprint: &str, error: ClientError) -> String {
 /// Row separators are LF; every cell passes the single terminal-control
 /// sanitizer. The result is bounded and marks its own truncation.
 fn render_rows(rows: &[Vec<StyledRun>]) -> String {
-    // Reserve the marker up front and stop as soon as the bound is reached.
-    // The peer already bounded the frame; this avoids expanding every cell and
-    // building a second full screen just to throw most of it away.
-    let limit = MAX_CAPTURE_BYTES.saturating_sub(TRUNCATION_MARKER.len());
+    // Buffer at most the public bound, then replace its tail with the marker
+    // only when more content exists. This keeps the contract that a screen at
+    // or under 256 KiB is returned untouched while never expanding the frame.
+    let limit = MAX_CAPTURE_BYTES;
     let mut text = String::with_capacity(limit);
     let mut truncated = false;
     'rows: for (index, row) in rows.iter().enumerate() {
@@ -189,6 +189,12 @@ fn render_rows(rows: &[Vec<StyledRun>]) -> String {
         }
     }
     if truncated {
+        let keep = MAX_CAPTURE_BYTES.saturating_sub(TRUNCATION_MARKER.len());
+        let mut cut = keep;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
         text.push_str(TRUNCATION_MARKER);
     }
     text
@@ -466,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_truncation_stops_at_the_exact_bound_and_keeps_empty_rows() {
+    fn text_at_the_bound_is_untouched_and_empty_rows_survive() {
         let exact = vec![vec![plain_run(&"x".repeat(MAX_CAPTURE_BYTES))]];
         assert_eq!(render_rows(&exact).len(), MAX_CAPTURE_BYTES);
         let over = vec![vec![plain_run(&"x".repeat(MAX_CAPTURE_BYTES + 1))]];
