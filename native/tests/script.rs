@@ -422,7 +422,7 @@ fn the_bound_surface_is_exactly_the_protocols() {
         for key in pairs(remuda.session) do session_names[#session_names + 1] = key end
         table.sort(session_names)
         local session_got = table.concat(session_names, ",")
-        local session_want = "attach,close,list,new,resize"
+        local session_want = "attach,close,list,new,remote_input,resize"
         if session_got ~= session_want then
           error("session namespace is " .. session_got .. ", expected " .. session_want)
         end
