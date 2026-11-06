@@ -412,6 +412,8 @@ pub enum ProgramState {
     Blocked,
     Done,
     Error,
+    #[serde(other)]
+    Unknown,
 }
 
 impl ProgramState {
@@ -422,6 +424,7 @@ impl ProgramState {
             ProgramState::Blocked => "blocked",
             ProgramState::Done => "done",
             ProgramState::Error => "error",
+            ProgramState::Unknown => "unknown",
         }
     }
 }
@@ -433,6 +436,8 @@ pub enum ProgramBlockKind {
     Permission,
     Question,
     Auth,
+    #[serde(other)]
+    Unknown,
 }
 
 impl ProgramBlockKind {
@@ -441,6 +446,7 @@ impl ProgramBlockKind {
             ProgramBlockKind::Permission => "permission",
             ProgramBlockKind::Question => "question",
             ProgramBlockKind::Auth => "auth",
+            ProgramBlockKind::Unknown => "unknown",
         }
     }
 }

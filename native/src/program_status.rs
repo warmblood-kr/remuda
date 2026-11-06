@@ -13,8 +13,10 @@ use std::time::Instant;
 /// OSC accumulation; this keeps a direct vt100 path equally bounded.
 const MAX_PAYLOAD: usize = 4096;
 const MAX_APP: usize = 32;
-const MAX_TITLE: usize = 192;
-const MAX_MESSAGE: usize = 2048;
+const MAX_TITLE_ENCODED: usize = 256;
+const MAX_TITLE_DECODED: usize = 192;
+const MAX_MESSAGE_ENCODED: usize = 2732;
+const MAX_MESSAGE_DECODED: usize = 2048;
 
 /// The fixed capability reply. It advertises only state/kind values Remuda
 /// stores and never reflects bytes from the querying program.
@@ -84,6 +86,8 @@ fn parse(payload: &str) -> Option<Record> {
     let mut app = None;
     let mut kind = None;
     let mut progress = None;
+    let mut title = None;
+    let mut message = None;
     let mut has_id = false;
 
     for field in payload.split(':') {
@@ -100,21 +104,27 @@ fn parse(payload: &str) -> Option<Record> {
             }
             "kind" => kind = parse_kind(value),
             "progress" => {
-                progress = Some(value.parse::<u8>().ok().filter(|n| *n <= 100)?);
+                progress = value.parse::<u8>().ok().filter(|n| *n <= 100);
             }
             // Root-only slice: an id-bearing report belongs to a child record,
             // so never apply it to the root (and never fall back to root).
             "id" => has_id = true,
-            // Text is validated but never retained. Controls in decoded text
-            // reject the whole report rather than silently stripping them.
-            "title" => valid_text(value, MAX_TITLE)?,
-            "msg" => valid_text(value, MAX_MESSAGE)?,
+            // Text is validated but never retained. Normalize duplicates first,
+            // then reject controls/oversize in the winning value.
+            "title" => title = Some(value),
+            "msg" => message = Some(value),
             _ => {}
         }
     }
 
     if has_id {
         return None;
+    }
+    if let Some(value) = title {
+        valid_text(value, MAX_TITLE_ENCODED, MAX_TITLE_DECODED)?;
+    }
+    if let Some(value) = message {
+        valid_text(value, MAX_MESSAGE_ENCODED, MAX_MESSAGE_DECODED)?;
     }
     let state = state?;
     if state == ParsedState::Clear {
@@ -180,21 +190,24 @@ fn parse_kind(value: &str) -> Option<ProgramBlockKind> {
     }
 }
 
-fn valid_text(value: &str, max: usize) -> Option<()> {
+fn valid_text(value: &str, max_encoded: usize, max_decoded: usize) -> Option<()> {
+    if value.len() > max_encoded {
+        return None;
+    }
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(value)
         .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(value))
         .ok()?;
-    if decoded.len() > max {
+    if decoded.len() > max_decoded {
         return None;
     }
-    if decoded
-        .iter()
-        .any(|b| *b < 0x20 || *b == 0x7f || (0x80..=0x9f).contains(b))
-    {
+    let text = std::str::from_utf8(&decoded).ok()?;
+    if text.chars().any(|c| {
+        let n = c as u32;
+        n < 0x20 || n == 0x7f || (0x80..=0x9f).contains(&n) || n == 0x1b
+    }) {
         return None;
     }
-    std::str::from_utf8(&decoded).ok()?;
     Some(())
 }
 
@@ -242,8 +255,6 @@ mod tests {
         for bad in [
             "state=working:state=idle",
             "state=nonsense",
-            "state=working:progress=101",
-            "state=working:progress=-1",
             "msg=not-a-state",
             "state=",
         ] {
@@ -259,6 +270,19 @@ mod tests {
             status.observation().unwrap().status.state,
             ProgramState::Working,
             "an invalid app is omitted, not the whole state"
+        );
+        observe(&mut status, "state=working:progress=101");
+        let invalid_progress = status.observation().unwrap();
+        assert_eq!(invalid_progress.status.state, ProgramState::Working);
+        assert_eq!(
+            invalid_progress.status.progress, None,
+            "invalid progress is omitted"
+        );
+        observe(&mut status, "state=working:progress=-1:progress=10");
+        assert_eq!(
+            status.observation().unwrap().status.progress,
+            Some(10),
+            "later duplicate keys win"
         );
         observe(&mut status, "state=clear");
         assert!(status.observation().is_none(), "explicit clear removes it");
@@ -288,6 +312,49 @@ mod tests {
         assert_eq!(
             status.observation().unwrap().status.state,
             ProgramState::Working
+        );
+    }
+
+    #[test]
+    fn multilingual_text_is_valid_but_controls_are_rejected() {
+        use base64::Engine;
+        let b64 = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+        let mut status = Tracker::default();
+        observe(
+            &mut status,
+            &format!(
+                "state=working:msg={}:title={}",
+                b64("한글 작업"),
+                b64("🚀 배포")
+            ),
+        );
+        assert_eq!(
+            status.observation().unwrap().status.state,
+            ProgramState::Working
+        );
+        observe(
+            &mut status,
+            &format!("state=blocked:msg={}", b64("line\u{85}break")),
+        );
+        assert_eq!(
+            status.observation().unwrap().status.state,
+            ProgramState::Working,
+            "U+0085 is a control, not ordinary multilingual text"
+        );
+        observe(
+            &mut status,
+            &format!("state=blocked:msg={}", b64("safe\u{1b}[31m")),
+        );
+        assert_eq!(
+            status.observation().unwrap().status.state,
+            ProgramState::Working,
+            "ESC in decoded text rejects the report"
+        );
+        observe(&mut status, "state=blocked:msg=//8=");
+        assert_eq!(
+            status.observation().unwrap().status.state,
+            ProgramState::Working,
+            "invalid UTF-8 rejects the report"
         );
     }
 

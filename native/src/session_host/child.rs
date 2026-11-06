@@ -4,7 +4,8 @@ use crate::pty::{PtyInputWriter, SharedWriter, PTY_WRITE_TIMEOUT};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use remuda_core::agent::{
     AgentError, AgentProcess, AgentWriter, Cursor, ExitInfo, MouseEncoding, MouseMode, MouseState,
-    OutputSignal, OutputWakeup, Result, Size, StyledCell, VersionedSnapshot,
+    OutputSignal, OutputWakeup, ProgramStatusObservation, Result, Size, StyledCell,
+    VersionedSnapshot,
 };
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -124,10 +125,12 @@ impl HostChild {
         let end = Arc::new(AtomicU8::new(0));
         let fault = Arc::new(AtomicBool::new(false));
         let (queries, replies) = sync_channel::<Vec<u8>>(32);
+        let (status_queries, status_replies) = sync_channel::<Vec<u8>>(32);
         let reply_fault = Arc::clone(&fault);
+        let cursor_writer = Arc::clone(&writer);
         std::thread::spawn(move || {
             while let Ok(reply) = replies.recv() {
-                let result = writer.lock().map_err(|_| ()).and_then(|mut writer| {
+                let result = cursor_writer.lock().map_err(|_| ()).and_then(|mut writer| {
                     writer
                         .write_all(&reply)
                         .and_then(|()| writer.flush())
@@ -137,6 +140,19 @@ impl HostChild {
                     reply_fault.store(true, Ordering::Release);
                     break;
                 }
+            }
+        });
+        let status_writer = Arc::clone(&writer);
+        std::thread::spawn(move || {
+            while let Ok(reply) = status_replies.recv() {
+                // An optional OSC reply failing is degradation, not a
+                // canonical host fault; the cursor lane remains authoritative.
+                let _ = status_writer.lock().map_err(|_| ()).and_then(|mut writer| {
+                    writer
+                        .write_all(&reply)
+                        .and_then(|()| writer.flush())
+                        .map_err(|_| ())
+                });
             }
         });
         let reader = pair.master.try_clone_reader().map_err(io)?;
@@ -152,7 +168,7 @@ impl HostChild {
             end: Arc::clone(&end),
             fault: Arc::clone(&fault),
         };
-        std::thread::spawn(move || drain(reader, context, queries));
+        std::thread::spawn(move || drain(reader, context, queries, status_queries));
         Ok(Self {
             terminal,
             writer: input,
@@ -190,6 +206,7 @@ fn drain(
     mut reader: Box<dyn Read + Send>,
     context: Reader,
     queries: std::sync::mpsc::SyncSender<Vec<u8>>,
+    status_queries: std::sync::mpsc::SyncSender<Vec<u8>>,
 ) {
     let mut bytes = [0; 8192];
     loop {
@@ -216,11 +233,11 @@ fn drain(
                         }
                     }
                     if terminal.take_program_query()
-                        && queries
+                        && status_queries
                             .try_send(crate::program_status::QUERY_REPLY.to_vec())
                             .is_err()
                     {
-                        context.fault.store(true, Ordering::Release);
+                        terminal.note_status_reply_dropped();
                     }
                     context
                         .version
@@ -260,6 +277,13 @@ fn pty_size(size: Size) -> PtySize {
     }
 }
 impl AgentProcess for HostChild {
+    fn program_status(&mut self) -> Option<ProgramStatusObservation> {
+        self.terminal
+            .lock()
+            .ok()
+            .and_then(|terminal| terminal.program_status())
+    }
+
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         self.writer.write_bounded(bytes)
     }
@@ -396,6 +420,25 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+    #[test]
+    fn host_child_exposes_the_terminal_program_status() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.env_clear();
+        command.env("PATH", "/usr/bin:/bin");
+        command.args([
+            "-c",
+            "printf '\\033]7501;state=working:app=codex\\007'; printf 'status-ready\\n'; while IFS= read -r _; do :; done",
+        ]);
+        let mut child = Cleanup(HostChild::spawn(command, Size::new(80, 24)).unwrap());
+        wait_for(&mut child.0, "status-ready");
+        let observed = child.0.program_status().expect("hosted OSC status");
+        assert_eq!(
+            observed.status.state,
+            remuda_core::agent::ProgramState::Working
+        );
+        assert_eq!(observed.status.app.as_deref(), Some("codex"));
+    }
+
     #[test]
     fn isolated_child_computes_input_and_retains_terminal_without_viewers() {
         let mut command = CommandBuilder::new("/bin/sh");

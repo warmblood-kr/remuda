@@ -160,6 +160,10 @@ impl Terminal {
     pub fn program_status(&self) -> Option<remuda_core::agent::ProgramStatusObservation> {
         self.parser.callbacks().status.observation()
     }
+    /// A dropped optional OSC reply is degraded, not a backend fault.
+    pub fn note_status_reply_dropped(&mut self) {
+        self.strings.unsupported = self.strings.unsupported.saturating_add(1);
+    }
     /// Runtime must expose these explicit unsupported/degraded counters;
     /// overflowing terminal replies cannot be reported as a healthy session.
     pub fn health(&self) -> (u64, u64) {

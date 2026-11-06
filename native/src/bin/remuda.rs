@@ -3100,6 +3100,10 @@ fn sanitize_peer_response(
                 if let Some(instance_id) = &mut session.instance_id {
                     strip(instance_id);
                 }
+                // Remote aging is not implemented yet; withhold the local-only
+                // OSC enrichment rather than publish a stale snapshot as fresh.
+                session.program_status = None;
+                session.program_status_age_ms = None;
             }
         }
         Response::Screen(text) | Response::Value(text) | Response::Error(text) => strip(text),

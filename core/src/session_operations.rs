@@ -405,6 +405,7 @@ impl SessionOperations for Session {
         } else {
             Lifecycle::Exited(self.exit_info())
         };
+        let program = self.program_status();
         Ok(Observation {
             identity: Identity::local(self),
             lifecycle,
@@ -418,9 +419,8 @@ impl SessionOperations for Session {
             mouse: self.mouse_state(),
             attached: self.is_attached(),
             closing: self.is_closing(),
-            program_status: self.program_status().as_ref().map(|o| o.status.clone()),
-            program_status_age_ms: self
-                .program_status()
+            program_status: program.as_ref().map(|o| o.status.clone()),
+            program_status_age_ms: program
                 .map(|o| o.age.as_millis().try_into().unwrap_or(u64::MAX)),
             host_build: None,
         })

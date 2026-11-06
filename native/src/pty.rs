@@ -447,9 +447,6 @@ const DSR_REPLY_RETRY_LIMIT: usize = 50;
 const DSR_REPLY_RETRY_DELAY: Duration = Duration::from_millis(10);
 const SCROLLBACK_ROWS: usize = 10_000;
 const SCROLLBACK_PROBE_CHUNK: usize = 512;
-/// The exact Program Status Protocol feature query. A response starts with
-/// `?` too, so only this exact request is answered.
-const PROGRAM_STATUS_QUERY: &[u8] = b"\x1b]7501;?";
 const PROGRAM_STATUS_REPLY: &[u8] =
     b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\";
 
@@ -466,7 +463,6 @@ struct ReplySlots {
 #[derive(Default)]
 struct ReaderCarry {
     cursor: Vec<u8>,
-    status: Vec<u8>,
 }
 
 /// vt100 callbacks that retain only the bounded typed status.
@@ -478,6 +474,12 @@ struct StatusCallbacks {
 impl vt100::Callbacks for StatusCallbacks {
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
         self.tracker.observe(params);
+    }
+}
+
+impl StatusCallbacks {
+    fn take_query(&mut self) -> bool {
+        self.tracker.take_query()
     }
 }
 
@@ -721,26 +723,16 @@ fn process_reader_chunk(
         .cursor
         .extend_from_slice(&cursor_window[cursor_window.len() - cursor_tail..]);
 
-    let mut status_window = Vec::with_capacity(carry.status.len() + bytes.len());
-    status_window.extend_from_slice(&carry.status);
-    status_window.extend_from_slice(bytes);
-    let asked_status = status_window
-        .windows(PROGRAM_STATUS_QUERY.len())
-        .any(|window| window == PROGRAM_STATUS_QUERY);
-    let status_tail = status_window.len().min(PROGRAM_STATUS_QUERY.len() - 1);
-    carry.status.clear();
-    carry
-        .status
-        .extend_from_slice(&status_window[status_window.len() - status_tail..]);
-    let at = match screen.lock() {
+    let (at, status_query) = match screen.lock() {
         Ok(mut parser) => {
             let size = parser.screen().size();
             let at = guard_parser(&mut parser, "output", size, |parser| {
                 process_output(parser, bytes, scrollback_total)
             })
             .unwrap_or((1, 1));
+            let query = parser.callbacks_mut().take_query();
             output_version.fetch_add(1, Ordering::SeqCst);
-            at
+            (at, query)
         }
         // Poisoned: the grid can no longer be trusted.
         Err(_) => return false,
@@ -748,7 +740,7 @@ fn process_reader_chunk(
     if asked {
         answer_cursor_query(&replies.cursor, at);
     }
-    if asked_status {
+    if status_query {
         answer_status_query(&replies.status);
     }
     true
@@ -1937,7 +1929,7 @@ mod input_writer_tests {
         )));
         let output_version = AtomicU64::new(0);
         let mut carry = ReaderCarry::default();
-        for chunk in [b"\x1b]75".as_slice(), b"01;?"] {
+        for chunk in [b"\x1b]75".as_slice(), b"01;?\x07"] {
             assert!(process_reader_chunk(
                 chunk,
                 &mut carry,
@@ -1954,6 +1946,45 @@ mod input_writer_tests {
         assert!(
             cursor_rx.try_recv().is_err(),
             "a program-status reply must not consume the cursor slot"
+        );
+    }
+
+    #[test]
+    fn capability_response_and_unterminated_query_are_not_answered() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer: SharedWriter =
+            Arc::new(Mutex::new(Box::new(CaptureWrites(Arc::clone(&captured)))));
+        let reader_closed = Arc::new(AtomicBool::new(false));
+        let pending_cursor =
+            spawn_reply_worker(Arc::clone(&writer), Arc::clone(&reader_closed), "cursor");
+        let pending_status =
+            spawn_reply_worker(Arc::clone(&writer), reader_closed, "program status");
+        let screen = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            24,
+            80,
+            SCROLLBACK_ROWS,
+            StatusCallbacks::default(),
+        )));
+        let scrollback_total = AtomicUsize::new(0);
+        let output_version = AtomicU64::new(0);
+        let mut carry = ReaderCarry::default();
+        for chunk in [b"\x1b]7501;?:states=idle\x07".as_slice(), b"\x1b]7501;?"] {
+            assert!(process_reader_chunk(
+                chunk,
+                &mut carry,
+                &screen,
+                &scrollback_total,
+                &output_version,
+                &ReplySlots {
+                    cursor: pending_cursor.clone(),
+                    status: pending_status.clone()
+                },
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "only a complete query may be answered"
         );
     }
 

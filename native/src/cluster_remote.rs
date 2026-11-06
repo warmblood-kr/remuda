@@ -556,7 +556,14 @@ impl ClusterRemoteTransport {
         target: &crate::cluster::ResolvedTarget,
     ) -> io::Result<Vec<remuda_core::registry::SessionSummary>> {
         match self.request(target, &Request::List)? {
-            Response::Sessions(sessions) => Ok(sessions),
+            Response::Sessions(mut sessions) => {
+                // Local-only until request-elapsed remote aging exists.
+                for session in &mut sessions {
+                    session.program_status = None;
+                    session.program_status_age_ms = None;
+                }
+                Ok(sessions)
+            }
             Response::Error(error) => Err(io::Error::other(error)),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
