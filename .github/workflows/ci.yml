@@ -109,6 +109,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # The full workspace suite is main-only. Keep the Windows session-host
+      # endpoint tests visible on every pull request that can change them.
+      - name: Windows session-host endpoint
+        run: cargo test -p remuda-native --lib session_host::windows -- --nocapture
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: cargo test --workspace --all-targets --no-fail-fast
       - run: pwsh -NoProfile -File scripts/check-install-pair.ps1

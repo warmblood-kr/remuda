@@ -48,10 +48,10 @@ pub(crate) const CAPABILITY: &str = "capability";
 const CAPABILITY_LEN: usize = 32;
 /// A fixed prelude, read before any framed message is allocated.
 const AUTH_ACK: &[u8] = b"remuda-session-host-auth-v1";
-/// Two instances: at most one connected client plus one reserved listener.
-/// Keeping the listener reserved means the pipe name never disappears between
-/// accepts, so another process cannot squat it and answer our clients.
-const MAX_INSTANCES: u32 = 2;
+/// One instance is always reserved for the name, so at most `MAX_INSTANCES - 1`
+/// clients can be connected. An accept holds its own instance while it creates
+/// the replacement, so reaching that many clients uses every instance.
+const MAX_INSTANCES: u32 = 16;
 const PIPE_BUFFER: u32 = 64 * 1024;
 
 fn denied() -> io::Error {
@@ -65,6 +65,20 @@ fn closed() -> io::Error {
     io::Error::new(
         io::ErrorKind::NotConnected,
         "host pipe unusable after failure",
+    )
+}
+
+fn unavailable() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotConnected,
+        "host endpoint has no reserved pipe instance",
+    )
+}
+
+fn latched() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotConnected,
+        "host endpoint is unusable: its reserved pipe instance could not be replaced",
     )
 }
 
@@ -673,13 +687,25 @@ pub(crate) fn connect(
     Ok(stream)
 }
 
+/// The reserved instance plus the fail-closed latch. Once latched, no accept
+/// may recreate the name: it may have been free for a squatter in between.
+struct Reservation {
+    /// The unconnected instance that keeps the pipe name reserved.
+    pipe: Option<Pipe>,
+    latched: bool,
+}
+
 /// The bound endpoint: one reserved instance, one capability, one user.
 pub(crate) struct Endpoint {
     name: String,
     capability: [u8; CAPABILITY_LEN],
-    /// Holding the bound instance from `bind` reserves the name; `accept`
-    /// consumes it and the next accept publishes a fresh instance.
-    pipe: Mutex<Option<Pipe>>,
+    /// One accept at a time: a second concurrent accept would find the slot
+    /// empty and could mistake another accept's in-flight instance for a loss.
+    accepting: Mutex<()>,
+    reservation: Mutex<Reservation>,
+    /// Fault injection for the fail-closed path; never set in production.
+    #[cfg(test)]
+    fail_replacement: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for Endpoint {
@@ -708,39 +734,129 @@ impl Endpoint {
         Ok(Self {
             name,
             capability,
-            pipe: Mutex::new(Some(pipe)),
+            accepting: Mutex::new(()),
+            reservation: Mutex::new(Reservation {
+                pipe: Some(pipe),
+                latched: false,
+            }),
+            #[cfg(test)]
+            fail_replacement: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     /// Wait for and authenticate one client. Both the wait and the capability
     /// handshake share the caller's absolute deadline.
     pub fn accept(&self, timeout: Duration) -> io::Result<Stream> {
+        let _accepting = self
+            .accepting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let until = Instant::now() + timeout;
         let pipe = self.take_instance()?;
-        connect_server(&pipe, until)?;
-        // Now that this client owns the taken instance, publish a replacement
-        // so the name stays reserved through the connection. Best effort:
-        // the connected instance still reserves the name until it closes.
-        self.reserve_replacement();
+        // Reserve before connecting: the taken instance is still unconnected,
+        // so either it or the replacement holds the name at every moment.
+        // An idle timeout, a failed handshake or the client closing then
+        // cannot remove the last instance.
+        if let Err(error) = self.reserve_replacement() {
+            // The taken instance is the only thing left that holds the name.
+            self.latch_with(pipe);
+            return Err(error);
+        }
+        if let Err(error) = connect_server(&pipe, until) {
+            // The reserved replacement keeps the name, so the timed-out
+            // instance can be discarded.
+            drop(pipe);
+            return Err(error);
+        }
         let mut stream = Stream::new(pipe, timeout)?;
         handshake_server(&mut stream, &self.capability, until)?;
         Ok(stream)
     }
 
     fn take_instance(&self) -> io::Result<Pipe> {
-        let mut slot = self.pipe.lock().unwrap_or_else(PoisonError::into_inner);
-        match slot.take() {
-            Some(pipe) => Ok(pipe),
-            None => create_instance(&self.name, false),
+        let mut reservation = self
+            .reservation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if reservation.latched {
+            return Err(latched());
+        }
+        // No fallback: creating a non-first instance here could reacquire a
+        // name that another process squatted while the reservation was missing.
+        reservation.pipe.take().ok_or_else(unavailable)
+    }
+
+    /// Record that the replacement failed and build the error to return. The
+    /// latch is permanent: a retry could reacquire a name a squatter now owns.
+    fn latch(&self, error: io::Error) -> io::Error {
+        self.reservation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .latched = true;
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!("host endpoint cannot replace its reserved instance: {error}"),
+        )
+    }
+
+    fn reserve_replacement(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_replacement
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let error = io::Error::other("injected replacement failure");
+            return Err(self.latch(error));
+        }
+        let replacement = create_instance(&self.name, false).map_err(|error| self.latch(error))?;
+        let mut reservation = self
+            .reservation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if reservation.latched {
+            return Err(latched());
+        }
+        debug_assert!(reservation.pipe.is_none(), "accepts are serialized");
+        reservation.pipe = Some(replacement);
+        Ok(())
+    }
+
+    fn latch_with(&self, pipe: Pipe) {
+        let mut reservation = self
+            .reservation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        reservation.latched = true;
+        // Keep the instance so the name stays held for the lifetime of this
+        // Endpoint, even though every later accept refuses.
+        if reservation.pipe.is_none() {
+            reservation.pipe = Some(pipe);
         }
     }
 
-    fn reserve_replacement(&self) {
-        let replacement = create_instance(&self.name, false);
-        let mut slot = self.pipe.lock().unwrap_or_else(PoisonError::into_inner);
-        if slot.is_none() {
-            *slot = replacement.ok();
-        }
+    #[cfg(test)]
+    fn reserved_handle(&self) -> HANDLE {
+        self.reservation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pipe
+            .as_ref()
+            .expect("reserved instance")
+            .raw()
+    }
+
+    #[cfg(test)]
+    fn drop_reserved_for_test(&self) {
+        self.reservation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pipe = None;
+    }
+
+    #[cfg(test)]
+    fn fail_next_replacement_for_test(&self) {
+        self.fail_replacement
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn name(&self) -> &str {
@@ -771,22 +887,125 @@ mod tests {
         ))
     }
 
-    fn bound(label: &str) -> Option<(Endpoint, std::path::PathBuf, Cleanup)> {
+    /// Strict setup: a bind failure is evidence the tests cannot assert, so it
+    /// must fail the test instead of skipping it.
+    fn bound(label: &str) -> (Endpoint, std::path::PathBuf, Cleanup) {
         let path = private_dir(label);
-        match Endpoint::bind(&path) {
-            Ok(endpoint) => Some((endpoint, path.clone(), Cleanup(path))),
-            Err(error) => {
-                eprintln!("skipping {label}: cannot create private endpoint: {error}");
-                None
-            }
-        }
+        let endpoint = Endpoint::bind(&path)
+            .unwrap_or_else(|error| panic!("cannot bind private endpoint {label}: {error}"));
+        (endpoint, path.clone(), Cleanup(path))
+    }
+
+    /// Query the kernel object's DACL, not the SDDL we asked for: a wrong flag,
+    /// an inherited ACE or an extra principal would show up here.
+    fn assert_kernel_dacl_is_owner_only(handle: HANDLE) {
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+        use windows_sys::Win32::Security::{
+            GetAce, GetAclInformation, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+            ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+        let mut descriptor: *mut c_void = ptr::null_mut();
+        // SAFETY: handle is live; optional outputs are null and the rest are
+        // valid out pointers.
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, 0, "GetSecurityInfo: {}", io::Error::last_os_error());
+        // GetSecurityInfo allocates with LocalAlloc; LocalFree releases it.
+        let descriptor = LocalMemory(descriptor);
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: descriptor is the live allocation returned above.
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) },
+            0
+        );
+        assert_ne!(control & SE_DACL_PROTECTED, 0, "pipe DACL is not protected");
+        let mut present = 0;
+        let mut dacl = ptr::null_mut();
+        let mut defaulted = 0;
+        // SAFETY: same live descriptor; dacl points into it.
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut dacl, &mut defaulted)
+            },
+            0
+        );
+        assert_ne!(present, 0, "pipe has no DACL");
+        assert!(!dacl.is_null());
+        let mut info = ACL_SIZE_INFORMATION::default();
+        // SAFETY: dacl is live and info is the documented size.
+        assert_ne!(
+            unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    windows_sys::Win32::Security::AclSizeInformation,
+                )
+            },
+            0
+        );
+        assert_eq!(info.AceCount, 1, "exactly one ACE");
+        let mut raw_ace = ptr::null_mut();
+        // SAFETY: index 0 exists as AceCount is one.
+        assert_ne!(unsafe { GetAce(dacl, 0, &mut raw_ace) }, 0);
+        assert!(!raw_ace.is_null());
+        // SAFETY: GetAce returned a live ACE inside the DACL above.
+        let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
+        assert!(ace.Header.AceSize as usize >= std::mem::size_of::<ACCESS_ALLOWED_ACE>());
+        assert_eq!(ace.Header.AceType, 0, "only an access-allowed ACE");
+        assert_eq!(ace.Header.AceFlags, 0, "no inheritance flags");
+        assert_eq!(ace.Mask, FILE_ALL_ACCESS, "full access only");
+        // SAFETY: the SID starts inside the ACE that GetAce returned.
+        let sid = (&ace.SidStart as *const u32).cast_mut().cast::<c_void>();
+        let user = current_user().unwrap();
+        assert_ne!(
+            unsafe { EqualSid(sid, user.sid()) },
+            0,
+            "only the current user"
+        );
     }
 
     #[test]
     fn capability_and_frame_exchange_round_trip() {
-        let Some((endpoint, dir, _cleanup)) = bound("exchange") else {
-            return;
-        };
+        let (endpoint, dir, _cleanup) = bound("exchange");
+        let capability = read_capability(&dir).unwrap();
+        let task = std::thread::spawn(move || {
+            let mut server = endpoint.accept(Duration::from_secs(2)).unwrap();
+            assert_eq!(read_frame(&mut server).unwrap(), b"inspect");
+            write_frame(&mut server, b"identity").unwrap();
+        });
+        let mut client = connect(&dir, &capability, Duration::from_secs(2)).unwrap();
+        write_frame(&mut client, b"inspect").unwrap();
+        assert_eq!(read_frame(&mut client).unwrap(), b"identity");
+        task.join().unwrap();
+    }
+
+    #[test]
+    fn idle_accept_timeout_keeps_the_reserved_name() {
+        let (endpoint, dir, _cleanup) = bound("idle-timeout");
+        let name = pipe_name(&dir).unwrap();
+        let error = endpoint
+            .accept(Duration::from_millis(150))
+            .err()
+            .expect("idle timeout");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        // The reserved replacement still owns the name, so a first-instance
+        // bind cannot take it while this Endpoint lives.
+        assert!(create_instance(&name, true).is_err());
+        // The failed accept did not consume the endpoint.
         let capability = read_capability(&dir).unwrap();
         let task = std::thread::spawn(move || {
             let mut server = endpoint.accept(Duration::from_secs(2)).unwrap();
@@ -801,9 +1020,7 @@ mod tests {
 
     #[test]
     fn wrong_capability_is_refused_by_both_sides() {
-        let Some((endpoint, dir, _cleanup)) = bound("wrong-capability") else {
-            return;
-        };
+        let (endpoint, dir, _cleanup) = bound("wrong-capability");
         let mut wrong = read_capability(&dir).unwrap();
         wrong[0] ^= 0xff;
         let task = std::thread::spawn(move || {
@@ -819,9 +1036,7 @@ mod tests {
 
     #[test]
     fn oversize_frame_is_refused_before_payload_and_consumes_stream() {
-        let Some((endpoint, dir, _cleanup)) = bound("oversize") else {
-            return;
-        };
+        let (endpoint, dir, _cleanup) = bound("oversize");
         let capability = read_capability(&dir).unwrap();
         let (sender, receiver) = mpsc::channel();
         let task = std::thread::spawn(move || {
@@ -847,9 +1062,7 @@ mod tests {
 
     #[test]
     fn truncated_and_silent_handshakes_are_refused_and_bounded() {
-        let Some((endpoint, dir, _cleanup)) = bound("truncated") else {
-            return;
-        };
+        let (endpoint, dir, _cleanup) = bound("truncated");
         let task = std::thread::spawn(move || {
             assert!(endpoint.accept(Duration::from_millis(500)).is_err());
         });
@@ -861,9 +1074,7 @@ mod tests {
         drop(raw);
         task.join().unwrap();
 
-        let Some((endpoint, dir, _cleanup)) = bound("silent") else {
-            return;
-        };
+        let (endpoint, dir, _cleanup) = bound("silent");
         let task = std::thread::spawn(move || {
             let error = endpoint
                 .accept(Duration::from_millis(150))
@@ -881,13 +1092,63 @@ mod tests {
 
     #[test]
     fn second_bind_and_second_first_instance_fail() {
-        let Some((endpoint, dir, _cleanup)) = bound("first-instance") else {
-            return;
-        };
+        let (endpoint, dir, _cleanup) = bound("first-instance");
         assert!(Endpoint::bind(&dir).is_err());
         let name = pipe_name(&dir).unwrap();
         assert_eq!(name, endpoint.name());
         assert!(create_instance(&name, true).is_err());
+    }
+
+    #[test]
+    fn lost_reserved_instance_refuses_instead_of_reacquiring() {
+        let (endpoint, dir, _cleanup) = bound("lost-reservation");
+        let name = pipe_name(&dir).unwrap();
+        // Simulate the reserved handle disappearing without a replacement.
+        endpoint.drop_reserved_for_test();
+        let error = endpoint
+            .accept(Duration::from_millis(150))
+            .err()
+            .expect("no reserved instance");
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        // No non-first instance was silently created: the name is free again,
+        // so only a first-instance bind can take it.
+        let reclaimed = create_instance(&name, true).expect("endpoint recreated nothing");
+        drop(reclaimed);
+        // Still refusing: no fallback path appeared after the failure.
+        let error = endpoint
+            .accept(Duration::from_millis(150))
+            .err()
+            .expect("no reserved instance");
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[test]
+    fn second_bind_after_failed_reservation_fails() {
+        let (endpoint, dir, _cleanup) = bound("failed-reservation");
+        let name = pipe_name(&dir).unwrap();
+        endpoint.fail_next_replacement_for_test();
+        let error = endpoint
+            .accept(Duration::from_millis(150))
+            .err()
+            .expect("replacement failed");
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        // The taken instance is kept, so the name is still held by this
+        // Endpoint and a second first-instance bind cannot take it.
+        assert!(create_instance(&name, true).is_err());
+        // Latched: later accepts refuse instead of silently creating a
+        // non-first instance for the now-untrusted name.
+        let error = endpoint
+            .accept(Duration::from_millis(150))
+            .err()
+            .expect("latched");
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        assert!(create_instance(&name, true).is_err());
+    }
+
+    #[test]
+    fn pipe_dacl_is_owner_only() {
+        let (endpoint, _dir, _cleanup) = bound("dacl");
+        assert_kernel_dacl_is_owner_only(endpoint.reserved_handle());
     }
 
     #[test]
