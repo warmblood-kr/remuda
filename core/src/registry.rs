@@ -1344,3 +1344,76 @@ mod attribution_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod launch_policy_tests {
+    use super::*;
+    use crate::agent::{AgentProcess, Cursor, Result as AgentResult, Size};
+    use crate::clock::ManualClock;
+    use crate::session::Session;
+    use std::sync::Arc;
+
+    struct Quiet;
+
+    impl AgentProcess for Quiet {
+        fn write(&mut self, _: &[u8]) -> AgentResult<()> {
+            Ok(())
+        }
+        fn screen_text(&mut self) -> AgentResult<String> {
+            Ok(String::new())
+        }
+        fn cursor(&mut self) -> AgentResult<Cursor> {
+            Ok(Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            })
+        }
+        fn size(&self) -> Size {
+            Size::new(80, 24)
+        }
+        fn is_alive(&mut self) -> bool {
+            true
+        }
+        fn terminate(&mut self) -> AgentResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_sessions_guard_is_held_through_launch_policy_insertion() {
+        let registry = Arc::new(Registry::new());
+        let policy = registry
+            .remote_input_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let registrar = {
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                let _ = registry.register_with_remote_input_disabled(
+                    Session::new(
+                        "launch-policy",
+                        Box::new(Quiet),
+                        Arc::new(ManualClock::new()),
+                    ),
+                    true,
+                );
+            })
+        };
+        for _ in 0..1_000_000 {
+            if registry.sessions.try_lock().is_err() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            registry.sessions.try_lock().is_err(),
+            "registration must hold the sessions guard while inserting policy; \
+             releasing it first lets an admission observe an unprotected instance"
+        );
+        drop(policy);
+        registrar.join().unwrap();
+        let session = registry.get("launch-policy").expect("registered");
+        assert!(registry.remote_input_disabled(session.instance_id()));
+    }
+}
