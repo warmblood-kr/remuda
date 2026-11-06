@@ -1086,6 +1086,15 @@ fn invalid_http(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+fn remote_input_bytes(request: &Request) -> Option<usize> {
+    match request {
+        Request::Input { bytes, .. }
+        | Request::InputLine { bytes, .. }
+        | Request::RemoteInputLine { bytes, .. } => Some(bytes.len()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 fn authorize_remote_request(request: &Request) -> io::Result<()> {
     crate::remote_front::authorize(request)
@@ -1616,8 +1625,8 @@ fn handle_admitted_request(
         let response = serde_json::to_vec(&response).unwrap_or_else(|_| b"null".to_vec());
         return send_encrypted_response(stream, opened, &response);
     }
-    if let Request::Input { bytes, .. } | Request::InputLine { bytes, .. } = &request {
-        if !state.limiter.allow_remote_input(&peer_fp, bytes.len()) {
+    if let Some(bytes) = remote_input_bytes(&request) {
+        if !state.limiter.allow_remote_input(&peer_fp, bytes) {
             audit(cluster::audit::Outcome::Limited);
             let response =
                 serde_json::to_vec(&Response::RateLimited).unwrap_or_else(|_| b"null".to_vec());
@@ -2873,6 +2882,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn socket_charges_the_peer_budget_for_a_guarded_line() {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let seen = dispatched.clone();
+        let settings = TestControlSettings::new(br#"{"allow_remote_control":true}"#);
+        let server = SocketTestServer::start_production_with_control_source(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Ok(())),
+            Arc::new(move |_, _| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::to_vec(&Response::Ack { duplicate: false }).unwrap())
+            }),
+            settings.source(),
+        );
+        server.exhaust_remote_input_budget(&peer.public);
+        let request = Request::RemoteInputLine {
+            name: "session".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
+            bytes: b"x".to_vec(),
+        };
+        let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&request).unwrap());
+        let (status, response) = server.exchange(sealed);
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Response>(&response).unwrap(),
+            Response::RateLimited
+        );
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn socket_setting_off_returns_disabled_without_dispatch() {
         let settings = TestControlSettings::new(br#"{"allow_remote_control":false}"#);
         let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
@@ -3283,6 +3332,36 @@ mod tests {
             keep_sessions: false,
         })
         .is_err());
+    }
+
+    #[test]
+    fn every_peer_line_variant_spends_the_peer_rate_budget() {
+        for request in [
+            Request::Input {
+                name: "session".into(),
+                instance_id: "instance".into(),
+                client_id: "0".repeat(32),
+                seq: 1,
+                bytes: b"x".to_vec(),
+            },
+            Request::InputLine {
+                name: "session".into(),
+                instance_id: "instance".into(),
+                client_id: "0".repeat(32),
+                seq: 1,
+                bytes: b"x".to_vec(),
+            },
+            Request::RemoteInputLine {
+                name: "session".into(),
+                instance_id: "instance".into(),
+                client_id: "0".repeat(32),
+                seq: 1,
+                bytes: b"x".to_vec(),
+            },
+        ] {
+            assert_eq!(remote_input_bytes(&request), Some(1), "{request:?}");
+        }
+        assert_eq!(remote_input_bytes(&Request::List), None);
     }
 
     #[test]

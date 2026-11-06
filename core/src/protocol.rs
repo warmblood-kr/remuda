@@ -247,10 +247,8 @@ pub enum Request {
         seq: u64,
         bytes: Vec<u8>,
     },
-    /// The guarded remote line. Only a daemon with the per-session opt-out
-    /// knows this variant, so an older receiver rejects the frame before any
-    /// PTY write instead of silently applying an unguarded `InputLine`. The
-    /// remote front maps it to [`Request::RemoteInput`] with `line: true`.
+    /// The guarded remote line: an old receiver rejects the variant before a
+    /// PTY write, and the remote front maps it to [`Request::RemoteInput`].
     RemoteInputLine {
         name: String,
         instance_id: String,

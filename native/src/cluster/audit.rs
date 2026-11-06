@@ -81,6 +81,9 @@ pub fn action(request: &Request) -> Option<Action> {
         }
         | Request::RemoteInput {
             name, instance_id, ..
+        }
+        | Request::RemoteInputLine {
+            name, instance_id, ..
         } => (Op::Input, name.clone(), Some(instance_id.clone())),
         Request::Send { name, .. }
         | Request::SendLine { name, .. }
@@ -319,6 +322,18 @@ mod tests {
     fn session_changing_requests_are_audited_and_reads_are_not() {
         assert_eq!(action(&input(b"x")).unwrap().op, Op::Input);
         assert_eq!(
+            action(&Request::RemoteInputLine {
+                name: "build".into(),
+                instance_id: "inst-1".into(),
+                client_id: "c".repeat(32),
+                seq: 1,
+                bytes: b"x".to_vec(),
+            })
+            .unwrap()
+            .op,
+            Op::Input
+        );
+        assert_eq!(
             action(&Request::ResizeSession {
                 name: "build".into(),
                 instance_id: "inst-1".into(),
@@ -382,6 +397,21 @@ mod tests {
         assert_eq!(entries[0].instance_id.as_deref(), Some("inst-1"));
         assert_eq!(entries[0].outcome, Outcome::Done);
         assert!(entries[0].at_unix_ms > 0);
+        sink.record(
+            "SHA256:peer",
+            &action(&Request::RemoteInputLine {
+                name: "build".into(),
+                instance_id: "inst-1".into(),
+                client_id: "c".repeat(32),
+                seq: 1,
+                bytes: b"guarded-secret".to_vec(),
+            })
+            .unwrap(),
+            Outcome::Done,
+        );
+        let text = std::fs::read_to_string(dir.join(AUDIT_FILE)).unwrap();
+        assert!(!text.contains("guarded-secret"));
+        assert_eq!(read_at(&dir, 10).unwrap().len(), 2);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -379,7 +379,6 @@ fn send_transport_error(fingerprint: &str, error: ClientError) -> SendFailure {
             | ClientError::PeerNotListening
             | ClientError::OsBlockedConnection
             | ClientError::Refused(_)
-            | ClientError::PeerTooNew
             | ClientError::RequestTooLarge
     );
     if not_written {
@@ -999,6 +998,7 @@ mod tests {
             (ClientError::Timeout, "uncertain"),
             (ClientError::PeerClosedConnection, "uncertain"),
             (ClientError::Crypto, "uncertain"),
+            (ClientError::PeerTooNew, "uncertain"),
         ] {
             let mut line_calls = 0;
             let result = send_remote(

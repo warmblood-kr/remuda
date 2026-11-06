@@ -23,7 +23,7 @@ struct Settings {
     allow_remote_control: bool,
     /// Sender-side rollout gate: authenticating the receiver is not enough
     /// until managed panes are protected. Off by default.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     allow_remote_send: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     node_aliases: BTreeMap<String, String>,
