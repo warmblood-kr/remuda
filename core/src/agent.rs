@@ -403,10 +403,7 @@ pub struct VersionedSnapshot {
     pub instance_id: Option<String>,
 }
 
-/// One state from the Program Status Protocol (OSC 7501).
-///
-/// This is an advisory, program-reported fact. It is not an executable
-/// identity, an authorization, or proof that the process is alive.
+/// One state from OSC 7501; advisory, never identity or authorization.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProgramState {
@@ -429,8 +426,7 @@ impl ProgramState {
     }
 }
 
-/// What a `blocked` program says it is waiting for. Display only; never an
-/// approval or permission grant.
+/// What a `blocked` program waits for; display only, never approval.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProgramBlockKind {
@@ -439,10 +435,6 @@ pub enum ProgramBlockKind {
     Auth,
 }
 
-/// The bounded part of an OSC 7501 report that Remuda shares.
-///
-/// Free text (`title`, `msg`, `id`) is deliberately absent: it can contain
-/// prompts, paths or credentials, and base64 is not redaction.
 impl ProgramBlockKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -453,6 +445,7 @@ impl ProgramBlockKind {
     }
 }
 
+/// Bounded OSC 7501 fields; free text is deliberately absent.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct ProgramStatus {
     pub state: ProgramState,

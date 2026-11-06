@@ -103,6 +103,7 @@ fn session_list_exposes_bounded_program_status() {
         ]
     };
     new_with_instance(&path, "status", command).expect("new status session");
+    std::thread::sleep(Duration::from_millis(200));
     let source = r#"
         for _, row in ipairs(remuda.session.list()) do
           if row.name == "status" then
