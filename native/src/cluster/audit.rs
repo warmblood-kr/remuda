@@ -78,6 +78,9 @@ pub fn action(request: &Request) -> Option<Action> {
         }
         | Request::InputLine {
             name, instance_id, ..
+        }
+        | Request::RemoteInput {
+            name, instance_id, ..
         } => (Op::Input, name.clone(), Some(instance_id.clone())),
         Request::Send { name, .. }
         | Request::SendLine { name, .. }

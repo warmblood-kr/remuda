@@ -112,6 +112,10 @@ pub struct SessionSummary {
     /// decision, not a core TTL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_status_age_ms: Option<u64>,
+    /// Local-only policy: this exact instance refuses authenticated cluster
+    /// input. Default false for older listings and new instances.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub remote_input_disabled: bool,
 }
 
 /// A session name from a program's argv[0]: basename, lowercased, anything
@@ -156,6 +160,9 @@ pub struct Registry {
     /// duplicate memory and rate budget an in-process Session keeps itself.
     /// Daemon memory only, so a daemon restart forgets it.
     hosted_input: Mutex<HashMap<String, Arc<HostedInput>>>,
+    /// Local-only remote-input opt-out, keyed by exact session instance so a
+    /// reused name never inherits it.
+    remote_input_policy: Mutex<HashMap<String, bool>>,
 }
 
 #[derive(Default)]
@@ -183,6 +190,103 @@ impl Registry {
             .map(|session| session.apply_input_line_batch(batch))
     }
 
+    /// The authenticated-cluster form of an input batch. The policy is keyed
+    /// by the exact instance; off rejects new admissions, not a past write.
+    pub fn apply_remote_input_batch(
+        &self,
+        name: &str,
+        batch: InputBatch<'_>,
+        line: bool,
+    ) -> Option<core::result::Result<InputOutcome, InputError>> {
+        let (session, disabled) = {
+            let sessions = self.lock();
+            let session = sessions.get(name)?.clone();
+            if session.instance_id() != batch.instance_id {
+                return Some(Ok(InputOutcome::WrongInstance));
+            }
+            let disabled = self
+                .remote_input_policy
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(batch.instance_id)
+                .copied()
+                .unwrap_or(false);
+            (session, disabled)
+        };
+        if disabled {
+            return Some(Err(InputError::RemoteInputDisabled));
+        }
+        Some(if line {
+            session.apply_input_line_batch(batch)
+        } else {
+            session.apply_input_batch(batch)
+        })
+    }
+
+    /// Change the local remote-input policy for one exact session instance.
+    /// `None` means the name/instance is not the current live/available one.
+    pub fn set_remote_input_opt_out(
+        &self,
+        name: &str,
+        instance_id: &str,
+        opted_out: bool,
+    ) -> Option<()> {
+        if instance_id.is_empty() {
+            return None;
+        }
+        if self.get(name).is_some() {
+            let sessions = self.lock();
+            let session = sessions.get(name)?;
+            if session.instance_id() != instance_id || !session.is_alive() || session.is_closing() {
+                return None;
+            }
+            return self.mutate_remote_input_policy(instance_id, opted_out);
+        }
+        let handle = self.hosted(name)?;
+        if handle.identity().instance != instance_id {
+            return None;
+        }
+        let observation = handle.inspect().ok()?;
+        if observation.lifecycle != Lifecycle::Running || observation.closing {
+            return None;
+        }
+        let hosted = self.hosted_lock();
+        let current = hosted.get(name)?;
+        if !Arc::ptr_eq(current, &handle) || current.identity().instance != instance_id {
+            return None;
+        }
+        self.mutate_remote_input_policy(instance_id, opted_out)
+    }
+
+    fn mutate_remote_input_policy(&self, instance_id: &str, opted_out: bool) -> Option<()> {
+        let mut policy = self
+            .remote_input_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if opted_out {
+            policy.insert(instance_id.to_string(), true);
+        } else {
+            policy.remove(instance_id);
+        }
+        Some(())
+    }
+
+    fn forget_remote_input_policy(&self, instance_id: &str) {
+        self.remote_input_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(instance_id);
+    }
+
+    pub fn remote_input_disabled(&self, instance_id: &str) -> bool {
+        self.remote_input_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(instance_id)
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// `apply_input_batch` (or `apply_input_line_batch`) for a host-backed
     /// session (#713): in-process checks here, the write as one host act; a
     /// concurrent batch is told Busy. `None` when no hosted session has `name`.
@@ -195,6 +299,22 @@ impl Registry {
     ) -> Option<core::result::Result<InputOutcome, InputError>> {
         let handle = self.hosted(name)?;
         Some(self.apply_hosted_batch(&handle, batch, line, now))
+    }
+
+    /// Host-backed remote input is refused in this slice: the policy is not
+    /// persisted across a daemon restart.
+    pub fn apply_hosted_remote_input_batch(
+        &self,
+        name: &str,
+        batch: InputBatch<'_>,
+        _line: bool,
+        _now: Duration,
+    ) -> Option<core::result::Result<InputOutcome, InputError>> {
+        let handle = self.hosted(name)?;
+        if handle.identity().instance != batch.instance_id {
+            return Some(Ok(InputOutcome::WrongInstance));
+        }
+        Some(Err(InputError::RemoteInputDisabled))
     }
 
     fn apply_hosted_batch(
@@ -327,6 +447,7 @@ impl Registry {
         let removed = self.hosted_lock().remove(name);
         if let Some(handle) = &removed {
             self.forget_hosted_input(handle);
+            self.forget_remote_input_policy(&handle.identity().instance);
         }
         removed
     }
@@ -517,32 +638,51 @@ impl Registry {
     /// A snapshot of every session, sorted by name so callers can diff two
     /// listings without sorting first.
     pub fn list(&self) -> Vec<SessionSummary> {
-        let mut out: Vec<_> = self
-            .lock()
-            .values()
-            .map(|s| {
-                let program = s.program_status();
-                SessionSummary {
-                    id: s.id().to_string(),
-                    name: s.name().to_string(),
-                    instance_id: Some(s.instance_id().to_string()),
-                    output_version: s.output_version(),
-                    alive: s.is_alive(),
-                    idle: s.idle_for(),
-                    output_idle: Some(s.output_idle_for()),
-                    size: s.size(),
-                    attached: s.is_attached(),
-                    human_idle: s.human_idle_for(),
-                    mouse_tracking: s.mouse_tracking(),
-                    unavailable: false,
-                    program_status: program.as_ref().map(|o| o.status.clone()),
-                    program_status_age_ms: program
-                        .map(|o| o.age.as_millis().try_into().unwrap_or(u64::MAX)),
-                }
-            })
-            .collect();
+        let (mut out, policy): (Vec<_>, HashMap<_, _>) = {
+            let sessions = self.lock();
+            let policy = self
+                .remote_input_policy
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let out = sessions
+                .values()
+                .map(|s| {
+                    let program = s.program_status();
+                    SessionSummary {
+                        id: s.id().to_string(),
+                        name: s.name().to_string(),
+                        instance_id: Some(s.instance_id().to_string()),
+                        output_version: s.output_version(),
+                        alive: s.is_alive(),
+                        idle: s.idle_for(),
+                        output_idle: Some(s.output_idle_for()),
+                        size: s.size(),
+                        attached: s.is_attached(),
+                        human_idle: s.human_idle_for(),
+                        mouse_tracking: s.mouse_tracking(),
+                        unavailable: false,
+                        program_status: program.as_ref().map(|o| o.status.clone()),
+                        program_status_age_ms: program
+                            .map(|o| o.age.as_millis().try_into().unwrap_or(u64::MAX)),
+                        remote_input_disabled: policy
+                            .get(s.instance_id())
+                            .copied()
+                            .unwrap_or(false),
+                    }
+                })
+                .collect();
+            (out, policy)
+        };
         let hosted: Vec<_> = self.hosted_lock().values().map(Arc::clone).collect();
-        out.extend(hosted.iter().map(|handle| hosted_summary(handle)));
+        for handle in hosted {
+            let mut summary = hosted_summary(&handle);
+            summary.remote_input_disabled = policy
+                .get(&handle.identity().instance)
+                .copied()
+                .unwrap_or(false);
+            out.push(summary);
+        }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
@@ -551,7 +691,11 @@ impl Registry {
     /// taken keeps working, which is what makes this safe to call on a viewer's
     /// behalf.
     pub fn remove(&self, name: &str) -> Option<Arc<Session>> {
-        self.lock().remove(name)
+        let removed = self.lock().remove(name);
+        if let Some(session) = &removed {
+            self.forget_remote_input_policy(session.instance_id());
+        }
+        removed
     }
 
     /// Drop every session whose process has exited, returning their names.
@@ -585,7 +729,9 @@ impl Registry {
             })
             .collect();
         for (name, _, _, _, _) in &dead {
-            sessions.remove(name);
+            if let Some(session) = sessions.remove(name) {
+                self.forget_remote_input_policy(session.instance_id());
+            }
         }
         drop(sessions);
         dead.into_iter()
@@ -627,6 +773,7 @@ impl Registry {
                     return None;
                 }
                 hosted.remove(&identity.name);
+                self.forget_remote_input_policy(&identity.instance);
                 let closed = self.closing_hosted_lock().remove(&identity.instance);
                 let reason = if closing || closed {
                     "closed"
@@ -737,6 +884,7 @@ fn hosted_summary(handle: &SessionHandle) -> SessionSummary {
         unavailable: false,
         program_status: None,
         program_status_age_ms: None,
+        remote_input_disabled: false,
     };
     let Ok(observation) = handle.inspect() else {
         summary.unavailable = true;
@@ -966,7 +1114,11 @@ impl Registry {
             session.clear_closing();
             return Some(Err(error));
         }
-        Some(Ok(sessions.remove(name).is_some()))
+        let removed = sessions.remove(name);
+        if let Some(session) = &removed {
+            self.forget_remote_input_policy(session.instance_id());
+        }
+        Some(Ok(removed.is_some()))
     }
 
     /// End a host-backed child, then stop tracking that exact handle. Host
@@ -1000,6 +1152,7 @@ impl Registry {
             hosted.remove(name);
             drop(hosted);
             self.forget_hosted_input(&handle);
+            self.forget_remote_input_policy(&handle.identity().instance);
         }
         // Lock order: `hosted`, then `closing_hosted`, as in the reaper.
         self.closing_hosted_lock()

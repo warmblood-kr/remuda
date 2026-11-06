@@ -2953,6 +2953,7 @@ fn old_json_shapes_parse_with_defaults_for_additive_session_fields() {
         human_idle: None,
         mouse_tracking: false,
         unavailable: false,
+        remote_input_disabled: false,
         program_status: None,
         program_status_age_ms: None,
     };
@@ -3135,6 +3136,138 @@ fn capture_styled_snapshot(path: &Path, name: &str, scrollback: usize) -> (Strin
         ),
         other => panic!("styled capture failed: {other:?}"),
     }
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)] // One end-to-end case: receive, refuse, local, reuse.
+fn remote_input_opt_out_refuses_before_the_pty_and_keeps_local_input() {
+    let path = scratch("remote-input-opt-out");
+    let _daemon = daemon_at(&path);
+    let response = client::request(
+        &path,
+        &Request::NewWithInstance {
+            name: Some("opted".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start opted session");
+    let (name, instance) = match response {
+        Response::SessionStarted { name, instance_id } => (name, instance_id),
+        other => panic!("unexpected start response: {other:?}"),
+    };
+    let batch = |client: &str, bytes: &'static [u8], line: bool| Request::RemoteInput {
+        name: name.clone(),
+        instance_id: instance.clone(),
+        client_id: client.into(),
+        seq: 1,
+        bytes: bytes.to_vec(),
+        line,
+    };
+    assert!(matches!(
+        client::request(
+            &path,
+            &batch("00000000000000000000000000000001", b"first", true)
+        )
+        .expect("remote line"),
+        Response::Ack { duplicate: false }
+    ));
+    wait_for(&path, &name, "got:first");
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::SetRemoteInputOptOut {
+                name: name.clone(),
+                instance_id: instance.clone(),
+                opted_out: true,
+            }
+        )
+        .expect("disable remote input"),
+        Response::Ok
+    );
+    for request in [
+        batch("00000000000000000000000000000002", b"leak", false),
+        batch("00000000000000000000000000000003", b"leak", true),
+    ] {
+        assert_eq!(
+            client::request(&path, &request).expect("refused remote input"),
+            Response::RemoteControlDisabled
+        );
+    }
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::SendLine {
+                name: name.clone(),
+                text: "local".into(),
+            }
+        )
+        .expect("local send"),
+        Response::Ok
+    );
+    let screen = wait_for(&path, &name, "got:local");
+    assert!(!screen.contains("leak"), "refused bytes reached the PTY");
+    let listed = match client::request(&path, &Request::List).expect("list") {
+        Response::Sessions(rows) => rows,
+        other => panic!("unexpected list: {other:?}"),
+    };
+    assert!(listed
+        .iter()
+        .any(|row| row.name == name && row.remote_input_disabled));
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::SetRemoteInputOptOut {
+                name: name.clone(),
+                instance_id: "wrong".into(),
+                opted_out: false,
+            }
+        )
+        .expect("wrong instance"),
+        Response::Error("no such session: opted".into())
+    );
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::Close {
+                name: name.clone(),
+                instance_id: None,
+                confirm: None,
+            }
+        )
+        .expect("close"),
+        Response::Ok
+    );
+    let replacement = client::request(
+        &path,
+        &Request::NewWithInstance {
+            name: Some(name.clone()),
+            command: vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("replacement session");
+    let replacement_instance = match replacement {
+        Response::SessionStarted { instance_id, .. } => instance_id,
+        other => panic!("unexpected replacement: {other:?}"),
+    };
+    assert_ne!(instance, replacement_instance);
+    let listed = match client::request(&path, &Request::List).expect("list") {
+        Response::Sessions(rows) => rows,
+        other => panic!("unexpected list: {other:?}"),
+    };
+    assert!(listed
+        .iter()
+        .any(|row| row.name == name && !row.remote_input_disabled));
 }
 
 fn wait_for(path: &Path, name: &str, needle: &str) -> String {

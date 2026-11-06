@@ -247,6 +247,25 @@ pub enum Request {
         seq: u64,
         bytes: Vec<u8>,
     },
+    /// The local-daemon form of a cluster peer's `Input`/`InputLine`: identical
+    /// bytes, but the session's local remote-input policy is checked before
+    /// any bytes reach the PTY. A peer never sends this variant directly.
+    RemoteInput {
+        name: String,
+        instance_id: String,
+        client_id: String,
+        seq: u64,
+        bytes: Vec<u8>,
+        #[serde(default)]
+        line: bool,
+    },
+    /// Set one session instance's local opt-out from authenticated remote
+    /// input. Refused by the remote front; local daemon/Lua/CLI only.
+    SetRemoteInputOptOut {
+        name: String,
+        instance_id: String,
+        opted_out: bool,
+    },
     /// Deliver a burst of input bytes as an indivisible act, appending nothing —
     /// the primitive [`Request::SendLine`] is made of. Indivisible is the
     /// load-bearing word; an attached terminal does not block it.
@@ -465,7 +484,8 @@ pub enum Response {
     Busy,
     /// The bounded PTY write deadline elapsed; delivery may be partial or late.
     WriteTimeout,
-    /// The receiving cluster node has disabled remote Input locally.
+    /// The receiving cluster node or the target session instance has disabled
+    /// remote Input locally.
     RemoteControlDisabled,
     /// A styled screen, answering [`Request::CaptureStyled`] — as runs, not
     /// cells; see [`StyledRun`]. `cursor` rides the same round trip, so the

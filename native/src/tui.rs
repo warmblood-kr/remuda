@@ -1450,6 +1450,7 @@ mod visual_mode_tests {
                 human_idle: None,
                 mouse_tracking: false,
                 unavailable: false,
+                remote_input_disabled: false,
                 program_status: None,
                 program_status_age_ms: None,
             }],
@@ -3999,6 +4000,7 @@ mod keybindings_adopter_tests {
             human_idle: None,
             mouse_tracking: false,
             unavailable: false,
+            remote_input_disabled: false,
             program_status: None,
             program_status_age_ms: None,
         }];
@@ -4060,6 +4062,7 @@ mod composer_tests {
             human_idle: None,
             mouse_tracking: false,
             unavailable: false,
+            remote_input_disabled: false,
             program_status: None,
             program_status_age_ms: None,
         }

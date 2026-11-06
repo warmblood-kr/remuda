@@ -30,7 +30,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 112] = [
+pub const BINDINGS: [&str; 113] = [
     "_advice_reattach",
     "_call",
     "_caller_live",
@@ -64,6 +64,7 @@ pub const BINDINGS: [&str; 112] = [
     "_run_due_schedules",
     "_run_schedule",
     "_schedule_fire_counts",
+    "_session_remote_input",
     "_session_resize",
     "_sync_window_shown",
     "_take_due_schedules",
@@ -267,6 +268,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_session_resize",
         "Resize a session after validating its requested dimensions.",
         "_session_resize(name, cols, rows) -> true, nil | nil, error",
+    ),
+    (
+        "_session_remote_input",
+        "Set the local-only remote-input opt-out for one exact session instance. Unknown, exited or mismatched instances are refused; references do not inherit it.",
+        "_session_remote_input(name, instance_id, enabled) -> true, nil | nil, error",
     ),
     (
         "http",
@@ -1207,6 +1213,7 @@ pub(crate) fn bindings(
     )?;
 
     session_resize_binding(lua, &table, at())?;
+    session_remote_input_binding(lua, &table, at())?;
 
     new_binding(lua, &table, at())?;
 
@@ -1384,6 +1391,38 @@ fn session_resize_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) ->
                 other => Ok((Value::Nil, Some(format!("unexpected response: {other:?}")))),
             }
         })?,
+    )
+}
+
+fn session_remote_input_binding(
+    lua: &Lua,
+    table: &Table,
+    path: std::path::PathBuf,
+) -> mlua::Result<()> {
+    table.set(
+        "_session_remote_input",
+        lua.create_function(
+            move |_, (name, instance_id, enabled): (String, String, bool)| {
+                if instance_id.is_empty() {
+                    return Ok((
+                        Value::Nil,
+                        Some("instance_id must not be empty".to_string()),
+                    ));
+                }
+                match ask(
+                    &path,
+                    Request::SetRemoteInputOptOut {
+                        name,
+                        instance_id,
+                        opted_out: !enabled,
+                    },
+                )? {
+                    Response::Ok => Ok((Value::Boolean(true), None)),
+                    Response::Error(reason) => Ok((Value::Nil, Some(reason))),
+                    other => Ok((Value::Nil, Some(format!("unexpected response: {other:?}")))),
+                }
+            },
+        )?,
     )
 }
 
@@ -2475,6 +2514,7 @@ fn session_rows(
         row.set("cols", session.size.cols())?;
         row.set("rows", session.size.rows())?;
         row.set("attached", session.attached)?;
+        row.set("remote_input_disabled", session.remote_input_disabled)?;
         row.set(
             "human_idle",
             session
@@ -2698,6 +2738,7 @@ mod binding_tests {
                     human_idle: None,
                     mouse_tracking: false,
                     unavailable: false,
+                    remote_input_disabled: false,
                     program_status: None,
                     program_status_age_ms: None,
                 }]),

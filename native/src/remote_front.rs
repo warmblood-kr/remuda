@@ -262,6 +262,8 @@ pub fn authorize(request: &Request) -> Result<(), String> {
             }
             validate_batch(client_id, *seq, bytes).map(|_| ())
         }
+        Request::RemoteInput { .. } => Err(refusal("RemoteInput")),
+        Request::SetRemoteInputOptOut { .. } => Err(refusal("SetRemoteInputOptOut")),
         Request::New { .. } => Err(refusal("New")),
         Request::NewWithInstance { .. } => Err(refusal("NewWithInstance")),
         Request::SendLine { .. } => Err(refusal("SendLine")),
