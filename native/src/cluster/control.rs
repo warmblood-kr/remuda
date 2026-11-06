@@ -434,6 +434,25 @@ mod tests {
     }
 
     #[test]
+    fn a_false_remote_send_is_omitted_so_old_readers_still_parse_settings() {
+        let dir = cluster_dir();
+        set_enabled_at(&dir, false).unwrap();
+        let text = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert!(
+            !text.contains("allow_remote_send"),
+            "a false gate must not become an unknown field for an older binary: {text}"
+        );
+        std::fs::write(
+            dir.join("settings.json"),
+            br#"{"allow_remote_control":true}"#,
+        )
+        .unwrap();
+        assert!(!remote_send_enabled_at(&dir).unwrap());
+        assert!(enabled_at(&dir).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn missing_remote_send_setting_defaults_to_off_and_round_trips() {
         let dir = cluster_dir();
         assert!(!remote_send_enabled_at(&dir).unwrap(), "default is off");
