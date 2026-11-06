@@ -395,6 +395,20 @@ impl Registry {
         reason = "the refused session is handed back whole"
     )]
     pub fn register(&self, session: Session) -> core::result::Result<Arc<Session>, Session> {
+        self.register_with_remote_input_disabled(session, false)
+    }
+
+    /// Insert a session and its launch-time opt-out under one sessions lock, so
+    /// no remote admission can observe the new instance before the policy does.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the refused handle is handed back whole, like register_hosted"
+    )]
+    pub fn register_with_remote_input_disabled(
+        &self,
+        session: Session,
+        remote_input_disabled: bool,
+    ) -> core::result::Result<Arc<Session>, Session> {
         let mut sessions = self.lock();
         if sessions.contains_key(session.name()) || self.hosted_lock().contains_key(session.name())
         {
@@ -402,6 +416,11 @@ impl Registry {
         }
         let handle = Arc::new(session);
         sessions.insert(handle.name().to_string(), Arc::clone(&handle));
+        if remote_input_disabled {
+            let instance = handle.instance_id().to_owned();
+            drop(sessions);
+            self.mutate_remote_input_policy(&instance, true);
+        }
         Ok(handle)
     }
 

@@ -1909,8 +1909,8 @@ setmetatable(remuda.session, {
 register("session", "Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach, resize and remote_input.",
   "session(name) -> handle; table {list, new, close, attach, resize, remote_input}")
 register("session.list", "List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.", "session.list() -> {session...}")
-register("session.new", "Start a session and return its name and registered instance_id.",
-  "session.new(name?, argv?, cwd?, env?) -> name, instance_id")
+register("session.new", "Start a session and return its name and registered instance_id. The options table can set remote_input_disabled=true to protect the exact instance at registration.",
+  "session.new(name?, argv?, cwd?, env?, options?) -> name, instance_id")
 register("session.close", "End a session, live or already self-exited.", "session.close(name) -> nil")
 register("session.attach", "Enter raw mode on a session.", "session.attach(name) -> nil")
 register("session.resize", "Resize a session's terminal (cols 20..1000, rows 24..500).", "session.resize(name, cols, rows) -> true | nil, err")
@@ -1920,7 +1920,7 @@ remuda.new = deprecated_alias("new", "new", flat_session_words.new)
 remuda.close = deprecated_alias("close", "close", flat_session_words.close)
 remuda.attach = deprecated_alias("attach", "attach", flat_session_words.attach)
 register("ls", "Deprecated alias for `remuda.session.list`.", "ls() -> {session...}")
-register("new", "Deprecated alias for `remuda.session.new`; returns name and registered instance_id.", "new(name?, argv?, cwd?, env?) -> name, instance_id")
+register("new", "Deprecated alias for `remuda.session.new`; returns name and registered instance_id.", "new(name?, argv?, cwd?, env?, options?) -> name, instance_id")
 register("close", "Deprecated alias for `remuda.session.close`.", "close(name) -> nil")
 register("attach", "Deprecated alias for `remuda.session.attach`.", "attach(name) -> nil")
 

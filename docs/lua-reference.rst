@@ -354,7 +354,7 @@ mkdir
 new
 ---
 
-``new(name?, argv?, cwd?, env?) -> name, instance_id`` — Deprecated alias for `remuda.session.new`; returns name and registered instance_id.
+``new(name?, argv?, cwd?, env?, options?) -> name, instance_id`` — Deprecated alias for `remuda.session.new`; returns name and registered instance_id.
 
 on
 --
@@ -454,7 +454,7 @@ session.list
 session.new
 -----------
 
-``session.new(name?, argv?, cwd?, env?) -> name, instance_id`` — Start a session and return its name and registered instance_id.
+``session.new(name?, argv?, cwd?, env?, options?) -> name, instance_id`` — Start a session and return its name and registered instance_id. The options table can set remote_input_disabled=true to protect the exact instance at registration.
 
 session.resize
 --------------

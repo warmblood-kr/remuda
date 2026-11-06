@@ -137,6 +137,7 @@ impl Parity {
             size: Size::new(80, 24),
             cwd: Some("/".into()),
             env: None,
+            remote_input_disabled: false,
         }) {
             Response::SessionStarted { instance_id, .. } => instance_id,
             other => panic!("{:?}: new {name}: {other:?}", self.mode),

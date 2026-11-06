@@ -634,6 +634,32 @@ fn remote_input_line_adds_exactly_one_return_and_a_duplicate_adds_none() {
 }
 
 #[test]
+fn launch_time_protection_is_applied_with_registration() {
+    let registry = Registry::new();
+    let session = registry
+        .register_with_remote_input_disabled(
+            input_session(Arc::new(Mutex::new(Vec::new())), true),
+            true,
+        )
+        .expect("register protected");
+    assert!(registry.remote_input_disabled(session.instance_id()));
+    assert!(registry.list()[0].remote_input_disabled);
+    assert!(matches!(
+        registry.apply_remote_input_batch(
+            "input-test",
+            InputBatch {
+                instance_id: session.instance_id(),
+                client_id: [6; 16],
+                seq: 1,
+                bytes: b"blocked",
+            },
+            false,
+        ),
+        Some(Err(InputError::RemoteInputDisabled))
+    ));
+}
+
+#[test]
 fn remote_input_opt_out_does_not_follow_a_reused_name() {
     let registry = Registry::new();
     let first = registry

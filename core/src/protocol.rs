@@ -223,6 +223,11 @@ pub enum Request {
         cwd: Option<String>,
         #[serde(default)]
         env: Option<std::collections::HashMap<String, String>>,
+        /// Launch-time per-session opt-out, applied atomically with registry
+        /// insertion. Old daemons ignore the unknown field, so a caller that
+        /// needs the guarantee must also keep remote send gated off toward them.
+        #[serde(default)]
+        remote_input_disabled: bool,
     },
     /// Deliver one instruction as an indivisible act. An attached terminal is
     /// a viewer, not a delivery lock.

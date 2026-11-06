@@ -988,6 +988,7 @@ fn new_request(
     argv: Option<Vec<String>>,
     cwd: Option<String>,
     env: Option<std::collections::HashMap<String, String>>,
+    remote_input_disabled: bool,
 ) -> Request {
     Request::NewWithInstance {
         name,
@@ -995,6 +996,7 @@ fn new_request(
         size: crate::terminal_size(),
         cwd,
         env,
+        remote_input_disabled,
     }
 }
 
@@ -1655,21 +1657,33 @@ fn pending_bindings(
     Ok(())
 }
 
-/// `remuda.new(name, argv, cwd, env)` — returns name then launch identity.
-/// The last two arguments remain trailing and optional.
+/// `remuda.new(name, argv, cwd, env, options)` — returns name then launch
+/// identity. Every argument after the name is trailing and optional; the
+/// options table carries `remote_input_disabled` for launch-time protection.
+#[allow(clippy::type_complexity)] // The Lua binding's trailing option tuple.
 fn new_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
     table.set(
         "new",
         lua.create_function(
             move |lua,
-                  (name, argv, cwd, env): (
+                  (name, argv, cwd, env, options): (
                 Option<String>,
                 Option<Vec<String>>,
                 Option<String>,
                 Option<Table>,
+                Option<Table>,
             )| {
                 let env = env.map(lua_env_to_wire).transpose()?;
-                match ask(&path, new_request(name, argv, cwd, env))? {
+                let protected = options
+                    .as_ref()
+                    .and_then(|options| {
+                        options
+                            .get::<Option<bool>>("remote_input_disabled")
+                            .ok()
+                            .flatten()
+                    })
+                    .unwrap_or(false);
+                match ask(&path, new_request(name, argv, cwd, env, protected))? {
                     Response::SessionStarted { name, instance_id } => Ok((
                         Value::String(lua.create_string(&name)?),
                         Value::String(lua.create_string(&instance_id)?),

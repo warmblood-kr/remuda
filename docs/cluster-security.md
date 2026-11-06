@@ -120,6 +120,12 @@ remote Close is accepted only with the current session `instance_id` and
 remote control off refuses both remote Input and confirmed remote Close.
 
 A session may additionally opt out of remote Input with a local-only flag:
+A launcher may request the opt-out atomically with registration:
+`remuda.session.new(name, argv, cwd, env, { remote_input_disabled = true })`
+(or the deprecated `remuda.new` alias). The registry inserts the session and
+its policy under one lock, so no remote admission can observe the new instance
+before the policy does; a hosted launch still refuses remote input entirely.
+The post-launch setter is
 `remuda.session.remote_input(name, instance_id, enabled)` or
 `remuda remote-input NAME INSTANCE on|off`. The flag is keyed by the exact
 session instance, is refused by the remote front, and returns the same typed

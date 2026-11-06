@@ -2953,9 +2953,9 @@ fn old_json_shapes_parse_with_defaults_for_additive_session_fields() {
         human_idle: None,
         mouse_tracking: false,
         unavailable: false,
-        remote_input_disabled: false,
         program_status: None,
         program_status_age_ms: None,
+        remote_input_disabled: false,
     };
     let mut old_summary = serde_json::to_value(summary).expect("serialize summary");
     let fields = old_summary.as_object_mut().expect("summary object");
@@ -3156,6 +3156,7 @@ fn remote_input_opt_out_refuses_before_the_pty_and_keeps_local_input() {
             size: Size::new(80, 24),
             cwd: None,
             env: None,
+            remote_input_disabled: false,
         },
     )
     .expect("start opted session");
@@ -3253,6 +3254,7 @@ fn remote_input_opt_out_refuses_before_the_pty_and_keeps_local_input() {
             size: Size::new(80, 24),
             cwd: None,
             env: None,
+            remote_input_disabled: false,
         },
     )
     .expect("replacement session");
@@ -3268,6 +3270,62 @@ fn remote_input_opt_out_refuses_before_the_pty_and_keeps_local_input() {
     assert!(listed
         .iter()
         .any(|row| row.name == name && !row.remote_input_disabled));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_launch_flag_protects_the_instance_before_the_first_remote_request() {
+    let path = scratch("remote-input-launch-flag");
+    let _daemon = daemon_at(&path);
+    let response = client::request(
+        &path,
+        &Request::NewWithInstance {
+            name: Some("protected".into()),
+            command: vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+            remote_input_disabled: true,
+        },
+    )
+    .expect("start protected session");
+    let (name, instance) = match response {
+        Response::SessionStarted { name, instance_id } => (name, instance_id),
+        other => panic!("unexpected start response: {other:?}"),
+    };
+    let listed = match client::request(&path, &Request::List).expect("list") {
+        Response::Sessions(rows) => rows,
+        other => panic!("unexpected list: {other:?}"),
+    };
+    assert!(listed
+        .iter()
+        .any(|row| row.name == name && row.remote_input_disabled));
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::RemoteInput {
+                name: name.clone(),
+                instance_id: instance,
+                client_id: "00000000000000000000000000000004".into(),
+                seq: 1,
+                bytes: b"blocked".to_vec(),
+                line: true,
+            }
+        )
+        .expect("remote line"),
+        Response::RemoteControlDisabled
+    );
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::SendLine {
+                name: name.clone(),
+                text: "local".into(),
+            }
+        )
+        .expect("local send"),
+        Response::Ok
+    );
 }
 
 fn wait_for(path: &Path, name: &str, needle: &str) -> String {
