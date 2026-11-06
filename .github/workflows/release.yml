@@ -103,7 +103,7 @@ jobs:
             bin: remuda
             host: remuda-session-host
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             bin: remuda
             host: remuda-session-host
           - target: x86_64-pc-windows-msvc
