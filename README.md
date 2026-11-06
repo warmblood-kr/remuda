@@ -119,7 +119,7 @@ install; the command ends by printing
 unix socket, and the terminal handling is the console API instead of termios;
 both live behind one seam, so there is one code path rather than two.
 
-⚠ **What is proven on Windows, and what is not.** CI builds and runs the whole
+⚠ **What is proven on Windows, and what is not.** On main pushes, CI builds and runs the whole
 suite on `windows-latest` — including tests that open real ConPTYs and drive the
 shipped binary through raw mode and the Ctrl-\ detach. Nobody has yet run
 `remuda attach` by hand in Windows Terminal or conhost, so the interactive
@@ -323,6 +323,11 @@ for wasm — the axis a pty crate sits on — and it does *not* catch a bare
 and fail only at runtime. Closing that second axis needs a lint, not a target.
 
 ## Build
+
+CI runs Rust library and binary unit tests on pull requests and merge groups;
+main pushes run all targets, including integration tests. Cross-process Butler,
+hosted and compatibility integration jobs run on main pushes. Architecture,
+security, release and installer gates retain their existing triggers.
 
 ```sh
 cargo test --workspace --all-targets                          # 96 tests

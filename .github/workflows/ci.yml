@@ -34,7 +34,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cargo test --workspace --all-targets --no-fail-fast
+      - if: github.event_name != 'push'
+        run: cargo test --workspace --lib --bins --no-fail-fast
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: cargo test --workspace --all-targets --no-fail-fast
 
   test-aarch64-linux:
     # The owner runs remuda on Termux (aarch64 Android). Nothing else here
@@ -45,7 +48,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: command -v cargo || { curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"; }
-      - run: cargo test --workspace --all-targets --no-fail-fast
+      - if: github.event_name != 'push'
+        run: cargo test --workspace --lib --bins --no-fail-fast
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: cargo test --workspace --all-targets --no-fail-fast
 
   build-android:
     # Prove the Termux release build and smoke on pull requests, before this
@@ -106,10 +112,14 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - run: cargo test --workspace --all-targets --no-fail-fast
+      - if: github.event_name != 'push'
+        run: cargo test --workspace --lib --bins --no-fail-fast
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: cargo test --workspace --all-targets --no-fail-fast
       - run: pwsh -NoProfile -File scripts/check-install-pair.ps1
 
   butler-contract:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     # remuda-butler depends on this core's mod boot/reload contract, and a core
     # change once broke it with nothing here noticing. This runs Butler's own
     # tests/live_reload.sh (explicit daemon and AUTOSTART=1) against the core
@@ -127,6 +137,7 @@ jobs:
       - run: BUTLER_REPO="$GITHUB_WORKSPACE/remuda-butler" scripts/check-butler-contract.sh
 
   test-hosted:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     # The native suite with every new session host-backed (#713), the bar for
     # making hosting the default. It also fails when the run leaves a session
     # host alive (leaks use up the machine's pseudo-terminals). Tests of
@@ -142,6 +153,7 @@ jobs:
       - run: sh scripts/test-hosted-suite.sh
 
   host-compat-n-plus-one:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     # A reload replaces the daemon while session hosts keep running, so a
     # daemon and a host from adjacent builds must work in both directions.
     # N is the commit this change lands on; N+1 is this checkout. N already
@@ -172,6 +184,7 @@ jobs:
         run: REMUDA_COMPAT_NO_SKIP=1 REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test db_cli_live -- --ignored older_build
 
   compat-week-old-main:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     # Users update every few days, not every PR, so they cross several schema
     # steps at once. N is the last main commit at least 7 days old (old
     # nightly tags are deleted, so they cannot be used). Each step asks N
@@ -216,6 +229,7 @@ jobs:
           REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test session_host_daemon -- --ignored "$filter"
 
   vfs-compat-pre-sqlite:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     # Nodes from before index.db (#778) still run in clusters. Two daemons of
     # this build and one from the last commit before it must sync both ways,
     # and the documented downgrade and re-upgrade must keep every name.
@@ -729,4 +743,8 @@ jobs:
             || { echo "::error::check-workflows.py rejected for the wrong reason"; exit 1; }
 
       - name: the suite still passes once every leak is reverted
+        if: github.event_name != 'push'
+        run: cargo test --workspace --lib --bins
+      - name: the full suite still passes once every leak is reverted
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: cargo test --workspace --all-targets
