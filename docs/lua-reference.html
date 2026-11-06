@@ -39,6 +39,10 @@
 <p><code>clock() -&gt; milliseconds</code> — Monotonic milliseconds since this Lua image started.</p>
 <h2 id="close">close</h2>
 <p><code>close(name) -&gt; nil</code> — Deprecated alias for <span class="title-ref">remuda.session.close</span>.</p>
+<h2 id="cluster">cluster</h2>
+<p><code>table</code> — Read-only discovery of this node's cluster membership. It reads the local registry only, never contacts a peer, and exposes no endpoint, key, credential or remote control response.</p>
+<h2 id="cluster.nodes">cluster.nodes</h2>
+<p><code>cluster.nodes() -&gt; { {id, alias, fingerprint, state, self}, ... } | nil, reason</code> — List admitted cluster nodes as {id, alias, fingerprint, state, self} tables. id is the deterministic node id, fingerprint is the exact authentication identity for disambiguation, alias is optional display metadata, and self marks this node. Revoked nodes are omitted. Returns nil, 'no_cluster' before init, or nil, 'cluster_state_unreadable' when the local registry cannot be read; it never turns that failure into an empty list.</p>
 <h2 id="contribute">contribute</h2>
 <p><code>contribute(point, id, entry) -&gt; nil</code> — Fill an extension point: the same owner can replace its entry; another mod cannot. <span class="title-ref">entry.order</span> sorts (default 0).</p>
 <h2 id="contributions">contributions</h2>
