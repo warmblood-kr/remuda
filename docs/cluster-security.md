@@ -125,7 +125,11 @@ A session may additionally opt out of remote Input with a local-only flag:
 session instance, is refused by the remote front, and returns the same typed
 `RemoteControlDisabled` response. Local send, attach and resize are unaffected;
 a reused name or a new instance starts allowed and never inherits the flag.
-`remuda ls` reports `remote_input_disabled`. The flag lives in the daemon
+`remuda ls` reports `remote_input_disabled`; false means no explicit session
+opt-out, not that the node's `allow_remote_control` is on or that the session is
+eligible in every backend. A successful hosted setter is remembered for
+listing/cleanup but does not enable hosted remote input in this slice. The flag
+lives in the daemon
 registry, not in a durable file, so a daemon restart forgets it. Because a
 host-backed session can survive that restart, this first slice refuses remote
 Input/InputLine for host-backed sessions entirely; in-process sessions keep the
