@@ -2953,6 +2953,7 @@ fn old_json_shapes_parse_with_defaults_for_additive_session_fields() {
         human_idle: None,
         mouse_tracking: false,
         unavailable: false,
+        remote_input_disabled: false,
         program_status: None,
         program_status_age_ms: None,
     };

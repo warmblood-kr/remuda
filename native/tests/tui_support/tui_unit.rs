@@ -225,6 +225,7 @@ fn row(name: &str, alive: bool, attached: bool) -> SessionSummary {
         human_idle: None,
         mouse_tracking: false,
         unavailable: false,
+        remote_input_disabled: false,
         program_status: None,
         program_status_age_ms: None,
     }

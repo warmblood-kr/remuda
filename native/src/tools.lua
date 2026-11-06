@@ -1901,12 +1901,13 @@ remuda.session = {
   close = function(...) return call_flat("close", ...) end,
   attach = function(...) return call_flat("attach", ...) end,
   resize = function(...) return remuda._session_resize(...) end,
+  remote_input = function(...) return remuda._session_remote_input(...) end,
 }
 setmetatable(remuda.session, {
   __call = function(_, name) return session_handle(name) end,
 })
-register("session", "Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach and resize.",
-  "session(name) -> handle; table {list, new, close, attach, resize}")
+register("session", "Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach, resize and remote_input.",
+  "session(name) -> handle; table {list, new, close, attach, resize, remote_input}")
 register("session.list", "List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.", "session.list() -> {session...}")
 register("session.new", "Start a session and return its name and registered instance_id.",
   "session.new(name?, argv?, cwd?, env?) -> name, instance_id")

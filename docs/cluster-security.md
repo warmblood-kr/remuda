@@ -119,6 +119,18 @@ remote Close is accepted only with the current session `instance_id` and
 `confirm: true`; a missing confirmation or stale instance is refused. Turning
 remote control off refuses both remote Input and confirmed remote Close.
 
+A session may additionally opt out of remote Input with a local-only flag:
+`remuda.session.remote_input(name, instance_id, enabled)` or
+`remuda remote-input NAME INSTANCE on|off`. The flag is keyed by the exact
+session instance, is refused by the remote front, and returns the same typed
+`RemoteControlDisabled` response. Local send, attach and resize are unaffected;
+a reused name or a new instance starts allowed and never inherits the flag.
+`remuda ls` reports `remote_input_disabled`. The flag lives in the daemon
+registry, not in a durable file: a daemon restart forgets it, and a host-backed
+session that survives a reload must be re-protected by its owner. This is an
+explicit limitation of the first receiver slice, not a claim of persistent
+per-session protection.
+
 A batch already in dispatch may still be delivered if the setting changes to
 off while that batch is in flight. A revoke during dispatch may likewise allow
 the Input write before the listener returns an Error; clients should treat that

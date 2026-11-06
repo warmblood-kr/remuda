@@ -434,7 +434,7 @@ send
 session
 -------
 
-``session(name) -> handle; table {list, new, close, attach, resize}`` — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach and resize.
+``session(name) -> handle; table {list, new, close, attach, resize, remote_input}`` — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach, resize and remote_input.
 
 session.attach
 --------------

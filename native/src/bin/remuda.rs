@@ -264,6 +264,7 @@ fn dispatch_cli_command(
         "reload" => reload_command(server, path, rest),
         "ls" => ls_command(server, path, rest),
         "resize" => resize_command(server, path, rest),
+        "remote-input" => remote_input_command(server, path, rest),
         "run" => run_session(server, path, rest),
         "send" => send_command(server, path, rest),
         "attach" => attach_command(server, path, rest),
@@ -852,6 +853,8 @@ remuda — terminal orchestration for coding agents
                                  --mouse=false disables mouse handling (before or after NAME)
   remuda ls | send NAME TEXT     inspect or message sessions
   remuda resize NAME COLS ROWS   resize a session (cols 20..1000, rows 24..500)
+  remuda remote-input NAME INSTANCE on|off
+                                 allow or refuse cluster input for one session instance
   remuda upgrade [--channel stable|nightly]  replace the CLI binary, then reload
   remuda reload [--check]        move the daemon onto this build; host-backed sessions keep running
   remuda stop [-f] [--yes] [--keep-sessions] [--i-am-inside]  stop the daemon (sessions end;
@@ -7112,6 +7115,38 @@ fn resize_session(path: &Path, name: &str, cols: &str, rows: &str) -> ExitCode {
     }
 }
 
+fn remote_input_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    let (name, instance, state) = match args {
+        [name, instance, state] => (*name, *instance, *state),
+        _ => {
+            eprintln!(
+                "Usage: remuda remote-input NAME INSTANCE on|off\nNext: remuda remote-input butler INSTANCE off"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let opted_out = match state {
+        "off" | "disable" | "disabled" => true,
+        "on" | "allow" | "allowed" => false,
+        _ => {
+            eprintln!("remote-input state must be on or off");
+            return ExitCode::from(2);
+        }
+    };
+    with_existing_daemon(server, path, |path| {
+        let request = Request::SetRemoteInputOptOut {
+            name: name.to_string(),
+            instance_id: instance.to_string(),
+            opted_out,
+        };
+        match remuda_native::client::request(path, &request) {
+            Ok(Response::Ok) => ExitCode::SUCCESS,
+            Ok(Response::Error(error)) => fail(error),
+            other => fail(format!("remote-input failed: {}", describe(other))),
+        }
+    })
+}
+
 fn resize_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     let values = match resize_cli_parse(args) {
         Ok(values) => values,
@@ -8064,6 +8099,7 @@ mod cluster_call_tests {
             human_idle: None,
             mouse_tracking: false,
             unavailable: false,
+            remote_input_disabled: false,
             program_status: None,
             program_status_age_ms: None,
         }]));
@@ -8631,6 +8667,7 @@ mod tests {
             human_idle: None,
             mouse_tracking: false,
             unavailable: false,
+            remote_input_disabled: false,
             program_status: None,
             program_status_age_ms: None,
         }

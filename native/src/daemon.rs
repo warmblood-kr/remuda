@@ -2302,6 +2302,21 @@ fn handle_request(
             &bytes,
         ),
 
+        request @ Request::RemoteInput { .. } => remote_input(&stream, registry, request),
+
+        Request::SetRemoteInputOptOut {
+            name,
+            instance_id,
+            opted_out,
+        } => respond(
+            &stream,
+            &name,
+            registry
+                .set_remote_input_opt_out(&name, &instance_id, opted_out)
+                .map(|()| Ok(())),
+            |()| Response::Ok,
+        ),
+
         Request::Send { name, bytes } => {
             respond(&stream, &name, registry.send(&name, &bytes), |()| {
                 Response::Ok
@@ -3861,6 +3876,37 @@ fn input_line(
     reply_input_result(stream, name, result)
 }
 
+fn remote_input(stream: &Stream, registry: &Registry, request: Request) -> std::io::Result<()> {
+    let Request::RemoteInput {
+        name,
+        instance_id,
+        client_id,
+        seq,
+        bytes,
+        line,
+    } = request
+    else {
+        unreachable!("only RemoteInput reaches remote_input")
+    };
+    if line && std::str::from_utf8(&bytes).is_err() {
+        return reply(stream, &Response::error("input line must be UTF-8"));
+    }
+    let client_id = match remuda_core::input::validate_batch(&client_id, seq, &bytes) {
+        Ok(client_id) => client_id,
+        Err(error) => return reply(stream, &Response::error(error)),
+    };
+    let batch = remuda_core::input::InputBatch {
+        instance_id: &instance_id,
+        client_id,
+        seq,
+        bytes: &bytes,
+    };
+    let result = registry
+        .apply_remote_input_batch(&name, batch)
+        .or_else(|| registry.apply_hosted_remote_input_batch(&name, batch, line, input_clock()));
+    reply_input_result(stream, &name, result)
+}
+
 fn reply_input_result(
     stream: &Stream,
     name: &str,
@@ -3872,6 +3918,9 @@ fn reply_input_result(
             reply(stream, &Response::RateLimited)
         }
         Some(Err(remuda_core::input::InputError::Busy)) => reply(stream, &Response::Busy),
+        Some(Err(remuda_core::input::InputError::RemoteInputDisabled)) => {
+            reply(stream, &Response::RemoteControlDisabled)
+        }
         Some(Err(error)) => reply(stream, &Response::error(error.to_string())),
         Some(Ok(remuda_core::input::InputOutcome::Ack { duplicate })) => {
             reply(stream, &Response::Ack { duplicate })
