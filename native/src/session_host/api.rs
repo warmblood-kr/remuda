@@ -106,6 +106,17 @@ pub(crate) struct Info {
     /// Optional for older hosts; daemon observations need these Session fields.
     #[serde(default)]
     pub activity: Option<Activity>,
+    /// Where human input stands, so a daemon can take a grant and continue
+    /// the raw sequence. Absent on older hosts: their attach stays read-only.
+    #[serde(default)]
+    pub human: Option<HumanCounters>,
+}
+/// The human grant high-water (the core attach generation) and the last raw
+/// input sequence any grant reserved. Both only grow within a host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HumanCounters {
+    pub high_water: u64,
+    pub last_raw: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

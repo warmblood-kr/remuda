@@ -127,6 +127,7 @@ impl SessionOperations for Remote {
             attached: self.shared.active.load(Ordering::SeqCst) != 0,
             closing: false,
             host_build: Some("test-host".into()),
+            attach_generation: None,
         })
     }
     fn recover(&self, key: &RequestIdentity) -> Result<Recovery> {

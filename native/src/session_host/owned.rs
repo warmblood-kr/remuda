@@ -142,6 +142,7 @@ impl Owned {
                 closing: self.session.is_closing(),
                 mouse: self.session.mouse_state(),
             }),
+            human: Some(self.coordinator.lock().unwrap().human_counters()),
         })
     }
     pub fn resize(&self, fence: Fence, rows: u16, cols: u16) -> Result<(), Error> {
