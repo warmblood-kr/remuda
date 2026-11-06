@@ -128,6 +128,12 @@ impl Coordinator {
             .grant_with(connection, request, cas)
             .map_err(Error::Grant)
     }
+    pub fn human_counters(&self) -> super::api::HumanCounters {
+        super::api::HumanCounters {
+            high_water: self.human.high_water(),
+            last_raw: self.human.last_raw(),
+        }
+    }
     pub fn disconnect_human(&mut self, connection: ConnectionId) -> Option<u64> {
         self.human.disconnect(connection)
     }
