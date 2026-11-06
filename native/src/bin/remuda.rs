@@ -985,7 +985,17 @@ fn is_command_word(word: &str) -> bool {
 
 fn suggest_command(word: &str) -> Option<String> {
     const CLUSTER_VERBS: &[&str] = &[
-        "nodes", "init", "invite", "join", "revoke", "leave", "remote", "listen", "control", "call",
+        "nodes",
+        "init",
+        "invite",
+        "join",
+        "revoke",
+        "leave",
+        "remote",
+        "listen",
+        "control",
+        "remote-send",
+        "call",
     ];
     if CLUSTER_VERBS.contains(&word) {
         return Some(format!("cluster {word}"));
@@ -1052,6 +1062,7 @@ enum ClusterCommand {
         alias: Option<String>,
     },
     Control(bool),
+    RemoteSend(bool),
     Revoke {
         target: String,
         yes: bool,
@@ -1138,6 +1149,8 @@ fn cluster_cli_spec() -> remuda_native::cli_parse::Spec {
                 vec![option("clear", None, "Clear the cluster-wide display alias", false)], "remuda cluster alias TARGET ALIAS | alias TARGET --clear"),
             verb("control", "Enable or disable remote control. Example: remuda cluster control off",
                 vec![arg("MODE", "on or off", false, true)], vec![], "remuda cluster control on|off"),
+            verb("remote-send", "Enable or disable originating peer sends; off until managed panes are protected. Example: remuda cluster remote-send on",
+                vec![arg("MODE", "on or off", false, true)], vec![], "remuda cluster remote-send on|off"),
             verb("revoke", "Revoke a node or fingerprint; prompt before revoking unless --yes is used. Example: remuda cluster revoke node-abcd1234",
                 vec![arg("TARGET", "Node id, alias or fingerprint", false, true)],
                 vec![option("yes", None, "Confirm without prompting", false)], "remuda cluster revoke TARGET [--yes]"),
@@ -1280,6 +1293,11 @@ fn parse_cluster_values(
         "control" => match cluster_value(values, "MODE") {
             Some("on") => Ok(ClusterCommand::Control(true)),
             Some("off") => Ok(ClusterCommand::Control(false)),
+            _ => Err("expected on or off".into()),
+        },
+        "remote-send" => match cluster_value(values, "MODE") {
+            Some("on") => Ok(ClusterCommand::RemoteSend(true)),
+            Some("off") => Ok(ClusterCommand::RemoteSend(false)),
             _ => Err("expected on or off".into()),
         },
         "leave" => Ok(ClusterCommand::Leave {
@@ -1460,6 +1478,15 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(error) => fail(format!("cluster control: {error}")),
+            }
+        }
+        ClusterCommand::RemoteSend(enabled) => {
+            match remuda_native::cluster::control::set_remote_send_enabled(enabled) {
+                Ok(()) => {
+                    println!("Remote send {}.", remote_control_label(enabled));
+                    ExitCode::SUCCESS
+                }
+                Err(error) => fail(format!("cluster remote-send: {error}")),
             }
         }
         ClusterCommand::Remote(target) => {
@@ -5109,6 +5136,22 @@ mod cluster_cli_tests {
     #[test]
     fn cluster_nodes_is_recognized() {
         assert_eq!(parse_cluster_command(&["nodes"]), ClusterCommand::Nodes);
+    }
+
+    #[test]
+    fn cluster_remote_send_requires_an_explicit_on_or_off_value() {
+        assert_eq!(
+            parse_cluster_command(&["remote-send", "on"]),
+            ClusterCommand::RemoteSend(true)
+        );
+        assert_eq!(
+            parse_cluster_command(&["remote-send", "off"]),
+            ClusterCommand::RemoteSend(false)
+        );
+        assert!(matches!(
+            parse_cluster_command(&["remote-send", "yes"]),
+            ClusterCommand::Invalid { .. }
+        ));
     }
 
     #[test]

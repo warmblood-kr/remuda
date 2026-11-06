@@ -152,7 +152,14 @@ fn explicit_node_reply(id: &Value, name: &str, args: &Value) -> Option<String> {
                     "applied"
                 }),
             )),
-            Err(error) => Some(ok_reply(id.clone(), tool_error(&error))),
+            Err(error) => {
+                let reply = if matches!(error, crate::cluster_api::SendFailure::Uncertain(_)) {
+                    tool_uncertain(&error.to_string())
+                } else {
+                    tool_error(&error.to_string())
+                };
+                Some(ok_reply(id.clone(), reply))
+            }
         }
     } else {
         Some(ok_reply(
@@ -496,8 +503,8 @@ fn frame() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "session": {"type": "string"},
-                    "text": {"type": "string", "description": "The line to send."},
-                    "node": {"type": "string", "description": "Cluster node alias, id, or fingerprint. Omit for this node; a node naming this node uses the local path. A peer must prove per-session remote-input policy and the exact live instance."},
+                    "text": {"type": "string", "description": "One line, 1..=12288 UTF-8 bytes, with no CR, LF, ESC or other C0/C1 control; the receiver appends the single Return."},
+                    "node": {"type": "string", "description": "Cluster node alias, id, or fingerprint. Omit for this node; a node naming this node uses the local path. Peer send is off unless this node enabled `remuda cluster remote-send`; an `uncertain` refusal means bytes may have been typed, so do not call the tool again automatically (a new client id can duplicate the line)."},
                 },
                 "required": ["session", "text"],
             },
@@ -556,6 +563,17 @@ fn tool_error(reason: &str) -> Value {
     json!({"content": [{"type": "text", "text": reason}], "isError": true})
 }
 
+/// An uncertain write is an error, but the structured field is what tells a
+/// caller not to retry: this call did not retry, and a fresh call would use a
+/// new client id that can type the line twice.
+fn tool_uncertain(reason: &str) -> Value {
+    json!({
+        "content": [{"type": "text", "text": reason}],
+        "isError": true,
+        "structuredContent": {"delivery": "uncertain", "retryable": false},
+    })
+}
+
 fn ok_reply(id: Value, result: Value) -> String {
     json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string()
 }
@@ -566,9 +584,19 @@ fn error_reply(id: Value, code: i32, message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{input_error_message, lua_literal, lua_string};
+    use super::{input_error_message, lua_literal, lua_string, tool_uncertain};
     use remuda_core::protocol::Response;
     use serde_json::json;
+
+    #[test]
+    fn an_uncertain_send_is_structured_and_non_retryable() {
+        let result = tool_uncertain("send on peer: uncertain, not retried: timeout");
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"],
+            json!({"delivery": "uncertain", "retryable": false})
+        );
+    }
 
     #[test]
     fn arguments_become_a_lua_table() {

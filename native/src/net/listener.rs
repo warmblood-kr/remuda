@@ -1100,12 +1100,15 @@ fn authorize_remote_request_with_source(
         request,
         Request::Input { .. }
             | Request::InputLine { .. }
+            | Request::RemoteInputLine { .. }
             | Request::ResizeSession { .. }
             | Request::Close { .. }
     ) {
         control_source.enabled().map_err(|_| {
             let operation = match request {
-                Request::Input { .. } | Request::InputLine { .. } => "Input",
+                Request::Input { .. }
+                | Request::InputLine { .. }
+                | Request::RemoteInputLine { .. } => "Input",
                 Request::ResizeSession { .. } => "ResizeSession",
                 _ => "Close",
             };
@@ -1124,7 +1127,9 @@ fn authorize_remote_request_with_control(
     allow_remote_control: bool,
 ) -> Result<(), Response> {
     match request {
-        Request::Input { .. } | Request::InputLine { .. } if !allow_remote_control => {
+        Request::Input { .. } | Request::InputLine { .. } | Request::RemoteInputLine { .. }
+            if !allow_remote_control =>
+        {
             return Err(Response::RemoteControlDisabled);
         }
         Request::ResizeSession { .. } if !allow_remote_control => {
@@ -3318,6 +3323,17 @@ mod tests {
                 line: true,
             }
         );
+        let guarded = Request::RemoteInputLine {
+            name: "session".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000003".into(),
+            seq: 1,
+            bytes: b"hello".to_vec(),
+        };
+        assert!(matches!(
+            crate::remote_front::peer_input_request(guarded),
+            Request::RemoteInput { line: true, .. }
+        ));
     }
 
     #[test]

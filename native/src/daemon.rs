@@ -2303,6 +2303,25 @@ fn handle_request(
             &bytes,
         ),
 
+        Request::RemoteInputLine {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+        } => remote_input(
+            &stream,
+            registry,
+            Request::RemoteInput {
+                name,
+                instance_id,
+                client_id,
+                seq,
+                bytes,
+                line: true,
+            },
+        ),
+
         request @ Request::RemoteInput { .. } => remote_input(&stream, registry, request),
 
         Request::SetRemoteInputOptOut {

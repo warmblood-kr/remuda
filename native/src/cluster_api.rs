@@ -153,21 +153,59 @@ pub enum Send {
     Remote { duplicate: bool },
 }
 
+/// A failed remote send, classified by whether the peer could have typed the
+/// line. None is safe to retry automatically: even a refusal is final for this
+/// call, and a retry makes a new client id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SendFailure {
+    /// Refused before framing or by the receiver's own policy; nothing typed.
+    Refused(String),
+    /// The peer explicitly refused the write before applying it; nothing typed.
+    NotWritten(String),
+    /// Bytes may have been typed; do not retry with a new client id.
+    Uncertain(String),
+}
+
+impl SendFailure {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Refused(message) | Self::NotWritten(message) | Self::Uncertain(message) => {
+                message
+            }
+        }
+    }
+
+    /// Every remote send failure is non-retryable in this slice.
+    pub fn retryable(&self) -> bool {
+        false
+    }
+}
+
+impl std::fmt::Display for SendFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
 /// Send one line to a session on a peer. A refusal is final: this never falls
 /// back to the local daemon, never retries with a new client id, and never
 /// resolves the node again after a request has started.
-pub fn send(target: &str, session: &str, text: &str) -> Result<Send, String> {
+pub fn send(target: &str, session: &str, text: &str) -> Result<Send, SendFailure> {
+    let refused = SendFailure::Refused;
     let ResolvedCall::Remote {
         fingerprint,
         address,
         pinned_static_key,
-    } = resolve(target)?
+    } = resolve(target).map_err(refused)?
     else {
         return Ok(Send::Local);
     };
-    validate_send_text(text)?;
+    let enabled = cluster::control::remote_send_enabled()
+        .map_err(|_| refused("cluster settings are unreadable".to_owned()))?;
+    check_remote_send_enabled(enabled)?;
+    validate_send_text(text).map_err(refused)?;
     let private_key = cluster::identity::load_static_private_key()
-        .map_err(|_| "cluster identity is unavailable".to_owned())?;
+        .map_err(|_| refused("cluster identity is unavailable".to_owned()))?;
     let mut call = |address, pinned: &[u8], request: &Request| {
         ClusterClient::system().request(address, pinned, &private_key, request)
     };
@@ -179,6 +217,16 @@ pub fn send(target: &str, session: &str, text: &str) -> Result<Send, String> {
         text,
         &mut call,
     )
+}
+
+fn check_remote_send_enabled(enabled: bool) -> Result<(), SendFailure> {
+    if enabled {
+        return Ok(());
+    }
+    Err(SendFailure::Refused(
+        "remote send is disabled on this node; run `remuda cluster remote-send on` after protected panes are verified"
+            .into(),
+    ))
 }
 
 /// One line of text, without the terminator the receiver adds. Control
@@ -206,16 +254,16 @@ fn send_remote(
     session: &str,
     text: &str,
     call: &mut impl FnMut(SocketAddr, &[u8], &Request) -> Result<Response, ClientError>,
-) -> Result<Send, String> {
+) -> Result<Send, SendFailure> {
     let label = cluster::node_label(fingerprint);
     match call(address, pinned_static_key, &Request::RemoteInputSupport)
         .map_err(|error| preflight_error(fingerprint, error))?
     {
         Response::Ok => {}
         Response::Error(reason) => {
-            return Err(sanitize(format!(
+            return Err(SendFailure::Refused(sanitize(format!(
                 "send on {label}: the peer does not enforce per-session remote input ({reason})"
-            )))
+            ))))
         }
         _ => {
             return Err(refused(
@@ -238,7 +286,7 @@ fn send_remote(
         }
     };
     let client_id = new_client_id()?;
-    let request = Request::InputLine {
+    let request = Request::RemoteInputLine {
         name: session.to_owned(),
         instance_id: instance,
         client_id,
@@ -267,6 +315,11 @@ fn send_remote(
             &label,
             "the PTY write timed out; delivery may be partial or late",
         )),
+        Ok(Response::Error(reason)) if reason == "invalid remote request" => {
+            Err(SendFailure::Refused(format!(
+                "send on {label}: the peer does not support guarded remote send; nothing was written"
+            )))
+        }
         Ok(Response::Error(reason)) => Err(uncertain(
             &label,
             &sanitize(format!("the peer reported {reason} after the request")),
@@ -304,20 +357,21 @@ fn pinned_instance(rows: &[remuda_core::SessionSummary], session: &str) -> Resul
         .ok_or_else(|| "the peer cannot prove the target instance".to_owned())
 }
 
-fn new_client_id() -> Result<String, String> {
+fn new_client_id() -> Result<String, SendFailure> {
     let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).map_err(|_| "randomness unavailable".to_owned())?;
+    getrandom::fill(&mut bytes)
+        .map_err(|_| SendFailure::Refused("randomness unavailable".to_owned()))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// A failed probe or list cannot have written input, so it is reported as not
 /// sent rather than uncertain. Only the line request itself can be uncertain.
-fn preflight_error(fingerprint: &str, error: ClientError) -> String {
+fn preflight_error(fingerprint: &str, error: ClientError) -> SendFailure {
     let label = cluster::node_label(fingerprint);
-    format!("send on {label}: not sent: {error}")
+    SendFailure::Refused(format!("send on {label}: not sent: {error}"))
 }
 
-fn send_transport_error(fingerprint: &str, error: ClientError) -> String {
+fn send_transport_error(fingerprint: &str, error: ClientError) -> SendFailure {
     let label = cluster::node_label(fingerprint);
     let not_written = matches!(
         error,
@@ -329,21 +383,21 @@ fn send_transport_error(fingerprint: &str, error: ClientError) -> String {
             | ClientError::RequestTooLarge
     );
     if not_written {
-        return uncertain(&label, &format!("the peer refused before input; {error}"));
+        return known_not_written(&label, &format!("{error}"));
     }
     uncertain(&label, &format!("{error}"))
 }
 
-fn refused(label: &str, reason: &str) -> String {
-    format!("send on {label}: {reason}; not sent")
+fn refused(label: &str, reason: &str) -> SendFailure {
+    SendFailure::Refused(format!("send on {label}: {reason}; not sent"))
 }
 
-fn known_not_written(label: &str, reason: &str) -> String {
-    format!("send on {label}: not written: {reason}")
+fn known_not_written(label: &str, reason: &str) -> SendFailure {
+    SendFailure::NotWritten(format!("send on {label}: not written: {reason}"))
 }
 
-fn uncertain(label: &str, reason: &str) -> String {
-    format!("send on {label}: uncertain, not retried: {reason}")
+fn uncertain(label: &str, reason: &str) -> SendFailure {
+    SendFailure::Uncertain(format!("send on {label}: uncertain, not retried: {reason}"))
 }
 
 fn remote_error(fingerprint: &str, error: ClientError) -> String {
@@ -715,6 +769,13 @@ mod tests {
     }
 
     #[test]
+    fn remote_send_is_off_until_the_local_rollout_gate_is_open() {
+        let error = check_remote_send_enabled(false).unwrap_err();
+        assert!(error.message().contains("remote-send on"), "{error}");
+        assert!(check_remote_send_enabled(true).is_ok());
+    }
+
+    #[test]
     fn remote_send_probes_lists_and_sends_one_exact_line() {
         let address: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let mut seen = Vec::new();
@@ -734,7 +795,7 @@ mod tests {
                         summary("other", Some("x")),
                         summary("agent/slash", Some("instance")),
                     ])),
-                    Request::InputLine {
+                    Request::RemoteInputLine {
                         name,
                         instance_id,
                         client_id,
@@ -772,7 +833,10 @@ mod tests {
             },
         );
         let error = result.expect_err("old peer refused");
-        assert!(error.contains("does not enforce per-session"), "{error:?}");
+        assert!(
+            error.message().contains("does not enforce per-session"),
+            "{error:?}"
+        );
         assert_eq!(calls, 1);
     }
 
@@ -828,7 +892,7 @@ mod tests {
                 },
             );
             let error = result.expect_err("must refuse");
-            assert!(error.contains(needle), "{needle}: {error:?}");
+            assert!(error.message().contains(needle), "{needle}: {error:?}");
             assert_eq!(line_calls, 0, "no line request for {needle}");
         }
     }
@@ -869,12 +933,39 @@ mod tests {
             (Response::Ok, "unexpected"),
         ] {
             let error = answer(response).unwrap_err();
-            assert!(error.contains(needle), "{error} does not contain {needle}");
+            assert!(
+                error.message().contains(needle),
+                "{error} does not contain {needle}"
+            );
         }
         let rate = answer(Response::RateLimited).unwrap_err();
-        assert!(rate.contains("not written"));
+        assert!(rate.message().contains("not written"));
+        assert!(!rate.retryable());
         let timeout = answer(Response::WriteTimeout).unwrap_err();
-        assert!(timeout.contains("not retried"));
+        assert!(timeout.message().contains("not retried"));
+        assert!(matches!(timeout, SendFailure::Uncertain(_)));
+    }
+
+    #[test]
+    fn a_guarded_line_that_an_old_receiver_cannot_parse_writes_nothing() {
+        let result = send_remote(
+            "SHA256:peer",
+            "127.0.0.1:9".parse().unwrap(),
+            b"key",
+            "agent",
+            "x",
+            &mut |_, _, request| match request {
+                Request::RemoteInputSupport => Ok(Response::Ok),
+                Request::List => Ok(list(vec![summary("agent", Some("instance"))])),
+                Request::RemoteInputLine { .. } => {
+                    Ok(Response::Error("invalid remote request".into()))
+                }
+                other => panic!("unexpected request: {other:?}"),
+            },
+        );
+        let error = result.expect_err("old receiver");
+        assert!(error.message().contains("guarded remote send"));
+        assert!(matches!(error, SendFailure::Refused(_)));
     }
 
     #[test]
@@ -901,7 +992,7 @@ mod tests {
                 },
             );
             let error = result.expect_err("must refuse");
-            assert!(error.contains(needle), "{needle}: {error:?}");
+            assert!(error.message().contains(needle), "{needle}: {error:?}");
         }
         // A line failure after a good probe is uncertain, never a second request.
         for (error, needle) in [
@@ -926,7 +1017,7 @@ mod tests {
                 },
             );
             let error = result.expect_err("must refuse");
-            assert!(error.contains(needle), "{needle}: {error:?}");
+            assert!(error.message().contains(needle), "{needle}: {error:?}");
             assert_eq!(line_calls, 1);
         }
     }

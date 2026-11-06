@@ -137,20 +137,33 @@ Input/InputLine for host-backed sessions entirely; in-process sessions keep the
 default-allowed behavior and the opt-out. This is an explicit limitation of
 the first receiver slice, not a claim of persistent per-session protection.
 
-An MCP `send` with `node` is one line, never a stream. It resolves the peer
-with the same fail-closed rules as capture, probes `RemoteInputSupport` so an
-older peer that cannot parse the opt-out is refused rather than assumed safe,
-pins the exact live `instance_id` from the peer's `List`, and sends
-`InputLine` with a fresh client id and sequence 1. The text is at most 12,288
+An MCP `send` with `node` is one line, never a stream. It is off by default on
+the sending node: `remuda cluster remote-send on` is the local rollout gate,
+and an operator should open it only after the Butler protection change is
+merged and deployed and the owner has verified the managed root/leader panes on
+every target node. The probe does not prove that a target's Butler actually
+marked those panes off; it only proves the core supports the flag. The setting is local and never replicated. It resolves the
+peer with the same fail-closed rules as capture, probes `RemoteInputSupport` so
+an older peer that cannot parse the opt-out is refused rather than assumed safe,
+pins the exact live `instance_id` from the peer's `List`, and sends the typed
+`RemoteInputLine` with a fresh client id and sequence 1. `RemoteInputLine` is a
+new request variant: a daemon older than the opt-out cannot parse it and
+rejects the frame before any PTY write, so the write itself, not only the
+preflight probe, requires a receiver that enforces the policy. The text is at most 12,288
 UTF-8 bytes and must be nonempty, one line, and free of terminal controls; the
 sender adds no newline because the receiver appends exactly one Return. A
 refusal is final: no local fallback, no name-based retry, no second node, and
 no new client id. `WrongInstance`, `RemoteControlDisabled`, `RateLimited` and
-`Busy` are known not written; `WriteTimeout`, transport/protocol failure after
-the line request, `Uncertain`, and an unexpected or generic peer error are
-reported uncertain and non-retryable because bytes may have been typed. The
-probe and list are separate read-only requests, so their failure is known not
-to have written input. `Ack { duplicate: true }` means the same idempotency
+`Busy` are known not written, as are connect/auth/frame-size refusals for the
+line request; `WriteTimeout`, EOF/timeout/crypto/bad-response failure after the
+line request, `Uncertain`, and an unexpected or generic peer error are reported
+uncertain and non-retryable because bytes may have been typed. The probe and
+list are separate read-only requests, so their failure is known not to have
+written input. The probe is a UX preflight; the guarded write is what binds the
+capability requirement. A peer restarted or downgraded between probe and line
+still rejects `RemoteInputLine` rather than accepting it as an unguarded
+`InputLine`. Open the sender gate only while every peer runs a protected build,
+and close it before a downgrade. `Ack { duplicate: true }` means the same idempotency
 scope already applied the line; it is not a new turn or a completion proof.
 
 An opted-out session still spends one peer rate token per refused request: the

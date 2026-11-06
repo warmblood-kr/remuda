@@ -247,6 +247,17 @@ pub enum Request {
         seq: u64,
         bytes: Vec<u8>,
     },
+    /// The guarded remote line. Only a daemon with the per-session opt-out
+    /// knows this variant, so an older receiver rejects the frame before any
+    /// PTY write instead of silently applying an unguarded `InputLine`. The
+    /// remote front maps it to [`Request::RemoteInput`] with `line: true`.
+    RemoteInputLine {
+        name: String,
+        instance_id: String,
+        client_id: String,
+        seq: u64,
+        bytes: Vec<u8>,
+    },
     /// The local-daemon form of a cluster peer's `Input`/`InputLine`: identical
     /// bytes, but the session's local remote-input policy is checked before
     /// any bytes reach the PTY. A peer never sends this variant directly.

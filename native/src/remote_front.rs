@@ -95,6 +95,20 @@ pub(crate) fn peer_input_request(request: Request) -> Request {
             bytes,
             line: false,
         },
+        Request::RemoteInputLine {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+        } => Request::RemoteInput {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+            line: true,
+        },
         Request::InputLine {
             name,
             instance_id,
@@ -248,7 +262,9 @@ fn request_timeout(request: &Request) -> std::time::Duration {
             std::time::Duration::from_millis((*timeout_ms).min(remuda_core::sync::MAX_TIMEOUT_MS))
                 + SYNC_TIMEOUT_MARGIN
         }
-        Request::InputLine { .. } => std::time::Duration::from_secs(8),
+        Request::InputLine { .. } | Request::RemoteInputLine { .. } => {
+            std::time::Duration::from_secs(8)
+        }
         _ => CONNECTION_TIMEOUT,
     }
 }
@@ -292,8 +308,18 @@ pub fn authorize(request: &Request) -> Result<(), String> {
             seq,
             bytes,
             ..
+        }
+        | Request::RemoteInputLine {
+            client_id,
+            seq,
+            bytes,
+            ..
         } => {
-            if matches!(request, Request::InputLine { .. }) && std::str::from_utf8(bytes).is_err() {
+            if matches!(
+                request,
+                Request::InputLine { .. } | Request::RemoteInputLine { .. }
+            ) && std::str::from_utf8(bytes).is_err()
+            {
                 return Err("input line must be UTF-8".into());
             }
             if bytes.len() > MAX_REMOTE_INPUT_BATCH_BYTES {
@@ -386,6 +412,23 @@ mod tests {
         serde_json::from_slice::<OldReceiverRequest>(&serde_json::to_vec(request).unwrap())
             .map(|_| Response::Ok)
             .unwrap_or_else(|_| Response::error("invalid remote request"))
+    }
+
+    #[test]
+    fn an_old_receiver_rejects_the_guarded_line_before_any_write() {
+        let request = Request::RemoteInputLine {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "0".repeat(32),
+            seq: 1,
+            bytes: b"x".to_vec(),
+        };
+        assert_eq!(
+            old_receiver_response(&request),
+            Response::Error("invalid remote request".into())
+        );
+        let frame = serde_json::to_vec(&request).expect("encode guarded line");
+        assert!(decode_frame(&frame).is_ok(), "the new front allows it");
     }
 
     #[test]
@@ -575,6 +618,14 @@ mod tests {
             bytes: b"a".to_vec(),
         });
         assert!(matches!(line, Request::RemoteInput { line: true, .. }));
+        let guarded = peer_input_request(Request::RemoteInputLine {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "0".repeat(32),
+            seq: 1,
+            bytes: b"a".to_vec(),
+        });
+        assert!(matches!(guarded, Request::RemoteInput { line: true, .. }));
         let other = peer_input_request(Request::List);
         assert_eq!(other, Request::List);
     }
