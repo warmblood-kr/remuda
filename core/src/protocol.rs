@@ -223,6 +223,11 @@ pub enum Request {
         cwd: Option<String>,
         #[serde(default)]
         env: Option<std::collections::HashMap<String, String>>,
+        /// Launch-time per-session opt-out, applied atomically with registry
+        /// insertion. Old daemons ignore the unknown field, so a caller that
+        /// needs the guarantee must also keep remote send gated off toward them.
+        #[serde(default)]
+        remote_input_disabled: bool,
     },
     /// Deliver one instruction as an indivisible act. An attached terminal is
     /// a viewer, not a delivery lock.
@@ -241,6 +246,15 @@ pub enum Request {
     /// Idempotent text and one Return, sharing the session line-delivery path.
     /// A trailing composer CR is consumed rather than submitted twice.
     InputLine {
+        name: String,
+        instance_id: String,
+        client_id: String,
+        seq: u64,
+        bytes: Vec<u8>,
+    },
+    /// The guarded remote line: an old receiver rejects the variant before a
+    /// PTY write, and the remote front maps it to [`Request::RemoteInput`].
+    RemoteInputLine {
         name: String,
         instance_id: String,
         client_id: String,
@@ -343,6 +357,10 @@ pub enum Request {
     /// hosts outlive daemons, so builds can differ (#713). Older daemons
     /// answer `bad request`.
     SessionHostBuilds,
+    /// Probe the authenticated per-session remote-input opt-out (#276), as
+    /// [`Response::Ok`]. A daemon older than this variant cannot parse it, so a
+    /// sender refuses instead of assuming its peer enforces the flag.
+    RemoteInputSupport,
     /// Replace this daemon with one started from `binary`, keeping host-backed
     /// sessions (#713). Only `check` runs yet: a report in [`Response::Value`],
     /// or a refusal in [`Response::Error`].

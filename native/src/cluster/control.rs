@@ -21,6 +21,10 @@ pub struct RevokedNotice {
 #[serde(deny_unknown_fields)]
 struct Settings {
     allow_remote_control: bool,
+    /// Sender-side rollout gate: authenticating the receiver is not enough
+    /// until managed panes are protected. Off by default.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    allow_remote_send: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     node_aliases: BTreeMap<String, String>,
 }
@@ -29,6 +33,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             allow_remote_control: true,
+            allow_remote_send: false,
             node_aliases: BTreeMap::new(),
         }
     }
@@ -161,6 +166,19 @@ pub fn set_enabled(value: bool) -> io::Result<()> {
     set_enabled_at(&dir, value)
 }
 
+/// Whether this node may originate remote sends; missing setting is off.
+pub fn remote_send_enabled() -> io::Result<bool> {
+    let dir = super::storage::cluster_state_dir()?.join("cluster");
+    remote_send_enabled_at(&dir)
+}
+
+/// Persist this node's sender rollout gate.
+pub fn set_remote_send_enabled(value: bool) -> io::Result<()> {
+    let dir = super::storage::cluster_state_dir()?.join("cluster");
+    super::identity::load_identity_at(&dir)?;
+    set_remote_send_at(&dir, value)
+}
+
 /// Read this node's local revocation notice, if an admitted member has sent one.
 pub fn revoked_notice() -> io::Result<Option<RevokedNotice>> {
     revoked_notice_at(&super::storage::cluster_state_dir()?.join("cluster"))
@@ -266,6 +284,12 @@ pub fn enabled_at(dir: &Path) -> io::Result<bool> {
     Ok(settings_at(dir)?.allow_remote_control)
 }
 
+/// Whether this node may originate remote sends. Defaults to false until the
+/// sender rollout gate is explicitly opened.
+pub fn remote_send_enabled_at(dir: &Path) -> io::Result<bool> {
+    Ok(settings_at(dir)?.allow_remote_send)
+}
+
 fn settings_at(dir: &Path) -> io::Result<Settings> {
     use std::fs;
     #[cfg(not(windows))]
@@ -338,6 +362,15 @@ pub fn set_enabled_at(dir: &Path, value: bool) -> io::Result<()> {
     save_settings_at(dir, &settings)
 }
 
+/// Persist the sender rollout gate in one cluster state directory.
+pub fn set_remote_send_at(dir: &Path, value: bool) -> io::Result<()> {
+    super::storage::verify_directory(dir)?;
+    let _guard = super::storage::StateLock::acquire(dir)?;
+    let mut settings = settings_at(dir)?;
+    settings.allow_remote_send = value;
+    save_settings_at(dir, &settings)
+}
+
 fn save_settings_at(dir: &Path, settings: &Settings) -> io::Result<()> {
     use std::fs;
 
@@ -367,7 +400,10 @@ fn save_settings_at(dir: &Path, settings: &Settings) -> io::Result<()> {
 
 #[cfg(all(test, not(windows)))]
 mod tests {
-    use super::{enabled_at, merged_aliases, set_enabled_at, settings_at};
+    use super::{
+        enabled_at, merged_aliases, remote_send_enabled_at, set_enabled_at, set_remote_send_at,
+        settings_at,
+    };
     use std::collections::BTreeMap;
     use std::path::Path;
     use std::path::PathBuf;
@@ -394,6 +430,42 @@ mod tests {
     fn missing_control_setting_defaults_to_enabled() {
         let dir = cluster_dir();
         assert!(enabled_at(&dir).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_false_remote_send_is_omitted_so_old_readers_still_parse_settings() {
+        let dir = cluster_dir();
+        set_enabled_at(&dir, false).unwrap();
+        let text = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert!(
+            !text.contains("allow_remote_send"),
+            "a false gate must not become an unknown field for an older binary: {text}"
+        );
+        std::fs::write(
+            dir.join("settings.json"),
+            br#"{"allow_remote_control":true}"#,
+        )
+        .unwrap();
+        assert!(!remote_send_enabled_at(&dir).unwrap());
+        assert!(enabled_at(&dir).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_remote_send_setting_defaults_to_off_and_round_trips() {
+        let dir = cluster_dir();
+        assert!(!remote_send_enabled_at(&dir).unwrap(), "default is off");
+        set_remote_send_at(&dir, true).unwrap();
+        assert!(remote_send_enabled_at(&dir).unwrap());
+        assert!(
+            enabled_at(&dir).unwrap(),
+            "the two settings are independent"
+        );
+        set_enabled_at(&dir, false).unwrap();
+        assert!(remote_send_enabled_at(&dir).unwrap());
+        set_remote_send_at(&dir, false).unwrap();
+        assert!(!remote_send_enabled_at(&dir).unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
 

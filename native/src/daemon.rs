@@ -2160,6 +2160,7 @@ fn handle_request(
         }
 
         Request::Version => reply(&stream, &Response::Value(crate::dist::BUILD_VERSION.into())),
+        Request::RemoteInputSupport => reply(&stream, &Response::Ok),
         Request::SocketPublication => reply(&stream, &Response::Value(socket_publication())),
         Request::SessionHostBuilds => reply(
             &stream,
@@ -2229,6 +2230,7 @@ fn handle_request(
                 cwd,
                 env,
                 return_instance_id: false,
+                remote_input_disabled: false,
             },
         ),
 
@@ -2238,6 +2240,7 @@ fn handle_request(
             size,
             cwd,
             env,
+            remote_input_disabled,
         } => handle_new(
             stream,
             registry,
@@ -2249,6 +2252,7 @@ fn handle_request(
                 cwd,
                 env,
                 return_instance_id: true,
+                remote_input_disabled,
             },
         ),
 
@@ -2300,6 +2304,25 @@ fn handle_request(
             &client_id,
             seq,
             &bytes,
+        ),
+
+        Request::RemoteInputLine {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+        } => remote_input(
+            &stream,
+            registry,
+            Request::RemoteInput {
+                name,
+                instance_id,
+                client_id,
+                seq,
+                bytes,
+                line: true,
+            },
         ),
 
         request @ Request::RemoteInput { .. } => remote_input(&stream, registry, request),
@@ -3619,6 +3642,7 @@ struct NewSessionRequest {
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
     return_instance_id: bool,
+    remote_input_disabled: bool,
 }
 
 /// Feed a host-backed session's output into the same `session_output` hook
@@ -3685,6 +3709,7 @@ fn handle_new(
         cwd,
         env,
         return_instance_id,
+        remote_input_disabled,
     } = request;
     let name = match name {
         Some(given) => given,
@@ -3732,7 +3757,7 @@ fn handle_new(
         Ok(session) => {
             let session_id = session.id().to_string();
             let notifier = image.session_output_notifier(&name, &session_id);
-            match registry.register(session) {
+            match registry.register_with_remote_input_disabled(session, remote_input_disabled) {
                 Ok(session) => {
                     let response = if return_instance_id {
                         Response::SessionStarted {

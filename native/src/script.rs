@@ -973,6 +973,37 @@ pub fn eval_source(socket: &Path, name: &str, source: &str) -> Result<String, St
     }
 }
 
+/// Parse `remuda.new`'s options table strictly: an invalid or unknown key
+/// must not silently degrade a requested protection to "off".
+fn launch_options(options: Table) -> mlua::Result<bool> {
+    let mut protected = false;
+    for pair in options.pairs::<mlua::Value, mlua::Value>() {
+        let (key, value) = pair?;
+        let Some(key) = key.as_string() else {
+            return Err(mlua::Error::runtime(
+                "session.new option keys must be strings",
+            ));
+        };
+        let key = key.to_str()?;
+        match &*key {
+            "remote_input_disabled" => match value {
+                mlua::Value::Boolean(enabled) => protected = enabled,
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "session.new remote_input_disabled must be a boolean",
+                    ))
+                }
+            },
+            other => {
+                return Err(mlua::Error::runtime(format!(
+                    "unknown session.new option: {other}"
+                )))
+            }
+        }
+    }
+    Ok(protected)
+}
+
 /// Run a script file **in the daemon's image**, never in a fresh `Lua::new()`
 /// here — a script must see the state `-e` and the REPL share. The chunk name
 /// travels with the source so a traceback still names the file.
@@ -988,6 +1019,7 @@ fn new_request(
     argv: Option<Vec<String>>,
     cwd: Option<String>,
     env: Option<std::collections::HashMap<String, String>>,
+    remote_input_disabled: bool,
 ) -> Request {
     Request::NewWithInstance {
         name,
@@ -995,6 +1027,7 @@ fn new_request(
         size: crate::terminal_size(),
         cwd,
         env,
+        remote_input_disabled,
     }
 }
 
@@ -1655,21 +1688,28 @@ fn pending_bindings(
     Ok(())
 }
 
-/// `remuda.new(name, argv, cwd, env)` — returns name then launch identity.
-/// The last two arguments remain trailing and optional.
+/// `remuda.new(name, argv, cwd, env, options)` — returns name then launch
+/// identity. Every argument after the name is trailing and optional; the
+/// options table carries `remote_input_disabled` for launch-time protection.
+#[allow(clippy::type_complexity)] // The Lua binding's trailing option tuple.
 fn new_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
     table.set(
         "new",
         lua.create_function(
             move |lua,
-                  (name, argv, cwd, env): (
+                  (name, argv, cwd, env, options): (
                 Option<String>,
                 Option<Vec<String>>,
                 Option<String>,
                 Option<Table>,
+                Option<Table>,
             )| {
                 let env = env.map(lua_env_to_wire).transpose()?;
-                match ask(&path, new_request(name, argv, cwd, env))? {
+                let protected = match options {
+                    Some(options) => launch_options(options)?,
+                    None => false,
+                };
+                match ask(&path, new_request(name, argv, cwd, env, protected))? {
                     Response::SessionStarted { name, instance_id } => Ok((
                         Value::String(lua.create_string(&name)?),
                         Value::String(lua.create_string(&instance_id)?),

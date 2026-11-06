@@ -73,6 +73,7 @@ fn new_with_instance(path: &Path, name: &str, command: Vec<String>) -> std::io::
             size: remuda_core::Size::new(80, 24),
             cwd: None,
             env: None,
+            remote_input_disabled: false,
         },
     )
 }
@@ -188,6 +189,7 @@ fn new_registers_the_launch_when_its_reply_cannot_be_delivered() {
             size: remuda_core::Size::new(80, 24),
             cwd: None,
             env: None,
+            remote_input_disabled: false,
         })
         .expect("encode");
         line.push('\n');

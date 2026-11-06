@@ -72,7 +72,59 @@ pub fn forward_frame_with_timeout(
     timeout: std::time::Duration,
 ) -> Result<Vec<u8>, String> {
     let request = decode_frame(frame)?;
+    let request = peer_input_request(request);
     forward_request_with_timeout(path, &request, timeout)
+}
+
+/// Mark peer input as remote at the transport boundary before the daemon sees
+/// it. The local front does not call this, and a peer cannot claim the local
+/// form itself.
+pub(crate) fn peer_input_request(request: Request) -> Request {
+    match request {
+        Request::Input {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+        } => Request::RemoteInput {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+            line: false,
+        },
+        Request::RemoteInputLine {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+        } => Request::RemoteInput {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+            line: true,
+        },
+        Request::InputLine {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+        } => Request::RemoteInput {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+            line: true,
+        },
+        request => request,
+    }
 }
 
 fn forward_request_with_timeout(
@@ -210,7 +262,9 @@ fn request_timeout(request: &Request) -> std::time::Duration {
             std::time::Duration::from_millis((*timeout_ms).min(remuda_core::sync::MAX_TIMEOUT_MS))
                 + SYNC_TIMEOUT_MARGIN
         }
-        Request::InputLine { .. } => std::time::Duration::from_secs(8),
+        Request::InputLine { .. } | Request::RemoteInputLine { .. } => {
+            std::time::Duration::from_secs(8)
+        }
         _ => CONNECTION_TIMEOUT,
     }
 }
@@ -239,7 +293,10 @@ fn write_response(stream: &mut crate::ipc::Stream, reply: Vec<u8>) -> std::io::R
 /// Threat model: Sync is read-only and bounded; Eval and writes stay refused.
 pub fn authorize(request: &Request) -> Result<(), String> {
     match request {
-        Request::List | Request::CaptureStyled { .. } | Request::Sync { .. } => Ok(()),
+        Request::List
+        | Request::RemoteInputSupport
+        | Request::CaptureStyled { .. }
+        | Request::Sync { .. } => Ok(()),
         Request::Input {
             client_id,
             seq,
@@ -251,8 +308,18 @@ pub fn authorize(request: &Request) -> Result<(), String> {
             seq,
             bytes,
             ..
+        }
+        | Request::RemoteInputLine {
+            client_id,
+            seq,
+            bytes,
+            ..
         } => {
-            if matches!(request, Request::InputLine { .. }) && std::str::from_utf8(bytes).is_err() {
+            if matches!(
+                request,
+                Request::InputLine { .. } | Request::RemoteInputLine { .. }
+            ) && std::str::from_utf8(bytes).is_err()
+            {
                 return Err("input line must be UTF-8".into());
             }
             if bytes.len() > MAX_REMOTE_INPUT_BATCH_BYTES {
@@ -345,6 +412,23 @@ mod tests {
         serde_json::from_slice::<OldReceiverRequest>(&serde_json::to_vec(request).unwrap())
             .map(|_| Response::Ok)
             .unwrap_or_else(|_| Response::error("invalid remote request"))
+    }
+
+    #[test]
+    fn an_old_receiver_rejects_the_guarded_line_before_any_write() {
+        let request = Request::RemoteInputLine {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "0".repeat(32),
+            seq: 1,
+            bytes: b"x".to_vec(),
+        };
+        assert_eq!(
+            old_receiver_response(&request),
+            Response::Error("invalid remote request".into())
+        );
+        let frame = serde_json::to_vec(&request).expect("encode guarded line");
+        assert!(decode_frame(&frame).is_ok(), "the new front allows it");
     }
 
     #[test]
@@ -504,6 +588,56 @@ mod tests {
             steps: vec![]
         })
         .is_err());
+    }
+
+    #[test]
+    fn peer_input_is_mapped_to_the_policy_checked_form_at_the_boundary() {
+        let plain = peer_input_request(Request::Input {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "0".repeat(32),
+            seq: 1,
+            bytes: b"a".to_vec(),
+        });
+        assert_eq!(
+            plain,
+            Request::RemoteInput {
+                name: "dev".into(),
+                instance_id: "instance".into(),
+                client_id: "0".repeat(32),
+                seq: 1,
+                bytes: b"a".to_vec(),
+                line: false,
+            }
+        );
+        let line = peer_input_request(Request::InputLine {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "0".repeat(32),
+            seq: 1,
+            bytes: b"a".to_vec(),
+        });
+        assert!(matches!(line, Request::RemoteInput { line: true, .. }));
+        let guarded = peer_input_request(Request::RemoteInputLine {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "0".repeat(32),
+            seq: 1,
+            bytes: b"a".to_vec(),
+        });
+        assert!(matches!(guarded, Request::RemoteInput { line: true, .. }));
+        let other = peer_input_request(Request::List);
+        assert_eq!(other, Request::List);
+    }
+
+    #[test]
+    fn remote_input_support_is_an_allowlisted_capability_probe() {
+        let encoded = serde_json::to_vec(&Request::RemoteInputSupport).unwrap();
+        assert_eq!(
+            decode_frame(&encoded).unwrap(),
+            Request::RemoteInputSupport,
+            "a sender must be able to prove the peer enforces the opt-out"
+        );
     }
 
     #[test]

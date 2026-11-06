@@ -1809,6 +1809,13 @@ impl Session {
         }
     }
 
+    /// The cached liveness bit, without asking the backend. Use this where a
+    /// caller must not wait behind a stalled PTY write; `is_alive` is the
+    /// authoritative check when the backend can be asked.
+    pub fn is_running(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+
     pub fn is_alive(&self) -> bool {
         if !self.alive.load(Ordering::SeqCst) {
             Self::notify_output_changed(&self.output_changed);

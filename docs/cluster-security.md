@@ -120,12 +120,19 @@ remote Close is accepted only with the current session `instance_id` and
 remote control off refuses both remote Input and confirmed remote Close.
 
 A session may additionally opt out of remote Input with a local-only flag:
+A launcher may request the opt-out atomically with registration:
+`remuda.session.new(name, argv, cwd, env, { remote_input_disabled = true })`
+(or the deprecated `remuda.new` alias). The registry inserts the session and
+its policy under one lock, so no remote admission can observe the new instance
+before the policy does; a hosted launch still refuses remote input entirely.
+The post-launch setter is
 `remuda.session.remote_input(name, instance_id, enabled)` or
 `remuda remote-input NAME INSTANCE on|off`. The flag is keyed by the exact
 session instance, is refused by the remote front, and returns the same typed
 `RemoteControlDisabled` response. Local send, attach and resize are unaffected;
 a reused name or a new instance starts allowed and never inherits the flag.
-`remuda ls` reports `remote_input_disabled`; false means no explicit session
+`remuda ls --json` and Lua `remuda.session.list()` report
+`remote_input_disabled` (the human table does not); false means no explicit session
 opt-out, not that the node's `allow_remote_control` is on or that the session is
 eligible in every backend. A successful hosted setter is remembered for
 listing/cleanup but does not enable hosted remote input in this slice. The flag
@@ -135,6 +142,40 @@ host-backed session can survive that restart, this first slice refuses remote
 Input/InputLine for host-backed sessions entirely; in-process sessions keep the
 default-allowed behavior and the opt-out. This is an explicit limitation of
 the first receiver slice, not a claim of persistent per-session protection.
+
+An MCP `send` with `node` is one line, never a stream. It is off by default on
+the sending node: `remuda cluster remote-send on` is the local rollout gate,
+and an operator should open it only after the Butler protection change is
+merged and deployed and the owner has verified the managed root/leader panes on
+every target node. The probe does not prove that a target's Butler actually
+marked those panes off; it only proves the core supports the flag. The setting is local and never replicated. It resolves the
+peer with the same fail-closed rules as capture, probes `RemoteInputSupport` so
+an older peer that cannot parse the opt-out is refused rather than assumed safe,
+pins the exact live `instance_id` from the peer's `List`, and sends the typed
+`RemoteInputLine` with a fresh client id and sequence 1. `RemoteInputLine` is a
+new request variant: a daemon older than the opt-out cannot parse it and
+rejects the frame before any PTY write, so the write itself, not only the
+preflight probe, requires a receiver that enforces the policy. The text is at most 12,288
+UTF-8 bytes and must be nonempty, one line, and free of terminal controls; the
+sender adds no newline because the receiver appends exactly one Return. A
+refusal is final: no local fallback, no name-based retry, no second node, and
+no new client id. `WrongInstance`, `RemoteControlDisabled`, `RateLimited` and
+`Busy` are known not written, as are connect/auth/frame-size refusals for the
+line request; `WriteTimeout`, EOF/timeout/crypto/bad-response failure after the
+line request, `Uncertain`, and an unexpected or generic peer error are reported
+uncertain and non-retryable because bytes may have been typed. The probe and
+list are separate read-only requests, so their failure is known not to have
+written input. The probe is a UX preflight; the guarded write is what binds the
+capability requirement. A peer restarted or downgraded between probe and line
+still rejects `RemoteInputLine` rather than accepting it as an unguarded
+`InputLine`. Open the sender gate only while every peer runs a protected build,
+and close it before a downgrade. `Ack { duplicate: true }` means the same idempotency
+scope already applied the line; it is not a new turn or a completion proof.
+
+An opted-out session still spends one peer rate token per refused request: the
+listener's pre-dispatch limiter runs before the session policy is checked, and
+the receiver returns `RemoteControlDisabled` after that charge. This is a
+documented cost of the first slice, not a claim that refusals are free.
 
 A batch already in dispatch may still be delivered if the setting changes to
 off while that batch is in flight. A revoke during dispatch may likewise allow

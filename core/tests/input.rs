@@ -531,6 +531,69 @@ fn remote_input_opt_out_refuses_only_remote_input() {
 }
 
 #[test]
+fn an_admitted_remote_line_finishes_after_opt_out_and_later_lines_are_refused() {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let registry = Arc::new(Registry::new());
+    let session = registry
+        .register(Session::new(
+            "input-test",
+            Box::new(StallingAgent {
+                started: Mutex::new(Some(started_tx)),
+                release: Mutex::new(release_rx),
+                released: std::sync::atomic::AtomicBool::new(false),
+            }),
+            Arc::new(ManualClock::new()),
+        ))
+        .expect("register");
+    let instance = session.instance_id().to_string();
+    let admitted_instance = instance.clone();
+    let admitted_registry = Arc::clone(&registry);
+    let admitted = thread::spawn(move || {
+        admitted_registry.apply_remote_input_batch(
+            "input-test",
+            InputBatch {
+                instance_id: &admitted_instance,
+                client_id: [4; 16],
+                seq: 1,
+                bytes: b"admitted",
+            },
+            true,
+        )
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("admitted line reached the writer");
+    assert_eq!(
+        registry.set_remote_input_opt_out("input-test", &instance, true),
+        Some(()),
+        "off must not wait for an admitted write outside the registry lock"
+    );
+    assert!(
+        matches!(
+            registry.apply_remote_input_batch(
+                "input-test",
+                InputBatch {
+                    instance_id: &instance,
+                    client_id: [5; 16],
+                    seq: 1,
+                    bytes: b"after",
+                },
+                false,
+            ),
+            Some(Err(InputError::RemoteInputDisabled))
+        ),
+        "a line admitted after the off store is refused"
+    );
+    release_tx.send(()).expect("release writer");
+    let outcome = admitted.join().unwrap();
+    assert!(
+        matches!(outcome, Some(Ok(InputOutcome::Ack { duplicate: false }))),
+        "admitted line outcome: {outcome:?}"
+    );
+}
+
+#[test]
 fn remote_input_line_adds_exactly_one_return_and_a_duplicate_adds_none() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let registry = Registry::new();
@@ -571,6 +634,32 @@ fn remote_input_line_adds_exactly_one_return_and_a_duplicate_adds_none() {
 }
 
 #[test]
+fn launch_time_protection_is_applied_with_registration() {
+    let registry = Registry::new();
+    let session = registry
+        .register_with_remote_input_disabled(
+            input_session(Arc::new(Mutex::new(Vec::new())), true),
+            true,
+        )
+        .expect("register protected");
+    assert!(registry.remote_input_disabled(session.instance_id()));
+    assert!(registry.list()[0].remote_input_disabled);
+    assert!(matches!(
+        registry.apply_remote_input_batch(
+            "input-test",
+            InputBatch {
+                instance_id: session.instance_id(),
+                client_id: [6; 16],
+                seq: 1,
+                bytes: b"blocked",
+            },
+            false,
+        ),
+        Some(Err(InputError::RemoteInputDisabled))
+    ));
+}
+
+#[test]
 fn remote_input_opt_out_does_not_follow_a_reused_name() {
     let registry = Registry::new();
     let first = registry
@@ -604,6 +693,57 @@ fn input_session(writes: Arc<Mutex<Vec<Vec<u8>>>>, alive: bool) -> Session {
         }),
         Arc::new(ManualClock::new()),
     )
+}
+
+/// A writer that reports when a line arrived and waits for release, so the
+/// linearization of an admitted write against a later opt-out is deterministic.
+struct StallingAgent {
+    started: Mutex<Option<mpsc::Sender<()>>>,
+    release: Mutex<mpsc::Receiver<()>>,
+    released: std::sync::atomic::AtomicBool,
+}
+
+impl AgentProcess for StallingAgent {
+    fn write(&mut self, _bytes: &[u8]) -> Result<()> {
+        if let Some(started) = self.started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        if !self
+            .released
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .map_err(|_| AgentError::Io("stalled writer was not released".into()))?;
+        }
+        Ok(())
+    }
+
+    fn screen_text(&mut self) -> Result<String> {
+        Ok(String::new())
+    }
+
+    fn cursor(&mut self) -> Result<Cursor> {
+        Ok(Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        })
+    }
+
+    fn size(&self) -> Size {
+        Size::new(80, 24)
+    }
+
+    fn is_alive(&mut self) -> bool {
+        true
+    }
+
+    fn terminate(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct InputRecordingAgent {
