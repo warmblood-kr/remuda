@@ -5074,6 +5074,8 @@ mod tests {
             human_idle: None,
             mouse_tracking: false,
             unavailable: false,
+            program_status: None,
+            program_status_age_ms: None,
             instance_id: None,
             output_version: None,
         }]
@@ -5091,6 +5093,8 @@ mod tests {
             human_idle: None,
             mouse_tracking: false,
             unavailable: false,
+            program_status: None,
+            program_status_age_ms: None,
             instance_id: Some(format!("instance-{name}")),
             output_version: None,
         }
@@ -5121,6 +5125,8 @@ mod tests {
             human_idle: None,
             mouse_tracking: false,
             unavailable: false,
+            program_status: None,
+            program_status_age_ms: None,
             instance_id: None,
             output_version: None,
         });

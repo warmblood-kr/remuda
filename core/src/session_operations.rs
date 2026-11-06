@@ -168,6 +168,10 @@ pub struct Observation {
     pub mouse: MouseState,
     pub attached: bool,
     pub closing: bool,
+    /// Advisory OSC 7501 report and its monotonic age. Additive: older hosts
+    /// and sessions without a report leave both `None`.
+    pub program_status: Option<crate::agent::ProgramStatus>,
+    pub program_status_age_ms: Option<u64>,
     /// The build of the session host serving it; `None` for an in-process
     /// session, which runs the daemon's own build (#713).
     pub host_build: Option<String>,
@@ -401,6 +405,7 @@ impl SessionOperations for Session {
         } else {
             Lifecycle::Exited(self.exit_info())
         };
+        let program = self.program_status();
         Ok(Observation {
             identity: Identity::local(self),
             lifecycle,
@@ -414,6 +419,9 @@ impl SessionOperations for Session {
             mouse: self.mouse_state(),
             attached: self.is_attached(),
             closing: self.is_closing(),
+            program_status: program.as_ref().map(|o| o.status.clone()),
+            program_status_age_ms: program
+                .map(|o| o.age.as_millis().try_into().unwrap_or(u64::MAX)),
             host_build: None,
         })
     }

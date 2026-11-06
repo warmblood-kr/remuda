@@ -21,14 +21,16 @@
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use remuda_core::agent::{
     AgentError, AgentProcess, AgentWriter, ChainOutcome, Color, Cursor, ExitInfo, MouseEncoding,
-    MouseMode, MouseState, OutputSignal, OutputWakeup, Result, ScreenSnapshot, Size, StyledCell,
-    VersionedSnapshot,
+    MouseMode, MouseState, OutputSignal, OutputWakeup, ProgramStatusObservation, Result,
+    ScreenSnapshot, Size, StyledCell, VersionedSnapshot,
 };
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
+
+use crate::program_status::Tracker;
 
 /// Live viewers of one pty's output. Shared with the reader thread, which is
 /// the only producer; every consumer holds the other end of a channel.
@@ -445,6 +447,23 @@ const DSR_REPLY_RETRY_LIMIT: usize = 50;
 const DSR_REPLY_RETRY_DELAY: Duration = Duration::from_millis(10);
 const SCROLLBACK_ROWS: usize = 10_000;
 const SCROLLBACK_PROBE_CHUNK: usize = 512;
+/// Query prefixes partially received in an earlier read.
+#[derive(Default)]
+struct ReaderCarry {
+    cursor: Vec<u8>,
+}
+
+/// vt100 callbacks that retain only the bounded typed status.
+#[derive(Default)]
+struct StatusCallbacks {
+    tracker: Tracker,
+}
+
+impl vt100::Callbacks for StatusCallbacks {
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        self.tracker.observe(params);
+    }
+}
 
 fn io<E: std::fmt::Display>(e: E) -> AgentError {
     AgentError::Io(e.to_string())
@@ -487,7 +506,7 @@ fn color(c: vt100::Color) -> Color {
 /// A child process attached to a pty, with its screen parsed into a grid.
 pub struct PtyAgent {
     size: Size,
-    screen: Arc<Mutex<vt100::Parser>>,
+    screen: Arc<Mutex<vt100::Parser<StatusCallbacks>>>,
     input_writer: Arc<PtyInputWriter>,
     child: Box<dyn Child + Send + Sync>,
     watchers: Watchers,
@@ -567,15 +586,16 @@ impl PtyAgent {
             .map_err(io)?,
         );
         let reader = pair.master.try_clone_reader().map_err(io)?;
-        let screen = Arc::new(Mutex::new(vt100::Parser::new(
+        let screen = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
             size.rows(),
             size.cols(),
             SCROLLBACK_ROWS,
+            StatusCallbacks::default(),
         )));
         let watchers: Watchers = Arc::new(Mutex::new(Vec::new()));
         let reader_closed = Arc::new(AtomicBool::new(false));
         let pending_cursor_replies =
-            spawn_cursor_reply_worker(Arc::clone(&writer), Arc::clone(&reader_closed));
+            spawn_reply_worker(Arc::clone(&writer), Arc::clone(&reader_closed), "cursor");
         let scrollback_total = Arc::new(AtomicUsize::new(0));
         let output_version = Arc::new(AtomicU64::new(0));
         spawn_reader(
@@ -612,7 +632,7 @@ impl PtyAgent {
 /// come. A hung-up subscriber is dropped on its next failed send.
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
-    screen: Arc<Mutex<vt100::Parser>>,
+    screen: Arc<Mutex<vt100::Parser<StatusCallbacks>>>,
     watchers: Watchers,
     reader_closed: Arc<AtomicBool>,
     scrollback_total: Arc<AtomicUsize>,
@@ -621,14 +641,14 @@ fn spawn_reader(
 ) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
-        let mut dsr_carry = Vec::new();
+        let mut carry = ReaderCarry::default();
         while let Ok(n) = reader.read(&mut buf) {
             if n == 0 {
                 break;
             }
             if !process_reader_chunk(
                 &buf[..n],
-                &mut dsr_carry,
+                &mut carry,
                 &screen,
                 &scrollback_total,
                 &output_version,
@@ -659,21 +679,24 @@ fn spawn_reader(
 /// can be exercised without a platform pty.
 fn process_reader_chunk(
     bytes: &[u8],
-    dsr_carry: &mut Vec<u8>,
-    screen: &Arc<Mutex<vt100::Parser>>,
+    carry: &mut ReaderCarry,
+    screen: &Arc<Mutex<vt100::Parser<StatusCallbacks>>>,
     scrollback_total: &AtomicUsize,
     output_version: &AtomicU64,
     pending_cursor_replies: &SyncSender<Vec<u8>>,
 ) -> bool {
-    let mut query_window = Vec::with_capacity(dsr_carry.len() + bytes.len());
-    query_window.extend_from_slice(dsr_carry);
-    query_window.extend_from_slice(bytes);
-    let asked = query_window
+    let mut cursor_window = Vec::with_capacity(carry.cursor.len() + bytes.len());
+    cursor_window.extend_from_slice(&carry.cursor);
+    cursor_window.extend_from_slice(bytes);
+    let asked = cursor_window
         .windows(DSR_CURSOR.len())
         .any(|window| window == DSR_CURSOR);
-    let carry_len = query_window.len().min(DSR_CURSOR.len() - 1);
-    dsr_carry.clear();
-    dsr_carry.extend_from_slice(&query_window[query_window.len() - carry_len..]);
+    let cursor_tail = cursor_window.len().min(DSR_CURSOR.len() - 1);
+    carry.cursor.clear();
+    carry
+        .cursor
+        .extend_from_slice(&cursor_window[cursor_window.len() - cursor_tail..]);
+
     let at = match screen.lock() {
         Ok(mut parser) => {
             let size = parser.screen().size();
@@ -694,7 +717,10 @@ fn process_reader_chunk(
 }
 
 /// Resize the parsed grid to match the pty.
-fn resize_screen(screen: &Mutex<vt100::Parser>, size: Size) -> Result<()> {
+fn resize_screen<CB: vt100::Callbacks + Default>(
+    screen: &Mutex<vt100::Parser<CB>>,
+    size: Size,
+) -> Result<()> {
     let mut parser = screen.lock().map_err(|_| io("screen lock poisoned"))?;
     let (rows, cols) = (size.rows(), size.cols());
     guard_parser(&mut parser, "resize", (rows, cols), |parser| {
@@ -706,11 +732,11 @@ fn resize_screen(screen: &Mutex<vt100::Parser>, size: Size) -> Result<()> {
 /// vt100 can panic on ordinary output (a wide glyph cut by a resize). Log it and
 /// start a blank grid at `size` rather than poison the screen lock; the child
 /// repaints.
-fn guard_parser<T>(
-    parser: &mut vt100::Parser,
+fn guard_parser<CB: vt100::Callbacks + Default, T>(
+    parser: &mut vt100::Parser<CB>,
     what: &str,
     (rows, cols): (u16, u16),
-    run: impl FnOnce(&mut vt100::Parser) -> T,
+    run: impl FnOnce(&mut vt100::Parser<CB>) -> T,
 ) -> Option<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(parser))) {
         Ok(value) => Some(value),
@@ -721,7 +747,7 @@ fn guard_parser<T>(
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".into());
             eprintln!("remuda pty: terminal parser panicked on {what}; screen reset: {message}");
-            *parser = vt100::Parser::new(rows, cols, SCROLLBACK_ROWS);
+            *parser = vt100::Parser::new_with_callbacks(rows, cols, SCROLLBACK_ROWS, CB::default());
             None
         }
     }
@@ -765,9 +791,10 @@ pub(crate) fn process_output<CB: vt100::Callbacks>(
 
 /// Start the bounded worker that writes cursor replies away from the reader.
 /// The one-item channel is the pending slot; retrying never blocks PTY output.
-fn spawn_cursor_reply_worker(
+fn spawn_reply_worker(
     writer: SharedWriter,
     reader_closed: Arc<AtomicBool>,
+    what: &'static str,
 ) -> SyncSender<Vec<u8>> {
     let (pending, replies) = sync_channel::<Vec<u8>>(1);
     std::thread::spawn(move || {
@@ -776,7 +803,7 @@ fn spawn_cursor_reply_worker(
             for _ in 0..DSR_REPLY_RETRY_LIMIT {
                 if reader_closed.load(Ordering::Acquire) {
                     eprintln!(
-                        "remuda pty: dropping pending cursor reply because the session closed"
+                        "remuda pty: dropping pending {what} reply because the session closed"
                     );
                     break;
                 }
@@ -787,7 +814,7 @@ fn spawn_cursor_reply_worker(
                             .and_then(|()| writer.flush())
                             .is_ok();
                         if !sent {
-                            eprintln!("remuda pty: cursor reply write failed");
+                            eprintln!("remuda pty: {what} reply write failed");
                         }
                         break;
                     }
@@ -796,14 +823,14 @@ fn spawn_cursor_reply_worker(
                     }
                     Err(TryLockError::Poisoned(_)) => {
                         eprintln!(
-                            "remuda pty: dropping cursor reply because the writer lock is poisoned"
+                            "remuda pty: dropping {what} reply because the writer lock is poisoned"
                         );
                         break;
                     }
                 }
             }
             if !sent && !reader_closed.load(Ordering::Acquire) {
-                eprintln!("remuda pty: dropping cursor reply after the retry limit");
+                eprintln!("remuda pty: dropping {what} reply after the retry limit");
             }
         }
     });
@@ -812,14 +839,17 @@ fn spawn_cursor_reply_worker(
 
 /// Enqueue one cursor reply without blocking the PTY reader thread.
 fn answer_cursor_query(pending: &SyncSender<Vec<u8>>, (row, col): (u16, u16)) {
-    let reply = format!("\x1b[{row};{col}R").into_bytes();
+    enqueue_reply(pending, format!("\x1b[{row};{col}R").into_bytes(), "cursor");
+}
+
+fn enqueue_reply(pending: &SyncSender<Vec<u8>>, reply: Vec<u8>, what: &'static str) {
     match pending.try_send(reply) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
-            eprintln!("remuda pty: dropping cursor reply because the pending slot is full");
+            eprintln!("remuda pty: dropping {what} reply because the pending slot is full");
         }
         Err(TrySendError::Disconnected(_)) => {
-            eprintln!("remuda pty: dropping cursor reply because the session is closed");
+            eprintln!("remuda pty: dropping {what} reply because the session is closed");
         }
     }
 }
@@ -912,6 +942,13 @@ impl AgentProcess for PtyAgent {
             .lock()
             .map(|parser| parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)
             .unwrap_or(false)
+    }
+
+    fn program_status(&mut self) -> Option<ProgramStatusObservation> {
+        self.screen
+            .lock()
+            .ok()
+            .and_then(|parser| parser.callbacks().tracker.observation())
     }
 
     fn mouse_state(&mut self) -> MouseState {
@@ -1700,18 +1737,23 @@ mod input_writer_tests {
     #[test]
     fn parser_panic_resets_the_grid_instead_of_poisoning_the_screen_lock() {
         let (pending, _replies) = sync_channel(1);
-        let screen = Arc::new(Mutex::new(vt100::Parser::new(24, 80, SCROLLBACK_ROWS)));
+        let screen = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            24,
+            80,
+            SCROLLBACK_ROWS,
+            StatusCallbacks::default(),
+        )));
         let scrollback_total = AtomicUsize::new(0);
         let output_version = AtomicU64::new(0);
-        let mut dsr_carry = Vec::new();
+        let mut carry = ReaderCarry::default();
         let mut feed = |bytes: &[u8]| {
             process_reader_chunk(
                 bytes,
-                &mut dsr_carry,
+                &mut carry,
                 &screen,
                 &scrollback_total,
                 &output_version,
-                &pending,
+                &pending.clone(),
             )
         };
         assert!(feed("\x1b[1;79H가".as_bytes()));
@@ -1730,30 +1772,35 @@ mod input_writer_tests {
         let writer: SharedWriter =
             Arc::new(Mutex::new(Box::new(CaptureWrites(Arc::clone(&captured)))));
         let reader_closed = Arc::new(AtomicBool::new(false));
-        let pending = spawn_cursor_reply_worker(Arc::clone(&writer), reader_closed);
-        let screen = Arc::new(Mutex::new(vt100::Parser::new(24, 80, SCROLLBACK_ROWS)));
+        let pending = spawn_reply_worker(Arc::clone(&writer), reader_closed, "cursor");
+        let screen = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            24,
+            80,
+            SCROLLBACK_ROWS,
+            StatusCallbacks::default(),
+        )));
         let scrollback_total = AtomicUsize::new(0);
         let output_version = AtomicU64::new(0);
-        let mut dsr_carry = Vec::new();
+        let mut carry = ReaderCarry::default();
         let guard = writer.lock().unwrap();
         let started = std::time::Instant::now();
         assert!(process_reader_chunk(
             DSR_CURSOR,
-            &mut dsr_carry,
+            &mut carry,
             &screen,
             &scrollback_total,
             &output_version,
-            &pending,
+            &pending.clone(),
         ));
         assert!(started.elapsed() < Duration::from_millis(100));
         assert!(captured.lock().unwrap().is_empty());
         assert!(process_reader_chunk(
             b"x",
-            &mut dsr_carry,
+            &mut carry,
             &screen,
             &scrollback_total,
             &output_version,
-            &pending,
+            &pending.clone(),
         ));
         assert_eq!(output_version.load(Ordering::SeqCst), 2);
         drop(guard);
@@ -1765,24 +1812,63 @@ mod input_writer_tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let writer: SharedWriter =
             Arc::new(Mutex::new(Box::new(CaptureWrites(Arc::clone(&captured)))));
-        let screen = Arc::new(Mutex::new(vt100::Parser::new(24, 80, SCROLLBACK_ROWS)));
+        let screen = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            24,
+            80,
+            SCROLLBACK_ROWS,
+            StatusCallbacks::default(),
+        )));
         let scrollback_total = AtomicUsize::new(0);
         let output_version = AtomicU64::new(0);
-        let mut dsr_carry = Vec::new();
+        let mut carry = ReaderCarry::default();
         let reader_closed = Arc::new(AtomicBool::new(false));
-        let pending = spawn_cursor_reply_worker(Arc::clone(&writer), reader_closed);
+        let pending = spawn_reply_worker(Arc::clone(&writer), reader_closed, "cursor");
 
         for chunk in [b"\x1b[".as_slice(), b"6n"] {
             assert!(process_reader_chunk(
                 chunk,
-                &mut dsr_carry,
+                &mut carry,
                 &screen,
                 &scrollback_total,
                 &output_version,
-                &pending,
+                &pending.clone(),
             ));
         }
         wait_for_captured(&captured, b"\x1b[1;1R");
+    }
+
+    #[test]
+    fn program_status_is_typed_and_a_query_is_inert() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, SCROLLBACK_ROWS, StatusCallbacks::default());
+        let scrollback_total = AtomicUsize::new(0);
+        process_output(
+            &mut parser,
+            b"\x1b]7501;state=working:app=codex:msg=c2VjcmV0\x1b\\",
+            &scrollback_total,
+        );
+        let observed = parser
+            .callbacks()
+            .tracker
+            .observation()
+            .expect("working status");
+        assert_eq!(
+            observed.status.state,
+            remuda_core::agent::ProgramState::Working
+        );
+        assert_eq!(observed.status.app.as_deref(), Some("codex"));
+        // This phase observes reports only. A feature query must neither
+        // overwrite the typed status nor make the reader emit a reply.
+        process_output(&mut parser, b"\x1b]7501;?\x07", &scrollback_total);
+        let observed = parser
+            .callbacks()
+            .tracker
+            .observation()
+            .expect("query leaves the last report");
+        assert_eq!(
+            observed.status.state,
+            remuda_core::agent::ProgramState::Working
+        );
     }
 
     fn wait_for_captured(captured: &Arc<Mutex<Vec<u8>>>, expected: &[u8]) {
@@ -1882,8 +1968,8 @@ pub(crate) fn signal_name(_: i32) -> Option<String> {
     None
 }
 
-fn capture_snapshot(
-    screen: &Arc<Mutex<vt100::Parser>>,
+fn capture_snapshot<CB: vt100::Callbacks + Default>(
+    screen: &Arc<Mutex<vt100::Parser<CB>>>,
     size: Size,
     scrollback_total: &AtomicUsize,
     output_version: &AtomicU64,
@@ -2035,7 +2121,8 @@ mod tests {
 
     #[test]
     fn monotonic_scrollback_counter_advances_after_retained_history_is_full() {
-        let mut parser = vt100::Parser::new(24, 80, SCROLLBACK_ROWS);
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, SCROLLBACK_ROWS, StatusCallbacks::default());
         let total = AtomicUsize::new(0);
         let fill: String = (0..SCROLLBACK_ROWS + 100)
             .map(|row| format!("row-{row:05}\r\n"))
@@ -2061,7 +2148,7 @@ mod tests {
         assert_eq!(retained_history_len(&mut parser), 2);
     }
 
-    fn retained_history_len(parser: &mut vt100::Parser) -> usize {
+    fn retained_history_len<CB: vt100::Callbacks>(parser: &mut vt100::Parser<CB>) -> usize {
         let screen = parser.screen_mut();
         let previous = screen.scrollback();
         screen.set_scrollback(usize::MAX);

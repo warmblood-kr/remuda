@@ -1,6 +1,7 @@
 //! Host-only terminal preparation; not yet wired into PtyAgent.
 use super::strings::Strings;
 use super::viewport::{Modes, RenderingProfile, Viewport};
+use crate::program_status::Tracker;
 use remuda_core::agent::{Cursor, MouseEncoding, MouseMode, MouseState, VersionedSnapshot};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,8 +18,13 @@ const MAX_QUERIES: usize = 32;
 struct Queries {
     positions: VecDeque<(u16, u16)>,
     overflow: u64,
+    status: Tracker,
 }
 impl vt100::Callbacks for Queries {
+    fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        self.status.observe(params);
+    }
+
     fn unhandled_csi(
         &mut self,
         screen: &mut vt100::Screen,
@@ -147,6 +153,9 @@ impl Terminal {
     pub fn take_query(&mut self) -> Option<(u16, u16)> {
         self.parser.callbacks_mut().positions.pop_front()
     }
+    pub fn program_status(&self) -> Option<remuda_core::agent::ProgramStatusObservation> {
+        self.parser.callbacks().status.observation()
+    }
     /// Runtime must expose these explicit unsupported/degraded counters;
     /// overflowing terminal replies cannot be reported as a healthy session.
     pub fn health(&self) -> (u64, u64) {
@@ -221,6 +230,35 @@ mod tests {
             assert_eq!(terminal.health(), (0, 0));
         }
     }
+    #[test]
+    fn program_status_is_recorded_and_a_query_is_inert() {
+        let mut terminal = Terminal::new(24, 80, 10).unwrap();
+        feed(&mut terminal, b"\x1b]7501;?\x1b\\\x1b]7501;?\x07");
+        assert!(terminal.program_status().is_none());
+
+        feed(
+            &mut terminal,
+            b"\x1b]7501;state=blocked:app=claude-code:kind=question\x1b\\",
+        );
+        let observed = terminal.program_status().expect("blocked status");
+        assert_eq!(
+            observed.status.state,
+            remuda_core::agent::ProgramState::Blocked
+        );
+        assert_eq!(
+            observed.status.kind,
+            Some(remuda_core::agent::ProgramBlockKind::Question)
+        );
+        feed(&mut terminal, b"\x1b]7501;state=bogus\x1b\\");
+        assert_eq!(
+            terminal.program_status().unwrap().status.state,
+            remuda_core::agent::ProgramState::Blocked,
+            "malformed records keep the last status"
+        );
+        feed(&mut terminal, b"\x1b]7501;state=clear\x07");
+        assert!(terminal.program_status().is_none());
+    }
+
     #[test]
     fn work_geometry_reply_limits_and_generation_are_explicit() {
         assert!(Terminal::new(u16::MAX, 80, 10).is_err());

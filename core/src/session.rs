@@ -1688,6 +1688,14 @@ impl Session {
             .unwrap_or(false)
     }
 
+    /// The last OSC 7501 report, advisory and independent of liveness.
+    pub fn program_status(&self) -> Option<crate::agent::ProgramStatusObservation> {
+        self.agent
+            .lock()
+            .map(|mut agent| agent.program_status())
+            .unwrap_or(None)
+    }
+
     pub fn mouse_state(&self) -> MouseState {
         self.agent
             .lock()

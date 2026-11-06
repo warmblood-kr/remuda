@@ -403,6 +403,73 @@ pub struct VersionedSnapshot {
     pub instance_id: Option<String>,
 }
 
+/// One state from OSC 7501; advisory, never identity or authorization.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProgramState {
+    Idle,
+    Working,
+    Blocked,
+    Done,
+    Error,
+    #[serde(other)]
+    Unknown,
+}
+
+impl ProgramState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProgramState::Idle => "idle",
+            ProgramState::Working => "working",
+            ProgramState::Blocked => "blocked",
+            ProgramState::Done => "done",
+            ProgramState::Error => "error",
+            ProgramState::Unknown => "unknown",
+        }
+    }
+}
+
+/// What a `blocked` program waits for; display only, never approval.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProgramBlockKind {
+    Permission,
+    Question,
+    Auth,
+    #[serde(other)]
+    Unknown,
+}
+
+impl ProgramBlockKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProgramBlockKind::Permission => "permission",
+            ProgramBlockKind::Question => "question",
+            ProgramBlockKind::Auth => "auth",
+            ProgramBlockKind::Unknown => "unknown",
+        }
+    }
+}
+
+/// Bounded OSC 7501 fields; free text is deliberately absent.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct ProgramStatus {
+    pub state: ProgramState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ProgramBlockKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
+}
+
+/// A status with the monotonic age of the report that produced it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ProgramStatusObservation {
+    pub status: ProgramStatus,
+    pub age: core::time::Duration,
+}
+
 /// A live agent process: a screen we can read, a keyboard we can type on.
 /// Caution: every method is sync for correctness, not simplicity — awaiting a
 /// body write and its Enter separately lets a second writer land between them.
@@ -435,6 +502,12 @@ pub trait AgentProcess: Send {
 
     fn mouse_state(&mut self) -> MouseState {
         MouseState::default()
+    }
+
+    /// The last Program Status Protocol report (OSC 7501) this backend saw,
+    /// with its monotonic age. Backends without a terminal parser return None.
+    fn program_status(&mut self) -> Option<ProgramStatusObservation> {
+        None
     }
 
     /// The operating-system process ID for a process-backed agent.

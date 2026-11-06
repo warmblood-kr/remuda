@@ -2456,6 +2456,69 @@ fn host_builds(lua: &Lua, builds: Vec<remuda_core::protocol::HostBuild>) -> mlua
     Ok(Value::Table(rows))
 }
 
+fn session_rows(
+    lua: &Lua,
+    list: Vec<remuda_core::registry::SessionSummary>,
+) -> mlua::Result<Value> {
+    let rows = lua.create_table()?;
+    for (index, session) in list.into_iter().enumerate() {
+        let row = lua.create_table()?;
+        row.set("id", session.id)?;
+        row.set("name", session.name)?;
+        row.set("instance_id", session.instance_id.as_deref())?;
+        row.set("alive", session.alive)?;
+        row.set("idle", session.idle.as_secs_f64())?;
+        row.set(
+            "output_idle",
+            session.output_idle.unwrap_or(session.idle).as_secs_f64(),
+        )?;
+        row.set("cols", session.size.cols())?;
+        row.set("rows", session.size.rows())?;
+        row.set("attached", session.attached)?;
+        row.set(
+            "human_idle",
+            session
+                .human_idle
+                .map_or(f64::INFINITY, |idle| idle.as_secs_f64()),
+        )?;
+        set_program_status(
+            lua,
+            &row,
+            session.program_status,
+            session.program_status_age_ms,
+        )?;
+        rows.set(index + 1, row)?;
+    }
+    Ok(Value::Table(rows))
+}
+
+/// Additive OSC 7501 state; free text is never exposed.
+fn set_program_status(
+    lua: &Lua,
+    row: &mlua::Table,
+    status: Option<remuda_core::agent::ProgramStatus>,
+    age_ms: Option<u64>,
+) -> mlua::Result<()> {
+    if let Some(status) = status {
+        let value = lua.create_table()?;
+        value.set("state", status.state.as_str())?;
+        if let Some(app) = status.app {
+            value.set("app", app)?;
+        }
+        if let Some(kind) = status.kind {
+            value.set("kind", kind.as_str())?;
+        }
+        if let Some(progress) = status.progress {
+            value.set("progress", progress)?;
+        }
+        row.set("program_status", value)?;
+    }
+    if let Some(age) = age_ms {
+        row.set("program_status_age", age as f64 / 1000.0)?;
+    }
+    Ok(())
+}
+
 /// Turn a response into what the script sees. Caution: [`Response::Error`]
 /// raises rather than returning a value — a script that forgot to check one
 /// would otherwise carry on over a session that was never created.
@@ -2498,39 +2561,7 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::CommandResult { .. } => Err(mlua::Error::runtime(
             "deferred command replies cannot be consumed as a Lua value",
         )),
-        Response::Sessions(list) => {
-            let rows = lua.create_table()?;
-            for (index, session) in list.into_iter().enumerate() {
-                let row = lua.create_table()?;
-                row.set("id", session.id)?;
-                row.set("name", session.name)?;
-                row.set("instance_id", session.instance_id.as_deref())?;
-                row.set("alive", session.alive)?;
-                row.set("idle", session.idle.as_secs_f64())?;
-                row.set(
-                    "output_idle",
-                    session.output_idle.unwrap_or(session.idle).as_secs_f64(),
-                )?;
-                row.set("cols", session.size.cols())?;
-                row.set("rows", session.size.rows())?;
-                // Additive: `tests/api/v1.lua` asserts specific fields exist,
-                // never that no others do, so a new field widens v1 rather
-                // than breaking it. Needed so a Lua-authored panel (the
-                // "*sessions*" buffer, `tools.lua`) can show the same
-                // attached state the list has always drawn.
-                row.set("attached", session.attached)?;
-                // Seconds since an attached human typed; math.huge if never, so
-                // the field is always present and nil means an older core.
-                row.set(
-                    "human_idle",
-                    session
-                        .human_idle
-                        .map_or(f64::INFINITY, |idle| idle.as_secs_f64()),
-                )?;
-                rows.set(index + 1, row)?;
-            }
-            Ok(Value::Table(rows))
-        }
+        Response::Sessions(list) => session_rows(lua, list),
         Response::SessionHostBuilds(builds) => host_builds(lua, builds),
         Response::Entries(names) => {
             let rows = lua.create_table()?;
@@ -2667,6 +2698,8 @@ mod binding_tests {
                     human_idle: None,
                     mouse_tracking: false,
                     unavailable: false,
+                    program_status: None,
+                    program_status_age_ms: None,
                 }]),
                 other => panic!("unexpected test request: {other:?}"),
             };

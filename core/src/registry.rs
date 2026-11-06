@@ -19,7 +19,9 @@
 //! transport. Adding those here would put a socket in the policy layer, which
 //! `core/clippy.toml` denies outright.
 
-use crate::agent::{AgentError, Cursor, ExitInfo, Result, ScreenSnapshot, Size, StyledCell};
+use crate::agent::{
+    AgentError, Cursor, ExitInfo, ProgramStatus, Result, ScreenSnapshot, Size, StyledCell,
+};
 use crate::input::{
     ExpectedInstanceInputError, InputBatch, InputDeduplicator, InputError, InputOutcome,
     InputRateLimiter, MAX_INPUT_BYTES,
@@ -101,6 +103,15 @@ pub struct SessionSummary {
     /// its names is unknown. Omitted when false; older listings parse.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub unavailable: bool,
+    /// Additive advisory state from OSC 7501. Omitted when the backend has no
+    /// report or its instance was replaced; older readers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_status: Option<ProgramStatus>,
+    /// Monotonic age of `program_status` when it was copied out. A list,
+    /// cache clone or relist must not reset this; staleness is a display
+    /// decision, not a core TTL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_status_age_ms: Option<u64>,
 }
 
 /// A session name from a program's argv[0]: basename, lowercased, anything
@@ -509,19 +520,25 @@ impl Registry {
         let mut out: Vec<_> = self
             .lock()
             .values()
-            .map(|s| SessionSummary {
-                id: s.id().to_string(),
-                name: s.name().to_string(),
-                instance_id: Some(s.instance_id().to_string()),
-                output_version: s.output_version(),
-                alive: s.is_alive(),
-                idle: s.idle_for(),
-                output_idle: Some(s.output_idle_for()),
-                size: s.size(),
-                attached: s.is_attached(),
-                human_idle: s.human_idle_for(),
-                mouse_tracking: s.mouse_tracking(),
-                unavailable: false,
+            .map(|s| {
+                let program = s.program_status();
+                SessionSummary {
+                    id: s.id().to_string(),
+                    name: s.name().to_string(),
+                    instance_id: Some(s.instance_id().to_string()),
+                    output_version: s.output_version(),
+                    alive: s.is_alive(),
+                    idle: s.idle_for(),
+                    output_idle: Some(s.output_idle_for()),
+                    size: s.size(),
+                    attached: s.is_attached(),
+                    human_idle: s.human_idle_for(),
+                    mouse_tracking: s.mouse_tracking(),
+                    unavailable: false,
+                    program_status: program.as_ref().map(|o| o.status.clone()),
+                    program_status_age_ms: program
+                        .map(|o| o.age.as_millis().try_into().unwrap_or(u64::MAX)),
+                }
             })
             .collect();
         let hosted: Vec<_> = self.hosted_lock().values().map(Arc::clone).collect();
@@ -718,6 +735,8 @@ fn hosted_summary(handle: &SessionHandle) -> SessionSummary {
         human_idle: None,
         mouse_tracking: false,
         unavailable: false,
+        program_status: None,
+        program_status_age_ms: None,
     };
     let Ok(observation) = handle.inspect() else {
         summary.unavailable = true;
@@ -731,6 +750,8 @@ fn hosted_summary(handle: &SessionHandle) -> SessionSummary {
     summary.attached = observation.attached;
     summary.human_idle = observation.human_idle;
     summary.mouse_tracking = observation.mouse.mode != crate::agent::MouseMode::default();
+    summary.program_status = observation.program_status;
+    summary.program_status_age_ms = observation.program_status_age_ms;
     summary
 }
 

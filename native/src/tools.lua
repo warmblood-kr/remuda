@@ -2283,6 +2283,32 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
     end
   end
   local lines = {}
+  -- Extensions may add typed presentation fields, never arbitrary rows or
+  -- executable snippets. Keep the core list complete when an extension fails.
+  local function session_decoration(session)
+    if type(remuda.session_list_decorate) ~= "function" then return nil end
+    local ok, value = pcall(remuda.session_list_decorate, session)
+    if not ok or type(value) ~= "table" then return nil end
+    local function text_field(key, limit)
+      local field = value[key]
+      if type(field) ~= "string" then return nil end
+      field = field:gsub("[%z\1-\31\127]", " ")
+      if #field > limit then field = field:sub(1, limit) end
+      return field ~= "" and field or nil
+    end
+    local activity = value.activity
+    if activity ~= "working" and activity ~= "idle" and activity ~= "other" and activity ~= "needs you" then
+      activity = nil
+    end
+    local layout = value.layout
+    if layout ~= "stacked" and layout ~= "compact" then layout = nil end
+    return {
+      agent_kind = text_field("agent_kind", 32),
+      activity = activity,
+      description = text_field("description", 160),
+      layout = layout,
+    }
+  end
   -- One entry is a block of rows laid out at x = 0; nesting moves the whole
   -- block, so no row can keep a position of its own.
   local function place(block, dx)
@@ -2290,17 +2316,42 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
     for i, row in ipairs(block) do block[i] = pad .. row end
     return block
   end
-  local function session_detail(session)
+  local function session_detail(session, decoration)
+    if decoration then
+      local fields = {}
+      if decoration.activity then fields[#fields + 1] = decoration.activity end
+      if decoration.agent_kind then fields[#fields + 1] = decoration.agent_kind end
+      if decoration.description then fields[#fields + 1] = decoration.description end
+      if #fields > 0 then return table.concat(fields, " · ") end
+    end
     if type(remuda.session_detail) ~= "function" then return nil end
-    return remuda.session_detail(session)
+    local ok, detail = pcall(remuda.session_detail, session)
+    if ok and type(detail) == "string" then
+      detail = detail:gsub("[%z\1-\31\127]", " ")
+      if #detail > 256 then detail = detail:sub(1, 256) end
+      return detail ~= "" and detail or nil
+    end
+    return nil
   end
+  -- The native bridge carries one row height for every entry, so a compact
+  -- request is a whole-list choice. Mixed decorations keep the stacked
+  -- layout rather than making row-to-session mapping disagree with itself.
+  local decorations, compact = {}, false
+  for i, item in ipairs(ordered) do
+    decorations[i] = session_decoration(item.session or item)
+    if decorations[i] and decorations[i].layout == "compact" then compact = true end
+  end
+  -- The bridge header is the row height of ONE entry, which the native list
+  -- uses to map pointer/selection rows back to sessions.
+  local rows = compact and 1 or 3
   if #sessions == 0 then
     lines = { "the herd is empty.", "press n to start a session." }
   else
     for i, item in ipairs(ordered) do
       local s = item.session or item
       local depth = item.depth or 0
-      local detail = session_detail(s)
+      local decoration = decorations[i]
+      local detail = session_detail(s, decoration)
       local state_color = s.alive and "\27[32m" or "\27[31m"
       local reset = "\27[0m"
       local base = (i - 1) * 3
@@ -2319,7 +2370,10 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
       local marker = s.attached and " 🏇" or ""
       local parts = {}
       if detail then parts[#parts + 1] = "\27[2m" .. detail .. reset end
-      local block = place({
+      local block = place(compact and {
+        name_style .. s.name .. reset .. " " .. state_color .. dot .. reset .. marker
+          .. (detail and ("  \27[2m" .. detail .. reset) or ""),
+      } or {
         name_style .. s.name .. reset .. " " .. state_color .. dot .. reset .. marker,
         table.concat(parts, "  "),
         "",
@@ -2330,7 +2384,7 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
   -- The private first line is the native bridge contract: Lua selects the
   -- number of rows and all visual treatment, while Rust only maps input and
   -- viewport positions onto those rows.
-  table.insert(lines, 1, "\30" .. tostring(3))
+  table.insert(lines, 1, "\30" .. tostring(rows))
   -- A successful ordering hook adds a second private line for Rust.
   if has_order then
     local names = {}

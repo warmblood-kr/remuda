@@ -4,7 +4,8 @@ use crate::pty::{PtyInputWriter, SharedWriter, PTY_WRITE_TIMEOUT};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use remuda_core::agent::{
     AgentError, AgentProcess, AgentWriter, Cursor, ExitInfo, MouseEncoding, MouseMode, MouseState,
-    OutputSignal, OutputWakeup, Result, Size, StyledCell, VersionedSnapshot,
+    OutputSignal, OutputWakeup, ProgramStatusObservation, Result, Size, StyledCell,
+    VersionedSnapshot,
 };
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -123,14 +124,14 @@ impl HostChild {
         let drained = Arc::new(AtomicU64::new(0));
         let end = Arc::new(AtomicU8::new(0));
         let fault = Arc::new(AtomicBool::new(false));
-        let (queries, replies) = sync_channel::<(u16, u16)>(32);
+        let (queries, replies) = sync_channel::<Vec<u8>>(32);
         let reply_fault = Arc::clone(&fault);
+        let cursor_writer = Arc::clone(&writer);
         std::thread::spawn(move || {
-            while let Ok((row, col)) = replies.recv() {
-                let reply = format!("\x1b[{row};{col}R");
-                let result = writer.lock().map_err(|_| ()).and_then(|mut writer| {
+            while let Ok(reply) = replies.recv() {
+                let result = cursor_writer.lock().map_err(|_| ()).and_then(|mut writer| {
                     writer
-                        .write_all(reply.as_bytes())
+                        .write_all(&reply)
                         .and_then(|()| writer.flush())
                         .map_err(|_| ())
                 });
@@ -190,7 +191,7 @@ struct Reader {
 fn drain(
     mut reader: Box<dyn Read + Send>,
     context: Reader,
-    queries: std::sync::mpsc::SyncSender<(u16, u16)>,
+    queries: std::sync::mpsc::SyncSender<Vec<u8>>,
 ) {
     let mut bytes = [0; 8192];
     loop {
@@ -208,8 +209,11 @@ fn drain(
                         break;
                     };
                     remaining = &remaining[consumed..];
-                    while let Some(query) = terminal.take_query() {
-                        if queries.try_send(query).is_err() {
+                    while let Some((row, col)) = terminal.take_query() {
+                        if queries
+                            .try_send(format!("\x1b[{row};{col}R").into_bytes())
+                            .is_err()
+                        {
                             context.fault.store(true, Ordering::Release);
                         }
                     }
@@ -251,6 +255,13 @@ fn pty_size(size: Size) -> PtySize {
     }
 }
 impl AgentProcess for HostChild {
+    fn program_status(&mut self) -> Option<ProgramStatusObservation> {
+        self.terminal
+            .lock()
+            .ok()
+            .and_then(|terminal| terminal.program_status())
+    }
+
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         self.writer.write_bounded(bytes)
     }
@@ -387,6 +398,25 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+    #[test]
+    fn host_child_exposes_the_terminal_program_status() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.env_clear();
+        command.env("PATH", "/usr/bin:/bin");
+        command.args([
+            "-c",
+            "printf '\\033]7501;state=working:app=codex\\007'; printf 'status-ready\\n'; while IFS= read -r _; do :; done",
+        ]);
+        let mut child = Cleanup(HostChild::spawn(command, Size::new(80, 24)).unwrap());
+        wait_for(&mut child.0, "status-ready");
+        let observed = child.0.program_status().expect("hosted OSC status");
+        assert_eq!(
+            observed.status.state,
+            remuda_core::agent::ProgramState::Working
+        );
+        assert_eq!(observed.status.app.as_deref(), Some("codex"));
+    }
+
     #[test]
     fn isolated_child_computes_input_and_retains_terminal_without_viewers() {
         let mut command = CommandBuilder::new("/bin/sh");
