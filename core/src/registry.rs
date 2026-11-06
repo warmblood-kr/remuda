@@ -1381,6 +1381,7 @@ mod launch_policy_tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // A deterministic pause behind a test-held lock.
     fn the_sessions_guard_is_held_through_launch_policy_insertion() {
         let registry = Arc::new(Registry::new());
         let policy = registry
@@ -1400,12 +1401,9 @@ mod launch_policy_tests {
                 );
             })
         };
-        for _ in 0..1_000_000 {
-            if registry.sessions.try_lock().is_err() {
-                break;
-            }
-            std::thread::yield_now();
-        }
+        // Let the registrar reach the policy insert. It either still holds the
+        // sessions guard (fixed) or dropped it before blocking (old bug).
+        std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(
             registry.sessions.try_lock().is_err(),
             "registration must hold the sessions guard while inserting policy; \
