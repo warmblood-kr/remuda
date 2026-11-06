@@ -183,6 +183,9 @@ impl Drop for Cleanup {
 }
 
 fn launch(binding: PathBuf, cwd: PathBuf, status: Option<PathBuf>) -> Result<ExitCode, String> {
+    // Resolve once, before any binding or spawn: both the server and the TUI
+    // must start the same absolute executable.
+    let opencode = opencode_program()?;
     let nonce = env_value("REMUDA_BUTLER_BINDING_NONCE")?;
     let session = env_value("REMUDA_SESSION_ID")?;
     let cwd = cwd
@@ -207,7 +210,7 @@ fn launch(binding: PathBuf, cwd: PathBuf, status: Option<PathBuf>) -> Result<Exi
         watcher: None,
         manifest: None,
     };
-    cleanup.server = Some(spawn_server(&password)?);
+    cleanup.server = Some(spawn_server(&opencode, &password)?);
     let server_pid = cleanup.server.as_ref().expect("server just stored").id();
     // Fence the owned child BEFORE any blocking startup IO or publication.
     let generation = attach_watch(&mut cleanup, server_pid)?;
@@ -232,7 +235,7 @@ fn launch(binding: PathBuf, cwd: PathBuf, status: Option<PathBuf>) -> Result<Exi
     if let Some(path) = status.as_ref() {
         let _ = fs::write(path, "MODEL:? CTX:? CTXWIN:? CTXPCT:?\n");
     }
-    let code = run_tui(&url, &conversation, &cwd, &password);
+    let code = run_tui(&opencode, &url, &conversation, &cwd, &password);
     drop(cleanup);
     Ok(code)
 }
@@ -244,8 +247,73 @@ fn env_value(name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{name} is required in binding mode"))
 }
 
-fn spawn_server(password: &str) -> Result<Child, String> {
-    let mut command = Command::new("opencode");
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    metadata.is_file()
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+}
+
+fn opencode_file_name() -> &'static str {
+    if cfg!(windows) {
+        "opencode.exe"
+    } else {
+        "opencode"
+    }
+}
+
+/// Resolve `opencode` once: PATH first, then the installer's per-user location.
+fn opencode_program() -> Result<PathBuf, String> {
+    resolve_opencode(
+        remuda_native::find_command::find_on_path("opencode"),
+        home_dir(),
+        &executable_file,
+    )
+}
+
+fn resolve_opencode(
+    found: Result<String, remuda_native::find_command::Refusal>,
+    home: Option<PathBuf>,
+    is_executable: &dyn Fn(&Path) -> bool,
+) -> Result<PathBuf, String> {
+    match found {
+        Ok(path) => Ok(PathBuf::from(path)),
+        Err(
+            remuda_native::find_command::Refusal::NotFound(_)
+            | remuda_native::find_command::Refusal::NoPath,
+        ) => {
+            let fallback = home
+                .filter(|home| home.is_absolute())
+                .map(|home| {
+                    home.join(".opencode")
+                        .join("bin")
+                        .join(opencode_file_name())
+                })
+                .filter(|candidate| candidate.is_absolute() && is_executable(candidate));
+            fallback.ok_or_else(|| {
+                "opencode is not on PATH and $HOME/.opencode/bin/opencode is not executable. \
+                 Next: install OpenCode or add its folder to PATH."
+                    .to_string()
+            })
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn server_command(opencode: &Path, password: &str) -> Command {
+    let mut command = Command::new(opencode);
     command
         .args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
         .stdin(Stdio::null())
@@ -254,6 +322,10 @@ fn spawn_server(password: &str) -> Result<Child, String> {
     configure_auth(&mut command, password);
     remuda_native::child_guard::harden(&mut command);
     command
+}
+
+fn spawn_server(opencode: &Path, password: &str) -> Result<Child, String> {
+    server_command(opencode, password)
         .spawn()
         .map_err(|error| format!("cannot start OpenCode server: {error}"))
 }
@@ -475,8 +547,14 @@ where
     Ok(created)
 }
 
-fn run_tui(url: &str, conversation: &str, cwd: &Path, password: &str) -> ExitCode {
-    let mut command = Command::new("opencode");
+fn tui_command(
+    opencode: &Path,
+    url: &str,
+    conversation: &str,
+    cwd: &Path,
+    password: &str,
+) -> Command {
+    let mut command = Command::new(opencode);
     command
         .arg("--server")
         .arg(url)
@@ -487,7 +565,11 @@ fn run_tui(url: &str, conversation: &str, cwd: &Path, password: &str) -> ExitCod
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     configure_auth(&mut command, password);
-    match command.status() {
+    command
+}
+
+fn run_tui(opencode: &Path, url: &str, conversation: &str, cwd: &Path, password: &str) -> ExitCode {
+    match tui_command(opencode, url, conversation, cwd, password).status() {
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
         Err(error) => {
             eprintln!("remuda: OpenCode TUI: cannot start: {error}");
@@ -696,6 +778,93 @@ fn random_hex(bytes: usize) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remuda_native::find_command::Refusal;
+
+    #[test]
+    fn opencode_resolution_prefers_path_then_the_per_user_install() {
+        let root =
+            std::env::temp_dir().join(format!("remuda-opencode-resolve-{}", std::process::id()));
+        let home = root.join("home");
+        let path_hit = root.join("opt").join("bin").join("opencode");
+        let fallback = home
+            .join(".opencode")
+            .join("bin")
+            .join(opencode_file_name());
+        let both = |candidate: &Path| candidate == path_hit || candidate == fallback;
+        assert_eq!(
+            resolve_opencode(
+                Ok(path_hit.to_string_lossy().into_owned()),
+                Some(home.clone()),
+                &both
+            )
+            .expect("path wins"),
+            path_hit
+        );
+        for missing in [Refusal::NotFound("opencode".into()), Refusal::NoPath] {
+            assert_eq!(
+                resolve_opencode(Err(missing), Some(home.clone()), &both).expect("home fallback"),
+                fallback
+            );
+        }
+        for (found, home) in [
+            (
+                Err(Refusal::NotFound("opencode".into())),
+                Some(home.clone()),
+            ),
+            (Err(Refusal::NotFound("opencode".into())), None),
+            (Err(Refusal::NoPath), None),
+        ] {
+            assert!(
+                resolve_opencode(found, home, &|_| false).is_err(),
+                "no executable"
+            );
+        }
+        // A relative or empty HOME can never produce the claimed absolute
+        // program, even if the predicate would accept its candidate.
+        for home in ["relative-home", ""] {
+            assert!(resolve_opencode(
+                Err(Refusal::NotFound("opencode".into())),
+                Some(PathBuf::from(home)),
+                &|_| true
+            )
+            .is_err());
+        }
+        // Only NotFound/NoPath permit the fallback; a bare-name refusal must
+        // not silently try a different file.
+        let existing = |candidate: &Path| candidate == fallback;
+        assert!(resolve_opencode(Err(Refusal::BareName), Some(home), &existing).is_err());
+    }
+
+    #[test]
+    fn both_commands_start_the_same_absolute_executable() {
+        let root =
+            std::env::temp_dir().join(format!("remuda-opencode-argv-{}", std::process::id()));
+        let executable = root.join("opt").join("bin").join("opencode");
+        let cwd = root.join("cwd");
+        let server = server_command(&executable, "pw");
+        assert_eq!(Path::new(server.get_program()), executable);
+        assert_eq!(
+            server
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["serve", "--hostname", "127.0.0.1", "--port", "0"]
+        );
+        let tui = tui_command(&executable, "http://127.0.0.1:9", "ses_test", &cwd, "pw");
+        assert_eq!(Path::new(tui.get_program()), executable);
+        assert_eq!(
+            tui.get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            [
+                "--server".to_string(),
+                "http://127.0.0.1:9".to_string(),
+                "--session".to_string(),
+                "ses_test".to_string(),
+                cwd.to_string_lossy().into_owned(),
+            ]
+        );
+    }
 
     #[cfg(unix)]
     fn private_test_dir() -> PathBuf {
