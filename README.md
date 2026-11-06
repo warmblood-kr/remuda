@@ -324,10 +324,10 @@ and fail only at runtime. Closing that second axis needs a lint, not a target.
 
 ## Build
 
-CI runs Rust library and binary unit tests on pull requests and merge groups;
-main pushes run all targets, including integration tests. Cross-process Butler,
-hosted and compatibility integration jobs run on main pushes. Architecture,
-security, release and installer gates retain their existing triggers.
+CI runs Rust unit and integration tests on main pushes. Cross-process Butler,
+hosted and compatibility integration jobs also run on main pushes. Pull requests
+and merge groups retain architecture, security and installer policy gates; release
+checks retain their existing triggers. Developers run tests locally before PRs.
 
 ```sh
 cargo test --workspace --all-targets                          # 96 tests
