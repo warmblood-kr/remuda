@@ -168,3 +168,32 @@ fn autostart_after_a_crash_names_the_sessions_it_found() {
         }
     }
 }
+
+/// What an attach that just lost its stream reports: a session still
+/// running, no daemon, or one that ended. Only a host-backed one survives.
+#[test]
+fn an_ended_attach_tells_a_lost_daemon_from_an_ended_session() {
+    use remuda_native::client::{aftermath, Aftermath};
+    for mode in MODES {
+        let mut daemon = Parity::start(mode);
+        sleeper(&daemon);
+        assert_eq!(
+            aftermath(&daemon.socket(), "keeper"),
+            Aftermath::Running,
+            "{mode:?}"
+        );
+        daemon.kill_daemon();
+        assert_eq!(
+            aftermath(&daemon.socket(), "keeper"),
+            Aftermath::NoDaemon,
+            "{mode:?}"
+        );
+        daemon.restart();
+        let expected = match mode {
+            Mode::Hosted => Aftermath::Running,
+            Mode::InProcess => Aftermath::Ended,
+        };
+        assert_eq!(aftermath(&daemon.socket(), "keeper"), expected, "{mode:?}");
+        stop(&daemon, false);
+    }
+}
