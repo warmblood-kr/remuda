@@ -77,6 +77,12 @@ impl Parity {
         let _ = self.daemon.wait();
     }
 
+    /// SIGKILL this daemon, as a crash would; its hosts keep running.
+    pub fn kill_daemon(&mut self) {
+        let _ = self.daemon.kill();
+        let _ = self.daemon.wait();
+    }
+
     fn wait_bound(&self) {
         let deadline = Instant::now() + PATIENCE;
         while remuda_native::ipc::connect(&self.socket()).is_err() {
