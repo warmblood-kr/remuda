@@ -973,6 +973,37 @@ pub fn eval_source(socket: &Path, name: &str, source: &str) -> Result<String, St
     }
 }
 
+/// Parse `remuda.new`'s options table strictly: an invalid or unknown key
+/// must not silently degrade a requested protection to "off".
+fn launch_options(options: Table) -> mlua::Result<bool> {
+    let mut protected = false;
+    for pair in options.pairs::<mlua::Value, mlua::Value>() {
+        let (key, value) = pair?;
+        let Some(key) = key.as_string() else {
+            return Err(mlua::Error::runtime(
+                "session.new option keys must be strings",
+            ));
+        };
+        let key = key.to_str()?;
+        match &*key {
+            "remote_input_disabled" => match value {
+                mlua::Value::Boolean(enabled) => protected = enabled,
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "session.new remote_input_disabled must be a boolean",
+                    ))
+                }
+            },
+            other => {
+                return Err(mlua::Error::runtime(format!(
+                    "unknown session.new option: {other}"
+                )))
+            }
+        }
+    }
+    Ok(protected)
+}
+
 /// Run a script file **in the daemon's image**, never in a fresh `Lua::new()`
 /// here — a script must see the state `-e` and the REPL share. The chunk name
 /// travels with the source so a traceback still names the file.
@@ -1674,15 +1705,10 @@ fn new_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Resu
                 Option<Table>,
             )| {
                 let env = env.map(lua_env_to_wire).transpose()?;
-                let protected = options
-                    .as_ref()
-                    .and_then(|options| {
-                        options
-                            .get::<Option<bool>>("remote_input_disabled")
-                            .ok()
-                            .flatten()
-                    })
-                    .unwrap_or(false);
+                let protected = match options {
+                    Some(options) => launch_options(options)?,
+                    None => false,
+                };
                 match ask(&path, new_request(name, argv, cwd, env, protected))? {
                     Response::SessionStarted { name, instance_id } => Ok((
                         Value::String(lua.create_string(&name)?),

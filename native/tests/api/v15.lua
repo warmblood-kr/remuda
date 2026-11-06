@@ -31,6 +31,13 @@ end
 assert(protected_row and protected_row.remote_input_disabled == true,
   "launch-time protection is visible immediately")
 
+local bad_type = pcall(remuda.session.new, "api-v15-bad", nil, nil, nil,
+  { remote_input_disabled = "yes" })
+assert(bad_type == false, "a non-boolean protection option is refused")
+local bad_key = pcall(remuda.session.new, "api-v15-unknown", nil, nil, nil,
+  { protected = true })
+assert(bad_key == false, "an unknown option key is refused")
+
 remuda.session.close(protected_name)
 remuda.session.close(name)
 print("v15 ok")

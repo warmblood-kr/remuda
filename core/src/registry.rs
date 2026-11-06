@@ -417,9 +417,10 @@ impl Registry {
         let handle = Arc::new(session);
         sessions.insert(handle.name().to_string(), Arc::clone(&handle));
         if remote_input_disabled {
-            let instance = handle.instance_id().to_owned();
-            drop(sessions);
-            self.mutate_remote_input_policy(&instance, true);
+            // Keep the sessions guard held through the policy write: the
+            // documented lock order is sessions -> policy, and releasing here
+            // would let a remote admission observe the new instance first.
+            self.mutate_remote_input_policy(handle.instance_id(), true);
         }
         Ok(handle)
     }
