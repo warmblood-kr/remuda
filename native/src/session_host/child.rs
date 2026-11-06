@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) struct HostChild {
     terminal: Arc<Mutex<Terminal>>,
@@ -144,15 +144,22 @@ impl HostChild {
         });
         let status_writer = Arc::clone(&writer);
         std::thread::spawn(move || {
+            let mut last = Instant::now() - Duration::from_secs(1);
             while let Ok(reply) = status_replies.recv() {
-                // An optional OSC reply failing is degradation, not a
-                // canonical host fault; the cursor lane remains authoritative.
-                let _ = status_writer.lock().map_err(|_| ()).and_then(|mut writer| {
-                    writer
+                // Optional OSC traffic must never block cursor or user input.
+                // Coalesce by age and drop when the writer is busy.
+                if last.elapsed() < Duration::from_millis(100) {
+                    continue;
+                }
+                if let Ok(mut writer) = status_writer.try_lock() {
+                    if writer
                         .write_all(&reply)
                         .and_then(|()| writer.flush())
-                        .map_err(|_| ())
-                });
+                        .is_ok()
+                    {
+                        last = Instant::now();
+                    }
+                }
             }
         });
         let reader = pair.master.try_clone_reader().map_err(io)?;
