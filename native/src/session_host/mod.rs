@@ -46,6 +46,8 @@ mod view_budget;
 mod view_frames;
 mod viewport;
 #[cfg(windows)]
+pub(crate) mod windows;
+#[cfg(windows)]
 #[doc(hidden)]
 pub mod windows_process;
 mod wire;
