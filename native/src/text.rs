@@ -16,7 +16,7 @@ pub fn strip_terminal_controls(text: &str) -> Cow<'_, str> {
     )
 }
 
-fn is_terminal_control(character: char) -> bool {
+pub(crate) fn is_terminal_control(character: char) -> bool {
     character.is_control()
         || matches!(
             character,

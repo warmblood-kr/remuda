@@ -7,8 +7,8 @@
 
 use crate::cluster::{self, NodeState};
 use crate::net::cluster_client::{ClientError, ClusterClient};
-use crate::text::strip_terminal_controls;
-use remuda_core::protocol::{expand_runs, Request, Response, StyledRun};
+use crate::text::{is_terminal_control, strip_terminal_controls};
+use remuda_core::protocol::{Request, Response, StyledRun};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
@@ -90,32 +90,50 @@ pub fn capture(target: &str, session: &str) -> Result<Capture, String> {
     else {
         return Ok(Capture::Local);
     };
-    let private_key = cluster::identity::load_static_private_key()
-        .map_err(|_| "cluster identity is unreadable".to_owned())?;
-    let response = ClusterClient::system()
-        .request(
-            address,
-            &pinned_static_key,
-            &private_key,
-            &Request::CaptureStyled {
-                name: session.to_owned(),
-                scrollback: 0,
-            },
-        )
-        .map_err(|error| remote_error(&fingerprint, error))?;
+    capture_remote(
+        &fingerprint,
+        address,
+        &pinned_static_key,
+        session,
+        |address, pinned, request| {
+            let private_key =
+                cluster::identity::load_static_private_key().map_err(|_| ClientError::Crypto)?;
+            ClusterClient::system().request(address, pinned, &private_key, request)
+        },
+    )
+}
+
+/// The remote half with its transport injected, so the exact request and every
+/// error path can be exercised without a live peer or a local daemon.
+fn capture_remote(
+    fingerprint: &str,
+    address: SocketAddr,
+    pinned_static_key: &[u8],
+    session: &str,
+    send: impl FnOnce(SocketAddr, &[u8], &Request) -> Result<Response, ClientError>,
+) -> Result<Capture, String> {
+    let response = send(
+        address,
+        pinned_static_key,
+        &Request::CaptureStyled {
+            name: session.to_owned(),
+            scrollback: 0,
+        },
+    )
+    .map_err(|error| remote_error(fingerprint, error))?;
     match response {
         Response::StyledScreen { rows, .. } => Ok(Capture::Remote(render_rows(&rows))),
         Response::Error(message) => Err(sanitize(format!(
             "capture on {}: {message}",
-            cluster::node_label(&fingerprint)
+            cluster::node_label(fingerprint)
         ))),
         Response::RemoteControlDisabled => Err(format!(
             "capture on {}: remote control is disabled there",
-            cluster::node_label(&fingerprint)
+            cluster::node_label(fingerprint)
         )),
         _ => Err(format!(
             "capture on {}: peer returned an unexpected response",
-            cluster::node_label(&fingerprint)
+            cluster::node_label(fingerprint)
         )),
     }
 }
@@ -143,34 +161,37 @@ fn remote_error(fingerprint: &str, error: ClientError) -> String {
 /// Row separators are LF; every cell passes the single terminal-control
 /// sanitizer. The result is bounded and marks its own truncation.
 fn render_rows(rows: &[Vec<StyledRun>]) -> String {
-    let mut text = String::new();
-    for (index, row) in rows.iter().enumerate() {
+    // Reserve the marker up front and stop as soon as the bound is reached.
+    // The peer already bounded the frame; this avoids expanding every cell and
+    // building a second full screen just to throw most of it away.
+    let limit = MAX_CAPTURE_BYTES.saturating_sub(TRUNCATION_MARKER.len());
+    let mut text = String::with_capacity(limit);
+    let mut truncated = false;
+    'rows: for (index, row) in rows.iter().enumerate() {
         if index > 0 {
+            if text.len() == limit {
+                truncated = true;
+                break;
+            }
             text.push('\n');
         }
         for run in row {
-            for cell in expand_runs(std::slice::from_ref(run)) {
-                text.push_str(&strip_terminal_controls(&cell.text));
+            for character in run.text.chars() {
+                if is_terminal_control(character) {
+                    continue;
+                }
+                if text.len() + character.len_utf8() > limit {
+                    truncated = true;
+                    break 'rows;
+                }
+                text.push(character);
             }
         }
     }
-    truncate_capture(&text)
-}
-
-/// Bound text by UTF-8 bytes without splitting a code point. The marker is
-/// included in the bound. Text at or under the bound is returned untouched.
-fn truncate_capture(text: &str) -> String {
-    if text.len() <= MAX_CAPTURE_BYTES {
-        return text.to_owned();
+    if truncated {
+        text.push_str(TRUNCATION_MARKER);
     }
-    let marker_bytes = TRUNCATION_MARKER.len();
-    let mut cut = MAX_CAPTURE_BYTES - marker_bytes;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let mut bounded = text[..cut].to_owned();
-    bounded.push_str(TRUNCATION_MARKER);
-    bounded
+    text
 }
 
 fn sanitize(message: String) -> String {
@@ -368,6 +389,62 @@ mod tests {
     }
 
     #[test]
+    fn remote_capture_sends_the_exact_request_and_pinned_key() {
+        let address: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let result = capture_remote(
+            "SHA256:peer",
+            address,
+            b"pinned-key",
+            "agent/slash",
+            |seen_address, seen_key, request| {
+                assert_eq!(seen_address, address);
+                assert_eq!(seen_key, b"pinned-key");
+                match request {
+                    Request::CaptureStyled { name, scrollback } => {
+                        assert_eq!(name, "agent/slash");
+                        assert_eq!(*scrollback, 0);
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                }
+                Ok(Response::StyledScreen {
+                    rows: vec![vec![plain_run("screen")]],
+                    instance_id: Some("instance".into()),
+                    output_version: Some(7),
+                    wrapped: Vec::new(),
+                    scrollback_len: 0,
+                    scrollback_total: 0,
+                    cursor: remuda_core::agent::Cursor {
+                        row: 0,
+                        col: 0,
+                        visible: true,
+                    },
+                })
+            },
+        );
+        assert_eq!(result, Ok(Capture::Remote("screen".into())));
+    }
+
+    #[test]
+    fn remote_capture_errors_are_reported_without_a_local_fallback() {
+        let address: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        for (error, expected) in [
+            (ClientError::Timeout, "unreachable"),
+            (ClientError::Refused(403), "refused"),
+            (ClientError::Crypto, "protocol"),
+            (ClientError::BadResponse, "protocol"),
+        ] {
+            let result = capture_remote("SHA256:peer", address, b"key", "agent", move |_, _, _| {
+                Err(error)
+            });
+            assert!(result.unwrap_err().contains(expected), "{expected}");
+        }
+        let unexpected = capture_remote("SHA256:peer", address, b"key", "agent", |_, _, _| {
+            Ok(Response::Busy)
+        });
+        assert!(unexpected.unwrap_err().contains("unexpected response"));
+    }
+
+    #[test]
     fn rendered_rows_keep_lf_and_drop_control_characters() {
         let rows = vec![
             vec![plain_run("a\u{1b}]0;pwn\u{7}b")],
@@ -377,9 +454,9 @@ mod tests {
     }
 
     #[test]
-    fn truncation_keeps_a_utf8_boundary_and_counts_the_marker() {
-        let text = "é".repeat(MAX_CAPTURE_BYTES);
-        let bounded = truncate_capture(&text);
+    fn streaming_truncation_keeps_a_utf8_boundary_and_counts_the_marker() {
+        let rows = vec![vec![plain_run(&"é".repeat(MAX_CAPTURE_BYTES))]];
+        let bounded = render_rows(&rows);
         assert!(bounded.len() <= MAX_CAPTURE_BYTES);
         assert!(bounded.ends_with(TRUNCATION_MARKER));
         assert!(bounded.is_char_boundary(bounded.len() - TRUNCATION_MARKER.len()));
@@ -389,8 +466,12 @@ mod tests {
     }
 
     #[test]
-    fn text_at_the_bound_is_untouched() {
-        let text = "x".repeat(MAX_CAPTURE_BYTES);
-        assert_eq!(truncate_capture(&text), text);
+    fn streaming_truncation_stops_at_the_exact_bound_and_keeps_empty_rows() {
+        let exact = vec![vec![plain_run(&"x".repeat(MAX_CAPTURE_BYTES))]];
+        assert_eq!(render_rows(&exact).len(), MAX_CAPTURE_BYTES);
+        let over = vec![vec![plain_run(&"x".repeat(MAX_CAPTURE_BYTES + 1))]];
+        assert!(render_rows(&over).ends_with(TRUNCATION_MARKER));
+        let rows = vec![vec![plain_run("a")], Vec::new(), vec![plain_run("b")]];
+        assert_eq!(render_rows(&rows), "a\n\nb");
     }
 }

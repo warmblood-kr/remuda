@@ -209,6 +209,27 @@ fn an_explicit_node_is_never_a_silent_local_fallback() {
         "the error names the empty node: {empty}"
     );
 
+    for node in [serde_json::Value::Null, json!(1), json!({})] {
+        let result = call(&path, "capture", json!({"session": "build", "node": node}));
+        assert_eq!(
+            result["result"]["isError"], true,
+            "a non-string node must be an error: {result}"
+        );
+        assert!(
+            text_of(&result).contains("node"),
+            "the error names the node: {result}"
+        );
+    }
+    let unknown = call(
+        &path,
+        "capture",
+        json!({"session": "build", "node": "missing"}),
+    );
+    assert_eq!(
+        unknown["result"]["isError"], true,
+        "an unknown node must not fall back locally: {unknown}"
+    );
+
     // Remote send is deliberately not enabled before receiver-side pane
     // protection exists; a node argument must not fall back to local input.
     let send = call(
