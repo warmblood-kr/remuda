@@ -1414,7 +1414,7 @@ fn session_remote_input_binding(
                     Request::SetRemoteInputOptOut {
                         name,
                         instance_id,
-                        opted_out: enabled,
+                        opted_out: !enabled,
                     },
                 )? {
                     Response::Ok => Ok((Value::Boolean(true), None)),
@@ -2514,6 +2514,7 @@ fn session_rows(
         row.set("cols", session.size.cols())?;
         row.set("rows", session.size.rows())?;
         row.set("attached", session.attached)?;
+        row.set("remote_input_disabled", session.remote_input_disabled)?;
         row.set(
             "human_idle",
             session
