@@ -438,6 +438,16 @@ const WORDS: &[(&str, &str, &str)] = &[
         "table",
     ),
     (
+        "cluster",
+        "Read-only discovery of this node's cluster membership. It reads the local registry only, never contacts a peer, and exposes no endpoint, key, credential or remote control response.",
+        "table",
+    ),
+    (
+        "cluster.nodes",
+        "List admitted cluster nodes as {id, alias, fingerprint, state, self} tables. id is the deterministic node id, fingerprint is the exact authentication identity for disambiguation, alias is optional display metadata, and self marks this node. Revoked nodes are omitted. Returns nil, 'no_cluster' before init, or nil, 'cluster_state_unreadable' when the local registry cannot be read; it never turns that failure into an empty list.",
+        "cluster.nodes() -> { {id, alias, fingerprint, state, self}, ... } | nil, reason",
+    ),
+    (
         "vfs",
         "Access to the cluster file store at remuda:// URIs. Calls answer from this node's index and cached copies and never wait on the network; put and rm tell peers in the background. Failures return nil and a reason starting with a code: no_cluster, not_found, not_local, bad_uri, wrong_cluster, corrupt, too_large or io.",
         "table",
@@ -568,6 +578,7 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
     table.set("system", crate::credential::bindings(lua)?)?;
     table.set("storage", crate::storage::bindings(lua)?)?;
     table.set("vfs", crate::vfs_lua::bindings(lua)?)?;
+    table.set("cluster", crate::cluster_lua::bindings(lua)?)?;
     crate::db_lua::register(lua, table)?;
     fs_bindings(lua, table)?;
     table.set("_registry", registry)

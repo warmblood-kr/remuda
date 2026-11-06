@@ -194,6 +194,39 @@ fn a_tool_call_moves_a_real_session() {
 }
 
 #[test]
+fn an_explicit_node_is_never_a_silent_local_fallback() {
+    let dir = scratch("node");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    let empty = call(&path, "capture", json!({"session": "build", "node": ""}));
+    assert_eq!(
+        empty["result"]["isError"], true,
+        "an empty node must be an error: {empty}"
+    );
+    assert!(
+        text_of(&empty).contains("must not be empty"),
+        "the error names the empty node: {empty}"
+    );
+
+    // Remote send is deliberately not enabled before receiver-side pane
+    // protection exists; a node argument must not fall back to local input.
+    let send = call(
+        &path,
+        "send",
+        json!({"session": "build", "text": "x", "node": "peer"}),
+    );
+    assert_eq!(
+        send["result"]["isError"], true,
+        "remote send must refuse rather than sending locally: {send}"
+    );
+    assert!(
+        text_of(&send).contains("remote send is not available yet"),
+        "the refusal states the limitation: {send}"
+    );
+}
+
+#[test]
 fn a_refusal_is_an_error_not_an_empty_success() {
     // The shell failure this rules out: `$(remuda -e ...capture...)` is "" and the
     // caller proceeds over a session that was never created. A model does worse
