@@ -107,6 +107,7 @@ impl Owned {
         let exit = self.session.exit_info();
         let ((unsupported_osc, query_overflow), output_eof, backend_fault) = self.view.health()?;
         let (generation, (rows, cols)) = self.view.status()?;
+        let program = self.session.program_status();
         let lifecycle = if backend_fault || (!alive && exit.is_none()) {
             super::api::Lifecycle::Unavailable
         } else if alive {
@@ -134,6 +135,9 @@ impl Owned {
             query_overflow,
             backend_fault,
             active_connections: 0,
+            program_status: program.as_ref().map(|o| Box::new(o.status.clone())),
+            program_status_age_ms: program
+                .map(|o| o.age.as_millis().try_into().unwrap_or(u64::MAX)),
             activity: Some(super::api::Activity {
                 idle_ms: millis(self.session.idle_for()),
                 output_idle_ms: millis(self.session.output_idle_for()),

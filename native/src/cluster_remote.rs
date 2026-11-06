@@ -1303,6 +1303,8 @@ mod tests {
             human_idle: None,
             mouse_tracking: false,
             unavailable: false,
+            program_status: None,
+            program_status_age_ms: None,
         };
         assert!(previous_session(&listed, std::slice::from_ref(&old)).is_none());
         let fresh = unpolled_session_snapshot(listed, None).unwrap();
@@ -1327,6 +1329,8 @@ mod tests {
             human_idle: None,
             mouse_tracking: false,
             unavailable: false,
+            program_status: None,
+            program_status_age_ms: None,
         };
         let retained =
             session_after_poll_error(listed, Some(&prior), io::Error::other("sync failed"))
@@ -1902,6 +1906,8 @@ mod tests {
             human_idle: None,
             mouse_tracking: false,
             unavailable: false,
+            program_status: None,
+            program_status_age_ms: None,
         }
     }
 

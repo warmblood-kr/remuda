@@ -51,6 +51,8 @@ mod tests {
                 human_idle: None,
                 mouse_tracking: false,
                 unavailable: false,
+                program_status: None,
+                program_status_age_ms: None,
             },
             "last output".into(),
             Duration::from_secs(3),

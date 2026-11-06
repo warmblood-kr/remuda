@@ -106,6 +106,12 @@ pub(crate) struct Info {
     /// Optional for older hosts; daemon observations need these Session fields.
     #[serde(default)]
     pub activity: Option<Activity>,
+    /// Additive advisory OSC 7501 report. Older hosts omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_status: Option<Box<remuda_core::agent::ProgramStatus>>,
+    /// Monotonic age at Inspect time; never refreshed by a read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_status_age_ms: Option<u64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

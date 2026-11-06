@@ -2333,13 +2333,24 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
     end
     return nil
   end
+  -- The native bridge carries one row height for every entry, so a compact
+  -- request is a whole-list choice. Mixed decorations keep the stacked
+  -- layout rather than making row-to-session mapping disagree with itself.
+  local decorations, compact = {}, false
+  for i, item in ipairs(ordered) do
+    decorations[i] = session_decoration(item.session or item)
+    if decorations[i] and decorations[i].layout == "compact" then compact = true end
+  end
+  -- The bridge header is the row height of ONE entry, which the native list
+  -- uses to map pointer/selection rows back to sessions.
+  local rows = compact and 1 or 3
   if #sessions == 0 then
     lines = { "the herd is empty.", "press n to start a session." }
   else
     for i, item in ipairs(ordered) do
       local s = item.session or item
       local depth = item.depth or 0
-      local decoration = session_decoration(s)
+      local decoration = decorations[i]
       local detail = session_detail(s, decoration)
       local state_color = s.alive and "\27[32m" or "\27[31m"
       local reset = "\27[0m"
@@ -2359,8 +2370,7 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
       local marker = s.attached and " 🏇" or ""
       local parts = {}
       if detail then parts[#parts + 1] = "\27[2m" .. detail .. reset end
-      local layout = decoration and decoration.layout or "stacked"
-      local block = place(layout == "compact" and {
+      local block = place(compact and {
         name_style .. s.name .. reset .. " " .. state_color .. dot .. reset .. marker
           .. (detail and ("  \27[2m" .. detail .. reset) or ""),
       } or {
@@ -2374,7 +2384,7 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
   -- The private first line is the native bridge contract: Lua selects the
   -- number of rows and all visual treatment, while Rust only maps input and
   -- viewport positions onto those rows.
-  table.insert(lines, 1, "\30" .. tostring(3))
+  table.insert(lines, 1, "\30" .. tostring(rows))
   -- A successful ordering hook adds a second private line for Rust.
   if has_order then
     local names = {}

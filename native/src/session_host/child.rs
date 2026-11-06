@@ -123,14 +123,13 @@ impl HostChild {
         let drained = Arc::new(AtomicU64::new(0));
         let end = Arc::new(AtomicU8::new(0));
         let fault = Arc::new(AtomicBool::new(false));
-        let (queries, replies) = sync_channel::<(u16, u16)>(32);
+        let (queries, replies) = sync_channel::<Vec<u8>>(32);
         let reply_fault = Arc::clone(&fault);
         std::thread::spawn(move || {
-            while let Ok((row, col)) = replies.recv() {
-                let reply = format!("\x1b[{row};{col}R");
+            while let Ok(reply) = replies.recv() {
                 let result = writer.lock().map_err(|_| ()).and_then(|mut writer| {
                     writer
-                        .write_all(reply.as_bytes())
+                        .write_all(&reply)
                         .and_then(|()| writer.flush())
                         .map_err(|_| ())
                 });
@@ -190,7 +189,7 @@ struct Reader {
 fn drain(
     mut reader: Box<dyn Read + Send>,
     context: Reader,
-    queries: std::sync::mpsc::SyncSender<(u16, u16)>,
+    queries: std::sync::mpsc::SyncSender<Vec<u8>>,
 ) {
     let mut bytes = [0; 8192];
     loop {
@@ -208,10 +207,20 @@ fn drain(
                         break;
                     };
                     remaining = &remaining[consumed..];
-                    while let Some(query) = terminal.take_query() {
-                        if queries.try_send(query).is_err() {
+                    while let Some((row, col)) = terminal.take_query() {
+                        if queries
+                            .try_send(format!("\x1b[{row};{col}R").into_bytes())
+                            .is_err()
+                        {
                             context.fault.store(true, Ordering::Release);
                         }
+                    }
+                    if terminal.take_program_query()
+                        && queries
+                            .try_send(crate::program_status::QUERY_REPLY.to_vec())
+                            .is_err()
+                    {
+                        context.fault.store(true, Ordering::Release);
                     }
                     context
                         .version

@@ -8060,6 +8060,8 @@ mod cluster_call_tests {
             human_idle: None,
             mouse_tracking: false,
             unavailable: false,
+            program_status: None,
+            program_status_age_ms: None,
         }]));
         let Response::Sessions(sessions) = sessions else {
             panic!("expected sanitized sessions");
@@ -8625,6 +8627,8 @@ mod tests {
             human_idle: None,
             mouse_tracking: false,
             unavailable: false,
+            program_status: None,
+            program_status_age_ms: None,
         }
     }
 

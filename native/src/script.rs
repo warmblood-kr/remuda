@@ -2447,6 +2447,34 @@ fn host_builds(lua: &Lua, builds: Vec<remuda_core::protocol::HostBuild>) -> mlua
 /// Turn a response into what the script sees. Caution: [`Response::Error`]
 /// raises rather than returning a value — a script that forgot to check one
 /// would otherwise carry on over a session that was never created.
+/// Additive OSC 7501 enrichment. Free text (`title`, `msg`, `id`) is never
+/// exposed; only the bounded typed state and its monotonic age.
+fn set_program_status(
+    lua: &Lua,
+    row: &mlua::Table,
+    status: Option<remuda_core::agent::ProgramStatus>,
+    age_ms: Option<u64>,
+) -> mlua::Result<()> {
+    if let Some(status) = status {
+        let value = lua.create_table()?;
+        value.set("state", status.state.as_str())?;
+        if let Some(app) = status.app {
+            value.set("app", app)?;
+        }
+        if let Some(kind) = status.kind {
+            value.set("kind", kind.as_str())?;
+        }
+        if let Some(progress) = status.progress {
+            value.set("progress", progress)?;
+        }
+        row.set("program_status", value)?;
+    }
+    if let Some(age) = age_ms {
+        row.set("program_status_age", age as f64 / 1000.0)?;
+    }
+    Ok(())
+}
+
 fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
     match response {
         Response::Ok => Ok(Value::Nil),
@@ -2514,6 +2542,12 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
                     session
                         .human_idle
                         .map_or(f64::INFINITY, |idle| idle.as_secs_f64()),
+                )?;
+                set_program_status(
+                    lua,
+                    &row,
+                    session.program_status,
+                    session.program_status_age_ms,
                 )?;
                 rows.set(index + 1, row)?;
             }
@@ -2655,6 +2689,8 @@ mod binding_tests {
                     human_idle: None,
                     mouse_tracking: false,
                     unavailable: false,
+                    program_status: None,
+                    program_status_age_ms: None,
                 }]),
                 other => panic!("unexpected test request: {other:?}"),
             };

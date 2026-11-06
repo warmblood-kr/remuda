@@ -1450,6 +1450,8 @@ mod visual_mode_tests {
                 human_idle: None,
                 mouse_tracking: false,
                 unavailable: false,
+                program_status: None,
+                program_status_age_ms: None,
             }],
             "sh",
             None,
@@ -3997,6 +3999,8 @@ mod keybindings_adopter_tests {
             human_idle: None,
             mouse_tracking: false,
             unavailable: false,
+            program_status: None,
+            program_status_age_ms: None,
         }];
         let mut ui = Ui::new(sessions, "sh", None);
         ui.set_keymap(crate::keybindings::Snapshot::from_json(r#"{"generation":2,"ready":true,"rows":[{"context":"session.list.browse","key":"M-l","action":"session.toggle_list","help":"list"}]}"#).unwrap());
@@ -4056,6 +4060,8 @@ mod composer_tests {
             human_idle: None,
             mouse_tracking: false,
             unavailable: false,
+            program_status: None,
+            program_status_age_ms: None,
         }
     }
 

@@ -16,6 +16,16 @@ notices, set `REMUDA_SUPPRESS_DEPRECATIONS=1` in the daemon's environment when
 the daemon starts; setting it only on a CLI process cannot change the
 environment of a running daemon.
 
+A row from `remuda.session.list()` can carry an additive `program_status`
+table when the child emitted a bounded OSC 7501 Program Status report. It has
+`state` (`idle`, `working`, `blocked`, `done` or `error`), and optional
+`app`, `kind` (`permission`, `question`, `auth`) and `progress` (0-100).
+`program_status_age` is the monotonic age in seconds when the list was copied;
+listing again does not renew it. Free text (`title`, `msg`, `id`) is never
+exposed. The report is advisory: it is not an executable identity, an
+authorization, or proof that the process is alive. A stale report belongs to
+the display layer's freshness policy, not to the stored record.
+
 `remuda.session.new(name?, argv?, cwd?, env?)` and its `remuda.new` alias
 return two values: the chosen session name first, then that launch's
 `instance_id`. Existing single-value assignments still receive the name.

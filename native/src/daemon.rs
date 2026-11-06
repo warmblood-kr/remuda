@@ -4854,6 +4854,8 @@ mod tests {
                 mouse: remuda_core::agent::MouseState::default(),
                 attached: false,
                 closing: false,
+                program_status: None,
+                program_status_age_ms: None,
                 host_build: Some("test-host".into()),
             })
         };

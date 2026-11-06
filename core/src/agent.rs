@@ -403,6 +403,74 @@ pub struct VersionedSnapshot {
     pub instance_id: Option<String>,
 }
 
+/// One state from the Program Status Protocol (OSC 7501).
+///
+/// This is an advisory, program-reported fact. It is not an executable
+/// identity, an authorization, or proof that the process is alive.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProgramState {
+    Idle,
+    Working,
+    Blocked,
+    Done,
+    Error,
+}
+
+impl ProgramState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProgramState::Idle => "idle",
+            ProgramState::Working => "working",
+            ProgramState::Blocked => "blocked",
+            ProgramState::Done => "done",
+            ProgramState::Error => "error",
+        }
+    }
+}
+
+/// What a `blocked` program says it is waiting for. Display only; never an
+/// approval or permission grant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProgramBlockKind {
+    Permission,
+    Question,
+    Auth,
+}
+
+/// The bounded part of an OSC 7501 report that Remuda shares.
+///
+/// Free text (`title`, `msg`, `id`) is deliberately absent: it can contain
+/// prompts, paths or credentials, and base64 is not redaction.
+impl ProgramBlockKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProgramBlockKind::Permission => "permission",
+            ProgramBlockKind::Question => "question",
+            ProgramBlockKind::Auth => "auth",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct ProgramStatus {
+    pub state: ProgramState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ProgramBlockKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
+}
+
+/// A status with the monotonic age of the report that produced it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ProgramStatusObservation {
+    pub status: ProgramStatus,
+    pub age: core::time::Duration,
+}
+
 /// A live agent process: a screen we can read, a keyboard we can type on.
 /// Caution: every method is sync for correctness, not simplicity — awaiting a
 /// body write and its Enter separately lets a second writer land between them.
@@ -435,6 +503,12 @@ pub trait AgentProcess: Send {
 
     fn mouse_state(&mut self) -> MouseState {
         MouseState::default()
+    }
+
+    /// The last Program Status Protocol report (OSC 7501) this backend saw,
+    /// with its monotonic age. Backends without a terminal parser return None.
+    fn program_status(&mut self) -> Option<ProgramStatusObservation> {
+        None
     }
 
     /// The operating-system process ID for a process-backed agent.

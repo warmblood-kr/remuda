@@ -36,6 +36,7 @@ pub mod packages;
 pub mod pending;
 pub mod process;
 mod process_ancestry;
+pub mod program_status;
 pub mod pty;
 #[cfg(unix)]
 pub mod reload;

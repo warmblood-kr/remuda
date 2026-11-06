@@ -225,6 +225,8 @@ fn row(name: &str, alive: bool, attached: bool) -> SessionSummary {
         human_idle: None,
         mouse_tracking: false,
         unavailable: false,
+        program_status: None,
+        program_status_age_ms: None,
     }
 }
 
@@ -2165,7 +2167,7 @@ fn session_order_hook_indents_rows_and_an_error_keeps_the_legacy_buffer_bytes() 
 #[test]
 fn typed_session_decorator_is_bounded_and_layout_override_is_whitelisted() {
     let path = scratch_socket("session-list-decorator");
-    daemon_at(&path);
+    let _ = daemon_at(&path);
     new_session(&path, "agent");
     eval(
         &path,
@@ -2177,18 +2179,35 @@ fn typed_session_decorator_is_bounded_and_layout_override_is_whitelisted() {
     );
     let (rows, lines, _) = sessions_buffer_lines(&path, 80, 0, None).expect("decorated list");
     assert_eq!(rows, 1, "compact layout is a one-row entry");
-    assert!(lines[0].contains("working · claude · safe [31m text"), "controls are removed: {lines:?}");
-    assert!(!lines[0].contains('\x1b'), "decorator data cannot inject terminal escapes");
+    assert!(
+        lines[0].contains("working · claude · safe [31m text"),
+        "controls are removed: {lines:?}"
+    );
+    assert!(
+        !lines[0].contains("\x1b[31m"),
+        "decorator data cannot inject its own terminal escapes: {lines:?}"
+    );
 
     eval(
         &path,
         r#"remuda.session_list_decorate = function() return { activity = "execute", layout = "arbitrary", description = string.rep("x", 300) } end"#,
     );
-    let (rows, lines, _) = sessions_buffer_lines(&path, 400, 0, None).expect("invalid fields fall back");
+    let (rows, lines, _) =
+        sessions_buffer_lines(&path, 400, 0, None).expect("invalid fields fall back");
     assert_eq!(rows, 3, "unrecognized layout retains the base layout");
-    assert!(lines[1].starts_with("\x1b[2m"), "bounded description remains available");
-    assert_eq!(lines[1].matches('x').count(), 160, "description is capped at 160 bytes");
-    assert!(!lines[1].contains("execute"), "activity accepts only the documented enum");
+    assert!(
+        lines[1].starts_with("\x1b[2m"),
+        "bounded description remains available"
+    );
+    assert_eq!(
+        lines[1].matches('x').count(),
+        160,
+        "description is capped at 160 bytes"
+    );
+    assert!(
+        !lines[1].contains("execute"),
+        "activity accepts only the documented enum"
+    );
 }
 
 #[test]

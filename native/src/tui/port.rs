@@ -217,6 +217,8 @@ mod tests {
                     human_idle: None,
                     mouse_tracking: false,
                     unavailable: false,
+                    program_status: None,
+                    program_status_age_ms: None,
                 }]),
                 Request::CaptureStyled { .. } => Response::StyledScreen {
                     rows: vec![remuda_core::protocol::collapse_runs(&[

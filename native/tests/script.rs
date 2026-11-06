@@ -89,6 +89,37 @@ fn listed_instance(path: &Path, name: &str) -> Option<Option<String>> {
 }
 
 #[test]
+fn session_list_exposes_bounded_program_status() {
+    let dir = scratch("program-status-list");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path, &dir);
+    let command: Vec<String> = if cfg!(windows) {
+        vec!["cmd.exe".into(), "/c".into(), "echo off".into()]
+    } else {
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "printf '\\033]7501;state=working:app=codex:msg=c2VjcmV0\\033\\\\'; sleep 5".into(),
+        ]
+    };
+    new_with_instance(&path, "status", command).expect("new status session");
+    let source = r#"
+        for _, row in ipairs(remuda.session.list()) do
+          if row.name == "status" then
+            assert(type(row.program_status) == "table", "status must be present")
+            assert(row.program_status.state == "working", "state is typed")
+            assert(row.program_status.app == "codex", "app is bounded metadata")
+            assert(row.program_status.msg == nil, "free text is never exposed")
+            assert(type(row.program_status_age) == "number", "age is monotonic")
+            return
+          end
+        end
+        error("status session was not listed")
+    "#;
+    script::run_source(&path, "=program-status-list", source).expect("program status in list");
+}
+
+#[test]
 fn new_refuses_a_taken_name_without_an_instance_id() {
     let dir = scratch("new-instance-taken");
     let path = daemon::socket_path_in(&dir, "s");
