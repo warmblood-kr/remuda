@@ -141,12 +141,19 @@ fn explicit_node_reply(id: &Value, name: &str, args: &Value) -> Option<String> {
             Err(error) => Some(ok_reply(id.clone(), tool_error(&error))),
         }
     } else if name == "send" {
-        Some(ok_reply(
-            id.clone(),
-            tool_error(
-                "remote send is not available yet; omit node to send to this node's session",
-            ),
-        ))
+        let text = args.get("text").and_then(Value::as_str).unwrap_or_default();
+        match crate::cluster_api::send(node, session, text) {
+            Ok(crate::cluster_api::Send::Local) => None,
+            Ok(crate::cluster_api::Send::Remote { duplicate }) => Some(ok_reply(
+                id.clone(),
+                tool_text(if duplicate {
+                    "already applied"
+                } else {
+                    "applied"
+                }),
+            )),
+            Err(error) => Some(ok_reply(id.clone(), tool_error(&error))),
+        }
     } else {
         Some(ok_reply(
             id.clone(),
@@ -490,6 +497,7 @@ fn frame() -> Vec<Value> {
                 "properties": {
                     "session": {"type": "string"},
                     "text": {"type": "string", "description": "The line to send."},
+                    "node": {"type": "string", "description": "Cluster node alias, id, or fingerprint. Omit for this node; a node naming this node uses the local path. A peer must prove per-session remote-input policy and the exact live instance."},
                 },
                 "required": ["session", "text"],
             },

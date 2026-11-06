@@ -343,6 +343,10 @@ pub enum Request {
     /// hosts outlive daemons, so builds can differ (#713). Older daemons
     /// answer `bad request`.
     SessionHostBuilds,
+    /// Probe the authenticated per-session remote-input opt-out (#276), as
+    /// [`Response::Ok`]. A daemon older than this variant cannot parse it, so a
+    /// sender refuses instead of assuming its peer enforces the flag.
+    RemoteInputSupport,
     /// Replace this daemon with one started from `binary`, keeping host-backed
     /// sessions (#713). Only `check` runs yet: a report in [`Response::Value`],
     /// or a refusal in [`Response::Error`].

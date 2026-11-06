@@ -1334,16 +1334,6 @@ fn dispatch_payload(
             {
                 return serde_json::to_vec(&response).map_err(io::Error::other);
             }
-            if matches!(request, Request::Input { .. } | Request::InputLine { .. }) {
-                let local_request = remote_dispatch_request(request);
-                let response = crate::client::request_with_timeout(
-                    daemon_path,
-                    &local_request,
-                    LOCAL_DAEMON_REQUEST_TIMEOUT.min(MAX_HELD_REQUEST),
-                )
-                .map_err(|error| io::Error::other(format!("local request failed: {error}")))?;
-                return serde_json::to_vec(&response).map_err(io::Error::other);
-            }
             crate::remote_front::forward_frame_with_timeout(
                 daemon_path,
                 payload,
@@ -1351,43 +1341,6 @@ fn dispatch_payload(
             )
             .map_err(|reason| io::Error::other(format!("local request failed: {reason}")))
         }
-    }
-}
-
-/// Mark an authenticated peer's input as remote before the local daemon sees
-/// it. Local `Input`/`InputLine` (same daemon request from a local client)
-/// stays unprotected, while a peer can never claim the local form.
-fn remote_dispatch_request(request: Request) -> Request {
-    match request {
-        Request::Input {
-            name,
-            instance_id,
-            client_id,
-            seq,
-            bytes,
-        } => Request::RemoteInput {
-            name,
-            instance_id,
-            client_id,
-            seq,
-            bytes,
-            line: false,
-        },
-        Request::InputLine {
-            name,
-            instance_id,
-            client_id,
-            seq,
-            bytes,
-        } => Request::RemoteInput {
-            name,
-            instance_id,
-            client_id,
-            seq,
-            bytes,
-            line: true,
-        },
-        request => request,
     }
 }
 
@@ -1400,16 +1353,6 @@ fn dispatch_payload_with_control_source(
     let request = crate::remote_front::decode_frame(payload)
         .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
     if let Err(response) = authorize_remote_request_with_source(&request, control_source) {
-        return serde_json::to_vec(&response).map_err(io::Error::other);
-    }
-    if matches!(request, Request::Input { .. } | Request::InputLine { .. }) {
-        let local_request = remote_dispatch_request(request);
-        let response = crate::client::request_with_timeout(
-            daemon_path,
-            &local_request,
-            LOCAL_DAEMON_REQUEST_TIMEOUT.min(MAX_HELD_REQUEST),
-        )
-        .map_err(|error| io::Error::other(format!("local request failed: {error}")))?;
         return serde_json::to_vec(&response).map_err(io::Error::other);
     }
     crate::remote_front::forward_frame_with_timeout(
@@ -3347,7 +3290,7 @@ mod tests {
             bytes: b"hello".to_vec(),
         };
         assert_eq!(
-            remote_dispatch_request(input),
+            crate::remote_front::peer_input_request(input),
             Request::RemoteInput {
                 name: "session".into(),
                 instance_id: "instance".into(),
@@ -3365,7 +3308,7 @@ mod tests {
             bytes: b"hello".to_vec(),
         };
         assert_eq!(
-            remote_dispatch_request(line),
+            crate::remote_front::peer_input_request(line),
             Request::RemoteInput {
                 name: "session".into(),
                 instance_id: "instance".into(),

@@ -237,7 +237,11 @@ impl Registry {
         if self.get(name).is_some() {
             let sessions = self.lock();
             let session = sessions.get(name)?;
-            if session.instance_id() != instance_id || !session.is_alive() || session.is_closing() {
+            // The cached bit, not `is_alive`: asking the backend would wait
+            // behind an admitted stalled write, and turning protection on must
+            // not block behind the very act it protects against later.
+            if session.instance_id() != instance_id || !session.is_running() || session.is_closing()
+            {
                 return None;
             }
             return self.mutate_remote_input_policy(instance_id, opted_out);

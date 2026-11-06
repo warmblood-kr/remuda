@@ -125,7 +125,8 @@ A session may additionally opt out of remote Input with a local-only flag:
 session instance, is refused by the remote front, and returns the same typed
 `RemoteControlDisabled` response. Local send, attach and resize are unaffected;
 a reused name or a new instance starts allowed and never inherits the flag.
-`remuda ls` reports `remote_input_disabled`; false means no explicit session
+`remuda ls --json` and Lua `remuda.session.list()` report
+`remote_input_disabled` (the human table does not); false means no explicit session
 opt-out, not that the node's `allow_remote_control` is on or that the session is
 eligible in every backend. A successful hosted setter is remembered for
 listing/cleanup but does not enable hosted remote input in this slice. The flag
@@ -135,6 +136,27 @@ host-backed session can survive that restart, this first slice refuses remote
 Input/InputLine for host-backed sessions entirely; in-process sessions keep the
 default-allowed behavior and the opt-out. This is an explicit limitation of
 the first receiver slice, not a claim of persistent per-session protection.
+
+An MCP `send` with `node` is one line, never a stream. It resolves the peer
+with the same fail-closed rules as capture, probes `RemoteInputSupport` so an
+older peer that cannot parse the opt-out is refused rather than assumed safe,
+pins the exact live `instance_id` from the peer's `List`, and sends
+`InputLine` with a fresh client id and sequence 1. The text is at most 12,288
+UTF-8 bytes and must be nonempty, one line, and free of terminal controls; the
+sender adds no newline because the receiver appends exactly one Return. A
+refusal is final: no local fallback, no name-based retry, no second node, and
+no new client id. `WrongInstance`, `RemoteControlDisabled`, `RateLimited` and
+`Busy` are known not written; `WriteTimeout`, transport/protocol failure after
+the line request, `Uncertain`, and an unexpected or generic peer error are
+reported uncertain and non-retryable because bytes may have been typed. The
+probe and list are separate read-only requests, so their failure is known not
+to have written input. `Ack { duplicate: true }` means the same idempotency
+scope already applied the line; it is not a new turn or a completion proof.
+
+An opted-out session still spends one peer rate token per refused request: the
+listener's pre-dispatch limiter runs before the session policy is checked, and
+the receiver returns `RemoteControlDisabled` after that charge. This is a
+documented cost of the first slice, not a claim that refusals are free.
 
 A batch already in dispatch may still be delivered if the setting changes to
 off while that batch is in flight. A revoke during dispatch may likewise allow

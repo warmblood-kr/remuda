@@ -230,8 +230,14 @@ fn an_explicit_node_is_never_a_silent_local_fallback() {
         "an unknown node must not fall back locally: {unknown}"
     );
 
-    // Remote send is deliberately not enabled before receiver-side pane
-    // protection exists; a node argument must not fall back to local input.
+    // An unknown peer refuses before any local request; a live local session
+    // with the same name must not receive the line instead.
+    let started = call(
+        &path,
+        "new",
+        json!({"name": "build", "command": ["sh", "-c", "read line; printf 'got:%s\\n' \"$line\""]}),
+    );
+    assert_eq!(started["result"]["isError"], false, "{started}");
     let send = call(
         &path,
         "send",
@@ -242,8 +248,13 @@ fn an_explicit_node_is_never_a_silent_local_fallback() {
         "remote send must refuse rather than sending locally: {send}"
     );
     assert!(
-        text_of(&send).contains("remote send is not available yet"),
-        "the refusal states the limitation: {send}"
+        text_of(&send).contains("send on") || text_of(&send).contains("cluster"),
+        "the refusal names the peer path: {send}"
+    );
+    let screen = call(&path, "capture", json!({"session": "build"}));
+    assert!(
+        !text_of(&screen).contains("got:x"),
+        "the refused peer line reached the local session: {screen}"
     );
 }
 

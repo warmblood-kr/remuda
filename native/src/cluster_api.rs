@@ -138,6 +138,214 @@ fn capture_remote(
     }
 }
 
+/// Upper bound for one remote send line. This is the receiver's batch bound,
+/// and it is the text length: the receiver appends the one Return, so a sender
+/// that adds its own newline would submit twice.
+pub const MAX_REMOTE_SEND_BYTES: usize = crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES;
+
+/// The result of a remote-aware send.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Send {
+    /// The target names this node; the caller keeps its existing local path.
+    Local,
+    /// The peer accepted the line. `duplicate` means this exact client/sequence
+    /// was already applied; it is not a new turn or a completion guarantee.
+    Remote { duplicate: bool },
+}
+
+/// Send one line to a session on a peer. A refusal is final: this never falls
+/// back to the local daemon, never retries with a new client id, and never
+/// resolves the node again after a request has started.
+pub fn send(target: &str, session: &str, text: &str) -> Result<Send, String> {
+    let ResolvedCall::Remote {
+        fingerprint,
+        address,
+        pinned_static_key,
+    } = resolve(target)?
+    else {
+        return Ok(Send::Local);
+    };
+    validate_send_text(text)?;
+    let private_key = cluster::identity::load_static_private_key()
+        .map_err(|_| "cluster identity is unavailable".to_owned())?;
+    let mut call = |address, pinned: &[u8], request: &Request| {
+        ClusterClient::system().request(address, pinned, &private_key, request)
+    };
+    send_remote(
+        &fingerprint,
+        address,
+        &pinned_static_key,
+        session,
+        text,
+        &mut call,
+    )
+}
+
+/// One line of text, without the terminator the receiver adds. Control
+/// characters are refused rather than stripped, because the line is what the
+/// caller asked to type; silently changing it is worse than saying no.
+fn validate_send_text(text: &str) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("send text must not be empty".into());
+    }
+    if text.len() > MAX_REMOTE_SEND_BYTES {
+        return Err(format!("send text exceeds {MAX_REMOTE_SEND_BYTES} bytes"));
+    }
+    if text.chars().any(is_terminal_control) {
+        return Err("send text must be one line without terminal controls".into());
+    }
+    Ok(())
+}
+
+/// The remote half with its transport injected, so the exact probe, list and
+/// line requests, and every response class, are exercised without a peer.
+fn send_remote(
+    fingerprint: &str,
+    address: SocketAddr,
+    pinned_static_key: &[u8],
+    session: &str,
+    text: &str,
+    call: &mut impl FnMut(SocketAddr, &[u8], &Request) -> Result<Response, ClientError>,
+) -> Result<Send, String> {
+    let label = cluster::node_label(fingerprint);
+    match call(address, pinned_static_key, &Request::RemoteInputSupport)
+        .map_err(|error| preflight_error(fingerprint, error))?
+    {
+        Response::Ok => {}
+        Response::Error(reason) => {
+            return Err(sanitize(format!(
+                "send on {label}: the peer does not enforce per-session remote input ({reason})"
+            )))
+        }
+        _ => {
+            return Err(refused(
+                &label,
+                "the peer did not confirm session remote input",
+            ))
+        }
+    }
+    let instance = match call(address, pinned_static_key, &Request::List)
+        .map_err(|error| preflight_error(fingerprint, error))?
+    {
+        Response::Sessions(rows) => {
+            pinned_instance(&rows, session).map_err(|error| refused(&label, &error))?
+        }
+        _ => {
+            return Err(refused(
+                &label,
+                "the peer returned an unexpected session list",
+            ))
+        }
+    };
+    let client_id = new_client_id()?;
+    let request = Request::InputLine {
+        name: session.to_owned(),
+        instance_id: instance,
+        client_id,
+        seq: 1,
+        bytes: text.as_bytes().to_vec(),
+    };
+    match call(address, pinned_static_key, &request) {
+        Err(error) => Err(send_transport_error(fingerprint, error)),
+        Ok(Response::Ack { duplicate: false }) => Ok(Send::Remote { duplicate: false }),
+        Ok(Response::Ack { duplicate: true }) => Ok(Send::Remote { duplicate: true }),
+        Ok(Response::WrongInstance) => Err(refused(
+            &label,
+            "the target session instance changed; not sent",
+        )),
+        Ok(Response::RemoteControlDisabled) => Err(refused(
+            &label,
+            "the target session has remote input disabled",
+        )),
+        Ok(Response::RateLimited) => Err(known_not_written(
+            &label,
+            "session input rate limit exceeded",
+        )),
+        Ok(Response::Busy) => Err(known_not_written(&label, "another write is in flight")),
+        Ok(Response::Uncertain) => Err(uncertain(&label, "the peer could not confirm the line")),
+        Ok(Response::WriteTimeout) => Err(uncertain(
+            &label,
+            "the PTY write timed out; delivery may be partial or late",
+        )),
+        Ok(Response::Error(reason)) => Err(uncertain(
+            &label,
+            &sanitize(format!("the peer reported {reason} after the request")),
+        )),
+        Ok(_) => Err(uncertain(
+            &label,
+            "the peer returned an unexpected response",
+        )),
+    }
+}
+
+/// Pick exactly one live, available session row and its exact instance. The
+/// local flag is checked here to avoid spending a rate token on a request the
+/// receiver would refuse; the receiver's check remains the safety boundary.
+fn pinned_instance(rows: &[remuda_core::SessionSummary], session: &str) -> Result<String, String> {
+    let mut matching = rows.iter().filter(|row| row.name == session);
+    let Some(row) = matching.next() else {
+        return Err("no such session on the peer".into());
+    };
+    if matching.next().is_some() {
+        return Err("the peer listed more than one session with that name".into());
+    }
+    if !row.alive {
+        return Err("the target session is not alive".into());
+    }
+    if row.unavailable {
+        return Err("the target session is unavailable on its host".into());
+    }
+    if row.remote_input_disabled {
+        return Err("the target session has remote input disabled".into());
+    }
+    row.instance_id
+        .clone()
+        .filter(|instance| !instance.is_empty())
+        .ok_or_else(|| "the peer cannot prove the target instance".to_owned())
+}
+
+fn new_client_id() -> Result<String, String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|_| "randomness unavailable".to_owned())?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// A failed probe or list cannot have written input, so it is reported as not
+/// sent rather than uncertain. Only the line request itself can be uncertain.
+fn preflight_error(fingerprint: &str, error: ClientError) -> String {
+    let label = cluster::node_label(fingerprint);
+    format!("send on {label}: not sent: {error}")
+}
+
+fn send_transport_error(fingerprint: &str, error: ClientError) -> String {
+    let label = cluster::node_label(fingerprint);
+    let not_written = matches!(
+        error,
+        ClientError::Unreachable
+            | ClientError::PeerNotListening
+            | ClientError::OsBlockedConnection
+            | ClientError::Refused(_)
+            | ClientError::PeerTooNew
+            | ClientError::RequestTooLarge
+    );
+    if not_written {
+        return uncertain(&label, &format!("the peer refused before input; {error}"));
+    }
+    uncertain(&label, &format!("{error}"))
+}
+
+fn refused(label: &str, reason: &str) -> String {
+    format!("send on {label}: {reason}; not sent")
+}
+
+fn known_not_written(label: &str, reason: &str) -> String {
+    format!("send on {label}: not written: {reason}")
+}
+
+fn uncertain(label: &str, reason: &str) -> String {
+    format!("send on {label}: uncertain, not retried: {reason}")
+}
+
 fn remote_error(fingerprint: &str, error: ClientError) -> String {
     let code = match error {
         ClientError::Unreachable
@@ -245,6 +453,7 @@ fn resolve_name(
 mod tests {
     use super::*;
     use crate::cluster::registry::AuthorizedNode;
+    use std::time::Duration;
 
     fn entry(fingerprint: &str, state: NodeState) -> AuthorizedNode {
         AuthorizedNode {
@@ -479,5 +688,258 @@ mod tests {
         assert!(render_rows(&over).ends_with(TRUNCATION_MARKER));
         let rows = vec![vec![plain_run("a")], Vec::new(), vec![plain_run("b")]];
         assert_eq!(render_rows(&rows), "a\n\nb");
+    }
+
+    fn summary(name: &str, instance: Option<&str>) -> remuda_core::SessionSummary {
+        remuda_core::SessionSummary {
+            id: format!("id-{name}"),
+            name: name.to_owned(),
+            instance_id: instance.map(str::to_owned),
+            output_version: Some(1),
+            alive: true,
+            idle: Duration::ZERO,
+            output_idle: Some(Duration::ZERO),
+            size: remuda_core::Size::new(80, 24),
+            attached: false,
+            human_idle: None,
+            mouse_tracking: false,
+            unavailable: false,
+            program_status: None,
+            program_status_age_ms: None,
+            remote_input_disabled: false,
+        }
+    }
+
+    fn list(rows: Vec<remuda_core::SessionSummary>) -> Response {
+        Response::Sessions(rows)
+    }
+
+    #[test]
+    fn remote_send_probes_lists_and_sends_one_exact_line() {
+        let address: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let mut seen = Vec::new();
+        let result = send_remote(
+            "SHA256:peer",
+            address,
+            b"pinned-key",
+            "agent/slash",
+            "hello",
+            &mut |seen_address, seen_key, request| {
+                assert_eq!(seen_address, address);
+                assert_eq!(seen_key, b"pinned-key");
+                seen.push(request.clone());
+                match request {
+                    Request::RemoteInputSupport => Ok(Response::Ok),
+                    Request::List => Ok(list(vec![
+                        summary("other", Some("x")),
+                        summary("agent/slash", Some("instance")),
+                    ])),
+                    Request::InputLine {
+                        name,
+                        instance_id,
+                        client_id,
+                        seq,
+                        bytes,
+                    } => {
+                        assert_eq!(name, "agent/slash");
+                        assert_eq!(instance_id, "instance");
+                        assert_eq!(*seq, 1);
+                        assert_eq!(client_id.len(), 32);
+                        assert!(client_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                        assert_eq!(bytes, b"hello", "the sender adds no Return");
+                        Ok(Response::Ack { duplicate: false })
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                }
+            },
+        );
+        assert_eq!(result, Ok(Send::Remote { duplicate: false }));
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn remote_send_refuses_an_unproven_peer_before_listing() {
+        let mut calls = 0;
+        let result = send_remote(
+            "SHA256:old",
+            "127.0.0.1:9".parse().unwrap(),
+            b"key",
+            "agent",
+            "x",
+            &mut |_, _, _| {
+                calls += 1;
+                Ok(Response::Error("invalid remote request".into()))
+            },
+        );
+        let error = result.expect_err("old peer refused");
+        assert!(error.contains("does not enforce per-session"), "{error:?}");
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn remote_send_refuses_rows_it_cannot_pin_and_never_writes() {
+        let cases = [
+            (Vec::new(), "no such session"),
+            (vec![summary("agent", None)], "cannot prove"),
+            (
+                {
+                    let mut row = summary("agent", Some("instance"));
+                    row.alive = false;
+                    vec![row]
+                },
+                "not alive",
+            ),
+            (
+                {
+                    let mut row = summary("agent", Some("instance"));
+                    row.unavailable = true;
+                    vec![row]
+                },
+                "unavailable",
+            ),
+            (
+                {
+                    let mut row = summary("agent", Some("instance"));
+                    row.remote_input_disabled = true;
+                    vec![row]
+                },
+                "disabled",
+            ),
+            (
+                vec![summary("agent", Some("one")), summary("agent", Some("two"))],
+                "more than one",
+            ),
+        ];
+        for (rows, needle) in cases {
+            let mut line_calls = 0;
+            let result = send_remote(
+                "SHA256:peer",
+                "127.0.0.1:9".parse().unwrap(),
+                b"key",
+                "agent",
+                "x",
+                &mut |_, _, request| match request {
+                    Request::RemoteInputSupport => Ok(Response::Ok),
+                    Request::List => Ok(list(rows.clone())),
+                    _ => {
+                        line_calls += 1;
+                        Ok(Response::Ack { duplicate: false })
+                    }
+                },
+            );
+            let error = result.expect_err("must refuse");
+            assert!(error.contains(needle), "{needle}: {error:?}");
+            assert_eq!(line_calls, 0, "no line request for {needle}");
+        }
+    }
+
+    #[test]
+    fn remote_send_classifies_every_answer() {
+        let address: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let answer = |response: Response| {
+            send_remote(
+                "SHA256:peer",
+                address,
+                b"key",
+                "agent",
+                "x",
+                &mut |_, _, request| match request {
+                    Request::RemoteInputSupport => Ok(Response::Ok),
+                    Request::List => Ok(list(vec![summary("agent", Some("instance"))])),
+                    _ => Ok(response.clone()),
+                },
+            )
+        };
+        assert_eq!(
+            answer(Response::Ack { duplicate: false }),
+            Ok(Send::Remote { duplicate: false })
+        );
+        assert_eq!(
+            answer(Response::Ack { duplicate: true }),
+            Ok(Send::Remote { duplicate: true })
+        );
+        for (response, needle) in [
+            (Response::WrongInstance, "instance changed"),
+            (Response::RemoteControlDisabled, "remote input disabled"),
+            (Response::RateLimited, "rate limit"),
+            (Response::Busy, "in flight"),
+            (Response::Uncertain, "uncertain"),
+            (Response::WriteTimeout, "uncertain"),
+            (Response::Error("no such session".into()), "uncertain"),
+            (Response::Ok, "unexpected"),
+        ] {
+            let error = answer(response).unwrap_err();
+            assert!(error.contains(needle), "{error} does not contain {needle}");
+        }
+        let rate = answer(Response::RateLimited).unwrap_err();
+        assert!(rate.contains("not written"));
+        let timeout = answer(Response::WriteTimeout).unwrap_err();
+        assert!(timeout.contains("not retried"));
+    }
+
+    #[test]
+    fn remote_send_transport_errors_are_never_a_local_retry() {
+        let address: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        for error in [
+            ClientError::Unreachable,
+            ClientError::PeerNotListening,
+            ClientError::Timeout,
+            ClientError::PeerClosedConnection,
+            ClientError::Crypto,
+            ClientError::BadResponse,
+        ] {
+            let needle = "not sent";
+            let result = send_remote(
+                "SHA256:peer",
+                address,
+                b"key",
+                "agent",
+                "x",
+                &mut |_, _, request| match request {
+                    Request::RemoteInputSupport => Err(error),
+                    _ => panic!("must not continue after a failed probe"),
+                },
+            );
+            let error = result.expect_err("must refuse");
+            assert!(error.contains(needle), "{needle}: {error:?}");
+        }
+        // A line failure after a good probe is uncertain, never a second request.
+        for (error, needle) in [
+            (ClientError::Timeout, "uncertain"),
+            (ClientError::PeerClosedConnection, "uncertain"),
+            (ClientError::Crypto, "uncertain"),
+        ] {
+            let mut line_calls = 0;
+            let result = send_remote(
+                "SHA256:peer",
+                address,
+                b"key",
+                "agent",
+                "x",
+                &mut |_, _, request| match request {
+                    Request::RemoteInputSupport => Ok(Response::Ok),
+                    Request::List => Ok(list(vec![summary("agent", Some("instance"))])),
+                    _ => {
+                        line_calls += 1;
+                        Err(error)
+                    }
+                },
+            );
+            let error = result.expect_err("must refuse");
+            assert!(error.contains(needle), "{needle}: {error:?}");
+            assert_eq!(line_calls, 1);
+        }
+    }
+
+    #[test]
+    fn remote_send_text_is_one_bounded_line() {
+        assert!(validate_send_text("").is_err());
+        assert!(validate_send_text("a\nb").is_err());
+        assert!(validate_send_text("a\rb").is_err());
+        assert!(validate_send_text("a\u{1b}b").is_err());
+        assert!(validate_send_text("a\u{9b}b").is_err());
+        assert!(validate_send_text(&"x".repeat(MAX_REMOTE_SEND_BYTES)).is_ok());
+        assert!(validate_send_text(&"x".repeat(MAX_REMOTE_SEND_BYTES + 1)).is_err());
+        assert!(validate_send_text("한 line").is_ok());
     }
 }

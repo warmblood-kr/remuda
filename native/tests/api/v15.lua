@@ -1,5 +1,5 @@
 -- Local remote-input opt-out: enabled=false disables, enabled=true enables.
-local name, instance = remuda.session.new("api-v15", { "sh" })
+local name, instance = remuda.session.new("api-v15")
 assert(type(name) == "string" and name ~= "", "session name")
 assert(type(instance) == "string" and instance ~= "", "session instance")
 

@@ -2160,6 +2160,7 @@ fn handle_request(
         }
 
         Request::Version => reply(&stream, &Response::Value(crate::dist::BUILD_VERSION.into())),
+        Request::RemoteInputSupport => reply(&stream, &Response::Ok),
         Request::SocketPublication => reply(&stream, &Response::Value(socket_publication())),
         Request::SessionHostBuilds => reply(
             &stream,
