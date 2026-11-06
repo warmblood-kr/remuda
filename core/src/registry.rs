@@ -237,7 +237,7 @@ impl Registry {
         if self.get(name).is_some() {
             let sessions = self.lock();
             let session = sessions.get(name)?;
-            if session.instance_id() != instance_id || !session.is_alive() {
+            if session.instance_id() != instance_id || !session.is_alive() || session.is_closing() {
                 return None;
             }
             return self.mutate_remote_input_policy(instance_id, opted_out);
@@ -305,11 +305,15 @@ impl Registry {
     /// persisted across a daemon restart.
     pub fn apply_hosted_remote_input_batch(
         &self,
-        _name: &str,
-        _batch: InputBatch<'_>,
+        name: &str,
+        batch: InputBatch<'_>,
         _line: bool,
         _now: Duration,
     ) -> Option<core::result::Result<InputOutcome, InputError>> {
+        let handle = self.hosted(name)?;
+        if handle.identity().instance != batch.instance_id {
+            return Some(Ok(InputOutcome::WrongInstance));
+        }
         Some(Err(InputError::RemoteInputDisabled))
     }
 
@@ -725,7 +729,9 @@ impl Registry {
             })
             .collect();
         for (name, _, _, _, _) in &dead {
-            sessions.remove(name);
+            if let Some(session) = sessions.remove(name) {
+                self.forget_remote_input_policy(session.instance_id());
+            }
         }
         drop(sessions);
         dead.into_iter()
@@ -767,6 +773,7 @@ impl Registry {
                     return None;
                 }
                 hosted.remove(&identity.name);
+                self.forget_remote_input_policy(&identity.instance);
                 let closed = self.closing_hosted_lock().remove(&identity.instance);
                 let reason = if closing || closed {
                     "closed"
@@ -1107,7 +1114,11 @@ impl Registry {
             session.clear_closing();
             return Some(Err(error));
         }
-        Some(Ok(sessions.remove(name).is_some()))
+        let removed = sessions.remove(name);
+        if let Some(session) = &removed {
+            self.forget_remote_input_policy(session.instance_id());
+        }
+        Some(Ok(removed.is_some()))
     }
 
     /// End a host-backed child, then stop tracking that exact handle. Host
@@ -1141,6 +1152,7 @@ impl Registry {
             hosted.remove(name);
             drop(hosted);
             self.forget_hosted_input(&handle);
+            self.forget_remote_input_policy(&handle.identity().instance);
         }
         // Lock order: `hosted`, then `closing_hosted`, as in the reaper.
         self.closing_hosted_lock()

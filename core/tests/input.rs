@@ -582,6 +582,10 @@ fn remote_input_opt_out_does_not_follow_a_reused_name() {
         Some(())
     );
     registry.remove("input-test");
+    assert!(
+        !registry.remote_input_disabled(&instance),
+        "removal prunes the exact-instance policy"
+    );
     let replacement = registry
         .register(input_session(Arc::new(Mutex::new(Vec::new())), true))
         .expect("replacement");
