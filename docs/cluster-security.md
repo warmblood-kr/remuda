@@ -126,10 +126,11 @@ session instance, is refused by the remote front, and returns the same typed
 `RemoteControlDisabled` response. Local send, attach and resize are unaffected;
 a reused name or a new instance starts allowed and never inherits the flag.
 `remuda ls` reports `remote_input_disabled`. The flag lives in the daemon
-registry, not in a durable file: a daemon restart forgets it, and a host-backed
-session that survives a reload must be re-protected by its owner. This is an
-explicit limitation of the first receiver slice, not a claim of persistent
-per-session protection.
+registry, not in a durable file, so a daemon restart forgets it. Because a
+host-backed session can survive that restart, this first slice refuses remote
+Input/InputLine for host-backed sessions entirely; in-process sessions keep the
+default-allowed behavior and the opt-out. This is an explicit limitation of
+the first receiver slice, not a claim of persistent per-session protection.
 
 A batch already in dispatch may still be delivered if the setting changes to
 off while that batch is in flight. A revoke during dispatch may likewise allow

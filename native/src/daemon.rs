@@ -3902,7 +3902,7 @@ fn remote_input(stream: &Stream, registry: &Registry, request: Request) -> std::
         bytes: &bytes,
     };
     let result = registry
-        .apply_remote_input_batch(&name, batch)
+        .apply_remote_input_batch(&name, batch, line)
         .or_else(|| registry.apply_hosted_remote_input_batch(&name, batch, line, input_clock()));
     reply_input_result(stream, &name, result)
 }

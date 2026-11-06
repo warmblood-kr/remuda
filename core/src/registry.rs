@@ -196,15 +196,31 @@ impl Registry {
         &self,
         name: &str,
         batch: InputBatch<'_>,
+        line: bool,
     ) -> Option<core::result::Result<InputOutcome, InputError>> {
-        let session = self.get(name)?;
-        if session.instance_id() != batch.instance_id {
-            return Some(Ok(InputOutcome::WrongInstance));
-        }
-        if self.remote_input_disabled(batch.instance_id) {
+        let (session, disabled) = {
+            let sessions = self.lock();
+            let session = sessions.get(name)?.clone();
+            if session.instance_id() != batch.instance_id {
+                return Some(Ok(InputOutcome::WrongInstance));
+            }
+            let disabled = self
+                .remote_input_policy
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(batch.instance_id)
+                .copied()
+                .unwrap_or(false);
+            (session, disabled)
+        };
+        if disabled {
             return Some(Err(InputError::RemoteInputDisabled));
         }
-        Some(session.apply_input_batch(batch))
+        Some(if line {
+            session.apply_input_line_batch(batch)
+        } else {
+            session.apply_input_batch(batch)
+        })
     }
 
     /// Change the local remote-input policy for one exact session instance.
@@ -218,19 +234,31 @@ impl Registry {
         if instance_id.is_empty() {
             return None;
         }
-        let current = match self.get(name) {
-            Some(session) => (session.instance_id().to_string(), session.is_alive()),
-            None => {
-                let handle = self.hosted(name)?;
-                let running = handle
-                    .inspect()
-                    .is_ok_and(|observation| observation.lifecycle == Lifecycle::Running);
-                (handle.identity().instance.clone(), running)
+        if self.get(name).is_some() {
+            let sessions = self.lock();
+            let session = sessions.get(name)?;
+            if session.instance_id() != instance_id || !session.is_alive() {
+                return None;
             }
-        };
-        if current.0 != instance_id || !current.1 {
+            return self.mutate_remote_input_policy(instance_id, opted_out);
+        }
+        let handle = self.hosted(name)?;
+        if handle.identity().instance != instance_id {
             return None;
         }
+        let observation = handle.inspect().ok()?;
+        if observation.lifecycle != Lifecycle::Running || observation.closing {
+            return None;
+        }
+        let hosted = self.hosted_lock();
+        let current = hosted.get(name)?;
+        if !Arc::ptr_eq(current, &handle) || current.identity().instance != instance_id {
+            return None;
+        }
+        self.mutate_remote_input_policy(instance_id, opted_out)
+    }
+
+    fn mutate_remote_input_policy(&self, instance_id: &str, opted_out: bool) -> Option<()> {
         let mut policy = self
             .remote_input_policy
             .lock()
@@ -241,6 +269,13 @@ impl Registry {
             policy.remove(instance_id);
         }
         Some(())
+    }
+
+    fn forget_remote_input_policy(&self, instance_id: &str) {
+        self.remote_input_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(instance_id);
     }
 
     pub fn remote_input_disabled(&self, instance_id: &str) -> bool {
@@ -266,24 +301,16 @@ impl Registry {
         Some(self.apply_hosted_batch(&handle, batch, line, now))
     }
 
-    /// Host-backed variant of [`Registry::apply_remote_input_batch`]. The
-    /// handle is cloned before the policy check, so no registry lock is held
-    /// across the host write.
+    /// Host-backed remote input is refused in this slice: the policy is not
+    /// persisted across a daemon restart.
     pub fn apply_hosted_remote_input_batch(
         &self,
-        name: &str,
-        batch: InputBatch<'_>,
-        line: bool,
-        now: Duration,
+        _name: &str,
+        _batch: InputBatch<'_>,
+        _line: bool,
+        _now: Duration,
     ) -> Option<core::result::Result<InputOutcome, InputError>> {
-        let handle = self.hosted(name)?;
-        if handle.identity().instance != batch.instance_id {
-            return Some(Ok(InputOutcome::WrongInstance));
-        }
-        if self.remote_input_disabled(batch.instance_id) {
-            return Some(Err(InputError::RemoteInputDisabled));
-        }
-        Some(self.apply_hosted_batch(&handle, batch, line, now))
+        Some(Err(InputError::RemoteInputDisabled))
     }
 
     fn apply_hosted_batch(
@@ -416,6 +443,7 @@ impl Registry {
         let removed = self.hosted_lock().remove(name);
         if let Some(handle) = &removed {
             self.forget_hosted_input(handle);
+            self.forget_remote_input_policy(&handle.identity().instance);
         }
         removed
     }
@@ -659,7 +687,11 @@ impl Registry {
     /// taken keeps working, which is what makes this safe to call on a viewer's
     /// behalf.
     pub fn remove(&self, name: &str) -> Option<Arc<Session>> {
-        self.lock().remove(name)
+        let removed = self.lock().remove(name);
+        if let Some(session) = &removed {
+            self.forget_remote_input_policy(session.instance_id());
+        }
+        removed
     }
 
     /// Drop every session whose process has exited, returning their names.

@@ -498,7 +498,7 @@ fn remote_input_opt_out_refuses_only_remote_input() {
         bytes,
     };
     assert!(matches!(
-        registry.apply_remote_input_batch("input-test", remote(b"a")),
+        registry.apply_remote_input_batch("input-test", remote(b"a"), false),
         Some(Ok(InputOutcome::Ack { duplicate: false }))
     ));
     assert_eq!(
@@ -506,7 +506,7 @@ fn remote_input_opt_out_refuses_only_remote_input() {
         Some(())
     );
     assert!(matches!(
-        registry.apply_remote_input_batch("input-test", remote(b"b")),
+        registry.apply_remote_input_batch("input-test", remote(b"b"), false),
         Some(Err(InputError::RemoteInputDisabled))
     ));
     assert!(registry
@@ -528,6 +528,46 @@ fn remote_input_opt_out_refuses_only_remote_input() {
         registry.set_remote_input_opt_out("input-test", "not-the-instance", false),
         None
     );
+}
+
+#[test]
+fn remote_input_line_adds_exactly_one_return_and_a_duplicate_adds_none() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let registry = Registry::new();
+    let session = registry
+        .register(input_session(Arc::clone(&writes), true))
+        .expect("register");
+    let batch = InputBatch {
+        instance_id: session.instance_id(),
+        client_id: [7; 16],
+        seq: 1,
+        bytes: b"hello",
+    };
+    assert!(matches!(
+        registry.apply_remote_input_batch("input-test", batch, true),
+        Some(Ok(InputOutcome::Ack { duplicate: false }))
+    ));
+    let written: Vec<u8> = writes
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|chunk| chunk.iter().copied())
+        .collect();
+    assert!(
+        written.ends_with(b"hello\r"),
+        "line writes text then one Return: {written:?}"
+    );
+    let again = InputBatch {
+        instance_id: session.instance_id(),
+        client_id: [7; 16],
+        seq: 1,
+        bytes: b"hello",
+    };
+    assert!(matches!(
+        registry.apply_remote_input_batch("input-test", again, true),
+        Some(Ok(InputOutcome::Ack { duplicate: true }))
+    ));
+    assert_eq!(writes.lock().unwrap().len(), 1, "duplicate writes no bytes");
 }
 
 #[test]
