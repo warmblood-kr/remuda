@@ -666,6 +666,93 @@ See [the design notes](design.md#one-registry-for-every-word) for the registry
 model and [the project source](https://github.com/warmblood-kr/remuda) for the
 current implementation.
 
+### Remote UI composition
+
+The cluster tree and whole-node remote session list use a dedicated local Lua
+composer for rows, colors, ordering, panel sizes and split direction. The
+default composer is embedded in the frontend. Customize it in
+`$XDG_CONFIG_HOME/remuda/cluster-ui.lua` (otherwise
+`~/.config/remuda/cluster-ui.lua`; on Windows, Remuda's config storage
+directory). The frontend reads this file once when the UI opens; reopen to
+apply edits. This file is separate from the daemon's `init.lua` and does not
+run inside its `remuda.*` image.
+
+For example, retain the default rows and stack a six-row list above the
+preview when enough body space is available:
+
+```lua
+local builtin = compose
+function compose(model)
+  local document = builtin(model)
+  if model.viewport.body_rows >= 10 then
+    document.layout = {
+      axis = "vertical", list_cells = 6, divider = "─",
+    }
+  end
+  for _, group in ipairs(document.groups) do
+    for _, session in ipairs(group.sessions) do
+      for _, row in ipairs(session.rows) do
+        for _, span in ipairs(row.spans) do
+          if span.field == "status" then
+            span.fg = {index = 14}
+          end
+        end
+      end
+    end
+  end
+  return document
+end
+```
+
+The composer receives a read-only display model: terminal/body dimensions,
+selection tokens, node groups, visible sessions, expansion/filter state and
+operational display facts. Routing identities, wire names, credentials and
+terminal captures stay in Rust. Returned tokens must cover exactly the
+current visible targets, with each session inside its own node group.
+Ordering changes navigation order while actions remain bound to the original
+node and session instance. Display labels never become operation targets.
+
+Lua chooses text spans, indexed/RGB colors and attributes, and a horizontal or
+vertical list/preview split. Rust validates the complete result before use,
+strips terminal controls, clips by display cells and bounds the rectangles to
+available space after notices, queued input and the footer. The same geometry
+drives painting and the selected session's resize viewport. Existing keys mode
+and the list toggle retain control over hiding the list; customization cannot
+change command dispatch, input delivery or remote permissions.
+
+This VM has no filesystem, process, network, module loader or daemon bindings.
+Only restricted Lua libraries and pure text-width/fitting primitives are
+available. Protected calls (`pcall`/`xpcall`) and the native pattern functions
+`string.find`, `match`, `gmatch` and `gsub` are unavailable so custom code cannot
+catch execution-limit failures or keep running inside uninterruptible pattern
+matching. Loading and composing have memory, instruction and output limits.
+Syntax, runtime, budget or schema errors reject the whole custom document and
+use the embedded Lua default with a bounded diagnostic. If the embedded
+composer also fails, the frontend keeps a native emergency roster. Composition
+never evaluates Lua on a peer, and the peer session port still has Lua disabled.
+
+The complete versioned model, grouped row/span schema and safety limits are
+documented in [the composition contract](design-cluster-ui.md). A span color
+is `{index = 0..255}` or `{rgb = {r = 12, g = 34, b = 56}}` with integer channels; attributes
+are booleans. Use canonical status spans for operational facts rather than
+replacing them with arbitrary text.
+
+| Limit | Value |
+| --- | --- |
+| Lua VM memory | 16 MiB |
+| Composition instructions / checked deadline | 50 million / 100 ms |
+| Source-load instructions / checked deadline | 20 million / 250 ms per source |
+| Configuration / output size | 1 MiB each |
+| Rows / spans per row / bytes per text span | 4,096 / 32 / 1,024 |
+| Aggregate decoded spans / tables | 65,536 / 32,768 |
+
+Deadlines are checked by VM hooks and during bounded decoding, rather than
+preempting every native operation. A failed custom attempt may also require a
+default load/composition; these stage budgets are not a strict total frame
+latency guarantee. The 1,000-session fixture verifies complete target coverage;
+its release-build timing is calibration evidence for this default, not a
+guarantee for every terminal or machine.
+
 ### UI key bindings (session list and cluster UI)
 
 The Lua image owns UI declarations and help metadata. The native UI takes one

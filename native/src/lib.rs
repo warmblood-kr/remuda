@@ -14,6 +14,7 @@ pub mod cluster_api;
 mod cluster_lua;
 pub mod cluster_remote;
 pub mod cluster_tui;
+pub mod cluster_ui;
 pub mod cmd_arguments;
 #[doc(hidden)]
 pub mod codex_observer;

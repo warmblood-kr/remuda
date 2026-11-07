@@ -8,6 +8,14 @@ Owner approval #206 fixes the first implementation scope: the `remuda.session` t
 
 ## Inventory and classification
 
+Remote UI composition has a separate frontend vocabulary. The local
+`cluster-ui.lua` composer combines a read-only display snapshot with safe
+cell-width, text-fitting, style and rectangle primitives. Rows, colors,
+ordering and list/preview layout are Lua policy; target validation, terminal
+rendering and remote operations remain native primitives. This environment
+does not extend the daemon's `remuda.*` registry or the peer request surface.
+See [remote UI composition](lua.md) for its contract and configuration.
+
 **Primitive** means a small operation or data word with no higher policy bundled into it. **Composite** means it composes primitive/composite words into a reusable behavior. **Internal mechanism** means runtime state, dispatch, lifecycle, test seam, or implementation helper; it is not a supported caller vocabulary. Existing functions are classified as they behave today, before any promotion.
 
 ### Core Lua surface
