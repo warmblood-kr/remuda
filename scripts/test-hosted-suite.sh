@@ -17,6 +17,10 @@
 # they check behaviour hosted sessions deliberately do not have.
 #
 # Usage: scripts/test-hosted-suite.sh [TEST_NAME_FILTER...]
+#
+# HOSTED_SUITE_TARGET=some_test_file narrows the run to one test target, so a
+# small platform smoke (macOS CI) can pay for one binary instead of all of
+# them. Unset, every test target runs.
 set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -49,8 +53,14 @@ run=$(mktemp -d /tmp/rh.XXXXXX)
 for name in $(sed -e 's/#.*//' "$ROOT/scripts/hosted-suite-known-differences.txt"); do
     set -- "$@" --skip "$name"
 done
+if [ -n "${HOSTED_SUITE_TARGET:-}" ]; then
+    targets="--test $HOSTED_SUITE_TARGET"
+else
+    targets="--tests"
+fi
+# shellcheck disable=SC2086 # targets is one flag plus one plain target name
 TMPDIR="$run" REMUDA_EXPERIMENTAL_SESSION_HOST=1 \
-    cargo test -p remuda-native --tests --no-fail-fast -- "$@"
+    cargo test -p remuda-native $targets --no-fail-fast -- "$@"
 status=$?
 
 leaked=$(hosts_of_run)
