@@ -453,9 +453,8 @@ impl Registry {
         self.register_hosted_with_remote_input_disabled(handle, false)
     }
 
-    /// Track a checked host-backed handle and, in the same critical section,
-    /// its launch-time remote-input opt-out. The sessions and hosted guards
-    /// stay held through the policy write, so no remote admission can observe
+    /// Track a checked host-backed handle and its launch-time remote-input
+    /// opt-out under one critical section, so no remote admission can observe
     /// the new instance first. A refused name writes no policy.
     #[allow(
         clippy::result_large_err,
