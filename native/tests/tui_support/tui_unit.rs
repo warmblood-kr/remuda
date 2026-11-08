@@ -2168,7 +2168,7 @@ fn session_order_hook_indents_rows_and_an_error_keeps_the_legacy_buffer_bytes() 
 #[test]
 fn typed_session_decorator_is_bounded_and_layout_override_is_whitelisted() {
     let path = scratch_socket("session-list-decorator");
-    let _ = daemon_at(&path);
+    let _daemon = daemon_at(&path);
     new_session(&path, "agent");
     eval(
         &path,
