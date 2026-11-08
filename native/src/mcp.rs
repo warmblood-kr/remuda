@@ -28,7 +28,15 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 /// The tools the frame itself serves. Not the whole list — `tools/list` adds
 /// the image's registry to these. A constant so a test can assert both ways:
 /// an undecided addition here and an unserved name each fail.
-pub const TOOLS: [&str; 6] = ["capture", "clear_input", "ls", "new", "run_script", "send"];
+pub const TOOLS: [&str; 7] = [
+    "capture",
+    "clear_input",
+    "ls",
+    "new",
+    "nodes",
+    "run_script",
+    "send",
+];
 
 /// Serve MCP over stdin/stdout until the client closes the stream.
 pub fn serve(socket: &Path) -> std::io::Result<()> {
@@ -177,6 +185,16 @@ fn explicit_node_reply(id: &Value, name: &str, args: &Value) -> Option<String> {
     }
 }
 
+/// `nodes` takes no arguments. An omitted field or `{}` is accepted; any
+/// supplied field is refused before the shared `node` handling can claim it.
+fn nodes_arguments_supplied(args: &Value) -> bool {
+    match args {
+        Value::Null => false,
+        Value::Object(map) => !map.is_empty(),
+        _ => true,
+    }
+}
+
 /// Run one tool call. Caution: a refusal must come back as `isError: true` with
 /// the daemon's own words, never as success with empty content — a model reads
 /// an empty screen as an idle session and narrates a story about it.
@@ -189,6 +207,16 @@ fn call(socket: &Path, id: Value, params: &Value, capability: Option<&str>) -> S
             .unwrap_or_default()
             .to_string()
     };
+
+    if name == "nodes" {
+        if nodes_arguments_supplied(&args) {
+            return ok_reply(id, tool_error("nodes takes no arguments"));
+        }
+        return match crate::cluster::nodes::list() {
+            Ok(text) => ok_reply(id, tool_text(&text)),
+            Err(error) => ok_reply(id, tool_error(error.as_str())),
+        };
+    }
 
     if let Some(reply) = explicit_node_reply(&id, name, &args) {
         return reply;
@@ -438,7 +466,7 @@ fn registered(socket: &Path) -> Vec<Value> {
     }
 }
 
-/// The five the frame serves itself. Order follows `TOOLS`, which is sorted.
+/// The frame's own tools. Order follows `TOOLS`, which is sorted.
 fn frame() -> Vec<Value> {
     vec![
         json!({
@@ -493,6 +521,14 @@ fn frame() -> Vec<Value> {
                     "cwd": {"type": "string"},
                     "env": {"type": "object", "additionalProperties": {"type": "string"}},
                 },
+            },
+        }),
+        json!({
+            "name": "nodes",
+            "description": "List local cluster membership for target discovery. Reads the local identity and registry only; it never opens a socket, probes reachability, or mutates membership. Revoked nodes remain visible but are not routable.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
             },
         }),
         json!({
@@ -598,7 +634,8 @@ fn error_reply(id: Value, code: i32, message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        explicit_node_reply, frame, input_error_message, lua_literal, lua_string, tool_uncertain,
+        explicit_node_reply, frame, input_error_message, lua_literal, lua_string,
+        nodes_arguments_supplied, tool_uncertain,
     };
     use remuda_core::protocol::Response;
     use serde_json::json;
@@ -628,6 +665,30 @@ mod tests {
                 "ls with node must route or fail on resolution, not be rejected: {text}"
             );
         }
+    }
+
+    #[test]
+    fn nodes_descriptor_declares_no_arguments() {
+        let nodes = frame()
+            .into_iter()
+            .find(|tool| tool["name"] == "nodes")
+            .expect("nodes descriptor");
+        assert_eq!(nodes["inputSchema"]["properties"], json!({}));
+        assert!(nodes["inputSchema"].get("required").is_none());
+        assert!(nodes["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("membership"));
+    }
+
+    #[test]
+    fn nodes_argument_check_accepts_only_omitted_or_empty_objects() {
+        assert!(!nodes_arguments_supplied(&json!(null)));
+        assert!(!nodes_arguments_supplied(&json!({})));
+        assert!(nodes_arguments_supplied(&json!({"node": "peer"})));
+        assert!(nodes_arguments_supplied(&json!({"unexpected": true})));
+        assert!(nodes_arguments_supplied(&json!("unexpected")));
     }
 
     #[test]

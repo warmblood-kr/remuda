@@ -40,7 +40,7 @@ the [RST source](lua-reference.rst) is also available to documentation tools.
 The same [Lua extensions page](lua.md) documents the live mod inventory
 exposed by `remuda mod list`.
 
-The same herd is reachable over MCP — `new`, `ls`, `send`, `capture` — so an
+The same herd is reachable over MCP — `new`, `ls`, `nodes`, `send`, `capture` — so an
 agent can drive other agents.
 
 What a running agent can change about its own environment, and which of those

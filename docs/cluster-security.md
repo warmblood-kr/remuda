@@ -183,6 +183,14 @@ bounded to 256 lines and 32 KiB with a `... [list truncated]` marker; an
 instance id that cannot be pinned is reported as `unpinnable=true` and must
 not be used as a send target.
 
+An MCP `nodes` call is local registry discovery only: the same membership state
+as `remuda cluster nodes` plus compatibility defaults for older entries. It
+reads the local identity and registry, never opens a socket, and exposes no
+endpoint text, host, IP, port or scheme — only `endpoint=present|missing`.
+Reachability and offline state are unknown and not asserted; a caller must
+still attempt a bounded read and handle transport failure before routing.
+Revoked nodes remain visible with `state=revoked` and are not routable.
+
 An opted-out session still spends one peer rate token per refused request: the
 listener's pre-dispatch limiter runs before the session policy is checked, and
 the receiver returns `RemoteControlDisabled` after that charge. This is a

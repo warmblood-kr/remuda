@@ -11,6 +11,7 @@ pub mod join_token;
 pub mod leave;
 pub mod listener_config;
 pub mod listener_control;
+pub mod nodes;
 pub mod registry;
 pub mod replication;
 mod sealed;
