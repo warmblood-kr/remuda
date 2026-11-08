@@ -584,9 +584,38 @@ fn error_reply(id: Value, code: i32, message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{input_error_message, lua_literal, lua_string, tool_uncertain};
+    use super::{
+        explicit_node_reply, frame, input_error_message, lua_literal, lua_string, tool_uncertain,
+    };
     use remuda_core::protocol::Response;
     use serde_json::json;
+
+    #[test]
+    fn ls_descriptor_offers_an_optional_node() {
+        let ls = frame()
+            .into_iter()
+            .find(|tool| tool["name"] == "ls")
+            .expect("ls descriptor");
+        assert!(
+            ls["inputSchema"]["properties"]["node"].is_object(),
+            "ls must offer the same optional node as capture/send: {ls}"
+        );
+    }
+
+    #[test]
+    fn ls_node_is_not_rejected_as_capture_only() {
+        let reply = explicit_node_reply(&json!(1), "ls", &json!({"node": "peer"}));
+        if let Some(reply) = reply {
+            let reply: serde_json::Value = serde_json::from_str(&reply).expect("JSON reply");
+            let text = reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                !text.contains("node is only supported by capture"),
+                "ls with node must route or fail on resolution, not be rejected: {text}"
+            );
+        }
+    }
 
     #[test]
     fn an_uncertain_send_is_structured_and_non_retryable() {

@@ -192,6 +192,174 @@ fn listener(server: &Node) -> (Listener, SocketAddr) {
     }
 }
 
+/// One authenticated request the fake peer received.
+struct FakePeer {
+    address: SocketAddr,
+    public: Vec<u8>,
+    task: std::thread::JoinHandle<Vec<remuda_core::protocol::Request>>,
+}
+
+enum FakeAnswer {
+    Reply(remuda_core::protocol::Response),
+    Close,
+}
+
+fn read_http_body(stream: &TcpStream) -> Vec<u8> {
+    use std::io::{BufRead, BufReader, Read};
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut length = 0;
+    loop {
+        let mut line = Vec::new();
+        reader.read_until(b'\n', &mut line).unwrap();
+        if line == b"\r\n" || line == b"\n" {
+            break;
+        }
+        if let Ok(line) = std::str::from_utf8(&line) {
+            if line.to_ascii_lowercase().starts_with("content-length:") {
+                length = line.split_once(':').unwrap().1.trim().parse().unwrap();
+            }
+        }
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    body
+}
+
+fn write_http_body(stream: &mut TcpStream, body: &[u8]) {
+    use std::io::Write;
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .unwrap();
+    stream.write_all(body).unwrap();
+    stream.flush().unwrap();
+}
+
+/// A single-request Noise peer whose exact request and answer the test owns.
+fn fake_peer(
+    answer: impl Fn(&remuda_core::protocol::Request) -> FakeAnswer + Send + 'static,
+) -> FakePeer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+        .generate_keypair()
+        .unwrap();
+    let public = responder.public.clone();
+    let private = responder.private.clone();
+    let task = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let body = read_http_body(&stream);
+        let opened =
+            remuda_native::net::frame::open_request(&private, &body).expect("open request");
+        let request: remuda_core::protocol::Request =
+            serde_json::from_slice(&opened.payload).expect("request JSON");
+        match answer(&request) {
+            FakeAnswer::Reply(response) => {
+                let payload = serde_json::to_vec(&response).unwrap();
+                let sealed =
+                    remuda_native::net::frame::seal_response(opened, &payload).expect("seal");
+                write_http_body(&mut stream, &sealed);
+            }
+            FakeAnswer::Close => drop(stream),
+        }
+        vec![request]
+    });
+    FakePeer {
+        address,
+        public,
+        task,
+    }
+}
+
+fn admit_peer(client: &Node, public: &[u8], address: Option<SocketAddr>) -> String {
+    let fingerprint = encoding::fingerprint(public);
+    let path = client.state.join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry.authorized_nodes.push(AuthorizedNode {
+        node_fp: fingerprint.clone(),
+        static_pubkey: encoding::encode_base64(public),
+        format_major: remuda_native::cluster::registry::REGISTRY_FORMAT_MAJOR,
+        format_minor: remuda_native::cluster::registry::REGISTRY_FORMAT_MINOR,
+        endpoint: address.map(|address| address.to_string()),
+        delivered_by: None,
+        state: NodeState::Admitted,
+        version: 1,
+        by: client.fingerprint(),
+        optional_fields: Default::default(),
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+    fingerprint
+}
+
+fn set_endpoint(client: &Node, fingerprint: &str, address: SocketAddr) {
+    let path = client.state.join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == fingerprint)
+        .expect("peer entry")
+        .endpoint = Some(address.to_string());
+    fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+}
+
+fn mcp_call(node: &Node, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+    use std::io::{BufRead, BufReader, Write};
+    let mut child = node
+        .command()
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    });
+    writeln!(child.stdin.as_mut().unwrap(), "{request}").unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    serde_json::from_str(&line).unwrap_or_else(|error| {
+        panic!("MCP reply is not JSON ({error}): {line}");
+    })
+}
+
+fn mcp_text(reply: &serde_json::Value) -> String {
+    reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn fake_summary(name: &str, instance: Option<&str>) -> remuda_core::SessionSummary {
+    remuda_core::SessionSummary {
+        id: format!("id-{name}"),
+        name: name.to_owned(),
+        instance_id: instance.map(str::to_owned),
+        output_version: Some(1),
+        alive: true,
+        idle: std::time::Duration::from_secs(2),
+        output_idle: Some(std::time::Duration::from_secs(3)),
+        size: remuda_core::Size::new(80, 24),
+        attached: false,
+        human_idle: None,
+        mouse_tracking: false,
+        unavailable: false,
+        program_status: None,
+        program_status_age_ms: None,
+        remote_input_disabled: false,
+    }
+}
+
 fn remote_request(
     peer: &Node,
     server: &Node,
@@ -581,4 +749,285 @@ fn cluster_call_maps_revoked_members_and_unreachable_peers_to_their_exit_codes()
         .output()
         .unwrap();
     assert_eq!(revoked.status.code(), Some(4));
+}
+
+#[test]
+fn cluster_call_uses_the_registry_endpoint_without_addr() {
+    let client = Node::start("endpoint-client");
+    let server = Node::start("endpoint-server");
+    admit_pair(&client, &server);
+    let (_listener, address) = listener(&server);
+    set_endpoint(&client, &server.fingerprint(), address);
+    start_proof_session(&server);
+    let label = remuda_native::cluster::node_label(&server.fingerprint());
+
+    let call = client
+        .command()
+        .args(["cluster", "call", &label, "list"])
+        .output()
+        .unwrap();
+    assert!(
+        call.status.success(),
+        "registry endpoint fallback failed: {call:?}"
+    );
+    let stdout = String::from_utf8_lossy(&call.stdout);
+    assert!(
+        stdout.contains("proof"),
+        "list did not reach the peer: {stdout}"
+    );
+}
+
+#[test]
+fn cluster_call_without_addr_reports_missing_endpoint() {
+    let client = Node::start("no-endpoint-client");
+    let server = Node::start("no-endpoint-server");
+    admit_pair(&client, &server);
+    let label = remuda_native::cluster::node_label(&server.fingerprint());
+
+    let call = client
+        .command()
+        .args(["cluster", "call", &label, "list"])
+        .output()
+        .unwrap();
+    assert_eq!(call.status.code(), Some(2), "{call:?}");
+    let stderr = String::from_utf8_lossy(&call.stderr);
+    assert!(
+        stderr.contains("no registry endpoint"),
+        "missing endpoint must be typed, not a usage error: {stderr}"
+    );
+}
+
+#[test]
+fn cluster_call_without_addr_keeps_typed_failures() {
+    let client = Node::start("typed-client");
+    let server = Node::start("typed-server");
+    admit_pair(&client, &server);
+    let label = remuda_native::cluster::node_label(&server.fingerprint());
+    let run = |target: &str| {
+        client
+            .command()
+            .args(["cluster", "call", target, "list"])
+            .output()
+            .unwrap()
+    };
+
+    let unknown = run("node-missing");
+    assert_eq!(unknown.status.code(), Some(4), "{unknown:?}");
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("no cluster node matches"),
+        "{unknown:?}"
+    );
+
+    for target in [server.fingerprint(), client.fingerprint()] {
+        let assigned = client
+            .command()
+            .args(["cluster", "alias", &target, "twin"])
+            .output()
+            .unwrap();
+        assert!(assigned.status.success(), "alias failed: {assigned:?}");
+    }
+    let ambiguous = run("twin");
+    assert_eq!(ambiguous.status.code(), Some(2), "{ambiguous:?}");
+    assert!(
+        String::from_utf8_lossy(&ambiguous.stderr).contains("ambiguous"),
+        "{ambiguous:?}"
+    );
+
+    let path = client.state.join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server.fingerprint())
+        .unwrap()
+        .state = NodeState::Revoked;
+    fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+    let revoked = run(&label);
+    assert_eq!(revoked.status.code(), Some(4), "{revoked:?}");
+    assert!(
+        String::from_utf8_lossy(&revoked.stderr).contains("revoked"),
+        "{revoked:?}"
+    );
+}
+
+#[test]
+fn cluster_call_refuses_a_local_target_without_listing_it() {
+    let client = Node::start("local-target-client");
+    start_proof_session(&client);
+    let fingerprint = client.fingerprint();
+
+    let call = client
+        .command()
+        .args(["cluster", "call", &fingerprint, "list"])
+        .output()
+        .unwrap();
+    assert_eq!(call.status.code(), Some(2), "{call:?}");
+    let stderr = String::from_utf8_lossy(&call.stderr);
+    assert!(stderr.contains("this node"), "{stderr}");
+    assert!(stderr.contains("no local fallback"), "{stderr}");
+    assert!(
+        !String::from_utf8_lossy(&call.stdout).contains("proof"),
+        "a local target must not list local sessions: {call:?}"
+    );
+}
+
+#[test]
+fn support_probe_reports_supported_without_touching_the_gate() {
+    let client = Node::start("support-client");
+    let peer = fake_peer(|request| match request {
+        remuda_core::protocol::Request::RemoteInputSupport => {
+            FakeAnswer::Reply(remuda_core::protocol::Response::Ok)
+        }
+        other => panic!("support must not send {other:?}"),
+    });
+    let fingerprint = admit_peer(&client, &peer.public, Some(peer.address));
+    let label = remuda_native::cluster::node_label(&fingerprint);
+    let settings = client.state.join("remuda/cluster/settings.json");
+    let before = fs::read(&settings).ok();
+
+    let call = client
+        .command()
+        .args(["cluster", "call", &label, "support"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&call.stdout);
+    assert!(call.status.success(), "support failed: {call:?}");
+    assert!(stdout.contains("supported"), "{stdout}");
+    assert!(stdout.contains("per-session"), "{stdout}");
+    assert_eq!(fs::read(&settings).ok(), before, "support changed settings");
+
+    let requests = peer.task.join().unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "support must be one request: {requests:?}"
+    );
+    assert!(matches!(
+        requests[0],
+        remuda_core::protocol::Request::RemoteInputSupport
+    ));
+}
+
+#[test]
+fn support_probe_classifies_an_old_peer_without_retry() {
+    let client = Node::start("old-client");
+    let peer = fake_peer(|_| {
+        FakeAnswer::Reply(remuda_core::protocol::Response::Error(
+            "invalid remote request".into(),
+        ))
+    });
+    let fingerprint = admit_peer(&client, &peer.public, Some(peer.address));
+    let label = remuda_native::cluster::node_label(&fingerprint);
+
+    let call = client
+        .command()
+        .args(["cluster", "call", &label, "support"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&call.stderr);
+    assert_eq!(call.status.code(), Some(4), "{call:?}");
+    assert!(stderr.contains("old peer"), "{stderr}");
+    assert!(stderr.contains("upgrade"), "{stderr}");
+    assert!(stderr.contains("not written"), "{stderr}");
+
+    let requests = peer.task.join().unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "old peer must not be retried: {requests:?}"
+    );
+}
+
+#[test]
+fn support_probe_classifies_refusal_and_transport() {
+    let client = Node::start("refused-client");
+    let refused =
+        fake_peer(|_| FakeAnswer::Reply(remuda_core::protocol::Response::RemoteControlDisabled));
+    let refused_fp = admit_peer(&client, &refused.public, Some(refused.address));
+    let refused_label = remuda_native::cluster::node_label(&refused_fp);
+    let call = client
+        .command()
+        .args(["cluster", "call", &refused_label, "support"])
+        .output()
+        .unwrap();
+    assert_eq!(call.status.code(), Some(4), "{call:?}");
+    assert!(
+        String::from_utf8_lossy(&call.stderr).contains("refused"),
+        "{call:?}"
+    );
+    assert_eq!(refused.task.join().unwrap().len(), 1);
+
+    let closed = fake_peer(|_| FakeAnswer::Close);
+    let closed_fp = admit_peer(&client, &closed.public, Some(closed.address));
+    let closed_label = remuda_native::cluster::node_label(&closed_fp);
+    let call = client
+        .command()
+        .args(["cluster", "call", &closed_label, "support"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&call.stderr);
+    assert_eq!(call.status.code(), Some(3), "{call:?}");
+    assert!(
+        stderr.contains("closed") || stderr.contains("unreachable"),
+        "{stderr}"
+    );
+    assert_eq!(closed.task.join().unwrap().len(), 1);
+}
+
+#[test]
+fn mcp_ls_with_node_bounds_and_sanitizes_peer_rows() {
+    let client = Node::start("mcp-peer-client");
+    let peer = fake_peer(|request| match request {
+        remuda_core::protocol::Request::List => {
+            let mut rows = vec![
+                fake_summary("evil\tname\u{1b}]0;title\u{7}", Some("inst-1")),
+                fake_summary("bad-instance", Some("bad\u{1b}")),
+            ];
+            for index in 0..300 {
+                rows.push(fake_summary(&format!("s{index:03}"), Some("inst-ok")));
+            }
+            FakeAnswer::Reply(remuda_core::protocol::Response::Sessions(rows))
+        }
+        other => panic!("ls must send List, not {other:?}"),
+    });
+    let fingerprint = admit_peer(&client, &peer.public, Some(peer.address));
+
+    let reply = mcp_call(&client, "ls", serde_json::json!({"node": fingerprint}));
+    let text = mcp_text(&reply);
+    assert!(!text.is_empty(), "peer list was empty: {reply}");
+    assert!(
+        !text.contains('\u{1b}'),
+        "terminal controls leaked: {text:?}"
+    );
+    assert!(text.contains("instance_id=inst-1"), "{text}");
+    assert!(text.contains("unpinnable=true"), "{text}");
+    assert!(text.contains("evil name"), "name was not sanitized: {text}");
+    assert!(text.contains("list truncated"), "row bound missing: {text}");
+    let lines: Vec<_> = text.lines().collect();
+    assert!(lines.len() <= 257, "row bound exceeded: {}", lines.len());
+
+    let requests = peer.task.join().unwrap();
+    assert_eq!(requests.len(), 1, "ls must be one request: {requests:?}");
+}
+
+#[test]
+fn mcp_ls_without_node_is_byte_identical() {
+    let client = Node::start("mcp-local-client");
+    start_proof_session(&client);
+
+    let omitted = mcp_text(&mcp_call(&client, "ls", serde_json::json!({})));
+    assert!(
+        omitted.contains("proof"),
+        "local ls lost the session: {omitted}"
+    );
+    let fingerprint = client.fingerprint();
+    let local_target = mcp_text(&mcp_call(
+        &client,
+        "ls",
+        serde_json::json!({"node": fingerprint}),
+    ));
+    assert_eq!(
+        omitted, local_target,
+        "a node naming this node must use the byte-identical local path"
+    );
 }

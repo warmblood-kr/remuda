@@ -8183,6 +8183,34 @@ mod cluster_call_tests {
         };
         assert_eq!(rows[0][0].text, "screen]0;peer title");
     }
+
+    #[test]
+    fn cluster_call_accepts_an_omitted_address() {
+        let command = parse_cluster_command(&["call", "node-abc", "list"]);
+        assert!(
+            matches!(command, ClusterCommand::Call { .. }),
+            "a registry-endpoint call should parse without --addr: {command:?}"
+        );
+        let usage = super::cluster_usage("call");
+        assert!(
+            usage.contains("[--addr IP[:PORT]]"),
+            "--addr must be optional in the declared usage: {usage}"
+        );
+    }
+
+    #[test]
+    fn cluster_call_accepts_support_action() {
+        let command = parse_cluster_command(&["call", "node-abc", "support"]);
+        assert!(
+            matches!(command, ClusterCommand::Call { .. }),
+            "support should be a call action: {command:?}"
+        );
+        let usage = super::cluster_usage("call");
+        assert!(
+            usage.contains("support"),
+            "support must be declared in the usage: {usage}"
+        );
+    }
 }
 
 #[cfg(test)]
