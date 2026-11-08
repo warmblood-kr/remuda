@@ -4,6 +4,8 @@
 #![allow(dead_code)]
 mod api;
 #[cfg(unix)]
+mod attachment;
+#[cfg(unix)]
 mod birth;
 mod channel;
 #[cfg(unix)]

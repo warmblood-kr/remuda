@@ -4,8 +4,8 @@
 //! the host ledger by its original key, so a lost reply is recovered, never
 //! replayed. Results are retained up to a bound, then retired as Forgotten.
 //! Expected identity and endpoint come only from the private inventory.
-//! The opt-in daemon path (`hosted`) registers it; attach and legacy raw
-//! batches are refused as Unsupported for now.
+//! The opt-in daemon path (`hosted`) registers it; attach is a Human-role
+//! grant (see `attachment`); legacy raw batches are refused as Unsupported.
 use super::api::{Identity as HostIdentity, Lifecycle as HostLifecycle, Request, Response, Role};
 use super::entry::Client;
 use super::inventory::disk::Error as StoreError;
@@ -592,7 +592,7 @@ impl SessionOperations for HostSession {
         let mut client =
             Client::open_observer(&self.endpoint, self.identity.clone()).map_err(opened)?;
         let info = match client.request(&Request::Inspect).map_err(transport)? {
-            Response::Info { info } => info,
+            Response::Info { info } => *info,
             Response::Error { code } => return Err(refused(&code)),
             _ => return Err(Error::Protocol("unexpected host inspect reply")),
         };
@@ -634,6 +634,7 @@ impl SessionOperations for HostSession {
             program_status: info.program_status.map(|status| *status),
             program_status_age_ms: info.program_status_age_ms,
             host_build: Some(info.host_build),
+            attach_generation: info.human.map(|human| human.high_water),
         })
     }
     fn recover(&self, request: &RequestIdentity) -> Result<Recovery> {
@@ -765,7 +766,12 @@ impl SessionOperations for HostSession {
         Ok(Some(wakeup))
     }
     fn attach(&self) -> Result<Box<dyn AttachmentOperations + '_>> {
-        Err(Error::Unavailable(Unavailable::Unsupported))
+        Ok(Box::new(super::attachment::HostAttachment::open(
+            &self.endpoint,
+            self.identity.clone(),
+            SessionOperations::identity(self),
+            Arc::clone(&self.gate),
+        )?))
     }
 }
 /// Fastest and slowest generation polls: fast right after output, backing

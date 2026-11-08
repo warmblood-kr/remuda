@@ -475,7 +475,7 @@ fn retired(response: Response) -> Retire {
 }
 fn info(client: &mut Client) -> Info {
     match client.request(&Request::Inspect).unwrap() {
-        Response::Info { info } => info,
+        Response::Info { info } => *info,
         other => panic!("expected info, got {other:?}"),
     }
 }
