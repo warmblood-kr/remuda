@@ -7226,6 +7226,10 @@ fn sessions_json(sessions: &[SessionSummary]) -> Result<String, serde_json::Erro
     serde_json::to_string_pretty(sessions)
 }
 
+#[cfg(test)]
+#[path = "enrichment_local_contract.rs"]
+mod enrichment_local_contract;
+
 fn session_line(session: &SessionSummary) -> String {
     let state = if session.unavailable {
         "unreachable"

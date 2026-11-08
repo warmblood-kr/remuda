@@ -580,6 +580,15 @@ fn list_remote_error(fingerprint: &str, error: ClientError) -> String {
 }
 
 /// Every peer row: one line each, in the peer's order, bounded by whole lines.
+#[cfg(test)]
+#[path = "enrichment_contract/remote_text.rs"]
+mod enrichment_contract;
+
+#[cfg(test)]
+pub(crate) fn enrichment_contract_remote_text(sessions: &[remuda_core::SessionSummary]) -> String {
+    remote_sessions_text(sessions)
+}
+
 fn remote_sessions_text(sessions: &[remuda_core::SessionSummary]) -> String {
     let mut text = String::new();
     let mut truncated = false;

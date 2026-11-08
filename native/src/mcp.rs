@@ -414,6 +414,10 @@ fn input_error_message(response: &Response) -> &'static str {
     }
 }
 
+#[cfg(test)]
+#[path = "enrichment_contract/mcp_text.rs"]
+mod enrichment_contract;
+
 fn sessions_text(sessions: Vec<remuda_core::SessionSummary>) -> Value {
     let rows: Vec<String> = sessions
         .iter()

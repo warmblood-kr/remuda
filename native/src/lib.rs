@@ -22,6 +22,8 @@ pub mod daemon;
 pub mod db_cli;
 pub(crate) mod db_lua;
 pub mod dist;
+#[cfg(test)]
+mod enrichment_contract;
 pub mod find_command;
 pub(crate) mod fs_atomic;
 pub mod fs_lock;

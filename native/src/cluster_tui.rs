@@ -128,6 +128,10 @@ pub fn cluster_tree_has_sessions(
             .any(|node| !node.sessions.is_empty())
 }
 
+#[cfg(test)]
+#[path = "enrichment_contract/tree.rs"]
+mod enrichment_contract;
+
 pub struct ClusterUi {
     node: String,
     local_targets: Vec<String>,
