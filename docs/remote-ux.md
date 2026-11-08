@@ -79,7 +79,7 @@ remuda run -n dev claude
 
 From an already joined node, run `remuda cluster remote` to open the same Remuda TUI with the cluster tree on the left and selected-session screen on the right. `remuda cluster remote studio/dev` opens that same UI with the target selected. The daemon keeps the session alive when the initiating terminal goes away.
 
-At first open, expand the local/current node and collapse other nodes. Use ↑/↓ to move through the tree, ←/→ to collapse or expand node groups, and Enter to select a session and focus its line composer. Press `k` (`k keys` in the footer) on a live selected session to enter fullscreen keys mode; Ctrl-\\ returns to the tree. The current target is always named `node / session` in the right pane. A terminal snapshot is shown there with its capture age; the line composer remains in the familiar Remuda footer area.
+At first open, expand the local/current node and collapse other nodes. Use ↑/↓ to move through the tree, ←/→ to collapse or expand node groups, and Enter to select a session and focus its line composer. Press `k` on a live selected session to enter fullscreen keys mode; Ctrl-\\ returns to the tree. The footer only advertises `? help`; `?` opens the full key list for every cluster context together with the status-glyph legend. The current target is always named `node / session` in the right pane. A terminal snapshot is shown there with its capture age; the line composer remains in the familiar Remuda footer area.
 
 ### 2. Phone or laptop view on an unstable network
 
@@ -96,16 +96,17 @@ Use the same tree and keyboard model on each platform. Node groups collapse, the
 If one node drops off the VPN, keep its last screen visible and show its reachability and snapshot age in both the tree and right pane. Continue composing text locally. Enter freezes the entire line as a batch; show each pending line until acknowledged. On recovery, resume from the last screen version and retry each batch with its original ID.
 
 ```text
-remuda · cluster (2/3 reachable)
-> ▼ studio       local · reachable · sync 1s
-    dev          live
-  ▶ field-laptop unreachable · last sync 28s
-  ▶ buildbox     reachable · sync 2s
+remuda · cluster (2/3 ok)
+▼ studio          @ · sync 1s
+     dev          @
+ ▶ field-laptop   x
+ ▶ buildbox       @
 ─────────────────────────────────────────────────────────
 field-laptop / dev · stale snapshot · reconnecting
 $ Please check the migration output
 
 Input pending · 1 line · retrying with same batch ID
+? help
 ```
 
 A line stays in the draft until Enter. Once submitted, it remains in the pending queue until the daemon acknowledges it. A timeout retries the exact batch ID and bytes; it never creates a new batch for the same line. If deduplication history cannot prove whether the batch applied, show `delivery uncertain` and do not silently send it again under a new ID.
@@ -128,52 +129,55 @@ After the process exits, retain its selected final screen/status long enough to 
 
 ## Screen states
 
-The same Remuda TUI layout is used in every state: virtual node/session tree on the left, selected screen on the right. Nodes are collapsible groups. Expand the local/current node by default and collapse the rest. Show each node’s reachable/unreachable badge and last-sync age; show session status and pending-input markers on child rows. `/` searches names; optionally `!` filters to sessions needing attention.
+The same Remuda TUI layout is used in every state: virtual node/session tree on the left, selected screen on the right. Nodes are collapsible groups. Expand the local/current node by default and collapse the rest. Every row carries one ASCII status cell (`@` up/live, `~` connecting, `?` stale, `x` unreachable, `!` error, `-` ended) so names and columns never shift, including in CJK terminals. The selected remote node or session keeps its full words, sync age, and reason on a detail line above the footer; sessions add pending input as `+N`. `/` searches names; optionally `!` filters to sessions needing attention. `?` opens the key list and glyph legend.
 
 ### All nodes up
 
 ```text
-remuda · cluster (3/3 reachable)
-> ▼ studio       local · reachable · sync 1s
-    dev          live
-  ▶ field-laptop reachable · sync 2s · 2 sessions
-  ▶ buildbox     reachable · sync 1s · 4 sessions
+remuda · cluster (3/3 ok)
+▼ studio          @ · sync 1s
+>    dev          @
+ ▶ field-laptop   @
+ ▶ buildbox       @
 ──────────────────────────────────────────────────────
 studio / dev · live · snapshot 1s ago
 $ Waiting for test results…
 
-> Type a line; Enter sends · Ctrl-\ list · q detach
+? help
 ```
 
 ### One node unreachable
 
 ```text
-remuda · cluster (2/3 reachable)
-> ▼ studio       local · reachable · sync 1s
-    dev          live
-  ▶ field-laptop unreachable · last sync 28s
-  ▶ buildbox     reachable · sync 2s
+remuda · cluster (2/3 ok)
+▼ studio          @ · sync 1s
+     dev          @
+ ▶ field-laptop   x
+ ▶ buildbox       @
 ──────────────────────────────────────────────────────
 field-laptop / dev · stale snapshot · reconnecting
 $ Waiting for test results…
 
 Node unreachable. Keeping last screen; retrying…
+? help
 ```
 
 ### Stale snapshot while recovering
 
 ```text
-remuda · cluster (2/3 reachable)
-> ▼ studio       local · reachable · sync 1s
-    dev          live
-  ▼ field-laptop reconnecting · last sync 28s
-    dev          stale · pending input 1
-  ▶ buildbox     reachable · sync 2s
+remuda · cluster (2/3 ok)
+▼ studio          @ · sync 1s
+     dev          @
+ ▼ field-laptop   ~
+     dev          @ +1
+ ▶ buildbox       @
 ──────────────────────────────────────────────────────
+· field-laptop/dev · live · reconnecting · last sync 28s ago
 field-laptop / dev · stale · snapshot 28s ago
 $ Waiting for test results…
 
 Input pending · 1 line · retrying with same batch ID
+? help
 ```
 
 ### Ended session
@@ -181,7 +185,8 @@ Input pending · 1 line · retrying with same batch ID
 ```text
 studio / dev · ended · final snapshot 2s ago
 $ Process exited (status 0). Input is disabled.
-x clears ended session · q detaches
+
+Input disabled · ? help
 ```
 
 Other actionable failures name the target and next step: `field-laptop / dev · access denied — ask the cluster operator`; `field-laptop / dev · session not found — check the session name`; `field-laptop · unreachable — check VPN, retrying`; `field-laptop / dev · delivery uncertain — batch <id> may have been applied; do not resend as a new line`.

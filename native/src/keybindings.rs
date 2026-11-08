@@ -25,6 +25,7 @@ fn validate(context: &str, key: &str, action: Option<&str>) -> Result<String, St
             "cluster.left",
             "cluster.right",
             "cluster.select",
+            "cluster.help",
         ],
         "cluster.search" => &[
             "cluster.search.clear",
@@ -34,6 +35,7 @@ fn validate(context: &str, key: &str, action: Option<&str>) -> Result<String, St
             "cluster.left",
             "cluster.right",
             "cluster.select",
+            "cluster.help",
         ],
         "cluster.composer" => &[
             "cluster.composer.submit",
@@ -57,6 +59,16 @@ fn validate(context: &str, key: &str, action: Option<&str>) -> Result<String, St
         "cluster.confirm" => &["cluster.confirm.accept", "cluster.confirm.accept_upper"],
         "cluster.remote.keys" => &["cluster.remote.back"],
         "cluster.runtime" => &["cluster.redraw"],
+        "cluster.help" => &[
+            "cluster.help.close",
+            "cluster.help.escape",
+            "cluster.help.up",
+            "cluster.help.down",
+            "cluster.help.page_up",
+            "cluster.help.page_down",
+            "cluster.help.home",
+            "cluster.help.end",
+        ],
         _ => return Err(format!("unknown key context: {context}")),
     };
     if action.is_some_and(|action| !actions.contains(&action)) {
@@ -294,6 +306,15 @@ impl Snapshot {
             .collect::<Vec<_>>()
             .join("   ")
     }
+    /// Every binding in one context as (displayed key, help), in row order.
+    pub fn help_rows(&self, context: &str) -> Vec<(String, String)> {
+        self.rows
+            .iter()
+            .filter(|row| row.context == context)
+            .map(|row| (key_label(&row.key), row.help.clone()))
+            .collect()
+    }
+
     pub fn display_help(&self, context: &str, actions: &[&str]) -> String {
         self.rows
             .iter()

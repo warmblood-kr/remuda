@@ -94,6 +94,29 @@ pub fn render_badge(badge: Badge) -> &'static str {
     }
 }
 
+/// Single-cell ASCII marker for a remote node. ASCII keeps the status column
+/// fixed in terminals that draw East Asian Ambiguous glyphs two cells wide.
+pub fn status_glyph(state: RemoteState) -> char {
+    match state {
+        RemoteState::Reachable => '@',
+        RemoteState::Stale => '?',
+        RemoteState::Reconnecting => '~',
+        RemoteState::Unreachable => 'x',
+    }
+}
+
+/// Single-cell ASCII marker for a session.
+pub fn session_glyph(alive: bool) -> char {
+    if alive {
+        '@'
+    } else {
+        '-'
+    }
+}
+
+/// A session that reports an error outranks its liveness in the one-cell column.
+pub const ERROR_GLYPH: char = '!';
+
 pub fn cluster_tree_has_sessions(
     local_sessions: &[SessionSummary],
     remote_snapshot: &RemoteSnapshot,
@@ -142,6 +165,9 @@ pub struct ClusterUi {
     resize_in_flight: bool,
     remote_input_in_flight: bool,
     remote_control_disabled: HashSet<String>,
+    // `render` is &self, so the help mode keeps its state in cells.
+    help_open: std::cell::Cell<bool>,
+    help_scroll: std::cell::Cell<usize>,
 }
 
 struct PaneResize {
@@ -219,6 +245,13 @@ enum TreeSelection {
     },
 }
 
+/// A ready-to-render tree row: prefix carries the selection/expander glyphs.
+struct TreeRow {
+    prefix: String,
+    label: String,
+    status: String,
+}
+
 impl ClusterUi {
     pub fn new(node: &str, sessions: Vec<SessionSummary>, synced_at: Duration) -> Self {
         Self::with_sender(
@@ -271,6 +304,8 @@ impl ClusterUi {
             resize_in_flight: false,
             remote_input_in_flight: false,
             remote_control_disabled: HashSet::new(),
+            help_open: std::cell::Cell::new(false),
+            help_scroll: std::cell::Cell::new(0),
         }
     }
 
@@ -699,6 +734,9 @@ impl ClusterUi {
         let (cols, rows) = normalized_terminal_size(cols, rows);
         let width = usize::from(cols.max(1));
         let height = usize::from(rows.max(1));
+        if self.help_open.get() {
+            return self.render_help_mode(width, height);
+        }
         if self.remote_keys_mode.is_some() {
             return self.render_remote_keys_mode(width, height);
         }
@@ -753,45 +791,48 @@ impl ClusterUi {
             .filter(|node| node.state == RemoteState::Reachable)
             .count();
         frame.push(format!(
-            "remuda · cluster ({reachable}/{} reachable)",
+            "remuda · cluster ({reachable}/{} ok)",
             self.remote_snapshot.nodes.len() + 1
         ));
-        frame.push(format!(
-            "{} {}  {} · {} · sync {}s",
-            if self.expanded { "▼" } else { "▶" },
-            self.node,
-            render_badge(Badge::Local),
-            render_badge(Badge::Reachable),
-            age_seconds(now, self.synced_at)
+        let local_rows = self.local_tree_rows();
+        let remote_rows = self.remote_tree_rows();
+        let status_col = status_column(
+            local_rows
+                .iter()
+                .chain(remote_rows.iter())
+                .map(|row| row.label.as_str())
+                .chain(std::iter::once(self.node.as_str())),
+            width,
+        );
+        frame.push(tree_label_line(
+            &format!("{} ", if self.expanded { "▼" } else { "▶" }),
+            &self.node,
+            &format!("@ · sync {}s", age_seconds(now, self.synced_at)),
+            status_col,
+            width,
         ));
-        if self.expanded {
-            let visible = self.visible_sessions();
-            for index in visible.iter().copied() {
-                let session = &self.sessions[index];
-                let prefix = format!("{}    ", if index == self.selected { ">" } else { " " },);
-                let status = session_status(
-                    render_badge(if session.alive {
-                        Badge::Live
-                    } else {
-                        Badge::Ended
-                    }),
-                    self.pending_count(session),
+        frame.extend(
+            local_rows.iter().chain(remote_rows.iter()).map(|row| {
+                tree_label_line(&row.prefix, &row.label, &row.status, status_col, width)
+            }),
+        );
+        if self.expanded && local_rows.is_empty() {
+            let hint = if self.attention_only {
+                "    no sessions need attention"
+            } else {
+                "    no matching sessions"
+            };
+            // Keep the local empty hint between the local node and remote rows.
+            let insert_at = 2 + local_rows.len();
+            frame.insert(insert_at, hint.into());
+            if !cluster_tree_has_sessions(&self.sessions, &self.remote_snapshot) {
+                frame.insert(
+                    insert_at + 1,
+                    "    No sessions yet. Start one on any machine:".into(),
                 );
-                frame.push(tree_label_line(&prefix, &session.name, &status, 12, width));
-            }
-            if visible.is_empty() {
-                frame.push(if self.attention_only {
-                    "    no sessions need attention".into()
-                } else {
-                    "    no matching sessions".into()
-                });
-                if !cluster_tree_has_sessions(&self.sessions, &self.remote_snapshot) {
-                    frame.push("    No sessions yet. Start one on any machine:".into());
-                    frame.push("    remuda run -n NAME COMMAND".into());
-                }
+                frame.insert(insert_at + 2, "    remuda run -n NAME COMMAND".into());
             }
         }
-        self.append_remote_tree(&mut frame, width);
         frame
     }
 
@@ -1038,6 +1079,46 @@ impl ClusterUi {
             .join("\n")
     }
 
+    fn handle_help_key(&self, event: crossterm::event::KeyEvent) {
+        const PAGE: usize = 10;
+        let scroll = self.help_scroll.get();
+        match self.keymap.resolve("cluster.help", event) {
+            Some("cluster.help.close" | "cluster.help.escape") => {
+                self.help_open.set(false);
+                self.help_scroll.set(0);
+            }
+            Some("cluster.help.up") => self.help_scroll.set(scroll.saturating_sub(1)),
+            Some("cluster.help.down") => self.help_scroll.set(scroll.saturating_add(1)),
+            Some("cluster.help.page_up") => self.help_scroll.set(scroll.saturating_sub(PAGE)),
+            Some("cluster.help.page_down") => self.help_scroll.set(scroll.saturating_add(PAGE)),
+            Some("cluster.help.home") => self.help_scroll.set(0),
+            Some("cluster.help.end") => self.help_scroll.set(usize::MAX / 2),
+            _ => {}
+        }
+    }
+
+    fn render_help_mode(&self, width: usize, height: usize) -> String {
+        let lines = help_lines(&self.keymap, width);
+        let footer = self
+            .keymap
+            .display_help("cluster.help", &["cluster.help.close"]);
+        let footer = if footer.is_empty() {
+            "? closes".to_string()
+        } else {
+            format!("{footer} · ↑↓ scroll")
+        };
+        let body_height = height.saturating_sub(1).max(1);
+        let (mut frame, _) = help_window(&lines, self.help_scroll.get(), body_height);
+        frame.push(footer);
+        frame.resize(height, String::new());
+        frame
+            .into_iter()
+            .take(height)
+            .map(|line| truncate(&line, width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn render_remote_keys_mode(&self, width: usize, height: usize) -> String {
         let Some(target @ RemoteSelection::Session { .. }) = &self.remote_keys_mode else {
             return String::new();
@@ -1105,14 +1186,8 @@ impl ClusterUi {
         let mut lines = if let Some(prompt) = self.confirmation.prompt(width, &confirm_help) {
             wrap_help(&prompt, width)
         } else if self.composer_focused {
-            let mut lines = self
-                .composer
-                .display_lines(&self.composer_prefix(), width, 3);
-            lines.extend(wrap_help(
-                &self.keymap.display_help("cluster.composer", &[]),
-                width,
-            ));
-            lines
+            self.composer
+                .display_lines(&self.composer_prefix(), width, 3)
         } else if self.remote_active.is_some() {
             let input = self.remote_active.as_ref().is_some_and(|target| {
                 self.remote_input_enabled
@@ -1120,35 +1195,13 @@ impl ClusterUi {
                         .remote_session(target)
                         .is_some_and(|(_, session)| session.alive)
             });
-            let actions: &[&str] = if input {
-                &[
-                    "cluster.select",
-                    "cluster.remote.keys",
-                    "cluster.close",
-                    "cluster.detach",
-                ]
-            } else {
-                &["cluster.detach"]
-            };
-            let help = self.keymap.display_help("cluster.tree", actions);
             let status = if input { "" } else { "Read-only · " };
-            wrap_help(&format!("{status}{help}"), width)
+            wrap_help(&format!("{status}{}", self.help_hint()), width)
         } else if self.ended.is_some() {
-            wrap_help(
-                &format!(
-                    "Input disabled · {}",
-                    self.keymap
-                        .display_help("cluster.tree", &["cluster.close", "cluster.detach"])
-                ),
-                width,
-            )
+            wrap_help(&format!("Input disabled · {}", self.help_hint()), width)
         } else {
             self.footer(width)
         };
-        lines.extend(wrap_help(
-            &self.keymap.display_help("cluster.runtime", &[]),
-            width,
-        ));
         if let Some(diagnostic) = &self.keymap.diagnostic {
             lines.extend(wrap_help(&format!("keymap config: {diagnostic}"), width));
         }
@@ -1161,7 +1214,27 @@ impl ClusterUi {
         lines.len()
     }
 
-    fn append_remote_tree(&self, frame: &mut Vec<String>, width: usize) {
+    /// Local session rows, in display order; empty while the local node is collapsed.
+    fn local_tree_rows(&self) -> Vec<TreeRow> {
+        if !self.expanded {
+            return Vec::new();
+        }
+        self.visible_sessions()
+            .into_iter()
+            .map(|index| {
+                let session = &self.sessions[index];
+                TreeRow {
+                    prefix: format!("{}    ", if index == self.selected { ">" } else { " " }),
+                    label: session.name.clone(),
+                    status: session_cell(session.alive, false, self.pending_count(session)),
+                }
+            })
+            .collect()
+    }
+
+    /// Remote node and session rows, in display order.
+    fn remote_tree_rows(&self) -> Vec<TreeRow> {
+        let mut rows = Vec::new();
         let query = self.query.as_deref().unwrap_or_default();
         for node in &self.remote_snapshot.nodes {
             let node_matches = query.is_empty() || matches_query(query, &node.name);
@@ -1179,16 +1252,15 @@ impl ClusterUi {
             let is_expanded = self.remote_expanded.contains(&node.registry_key);
             let is_selected =
                 self.remote_selected == Some(RemoteSelection::Node(node.registry_key.clone()));
-            let prefix = format!(
-                "{}{} ",
-                if is_selected { ">" } else { " " },
-                if is_expanded { "▼" } else { "▶" },
-            );
-            let state = format!(
-                "· {}",
-                remote_state_label(node.state, node.last_sync_age, node.last_error.as_deref())
-            );
-            frame.push(tree_label_line(&prefix, &node.name, &state, 0, width));
+            rows.push(TreeRow {
+                prefix: format!(
+                    "{}{} ",
+                    if is_selected { ">" } else { " " },
+                    if is_expanded { "▼" } else { "▶" },
+                ),
+                label: node.name.clone(),
+                status: status_glyph(node.state).to_string(),
+            });
             if is_expanded {
                 for session in visible_sessions {
                     let is_selected = self.remote_selected
@@ -1197,19 +1269,19 @@ impl ClusterUi {
                             name: session.name.clone(),
                             instance_id: session.instance_id.clone(),
                         });
-                    let prefix = format!("{}    ", if is_selected { ">" } else { " " });
-                    let status = format!(
-                        "{}{}",
-                        session_status(
-                            if session.alive { "live" } else { "ended" },
+                    rows.push(TreeRow {
+                        prefix: format!("{}    ", if is_selected { ">" } else { " " }),
+                        label: session.name.clone(),
+                        status: session_cell(
+                            session.alive,
+                            session.last_error.is_some(),
                             self.remote_pending_count(node, session),
                         ),
-                        session_error_suffix(session.last_error.as_deref())
-                    );
-                    frame.push(tree_label_line(&prefix, &session.name, &status, 12, width));
+                    });
                 }
             }
         }
+        rows
     }
 
     fn remote_pane(&self, local_header: String, local_screen: &str) -> (String, String) {
@@ -1361,6 +1433,10 @@ impl ClusterUi {
             self.handle_composer_event(event, now);
             return false;
         }
+        if self.help_open.get() {
+            self.handle_help_key(event);
+            return false;
+        }
         let context = if self.query.is_some() {
             "cluster.search"
         } else {
@@ -1368,6 +1444,10 @@ impl ClusterUi {
         };
         match self.keymap.resolve(context, event) {
             Some("cluster.detach") => return true,
+            Some("cluster.help") => {
+                self.help_open.set(true);
+                self.help_scroll.set(0);
+            }
             Some("cluster.close") => self.handle_close_key(now),
             Some("cluster.search") => self.query = Some(String::new()),
             Some("cluster.attention") => {
@@ -2128,25 +2208,80 @@ impl ClusterUi {
     }
 
     fn footer(&self, width: usize) -> Vec<String> {
+        let hint = self.help_hint();
         if let Some(query) = &self.query {
-            let mut lines = vec![format!(
-                "search: {}",
-                ellipsize(query, width.saturating_sub(8))
-            )];
-            lines.extend(wrap_help(
-                &self.keymap.display_help("cluster.search", &[]),
-                width,
-            ));
-            lines
+            let room = width.saturating_sub(8 + crate::tui::visible_width(&hint));
+            let mut line = format!("search: {}", ellipsize(query, room));
+            if !hint.is_empty() {
+                line.push_str(&format!(" · {hint}"));
+            }
+            return vec![line];
+        }
+        let mut lines = Vec::new();
+        if let Some(detail) = self.selection_detail() {
+            lines.extend(wrap_help(&format!("· {detail}"), width));
+        }
+        let mut hint = hint;
+        if self.attention_only {
+            hint = format!("attention · {hint}");
+        }
+        if !hint.is_empty() {
+            lines.extend(wrap_help(&hint, width));
+        }
+        lines
+    }
+
+    /// The one footer affordance: the bound help key and its label.
+    fn help_hint(&self) -> String {
+        let hint = self.keymap.display_help("cluster.tree", &["cluster.help"]);
+        if hint.is_empty() {
+            "? help".into()
         } else {
-            let attention = if self.attention_only { "on" } else { "off" };
-            wrap_help(
-                &format!(
-                    "{} · attention: {attention}",
-                    self.keymap.display_help("cluster.tree", &[])
-                ),
-                width,
-            )
+            hint
+        }
+    }
+
+    /// The selected remote node or session in words, so the one-cell status
+    /// column never hides its reason. Local selection detail stays in the pane
+    /// header, where the active session already shows it.
+    fn selection_detail(&self) -> Option<String> {
+        match self.current_tree_selection() {
+            TreeSelection::LocalSession(_) => None,
+            TreeSelection::RemoteNode(registry_key) => {
+                let node = self
+                    .remote_snapshot
+                    .nodes
+                    .iter()
+                    .find(|node| node.registry_key == registry_key)?;
+                Some(format!(
+                    "{} · {}",
+                    node.name,
+                    remote_state_label(node.state, node.last_sync_age, node.last_error.as_deref())
+                ))
+            }
+            TreeSelection::RemoteSession {
+                node,
+                name,
+                instance_id,
+            } => {
+                let selection = RemoteSelection::Session {
+                    node,
+                    name,
+                    instance_id,
+                };
+                let (node, session) = self.remote_session(&selection)?;
+                Some(format!(
+                    "{}/{} · {}{} · {}",
+                    node.name,
+                    session.name,
+                    session_status(
+                        if session.alive { "live" } else { "ended" },
+                        self.remote_pending_count(node, session),
+                    ),
+                    session_error_suffix(session.last_error.as_deref()),
+                    remote_state_label(node.state, node.last_sync_age, node.last_error.as_deref())
+                ))
+            }
         }
     }
 
@@ -2647,31 +2782,70 @@ fn pad_to(text: &str, width: usize) -> String {
     format!("{text}{}", " ".repeat(width.saturating_sub(w)))
 }
 
-fn tree_label_line(prefix: &str, label: &str, status: &str, pad_to: usize, width: usize) -> String {
-    let available = width
-        .saturating_sub(UnicodeWidthStr::width(prefix) + 1 + crate::tui::visible_width(status));
+fn tree_label_line(
+    prefix: &str,
+    label: &str,
+    status: &str,
+    status_col: usize,
+    width: usize,
+) -> String {
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    let available = width.saturating_sub(prefix_width + 1 + crate::tui::visible_width(status));
     let label = ellipsize(label, available);
     let label_width = UnicodeWidthStr::width(label.as_str());
-    let padding = pad_to
-        .saturating_sub(label_width)
-        .min(available.saturating_sub(label_width));
+    let padding = status_col.saturating_sub(prefix_width + label_width).max(1);
     let label = crate::text::strip_terminal_controls(&label);
     let label_style = if prefix.starts_with('>') {
         "\x1b[1;7;36m"
     } else {
         "\x1b[1m"
     };
-    let status = if status.starts_with("live") {
-        format!("\x1b[32m{status}\x1b[0m")
-    } else if status.starts_with("ended") {
-        format!("\x1b[31m{status}\x1b[0m")
-    } else {
-        status.into()
-    };
+    let status = status_style(status).map_or_else(
+        || status.to_string(),
+        |style| format!("{style}{status}\x1b[0m"),
+    );
     format!(
         "{prefix}{label_style}{label}\x1b[0m{}{status}",
-        " ".repeat(padding + 1)
+        " ".repeat(padding)
     )
+}
+
+/// Green for healthy, yellow for transition, red for stopped or unreachable.
+fn status_style(status: &str) -> Option<&'static str> {
+    match status.chars().next()? {
+        '@' => Some("\x1b[32m"),
+        '~' | '?' => Some("\x1b[33m"),
+        '!' | 'x' | '-' => Some("\x1b[31m"),
+        _ => None,
+    }
+}
+
+/// The status cell: one ASCII glyph, then a pending count that never shifts the column.
+fn session_cell(alive: bool, has_error: bool, pending: usize) -> String {
+    let glyph = if has_error {
+        ERROR_GLYPH
+    } else {
+        session_glyph(alive)
+    };
+    if pending == 0 {
+        glyph.to_string()
+    } else {
+        format!("{glyph} +{pending}")
+    }
+}
+
+/// The column where every row's status glyph starts, shared by nodes and sessions.
+fn status_column<'a>(labels: impl Iterator<Item = &'a str>, width: usize) -> usize {
+    const INDENT: usize = 5;
+    const WIDEST: usize = 24;
+    let widest = labels
+        .map(crate::tui::visible_width)
+        .max()
+        .unwrap_or(0)
+        .min(WIDEST);
+    (INDENT + widest + 1)
+        .min(width.saturating_sub(1))
+        .max(INDENT + 1)
 }
 
 // Crossterm names the raw Ctrl-backslash byte Ctrl-4. Other command
@@ -2704,6 +2878,61 @@ fn remote_keys_hint(node: &str, session: &str, width: usize, help: &str) -> Vec<
         ));
         lines
     }
+}
+
+/// Status legend shared by the help screen, so a glyph is never a guess.
+pub fn legend_lines(width: usize) -> Vec<String> {
+    wrap_help(
+        "@ live/reachable · ~ connecting/reconnecting · ! error · \
+         x unreachable · - ended · ? stale/unknown",
+        width.saturating_sub(2),
+    )
+    .into_iter()
+    .map(|line| format!("  {line}"))
+    .collect()
+}
+
+/// Every cluster binding plus the status legend, wrapped for `width`.
+pub fn help_lines(keymap: &crate::keybindings::Snapshot, width: usize) -> Vec<String> {
+    const CONTEXTS: [&str; 7] = [
+        "cluster.tree",
+        "cluster.search",
+        "cluster.composer",
+        "cluster.confirm",
+        "cluster.remote.keys",
+        "cluster.runtime",
+        "cluster.help",
+    ];
+    let mut lines = vec![
+        "remuda · cluster help".to_string(),
+        String::new(),
+        "keys".into(),
+    ];
+    for context in CONTEXTS {
+        let rows = keymap.help_rows(context);
+        if rows.is_empty() {
+            continue;
+        }
+        lines.push(format!("  {context}"));
+        for (key, help) in rows {
+            for line in wrap_help(&format!("{key} {help}"), width.saturating_sub(4)) {
+                lines.push(format!("    {line}"));
+            }
+        }
+    }
+    lines.push(String::new());
+    lines.push("status".into());
+    lines.extend(legend_lines(width));
+    lines
+}
+
+/// A height-sized window over the help text, with the scroll clamped to its end.
+pub fn help_window(lines: &[String], scroll: usize, height: usize) -> (Vec<String>, usize) {
+    let height = height.max(1);
+    let scroll = scroll.min(lines.len().saturating_sub(height));
+    let mut window: Vec<String> = lines.iter().skip(scroll).take(height).cloned().collect();
+    window.resize(height, String::new());
+    (window, scroll)
 }
 
 // Wrap every effective control; wide Unicode and long user keys must not be clipped.
@@ -3219,9 +3448,11 @@ fn select_target_with_remote_wait(
 mod tests {
     use super::queue::{InputTarget, QueueEvent, QueueState, SendOutcome, MAX_IO_RETRIES};
     use super::{
-        is_attention, normalized_terminal_size, present, remote_state_label, render_badge,
-        resize_requires_full_repaint, select_target_with_remote_wait, terminal_frame,
-        AttentionSignals, Badge, ClusterUi, RemoteInputTransport, RemoteSelection, RemoteSource,
+        help_lines, help_window, is_attention, legend_lines, normalized_terminal_size, present,
+        remote_state_label, render_badge, resize_requires_full_repaint,
+        select_target_with_remote_wait, session_cell, session_glyph, status_column, status_glyph,
+        status_style, terminal_frame, AttentionSignals, Badge, ClusterUi, RemoteInputTransport,
+        RemoteSelection, RemoteSource, TreeSelection, ERROR_GLYPH,
     };
     use crate::cluster_remote::{
         RemoteNodeSnapshot, RemoteSessionSnapshot, RemoteSnapshot, RemoteState,
@@ -3280,6 +3511,14 @@ mod tests {
                 .all(|(index, _)| { frame.as_bytes().get(index + 1) == Some(&b'\n') }),
             "rendered frame contains a lone carriage return: {frame:?}"
         );
+    }
+
+    /// The virtual tree lives left of the split divider; prose rows may repeat names.
+    fn tree_side(frame: &str) -> Vec<&str> {
+        frame
+            .lines()
+            .map(|line| line.split('│').next().unwrap_or(line))
+            .collect()
     }
 
     fn make_ui(node: &str, sessions: Vec<SessionSummary>, at: Duration) -> ClusterUi {
@@ -4613,25 +4852,353 @@ mod tests {
     }
 
     #[test]
-    fn default_footer_keeps_action_keys_at_40_columns() {
+    fn default_footer_is_only_the_help_hint_at_40_columns() {
         let clock = ManualClock::new();
-        let ui = make_ui("studio", sessions(), clock.now());
+        let mut ui = make_ui("studio", sessions(), clock.now());
         let frame = ui.render_text(40, 24, "", &clock);
-        let footer = frame.lines().collect::<Vec<_>>().join(" ");
-        for binding in ["↑", "←", "Enter", "k", "x", "/", "!", "q"] {
+        let footer = frame.lines().last().unwrap_or_default();
+        assert_eq!(footer.trim_end(), "? help", "default footer: {footer:?}");
+
+        ui.key(crossterm::event::KeyCode::Char('?'));
+        let help = ui.render_text(40, 24, "", &clock);
+        for binding in ["Enter", "k", "x", "/", "!", "q"] {
+            assert!(help.contains(binding), "help screen lost {binding}: {help}");
+        }
+    }
+
+    #[test]
+    fn status_glyphs_are_single_cell_ascii() {
+        assert_eq!(status_glyph(RemoteState::Reachable), '@');
+        assert_eq!(status_glyph(RemoteState::Stale), '?');
+        assert_eq!(status_glyph(RemoteState::Reconnecting), '~');
+        assert_eq!(status_glyph(RemoteState::Unreachable), 'x');
+        assert_eq!(session_glyph(true), '@');
+        assert_eq!(session_glyph(false), '-');
+        assert_eq!(ERROR_GLYPH, '!');
+        for glyph in ['@', '?', '~', 'x', '-', '!'] {
+            assert!(glyph.is_ascii(), "{glyph} must not be ambiguous-width");
+            assert_eq!(crate::tui::visible_width(&glyph.to_string()), 1);
+        }
+    }
+
+    #[test]
+    fn session_cell_keeps_the_glyph_first_and_adds_pending() {
+        assert_eq!(session_cell(true, false, 0), "@");
+        assert_eq!(session_cell(false, false, 0), "-");
+        assert_eq!(session_cell(true, true, 0), "!");
+        assert_eq!(session_cell(true, false, 2), "@ +2");
+        assert_eq!(session_cell(false, true, 12), "! +12");
+    }
+
+    #[test]
+    fn status_column_is_shared_and_bounded() {
+        let widest = "a-much-longer-node-label";
+        assert_eq!(
+            status_column(["short", widest, "x"].into_iter(), 80),
+            5 + widest.len() + 1
+        );
+        assert_eq!(
+            status_column(["short"].into_iter(), 12),
+            5 + "short".len() + 1
+        );
+        let narrow = status_column(["long-enough-label"].into_iter(), 12);
+        assert!(narrow < 12, "column must leave room: {narrow}");
+        let capped = status_column([widest; 3].into_iter(), 80);
+        assert_eq!(capped, 5 + 24 + 1, "very long names cap the column");
+    }
+
+    #[test]
+    fn status_style_marks_health_transition_and_failure() {
+        assert_eq!(status_style("@"), Some("\x1b[32m"));
+        assert_eq!(status_style("~ +1"), Some("\x1b[33m"));
+        assert_eq!(status_style("?"), Some("\x1b[33m"));
+        assert_eq!(status_style("x"), Some("\x1b[31m"));
+        assert_eq!(status_style("-"), Some("\x1b[31m"));
+        assert_eq!(status_style("! +2"), Some("\x1b[31m"));
+        assert_eq!(status_style("· words"), None);
+    }
+
+    fn glyph_column(line: &str, glyph: char) -> usize {
+        let plain = crate::text::strip_terminal_controls(line);
+        let byte = plain
+            .find(glyph)
+            .unwrap_or_else(|| panic!("{glyph} missing from {plain:?}"));
+        crate::tui::visible_width(&plain[..byte])
+    }
+
+    #[test]
+    fn every_tree_row_starts_its_status_in_the_same_column() {
+        for width in [40u16, 59, 60, 80, 100] {
+            let clock = ManualClock::new();
+            let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
+            let source = FakeRemoteSource(Mutex::new(remote_snapshot(
+                RemoteState::Reconnecting,
+                Duration::from_secs(4),
+                None,
+            )));
+            ui.remote_synced(&source);
+            ui.remote_expanded.insert("fp-laptop".into());
+            let frame = ui.render_text(width, 24, "", &clock);
+            let rows = tree_side(&frame);
+            let cases = [
+                ("studio", '@'),
+                ("dev", '@'),
+                ("laptop", '~'),
+                ("build", '@'),
+            ];
+            let mut expected = None;
+            for (needle, glyph) in cases {
+                let line = rows
+                    .iter()
+                    .find(|line| line.contains(needle))
+                    .unwrap_or_else(|| panic!("{needle} row missing at {width}:\n{frame}"));
+                let column = glyph_column(line, glyph);
+                match expected {
+                    None => expected = Some(column),
+                    Some(expected) => assert_eq!(
+                        column, expected,
+                        "{needle} glyph sits at {column}, not {expected} at {width} columns:\n{frame}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_width_names_do_not_shift_the_status_column() {
+        let clock = ManualClock::new();
+        let mut snapshot = remote_snapshot(RemoteState::Stale, Duration::ZERO, None);
+        snapshot.nodes[0].name = "lap●top".into();
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        ui.remote_expanded.insert("fp-laptop".into());
+        let frame = ui.render_text(80, 24, "", &clock);
+        let rows = tree_side(&frame);
+        let local = rows.iter().find(|line| line.contains("dev")).unwrap();
+        let remote = rows.iter().find(|line| line.contains('●')).unwrap();
+        assert_eq!(
+            glyph_column(local, '@'),
+            glyph_column(remote, '?'),
+            "an ambiguous-width node name moved the status column:\n{frame}"
+        );
+    }
+
+    #[test]
+    fn selected_remote_node_and_session_keep_words_and_reason() {
+        let clock = ManualClock::new();
+        let mut snapshot = remote_snapshot(
+            RemoteState::Unreachable,
+            Duration::from_secs(23),
+            Some(remote_screen("last good screen")),
+        );
+        snapshot.nodes[0].last_error = Some("supply --addr is missing".into());
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        ui.remote_expanded.insert("fp-laptop".into());
+
+        ui.set_tree_selection(TreeSelection::RemoteNode("fp-laptop".into()));
+        let node_frame = ui.render_text(100, 24, "", &clock);
+        assert!(
+            node_frame.contains("laptop · unreachable · no address known"),
+            "node detail missing:\n{node_frame}"
+        );
+
+        ui.set_tree_selection(TreeSelection::RemoteSession {
+            node: "fp-laptop".into(),
+            name: "build".into(),
+            instance_id: "remote-instance".into(),
+        });
+        let session_frame = ui.render_text(100, 24, "", &clock);
+        assert!(
+            session_frame.contains("laptop/build · live · unreachable · no address known"),
+            "session detail missing:\n{session_frame}"
+        );
+    }
+
+    #[test]
+    fn question_mark_opens_full_screen_help_and_closes() {
+        use crossterm::event::KeyCode;
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        ui.key(KeyCode::Char('?'));
+        let frame = ui.render_text(80, 24, "", &clock);
+        assert!(frame.starts_with("remuda · cluster help"), "{frame}");
+        assert!(frame.contains("cluster.tree"));
+        assert!(!frame.contains('│'), "help is full screen: {frame}");
+        ui.key(KeyCode::End);
+        let bottom = ui.render_text(80, 24, "", &clock);
+        assert!(
+            bottom.contains("@ live/reachable"),
+            "legend is reachable by scrolling: {bottom}"
+        );
+        ui.key(KeyCode::Char('?'));
+        assert!(ui
+            .render_text(80, 24, "", &clock)
+            .starts_with("remuda · cluster ("));
+    }
+
+    #[test]
+    fn escape_closes_help_and_home_returns_to_the_top() {
+        use crossterm::event::KeyCode;
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        ui.key(KeyCode::Char('?'));
+        let top = ui.render_text(80, 8, "", &clock);
+        ui.key(KeyCode::Down);
+        ui.key(KeyCode::Down);
+        let scrolled = ui.render_text(80, 8, "", &clock);
+        assert_ne!(top, scrolled, "down must move the help window");
+        ui.key(KeyCode::Home);
+        assert_eq!(top, ui.render_text(80, 8, "", &clock));
+        ui.key(KeyCode::Esc);
+        assert!(ui
+            .render_text(80, 24, "", &clock)
+            .starts_with("remuda · cluster ("));
+    }
+
+    #[test]
+    fn help_lists_every_context_and_the_status_legend_at_narrow_width() {
+        let keymap = crate::keybindings::test_snapshot("");
+        for width in [40usize, 80, 100] {
+            let lines = help_lines(&keymap, width);
+            for context in [
+                "cluster.tree",
+                "cluster.search",
+                "cluster.composer",
+                "cluster.remote.keys",
+                "cluster.help",
+            ] {
+                assert!(
+                    lines.iter().any(|line| line.contains(context)),
+                    "{context} missing at {width}: {lines:?}"
+                );
+            }
+            assert!(lines.iter().any(|line| line.contains("@ live/reachable")));
+            for line in &lines {
+                assert!(
+                    crate::tui::visible_width(line) <= width,
+                    "help line wider than {width}: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_window_clamps_to_the_last_page() {
+        let lines: Vec<String> = (0..40).map(|index| format!("line-{index}")).collect();
+        let (window, scroll) = help_window(&lines, 5, 10);
+        assert_eq!((scroll, window[0].as_str()), (5, "line-5"));
+        assert_eq!(window.len(), 10);
+        let (window, scroll) = help_window(&lines, usize::MAX, 10);
+        assert_eq!(scroll, 30);
+        assert_eq!(window[9], "line-39");
+        let (window, _) = help_window(&lines[..3], 20, 10);
+        assert_eq!(window.len(), 10);
+        assert!(window[3..].iter().all(String::is_empty));
+    }
+
+    #[test]
+    fn legend_is_wrapped_and_names_every_glyph() {
+        let words = [
+            ('@', "live/reachable"),
+            ('~', "connecting"),
+            ('!', "error"),
+            ('x', "unreachable"),
+            ('-', "ended"),
+            ('?', "stale"),
+        ];
+        let wide = legend_lines(120).join(" ");
+        for (glyph, word) in words {
             assert!(
-                footer.contains(binding),
-                "footer lost {binding}: {footer:?}"
+                wide.contains(&format!("{glyph} {word}")),
+                "{glyph} {word} missing: {wide}"
             );
         }
+        let narrow = legend_lines(40);
+        let joined = narrow.join(" ");
+        for (glyph, word) in words {
+            assert!(
+                joined.contains(glyph) && joined.contains(word),
+                "{glyph}/{word} missing at 40: {joined}"
+            );
+        }
+        for line in narrow {
+            assert!(crate::tui::visible_width(&line) <= 40, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn question_mark_stays_a_composer_character() {
+        use crossterm::event::KeyCode;
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
+        ui.key(KeyCode::Enter);
+        assert!(ui.composer_focused);
+        ui.key(KeyCode::Char('?'));
+        assert!(!ui.help_open.get(), "composer must keep '?' as input");
+        assert_eq!(ui.composer.text(), "?");
+    }
+
+    #[test]
+    fn question_mark_is_forwarded_in_remote_keys_mode() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("body"));
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        assert!(ui.remote_keys_mode.is_some());
+        key_event(&mut ui, KeyCode::Char('?'), KeyModifiers::NONE, clock.now());
+        assert!(!ui.help_open.get(), "keys mode must not open help");
+        assert!(ui.remote_keys_mode.is_some(), "keys mode must stay open");
+        assert!(
+            ui.remote_key_buffers
+                .iter()
+                .any(|buffer| buffer.bytes == b"?"),
+            "'?' must reach the remote input path"
+        );
+    }
+
+    #[test]
+    fn question_mark_in_search_opens_help_and_closing_keeps_the_query() {
+        use crossterm::event::KeyCode;
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        ui.key(KeyCode::Char('/'));
+        ui.key(KeyCode::Char('?'));
+        assert!(ui.help_open.get());
+        assert_eq!(ui.query.as_deref(), Some(""));
+        ui.key(KeyCode::Esc);
+        assert!(!ui.help_open.get());
+        assert_eq!(ui.query.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_shorter_footer_gives_the_pane_more_rows() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            None,
+        ))));
+        assert_eq!(ui.footer_row_count(100), 1);
+        let plain = ui.pane_size(100, 40, clock.now());
+        ui.set_tree_selection(TreeSelection::RemoteNode("fp-laptop".into()));
+        assert_eq!(ui.footer_row_count(100), 2, "detail line is one row");
+        let detailed = ui.pane_size(100, 40, clock.now());
+        assert_eq!(
+            detailed.rows(),
+            plain.rows().saturating_sub(1),
+            "the footer and pane must share the height"
+        );
     }
 
     #[test]
     fn remote_tree_labels_are_ellipsized_at_40_columns() {
         let clock = ManualClock::new();
         let mut snapshot = remote_snapshot(RemoteState::Reachable, Duration::ZERO, None);
-        snapshot.nodes[0].name = "laptop-with-a-very-long-node-name".into();
-        snapshot.nodes[0].sessions[0].name = "build-with-a-very-long-session-name".into();
+        snapshot.nodes[0].name = "laptop-with-a-very-long-node-name-that-needs-clipping".into();
+        snapshot.nodes[0].sessions[0].name =
+            "build-with-a-very-long-session-name-that-needs-clipping".into();
         let mut ui = make_ui("studio", sessions(), clock.now());
         ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
         ui.remote_expanded.insert("fp-laptop".into());
@@ -4647,7 +5214,7 @@ mod tests {
         );
         assert!(node.chars().count() <= 40, "node row too wide: {node:?}");
         assert!(
-            frame.lines().any(|line| line.contains("… live")),
+            frame.lines().any(|line| line.contains("… @")),
             "session label was not elided: {frame}"
         );
     }
@@ -4668,7 +5235,8 @@ mod tests {
 
         let frame = ui.render_text(40, 24, "", &clock);
         assert!(frame.lines().count() <= 24, "tree overflowed viewport");
-        assert!(frame.lines().any(|line| line.contains("q detach")));
+        assert!(frame.lines().any(|line| line.contains("? help")));
+        assert!(!frame.contains("q detach"), "keys belong in help now");
     }
 
     #[test]
@@ -5108,8 +5676,16 @@ mod tests {
         let mut ui = make_ui("studio", sessions(), clock.now());
         ui.capture_completed(clock.now());
         let frame = ui.render_text(80, 24, "snapshot", &clock);
-        assert!(frame.contains("▼ studio  local"));
-        assert!(frame.contains("    dev          live"));
+        assert!(frame.contains("▼ studio"));
+        assert!(frame.contains("@ · sync 0s"));
+        let dev_row = tree_side(&frame)
+            .into_iter()
+            .find(|line| line.contains("dev"))
+            .expect("local session row");
+        assert!(
+            dev_row.trim_end().ends_with('@'),
+            "session status glyph: {dev_row:?}"
+        );
         assert!(frame.contains("studio / dev · live · snapshot 0s ago"));
     }
 
@@ -5153,7 +5729,7 @@ mod tests {
         ui.sync_completed(clock.now());
         clock.advance(Duration::from_secs(5));
         let frame = ui.render_text(80, 24, "snapshot", &clock);
-        assert!(frame.contains("local · reachable · sync 5s"));
+        assert!(frame.contains("@ · sync 5s"));
         assert!(frame.contains("studio / dev · live · snapshot 5s ago"));
     }
 
@@ -5234,8 +5810,7 @@ mod tests {
         let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("ended"));
         assert!(!frame.contains("    dev"));
-        assert!(frame.contains("attention: on"));
-        assert!(frame.contains("k keys"));
+        assert!(frame.contains("attention · ? help"));
     }
 
     #[test]
@@ -5576,8 +6151,8 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('!'));
         let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("no sessions need attention"));
-        assert!(frame.contains("local · reachable"));
-        assert!(frame.contains("attention: on"));
+        assert!(frame.contains("@ · sync 0s"));
+        assert!(frame.contains("attention · ? help"));
     }
 
     #[test]
@@ -5621,9 +6196,17 @@ mod tests {
             clock.now(),
         );
         let frame = ui.render_text(80, 24, "", &clock);
-        assert!(frame.contains("local · reachable"));
-        assert!(frame.contains("dev          live"));
-        assert!(frame.contains("ended        ended"));
+        assert!(frame.contains("@ · sync 0s"));
+        for (row, glyph) in [("dev", '@'), ("ended", '-')] {
+            let line = tree_side(&frame)
+                .into_iter()
+                .find(|line| line.contains(row))
+                .unwrap_or_else(|| panic!("{row} row missing from {frame}"));
+            assert!(
+                line.trim_end().ends_with(glyph),
+                "{row} row should end with {glyph}: {line:?}"
+            );
+        }
         assert_eq!(render_badge(Badge::Local), "local");
         assert_eq!(render_badge(Badge::Live), "live");
     }
@@ -5641,9 +6224,13 @@ mod tests {
 
         let frame = ui.render_text(100, 24, "", &clock);
 
+        let node_row = tree_side(&frame)
+            .into_iter()
+            .find(|line| line.contains("laptop"))
+            .unwrap_or_else(|| panic!("node row missing from {frame}"));
         assert!(
-            frame.contains("▶ laptop · stale · sync 17s ago"),
-            "unexpected frame: {frame}"
+            node_row.trim_end().ends_with('?'),
+            "stale node should end in the stale glyph: {node_row:?}"
         );
         assert!(!frame.contains("build"));
     }
@@ -5745,11 +6332,14 @@ mod tests {
         };
 
         let (_, clock, focused) = make_ui();
-        assert!(focused.contains("Enter send"));
+        assert!(
+            focused.contains("laptop/build>"),
+            "composer line missing: {focused}"
+        );
 
         let (ui, _, _) = make_ui();
         let footer = ui.render_text(100, 24, "", &clock);
-        assert!(footer.contains("x close · q detach · k keys · Enter select"));
+        assert!(footer.contains("? help"), "footer: {footer}");
 
         let (mut ui, _, _) = make_ui();
         ui.key(crossterm::event::KeyCode::Enter);
@@ -5803,7 +6393,8 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('x'));
 
         let frame = ui.render_text(100, 24, "", &clock);
-        assert!(frame.contains("laptop · unreachable"));
+        assert!(frame.contains("remote live · unreachable"));
+        assert!(frame.contains("laptop / build"));
         assert!(frame.contains("last good screen"));
         assert!(
             frame.contains("kill laptop(fp-lap)/build? y confirm · Y confirm · other key cancels")
@@ -6396,18 +6987,18 @@ mod tests {
 
         let frame = ui.render_text(100, 24, "", &clock);
         assert!(
-            frame.contains("live · pending input 1"),
+            frame.contains("@ +1"),
             "remote pending marker missing from frame:\n{frame}"
         );
 
         ui.start_pending(clock.now());
         let sending_frame = ui.render_text(100, 24, "", &clock);
-        assert!(sending_frame.contains("live · pending input 1"));
+        assert!(sending_frame.contains("@ +1"));
 
         ui.key(crossterm::event::KeyCode::Char('!'));
         let attention_frame = ui.render_text(100, 24, "", &clock);
         assert!(attention_frame.contains("build"));
-        assert!(attention_frame.contains("pending input 1"));
+        assert!(attention_frame.contains("@ +1"));
     }
 
     #[test]
@@ -6705,9 +7296,7 @@ mod tests {
         ui.notice = Some(("heads up".into(), clock.now()));
         let frame = ui.render_text(100, 24, "", &clock);
         let lines: Vec<&str> = frame.lines().collect();
-        assert!(lines
-            .iter()
-            .any(|line| line.starts_with("x close · q detach · k keys · Enter select")));
+        assert!(lines.iter().any(|line| line.trim_end() == "? help"));
         assert!(lines
             .iter()
             .any(|l| l.starts_with("heads up") && !l.contains('│')));
@@ -6725,7 +7314,7 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('!'));
         ui.key(crossterm::event::KeyCode::Enter);
         let frame = ui.render_text(80, 24, "", &clock);
-        assert!(frame.contains("attention: on"));
+        assert!(frame.contains("attention · ? help"));
         assert!(frame.contains("no sessions need attention"));
         assert_eq!(ui.active, 0);
     }
@@ -6825,7 +7414,11 @@ mod tests {
         );
         ui.key(crossterm::event::KeyCode::Char('!'));
         let frame = ui.render_text(80, 24, "", &clock);
-        assert!(frame.contains("dev          live · pending input 1"));
+        let dev_row = tree_side(&frame)
+            .into_iter()
+            .find(|line| line.contains("dev"))
+            .expect("local session row");
+        assert!(dev_row.contains("@ +1"), "pending glyph: {dev_row:?}");
     }
 
     #[test]
@@ -6949,7 +7542,7 @@ mod tests {
         let frame = ui.render_text(80, 24, &ui.ended.as_ref().unwrap().screen, &clock);
         assert!(frame.contains("studio / dev · ended · final snapshot"));
         assert!(frame.contains("final output"));
-        assert!(frame.contains("Input disabled · x close"));
+        assert!(frame.contains("Input disabled · ? help"));
         ui.key(crossterm::event::KeyCode::Char('x'));
         let frame = ui.render_text(80, 24, "", &clock);
         assert!(!frame.contains("studio / dev · ended"));

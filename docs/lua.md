@@ -703,12 +703,18 @@ Cluster contexts and native actions:
 
 | Context | Actions |
 | --- | --- |
-| `cluster.tree` | `cluster.detach`, `cluster.close`, `cluster.search`, `cluster.attention`, `cluster.remote.keys`, `cluster.up`, `cluster.down`, `cluster.left`, `cluster.right`, `cluster.select` |
-| `cluster.search` | `cluster.search.clear`, `cluster.search.delete`, plus the same navigation and select actions |
+| `cluster.tree` | `cluster.detach`, `cluster.close`, `cluster.search`, `cluster.attention`, `cluster.remote.keys`, `cluster.up`, `cluster.down`, `cluster.left`, `cluster.right`, `cluster.select`, `cluster.help` |
+| `cluster.search` | `cluster.search.clear`, `cluster.search.delete`, plus the same navigation and select actions, and `cluster.help` |
 | `cluster.composer` | `cluster.composer.submit`, `.clear`, `.back`, `.detach`, `.left`, `.right`, `.forward`, `.backward`, `.up`, `.down`, `.home`, `.end`, `.home_emacs`, `.end_emacs`, `.kill`, `.backspace`, `.delete` (all use the `cluster.composer` prefix) |
 | `cluster.confirm` | `cluster.confirm.accept`, `cluster.confirm.accept_upper` |
 | `cluster.remote.keys` | `cluster.remote.back` |
 | `cluster.runtime` | `cluster.redraw` |
+| `cluster.help` | `cluster.help.close`, `.escape`, `.up`, `.down`, `.page_up`, `.page_down`, `.home`, `.end` (the full-screen help view) |
+
+`?` is bound in `cluster.tree` and `cluster.search` only. It stays ordinary
+input in the composer and is forwarded in `cluster.remote.keys`, so typing
+`?` into a session never opens help. The help view has its own context, so a
+user can rebind closing or scrolling without touching the list keys.
 
 For example:
 
