@@ -304,3 +304,79 @@ fn attach_passes_the_childs_input_modes_to_the_viewer_in_both_backends() {
         viewer.wait_for("\x1b[?2004h");
     }
 }
+
+/// A viewer taken over mid-paste leaves input the host cannot retire for it.
+/// The next viewer's typing must all land, and close and stop must still
+/// end the session, more raw writes than the host's window holds included.
+#[test]
+fn a_takeover_mid_paste_leaves_later_typing_close_and_stop_working_in_both_backends() {
+    for mode in MODES {
+        let daemon = Parity::start(mode);
+        // Raw mode, so a full input queue blocks the writer instead of
+        // dropping keys. Not reading for 2 s keeps the first viewer's paste
+        // in flight across the takeover; then 4 s of draining, then a shell.
+        daemon.start_command(
+            "p",
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "stty raw -echo; sleep 2; perl -e 'alarm 4; while (sysread STDIN, $b, 65536) {}'; stty sane; exec /bin/sh".into(),
+            ],
+        );
+        let first = Viewer::attach(&daemon, "p");
+        let mut paste = remuda_native::ipc::TryClone::try_clone(&first.stream).unwrap();
+        std::thread::spawn(move || {
+            let _ = paste.write_all(&[b'x'; 512 * 1024]);
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        let mut second = Viewer::attach(&daemon, "p");
+        first.wait_ended();
+        // Past the drain: the shell reads from here on.
+        std::thread::sleep(Duration::from_millis(6500));
+
+        // One command at a time, each waited for: a full terminal input
+        // queue would drop keys in either backend. Each is one raw write.
+        let out = daemon.root().join("out");
+        let landed = || {
+            std::fs::read_to_string(&out)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        for n in 0..300 {
+            second.type_keys(format!("echo B{n} >> {}\r", out.display()).as_bytes());
+            let deadline = Instant::now() + PATIENCE;
+            while landed() <= n {
+                assert!(
+                    Instant::now() < deadline,
+                    "{mode:?}: typed command {n} never ran ({} ran)",
+                    landed()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        drop(second);
+        let deadline = Instant::now() + PATIENCE;
+        while attached(&daemon, "p") {
+            assert!(Instant::now() < deadline, "{mode:?}: still attached");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            daemon.request(&Request::Close {
+                name: "p".into(),
+                instance_id: None,
+                confirm: None,
+            }),
+            Response::Ok,
+            "{mode:?}: close"
+        );
+        let out = daemon.cli(&["stop", "-f"]);
+        assert!(out.status.success(), "{mode:?}: stop: {out:?}");
+        let deadline = Instant::now() + PATIENCE;
+        while daemon.hosts_running() > 0 {
+            assert!(Instant::now() < deadline, "{mode:?}: a host outlived stop");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}

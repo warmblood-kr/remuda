@@ -6,7 +6,7 @@
 //! the daemon's attach then stays read-only.
 use super::api::{HumanCounters, Identity as HostIdentity, Request, Response};
 use super::entry::Client;
-use super::human::Raw;
+use super::human::{Raw, Retire};
 use super::result::Delivery;
 use remuda_core::agent::{AgentError, OutputWakeup};
 use remuda_core::session_operations::{AttachmentOperations, Error, Identity, Result, Unavailable};
@@ -18,13 +18,13 @@ use std::time::{Duration, Instant};
 /// How long one write may take to settle before it is reported uncertain.
 const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 const SETTLE_POLL: Duration = Duration::from_millis(1);
+/// Between tries while the host's raw window is full.
+const BUSY_POLL: Duration = Duration::from_millis(20);
 /// Grant races (another viewer granted between Inspect and grant) retried.
 const GRANT_ATTEMPTS: usize = 3;
-/// How long a host may answer Busy for one sequence before the write is refused.
-/// Bounded because Busy retries hold the client mutex and the drain gate.
-const BUSY_DEADLINE: Duration = Duration::from_secs(5);
 
-pub(crate) struct HostAttachment {
+pub(crate) struct HostAttachment<'a> {
+    session: &'a super::remote::HostSession,
     identity: Identity,
     grant: u64,
     client: Mutex<Client>,
@@ -33,8 +33,9 @@ pub(crate) struct HostAttachment {
     gate: Arc<super::gate::Gate>,
 }
 
-impl HostAttachment {
+impl<'a> HostAttachment<'a> {
     pub fn open(
+        session: &'a super::remote::HostSession,
         endpoint: &Path,
         host: HostIdentity,
         identity: Identity,
@@ -54,7 +55,11 @@ impl HostAttachment {
                 .map_err(transport)?;
             match response {
                 Response::HumanGranted { grant, .. } => {
+                    // Earlier grants are inactive now; their leftovers would
+                    // block this grant's writes. Best effort: a write retries.
+                    let _ = session.discard_abandoned_raw();
                     return Ok(Self {
+                        session,
                         identity,
                         grant,
                         client: Mutex::new(client),
@@ -86,7 +91,6 @@ impl HostAttachment {
         let mut last_raw = self.last_raw.lock().unwrap_or_else(|e| e.into_inner());
         let mut sequence = *last_raw + 1;
         let mut resynced = false;
-        let budget = BusyBudget::new(Instant::now());
         let state = loop {
             let state = raw(client.request(&Request::HumanInput {
                 grant: self.grant,
@@ -99,23 +103,28 @@ impl HostAttachment {
                     resynced = true;
                     sequence = counters(client)?.last_raw + 1;
                 }
-                Raw::Busy => budget.retry(Instant::now(), cancelled())?,
+                // The window is full: the caller releases every lock and polls.
+                Raw::Busy => return Err(Error::Agent(AgentError::Busy)),
                 state => break state,
             }
         };
         let delivery = match state {
-            Raw::New | Raw::Pending => self.settle(client, sequence, bytes)?,
+            Raw::New | Raw::Pending => self.settle(client, sequence, bytes, cancelled)?,
             Raw::Complete(delivery) => delivery,
             Raw::Stale => {
                 self.displaced.store(true, Ordering::SeqCst);
                 return Err(Error::Agent(AgentError::Attached));
             }
-            Raw::Forgotten | Raw::Conflict | Raw::OutOfOrder | Raw::Busy => {
+            Raw::Forgotten | Raw::Conflict | Raw::OutOfOrder => {
                 return Err(Error::Protocol("host refused the input sequence"));
             }
+            Raw::Busy => return Err(Error::Agent(AgentError::Busy)),
         };
         *last_raw = sequence;
-        retire(client, sequence);
+        // A gone grant's leftovers ahead of ours make our cut conflict.
+        if !retire(client, sequence) && self.session.discard_abandoned_raw().is_ok() {
+            retire(client, sequence);
+        }
         match delivery {
             Delivery::Written => Ok(()),
             Delivery::Rejected => Err(Error::Agent(AgentError::Io(
@@ -127,7 +136,37 @@ impl HostAttachment {
         }
     }
 
-    fn settle(&self, client: &mut Client, sequence: u64, bytes: &[u8]) -> Result<Delivery> {
+    /// Write one chunk, releasing the gate and client while the host's raw
+    /// window is full. No lock is held across the poll, so a takeover, a stop,
+    /// or another viewer's grant can proceed and cancel this wait.
+    fn write_chunk_waiting(&self, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
+        let wait = BusyWait::new(Instant::now());
+        loop {
+            let outcome = {
+                let _pass = self.gate.enter()?;
+                let mut client = self.client();
+                self.write_chunk(&mut client, bytes, cancelled)
+            };
+            match outcome {
+                Ok(()) => return Ok(()),
+                Err(Error::Agent(AgentError::Busy)) => {
+                    wait.poll(Instant::now(), cancelled())?;
+                    let _ = self.session.discard_abandoned_raw();
+                    std::thread::sleep(BUSY_POLL);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// A detach stops the wait; what it leaves unretired a later grant discards.
+    fn settle(
+        &self,
+        client: &mut Client,
+        sequence: u64,
+        bytes: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Delivery> {
         let until = Instant::now() + SETTLE_DEADLINE;
         loop {
             match raw(client.request(&Request::RecoverRaw {
@@ -136,6 +175,7 @@ impl HostAttachment {
                 bytes: bytes.to_vec(),
             }))? {
                 Raw::Complete(delivery) => return Ok(delivery),
+                Raw::Pending if cancelled() => return Err(Error::Agent(AgentError::Attached)),
                 Raw::Pending if Instant::now() < until => std::thread::sleep(SETTLE_POLL),
                 Raw::Pending => {
                     return Err(Error::Agent(AgentError::Io(
@@ -148,7 +188,7 @@ impl HostAttachment {
     }
 }
 
-impl AttachmentOperations for HostAttachment {
+impl AttachmentOperations for HostAttachment<'_> {
     fn identity(&self) -> Identity {
         self.identity.clone()
     }
@@ -175,14 +215,12 @@ impl AttachmentOperations for HostAttachment {
         cancelled: &dyn Fn() -> bool,
         on_start: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<()> {
-        let _pass = self.gate.enter()?;
-        let mut client = self.client();
         for chunk in bytes.chunks(super::wire::MAX_INPUT) {
             if cancelled() {
                 break;
             }
             on_start();
-            self.write_chunk(&mut client, chunk, cancelled)?;
+            self.write_chunk_waiting(chunk, cancelled)?;
         }
         Ok(())
     }
@@ -196,10 +234,16 @@ impl AttachmentOperations for HostAttachment {
 }
 
 /// Best effort: a cut that cannot retire now is retired by a later one.
-fn retire(client: &mut Client, last: u64) {
-    if let Ok(Response::RawCut { cut }) = client.request(&Request::RawCut { last }) {
-        let _ = client.request(&Request::AcknowledgeRaw { cut });
-    }
+fn retire(client: &mut Client, last: u64) -> bool {
+    let Ok(Response::RawCut { cut }) = client.request(&Request::RawCut { last }) else {
+        return false;
+    };
+    matches!(
+        client.request(&Request::AcknowledgeRaw { cut }),
+        Ok(Response::Retired {
+            state: Retire::Retired | Retire::Forgotten
+        })
+    )
 }
 
 fn counters(client: &mut Client) -> Result<HumanCounters> {
@@ -233,63 +277,69 @@ fn transport(_: std::io::Error) -> Error {
     Error::Unavailable(Unavailable::Transport)
 }
 
-/// One sequence's Busy retry budget. Waiting past `until` would hold the
-/// client mutex and the drain gate forever, so the write is refused instead.
-struct BusyBudget {
+/// One write's wait while the host's raw window is full. The caller polls with
+/// no gate or client lock held, so this only bounds and cancels the wait.
+struct BusyWait {
     until: Instant,
 }
 
-impl BusyBudget {
+impl BusyWait {
     fn new(now: Instant) -> Self {
         Self {
-            until: now + BUSY_DEADLINE,
+            until: now + SETTLE_DEADLINE,
         }
     }
 
-    /// One more short wait, or the refusal that ends the retry loop.
-    fn retry(&self, now: Instant, cancelled: bool) -> Result<()> {
+    /// Continue polling, or end with the reason the write is refused.
+    fn poll(&self, now: Instant, cancelled: bool) -> Result<()> {
         if cancelled {
             return Err(Error::Agent(AgentError::Attached));
         }
         if now >= self.until {
-            return Err(Error::Agent(AgentError::Busy));
+            return Err(Error::Agent(AgentError::Io(
+                "the session's host is not taking input".into(),
+            )));
         }
-        std::thread::sleep(SETTLE_POLL);
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BusyBudget, BUSY_DEADLINE};
+    use super::{BusyWait, SETTLE_DEADLINE};
     use remuda_core::agent::AgentError;
     use remuda_core::session_operations::Error;
     use std::time::{Duration, Instant};
 
+    fn io_message(result: Result<(), Error>) -> String {
+        match result {
+            Err(Error::Agent(AgentError::Io(message))) => message,
+            other => panic!("expected an explicit refusal, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn a_busy_retry_is_bounded_and_stops_when_cancelled() {
+    fn a_full_host_window_is_bounded_cancellable_and_refuses_at_the_ceiling() {
         let now = Instant::now();
-        let budget = BusyBudget {
+        let wait = BusyWait {
             until: now + Duration::from_secs(1),
         };
-        assert!(budget.retry(now, false).is_ok(), "a fresh budget waits");
+        assert!(wait.poll(now, false).is_ok(), "a fresh wait keeps polling");
         assert!(
             matches!(
-                budget.retry(now + Duration::from_secs(2), false),
-                Err(Error::Agent(AgentError::Busy))
-            ),
-            "a host still busy after the deadline is refused"
-        );
-        assert!(
-            matches!(
-                budget.retry(now, true),
+                wait.poll(now, true),
                 Err(Error::Agent(AgentError::Attached))
             ),
-            "cancellation ends the wait immediately"
+            "a detach or takeover ends the wait immediately"
+        );
+        let refusal = io_message(wait.poll(now + Duration::from_secs(2), false));
+        assert!(
+            refusal.contains("not taking input"),
+            "the ceiling is an explicit refusal, not a replay: {refusal}"
         );
         assert!(
-            BusyBudget::new(now).until <= now + BUSY_DEADLINE,
-            "the default budget is bounded"
+            BusyWait::new(now).until <= now + SETTLE_DEADLINE,
+            "the default ceiling is bounded"
         );
     }
 }
