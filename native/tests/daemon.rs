@@ -15,6 +15,7 @@
 use remuda_core::protocol::{ListenerOp, ListenerStatus};
 use remuda_core::protocol::{Request, Response};
 use remuda_core::{Session, Size};
+use remuda_native::ipc::TryClone;
 use remuda_native::{client, daemon, ipc, CommandBuilder, PtyAgent, SystemClock};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -3033,6 +3034,79 @@ fn resizing_without_child_output_advances_the_output_version() {
 /// Connect using the original attach wire shape and leave the connection in
 /// raw mode. Reading the acknowledgement one byte at a time keeps any initial
 /// screen bytes in the socket for the caller.
+/// Whether `name` is kept by a session host rather than by this daemon.
+/// `SessionHostBuilds` is the daemon's own answer; do not guess from env.
+fn hosted_session(path: &Path, name: &str) -> bool {
+    match client::request(path, &Request::SessionHostBuilds).expect("host builds") {
+        Response::SessionHostBuilds(builds) => builds.iter().any(|build| build.name == name),
+        other => panic!("unexpected host-builds answer: {other:?}"),
+    }
+}
+
+/// Reads one viewer's socket on its own thread so a test can wait a bounded
+/// time for output without ever blocking forever on a viewer that stays alive.
+struct ViewerReader {
+    chunks: Receiver<Vec<u8>>,
+}
+
+impl ViewerReader {
+    fn new(stream: &ipc::Stream) -> Self {
+        let reader = stream.try_clone().expect("clone viewer stream");
+        let (send, chunks) = std::sync::mpsc::channel();
+        std::thread::spawn(move || forward_chunks(reader, send));
+        Self { chunks }
+    }
+
+    /// Every byte that arrived within `window`, then stop.
+    fn read_for(&self, window: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + window;
+        let mut out = Vec::new();
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match self.chunks.recv_timeout(deadline - now) {
+                Ok(chunk) => out.extend_from_slice(&chunk),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+}
+
+/// Forward every chunk a viewer's socket yields until EOF or a closed channel.
+fn forward_chunks(mut reader: impl std::io::Read, send: std::sync::mpsc::Sender<Vec<u8>>) {
+    let mut buf = [0u8; 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if send.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_viewer_reader_forwards_chunks_until_eof() {
+    let (send, chunks) = std::sync::mpsc::channel();
+    forward_chunks(std::io::Cursor::new(b"viewer bytes".to_vec()), send);
+    let mut forwarded = Vec::new();
+    while let Ok(chunk) = chunks.try_recv() {
+        forwarded.extend_from_slice(&chunk);
+    }
+    assert_eq!(forwarded, b"viewer bytes");
+}
+
+fn contains_text(bytes: &[u8], text: &str) -> bool {
+    bytes
+        .windows(text.len())
+        .any(|window| window == text.as_bytes())
+}
+
 fn raw_attach(path: &Path, name: &str) -> ipc::Stream {
     let mut stream = ipc::connect(path).expect("connect attach client");
     let mut request = serde_json::to_vec(&Request::Attach {
@@ -4155,15 +4229,21 @@ fn a_new_attach_takes_over_and_old_raw_clients_get_a_plain_notice() {
 
     // This connection models a pre-upgrade client: it knows only the existing
     // Attach request followed by a raw byte stream, and treats EOF as ordinary.
-    let mut old = raw_attach(&path, "target");
+    let old = raw_attach(&path, "target");
     let mut current = raw_attach(&path, "target");
-    let mut old_output = Vec::new();
-    old.read_to_end(&mut old_output)
-        .expect("displaced connection closes cleanly");
+    let old_view = ViewerReader::new(&old);
+    let current_view = ViewerReader::new(&current);
+    let hosted = hosted_session(&path, "target");
+    if hosted {
+        assert_hosted_viewers_coexist(&path, &old_view, &current_view);
+        return;
+    }
+
+    // In-process attach hands the terminal to the newer viewer, so the old one
+    // gets a printable explanation and then EOF.
+    let old_output = old_view.read_for(Duration::from_millis(500));
     assert!(
-        old_output
-            .windows(b"[remuda] attached elsewhere, detached".len())
-            .any(|window| window == b"[remuda] attached elsewhere, detached"),
+        contains_text(&old_output, "[remuda] attached elsewhere, detached"),
         "older clients receive a printable explanation before EOF: {old_output:?}"
     );
 
@@ -4183,6 +4263,35 @@ fn a_new_attach_takes_over_and_old_raw_clients_get_a_plain_notice() {
         assert!(Instant::now() < deadline, "all attaches should release");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// #802's hosted attach is a read-only view, so a second viewer coexists with
+/// the first instead of displacing it, and both keep following output.
+fn assert_hosted_viewers_coexist(path: &Path, old: &ViewerReader, current: &ViewerReader) {
+    let quiet = old.read_for(Duration::from_millis(500));
+    assert!(
+        !contains_text(&quiet, "[remuda] attached elsewhere, detached"),
+        "a read-only hosted viewer is not displaced: {quiet:?}"
+    );
+    client::request(
+        path,
+        &Request::SendLine {
+            name: "target".into(),
+            text: "echo VIEWBOTH".into(),
+        },
+    )
+    .expect("send a line the child echoes");
+    wait_for(path, "target", "VIEWBOTH");
+    let old_later = old.read_for(Duration::from_millis(500));
+    let current_later = current.read_for(Duration::from_millis(500));
+    assert!(
+        contains_text(&old_later, "VIEWBOTH"),
+        "the first viewer still follows output: {old_later:?}"
+    );
+    assert!(
+        contains_text(&current_later, "VIEWBOTH"),
+        "the second viewer follows output: {current_later:?}"
+    );
 }
 
 #[test]
