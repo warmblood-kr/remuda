@@ -4764,9 +4764,8 @@ mod cluster_cli_tests {
             assert!(usage.contains("IP[:PORT]"), "{verb}: {usage}");
             assert!(usage.contains("defaults to 7441"), "{verb}: {usage}");
         }
-        assert!(cluster_usage("call").contains("--addr IP[:PORT]"));
-        assert!(cluster_usage("call")
-            .contains("Example: remuda cluster call node-abcd1234 list --addr 192.0.2.1"));
+        assert!(cluster_usage("call").contains("[--addr IP[:PORT]]"));
+        assert!(cluster_usage("call").contains("Example: remuda cluster call node-abcd1234 list"));
         let join = cluster_usage("join");
         assert!(
             join.contains(
@@ -8165,7 +8164,9 @@ mod mod_update_tests {
 
 #[cfg(test)]
 mod cluster_call_tests {
-    use super::{parse_cluster_command, sanitize_peer_response, CallAction, ClusterCommand};
+    use super::{
+        cluster_usage, parse_cluster_command, sanitize_peer_response, CallAction, ClusterCommand,
+    };
     use remuda_core::agent::{Color, Cursor, Size};
     use remuda_core::protocol::{Response, StyledRun};
     use remuda_core::registry::SessionSummary;
@@ -8264,11 +8265,13 @@ mod cluster_call_tests {
         else {
             panic!("capture without SESSION should be invalid");
         };
+        assert_eq!(reason, "missing SESSION for capture");
         assert!(
-            reason.contains(
+            cluster_usage("call").contains(
                 "Usage: remuda cluster call NODE (list|capture SESSION|support) [--addr IP[:PORT]] [--json]"
             ),
-            "{reason}"
+            "{}",
+            cluster_usage("call")
         );
     }
 
