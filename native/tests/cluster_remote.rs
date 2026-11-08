@@ -1320,3 +1320,243 @@ fn switching_away_from_a_quiet_selected_session_does_not_wait_out_its_sync() {
     // A 20s Sync hold made this take ~20s before the hold was bounded.
     assert!(waited < Duration::from_secs(5), "switch took {waited:?}");
 }
+
+/// Point the client's registry at the server listener and optionally advertise
+/// the session-facts sidecar, exactly as a real owning node would.
+fn advertise_session_facts(client: &Node, server: &Node, listener: &Listener, enabled: bool) {
+    let path = client.state.join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let entry = registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server.fingerprint())
+        .expect("server entry");
+    entry.endpoint = Some(listener.address.to_string());
+    if enabled {
+        entry.optional_fields.insert(
+            remuda_core::protocol::CLUSTER_SESSION_FACTS_FIELD.into(),
+            serde_json::json!([remuda_core::protocol::CLUSTER_SESSION_FACTS_V1]),
+        );
+    } else {
+        entry
+            .optional_fields
+            .remove(remuda_core::protocol::CLUSTER_SESSION_FACTS_FIELD);
+    }
+    fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+}
+
+fn mcp_call(node: &Node, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+    use std::io::{BufRead, BufReader, Write};
+    let mut child = node
+        .command()
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    });
+    writeln!(child.stdin.as_mut().unwrap(), "{request}").unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    serde_json::from_str(&line).unwrap_or_else(|error| {
+        panic!("MCP reply is not JSON ({error}): {line}");
+    })
+}
+
+fn mcp_text(reply: &serde_json::Value) -> String {
+    reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Publishes one real session through the daemon's local Lua setter.
+///
+/// When `REMUDA_BUTLER_PUBLISHER` names the Butler checkout's
+/// `packages/butler/session_display.lua`, the daemon loads that real publisher
+/// and ticks it instead of calling the setter directly. The default path stays
+/// self-contained so the test runs in core CI without the Butler checkout.
+fn publish_facts_fixture(server_node: &Node) {
+    let publish = r#"
+        local name, instance = remuda.session.new("proof", {"/bin/sh", "-c", "sleep 60"})
+        local publisher = os.getenv("REMUDA_BUTLER_PUBLISHER")
+        if publisher and publisher ~= "" then
+          remuda._butler_session_display_config = { bus = { agents = {
+            proof = { id = "private-MID", kind = "codex", model = "configured-model",
+              session_name = "proof", alias = "proof", instance_id = instance,
+              instance_binding = 1, parent = "lead", parent_id = "private-LEAD" },
+            lead = { id = "private-LEAD" },
+          } } }
+          remuda._butler_telemetry_for = function(agent)
+            if agent.id ~= "private-MID" then return {} end
+            return { model = "publisher-model", context_used = 42000,
+              context_window = 100000, context_percent = 42, observed_at = os.time() }
+          end
+          dofile(publisher)
+          assert(remuda._butler_session_display_tick)
+          remuda._butler_session_display_tick()
+        else
+          assert(remuda.session.set_display(name, instance, {
+            version = 1, provider = "butler",
+            member_id = "private-MID", leader_id = "private-LEAD",
+            alias = "proof", kind = "codex", model = "configured-model",
+            context_used = 42000, context_window = 100000, context_percent = 42,
+          }))
+        end
+        return instance
+    "#;
+    let output = server_node
+        .command()
+        .args(["-e", publish])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "publish failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Local `ls --json` must stay the ordinary SessionSummary shape.
+fn assert_local_json_unchanged(server_node: &Node) {
+    let output = server_node
+        .command()
+        .args(["ls", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let proof = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "proof")
+        .expect("proof row");
+    for forbidden in ["display", "member_id", "leader_id", "facts"] {
+        assert!(
+            proof.get(forbidden).is_none(),
+            "local JSON acquired {forbidden}: {proof}"
+        );
+    }
+}
+
+/// One authenticated sidecar request from the client identity.
+fn fetch_facts(
+    client_node: &Node,
+    server_node: &Node,
+    listener: &Listener,
+) -> Vec<remuda_core::protocol::ClusterSessionFactWire> {
+    let private = Zeroizing::new(client_node.private.clone());
+    let sidecar = ClusterClient::system()
+        .request(
+            listener.address,
+            &server_node.public,
+            &private,
+            &Request::ClusterSessionFacts,
+        )
+        .unwrap();
+    match sidecar {
+        Response::ClusterSessionFacts(entries) => entries,
+        other => panic!("expected session facts, got {other:?}"),
+    }
+}
+
+fn assert_base_list_text(base: &str) {
+    assert!(
+        base.contains("proof")
+            && base.contains("alive=true")
+            && base.contains("idle=")
+            && base.contains("output_idle=")
+            && base.contains("instance_id="),
+        "base list framing changed: {base}"
+    );
+    assert!(!base.contains("kind=") && !base.contains("ctx="));
+}
+
+fn assert_enriched_list_text(enriched: &str, expected_model: &str) {
+    assert!(
+        enriched.contains("kind=codex")
+            && enriched.contains(&format!("model={expected_model}"))
+            && enriched.contains("ctx=42000/100000")
+            && enriched.contains("ctx_percent=42"),
+        "{enriched}"
+    );
+    assert!(
+        !enriched.contains("private-MID")
+            && !enriched.contains("private-LEAD")
+            && !enriched.contains("member_id")
+            && !enriched.contains("leader_id"),
+        "{enriched}"
+    );
+}
+
+#[test]
+fn real_two_node_authenticated_session_facts_negotiation_and_expiry() {
+    let client_node = Node::start("facts-client");
+    let server_node = Node::start("facts-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    let label = remuda_native::cluster::node_label(&server_node.fingerprint());
+
+    let real_publisher =
+        std::env::var("REMUDA_BUTLER_PUBLISHER").is_ok_and(|path| !path.is_empty());
+    let expected_model = if real_publisher {
+        "publisher-model"
+    } else {
+        "configured-model"
+    };
+
+    publish_facts_fixture(&server_node);
+    assert_local_json_unchanged(&server_node);
+
+    let entries = fetch_facts(&client_node, &server_node, &listener);
+    let entry = entries
+        .iter()
+        .find(|entry| entry.wire_name == "proof")
+        .expect("proof facts entry");
+    assert_eq!(entry.member_id, "private-MID");
+    assert_eq!(entry.leader_id.as_deref(), Some("private-LEAD"));
+    assert_eq!(entry.model.as_deref(), Some(expected_model));
+    assert_eq!(entry.context_percent, Some(42));
+
+    // No advertisement means base List only, even though the peer would answer.
+    advertise_session_facts(&client_node, &server_node, &listener, false);
+    let base = mcp_text(&mcp_call(
+        &client_node,
+        "ls",
+        serde_json::json!({"node": label}),
+    ));
+    assert_base_list_text(&base);
+
+    // Positive v1 advertisement enables the bounded managed fields. The model
+    // proves which publisher ran: the real Butler publisher overrides the
+    // configured model with its fresh telemetry.
+    advertise_session_facts(&client_node, &server_node, &listener, true);
+    let enriched = mcp_text(&mcp_call(
+        &client_node,
+        "ls",
+        serde_json::json!({"node": label}),
+    ));
+    assert_enriched_list_text(&enriched, expected_model);
+
+    // The native TTL is measured from publication; a late read sheds the facts.
+    std::thread::sleep(Duration::from_millis(
+        remuda_core::session_enrichment::CLUSTER_FACTS_TTL_MS + 500,
+    ));
+    let entries = fetch_facts(&client_node, &server_node, &listener);
+    assert!(
+        entries.iter().all(|entry| entry.wire_name != "proof"),
+        "expired facts survived: {entries:?}"
+    );
+}
