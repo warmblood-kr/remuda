@@ -517,18 +517,6 @@ fn assert_remote_screen_columns(tui: &RemoteTui, cols: u16, server_label: &str) 
         "{cols} columns:\n{}",
         screen.join("\n")
     );
-    let expected_marker_column = if cols >= 60 {
-        usize::from(cols / 2 + 1)
-    } else {
-        0
-    };
-    assert_eq!(
-        column_of("CRLF-MARKER"),
-        expected_marker_column,
-        "{cols} columns; remote pane must begin at its layout column:\n{}",
-        screen.join("\n")
-    );
-
     let separator = if cols >= 60 { "│" } else { "─" };
     let separator_column = if cols >= 60 { usize::from(cols / 2) } else { 0 };
     let separator_rows = screen_cells
@@ -543,14 +531,44 @@ fn assert_remote_screen_columns(tui: &RemoteTui, cols: u16, server_label: &str) 
         !separator_rows.is_empty(),
         "{cols} columns: no pane divider"
     );
-    for (row, column) in separator_rows {
+    for (row, column) in &separator_rows {
         assert_eq!(
-            column,
+            *column,
             separator_column,
             "{cols} columns: pane divider shifted from its frame column: {}",
             row.concat()
         );
     }
+
+    let marker_column = if cols >= 60 {
+        separator_rows
+            .iter()
+            .find_map(|(row, column)| {
+                let after = row.get(*column + 1..)?.concat();
+                after
+                    .find("CRLF-MARKER")
+                    .map(|offset| *column + 1 + after[..offset].chars().count())
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "CRLF-MARKER missing from the remote pane:\n{}",
+                    screen.join("\n")
+                )
+            })
+    } else {
+        column_of("CRLF-MARKER")
+    };
+    let expected_marker_column = if cols >= 60 {
+        usize::from(cols / 2 + 1)
+    } else {
+        0
+    };
+    assert_eq!(
+        marker_column,
+        expected_marker_column,
+        "{cols} columns; remote pane must begin at its layout column:\n{}",
+        screen.join("\n")
+    );
 }
 
 #[test]
