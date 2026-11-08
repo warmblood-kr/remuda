@@ -233,10 +233,9 @@ pub(super) fn notice(screen: &ScreenSnapshot) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// The mode sequences that move a viewer's terminal from `before` (none: a
-/// terminal in default modes) to `after`, so keys, pastes and
-/// mouse reports reach the child encoded as it asked. Nothing when the host
-/// does not report modes.
+/// Mode sequences moving a viewer from `before` (none: default modes) to
+/// `after`, so keys, pastes and mouse reports reach the child as it asked.
+/// Empty when the host does not report modes.
 pub(super) fn modes(before: Option<TerminalModes>, after: Option<TerminalModes>) -> Vec<u8> {
     let Some(after) = after else {
         return Vec::new();
@@ -244,11 +243,9 @@ pub(super) fn modes(before: Option<TerminalModes>, after: Option<TerminalModes>)
     // Like the in-process paint (vt100 `state_formatted`), a fresh terminal is
     // taken to be in default modes, so only modes the child changed are sent.
     // Stating "mouse off" would also undo the attach client's own wheel mode.
-    let before = Some(before.unwrap_or_default());
+    let before = before.unwrap_or_default();
     let mut out = String::new();
-    let changed =
-        |pick: fn(&TerminalModes) -> bool| before.is_none_or(|b| pick(&b) != pick(&after));
-    if before.is_none_or(|b| b.mouse.mode != after.mouse.mode) {
+    if before.mouse.mode != after.mouse.mode {
         out.push_str("\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l");
         out.push_str(match after.mouse.mode {
             MouseMode::None => "",
@@ -258,7 +255,7 @@ pub(super) fn modes(before: Option<TerminalModes>, after: Option<TerminalModes>)
             MouseMode::AnyMotion => "\x1b[?1003h",
         });
     }
-    if before.is_none_or(|b| b.mouse.encoding != after.mouse.encoding) {
+    if before.mouse.encoding != after.mouse.encoding {
         out.push_str("\x1b[?1005l\x1b[?1006l");
         out.push_str(match after.mouse.encoding {
             MouseEncoding::Default => "",
@@ -266,21 +263,21 @@ pub(super) fn modes(before: Option<TerminalModes>, after: Option<TerminalModes>)
             MouseEncoding::Sgr => "\x1b[?1006h",
         });
     }
-    if changed(|m| m.mouse.bracketed_paste) {
+    if before.mouse.bracketed_paste != after.mouse.bracketed_paste {
         out.push_str(if after.mouse.bracketed_paste {
             "\x1b[?2004h"
         } else {
             "\x1b[?2004l"
         });
     }
-    if changed(|m| m.application_cursor) {
+    if before.application_cursor != after.application_cursor {
         out.push_str(if after.application_cursor {
             "\x1b[?1h"
         } else {
             "\x1b[?1l"
         });
     }
-    if changed(|m| m.application_keypad) {
+    if before.application_keypad != after.application_keypad {
         out.push_str(if after.application_keypad {
             "\x1b="
         } else {
