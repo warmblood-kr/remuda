@@ -93,18 +93,23 @@ page as untrusted:
   origin, no script, and no way to read another file. The policy names the
   exact bridge origin for `img-src`/`style-src`, and sets `connect-src 'none'`,
   `object-src 'none'`, `base-uri 'none'`, `form-action 'none'` and
-  `worker-src 'none'`, so rendered content cannot call the network. Serving a
-  policy on non-document types costs nothing and closes the "open it directly
-  as an unpoliced document" hole that `application/xml` used to be.
+  `worker-src 'none'`, so the page cannot issue its own requests. A link the
+  viewer clicks still navigates the tab, and that GET can have side effects on
+  the target service; the new document gets no access to the bridge page or
+  the store. Serving a policy on non-document types costs nothing and closes
+  the "open it directly as an unpoliced document" hole that `application/xml`
+  used to be.
 - `--allow-scripts` drops the sandbox for artifacts the operator wrote and
   trusts. The page then runs as the loopback origin: it can read every file
-  under the bridge and put what it reads into an outbound navigation.
-  `connect-src` never covered navigation, so the docs say that instead of
-  claiming no network. Workers stay disabled either way: a worker runs outside
-  the document's `connect-src`.
+  under the bridge, use that origin's storage, open popups, and put what it
+  reads into an outbound navigation. `connect-src` never covered navigation,
+  so the docs say that instead of claiming no network. Workers stay disabled
+  either way: a worker runs outside the document's `connect-src`.
 - **Loopback is not private.** Another OS account on the machine can find the
   port and read the served tree with no daemon credentials. `--root` is the
-  scope an operator should be willing to show them.
+  scope an operator should be willing to show them. A random capability path
+  is a possible next step; it is not implemented, so `--root` remains the only
+  scope.
 - `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
   `Referrer-Policy: no-referrer`,
   `Cross-Origin-Resource-Policy: cross-origin` (a sandboxed page must load its
@@ -132,12 +137,16 @@ anything else is `421`. Headers are case-insensitive; values with control
 characters, and duplicate `Host`/`If-None-Match`, are `400`. Responses always
 carry `Content-Length` except `304`, which has no body and no length. `HEAD`
 answers exactly the `GET` head with no body. Eight connections are served at
-once; a ninth gets `503` and the socket closes.
+once; a ninth gets `503` and the socket closes. Reading a head has one absolute
+10-second deadline rather than a per-read idle timeout, so a client cannot keep
+a worker by trickling bytes. A local client can still take all eight
+connections and deny another viewer; that local denial is accepted for a
+read-only loopback service.
 
 ## Not here
 
-Authentication (the port is loopback and unauthenticated), range requests,
-`If-Modified-Since`, directory indexes for every parent of `--root`, and
+Authentication, range requests, `If-Modified-Since`, directory indexes for
+every parent of `--root`, and
 trimming copies the viewer fetched (a `get` keeps its blob, as documented;
 releasing fetched copies is a separate change).
 
