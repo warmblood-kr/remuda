@@ -1,18 +1,16 @@
-remuda: cluster call: missing required argument --addr <IP[:PORT]>
-Usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] [--json]
-Next: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] [--json]
-Call a remote node API. Example: remuda cluster call <NODE> list --addr 192.0.2.1
+remuda: cluster call: missing SESSION for capture
+Call a remote node API: list, capture, or a read-only support probe. Example: remuda cluster call <NODE> list
 
-Usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] [--json]
+Usage: remuda cluster call NODE (list|capture SESSION|support) [--addr IP[:PORT]] [--json]
 
 Arguments:
   <NODE>     Remote node id, alias or fingerprint
-  <ACTION>   list or capture
+  <ACTION>   list, capture or support
   [SESSION]  Session to capture; required for capture
 
 Options:
   -h, --help              Print help
       --addr <IP[:PORT]>  Address; omitted port defaults to 7441
-      --json              Print list results as JSON
+      --json              Print results as JSON; support defines its own object
 
-Next: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] [--json]
+Next: remuda cluster call NODE (list|capture SESSION|support) [--addr IP[:PORT]] [--json]

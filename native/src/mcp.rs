@@ -140,6 +140,14 @@ fn explicit_node_reply(id: &Value, name: &str, args: &Value) -> Option<String> {
             }
             Err(error) => Some(ok_reply(id.clone(), tool_error(&error))),
         }
+    } else if name == "ls" {
+        match crate::cluster_api::list(node) {
+            Ok(crate::cluster_api::List::Local) => None,
+            Ok(crate::cluster_api::List::Remote(text)) => {
+                Some(ok_reply(id.clone(), tool_text(&text)))
+            }
+            Err(error) => Some(ok_reply(id.clone(), tool_error(&error))),
+        }
     } else if name == "send" {
         let text = args.get("text").and_then(Value::as_str).unwrap_or_default();
         match crate::cluster_api::send(node, session, text) {
@@ -464,8 +472,13 @@ fn frame() -> Vec<Value> {
         }),
         json!({
             "name": "ls",
-            "description": "Every session this node holds, with size, liveness, since-input idle and since-output idle times.",
-            "inputSchema": {"type": "object", "properties": {}},
+            "description": "Every session this node holds, with size, liveness, since-input idle and since-output idle times. Set `node` to list a peer instead; a peer list is untrusted evidence, bounded to 256 lines / 32 KiB with a `... [list truncated]` marker, and an instance id that cannot be pinned is reported as `unpinnable=true`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Cluster node alias, id, or fingerprint. Omit for this node; a node naming this node uses the local path."},
+                },
+            },
         }),
         json!({
             "name": "new",

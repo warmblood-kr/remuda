@@ -1079,7 +1079,7 @@ enum ClusterCommand {
     },
     Call {
         target: String,
-        address: std::net::SocketAddr,
+        address: Option<std::net::SocketAddr>,
         action: CallAction,
         json: bool,
     },
@@ -1095,6 +1095,7 @@ enum ClusterCommand {
 enum CallAction {
     List,
     Capture(String),
+    Support,
 }
 
 fn cluster_cli_spec() -> remuda_native::cli_parse::Spec {
@@ -1165,10 +1166,10 @@ fn cluster_cli_spec() -> remuda_native::cli_parse::Spec {
                     option("allow-public", None, "Allow binding to a public interface", false),
                     option("foreground", None, "Run listener in the foreground", false),
                 ], "remuda cluster listen [--bind IP[:PORT] [--allow-public] [--foreground] | --off]"),
-            verb("call", "Call a remote node API. Example: remuda cluster call node-abcd1234 list --addr 192.0.2.1",
-                vec![arg("NODE", "Remote node id, alias or fingerprint", false, true), arg("ACTION", "list or capture", false, true), arg("SESSION", "Session to capture; required for capture", false, false)],
-                vec![option("addr", Some("IP[:PORT]"), &port, true), option("json", None, "Print list results as JSON", false)],
-                "remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] [--json]"),
+            verb("call", "Call a remote node API: list, capture, or a read-only support probe. Example: remuda cluster call node-abcd1234 list",
+                vec![arg("NODE", "Remote node id, alias or fingerprint", false, true), arg("ACTION", "list, capture or support", false, true), arg("SESSION", "Session to capture; required for capture", false, false)],
+                vec![option("addr", Some("IP[:PORT]"), &port, false), option("json", None, "Print results as JSON; support defines its own object", false)],
+                "remuda cluster call NODE (list|capture SESSION|support) [--addr IP[:PORT]] [--json]"),
             verb("help", "Print help for a cluster command", vec![arg("COMMAND", "Cluster command name", false, false)], vec![], "remuda cluster help [COMMAND]"),
         ],
     }
@@ -1377,9 +1378,11 @@ fn parse_cluster_call(
         (Some("list"), None) => CallAction::List,
         (Some("capture"), Some(session)) => CallAction::Capture(session.to_owned()),
         (Some("capture"), None) => return Err("missing SESSION for capture".into()),
-        _ => return Err("expected list or capture SESSION".into()),
+        (Some("support"), None) => CallAction::Support,
+        (Some("support"), Some(_)) => return Err("support takes no SESSION".into()),
+        _ => return Err("expected list, capture SESSION or support".into()),
     };
-    let address = cluster_option_addr(values, "addr")?.expect("required by parser");
+    let address = cluster_option_addr(values, "addr")?;
     Ok(ClusterCommand::Call {
         target,
         address,
@@ -3004,42 +3007,47 @@ fn remote_control_status_lines(enabled: bool) -> (&'static str, &'static str) {
 
 fn cluster_call(
     target: &str,
-    address: std::net::SocketAddr,
+    address: Option<std::net::SocketAddr>,
     action: CallAction,
     json: bool,
 ) -> ExitCode {
-    use remuda_core::protocol::{expand_runs, Response};
+    use remuda_native::cluster_api::{resolve_call, ResolvedCall};
     use remuda_native::net::cluster_client::{ClientError, ClusterClient};
-    let selector = match remuda_native::cluster::snapshot() {
-        Ok(Some(snapshot)) => match snapshot.resolve_user_target(target) {
-            Ok(entry) => entry.node_fp.clone(),
-            Err(error) => return cluster_call_failure(error),
-        },
-        Ok(None) => target.to_owned(),
-        Err(error) => return cluster_call_failure(error),
-    };
-    let resolved = match remuda_native::cluster::resolve_target(&selector, Some(address)) {
-        Ok(resolved) => resolved,
-        Err(error) => return cluster_call_failure(error),
+    let (address, pinned_static_key) = match resolve_call(target, address) {
+        Ok(ResolvedCall::Local) => return cluster_call_local_target(target),
+        Ok(ResolvedCall::Remote {
+            address,
+            pinned_static_key,
+            ..
+        }) => (address, pinned_static_key),
+        Err(error) => {
+            if matches!(action, CallAction::Support)
+                && json
+                && error.kind() == std::io::ErrorKind::InvalidInput
+                && error.to_string().contains("no registry endpoint")
+            {
+                return support_json("no-endpoint", 2);
+            }
+            return cluster_call_failure(error);
+        }
     };
     let private_key = match remuda_native::cluster::identity::load_static_private_key() {
         Ok(key) => key,
         Err(error) => return fail(format!("cluster call: {error}")),
     };
+    if matches!(action, CallAction::Support) {
+        return cluster_call_support(address, &pinned_static_key, &private_key, json);
+    }
     let request = match &action {
-        CallAction::List => Request::List,
-        CallAction::Capture(session) => Request::CaptureStyled {
+        CallAction::List => remuda_core::protocol::Request::List,
+        CallAction::Capture(session) => remuda_core::protocol::Request::CaptureStyled {
             name: session.clone(),
             scrollback: 0,
         },
+        CallAction::Support => unreachable!("handled above"),
     };
-    let response = match ClusterClient::system().request(
-        resolved.address,
-        &resolved.pinned_static_key,
-        &private_key,
-        &request,
-    ) {
-        Ok(response) => response,
+    match ClusterClient::system().request(address, &pinned_static_key, &private_key, &request) {
+        Ok(response) => cluster_call_render(action, response, json),
         Err(error) => {
             let code = match error {
                 ClientError::Unreachable
@@ -3054,9 +3062,17 @@ fn cluster_call(
                 | ClientError::RequestTooLarge => 5,
             };
             eprintln!("cluster call: {error}");
-            return ExitCode::from(code);
+            ExitCode::from(code)
         }
-    };
+    }
+}
+
+fn cluster_call_render(
+    action: CallAction,
+    response: remuda_core::protocol::Response,
+    json: bool,
+) -> ExitCode {
+    use remuda_core::protocol::{expand_runs, Response};
     let response = sanitize_peer_response(response);
     if let Response::Error(message) = &response {
         eprintln!("cluster call: {message}");
@@ -3100,6 +3116,105 @@ fn cluster_call(
             ExitCode::from(5)
         }
     }
+}
+
+/// A target naming this node is refused: the local daemon is never a fallback
+/// for a remote call, so a typo cannot list or capture local sessions.
+fn cluster_call_local_target(target: &str) -> ExitCode {
+    eprintln!("cluster call: {target} is this node; there is no local fallback");
+    ExitCode::from(2)
+}
+
+/// The read-only `support` probe. Exactly one `RemoteInputSupport` is sent; it
+/// never reads or writes settings, never lists, and never authorizes a send.
+fn cluster_call_support(
+    address: std::net::SocketAddr,
+    pinned_static_key: &[u8],
+    private_key: &[u8],
+    json: bool,
+) -> ExitCode {
+    use remuda_core::protocol::{Request, Response};
+    use remuda_native::net::cluster_client::{ClientError, ClusterClient};
+    match ClusterClient::system().request(
+        address,
+        pinned_static_key,
+        private_key,
+        &Request::RemoteInputSupport,
+    ) {
+        Ok(Response::Ok) => {
+            if json {
+                return support_json("supported", 0);
+            }
+            println!("supported: this peer answers the per-session remote-input probe");
+            ExitCode::SUCCESS
+        }
+        Ok(Response::Error(reason)) if reason == "invalid remote request" => {
+            if json {
+                return support_json("old-peer", 4);
+            }
+            eprintln!(
+                "cluster call: old peer: upgrade the peer to answer the per-session remote-input probe; not written"
+            );
+            ExitCode::from(4)
+        }
+        Ok(Response::Error(reason)) => support_refused(&reason, json),
+        Ok(Response::RemoteControlDisabled) => {
+            support_refused("remote control is disabled on the target node", json)
+        }
+        Ok(_) => support_protocol("peer returned an unexpected response", json),
+        Err(error) => match error {
+            ClientError::Crypto
+            | ClientError::BadResponse
+            | ClientError::PeerTooNew
+            | ClientError::RequestTooLarge => support_protocol(&error.to_string(), json),
+            ClientError::Refused(_) => {
+                support_refused(&format!("peer refused the probe ({error})"), json)
+            }
+            ClientError::Unreachable
+            | ClientError::PeerNotListening
+            | ClientError::PeerClosedConnection
+            | ClientError::OsBlockedConnection
+            | ClientError::Timeout => {
+                let word = if matches!(error, ClientError::Timeout) {
+                    "timeout"
+                } else {
+                    "unreachable"
+                };
+                eprintln!("cluster call: support {word}: {error}");
+                if json {
+                    return support_json("timeout", 3);
+                }
+                ExitCode::from(3)
+            }
+        },
+    }
+}
+
+fn support_json(kind: &str, code: u8) -> ExitCode {
+    println!("{}", serde_json::json!({ "support": kind }));
+    if code == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(code)
+    }
+}
+
+fn support_refused(reason: &str, json: bool) -> ExitCode {
+    if json {
+        return support_json("refused", 4);
+    }
+    let reason = remuda_native::text::strip_terminal_controls(reason);
+    eprintln!("cluster call: refused: {reason}");
+    ExitCode::from(4)
+}
+
+fn support_protocol(reason: &str, json: bool) -> ExitCode {
+    if json {
+        return support_json("protocol", 5);
+    }
+    let reason = remuda_native::text::strip_terminal_controls(reason);
+    eprintln!("cluster call: support protocol failure: {reason}");
+    ExitCode::from(5)
 }
 
 fn cluster_call_failure(error: std::io::Error) -> ExitCode {
@@ -4511,7 +4626,7 @@ mod cluster_cli_tests {
         assert!(matches!(
             parse_cluster_command(&["call", "node-abc", "list", "--addr", "192.0.2.4"]),
             ClusterCommand::Call { address, .. }
-                if address == "192.0.2.4:7441".parse().unwrap()
+                if address == Some("192.0.2.4:7441".parse().unwrap())
         ));
     }
 
@@ -8048,7 +8163,17 @@ mod cluster_call_tests {
     use std::time::Duration;
 
     #[test]
-    fn cluster_call_accepts_only_list_and_capture_with_required_address() {
+    fn cluster_call_accepts_optional_address_and_support() {
+        assert_eq!(
+            parse_cluster_command(&["call", "node-abc", "list"]),
+            ClusterCommand::Call {
+                target: "node-abc".into(),
+                address: None,
+                action: CallAction::List,
+                json: false,
+            },
+            "a registry-endpoint call parses without --addr"
+        );
         assert_eq!(
             parse_cluster_command(&[
                 "call",
@@ -8060,7 +8185,7 @@ mod cluster_call_tests {
             ]),
             ClusterCommand::Call {
                 target: "node-abc".into(),
-                address: "127.0.0.1:9".parse().unwrap(),
+                address: Some("127.0.0.1:9".parse().unwrap()),
                 action: CallAction::List,
                 json: true,
             }
@@ -8069,7 +8194,7 @@ mod cluster_call_tests {
             parse_cluster_command(&["call", "node-abc", "list", "--addr=127.0.0.1:9"]),
             ClusterCommand::Call {
                 target: "node-abc".into(),
-                address: "127.0.0.1:9".parse().unwrap(),
+                address: Some("127.0.0.1:9".parse().unwrap()),
                 action: CallAction::List,
                 json: false,
             }
@@ -8078,22 +8203,33 @@ mod cluster_call_tests {
             parse_cluster_command(&["call", "node-abc", "capture", "build", "--addr", "[::1]:9"]),
             ClusterCommand::Call {
                 target: "node-abc".into(),
-                address: "[::1]:9".parse().unwrap(),
+                address: Some("[::1]:9".parse().unwrap()),
                 action: CallAction::Capture("build".into()),
                 json: false,
             }
         );
+        assert_eq!(
+            parse_cluster_command(&["call", "node-abc", "support"]),
+            ClusterCommand::Call {
+                target: "node-abc".into(),
+                address: None,
+                action: CallAction::Support,
+                json: false,
+            }
+        );
+        assert_eq!(
+            parse_cluster_command(&["call", "node-abc", "support", "--json"]),
+            ClusterCommand::Call {
+                target: "node-abc".into(),
+                address: None,
+                action: CallAction::Support,
+                json: true,
+            }
+        );
         for args in [
-            vec!["call", "node-abc", "list"],
-            vec![
-                "call",
-                "node-abc",
-                "input",
-                "build",
-                "--addr",
-                "127.0.0.1:9",
-            ],
-            vec!["call", "node-abc", "capture", "--addr", "127.0.0.1:9"],
+            vec!["call", "node-abc", "input", "build"],
+            vec!["call", "node-abc", "capture"],
+            vec!["call", "node-abc", "support", "build"],
             vec!["call", "node-abc", "list", "--addr", "invalid"],
             vec![
                 "call",
@@ -8115,13 +8251,13 @@ mod cluster_call_tests {
     #[test]
     fn cluster_call_error_uses_the_declared_conditional_usage() {
         let ClusterCommand::Invalid { reason, .. } =
-            parse_cluster_command(&["call", "node-abc", "list"])
+            parse_cluster_command(&["call", "node-abc", "capture"])
         else {
-            panic!("missing required address should be invalid");
+            panic!("capture without SESSION should be invalid");
         };
         assert!(
             reason.contains(
-                "Usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] [--json]"
+                "Usage: remuda cluster call NODE (list|capture SESSION|support) [--addr IP[:PORT]] [--json]"
             ),
             "{reason}"
         );

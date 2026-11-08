@@ -172,6 +172,17 @@ still rejects `RemoteInputLine` rather than accepting it as an unguarded
 and close it before a downgrade. `Ack { duplicate: true }` means the same idempotency
 scope already applied the line; it is not a new turn or a completion proof.
 
+`remuda cluster call NODE support` is a read-only protocol-surface probe: it
+sends exactly one `RemoteInputSupport` request and reports whether that peer
+implements the per-session opt-out. It does not prove that the peer's policy is
+configured correctly, and a successful probe is not authorization to send
+input; only the separate local `cluster remote-send` gate and the guarded
+`RemoteInputLine` write govern sends. Neither the support probe nor an MCP `ls`
+with `node` reads or changes that gate. A peer list is untrusted evidence,
+bounded to 256 lines and 32 KiB with a `... [list truncated]` marker; an
+instance id that cannot be pinned is reported as `unpinnable=true` and must
+not be used as a send target.
+
 An opted-out session still spends one peer rate token per refused request: the
 listener's pre-dispatch limiter runs before the session policy is checked, and
 the receiver returns `RemoteControlDisabled` after that charge. This is a

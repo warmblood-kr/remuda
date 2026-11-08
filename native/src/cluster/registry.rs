@@ -267,13 +267,28 @@ impl RegistryUpdate {
 
 impl Registry {
     pub fn merge(&mut self, received: &Registry) -> io::Result<()> {
+        self.merge_with(received, false)
+    }
+
+    /// Like [`merge`](Self::merge), but a malformed endpoint hint is retained
+    /// instead of making the whole registry unreadable. Routing still rejects
+    /// it for the node that carries it; updates, saves and digests stay strict.
+    fn merge_loaded(&mut self, received: &Registry) -> io::Result<()> {
+        self.merge_with(received, true)
+    }
+
+    fn merge_with(&mut self, received: &Registry, lenient_endpoint: bool) -> io::Result<()> {
         let mut merged = BTreeMap::new();
         for entry in self
             .authorized_nodes
             .iter()
             .chain(&received.authorized_nodes)
         {
-            let key = validate_entry(entry)?;
+            let key = if lenient_endpoint {
+                validate_entry_lenient(entry)?
+            } else {
+                validate_entry(entry)?
+            };
             match merged.get(&key) {
                 Some(current) => {
                     merged.insert(key, merge_known_entry(entry, current));
@@ -476,6 +491,16 @@ fn invalid_update(message: &str) -> io::Error {
 }
 
 fn validate_entry(entry: &AuthorizedNode) -> io::Result<Vec<u8>> {
+    validate_entry_with(entry, false)
+}
+
+/// Load-time validation: an endpoint hint that cannot parse is kept as-is so a
+/// single bad hint does not hide the rest of the membership file.
+fn validate_entry_lenient(entry: &AuthorizedNode) -> io::Result<Vec<u8>> {
+    validate_entry_with(entry, true)
+}
+
+fn validate_entry_with(entry: &AuthorizedNode, lenient_endpoint: bool) -> io::Result<Vec<u8>> {
     if entry.format_major != REGISTRY_FORMAT_MAJOR {
         return Err(unsupported_major("entry", entry.format_major));
     }
@@ -492,7 +517,7 @@ fn validate_entry(entry: &AuthorizedNode) -> io::Result<Vec<u8>> {
             "registry entry optional fields are reserved or exceed cap",
         ));
     }
-    validate_entry_core(entry)
+    validate_entry_core(entry, lenient_endpoint)
 }
 
 fn ensure_supported_entry_major(entry: &AuthorizedNode) -> io::Result<()> {
@@ -502,7 +527,7 @@ fn ensure_supported_entry_major(entry: &AuthorizedNode) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_entry_core(entry: &AuthorizedNode) -> io::Result<Vec<u8>> {
+fn validate_entry_core(entry: &AuthorizedNode, lenient_endpoint: bool) -> io::Result<Vec<u8>> {
     let public_key = encoding::decode_base64(&entry.static_pubkey)?;
     if public_key.len() != 32 || encoding::fingerprint(&public_key) != entry.node_fp {
         return Err(io::Error::new(
@@ -533,17 +558,24 @@ fn validate_entry_core(entry: &AuthorizedNode) -> io::Result<Vec<u8>> {
         ));
     }
     if let Some(endpoint) = &entry.endpoint {
-        let parsed: std::net::SocketAddr = endpoint.parse().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "registry endpoint must be host:port",
-            )
-        })?;
-        if parsed.to_string() != *endpoint || super::join_line::validate_endpoint(parsed).is_err() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "registry endpoint must be a canonical unicast host:port",
-            ));
+        match endpoint.parse::<std::net::SocketAddr>() {
+            Ok(parsed) => {
+                if parsed.to_string() != *endpoint
+                    || super::join_line::validate_endpoint(parsed).is_err()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "registry endpoint must be a canonical unicast host:port",
+                    ));
+                }
+            }
+            Err(_) if lenient_endpoint => {}
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid endpoint in cluster registry",
+                ))
+            }
         }
     }
     Ok(public_key)
@@ -1058,7 +1090,7 @@ pub(super) fn load_registry_at(dir: &Path) -> io::Result<Registry> {
     }
     let registry: Registry = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
     let mut folded = Registry::default();
-    folded.merge(&registry)?;
+    folded.merge_loaded(&registry)?;
     Ok(folded)
 }
 

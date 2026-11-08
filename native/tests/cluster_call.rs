@@ -260,8 +260,8 @@ fn fake_peer(
         match answer(&request) {
             FakeAnswer::Reply(response) => {
                 let payload = serde_json::to_vec(&response).unwrap();
-                let sealed =
-                    remuda_native::net::frame::seal_response(opened, &payload).expect("seal");
+                let sealed = remuda_native::net::frame::seal_response_chunked(opened, &payload)
+                    .expect("seal");
                 write_http_body(&mut stream, &sealed);
             }
             FakeAnswer::Raw(body) => write_http_body(&mut stream, &body),

@@ -10,6 +10,7 @@ use crate::net::cluster_client::{ClientError, ClusterClient};
 use crate::text::{is_terminal_control, strip_terminal_controls};
 use remuda_core::protocol::{Request, Response, StyledRun};
 use std::collections::BTreeMap;
+use std::io;
 use std::net::SocketAddr;
 
 /// Upper bound for one remote capture returned to an agent. The MCP layer and
@@ -459,6 +460,204 @@ fn render_rows(rows: &[Vec<StyledRun>]) -> String {
         text.push_str(TRUNCATION_MARKER);
     }
     text
+}
+
+/// Resolve a user target with an optional routing override, keeping the IO
+/// error kind so the CLI maps typed failures instead of parsing text. The
+/// pinned identity always comes from the registry entry, never the override.
+pub fn resolve_call(target: &str, addr_override: Option<SocketAddr>) -> io::Result<ResolvedCall> {
+    let snapshot = cluster::snapshot()?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no cluster is initialized; run `remuda cluster init`",
+        )
+    })?;
+    let entry = match cluster::addressing::resolve_user_target(
+        &snapshot.registry.authorized_nodes,
+        &snapshot.aliases,
+        target,
+    ) {
+        Ok(entry) => entry,
+        // This node's hostname is local only when no admitted node claims it.
+        Err(error)
+            if snapshot.identity.node_name == target && error.kind() == io::ErrorKind::NotFound =>
+        {
+            return Ok(ResolvedCall::Local);
+        }
+        Err(error) => return Err(error),
+    };
+    if entry.state != NodeState::Admitted {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("node {} is revoked", cluster::node_label(&entry.node_fp)),
+        ));
+    }
+    if snapshot.identity.node_name == target && entry.node_fp != snapshot.identity.node_fp {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "node {target} is ambiguous: it is both this node's hostname and another admitted node; use the fingerprint"
+            ),
+        ));
+    }
+    if entry.node_fp == snapshot.identity.node_fp {
+        return Ok(ResolvedCall::Local);
+    }
+    let resolved = cluster::resolve_target(&entry.node_fp, addr_override)?;
+    Ok(ResolvedCall::Remote {
+        fingerprint: entry.node_fp.clone(),
+        address: resolved.address,
+        pinned_static_key: resolved.pinned_static_key,
+    })
+}
+
+/// The result of a remote-aware list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum List {
+    /// The target names this node; the caller keeps its existing local path.
+    Local,
+    /// Bounded, sanitized peer rows in peer list order.
+    Remote(String),
+}
+
+/// At most this many session lines before the truncation marker.
+const MAX_LIST_LINES: usize = 256;
+/// At most this many bytes of list text, marker included.
+const MAX_LIST_BYTES: usize = 32 * 1024;
+const LIST_TRUNCATION_MARKER: &str = "... [list truncated]";
+
+/// List a peer's sessions. One authenticated `List`; a local target is reported
+/// as [`List::Local`] so the local MCP path stays byte-identical. Never
+/// evaluates, syncs, captures, writes, or reads settings.
+pub fn list(target: &str) -> Result<List, String> {
+    let ResolvedCall::Remote {
+        fingerprint,
+        address,
+        pinned_static_key,
+    } = resolve_call(target, None).map_err(|error| sanitize(format!("cluster: {error}")))?
+    else {
+        return Ok(List::Local);
+    };
+    let private_key = cluster::identity::load_static_private_key()
+        .map_err(|_| "cluster identity is unavailable".to_owned())?;
+    let response = ClusterClient::system()
+        .request(address, &pinned_static_key, &private_key, &Request::List)
+        .map_err(|error| list_remote_error(&fingerprint, error))?;
+    match response {
+        Response::Sessions(rows) => Ok(List::Remote(remote_sessions_text(&rows))),
+        Response::Error(message) => Err(sanitize(format!(
+            "list on {}: {message}",
+            cluster::node_label(&fingerprint)
+        ))),
+        Response::RemoteControlDisabled => Err(format!(
+            "list on {}: remote control is disabled there",
+            cluster::node_label(&fingerprint)
+        )),
+        _ => Err(format!(
+            "list on {}: peer returned an unexpected response",
+            cluster::node_label(&fingerprint)
+        )),
+    }
+}
+
+fn list_remote_error(fingerprint: &str, error: ClientError) -> String {
+    let code = match error {
+        ClientError::Unreachable
+        | ClientError::PeerNotListening
+        | ClientError::PeerClosedConnection
+        | ClientError::OsBlockedConnection
+        | ClientError::Timeout => "unreachable",
+        ClientError::Refused(_) => "refused",
+        ClientError::Crypto
+        | ClientError::BadResponse
+        | ClientError::PeerTooNew
+        | ClientError::RequestTooLarge => "protocol",
+    };
+    format!(
+        "list on {}: {code}: {error}",
+        cluster::node_label(fingerprint)
+    )
+}
+
+/// Every peer row: one line each, in the peer's order, bounded by whole lines.
+fn remote_sessions_text(sessions: &[remuda_core::SessionSummary]) -> String {
+    let mut text = String::new();
+    let mut truncated = false;
+    for (index, session) in sessions.iter().enumerate() {
+        let line = remote_list_line(session);
+        let separator = usize::from(!text.is_empty());
+        let more_after = index + 1 < sessions.len();
+        // Reserve room for the marker whenever more content exists, so the
+        // bound always includes it and the marker is never a partial line.
+        let reserve = if more_after {
+            separator + LIST_TRUNCATION_MARKER.len()
+        } else {
+            0
+        };
+        if text.len() + separator + line.len() + reserve > MAX_LIST_BYTES {
+            truncated = true;
+            break;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&line);
+        if index + 1 == MAX_LIST_LINES && more_after {
+            truncated = true;
+            break;
+        }
+    }
+    if truncated {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(LIST_TRUNCATION_MARKER);
+    }
+    text
+}
+
+fn remote_list_line(session: &remuda_core::SessionSummary) -> String {
+    let mut line = format!(
+        "{}\t{}x{}\talive={}\tidle={:.0}s\toutput_idle={:.0}s\t{}",
+        list_name(&session.name),
+        session.size.cols(),
+        session.size.rows(),
+        session.alive,
+        session.idle.as_secs_f64(),
+        session.output_idle.unwrap_or(session.idle).as_secs_f64(),
+        list_instance(&session.instance_id),
+    );
+    if session.unavailable {
+        line.push_str("\tunavailable=true");
+    }
+    if session.remote_input_disabled {
+        line.push_str("\tremote_input_disabled=true");
+    }
+    line
+}
+
+/// Tab/newline framing becomes one space; other terminal controls are removed.
+fn list_name(name: &str) -> String {
+    let framed: String = name
+        .chars()
+        .map(|character| match character {
+            '\t' | '\n' | '\r' => ' ',
+            other => other,
+        })
+        .collect();
+    strip_terminal_controls(&framed).into_owned()
+}
+
+/// An id is emitted byte-exact only when it is nonempty and control-free; a
+/// partial or rewritten id could pin the wrong instance, so it is refused
+/// wholesale instead.
+fn list_instance(instance: &Option<String>) -> String {
+    match instance {
+        Some(value) if !value.is_empty() && !value.chars().any(is_terminal_control) => {
+            format!("instance_id={value}")
+        }
+        _ => "instance_id=\tunpinnable=true".to_string(),
+    }
 }
 
 fn sanitize(message: String) -> String {
