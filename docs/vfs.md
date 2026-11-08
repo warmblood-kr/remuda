@@ -130,16 +130,19 @@ store). `--addr` defaults to `127.0.0.1:0`: loopback on a free port.
 The bridge is read-only: `GET` and `HEAD` only, no cookies, no upload, nothing
 written back to the store. Stored HTML is treated as untrusted by default:
 `Content-Security-Policy: sandbox` gives it an opaque origin and no script, so
-links, stylesheets and images work but a page cannot call the network or read
-another file. The same policy covers XML and XHTML documents (a browser parses
-those as documents and can run their script) and every other type, so no file
-is served as an unpoliced document.
+links, stylesheets and images work but a page cannot make its own requests or
+read another file. A link you click still navigates the tab, so its target sees
+a normal GET; it gets no access to the bridge page or the store. The same
+policy covers XML and XHTML documents (a browser parses those as documents and
+can run their script) and every other type, so no file is served as an
+unpoliced document.
 
 `--allow-scripts` drops that guard for artifacts you wrote and trust. The page
-then runs as the loopback origin: it can read every file under the bridge, and
-it can put what it reads into an outbound navigation. Workers stay disabled,
-because a worker would bypass the page's `connect-src` and could send bytes
-anywhere. Treat a served tree as readable by anyone who can run code in it.
+then runs as the loopback origin: it can read every file under the bridge, use
+that origin's storage, open popups, and put what it reads into an outbound
+navigation. Workers stay disabled, because a worker would bypass the page's
+`connect-src` and could send bytes anywhere. Treat a served tree as readable by
+anyone who can run code in it.
 
 - A non-loopback `--addr` is refused unless you also pass `--allow-remote`.
   That flag publishes cluster files to the network, so it is asked for twice on
