@@ -461,8 +461,19 @@ fn enrichment_contract_zero_usage_is_a_proven_value_not_unavailable() {
     );
 }
 
+fn assert_rendered_rows_hide_private_join_ids(actual: &Result<Vec<String>, EnrichmentError>) {
+    if let Ok(rows) = actual {
+        for row in rows {
+            assert!(
+                !row.contains("private-MID")
+                    && !row.contains("member_id")
+                    && !row.contains("leader_id")
+            );
+        }
+    }
+}
+
 #[test]
-#[allow(clippy::too_many_lines)]
 fn enrichment_contract_internal_join_ids_never_reach_rendered_rows() {
     let summaries = [base("human leader"), base("worker")];
     let facts = [
@@ -517,13 +528,5 @@ fn enrichment_contract_internal_join_ids_never_reach_rendered_rows() {
             "  worker · ← human leader · live".into()
         ])
     );
-    if let Ok(rows) = actual {
-        for row in rows {
-            assert!(
-                !row.contains("private-MID")
-                    && !row.contains("member_id")
-                    && !row.contains("leader_id")
-            );
-        }
-    }
+    assert_rendered_rows_hide_private_join_ids(&actual);
 }

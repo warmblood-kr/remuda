@@ -737,12 +737,12 @@ fn activity_field(session: &remuda_core::SessionSummary, elapsed_ms: u64) -> Opt
     if session.instance_id.as_deref().is_none_or(str::is_empty) {
         return None;
     }
-    let age = session.program_status_age_ms?.saturating_add(elapsed_ms);
-    if age >= remuda_core::session_enrichment::PROGRAM_STATUS_MAX_AGE_MS {
-        return None;
-    }
     let status = session.program_status.as_ref()?;
     if status.state == remuda_core::agent::ProgramState::Unknown {
+        return None;
+    }
+    let age = session.program_status_age_ms?.saturating_add(elapsed_ms);
+    if age >= remuda_core::session_enrichment::program_status_max_age_ms(status.state) {
         return None;
     }
     Some(status.state.as_str())

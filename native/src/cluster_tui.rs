@@ -18,8 +18,8 @@ use remuda_core::clock::Clock;
 use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
 use remuda_core::session_enrichment::{
-    resolve_cluster_roster, ListedTarget, MetadataState, NodeRoster, ResolvedSession,
-    PROGRAM_STATUS_MAX_AGE_MS,
+    program_status_max_age_ms, resolve_cluster_roster, ListedTarget, MetadataState, NodeRoster,
+    ResolvedSession,
 };
 use sender::InputSender;
 use std::collections::{HashSet, VecDeque};
@@ -2854,10 +2854,14 @@ fn local_advice(session: &SessionSummary) -> Option<&'static str> {
     if session.instance_id.as_deref().is_none_or(str::is_empty) {
         return None;
     }
-    if session.program_status_age_ms? >= PROGRAM_STATUS_MAX_AGE_MS {
+    let status = session.program_status.as_ref()?;
+    if status.state == ProgramState::Unknown {
         return None;
     }
-    advice_text(session.program_status.as_ref())
+    if session.program_status_age_ms? >= program_status_max_age_ms(status.state) {
+        return None;
+    }
+    Some(status.state.as_str())
 }
 
 fn advice_text(status: Option<&ProgramStatus>) -> Option<&'static str> {
@@ -7862,7 +7866,7 @@ mod tests {
             kind: None,
             progress: None,
         });
-        session.program_status_age_ms = Some(59_000);
+        session.program_status_age_ms = Some(599_000);
         let node = RemoteNodeSnapshot {
             registry_key: "fp-a".into(),
             name: "peer".into(),

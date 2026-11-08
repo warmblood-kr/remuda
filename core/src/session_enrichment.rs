@@ -123,8 +123,18 @@ pub const MAX_FACT_STRING_BYTES: usize = 128;
 /// Independent response cap: even a full 4096-entry response is shed well
 /// before the base List frame limit.
 pub const MAX_CLUSTER_FACTS_BYTES: usize = 256 * 1024;
-/// Freshness requirement for an authoritative typed program status.
-pub const PROGRAM_STATUS_MAX_AGE_MS: u64 = 60_000;
+/// A working report is fresh for ten minutes; other known states stay useful
+/// for an hour. Unknown and stale sources are suppressed, never guessed.
+pub const PROGRAM_STATUS_WORKING_MAX_AGE_MS: u64 = 600_000;
+pub const PROGRAM_STATUS_OTHER_MAX_AGE_MS: u64 = 3_600_000;
+
+pub fn program_status_max_age_ms(state: ProgramState) -> u64 {
+    if state == ProgramState::Working {
+        PROGRAM_STATUS_WORKING_MAX_AGE_MS
+    } else {
+        PROGRAM_STATUS_OTHER_MAX_AGE_MS
+    }
+}
 /// Visual indentation is capped at 20 levels (two cells each).
 pub const MAX_VISUAL_DEPTH: usize = 20;
 
@@ -411,12 +421,12 @@ fn fresh_program_status(
     {
         return None;
     }
-    let age = summary.program_status_age_ms?;
-    if age >= PROGRAM_STATUS_MAX_AGE_MS {
-        return None;
-    }
     let status = summary.program_status.as_ref()?;
     if status.state == ProgramState::Unknown {
+        return None;
+    }
+    let age = summary.program_status_age_ms?;
+    if age >= program_status_max_age_ms(status.state) {
         return None;
     }
     Some(status.clone())
@@ -607,7 +617,7 @@ mod status_age_tests {
     }
 
     #[test]
-    fn typed_status_is_fresh_strictly_under_sixty_seconds() {
+    fn typed_status_freshness_is_pinned_per_state() {
         let mut summary = base("shell");
         summary.program_status = Some(ProgramStatus {
             state: ProgramState::Working,
@@ -615,10 +625,31 @@ mod status_age_tests {
             kind: Some(ProgramBlockKind::Permission),
             progress: None,
         });
-        summary.program_status_age_ms = Some(PROGRAM_STATUS_MAX_AGE_MS - 1);
+        summary.program_status_age_ms = Some(PROGRAM_STATUS_WORKING_MAX_AGE_MS - 1);
         assert!(resolve_status(&summary, false).is_some());
-        summary.program_status_age_ms = Some(PROGRAM_STATUS_MAX_AGE_MS);
+        summary.program_status_age_ms = Some(PROGRAM_STATUS_WORKING_MAX_AGE_MS);
         assert!(resolve_status(&summary, false).is_none());
+        summary.program_status.as_mut().unwrap().state = ProgramState::Idle;
+        summary.program_status_age_ms = Some(PROGRAM_STATUS_OTHER_MAX_AGE_MS - 1);
+        assert!(resolve_status(&summary, false).is_some());
+        summary.program_status_age_ms = Some(PROGRAM_STATUS_OTHER_MAX_AGE_MS);
+        assert!(resolve_status(&summary, false).is_none());
+    }
+
+    #[test]
+    fn activity_vocabulary_is_the_existing_typed_enum() {
+        for (state, word) in [
+            (ProgramState::Idle, "idle"),
+            (ProgramState::Working, "working"),
+            (ProgramState::Blocked, "blocked"),
+            (ProgramState::Done, "done"),
+            (ProgramState::Error, "error"),
+        ] {
+            assert_eq!(state.as_str(), word);
+            assert!(program_status_max_age_ms(state) >= 600_000);
+        }
+        assert_eq!(ProgramState::Unknown.as_str(), "unknown");
+        assert_eq!(program_status_max_age_ms(ProgramState::Unknown), 3_600_000);
     }
 
     #[test]
