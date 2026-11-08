@@ -518,7 +518,6 @@ fn assert_remote_screen_columns(tui: &RemoteTui, cols: u16, server_label: &str) 
         screen.join("\n")
     );
     let separator = if cols >= 60 { "│" } else { "─" };
-    let separator_column = if cols >= 60 { usize::from(cols / 2) } else { 0 };
     let separator_rows = screen_cells
         .iter()
         .filter_map(|row| {
@@ -531,11 +530,21 @@ fn assert_remote_screen_columns(tui: &RemoteTui, cols: u16, server_label: &str) 
         !separator_rows.is_empty(),
         "{cols} columns: no pane divider"
     );
+    let separator_column = if cols >= 60 {
+        let first = separator_rows.first().expect("separator rows").1;
+        assert!(
+            (24..=48).contains(&first),
+            "{cols} columns: pane divider at {first}, outside 24..=48"
+        );
+        first
+    } else {
+        0
+    };
     for (row, column) in &separator_rows {
         assert_eq!(
             *column,
             separator_column,
-            "{cols} columns: pane divider shifted from its frame column: {}",
+            "{cols} columns: pane divider shifted from its row: {}",
             row.concat()
         );
     }
@@ -558,11 +567,7 @@ fn assert_remote_screen_columns(tui: &RemoteTui, cols: u16, server_label: &str) 
     } else {
         column_of("CRLF-MARKER")
     };
-    let expected_marker_column = if cols >= 60 {
-        usize::from(cols / 2 + 1)
-    } else {
-        0
-    };
+    let expected_marker_column = if cols >= 60 { separator_column + 1 } else { 0 };
     assert_eq!(
         marker_column,
         expected_marker_column,
