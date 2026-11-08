@@ -353,7 +353,11 @@ fn read_line<R: Read>(reader: &mut BufReader<R>) -> Result<Vec<u8>, ClientError>
         .take((MAX_REQUEST_LINE_BYTES + 1) as u64)
         .read_until(b'\n', &mut line)
         .map_err(map_io)?;
-    if count == 0 || line.len() > MAX_REQUEST_LINE_BYTES || !line.ends_with(b"\r\n") {
+    if count == 0 {
+        // An established connection closed before the first response byte.
+        return Err(ClientError::PeerClosedConnection);
+    }
+    if line.len() > MAX_REQUEST_LINE_BYTES || !line.ends_with(b"\r\n") {
         return Err(ClientError::BadResponse);
     }
     line.truncate(line.len() - 2);

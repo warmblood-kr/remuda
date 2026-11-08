@@ -8,9 +8,10 @@ Commands:
   advertise  Refresh this node's endpoint from its running listener without restarting it
   alias      Set or clear a cluster-wide display alias for a node. Example: remuda cluster alias <NODE> macbook
   control    Enable or disable remote control. Example: remuda cluster control off
+  remote-send Enable or disable originating peer sends; off until managed panes are protected. Example: remuda cluster remote-send on
   revoke     Revoke a node or fingerprint; prompt before revoking unless --yes is used. Example: remuda cluster revoke <NODE>
   leave      Leave the cluster: copy files to other nodes, have one of them revoke this node, then forget its membership. Example: remuda cluster leave
   remote     Attach to a remote session, or show the remote session picker. Example: remuda cluster remote node/session
   listen     Manage the cluster listener. Example: remuda cluster listen --bind 127.0.0.1
-  call       Call a remote node API. Example: remuda cluster call <NODE> list --addr 192.0.2.1
+  call       Call a remote node API: list, capture, or a read-only support probe. Example: remuda cluster call <NODE> list
   help       Print help for a cluster command
