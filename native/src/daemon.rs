@@ -3741,6 +3741,7 @@ fn handle_new(
                 size,
                 cwd: cwd.as_deref(),
                 env: &session_env,
+                remote_input_disabled,
             },
             return_instance_id,
         );

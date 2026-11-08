@@ -570,6 +570,28 @@ fn hosted_and_local_sessions_share_one_registry_name_space() {
     assert!(registry.hosted("fixture").is_some());
 }
 #[test]
+fn a_hosted_launch_time_opt_out_is_written_with_its_registration() {
+    let registry = crate::Registry::new();
+    let registered = handle(&Shared::new());
+    let instance = registered.identity().instance.clone();
+    assert!(registry
+        .register_hosted_with_remote_input_disabled(registered, true)
+        .is_ok());
+    assert!(registry.remote_input_disabled(&instance));
+    // A protected registration refused for a taken name writes no policy
+    // for the name's existing occupant.
+    let plain = crate::Registry::new();
+    let occupant = handle(&Shared::new());
+    let occupant_instance = occupant.identity().instance.clone();
+    assert!(plain.register_hosted(occupant).is_ok());
+    assert!(!plain.remote_input_disabled(&occupant_instance));
+    assert!(plain
+        .register_hosted_with_remote_input_disabled(handle(&Shared::new()), true)
+        .is_err());
+    assert!(!plain.remote_input_disabled(&occupant_instance));
+}
+
+#[test]
 fn name_routes_reach_a_hosted_handle_and_keep_its_errors() {
     let registry = crate::Registry::new();
     let shared = Shared::new();

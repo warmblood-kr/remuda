@@ -85,6 +85,9 @@ pub struct NewHosted<'a> {
     pub size: Size,
     pub cwd: Option<&'a str>,
     pub env: &'a HashMap<String, String>,
+    /// Launch-time protection: remote input is refused for this instance
+    /// before its first remote request, exactly as for an in-process one.
+    pub remote_input_disabled: bool,
 }
 
 impl Hosting {
@@ -182,7 +185,7 @@ impl Hosting {
         let session = hosts.spawn(request)?;
         let handle = SessionHandle::hosted(session.clone()).map_err(|error| error.to_string())?;
         registry
-            .register_hosted(handle)
+            .register_hosted_with_remote_input_disabled(handle, request.remote_input_disabled)
             .map(|_| ())
             .map_err(|_| format!("name taken: {}", request.name))
     }

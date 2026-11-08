@@ -450,14 +450,33 @@ impl Registry {
         &self,
         handle: SessionHandle,
     ) -> core::result::Result<Arc<SessionHandle>, SessionHandle> {
+        self.register_hosted_with_remote_input_disabled(handle, false)
+    }
+
+    /// Track a checked host-backed handle and its launch-time remote-input
+    /// opt-out under one critical section, so no remote admission can observe
+    /// the new instance first. A refused name writes no policy.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the refused handle is handed back whole"
+    )]
+    pub fn register_hosted_with_remote_input_disabled(
+        &self,
+        handle: SessionHandle,
+        remote_input_disabled: bool,
+    ) -> core::result::Result<Arc<SessionHandle>, SessionHandle> {
         let sessions = self.lock();
         let mut hosted = self.hosted_lock();
         let name = handle.identity().name.clone();
         if sessions.contains_key(&name) || hosted.contains_key(&name) {
             return Err(handle);
         }
+        let instance = handle.identity().instance.clone();
         let handle = Arc::new(handle);
         hosted.insert(name, Arc::clone(&handle));
+        if remote_input_disabled {
+            self.mutate_remote_input_policy(&instance, true);
+        }
         Ok(handle)
     }
 
