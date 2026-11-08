@@ -151,6 +151,25 @@ jobs:
       - uses: actions/checkout@v4
       - run: sh scripts/test-hosted-suite.sh
 
+  test-hosted-macos:
+    # macOS had no hosted coverage at all: this job proves the #713 promise on
+    # the desktop platform - a host and its child outlive the daemon that
+    # started them - in one test target instead of the whole suite.
+    # The Linux job runs the full suite; this one is the platform smoke.
+    # Pull requests opt in with the `ci-macos` label, because macOS runners
+    # cost ten times a Linux one.
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-macos'))
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: A host and its child outlive a killed daemon, and no host leaks
+        env:
+          HOSTED_SUITE_TARGET: session_host_daemon
+        run: sh scripts/test-hosted-suite.sh hosted
+
   host-compat-n-plus-one:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     # A reload replaces the daemon while session hosts keep running, so a
