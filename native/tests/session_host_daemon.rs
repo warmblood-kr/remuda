@@ -201,6 +201,63 @@ fn without_the_opt_in_new_sessions_stay_in_process() {
 }
 
 #[test]
+fn a_launch_flag_protects_a_hosted_instance() {
+    let root = Root::new();
+    let _daemon = Daemon::spawn(&root, true);
+    let path = root.socket();
+    let response = request(
+        &path,
+        &Request::NewWithInstance {
+            name: Some("protected".into()),
+            command: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            size: Size::new(80, 24),
+            cwd: Some("/".into()),
+            env: None,
+            remote_input_disabled: true,
+        },
+    );
+    let (name, instance) = match response {
+        Response::SessionStarted { name, instance_id } => (name, instance_id),
+        other => panic!("unexpected start response: {other:?}"),
+    };
+    let listed = match request(&path, &Request::List) {
+        Response::Sessions(rows) => rows,
+        other => panic!("unexpected list: {other:?}"),
+    };
+    assert!(
+        listed
+            .iter()
+            .any(|row| row.name == name && row.remote_input_disabled),
+        "the launch-time opt-out is missing from the hosted listing: {listed:?}"
+    );
+    assert_eq!(
+        request(
+            &path,
+            &Request::RemoteInput {
+                name: name.clone(),
+                instance_id: instance,
+                client_id: "00000000000000000000000000000005".into(),
+                seq: 1,
+                bytes: b"blocked".to_vec(),
+                line: true,
+            }
+        ),
+        Response::RemoteControlDisabled
+    );
+    assert_eq!(
+        request(
+            &path,
+            &Request::SendLine {
+                name: name.clone(),
+                text: "local".into(),
+            }
+        ),
+        Response::Ok
+    );
+    assert_eq!(close(&path, &name), Response::Ok);
+}
+
+#[test]
 fn a_hosted_session_survives_daemon_sigkill_and_is_rediscovered() {
     let root = Root::new();
     let path = root.socket();
