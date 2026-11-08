@@ -583,7 +583,7 @@ fn real_remote_tui_frames_start_each_row_at_column_zero_at_wide_and_narrow_sizes
     for cols in [80, 40] {
         let mut tui = RemoteTui::start_at_size(&client_node, None, cols, 24);
         tui.wait_for(&server_label, Duration::from_secs(10));
-        tui.wait_for("reachable", Duration::from_secs(10));
+        tui.wait_for(" · sync ", Duration::from_secs(10));
         tui.writer.write_all(b"\x1b[B\x1b[C").unwrap();
         tui.wait_for("proof", Duration::from_secs(10));
         tui.writer.write_all(b"\x1b[B\r").unwrap();
@@ -630,11 +630,7 @@ fn real_ctrl_backslash_byte_returns_from_remote_composer_to_tree() {
 
     let output_start = tui.output_len();
     tui.writer.write_all(b"\x1c").unwrap();
-    tui.wait_for_from(
-        output_start,
-        "x close · q detach · k keys · Enter select",
-        Duration::from_secs(3),
-    );
+    tui.wait_for_from(output_start, "? help", Duration::from_secs(3));
 }
 
 #[test]
@@ -770,11 +766,7 @@ fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
     tui.writer.write_all(b"\x1b[201~").unwrap();
     let back_start = tui.output_len();
     tui.writer.write_all(b"\x1c").unwrap();
-    tui.wait_for_from(
-        back_start,
-        "x close · q detach · k keys · Enter select",
-        Duration::from_secs(3),
-    );
+    tui.wait_for_from(back_start, "? help", Duration::from_secs(3));
     tui.wait_for_from(output_start, "Input sent", Duration::from_secs(10));
     let payload = "received=108,105,110,101,49,13,108,105,110,101,50,";
     tui.wait_for_from(output_start, payload, Duration::from_secs(10));
