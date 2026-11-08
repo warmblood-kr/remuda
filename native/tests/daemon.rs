@@ -3051,21 +3051,9 @@ struct ViewerReader {
 
 impl ViewerReader {
     fn new(stream: &ipc::Stream) -> Self {
-        let mut reader = stream.try_clone().expect("clone viewer stream");
+        let reader = stream.try_clone().expect("clone viewer stream");
         let (send, chunks) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 1024];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if send.send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        std::thread::spawn(move || forward_chunks(reader, send));
         Self { chunks }
     }
 
@@ -3085,6 +3073,32 @@ impl ViewerReader {
         }
         out
     }
+}
+
+/// Forward every chunk a viewer's socket yields until EOF or a closed channel.
+fn forward_chunks(mut reader: impl std::io::Read, send: std::sync::mpsc::Sender<Vec<u8>>) {
+    let mut buf = [0u8; 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if send.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_viewer_reader_forwards_chunks_until_eof() {
+    let (send, chunks) = std::sync::mpsc::channel();
+    forward_chunks(std::io::Cursor::new(b"viewer bytes".to_vec()), send);
+    let mut forwarded = Vec::new();
+    while let Ok(chunk) = chunks.try_recv() {
+        forwarded.extend_from_slice(&chunk);
+    }
+    assert_eq!(forwarded, b"viewer bytes");
 }
 
 fn contains_text(bytes: &[u8], text: &str) -> bool {
