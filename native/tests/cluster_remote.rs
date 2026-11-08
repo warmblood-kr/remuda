@@ -496,11 +496,12 @@ fn assert_remote_screen_columns(tui: &RemoteTui, cols: u16, server_label: &str) 
     let column_of = |needle: &str| {
         screen_cells
             .iter()
-            .find_map(|row| {
+            .filter_map(|row| {
                 let text = row.concat();
                 text.find(needle)
                     .map(|byte_column| text[..byte_column].chars().count())
             })
+            .min()
             .unwrap_or_else(|| panic!("{needle:?} missing from screen:\n{}", screen.join("\n")))
     };
 
@@ -511,7 +512,7 @@ fn assert_remote_screen_columns(tui: &RemoteTui, cols: u16, server_label: &str) 
         screen.join("\n")
     );
     assert_eq!(
-        column_of(server_label),
+        column_of(&format!("{server_label} ")),
         3,
         "{cols} columns:\n{}",
         screen.join("\n")
