@@ -3012,7 +3012,7 @@ fn cluster_call(
     json: bool,
 ) -> ExitCode {
     use remuda_native::cluster_api::{resolve_call, ResolvedCall};
-    use remuda_native::net::cluster_client::{ClientError, ClusterClient};
+    use remuda_native::net::cluster_client::ClusterClient;
     let (address, pinned_static_key) = match resolve_call(target, address) {
         Ok(ResolvedCall::Local) => return cluster_call_local_target(target),
         Ok(ResolvedCall::Remote {
@@ -3026,6 +3026,7 @@ fn cluster_call(
                 && error.kind() == std::io::ErrorKind::InvalidInput
                 && error.to_string().contains("no registry endpoint")
             {
+                eprintln!("cluster call: {error}");
                 return support_json("no-endpoint", 2);
             }
             return cluster_call_failure(error);
@@ -3049,21 +3050,29 @@ fn cluster_call(
     match ClusterClient::system().request(address, &pinned_static_key, &private_key, &request) {
         Ok(response) => cluster_call_render(action, response, json),
         Err(error) => {
-            let code = match error {
-                ClientError::Unreachable
-                | ClientError::PeerNotListening
-                | ClientError::PeerClosedConnection
-                | ClientError::OsBlockedConnection
-                | ClientError::Timeout => 3,
-                ClientError::Refused(_) => 4,
-                ClientError::Crypto
-                | ClientError::BadResponse
-                | ClientError::PeerTooNew
-                | ClientError::RequestTooLarge => 5,
-            };
-            eprintln!("cluster call: {error}");
+            let (word, code) = cluster_call_error_word(&error);
+            eprintln!("cluster call: {word}: {error}");
             ExitCode::from(code)
         }
+    }
+}
+
+/// Stable list/capture failure words, so scripts do not depend on Display text.
+fn cluster_call_error_word(
+    error: &remuda_native::net::cluster_client::ClientError,
+) -> (&'static str, u8) {
+    use remuda_native::net::cluster_client::ClientError;
+    match error {
+        ClientError::Timeout => ("timeout", 3),
+        ClientError::Unreachable
+        | ClientError::PeerNotListening
+        | ClientError::PeerClosedConnection
+        | ClientError::OsBlockedConnection => ("unreachable", 3),
+        ClientError::Refused(_) => ("refused", 4),
+        ClientError::Crypto => ("crypto", 5),
+        ClientError::BadResponse => ("bad response", 5),
+        ClientError::PeerTooNew => ("protocol", 5),
+        ClientError::RequestTooLarge => ("too large", 5),
     }
 }
 
@@ -3209,11 +3218,11 @@ fn support_refused(reason: &str, json: bool) -> ExitCode {
 }
 
 fn support_protocol(reason: &str, json: bool) -> ExitCode {
+    let reason = remuda_native::text::strip_terminal_controls(reason);
+    eprintln!("cluster call: support protocol failure: {reason}");
     if json {
         return support_json("protocol", 5);
     }
-    let reason = remuda_native::text::strip_terminal_controls(reason);
-    eprintln!("cluster call: support protocol failure: {reason}");
     ExitCode::from(5)
 }
 

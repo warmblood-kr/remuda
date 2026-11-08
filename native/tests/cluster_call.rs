@@ -202,6 +202,8 @@ struct FakePeer {
 enum FakeAnswer {
     Reply(remuda_core::protocol::Response),
     Raw(Vec<u8>),
+    Payload(Vec<u8>),
+    Http(u16),
     Stall(std::time::Duration),
     Close,
 }
@@ -265,6 +267,20 @@ fn fake_peer(
                 write_http_body(&mut stream, &sealed);
             }
             FakeAnswer::Raw(body) => write_http_body(&mut stream, &body),
+            FakeAnswer::Payload(payload) => {
+                let sealed = remuda_native::net::frame::seal_response_chunked(opened, &payload)
+                    .expect("seal");
+                write_http_body(&mut stream, &sealed);
+            }
+            FakeAnswer::Http(status) => {
+                use std::io::Write;
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
             FakeAnswer::Stall(delay) => {
                 std::thread::sleep(delay);
                 drop(stream);
@@ -874,7 +890,7 @@ fn cluster_call_without_addr_keeps_typed_failures() {
         "{refused:?}"
     );
 
-    let protocol_peer = fake_peer(|_| FakeAnswer::Raw(vec![0xde, 0xad, 0xbe, 0xef]));
+    let protocol_peer = fake_peer(|_| FakeAnswer::Payload(b"not json".to_vec()));
     let protocol_fp = admit_peer(&client, &protocol_peer.public, Some(protocol_peer.address));
     let protocol_label = remuda_native::cluster::node_label(&protocol_fp);
     let protocol = client
@@ -883,6 +899,10 @@ fn cluster_call_without_addr_keeps_typed_failures() {
         .output()
         .unwrap();
     assert_eq!(protocol.status.code(), Some(5), "{protocol:?}");
+    assert!(
+        String::from_utf8_lossy(&protocol.stderr).contains("bad response"),
+        "{protocol:?}"
+    );
 
     let path = client.state.join("remuda/cluster/authorized_nodes.json");
     let mut registry: Registry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -1093,6 +1113,153 @@ fn support_probe_classifies_refusal_and_transport() {
     let value: serde_json::Value = serde_json::from_slice(&call.stdout).unwrap();
     assert_eq!(value, serde_json::json!({"support": "timeout"}));
     assert_eq!(stalled.task.join().unwrap().len(), 1);
+}
+
+#[test]
+fn cluster_call_reports_stable_words_for_transport_and_protocol_failures() {
+    let client = Node::start("stable-word-client");
+    let call = |label: &str| {
+        client
+            .command()
+            .args(["cluster", "call", label, "list"])
+            .output()
+            .unwrap()
+    };
+
+    // TCP connection refused is transport, not a protocol failure.
+    let refused_address = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        address
+    };
+    let keypair = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+        .generate_keypair()
+        .unwrap();
+    let refused_fp = admit_peer(&client, &keypair.public, Some(refused_address));
+    let refused_label = remuda_native::cluster::node_label(&refused_fp);
+    let refused = call(&refused_label);
+    assert_eq!(refused.status.code(), Some(3), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("unreachable"),
+        "{refused:?}"
+    );
+
+    let stalled = fake_peer(|_| FakeAnswer::Stall(Duration::from_secs(7)));
+    let stalled_fp = admit_peer(&client, &stalled.public, Some(stalled.address));
+    let stalled_label = remuda_native::cluster::node_label(&stalled_fp);
+    let stalled_call = call(&stalled_label);
+    assert_eq!(stalled_call.status.code(), Some(3), "{stalled_call:?}");
+    let stderr = String::from_utf8_lossy(&stalled_call.stderr);
+    assert!(stderr.contains("timeout"), "{stderr}");
+
+    let closed = fake_peer(|_| FakeAnswer::Close);
+    let closed_fp = admit_peer(&client, &closed.public, Some(closed.address));
+    let closed_label = remuda_native::cluster::node_label(&closed_fp);
+    let closed_call = call(&closed_label);
+    assert_eq!(closed_call.status.code(), Some(3), "{closed_call:?}");
+    assert!(
+        String::from_utf8_lossy(&closed_call.stderr).contains("unreachable"),
+        "{closed_call:?}"
+    );
+    assert_eq!(closed.task.join().unwrap().len(), 1);
+
+    let http_refused = fake_peer(|_| FakeAnswer::Http(429));
+    let http_refused_fp = admit_peer(&client, &http_refused.public, Some(http_refused.address));
+    let http_refused_label = remuda_native::cluster::node_label(&http_refused_fp);
+    let http_refused_call = call(&http_refused_label);
+    assert_eq!(
+        http_refused_call.status.code(),
+        Some(4),
+        "{http_refused_call:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&http_refused_call.stderr).contains("refused"),
+        "{http_refused_call:?}"
+    );
+    assert_eq!(http_refused.task.join().unwrap().len(), 1);
+
+    // Noise authentication failure is a crypto/protocol failure.
+    let crypto = fake_peer(|_| FakeAnswer::Raw(vec![0xde, 0xad, 0xbe, 0xef]));
+    let crypto_fp = admit_peer(&client, &crypto.public, Some(crypto.address));
+    let crypto_label = remuda_native::cluster::node_label(&crypto_fp);
+    let crypto_call = call(&crypto_label);
+    assert_eq!(crypto_call.status.code(), Some(5), "{crypto_call:?}");
+    assert!(
+        String::from_utf8_lossy(&crypto_call.stderr).contains("crypto"),
+        "{crypto_call:?}"
+    );
+    assert_eq!(crypto.task.join().unwrap().len(), 1);
+
+    // A well-framed response whose payload is not JSON is a bad response.
+    let bad = fake_peer(|_| FakeAnswer::Payload(b"not json".to_vec()));
+    let bad_fp = admit_peer(&client, &bad.public, Some(bad.address));
+    let bad_label = remuda_native::cluster::node_label(&bad_fp);
+    let bad_call = call(&bad_label);
+    assert_eq!(bad_call.status.code(), Some(5), "{bad_call:?}");
+    assert!(
+        String::from_utf8_lossy(&bad_call.stderr).contains("bad response"),
+        "{bad_call:?}"
+    );
+    assert_eq!(bad.task.join().unwrap().len(), 1);
+
+    // A fingerprint/pinned-key mismatch is typed before any connection.
+    let path = client.state.join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let wrong = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+        .generate_keypair()
+        .unwrap()
+        .public;
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == bad_fp)
+        .unwrap()
+        .static_pubkey = encoding::encode_base64(&wrong);
+    fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+    let pinned = call(&bad_label);
+    assert_eq!(pinned.status.code(), Some(5), "{pinned:?}");
+    assert!(
+        String::from_utf8_lossy(&pinned.stderr).contains("pinned"),
+        "{pinned:?}"
+    );
+}
+
+#[test]
+fn support_json_reports_no_endpoint_and_protocol_failures() {
+    let client = Node::start("support-json-client");
+    let keypair = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+        .generate_keypair()
+        .unwrap();
+    let no_endpoint_fp = admit_peer(&client, &keypair.public, None);
+    let no_endpoint_label = remuda_native::cluster::node_label(&no_endpoint_fp);
+    let call = client
+        .command()
+        .args(["cluster", "call", &no_endpoint_label, "support", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(call.status.code(), Some(2), "{call:?}");
+    assert!(
+        String::from_utf8_lossy(&call.stderr).contains("no registry endpoint"),
+        "{call:?}"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&call.stdout).unwrap();
+    assert_eq!(value, serde_json::json!({"support": "no-endpoint"}));
+
+    let protocol = fake_peer(|_| FakeAnswer::Payload(b"not json".to_vec()));
+    let protocol_fp = admit_peer(&client, &protocol.public, Some(protocol.address));
+    let protocol_label = remuda_native::cluster::node_label(&protocol_fp);
+    let call = client
+        .command()
+        .args(["cluster", "call", &protocol_label, "support", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(call.status.code(), Some(5), "{call:?}");
+    let stderr = String::from_utf8_lossy(&call.stderr);
+    assert!(stderr.contains("protocol"), "{stderr}");
+    let value: serde_json::Value = serde_json::from_slice(&call.stdout).unwrap();
+    assert_eq!(value, serde_json::json!({"support": "protocol"}));
+    assert_eq!(protocol.task.join().unwrap().len(), 1);
 }
 
 #[test]

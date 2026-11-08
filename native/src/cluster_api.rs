@@ -641,7 +641,7 @@ fn list_name(name: &str) -> String {
     let framed: String = name
         .chars()
         .map(|character| match character {
-            '\t' | '\n' | '\r' => ' ',
+            '\t' | '\n' | '\r' | '\u{2028}' | '\u{2029}' => ' ',
             other => other,
         })
         .collect();
@@ -777,6 +777,11 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("revoked"), "{error}");
+    }
+
+    #[test]
+    fn line_separators_in_names_become_spaces() {
+        assert_eq!(list_name("a\tb\nc\rd\u{2028}e\u{2029}f"), "a b c d e f");
     }
 
     #[test]

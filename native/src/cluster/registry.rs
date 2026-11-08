@@ -532,7 +532,7 @@ fn validate_entry_core(entry: &AuthorizedNode, lenient_endpoint: bool) -> io::Re
     if public_key.len() != 32 || encoding::fingerprint(&public_key) != entry.node_fp {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "registry fingerprint does not match public key",
+            "registry pinned key does not match its fingerprint",
         ));
     }
     crate::net::frame::validate_static_public_key(&public_key).map_err(|_| {
