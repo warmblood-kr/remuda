@@ -31,7 +31,7 @@ fn enrichment_contract_local_cli_text_and_json_are_unchanged() {
     );
     assert_eq!(session_line(&row), expected);
     assert_eq!(
-        sessions_json(&[row.clone()]).unwrap(),
+        sessions_json(std::slice::from_ref(&row)).unwrap(),
         serde_json::to_string_pretty(&vec![row]).unwrap()
     );
 }

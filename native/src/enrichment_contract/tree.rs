@@ -38,10 +38,16 @@ fn enrichment_contract_unknown_remote_keeps_ordinary_base_row_without_noise() {
             wire_name: "wire-worker".into(),
             instance_id: "instance-B".into(),
             alive: true,
+            unavailable: false,
             output_version: None,
             bracketed_paste: false,
             screen: None,
             last_error: None,
+            facts: None,
+            facts_remaining_ms: 0,
+            program_status: None,
+            program_status_age_ms: None,
+            listed_at: std::time::Instant::now(),
         }],
     });
     ui.remote_expanded.insert("node-B".into());

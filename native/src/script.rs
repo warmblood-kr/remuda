@@ -275,6 +275,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_session_remote_input(name, instance_id, enabled) -> true, nil | nil, error",
     ),
     (
+        "_session_set_display",
+        "Publish bounded, expiring cluster display facts for one exact live session instance. Local-only setter; no wire input, no tasks, paths, mail or terminal text.",
+        "_session_set_display(name, instance_id, facts | nil) -> true, nil | nil, error",
+    ),
+    (
         "http",
         "Start an asynchronous bounded HTTP request; completion is delivered on the Lua image queue. pin_only must be a boolean; when true on http.request or http.peer_certificate, it replaces chain validation while preserving hostname, validity-date, and TLS signature checks. A valid SPKI pin and HTTPS are required; plain pin remains additive, and ca_file does not contribute chain trust in pin-only mode.",
         "http.request(options) -> {cancel()}",
@@ -1235,18 +1240,20 @@ pub(crate) fn bindings(
     // for an answer this call already has bought nothing but a socket round
     // trip on every non-skip_list tick refresh. See steps/031.
     let image_for_ls = image.clone();
+    let registry_for_ls = Arc::clone(&registry);
     table.set(
         "ls",
         lua.create_function(move |lua, ()| {
             if !crate::daemon::keep_exited() {
-                crate::daemon::reap_and_notify(&registry, &image_for_ls);
+                crate::daemon::reap_and_notify(&registry_for_ls, &image_for_ls);
             }
-            value(lua, Response::Sessions(registry.list()))
+            value(lua, Response::Sessions(registry_for_ls.list()))
         })?,
     )?;
 
     session_resize_binding(lua, &table, at())?;
     session_remote_input_binding(lua, &table, at())?;
+    crate::session_display::install(lua, &table, Arc::clone(&registry))?;
 
     new_binding(lua, &table, at())?;
 
@@ -1977,6 +1984,7 @@ pub(crate) fn hide_module_activator(lua: &Lua) -> mlua::Result<()> {
 }
 
 pub(crate) fn stop_modules(lua: &Lua) -> mlua::Result<()> {
+    crate::session_display::dispose(lua);
     let stop_modules: mlua::Function = lua.named_registry_value("remuda.lifecycle.stop_modules")?;
     stop_modules.call(())
 }
@@ -2612,6 +2620,9 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::WrongInstance => Err(mlua::Error::runtime("session instance changed")),
         Response::RateLimited => Err(mlua::Error::runtime("session input rate limit exceeded")),
         Response::SyncAtCapacity => Err(mlua::Error::runtime("Sync is at capacity; retry shortly")),
+        Response::ClusterSessionFacts(_) => Err(mlua::Error::runtime(
+            "cluster session facts are not available to local callers",
+        )),
         Response::Busy => Err(mlua::Error::runtime(crate::BUSY_RETRY_MESSAGE)),
         Response::WriteTimeout => Err(mlua::Error::runtime(
             "session PTY write timed out; delivery may be partial or late",

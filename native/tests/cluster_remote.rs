@@ -1044,6 +1044,7 @@ fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_res
         name: label.clone(),
         registry_key: server_node.fingerprint(),
         addr_override: Some(address),
+        session_facts_v1: false,
     };
     let poller = RemotePoller::new(vec![target.clone()], transport);
     let source = poller.source();
@@ -1167,6 +1168,7 @@ fn selected_remote_session_with_hangul_text_syncs_within_the_frame_limit() {
         name: remuda_native::cluster::node_label(&server_node.fingerprint()),
         registry_key: server_node.fingerprint(),
         addr_override: Some(address),
+        session_facts_v1: false,
     };
     let poller = RemotePoller::new(vec![target.clone()], transport);
     let source = poller.source();
@@ -1229,6 +1231,7 @@ fn selected_remote_session_shows_a_change_soon_after_the_previous_one() {
         name: remuda_native::cluster::node_label(&server_node.fingerprint()),
         registry_key: server_node.fingerprint(),
         addr_override: Some(address),
+        session_facts_v1: false,
     };
     let poller = RemotePoller::new(vec![target.clone()], transport);
     let source = poller.source();
@@ -1291,6 +1294,7 @@ fn switching_away_from_a_quiet_selected_session_does_not_wait_out_its_sync() {
         name: remuda_native::cluster::node_label(&server_node.fingerprint()),
         registry_key: server_node.fingerprint(),
         addr_override: Some(address),
+        session_facts_v1: false,
     };
     let poller = RemotePoller::new(vec![target.clone()], transport);
     let source = poller.source();

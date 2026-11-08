@@ -172,7 +172,7 @@ fn add_self_to_registry_at(dir: &Path, node: &NodeIdentity) -> io::Result<()> {
             delivered_by: None,
             format_major: 1,
             format_minor: 0,
-            optional_fields: std::collections::BTreeMap::new(),
+            optional_fields: session_facts_optional_fields(),
             endpoint: None,
             state: NodeState::Admitted,
             version: 1,
@@ -180,6 +180,83 @@ fn add_self_to_registry_at(dir: &Path, node: &NodeIdentity) -> io::Result<()> {
         }],
     })?;
     registry::save_registry_at(dir, &registry)
+}
+
+fn session_facts_optional_fields() -> std::collections::BTreeMap<String, serde_json::Value> {
+    std::collections::BTreeMap::from([(
+        remuda_core::protocol::CLUSTER_SESSION_FACTS_FIELD.to_owned(),
+        serde_json::json!([remuda_core::protocol::CLUSTER_SESSION_FACTS_V1]),
+    )])
+}
+
+/// Add the sidecar capability to an admitted self entry; returns whether the
+/// entry changed and bumps its version so the advertisement replicates.
+fn advertise_self_session_facts(entry: &mut AuthorizedNode) -> bool {
+    let desired = serde_json::json!([remuda_core::protocol::CLUSTER_SESSION_FACTS_V1]);
+    if entry
+        .optional_fields
+        .get(remuda_core::protocol::CLUSTER_SESSION_FACTS_FIELD)
+        == Some(&desired)
+    {
+        return false;
+    }
+    entry.optional_fields.insert(
+        remuda_core::protocol::CLUSTER_SESSION_FACTS_FIELD.to_owned(),
+        desired,
+    );
+    entry.version = entry.version.saturating_add(1);
+    true
+}
+
+/// Ensure this node's own admitted entry advertises the enrichment sidecar.
+/// Existing clusters predate the field, so a daemon start repairs it once.
+pub fn advertise_session_facts() -> io::Result<()> {
+    let Ok(state_dir) = storage::cluster_state_dir() else {
+        return Ok(());
+    };
+    let dir = state_dir.join("cluster");
+    match fs::symlink_metadata(&dir) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let guard = storage::StateLock::acquire(&dir)?;
+    let node = match identity::load_identity_at(&dir) {
+        Ok(node) => node,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut registry = registry::load_registry_at(&dir)?;
+    let changed = {
+        let Some(entry) = registry
+            .authorized_nodes
+            .iter_mut()
+            .find(|entry| entry.node_fp == node.node_fp && entry.state == NodeState::Admitted)
+        else {
+            return Ok(());
+        };
+        let desired = serde_json::json!([remuda_core::protocol::CLUSTER_SESSION_FACTS_V1]);
+        if entry
+            .optional_fields
+            .get(remuda_core::protocol::CLUSTER_SESSION_FACTS_FIELD)
+            == Some(&desired)
+        {
+            false
+        } else {
+            entry.optional_fields.insert(
+                remuda_core::protocol::CLUSTER_SESSION_FACTS_FIELD.to_owned(),
+                desired,
+            );
+            entry.version = entry.version.saturating_add(1);
+            true
+        }
+    };
+    if changed {
+        registry::save_registry_at(&dir, &registry)?;
+        drop(guard);
+        replication::registry_changed();
+    }
+    Ok(())
 }
 
 /// Replace the local identity and reset membership to the new local node only.
@@ -201,7 +278,7 @@ pub fn init_new_identity(left: &Path) -> io::Result<(NodeIdentity, bool)> {
                 delivered_by: None,
                 format_major: 1,
                 format_minor: 0,
-                optional_fields: std::collections::BTreeMap::new(),
+                optional_fields: session_facts_optional_fields(),
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -382,6 +459,7 @@ fn record_join_success_with_schedule(
             self_entry.by = issuer_fp;
             changed = true;
         }
+        changed |= advertise_self_session_facts(self_entry);
         if let Some(endpoint) = local_endpoint {
             let endpoint = endpoint.to_string();
             if self_entry.endpoint.as_deref() != Some(endpoint.as_str()) {

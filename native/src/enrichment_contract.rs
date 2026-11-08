@@ -60,3 +60,85 @@ fn enrichment_contract_existing_typed_program_status_survives() {
     );
     assert_eq!(output["instance_id"], wire["instance_id"]);
 }
+
+/// Non-tautological local-JSON control: real owner facts are published, and
+/// the ordinary SessionSummary serialization still has no join or display key.
+#[test]
+fn published_cluster_facts_never_enter_local_session_json() {
+    use remuda_core::session_enrichment::{ButlerFacts, FieldState};
+    let registry = std::sync::Arc::new(Registry::with_cluster_facts_clock(std::sync::Arc::new(
+        ManualClock::new(),
+    )));
+    let session = registry
+        .register(Session::new(
+            "worker",
+            Box::new(ScriptedAgent::new(vec![])),
+            Arc::new(ManualClock::new()),
+        ))
+        .unwrap();
+    let instance = session.instance_id().to_string();
+    let generation = registry.begin_cluster_facts_generation();
+    registry
+        .set_cluster_facts_for(
+            generation,
+            "worker",
+            &instance,
+            Some(ButlerFacts {
+                member_id: "private-MID".into(),
+                leader_id: Some("private-LEAD".into()),
+                alias: Some("worker".into()),
+                kind: FieldState::Value("codex".into()),
+                model: FieldState::Unavailable,
+                context_used: FieldState::Value(42),
+                context_window: FieldState::Value(100),
+                context_percent: FieldState::Value(42),
+            }),
+        )
+        .unwrap();
+    let local = serde_json::to_value(registry.list().remove(0)).unwrap();
+    assert!(
+        local.get("display").is_none()
+            && local.get("member_id").is_none()
+            && local.get("leader_id").is_none()
+            && local.get("facts").is_none(),
+        "local JSON acquired cluster-only facts: {local}"
+    );
+    let sidecar = registry.cluster_facts_now();
+    assert_eq!(sidecar.len(), 1);
+    assert_eq!(sidecar[0].3.member_id, "private-MID");
+}
+
+/// The sidecar encoding is explicit: absent optional fields are omitted, so an
+/// older peer never sees a field it cannot parse, and no join ID leaks into
+/// the base List row.
+#[test]
+fn session_facts_wire_encoding_is_additive_and_omits_absent_fields() {
+    use remuda_core::protocol::{ClusterSessionFactWire, Request, Response};
+    let request = serde_json::to_value(Request::ClusterSessionFacts).unwrap();
+    assert_eq!(request, json!("ClusterSessionFacts"));
+    let response = Response::ClusterSessionFacts(vec![ClusterSessionFactWire {
+        wire_name: "worker".into(),
+        instance_id: "instance-1".into(),
+        valid_for_ms: 9_000,
+        member_id: "private-MID".into(),
+        leader_id: Some("private-LEAD".into()),
+        alias: None,
+        kind: Some("codex".into()),
+        model: None,
+        context_used: Some(42_000),
+        context_window: Some(100_000),
+        context_percent: Some(42),
+    }]);
+    let value = serde_json::to_value(&response).unwrap();
+    let entry = &value["ClusterSessionFacts"][0];
+    assert_eq!(entry["wire_name"], "worker");
+    assert_eq!(entry["instance_id"], "instance-1");
+    assert_eq!(entry["member_id"], "private-MID");
+    assert_eq!(entry["context_percent"], 42);
+    assert!(entry.get("alias").is_none());
+    assert!(entry.get("model").is_none());
+    // Old readers only need the enum tag; an unknown variant is never sent
+    // without a positive advertisement, which is a transport policy test.
+    let old: serde_json::Value = serde_json::from_str(r#""Sessions""#).unwrap();
+    assert_eq!(old, json!("Sessions"));
+}

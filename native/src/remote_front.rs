@@ -366,6 +366,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::SocketPublication => Err(refusal("SocketPublication")),
         Request::ClusterRegistrySync { .. } => Err(refusal("ClusterRegistrySync")),
         Request::ClusterRegistryUpdate { .. } => Err(refusal("ClusterRegistryUpdate")),
+        Request::ClusterSessionFacts => Err(refusal("ClusterSessionFacts")),
         Request::ClusterVfsIndexSync { .. } => Err(refusal("ClusterVfsIndexSync")),
         Request::ClusterVfsChanges { .. } => Err(refusal("ClusterVfsChanges")),
         Request::ClusterVfsIndexUpdate { .. } => Err(refusal("ClusterVfsIndexUpdate")),

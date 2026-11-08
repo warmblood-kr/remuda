@@ -462,6 +462,7 @@ fn enrichment_contract_zero_usage_is_a_proven_value_not_unavailable() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn enrichment_contract_internal_join_ids_never_reach_rendered_rows() {
     let summaries = [base("human leader"), base("worker")];
     let facts = [

@@ -28,7 +28,9 @@ use crate::input::{
 };
 use crate::protocol::Step;
 use crate::session::{InputSubmitOutcome, Session};
+use crate::session_enrichment::{ButlerFacts, CLUSTER_FACTS_TTL_MS, MAX_CLUSTER_FACTS_ENTRIES};
 use crate::session_operations::{Lifecycle, SessionHandle};
+use crate::Clock;
 use core::time::Duration;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -163,6 +165,26 @@ pub struct Registry {
     /// Local-only remote-input opt-out, keyed by exact session instance so a
     /// reused name never inherits it.
     remote_input_policy: Mutex<HashMap<String, bool>>,
+    /// Owner-published cluster facts, keyed by exact session instance. Never
+    /// part of SessionSummary and never serialized into local JSON.
+    cluster_facts: Mutex<ClusterFactsCache>,
+}
+
+#[derive(Default)]
+struct ClusterFactsCache {
+    generation: u64,
+    /// Without an injected clock, publication is disabled: policy code never
+    /// reads a global clock.
+    clock: Option<Arc<dyn Clock>>,
+    entries: HashMap<String, PublishedClusterFacts>,
+}
+
+#[derive(Clone)]
+struct PublishedClusterFacts {
+    name: String,
+    instance_id: String,
+    facts: ButlerFacts,
+    published: Duration,
 }
 
 #[derive(Default)]
@@ -172,6 +194,19 @@ struct HostedInput {
 }
 
 impl Registry {
+    /// A registry that can publish and serve cluster facts. Production uses a
+    /// system clock; tests inject a manual one. A plain `Registry::new()` has
+    /// no facts clock, so publication is disabled there.
+    pub fn with_cluster_facts_clock(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            cluster_facts: Mutex::new(ClusterFactsCache {
+                clock: Some(clock),
+                ..ClusterFactsCache::default()
+            }),
+            ..Self::default()
+        }
+    }
+
     pub fn apply_input_batch(
         &self,
         name: &str,
@@ -289,6 +324,168 @@ impl Registry {
             .get(instance_id)
             .copied()
             .unwrap_or(false)
+    }
+
+    /// Start a new publisher image; old callbacks can no longer write or clear.
+    pub fn begin_cluster_facts_generation(&self) -> u64 {
+        let mut cache = self
+            .cluster_facts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.generation = cache
+            .generation
+            .checked_add(1)
+            .expect("cluster facts generation exhausted");
+        cache.entries.clear();
+        cache.generation
+    }
+
+    /// Dispose one image's publications without letting a stale image clear a
+    /// newer image's facts.
+    pub fn clear_cluster_facts_for(
+        &self,
+        generation: u64,
+    ) -> core::result::Result<(), &'static str> {
+        let mut cache = self
+            .cluster_facts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if generation == 0 || cache.generation != generation {
+            return Err("disposed cluster facts generation");
+        }
+        cache.entries.clear();
+        cache.generation = cache
+            .generation
+            .checked_add(1)
+            .expect("cluster facts generation exhausted");
+        Ok(())
+    }
+
+    /// Full replacement (or nil clear), fenced by image and exact live instance.
+    /// IDs and values are validated before the cache is touched; clearing a
+    /// prior instance is always allowed so a replaced name leaves no residue.
+    pub fn set_cluster_facts_for(
+        &self,
+        generation: u64,
+        name: &str,
+        instance_id: &str,
+        facts: Option<ButlerFacts>,
+    ) -> core::result::Result<(), &'static str> {
+        if name.is_empty() || instance_id.is_empty() {
+            return Err("missing session identity");
+        }
+        if let Some(facts) = &facts {
+            facts.validate().map_err(|_| "invalid cluster facts")?;
+            self.ensure_live_instance(name, instance_id)?;
+        }
+        let mut cache = self
+            .cluster_facts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if generation == 0 || cache.generation != generation {
+            return Err("disposed cluster facts generation");
+        }
+        let published = cache
+            .clock
+            .as_ref()
+            .ok_or("cluster facts publication is disabled")?
+            .now();
+        match facts {
+            Some(facts) => {
+                if cache.entries.len() >= MAX_CLUSTER_FACTS_ENTRIES
+                    && !cache.entries.contains_key(instance_id)
+                {
+                    return Err("too many published cluster facts");
+                }
+                cache.entries.insert(
+                    instance_id.to_owned(),
+                    PublishedClusterFacts {
+                        name: name.to_owned(),
+                        instance_id: instance_id.to_owned(),
+                        facts,
+                        published,
+                    },
+                );
+            }
+            None => {
+                cache.entries.remove(instance_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_live_instance(
+        &self,
+        name: &str,
+        instance_id: &str,
+    ) -> core::result::Result<(), &'static str> {
+        let local = self.get(name);
+        let hosted = if local.is_none() {
+            self.hosted(name)
+        } else {
+            None
+        };
+        if let Some(session) = &local {
+            if session.instance_id() != instance_id || !session.is_running() || session.is_closing()
+            {
+                return Err("session is not the live instance");
+            }
+        } else if let Some(handle) = &hosted {
+            if handle.identity().instance != instance_id {
+                return Err("session instance changed");
+            }
+            let observation = handle.inspect().map_err(|_| "session unavailable")?;
+            if observation.lifecycle != Lifecycle::Running || observation.closing {
+                return Err("session is not live");
+            }
+        } else {
+            return Err("session not registered");
+        }
+        Ok(())
+    }
+
+    /// Unexpired owner facts using this registry's injected clock.
+    pub fn cluster_facts_now(&self) -> Vec<(String, String, u64, ButlerFacts)> {
+        let now = self
+            .cluster_facts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clock
+            .as_ref()
+            .map(|clock| clock.now());
+        now.map_or_else(Vec::new, |now| self.cluster_facts(now))
+    }
+
+    /// Unexpired owner facts, bounded and sorted for a deterministic response.
+    /// Remaining lifetime is measured from the original publication.
+    pub fn cluster_facts(&self, now: Duration) -> Vec<(String, String, u64, ButlerFacts)> {
+        let mut cache = self
+            .cluster_facts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.clock.is_none() {
+            return Vec::new();
+        }
+        cache.entries.retain(|_, entry| {
+            now.saturating_sub(entry.published) < Duration::from_millis(CLUSTER_FACTS_TTL_MS)
+        });
+        let mut rows: Vec<_> = cache
+            .entries
+            .values()
+            .map(|entry| {
+                let elapsed = now.saturating_sub(entry.published);
+                let remaining = CLUSTER_FACTS_TTL_MS.saturating_sub(elapsed.as_millis() as u64);
+                (
+                    entry.name.clone(),
+                    entry.instance_id.clone(),
+                    remaining,
+                    entry.facts.clone(),
+                )
+            })
+            .collect();
+        rows.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        rows.truncate(MAX_CLUSTER_FACTS_ENTRIES);
+        rows
     }
 
     /// `apply_input_batch` (or `apply_input_line_batch`) for a host-backed
@@ -1432,5 +1629,111 @@ mod launch_policy_tests {
         registrar.join().unwrap();
         let session = registry.get("launch-policy").expect("registered");
         assert!(registry.remote_input_disabled(session.instance_id()));
+    }
+}
+
+#[cfg(test)]
+mod cluster_facts_tests {
+    use super::*;
+    use crate::agent::ScriptedAgent;
+    use crate::session_enrichment::{ButlerFacts, FieldState};
+    use crate::{ManualClock, Session};
+
+    fn registry_with(name: &str) -> (Arc<Registry>, String, Arc<ManualClock>) {
+        let clock = Arc::new(ManualClock::new());
+        let registry = Arc::new(Registry::with_cluster_facts_clock(clock.clone()));
+        let session = registry
+            .register(Session::new(
+                name,
+                Box::new(ScriptedAgent::new(vec![])),
+                Arc::new(ManualClock::new()),
+            ))
+            .unwrap();
+        let instance = session.instance_id().to_string();
+        (registry, instance, clock)
+    }
+
+    fn facts(member: &str) -> ButlerFacts {
+        ButlerFacts {
+            member_id: member.into(),
+            leader_id: None,
+            alias: None,
+            kind: FieldState::Value("codex".into()),
+            model: FieldState::Unavailable,
+            context_used: FieldState::Value(42),
+            context_window: FieldState::Value(100),
+            context_percent: FieldState::Value(42),
+        }
+    }
+
+    #[test]
+    fn published_facts_stay_outside_the_session_summary_and_inside_the_sidecar() {
+        let (registry, instance, clock) = registry_with("worker");
+        let generation = registry.begin_cluster_facts_generation();
+        registry
+            .set_cluster_facts_for(generation, "worker", &instance, Some(facts("MID")))
+            .unwrap();
+        let summary = registry.list().remove(0);
+        assert_eq!(summary.name, "worker");
+        assert_eq!(summary.instance_id.as_deref(), Some(instance.as_str()));
+        let sidecar = registry.cluster_facts(clock.now());
+        assert_eq!(sidecar.len(), 1);
+        assert_eq!(sidecar[0].0, "worker");
+        assert_eq!(sidecar[0].1, instance);
+        assert_eq!(sidecar[0].3.member_id, "MID");
+    }
+
+    #[test]
+    fn facts_are_bound_to_the_exact_live_instance() {
+        let (registry, instance, clock) = registry_with("worker");
+        let generation = registry.begin_cluster_facts_generation();
+        assert!(registry
+            .set_cluster_facts_for(generation, "worker", "another-instance", Some(facts("MID")))
+            .is_err());
+        assert!(registry
+            .set_cluster_facts_for(generation, "missing", &instance, Some(facts("MID")))
+            .is_err());
+        let mut invalid = facts("MID");
+        invalid.context_percent = FieldState::Value(101);
+        assert!(registry
+            .set_cluster_facts_for(generation, "worker", &instance, Some(invalid))
+            .is_err());
+        assert!(registry.cluster_facts(clock.now()).is_empty());
+    }
+
+    #[test]
+    fn facts_expire_against_the_original_publication() {
+        let (registry, instance, clock) = registry_with("worker");
+        let generation = registry.begin_cluster_facts_generation();
+        registry
+            .set_cluster_facts_for(generation, "worker", &instance, Some(facts("MID")))
+            .unwrap();
+        let now = clock.now();
+        let remaining = registry.cluster_facts(now)[0].2;
+        assert!(remaining <= crate::session_enrichment::CLUSTER_FACTS_TTL_MS);
+        assert!(remaining > 0);
+        clock.advance(Duration::from_millis(
+            crate::session_enrichment::CLUSTER_FACTS_TTL_MS + 1,
+        ));
+        assert!(registry.cluster_facts(clock.now()).is_empty());
+    }
+
+    #[test]
+    fn a_disposed_generation_cannot_clear_newer_facts() {
+        let (registry, instance, clock) = registry_with("worker");
+        let old = registry.begin_cluster_facts_generation();
+        registry
+            .set_cluster_facts_for(old, "worker", &instance, Some(facts("OLD")))
+            .unwrap();
+        let new = registry.begin_cluster_facts_generation();
+        registry
+            .set_cluster_facts_for(new, "worker", &instance, Some(facts("NEW")))
+            .unwrap();
+        assert!(registry.clear_cluster_facts_for(old).is_err());
+        let rows = registry.cluster_facts(clock.now());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].3.member_id, "NEW");
+        registry.clear_cluster_facts_for(new).unwrap();
+        assert!(registry.cluster_facts(clock.now()).is_empty());
     }
 }

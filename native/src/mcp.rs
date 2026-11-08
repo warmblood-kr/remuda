@@ -315,6 +315,10 @@ fn call_response(id: Value, response: Response) -> String {
             ok_reply(id, tool_error("styled capture is not exposed over MCP"))
         }
         Response::Sync { .. } => ok_reply(id, tool_error("Sync is not exposed over MCP")),
+        Response::ClusterSessionFacts(_) => ok_reply(
+            id,
+            tool_error("cluster session facts are not exposed over MCP"),
+        ),
         // No MCP tool asks for the directory verbs either — same reasoning.
         Response::Entries(_) => {
             ok_reply(id, tool_error("directory listing is not exposed over MCP"))

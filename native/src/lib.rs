@@ -47,6 +47,7 @@ pub mod reload;
 pub mod remote_front;
 pub mod reply_limit;
 pub mod script;
+pub mod session_display;
 #[doc(hidden)]
 pub mod session_host;
 pub mod session_job;
