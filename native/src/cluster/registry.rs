@@ -490,6 +490,17 @@ fn invalid_update(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+/// Marker used to distinguish the discovery cap error from other load errors.
+const REGISTRY_TOO_LARGE: &str = "cluster registry exceeds byte cap";
+
+fn registry_too_large() -> io::Error {
+    invalid_update(REGISTRY_TOO_LARGE)
+}
+
+pub(super) fn is_registry_too_large(error: &io::Error) -> bool {
+    error.to_string() == REGISTRY_TOO_LARGE
+}
+
 fn validate_entry(entry: &AuthorizedNode) -> io::Result<Vec<u8>> {
     validate_entry_with(entry, false)
 }
@@ -995,7 +1006,7 @@ pub(super) fn registry_revision_token_at(dir: &Path) -> io::Result<String> {
         file.take(MAX_REGISTRY_BYTES as u64 + 1)
             .read_to_end(&mut bytes)?;
         if bytes.len() > MAX_REGISTRY_BYTES {
-            return Err(invalid_update("cluster registry exceeds byte cap"));
+            return Err(registry_too_large());
         }
         Ok(format!("sha256:{:x}", Sha256::digest(&bytes)))
     }
@@ -1045,6 +1056,52 @@ pub fn save_registry(_registry: &Registry) -> io::Result<()> {
 }
 
 pub(super) fn load_registry_at(dir: &Path) -> io::Result<Registry> {
+    let Some(bytes) = read_registry_bytes_at(dir)? else {
+        return Ok(Registry::default());
+    };
+    let registry: Registry = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    let mut folded = Registry::default();
+    folded.merge_loaded(&registry)?;
+    Ok(folded)
+}
+
+/// Load membership for local discovery. Missing `state` reads as admitted and
+/// an empty endpoint reads as absent, so older registries stay discoverable;
+/// every other field still goes through the strict loader's validation.
+pub(super) fn load_registry_for_discovery_at(dir: &Path) -> io::Result<Registry> {
+    let Some(bytes) = read_registry_bytes_at(dir)? else {
+        return Ok(Registry::default());
+    };
+    let mut value: Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    apply_discovery_defaults(&mut value);
+    let registry: Registry = serde_json::from_value(value).map_err(io::Error::other)?;
+    let mut folded = Registry::default();
+    folded.merge(&registry)?;
+    Ok(folded)
+}
+
+/// Apply the discovery contract's compatibility defaults before validation.
+fn apply_discovery_defaults(value: &mut Value) {
+    let Some(entries) = value
+        .get_mut("authorized_nodes")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for entry in entries {
+        let Some(object) = entry.as_object_mut() else {
+            continue;
+        };
+        object
+            .entry("state")
+            .or_insert_with(|| Value::String("admitted".to_string()));
+        if object.get("endpoint").and_then(Value::as_str) == Some("") {
+            object.insert("endpoint".to_string(), Value::Null);
+        }
+    }
+}
+
+fn read_registry_bytes_at(dir: &Path) -> io::Result<Option<Vec<u8>>> {
     if fs::symlink_metadata(dir).is_ok() {
         storage::verify_directory(dir)?;
     }
@@ -1060,7 +1117,7 @@ pub(super) fn load_registry_at(dir: &Path) -> io::Result<Registry> {
         }
         match options.open(&path) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Registry::default()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             #[cfg(unix)]
             Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
                 return Err(io::Error::new(
@@ -1074,24 +1131,21 @@ pub(super) fn load_registry_at(dir: &Path) -> io::Result<Registry> {
     #[cfg(windows)]
     let file = match super::windows_security::open_for_read(&path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Registry::default()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
     storage::check_private_file(&file, "cluster registry", &path)?;
     use std::io::Read;
     if file.metadata()?.len() > MAX_REGISTRY_BYTES as u64 {
-        return Err(invalid_update("cluster registry exceeds byte cap"));
+        return Err(registry_too_large());
     }
     let mut bytes = Vec::new();
     file.take(MAX_REGISTRY_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_REGISTRY_BYTES {
-        return Err(invalid_update("cluster registry exceeds byte cap"));
+        return Err(registry_too_large());
     }
-    let registry: Registry = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    let mut folded = Registry::default();
-    folded.merge_loaded(&registry)?;
-    Ok(folded)
+    Ok(Some(bytes))
 }
 
 pub(super) fn save_registry_at(dir: &Path, registry: &Registry) -> io::Result<()> {
