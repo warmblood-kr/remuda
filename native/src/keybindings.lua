@@ -147,6 +147,16 @@ return function(owner, validate, config_status, validate_help)
   api.define_key{context="cluster.confirm", key="Y", action="cluster.confirm.accept_upper", help="confirm"}
   api.define_key{context="cluster.remote.keys", key="C-\\", action="cluster.remote.back", help="back"}
   api.define_key{context="cluster.runtime", key="C-l", action="cluster.redraw", help="redraw"}
+  api.define_key{context="cluster.tree", key="?", action="cluster.help", help="help"}
+  api.define_key{context="cluster.search", key="?", action="cluster.help", help="help"}
+  api.define_key{context="cluster.help", key="?", action="cluster.help.close", help="close"}
+  api.define_key{context="cluster.help", key="ESC", action="cluster.help.escape", help="close"}
+  api.define_key{context="cluster.help", key="<up>", action="cluster.help.up", help="up"}
+  api.define_key{context="cluster.help", key="<down>", action="cluster.help.down", help="down"}
+  api.define_key{context="cluster.help", key="<prior>", action="cluster.help.page_up", help="page up"}
+  api.define_key{context="cluster.help", key="<next>", action="cluster.help.page_down", help="page down"}
+  api.define_key{context="cluster.help", key="<home>", action="cluster.help.home", help="top"}
+  api.define_key{context="cluster.help", key="<end>", action="cluster.help.end", help="bottom"}
   initializing = false
   return api, {drop=drop, save=save, restore=restore}
 end
