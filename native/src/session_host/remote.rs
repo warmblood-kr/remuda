@@ -440,6 +440,33 @@ impl HostSession {
             Err(error) => Announced::Unreachable(error.to_string()),
         }
     }
+    /// For `stop`: revoke the newest human grant (the high-water), so the host
+    /// accepts Close, which it refuses while a human holds one. Revoking a
+    /// released grant is a no-op; a host without human counters never granted.
+    pub fn revoke_human(&self) -> Result<bool> {
+        let _pass = self.gate.enter()?;
+        let mut client = self.controller()?;
+        let grant = match client.request(&Request::Inspect).map_err(transport)? {
+            Response::Info { info } => info.human.map(|human| human.high_water),
+            Response::Error { code } => return Err(refused(&code)),
+            _ => return Err(Error::Protocol("unexpected host inspect reply")),
+        };
+        let revoked = match grant {
+            Some(grant) if grant > 0 => {
+                match client
+                    .request(&Request::RevokeHuman { grant })
+                    .map_err(transport)?
+                {
+                    Response::Revoked { revoked } => revoked,
+                    Response::Error { code } => return Err(refused(&code)),
+                    _ => return Err(Error::Protocol("unexpected host revoke reply")),
+                }
+            }
+            _ => false,
+        };
+        let _ = client.request(&Request::Release);
+        Ok(revoked)
+    }
     fn control(&self, request: Request) -> Result<()> {
         let _pass = self.gate.enter()?;
         let mut client = self.controller()?;
