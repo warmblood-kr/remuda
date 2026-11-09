@@ -30,6 +30,16 @@ jobs:
       - run: scripts/check-no-python.sh
       - run: sh scripts/test-no-python.sh
 
+  enrichment-guard:
+    # The implementation merge gate is a required CI job so it cannot be
+    # skipped by a local checklist. The regression test runs the real gate in
+    # disposable trees with only sh and grep available.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh scripts/check-enrichment-ready.sh
+      - run: sh scripts/test-enrichment-ready.sh
+
   test:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest

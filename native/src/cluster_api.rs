@@ -31,6 +31,8 @@ pub enum ResolvedCall {
         fingerprint: String,
         address: SocketAddr,
         pinned_static_key: Vec<u8>,
+        /// Positive peer advertisement of the session-facts sidecar (v1).
+        session_facts_v1: bool,
     },
 }
 
@@ -65,12 +67,27 @@ pub fn resolve(target: &str) -> Result<ResolvedCall, String> {
                 ))
             })?;
             Ok(ResolvedCall::Remote {
+                session_facts_v1: advertises_session_facts(&snapshot.registry, &fingerprint),
                 fingerprint,
                 address: resolved.address,
                 pinned_static_key: resolved.pinned_static_key,
             })
         }
     }
+}
+
+/// Positive v1 advertisement only; a missing or malformed field is no.
+fn advertises_session_facts(registry: &cluster::Registry, fingerprint: &str) -> bool {
+    registry
+        .authorized_nodes
+        .iter()
+        .find(|entry| entry.node_fp == fingerprint)
+        .and_then(cluster::registry::session_facts_versions)
+        .is_some_and(|versions| {
+            versions
+                .iter()
+                .any(|version| version == remuda_core::protocol::CLUSTER_SESSION_FACTS_V1)
+        })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,6 +104,7 @@ pub fn capture(target: &str, session: &str) -> Result<Capture, String> {
         fingerprint,
         address,
         pinned_static_key,
+        ..
     } = resolve(target)?
     else {
         return Ok(Capture::Local);
@@ -197,6 +215,7 @@ pub fn send(target: &str, session: &str, text: &str) -> Result<Send, SendFailure
         fingerprint,
         address,
         pinned_static_key,
+        ..
     } = resolve(target).map_err(refused)?
     else {
         return Ok(Send::Local);
@@ -508,6 +527,13 @@ pub fn resolve_call(target: &str, addr_override: Option<SocketAddr>) -> io::Resu
         fingerprint: entry.node_fp.clone(),
         address: resolved.address,
         pinned_static_key: resolved.pinned_static_key,
+        session_facts_v1: cluster::registry::session_facts_versions(entry).is_some_and(
+            |versions| {
+                versions
+                    .iter()
+                    .any(|version| version == remuda_core::protocol::CLUSTER_SESSION_FACTS_V1)
+            },
+        ),
     })
 }
 
@@ -534,30 +560,58 @@ pub fn list(target: &str) -> Result<List, String> {
         fingerprint,
         address,
         pinned_static_key,
+        session_facts_v1,
     } = resolve_call(target, None).map_err(|error| sanitize(format!("cluster: {error}")))?
     else {
         return Ok(List::Local);
     };
     let private_key = cluster::identity::load_static_private_key()
         .map_err(|_| "cluster identity is unavailable".to_owned())?;
-    let response = ClusterClient::system()
+    let client = ClusterClient::system();
+    let started = std::time::Instant::now();
+    let response = client
         .request(address, &pinned_static_key, &private_key, &Request::List)
         .map_err(|error| list_remote_error(&fingerprint, error))?;
-    match response {
-        Response::Sessions(rows) => Ok(List::Remote(remote_sessions_text(&rows))),
-        Response::Error(message) => Err(sanitize(format!(
-            "list on {}: {message}",
-            cluster::node_label(&fingerprint)
-        ))),
-        Response::RemoteControlDisabled => Err(format!(
-            "list on {}: remote control is disabled there",
-            cluster::node_label(&fingerprint)
-        )),
-        _ => Err(format!(
-            "list on {}: peer returned an unexpected response",
-            cluster::node_label(&fingerprint)
-        )),
-    }
+    let rows = match response {
+        Response::Sessions(rows) => rows,
+        Response::Error(message) => {
+            return Err(sanitize(format!(
+                "list on {}: {message}",
+                cluster::node_label(&fingerprint)
+            )))
+        }
+        Response::RemoteControlDisabled => {
+            return Err(format!(
+                "list on {}: remote control is disabled there",
+                cluster::node_label(&fingerprint)
+            ))
+        }
+        _ => {
+            return Err(format!(
+                "list on {}: peer returned an unexpected response",
+                cluster::node_label(&fingerprint)
+            ))
+        }
+    };
+    // Positive advertisement only. Any sidecar failure leaves the base rows
+    // intact; the elapsed List request still ages typed status.
+    let facts = if session_facts_v1 {
+        match client.request(
+            address,
+            &pinned_static_key,
+            &private_key,
+            &Request::ClusterSessionFacts,
+        ) {
+            Ok(Response::ClusterSessionFacts(entries)) => entries,
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    Ok(List::Remote(remote_sessions_text_with_facts(
+        &rows, &facts, elapsed_ms,
+    )))
 }
 
 fn list_remote_error(fingerprint: &str, error: ClientError) -> String {
@@ -580,11 +634,38 @@ fn list_remote_error(fingerprint: &str, error: ClientError) -> String {
 }
 
 /// Every peer row: one line each, in the peer's order, bounded by whole lines.
+#[cfg(test)]
+#[path = "enrichment_contract/remote_text.rs"]
+mod enrichment_contract;
+
+#[cfg(test)]
+pub(crate) fn enrichment_contract_remote_text(sessions: &[remuda_core::SessionSummary]) -> String {
+    remote_sessions_text(sessions)
+}
+
+#[cfg(test)]
 fn remote_sessions_text(sessions: &[remuda_core::SessionSummary]) -> String {
+    remote_sessions_text_with_facts(sessions, &[], 0)
+}
+
+fn remote_sessions_text_with_facts(
+    sessions: &[remuda_core::SessionSummary],
+    facts: &[remuda_core::protocol::ClusterSessionFactWire],
+    elapsed_ms: u64,
+) -> String {
     let mut text = String::new();
     let mut truncated = false;
     for (index, session) in sessions.iter().enumerate() {
-        let line = remote_list_line(session);
+        let fact = session
+            .instance_id
+            .as_deref()
+            .and_then(|instance| {
+                facts
+                    .iter()
+                    .find(|fact| fact.wire_name == session.name && fact.instance_id == instance)
+            })
+            .filter(|fact| fact.valid_for_ms > elapsed_ms);
+        let line = remote_list_line(session, fact, elapsed_ms);
         let separator = usize::from(!text.is_empty());
         let more_after = index + 1 < sessions.len();
         // Reserve room for the marker whenever more content exists, so the
@@ -616,7 +697,11 @@ fn remote_sessions_text(sessions: &[remuda_core::SessionSummary]) -> String {
     text
 }
 
-fn remote_list_line(session: &remuda_core::SessionSummary) -> String {
+fn remote_list_line(
+    session: &remuda_core::SessionSummary,
+    fact: Option<&remuda_core::protocol::ClusterSessionFactWire>,
+    elapsed_ms: u64,
+) -> String {
     let mut line = format!(
         "{}\t{}x{}\talive={}\tidle={:.0}s\toutput_idle={:.0}s\t{}",
         list_name(&session.name),
@@ -633,7 +718,72 @@ fn remote_list_line(session: &remuda_core::SessionSummary) -> String {
     if session.remote_input_disabled {
         line.push_str("\tremote_input_disabled=true");
     }
+    if let Some(activity) = activity_field(session, elapsed_ms) {
+        line.push_str("\tactivity=");
+        line.push_str(activity);
+    }
+    if let Some(fact) = fact {
+        append_fact_fields(&mut line, fact);
+    }
     line
+}
+
+/// A fresh typed OSC status describes any exact live instance; it is never
+/// guessed from terminal text and is suppressed on ended/unavailable/stale rows.
+fn activity_field(session: &remuda_core::SessionSummary, elapsed_ms: u64) -> Option<&'static str> {
+    if !session.alive || session.unavailable {
+        return None;
+    }
+    if session.instance_id.as_deref().is_none_or(str::is_empty) {
+        return None;
+    }
+    let status = session.program_status.as_ref()?;
+    if status.state == remuda_core::agent::ProgramState::Unknown {
+        return None;
+    }
+    let age = session.program_status_age_ms?.saturating_add(elapsed_ms);
+    if age >= remuda_core::session_enrichment::program_status_max_age_ms(status.state) {
+        return None;
+    }
+    Some(status.state.as_str())
+}
+
+fn append_fact_fields(line: &mut String, fact: &remuda_core::protocol::ClusterSessionFactWire) {
+    if let Some(kind) = &fact.kind {
+        line.push_str("\tkind=");
+        line.push_str(&fact_value(kind));
+    } else {
+        line.push_str("\tkind=unavailable");
+    }
+    if let Some(model) = &fact.model {
+        line.push_str("\tmodel=");
+        line.push_str(&fact_value(model));
+    } else {
+        line.push_str("\tmodel=unavailable");
+    }
+    match (fact.context_used, fact.context_window) {
+        (Some(used), Some(window)) => {
+            line.push_str(&format!("\tctx={used}/{window}"));
+            if let Some(percent) = fact.context_percent {
+                line.push_str(&format!("\tctx_percent={percent}"));
+            }
+        }
+        _ => line.push_str("\tctx=unavailable"),
+    }
+}
+
+/// One TAB/key=value field value: framing characters and controls removed.
+fn fact_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '\t' | '\n' | '\r' => ' ',
+            other => other,
+        })
+        .collect::<String>()
+        .chars()
+        .filter(|character| !is_terminal_control(*character))
+        .collect()
 }
 
 /// Tab/newline framing becomes one space; other terminal controls are removed.
@@ -1236,5 +1386,47 @@ mod tests {
         assert!(validate_send_text(&"x".repeat(MAX_REMOTE_SEND_BYTES)).is_ok());
         assert!(validate_send_text(&"x".repeat(MAX_REMOTE_SEND_BYTES + 1)).is_err());
         assert!(validate_send_text("한 line").is_ok());
+    }
+
+    #[test]
+    fn remote_text_adds_bounded_managed_fields_but_never_join_ids() {
+        use remuda_core::agent::{ProgramState, ProgramStatus};
+        use remuda_core::protocol::ClusterSessionFactWire;
+        let mut row = crate::enrichment_contract::summary("worker", "MID", Some("LEAD"));
+        row.program_status = Some(ProgramStatus {
+            state: ProgramState::Working,
+            app: None,
+            kind: None,
+            progress: None,
+        });
+        row.program_status_age_ms = Some(0);
+        let fact = ClusterSessionFactWire {
+            wire_name: "worker".into(),
+            instance_id: row.instance_id.clone().unwrap(),
+            valid_for_ms: 10_000,
+            member_id: "MID".into(),
+            leader_id: Some("LEAD".into()),
+            alias: Some("worker".into()),
+            kind: Some("codex".into()),
+            model: None,
+            context_used: Some(42_000),
+            context_window: Some(100_000),
+            context_percent: Some(42),
+        };
+        let text = remote_sessions_text_with_facts(&[row.clone()], std::slice::from_ref(&fact), 0);
+        assert!(text.ends_with(
+            "\tactivity=working\tkind=codex\tmodel=unavailable\tctx=42000/100000\tctx_percent=42"
+        ), "{text}");
+        assert!(!text.contains("MID") && !text.contains("LEAD"));
+        assert!(!text.contains("member_id") && !text.contains("leader_id"));
+
+        // Expired facts never reach the row, while the base framing stays.
+        let expired = ClusterSessionFactWire {
+            valid_for_ms: 0,
+            ..fact
+        };
+        let text = remote_sessions_text_with_facts(&[row], &[expired], 0);
+        assert!(text.contains("worker") && text.contains("alive=true"));
+        assert!(!text.contains("kind=codex") && !text.contains("MID"));
     }
 }

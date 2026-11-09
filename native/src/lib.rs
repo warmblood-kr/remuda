@@ -22,6 +22,8 @@ pub mod daemon;
 pub mod db_cli;
 pub(crate) mod db_lua;
 pub mod dist;
+#[cfg(test)]
+mod enrichment_contract;
 pub mod find_command;
 pub(crate) mod fs_atomic;
 pub mod fs_lock;
@@ -45,6 +47,7 @@ pub mod reload;
 pub mod remote_front;
 pub mod reply_limit;
 pub mod script;
+pub mod session_display;
 #[doc(hidden)]
 pub mod session_host;
 pub mod session_job;

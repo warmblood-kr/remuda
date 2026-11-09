@@ -30,7 +30,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 113] = [
+pub const BINDINGS: [&str; 114] = [
     "_advice_reattach",
     "_call",
     "_caller_live",
@@ -66,6 +66,7 @@ pub const BINDINGS: [&str; 113] = [
     "_schedule_fire_counts",
     "_session_remote_input",
     "_session_resize",
+    "_session_set_display",
     "_sync_window_shown",
     "_take_due_schedules",
     "advice_list",
@@ -273,6 +274,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_session_remote_input",
         "Set the local-only remote-input opt-out for one exact session instance. Unknown, exited or mismatched instances are refused; references do not inherit it.",
         "_session_remote_input(name, instance_id, enabled) -> true, nil | nil, error",
+    ),
+    (
+        "_session_set_display",
+        "Publish bounded, expiring cluster display facts for one exact live session instance. Local-only setter; no wire input, no tasks, paths, mail or terminal text.",
+        "_session_set_display(name, instance_id, facts | nil) -> true, nil | nil, error",
     ),
     (
         "http",
@@ -1235,18 +1241,20 @@ pub(crate) fn bindings(
     // for an answer this call already has bought nothing but a socket round
     // trip on every non-skip_list tick refresh. See steps/031.
     let image_for_ls = image.clone();
+    let registry_for_ls = Arc::clone(&registry);
     table.set(
         "ls",
         lua.create_function(move |lua, ()| {
             if !crate::daemon::keep_exited() {
-                crate::daemon::reap_and_notify(&registry, &image_for_ls);
+                crate::daemon::reap_and_notify(&registry_for_ls, &image_for_ls);
             }
-            value(lua, Response::Sessions(registry.list()))
+            value(lua, Response::Sessions(registry_for_ls.list()))
         })?,
     )?;
 
     session_resize_binding(lua, &table, at())?;
     session_remote_input_binding(lua, &table, at())?;
+    crate::session_display::install(lua, &table, Arc::clone(&registry))?;
 
     new_binding(lua, &table, at())?;
 
@@ -1977,6 +1985,7 @@ pub(crate) fn hide_module_activator(lua: &Lua) -> mlua::Result<()> {
 }
 
 pub(crate) fn stop_modules(lua: &Lua) -> mlua::Result<()> {
+    crate::session_display::dispose(lua);
     let stop_modules: mlua::Function = lua.named_registry_value("remuda.lifecycle.stop_modules")?;
     stop_modules.call(())
 }
@@ -2612,6 +2621,9 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::WrongInstance => Err(mlua::Error::runtime("session instance changed")),
         Response::RateLimited => Err(mlua::Error::runtime("session input rate limit exceeded")),
         Response::SyncAtCapacity => Err(mlua::Error::runtime("Sync is at capacity; retry shortly")),
+        Response::ClusterSessionFacts(_) => Err(mlua::Error::runtime(
+            "cluster session facts are not available to local callers",
+        )),
         Response::Busy => Err(mlua::Error::runtime(crate::BUSY_RETRY_MESSAGE)),
         Response::WriteTimeout => Err(mlua::Error::runtime(
             "session PTY write timed out; delivery may be partial or late",

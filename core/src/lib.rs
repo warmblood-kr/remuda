@@ -26,6 +26,7 @@ pub mod keys;
 pub mod protocol;
 pub mod registry;
 pub mod session;
+pub mod session_enrichment;
 pub mod session_operations;
 pub mod sync;
 pub mod vfs;

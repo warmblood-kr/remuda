@@ -13,10 +13,14 @@ use confirm::{Confirmation, Decision};
 use ended::EndedState;
 use queue::{InputQueue, PendingBatch, QueueEvent, QueueState};
 use remote_calls::{RemoteCall, RemoteDispatcher, RemotePort};
-use remuda_core::agent::StyledCell;
+use remuda_core::agent::{ProgramState, ProgramStatus, StyledCell};
 use remuda_core::clock::Clock;
 use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
+use remuda_core::session_enrichment::{
+    program_status_max_age_ms, resolve_cluster_roster, ListedTarget, MetadataState, NodeRoster,
+    ResolvedSession,
+};
 use sender::InputSender;
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, Write};
@@ -127,6 +131,10 @@ pub fn cluster_tree_has_sessions(
             .iter()
             .any(|node| !node.sessions.is_empty())
 }
+
+#[cfg(test)]
+#[path = "enrichment_contract/tree.rs"]
+mod enrichment_contract;
 
 pub struct ClusterUi {
     node: String,
@@ -795,7 +803,7 @@ impl ClusterUi {
             self.remote_snapshot.nodes.len() + 1
         ));
         let local_rows = self.local_tree_rows();
-        let remote_rows = self.remote_tree_rows();
+        let remote_rows = self.remote_tree_rows_at(width);
         let status_col = status_column(
             local_rows
                 .iter()
@@ -1223,25 +1231,33 @@ impl ClusterUi {
             .into_iter()
             .map(|index| {
                 let session = &self.sessions[index];
+                let glyph = session_cell(session.alive, false, self.pending_count(session));
+                let status = local_advice(session)
+                    .map_or_else(|| glyph.clone(), |advice| format!("{glyph} {advice}"));
                 TreeRow {
                     prefix: format!("{}    ", if index == self.selected { ">" } else { " " }),
                     label: session.name.clone(),
-                    status: session_cell(session.alive, false, self.pending_count(session)),
+                    status,
                 }
             })
             .collect()
     }
 
     /// Remote node and session rows, in display order.
+    #[cfg(test)]
     fn remote_tree_rows(&self) -> Vec<TreeRow> {
+        self.remote_tree_rows_at(usize::MAX)
+    }
+
+    fn remote_tree_rows_at(&self, width: usize) -> Vec<TreeRow> {
         let mut rows = Vec::new();
         let query = self.query.as_deref().unwrap_or_default();
         for node in &self.remote_snapshot.nodes {
             let node_matches = query.is_empty() || matches_query(query, &node.name);
-            let visible_sessions = node
-                .sessions
+            let resolved = remote_rows_for_node(node);
+            let visible_sessions = resolved
                 .iter()
-                .filter(|session| self.remote_session_visible(node, session, query))
+                .filter(|(_, session)| self.remote_session_visible(node, session, query))
                 .collect::<Vec<_>>();
             let node_attention = node.state != RemoteState::Reachable;
             if (self.attention_only && !node_attention && visible_sessions.is_empty())
@@ -1262,21 +1278,31 @@ impl ClusterUi {
                 status: status_glyph(node.state).to_string(),
             });
             if is_expanded {
-                for session in visible_sessions {
+                for (resolved, session) in visible_sessions {
                     let is_selected = self.remote_selected
                         == Some(RemoteSelection::Session {
                             node: node.registry_key.clone(),
                             name: session.name.clone(),
                             instance_id: session.instance_id.clone(),
                         });
+                    let glyph = session_cell(
+                        session.alive,
+                        session.last_error.is_some(),
+                        self.remote_pending_count(node, session),
+                    );
+                    let status = advice_text(resolved.program_status.as_ref())
+                        .map_or_else(|| glyph.clone(), |advice| format!("{glyph} {advice}"));
+                    let (label, _) = remuda_core::session_enrichment::format_cluster_row_parts(
+                        resolved,
+                        &session.name,
+                        &status,
+                        width,
+                    )
+                    .unwrap_or_else(|_| (session.name.clone(), status.clone()));
                     rows.push(TreeRow {
                         prefix: format!("{}    ", if is_selected { ">" } else { " " }),
-                        label: session.name.clone(),
-                        status: session_cell(
-                            session.alive,
-                            session.last_error.is_some(),
-                            self.remote_pending_count(node, session),
-                        ),
+                        label,
+                        status,
                     });
                 }
             }
@@ -2817,6 +2843,127 @@ fn status_style(status: &str) -> Option<&'static str> {
         '~' | '?' => Some("\x1b[33m"),
         '!' | 'x' | '-' => Some("\x1b[31m"),
         _ => None,
+    }
+}
+
+/// Fresh authoritative typed status for a local row, independent of Butler.
+fn local_advice(session: &SessionSummary) -> Option<&'static str> {
+    if !session.alive || session.unavailable {
+        return None;
+    }
+    if session.instance_id.as_deref().is_none_or(str::is_empty) {
+        return None;
+    }
+    let status = session.program_status.as_ref()?;
+    if status.state == ProgramState::Unknown {
+        return None;
+    }
+    if session.program_status_age_ms? >= program_status_max_age_ms(status.state) {
+        return None;
+    }
+    Some(status.state.as_str())
+}
+
+fn advice_text(status: Option<&ProgramStatus>) -> Option<&'static str> {
+    let status = status?;
+    if status.state == ProgramState::Unknown {
+        return None;
+    }
+    Some(status.state.as_str())
+}
+
+/// Rebuild the minimal summary the resolver needs, aging the typed status by
+/// the time since the snapshot was taken. A Sync refreshes the screen, not the
+/// status observation.
+fn remote_summary(snapshot: &RemoteSessionSnapshot, age: Duration) -> SessionSummary {
+    let elapsed = age.as_millis().min(u128::from(u64::MAX)) as u64;
+    SessionSummary {
+        id: String::new(),
+        name: snapshot.wire_name.clone(),
+        instance_id: Some(snapshot.instance_id.clone()),
+        output_version: snapshot.output_version,
+        alive: snapshot.alive,
+        idle: Duration::ZERO,
+        output_idle: None,
+        size: remuda_core::Size::default(),
+        attached: false,
+        human_idle: None,
+        mouse_tracking: false,
+        unavailable: snapshot.unavailable,
+        program_status: snapshot.program_status.clone(),
+        program_status_age_ms: snapshot
+            .program_status_age_ms
+            .map(|value| value.saturating_add(elapsed)),
+        remote_input_disabled: false,
+    }
+}
+
+/// Resolve one owning node's sessions into stable forest preorder. The
+/// partition is the node itself, so identical durable IDs on another node can
+/// never join here.
+fn remote_rows_for_node(
+    node: &RemoteNodeSnapshot,
+) -> Vec<(ResolvedSession, &RemoteSessionSnapshot)> {
+    let now = std::time::Instant::now();
+    let summaries: Vec<_> = node
+        .sessions
+        .iter()
+        .map(|snapshot| {
+            let age = now.saturating_duration_since(snapshot.listed_at);
+            remote_summary(snapshot, age)
+        })
+        .collect();
+    let targets: Vec<_> = summaries
+        .iter()
+        .zip(&node.sessions)
+        .enumerate()
+        .map(|(index, (summary, snapshot))| {
+            let age_ms = now
+                .saturating_duration_since(snapshot.listed_at)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            ListedTarget {
+                token: index as u32 + 1,
+                summary,
+                managed: snapshot.facts.is_some(),
+                butler: snapshot.facts.as_ref(),
+                facts_remaining_ms: snapshot.facts_remaining_ms.saturating_sub(age_ms),
+            }
+        })
+        .collect();
+    let roster = NodeRoster {
+        stale_or_unreachable: node.state != RemoteState::Reachable,
+        // Per-session evidence is pre-aged from its own List observation, so
+        // the roster itself needs no additional elapsed time.
+        list_elapsed_ms: 0,
+        targets: &targets,
+    };
+    match resolve_cluster_roster(&roster) {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(|row| {
+                let index = usize::try_from(row.token).ok()?.checked_sub(1)?;
+                node.sessions.get(index).map(|session| (row, session))
+            })
+            .collect(),
+        Err(_) => node
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(index, session)| {
+                (
+                    ResolvedSession {
+                        token: index as u32 + 1,
+                        parent_token: None,
+                        parent_label: None,
+                        depth: 0,
+                        metadata: MetadataState::NotProvided,
+                        program_status: None,
+                    },
+                    session,
+                )
+            })
+            .collect(),
     }
 }
 
@@ -4468,10 +4615,16 @@ mod tests {
                     wire_name: "build".into(),
                     instance_id: "remote-instance".into(),
                     alive: true,
+                    unavailable: false,
                     output_version: Some(7),
                     bracketed_paste: false,
                     screen,
                     last_error: None,
+                    facts: None,
+                    facts_remaining_ms: 0,
+                    program_status: None,
+                    program_status_age_ms: None,
+                    listed_at: std::time::Instant::now(),
                 }],
             }],
         }
@@ -7566,5 +7719,169 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].remote_node.as_deref(), Some("fp-laptop"));
         assert!(batches[0].line_submit);
+    }
+
+    fn enriched_session(
+        name: &str,
+        instance: &str,
+        member: &str,
+        leader: Option<&str>,
+        context: bool,
+    ) -> RemoteSessionSnapshot {
+        use remuda_core::session_enrichment::{ButlerFacts, FieldState};
+        RemoteSessionSnapshot {
+            name: name.into(),
+            wire_name: name.into(),
+            instance_id: instance.into(),
+            alive: true,
+            unavailable: false,
+            output_version: None,
+            bracketed_paste: false,
+            screen: None,
+            last_error: None,
+            facts: Some(ButlerFacts {
+                member_id: member.into(),
+                leader_id: leader.map(str::to_owned),
+                alias: Some(name.into()),
+                kind: FieldState::Value("codex".into()),
+                model: FieldState::Value("model".into()),
+                context_used: if context {
+                    FieldState::Value(42_000)
+                } else {
+                    FieldState::Unavailable
+                },
+                context_window: if context {
+                    FieldState::Value(100_000)
+                } else {
+                    FieldState::Unavailable
+                },
+                context_percent: if context {
+                    FieldState::Value(42)
+                } else {
+                    FieldState::Unavailable
+                },
+            }),
+            facts_remaining_ms: 10_000,
+            program_status: None,
+            program_status_age_ms: None,
+            listed_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn identical_durable_ids_on_two_nodes_never_join_across_the_partition() {
+        let node_a = RemoteNodeSnapshot {
+            registry_key: "fp-a".into(),
+            name: "laptop-a".into(),
+            state: RemoteState::Reachable,
+            last_sync_age: Some(Duration::ZERO),
+            last_error: None,
+            sessions: vec![
+                enriched_session("lead-a", "instance-a1", "M1", None, true),
+                enriched_session("child-a", "instance-a2", "M2", Some("M1"), false),
+            ],
+        };
+        let node_b = RemoteNodeSnapshot {
+            registry_key: "fp-b".into(),
+            name: "laptop-b".into(),
+            state: RemoteState::Reachable,
+            last_sync_age: Some(Duration::ZERO),
+            last_error: None,
+            sessions: vec![
+                enriched_session("lead-b", "instance-b1", "M1", None, false),
+                enriched_session("child-b", "instance-b2", "M2", Some("M1"), true),
+            ],
+        };
+        let a = super::remote_rows_for_node(&node_a);
+        let b = super::remote_rows_for_node(&node_b);
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[1].0.parent_label.as_deref(), Some("lead-a"));
+        assert_eq!(a[1].0.depth, 1);
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[1].0.parent_label.as_deref(), Some("lead-b"));
+        assert_eq!(b[1].0.depth, 1);
+        // The same IDs prove a join only inside one owning node.
+        assert!(a
+            .iter()
+            .all(|(row, _)| row.parent_label.as_deref() != Some("lead-b")));
+        assert!(b
+            .iter()
+            .all(|(row, _)| row.parent_label.as_deref() != Some("lead-a")));
+    }
+
+    #[test]
+    fn picker_renders_managed_facts_and_keeps_unknown_rows_ordinary() {
+        let mut ui = ClusterUi::new("local", vec![], Duration::ZERO);
+        ui.remote_snapshot.nodes.push(RemoteNodeSnapshot {
+            registry_key: "fp-a".into(),
+            name: "peer".into(),
+            state: RemoteState::Reachable,
+            last_sync_age: Some(Duration::ZERO),
+            last_error: None,
+            sessions: vec![
+                enriched_session("worker", "instance-1", "M1", None, true),
+                RemoteSessionSnapshot {
+                    name: "ordinary".into(),
+                    wire_name: "ordinary".into(),
+                    instance_id: "instance-2".into(),
+                    alive: true,
+                    unavailable: false,
+                    output_version: None,
+                    bracketed_paste: false,
+                    screen: None,
+                    last_error: None,
+                    facts: None,
+                    facts_remaining_ms: 0,
+                    program_status: None,
+                    program_status_age_ms: None,
+                    listed_at: std::time::Instant::now(),
+                },
+            ],
+        });
+        ui.remote_expanded.insert("fp-a".into());
+        let rows = ui.remote_tree_rows();
+        let worker = rows
+            .iter()
+            .find(|row| row.label.contains("worker"))
+            .unwrap();
+        assert!(worker.label.contains("codex"), "{}", worker.label);
+        assert!(worker.label.contains("42K/100K"), "{}", worker.label);
+        assert!(worker.label.contains("42% ctx"), "{}", worker.label);
+        let ordinary = rows
+            .iter()
+            .find(|row| row.label.contains("ordinary"))
+            .unwrap();
+        assert_eq!(ordinary.label, "ordinary");
+        assert!(!ordinary.label.contains("unavailable"));
+    }
+
+    #[test]
+    fn a_sync_or_redraw_cannot_renew_list_observed_facts_or_status() {
+        let mut session = enriched_session("worker", "instance-1", "M1", None, true);
+        session.facts_remaining_ms = 1_000;
+        session.listed_at = std::time::Instant::now() - Duration::from_millis(1_500);
+        session.program_status = Some(remuda_core::agent::ProgramStatus {
+            state: remuda_core::agent::ProgramState::Working,
+            app: None,
+            kind: None,
+            progress: None,
+        });
+        session.program_status_age_ms = Some(599_000);
+        let node = RemoteNodeSnapshot {
+            registry_key: "fp-a".into(),
+            name: "peer".into(),
+            state: RemoteState::Reachable,
+            // A fresh Sync must not make the old List evidence look new.
+            last_sync_age: Some(Duration::ZERO),
+            last_error: None,
+            sessions: vec![session],
+        };
+        let rows = super::remote_rows_for_node(&node);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].0.metadata,
+            remuda_core::session_enrichment::MetadataState::Unavailable
+        );
+        assert!(rows[0].0.program_status.is_none());
     }
 }

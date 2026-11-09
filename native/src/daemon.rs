@@ -370,9 +370,7 @@ fn serve_from(
         claim_vfs();
     }
     let anti_entropy = Arc::new(AntiEntropyTask::start()?);
-    let listener_task = Arc::new(DaemonListenerControl::new(ListenerTask::start(path)));
-
-    let registry = Arc::new(Registry::new());
+    let (registry, listener_task) = start_listener_task(path);
     // The image starts with the daemon and lives exactly as long (step 007).
     // It is started *after* the bind, so the `remuda` table it binds points at
     // a socket that is already accepting — the interpreter's first call cannot
@@ -657,34 +655,61 @@ pub struct ListenerTask {
     status: Arc<Mutex<ListenerStatus>>,
     stop: std::sync::mpsc::Sender<()>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// The in-process session registry, shared with the cluster listener so an
+    /// authenticated sidecar read never has to round-trip the local daemon.
+    session_registry: Option<Arc<Registry>>,
 }
 
 impl ListenerTask {
     pub fn start(daemon_path: &Path) -> Self {
-        Self::start_with_retry_interval(daemon_path, LISTENER_HOST_LOCK_RETRY_INTERVAL)
+        Self::start_with_retry_interval_and_registry(
+            daemon_path,
+            LISTENER_HOST_LOCK_RETRY_INTERVAL,
+            None,
+        )
     }
 
-    fn start_with_retry_interval(daemon_path: &Path, retry_interval: Duration) -> Self {
-        Self::start_with_retry_interval_and_detector(
+    pub fn start_with_registry(daemon_path: &Path, registry: Arc<Registry>) -> Self {
+        Self::start_with_retry_interval_and_registry(
+            daemon_path,
+            LISTENER_HOST_LOCK_RETRY_INTERVAL,
+            Some(registry),
+        )
+    }
+
+    fn start_with_retry_interval_and_registry(
+        daemon_path: &Path,
+        retry_interval: Duration,
+        registry: Option<Arc<Registry>>,
+    ) -> Self {
+        Self::start_with_retry_interval_and_detector_and_registry(
             daemon_path,
             retry_interval,
             Arc::new(crate::net::advertise_addr::auto_advertise_addr),
+            registry,
         )
+    }
+
+    #[cfg(test)]
+    fn start_with_retry_interval(daemon_path: &Path, retry_interval: Duration) -> Self {
+        Self::start_with_retry_interval_and_registry(daemon_path, retry_interval, None)
     }
 
     #[cfg(all(test, not(windows)))]
     fn start_with_detector(daemon_path: &Path, detector: AutoAddressDetector) -> Self {
-        Self::start_with_retry_interval_and_detector(
+        Self::start_with_retry_interval_and_detector_and_registry(
             daemon_path,
             LISTENER_HOST_LOCK_RETRY_INTERVAL,
             detector,
+            None,
         )
     }
 
-    fn start_with_retry_interval_and_detector(
+    fn start_with_retry_interval_and_detector_and_registry(
         daemon_path: &Path,
         retry_interval: Duration,
         detector: AutoAddressDetector,
+        session_registry: Option<Arc<Registry>>,
     ) -> Self {
         let status = Arc::new(Mutex::new(ListenerStatus::Off));
         let (stop, stopped) = std::sync::mpsc::channel();
@@ -693,6 +718,7 @@ impl ListenerTask {
         let daemon_path = daemon_path.to_path_buf();
         let thread_path = daemon_path.clone();
         let ready_on_error = ready.clone();
+        let registry_for_thread = session_registry.clone();
         let thread = std::thread::Builder::new()
             .name("remuda-cluster-listener".into())
             .spawn(move || {
@@ -703,6 +729,7 @@ impl ListenerTask {
                     retry_interval,
                     detector,
                     &ready,
+                    registry_for_thread,
                 );
                 if let Err(reason) = result {
                     set_listener_status(&status_for_thread, ListenerStatus::Failed(reason));
@@ -725,6 +752,7 @@ impl ListenerTask {
             status,
             stop,
             thread: Mutex::new(thread),
+            session_registry,
         };
         if started {
             match startup.recv_timeout(Duration::from_secs(30)) {
@@ -744,9 +772,14 @@ impl ListenerTask {
 
     fn restart(&mut self) -> ListenerStatus {
         let daemon_path = self.daemon_path.clone();
+        let session_registry = self.session_registry.clone();
         self.stop_and_join();
         set_listener_status(&self.status, ListenerStatus::Off);
-        *self = Self::start(&daemon_path);
+        *self = Self::start_with_retry_interval_and_registry(
+            &daemon_path,
+            LISTENER_HOST_LOCK_RETRY_INTERVAL,
+            session_registry,
+        );
         self.status()
     }
 
@@ -944,6 +977,21 @@ fn serve_bound_listener(
     })
 }
 
+/// Repair an existing cluster's capability advertisement, then start the
+/// listener with the in-process session registry it serves facts from.
+fn start_listener_task(path: &Path) -> (Arc<Registry>, Arc<DaemonListenerControl>) {
+    if let Err(error) = crate::cluster::advertise_session_facts() {
+        eprintln!("remuda daemon: cluster session-facts advertisement: {error}");
+    }
+    let registry = Arc::new(Registry::with_cluster_facts_clock(Arc::new(
+        crate::SystemClock::new(),
+    )));
+    let listener_task = Arc::new(DaemonListenerControl::new(
+        ListenerTask::start_with_registry(path, Arc::clone(&registry)),
+    ));
+    (registry, listener_task)
+}
+
 fn start_listener(
     daemon_path: &Path,
     status: &Arc<Mutex<ListenerStatus>>,
@@ -951,6 +999,7 @@ fn start_listener(
     retry_interval: Duration,
     detector: AutoAddressDetector,
     ready: &std::sync::mpsc::Sender<()>,
+    session_registry: Option<Arc<Registry>>,
 ) -> Result<(), String> {
     let stopped = Arc::new(Mutex::new(stopped));
     let security = crate::net::listener::ListenerSecurityResources::new();
@@ -1006,6 +1055,7 @@ fn start_listener(
             },
             daemon_path,
             &security,
+            session_registry.clone(),
         )
         .map_err(|error| format!("bind cluster listener: {error}"))?;
         let result = serve_bound_listener(
@@ -2172,6 +2222,7 @@ fn handle_request(
 
         Request::ClusterRegistrySync { .. }
         | Request::ClusterRegistryUpdate { .. }
+        | Request::ClusterSessionFacts
         | Request::ClusterVfsIndexSync { .. }
         | Request::ClusterVfsChanges { .. }
         | Request::ClusterVfsIndexUpdate { .. }

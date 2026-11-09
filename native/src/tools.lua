@@ -1902,6 +1902,7 @@ remuda.session = {
   attach = function(...) return call_flat("attach", ...) end,
   resize = function(...) return remuda._session_resize(...) end,
   remote_input = function(...) return remuda._session_remote_input(...) end,
+  set_display = function(...) return remuda._session_set_display(...) end,
 }
 setmetatable(remuda.session, {
   __call = function(_, name) return session_handle(name) end,

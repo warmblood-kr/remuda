@@ -391,6 +391,27 @@ fn merge_known_entry(incoming: &AuthorizedNode, current: &AuthorizedNode) -> Aut
 /// Optional-field key carrying a node's replicated display alias.
 const ALIAS_FIELD: &str = "alias";
 
+/// Read a peer's advertised `session_facts` versions. Malformed values are
+/// treated as no advertisement (base List only), never as an optimistic yes.
+pub fn session_facts_versions(entry: &AuthorizedNode) -> Option<Vec<String>> {
+    let value = entry
+        .optional_fields
+        .get(remuda_core::protocol::CLUSTER_SESSION_FACTS_FIELD)?;
+    let items = value.as_array()?;
+    if items.is_empty() || items.len() > 8 {
+        return None;
+    }
+    let mut versions = Vec::with_capacity(items.len());
+    for item in items {
+        let text = item.as_str()?;
+        if text.is_empty() || text.len() > 16 {
+            return None;
+        }
+        versions.push(text.to_owned());
+    }
+    Some(versions)
+}
+
 /// Last-writer-wins display alias for one node. `name: None` is a tombstone
 /// so that a clear propagates instead of being resurrected by older copies.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]

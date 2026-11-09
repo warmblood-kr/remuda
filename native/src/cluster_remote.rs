@@ -1,7 +1,8 @@
 //! Bounded remote-node polling state, separate from the cluster tree renderer.
 
-use remuda_core::agent::ScreenSnapshot;
-use remuda_core::protocol::{expand_runs, Request, Response};
+use remuda_core::agent::{ProgramStatus, ScreenSnapshot};
+use remuda_core::protocol::{expand_runs, ClusterSessionFactWire, Request, Response};
+use remuda_core::session_enrichment::{ButlerFacts, FieldState};
 use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
@@ -36,10 +37,22 @@ pub struct RemoteSessionSnapshot {
     pub wire_name: String,
     pub instance_id: String,
     pub alive: bool,
+    /// A host-backed row whose host did not answer; advice is suppressed.
+    pub unavailable: bool,
     pub output_version: Option<u64>,
     pub bracketed_paste: bool,
     pub screen: Option<ScreenSnapshot>,
     pub last_error: Option<String>,
+    /// Owner-published facts bound to this exact wire name+instance.
+    pub facts: Option<ButlerFacts>,
+    /// Remaining lifetime measured at the owner's response.
+    pub facts_remaining_ms: u64,
+    /// Fresh typed status copied from the List row; aged by request elapsed.
+    pub program_status: Option<ProgramStatus>,
+    pub program_status_age_ms: Option<u64>,
+    /// When this row's List evidence was observed. A Sync updates the screen,
+    /// never this instant, so facts and status cannot be renewed by a redraw.
+    pub listed_at: Instant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,6 +160,8 @@ pub struct RemoteTarget {
     /// Exact registry fingerprint, so colliding short node labels stay distinct.
     pub registry_key: String,
     pub addr_override: Option<SocketAddr>,
+    /// Positive owner advertisement of the enrichment sidecar (v1 only).
+    pub session_facts_v1: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -213,6 +228,13 @@ fn registry_targets_with_aliases(
             name: crate::cluster::display_node_label(&entry.node_fp, aliases),
             registry_key: entry.node_fp.clone(),
             addr_override: None,
+            session_facts_v1: crate::cluster::registry::session_facts_versions(entry).is_some_and(
+                |versions| {
+                    versions
+                        .iter()
+                        .any(|version| version == remuda_core::protocol::CLUSTER_SESSION_FACTS_V1)
+                },
+            ),
         })
         .collect()
 }
@@ -553,23 +575,32 @@ impl ClusterRemoteTransport {
 
     fn list_sessions(
         &self,
-        target: &crate::cluster::ResolvedTarget,
-    ) -> io::Result<Vec<remuda_core::registry::SessionSummary>> {
-        match self.request(target, &Request::List)? {
-            Response::Sessions(mut sessions) => {
-                // Local-only until request-elapsed remote aging exists.
-                for session in &mut sessions {
-                    session.program_status = None;
-                    session.program_status_age_ms = None;
-                }
-                Ok(sessions)
+        resolved: &crate::cluster::ResolvedTarget,
+        target: &RemoteTarget,
+    ) -> io::Result<(
+        Vec<remuda_core::registry::SessionSummary>,
+        Vec<ClusterSessionFactWire>,
+        Instant,
+    )> {
+        // Expiry is measured from this original List request start; a later
+        // redraw, cache or Sync never renews it.
+        let started = Instant::now();
+        let sessions = match self.request(resolved, &Request::List)? {
+            Response::Sessions(sessions) => sessions,
+            Response::Error(error) => return Err(io::Error::other(error)),
+            other => return Err(unexpected_response("List", other)),
+        };
+        let mut facts = Vec::new();
+        // Only a peer that positively advertised v1 may receive this request;
+        // any failure leaves the base List untouched.
+        if target.session_facts_v1 {
+            if let Ok(Response::ClusterSessionFacts(entries)) =
+                self.request(resolved, &Request::ClusterSessionFacts)
+            {
+                facts = entries;
             }
-            Response::Error(error) => Err(io::Error::other(error)),
-            other => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unexpected remote List response: {other:?}"),
-            )),
         }
+        Ok((sessions, facts, started))
     }
 
     /// Read the selected session with one request: a Sync long-poll against a
@@ -579,6 +610,7 @@ impl ClusterRemoteTransport {
         target: &crate::cluster::ResolvedTarget,
         session: &remuda_core::registry::SessionSummary,
         prior: Option<&RemoteSessionSnapshot>,
+        listed_at: Instant,
     ) -> io::Result<RemoteSessionSnapshot> {
         let request = match prior.filter(|prior| should_sync(Some(prior))) {
             Some(prior) => selected_sync_request(prior),
@@ -588,7 +620,7 @@ impl ClusterRemoteTransport {
             },
         };
         let response = self.request(target, &request)?;
-        selected_snapshot(session, prior, &request, response)
+        selected_snapshot(session, prior, &request, response, listed_at)
     }
 }
 
@@ -599,6 +631,7 @@ fn selected_snapshot(
     prior: Option<&RemoteSessionSnapshot>,
     request: &Request,
     response: Response,
+    listed_at: Instant,
 ) -> io::Result<RemoteSessionSnapshot> {
     let synced = matches!(request, Request::Sync { .. });
     match response {
@@ -611,10 +644,16 @@ fn selected_snapshot(
             wire_name: session.name.clone(),
             instance_id,
             alive: true,
+            unavailable: false,
             output_version: Some(output_version),
             bracketed_paste: snapshot.bracketed_paste,
             screen: Some(to_screen_snapshot(snapshot)),
             last_error: None,
+            facts: None,
+            facts_remaining_ms: 0,
+            program_status: None,
+            program_status_age_ms: None,
+            listed_at,
         }),
         Response::StyledScreen {
             rows,
@@ -636,6 +675,7 @@ fn selected_snapshot(
                 wire_name: session.name.clone(),
                 instance_id,
                 alive: true,
+                unavailable: false,
                 output_version,
                 bracketed_paste,
                 screen: Some(to_screen_snapshot(remuda_core::protocol::StyledScreen {
@@ -647,6 +687,11 @@ fn selected_snapshot(
                     cursor,
                 })),
                 last_error: None,
+                facts: None,
+                facts_remaining_ms: 0,
+                program_status: None,
+                program_status_age_ms: None,
+                listed_at,
             })
         }
         Response::WrongInstance => Err(io::Error::new(
@@ -658,10 +703,7 @@ fn selected_snapshot(
             "remote Sync is at capacity",
         )),
         Response::Error(error) => Err(io::Error::other(error)),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected remote screen response: {other:?}"),
-        )),
+        other => Err(unexpected_response("screen", other)),
     }
 }
 
@@ -673,12 +715,14 @@ impl RemoteTransport for ClusterRemoteTransport {
         previous: &[RemoteSessionSnapshot],
     ) -> io::Result<RemotePoll> {
         let resolved = (self.resolve)(target)?;
-        let sessions = self.list_sessions(&resolved)?;
+        let (sessions, facts, listed_at) = self.list_sessions(&resolved, target)?;
         Ok(poll_listed_sessions(
             sessions,
+            &facts,
             selected_session,
             previous,
-            |session, prior| self.selected_session_snapshot(&resolved, session, prior),
+            listed_at,
+            |session, prior| self.selected_session_snapshot(&resolved, session, prior, listed_at),
         ))
     }
 
@@ -717,8 +761,10 @@ impl RemoteTransport for ClusterRemoteTransport {
 /// selected name is read, so a List costs at most one selected Sync.
 fn poll_listed_sessions(
     sessions: Vec<remuda_core::registry::SessionSummary>,
+    facts: &[ClusterSessionFactWire],
     selected_session: Option<&str>,
     previous: &[RemoteSessionSnapshot],
+    listed_at: Instant,
     mut read: impl FnMut(
         &remuda_core::registry::SessionSummary,
         Option<&RemoteSessionSnapshot>,
@@ -733,15 +779,29 @@ fn poll_listed_sessions(
             && !selected_read
             && selected_session == Some(display_name(&session.name).as_str());
         if !selected {
-            snapshots.extend(unpolled_session_snapshot(session, prior));
+            snapshots.extend(unpolled_session_snapshot(session, prior, facts, listed_at));
             continue;
         }
         selected_read = true;
         match read(&session, prior) {
-            Ok(snapshot) => snapshots.push(snapshot),
+            Ok(mut snapshot) => {
+                if snapshot.facts.is_none() {
+                    let (butler, remaining) =
+                        facts_for(&session.name, &snapshot.instance_id, facts);
+                    snapshot.facts = butler;
+                    snapshot.facts_remaining_ms = remaining;
+                }
+                if snapshot.program_status.is_none() {
+                    snapshot.program_status = session.program_status.clone();
+                    snapshot.program_status_age_ms = session.program_status_age_ms;
+                }
+                snapshots.push(snapshot);
+            }
             Err(error) => {
                 selected_error = Some(error.to_string());
-                snapshots.extend(session_after_poll_error(session, prior, error));
+                snapshots.extend(session_after_poll_error(
+                    session, prior, error, facts, listed_at,
+                ));
             }
         }
     }
@@ -783,11 +843,22 @@ fn synced_snapshot(
             "remote Sync is at capacity",
         )),
         Response::Error(error) => Err(io::Error::other(error)),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected remote Sync response: {other:?}"),
-        )),
+        other => Err(unexpected_response("Sync", other)),
     }
+}
+
+/// Format an unexpected remote reply without echoing an ID-bearing payload.
+fn unexpected_response(kind: &str, response: Response) -> io::Error {
+    if matches!(response, Response::ClusterSessionFacts(_)) {
+        return io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected remote {kind} response: session facts"),
+        );
+    }
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("unexpected remote {kind} response: {response:?}"),
+    )
 }
 
 fn listed_instance_id(session: &remuda_core::registry::SessionSummary) -> Option<String> {
@@ -818,29 +889,80 @@ fn should_sync(prior: Option<&RemoteSessionSnapshot>) -> bool {
 fn unpolled_session_snapshot(
     session: remuda_core::registry::SessionSummary,
     prior: Option<&RemoteSessionSnapshot>,
+    facts: &[ClusterSessionFactWire],
+    listed_at: Instant,
 ) -> Option<RemoteSessionSnapshot> {
     let wire_name = session.name.clone();
     let instance_id = prior
         .map(|old| old.instance_id.clone())
         .or_else(|| listed_instance_id(&session))?;
+    let (butler, remaining_ms) = facts_for(&wire_name, &instance_id, facts);
     Some(RemoteSessionSnapshot {
         name: display_name(&session.name),
         wire_name,
         instance_id,
         alive: session.alive,
+        unavailable: session.unavailable,
         output_version: session.output_version,
         bracketed_paste: prior.is_some_and(|old| old.bracketed_paste),
         screen: prior.and_then(|old| old.screen.clone()),
         last_error: prior.and_then(|old| old.last_error.clone()),
+        facts: butler,
+        facts_remaining_ms: remaining_ms,
+        program_status: session.program_status,
+        program_status_age_ms: session.program_status_age_ms,
+        listed_at,
     })
+}
+
+/// Bind owner facts to the exact wire name and instance; any mismatch is no
+/// evidence at all, never a name-only guess.
+fn facts_for(
+    wire_name: &str,
+    instance_id: &str,
+    facts: &[ClusterSessionFactWire],
+) -> (Option<ButlerFacts>, u64) {
+    facts
+        .iter()
+        .find(|fact| fact.wire_name == wire_name && fact.instance_id == instance_id)
+        .map(|fact| {
+            (
+                Some(ButlerFacts {
+                    member_id: fact.member_id.clone(),
+                    leader_id: fact.leader_id.clone(),
+                    alias: fact.alias.clone(),
+                    kind: fact_state(fact.kind.clone()),
+                    model: fact_state(fact.model.clone()),
+                    context_used: fact_number(fact.context_used),
+                    context_window: fact_number(fact.context_window),
+                    context_percent: fact_percent(fact.context_percent),
+                }),
+                fact.valid_for_ms,
+            )
+        })
+        .unwrap_or((None, 0))
+}
+
+fn fact_state(value: Option<String>) -> FieldState<String> {
+    value.map_or(FieldState::Unavailable, FieldState::Value)
+}
+
+fn fact_number(value: Option<u64>) -> FieldState<u64> {
+    value.map_or(FieldState::Unavailable, FieldState::Value)
+}
+
+fn fact_percent(value: Option<u8>) -> FieldState<u8> {
+    value.map_or(FieldState::Unavailable, FieldState::Value)
 }
 
 fn session_after_poll_error(
     session: remuda_core::registry::SessionSummary,
     prior: Option<&RemoteSessionSnapshot>,
     error: io::Error,
+    facts: &[ClusterSessionFactWire],
+    listed_at: Instant,
 ) -> Option<RemoteSessionSnapshot> {
-    let mut snapshot = unpolled_session_snapshot(session, prior)?;
+    let mut snapshot = unpolled_session_snapshot(session, prior, facts, listed_at)?;
     snapshot.last_error = Some(error.to_string());
     Some(snapshot)
 }
@@ -1231,10 +1353,16 @@ mod tests {
             wire_name: name.into(),
             instance_id: "instance-1".into(),
             alive: true,
+            unavailable: false,
             output_version: Some(4),
             bracketed_paste: false,
             screen: Some(screen(text)),
             last_error: None,
+            facts: None,
+            facts_remaining_ms: 0,
+            program_status: None,
+            program_status_age_ms: None,
+            listed_at: Instant::now(),
         }
     }
 
@@ -1315,7 +1443,7 @@ mod tests {
             program_status_age_ms: None,
         };
         assert!(previous_session(&listed, std::slice::from_ref(&old)).is_none());
-        let fresh = unpolled_session_snapshot(listed, None).unwrap();
+        let fresh = unpolled_session_snapshot(listed, None, &[], Instant::now()).unwrap();
         assert!(fresh.screen.is_none());
         assert_eq!(fresh.output_version, Some(8));
         assert!(!should_sync(Some(&fresh)));
@@ -1341,9 +1469,14 @@ mod tests {
             program_status: None,
             program_status_age_ms: None,
         };
-        let retained =
-            session_after_poll_error(listed, Some(&prior), io::Error::other("sync failed"))
-                .unwrap();
+        let retained = session_after_poll_error(
+            listed,
+            Some(&prior),
+            io::Error::other("sync failed"),
+            &[],
+            Instant::now(),
+        )
+        .unwrap();
         assert_eq!(retained.screen, prior.screen);
         assert_eq!(retained.output_version, Some(5));
         assert_eq!(retained.last_error.as_deref(), Some("sync failed"));
@@ -1396,6 +1529,7 @@ mod tests {
             registry_key: "peer-fp".into(),
             name: "old".into(),
             addr_override: None,
+            session_facts_v1: false,
         };
         super::reconcile_registry_targets(&state, &mut targets, vec![target.clone()]);
         state.with_node("peer-fp", |node| node.last_error = Some("retained".into()));
@@ -1442,6 +1576,7 @@ mod tests {
                 name: "laptop".into(),
                 registry_key: registry_key.into(),
                 addr_override: None,
+                session_facts_v1: false,
             })
             .collect();
         let poller = RemotePoller::new(targets, transport.clone());
@@ -1475,6 +1610,7 @@ mod tests {
             name: "laptop".into(),
             registry_key: "revoked-fingerprint".into(),
             addr_override: None,
+            session_facts_v1: false,
         }];
         state.insert_node(RemoteNode::with_key(
             "revoked-fingerprint".into(),
@@ -1492,6 +1628,7 @@ mod tests {
                 name: "tablet".into(),
                 registry_key: "new-fingerprint".into(),
                 addr_override: None,
+                session_facts_v1: false,
             }],
         );
         let snapshot = state.snapshot_at(now);
@@ -1648,6 +1785,7 @@ mod tests {
             name: "laptop".into(),
             registry_key: "fp-a".into(),
             addr_override: None,
+            session_facts_v1: false,
         };
         let poller = RemotePoller::new(vec![target], peer);
         poller.selection().select("fp-a", "proof");
@@ -1866,8 +2004,10 @@ mod tests {
         for backoff in [1, 2, 4, 8, 16, 30, 30] {
             let poll = poll_listed_sessions(
                 vec![nameless.clone(), summary("other", "2")],
+                &[],
                 Some("proof"),
                 &[],
+                Instant::now(),
                 |_, _| Err(io::Error::other("capture failed")),
             );
             assert_eq!(poll.sessions.len(), 1, "only the identified session stays");
@@ -1893,10 +2033,17 @@ mod tests {
             listed("other", "4"),
         ];
         let mut reads = Vec::new();
-        let snapshots = poll_listed_sessions(sessions, Some("proof"), &[], |session, _| {
-            reads.push(session.id.clone());
-            Ok(session_named(&display_name(&session.name), &session.id))
-        });
+        let snapshots = poll_listed_sessions(
+            sessions,
+            &[],
+            Some("proof"),
+            &[],
+            Instant::now(),
+            |session, _| {
+                reads.push(session.id.clone());
+                Ok(session_named(&display_name(&session.name), &session.id))
+            },
+        );
         assert_eq!(reads, ["1"]);
         assert_eq!(snapshots.sessions.len(), 4);
     }
@@ -1952,6 +2099,62 @@ mod tests {
     }
 
     #[test]
+    fn unexpected_facts_response_never_echoes_durable_ids() {
+        let facts =
+            Response::ClusterSessionFacts(vec![remuda_core::protocol::ClusterSessionFactWire {
+                wire_name: "proof".into(),
+                instance_id: "instance-1".into(),
+                valid_for_ms: 10_000,
+                member_id: "private-MID".into(),
+                leader_id: Some("private-LEAD".into()),
+                alias: None,
+                kind: None,
+                model: None,
+                context_used: None,
+                context_window: None,
+                context_percent: None,
+            }]);
+        let error = unexpected_response("List", facts).to_string();
+        assert!(error.contains("session facts"), "{error}");
+        assert!(
+            !error.contains("private-MID") && !error.contains("private-LEAD"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn selected_snapshot_keeps_the_original_list_start() {
+        let prior = session("proof", "a");
+        let listed = summary("proof", "instance-1");
+        let listed_at = Instant::now()
+            .checked_sub(Duration::from_secs(9))
+            .expect("monotonic clock");
+        let request = selected_sync_request(&prior);
+        let response = Response::Sync {
+            instance_id: "instance-1".into(),
+            output_version: 9,
+            snapshot: remuda_core::protocol::StyledScreen {
+                rows: Vec::new(),
+                bracketed_paste: false,
+                wrapped: Vec::new(),
+                scrollback_len: 0,
+                scrollback_total: 0,
+                cursor: Cursor {
+                    row: 0,
+                    col: 0,
+                    visible: true,
+                },
+            },
+        };
+        let snapshot = selected_snapshot(&listed, Some(&prior), &request, response, listed_at)
+            .expect("sync maps");
+        assert_eq!(snapshot.listed_at, listed_at);
+
+        let unpolled = unpolled_session_snapshot(listed, None, &[], listed_at).unwrap();
+        assert_eq!(unpolled.listed_at, listed_at);
+    }
+
+    #[test]
     fn a_selected_reply_of_the_other_kind_is_rejected() {
         let prior = session("proof", "a");
         let listed = summary("proof", "instance-1");
@@ -1986,10 +2189,19 @@ mod tests {
             name: "proof".into(),
             scrollback: 0,
         };
-        assert!(selected_snapshot(&listed, Some(&prior), &sync_request, sync.clone()).is_ok());
-        assert!(selected_snapshot(&listed, None, &capture, screen.clone()).is_ok());
+        let listed_at = Instant::now();
+        assert!(selected_snapshot(
+            &listed,
+            Some(&prior),
+            &sync_request,
+            sync.clone(),
+            listed_at
+        )
+        .is_ok());
+        assert!(selected_snapshot(&listed, None, &capture, screen.clone(), listed_at).is_ok());
         for (request, response) in [(&sync_request, screen), (&capture, sync)] {
-            let error = selected_snapshot(&listed, Some(&prior), request, response).unwrap_err();
+            let error =
+                selected_snapshot(&listed, Some(&prior), request, response, listed_at).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
     }
@@ -2049,6 +2261,7 @@ mod tests {
             name: "laptop".into(),
             registry_key: "fp-a".into(),
             addr_override: None,
+            session_facts_v1: false,
         };
         let state = Arc::new(RemoteTreeState::default());
         let transport: Arc<dyn RemoteTransport> = Arc::new(Down);
@@ -2200,6 +2413,7 @@ mod tests {
             name: "laptop".into(),
             registry_key: "fp-a".into(),
             addr_override: None,
+            session_facts_v1: false,
         };
         let poller = RemotePoller::new(vec![target], Arc::new(Once));
         let source = poller.source();
@@ -2226,6 +2440,7 @@ mod tests {
             name: "laptop".into(),
             registry_key: key.into(),
             addr_override: None,
+            session_facts_v1: false,
         };
         let state = RemoteTreeState::default();
         let mut targets = Vec::new();
@@ -2281,5 +2496,44 @@ mod tests {
             Some(Duration::from_secs(3))
         );
         assert_eq!(snapshot.nodes[0].sessions[0].name, "dev");
+    }
+
+    #[test]
+    fn only_a_positive_v1_advertisement_enables_the_session_facts_request() {
+        let mut entry = crate::cluster::AuthorizedNode {
+            node_fp: "peer-fp".into(),
+            static_pubkey: String::new(),
+            format_major: 1,
+            format_minor: 0,
+            endpoint: None,
+            delivered_by: None,
+            optional_fields: std::collections::BTreeMap::new(),
+            state: crate::cluster::NodeState::Admitted,
+            version: 1,
+            by: "local".into(),
+        };
+        let registry = |entry: &crate::cluster::AuthorizedNode| crate::cluster::Registry {
+            authorized_nodes: vec![entry.clone()],
+        };
+        assert!(!super::registry_targets(&registry(&entry), "local")[0].session_facts_v1);
+
+        entry.optional_fields.insert(
+            remuda_core::protocol::CLUSTER_SESSION_FACTS_FIELD.into(),
+            serde_json::json!(["v2"]),
+        );
+        assert!(!super::registry_targets(&registry(&entry), "local")[0].session_facts_v1);
+
+        entry.optional_fields.insert(
+            remuda_core::protocol::CLUSTER_SESSION_FACTS_FIELD.into(),
+            serde_json::json!(["v1"]),
+        );
+        assert!(super::registry_targets(&registry(&entry), "local")[0].session_facts_v1);
+
+        // Malformed advertisements fail closed to base List only.
+        entry.optional_fields.insert(
+            remuda_core::protocol::CLUSTER_SESSION_FACTS_FIELD.into(),
+            serde_json::json!({"v1": true}),
+        );
+        assert!(!super::registry_targets(&registry(&entry), "local")[0].session_facts_v1);
     }
 }

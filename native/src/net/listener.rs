@@ -4,7 +4,7 @@
 use super::{frame, replay};
 use crate::cluster::{self, identity, join_token::JoinTokenStore, NodeState};
 use remuda_core::agent::Color;
-use remuda_core::protocol::{Request, Response};
+use remuda_core::protocol::{ClusterSessionFactWire, Request, Response};
 use remuda_core::WallClock;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Read, Write};
@@ -398,13 +398,14 @@ pub fn validate_bind_address(address: SocketAddr, allow_public: bool) -> io::Res
 /// Bind the configured address after confirming that this node is initialized.
 pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> {
     let security = ListenerSecurityResources::new();
-    bind_with_security(config, daemon_path, &security)
+    bind_with_security(config, daemon_path, &security, None)
 }
 
 pub(crate) fn bind_with_security(
     config: ListenerConfig,
     daemon_path: &Path,
     security: &ListenerSecurityResources,
+    session_registry: Option<Arc<remuda_core::Registry>>,
 ) -> io::Result<Listener> {
     validate_bind_address(config.bind_addr, config.allow_unspecified)?;
     let (identity_node, registry) = cluster::nodes()?.ok_or_else(|| {
@@ -436,8 +437,15 @@ pub(crate) fn bind_with_security(
         Arc::new(move |peer_static| authorizer_cache.authorize(peer_static));
     let dispatch_path = daemon_path.to_path_buf();
     let dispatch_limiter = Arc::clone(&security.limiter);
+    let dispatch_registry = session_registry.clone();
     let dispatch: FrameDispatcher = Arc::new(move |payload, peer_static| {
-        dispatch_payload(payload, peer_static, &dispatch_path, &dispatch_limiter)
+        dispatch_payload(
+            payload,
+            peer_static,
+            &dispatch_path,
+            &dispatch_limiter,
+            dispatch_registry.as_deref(),
+        )
     });
     let listener = Listener {
         socket,
@@ -1161,6 +1169,7 @@ fn authorize_remote_request_with_control(
         request,
         Request::ClusterRegistrySync { .. }
             | Request::ClusterRegistryUpdate { .. }
+            | Request::ClusterSessionFacts
             | Request::ClusterVfsIndexSync { .. }
             | Request::ClusterVfsChanges { .. }
             | Request::ClusterVfsIndexUpdate { .. }
@@ -1244,6 +1253,69 @@ where
 }
 
 /// A rate-limited VFS request, or a leave, from an authenticated member.
+/// Optional wire encoding: absent means "field unavailable" for a managed row.
+fn fact_text(state: remuda_core::session_enrichment::FieldState<String>) -> Option<String> {
+    match state {
+        remuda_core::session_enrichment::FieldState::Value(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn fact_number(state: remuda_core::session_enrichment::FieldState<u64>) -> Option<u64> {
+    match state {
+        remuda_core::session_enrichment::FieldState::Value(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn fact_percent(state: remuda_core::session_enrichment::FieldState<u8>) -> Option<u8> {
+    match state {
+        remuda_core::session_enrichment::FieldState::Value(value) => Some(value),
+        _ => None,
+    }
+}
+
+/// Bounded, authenticated sidecar read. A missing in-process registry fails
+/// closed; a large response sheds whole entries before the base List is ever
+/// affected.
+fn serve_session_facts(session_registry: Option<&remuda_core::Registry>) -> io::Result<Vec<u8>> {
+    let Some(registry) = session_registry else {
+        return serde_json::to_vec(&Response::error(
+            "session facts are unavailable on this node",
+        ))
+        .map_err(io::Error::other);
+    };
+    let mut entries: Vec<ClusterSessionFactWire> = registry
+        .cluster_facts_now()
+        .into_iter()
+        .map(
+            |(wire_name, instance_id, valid_for_ms, facts)| ClusterSessionFactWire {
+                wire_name,
+                instance_id,
+                valid_for_ms,
+                member_id: facts.member_id,
+                leader_id: facts.leader_id,
+                alias: facts.alias,
+                kind: fact_text(facts.kind),
+                model: fact_text(facts.model),
+                context_used: fact_number(facts.context_used),
+                context_window: fact_number(facts.context_window),
+                context_percent: fact_percent(facts.context_percent),
+            },
+        )
+        .collect();
+    let mut encoded = serde_json::to_vec(&Response::ClusterSessionFacts(entries.clone()))
+        .map_err(|_| io::Error::other("session facts response encode failed"))?;
+    while encoded.len() > remuda_core::session_enrichment::MAX_CLUSTER_FACTS_BYTES
+        && entries.len() > 1
+    {
+        entries.truncate(entries.len() / 2);
+        encoded = serde_json::to_vec(&Response::ClusterSessionFacts(entries.clone()))
+            .map_err(|_| io::Error::other("session facts response encode failed"))?;
+    }
+    Ok(encoded)
+}
+
 fn serve_vfs(
     request: &Request,
     peer_static: &[u8],
@@ -1266,6 +1338,7 @@ fn dispatch_payload(
     peer_static: &[u8],
     daemon_path: &Path,
     limiter: &RequestLimiter,
+    session_registry: Option<&remuda_core::Registry>,
 ) -> io::Result<Vec<u8>> {
     let request: Request = serde_json::from_slice(payload)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid cluster request"))?;
@@ -1335,6 +1408,7 @@ fn dispatch_payload(
             })
             .map_err(|_| io::Error::other("registry acknowledgement encode failed"))
         }
+        Request::ClusterSessionFacts => serve_session_facts(session_registry),
         request @ (Request::ClusterVfsIndexSync { .. }
         | Request::ClusterVfsChanges { .. }
         | Request::ClusterVfsIndexUpdate { .. }
@@ -3266,6 +3340,7 @@ mod tests {
             &pair.public,
             Path::new("unused-local-daemon.sock"),
             &RequestLimiter::default(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -4890,6 +4965,7 @@ mod tests {
                     peer,
                     Path::new("unused-daemon-path"),
                     &RequestLimiter::default(),
+                    None,
                 )
             },
             socket_test_timeout(),
@@ -5075,6 +5151,7 @@ mod tests {
                     peer,
                     Path::new("unused-daemon-path"),
                     &RequestLimiter::default(),
+                    None,
                 )
             },
             socket_test_timeout(),
@@ -5781,5 +5858,78 @@ mod tests {
         revoked.authorized_nodes[0].state = NodeState::Revoked;
         refresh_registry_snapshot(&mut cached, "revision-2".into(), || Ok(revoked)).unwrap();
         assert!(authorize_key_in_registry(&cached.1, &pair.public).is_err());
+    }
+
+    #[test]
+    fn authenticated_cluster_dispatch_serves_session_facts_but_the_local_front_refuses_them() {
+        use remuda_core::agent::ScriptedAgent;
+        use remuda_core::session_enrichment::{ButlerFacts, FieldState};
+        use remuda_core::{ManualClock, Session};
+
+        let registry =
+            remuda_core::Registry::with_cluster_facts_clock(Arc::new(ManualClock::new()));
+        let session = registry
+            .register(Session::new(
+                "worker",
+                Box::new(ScriptedAgent::new(vec![])),
+                Arc::new(ManualClock::new()),
+            ))
+            .unwrap();
+        let instance = session.instance_id().to_string();
+        let generation = registry.begin_cluster_facts_generation();
+        registry
+            .set_cluster_facts_for(
+                generation,
+                "worker",
+                &instance,
+                Some(ButlerFacts {
+                    member_id: "private-MID".into(),
+                    leader_id: Some("private-LEAD".into()),
+                    alias: Some("worker".into()),
+                    kind: FieldState::Value("codex".into()),
+                    model: FieldState::Unavailable,
+                    context_used: FieldState::Value(42),
+                    context_window: FieldState::Value(100),
+                    context_percent: FieldState::Value(42),
+                }),
+            )
+            .unwrap();
+
+        let payload = serde_json::to_vec(&Request::ClusterSessionFacts).unwrap();
+        let response = dispatch_payload(
+            &payload,
+            b"authenticated-peer",
+            Path::new("unused-local-daemon.sock"),
+            &RequestLimiter::default(),
+            Some(&registry),
+        )
+        .unwrap();
+        match serde_json::from_slice::<Response>(&response).unwrap() {
+            Response::ClusterSessionFacts(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].wire_name, "worker");
+                assert_eq!(entries[0].instance_id, instance);
+                assert_eq!(entries[0].member_id, "private-MID");
+                assert_eq!(entries[0].leader_id.as_deref(), Some("private-LEAD"));
+                assert!(entries[0].valid_for_ms > 0);
+            }
+            other => panic!("expected session facts, got {other:?}"),
+        }
+
+        // No in-process registry: the sidecar fails closed, never fabricates.
+        let response = dispatch_payload(
+            &payload,
+            b"authenticated-peer",
+            Path::new("unused-local-daemon.sock"),
+            &RequestLimiter::default(),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<Response>(&response).unwrap(),
+            Response::Error(_)
+        ));
+        // The ordinary remote-control front never exposes this sidecar.
+        assert!(crate::remote_front::authorize(&Request::ClusterSessionFacts).is_err());
     }
 }
