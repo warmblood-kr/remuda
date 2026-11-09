@@ -660,6 +660,11 @@ fn real_ctrl_backslash_byte_returns_from_remote_composer_to_tree() {
 #[test]
 #[cfg(unix)]
 fn real_remote_keys_mode_forwards_character_escape_and_ctrl_c() {
+    // This checks the in-process path (docs/concepts/session-host-parity.md).
+    if remuda_native::session_host::hosting() {
+        eprintln!("skip: hosted remote input is fail-closed until its opt-out survives a daemon restart (core registry apply_hosted_remote_input_batch)");
+        return;
+    }
     let client_node = Node::start("keys-live-client");
     let server_node = Node::start("keys-live-server");
     admit_pair(&client_node, &server_node);
@@ -724,6 +729,11 @@ fn real_remote_keys_mode_forwards_character_escape_and_ctrl_c() {
 #[test]
 #[cfg(unix)]
 fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
+    // This checks the in-process path (docs/concepts/session-host-parity.md).
+    if remuda_native::session_host::hosting() {
+        eprintln!("skip: hosted remote input is fail-closed until its opt-out survives a daemon restart (core registry apply_hosted_remote_input_batch)");
+        return;
+    }
     let client_node = Node::start("paste-live-client");
     let server_node = Node::start("paste-live-server");
     admit_pair(&client_node, &server_node);

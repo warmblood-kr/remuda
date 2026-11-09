@@ -20,6 +20,14 @@ mod gate;
 mod host_build;
 #[cfg(unix)]
 pub(crate) mod hosted;
+
+/// True when a daemon in this process starts new sessions host-backed.
+pub fn hosting() -> bool {
+    #[cfg(unix)]
+    return hosted::opted_in();
+    #[cfg(not(unix))]
+    return false;
+}
 mod human;
 mod inventory;
 #[cfg(unix)]

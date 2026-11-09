@@ -3216,6 +3216,11 @@ fn capture_styled_snapshot(path: &Path, name: &str, scrollback: usize) -> (Strin
 #[test]
 #[allow(clippy::too_many_lines)] // One end-to-end case: receive, refuse, local, reuse.
 fn remote_input_opt_out_refuses_before_the_pty_and_keeps_local_input() {
+    // This checks the in-process path (docs/concepts/session-host-parity.md).
+    if remuda_native::session_host::hosting() {
+        eprintln!("skip: hosted remote input is fail-closed by design; the same instance still takes local input");
+        return;
+    }
     let path = scratch("remote-input-opt-out");
     let _daemon = daemon_at(&path);
     let response = client::request(
