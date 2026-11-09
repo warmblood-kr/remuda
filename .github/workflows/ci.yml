@@ -137,15 +137,12 @@ jobs:
 
   test-hosted:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    # The native suite with every new session host-backed (#713), the bar for
-    # making hosting the default. It also fails when the run leaves a session
-    # host alive (leaks use up the machine's pseudo-terminals). Tests of
+    # The native suite with every new session host-backed (#713), which is
+    # the default; this job also fails when the run leaves a session host
+    # alive (leaks use up the machine's pseudo-terminals). Tests of
     # deliberate differences are skipped by name, with reasons, in
     # scripts/hosted-suite-known-differences.txt.
-    # `continue-on-error` until the suite is green with hosting on; then this
-    # line goes and the job gates like every other.
     runs-on: ubuntu-latest
-    continue-on-error: true
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -169,6 +166,17 @@ jobs:
         env:
           HOSTED_SUITE_TARGET: session_host_daemon
         run: sh scripts/test-hosted-suite.sh hosted
+
+  test-in-process:
+    # The native suite with sessions kept in the daemon, the opt-out
+    # (REMUDA_EXPERIMENTAL_SESSION_HOST=0) and the only mode on Windows.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      REMUDA_EXPERIMENTAL_SESSION_HOST: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test -p remuda-native --tests --no-fail-fast
 
   host-compat-n-plus-one:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
