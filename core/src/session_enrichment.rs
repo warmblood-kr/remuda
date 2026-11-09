@@ -93,16 +93,9 @@ pub struct ResolvedSession {
     pub program_status: Option<ProgramStatus>,
 }
 
-/// Cluster/remote picker and List-backed cluster text share this boundary.
-/// Existing non-cluster local format/order is outside its scope.
-///
-/// Return every token once in stable forest preorder. Resolve unique durable
-/// IDs within one node; missing, ambiguous, self and cyclic edges become roots.
-/// Unknown ownership leaves ordinary compact base rows (NotProvided).
-/// Managed missing/stale fields mean unavailable; never infer unmanaged.
-/// Fresh typed program status can describe ANY
-/// exact live instance. Suppress it on ended/unavailable/stale rows. Never
-/// classify from terminal text or use advice as input/close authority.
+/// Cluster/remote picker and List-backed cluster text share this boundary;
+/// local non-cluster formatting is outside it. Return every token once in
+/// stable forest preorder, joining only unique durable IDs within one node.
 pub trait SessionListEnrichment {
     fn resolve(&self, roster: &NodeRoster<'_>) -> Result<Vec<ResolvedSession>, EnrichmentError>;
 }

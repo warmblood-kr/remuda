@@ -3242,6 +3242,12 @@ fn sanitize_peer_response(
 ) -> remuda_core::protocol::Response {
     use remuda_core::protocol::Response;
 
+    // `cluster call` never expects owner-published facts; a peer that answers
+    // with them must not reach JSON or text output carrying durable IDs.
+    if matches!(response, Response::ClusterSessionFacts(_)) {
+        return Response::Error("refused: session facts are not a call response".into());
+    }
+
     fn strip(text: &mut String) {
         *text = remuda_native::text::strip_terminal_controls(text).into_owned();
     }
@@ -8334,6 +8340,32 @@ mod cluster_call_tests {
             panic!("expected sanitized capture");
         };
         assert_eq!(rows[0][0].text, "screen]0;peer title");
+    }
+
+    #[test]
+    fn cluster_call_refuses_peer_session_facts_without_ids() {
+        let facts =
+            Response::ClusterSessionFacts(vec![remuda_core::protocol::ClusterSessionFactWire {
+                wire_name: "proof".into(),
+                instance_id: "instance-1".into(),
+                valid_for_ms: 10_000,
+                member_id: "private-MID".into(),
+                leader_id: Some("private-LEAD".into()),
+                alias: None,
+                kind: None,
+                model: None,
+                context_used: None,
+                context_window: None,
+                context_percent: None,
+            }]);
+        let sanitized = sanitize_peer_response(facts);
+        assert!(matches!(sanitized, Response::Error(_)));
+        let json = serde_json::to_string_pretty(&sanitized).unwrap();
+        assert!(
+            !json.contains("private-MID") && !json.contains("private-LEAD"),
+            "{json}"
+        );
+        assert!(json.contains("refused"), "{json}");
     }
 
     #[test]

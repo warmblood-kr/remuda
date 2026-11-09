@@ -580,7 +580,7 @@ impl ClusterRemoteTransport {
     ) -> io::Result<(
         Vec<remuda_core::registry::SessionSummary>,
         Vec<ClusterSessionFactWire>,
-        u64,
+        Instant,
     )> {
         // Expiry is measured from this original List request start; a later
         // redraw, cache or Sync never renews it.
@@ -588,12 +588,7 @@ impl ClusterRemoteTransport {
         let sessions = match self.request(resolved, &Request::List)? {
             Response::Sessions(sessions) => sessions,
             Response::Error(error) => return Err(io::Error::other(error)),
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unexpected remote List response: {other:?}"),
-                ))
-            }
+            other => return Err(unexpected_response("List", other)),
         };
         let mut facts = Vec::new();
         // Only a peer that positively advertised v1 may receive this request;
@@ -605,8 +600,7 @@ impl ClusterRemoteTransport {
                 facts = entries;
             }
         }
-        let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        Ok((sessions, facts, elapsed_ms))
+        Ok((sessions, facts, started))
     }
 
     /// Read the selected session with one request: a Sync long-poll against a
@@ -616,6 +610,7 @@ impl ClusterRemoteTransport {
         target: &crate::cluster::ResolvedTarget,
         session: &remuda_core::registry::SessionSummary,
         prior: Option<&RemoteSessionSnapshot>,
+        listed_at: Instant,
     ) -> io::Result<RemoteSessionSnapshot> {
         let request = match prior.filter(|prior| should_sync(Some(prior))) {
             Some(prior) => selected_sync_request(prior),
@@ -625,7 +620,7 @@ impl ClusterRemoteTransport {
             },
         };
         let response = self.request(target, &request)?;
-        selected_snapshot(session, prior, &request, response)
+        selected_snapshot(session, prior, &request, response, listed_at)
     }
 }
 
@@ -636,6 +631,7 @@ fn selected_snapshot(
     prior: Option<&RemoteSessionSnapshot>,
     request: &Request,
     response: Response,
+    listed_at: Instant,
 ) -> io::Result<RemoteSessionSnapshot> {
     let synced = matches!(request, Request::Sync { .. });
     match response {
@@ -657,7 +653,7 @@ fn selected_snapshot(
             facts_remaining_ms: 0,
             program_status: None,
             program_status_age_ms: None,
-            listed_at: Instant::now(),
+            listed_at,
         }),
         Response::StyledScreen {
             rows,
@@ -695,7 +691,7 @@ fn selected_snapshot(
                 facts_remaining_ms: 0,
                 program_status: None,
                 program_status_age_ms: None,
-                listed_at: Instant::now(),
+                listed_at,
             })
         }
         Response::WrongInstance => Err(io::Error::new(
@@ -707,10 +703,7 @@ fn selected_snapshot(
             "remote Sync is at capacity",
         )),
         Response::Error(error) => Err(io::Error::other(error)),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected remote screen response: {other:?}"),
-        )),
+        other => Err(unexpected_response("screen", other)),
     }
 }
 
@@ -722,13 +715,14 @@ impl RemoteTransport for ClusterRemoteTransport {
         previous: &[RemoteSessionSnapshot],
     ) -> io::Result<RemotePoll> {
         let resolved = (self.resolve)(target)?;
-        let (sessions, facts, _elapsed_ms) = self.list_sessions(&resolved, target)?;
+        let (sessions, facts, listed_at) = self.list_sessions(&resolved, target)?;
         Ok(poll_listed_sessions(
             sessions,
             &facts,
             selected_session,
             previous,
-            |session, prior| self.selected_session_snapshot(&resolved, session, prior),
+            listed_at,
+            |session, prior| self.selected_session_snapshot(&resolved, session, prior, listed_at),
         ))
     }
 
@@ -770,6 +764,7 @@ fn poll_listed_sessions(
     facts: &[ClusterSessionFactWire],
     selected_session: Option<&str>,
     previous: &[RemoteSessionSnapshot],
+    listed_at: Instant,
     mut read: impl FnMut(
         &remuda_core::registry::SessionSummary,
         Option<&RemoteSessionSnapshot>,
@@ -784,7 +779,7 @@ fn poll_listed_sessions(
             && !selected_read
             && selected_session == Some(display_name(&session.name).as_str());
         if !selected {
-            snapshots.extend(unpolled_session_snapshot(session, prior, facts));
+            snapshots.extend(unpolled_session_snapshot(session, prior, facts, listed_at));
             continue;
         }
         selected_read = true;
@@ -804,7 +799,9 @@ fn poll_listed_sessions(
             }
             Err(error) => {
                 selected_error = Some(error.to_string());
-                snapshots.extend(session_after_poll_error(session, prior, error, facts));
+                snapshots.extend(session_after_poll_error(
+                    session, prior, error, facts, listed_at,
+                ));
             }
         }
     }
@@ -846,11 +843,22 @@ fn synced_snapshot(
             "remote Sync is at capacity",
         )),
         Response::Error(error) => Err(io::Error::other(error)),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected remote Sync response: {other:?}"),
-        )),
+        other => Err(unexpected_response("Sync", other)),
     }
+}
+
+/// Format an unexpected remote reply without echoing an ID-bearing payload.
+fn unexpected_response(kind: &str, response: Response) -> io::Error {
+    if matches!(response, Response::ClusterSessionFacts(_)) {
+        return io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected remote {kind} response: session facts"),
+        );
+    }
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("unexpected remote {kind} response: {response:?}"),
+    )
 }
 
 fn listed_instance_id(session: &remuda_core::registry::SessionSummary) -> Option<String> {
@@ -882,6 +890,7 @@ fn unpolled_session_snapshot(
     session: remuda_core::registry::SessionSummary,
     prior: Option<&RemoteSessionSnapshot>,
     facts: &[ClusterSessionFactWire],
+    listed_at: Instant,
 ) -> Option<RemoteSessionSnapshot> {
     let wire_name = session.name.clone();
     let instance_id = prior
@@ -902,7 +911,7 @@ fn unpolled_session_snapshot(
         facts_remaining_ms: remaining_ms,
         program_status: session.program_status,
         program_status_age_ms: session.program_status_age_ms,
-        listed_at: Instant::now(),
+        listed_at,
     })
 }
 
@@ -951,8 +960,9 @@ fn session_after_poll_error(
     prior: Option<&RemoteSessionSnapshot>,
     error: io::Error,
     facts: &[ClusterSessionFactWire],
+    listed_at: Instant,
 ) -> Option<RemoteSessionSnapshot> {
-    let mut snapshot = unpolled_session_snapshot(session, prior, facts)?;
+    let mut snapshot = unpolled_session_snapshot(session, prior, facts, listed_at)?;
     snapshot.last_error = Some(error.to_string());
     Some(snapshot)
 }
@@ -1433,7 +1443,7 @@ mod tests {
             program_status_age_ms: None,
         };
         assert!(previous_session(&listed, std::slice::from_ref(&old)).is_none());
-        let fresh = unpolled_session_snapshot(listed, None, &[]).unwrap();
+        let fresh = unpolled_session_snapshot(listed, None, &[], Instant::now()).unwrap();
         assert!(fresh.screen.is_none());
         assert_eq!(fresh.output_version, Some(8));
         assert!(!should_sync(Some(&fresh)));
@@ -1459,9 +1469,14 @@ mod tests {
             program_status: None,
             program_status_age_ms: None,
         };
-        let retained =
-            session_after_poll_error(listed, Some(&prior), io::Error::other("sync failed"), &[])
-                .unwrap();
+        let retained = session_after_poll_error(
+            listed,
+            Some(&prior),
+            io::Error::other("sync failed"),
+            &[],
+            Instant::now(),
+        )
+        .unwrap();
         assert_eq!(retained.screen, prior.screen);
         assert_eq!(retained.output_version, Some(5));
         assert_eq!(retained.last_error.as_deref(), Some("sync failed"));
@@ -1992,6 +2007,7 @@ mod tests {
                 &[],
                 Some("proof"),
                 &[],
+                Instant::now(),
                 |_, _| Err(io::Error::other("capture failed")),
             );
             assert_eq!(poll.sessions.len(), 1, "only the identified session stays");
@@ -2017,10 +2033,17 @@ mod tests {
             listed("other", "4"),
         ];
         let mut reads = Vec::new();
-        let snapshots = poll_listed_sessions(sessions, &[], Some("proof"), &[], |session, _| {
-            reads.push(session.id.clone());
-            Ok(session_named(&display_name(&session.name), &session.id))
-        });
+        let snapshots = poll_listed_sessions(
+            sessions,
+            &[],
+            Some("proof"),
+            &[],
+            Instant::now(),
+            |session, _| {
+                reads.push(session.id.clone());
+                Ok(session_named(&display_name(&session.name), &session.id))
+            },
+        );
         assert_eq!(reads, ["1"]);
         assert_eq!(snapshots.sessions.len(), 4);
     }
@@ -2076,6 +2099,62 @@ mod tests {
     }
 
     #[test]
+    fn unexpected_facts_response_never_echoes_durable_ids() {
+        let facts =
+            Response::ClusterSessionFacts(vec![remuda_core::protocol::ClusterSessionFactWire {
+                wire_name: "proof".into(),
+                instance_id: "instance-1".into(),
+                valid_for_ms: 10_000,
+                member_id: "private-MID".into(),
+                leader_id: Some("private-LEAD".into()),
+                alias: None,
+                kind: None,
+                model: None,
+                context_used: None,
+                context_window: None,
+                context_percent: None,
+            }]);
+        let error = unexpected_response("List", facts).to_string();
+        assert!(error.contains("session facts"), "{error}");
+        assert!(
+            !error.contains("private-MID") && !error.contains("private-LEAD"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn selected_snapshot_keeps_the_original_list_start() {
+        let prior = session("proof", "a");
+        let listed = summary("proof", "instance-1");
+        let listed_at = Instant::now()
+            .checked_sub(Duration::from_secs(9))
+            .expect("monotonic clock");
+        let request = selected_sync_request(&prior);
+        let response = Response::Sync {
+            instance_id: "instance-1".into(),
+            output_version: 9,
+            snapshot: remuda_core::protocol::StyledScreen {
+                rows: Vec::new(),
+                bracketed_paste: false,
+                wrapped: Vec::new(),
+                scrollback_len: 0,
+                scrollback_total: 0,
+                cursor: Cursor {
+                    row: 0,
+                    col: 0,
+                    visible: true,
+                },
+            },
+        };
+        let snapshot = selected_snapshot(&listed, Some(&prior), &request, response, listed_at)
+            .expect("sync maps");
+        assert_eq!(snapshot.listed_at, listed_at);
+
+        let unpolled = unpolled_session_snapshot(listed, None, &[], listed_at).unwrap();
+        assert_eq!(unpolled.listed_at, listed_at);
+    }
+
+    #[test]
     fn a_selected_reply_of_the_other_kind_is_rejected() {
         let prior = session("proof", "a");
         let listed = summary("proof", "instance-1");
@@ -2110,10 +2189,19 @@ mod tests {
             name: "proof".into(),
             scrollback: 0,
         };
-        assert!(selected_snapshot(&listed, Some(&prior), &sync_request, sync.clone()).is_ok());
-        assert!(selected_snapshot(&listed, None, &capture, screen.clone()).is_ok());
+        let listed_at = Instant::now();
+        assert!(selected_snapshot(
+            &listed,
+            Some(&prior),
+            &sync_request,
+            sync.clone(),
+            listed_at
+        )
+        .is_ok());
+        assert!(selected_snapshot(&listed, None, &capture, screen.clone(), listed_at).is_ok());
         for (request, response) in [(&sync_request, screen), (&capture, sync)] {
-            let error = selected_snapshot(&listed, Some(&prior), request, response).unwrap_err();
+            let error =
+                selected_snapshot(&listed, Some(&prior), request, response, listed_at).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
     }

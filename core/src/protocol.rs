@@ -196,11 +196,8 @@ pub struct HostBuild {
 }
 
 /// One owner-published cluster fact, keyed by exact wire name and instance.
-///
-/// Wire encoding is explicit and additive: every optional field is omitted
-/// when absent, so an old peer never has to understand it. `member_id` is the
-/// only required identity; a managed entry with no optional field is a valid
-/// "field unavailable" publication, not a malformed one.
+/// Optional fields are omitted when absent; `member_id` is the only required
+/// identity, so a managed entry with no optional field means "unavailable".
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct ClusterSessionFactWire {
     pub wire_name: String,
@@ -391,10 +388,9 @@ pub enum Request {
     /// hosts outlive daemons, so builds can differ (#713). Older daemons
     /// answer `bad request`.
     SessionHostBuilds,
-    /// Owner-published enrichment facts for this node's sessions, as
-    /// [`Response::ClusterSessionFacts`]. Cluster-listener only: sent only
-    /// after the peer positively advertised `session_facts=v1`; older peers
-    /// cannot parse it, so callers never optimistically send it.
+    /// Owner-published enrichment facts, as [`Response::ClusterSessionFacts`].
+    /// Cluster-listener only, sent only after the peer advertised
+    /// `session_facts=v1`; callers never optimistically send it.
     ClusterSessionFacts,
     /// Probe the authenticated per-session remote-input opt-out (#276), as
     /// [`Response::Ok`]. A daemon older than this variant cannot parse it, so a
