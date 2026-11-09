@@ -380,3 +380,105 @@ fn a_takeover_mid_paste_leaves_later_typing_close_and_stop_working_in_both_backe
         }
     }
 }
+
+/// #924: a takeover after an act has completed but before its ACK leaves the
+/// old outcome unretired. The successor then performs more raw writes than the
+/// host's window holds. Every write must land exactly once, the old act must
+/// not be replayed, and the session must not stop input on Busy.
+#[test]
+fn a_takeover_after_a_completed_act_does_not_wedge_or_replay_in_both_backends() {
+    for mode in MODES {
+        let daemon = Parity::start(mode);
+        let out = daemon.root().join("out");
+        daemon.start_command(
+            "p",
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "stty -echo; while IFS= read -r line; do printf '%s\\n' \"$line\" >> {}; done",
+                    out.display()
+                ),
+            ],
+        );
+        let mut first = Viewer::attach(&daemon, "p");
+        first.type_keys(b"old\r");
+
+        // The child has the act: this is completion, not just admission.
+        let seen = |line: &str| {
+            std::fs::read_to_string(&out)
+                .unwrap_or_default()
+                .lines()
+                .any(|landed| landed == line)
+        };
+        let deadline = Instant::now() + PATIENCE;
+        while !seen("old") {
+            assert!(Instant::now() < deadline, "{mode:?}: the old act never ran");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Take over while that completed outcome may still be unacknowledged.
+        let mut second = Viewer::attach(&daemon, "p");
+        first.wait_for("attached elsewhere");
+        first.wait_ended();
+
+        let writes = 300;
+        for n in 0..writes {
+            let line = format!("b{n}");
+            second.type_keys(format!("{line}\r").as_bytes());
+            let deadline = Instant::now() + PATIENCE;
+            while !seen(&line) {
+                assert!(
+                    Instant::now() < deadline,
+                    "{mode:?}: successor write {n} never ran"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        let landed: Vec<String> = std::fs::read_to_string(&out)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let count = |line: &str| landed.iter().filter(|got| *got == line).count();
+        assert_eq!(
+            count("old"),
+            1,
+            "{mode:?}: the old act replayed: {landed:?}"
+        );
+        for n in 0..writes {
+            let line = format!("b{n}");
+            assert_eq!(count(&line), 1, "{mode:?}: {line} not exactly once");
+        }
+        // Busy past its bound stops input with this notice; it must never fire.
+        let stream = String::from_utf8_lossy(&second.seen.lock().unwrap()).into_owned();
+        assert!(
+            !stream.contains("input stopped"),
+            "{mode:?}: the successor stopped on Busy"
+        );
+
+        drop(second);
+        let deadline = Instant::now() + PATIENCE;
+        while attached(&daemon, "p") {
+            assert!(Instant::now() < deadline, "{mode:?}: still attached");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            daemon.request(&Request::Close {
+                name: "p".into(),
+                instance_id: None,
+                confirm: None,
+            }),
+            Response::Ok,
+            "{mode:?}: close"
+        );
+        let out = daemon.cli(&["stop", "-f"]);
+        assert!(out.status.success(), "{mode:?}: stop: {out:?}");
+        let deadline = Instant::now() + PATIENCE;
+        while daemon.hosts_running() > 0 {
+            assert!(Instant::now() < deadline, "{mode:?}: a host outlived stop");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}

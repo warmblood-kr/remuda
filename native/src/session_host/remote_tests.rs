@@ -858,6 +858,105 @@ fn abandon_one_write(session: &HostSession, line: &str) {
     });
 }
 
+/// #924: a takeover lands after the old grant's act completed on the host but
+/// before its ACK. The old outcome is retained, and the successor's later
+/// writes must retire it rather than accumulate to MAX_RAW and pin Busy.
+#[test]
+fn a_takeover_between_completion_and_ack_does_not_wedge_later_writes() {
+    use crate::session_host::human::{Raw, MAX_RAW};
+    let mut fixture = Fixture::new();
+    let session = Arc::new(adapter(&fixture.root));
+
+    // The old viewer keeps its connection: this is a takeover, not a gone
+    // viewer. Its one act completes but is never acknowledged.
+    let mut old = Client::open_human(&session.endpoint, session.identity.clone()).unwrap();
+    let human = match old.request(&Request::Inspect).unwrap() {
+        Response::Info { info } => info.human.expect("host has human counters"),
+        other => panic!("inspect: {other:?}"),
+    };
+    let old_grant = match old
+        .request(&Request::HumanGrant {
+            request: [3; 16],
+            expected: human.high_water,
+            recovery_secret: [4; 32],
+        })
+        .unwrap()
+    {
+        Response::HumanGranted { grant, .. } => grant,
+        other => panic!("grant: {other:?}"),
+    };
+    let old_bytes = b"old\n".to_vec();
+    let old_sequence = human.last_raw + 1;
+    match old
+        .request(&Request::HumanInput {
+            grant: old_grant,
+            sequence: old_sequence,
+            bytes: old_bytes.clone(),
+        })
+        .unwrap()
+    {
+        Response::RawOutcome { .. } => {}
+        other => panic!("admit old: {other:?}"),
+    }
+    eventually("old act completed", || {
+        matches!(
+            old.request(&Request::RecoverRaw {
+                grant: old_grant,
+                sequence: old_sequence,
+                bytes: old_bytes.clone(),
+            })
+            .ok()?,
+            Response::RawOutcome {
+                state: Raw::Complete(_)
+            }
+        )
+        .then_some(())
+    });
+
+    // The successor takes over while that completed outcome is unretired.
+    let writes = MAX_RAW + 44;
+    {
+        let successor = session.attach().unwrap();
+        for n in 0..writes {
+            successor
+                .write_raw(format!("b{n}\n").as_bytes(), &|| false, Arc::new(|| {}))
+                .unwrap_or_else(|error| panic!("successor write {n} refused: {error:?}"));
+        }
+    }
+
+    let effects = fixture.effects();
+    let count = |line: &str| effects.iter().filter(|landed| *landed == line).count();
+    assert_eq!(count("old"), 1, "old act replayed or lost: {effects:?}");
+    for n in 0..writes {
+        let line = format!("b{n}");
+        assert_eq!(count(&line), 1, "{line} not exactly once: {effects:?}");
+    }
+
+    // The old connection is still open; its superseded grant cannot write.
+    let late = old
+        .request(&Request::HumanInput {
+            grant: old_grant,
+            sequence: old_sequence + 1,
+            bytes: b"late\n".to_vec(),
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            late,
+            Response::RawOutcome {
+                state: Raw::Stale | Raw::Conflict | Raw::Forgotten
+            }
+        ),
+        "superseded grant wrote: {late:?}"
+    );
+
+    drop(old);
+    eventually("closed", || session.terminate().ok());
+    session.teardown(Duration::from_secs(10)).unwrap();
+    let host = fixture.host.as_mut().unwrap();
+    eventually("host stopped", || host.0.try_wait().ok().flatten());
+}
+
 #[test]
 fn input_a_gone_viewer_left_does_not_wedge_the_next_attach() {
     let mut fixture = Fixture::new();
