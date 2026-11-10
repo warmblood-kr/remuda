@@ -19,6 +19,7 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 pub enum Mode {
     InProcess,
     Hosted,
+    Default,
 }
 pub const MODES: [Mode; 2] = [Mode::InProcess, Mode::Hosted];
 
@@ -207,6 +208,8 @@ fn spawn_daemon(mode: Mode, root: &Path, env: &[(String, String)]) -> Child {
     command.envs(env.iter().map(|(key, value)| (key, value)));
     if mode == Mode::Hosted {
         command.env("REMUDA_EXPERIMENTAL_SESSION_HOST", "1");
+    } else if mode == Mode::Default {
+        command.env_remove("REMUDA_EXPERIMENTAL_SESSION_HOST");
     }
     command.spawn().expect("spawn daemon")
 }

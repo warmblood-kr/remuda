@@ -42,7 +42,7 @@ impl Root {
             .env("XDG_CONFIG_HOME", self.0.join("config"))
             .env("XDG_DATA_HOME", self.0.join("data"))
             .env("REMUDA_NO_UPDATE_CHECK", "1")
-            .env_remove("REMUDA_EXPERIMENTAL_SESSION_HOST")
+            .env("REMUDA_EXPERIMENTAL_SESSION_HOST", "0")
             .env_remove("REMUDA_TEST_RELOAD_FAULT");
         command
     }

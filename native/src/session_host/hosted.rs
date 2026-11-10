@@ -24,7 +24,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Daemon environment switch; anything but "1" keeps the default path.
+/// Set to "0" to use in-process sessions instead of the default host.
 pub const OPT_IN: &str = "REMUDA_EXPERIMENTAL_SESSION_HOST";
 /// The daemon's stable input identity, so a restarted daemon recovers acts
 /// an earlier one reserved. The writer fence, not this id, excludes owners.
@@ -59,7 +59,29 @@ fn inherited() -> HashMap<String, String> {
 }
 
 pub fn opted_in() -> bool {
-    std::env::var(OPT_IN).is_ok_and(|value| value == "1")
+    hosting_enabled(
+        cfg!(any(target_os = "linux", target_os = "macos")),
+        std::env::var_os(OPT_IN).as_deref(),
+    )
+}
+
+fn hosting_enabled(supported: bool, value: Option<&std::ffi::OsStr>) -> bool {
+    supported && value != Some(std::ffi::OsStr::new("0"))
+}
+
+#[cfg(test)]
+mod default_hosting_tests {
+    use super::hosting_enabled;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn hosting_defaults_on_only_where_the_host_is_implemented() {
+        assert!(hosting_enabled(true, None));
+        assert!(hosting_enabled(true, Some(OsStr::new("1"))));
+        assert!(!hosting_enabled(true, Some(OsStr::new("0"))));
+        assert!(!hosting_enabled(false, None));
+        assert!(!hosting_enabled(false, Some(OsStr::new("1"))));
+    }
 }
 
 /// Private per-daemon state: `<socket>.hosts/` holds the inventory and one
@@ -169,7 +191,21 @@ impl Hosting {
             let Ok(handle) = SessionHandle::hosted(session) else {
                 continue;
             };
-            if registry.register_hosted(handle).is_ok() {
+            // The inventory may change between the discovery snapshot and
+            // opening the host. Never apply an older instance's policy to a
+            // newly reused session name.
+            let identity = handle.identity();
+            if identity.host != Some(entry.identity.host)
+                || identity.id != entry.identity.session
+                || identity.instance != entry.identity.instance
+            {
+                continue;
+            }
+            let disabled = super::recovery::remote_input_disabled(entry);
+            if registry
+                .register_hosted_with_remote_input_disabled(handle, disabled)
+                .is_ok()
+            {
                 names.push(name.clone());
             }
         }
@@ -422,6 +458,7 @@ impl Hosts {
             .to_owned();
         let mut entry = Entry::reserved(identity.clone(), launch_id, &raw)
             .map_err(|error| format!("session host launch: {error:?}"))?;
+        set_launch_remote_policy(&mut entry, request.remote_input_disabled)?;
         entry.birth = Some(
             Birth::new(endpoint_text, nonce)
                 .map_err(|error| format!("session host birth: {error:?}"))?,
@@ -442,11 +479,30 @@ impl Hosts {
         };
         let bootstrap = serde_json::to_vec(&Bootstrap {
             store: self.root.join("inventory"),
-            lease: Lease::new(store, target, launch_id, nonce),
+            lease: Lease::new(
+                store,
+                Target {
+                    name: target.name.clone(),
+                    identity: target.identity.clone(),
+                },
+                launch_id,
+                nonce,
+            ),
             launch: RawValue::from_string(raw).map_err(|e| e.to_string())?,
         })
         .map_err(|e| e.to_string())?;
-        let exit = start(&exe, &endpoint, &bootstrap)?;
+        let exit = match start(&exe, &endpoint, &bootstrap) {
+            Ok(exit) => exit,
+            Err(StartError::NotSpawned(error)) => {
+                return match self.owner.cancel_unspawned(target, launch_id) {
+                    Ok(()) => Err(error),
+                    Err(cancel) => Err(format!(
+                        "{error}; could not confirm reservation cleanup: {cancel:?}"
+                    )),
+                };
+            }
+            Err(StartError::Ambiguous(error)) => return Err(error),
+        };
         match self.published(request.name, &exit) {
             Ok(()) => self.open(request.name),
             // The child already ended. Like an in-process `new` of a short
@@ -535,6 +591,15 @@ impl Hosts {
 }
 /// True once a registered host takes input. A host that cannot be asked
 /// counts as accepting: the request that follows reports what is wrong.
+fn set_launch_remote_policy(entry: &mut Entry, disabled: bool) -> Result<(), String> {
+    let value = super::inventory::model::Namespace::new(1, if disabled { "true" } else { "false" })
+        .map_err(|error| format!("session host policy: {error:?}"))?;
+    entry
+        .metadata
+        .insert(super::recovery::REMOTE_INPUT_POLICY.into(), value);
+    Ok(())
+}
+
 fn accepting(entry: &Entry) -> bool {
     use super::api::{PublicationStatus, Request, Response};
     let Some(birth) = entry.birth.as_ref() else {
@@ -608,11 +673,17 @@ fn host_executable() -> Result<PathBuf, String> {
 }
 /// Start the host. The receiver gets its exit status if it ends; a host that
 /// ends before it publishes failed to start.
+#[derive(Debug)]
+enum StartError {
+    NotSpawned(String),
+    Ambiguous(String),
+}
+
 fn start(
     exe: &Path,
     endpoint: &Path,
     bootstrap: &[u8],
-) -> Result<mpsc::Receiver<ExitStatus>, String> {
+) -> Result<mpsc::Receiver<ExitStatus>, StartError> {
     let mut child = Command::new(exe)
         .arg("run-reserved")
         .arg(endpoint)
@@ -623,7 +694,7 @@ fn start(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| format!("start {}: {error}", exe.display()))?;
+        .map_err(|error| StartError::NotSpawned(format!("start {}: {error}", exe.display())))?;
     let written = child
         .stdin
         .take()
@@ -649,7 +720,7 @@ fn start(
         // A host that exits before reading its bootstrap (another build) is
         // reported by its exit status, not by this lost write.
         Err(error) if error.broken_pipe => Ok(exit),
-        Err(error) => Err(error.text),
+        Err(error) => Err(StartError::Ambiguous(error.text)),
     }
 }
 struct Unwritten {

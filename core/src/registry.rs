@@ -231,35 +231,65 @@ impl Registry {
         instance_id: &str,
         opted_out: bool,
     ) -> Option<()> {
+        self.set_remote_input_opt_out_result(name, instance_id, opted_out)?
+            .ok()
+    }
+
+    /// Persist hosted changes without holding the global registry lock during I/O.
+    pub fn set_remote_input_opt_out_result(
+        &self,
+        name: &str,
+        instance_id: &str,
+        opted_out: bool,
+    ) -> Option<crate::session_operations::Result<()>> {
         if instance_id.is_empty() {
             return None;
         }
         if self.get(name).is_some() {
             let sessions = self.lock();
             let session = sessions.get(name)?;
-            // The cached bit, not `is_alive`: asking the backend would wait
-            // behind an admitted stalled write, and turning protection on must
-            // not block behind the very act it protects against later.
             if session.instance_id() != instance_id || !session.is_running() || session.is_closing()
             {
                 return None;
             }
-            return self.mutate_remote_input_policy(instance_id, opted_out);
+            return self
+                .mutate_remote_input_policy(instance_id, opted_out)
+                .map(Ok);
         }
         let handle = self.hosted(name)?;
         if handle.identity().instance != instance_id {
             return None;
         }
-        let observation = handle.inspect().ok()?;
+        let observation = match handle.inspect() {
+            Ok(value) => value,
+            Err(error) => return Some(Err(error)),
+        };
         if observation.lifecycle != Lifecycle::Running || observation.closing {
             return None;
         }
+        let _update = handle.lock_policy_update();
+        {
+            let hosted = self.hosted_lock();
+            let current = hosted.get(name)?;
+            if !Arc::ptr_eq(current, &handle) || current.identity().instance != instance_id {
+                return None;
+            }
+        }
+        if let Err(error) = handle.set_remote_input_disabled(opted_out) {
+            // Unknown state is locally conservative; the caller is told the
+            // durable change may have happened and must inspect it.
+            if matches!(error, crate::session_operations::Error::PolicyIndeterminate) {
+                self.mutate_remote_input_policy(instance_id, true);
+            }
+            return Some(Err(error));
+        }
         let hosted = self.hosted_lock();
         let current = hosted.get(name)?;
-        if !Arc::ptr_eq(current, &handle) || current.identity().instance != instance_id {
+        if !Arc::ptr_eq(current, &handle) {
             return None;
         }
         self.mutate_remote_input_policy(instance_id, opted_out)
+            .map(Ok)
     }
 
     fn mutate_remote_input_policy(&self, instance_id: &str, opted_out: bool) -> Option<()> {
@@ -305,17 +335,44 @@ impl Registry {
         Some(self.apply_hosted_batch(&handle, batch, line, now))
     }
 
-    /// Host-backed remote input is refused in this slice: the policy is not
-    /// persisted across a daemon restart.
+    /// Admit remote input only after checking the durable policy for the
+    /// exact hosted instance. Policy updates serialize with this admission.
     pub fn apply_hosted_remote_input_batch(
         &self,
         name: &str,
         batch: InputBatch<'_>,
-        _line: bool,
-        _now: Duration,
+        line: bool,
+        now: Duration,
     ) -> Option<core::result::Result<InputOutcome, InputError>> {
         let handle = self.hosted(name)?;
         if handle.identity().instance != batch.instance_id {
+            return Some(Ok(InputOutcome::WrongInstance));
+        }
+        let admission = handle.lock_policy_update();
+        {
+            let hosted = self.hosted_lock();
+            let current = hosted.get(name)?;
+            if !Arc::ptr_eq(current, &handle) || current.identity().instance != batch.instance_id {
+                return Some(Ok(InputOutcome::WrongInstance));
+            }
+            if self.remote_input_disabled(batch.instance_id) {
+                return Some(Err(InputError::RemoteInputDisabled));
+            }
+        }
+        // A disable rejects subsequent admissions, not a batch already admitted.
+        drop(admission);
+        Some(self.apply_hosted_batch(&handle, batch, line, now))
+    }
+
+    /// Hosted paste requires an atomic hosted paste operation; never treat it
+    /// as raw input while that operation is unavailable.
+    pub fn refuse_hosted_remote_paste(
+        &self,
+        name: &str,
+        instance_id: &str,
+    ) -> Option<core::result::Result<InputOutcome, InputError>> {
+        let handle = self.hosted(name)?;
+        if handle.identity().instance != instance_id {
             return Some(Ok(InputOutcome::WrongInstance));
         }
         Some(Err(InputError::RemoteInputDisabled))

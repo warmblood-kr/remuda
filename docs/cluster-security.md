@@ -119,29 +119,28 @@ remote Close is accepted only with the current session `instance_id` and
 `confirm: true`; a missing confirmation or stale instance is refused. Turning
 remote control off refuses both remote Input and confirmed remote Close.
 
-A session may additionally opt out of remote Input with a local-only flag:
-A launcher may request the opt-out atomically with registration:
-`remuda.session.new(name, argv, cwd, env, { remote_input_disabled = true })`
-(or the deprecated `remuda.new` alias). The registry inserts the session and
-its policy under one lock, so no remote admission can observe the new instance
-before the policy does; a hosted launch still refuses remote input entirely.
-The post-launch setter is
+A session may additionally opt out of remote Input. A launcher can request the
+opt-out atomically with `remuda.session.new(name, argv, cwd, env,
+{ remote_input_disabled = true })`. The post-launch setter is
 `remuda.session.remote_input(name, instance_id, enabled)` or
-`remuda remote-input NAME INSTANCE on|off`. The flag is keyed by the exact
-session instance, is refused by the remote front, and returns the same typed
-`RemoteControlDisabled` response. Local send, attach and resize are unaffected;
-a reused name or a new instance starts allowed and never inherits the flag.
-`remuda ls --json` and Lua `remuda.session.list()` report
-`remote_input_disabled` (the human table does not); false means no explicit session
-opt-out, not that the node's `allow_remote_control` is on or that the session is
-eligible in every backend. A successful hosted setter is remembered for
-listing/cleanup but does not enable hosted remote input in this slice. The flag
-lives in the daemon
-registry, not in a durable file, so a daemon restart forgets it. Because a
-host-backed session can survive that restart, this first slice refuses remote
-Input/InputLine for host-backed sessions entirely; in-process sessions keep the
-default-allowed behavior and the opt-out. This is an explicit limitation of
-the first receiver slice, not a claim of persistent per-session protection.
+`remuda remote-input NAME INSTANCE on|off`. The flag is bound to the exact
+session instance and is refused by the remote front. Local send, attach and
+resize are unaffected. `remuda ls --json` and Lua `remuda.session.list()`
+report `remote_input_disabled`.
+
+Host-backed sessions persist this policy through daemon reload and restart.
+A previously created host without the policy metadata is recovered with remote
+input disabled. To allow it, inspect its instance ID and explicitly run
+`remuda remote-input NAME INSTANCE on`. Malformed or unknown policy metadata
+also fails closed. If a policy update returns `Uncertain`, the running daemon
+locally disables remote input, but the stored setting may differ and may be
+recovered on restart.
+
+Remote hosted input uses the existing in-memory request deduplication. A retry
+with the same request ID after daemon restart can write again; an uncertain
+outcome should be inspected before retrying. Hosted input acts currently have
+an 8 KiB limit, so larger pastes may be refused or interrupted; do not assume
+they are atomic. Existing in-process sessions cannot be converted in place.
 
 An MCP `send` with `node` is one line, never a stream. It is off by default on
 the sending node: `remuda cluster remote-send on` is the local rollout gate,

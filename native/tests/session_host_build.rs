@@ -283,3 +283,113 @@ fn a_real_host_of_another_build_exits_before_reading_its_bootstrap() {
         "{stderr}"
     );
 }
+
+#[test]
+fn missing_executable_after_version_probe_does_not_hold_session_name() {
+    let root = Root::new();
+    let socket = root.socket();
+    let host = root.bin("remuda-session-host");
+    let real_host = root.bin("saved-host");
+    std::fs::rename(&host, &real_host).unwrap();
+    let expected = build();
+    install_script(
+        &host,
+        &format!(
+            "[ \"$1\" = version ] && {{ echo '{expected}'; /bin/rm \"$0\"; exit 0; }}; exit 1"
+        ),
+    );
+    let _daemon = Daemon::spawn(&root);
+    let refused = new_session(&socket, "retry");
+    assert!(
+        matches!(&refused, Response::Error(text) if text.contains("start ")),
+        "{refused:?}"
+    );
+    assert!(hosts(&root.0).is_empty());
+    std::fs::rename(&real_host, &host).unwrap();
+    let answer = client::request_with_timeout(
+        &socket,
+        &Request::New {
+            name: Some("retry".into()),
+            command: vec!["/bin/sh".into()],
+            size: Size::new(80, 24),
+            cwd: Some("/".into()),
+            env: None,
+        },
+        Duration::from_secs(20),
+    )
+    .unwrap();
+    assert_eq!(
+        answer,
+        Response::Value("retry".into()),
+        "failed exec must not reserve the name"
+    );
+    echo(&socket, "retry", "exec_retry");
+}
+
+#[test]
+fn exited_host_without_unspawned_proof_keeps_reservation() {
+    let root = Root::new();
+    let socket = root.socket();
+    let host = root.bin("remuda-session-host");
+    let real_host = root.bin("saved-host");
+    std::fs::rename(&host, &real_host).unwrap();
+    let expected = build();
+    install_script(
+        &host,
+        &format!("[ \"$1\" = version ] && echo '{expected}' && exit 0; exit 3"),
+    );
+    let _daemon = Daemon::spawn(&root);
+    assert!(matches!(new_session(&socket, "held"), Response::Error(_)));
+    std::fs::remove_file(&host).unwrap();
+    std::fs::rename(&real_host, &host).unwrap();
+    let answer = client::request_with_timeout(
+        &socket,
+        &Request::New {
+            name: Some("held".into()),
+            command: vec!["/bin/sh".into()],
+            size: Size::new(80, 24),
+            cwd: Some("/".into()),
+            env: None,
+        },
+        Duration::from_secs(20),
+    )
+    .unwrap();
+    assert!(matches!(answer, Response::Error(message) if message.contains("still held")));
+    assert!(hosts(&root.0).is_empty());
+}
+
+#[test]
+fn unspawned_reservation_cleanup_survives_daemon_restart() {
+    let root = Root::new();
+    let socket = root.socket();
+    let host = root.bin("remuda-session-host");
+    let real_host = root.bin("saved-host");
+    std::fs::rename(&host, &real_host).unwrap();
+    let expected = build();
+    install_script(
+        &host,
+        &format!(
+            "[ \"$1\" = version ] && {{ echo '{expected}'; /bin/rm \"$0\"; exit 0; }}; exit 1"
+        ),
+    );
+    let daemon = Daemon::spawn(&root);
+    assert!(matches!(new_session(&socket, "retry"), Response::Error(_)));
+    assert!(hosts(&root.0).is_empty());
+    std::fs::rename(&real_host, &host).unwrap();
+    drop(daemon);
+    let _restarted = Daemon::spawn(&root);
+    let answer = client::request_with_timeout(
+        &socket,
+        &Request::New {
+            name: Some("retry".into()),
+            command: vec!["/bin/sh".into()],
+            size: Size::new(80, 24),
+            cwd: Some("/".into()),
+            env: None,
+        },
+        Duration::from_secs(20),
+    )
+    .unwrap();
+    assert_eq!(answer, Response::Value("retry".into()));
+    echo(&socket, "retry", "exec_restart");
+}

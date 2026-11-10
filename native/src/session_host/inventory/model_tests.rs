@@ -839,3 +839,123 @@ fn store_revision_and_writer_epoch_exhaustion_never_wrap_or_mutate() {
         Err(Error::Exhausted)
     ));
 }
+
+#[test]
+fn cancel_unspawned_preserves_identity_history_and_refuses_registered_or_wrong_launch() {
+    let (mut index, fence) = initial();
+    let mut entry = Entry::reserved(identity(), [4; 16], r#"{"argv":["synthetic"]}"#).unwrap();
+    entry.birth = Some(Birth::new("/tmp/private-host".into(), [7; 16]).unwrap());
+    apply(
+        &mut index,
+        fence,
+        Mutation::ReserveLaunch {
+            name: "synthetic".into(),
+            entry: entry.clone(),
+        },
+    );
+    let cancel = |launch| Mutation::CancelUnspawned {
+        target: target(),
+        launch,
+    };
+    assert!(matches!(
+        index.apply(index.cursor(), Some(fence), cancel([5; 16])),
+        Err(Error::Conflict)
+    ));
+    let mut registered = index.clone();
+    registered.entries.get_mut("synthetic").unwrap().phase = Phase::Registered;
+    assert!(matches!(
+        registered.apply(registered.cursor(), Some(fence), cancel([4; 16])),
+        Err(Error::Conflict)
+    ));
+    let next = index
+        .apply(index.cursor(), Some(fence), cancel([4; 16]))
+        .unwrap()
+        .next;
+    assert!(!next.entries.contains_key("synthetic"));
+    assert!(matches!(next.events.back().unwrap().kind, EventKind::Host));
+    let lease = Lease::new(next.cursor().store, target(), [4; 16], [7; 16]);
+    assert!(
+        matches!(
+            lease.launch_binding(&next, "/tmp/private-host", entry.launch_hash),
+            Err(Error::Unavailable)
+        ),
+        "a stale bootstrap cannot start after cancellation"
+    );
+    assert!(
+        matches!(
+            next.apply(
+                next.cursor(),
+                Some(fence),
+                Mutation::ReserveLaunch {
+                    name: "synthetic".into(),
+                    entry
+                }
+            ),
+            Err(Error::Conflict)
+        ),
+        "a canceled identity must never be reused"
+    );
+    let claimed = next
+        .apply(next.cursor(), None, Mutation::Claim { nonce: [8; 16] })
+        .unwrap();
+    assert!(matches!(
+        claimed
+            .next
+            .apply(claimed.next.cursor(), Some(fence), cancel([4; 16])),
+        Err(Error::StaleFence)
+    ));
+}
+
+#[test]
+fn canceled_unspawned_launches_still_exhaust_lifetime_identity_budget() {
+    let (index, fence) = initial();
+    let mut json: serde_json::Value = serde_json::from_slice(&index.encode().unwrap()).unwrap();
+    let allocations = (0..1023)
+        .map(|n| {
+            serde_json::json!({
+                "host": vec![3; 16], "session": format!("s{n}"), "instance": format!("i{n}")
+            })
+        })
+        .collect::<Vec<_>>();
+    json["allocations"] = allocations.into();
+    let mut index = Index::decode(&serde_json::to_vec(&json).unwrap()).unwrap();
+    let mut entry = Entry::reserved(identity(), [4; 16], "{}").unwrap();
+    entry.birth = Some(Birth::new("/tmp/private-host".into(), [7; 16]).unwrap());
+    apply(
+        &mut index,
+        fence,
+        Mutation::ReserveLaunch {
+            name: "synthetic".into(),
+            entry,
+        },
+    );
+    apply(
+        &mut index,
+        fence,
+        Mutation::CancelUnspawned {
+            target: target(),
+            launch: [4; 16],
+        },
+    );
+    let next = Entry::reserved(
+        super::super::api::Identity {
+            host: [9; 16],
+            session: "next".into(),
+            instance: "next".into(),
+        },
+        [5; 16],
+        "{}",
+    )
+    .unwrap();
+    assert!(matches!(
+        index.apply(
+            index.cursor(),
+            Some(fence),
+            Mutation::ReserveLaunch {
+                name: "next".into(),
+                entry: next
+            }
+        ),
+        Err(Error::Exhausted)
+    ));
+}

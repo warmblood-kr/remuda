@@ -229,6 +229,11 @@ pub(crate) enum Mutation {
         name: String,
         entry: Entry,
     },
+    /// Caller proved that the OS did not create a host process for this launch.
+    CancelUnspawned {
+        target: Target,
+        launch: [u8; 16],
+    },
     Register(Target),
     Metadata {
         target: Target,
@@ -400,7 +405,8 @@ impl Index {
         let identity = match &mutation {
             Mutation::Claim { .. } => None,
             Mutation::ReserveLaunch { entry, .. } => Some(entry.identity.clone()),
-            Mutation::Register(target)
+            Mutation::CancelUnspawned { target, .. }
+            | Mutation::Register(target)
             | Mutation::Metadata { target, .. }
             | Mutation::Input { target, .. }
             | Mutation::Exit { target, .. } => Some(target.identity.clone()),
@@ -512,6 +518,21 @@ impl Index {
                 }
                 self.entries.insert(name.clone(), entry);
                 Ok((Some(name), EventKind::Launch))
+            }
+            Mutation::CancelUnspawned { target, launch } => {
+                let entry = self.entry(&target.name, &target.identity)?;
+                if entry.launch != launch
+                    || entry.phase != Phase::Reserved
+                    || entry.pending.is_some()
+                    || !entry.streams.is_empty()
+                    || entry.birth.is_none()
+                {
+                    return Err(Error::Conflict);
+                }
+                self.entries.remove(&target.name);
+                // Host lifecycle changed; readers must re-read this entry.
+                // Reuse the existing wire value so older readers still decode.
+                Ok((Some(target.name), EventKind::Host))
             }
             Mutation::Register(target) => {
                 let entry = self.entry(&target.name, &target.identity)?;

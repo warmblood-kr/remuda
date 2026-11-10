@@ -25,6 +25,18 @@ pub(crate) enum Progress {
 }
 /// Metadata namespace a daemon writes once it closed a session's child.
 pub(crate) const CLOSING: &str = "closing";
+/// Per-instance remote input policy. Missing or unknown data is disabled.
+pub(crate) const REMOTE_INPUT_POLICY: &str = "remote-input-policy";
+
+pub(crate) fn remote_input_disabled(entry: &model::Entry) -> bool {
+    let Some(value) = entry.metadata.get(REMOTE_INPUT_POLICY) else {
+        return true;
+    };
+    if value.schema != 1 {
+        return true;
+    }
+    serde_json::from_str::<bool>(value.payload.get()).unwrap_or(true)
+}
 /// One writer claim: a fresh nonce under the next epoch. A host publishing
 /// between our read and commit is retried, not fatal.
 fn new_claim(store: &Store) -> Result<Fence, Error> {
@@ -196,6 +208,69 @@ impl Owner {
             }
         }
     }
+    /// Cancel only when this launcher knows the OS created no process.
+    /// Exact identity, launch and current writer fence prevent deleting a successor.
+    pub fn cancel_unspawned(&self, target: Target, launch: [u8; 16]) -> Result<(), Error> {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let current = self.store.read()?;
+            let target = copy_target(&target);
+            match self.store.commit(
+                current.cursor(),
+                Some(self.fence()),
+                Mutation::CancelUnspawned { target, launch },
+                Duration::from_secs(1),
+            ) {
+                Ok(_) => return Ok(()),
+                Err(Error::Busy | Error::Data(model::Error::StaleRevision))
+                    if std::time::Instant::now() < until =>
+                {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Persist this exact instance's remote input policy under the current fence.
+    pub fn set_remote_input_disabled(&self, target: Target, disabled: bool) -> Result<(), Error> {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let index = self.store.read()?;
+            let entry = index
+                .entries
+                .get(&target.name)
+                .ok_or(Error::Data(model::Error::Conflict))?;
+            if entry.identity != target.identity {
+                return Err(Error::Data(model::Error::Conflict));
+            }
+            let expected = entry.metadata.get(REMOTE_INPUT_POLICY).map(|v| v.revision);
+            let update = model::MetadataUpdate {
+                namespace: REMOTE_INPUT_POLICY.into(),
+                expected,
+                value: model::Namespace::new(1, if disabled { "true" } else { "false" })
+                    .map_err(Error::Data)?,
+            };
+            match self.store.commit(
+                index.cursor(),
+                Some(self.fence()),
+                Mutation::Metadata {
+                    target: copy_target(&target),
+                    update,
+                },
+                Duration::from_secs(1),
+            ) {
+                Ok(_) => return Ok(()),
+                Err(Error::Busy | Error::Data(model::Error::StaleRevision))
+                    if std::time::Instant::now() < until =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Durable close intent: discovery tears such an entry down instead of
     /// registering it again. Idempotent; contention is retried briefly.
     pub fn mark_closing(&self, target: Target) -> Result<(), Error> {

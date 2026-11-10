@@ -435,3 +435,136 @@ fn controller_death_after_durable_reservation_before_receipt_recovers_original_w
 fn controller_death_after_host_admission_before_observation_recovers_without_duplicate_effect() {
     exercise_cut(2);
 }
+
+#[test]
+fn canceled_unspawned_reservation_faults_are_explicit_and_fail_closed() {
+    for stage in [1, 2] {
+        let root = std::env::temp_dir().join(format!(
+            "rm-unspawned-fault-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let store = Store::create(&root.join("inventory")).unwrap();
+        let owner = Owner::claim(store).unwrap();
+        let identity = super::super::api::Identity {
+            host: [3; 16],
+            session: "session".into(),
+            instance: "instance".into(),
+        };
+        let target = || Target {
+            name: "name".into(),
+            identity: identity.clone(),
+        };
+        let mut entry = model::Entry::reserved(identity.clone(), [4; 16], "{}").unwrap();
+        entry.birth =
+            Some(model::Birth::new(root.join("host").to_string_lossy().into(), [7; 16]).unwrap());
+        owner.reserve_launch("name".into(), entry).unwrap();
+        super::super::inventory::disk::fail_at(stage);
+        assert!(matches!(
+            owner.cancel_unspawned(target(), [4; 16]),
+            Err(Error::CommitUnknown(_))
+        ));
+        drop(owner);
+        let recovered = Owner::claim(Store::open(&root.join("inventory")).unwrap()).unwrap();
+        let current = recovered.index().unwrap();
+        assert_eq!(
+            current.entries.contains_key("name"),
+            stage == 1,
+            "pre-replacement retains reservation; post-replacement may have removed it"
+        );
+        // Both outcomes retain identity history, and neither creates a process.
+        let duplicate = model::Entry::reserved(identity, [5; 16], "{}").unwrap();
+        assert!(recovered.reserve_launch("other".into(), duplicate).is_err());
+        drop(recovered);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn uncertain_launch_reservation_may_remain_even_when_no_host_was_spawned() {
+    for stage in [1, 2] {
+        let root = std::env::temp_dir().join(format!(
+            "rm-unspawned-reserve-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let owner = Owner::claim(Store::create(&root.join("inventory")).unwrap()).unwrap();
+        let identity = super::super::api::Identity {
+            host: [3; 16],
+            session: "session".into(),
+            instance: "instance".into(),
+        };
+        let mut entry = model::Entry::reserved(identity, [4; 16], "{}").unwrap();
+        entry.birth =
+            Some(model::Birth::new(root.join("host").to_string_lossy().into(), [7; 16]).unwrap());
+        super::super::inventory::disk::fail_at(stage);
+        assert!(matches!(
+            owner.reserve_launch("name".into(), entry),
+            Err(Error::CommitUnknown(_))
+        ));
+        drop(owner);
+        let recovered = Owner::claim(Store::open(&root.join("inventory")).unwrap()).unwrap();
+        assert_eq!(
+            recovered.index().unwrap().entries.contains_key("name"),
+            stage == 2
+        );
+        drop(recovered);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn missing_malformed_or_unknown_remote_policy_fails_closed() {
+    let identity = super::super::api::Identity {
+        host: [1; 16],
+        session: "session".into(),
+        instance: "instance".into(),
+    };
+    let mut entry = super::model::Entry::reserved(identity, [2; 16], "{}").unwrap();
+    assert!(super::remote_input_disabled(&entry));
+    for (schema, payload) in [(1, "null"), (1, "{}"), (2, "false")] {
+        entry.metadata.insert(
+            super::REMOTE_INPUT_POLICY.into(),
+            super::model::Namespace::new(schema, payload).unwrap(),
+        );
+        assert!(super::remote_input_disabled(&entry));
+    }
+    entry.metadata.insert(
+        super::REMOTE_INPUT_POLICY.into(),
+        super::model::Namespace::new(1, "false").unwrap(),
+    );
+    assert!(!super::remote_input_disabled(&entry));
+}
+
+#[test]
+fn policy_commit_unknown_can_mean_either_old_or_new_value() {
+    let fixture = Fixture::new();
+    let owner = fixture.owner();
+    owner
+        .set_remote_input_disabled(fixture.target(), true)
+        .unwrap();
+    super::super::inventory::disk::fail_at(1);
+    assert!(matches!(
+        owner.set_remote_input_disabled(fixture.target(), false),
+        Err(Error::CommitUnknown(_))
+    ));
+    assert!(remote_input_disabled(
+        &owner.index().unwrap().entries["synthetic"]
+    ));
+    super::super::inventory::disk::fail_at(2);
+    assert!(matches!(
+        owner.set_remote_input_disabled(fixture.target(), false),
+        Err(Error::CommitUnknown(_))
+    ));
+    assert!(!remote_input_disabled(
+        &owner.index().unwrap().entries["synthetic"]
+    ));
+}
