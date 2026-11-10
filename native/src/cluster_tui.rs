@@ -18,13 +18,15 @@ use remuda_core::clock::Clock;
 use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
 use sender::InputSender;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+type QueueIdentity = (Option<String>, String, String, String, u64);
 
 const INVALID_REMOTE_REQUEST: &str = "invalid remote request";
 
@@ -145,6 +147,7 @@ pub struct ClusterUi {
     composer_target: Option<(String, String)>,
     input_sender: InputSender,
     input_queue: InputQueue,
+    uncertain_visible_since: std::cell::RefCell<HashMap<QueueIdentity, Duration>>,
     notice: Option<(String, Duration)>,
     pending_close: Option<PendingClose>,
     remote_close_confirmation: Option<RemoteCloseTarget>,
@@ -285,6 +288,7 @@ impl ClusterUi {
             composer_target: None,
             input_sender,
             input_queue: InputQueue::default(),
+            uncertain_visible_since: std::cell::RefCell::new(HashMap::new()),
             notice: None,
             pending_close: None,
             remote_close_confirmation: None,
@@ -748,7 +752,7 @@ impl ClusterUi {
         let tree_start = 2;
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
         let divider = "─".repeat(width);
-        let queue_rows: Vec<&PendingBatch> = self.visible_queue().rev().take(3).collect();
+        let queue_rows: Vec<&PendingBatch> = self.visible_queue(now).rev().take(3).collect();
         let notice_lines = self.active_notice_lines(now, width);
         let footer_rows = self.footer_row_count(width);
         let tree_capacity = height.saturating_sub(
@@ -772,7 +776,12 @@ impl ClusterUi {
                 .map(str::to_string),
         );
         frame.extend(notice_lines);
-        frame.extend(queue_rows.into_iter().rev().map(queue_line));
+        for batch in queue_rows.into_iter().rev() {
+            if frame.len() < height {
+                self.mark_uncertain_visible(batch, now);
+            }
+            frame.push(queue_line(batch));
+        }
         self.append_footer(&mut frame, width);
         frame
             .into_iter()
@@ -852,7 +861,7 @@ impl ClusterUi {
         let height = usize::from(rows);
         let footer = self.footer_row_count(width);
         let notices = self.active_notice_lines(now, width).len();
-        let queue = self.visible_queue().rev().take(3).count();
+        let queue = self.visible_queue(now).rev().take(3).count();
         let (pane_cols, pane_rows) = if self.remote_keys_mode.is_some() {
             let Some(target @ RemoteSelection::Session { .. }) = self.remote_keys_mode.as_ref()
             else {
@@ -1038,14 +1047,13 @@ impl ClusterUi {
         let right_w = width - left_w - 1;
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
         let notices = self.active_notice_lines(now, width);
-        let queue: Vec<String> = self
-            .visible_queue()
+        let queue: Vec<&PendingBatch> = self
+            .visible_queue(now)
             .rev()
             .take(3)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
-            .map(queue_line)
             .collect();
         let body_rows = height
             .saturating_sub(self.footer_row_count(width) + notices.len() + queue.len())
@@ -1070,7 +1078,12 @@ impl ClusterUi {
             })
             .collect();
         frame.extend(notices);
-        frame.extend(queue);
+        for batch in queue {
+            if frame.len() < height {
+                self.mark_uncertain_visible(batch, now);
+            }
+            frame.push(queue_line(batch));
+        }
         self.append_footer(&mut frame, width);
         frame
             .into_iter()
@@ -2048,6 +2061,11 @@ impl ClusterUi {
     }
 
     fn handle_send_event(&mut self, event: Option<QueueEvent>, now: Duration) {
+        self.uncertain_visible_since.borrow_mut().retain(|key, _| {
+            self.input_queue
+                .items()
+                .any(|batch| batch.state == QueueState::Uncertain && queue_identity(batch) == *key)
+        });
         match event {
             Some(QueueEvent::Sent { .. }) => {
                 if self.notice.as_ref().is_none_or(|(notice, _)| {
@@ -2097,10 +2115,25 @@ impl ClusterUi {
         }
     }
 
-    fn visible_queue(&self) -> impl DoubleEndedIterator<Item = &PendingBatch> {
-        self.input_queue
-            .items()
-            .filter(|batch| batch.state != QueueState::Sent)
+    fn visible_queue(&self, now: Duration) -> impl DoubleEndedIterator<Item = &PendingBatch> {
+        self.input_queue.items().filter(move |batch| {
+            batch.state != QueueState::Sent
+                && (batch.state != QueueState::Uncertain
+                    || self
+                        .uncertain_visible_since
+                        .borrow()
+                        .get(&queue_identity(batch))
+                        .is_none_or(|at| now.saturating_sub(*at) < Duration::from_secs(5)))
+        })
+    }
+
+    fn mark_uncertain_visible(&self, batch: &PendingBatch, now: Duration) {
+        if batch.state == QueueState::Uncertain {
+            self.uncertain_visible_since
+                .borrow_mut()
+                .entry(queue_identity(batch))
+                .or_insert(now);
+        }
     }
 
     fn clear_sending_notice(&mut self) {
@@ -3032,6 +3065,16 @@ fn wrap_to_two_lines(text: &str, width: usize) -> Vec<String> {
         }
     }
     vec![first, second]
+}
+
+fn queue_identity(batch: &PendingBatch) -> QueueIdentity {
+    (
+        batch.remote_node.clone(),
+        batch.name.clone(),
+        batch.instance_id.clone(),
+        batch.client_id.clone(),
+        batch.seq,
+    )
 }
 
 fn queue_line(batch: &PendingBatch) -> String {
@@ -5976,6 +6019,67 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_status_expires_without_clearing_delivery_safety() {
+        let (clock, mut ui, _) = ui_with_uncertain_remote_target();
+        assert!(ui.render_text(100, 24, "", &clock).contains("uncertain ·"));
+        clock.advance(Duration::from_secs(5));
+        assert!(!ui.render_text(100, 24, "", &clock).contains("uncertain ·"));
+        assert!(ui
+            .input_queue
+            .items()
+            .any(|item| item.state == QueueState::Uncertain));
+        arm_partial_input_confirmation(&mut ui);
+    }
+
+    #[test]
+    fn uncertain_timer_starts_only_when_help_is_closed() {
+        let (clock, ui, _) = ui_with_uncertain_remote_target();
+        ui.help_open.set(true);
+        clock.advance(Duration::from_secs(10));
+        assert!(!ui.render_text(100, 24, "", &clock).contains("uncertain ·"));
+        ui.help_open.set(false);
+        assert!(ui.render_text(100, 24, "", &clock).contains("uncertain ·"));
+        clock.advance(Duration::from_secs(5));
+        assert!(!ui.render_text(100, 24, "", &clock).contains("uncertain ·"));
+    }
+
+    #[test]
+    fn uncertain_rows_wait_for_their_turn_before_expiring() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        for i in 0..4 {
+            let now = Instant::now();
+            assert!(ui.input_queue.enqueue(
+                format!("session{i}"),
+                "instance".into(),
+                "client".into(),
+                i,
+                format!("item{i}\r").into_bytes(),
+                now
+            ));
+            if i == 0 {
+                ui.input_queue.begin_due(now);
+                ui.input_queue
+                    .finish(i, super::queue::SendOutcome::Uncertain, now);
+            }
+        }
+        let first = ui.render_text(100, 24, "", &clock);
+        assert!(!first.contains("item0"));
+        assert!(first.contains("item1"));
+        clock.advance(Duration::from_secs(10));
+        assert!(!ui.render_text(100, 24, "", &clock).contains("item0"));
+        let now = Instant::now();
+        ui.input_queue.begin_due(now);
+        ui.input_queue
+            .finish(1, super::queue::SendOutcome::Ack { duplicate: false }, now);
+        let second = ui.render_text(100, 24, "", &clock);
+        assert!(second.contains("item0"));
+        assert!(!second.contains("item1"));
+        clock.advance(Duration::from_secs(5));
+        assert!(!ui.render_text(100, 24, "", &clock).contains("item0"));
+    }
+
+    #[test]
     fn uncertain_remote_target_warns_on_its_next_send_once() {
         let (clock, mut ui, transport) = ui_with_uncertain_remote_target();
         let failure_notice = ui.notice.as_ref().map(|(notice, _)| notice.as_str());
@@ -7605,7 +7709,7 @@ mod tests {
         // composer is enabled by the remote dispatcher alone; support probing
         // must not make it read or change that gate.
         ui.enqueue_remote_draft(b"typed line\r".to_vec(), clock.now());
-        let batches: Vec<_> = ui.visible_queue().collect();
+        let batches: Vec<_> = ui.visible_queue(clock.now()).collect();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].remote_node.as_deref(), Some("fp-laptop"));
         assert!(batches[0].line_submit);
