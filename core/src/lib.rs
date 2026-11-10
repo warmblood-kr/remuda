@@ -27,6 +27,7 @@ pub mod protocol;
 pub mod registry;
 pub mod session;
 pub mod session_operations;
+pub mod session_view;
 pub mod sync;
 pub mod vfs;
 
