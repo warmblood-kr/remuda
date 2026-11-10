@@ -2247,161 +2247,148 @@ register(
 -- — status color, detail, and the breathing room between sessions — belongs
 -- here, where a live Lua image can revise it without rebuilding the TUI.
 --
--- WIDTH travels with the bridge call so any budget-aware row detail can be
--- chosen here; Rust still fits the resulting rows to the caller's pane.
+-- A render result carries the exact identity alongside every block. The
+-- caller provides one snapshot; this function does not query the registry or
+-- write the shared *sessions* buffer. Extensions receive copies, so changing
+-- a row cannot redirect the identity bound to its rendered block.
+local function session_copy(session)
+  local copies, count = {}, 0
+  local function copy(value, depth)
+    if type(value) ~= "table" then return value end
+    if copies[value] then return copies[value] end
+    assert(depth <= 16, "session data too deep")
+    local out = {}
+    copies[value] = out
+    for key, item in pairs(value) do
+      count = count + 1
+      assert(count <= 8192, "session data too large")
+      out[copy(key, depth + 1)] = copy(item, depth + 1)
+    end
+    return out
+  end
+  return copy(session, 0)
+end
+
+local function render_session_snapshot(sessions, width, selected_name, selected_id, strict, selected_index)
+  assert(type(sessions) == "table", "invalid session snapshot")
+  if strict then
+    local count, length = 0, #sessions
+    assert(length <= 256, "session snapshot too large")
+    for key in pairs(sessions) do
+      assert(type(key) == "number" and key % 1 == 0 and key >= 1 and key <= length, "invalid session snapshot key")
+      count = count + 1
+    end
+    assert(count == length, "sparse session snapshot")
+  end
+  local ordered, seen, frameable = {}, {}, true
+  for _, session in ipairs(sessions) do
+    assert(type(session) == "table" and type(session.name) == "string", "invalid session name")
+    if strict then
+      assert(session.name ~= "" and #session.name <= 256 and not session.name:find("[%z\1-\31\127]"), "invalid session name")
+    elseif session.name:find("[\t\r\n]") then
+      frameable = false
+    end
+    assert(not seen[session.name], "duplicate session name")
+    local id = session.instance_id
+    if strict then assert(type(id) == "string" and id ~= "" and #id <= 256
+      and not id:find("[%z\1-\31\127]"), "unbound session instance") end
+    seen[session.name] = { name = session.name, instance_id = id, snapshot = session_copy(session), depth = 0 }
+    ordered[#ordered + 1] = seen[session.name]
+  end
+  local has_order = false
+  if frameable and type(remuda.session_order) == "function" then
+    local copies = {}
+    for _, entry in ipairs(ordered) do copies[#copies + 1] = session_copy(entry.snapshot) end
+    local ok, requested = pcall(remuda.session_order, copies)
+    if ok and type(requested) == "table" then
+      local chosen, result = {}, {}
+      for _, item in ipairs(requested) do
+        local name = type(item) == "table" and item.name
+        local entry = type(name) == "string" and seen[name]
+        if entry and not chosen[name] then
+          local depth = tonumber(item.depth) or 0
+          if depth ~= depth then depth = 0 end
+          entry.depth = math.max(0, math.min(20, math.floor(depth)))
+          result[#result + 1], chosen[name] = entry, true
+        end
+      end
+      for _, entry in ipairs(ordered) do
+        if not chosen[entry.name] then result[#result + 1] = entry end
+      end
+      ordered, has_order = result, true
+    end
+  end
+  local function safe_text(value, limit)
+    if type(value) ~= "string" then return nil end
+    value = value:gsub("[%z\1-\31\127]", " ")
+    if not utf8.len(value) then return nil end
+    if #value > limit then
+      value = value:sub(1, limit)
+      while #value > 0 and not utf8.len(value) do value = value:sub(1, -2) end
+    end
+    return value ~= "" and value or nil
+  end
+  local compact = false
+  for _, entry in ipairs(ordered) do
+    local decoration
+    if type(remuda.session_list_decorate) == "function" then
+      local ok, value = pcall(remuda.session_list_decorate, session_copy(entry.snapshot))
+      if ok and type(value) == "table" then decoration = value end
+    end
+    local fields = {}
+    if decoration then
+      local activity = decoration.activity
+      if activity == "working" or activity == "idle" or activity == "other" or activity == "needs you" then fields[#fields + 1] = activity end
+      local kind = safe_text(decoration.agent_kind, 32)
+      local description = safe_text(decoration.description, 160)
+      if kind then fields[#fields + 1] = kind end
+      if description then fields[#fields + 1] = description end
+      if decoration.layout == "compact" then compact = true end
+    end
+    if #fields == 0 and type(remuda.session_detail) == "function" then
+      local ok, value = pcall(remuda.session_detail, session_copy(entry.snapshot))
+      if ok then local detail = safe_text(value, 256); if detail then fields[#fields + 1] = detail end end
+    end
+    entry.detail = #fields > 0 and table.concat(fields, " · ") or nil
+  end
+  local height, entries = compact and 1 or 3, {}
+  for index, entry in ipairs(ordered) do
+    local session, detail = entry.snapshot, entry.detail
+    local selected = selected_name ~= nil and entry.name == selected_name and (selected_id == nil or entry.instance_id == selected_id)
+      or selected_name == nil and selected_index ~= nil and index - 1 == selected_index
+    local name_style = selected and "\27[1;7;36m" or "\27[1m"
+    local color, reset = session.alive and "\27[32m" or "\27[31m", "\27[0m"
+    local first = name_style .. entry.name .. reset .. " " .. color .. "●" .. reset .. (session.attached and " 🏇" or "")
+    local second = detail and ("\27[2m" .. detail .. reset) or ""
+    local lines = compact and { first .. (detail and ("  " .. second) or "") } or { first, second, "" }
+    local pad = string.rep(" ", 2 * entry.depth)
+    for i, line in ipairs(lines) do lines[i] = pad .. line end
+    entries[#entries + 1] = { name = entry.name, instance_id = entry.instance_id, lines = lines }
+  end
+  return { height = height, entries = entries, has_order = has_order }
+end
+
+function remuda._render_sessions_snapshot(sessions, width, selected_name, selected_id)
+  return render_session_snapshot(sessions, width, selected_name, selected_id, true)
+end
+
+-- The local pane retains its existing buffer contract, but delegates layout
+-- to the same snapshot renderer that a future remote view can use.
 function remuda._refresh_sessions_buffer(width, selected, selected_name)
   local sessions = remuda.session.list()
-  local ordered = sessions
-  local has_order = false
-  -- The private order line is tab-delimited. A daemon normally receives names
-  -- from a shell/CLI, but its protocol permits arbitrary strings, so verify
-  -- the framing assumption before opting into a reordered render.
-  local names_are_frameable = true
-  for _, session in ipairs(sessions) do
-    if session.name:find("[\t\r\n]") then names_are_frameable = false break end
-  end
-  if names_are_frameable and type(remuda.session_order) == "function" then
-    local ok, requested = pcall(remuda.session_order, sessions)
-    if ok and type(requested) == "table" then
-      local live, seen, reordered = {}, {}, {}
-      for _, session in ipairs(sessions) do live[session.name] = session end
-      for _, entry in ipairs(requested) do
-        local name = type(entry) == "table" and entry.name
-        local session = type(name) == "string" and live[name]
-        if session and not seen[name] then
-          local depth = tonumber(entry.depth) or 0
-          depth = math.max(0, math.floor(depth))
-          reordered[#reordered + 1] = { session = session, depth = depth }
-          seen[name] = true
-        end
-      end
-      for _, session in ipairs(sessions) do
-        if not seen[session.name] then
-          reordered[#reordered + 1] = { session = session, depth = 0 }
-        end
-      end
-      ordered, has_order = reordered, true
-    end
-  end
-  local lines = {}
-  -- Extensions may add typed presentation fields, never arbitrary rows or
-  -- executable snippets. Keep the core list complete when an extension fails.
-  local function session_decoration(session)
-    if type(remuda.session_list_decorate) ~= "function" then return nil end
-    local ok, value = pcall(remuda.session_list_decorate, session)
-    if not ok or type(value) ~= "table" then return nil end
-    local function text_field(key, limit)
-      local field = value[key]
-      if type(field) ~= "string" then return nil end
-      field = field:gsub("[%z\1-\31\127]", " ")
-      if #field > limit then field = field:sub(1, limit) end
-      return field ~= "" and field or nil
-    end
-    local activity = value.activity
-    if activity ~= "working" and activity ~= "idle" and activity ~= "other" and activity ~= "needs you" then
-      activity = nil
-    end
-    local layout = value.layout
-    if layout ~= "stacked" and layout ~= "compact" then layout = nil end
-    return {
-      agent_kind = text_field("agent_kind", 32),
-      activity = activity,
-      description = text_field("description", 160),
-      layout = layout,
-    }
-  end
-  -- One entry is a block of rows laid out at x = 0; nesting moves the whole
-  -- block, so no row can keep a position of its own.
-  local function place(block, dx)
-    local pad = string.rep(" ", dx)
-    for i, row in ipairs(block) do block[i] = pad .. row end
-    return block
-  end
-  local function session_detail(session, decoration)
-    if decoration then
-      local fields = {}
-      if decoration.activity then fields[#fields + 1] = decoration.activity end
-      if decoration.agent_kind then fields[#fields + 1] = decoration.agent_kind end
-      if decoration.description then fields[#fields + 1] = decoration.description end
-      if #fields > 0 then return table.concat(fields, " · ") end
-    end
-    if type(remuda.session_detail) ~= "function" then return nil end
-    local ok, detail = pcall(remuda.session_detail, session)
-    if ok and type(detail) == "string" then
-      detail = detail:gsub("[%z\1-\31\127]", " ")
-      if #detail > 256 then detail = detail:sub(1, 256) end
-      return detail ~= "" and detail or nil
-    end
-    return nil
-  end
-  -- The native bridge carries one row height for every entry, so a compact
-  -- request is a whole-list choice. Mixed decorations keep the stacked
-  -- layout rather than making row-to-session mapping disagree with itself.
-  local decorations, compact = {}, false
-  for i, item in ipairs(ordered) do
-    decorations[i] = session_decoration(item.session or item)
-    if decorations[i] and decorations[i].layout == "compact" then compact = true end
-  end
-  -- The bridge header is the row height of ONE entry, which the native list
-  -- uses to map pointer/selection rows back to sessions.
-  local rows = compact and 1 or 3
-  if #sessions == 0 then
-    lines = { "the herd is empty.", "press n to start a session." }
+  local view = render_session_snapshot(sessions, width, selected_name, nil, false, selected or 0)
+  local lines, names = { "\30" .. tostring(view.height) }, {}
+  for _, entry in ipairs(view.entries) do names[#names + 1] = entry.name end
+  if #view.entries == 0 then
+    lines[#lines + 1] = "the herd is empty."
+    lines[#lines + 1] = "press n to start a session."
   else
-    for i, item in ipairs(ordered) do
-      local s = item.session or item
-      local depth = item.depth or 0
-      local decoration = decorations[i]
-      local detail = session_detail(s, decoration)
-      local state_color = s.alive and "\27[32m" or "\27[31m"
-      local reset = "\27[0m"
-      local base = (i - 1) * rows
-      -- Names remain neutral and readable; state carries the color. Keeping
-      -- an actually blank third row gives entries whitespace rather than a
-      -- second competing visual treatment.
-      local is_selected = selected_name and s.name == selected_name
-        or (not selected_name and i - 1 == selected)
-      -- Reverse video marks the selection without a caret column.
-      local name_style = is_selected and "\27[1;7;36m" or "\27[1m"
-      -- The dot carries live/dead; row 2 is reserved for telemetry.
-      -- Each style resets before the next starts, so none bleeds into another.
-      -- U+25CF BLACK CIRCLE. Ambiguous width; tui.rs's char_width counts it
-      -- as one cell by owner choice.
-      local dot = "●"
-      local marker = s.attached and " 🏇" or ""
-      local parts = {}
-      if detail then parts[#parts + 1] = "\27[2m" .. detail .. reset end
-      local block = place(compact and {
-        name_style .. s.name .. reset .. " " .. state_color .. dot .. reset .. marker
-          .. (detail and ("  \27[2m" .. detail .. reset) or ""),
-      } or {
-        name_style .. s.name .. reset .. " " .. state_color .. dot .. reset .. marker,
-        table.concat(parts, "  "),
-        "",
-      }, 2 * depth)
-      for r, row in ipairs(block) do lines[base + r] = row end
-    end
-  end
-  -- The private first line is the native bridge contract: Lua selects the
-  -- number of rows and all visual treatment, while Rust only maps input and
-  -- viewport positions onto those rows.
-  table.insert(lines, 1, "\30" .. tostring(rows))
-  -- A successful ordering hook adds a second private line for Rust.
-  if has_order then
-    local names = {}
-    for _, item in ipairs(ordered) do
-      local name = (item.session or item).name
-      names[#names + 1] = name
-    end
-    table.insert(lines, 2, "\31" .. table.concat(names, "\t"))
+    if view.has_order then lines[#lines + 1] = "\31" .. table.concat(names, "\t") end
+    for _, entry in ipairs(view.entries) do for _, line in ipairs(entry.lines) do lines[#lines + 1] = line end end
   end
   remuda.buffer.new("*sessions*"):set(table.concat(lines, "\n"))
 end
-register(
-  "_refresh_sessions_buffer",
-  "Rebuild the *sessions* buffer's content.",
-  "_refresh_sessions_buffer(width, selected) -> nil"
-)
+register("_refresh_sessions_buffer", "Rebuild the *sessions* buffer's content.", "_refresh_sessions_buffer(width, selected) -> nil")
 
 -- Render the live registry for the manual command. The registry is the source
 -- of truth for every host-bound and Lua-defined word; format changes only affect

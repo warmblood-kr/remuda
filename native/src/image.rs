@@ -232,6 +232,11 @@ enum JobKind {
         allow_pending: bool,
         caller: CallerContext,
     },
+    RenderSessionView {
+        sessions: Vec<remuda_core::SessionSummary>,
+        width: u16,
+        _permit: RenderViewPermit,
+    },
     StopModules,
     RunSchedules {
         now: f64,
@@ -259,6 +264,14 @@ enum JobKind {
         entered: Sender<()>,
         release: Arc<Mutex<Receiver<()>>>,
     },
+}
+
+static RENDER_VIEW_BUSY: AtomicBool = AtomicBool::new(false);
+struct RenderViewPermit;
+impl Drop for RenderViewPermit {
+    fn drop(&mut self) {
+        RENDER_VIEW_BUSY.store(false, Ordering::Release);
+    }
 }
 
 /// How much the daemon can say about the process that submitted this Eval.
@@ -785,6 +798,32 @@ impl Image {
             .map_err(|_| "the image stopped without answering".to_string())?
     }
 
+    /// One bounded view job at a time, including jobs whose caller timed out.
+    pub(crate) fn render_session_view(
+        &self,
+        sessions: Vec<remuda_core::SessionSummary>,
+        width: u16,
+    ) -> Result<String, String> {
+        RENDER_VIEW_BUSY
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| "session view renderer busy".to_owned())?;
+        let permit = RenderViewPermit;
+        let (reply, answer) = channel();
+        self.jobs
+            .send(Job {
+                kind: JobKind::RenderSessionView {
+                    sessions,
+                    width,
+                    _permit: permit,
+                },
+                reply: Some(reply),
+            })
+            .map_err(|_| "the image is not running".to_owned())?;
+        answer
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|_| "session view renderer timed out".to_owned())?
+    }
+
     /// Best-effort module cleanup for clean daemon shutdown. A stuck user
     /// callback must not hold shutdown indefinitely.
     pub fn stop_modules_bounded(&self) {
@@ -850,6 +889,12 @@ fn process_job(
                     handle.pending.finish_eval(pending_id);
                     answer
                 }
+            }
+            JobKind::RenderSessionView {
+                sessions, width, ..
+            } => {
+                *caller.borrow_mut() = CallerContext::default();
+                budget.run(lua, || render_session_view(lua, sessions, *width))
             }
             JobKind::StopModules => {
                 *caller.borrow_mut() = CallerContext::default();
@@ -1149,6 +1194,48 @@ fn deliver_http(
         Err(error) => value.set("error", error)?,
     }
     callback.call::<()>(value)
+}
+
+fn render_session_view(
+    lua: &Lua,
+    sessions: &[remuda_core::SessionSummary],
+    width: u16,
+) -> Result<String, String> {
+    let render = || -> mlua::Result<(usize, Vec<remuda_core::session_view::ViewEntry>)> {
+        let remuda: mlua::Table = lua.globals().get("remuda")?;
+        let function: mlua::Function = remuda.get("_render_sessions_snapshot")?;
+        let rows = crate::script::session_rows(lua, sessions.to_vec())?;
+        let result: mlua::Table = function.call((rows, width))?;
+        let height: usize = result.get("height")?;
+        let items: mlua::Table = result.get("entries")?;
+        if items.raw_len() > 256 {
+            return Err(mlua::Error::runtime("too many view rows"));
+        }
+        let mut entries = Vec::new();
+        for entry in items.sequence_values::<mlua::Table>() {
+            let entry = entry?;
+            let lines: mlua::Table = entry.get("lines")?;
+            if lines.raw_len() > 3 {
+                return Err(mlua::Error::runtime("too many view lines"));
+            }
+            entries.push(remuda_core::session_view::ViewEntry {
+                name: entry.get("name")?,
+                instance_id: entry.get("instance_id")?,
+                lines: lines
+                    .sequence_values::<String>()
+                    .collect::<mlua::Result<Vec<_>>>()?,
+            });
+        }
+        Ok((height, entries))
+    };
+    let (height, entries) = render().map_err(|error| error.to_string())?;
+    let view = remuda_core::session_view::SessionView::new(sessions.to_vec(), height, entries);
+    view.validate().map_err(str::to_owned)?;
+    let result = serde_json::to_string(&view).map_err(|error| error.to_string())?;
+    if result.len() > 32768 {
+        return Err("session view too large".into());
+    }
+    Ok(result)
 }
 
 /// Evaluate one chunk, expression-first: `return <code>` is tried before plain
@@ -1462,6 +1549,167 @@ mod tests {
         lua.globals().set("remuda", remuda).unwrap();
         lua.load(include_str!("tools.lua")).exec().unwrap();
         lua
+    }
+
+    #[test]
+    fn session_snapshot_renderer_binds_decorated_rows_to_immutable_instances() {
+        let lua = lifecycle_lua();
+        lua.load(
+            r#"
+            remuda.buffer = {new = function() error('shared buffer touched') end}
+            remuda.session_order = function(sessions)
+                return {{name='child', depth=1}, {name='lead', depth=0}}
+            end
+            remuda.session_list_decorate = function(session)
+                local description = session.name == 'child' and 'codex · model · 42%' or 'claude'
+                session.instance_id = 'tampered'
+                return { layout='compact', description=description }
+            end
+            local view = remuda._render_sessions_snapshot({
+                {name='lead', instance_id='lead-1', alive=true},
+                {name='child', instance_id='child-1', alive=true},
+            }, 50, 'child', 'child-1')
+            assert(view.height == 1 and #view.entries == 2)
+            assert(view.entries[1].name == 'child' and view.entries[1].instance_id == 'child-1')
+            assert(view.entries[1].lines[1]:find('codex', 1, true))
+            assert(view.entries[1].lines[1]:sub(1, 2) == '  ')
+            assert(view.entries[2].name == 'lead' and view.entries[2].instance_id == 'lead-1')
+
+        "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn session_snapshot_renderer_recreated_name_does_not_inherit_selection() {
+        let lua = lifecycle_lua();
+        lua.load(
+            r#"
+            local view = remuda._render_sessions_snapshot({
+                {name='work', instance_id='new', alive=true}
+            }, 40, 'work', 'old')
+            assert(view.entries[1].instance_id == 'new')
+            assert(not view.entries[1].lines[1]:find('\27[1;7;36m', 1, true))
+            local selected = remuda._render_sessions_snapshot({
+                {name='work', instance_id='new', alive=true}
+            }, 40, 'work', 'new')
+            assert(selected.entries[1].lines[1]:find('\27[1;7;36m', 1, true))
+        "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn local_compact_and_plain_sessions_render_without_sparse_rows() {
+        let lua = lifecycle_lua();
+        lua.load(r#"
+            local contents = 'unchanged'
+            remuda.session = {list = function() return {
+                {name='agent-one', instance_id='1', alive=true},
+                {name='shell', instance_id='2', alive=true},
+                {name='agent-two', instance_id='3', alive=true},
+            } end}
+            remuda.buffer = {new = function(name)
+                assert(name == '*sessions*')
+                return {set = function(_, value) contents = value end}
+            end}
+            remuda.session_list_decorate = function(row)
+                if row.name ~= 'shell' then return {layout='compact', description='codex'} end
+            end
+            remuda._refresh_sessions_buffer(80, 0, 'agent-one')
+            assert(contents:sub(1, 2) == '\30' .. '1')
+            local _, line_count = contents:gsub('\n', '')
+            assert(line_count == 3, contents)
+            assert(contents:find('agent%-one') and contents:find('shell') and contents:find('agent%-two'))
+        "#).exec().unwrap();
+    }
+
+    #[test]
+    fn snapshot_hooks_cannot_mutate_nested_caller_data() {
+        let lua = lifecycle_lua();
+        lua.load(r#"
+            local source = {name='one', instance_id='i', alive=true, program_status={state='working', nested={count=2}}}
+            remuda.session_order = function(rows) rows[1].program_status.nested.count=9; return {} end
+            remuda.session_list_decorate = function(row) row.program_status.state='idle' end
+            remuda._render_sessions_snapshot({source}, 30)
+            assert(source.program_status.state == 'working')
+            assert(source.program_status.nested.count == 2)
+        "#).exec().unwrap();
+    }
+
+    #[test]
+    fn local_session_list_accepts_an_empty_session_name() {
+        let lua = lifecycle_lua();
+        lua.load(r#"
+            local text
+            remuda.session = {list=function() return {{name='',alive=true},{name='other',alive=true}} end}
+            remuda.buffer = {new=function() return {set=function(_,value) text=value end} end}
+            remuda._refresh_sessions_buffer(80, 0, '')
+            assert(text:find('other', 1, true), text)
+            assert(text:find('\27[1;7;36m\27[0m', 1, true), text)
+            assert(not pcall(remuda._render_sessions_snapshot, {{name='',instance_id='i'}}, 30))
+        "#).exec().unwrap();
+    }
+
+    #[test]
+    fn local_selection_without_a_name_uses_the_reordered_index() {
+        let lua = lifecycle_lua();
+        lua.load(r#"
+            local text
+            remuda.session = {list=function() return {{name='alpha', alive=true},{name='bravo',alive=true}} end}
+            remuda.session_order = function() return {{name='bravo'},{name='alpha'}} end
+            remuda.buffer = {new=function() return {set=function(_, value) text=value end} end}
+            remuda._refresh_sessions_buffer(80, 0, nil)
+            assert(text:find('\27[1;7;36mbravo', 1, true), text)
+        "#).exec().unwrap();
+    }
+
+    #[test]
+    fn strict_snapshot_rejects_sparse_or_extra_entries() {
+        let lua = lifecycle_lua();
+        lua.load(
+            r#"
+            local row={name='x', instance_id='id'}
+            assert(not pcall(remuda._render_sessions_snapshot, {[1]=row,[3]=row}, 30))
+            assert(not pcall(remuda._render_sessions_snapshot, {row, extra=row}, 30))
+        "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn snapshot_truncation_keeps_utf8_codepoints() {
+        let lua = lifecycle_lua();
+        lua.load(
+            r#"
+            remuda.session_list_decorate = function()
+                return {description=string.rep('é', 79) .. '한', layout='compact'}
+            end
+            local view=remuda._render_sessions_snapshot({{name='x',instance_id='i'}},30)
+            assert(utf8.len(view.entries[1].lines[1]), 'invalid UTF-8 in row')
+        "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn session_snapshot_renderer_refuses_duplicate_or_unbound_identity() {
+        let lua = lifecycle_lua();
+        lua.load(
+            r#"
+            assert(type(remuda._render_sessions_snapshot) == 'function')
+            local function valid(rows) return pcall(remuda._render_sessions_snapshot, rows, 30) end
+            assert(not valid({{name='x', instance_id='a'}, {name='x', instance_id='b'}}))
+            assert(not valid({{name='x'}}))
+            assert(not valid({{name='x', instance_id=''}}))
+        "#,
+        )
+        .exec()
+        .unwrap();
     }
 
     #[test]

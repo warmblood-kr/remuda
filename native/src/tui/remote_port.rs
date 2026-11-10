@@ -50,12 +50,15 @@ impl PeerLink for NoiseLink {
     }
 }
 
+type ScreenKey = (String, String, usize);
+type CachedScreen = (ScreenKey, Result<Response, String>);
+
 #[derive(Default)]
 struct Cache {
     list: Option<Result<Response, String>>,
-    /// The screen the user is looking at: (name, scrollback) and its answer.
-    wanted: Option<(String, usize)>,
-    screen: Option<((String, usize), Result<Response, String>)>,
+    /// The screen the user is looking at: (name, instance, scrollback).
+    wanted: Option<ScreenKey>,
+    screen: Option<CachedScreen>,
     last_ok: Option<Instant>,
 }
 
@@ -63,7 +66,24 @@ struct Shared {
     cache: Mutex<Cache>,
     changed: Condvar,
     stop: AtomicBool,
+    view: Mutex<ViewCache>,
 }
+
+#[derive(Default)]
+struct ViewCache {
+    key: Option<ViewKey>,
+    generation: u64,
+    in_flight: bool,
+    started: Option<Instant>,
+    answer: Option<(Instant, remuda_core::session_view::SessionView)>,
+}
+#[derive(Clone, PartialEq, Eq)]
+struct ViewKey {
+    width: u16,
+    selected: Option<(String, String)>,
+}
+const VIEW_TTL: Duration = Duration::from_secs(2);
+const VIEW_RETRY: Duration = Duration::from_millis(250);
 
 pub struct RemotePort {
     link: Arc<dyn PeerLink>,
@@ -92,6 +112,7 @@ impl RemotePort {
             cache: Mutex::new(Cache::default()),
             changed: Condvar::new(),
             stop: AtomicBool::new(false),
+            view: Mutex::new(ViewCache::default()),
         });
         spawn_reader(link.clone(), shared.clone());
         let (lines, replies) = spawn_writer(link.clone());
@@ -153,13 +174,13 @@ fn spawn_reader(link: Arc<dyn PeerLink>, shared: Arc<Shared>) {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .wanted
                 .clone();
-            let screen = wanted.map(|(name, scrollback)| {
+            let screen = wanted.map(|(name, instance, scrollback)| {
                 let request = Request::CaptureStyled {
                     name: name.clone(),
                     scrollback,
                 };
                 (
-                    (name, scrollback),
+                    (name, instance, scrollback),
                     link.send(&request, REMOTE_REQUEST_TIMEOUT),
                 )
             });
@@ -205,48 +226,231 @@ fn spawn_writer(
     (line_tx, reply_rx)
 }
 
-/// Live keys to a peer are not wired yet; taking them is refused.
-pub struct NoRemoteKeys;
+/// A bounded, ordered stream of input to one exact remote session instance.
+pub struct RemoteKeys {
+    sender: mpsc::SyncSender<Vec<u8>>,
+    failure: Arc<Mutex<Option<String>>>,
+    stopped: Arc<AtomicBool>,
+}
 
-impl KeyStream for NoRemoteKeys {
-    fn keys(&self, _bytes: &[u8]) -> io::Result<()> {
-        Err(io::Error::other(
-            "live keys to a remote session are not available yet",
-        ))
+impl Drop for RemoteKeys {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::SeqCst);
     }
 }
 
+impl KeyStream for RemoteKeys {
+    fn keys(&self, bytes: &[u8]) -> io::Result<()> {
+        self.check()?;
+        if bytes.len() > crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES {
+            return Err(io::Error::other(
+                "remote input exceeds the batch limit; nothing was queued",
+            ));
+        }
+        if !bytes.is_empty() {
+            self.sender.try_send(bytes.to_vec()).map_err(|error| {
+                io::Error::other(format!("remote input could not be queued: {error}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn check(&self) -> io::Result<()> {
+        match self
+            .failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            Some(error) => Err(io::Error::other(error.clone())),
+            None => Ok(()),
+        }
+    }
+}
+
+fn remote_keys(
+    link: Arc<dyn PeerLink>,
+    name: String,
+    instance_id: String,
+) -> io::Result<RemoteKeys> {
+    let mut id = [0u8; 16];
+    getrandom::fill(&mut id).map_err(|error| io::Error::other(error.to_string()))?;
+    let client_id: String = id.iter().map(|byte| format!("{byte:02x}")).collect();
+    let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(128);
+    let failure = Arc::new(Mutex::new(None));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let worker_failure = failure.clone();
+    let worker_stopped = stopped.clone();
+    std::thread::spawn(move || {
+        for (index, bytes) in receiver.into_iter().enumerate() {
+            if worker_stopped.load(Ordering::SeqCst) {
+                break;
+            }
+            let request = Request::Input {
+                name: name.clone(),
+                instance_id: instance_id.clone(),
+                client_id: client_id.clone(),
+                seq: index as u64 + 1,
+                bytes,
+            };
+            let result = link.send(&request, REMOTE_LINE_TIMEOUT);
+            if !matches!(result, Ok(Response::Ack { .. })) {
+                let message = format!("remote input stopped ({result:?}); delivery may be uncertain; remaining keys discarded");
+                *worker_failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
+                break;
+            }
+        }
+    });
+    Ok(RemoteKeys {
+        sender,
+        failure,
+        stopped,
+    })
+}
+
 impl SessionPort for RemotePort {
-    type Keys = NoRemoteKeys;
+    type Keys = RemoteKeys;
 
     fn request(&self, request: &Request) -> io::Result<Response> {
         match request {
             Request::List => self.cached(|cache| cache.list.clone()),
-            Request::CaptureStyled { name, scrollback } => {
-                let key = (name.clone(), *scrollback);
-                {
-                    let mut cache = self.cache();
-                    if cache.wanted.as_ref() != Some(&key) {
-                        cache.wanted = Some(key.clone());
-                        self.shared.changed.notify_all();
-                    }
-                }
-                // The exact view if read, else this session's last screen.
-                self.cached(|cache| match &cache.screen {
-                    Some((read, answer)) if *read == key => Some(answer.clone()),
-                    Some((read, Ok(answer))) if read.0 == key.0 => Some(Ok(answer.clone())),
-                    _ => None,
-                })
-            }
+            Request::CaptureStyled { .. } => Err(io::Error::other(
+                "remote preview requires an exact instance",
+            )),
             // One-shot user actions (close, new, resize) wait for their answer.
             other => self.link.send(other, REMOTE_REQUEST_TIMEOUT),
         }
     }
 
-    fn hold(&self, _name: &str) -> io::Result<NoRemoteKeys> {
-        Err(io::Error::other(
-            "live keys to a remote session are not available yet; press m to send a line",
-        ))
+    fn hold(&self, _name: &str) -> io::Result<RemoteKeys> {
+        Err(io::Error::other("remote input requires an exact instance"))
+    }
+
+    fn hold_instance(&self, name: &str, instance: Option<&str>) -> io::Result<RemoteKeys> {
+        let expected = instance
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| io::Error::other("peer did not provide a session instance"))?;
+        let Response::Sessions(rows) = self.request(&Request::List)? else {
+            return Err(io::Error::other("peer did not return a session list"));
+        };
+        let current = crate::cluster_api::pinned_instance(&rows, name).map_err(io::Error::other)?;
+        if current != expected {
+            return Err(io::Error::other("session instance changed; select again"));
+        }
+        remote_keys(self.link.clone(), name.to_owned(), expected.to_owned())
+    }
+
+    fn capture_instance(
+        &self,
+        name: &str,
+        instance: Option<&str>,
+        scrollback: usize,
+    ) -> io::Result<Response> {
+        let expected = instance
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| io::Error::other("peer did not provide a session instance"))?;
+        let Response::Sessions(rows) = self.request(&Request::List)? else {
+            return Err(io::Error::other("peer did not return a session list"));
+        };
+        let mut matching = rows.iter().filter(|row| row.name == name);
+        let Some(current) = matching.next() else {
+            return Err(io::Error::other("session is no longer listed"));
+        };
+        if matching.next().is_some()
+            || current.unavailable
+            || current.instance_id.as_deref() != Some(expected)
+        {
+            return Err(io::Error::other(
+                "session instance changed or is unavailable; preview unavailable",
+            ));
+        }
+        let key = (name.to_owned(), expected.to_owned(), scrollback);
+        {
+            let mut cache = self.cache();
+            if cache.wanted.as_ref() != Some(&key) {
+                cache.wanted = Some(key.clone());
+                self.shared.changed.notify_all();
+            }
+        }
+        self.cached(|cache| match &cache.screen {
+            Some((read, answer))
+                if read.0 == key.0 && read.1 == key.1 && (read.2 == key.2 || answer.is_ok()) =>
+            {
+                Some(match answer {
+                    Ok(Response::StyledScreen {
+                        instance_id: Some(id),
+                        ..
+                    }) if id == expected => answer.clone(),
+                    Ok(Response::StyledScreen {
+                        instance_id: None, ..
+                    }) => Err("peer cannot prove preview instance; upgrade the peer".into()),
+                    Ok(Response::StyledScreen { .. }) => {
+                        Err("session instance changed; preview unavailable".into())
+                    }
+                    other => other.clone(),
+                })
+            }
+            _ => None,
+        })
+    }
+
+    fn session_list_view(
+        &self,
+        width: u16,
+        selected: Option<(&str, &str)>,
+    ) -> Option<remuda_core::session_view::SessionView> {
+        let key = ViewKey {
+            width,
+            selected: selected.map(|(name, instance)| (name.into(), instance.into())),
+        };
+        let mut cache = self
+            .shared
+            .view
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.key.as_ref() != Some(&key) {
+            cache.key = Some(key.clone());
+            cache.generation = cache.generation.wrapping_add(1);
+            cache.answer = None;
+            cache.started = None;
+        }
+        let now = Instant::now();
+        let answer = cache
+            .answer
+            .as_ref()
+            .filter(|(started, _)| now.duration_since(*started) < VIEW_TTL)
+            .map(|(_, view)| view.clone());
+        if !cache.in_flight
+            && cache
+                .started
+                .is_none_or(|started| now.duration_since(started) >= VIEW_RETRY)
+        {
+            cache.in_flight = true;
+            cache.started = Some(now);
+            let generation = cache.generation;
+            let shared = self.shared.clone();
+            let link = self.link.clone();
+            std::thread::spawn(move || {
+                let response = link.send(
+                    &Request::RenderedSessionList { width: key.width },
+                    REMOTE_REQUEST_TIMEOUT,
+                );
+                let mut cache = shared
+                    .view
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                cache.in_flight = false;
+                if cache.generation == generation {
+                    cache.answer = match response {
+                        Ok(Response::RenderedSessionList(view)) if now.elapsed() < VIEW_TTL => {
+                            Some((now, view))
+                        }
+                        _ => None,
+                    };
+                }
+            });
+        }
+        answer
     }
 
     fn probe(&self) -> io::Result<()> {
@@ -324,7 +528,23 @@ mod tests {
         fn send(&self, request: &Request, _timeout: Duration) -> io::Result<Response> {
             self.sent.lock().unwrap().push(request.clone());
             match request {
-                Request::List => Ok(Response::Sessions(Vec::new())),
+                Request::List => Ok(Response::Sessions(vec![remuda_core::SessionSummary {
+                    id: "id".into(),
+                    name: "build".into(),
+                    instance_id: Some("i".into()),
+                    output_version: None,
+                    alive: true,
+                    idle: Duration::ZERO,
+                    output_idle: None,
+                    size: remuda_core::Size::new(80, 24),
+                    attached: false,
+                    human_idle: None,
+                    mouse_tracking: false,
+                    unavailable: false,
+                    program_status: None,
+                    program_status_age_ms: None,
+                    remote_input_disabled: false,
+                }])),
                 Request::CaptureStyled { .. } => Ok(Response::Error("no such session".into())),
                 _ => {
                     let release = self.release.lock().unwrap();
@@ -339,6 +559,184 @@ mod tests {
         fn release(&self) {
             *self.release.lock().unwrap() = true;
             self.released.notify_all();
+        }
+    }
+
+    #[test]
+    fn cached_preview_never_crosses_same_name_instance_changes() {
+        struct Peer(AtomicBool);
+        impl PeerLink for Peer {
+            fn send(&self, request: &Request, _: Duration) -> io::Result<Response> {
+                let instance = if self.0.load(Ordering::SeqCst) {
+                    "new"
+                } else {
+                    "old"
+                };
+                match request {
+                    Request::List => Ok(Response::Sessions(vec![remuda_core::SessionSummary {
+                        id: instance.into(),
+                        name: "proof".into(),
+                        instance_id: Some(instance.into()),
+                        output_version: None,
+                        alive: true,
+                        idle: Duration::ZERO,
+                        output_idle: None,
+                        size: remuda_core::Size::new(80, 24),
+                        attached: false,
+                        human_idle: None,
+                        mouse_tracking: false,
+                        unavailable: false,
+                        program_status: None,
+                        program_status_age_ms: None,
+                        remote_input_disabled: false,
+                    }])),
+                    Request::CaptureStyled { .. } => Ok(Response::StyledScreen {
+                        rows: vec![],
+                        instance_id: Some(instance.into()),
+                        output_version: Some(1),
+                        wrapped: vec![],
+                        scrollback_len: 0,
+                        scrollback_total: 0,
+                        cursor: remuda_core::agent::Cursor {
+                            row: 0,
+                            col: 0,
+                            visible: false,
+                        },
+                    }),
+                    _ => Ok(Response::Error("unsupported".into())),
+                }
+            }
+        }
+        let peer = Arc::new(Peer(AtomicBool::new(false)));
+        let port = RemotePort::with_link("peer", peer.clone());
+        assert!(
+            matches!(port.capture_instance("proof", Some("old"), 0), Ok(Response::StyledScreen { instance_id: Some(id), .. }) if id == "old")
+        );
+        peer.0.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match port.capture_instance("proof", Some("new"), 0) {
+                Ok(Response::StyledScreen {
+                    instance_id: Some(id),
+                    ..
+                }) => {
+                    assert_eq!(id, "new");
+                    break;
+                }
+                Err(_) => {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => panic!("unexpected preview: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn stalled_view_never_blocks_the_base_list_and_old_peer_falls_back() {
+        let peer = Arc::new(SlowPeer::default());
+        let port = RemotePort::with_link("peer", peer.clone());
+        let started = Instant::now();
+        assert!(port.session_list_view(40, None).is_none());
+        assert!(matches!(
+            port.request(&Request::List),
+            Ok(Response::Sessions(_))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        peer.release();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            port.session_list_view(40, None).is_none(),
+            "unsupported view keeps the plain list"
+        );
+    }
+
+    #[test]
+    fn stale_or_wrong_generation_views_are_not_exposed() {
+        let peer = Arc::new(SlowPeer::default());
+        let port = RemotePort::with_link("peer", peer.clone());
+        let old = ViewKey {
+            width: 40,
+            selected: None,
+        };
+        {
+            let mut cache = port.shared.view.lock().unwrap();
+            cache.key = Some(old);
+            cache.started = Some(Instant::now());
+            cache.answer = Some((
+                Instant::now() - VIEW_TTL,
+                remuda_core::session_view::SessionView::new(vec![], 1, vec![]),
+            ));
+        }
+        assert!(
+            port.session_list_view(40, None).is_none(),
+            "expired view is discarded"
+        );
+        assert!(
+            port.session_list_view(20, None).is_none(),
+            "resizing drops the old view"
+        );
+        assert!(
+            port.session_list_view(20, Some(("session", "new-instance")))
+                .is_none(),
+            "selection changes drop old views"
+        );
+        peer.release();
+    }
+
+    #[test]
+    fn late_success_for_old_width_is_discarded_before_next_request() {
+        struct Peer {
+            started: AtomicBool,
+            release: Mutex<bool>,
+            gate: Condvar,
+        }
+        impl PeerLink for Peer {
+            fn send(&self, request: &Request, _: Duration) -> io::Result<Response> {
+                match request {
+                    Request::List => Ok(Response::Sessions(vec![])),
+                    Request::RenderedSessionList { width: 40 } => {
+                        self.started.store(true, Ordering::SeqCst);
+                        let release = self.release.lock().unwrap();
+                        let _release = self.gate.wait_while(release, |ok| !*ok).unwrap();
+                        Ok(Response::RenderedSessionList(
+                            remuda_core::session_view::SessionView::new(vec![], 1, vec![]),
+                        ))
+                    }
+                    Request::RenderedSessionList { .. } => Ok(Response::RenderedSessionList(
+                        remuda_core::session_view::SessionView::new(vec![], 1, vec![]),
+                    )),
+                    _ => Ok(Response::Error("unsupported".into())),
+                }
+            }
+        }
+        let peer = Arc::new(Peer {
+            started: AtomicBool::new(false),
+            release: Mutex::new(false),
+            gate: Condvar::new(),
+        });
+        let port = RemotePort::with_link("peer", peer.clone());
+        assert!(port.session_list_view(40, None).is_none());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !peer.started.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(port.session_list_view(20, None).is_none());
+        *peer.release.lock().unwrap() = true;
+        peer.gate.notify_all();
+        while port.shared.view.lock().unwrap().in_flight {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            port.shared.view.lock().unwrap().answer.is_none(),
+            "old response must not be cached"
+        );
+        assert!(port.session_list_view(20, None).is_none());
+        while port.session_list_view(20, None).is_none() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -402,10 +800,7 @@ mod tests {
     fn the_shown_screen_is_read_for_the_session_asked_for() {
         let peer = Arc::new(SlowPeer::default());
         let port = RemotePort::with_link("peer", peer.clone());
-        let answer = port.request(&Request::CaptureStyled {
-            name: "build".into(),
-            scrollback: 0,
-        });
+        let answer = port.capture_instance("build", Some("i"), 0);
         assert!(matches!(answer, Ok(Response::Error(reason)) if reason == "no such session"));
         assert!(peer.sent.lock().unwrap().iter().any(|request| matches!(
             request,

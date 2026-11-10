@@ -294,6 +294,7 @@ fn write_response(stream: &mut crate::ipc::Stream, reply: Vec<u8>) -> std::io::R
 pub fn authorize(request: &Request) -> Result<(), String> {
     match request {
         Request::List
+        | Request::RenderedSessionList { width: 1..=512 }
         | Request::RemoteInputSupport
         | Request::CaptureStyled { .. }
         | Request::Sync { .. } => Ok(()),
@@ -329,6 +330,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
             }
             validate_batch(client_id, *seq, bytes).map(|_| ())
         }
+        Request::RenderedSessionList { .. } => Err("invalid rendered list width".into()),
         Request::RemoteInput { .. } => Err(refusal("RemoteInput")),
         Request::SetRemoteInputOptOut { .. } => Err(refusal("SetRemoteInputOptOut")),
         Request::New { .. } => Err(refusal("New")),

@@ -2535,7 +2535,7 @@ fn host_builds(lua: &Lua, builds: Vec<remuda_core::protocol::HostBuild>) -> mlua
     Ok(Value::Table(rows))
 }
 
-fn session_rows(
+pub(crate) fn session_rows(
     lua: &Lua,
     list: Vec<remuda_core::registry::SessionSummary>,
 ) -> mlua::Result<Value> {
@@ -2604,6 +2604,9 @@ fn set_program_status(
 /// would otherwise carry on over a session that was never created.
 fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
     match response {
+        Response::RenderedSessionList(_) => Err(mlua::Error::runtime(
+            "rendered session view is not exposed to scripts",
+        )),
         Response::Ok => Ok(Value::Nil),
         Response::Ack { .. } => Ok(Value::Nil),
         Response::Uncertain => Err(mlua::Error::runtime(

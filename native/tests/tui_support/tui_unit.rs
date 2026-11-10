@@ -1388,13 +1388,19 @@ fn killing_a_live_session_asks_and_killing_a_dead_one_does_not() {
     assert_eq!(ui.mode, Mode::Confirm("live".into()));
     assert_eq!(
         ui.on_key(press(KeyCode::Char('y'))),
-        Action::Kill("live".into())
+        Action::Kill {
+            name: "live".into(),
+            instance_id: Some("test-session".into())
+        }
     );
 
     let mut dead = make_ui(vec![row("dead", false, false)]);
     assert_eq!(
         dead.on_key(press(KeyCode::Char('x'))),
-        Action::Kill("dead".into())
+        Action::Kill {
+            name: "dead".into(),
+            instance_id: Some("test-session".into())
+        }
     );
 }
 

@@ -74,7 +74,11 @@ pub enum Action {
     /// Bytes for the focused session's pty, already encoded.
     Type(Vec<u8>),
     Start(String),
-    Kill(String),
+    /// The identity is captured when the user asks to close the session.
+    Kill {
+        name: String,
+        instance_id: Option<String>,
+    },
     /// `focus_session` succeeded: keyboard and mouse now point at this name.
     /// `run`'s `reconcile_hold` re-attaches if it differs from what's held.
     Focus(String),
@@ -132,6 +136,8 @@ pub struct Ui {
     yank: String,
     scrollback: HashMap<String, ScrollState>,
     pub mode: Mode,
+    /// Immutable target captured when the confirmation was opened.
+    confirmation_target: Option<(String, Option<String>)>,
     pub focus: Focus,
     /// Visual mode (tmux copy-mode-vi): `visual_cursor` moves; the selection
     /// (`text_selection`) exists only once `v`/Space anchors it there.
@@ -203,6 +209,7 @@ impl Ui {
             // waits. It must never spawn a shell on its own — that silent spawn
             // is half of the incident `steps/012` is named after.
             mode: Mode::Browse,
+            confirmation_target: None,
             focus: Focus::List,
             visual: false,
             visual_cursor: TextPoint { row: 0, col: 0 },
@@ -254,6 +261,16 @@ impl Ui {
         let Some(session) = self.selected() else {
             return Action::Nothing;
         };
+        if self
+            .sessions
+            .iter()
+            .filter(|row| row.name == session.name)
+            .count()
+            != 1
+        {
+            self.notice = Some("duplicate session names; action refused".into());
+            return Action::Nothing;
+        }
         if !session.alive {
             self.notice = Some(format!("{} has exited; nothing to send to", session.name));
             return Action::Nothing;
@@ -1074,6 +1091,16 @@ impl Ui {
         let Some(session) = self.selected() else {
             return Action::Nothing;
         };
+        if self
+            .sessions
+            .iter()
+            .filter(|row| row.name == session.name)
+            .count()
+            != 1
+        {
+            self.notice = Some("duplicate session names; action refused".into());
+            return Action::Nothing;
+        }
         if session.attached {
             self.notice = Some(format!("{} is attached by someone else", session.name));
             return Action::Nothing;
@@ -1099,22 +1126,62 @@ impl Ui {
     }
 
     fn kill_selected(&mut self) -> Action {
-        let Some((name, alive)) = self.selected().map(|s| (s.name.clone(), s.alive)) else {
+        let Some((name, instance, alive)) = self
+            .selected()
+            .map(|s| (s.name.clone(), s.instance_id.clone(), s.alive))
+        else {
             return Action::Nothing;
         };
+        if self
+            .sessions
+            .iter()
+            .filter(|session| session.name == name)
+            .count()
+            != 1
+        {
+            self.notice = Some("duplicate session names; action refused".into());
+            return Action::Nothing;
+        }
         self.notice = None;
         if alive {
+            self.confirmation_target = Some((name.clone(), instance));
             self.mode = Mode::Confirm(name);
             Action::Nothing
         } else {
-            Action::Kill(name)
+            Action::Kill {
+                name,
+                instance_id: instance,
+            }
         }
     }
 
     fn confirm_key(&mut self, key: KeyEvent, name: String) -> Action {
         self.mode = Mode::Browse;
+        let target = self.confirmation_target.take();
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => Action::Kill(name),
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if target.as_ref().is_some_and(|(target_name, instance)| {
+                    target_name == &name
+                        && self
+                            .sessions
+                            .iter()
+                            .filter(|session| session.name == name)
+                            .count()
+                            == 1
+                        && self
+                            .sessions
+                            .iter()
+                            .any(|session| session.name == name && session.instance_id == *instance)
+                }) {
+                    Action::Kill {
+                        name,
+                        instance_id: target.and_then(|(_, instance)| instance),
+                    }
+                } else {
+                    self.notice = Some("session changed; confirmation cancelled".into());
+                    Action::Nothing
+                }
+            }
             _ => Action::Nothing,
         }
     }
@@ -1991,45 +2058,7 @@ pub fn crop(screen: &str, cols: u16, rows: u16, pan: u16) -> (Vec<String>, bool)
 /// last cell. Counts real display width via `visible_width`, not `char`s —
 /// a wide (CJK) name used to overflow this budget. See steps/025.
 fn fit(text: &str, width: u16) -> String {
-    let width = width as usize;
-    if width == 0 {
-        return String::new();
-    }
-    if visible_width(text) > width {
-        let mut out = String::new();
-        let mut used = 0usize;
-        let mut chars = text.chars();
-        let mut styled = false;
-        while let Some(c) = chars.next() {
-            if c == '\x1b' {
-                styled = true;
-                out.push(c);
-                for escape in chars.by_ref() {
-                    out.push(escape);
-                    if escape == 'm' {
-                        break;
-                    }
-                }
-                continue;
-            }
-            let w = char_width(c);
-            if used + w > width.saturating_sub(1) {
-                break;
-            }
-            out.push(c);
-            used += w;
-        }
-        if styled {
-            out.push_str("\x1b[0m");
-        }
-        out.push('→');
-        out.push_str(&" ".repeat(width.saturating_sub(used + 1)));
-        out
-    } else {
-        let mut out = text.to_string();
-        out.push_str(&" ".repeat(width - visible_width(text)));
-        out
-    }
+    remuda_core::session_view::fit(text, width)
 }
 
 /// The whole frame as one string of text and ANSI cursor moves. Pure on
@@ -2523,8 +2552,10 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
     let content = match ui.sessions_text.get(row) {
         Some(text) => text.clone(),
         None if !row.is_multiple_of(ui.session_rows) => String::new(),
-        None if session_index == ui.selected => format!("\x1b[7m{}\x1b[0m", session.name),
-        None => session.name.clone(),
+        None if session_index == ui.selected => {
+            format!("\x1b[7m{}\x1b[0m", safe_session_label(&session.name))
+        }
+        None => safe_session_label(&session.name),
     };
     fit_session_row(&content, width)
 }
@@ -2533,25 +2564,56 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
 /// the horse in the final three cells; other rows reserve the same cells.
 /// Only the styled name is shortened, one Unicode scalar at a time, by `fit`.
 fn fit_session_row(content: &str, width: u16) -> String {
-    const MARKER: &str = " 🏇";
-    const PLAIN_PAD: &str = "   ";
-    for state in [" \x1b[32m●\x1b[0m", " \x1b[31m●\x1b[0m"] {
-        if let Some(name) = content.strip_suffix(state) {
-            let suffix = format!("{state}{PLAIN_PAD}");
-            let name_width = width.saturating_sub(visible_width(&suffix) as u16);
-            return format!("{}{}", fit(name, name_width), suffix);
-        }
-        let attached = format!("{state}{MARKER}");
-        if let Some(name) = content.strip_suffix(&attached) {
-            let name_width = width.saturating_sub(visible_width(&attached) as u16);
-            return format!("{}{}", fit(name, name_width), attached);
+    remuda_core::session_view::fit_session_row(content, width)
+}
+
+/// Validate remote Lua rows using the exact paint path and local selection.
+#[cfg(test)]
+fn validated_peer_view(
+    view: &remuda_core::session_view::SessionView,
+    width: u16,
+    selected: Option<(&str, &str)>,
+) -> Result<remuda_core::session_view::ValidatedView, &'static str> {
+    view.validate_for_display(selected, width)
+}
+
+/// Quote and escape invisible or ambiguous names without changing their identity.
+fn safe_session_label(name: &str) -> String {
+    let hidden = |ch: char| {
+        crate::text::is_terminal_control(ch)
+            || unicode_width::UnicodeWidthChar::width(ch) == Some(0)
+            || (ch.is_whitespace() && ch != ' ')
+    };
+    if !name.is_empty() && name.trim() == name && !name.chars().any(hidden) {
+        return name.to_owned();
+    }
+    let mut result = String::from("\"");
+    for ch in name.chars() {
+        if hidden(ch) {
+            use std::fmt::Write as _;
+            let _ = write!(&mut result, "\\u{{{:x}}}", ch as u32);
+        } else if ch == '\\' || ch == '\"' {
+            result.push('\\');
+            result.push(ch);
+        } else {
+            result.push(ch);
         }
     }
-    if let Some(name) = content.strip_suffix(MARKER) {
-        let name_width = width.saturating_sub(visible_width(MARKER) as u16);
-        return format!("{}{}", fit(name, name_width), MARKER);
-    }
-    fit(content, width)
+    result.push('\"');
+    result
+}
+
+/// Session names and notices can originate at a peer; never emit control effects.
+fn safe_display_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if crate::text::is_terminal_control(ch) {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
 }
 
 /// The crop notice moved here when the preview lost its title band: a crop that
@@ -2561,9 +2623,9 @@ fn footer(ui: &Ui, server: &str, cut: bool, preview_w: u16, cols: u16) -> String
     let binding_help = ui.keymap.help(crate::keybindings::LIST_CONTEXT);
     let status = match &ui.mode {
         Mode::Prompt(buffer) => format!("start: {buffer}▏   ⏎ run · esc cancel"),
-        Mode::Confirm(name) => format!("kill {name}? it is running — y / n"),
+        Mode::Confirm(name) => format!("kill {}? it is running — y / n", safe_session_label(name)),
         Mode::Browse if let Some(name) = ui.composing() => {
-            let prefix = format!("✎ {name} › ");
+            let prefix = format!("✎ {} › ", safe_session_label(name));
             let width = (cols as usize).saturating_sub(visible_width(&prefix));
             let line = ui
                 .composer
@@ -2577,7 +2639,8 @@ fn footer(ui: &Ui, server: &str, cut: bool, preview_w: u16, cols: u16) -> String
         // person must never wonder is where their next keystroke lands.
         Mode::Browse if ui.focus == Focus::Session => format!(
             "▶ {} — every key goes to the session{}   ctrl-\\ back to the list",
-            ui.selected().map_or("", |s| s.name.as_str()),
+            ui.selected()
+                .map_or_else(String::new, |s| safe_session_label(&s.name)),
             if cut {
                 format!("   showing {preview_w} cols")
             } else {
@@ -2623,6 +2686,8 @@ fn footer(ui: &Ui, server: &str, cut: bool, preview_w: u16, cols: u16) -> String
         Some(age) => format!("remuda · {server} · stale {}s 🏇", age.as_secs()),
         None => format!("remuda · {server} 🏇"),
     };
+    let status = safe_display_text(&status);
+    let brand = safe_display_text(&brand);
     let status_width = visible_width(&status);
     let brand_width = visible_width(&brand);
     if status_width + 3 + brand_width <= cols as usize {
@@ -2668,6 +2733,7 @@ fn refresh<P: SessionPort + ?Sized>(
         // the old numeric position, so a refresh cannot move a cursor (or an
         // attached pane) onto its new neighbour.
         let selected_name = ui.selected().map(|session| session.name.clone());
+        let previous_instance = ui.selected().and_then(|s| s.instance_id.clone());
         match list(path) {
             Ok(sessions) => {
                 if ui.daemon_gone.take().is_some() {
@@ -2686,6 +2752,13 @@ fn refresh<P: SessionPort + ?Sized>(
                 Err(probe_error) => record_daemon_probe_failure(path, ui, e, probe_error),
             },
         }
+        sync_remote_selection(
+            path,
+            ui,
+            held,
+            selected_name.as_deref(),
+            previous_instance.as_deref(),
+        );
         // Same skip as the relist above, and for the same reason: a
         // `Type`-forced wake (fast-typing tick) needs none of this, so
         // paying for it there would be the exact per-keystroke IPC cost
@@ -2778,6 +2851,69 @@ fn refresh<P: SessionPort + ?Sized>(
     Ok((cols, rows))
 }
 
+fn sync_remote_selection<P: SessionPort + ?Sized>(
+    path: &P,
+    ui: &mut Ui,
+    held: &mut Option<(String, P::Keys)>,
+    name: Option<&str>,
+    instance: Option<&str>,
+) {
+    reselect_remote_session(path, ui, name, instance);
+    release_changed_remote_selection(path, ui, held, name, instance);
+}
+
+/// Keep the same selected instance when the peer returns a different order.
+fn reselect_remote_session<P: SessionPort + ?Sized>(
+    path: &P,
+    ui: &mut Ui,
+    name: Option<&str>,
+    instance: Option<&str>,
+) {
+    if path.remote_node().is_none() {
+        return;
+    }
+    if let Some(name) = name {
+        if let Some(index) = ui
+            .sessions
+            .iter()
+            .position(|s| s.name == name && s.instance_id.as_deref() == instance)
+        {
+            ui.selected = index;
+        }
+    }
+}
+
+/// A reused or vanished peer session must never retain an old focused hold.
+fn release_changed_remote_selection<P: SessionPort + ?Sized>(
+    path: &P,
+    ui: &mut Ui,
+    held: &mut Option<(String, P::Keys)>,
+    name: Option<&str>,
+    instance: Option<&str>,
+) {
+    if path.remote_node().is_none() {
+        return;
+    }
+    let (Some(name), Some(instance)) = (name, instance) else {
+        return;
+    };
+    let name_count = ui.sessions.iter().filter(|s| s.name == name).count();
+    let same = name_count == 1
+        && ui
+            .sessions
+            .iter()
+            .any(|s| s.name == name && s.instance_id.as_deref() == Some(instance));
+    if !same {
+        *held = None;
+        ui.focus = Focus::List;
+        ui.notice = Some(if name_count > 1 {
+            "duplicate session names; action refused".into()
+        } else {
+            format!("{name}: session instance changed or ended; select again")
+        });
+    }
+}
+
 /// The list column's text: Lua's sessions buffer, or plain names for a node
 /// whose Lua this screen cannot ask (a cluster peer).
 fn refresh_list_text<P: SessionPort + ?Sized>(
@@ -2787,11 +2923,74 @@ fn refresh_list_text<P: SessionPort + ?Sized>(
     selected_name: Option<&str>,
 ) {
     if !path.has_lua() {
+        let (width, _) = ui_layout(ui, cols);
+        let selection = selected_name
+            .and_then(|name| ui.sessions.iter().find(|s| s.name == name))
+            .and_then(|s| {
+                s.instance_id
+                    .as_deref()
+                    .map(|id| (s.name.clone(), id.to_owned()))
+            });
+        let view = if selection.is_none() && !ui.sessions.is_empty() {
+            None
+        } else {
+            path.session_list_view(
+                width,
+                selection
+                    .as_ref()
+                    .map(|(name, id)| (name.as_str(), id.as_str())),
+            )
+        };
+        if let Some(view) = view {
+            if let Ok(checked) = view.validate_for_display(
+                selection
+                    .as_ref()
+                    .map(|(name, id)| (name.as_str(), id.as_str())),
+                width,
+            ) {
+                let same_snapshot = checked.sessions().len() == ui.sessions.len()
+                    && checked.sessions().iter().all(|candidate| {
+                        ui.sessions.iter().any(|s| {
+                            s.name == candidate.name && s.instance_id == candidate.instance_id
+                        })
+                    });
+                if same_snapshot {
+                    ui.sessions = checked.sessions().to_vec();
+                    ui.session_rows = checked.height();
+                    ui.sessions_text = checked
+                        .entries()
+                        .iter()
+                        .flat_map(|entry| entry.lines.iter().cloned())
+                        .collect();
+                    ui.selected = selection
+                        .as_ref()
+                        .and_then(|(name, id)| {
+                            ui.sessions.iter().position(|s| {
+                                s.name == *name && s.instance_id.as_deref() == Some(id)
+                            })
+                        })
+                        .unwrap_or(ui.selected);
+                    ui.clamp();
+                    return;
+                }
+            }
+        }
         ui.session_rows = 1;
         ui.sessions_text = if ui.sessions.is_empty() {
             vec!["no sessions on this node".into()]
         } else {
-            Vec::new()
+            ui.sessions
+                .iter()
+                .enumerate()
+                .map(|(index, session)| {
+                    let name = safe_session_label(&session.name);
+                    if index == ui.selected {
+                        format!("\x1b[7m{name}\x1b[0m")
+                    } else {
+                        name
+                    }
+                })
+                .collect()
         };
         return;
     }
@@ -2816,7 +3015,15 @@ fn sync_shown_session<P: SessionPort + ?Sized>(
 ) {
     let selected_name = ui.selected().map(|s| s.name.clone());
     if !path.has_lua() {
-        *shown = selected_name.map(ShownTarget::Session);
+        *shown = selected_name
+            .filter(|name| {
+                ui.sessions
+                    .iter()
+                    .filter(|session| session.name == *name)
+                    .count()
+                    == 1
+            })
+            .map(ShownTarget::Session);
         return;
     }
     // `selection_moved` is `true` only for a real Up/Down keypress that
@@ -3061,15 +3268,17 @@ pub fn run_port<P: SessionPort + ?Sized>(
             selection_moved = false;
         }
 
+        if check_held_input(&mut ui, &mut held) {
+            force_refresh = true;
+        }
+
         // Only a port that takes lines queues any.
         let due = path
             .accepts_lines()
             .then(|| pump_lines(path, &mut line_sender, &mut line_queue, &mut line_in_flight))
             .flatten();
         if let Some(event) = due {
-            if let Some(notice) = line_notice(event) {
-                ui.notice = Some(notice);
-            }
+            ui.notice = line_notice(event).or(ui.notice.take());
             force_refresh = true;
         }
 
@@ -3095,13 +3304,18 @@ pub fn run_port<P: SessionPort + ?Sized>(
                 // Crossterm emits this only after finding the matching end
                 // marker; it buffers an unterminated host paste internally.
                 let Some((name, _)) = &held else { continue };
-                match path.request(&Request::MouseState { name: name.clone() }) {
-                    Ok(Response::MouseState(state)) => {
-                        Action::Type(paste_input(&text, state.bracketed_paste))
-                    }
-                    other => {
-                        ui.notice = Some(format!("{name}: cannot determine paste mode: {other:?}"));
-                        Action::Nothing
+                if path.remote_node().is_some() {
+                    Action::Type(text.into_bytes())
+                } else {
+                    match path.request(&Request::MouseState { name: name.clone() }) {
+                        Ok(Response::MouseState(state)) => {
+                            Action::Type(paste_input(&text, state.bracketed_paste))
+                        }
+                        other => {
+                            ui.notice =
+                                Some(format!("{name}: cannot determine paste mode: {other:?}"));
+                            Action::Nothing
+                        }
                     }
                 }
             }
@@ -3112,6 +3326,57 @@ pub fn run_port<P: SessionPort + ?Sized>(
             }
             _ => continue,
         };
+        if path.remote_node().is_some() {
+            let target = match &action {
+                Action::Focus(name)
+                | Action::Kill { name, .. }
+                | Action::SendLine { name, .. }
+                | Action::Copy(name)
+                | Action::CopySelection(name) => Some(name.as_str()),
+                Action::Type(_) | Action::Paste => held.as_ref().map(|(name, _)| name.as_str()),
+                _ => None,
+            };
+            if let Some(name) = target {
+                let (width, _) = ui_layout(&ui, cols);
+                let label = safe_session_label(name);
+                let displayed = fit_session_row(&label, width);
+                let ambiguous = ui
+                    .sessions
+                    .iter()
+                    .filter(|session| session.name == name)
+                    .count()
+                    != 1
+                    || ui.sessions.iter().any(|session| {
+                        session.name != name
+                            && fit_session_row(&safe_session_label(&session.name), width)
+                                == displayed
+                    });
+                if ambiguous
+                    || !remuda_core::session_view::fitted_row_shows_name(
+                        &fit_session_row(&label, width),
+                        &label,
+                    )
+                {
+                    if let Action::SendLine { bytes, .. } = &action {
+                        if let Ok(text) =
+                            std::str::from_utf8(bytes.strip_suffix(b"\r").unwrap_or(bytes))
+                        {
+                            ui.composer.restore_draft(text);
+                        }
+                    }
+                    held = None;
+                    ui.focus = Focus::List;
+                    ui.notice = Some(if ambiguous {
+                        "session names have identical display labels; action refused".into()
+                    } else {
+                        "session name is not fully visible; widen the list before sending input"
+                            .into()
+                    });
+                    force_refresh = true;
+                    continue;
+                }
+            }
+        }
         skip_list = matches!(action, Action::Type(_));
         match action {
             Action::Nothing => {}
@@ -3143,13 +3408,8 @@ pub fn run_port<P: SessionPort + ?Sized>(
                     Err(_) => {}
                 }
             }
-            Action::Kill(name) => {
-                let instance = ui
-                    .sessions
-                    .iter()
-                    .find(|session| session.name == name)
-                    .and_then(|session| session.instance_id.clone());
-                ui.notice = kill(path, &name, instance).err();
+            Action::Kill { name, instance_id } => {
+                ui.notice = kill(path, &name, instance_id).err();
             }
             Action::Focus(name) => reconcile_hold(path, &mut ui, &mut held, &name),
             Action::Scroll(delta) => {
@@ -3267,7 +3527,11 @@ fn line_notice(event: crate::cluster_tui::queue::QueueEvent) -> Option<String> {
 }
 
 fn copy_screen<P: SessionPort + ?Sized>(path: &P, ui: &mut Ui, name: &str) {
-    match capture_styled(path, name, 0) {
+    let instance = ui
+        .selected()
+        .filter(|session| session.name == name)
+        .and_then(|session| session.instance_id.clone());
+    match capture_styled_for_instance(path, name, instance.as_deref(), 0) {
         Ok((cells, wrapped, _, _, _)) => {
             ui.yank = all_screen_text(&cells, &wrapped);
             ui.notice = Some(format!(
@@ -3281,7 +3545,11 @@ fn copy_screen<P: SessionPort + ?Sized>(path: &P, ui: &mut Ui, name: &str) {
 
 fn copy_selection<P: SessionPort + ?Sized>(path: &P, ui: &mut Ui, name: &str) {
     let offset = ui.scrollback.get(name).map_or(0, |state| state.offset);
-    match capture_styled(path, name, offset) {
+    let instance = ui
+        .selected()
+        .filter(|session| session.name == name)
+        .and_then(|session| session.instance_id.clone());
+    match capture_styled_for_instance(path, name, instance.as_deref(), offset) {
         Ok((cells, wrapped, _, _, _)) => {
             // Copy-and-cancel, as tmux: the selection has done its job.
             ui.yank = ui.text_selection.take().map_or_else(
@@ -3426,10 +3694,15 @@ fn capture_preview<P: SessionPort + ?Sized>(
     ui: &mut Ui,
     name: &str,
 ) -> Result<PreviewCapture, String> {
+    let instance = ui
+        .selected()
+        .filter(|session| session.name == name)
+        .and_then(|session| session.instance_id.clone());
     let state = ui.scrollback.entry(name.to_string()).or_default();
     let (capture, history_rows, history_total, anchored, anchor_total) =
         capture_anchored(state.offset, state.anchor_total, |offset| {
-            let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, offset)?;
+            let (cells, wrapped, cursor, rows, total) =
+                capture_styled_for_instance(path, name, instance.as_deref(), offset)?;
             Ok(((cells, wrapped, cursor), rows, total))
         })?;
     let (cells, wrapped, cursor) = capture;
@@ -3443,6 +3716,17 @@ fn capture_preview<P: SessionPort + ?Sized>(
     state.history_total = history_total;
     state.anchor_total = anchor_total;
     Ok((cells, wrapped, cursor))
+}
+
+fn check_held_input<K: KeyStream>(ui: &mut Ui, held: &mut Option<(String, K)>) -> bool {
+    if let Some((name, error)) = held
+        .as_ref()
+        .and_then(|(name, keys)| keys.check().err().map(|error| (name.clone(), error)))
+    {
+        input_write_failed(ui, &name, &error, held);
+        return true;
+    }
+    false
 }
 
 fn input_write_failed<T>(ui: &mut Ui, name: &str, error: &std::io::Error, held: &mut Option<T>) {
@@ -3496,11 +3780,14 @@ fn reconcile_hold<P: SessionPort + ?Sized>(
 /// The refusal is the daemon's — a session someone else attached is refused
 /// there, not here, so a second viewer over any transport is refused too.
 fn take<P: SessionPort + ?Sized>(path: &P, ui: &mut Ui) -> Option<(String, P::Keys)> {
-    let Some(name) = ui.selected().map(|s| s.name.clone()) else {
+    let Some((name, instance)) = ui
+        .selected()
+        .map(|s| (s.name.clone(), s.instance_id.clone()))
+    else {
         ui.focus = Focus::List;
         return None;
     };
-    match path.hold(&name) {
+    match path.hold_instance(&name, instance.as_deref()) {
         Ok(hold) => Some((name, hold)),
         Err(e) => {
             ui.notice = Some(format!("{name}: {e}"));
@@ -3704,29 +3991,46 @@ type PreviewCapture = (Vec<Vec<StyledCell>>, Vec<bool>, Cursor);
 /// Styled counterpart of the (now unused) plain `capture` — see steps/020,
 /// 021. The wire carries runs, expanded back to cells here — see steps/022.
 /// The cursor rides the same round trip — see steps/027.
+#[cfg(test)]
 fn capture_styled<P: SessionPort + ?Sized>(
     path: &P,
     name: &str,
     scrollback: usize,
 ) -> Result<StyledCapture, String> {
-    match path.request(&Request::CaptureStyled {
-        name: name.to_string(),
-        scrollback,
-    }) {
+    capture_styled_for_instance(path, name, None, scrollback)
+}
+
+fn capture_styled_for_instance<P: SessionPort + ?Sized>(
+    path: &P,
+    name: &str,
+    expected: Option<&str>,
+    scrollback: usize,
+) -> Result<StyledCapture, String> {
+    match path.capture_instance(name, expected, scrollback) {
         Ok(Response::StyledScreen {
             rows,
             wrapped,
             cursor,
             scrollback_len,
             scrollback_total,
+            instance_id,
             ..
-        }) => Ok((
-            rows.iter().map(|row| expand_runs(row)).collect(),
-            wrapped,
-            cursor,
-            scrollback_len,
-            scrollback_total,
-        )),
+        }) => {
+            if path.remote_node().is_some()
+                && (expected.is_none() || instance_id.as_deref() != expected)
+            {
+                return Err("peer could not prove the selected preview instance".into());
+            }
+            let mut cells: Vec<Vec<StyledCell>> = rows.iter().map(|row| expand_runs(row)).collect();
+            if path.remote_node().is_some() {
+                for row in &mut cells {
+                    for cell in row {
+                        cell.text = crate::text::strip_terminal_controls(&cell.text).into_owned();
+                    }
+                }
+            }
+            Ok((cells, wrapped, cursor, scrollback_len, scrollback_total))
+        }
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
     }
@@ -4302,5 +4606,441 @@ mod composer_tests {
         assert!(event.is_some());
         server.join().unwrap();
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod peer_view_fit_acceptance {
+    use super::*;
+    use remuda_core::session_view::{SessionView, ViewEntry};
+    use std::time::Duration;
+
+    fn session(name: &str, id: &str) -> SessionSummary {
+        SessionSummary {
+            id: format!("id-{name}"),
+            name: name.into(),
+            instance_id: Some(id.into()),
+            output_version: None,
+            alive: true,
+            idle: Duration::ZERO,
+            output_idle: None,
+            size: Size::new(80, 24),
+            attached: false,
+            human_idle: None,
+            mouse_tracking: false,
+            unavailable: false,
+            program_status: None,
+            program_status_age_ms: None,
+            remote_input_disabled: false,
+        }
+    }
+    fn lua_view(compact: bool) -> SessionView {
+        let lua = mlua::Lua::new();
+        let remuda = lua.create_table().unwrap();
+        remuda
+            .set("_registry", lua.create_table().unwrap())
+            .unwrap();
+        lua.globals().set("remuda", remuda).unwrap();
+        lua.load(include_str!("tools.lua")).exec().unwrap();
+        lua.globals().set("compact", compact).unwrap();
+        let view: mlua::Table = lua.load(r#"
+            remuda.session_order = function(rows) return {{name='한글', depth=1}} end
+            remuda.session_list_decorate = function(row)
+                return { layout=compact and 'compact' or 'stacked', description='codex' }
+            end
+            return remuda._render_sessions_snapshot({{name='한글', instance_id='b', alive=true}}, 20, '한글', 'b')
+        "#).eval().unwrap();
+        let entries: mlua::Table = view.get("entries").unwrap();
+        let entries = entries
+            .sequence_values::<mlua::Table>()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let lines: mlua::Table = entry.get("lines").unwrap();
+                ViewEntry {
+                    name: entry.get("name").unwrap(),
+                    instance_id: entry.get("instance_id").unwrap(),
+                    lines: lines
+                        .sequence_values::<String>()
+                        .map(Result::unwrap)
+                        .collect(),
+                }
+            })
+            .collect();
+        SessionView::new(
+            vec![session("한글", "b")],
+            view.get("height").unwrap(),
+            entries,
+        )
+    }
+    #[test]
+    fn duplicate_names_block_ui_focus_composer_and_confirmation() {
+        let mut ui = Ui::new(
+            vec![session("proof", "first"), session("proof", "second")],
+            "sh",
+            None,
+        );
+        ui.selected = 1;
+        assert_eq!(ui.focus_session(), Action::Nothing);
+        assert_eq!(ui.focus, Focus::List);
+        assert_eq!(ui.open_composer(), Action::Nothing);
+        assert_eq!(ui.focus, Focus::List);
+        assert_eq!(ui.kill_selected(), Action::Nothing);
+        assert_eq!(ui.mode, Mode::Browse);
+        assert!(ui
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("duplicate")));
+    }
+
+    #[test]
+    fn confirmation_carries_exact_instance_and_rejects_later_duplicates() {
+        let mut ui = Ui::new(vec![session("proof", "second")], "sh", None);
+        assert_eq!(
+            ui.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Action::Nothing
+        );
+        let action = ui.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(
+            action,
+            Action::Kill {
+                name: "proof".into(),
+                instance_id: Some("second".into())
+            }
+        );
+        assert_eq!(
+            ui.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Action::Nothing
+        );
+        ui.sessions.insert(0, session("proof", "first"));
+        assert_eq!(
+            ui.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Action::Nothing
+        );
+        assert!(ui
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("changed")));
+    }
+
+    #[test]
+    fn ambiguous_peer_name_never_selects_a_name_only_preview() {
+        struct Peer;
+        impl super::remote_port::PeerLink for Peer {
+            fn send(&self, _: &Request, _: Duration) -> std::io::Result<Response> {
+                Ok(Response::Sessions(vec![]))
+            }
+        }
+        let port = super::remote_port::RemotePort::with_link("peer", std::sync::Arc::new(Peer));
+        let mut ui = Ui::new(
+            vec![session("proof", "first"), session("proof", "second")],
+            "sh",
+            None,
+        );
+        let mut shown = Some(ShownTarget::Session("proof".into()));
+        sync_shown_session(&port, &mut ui, &mut shown, false);
+        assert!(shown.is_none());
+    }
+
+    #[test]
+    fn confirmed_close_sends_the_confirmed_instance_without_name_lookup() {
+        struct Peer(std::sync::Mutex<Vec<Request>>);
+        impl super::remote_port::PeerLink for Peer {
+            fn send(&self, request: &Request, _: Duration) -> std::io::Result<Response> {
+                self.0.lock().unwrap().push(request.clone());
+                match request {
+                    Request::List => Ok(Response::Sessions(vec![])),
+                    _ => Ok(Response::Ok),
+                }
+            }
+        }
+        let peer = std::sync::Arc::new(Peer(std::sync::Mutex::new(vec![])));
+        let port = super::remote_port::RemotePort::with_link("peer", peer.clone());
+        let mut ui = Ui::new(vec![session("proof", "second")], "sh", None);
+        assert_eq!(
+            ui.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Action::Nothing
+        );
+        let Action::Kill { name, instance_id } =
+            ui.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        else {
+            panic!("missing close action");
+        };
+        // A name lookup here would pick this newly inserted first row instead.
+        ui.sessions.insert(0, session("proof", "first"));
+        kill(&port, &name, instance_id).unwrap();
+        assert!(peer.0.lock().unwrap().iter().any(|request| matches!(request, Request::Close { name, instance_id: Some(id), confirm: Some(true) } if name == "proof" && id == "second")));
+    }
+
+    #[test]
+    fn malicious_peer_styled_screen_cannot_emit_osc_or_c1_controls() {
+        struct Peer;
+        impl super::remote_port::PeerLink for Peer {
+            fn send(&self, request: &Request, _: Duration) -> std::io::Result<Response> {
+                match request {
+                    Request::List => Ok(Response::Sessions(vec![session("proof", "i")])),
+                    Request::CaptureStyled { .. } => {
+                        let cell = StyledCell {
+                            text: "before\x1b]52;c;PWNED\x07after\u{009b}2J".into(),
+                            fg: Color::Idx(1),
+                            ..Default::default()
+                        };
+                        Ok(Response::StyledScreen {
+                            rows: vec![remuda_core::protocol::collapse_runs(&[cell])],
+                            instance_id: Some("i".into()),
+                            output_version: Some(1),
+                            wrapped: vec![false],
+                            scrollback_len: 0,
+                            scrollback_total: 0,
+                            cursor: Cursor {
+                                row: 0,
+                                col: 0,
+                                visible: false,
+                            },
+                        })
+                    }
+                    _ => Ok(Response::Error("unsupported".into())),
+                }
+            }
+        }
+        let port =
+            super::remote_port::RemotePort::with_link("malicious", std::sync::Arc::new(Peer));
+        let (cells, _, _, _, _) =
+            capture_styled_for_instance(&port, "proof", Some("i"), 0).unwrap();
+        let rendered = render_styled_row(&cells[0]);
+        assert!(!rendered.contains("\x1b]52"), "{rendered:?}");
+        assert!(!rendered.contains('\u{009b}'), "{rendered:?}");
+        assert!(
+            rendered.contains("\x1b[31m"),
+            "legitimate style is retained: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn ui_hold_never_retargets_a_recreated_same_name_session() {
+        struct Peer(std::sync::Mutex<Vec<Request>>);
+        impl super::remote_port::PeerLink for Peer {
+            fn send(&self, request: &Request, _: Duration) -> std::io::Result<Response> {
+                self.0.lock().unwrap().push(request.clone());
+                match request {
+                    Request::List => Ok(Response::Sessions(vec![session("proof", "new")])),
+                    Request::Input { .. } => Ok(Response::Ack { duplicate: false }),
+                    _ => Ok(Response::Error("unsupported".into())),
+                }
+            }
+        }
+        let peer = std::sync::Arc::new(Peer(std::sync::Mutex::new(vec![])));
+        let port = super::remote_port::RemotePort::with_link("peer", peer.clone());
+        assert!(matches!(
+            port.request(&Request::List),
+            Ok(Response::Sessions(_))
+        ));
+        let mut ui = Ui::new(vec![session("proof", "old")], "sh", None);
+        ui.focus = Focus::Session;
+        let held = take(&port, &mut ui);
+        if let Some((_, keys)) = &held {
+            keys.keys(b"x").unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            held.is_none(),
+            "a newer instance must never be attached by name"
+        );
+        assert!(!peer
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, Request::Input { .. })));
+    }
+
+    #[test]
+    fn wire_keys_keep_the_displayed_instance_when_peer_restarts_after_hold() {
+        struct Peer(std::sync::Mutex<Vec<Request>>);
+        impl super::remote_port::PeerLink for Peer {
+            fn send(&self, request: &Request, _: Duration) -> std::io::Result<Response> {
+                self.0.lock().unwrap().push(request.clone());
+                match request {
+                    Request::List => Ok(Response::Sessions(vec![session("proof", "old")])),
+                    Request::Input { .. } => Ok(Response::WrongInstance),
+                    _ => Ok(Response::Error("unsupported".into())),
+                }
+            }
+        }
+        let peer = std::sync::Arc::new(Peer(std::sync::Mutex::new(vec![])));
+        let port = super::remote_port::RemotePort::with_link("peer", peer.clone());
+        let mut ui = Ui::new(vec![session("proof", "old")], "sh", None);
+        ui.focus = Focus::Session;
+        let (_, keys) = take(&port, &mut ui).expect("old instance remains in the observed list");
+        keys.keys(b"x").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while keys.check().is_ok() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(peer.0.lock().unwrap().iter().any(|request| matches!(request, Request::Input { name, instance_id, .. } if name == "proof" && instance_id == "old")));
+        assert!(!peer.0.lock().unwrap().iter().any(
+            |request| matches!(request, Request::Input { instance_id, .. } if instance_id == "new")
+        ));
+    }
+
+    #[test]
+    fn peer_preview_remains_readable_when_remote_input_is_disabled() {
+        struct Peer;
+        impl super::remote_port::PeerLink for Peer {
+            fn send(&self, request: &Request, _: Duration) -> std::io::Result<Response> {
+                match request {
+                    Request::List => {
+                        let mut row = session("proof", "old");
+                        row.remote_input_disabled = true;
+                        Ok(Response::Sessions(vec![row]))
+                    }
+                    Request::CaptureStyled { .. } => Ok(Response::StyledScreen {
+                        rows: vec![],
+                        instance_id: Some("old".into()),
+                        output_version: Some(1),
+                        wrapped: vec![],
+                        scrollback_len: 0,
+                        scrollback_total: 0,
+                        cursor: Cursor {
+                            row: 0,
+                            col: 0,
+                            visible: false,
+                        },
+                    }),
+                    _ => Ok(Response::Error("unsupported".into())),
+                }
+            }
+        }
+        let port = super::remote_port::RemotePort::with_link("peer", std::sync::Arc::new(Peer));
+        let mut ui = Ui::new(vec![session("proof", "old")], "sh", None);
+        assert!(capture_preview(&port, &mut ui, "proof").is_ok());
+    }
+
+    #[test]
+    fn peer_preview_rejects_recreated_instance_and_missing_proof() {
+        struct Peer(Option<String>);
+        impl super::remote_port::PeerLink for Peer {
+            fn send(&self, request: &Request, _: Duration) -> std::io::Result<Response> {
+                match request {
+                    Request::List => Ok(Response::Sessions(vec![session("proof", "old")])),
+                    Request::CaptureStyled { .. } => Ok(Response::StyledScreen {
+                        rows: vec![],
+                        instance_id: self.0.clone(),
+                        output_version: Some(1),
+                        wrapped: vec![],
+                        scrollback_len: 0,
+                        scrollback_total: 0,
+                        cursor: Cursor {
+                            row: 0,
+                            col: 0,
+                            visible: false,
+                        },
+                    }),
+                    _ => Ok(Response::Error("unsupported".into())),
+                }
+            }
+        }
+        for (proof, expected) in [(Some("new".into()), "changed"), (None, "cannot prove")] {
+            let port =
+                super::remote_port::RemotePort::with_link("peer", std::sync::Arc::new(Peer(proof)));
+            let mut ui = Ui::new(vec![session("proof", "old")], "sh", None);
+            let error = capture_preview(&port, &mut ui, "proof")
+                .expect_err("unbound preview must be unavailable");
+            assert!(error.contains(expected), "unexpected refusal: {error}");
+        }
+    }
+
+    #[test]
+    fn fallback_name_must_be_completely_visible_before_remote_input() {
+        assert!(!remuda_core::session_view::fitted_row_shows_name(
+            &fit_session_row("longname", 4),
+            "longname"
+        ));
+        assert!(remuda_core::session_view::fitted_row_shows_name(
+            &fit_session_row("longname", 8),
+            "longname"
+        ));
+        assert!(!remuda_core::session_view::fitted_row_shows_name(
+            &fit_session_row("a\u{200b}b", 8),
+            "a\u{200b}b"
+        ));
+    }
+
+    #[test]
+    fn changed_or_vanished_peer_instance_releases_focused_input() {
+        struct Keys;
+        impl super::port::KeyStream for Keys {
+            fn keys(&self, _: &[u8]) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        struct Peer;
+        impl super::port::SessionPort for Peer {
+            type Keys = Keys;
+            fn request(&self, _: &Request) -> std::io::Result<Response> {
+                Ok(Response::Sessions(vec![]))
+            }
+            fn hold(&self, _: &str) -> std::io::Result<Keys> {
+                Ok(Keys)
+            }
+            fn probe(&self) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn probe_verdict(&self, _: &std::io::Error) -> (bool, bool) {
+                (false, false)
+            }
+            fn label(&self) -> String {
+                "peer".into()
+            }
+            fn remote_node(&self) -> Option<String> {
+                Some("peer".into())
+            }
+        }
+        for sessions in [vec![session("한글", "new")], vec![]] {
+            let mut ui = Ui::new(sessions, "sh", None);
+            ui.focus = Focus::Session;
+            let mut held = Some(("한글".into(), Keys));
+            release_changed_remote_selection(&Peer, &mut ui, &mut held, Some("한글"), Some("old"));
+            assert!(held.is_none());
+            assert!(ui.focus == Focus::List);
+        }
+    }
+
+    #[test]
+    fn actual_fitting_gates_compact_wide_names_and_truncation() {
+        let view = lua_view(true);
+        assert!(validated_peer_view(&view, 6, Some(("한글", "b"))).is_err());
+        assert!(validated_peer_view(&view, 8, Some(("한글", "b"))).is_ok());
+    }
+    #[test]
+    fn actual_fitting_accounts_for_stacked_status_dot_space() {
+        let view = lua_view(false);
+        assert!(validated_peer_view(&view, 10, Some(("한글", "b"))).is_err());
+        assert!(validated_peer_view(&view, 11, Some(("한글", "b"))).is_ok());
+    }
+    #[test]
+    fn local_selection_survives_peer_resets_in_actual_fitted_output() {
+        let view = SessionView::new(
+            vec![session("한글", "b")],
+            1,
+            vec![ViewEntry {
+                name: "한글".into(),
+                instance_id: "b".into(),
+                lines: vec!["  \x1b[0m한\x1b[0m글 ● detail".into()],
+            }],
+        );
+        let checked = validated_peer_view(&view, 9, Some(("한글", "b"))).unwrap();
+        let painted = fit_session_row(&checked.entries()[0].lines[0], 9);
+        assert!(painted.contains("\x1b[1;7;36m한글\x1b[0m"), "{painted:?}");
+    }
+    #[test]
+    fn selected_style_is_chosen_locally_and_never_by_peer() {
+        let view = lua_view(true);
+        let checked = validated_peer_view(&view, 30, None).unwrap();
+        assert!(!checked.entries()[0].lines[0].contains("\x1b[7m"));
+        assert!(!checked.entries()[0].lines[0].contains("\x1b[1;7;36m"));
+        let checked = validated_peer_view(&view, 30, Some(("한글", "b"))).unwrap();
+        assert!(checked.entries()[0].lines[0].contains("\x1b[1;7;36m한글\x1b[0m"));
+        assert!(validated_peer_view(&view, 30, Some(("한글", "old"))).is_err());
     }
 }

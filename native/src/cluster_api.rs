@@ -335,7 +335,10 @@ fn send_remote(
 /// Pick exactly one live, available session row and its exact instance. The
 /// local flag is checked here to avoid spending a rate token on a request the
 /// receiver would refuse; the receiver's check remains the safety boundary.
-fn pinned_instance(rows: &[remuda_core::SessionSummary], session: &str) -> Result<String, String> {
+pub(crate) fn pinned_instance(
+    rows: &[remuda_core::SessionSummary],
+    session: &str,
+) -> Result<String, String> {
     let mut matching = rows.iter().filter(|row| row.name == session);
     let Some(row) = matching.next() else {
         return Err("no such session on the peer".into());

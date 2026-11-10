@@ -8,6 +8,9 @@ use std::path::Path;
 /// Live keys for the focused session; a local attach is the first kind.
 pub trait KeyStream {
     fn keys(&self, bytes: &[u8]) -> io::Result<()>;
+    fn check(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl KeyStream for Hold {
@@ -23,6 +26,33 @@ pub trait SessionPort {
 
     /// Take the session's live key stream; a refusal says why.
     fn hold(&self, name: &str) -> io::Result<Self::Keys>;
+
+    /// Attach to the exact session displayed by the caller.
+    fn hold_instance(&self, name: &str, _instance: Option<&str>) -> io::Result<Self::Keys> {
+        self.hold(name)
+    }
+
+    /// Capture the exact session displayed by the caller.
+    fn capture_instance(
+        &self,
+        name: &str,
+        _instance: Option<&str>,
+        scrollback: usize,
+    ) -> io::Result<Response> {
+        self.request(&Request::CaptureStyled {
+            name: name.to_owned(),
+            scrollback,
+        })
+    }
+
+    /// Nonblocking peer view; `None` keeps the plain list usable.
+    fn session_list_view(
+        &self,
+        _width: u16,
+        _selected: Option<(&str, &str)>,
+    ) -> Option<remuda_core::session_view::SessionView> {
+        None
+    }
 
     /// Whether the node answers at all, once a request has failed.
     fn probe(&self) -> io::Result<()>;
