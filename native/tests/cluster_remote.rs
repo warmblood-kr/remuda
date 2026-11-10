@@ -1552,6 +1552,10 @@ fn node_pane_refuses_actions_when_distinct_names_have_the_same_fallback_label() 
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "single integration scenario with its isolated fake peer"
+)]
 fn malicious_duplicate_names_never_close_or_focus_an_ambiguous_instance() {
     use std::io::BufRead;
     use std::sync::atomic::AtomicBool;
