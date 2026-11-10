@@ -2166,6 +2166,23 @@ fn session_order_hook_indents_rows_and_an_error_keeps_the_legacy_buffer_bytes() 
 }
 
 #[test]
+fn compact_session_list_renders_multiple_ordered_entries() {
+    let path = scratch_socket("compact-session-list");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "alpha");
+    new_session(&path, "bravo");
+    eval(
+        &path,
+        r#"remuda.session_list_decorate = function() return { layout = "compact" } end"#,
+    );
+    let (rows, lines, _) = sessions_buffer_lines(&path, 80, 0, None).expect("render compact list");
+    assert_eq!(rows, 1);
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("alpha"), "first entry: {lines:?}");
+    assert!(lines[1].contains("bravo"), "second entry: {lines:?}");
+}
+
+#[test]
 fn typed_session_decorator_is_bounded_and_layout_override_is_whitelisted() {
     let path = scratch_socket("session-list-decorator");
     let _daemon = daemon_at(&path);

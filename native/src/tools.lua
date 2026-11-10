@@ -2355,7 +2355,7 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
       local detail = session_detail(s, decoration)
       local state_color = s.alive and "\27[32m" or "\27[31m"
       local reset = "\27[0m"
-      local base = (i - 1) * 3
+      local base = (i - 1) * rows
       -- Names remain neutral and readable; state carries the color. Keeping
       -- an actually blank third row gives entries whitespace rather than a
       -- second competing visual treatment.
