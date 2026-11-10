@@ -20,6 +20,10 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 /// The table that records applied steps. Mod code may not write it.
 pub const TABLE: &str = "_remuda_migrations";
@@ -289,7 +293,7 @@ pub fn upgrade_set(
     // Plan again under the write lock: another connection may have run the
     // steps between our read and the lock.
     let mut moved = Moved { from, to: target };
-    in_run(conn, |tx| {
+    in_run(conn, |tx, authorizing| {
         let (from, adopting) = plan(tx, label, set, adopt)?;
         moved.from = from;
         if from == target && !adopting {
@@ -302,7 +306,7 @@ pub fn upgrade_set(
                 record(tx, number, wanted(set, label, number)?)?;
             }
         } else if let (0, Some(base)) = (from, &set.base) {
-            run_step_sql(tx, &base.up).map_err(|error| {
+            run_step_sql(tx, authorizing, &base.up).map_err(|error| {
                 format!("{error} (in {label} base {}, {})", base.version, base.name)
             })?;
             let step = Step {
@@ -315,7 +319,7 @@ pub fn upgrade_set(
         }
         for number in at + 1..=target {
             let step = wanted(set, label, number)?;
-            run_step_sql(tx, &step.up)
+            run_step_sql(tx, authorizing, &step.up)
                 .map_err(|error| format!("{error} (in {label} step {number}, {})", step.name))?;
             record(tx, number, step)?;
         }
@@ -425,7 +429,7 @@ pub fn drifted<'a>(set: &StepSet, recorded: &'a [Applied]) -> Option<&'a Applied
 pub fn downgrade(conn: &mut Connection, label: &str, to: u32) -> Result<Moved, String> {
     let mut moved = Moved { from: 0, to };
     // Checked under the write lock, so a concurrent run cannot slip in.
-    in_run(conn, |tx| {
+    in_run(conn, |tx, authorizing| {
         let from = version(tx)?;
         let recorded = status(tx)?;
         check_record(label, &recorded, from)?;
@@ -442,7 +446,7 @@ pub fn downgrade(conn: &mut Connection, label: &str, to: u32) -> Result<Moved, S
         }
         for (number, name, down) in &downs {
             let down = down.as_deref().unwrap_or_default();
-            run_step_sql(tx, down)
+            run_step_sql(tx, authorizing, down)
                 .map_err(|error| format!("{error} (in {label} step {number} down, {name})"))?;
             tx.execute(&format!("DELETE FROM {TABLE} WHERE version = ?1"), [number])
                 .map_err(sql)?;
@@ -509,18 +513,33 @@ fn set_version(tx: &Connection, version: u32) -> Result<(), String> {
 /// foreign keys go back to how they were whatever happens.
 fn in_run(
     conn: &mut Connection,
-    work: impl FnOnce(&Connection) -> Result<(), String>,
+    work: impl FnOnce(&Connection, &AtomicBool) -> Result<(), String>,
 ) -> Result<(), String> {
     let keys: bool = conn
         .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
         .map_err(sql)?;
     conn.pragma_update(None, "foreign_keys", false)
         .map_err(sql)?;
+    let authorizing = Arc::new(AtomicBool::new(false));
+    let active = Arc::clone(&authorizing);
+    let installed = conn
+        .authorizer(Some(move |context: AuthContext<'_>| {
+            if active.load(Ordering::Relaxed) {
+                step_authorize(context)
+            } else {
+                Authorization::Allow
+            }
+        }))
+        .map_err(sql);
+    if let Err(error) = installed {
+        let _ = conn.pragma_update(None, "foreign_keys", keys);
+        return Err(error);
+    }
     let result = (|| {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
-        work(&tx)?;
+        work(&tx, &authorizing)?;
         let violation: Option<String> = tx
             .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
             .optional()
@@ -532,16 +551,18 @@ fn in_run(
         }
         tx.commit().map_err(sql)
     })();
+    let removed = conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .map_err(sql);
     let restored = conn.pragma_update(None, "foreign_keys", keys).map_err(sql);
-    result.and(restored)
+    result.and(removed).and(restored)
 }
 
-/// Run one step's SQL under `step_authorize`, then drop the authorizer.
-fn run_step_sql(conn: &Connection, text: &str) -> Result<(), String> {
-    conn.authorizer(Some(step_authorize)).map_err(sql)?;
+/// Enable `step_authorize` only while executing one step's SQL.
+fn run_step_sql(conn: &Connection, authorizing: &AtomicBool, text: &str) -> Result<(), String> {
+    authorizing.store(true, Ordering::Relaxed);
     let result = conn.execute_batch(text).map_err(sql);
-    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
-        .map_err(sql)?;
+    authorizing.store(false, Ordering::Relaxed);
     result
 }
 

@@ -411,7 +411,11 @@ jobs:
           tool: cargo-audit
       - name: Report crate and finding counts
         run: |
-          cargo audit --json > audit.json
+          # Vulnerabilities make cargo-audit exit nonzero; still summarize a
+          # valid report and let the next step print and enforce all findings.
+          if ! cargo audit --json > audit.json; then
+            jq -e '.vulnerabilities.count | numbers' audit.json > /dev/null
+          fi
           crates=$(jq -r '.lockfile."dependency-count"' audit.json)
           vulns=$(jq -r '.vulnerabilities.count' audit.json)
           warns=$(jq -r '[.warnings[]? | length] | add // 0' audit.json)
