@@ -633,6 +633,15 @@ impl SessionOperations for HostSession {
     fn input_owner(&self) -> Option<[u8; 16]> {
         Some(self.client)
     }
+    fn set_remote_input_disabled(&self, disabled: bool) -> Result<()> {
+        let _pass = self.gate.enter()?;
+        self.owner
+            .set_remote_input_disabled(self.target(), disabled)
+            .map_err(|error| match error {
+                StoreError::CommitUnknown(_) => Error::PolicyIndeterminate,
+                other => store(other),
+            })
+    }
     fn inspect(&self) -> Result<Observation> {
         let mut client =
             Client::open_observer(&self.endpoint, self.identity.clone()).map_err(opened)?;

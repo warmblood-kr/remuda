@@ -2327,14 +2327,20 @@ fn handle_request(
             name,
             instance_id,
             opted_out,
-        } => respond(
-            &stream,
-            &name,
-            registry
-                .set_remote_input_opt_out(&name, &instance_id, opted_out)
-                .map(|()| Ok(())),
-            |()| Response::Ok,
-        ),
+        } => match registry.set_remote_input_opt_out_result(&name, &instance_id, opted_out) {
+            None => reply(
+                &stream,
+                &Response::error(format!("no such session: {name}")),
+            ),
+            Some(Ok(())) => reply(&stream, &Response::Ok),
+            Some(Err(remuda_core::session_operations::Error::PolicyIndeterminate)) => {
+                reply(&stream, &Response::Uncertain)
+            }
+            Some(Err(error)) => reply(
+                &stream,
+                &Response::error(format!("remote input policy update failed: {error}")),
+            ),
+        },
 
         Request::Send { name, bytes } => {
             respond(&stream, &name, registry.send(&name, &bytes), |()| {

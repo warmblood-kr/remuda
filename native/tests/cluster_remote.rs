@@ -130,6 +130,7 @@ impl Node {
 impl Drop for Node {
     fn drop(&mut self) {
         assert!(self.runtime.starts_with(&self.root));
+        let _ = self.command().args(["stop", "-f", "--yes"]).output();
         self.stop_daemon();
         hosts::stop_hosts_under(&self.root);
         let _ = fs::remove_dir_all(&self.root);
@@ -1551,6 +1552,10 @@ fn node_pane_refuses_actions_when_distinct_names_have_the_same_fallback_label() 
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "single integration scenario with its isolated fake peer"
+)]
 fn malicious_duplicate_names_never_close_or_focus_an_ambiguous_instance() {
     use std::io::BufRead;
     use std::sync::atomic::AtomicBool;
@@ -1713,4 +1718,162 @@ fn node_pane_live_keys_reach_the_displayed_exact_instance() {
     tui.wait_for("every key goes", Duration::from_secs(5));
     tui.writer.write_all(b"hello\r").unwrap();
     tui.wait_for("RECV:hello", Duration::from_secs(8));
+}
+
+#[test]
+fn node_pane_default_hosted_remote_keys_survive_reload() {
+    let (client, server) = pane_pair("hc");
+    server.start_named_session("proof", "stty -echo; printf 'HOST_PID:%s\\nHOST_READY' \"$$\"; while IFS= read -r line; do printf 'HOST_RECEIVED:%s\\n' \"$line\"; done");
+    let socket = remuda_native::daemon::socket_path_in(&server.runtime, &server.name);
+    let instance = match remuda_native::client::request(&socket, &Request::List).unwrap() {
+        Response::Sessions(rows) => rows
+            .into_iter()
+            .find(|row| row.name == "proof")
+            .unwrap()
+            .instance_id
+            .unwrap(),
+        other => panic!("unexpected list: {other:?}"),
+    };
+    {
+        let mut tui = RemoteTui::start(&client, Some(&server.fingerprint()));
+        tui.wait_for("HOST_READY", Duration::from_secs(10));
+        tui.writer.write_all(b"\r").unwrap();
+        tui.wait_for("every key goes", Duration::from_secs(5));
+        tui.writer.write_all(b"before-reload\r").unwrap();
+        tui.wait_for("HOST_RECEIVED:before-reload", Duration::from_secs(10));
+    }
+    let pid = || {
+        let Response::Screen(text) = remuda_native::client::request(
+            &socket,
+            &Request::Capture {
+                name: "proof".into(),
+            },
+        )
+        .unwrap() else {
+            panic!("capture failed")
+        };
+        text.lines()
+            .find_map(|line| line.strip_prefix("HOST_PID:"))
+            .expect("PID marker")
+            .trim()
+            .parse::<u32>()
+            .unwrap()
+    };
+    let original_pid = pid();
+    let reload = server.command().args(["reload"]).output().unwrap();
+    assert!(
+        reload.status.success(),
+        "reload: {} {}",
+        String::from_utf8_lossy(&reload.stdout),
+        String::from_utf8_lossy(&reload.stderr)
+    );
+    let after = match remuda_native::client::request(&socket, &Request::List).unwrap() {
+        Response::Sessions(rows) => rows
+            .into_iter()
+            .find(|row| row.name == "proof")
+            .unwrap()
+            .instance_id
+            .unwrap(),
+        other => panic!("unexpected list after reload: {other:?}"),
+    };
+    assert_eq!(after, instance);
+    assert_eq!(
+        pid(),
+        original_pid,
+        "reload must keep the same child process"
+    );
+    let mut tui = RemoteTui::start(&client, Some(&server.fingerprint()));
+    tui.wait_for("HOST_RECEIVED:before-reload", Duration::from_secs(10));
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("every key goes", Duration::from_secs(5));
+    tui.writer.write_all(b"after-reload\r").unwrap();
+    tui.wait_for("HOST_RECEIVED:after-reload", Duration::from_secs(10));
+}
+
+#[test]
+fn default_hosted_launch_remote_opt_out_survives_reload() {
+    let (client, server) = pane_pair("ho");
+    let socket = remuda_native::daemon::socket_path_in(&server.runtime, &server.name);
+    let response = remuda_native::client::request(
+        &socket,
+        &Request::NewWithInstance {
+            name: Some("proof".into()),
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "stty -echo; while IFS= read -r line; do printf 'RECV:%s\\n' \"$line\"; done"
+                    .into(),
+            ],
+            size: remuda_core::Size::new(80, 24),
+            cwd: None,
+            env: None,
+            remote_input_disabled: true,
+        },
+    )
+    .unwrap();
+    let instance = match response {
+        Response::SessionStarted { instance_id, .. } => instance_id,
+        other => panic!("failed to create protected session: {other:?}"),
+    };
+    let registry: Registry = serde_json::from_slice(
+        &fs::read(client.state.join("remuda/cluster/authorized_nodes.json")).unwrap(),
+    )
+    .unwrap();
+    let address = registry
+        .authorized_nodes
+        .iter()
+        .find(|entry| entry.node_fp == server.fingerprint())
+        .and_then(|entry| entry.endpoint.as_ref())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let peer = ClusterClient::system();
+    let request = || Request::Input {
+        name: "proof".into(),
+        instance_id: instance.clone(),
+        client_id: "2".repeat(32),
+        seq: 1,
+        bytes: b"do-not-send\r".to_vec(),
+    };
+    assert_eq!(
+        peer.request(address, &server.public, &client.private, &request())
+            .unwrap(),
+        Response::RemoteControlDisabled
+    );
+    let reload = server.command().args(["reload"]).output().unwrap();
+    assert!(
+        reload.status.success(),
+        "reload: {} {}",
+        String::from_utf8_lossy(&reload.stdout),
+        String::from_utf8_lossy(&reload.stderr)
+    );
+    assert_eq!(
+        peer.request(address, &server.public, &client.private, &request())
+            .unwrap(),
+        Response::RemoteControlDisabled
+    );
+    let screen = remuda_native::client::request(
+        &socket,
+        &Request::Capture {
+            name: "proof".into(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(screen, Response::Screen(text) if !text.contains("do-not-send")));
+}
+
+#[test]
+fn hosted_remote_pane_multiline_paste_reaches_session() {
+    let (client, server) = pane_pair("host-paste");
+    server.start_named_session("proof", "stty -echo; printf 'PASTE_READY\\n'; while IFS= read -r line; do printf 'PASTE_RECEIVED:%s\\n' \"$line\"; done");
+    let mut tui = RemoteTui::start(&client, Some(&server.fingerprint()));
+    tui.wait_for("PASTE_READY", Duration::from_secs(10));
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("every key goes", Duration::from_secs(5));
+    let at = tui.output_len();
+    tui.writer
+        .write_all(b"\x1b[200~first-line\nsecond-line\n\x1b[201~")
+        .unwrap();
+    tui.wait_for_from(at, "PASTE_RECEIVED:first-line", Duration::from_secs(10));
+    tui.wait_for_from(at, "PASTE_RECEIVED:second-line", Duration::from_secs(10));
 }

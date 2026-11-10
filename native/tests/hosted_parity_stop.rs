@@ -101,6 +101,7 @@ fn stop_keep_sessions_keeps_only_host_backed_ones() {
                 assert!(alive(child), "hosted: child ended with --keep-sessions");
                 assert_eq!(names(&daemon), ["keeper"]);
             }
+            Mode::Default => unreachable!("MODES contains only explicitly selected backends"),
             Mode::InProcess => {
                 let deadline = Instant::now() + PATIENCE;
                 while alive(child) {
@@ -160,6 +161,7 @@ fn autostart_after_a_crash_names_the_sessions_it_found() {
                     "hosted: notice: {stderr}"
                 );
             }
+            Mode::Default => unreachable!("MODES contains only explicitly selected backends"),
             Mode::InProcess => assert!(
                 stderr
                     .contains("none was running (sessions of an earlier daemon, if any, are gone)"),
@@ -191,6 +193,7 @@ fn an_ended_attach_tells_a_lost_daemon_from_an_ended_session() {
         daemon.restart();
         let expected = match mode {
             Mode::Hosted => Aftermath::Running,
+            Mode::Default => unreachable!("MODES contains only explicitly selected backends"),
             Mode::InProcess => Aftermath::Ended,
         };
         assert_eq!(aftermath(&daemon.socket(), "keeper"), expected, "{mode:?}");

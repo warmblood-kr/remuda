@@ -64,6 +64,8 @@ pub enum Error {
     /// identity; never allocate a replacement request or replay automatically.
     Indeterminate(Box<RequestIdentity>),
     Forgotten(Box<RequestIdentity>),
+    /// A policy update may have reached durable storage.
+    PolicyIndeterminate,
     Agent(AgentError),
     Input(InputError),
     Protocol(&'static str),
@@ -92,6 +94,9 @@ impl core::fmt::Display for Error {
                 f.write_str("input outcome unknown; recover the original request before retry")
             }
             Self::Forgotten(_) => f.write_str("input outcome was forgotten; replay is refused"),
+            Self::PolicyIndeterminate => {
+                f.write_str("remote input policy outcome unknown; remote input is disabled locally and the stored setting may differ")
+            }
             Self::Agent(error) => error.fmt(f),
             Self::Input(error) => error.fmt(f),
             Self::Protocol(reason) => write!(f, "session protocol refused: {reason}"),
@@ -185,6 +190,10 @@ pub struct Observation {
 pub trait SessionOperations: Send + Sync {
     fn identity(&self) -> Identity;
     fn input_owner(&self) -> Option<[u8; 16]>;
+    /// Persist the peer-input policy for this exact hosted instance.
+    fn set_remote_input_disabled(&self, _disabled: bool) -> Result<()> {
+        Err(Error::Unavailable(Unavailable::Unsupported))
+    }
     fn inspect(&self) -> Result<Observation>;
     fn recover(&self, request: &RequestIdentity) -> Result<Recovery>;
     fn send(&self, bytes: &[u8]) -> Result<()>;
@@ -229,6 +238,7 @@ enum Backend {
 pub struct SessionHandle {
     identity: Identity,
     input_owner: Option<[u8; 16]>,
+    policy_update: std::sync::Mutex<()>,
     backend: Backend,
 }
 impl SessionHandle {
@@ -236,6 +246,7 @@ impl SessionHandle {
         Self {
             identity: Identity::local(&session),
             input_owner: None,
+            policy_update: std::sync::Mutex::new(()),
             backend: Backend::Local(session),
         }
     }
@@ -255,6 +266,7 @@ impl SessionHandle {
         Ok(Self {
             identity,
             input_owner,
+            policy_update: std::sync::Mutex::new(()),
             backend: Backend::Remote(backend),
         })
     }
@@ -263,6 +275,14 @@ impl SessionHandle {
     }
     pub fn input_owner(&self) -> Option<[u8; 16]> {
         self.input_owner
+    }
+    pub(crate) fn lock_policy_update(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.policy_update
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+    pub fn set_remote_input_disabled(&self, disabled: bool) -> Result<()> {
+        self.operations().set_remote_input_disabled(disabled)
     }
     /// Lookup only. The provider retains the original bounded payload/context;
     /// Forgotten/Conflict/unknown never causes an automatic new request.

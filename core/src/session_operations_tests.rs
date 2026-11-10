@@ -686,3 +686,15 @@ fn a_recovering_refusal_says_to_try_again() {
         "session owner unavailable: Transport"
     );
 }
+
+#[test]
+fn hosted_policy_store_failure_is_not_misreported_as_a_missing_session() {
+    let registry = crate::Registry::new();
+    let hosted = handle(&Shared::new());
+    let instance = hosted.identity().instance.clone();
+    assert!(registry.register_hosted(hosted).is_ok());
+    assert!(matches!(
+        registry.set_remote_input_opt_out_result("fixture", &instance, true),
+        Some(Err(_))
+    ));
+}
