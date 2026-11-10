@@ -26,6 +26,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+type QueueIdentity = (Option<String>, String, String, String, u64);
+
 const INVALID_REMOTE_REQUEST: &str = "invalid remote request";
 
 fn unsupported_request_reason(request: &Request, response: &Response) -> Option<&'static str> {
@@ -145,7 +147,7 @@ pub struct ClusterUi {
     composer_target: Option<(String, String)>,
     input_sender: InputSender,
     input_queue: InputQueue,
-    uncertain_visible_since: HashMap<(Option<String>, String, String, String, u64), Duration>,
+    uncertain_visible_since: std::cell::RefCell<HashMap<QueueIdentity, Duration>>,
     notice: Option<(String, Duration)>,
     pending_close: Option<PendingClose>,
     remote_close_confirmation: Option<RemoteCloseTarget>,
@@ -286,7 +288,7 @@ impl ClusterUi {
             composer_target: None,
             input_sender,
             input_queue: InputQueue::default(),
-            uncertain_visible_since: HashMap::new(),
+            uncertain_visible_since: std::cell::RefCell::new(HashMap::new()),
             notice: None,
             pending_close: None,
             remote_close_confirmation: None,
@@ -774,7 +776,12 @@ impl ClusterUi {
                 .map(str::to_string),
         );
         frame.extend(notice_lines);
-        frame.extend(queue_rows.into_iter().rev().map(queue_line));
+        for batch in queue_rows.into_iter().rev() {
+            if frame.len() < height {
+                self.mark_uncertain_visible(batch, now);
+            }
+            frame.push(queue_line(batch));
+        }
         self.append_footer(&mut frame, width);
         frame
             .into_iter()
@@ -1040,14 +1047,13 @@ impl ClusterUi {
         let right_w = width - left_w - 1;
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
         let notices = self.active_notice_lines(now, width);
-        let queue: Vec<String> = self
+        let queue: Vec<&PendingBatch> = self
             .visible_queue(now)
             .rev()
             .take(3)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
-            .map(queue_line)
             .collect();
         let body_rows = height
             .saturating_sub(self.footer_row_count(width) + notices.len() + queue.len())
@@ -1072,7 +1078,12 @@ impl ClusterUi {
             })
             .collect();
         frame.extend(notices);
-        frame.extend(queue);
+        for batch in queue {
+            if frame.len() < height {
+                self.mark_uncertain_visible(batch, now);
+            }
+            frame.push(queue_line(batch));
+        }
         self.append_footer(&mut frame, width);
         frame
             .into_iter()
@@ -2050,26 +2061,11 @@ impl ClusterUi {
     }
 
     fn handle_send_event(&mut self, event: Option<QueueEvent>, now: Duration) {
-        self.uncertain_visible_since.retain(|key, _| {
+        self.uncertain_visible_since.borrow_mut().retain(|key, _| {
             self.input_queue
                 .items()
                 .any(|batch| batch.state == QueueState::Uncertain && queue_identity(batch) == *key)
         });
-        if let Some(
-            QueueEvent::Uncertain { seq, .. } | QueueEvent::RemoteTargetFailed { seq, .. },
-        ) = &event
-        {
-            if let Some(batch) = self.input_queue.items().find(|batch| {
-                batch.seq == *seq
-                    && batch.state == QueueState::Uncertain
-                    && !self
-                        .uncertain_visible_since
-                        .contains_key(&queue_identity(batch))
-            }) {
-                self.uncertain_visible_since
-                    .insert(queue_identity(batch), now);
-            }
-        }
         match event {
             Some(QueueEvent::Sent { .. }) => {
                 if self.notice.as_ref().is_none_or(|(notice, _)| {
@@ -2125,9 +2121,19 @@ impl ClusterUi {
                 && (batch.state != QueueState::Uncertain
                     || self
                         .uncertain_visible_since
+                        .borrow()
                         .get(&queue_identity(batch))
                         .is_none_or(|at| now.saturating_sub(*at) < Duration::from_secs(5)))
         })
+    }
+
+    fn mark_uncertain_visible(&self, batch: &PendingBatch, now: Duration) {
+        if batch.state == QueueState::Uncertain {
+            self.uncertain_visible_since
+                .borrow_mut()
+                .entry(queue_identity(batch))
+                .or_insert(now);
+        }
     }
 
     fn clear_sending_notice(&mut self) {
@@ -3061,7 +3067,7 @@ fn wrap_to_two_lines(text: &str, width: usize) -> Vec<String> {
     vec![first, second]
 }
 
-fn queue_identity(batch: &PendingBatch) -> (Option<String>, String, String, String, u64) {
+fn queue_identity(batch: &PendingBatch) -> QueueIdentity {
     (
         batch.remote_node.clone(),
         batch.name.clone(),
@@ -6023,6 +6029,54 @@ mod tests {
             .items()
             .any(|item| item.state == QueueState::Uncertain));
         arm_partial_input_confirmation(&mut ui);
+    }
+
+    #[test]
+    fn uncertain_timer_starts_only_when_help_is_closed() {
+        let (clock, ui, _) = ui_with_uncertain_remote_target();
+        ui.help_open.set(true);
+        clock.advance(Duration::from_secs(10));
+        assert!(!ui.render_text(100, 24, "", &clock).contains("uncertain ·"));
+        ui.help_open.set(false);
+        assert!(ui.render_text(100, 24, "", &clock).contains("uncertain ·"));
+        clock.advance(Duration::from_secs(5));
+        assert!(!ui.render_text(100, 24, "", &clock).contains("uncertain ·"));
+    }
+
+    #[test]
+    fn uncertain_rows_wait_for_their_turn_before_expiring() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        for i in 0..4 {
+            let now = Instant::now();
+            assert!(ui.input_queue.enqueue(
+                format!("session{i}"),
+                "instance".into(),
+                "client".into(),
+                i,
+                format!("item{i}\r").into_bytes(),
+                now
+            ));
+            if i == 0 {
+                ui.input_queue.begin_due(now);
+                ui.input_queue
+                    .finish(i, super::queue::SendOutcome::Uncertain, now);
+            }
+        }
+        let first = ui.render_text(100, 24, "", &clock);
+        assert!(!first.contains("item0"));
+        assert!(first.contains("item1"));
+        clock.advance(Duration::from_secs(10));
+        assert!(!ui.render_text(100, 24, "", &clock).contains("item0"));
+        let now = Instant::now();
+        ui.input_queue.begin_due(now);
+        ui.input_queue
+            .finish(1, super::queue::SendOutcome::Ack { duplicate: false }, now);
+        let second = ui.render_text(100, 24, "", &clock);
+        assert!(second.contains("item0"));
+        assert!(!second.contains("item1"));
+        clock.advance(Duration::from_secs(5));
+        assert!(!ui.render_text(100, 24, "", &clock).contains("item0"));
     }
 
     #[test]
