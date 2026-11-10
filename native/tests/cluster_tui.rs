@@ -261,7 +261,10 @@ fn stopped_daemon_input_becomes_uncertain_and_later_input_recovers() {
     daemon.stop();
     let redraw_start = tui.output_len();
     tui.writer.write_all(b"\r").unwrap();
-    tui.wait_for("Input sending · first line", Duration::from_secs(3));
+    tui.wait_for(
+        "Input sending            · first line",
+        Duration::from_secs(3),
+    );
     let started = Instant::now();
     // InputLine gets an eight-second response budget and three bounded retries.
     let uncertain_bound = Duration::from_secs(36);

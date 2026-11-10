@@ -3038,8 +3038,26 @@ fn queue_line(batch: &PendingBatch) -> String {
     let bytes = batch.bytes.strip_suffix(b"\r").unwrap_or(&batch.bytes);
     let text = String::from_utf8_lossy(bytes);
     let text = crate::text::strip_terminal_controls(&text);
+    let label = match batch.state {
+        QueueState::Waiting => "Input waiting",
+        QueueState::Sending => "Input sending",
+        QueueState::Sent => "Input sent",
+        QueueState::Uncertain
+            if batch.status.contains("timed out") || batch.status.contains("timeout") =>
+        {
+            "Input timeout uncertain"
+        }
+        QueueState::Uncertain => "Input delivery uncertain",
+        QueueState::Dropped => "Input dropped",
+        QueueState::Failed => "Input failed",
+    };
     let status = crate::text::strip_terminal_controls(&batch.status);
-    format!("Input {status} · {text}")
+    let detail = match batch.state {
+        QueueState::Waiting if status == "waiting to send" => "".to_string(),
+        QueueState::Sending | QueueState::Sent => "".to_string(),
+        _ => format!(" ({status})"),
+    };
+    format!("{label:<24} · {text}{detail}")
 }
 
 fn session_status(status: &str, pending_count: usize) -> String {
@@ -5811,6 +5829,34 @@ mod tests {
         assert!(frame.contains("ended"));
         assert!(!frame.contains("    dev"));
         assert!(frame.contains("attention · ? help"));
+    }
+
+    #[test]
+    fn input_status_prefix_keeps_text_in_the_same_column() {
+        let now = Instant::now();
+        let mut queue = super::queue::InputQueue::default();
+        assert!(queue.enqueue(
+            "dev".into(),
+            "instance".into(),
+            "client".into(),
+            1,
+            b"draft\r".to_vec(),
+            now
+        ));
+        let waiting = super::queue_line(queue.items().next().unwrap());
+        queue.begin_due(now);
+        let sending = super::queue_line(queue.items().next().unwrap());
+        queue.finish(1, super::queue::SendOutcome::Uncertain, now);
+        let uncertain = super::queue_line(queue.items().next().unwrap());
+        assert_eq!(waiting.find("draft"), sending.find("draft"));
+        assert_eq!(sending.find("draft"), uncertain.find("draft"));
+        assert!(uncertain.contains("delivery uncertain"));
+        let mut timeout = queue.items().next().unwrap().clone();
+        timeout.status = "delivery uncertain after retries: cluster request timed out".into();
+        let timeout = super::queue_line(&timeout);
+        assert_eq!(sending.find("draft"), timeout.find("draft"));
+        assert!(timeout.contains("Input timeout uncertain"));
+        assert!(timeout.contains("cluster request timed out"));
     }
 
     #[test]
