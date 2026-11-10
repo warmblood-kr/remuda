@@ -64,7 +64,7 @@ mlua = { version = "0.12.1", features = ["lua54", "vendored"] }
 # The daemon-owned SQLite capability (#778). `bundled` compiles the SQLite
 # amalgamation with `cc`, the same C toolchain `mlua`'s `vendored` already needs
 # on every release target, so no system libsqlite (absent on Windows/Android).
-rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "cache", "hooks", "limits"] }
+rusqlite = { version = "0.41.0", default-features = false, features = ["bundled", "cache", "hooks", "limits"] }
 rustyline = "14.0.0"
 # Already in the dependency graph via `vt100` itself, which uses it to decide
 # `Cell::is_wide` — pinned to the same major version so a rendered row's own
@@ -101,4 +101,4 @@ bench = false
 
 [dev-dependencies]
 # Tests define SQL functions (the migration crash test stops inside a step).
-rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "functions"] }
+rusqlite = { version = "0.41.0", default-features = false, features = ["bundled", "functions"] }

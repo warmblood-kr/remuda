@@ -346,11 +346,7 @@ impl Db {
         let max_rows = self.limits.max_rows;
         let rows = self.with_conn(|conn| {
             let mut statement = conn.prepare(sql).map_err(reason)?;
-            let names: Vec<String> = statement
-                .column_names()
-                .iter()
-                .map(|n| (*n).to_owned())
-                .collect();
+            let names: Vec<String> = statement.column_names().map(str::to_owned).collect();
             let mut cursor = statement
                 .query(rusqlite::params_from_iter(params))
                 .map_err(reason)?;
