@@ -1326,3 +1326,391 @@ fn switching_away_from_a_quiet_selected_session_does_not_wait_out_its_sync() {
     // A 20s Sync hold made this take ~20s before the hold was bounded.
     assert!(waited < Duration::from_secs(5), "switch took {waited:?}");
 }
+
+#[test]
+fn remote_lua_session_view_binds_the_display_to_the_exact_peer_session() {
+    let client_node = Node::start("view-client");
+    let server_node = Node::start("view-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    server_node.start_named_session("proof", "sleep 30");
+    let config = server_node.command().args(["-e", "remuda.session_list_decorate = function(s) return {layout='compact', agent_kind='codex', description='model · 42%'} end"]).output().unwrap();
+    assert!(config.status.success(), "{config:?}");
+    let client = ClusterClient::with_timeouts(
+        Arc::new(SystemWallClock::new()),
+        ClientTimeouts {
+            connect: Duration::from_secs(2),
+            read: Duration::from_secs(3),
+            total: Duration::from_secs(3),
+        },
+    );
+    let reply = client
+        .request(
+            listener.address,
+            &server_node.public,
+            &client_node.private,
+            &Request::RenderedSessionList { width: 40 },
+        )
+        .unwrap();
+    let Response::RenderedSessionList(view) = reply else {
+        panic!("unexpected response {reply:?}");
+    };
+    let checked = view.validate_for_display(None, 40).unwrap();
+    assert_eq!(checked.sessions().len(), 1);
+    assert_eq!(checked.sessions()[0].name, "proof");
+    assert!(checked.sessions()[0].instance_id.is_some());
+    assert!(checked.entries()[0].lines[0].contains("codex"));
+    assert!(checked.entries()[0].lines[0].contains("model · 42%"));
+}
+
+#[test]
+fn remote_node_pane_shows_the_peer_lua_decorated_session_list() {
+    let client_node = Node::start("view-ui-client");
+    let server_node = Node::start("view-ui-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    server_node.start_named_session("proof", "sleep 30");
+    let config = server_node.command().args(["-e", "remuda.session_list_decorate = function(s) return {layout='compact', agent_kind='codex', description='MODELTEST'} end"]).output().unwrap();
+    assert!(config.status.success(), "{config:?}");
+    let path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server_node.fingerprint())
+        .unwrap()
+        .endpoint = Some(listener.address.to_string());
+    fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+    let tui = RemoteTui::start(&client_node, Some(&server_node.fingerprint()));
+    tui.wait_for("proof", Duration::from_secs(10));
+    tui.wait_for("MODELTEST", Duration::from_secs(10));
+    assert!(tui.screen_text().contains("codex"));
+}
+
+fn pane_pair(label: &str) -> (Node, Node) {
+    let client = Node::start(&format!("{label}-client"));
+    let server = Node::start(&format!("{label}-server"));
+    admit_pair(&client, &server);
+    let listener = Listener::start(&server);
+    let path = client.state.join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server.fingerprint())
+        .unwrap()
+        .endpoint = Some(listener.address.to_string());
+    fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+    (client, server)
+}
+
+fn local_session(server: &Node, name: &str) -> Response {
+    remuda_native::client::request(
+        &remuda_native::daemon::socket_path_in(&server.runtime, &server.name),
+        &Request::New {
+            name: Some(name.into()),
+            command: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            size: remuda_core::Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn node_pane_confirmation_does_not_kill_a_recreated_session() {
+    let (client, server) = pane_pair("view-recreate");
+    assert!(matches!(
+        local_session(&server, "proof"),
+        Response::Value(_)
+    ));
+    let mut tui = RemoteTui::start(&client, Some(&server.fingerprint()));
+    tui.wait_for("proof", Duration::from_secs(10));
+    tui.writer.write_all(b"x").unwrap();
+    tui.wait_for("kill proof?", Duration::from_secs(5));
+    let socket = remuda_native::daemon::socket_path_in(&server.runtime, &server.name);
+    let response = remuda_native::client::request(
+        &socket,
+        &Request::Close {
+            name: "proof".into(),
+            instance_id: None,
+            confirm: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(response, Response::Ok);
+    assert!(matches!(
+        local_session(&server, "proof"),
+        Response::Value(_)
+    ));
+    std::thread::sleep(Duration::from_millis(700));
+    tui.writer.write_all(b"y").unwrap();
+    std::thread::sleep(Duration::from_millis(700));
+    let Response::Sessions(rows) = remuda_native::client::request(&socket, &Request::List).unwrap()
+    else {
+        panic!("list failed");
+    };
+    assert!(
+        rows.iter().any(|row| row.name == "proof" && row.alive),
+        "new session must remain alive"
+    );
+}
+
+#[test]
+fn node_pane_confirmation_never_emits_peer_terminal_commands() {
+    let (client, server) = pane_pair("view-escape");
+    let name = "proof\x1b]0;PWNED\x07";
+    assert!(matches!(local_session(&server, name), Response::Value(_)));
+    let mut tui = RemoteTui::start(&client, Some(&server.fingerprint()));
+    tui.wait_for("proof", Duration::from_secs(10));
+    let offset = tui.output_len();
+    tui.writer.write_all(b"x").unwrap();
+    tui.wait_for("kill \"proof", Duration::from_secs(5));
+    assert!(
+        !tui.raw_text_from(offset).contains("\x1b]0;PWNED\x07"),
+        "peer name must not emit terminal command"
+    );
+}
+
+#[test]
+fn node_pane_keeps_selected_instance_when_decorated_view_falls_back() {
+    let (client, server) = pane_pair("view-order");
+    assert!(matches!(local_session(&server, "aa"), Response::Value(_)));
+    assert!(matches!(local_session(&server, "zz"), Response::Value(_)));
+    let config = server.command().args(["-e", "remuda.session_order=function() return {{name='zz'},{name='aa'}} end; remuda.session_list_decorate=function() return {layout='compact', description='MODELTEST'} end"]).output().unwrap();
+    assert!(config.status.success());
+    let mut tui = RemoteTui::start(&client, Some(&server.fingerprint()));
+    tui.wait_for("MODELTEST", Duration::from_secs(10));
+    let disable = server
+        .command()
+        .args([
+            "-e",
+            "remuda._render_sessions_snapshot=function() error('unsupported') end",
+        ])
+        .output()
+        .unwrap();
+    assert!(disable.status.success());
+    wait_for("view fallback", Duration::from_secs(8), || {
+        !tui.screen_text().contains("MODELTEST")
+    });
+    tui.writer.write_all(b"x").unwrap();
+    tui.wait_for("kill aa?", Duration::from_secs(4));
+}
+
+#[test]
+fn node_pane_fallback_keeps_spaced_and_combining_names_actionable() {
+    for (tag, name, label) in [
+        ("spaces", " leading ", "\" leading \""),
+        ("combining", "e\u{301}", "\"e\\u{301}\""),
+    ] {
+        let (client, server) = pane_pair(tag);
+        assert!(matches!(local_session(&server, name), Response::Value(_)));
+        let mut tui = RemoteTui::start(&client, Some(&server.fingerprint()));
+        tui.wait_for(label, Duration::from_secs(10));
+        tui.writer.write_all(b"x").unwrap();
+        tui.wait_for(&format!("kill {label}?"), Duration::from_secs(5));
+        tui.writer.write_all(b"y").unwrap();
+        let socket = remuda_native::daemon::socket_path_in(&server.runtime, &server.name);
+        wait_for(
+            "closed exact instance",
+            Duration::from_secs(5),
+            || matches!(remuda_native::client::request(&socket, &Request::List), Ok(Response::Sessions(rows)) if !rows.iter().any(|row| row.name == name && row.alive)),
+        );
+    }
+}
+
+#[test]
+fn node_pane_refuses_actions_when_distinct_names_have_the_same_fallback_label() {
+    let (client, server) = pane_pair("view-label-collision");
+    let name_control = "proof\x1b";
+    let name_literal = "\"proof\\u{1b}\"";
+    assert!(matches!(
+        local_session(&server, name_control),
+        Response::Value(_)
+    ));
+    assert!(matches!(
+        local_session(&server, name_literal),
+        Response::Value(_)
+    ));
+    let mut tui = RemoteTui::start(&client, Some(&server.fingerprint()));
+    tui.wait_for("proof\\u{1b}", Duration::from_secs(10));
+    tui.writer.write_all(b"x").unwrap();
+    tui.wait_for("kill", Duration::from_secs(3));
+    tui.writer.write_all(b"y").unwrap();
+    std::thread::sleep(Duration::from_millis(700));
+    let socket = remuda_native::daemon::socket_path_in(&server.runtime, &server.name);
+    let Response::Sessions(rows) = remuda_native::client::request(&socket, &Request::List).unwrap()
+    else {
+        panic!("list failed");
+    };
+    assert!(rows.iter().any(|row| row.name == name_control && row.alive));
+    assert!(rows.iter().any(|row| row.name == name_literal && row.alive));
+}
+
+#[test]
+fn malicious_duplicate_names_never_close_or_focus_an_ambiguous_instance() {
+    use std::io::BufRead;
+    use std::sync::atomic::AtomicBool;
+    let client = Node::start("duplicate-client");
+    let peer = Node::start("duplicate-peer");
+    admit_pair(&client, &peer);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let path = client.state.join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == peer.fingerprint())
+        .unwrap()
+        .endpoint = Some(address.to_string());
+    fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+    let observed = Arc::new(std::sync::Mutex::new(Vec::<Request>::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let peer_private = peer.private.clone();
+    let log = observed.clone();
+    let done = stop.clone();
+    let worker = std::thread::spawn(move || {
+        while !done.load(Ordering::SeqCst) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let mut length = None;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().ok();
+                }
+            }
+            let Some(length) = length.filter(|n| *n <= 65535) else {
+                continue;
+            };
+            let mut body = vec![0; length];
+            if reader.read_exact(&mut body).is_err() {
+                continue;
+            }
+            let Ok(opened) = remuda_native::net::frame::open_request(&peer_private, &body) else {
+                continue;
+            };
+            let Ok(request) = serde_json::from_slice::<Request>(&opened.payload) else {
+                continue;
+            };
+            log.lock().unwrap().push(request.clone());
+            let row = |instance: &str| remuda_core::SessionSummary {
+                id: instance.into(),
+                name: "proof".into(),
+                instance_id: Some(instance.into()),
+                output_version: None,
+                alive: true,
+                idle: Duration::ZERO,
+                output_idle: None,
+                size: remuda_core::Size::new(80, 24),
+                attached: false,
+                human_idle: None,
+                mouse_tracking: false,
+                unavailable: false,
+                program_status: None,
+                program_status_age_ms: None,
+                remote_input_disabled: false,
+            };
+            let response = match request {
+                Request::List => Response::Sessions(vec![row("first"), row("second")]),
+                Request::CaptureStyled { .. } => Response::StyledScreen {
+                    rows: vec![],
+                    instance_id: Some("first".into()),
+                    output_version: Some(1),
+                    wrapped: vec![],
+                    scrollback_len: 0,
+                    scrollback_total: 0,
+                    cursor: remuda_core::agent::Cursor {
+                        row: 0,
+                        col: 0,
+                        visible: false,
+                    },
+                },
+                Request::RenderedSessionList { .. } => Response::Error("unsupported".into()),
+                _ => Response::Ok,
+            };
+            let body = remuda_native::net::frame::seal_response(
+                opened,
+                &serde_json::to_vec(&response).unwrap(),
+            )
+            .unwrap();
+            let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&body);
+        }
+    });
+    let mut tui = RemoteTui::start(&client, Some(&peer.fingerprint()));
+    tui.wait_for("proof", Duration::from_secs(8));
+    tui.writer.write_all(b"\x1b[Bx").unwrap();
+    tui.wait_for("duplicate session names", Duration::from_secs(4));
+    tui.writer.write_all(b"y").unwrap();
+    tui.writer.write_all(b"mhello\r\rtyped").unwrap();
+    std::thread::sleep(Duration::from_millis(700));
+    let requests = observed.lock().unwrap().clone();
+    stop.store(true, Ordering::SeqCst);
+    worker.join().unwrap();
+    assert!(
+        !requests.iter().any(|request| matches!(
+            request,
+            Request::Close { .. } | Request::Input { .. } | Request::InputLine { .. }
+        )),
+        "ambiguous target was acted on: {requests:?}"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| matches!(request, Request::CaptureStyled { .. })),
+        "ambiguous preview must not be requested: {requests:?}"
+    );
+}
+
+#[test]
+fn node_pane_distinguishes_ascii_space_from_nonbreaking_space() {
+    let (client, server) = pane_pair("view-nbsp");
+    assert!(matches!(local_session(&server, "a b"), Response::Value(_)));
+    assert!(matches!(
+        local_session(&server, "a\u{a0}b"),
+        Response::Value(_)
+    ));
+    let tui = RemoteTui::start(&client, Some(&server.fingerprint()));
+    tui.wait_for("a b", Duration::from_secs(10));
+    tui.wait_for("\\u{a0}", Duration::from_secs(10));
+}
+
+#[test]
+fn node_pane_live_keys_reach_the_displayed_exact_instance() {
+    let (client, server) = pane_pair("view-live-keys");
+    server.start_named_session(
+        "proof",
+        "while IFS= read -r line; do printf 'RECV:%s\\n' \"$line\"; done",
+    );
+    let mut tui = RemoteTui::start(&client, Some(&server.fingerprint()));
+    tui.wait_for("proof", Duration::from_secs(10));
+    std::thread::sleep(Duration::from_millis(500));
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("every key goes", Duration::from_secs(5));
+    tui.writer.write_all(b"hello\r").unwrap();
+    tui.wait_for("RECV:hello", Duration::from_secs(8));
+}

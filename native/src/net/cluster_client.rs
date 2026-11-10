@@ -162,7 +162,8 @@ impl ClusterClient {
             .max(Duration::from_millis(1));
         let mut stream = TcpStream::connect_timeout(&peer, connect_timeout).map_err(map_io)?;
         let remaining_total = remaining(deadline)?;
-        self.exchange(&mut stream, sealed, &body, remaining_total)
+        let view = matches!(request, Request::RenderedSessionList { .. });
+        self.exchange(&mut stream, sealed, &body, remaining_total, view)
     }
 
     fn exchange(
@@ -171,6 +172,7 @@ impl ClusterClient {
         sealed: frame::SealedRequest,
         body: &[u8],
         watchdog_after: Duration,
+        view: bool,
     ) -> Result<Response, ClientError> {
         let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let timer_stream = stream.try_clone().map_err(map_io)?;
@@ -182,7 +184,7 @@ impl ClusterClient {
                 let _ = timer_stream.shutdown(Shutdown::Both);
             }
         });
-        let result = self.exchange_inner(stream, sealed, body);
+        let result = self.exchange_inner(stream, sealed, body, view);
         let _ = done_tx.send(());
         let _ = watchdog.join();
         if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
@@ -197,6 +199,7 @@ impl ClusterClient {
         stream: &mut TcpStream,
         sealed: frame::SealedRequest,
         body: &[u8],
+        view: bool,
     ) -> Result<Response, ClientError> {
         stream
             .set_write_timeout(Some(self.timeouts.read))
@@ -210,7 +213,14 @@ impl ClusterClient {
         stream.shutdown(Shutdown::Write).map_err(map_io)?;
 
         let mut reader = BufReader::new(stream.try_clone().map_err(map_io)?);
-        let plaintext = read_response(&mut reader, sealed)?;
+        let plaintext = read_response_limited(
+            &mut reader,
+            sealed,
+            if view { 65535 } else { V2_BODY_BOUND },
+        )?;
+        if view && plaintext.len() > 32768 {
+            return Err(ClientError::BadResponse);
+        }
         serde_json::from_slice(&plaintext).map_err(|_| ClientError::BadResponse)
     }
 }
@@ -218,12 +228,21 @@ impl ClusterClient {
 /// Read the HTTP reply and open it. Bodies up to `MAX_BODY_BYTES` are v1/v2
 /// buffered; larger ones can only be v2 and are streamed through the record
 /// opener, which authenticates msg2 before anything else is consumed.
+#[cfg(test)]
 fn read_response<R: Read>(
     reader: &mut BufReader<R>,
     sealed: frame::SealedRequest,
 ) -> Result<Vec<u8>, ClientError> {
+    read_response_limited(reader, sealed, V2_BODY_BOUND)
+}
+
+fn read_response_limited<R: Read>(
+    reader: &mut BufReader<R>,
+    sealed: frame::SealedRequest,
+    max_body: usize,
+) -> Result<Vec<u8>, ClientError> {
     let (status, length) = read_http_head(reader)?;
-    if length > V2_BODY_BOUND {
+    if length > max_body {
         return Err(ClientError::BadResponse);
     }
     if status == 400 {
@@ -426,7 +445,9 @@ fn map_io(error: io::Error) -> ClientError {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_io, read_http_head, read_response, ClientError, V2_BODY_BOUND};
+    use super::{
+        map_io, read_http_head, read_response, read_response_limited, ClientError, V2_BODY_BOUND,
+    };
     use crate::net::frame;
     use std::io::{BufReader, Cursor, Read};
 
@@ -484,6 +505,24 @@ mod tests {
         let data = payload(len);
         let body = frame::seal_response_chunked(opened, &data).unwrap();
         (sealed, data, body)
+    }
+
+    #[test]
+    fn rendered_view_rejects_oversized_ciphertext_before_open_or_deserialization() {
+        let (sealed, _, body) = v2(70_000);
+        let total = body.len();
+        let mut reader = BufReader::new(CountedReader {
+            source: Cursor::new(http(&body, total)),
+            bytes_read: 0,
+        });
+        assert!(matches!(
+            read_response_limited(&mut reader, sealed, 65535),
+            Err(ClientError::BadResponse)
+        ));
+        assert!(
+            reader.get_ref().bytes_read < total,
+            "did not read the oversized body"
+        );
     }
 
     #[test]

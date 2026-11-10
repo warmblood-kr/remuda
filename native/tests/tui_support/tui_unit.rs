@@ -1388,13 +1388,19 @@ fn killing_a_live_session_asks_and_killing_a_dead_one_does_not() {
     assert_eq!(ui.mode, Mode::Confirm("live".into()));
     assert_eq!(
         ui.on_key(press(KeyCode::Char('y'))),
-        Action::Kill("live".into())
+        Action::Kill {
+            name: "live".into(),
+            instance_id: Some("test-session".into())
+        }
     );
 
     let mut dead = make_ui(vec![row("dead", false, false)]);
     assert_eq!(
         dead.on_key(press(KeyCode::Char('x'))),
-        Action::Kill("dead".into())
+        Action::Kill {
+            name: "dead".into(),
+            instance_id: Some("test-session".into())
+        }
     );
 }
 
@@ -2163,6 +2169,23 @@ fn session_order_hook_indents_rows_and_an_error_keeps_the_legacy_buffer_bytes() 
         legacy,
         "a hook error must fall back to the exact no-hook buffer"
     );
+}
+
+#[test]
+fn compact_session_list_renders_multiple_ordered_entries() {
+    let path = scratch_socket("compact-session-list");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "alpha");
+    new_session(&path, "bravo");
+    eval(
+        &path,
+        r#"remuda.session_list_decorate = function() return { layout = "compact" } end"#,
+    );
+    let (rows, lines, _) = sessions_buffer_lines(&path, 80, 0, None).expect("render compact list");
+    assert_eq!(rows, 1);
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("alpha"), "first entry: {lines:?}");
+    assert!(lines[1].contains("bravo"), "second entry: {lines:?}");
 }
 
 #[test]

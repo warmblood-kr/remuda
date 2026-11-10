@@ -199,6 +199,8 @@ pub struct HostBuild {
 pub enum Request {
     /// Every session this node holds.
     List,
+    /// One bounded Lua-rendered view and its exact session snapshot.
+    RenderedSessionList { width: u16 },
     /// Start a session, answering [`Response::Value`] with the name it got.
     /// `command` is argv (empty = shell); unset `name` derives and dedupes one.
     /// `cwd`/`env` default to the daemon's own directory/environment.
@@ -526,6 +528,8 @@ pub enum Response {
     },
     /// Current mouse tracking mode and encoding, read from the live parser.
     MouseState(MouseState),
+    /// Lua-rendered rows with the same immutable session snapshot.
+    RenderedSessionList(crate::session_view::SessionView),
     /// What an [`Request::Eval`] returned, already rendered to text. Kept
     /// distinct from `Screen` so a client can tell "the session printed
     /// nothing" from "the expression returned nothing".

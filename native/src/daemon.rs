@@ -2139,6 +2139,22 @@ fn handle_request(
             reply(&stream, &Response::Sessions(registry.list()))
         }
 
+        Request::RenderedSessionList { width } => {
+            if !(1..=512).contains(&width) {
+                return reply(&stream, &Response::error("invalid session view width"));
+            }
+            let sessions = registry.list();
+            if sessions.len() > 256 {
+                return reply(&stream, &Response::error("too many sessions"));
+            }
+            match image.render_session_view(sessions, width) {
+                Ok(json) => match serde_json::from_str(&json) {
+                    Ok(view) => reply(&stream, &Response::RenderedSessionList(view)),
+                    Err(_) => reply(&stream, &Response::error("invalid session view")),
+                },
+                Err(error) => reply(&stream, &Response::error(error)),
+            }
+        }
         Request::Version => reply(&stream, &Response::Value(crate::dist::BUILD_VERSION.into())),
         Request::RemoteInputSupport => reply(&stream, &Response::Ok),
         Request::SocketPublication => reply(&stream, &Response::Value(socket_publication())),
