@@ -3039,17 +3039,12 @@ fn queue_line(batch: &PendingBatch) -> String {
     let text = String::from_utf8_lossy(bytes);
     let text = crate::text::strip_terminal_controls(&text);
     let label = match batch.state {
-        QueueState::Waiting => "Input waiting",
-        QueueState::Sending => "Input sending",
-        QueueState::Sent => "Input sent",
-        QueueState::Uncertain
-            if batch.status.contains("timed out") || batch.status.contains("timeout") =>
-        {
-            "Input timeout uncertain"
-        }
-        QueueState::Uncertain => "Input delivery uncertain",
-        QueueState::Dropped => "Input dropped",
-        QueueState::Failed => "Input failed",
+        QueueState::Waiting => "waiting",
+        QueueState::Sending => "sending",
+        QueueState::Sent => "sent",
+        QueueState::Uncertain => "uncertain",
+        QueueState::Dropped => "dropped",
+        QueueState::Failed => "failed",
     };
     let status = crate::text::strip_terminal_controls(&batch.status);
     let detail = match batch.state {
@@ -3057,7 +3052,7 @@ fn queue_line(batch: &PendingBatch) -> String {
         QueueState::Sending | QueueState::Sent => "".to_string(),
         _ => format!(" ({status})"),
     };
-    format!("{label:<24} · {text}{detail}")
+    format!("{label:<9} · {text}{detail}")
 }
 
 fn session_status(status: &str, pending_count: usize) -> String {
@@ -5855,7 +5850,9 @@ mod tests {
         timeout.status = "delivery uncertain after retries: cluster request timed out".into();
         let timeout = super::queue_line(&timeout);
         assert_eq!(sending.find("draft"), timeout.find("draft"));
-        assert!(timeout.contains("Input timeout uncertain"));
+        assert!(timeout.starts_with("uncertain · draft"));
+        assert!(crate::tui::visible_width(&timeout) > 20);
+        assert!(super::truncate(&timeout, 20).contains("draft"));
         assert!(timeout.contains("cluster request timed out"));
     }
 
@@ -5877,7 +5874,7 @@ mod tests {
             Ok(remuda_core::protocol::Response::Uncertain)
         });
         let frame = ui.render_text(80, 24, "", &clock);
-        assert!(frame.contains("Input delivery uncertain"));
+        assert!(frame.contains("uncertain ·"));
         assert!(!frame.contains("pending input 1"));
         ui.key(crossterm::event::KeyCode::Char('!'));
         assert!(ui
