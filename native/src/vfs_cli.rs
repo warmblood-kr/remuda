@@ -124,6 +124,10 @@ fn spec() -> Spec {
                      option("json", None, "Print JSON"),
                      option("conflicts", None, "Paths with kept concurrent writes under PREFIX; deleted ones too")],
                 "remuda vfs ls [PREFIX] [-R] [--json] [--conflicts]"),
+            verb("grep", "Search for literal text in VFS files. Exit 0 for matches, 1 for none, 2 for incomplete results. Files over 1 MiB, binary files and conflicts are skipped; output is bounded.",
+                vec![arg("PATTERN", "Literal text to find", true), arg("PREFIX", "File or directory URI (default: entire VFS)", false)],
+                vec![option("local", None, "Do not fetch missing files from peers"), option("json", None, "Print structured results")],
+                "remuda vfs grep PATTERN [PREFIX] [--local] [--json]"),
             verb("resolve-conflict", "Settle a path's conflicts by writing one side again. Example: remuda vfs resolve-conflict remuda:///notes.md --keep winner",
                 vec![arg("URI", "remuda:// URI", true)],
                 vec![OptionSpec { required: true, ..option("keep", Some("WHICH"), "winner, or the VERSION of a conflict from `remuda vfs ls --conflicts`") }],
@@ -968,6 +972,7 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
         "resolve" => resolve(&store, values, out),
         "stat" => stat(&store, values, out),
         "ls" => list(&store, values, out),
+        "grep" => grep(&store, values, out),
         "rm" => remove(&store, values, out),
         "resolve-conflict" => settle(&store, values, out),
         "read" => unreachable!("read is answered before the store opens"),
@@ -1912,6 +1917,112 @@ fn list(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
         Scope::File(entry) => file_rows(out, json, &[entry], None, &local),
         Scope::Dir(dir) => list_dir(out, json, &dir, flag(values, "recursive"), &index, &local),
     }
+}
+
+const GREP_MAX_FILE: u64 = 1024 * 1024;
+const GREP_MAX_OUTPUT: usize = 512 * 1024;
+const GREP_MAX_MATCHES: usize = 1000;
+
+fn grep(store: &VfsStore, values: &Map<String, Value>, out: &mut Out) -> u8 {
+    let pattern = value(values, "PATTERN").unwrap_or_default();
+    if pattern.is_empty() {
+        return fail(out, "grep", "PATTERN must not be empty");
+    }
+    let Some(prefix) = or_fail(out, "grep", prefix(store, value(values, "PREFIX"))) else {
+        return 2;
+    };
+    let Some(index) = or_fail(out, "grep", store.load_index()) else {
+        return 2;
+    };
+    let entries = match scope(&index, &prefix) {
+        Scope::File(entry) => vec![entry],
+        Scope::Dir(dir) => index.list(&dir),
+    };
+    let mut matches = Vec::new();
+    let mut skipped = Vec::new();
+    let mut bytes_out = 0;
+    for entry in entries {
+        let uri = VfsUri {
+            cluster: None,
+            path: entry.path.clone(),
+        };
+        let name = format!("remuda:///{}", entry.path);
+        let reason = if !entry.conflicts.is_empty() {
+            Some("conflict".to_owned())
+        } else if entry.size > GREP_MAX_FILE {
+            Some("too_large".to_owned())
+        } else {
+            match fetch(store, &uri, flag(values, "local")) {
+                Ok((current, _))
+                    if current.sha256 != entry.sha256 || current.version != entry.version =>
+                {
+                    Some("changed".to_owned())
+                }
+                Ok((_, bytes)) if bytes.len() as u64 > GREP_MAX_FILE => {
+                    Some("too_large".to_owned())
+                }
+                Ok((current, bytes)) => match std::str::from_utf8(&bytes) {
+                    Ok(text) if !text.contains('\0') => {
+                        let mut full = false;
+                        for (i, line) in text
+                            .lines()
+                            .enumerate()
+                            .filter(|(_, line)| line.contains(pattern))
+                        {
+                            bytes_out += line.len() + name.len() + 128;
+                            if matches.len() >= GREP_MAX_MATCHES || bytes_out > GREP_MAX_OUTPUT {
+                                full = true;
+                                break;
+                            }
+                            matches.push(serde_json::json!({"uri":name,"line":i+1,"text":line,"version":current.version,"sha256":current.sha256}));
+                        }
+                        full.then(|| "limit".to_owned())
+                    }
+                    _ => Some("binary".to_owned()),
+                },
+                Err(error) => Some(error.kind.code().to_owned()),
+            }
+        };
+        if let Some(reason) = reason {
+            skipped.push(serde_json::json!({"uri":name,"reason":reason}));
+        }
+        if skipped.len() >= GREP_MAX_MATCHES || bytes_out > GREP_MAX_OUTPUT {
+            break;
+        }
+    }
+    let code = if !skipped.is_empty() {
+        2
+    } else if matches.is_empty() {
+        1
+    } else {
+        0
+    };
+    if flag(values, "json") {
+        say!(
+            out,
+            "{}",
+            serde_json::json!({"matches":matches,"skipped":skipped,"complete":code!=2})
+        );
+    } else {
+        for item in &matches {
+            say!(
+                out,
+                "{}:{}:{}",
+                item["uri"].as_str().unwrap(),
+                item["line"],
+                item["text"].as_str().unwrap()
+            );
+        }
+        for item in &skipped {
+            warn!(
+                out,
+                "remuda: grep: {}: {}",
+                item["uri"].as_str().unwrap(),
+                item["reason"].as_str().unwrap()
+            );
+        }
+    }
+    code
 }
 
 fn list_dir(
@@ -3140,5 +3251,67 @@ mod tests {
         assert!(parse_replicas("0").is_err());
         assert!(parse_replicas("17").is_err());
         assert!(parse_replicas("x").is_err());
+    }
+}
+
+#[cfg(test)]
+mod grep_tests {
+    use super::*;
+
+    #[test]
+    fn grep_reports_lines_and_partial_binary_without_losing_matches() {
+        let dir = std::env::temp_dir().join(format!("remuda-grep-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = VfsStore::open_at(&dir.join("vfs")).unwrap();
+        store
+            .put(
+                "notes/a.txt",
+                b"zero\nneedle here\nneedle again\n",
+                1,
+                "test",
+            )
+            .unwrap();
+        store
+            .put("notes/b.bin", b"needle\0binary", 1, "test")
+            .unwrap();
+        store
+            .put("elsewhere/c.txt", b"needle\n", 1, "test")
+            .unwrap();
+        let mut out = Out::default();
+        let values = serde_json::json!({"PATTERN":"needle", "PREFIX":"remuda:///notes/", "json":true, "local":true});
+        assert_eq!(grep(&store, values.as_object().unwrap(), &mut out), 2);
+        let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(result["matches"].as_array().unwrap().len(), 2);
+        assert_eq!(result["matches"][0]["line"], 2);
+        assert_eq!(result["matches"][0]["text"], "needle here");
+        assert_eq!(result["matches"][0]["uri"], "remuda:///notes/a.txt");
+        assert_eq!(result["skipped"][0]["reason"], "binary");
+        assert_eq!(result["complete"], false);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn grep_marks_unavailable_or_oversize_files_and_no_match() {
+        let dir = std::env::temp_dir().join(format!("remuda-grep-limits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = VfsStore::open_at(&dir.join("vfs")).unwrap();
+        let missing = store.put("missing", b"needle", 1, "test").unwrap();
+        store
+            .put("large", &vec![b'x'; GREP_MAX_FILE as usize + 1], 1, "test")
+            .unwrap();
+        std::fs::remove_file(store.blob_path(&missing.sha256).unwrap()).unwrap();
+        let values = serde_json::json!({"PATTERN":"needle", "json":true, "local":true});
+        let mut out = Out::default();
+        assert_eq!(grep(&store, values.as_object().unwrap(), &mut out), 2);
+        let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(result["skipped"].as_array().unwrap().len(), 2);
+        assert_eq!(result["complete"], false);
+        let mut out = Out::default();
+        let values =
+            serde_json::json!({"PATTERN":"absent", "PREFIX":"remuda:///empty/", "json":true});
+        assert_eq!(grep(&store, values.as_object().unwrap(), &mut out), 1);
+        let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(result["complete"], true);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

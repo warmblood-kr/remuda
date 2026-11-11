@@ -537,6 +537,27 @@ fn put_one_copy(node: &Node, uri: &str, body: &[u8]) {
     );
 }
 
+#[test]
+fn grep_reads_text_from_vfs_without_a_mount() {
+    let _serial = live_test_guard();
+    let (a, b, _c) = three_nodes();
+    put_one_copy(&a, "remuda:///grep/a.txt", b"first\nneedle in line two\n");
+    wait_until(
+        "grep file reaches peer index",
+        Duration::from_secs(10),
+        || b.stat_json("remuda:///grep/a.txt").is_some(),
+    );
+    let output = successful(
+        b.run(&["vfs", "grep", "needle", "remuda:///grep/", "--json"]),
+        "vfs grep",
+    );
+    let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(result["complete"], true);
+    assert_eq!(result["matches"][0]["uri"], "remuda:///grep/a.txt");
+    assert_eq!(result["matches"][0]["line"], 2);
+    assert_eq!(result["matches"][0]["text"], "needle in line two");
+}
+
 /// The default listing shows one level; `-R` shows every descendant.
 fn assert_listed_by_depth(node: &Node) {
     let listed = successful(node.run(&["vfs", "ls", "remuda:///butler/"]), "vfs ls");
