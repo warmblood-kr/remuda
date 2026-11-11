@@ -162,3 +162,31 @@ fn older_peers_frames_are_unchanged_and_still_accepted() {
     let granted: Response = serde_json::from_slice(&channel.receive().unwrap()).unwrap();
     assert!(matches!(granted, Response::Granted { .. }));
 }
+
+#[test]
+fn refresh_uses_existing_writer_fence_and_restores_dimensions() {
+    let fixture = Fixture::new();
+    let mut current = fixture.control();
+    assert!(matches!(
+        current.acquire(writer(7)).unwrap(),
+        Response::Granted { .. }
+    ));
+    assert!(matches!(
+        current.request(&Request::Refresh).unwrap(),
+        Response::Ok
+    ));
+    let info = fixture.host.inspect().unwrap();
+    assert_eq!((info.cols, info.rows), (80, 24));
+    let mut newer = fixture.control();
+    assert_eq!(code(newer.acquire(writer(8)).unwrap()), "controller_busy");
+    assert_eq!(
+        code(current.request(&Request::Refresh).unwrap()),
+        "superseded_writer"
+    );
+}
+
+#[test]
+fn refresh_capability_is_advertised() {
+    let fixture = Fixture::new();
+    assert!(fixture.control().offers(super::super::api::SCREEN_REFRESH));
+}

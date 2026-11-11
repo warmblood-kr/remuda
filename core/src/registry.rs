@@ -1113,6 +1113,19 @@ impl Registry {
         )
     }
 
+    pub fn refresh_instance(&self, name: &str, instance_id: &str) -> Option<Result<bool>> {
+        self.route(
+            name,
+            |session| session.refresh_instance(instance_id),
+            |handle| {
+                if handle.identity().instance != instance_id {
+                    return Ok(false);
+                }
+                handle.refresh().map(|()| true)
+            },
+        )
+    }
+
     pub fn resize(&self, name: &str, size: Size) -> Option<Result<()>> {
         self.route(name, |s| s.resize(size), |h| h.resize(size))
     }

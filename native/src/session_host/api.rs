@@ -24,6 +24,7 @@ pub(crate) const DEEP_HISTORY: &str = "deep-history-v1";
 pub(crate) const COMPACT_VIEW: &str = "compact-view-v1";
 /// AcquireWriter is understood; the host refuses any writer older than one seen.
 pub(crate) const WRITER_FENCE: &str = "writer-fence-v1";
+pub(crate) const SCREEN_REFRESH: &str = "screen-refresh-v1";
 /// The durable inventory writer a daemon presents: store incarnation, epoch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -158,6 +159,7 @@ pub(crate) enum Request {
         rows: u16,
         cols: u16,
     },
+    Refresh,
     Close,
     Snapshot,
     Viewport {

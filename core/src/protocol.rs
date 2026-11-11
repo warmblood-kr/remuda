@@ -300,6 +300,8 @@ pub enum Request {
         instance_id: String,
         size: Size,
     },
+    /// Request redraw for a specific local session instance.
+    RefreshSession { name: String, instance_id: String },
     /// Move a session's retained terminal history; positive means older.
     /// Read the screen as text without taking the session over. Needs no
     /// terminal, raw mode or exclusivity, so it works while a human is attached.

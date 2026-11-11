@@ -2371,6 +2371,19 @@ fn handle_request(
             },
         ),
 
+        Request::RefreshSession { name, instance_id } => respond(
+            &stream,
+            &name,
+            registry.refresh_instance(&name, &instance_id),
+            |refreshed| {
+                if refreshed {
+                    Response::Ok
+                } else {
+                    Response::WrongInstance
+                }
+            },
+        ),
+
         Request::Resize { name, size } => {
             respond(&stream, &name, registry.resize(&name, size), |()| {
                 Response::Ok

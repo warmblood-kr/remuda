@@ -967,6 +967,55 @@ impl Session {
         Ok(true)
     }
 
+    /// Request a redraw by briefly changing the terminal width. This only
+    /// confirms that the resize calls returned, not that the child redrew.
+    /// Keep the agent lock across both calls so another resize cannot be
+    /// overwritten by restoration of the original size.
+    pub fn refresh_instance(&self, instance_id: &str) -> Result<bool> {
+        if self.instance_id != instance_id {
+            return Ok(false);
+        }
+        let mut agent = self
+            .agent
+            .lock()
+            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        if !agent.is_alive() {
+            return Err(AgentError::Exited);
+        }
+        let mut current = self
+            .size
+            .lock()
+            .map_err(|_| AgentError::Io("session size lock poisoned".into()))?;
+        let original = *current;
+        // Stay within the host terminal's area and dimension limits.
+        let can_grow = original.cols() < Size::MAX_RESIZE_COLS
+            && u32::from(original.cols() + 1) * u32::from(original.rows()) <= 65_536;
+        let cols = if can_grow {
+            original.cols() + 1
+        } else {
+            original.cols() - 1
+        };
+        let temporary = Size::for_viewport(cols, original.rows());
+        agent.resize(temporary)?;
+        *current = temporary;
+        std::thread::sleep(Duration::from_millis(50));
+        if let Err(error) = agent.resize(original) {
+            drop(current);
+            drop(agent);
+            Self::notify_output_changed(&self.output_changed);
+            return Err(AgentError::Io(format!(
+                "screen refresh restore failed; last acknowledged size {}x{}: {error}",
+                temporary.cols(),
+                temporary.rows()
+            )));
+        }
+        *current = original;
+        drop(current);
+        drop(agent);
+        Self::notify_output_changed(&self.output_changed);
+        Ok(true)
+    }
+
     /// Resize the backing terminal and publish its new dimensions together.
     /// The agent lock serializes this with output capture and input delivery;
     /// a failed backend resize leaves the advertised session size unchanged.
@@ -2215,3 +2264,7 @@ impl<S: Borrow<Session>> Drop for Attachment<S> {
 #[cfg(test)]
 #[path = "attachment_tests.rs"]
 mod attachment_tests;
+
+#[cfg(test)]
+#[path = "session_refresh_tests.rs"]
+mod session_refresh_tests;

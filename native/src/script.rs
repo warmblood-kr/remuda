@@ -30,7 +30,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 114] = [
+pub const BINDINGS: [&str; 115] = [
     "_advice_reattach",
     "_call",
     "_caller_live",
@@ -66,6 +66,7 @@ pub const BINDINGS: [&str; 114] = [
     "_run_schedule",
     "_schedule_fire_counts",
     "_session_remote_input",
+    "_session_refresh",
     "_session_resize",
     "_sync_window_shown",
     "_take_due_schedules",
@@ -269,6 +270,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_session_resize",
         "Resize a session after validating its requested dimensions.",
         "_session_resize(name, cols, rows) -> true, nil | nil, error",
+    ),
+    (
+        "_session_refresh",
+        "Request an instance-fenced screen redraw. Success means resize completed, not that the application redrew.",
+        "_session_refresh(name, instance_id) -> true, nil | nil, error",
     ),
     (
         "_session_remote_input",
@@ -1247,6 +1253,7 @@ pub(crate) fn bindings(
     )?;
 
     session_resize_binding(lua, &table, at())?;
+    session_refresh_binding(lua, &table, at())?;
     session_remote_input_binding(lua, &table, at())?;
 
     new_binding(lua, &table, at())?;
@@ -1399,6 +1406,25 @@ fn clear_input_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> ml
                     },
                 )?,
             )
+        })?,
+    )
+}
+
+fn session_refresh_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
+    table.set(
+        "_session_refresh",
+        lua.create_function(move |_, (name, instance_id): (String, String)| {
+            if instance_id.is_empty() {
+                return Ok((Value::Nil, Some("session instance required".to_owned())));
+            }
+            match ask(&path, Request::RefreshSession { name, instance_id })? {
+                Response::Ok => Ok((Value::Boolean(true), None)),
+                Response::WrongInstance => {
+                    Ok((Value::Nil, Some("session instance changed".to_owned())))
+                }
+                Response::Error(reason) => Ok((Value::Nil, Some(reason))),
+                other => Ok((Value::Nil, Some(format!("unexpected response: {other:?}")))),
+            }
         })?,
     )
 }

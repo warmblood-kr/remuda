@@ -7588,3 +7588,101 @@ fn a_socket_replaced_during_startup_survives_the_daemon_shutdown() {
         "the daemon deleted a socket it never bound"
     );
 }
+
+#[test]
+fn refresh_requires_matching_instance_and_keeps_terminal_size() {
+    let path = scratch("refresh-instance");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "refreshed");
+    let sessions = match client::request(&path, &Request::List).unwrap() {
+        Response::Sessions(sessions) => sessions,
+        other => panic!("unexpected: {other:?}"),
+    };
+    let initial = &sessions[0];
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::RefreshSession {
+                name: "refreshed".into(),
+                instance_id: "old".into(),
+            }
+        )
+        .unwrap(),
+        Response::WrongInstance
+    );
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::RefreshSession {
+                name: "refreshed".into(),
+                instance_id: initial.instance_id.clone().unwrap(),
+            }
+        )
+        .unwrap(),
+        Response::Ok
+    );
+    let sessions = match client::request(&path, &Request::List).unwrap() {
+        Response::Sessions(sessions) => sessions,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(sessions[0].size, initial.size);
+}
+
+#[test]
+fn lua_refresh_rejects_replaced_instance_and_accepts_live_instance() {
+    let path = scratch("lua-refresh");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "refreshed");
+    let result = eval(&path, "local r = remuda.ls()[1]; local bad = remuda._session_refresh(r.name, 'wrong'); local ok = remuda._session_refresh(r.name, r.instance_id); return tostring(bad == nil and ok == true)");
+    assert_eq!(result, "true");
+}
+
+#[cfg(unix)]
+#[test]
+fn refresh_requests_redraw_from_an_actual_hosted_pty_child() {
+    let path = scratch("refresh-pty");
+    let _daemon = daemon_at(&path);
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::New {
+                name: Some("refresh-child".into()),
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "trap 'printf REDRAW\\n' WINCH; printf READY\\n; while :; do sleep 0.1; done"
+                        .into()
+                ],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: None,
+            }
+        )
+        .unwrap(),
+        Response::Value("refresh-child".into())
+    );
+    wait_for(&path, "refresh-child", "READY");
+    let rows = match client::request(&path, &Request::List).unwrap() {
+        Response::Sessions(rows) => rows,
+        other => panic!("unexpected: {other:?}"),
+    };
+    let id = rows
+        .iter()
+        .find(|row| row.name == "refresh-child")
+        .unwrap()
+        .instance_id
+        .clone()
+        .unwrap();
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::RefreshSession {
+                name: "refresh-child".into(),
+                instance_id: id
+            }
+        )
+        .unwrap(),
+        Response::Ok
+    );
+    wait_for(&path, "refresh-child", "REDRAW");
+}

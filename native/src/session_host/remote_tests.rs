@@ -1000,3 +1000,9 @@ fn teardown_retires_input_a_gone_viewer_left() {
     let host = fixture.host.as_mut().unwrap();
     eventually("host stopped", || host.0.try_wait().ok().flatten());
 }
+
+#[test]
+fn refresh_failure_preserves_acknowledged_geometry_diagnostic() {
+    let error = refused("refresh_failed: restore failed; last acknowledged size 511x128");
+    assert!(error.to_string().contains("last acknowledged size 511x128"));
+}

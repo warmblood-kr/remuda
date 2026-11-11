@@ -14,6 +14,7 @@ pub(crate) enum Admission {
 pub(crate) enum Error {
     Control(Refusal),
     Invalid(&'static str),
+    RefreshFailed(String),
     StaleCompletion,
     Stopping,
     Retained,

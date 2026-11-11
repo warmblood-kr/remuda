@@ -482,6 +482,9 @@ impl HostSession {
     fn control(&self, request: Request) -> Result<()> {
         let _pass = self.gate.enter()?;
         let mut client = self.controller()?;
+        if matches!(request, Request::Refresh) && !client.offers(super::api::SCREEN_REFRESH) {
+            return Err(Error::Unavailable(Unavailable::Unsupported));
+        }
         match client.request(&request).map_err(transport)? {
             Response::Ok => Ok(()),
             Response::Error { code } => Err(refused(&code)),
@@ -770,6 +773,9 @@ impl SessionOperations for HostSession {
             cols: size.cols(),
         })
     }
+    fn refresh(&self) -> Result<()> {
+        self.control(Request::Refresh)
+    }
     /// After Close, or when the host is provably gone (its PTY closed with
     /// it), the close intent is recorded so a restart does not re-register.
     fn terminate(&self) -> Result<()> {
@@ -970,6 +976,9 @@ fn discard_abandoned(client: &mut Client) -> u64 {
     }
 }
 fn refused(code: &str) -> Error {
+    if let Some(message) = code.strip_prefix("refresh_failed: ") {
+        return Error::Agent(AgentError::Io(format!("screen refresh failed: {message}")));
+    }
     match code {
         "controller_busy" | "snapshot_budget_busy" => Error::Agent(AgentError::Busy),
         // A stopping or unpublished host is not an exited session.
