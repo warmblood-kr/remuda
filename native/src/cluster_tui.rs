@@ -2115,6 +2115,7 @@ impl ClusterUi {
                 {
                     self.set_input_notice(notice, now);
                 }
+                self.input_notice_target = self.input_delivery_target.clone();
             }
         }
     }
@@ -3893,9 +3894,10 @@ mod tests {
             .unwrap();
         ui.selected = 1;
         ui.active = 1;
+        ui.start_pending(clock.now());
         let frame = ui.render_text(100, 24, "bravo screen", &clock);
         assert!(
-            !frame.contains("private-alpha"),
+            !frame.contains("private-alpha") && !frame.contains("sending input to alpha"),
             "other session input shown in selected pane: {frame}"
         );
     }
