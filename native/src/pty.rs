@@ -42,7 +42,7 @@ enum Watcher {
 type Watchers = Arc<Mutex<Vec<Watcher>>>;
 
 /// The pty's input end. Shared, because the reader thread must answer the
-/// terminal's own questions — see [`DSR_CURSOR`].
+/// terminal's own questions — see the cursor query handler.
 pub(crate) type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 pub const PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -440,6 +440,7 @@ impl AgentWriter for PtyInputWriter {
 /// "Where is the cursor?" — a query the terminal must answer. ⚠ ConPTY asks it
 /// BEFORE emitting anything and waits: unanswered, the child is alive and the
 /// screen is blank forever. Measured on a windows-latest runner; see steps/010.
+#[cfg(test)]
 const DSR_CURSOR: &[u8] = b"\x1b[6n";
 // A 500 ms cap covers ConPTY's startup query before user input while avoiding
 // a cursor reply arriving late between a user's write body and follow-up.
@@ -447,12 +448,6 @@ const DSR_REPLY_RETRY_LIMIT: usize = 50;
 const DSR_REPLY_RETRY_DELAY: Duration = Duration::from_millis(10);
 const SCROLLBACK_ROWS: usize = 10_000;
 const SCROLLBACK_PROBE_CHUNK: usize = 512;
-/// Query prefixes partially received in an earlier read.
-#[derive(Default)]
-struct ReaderCarry {
-    cursor: Vec<u8>,
-}
-
 /// vt100 callbacks that retain only the bounded typed status.
 #[derive(Default)]
 struct StatusCallbacks {
@@ -462,31 +457,42 @@ struct StatusCallbacks {
 
 impl vt100::Callbacks for StatusCallbacks {
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
-        if params == [b"7501".as_slice(), b"?".as_slice()] && self.replies.len() < 32 {
-            self.replies.push_back(b"\x1b]7501;?\x1b\\".to_vec());
+        if params == [b"7501".as_slice(), b"?".as_slice()] {
+            self.push_reply(b"\x1b]7501;?\x1b\\".to_vec());
         }
         self.tracker.observe(params);
     }
 
     fn unhandled_csi(
         &mut self,
-        _: &mut vt100::Screen,
+        screen: &mut vt100::Screen,
         i1: Option<u8>,
         i2: Option<u8>,
         params: &[&[u16]],
         c: char,
     ) {
+        if i1.is_none() && i2.is_none() && c == 'n' && params == [&[6_u16][..]] {
+            let (row, col) = screen.cursor_position();
+            let col = col.min(screen.size().1.saturating_sub(1));
+            self.push_reply(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes());
+        }
         if i1.is_none()
             && i2.is_none()
             && c == 'c'
             && (params.is_empty() || params == [&[0_u16][..]])
-            && self.replies.len() < 32
         {
-            self.replies.push_back(b"\x1b[?1;2c".to_vec());
+            self.push_reply(b"\x1b[?1;2c".to_vec());
         }
     }
 }
 impl StatusCallbacks {
+    fn push_reply(&mut self, reply: Vec<u8>) {
+        if self.replies.len() < 32 {
+            self.replies.push_back(reply);
+        } else {
+            eprintln!("remuda pty: dropping terminal reply because the pending queue is full");
+        }
+    }
     fn take_control_reply(&mut self) -> Option<Vec<u8>> {
         self.replies.pop_front()
     }
@@ -668,14 +674,12 @@ fn spawn_reader(
 ) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
-        let mut carry = ReaderCarry::default();
         while let Ok(n) = reader.read(&mut buf) {
             if n == 0 {
                 break;
             }
             if !process_reader_chunk(
                 &buf[..n],
-                &mut carry,
                 &screen,
                 &scrollback_total,
                 &output_version,
@@ -706,31 +710,17 @@ fn spawn_reader(
 /// can be exercised without a platform pty.
 fn process_reader_chunk(
     bytes: &[u8],
-    carry: &mut ReaderCarry,
     screen: &Arc<Mutex<vt100::Parser<StatusCallbacks>>>,
     scrollback_total: &AtomicUsize,
     output_version: &AtomicU64,
     pending_cursor_replies: &SyncSender<Vec<u8>>,
 ) -> bool {
-    let mut cursor_window = Vec::with_capacity(carry.cursor.len() + bytes.len());
-    cursor_window.extend_from_slice(&carry.cursor);
-    cursor_window.extend_from_slice(bytes);
-    let asked = cursor_window
-        .windows(DSR_CURSOR.len())
-        .any(|window| window == DSR_CURSOR);
-    let cursor_tail = cursor_window.len().min(DSR_CURSOR.len() - 1);
-    carry.cursor.clear();
-    carry
-        .cursor
-        .extend_from_slice(&cursor_window[cursor_window.len() - cursor_tail..]);
-
-    let at = match screen.lock() {
+    match screen.lock() {
         Ok(mut parser) => {
             let size = parser.screen().size();
-            let at = guard_parser(&mut parser, "output", size, |parser| {
+            guard_parser(&mut parser, "output", size, |parser| {
                 process_output(parser, bytes, scrollback_total)
-            })
-            .unwrap_or((1, 1));
+            });
             let mut replies = Vec::new();
             while let Some(reply) = parser.callbacks_mut().take_control_reply() {
                 replies.extend_from_slice(&reply);
@@ -739,14 +729,10 @@ fn process_reader_chunk(
                 enqueue_reply(pending_cursor_replies, replies, "terminal control");
             }
             output_version.fetch_add(1, Ordering::SeqCst);
-            at
         }
         // Poisoned: the grid can no longer be trusted.
         Err(_) => return false,
     };
-    if asked {
-        answer_cursor_query(pending_cursor_replies, at);
-    }
     true
 }
 
@@ -872,10 +858,6 @@ fn spawn_reply_worker(
 }
 
 /// Enqueue one cursor reply without blocking the PTY reader thread.
-fn answer_cursor_query(pending: &SyncSender<Vec<u8>>, (row, col): (u16, u16)) {
-    enqueue_reply(pending, format!("\x1b[{row};{col}R").into_bytes(), "cursor");
-}
-
 fn enqueue_reply(pending: &SyncSender<Vec<u8>>, reply: Vec<u8>, what: &'static str) {
     match pending.try_send(reply) {
         Ok(()) => {}
@@ -1779,11 +1761,9 @@ mod input_writer_tests {
         )));
         let scrollback_total = AtomicUsize::new(0);
         let output_version = AtomicU64::new(0);
-        let mut carry = ReaderCarry::default();
-        let mut feed = |bytes: &[u8]| {
+        let feed = |bytes: &[u8]| {
             process_reader_chunk(
                 bytes,
-                &mut carry,
                 &screen,
                 &scrollback_total,
                 &output_version,
@@ -1815,12 +1795,10 @@ mod input_writer_tests {
         )));
         let scrollback_total = AtomicUsize::new(0);
         let output_version = AtomicU64::new(0);
-        let mut carry = ReaderCarry::default();
         let guard = writer.lock().unwrap();
         let started = std::time::Instant::now();
         assert!(process_reader_chunk(
             DSR_CURSOR,
-            &mut carry,
             &screen,
             &scrollback_total,
             &output_version,
@@ -1830,7 +1808,6 @@ mod input_writer_tests {
         assert!(captured.lock().unwrap().is_empty());
         assert!(process_reader_chunk(
             b"x",
-            &mut carry,
             &screen,
             &scrollback_total,
             &output_version,
@@ -1854,14 +1831,12 @@ mod input_writer_tests {
         )));
         let scrollback_total = AtomicUsize::new(0);
         let output_version = AtomicU64::new(0);
-        let mut carry = ReaderCarry::default();
         let reader_closed = Arc::new(AtomicBool::new(false));
         let pending = spawn_reply_worker(Arc::clone(&writer), reader_closed, "cursor");
 
         for chunk in [b"\x1b[".as_slice(), b"6n"] {
             assert!(process_reader_chunk(
                 chunk,
-                &mut carry,
                 &screen,
                 &scrollback_total,
                 &output_version,
@@ -1869,6 +1844,27 @@ mod input_writer_tests {
             ));
         }
         wait_for_captured(&captured, b"\x1b[1;1R");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pty_answers_mixed_queries_in_order() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "stty raw -echo; printf '\\033[6n\\033]7501;?\\007\\033[c'; dd bs=1 count=23 2>/dev/null | od -An -tx1; sleep 2"]);
+        let mut agent = PtyAgent::spawn(command, Size::new(80, 24)).unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        loop {
+            let screen = agent.screen_text().unwrap();
+            let bytes = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+            if bytes
+                .contains("1b 5b 31 3b 31 52 1b 5d 37 35 30 31 3b 3f 1b 5c 1b 5b 3f 31 3b 32 63")
+            {
+                break;
+            }
+            assert!(Instant::now() < until, "screen: {screen:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        agent.terminate().unwrap();
     }
 
     #[test]
@@ -1888,6 +1884,32 @@ mod input_writer_tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         agent.terminate().unwrap();
+    }
+
+    #[test]
+    fn mixed_terminal_queries_preserve_source_order() {
+        let input = b"\x1b[6n\x1b]7501;?\x1b\\\x1b[c\x1b[6n";
+        for split in 0..=input.len() {
+            let (pending, replies) = sync_channel(32);
+            let screen = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+                24,
+                80,
+                0,
+                StatusCallbacks::default(),
+            )));
+            let count = AtomicUsize::new(0);
+            let version = AtomicU64::new(0);
+            for chunk in [&input[..split], &input[split..]] {
+                assert!(process_reader_chunk(
+                    chunk, &screen, &count, &version, &pending
+                ));
+            }
+            let mut bytes = Vec::new();
+            while let Ok(reply) = replies.try_recv() {
+                bytes.extend(reply);
+            }
+            assert_eq!(bytes, b"\x1b[1;1R\x1b]7501;?\x1b\\\x1b[?1;2c\x1b[1;1R");
+        }
     }
 
     #[test]

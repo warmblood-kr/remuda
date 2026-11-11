@@ -214,14 +214,6 @@ fn drain(
                             context.fault.store(true, Ordering::Release);
                         }
                     }
-                    while let Some((row, col)) = terminal.take_query() {
-                        if queries
-                            .try_send(format!("\x1b[{row};{col}R").into_bytes())
-                            .is_err()
-                        {
-                            context.fault.store(true, Ordering::Release);
-                        }
-                    }
                     context
                         .version
                         .store(terminal.generation(), Ordering::Release);
@@ -403,6 +395,21 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+    #[test]
+    #[cfg(unix)]
+    fn host_answers_mixed_queries_in_order() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "stty raw -echo; printf '\\033[6n\\033]7501;?\\007\\033[c'; dd bs=1 count=23 2>/dev/null | od -An -tx1; sleep 1"]);
+        let mut child = Cleanup(HostChild::spawn(command, Size::new(80, 24)).unwrap());
+        wait_for(&mut child.0, "1b  5b  31  3b  31  52");
+        let screen = child.0.screen_text().unwrap();
+        let bytes = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            bytes.contains("1b 5b 31 3b 31 52 1b 5d 37 35 30 31 3b 3f 1b 5c 1b 5b 3f 31 3b 32 63"),
+            "screen: {screen:?}"
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn host_answers_program_status_query_before_da1() {
