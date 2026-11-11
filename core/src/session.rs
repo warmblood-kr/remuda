@@ -996,7 +996,7 @@ impl Session {
         let temporary = Size::for_viewport(cols, original.rows());
         agent.resize(temporary)?;
         *current = temporary;
-        std::thread::sleep(Duration::from_millis(50));
+        self.clock.sleep(Duration::from_millis(50));
         if let Err(error) = agent.resize(original) {
             drop(current);
             drop(agent);

@@ -3,6 +3,14 @@ use crate::agent::{AgentProcess, Cursor, Size};
 use crate::clock::ManualClock;
 use std::sync::mpsc;
 
+struct ImmediateClock;
+impl crate::clock::Clock for ImmediateClock {
+    fn now(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn sleep(&self, _: Duration) {}
+}
+
 struct ResizeAgent {
     events: Arc<Mutex<Vec<Size>>>,
     started: mpsc::Sender<()>,
@@ -57,7 +65,7 @@ fn refresh_preserves_concurrent_resize_and_checks_instance() {
     let session = Arc::new(Session::new(
         "test",
         Box::new(agent),
-        Arc::new(ManualClock::new()),
+        Arc::new(ImmediateClock),
     ));
     assert!(!session.refresh_instance("wrong").unwrap());
     assert!(events.lock().unwrap().is_empty());
@@ -143,7 +151,7 @@ fn refresh_respects_host_area_limit_and_reports_restore_failure() {
     let session = Session::new(
         "test",
         Box::new(RestoreFailureAgent { calls: 0 }),
-        Arc::new(ManualClock::new()),
+        Arc::new(ImmediateClock),
     );
     let error = session
         .refresh_instance(session.instance_id())
