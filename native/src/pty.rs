@@ -457,11 +457,38 @@ struct ReaderCarry {
 #[derive(Default)]
 struct StatusCallbacks {
     tracker: Tracker,
+    replies: std::collections::VecDeque<Vec<u8>>,
 }
 
 impl vt100::Callbacks for StatusCallbacks {
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        if params == [b"7501".as_slice(), b"?".as_slice()] && self.replies.len() < 32 {
+            self.replies.push_back(b"\x1b]7501;?\x1b\\".to_vec());
+        }
         self.tracker.observe(params);
+    }
+
+    fn unhandled_csi(
+        &mut self,
+        _: &mut vt100::Screen,
+        i1: Option<u8>,
+        i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        if i1.is_none()
+            && i2.is_none()
+            && c == 'c'
+            && (params.is_empty() || params == [&[0_u16][..]])
+            && self.replies.len() < 32
+        {
+            self.replies.push_back(b"\x1b[?1;2c".to_vec());
+        }
+    }
+}
+impl StatusCallbacks {
+    fn take_control_reply(&mut self) -> Option<Vec<u8>> {
+        self.replies.pop_front()
     }
 }
 
@@ -704,6 +731,13 @@ fn process_reader_chunk(
                 process_output(parser, bytes, scrollback_total)
             })
             .unwrap_or((1, 1));
+            let mut replies = Vec::new();
+            while let Some(reply) = parser.callbacks_mut().take_control_reply() {
+                replies.extend_from_slice(&reply);
+            }
+            if !replies.is_empty() {
+                enqueue_reply(pending_cursor_replies, replies, "terminal control");
+            }
             output_version.fetch_add(1, Ordering::SeqCst);
             at
         }
@@ -790,13 +824,13 @@ pub(crate) fn process_output<CB: vt100::Callbacks>(
 }
 
 /// Start the bounded worker that writes cursor replies away from the reader.
-/// The one-item channel is the pending slot; retrying never blocks PTY output.
+/// A bounded queue keeps terminal responses ordered without blocking PTY output.
 fn spawn_reply_worker(
     writer: SharedWriter,
     reader_closed: Arc<AtomicBool>,
     what: &'static str,
 ) -> SyncSender<Vec<u8>> {
-    let (pending, replies) = sync_channel::<Vec<u8>>(1);
+    let (pending, replies) = sync_channel::<Vec<u8>>(32);
     std::thread::spawn(move || {
         while let Ok(reply) = replies.recv() {
             let mut sent = false;
@@ -1838,7 +1872,41 @@ mod input_writer_tests {
     }
 
     #[test]
-    fn program_status_is_typed_and_a_query_is_inert() {
+    #[cfg(unix)]
+    fn pty_answers_program_status_query_before_da1() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "stty raw -echo; printf '\\033]7501;?\\033\\\\\\033[c'; dd bs=1 count=17 2>/dev/null | od -An -tx1; sleep 2"]);
+        let mut agent = PtyAgent::spawn(command, Size::new(80, 24)).unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        loop {
+            let screen = agent.screen_text().unwrap();
+            let bytes = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+            if bytes.contains("1b 5d 37 35 30 31 3b 3f 1b 5c 1b 5b 3f 31 3b 32") {
+                break;
+            }
+            assert!(Instant::now() < until, "screen: {screen:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        agent.terminate().unwrap();
+    }
+
+    #[test]
+    fn program_status_query_reply_precedes_device_attributes() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, SCROLLBACK_ROWS, StatusCallbacks::default());
+        parser.process(b"\x1b]7501;?\x1b\\\x1b[c");
+        assert_eq!(
+            parser.callbacks_mut().take_control_reply(),
+            Some(b"\x1b]7501;?\x1b\\".to_vec())
+        );
+        assert_eq!(
+            parser.callbacks_mut().take_control_reply(),
+            Some(b"\x1b[?1;2c".to_vec())
+        );
+    }
+
+    #[test]
+    fn program_status_is_typed_and_a_query_preserves_it() {
         let mut parser =
             vt100::Parser::new_with_callbacks(24, 80, SCROLLBACK_ROWS, StatusCallbacks::default());
         let scrollback_total = AtomicUsize::new(0);
@@ -1857,8 +1925,7 @@ mod input_writer_tests {
             remuda_core::agent::ProgramState::Working
         );
         assert_eq!(observed.status.app.as_deref(), Some("codex"));
-        // This phase observes reports only. A feature query must neither
-        // overwrite the typed status nor make the reader emit a reply.
+        // A feature query does not overwrite the typed status.
         process_output(&mut parser, b"\x1b]7501;?\x07", &scrollback_total);
         let observed = parser
             .callbacks()

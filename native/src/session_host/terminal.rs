@@ -17,11 +17,15 @@ const MAX_QUERIES: usize = 32;
 #[derive(Default)]
 struct Queries {
     positions: VecDeque<(u16, u16)>,
+    replies: VecDeque<Vec<u8>>,
     overflow: u64,
     status: Tracker,
 }
 impl vt100::Callbacks for Queries {
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        if params == [b"7501".as_slice(), b"?".as_slice()] && self.replies.len() < MAX_QUERIES {
+            self.replies.push_back(b"\x1b]7501;?\x1b\\".to_vec());
+        }
         self.status.observe(params);
     }
 
@@ -33,6 +37,14 @@ impl vt100::Callbacks for Queries {
         params: &[&[u16]],
         c: char,
     ) {
+        if i1.is_none()
+            && i2.is_none()
+            && c == 'c'
+            && (params.is_empty() || params == [&[0_u16][..]])
+            && self.replies.len() < MAX_QUERIES
+        {
+            self.replies.push_back(b"\x1b[?1;2c".to_vec());
+        }
         if i1.is_none() && i2.is_none() && c == 'n' && params == [&[6_u16][..]] {
             if self.positions.len() == MAX_QUERIES {
                 self.overflow = self.overflow.saturating_add(1);
@@ -154,6 +166,9 @@ impl Terminal {
     pub fn take_query(&mut self) -> Option<(u16, u16)> {
         self.parser.callbacks_mut().positions.pop_front()
     }
+    pub fn take_control_reply(&mut self) -> Option<Vec<u8>> {
+        self.parser.callbacks_mut().replies.pop_front()
+    }
     pub fn program_status(&self) -> Option<remuda_core::agent::ProgramStatusObservation> {
         self.parser.callbacks().status.observation()
     }
@@ -211,6 +226,21 @@ mod tests {
         }
     }
     #[test]
+    fn program_status_query_reply_precedes_device_attributes_at_all_splits() {
+        let bytes = b"\x1b]7501;?\x1b\\\x1b[c";
+        for split in 0..=bytes.len() {
+            let mut terminal = Terminal::new(24, 80, 10).unwrap();
+            feed(&mut terminal, &bytes[..split]);
+            feed(&mut terminal, &bytes[split..]);
+            assert_eq!(
+                terminal.take_control_reply(),
+                Some(b"\x1b]7501;?\x1b\\".to_vec())
+            );
+            assert_eq!(terminal.take_control_reply(), Some(b"\x1b[?1;2c".to_vec()));
+        }
+    }
+
+    #[test]
     fn query_positions_and_modes_survive_every_byte_split() {
         let bytes =
             "abc\x1b[6ndef\x1b[6n\r\n\u{754c}e\u{301}\x1b[?2004h\x1b[?1049halt\x1b[?1049l\x1b[?25l"
@@ -232,7 +262,7 @@ mod tests {
         }
     }
     #[test]
-    fn program_status_is_recorded_and_a_query_is_inert() {
+    fn program_status_is_recorded_and_a_query_preserves_it() {
         let mut terminal = Terminal::new(24, 80, 10).unwrap();
         feed(&mut terminal, b"\x1b]7501;?\x1b\\\x1b]7501;?\x07");
         assert!(terminal.program_status().is_none());
