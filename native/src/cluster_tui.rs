@@ -148,6 +148,9 @@ pub struct ClusterUi {
     input_queue: InputQueue,
     uncertain_visible_since: std::cell::RefCell<HashMap<QueueIdentity, Duration>>,
     notice: Option<(String, Duration)>,
+    input_notice: Option<(String, Duration)>,
+    input_notice_target: Option<(Option<String>, String, String)>,
+    input_delivery_target: Option<(Option<String>, String, String)>,
     pending_close: Option<PendingClose>,
     remote_close_confirmation: Option<RemoteCloseTarget>,
     confirmation: Confirmation,
@@ -291,6 +294,9 @@ impl ClusterUi {
             input_queue: InputQueue::default(),
             uncertain_visible_since: std::cell::RefCell::new(HashMap::new()),
             notice: None,
+            input_notice: None,
+            input_notice_target: None,
+            input_delivery_target: None,
             pending_close: None,
             remote_close_confirmation: None,
             confirmation: Confirmation::default(),
@@ -772,8 +778,9 @@ impl ClusterUi {
         let tree_start = 2;
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
         let divider = "─".repeat(width);
-        let queue_rows: Vec<&PendingBatch> = self.visible_queue(now).rev().take(3).collect();
-        let notice_lines = self.active_notice_lines(now, width);
+        let queue_rows: Vec<&PendingBatch> = self.visible_pane_queue(now).rev().take(3).collect();
+        let mut notice_lines = self.scoped_notice_lines(now, width, false);
+        notice_lines.extend(self.scoped_notice_lines(now, width, true));
         let footer_rows = self.footer_row_count(width);
         let composer = self.composer_lines(width);
         let tree_capacity = height.saturating_sub(
@@ -887,8 +894,9 @@ impl ClusterUi {
         let width = usize::from(cols);
         let height = usize::from(rows);
         let footer = self.footer_row_count(width);
-        let notices = self.active_notice_lines(now, width).len();
-        let queue = self.visible_queue(now).rev().take(3).count();
+        let notices = self.scoped_notice_lines(now, width, false).len()
+            + self.scoped_notice_lines(now, width, true).len();
+        let queue = self.visible_pane_queue(now).rev().take(3).count();
         let (pane_cols, pane_rows) = if self.remote_keys_mode.is_some() {
             let Some(target @ RemoteSelection::Session { .. }) = self.remote_keys_mode.as_ref()
             else {
@@ -910,6 +918,14 @@ impl ClusterUi {
             (width, height.saturating_sub(header.len()))
         } else if width >= SPLIT_MIN_COLS {
             let pane_width = width - self.tree_width(width, now) - 1;
+            let notices = self.scoped_notice_lines(now, width, false).len()
+                + self.scoped_notice_lines(now, pane_width, true).len();
+            let queue: usize = self
+                .visible_pane_queue(now)
+                .rev()
+                .take(3)
+                .map(|batch| wrap_to_two_lines(&queue_line(batch), pane_width).len())
+                .sum();
             (
                 pane_width,
                 height
@@ -1077,27 +1093,53 @@ impl ClusterUi {
         let left_w = self.tree_width(width, now);
         let right_w = width - left_w - 1;
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
-        let notices = self.active_notice_lines(now, width);
+        let notices = self.scoped_notice_lines(now, right_w, true);
+        let global_notices = self.scoped_notice_lines(now, width, false);
         let queue: Vec<&PendingBatch> = self
-            .visible_queue(now)
+            .visible_pane_queue(now)
             .rev()
             .take(3)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
             .collect();
+        let queue_lines: usize = queue
+            .iter()
+            .map(|batch| wrap_to_two_lines(&queue_line(batch), right_w).len())
+            .sum();
         let body_rows = height
-            .saturating_sub(self.footer_row_count(width) + notices.len() + queue.len())
+            .saturating_sub(self.footer_row_count(width) + global_notices.len())
             .max(1);
         let composer = self.composer_lines(right_w);
-        let screen_rows = body_rows.saturating_sub(1 + composer.len());
+        let reserved = 1 + composer.len();
+        let extra_rows = body_rows.saturating_sub(reserved);
+        let screen_rows =
+            body_rows.saturating_sub(1 + composer.len() + notices.len() + queue_lines);
         let mut right = vec![ellipsize(&pane_header, right_w)];
+        if body_rows <= composer.len() {
+            right.clear();
+        }
         right.extend(
             visible_remote_pane_lines(&pane_body, self.remote_active.is_some(), screen_rows)
                 .into_iter()
                 .map(str::to_string),
         );
-        right.resize(body_rows.saturating_sub(composer.len()), String::new());
+        right.resize(
+            body_rows.saturating_sub(composer.len() + notices.len() + queue_lines),
+            String::new(),
+        );
+        right.extend(notices.into_iter().take(extra_rows));
+        for batch in queue {
+            if right.len() < body_rows.saturating_sub(composer.len()) {
+                self.mark_uncertain_visible(batch, now);
+            }
+            let available = body_rows.saturating_sub(composer.len() + right.len());
+            right.extend(
+                wrap_to_two_lines(&queue_line(batch), right_w)
+                    .into_iter()
+                    .take(available),
+            );
+        }
         right.extend(composer);
         let mut left = self.tree_lines(left_w, now);
         if left.len() > body_rows {
@@ -1111,13 +1153,7 @@ impl ClusterUi {
                 format!("{}│{r}", pad_to(&l, left_w))
             })
             .collect();
-        frame.extend(notices);
-        for batch in queue {
-            if frame.len() < height {
-                self.mark_uncertain_visible(batch, now);
-            }
-            frame.push(queue_line(batch));
-        }
+        frame.extend(global_notices);
         self.append_footer(&mut frame, width);
         frame
             .into_iter()
@@ -1226,6 +1262,28 @@ impl ClusterUi {
                 };
                 wrap_to_two_lines(&notice, width)
             })
+    }
+
+    fn scoped_notice_lines(&self, now: Duration, width: usize, input: bool) -> Vec<String> {
+        let same_target = self.input_notice_target == self.active_input_target();
+        if self.notice.is_some()
+            && (self.notice == self.input_notice) == input
+            && (!input || same_target)
+        {
+            self.active_notice_lines(now, width)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn mark_input_notice(&mut self) {
+        self.input_notice = self.notice.clone();
+        self.input_notice_target = self.active_input_target();
+    }
+
+    fn set_input_notice(&mut self, message: String, now: Duration) {
+        self.notice = Some((message, now));
+        self.mark_input_notice();
     }
 
     fn append_footer(&self, frame: &mut Vec<String>, width: usize) {
@@ -1854,7 +1912,7 @@ impl ClusterUi {
                 if self.remote_composer_target.is_none() {
                     self.composer_target = None;
                 }
-                self.notice = Some(("draft cleared".into(), now));
+                self.set_input_notice("draft cleared".into(), now);
             }
             ComposerAction::Detach => {
                 self.partial_input_confirm_target = None;
@@ -1875,7 +1933,7 @@ impl ClusterUi {
                     } else if self.remote_target_may_be_partial(&node, &name, &instance_id) {
                         self.restore_draft(&bytes);
                         self.partial_input_confirm_target = Some(target);
-                        self.notice = Some((REMOTE_PARTIAL_INPUT_NOTICE.into(), now));
+                        self.set_input_notice(REMOTE_PARTIAL_INPUT_NOTICE.into(), now);
                     } else {
                         self.enqueue_remote_draft(bytes, now);
                     }
@@ -1900,7 +1958,7 @@ impl ClusterUi {
                 false
             } else {
                 self.composer.clear();
-                self.notice = Some((format!("draft for {node_label}/{name} discarded"), now));
+                self.set_input_notice(format!("draft for {node_label}/{name} discarded"), now);
                 true
             }
         } else {
@@ -1937,22 +1995,22 @@ impl ClusterUi {
         let target = self.composer_target.clone();
         let Some((name, instance_id)) = target else {
             self.restore_draft(&bytes);
-            self.notice = Some(("input unavailable: session identity is missing".into(), now));
+            self.set_input_notice("input unavailable: session identity is missing".into(), now);
             return;
         };
         let Some(session) = self.sessions.iter().find(|session| session.name == name) else {
             self.restore_draft(&bytes);
-            self.notice = Some(("input unavailable: session is no longer listed".into(), now));
+            self.set_input_notice("input unavailable: session is no longer listed".into(), now);
             return;
         };
         if session.instance_id.as_deref() != Some(instance_id.as_str()) {
             self.restore_draft(&bytes);
-            self.notice = Some(("input disabled: session restarted".into(), now));
+            self.set_input_notice("input disabled: session restarted".into(), now);
             return;
         }
         if !session.alive {
             self.restore_draft(&bytes);
-            self.notice = Some(("input disabled: session ended".into(), now));
+            self.set_input_notice("input disabled: session ended".into(), now);
             return;
         }
         match self.input_sender.enqueue_line(
@@ -1971,7 +2029,7 @@ impl ClusterUi {
             }
             Err(error) => {
                 self.restore_draft(&bytes);
-                self.notice = Some((format!("input not queued: {error}"), now));
+                self.set_input_notice(format!("input not queued: {error}"), now);
             }
         }
     }
@@ -1983,7 +2041,7 @@ impl ClusterUi {
         };
         if self.remote_control_disabled.contains(&node_key) {
             self.restore_draft(&bytes);
-            self.notice = Some((format!("remote control disabled on {node_label}"), now));
+            self.set_input_notice(format!("remote control disabled on {node_label}"), now);
             return;
         }
         let selection = RemoteSelection::Session {
@@ -1993,19 +2051,19 @@ impl ClusterUi {
         };
         let Some((_, session)) = self.remote_session(&selection) else {
             self.restore_draft(&bytes);
-            self.notice = Some((
+            self.set_input_notice(
                 format!("remote input unavailable: {node_label}/{name} is no longer listed"),
                 now,
-            ));
+            );
             return;
         };
         let wire_name = session.wire_name.clone();
         if !session.alive {
             self.restore_draft(&bytes);
-            self.notice = Some((
+            self.set_input_notice(
                 format!("remote input disabled: {node_label}/{name} has ended"),
                 now,
-            ));
+            );
             return;
         }
         match self.input_sender.enqueue_line(
@@ -2021,7 +2079,7 @@ impl ClusterUi {
             Ok(_) => self.notice = None,
             Err(error) => {
                 self.restore_draft(&bytes);
-                self.notice = Some((format!("remote input not queued: {error}"), now));
+                self.set_input_notice(format!("remote input not queued: {error}"), now);
             }
         }
     }
@@ -2038,6 +2096,11 @@ impl ClusterUi {
         self.input_sender
             .begin_due(&mut self.input_queue, Instant::now());
         if let Some(batch) = self.input_queue.sending_batch() {
+            self.input_delivery_target = Some((
+                batch.remote_node.clone(),
+                batch.name.clone(),
+                batch.instance_id.clone(),
+            ));
             if self.partial_input_confirm_target.is_none()
                 && !self
                     .notice
@@ -2050,8 +2113,9 @@ impl ClusterUi {
                     .as_ref()
                     .is_some_and(|(current, _)| current == &notice)
                 {
-                    self.notice = Some((notice, now));
+                    self.set_input_notice(notice, now);
                 }
+                self.input_notice_target = self.input_delivery_target.clone();
             }
         }
     }
@@ -2140,25 +2204,26 @@ impl ClusterUi {
                 .items()
                 .any(|batch| batch.state == QueueState::Uncertain && queue_identity(batch) == *key)
         });
+        let has_event = event.is_some();
         match event {
             Some(QueueEvent::Sent { .. }) => {
                 if self.notice.as_ref().is_none_or(|(notice, _)| {
                     notice.starts_with("sending input to ") || notice == "Input sent"
                 }) {
-                    self.notice = Some(("Input sent".into(), now));
+                    self.set_input_notice("Input sent".into(), now);
                 }
             }
             Some(QueueEvent::Uncertain { .. }) => {
                 self.clear_sending_notice();
             }
             Some(QueueEvent::PasteAborted { .. }) => {
-                self.notice = Some((REMOTE_PASTE_FAILURE_NOTICE.into(), now));
+                self.set_input_notice(REMOTE_PASTE_FAILURE_NOTICE.into(), now);
             }
             Some(QueueEvent::RemoteTargetFailed { .. }) => {
-                self.notice = Some((REMOTE_PASTE_FAILURE_NOTICE.into(), now));
+                self.set_input_notice(REMOTE_PASTE_FAILURE_NOTICE.into(), now);
             }
             Some(QueueEvent::UnsupportedRequest { reason, .. }) => {
-                self.notice = Some((reason, now));
+                self.set_input_notice(reason, now);
             }
             Some(QueueEvent::Dropped { reason, .. }) | Some(QueueEvent::Failed { reason, .. }) => {
                 let mut draft_discarded = false;
@@ -2171,7 +2236,7 @@ impl ClusterUi {
                     }
                 }
                 if !draft_discarded {
-                    self.notice = Some((reason, now));
+                    self.set_input_notice(reason, now);
                 }
             }
             Some(QueueEvent::RemoteControlDisabled { node, .. }) => {
@@ -2183,10 +2248,35 @@ impl ClusterUi {
                     .find(|snapshot| snapshot.registry_key == node)
                     .map(|snapshot| snapshot.name.as_str())
                     .unwrap_or(&node);
-                self.notice = Some((format!("remote control disabled on {label}"), now));
+                self.set_input_notice(format!("remote control disabled on {label}"), now);
             }
             Some(QueueEvent::RetryScheduled { .. }) | None => {}
         }
+        if has_event && self.notice == self.input_notice {
+            self.input_notice_target = self.input_delivery_target.clone();
+        }
+    }
+
+    fn active_input_target(&self) -> Option<(Option<String>, String, String)> {
+        if let Some(active) = &self.remote_active {
+            let (node, session) = self.remote_session(active)?;
+            return Some((
+                Some(node.registry_key.clone()),
+                session.wire_name.clone(),
+                session.instance_id.clone(),
+            ));
+        }
+        let session = self.sessions.get(self.active)?;
+        Some((None, session.name.clone(), session.instance_id.clone()?))
+    }
+
+    fn visible_pane_queue(&self, now: Duration) -> impl DoubleEndedIterator<Item = &PendingBatch> {
+        let target = self.active_input_target();
+        self.visible_queue(now).filter(move |batch| {
+            target.as_ref().is_some_and(|(node, name, instance)| {
+                batch.remote_node == *node && batch.name == *name && batch.instance_id == *instance
+            })
+        })
     }
 
     fn visible_queue(&self, now: Duration) -> impl DoubleEndedIterator<Item = &PendingBatch> {
@@ -3731,6 +3821,159 @@ mod tests {
     }
 
     #[test]
+    fn split_input_feedback_is_inside_content_pane() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
+        ui.set_input_notice("sending input to dev".into(), clock.now());
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let line = frame
+            .lines()
+            .find(|line| line.contains("sending input"))
+            .unwrap();
+        assert!(
+            line.split_once('│')
+                .is_some_and(|(_, right)| right.contains("sending input")),
+            "{line}"
+        );
+        ui.set_input_notice("Input sent".into(), clock.now());
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let line = frame
+            .lines()
+            .find(|line| line.contains("Input sent"))
+            .unwrap();
+        assert!(
+            line.split_once('│')
+                .is_some_and(|(_, right)| right.contains("Input sent")),
+            "{line}"
+        );
+        ui.notice = None;
+        ui.input_sender
+            .enqueue(
+                &mut ui.input_queue,
+                "dev",
+                "instance-dev",
+                b"input\r".to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let line = frame.lines().find(|line| line.contains("waiting")).unwrap();
+        assert!(
+            line.split_once('│')
+                .is_some_and(|(_, right)| right.contains("waiting")),
+            "{line}"
+        );
+        ui.notice = Some(("node disconnected".into(), clock.now()));
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let line = frame
+            .lines()
+            .find(|line| line.contains("node disconnected"))
+            .unwrap();
+        assert!(
+            line.starts_with("node disconnected") && !line.contains('│'),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn review_other_session_input_not_in_selected_pane() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui(
+            "studio",
+            vec![session("alpha", true), session("bravo", true)],
+            clock.now(),
+        );
+        ui.input_sender
+            .enqueue(
+                &mut ui.input_queue,
+                "alpha",
+                "instance-alpha",
+                b"private-alpha\r".to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+        ui.selected = 1;
+        ui.active = 1;
+        ui.start_pending(clock.now());
+        let frame = ui.render_text(100, 24, "bravo screen", &clock);
+        assert!(
+            !frame.contains("private-alpha") && !frame.contains("sending input to alpha"),
+            "other session input shown in selected pane: {frame}"
+        );
+    }
+
+    #[test]
+    fn review_small_pane_keeps_composer_visible() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", vec![session("alpha", true)], clock.now());
+        ui.composer_focused = true;
+        ui.input_sender
+            .enqueue(
+                &mut ui.input_queue,
+                "alpha",
+                "instance-alpha",
+                b"first\r".to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+        ui.input_sender
+            .enqueue(
+                &mut ui.input_queue,
+                "alpha",
+                "instance-alpha",
+                b"second\r".to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+        ui.input_sender
+            .enqueue(
+                &mut ui.input_queue,
+                "alpha",
+                "instance-alpha",
+                b"third\r".to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+        let frame = ui.render_text(100, 4, "screen", &clock);
+        assert!(frame.contains("Remuda >"), "composer disappeared: {frame}");
+    }
+
+    #[test]
+    fn review_input_result_stays_with_its_session_after_switch() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui(
+            "studio",
+            vec![session("alpha", true), session("bravo", true)],
+            clock.now(),
+        );
+        ui.input_sender
+            .enqueue(
+                &mut ui.input_queue,
+                "alpha",
+                "instance-alpha",
+                b"hello\r".to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+        ui.start_pending(clock.now());
+        ui.active = 1;
+        ui.handle_send_event(
+            Some(QueueEvent::Sent {
+                seq: 1,
+                duplicate: false,
+            }),
+            clock.now(),
+        );
+        assert!(!ui
+            .render_text(100, 24, "bravo", &clock)
+            .contains("Input sent"));
+        ui.active = 0;
+        assert!(ui
+            .render_text(100, 24, "alpha", &clock)
+            .contains("Input sent"));
+    }
+
+    #[test]
     fn narrow_composer_stays_at_bottom_of_content_pane() {
         let clock = ManualClock::new();
         let mut ui = make_ui("studio", sessions(), clock.now());
@@ -4887,7 +5130,7 @@ mod tests {
     #[test]
     fn remote_input_error_status_is_safe_in_the_rendered_frame() {
         let clock = ManualClock::new();
-        let mut ui = make_ui("studio", sessions(), clock.now());
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
         let now = Instant::now();
         let hostile =
             "tail\rtext \u{1b}[31mred\u{1b}[0m \u{1b}]0;title\u{7} \u{1b}]2;title\u{1b}\\";
@@ -6302,9 +6545,13 @@ mod tests {
         let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
         for i in 0..4 {
             let now = Instant::now();
-            assert!(ui.input_queue.enqueue(
-                format!("session{i}"),
-                "instance".into(),
+            assert!(ui.input_queue.enqueue_target(
+                InputTarget {
+                    remote_node: Some("fp-laptop".into()),
+                    name: "build".into(),
+                    instance_id: "remote-instance".into(),
+                },
+                None,
                 "client".into(),
                 i,
                 format!("item{i}\r").into_bytes(),
