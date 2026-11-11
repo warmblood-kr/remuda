@@ -205,6 +205,9 @@ pub trait SessionOperations: Send + Sync {
     fn feed(&self, steps: &[Step]) -> Result<()>;
     fn apply_input_batch(&self, batch: InputBatch<'_>) -> Result<InputOutcome>;
     fn resize(&self, size: Size) -> Result<()>;
+    fn refresh(&self) -> Result<()> {
+        Err(Error::Unavailable(Unavailable::Unsupported))
+    }
     fn terminate(&self) -> Result<()>;
     fn screen_text(&self) -> Result<String>;
     fn snapshot(&self, scrollback: usize) -> Result<VersionedSnapshot>;
@@ -347,6 +350,9 @@ impl SessionHandle {
     pub fn resize(&self, size: Size) -> Result<()> {
         self.operations().resize(size)
     }
+    pub fn refresh(&self) -> Result<()> {
+        self.operations().refresh()
+    }
     pub fn terminate(&self) -> Result<()> {
         self.operations().terminate()
     }
@@ -475,6 +481,10 @@ impl SessionOperations for Session {
     }
     fn resize(&self, size: Size) -> Result<()> {
         Ok(Session::resize(self, size)?)
+    }
+    fn refresh(&self) -> Result<()> {
+        Session::refresh_instance(self, self.instance_id())?;
+        Ok(())
     }
     fn terminate(&self) -> Result<()> {
         Ok(Session::terminate(self)?)

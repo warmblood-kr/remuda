@@ -26,6 +26,7 @@ const CAPS: &[&str] = &[
     super::api::WRITER_FENCE,
     super::api::DEEP_HISTORY,
     super::api::COMPACT_VIEW,
+    super::api::SCREEN_REFRESH,
 ];
 pub(crate) struct Server {
     endpoint: Arc<Endpoint>,
@@ -272,6 +273,7 @@ impl Connection {
                     | Request::AcquireWriter { .. }
                     | Request::Input { .. }
                     | Request::Resize { .. }
+                    | Request::Refresh
                     | Request::Close
                     | Request::HumanGrant { .. }
                     | Request::HumanInput { .. }
@@ -320,6 +322,13 @@ impl Connection {
                 self.server
                     .host
                     .resize(self.controller()?, rows, cols)
+                    .map_err(control_error)?;
+                Ok(Response::Ok)
+            }
+            Request::Refresh => {
+                self.server
+                    .host
+                    .refresh(self.controller()?)
                     .map_err(control_error)?;
                 Ok(Response::Ok)
             }
@@ -693,12 +702,16 @@ fn raw_digest(bytes: Vec<u8>) -> Result<[u8; 32], String> {
 fn control_error(error: super::coordinator::Error) -> String {
     use super::control::Refusal;
     use super::coordinator::Error;
+    if let Error::RefreshFailed(ref message) = error {
+        return format!("refresh_failed: {message}");
+    }
     match error {
         Error::Control(Refusal::Busy) => "controller_busy",
         Error::Control(Refusal::Stale) | Error::StaleCompletion => "stale_controller_or_act",
         Error::Control(Refusal::Exhausted) => "host_sequence_exhausted",
         Error::Control(Refusal::Superseded) => "superseded_writer",
         Error::Invalid(_) => "invalid_or_unavailable_operation",
+        Error::RefreshFailed(_) => unreachable!(),
         Error::Stopping => "host_stopping",
         Error::Retained => "host_raw_retention_pending",
         Error::Grant(super::human::GrantError::Stale) => "human_grant_stale",

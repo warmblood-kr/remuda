@@ -158,6 +158,16 @@ impl Owned {
         self.coordinator.lock().unwrap().finish_mutation(token)?;
         result.map_err(|_| Error::Invalid("host resize failed; inspect health"))
     }
+    pub fn refresh(&self, fence: Fence) -> Result<(), Error> {
+        let token = self.coordinator.lock().unwrap().begin_mutation(fence)?;
+        let result = self.session.refresh_instance(self.session.instance_id());
+        self.coordinator.lock().unwrap().finish_mutation(token)?;
+        match result {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Error::Invalid("host refresh instance changed")),
+            Err(error) => Err(Error::RefreshFailed(error.to_string())),
+        }
+    }
     /// Latch Stop under the coordinator lock; caller proves settlement first,
     /// outside this lock. A human holder keeps the host alive.
     pub fn latch_stop(&self, fence: Fence) -> Result<(), Error> {

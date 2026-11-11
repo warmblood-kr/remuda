@@ -348,6 +348,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
             Ok(())
         }
         Request::Resize { .. } => Err(refusal("Resize")),
+        Request::RefreshSession { .. } => Err(refusal("RefreshSession")),
         Request::Capture { .. } => Err(refusal("Capture")),
         Request::MouseState { .. } => Err(refusal("MouseState")),
         Request::Attach { .. } => Err(refusal("Attach")),
