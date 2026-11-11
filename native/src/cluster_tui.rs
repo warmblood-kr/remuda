@@ -910,6 +910,13 @@ impl ClusterUi {
             (width, height.saturating_sub(header.len()))
         } else if width >= SPLIT_MIN_COLS {
             let pane_width = width - self.tree_width(width, now) - 1;
+            let notices = self.active_notice_lines(now, pane_width).len();
+            let queue: usize = self
+                .visible_queue(now)
+                .rev()
+                .take(3)
+                .map(|batch| wrap_to_two_lines(&queue_line(batch), pane_width).len())
+                .sum();
             (
                 pane_width,
                 height
@@ -1077,7 +1084,7 @@ impl ClusterUi {
         let left_w = self.tree_width(width, now);
         let right_w = width - left_w - 1;
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
-        let notices = self.active_notice_lines(now, width);
+        let notices = self.active_notice_lines(now, right_w);
         let queue: Vec<&PendingBatch> = self
             .visible_queue(now)
             .rev()
@@ -1086,18 +1093,31 @@ impl ClusterUi {
             .into_iter()
             .rev()
             .collect();
-        let body_rows = height
-            .saturating_sub(self.footer_row_count(width) + notices.len() + queue.len())
-            .max(1);
+        let queue_lines: usize = queue
+            .iter()
+            .map(|batch| wrap_to_two_lines(&queue_line(batch), right_w).len())
+            .sum();
+        let body_rows = height.saturating_sub(self.footer_row_count(width)).max(1);
         let composer = self.composer_lines(right_w);
-        let screen_rows = body_rows.saturating_sub(1 + composer.len());
+        let screen_rows =
+            body_rows.saturating_sub(1 + composer.len() + notices.len() + queue_lines);
         let mut right = vec![ellipsize(&pane_header, right_w)];
         right.extend(
             visible_remote_pane_lines(&pane_body, self.remote_active.is_some(), screen_rows)
                 .into_iter()
                 .map(str::to_string),
         );
-        right.resize(body_rows.saturating_sub(composer.len()), String::new());
+        right.resize(
+            body_rows.saturating_sub(composer.len() + notices.len() + queue_lines),
+            String::new(),
+        );
+        right.extend(notices);
+        for batch in queue {
+            if right.len() < body_rows {
+                self.mark_uncertain_visible(batch, now);
+            }
+            right.extend(wrap_to_two_lines(&queue_line(batch), right_w));
+        }
         right.extend(composer);
         let mut left = self.tree_lines(left_w, now);
         if left.len() > body_rows {
@@ -1111,13 +1131,6 @@ impl ClusterUi {
                 format!("{}│{r}", pad_to(&l, left_w))
             })
             .collect();
-        frame.extend(notices);
-        for batch in queue {
-            if frame.len() < height {
-                self.mark_uncertain_visible(batch, now);
-            }
-            frame.push(queue_line(batch));
-        }
         self.append_footer(&mut frame, width);
         frame
             .into_iter()
@@ -3728,6 +3741,51 @@ mod tests {
         );
         assert!(!line.contains("studio/"));
         assert!(text.lines().last().unwrap().ends_with("? help"));
+    }
+
+    #[test]
+    fn split_input_feedback_is_inside_content_pane() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
+        ui.notice = Some(("sending input to dev".into(), clock.now()));
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let line = frame
+            .lines()
+            .find(|line| line.contains("sending input"))
+            .unwrap();
+        assert!(
+            line.split_once('│')
+                .is_some_and(|(_, right)| right.contains("sending input")),
+            "{line}"
+        );
+        ui.notice = Some(("Input sent".into(), clock.now()));
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let line = frame
+            .lines()
+            .find(|line| line.contains("Input sent"))
+            .unwrap();
+        assert!(
+            line.split_once('│')
+                .is_some_and(|(_, right)| right.contains("Input sent")),
+            "{line}"
+        );
+        ui.notice = None;
+        ui.input_sender
+            .enqueue(
+                &mut ui.input_queue,
+                "dev",
+                "instance-dev",
+                b"input\r".to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let line = frame.lines().find(|line| line.contains("waiting")).unwrap();
+        assert!(
+            line.split_once('│')
+                .is_some_and(|(_, right)| right.contains("waiting")),
+            "{line}"
+        );
     }
 
     #[test]
@@ -7702,9 +7760,9 @@ mod tests {
         let frame = ui.render_text(100, 24, "", &clock);
         let lines: Vec<&str> = frame.lines().collect();
         assert!(lines.last().unwrap().ends_with("? help"));
-        assert!(lines
-            .iter()
-            .any(|l| l.starts_with("heads up") && !l.contains('│')));
+        assert!(lines.iter().any(|l| l
+            .split_once('│')
+            .is_some_and(|(_, right)| right.contains("heads up"))));
         assert!(lines.iter().all(|l| cell_width(l) <= 100));
         ui.remote_keys_mode = ui.remote_active.clone();
         let keys = ui.render_text(100, 24, "", &clock);
