@@ -1340,10 +1340,14 @@ impl ClusterUi {
                     rows.push(TreeRow {
                         prefix: format!("{}    ", if is_selected { ">" } else { " " }),
                         label: session.name.clone(),
-                        status: session_cell(
+                        status: remote_program_cell(
                             session.alive,
                             session.last_error.is_some(),
                             self.remote_pending_count(node, session),
+                            (node.state == RemoteState::Reachable)
+                                .then_some(session.program_status.as_ref())
+                                .flatten(),
+                            std::time::Instant::now(),
                         ),
                     });
                 }
@@ -2908,6 +2912,35 @@ fn session_cell(alive: bool, has_error: bool, pending: usize) -> String {
         glyph.to_string()
     } else {
         format!("{glyph} +{pending}")
+    }
+}
+
+fn remote_program_cell(
+    alive: bool,
+    has_error: bool,
+    pending: usize,
+    status: Option<&crate::cluster_remote::RemoteProgramStatus>,
+    now: std::time::Instant,
+) -> String {
+    use remuda_core::agent::ProgramState;
+    if !alive || has_error {
+        return session_cell(alive, has_error, pending);
+    }
+    let glyph =
+        status
+            .filter(|value| value.is_fresh_at(now))
+            .map(|value| match value.status.state {
+                ProgramState::Working => '◉',
+                ProgramState::Idle => '○',
+                ProgramState::Blocked => '!',
+                ProgramState::Done => '✓',
+                ProgramState::Error => 'x',
+                ProgramState::Unknown => session_glyph(alive),
+            });
+    match (glyph, pending) {
+        (Some(glyph), 0) => glyph.to_string(),
+        (Some(glyph), count) => format!("{glyph} +{count}"),
+        (None, _) => session_cell(alive, has_error, pending),
     }
 }
 
@@ -4646,6 +4679,7 @@ mod tests {
                     bracketed_paste: false,
                     screen,
                     last_error: None,
+                    program_status: None,
                 }],
             }],
         }
@@ -5063,6 +5097,40 @@ mod tests {
         assert_eq!(session_cell(true, true, 0), "!");
         assert_eq!(session_cell(true, false, 2), "● +2");
         assert_eq!(session_cell(false, true, 12), "! +12");
+    }
+
+    #[test]
+    fn remote_program_status_icons_expire_and_never_override_transport_error() {
+        use remuda_core::agent::{ProgramState, ProgramStatus};
+        let observed_at = std::time::Instant::now();
+        let blocked = crate::cluster_remote::RemoteProgramStatus {
+            status: ProgramStatus {
+                state: ProgramState::Blocked,
+                app: None,
+                kind: None,
+                progress: None,
+            },
+            age_at_observation_ms: 0,
+            observed_at,
+        };
+        assert_eq!(
+            super::remote_program_cell(true, false, 0, Some(&blocked), observed_at),
+            "!"
+        );
+        assert_eq!(
+            super::remote_program_cell(
+                true,
+                false,
+                0,
+                Some(&blocked),
+                observed_at + Duration::from_secs(3601)
+            ),
+            "●"
+        );
+        assert_eq!(
+            super::remote_program_cell(true, true, 0, Some(&blocked), observed_at),
+            "!"
+        );
     }
 
     #[test]

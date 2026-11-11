@@ -1,6 +1,6 @@
 //! Bounded remote-node polling state, separate from the cluster tree renderer.
 
-use remuda_core::agent::ScreenSnapshot;
+use remuda_core::agent::{ProgramState, ProgramStatus, ScreenSnapshot};
 use remuda_core::protocol::{expand_runs, Request, Response};
 use std::collections::{BTreeMap, HashSet};
 use std::io;
@@ -40,6 +40,34 @@ pub struct RemoteSessionSnapshot {
     pub bracketed_paste: bool,
     pub screen: Option<ScreenSnapshot>,
     pub last_error: Option<String>,
+    /// Advisory status from List, aged from the start of that request.
+    pub program_status: Option<RemoteProgramStatus>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteProgramStatus {
+    pub status: ProgramStatus,
+    pub age_at_observation_ms: u64,
+    pub observed_at: Instant,
+}
+
+impl RemoteProgramStatus {
+    pub fn age_at(&self, now: Instant) -> Duration {
+        Duration::from_millis(self.age_at_observation_ms)
+            .saturating_add(now.saturating_duration_since(self.observed_at))
+    }
+
+    pub fn is_fresh_at(&self, now: Instant) -> bool {
+        let limit = match self.status.state {
+            ProgramState::Working => Duration::from_secs(600),
+            ProgramState::Idle
+            | ProgramState::Blocked
+            | ProgramState::Done
+            | ProgramState::Error => Duration::from_secs(3600),
+            ProgramState::Unknown => return false,
+        };
+        self.age_at(now) <= limit
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -559,14 +587,7 @@ impl ClusterRemoteTransport {
         target: &crate::cluster::ResolvedTarget,
     ) -> io::Result<Vec<remuda_core::registry::SessionSummary>> {
         match self.request(target, &Request::List)? {
-            Response::Sessions(mut sessions) => {
-                // Local-only until request-elapsed remote aging exists.
-                for session in &mut sessions {
-                    session.program_status = None;
-                    session.program_status_age_ms = None;
-                }
-                Ok(sessions)
-            }
+            Response::Sessions(sessions) => Ok(sessions),
             Response::Error(error) => Err(io::Error::other(error)),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -618,6 +639,7 @@ fn selected_snapshot(
             bracketed_paste: snapshot.bracketed_paste,
             screen: Some(to_screen_snapshot(snapshot)),
             last_error: None,
+            program_status: None,
         }),
         Response::StyledScreen {
             rows,
@@ -650,6 +672,7 @@ fn selected_snapshot(
                     cursor,
                 })),
                 last_error: None,
+                program_status: None,
             })
         }
         Response::WrongInstance => Err(io::Error::new(
@@ -676,13 +699,19 @@ impl RemoteTransport for ClusterRemoteTransport {
         previous: &[RemoteSessionSnapshot],
     ) -> io::Result<RemotePoll> {
         let resolved = (self.resolve)(target)?;
+        let started = Instant::now();
         let sessions = self.list_sessions(&resolved)?;
-        Ok(poll_listed_sessions(
-            sessions,
-            selected_session,
-            previous,
-            |session, prior| self.selected_session_snapshot(&resolved, session, prior),
-        ))
+        let statuses = listed_program_statuses(&sessions, started);
+        let mut poll =
+            poll_listed_sessions(sessions, selected_session, previous, |session, prior| {
+                self.selected_session_snapshot(&resolved, session, prior)
+            });
+        for session in &mut poll.sessions {
+            session.program_status = statuses
+                .get(&(session.wire_name.clone(), session.instance_id.clone()))
+                .cloned();
+        }
+        Ok(poll)
     }
 
     /// One Sync for the selected session. Overload, errors and timeouts fail
@@ -714,6 +743,25 @@ impl RemoteTransport for ClusterRemoteTransport {
                 .collect()
         }))
     }
+}
+
+fn listed_program_statuses(
+    sessions: &[remuda_core::registry::SessionSummary],
+    started: Instant,
+) -> std::collections::HashMap<(String, String), RemoteProgramStatus> {
+    sessions
+        .iter()
+        .filter_map(|s| {
+            Some((
+                (s.name.clone(), listed_instance_id(s)?),
+                RemoteProgramStatus {
+                    status: s.program_status.clone()?,
+                    age_at_observation_ms: s.program_status_age_ms?,
+                    observed_at: started,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Snapshots for one List. Only the first live session shown under the
@@ -835,6 +883,7 @@ fn unpolled_session_snapshot(
         bracketed_paste: prior.is_some_and(|old| old.bracketed_paste),
         screen: prior.and_then(|old| old.screen.clone()),
         last_error: prior.and_then(|old| old.last_error.clone()),
+        program_status: None,
     })
 }
 
@@ -1238,6 +1287,7 @@ mod tests {
             bracketed_paste: false,
             screen: Some(screen(text)),
             last_error: None,
+            program_status: None,
         }
     }
 
@@ -2288,5 +2338,59 @@ mod tests {
             Some(Duration::from_secs(3))
         );
         assert_eq!(snapshot.nodes[0].sessions[0].name, "dev");
+    }
+
+    #[test]
+    fn program_status_ages_through_sync_only_and_expires() {
+        use remuda_core::agent::{ProgramState, ProgramStatus};
+        let start = Instant::now();
+        let mut original = session("dev", "screen");
+        original.program_status = Some(RemoteProgramStatus {
+            status: ProgramStatus {
+                state: ProgramState::Working,
+                app: None,
+                kind: None,
+                progress: None,
+            },
+            age_at_observation_ms: 1000,
+            observed_at: start,
+        });
+        let mut node = RemoteNode::new("peer", start);
+        node.poll_succeeded(vec![original], start);
+        let status = node
+            .snapshot_at(start + Duration::from_secs(10))
+            .sessions
+            .remove(0)
+            .program_status
+            .unwrap();
+        assert_eq!(
+            status.age_at(start + Duration::from_secs(10)),
+            Duration::from_secs(11)
+        );
+        assert!(!status.is_fresh_at(start + Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn listed_status_requires_age_and_is_keyed_by_original_name_and_instance() {
+        use remuda_core::agent::{ProgramState, ProgramStatus};
+        let at = Instant::now();
+        let mut listed = summary("worker", "old");
+        listed.program_status = Some(ProgramStatus {
+            state: ProgramState::Blocked,
+            app: Some("codex".into()),
+            kind: None,
+            progress: None,
+        });
+        assert!(listed_program_statuses(&[listed.clone()], at).is_empty());
+        listed.program_status_age_ms = Some(123);
+        let statuses = listed_program_statuses(&[listed], at);
+        assert_eq!(
+            statuses
+                .get(&("worker".into(), "old".into()))
+                .unwrap()
+                .age_at(at),
+            Duration::from_millis(123)
+        );
+        assert!(!statuses.contains_key(&("worker".into(), "new".into())));
     }
 }
