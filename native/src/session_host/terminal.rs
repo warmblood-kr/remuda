@@ -16,12 +16,15 @@ const MAX_HISTORY_CELLS: usize = HISTORY_ROWS * 1000;
 const MAX_QUERIES: usize = 32;
 #[derive(Default)]
 struct Queries {
-    positions: VecDeque<(u16, u16)>,
+    replies: VecDeque<Vec<u8>>,
     overflow: u64,
     status: Tracker,
 }
 impl vt100::Callbacks for Queries {
     fn unhandled_osc(&mut self, _: &mut vt100::Screen, params: &[&[u8]]) {
+        if params == [b"7501".as_slice(), b"?".as_slice()] {
+            self.push_reply(b"\x1b]7501;?\x1b\\".to_vec());
+        }
         self.status.observe(params);
     }
 
@@ -33,14 +36,27 @@ impl vt100::Callbacks for Queries {
         params: &[&[u16]],
         c: char,
     ) {
+        if i1.is_none()
+            && i2.is_none()
+            && c == 'c'
+            && (params.is_empty() || params == [&[0_u16][..]])
+        {
+            self.push_reply(b"\x1b[?1;2c".to_vec());
+        }
         if i1.is_none() && i2.is_none() && c == 'n' && params == [&[6_u16][..]] {
-            if self.positions.len() == MAX_QUERIES {
-                self.overflow = self.overflow.saturating_add(1);
-            } else {
-                let (row, col) = screen.cursor_position();
-                self.positions
-                    .push_back((row + 1, col.min(screen.size().1 - 1) + 1));
-            }
+            let (row, col) = screen.cursor_position();
+            self.push_reply(
+                format!("\x1b[{};{}R", row + 1, col.min(screen.size().1 - 1) + 1).into_bytes(),
+            );
+        }
+    }
+}
+impl Queries {
+    fn push_reply(&mut self, reply: Vec<u8>) {
+        if self.replies.len() == MAX_QUERIES {
+            self.overflow = self.overflow.saturating_add(1);
+        } else {
+            self.replies.push_back(reply);
         }
     }
 }
@@ -151,8 +167,8 @@ impl Terminal {
     pub fn generation_fixture(&mut self, generation: u64) {
         self.generation = generation;
     }
-    pub fn take_query(&mut self) -> Option<(u16, u16)> {
-        self.parser.callbacks_mut().positions.pop_front()
+    pub fn take_control_reply(&mut self) -> Option<Vec<u8>> {
+        self.parser.callbacks_mut().replies.pop_front()
     }
     pub fn program_status(&self) -> Option<remuda_core::agent::ProgramStatusObservation> {
         self.parser.callbacks().status.observation()
@@ -211,6 +227,44 @@ mod tests {
         }
     }
     #[test]
+    fn program_status_query_reply_precedes_device_attributes_at_all_splits() {
+        let bytes = b"\x1b]7501;?\x1b\\\x1b[c";
+        for split in 0..=bytes.len() {
+            let mut terminal = Terminal::new(24, 80, 10).unwrap();
+            feed(&mut terminal, &bytes[..split]);
+            feed(&mut terminal, &bytes[split..]);
+            assert_eq!(
+                terminal.take_control_reply(),
+                Some(b"\x1b]7501;?\x1b\\".to_vec())
+            );
+            assert_eq!(terminal.take_control_reply(), Some(b"\x1b[?1;2c".to_vec()));
+        }
+    }
+
+    #[test]
+    fn mixed_terminal_queries_preserve_source_order() {
+        let input = b"\x1b[6n\x1b]7501;?\x1b\\\x1b[c\x1b[6n";
+        for split in 0..=input.len() {
+            let mut terminal = Terminal::new(24, 80, 10).unwrap();
+            feed(&mut terminal, &input[..split]);
+            feed(&mut terminal, &input[split..]);
+            let mut bytes = Vec::new();
+            while let Some(reply) = terminal.take_control_reply() {
+                bytes.extend(reply);
+            }
+            assert_eq!(bytes, b"\x1b[1;1R\x1b]7501;?\x1b\\\x1b[?1;2c\x1b[1;1R");
+        }
+    }
+
+    #[test]
+    fn mixed_query_overflow_is_reported() {
+        let mut terminal = Terminal::new(24, 80, 10).unwrap();
+        feed(&mut terminal, &b"\x1b]7501;?\x07".repeat(MAX_QUERIES));
+        feed(&mut terminal, b"\x1b[c\x1b[6n");
+        assert_eq!(terminal.health(), (0, 2));
+    }
+
+    #[test]
     fn query_positions_and_modes_survive_every_byte_split() {
         let bytes =
             "abc\x1b[6ndef\x1b[6n\r\n\u{754c}e\u{301}\x1b[?2004h\x1b[?1049halt\x1b[?1049l\x1b[?25l"
@@ -221,9 +275,9 @@ mod tests {
             let mut terminal = Terminal::new(24, 80, 10).unwrap();
             feed(&mut terminal, &bytes[..split]);
             feed(&mut terminal, &bytes[split..]);
-            assert_eq!(terminal.take_query(), Some((1, 4)));
-            assert_eq!(terminal.take_query(), Some((1, 7)));
-            assert_eq!(terminal.take_query(), None);
+            assert_eq!(terminal.take_control_reply(), Some(b"\x1b[1;4R".to_vec()));
+            assert_eq!(terminal.take_control_reply(), Some(b"\x1b[1;7R".to_vec()));
+            assert_eq!(terminal.take_control_reply(), None);
             assert_eq!(
                 terminal.screen().state_formatted(),
                 reference.screen().state_formatted()
@@ -232,7 +286,7 @@ mod tests {
         }
     }
     #[test]
-    fn program_status_is_recorded_and_a_query_is_inert() {
+    fn program_status_is_recorded_and_a_query_preserves_it() {
         let mut terminal = Terminal::new(24, 80, 10).unwrap();
         feed(&mut terminal, b"\x1b]7501;?\x1b\\\x1b]7501;?\x07");
         assert!(terminal.program_status().is_none());
@@ -275,7 +329,7 @@ mod tests {
         assert_eq!(terminal.generation(), 2);
         feed(&mut terminal, &b"\x1b[6n".repeat(MAX_QUERIES + 1));
         assert_eq!(terminal.health(), (0, 1));
-        assert_eq!(terminal.parser.callbacks().positions.len(), MAX_QUERIES);
+        assert_eq!(terminal.parser.callbacks().replies.len(), MAX_QUERIES);
         terminal.generation = u64::MAX;
         assert!(terminal.process(b"no").is_err());
     }

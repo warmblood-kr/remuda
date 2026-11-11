@@ -36,8 +36,7 @@ impl Tracker {
         let Ok(payload) = std::str::from_utf8(payload) else {
             return;
         };
-        // This phase observes reports but does not answer the feature query,
-        // so both `?` and a capability response are inert.
+        // Query handling belongs to the terminal callback, not the tracker.
         if payload.starts_with('?') {
             return;
         }

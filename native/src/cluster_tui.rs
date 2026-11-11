@@ -508,7 +508,16 @@ impl ClusterUi {
     ) -> bool {
         let attention = node.state != RemoteState::Reachable
             || !session.alive
-            || self.remote_pending_count(node, session) > 0;
+            || session.last_error.is_some()
+            || self.remote_pending_count(node, session) > 0
+            || session.program_status.as_ref().is_some_and(|status| {
+                status.is_fresh_at(std::time::Instant::now())
+                    && matches!(
+                        status.status.state,
+                        remuda_core::agent::ProgramState::Blocked
+                            | remuda_core::agent::ProgramState::Error
+                    )
+            });
         let name_matches = query.is_empty()
             || matches_query(query, &node.name)
             || matches_query(query, &session.name);
@@ -1340,10 +1349,14 @@ impl ClusterUi {
                     rows.push(TreeRow {
                         prefix: format!("{}    ", if is_selected { ">" } else { " " }),
                         label: session.name.clone(),
-                        status: session_cell(
+                        status: remote_program_cell(
                             session.alive,
                             session.last_error.is_some(),
                             self.remote_pending_count(node, session),
+                            (node.state == RemoteState::Reachable)
+                                .then_some(session.program_status.as_ref())
+                                .flatten(),
+                            std::time::Instant::now(),
                         ),
                     });
                 }
@@ -2908,6 +2921,35 @@ fn session_cell(alive: bool, has_error: bool, pending: usize) -> String {
         glyph.to_string()
     } else {
         format!("{glyph} +{pending}")
+    }
+}
+
+fn remote_program_cell(
+    alive: bool,
+    has_error: bool,
+    pending: usize,
+    status: Option<&crate::cluster_remote::RemoteProgramStatus>,
+    now: std::time::Instant,
+) -> String {
+    use remuda_core::agent::ProgramState;
+    if !alive || has_error {
+        return session_cell(alive, has_error, pending);
+    }
+    let glyph =
+        status
+            .filter(|value| value.is_fresh_at(now))
+            .map(|value| match value.status.state {
+                ProgramState::Working => '◉',
+                ProgramState::Idle => '○',
+                ProgramState::Blocked => '!',
+                ProgramState::Done => '✓',
+                ProgramState::Error => 'x',
+                ProgramState::Unknown => session_glyph(alive),
+            });
+    match (glyph, pending) {
+        (Some(glyph), 0) => glyph.to_string(),
+        (Some(glyph), count) => format!("{glyph} +{count}"),
+        (None, _) => session_cell(alive, has_error, pending),
     }
 }
 
@@ -4646,6 +4688,7 @@ mod tests {
                     bracketed_paste: false,
                     screen,
                     last_error: None,
+                    program_status: None,
                 }],
             }],
         }
@@ -5063,6 +5106,80 @@ mod tests {
         assert_eq!(session_cell(true, true, 0), "!");
         assert_eq!(session_cell(true, false, 2), "● +2");
         assert_eq!(session_cell(false, true, 12), "! +12");
+    }
+
+    #[test]
+    fn remote_program_status_icons_expire_and_never_override_transport_error() {
+        use remuda_core::agent::{ProgramState, ProgramStatus};
+        let observed_at = std::time::Instant::now();
+        let blocked = crate::cluster_remote::RemoteProgramStatus {
+            status: ProgramStatus {
+                state: ProgramState::Blocked,
+                app: None,
+                kind: None,
+                progress: None,
+            },
+            age_at_observation_ms: 0,
+            observed_at,
+        };
+        assert_eq!(
+            super::remote_program_cell(true, false, 0, Some(&blocked), observed_at),
+            "!"
+        );
+        assert_eq!(
+            super::remote_program_cell(
+                true,
+                false,
+                0,
+                Some(&blocked),
+                observed_at + Duration::from_secs(3601)
+            ),
+            "●"
+        );
+        assert_eq!(
+            super::remote_program_cell(true, true, 0, Some(&blocked), observed_at),
+            "!"
+        );
+    }
+
+    #[test]
+    fn attention_filter_includes_fresh_blocked_and_error_only() {
+        use remuda_core::agent::{ProgramState, ProgramStatus};
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
+        ui.attention_only = true;
+        let mut snapshot = remote_snapshot(RemoteState::Reachable, Duration::ZERO, None);
+        for (state, age, expected) in [
+            (ProgramState::Blocked, 0, true),
+            (ProgramState::Error, 0, true),
+            (ProgramState::Working, 0, false),
+            (ProgramState::Blocked, 3_601_000, false),
+        ] {
+            snapshot.nodes[0].sessions[0].program_status =
+                Some(crate::cluster_remote::RemoteProgramStatus {
+                    status: ProgramStatus {
+                        state,
+                        app: None,
+                        kind: None,
+                        progress: None,
+                    },
+                    age_at_observation_ms: age,
+                    observed_at: std::time::Instant::now(),
+                });
+            ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot.clone())));
+            ui.remote_expanded.insert("fp-laptop".into());
+            let visible = ui.visible_tree_rows().iter().any(
+                |row| matches!(row, TreeSelection::RemoteSession { name, .. } if name == "build"),
+            );
+            assert_eq!(visible, expected, "state={state:?} age={age}");
+            let rendered = ui.render_text(80, 24, "", &clock);
+            assert_eq!(rendered.contains("build"), expected, "{rendered}");
+        }
+        snapshot.nodes[0].state = RemoteState::Unreachable;
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        assert!(ui.visible_tree_rows().iter().any(
+            |row| matches!(row, TreeSelection::RemoteSession { name, .. } if name == "build")
+        ));
     }
 
     #[test]
