@@ -508,7 +508,16 @@ impl ClusterUi {
     ) -> bool {
         let attention = node.state != RemoteState::Reachable
             || !session.alive
-            || self.remote_pending_count(node, session) > 0;
+            || session.last_error.is_some()
+            || self.remote_pending_count(node, session) > 0
+            || session.program_status.as_ref().is_some_and(|status| {
+                status.is_fresh_at(std::time::Instant::now())
+                    && matches!(
+                        status.status.state,
+                        remuda_core::agent::ProgramState::Blocked
+                            | remuda_core::agent::ProgramState::Error
+                    )
+            });
         let name_matches = query.is_empty()
             || matches_query(query, &node.name)
             || matches_query(query, &session.name);
@@ -5131,6 +5140,46 @@ mod tests {
             super::remote_program_cell(true, true, 0, Some(&blocked), observed_at),
             "!"
         );
+    }
+
+    #[test]
+    fn attention_filter_includes_fresh_blocked_and_error_only() {
+        use remuda_core::agent::{ProgramState, ProgramStatus};
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
+        ui.attention_only = true;
+        let mut snapshot = remote_snapshot(RemoteState::Reachable, Duration::ZERO, None);
+        for (state, age, expected) in [
+            (ProgramState::Blocked, 0, true),
+            (ProgramState::Error, 0, true),
+            (ProgramState::Working, 0, false),
+            (ProgramState::Blocked, 3_601_000, false),
+        ] {
+            snapshot.nodes[0].sessions[0].program_status =
+                Some(crate::cluster_remote::RemoteProgramStatus {
+                    status: ProgramStatus {
+                        state,
+                        app: None,
+                        kind: None,
+                        progress: None,
+                    },
+                    age_at_observation_ms: age,
+                    observed_at: std::time::Instant::now(),
+                });
+            ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot.clone())));
+            ui.remote_expanded.insert("fp-laptop".into());
+            let visible = ui.visible_tree_rows().iter().any(
+                |row| matches!(row, TreeSelection::RemoteSession { name, .. } if name == "build"),
+            );
+            assert_eq!(visible, expected, "state={state:?} age={age}");
+            let rendered = ui.render_text(80, 24, "", &clock);
+            assert_eq!(rendered.contains("build"), expected, "{rendered}");
+        }
+        snapshot.nodes[0].state = RemoteState::Unreachable;
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        assert!(ui.visible_tree_rows().iter().any(
+            |row| matches!(row, TreeSelection::RemoteSession { name, .. } if name == "build")
+        ));
     }
 
     #[test]
