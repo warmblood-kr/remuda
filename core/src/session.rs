@@ -967,10 +967,8 @@ impl Session {
         Ok(true)
     }
 
-    /// Request a redraw by briefly changing the terminal width. This only
-    /// confirms that the resize calls returned, not that the child redrew.
-    /// Keep the agent lock across both calls so another resize cannot be
-    /// overwritten by restoration of the original size.
+    /// Request a redraw with a serialized width round trip; completion does
+    /// not guarantee the child has repainted.
     pub fn refresh_instance(&self, instance_id: &str) -> Result<bool> {
         if self.instance_id != instance_id {
             return Ok(false);
