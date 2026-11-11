@@ -148,6 +148,7 @@ pub struct ClusterUi {
     input_queue: InputQueue,
     uncertain_visible_since: std::cell::RefCell<HashMap<QueueIdentity, Duration>>,
     notice: Option<(String, Duration)>,
+    input_notice: Option<(String, Duration)>,
     pending_close: Option<PendingClose>,
     remote_close_confirmation: Option<RemoteCloseTarget>,
     confirmation: Confirmation,
@@ -291,6 +292,7 @@ impl ClusterUi {
             input_queue: InputQueue::default(),
             uncertain_visible_since: std::cell::RefCell::new(HashMap::new()),
             notice: None,
+            input_notice: None,
             pending_close: None,
             remote_close_confirmation: None,
             confirmation: Confirmation::default(),
@@ -910,7 +912,8 @@ impl ClusterUi {
             (width, height.saturating_sub(header.len()))
         } else if width >= SPLIT_MIN_COLS {
             let pane_width = width - self.tree_width(width, now) - 1;
-            let notices = self.active_notice_lines(now, pane_width).len();
+            let notices = self.scoped_notice_lines(now, width, false).len()
+                + self.scoped_notice_lines(now, pane_width, true).len();
             let queue: usize = self
                 .visible_queue(now)
                 .rev()
@@ -1084,7 +1087,8 @@ impl ClusterUi {
         let left_w = self.tree_width(width, now);
         let right_w = width - left_w - 1;
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
-        let notices = self.active_notice_lines(now, right_w);
+        let notices = self.scoped_notice_lines(now, right_w, true);
+        let global_notices = self.scoped_notice_lines(now, width, false);
         let queue: Vec<&PendingBatch> = self
             .visible_queue(now)
             .rev()
@@ -1097,7 +1101,9 @@ impl ClusterUi {
             .iter()
             .map(|batch| wrap_to_two_lines(&queue_line(batch), right_w).len())
             .sum();
-        let body_rows = height.saturating_sub(self.footer_row_count(width)).max(1);
+        let body_rows = height
+            .saturating_sub(self.footer_row_count(width) + global_notices.len())
+            .max(1);
         let composer = self.composer_lines(right_w);
         let screen_rows =
             body_rows.saturating_sub(1 + composer.len() + notices.len() + queue_lines);
@@ -1131,6 +1137,7 @@ impl ClusterUi {
                 format!("{}│{r}", pad_to(&l, left_w))
             })
             .collect();
+        frame.extend(global_notices);
         self.append_footer(&mut frame, width);
         frame
             .into_iter()
@@ -1239,6 +1246,23 @@ impl ClusterUi {
                 };
                 wrap_to_two_lines(&notice, width)
             })
+    }
+
+    fn scoped_notice_lines(&self, now: Duration, width: usize, input: bool) -> Vec<String> {
+        if self.notice.is_some() && (self.notice == self.input_notice) == input {
+            self.active_notice_lines(now, width)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn mark_input_notice(&mut self) {
+        self.input_notice = self.notice.clone();
+    }
+
+    fn set_input_notice(&mut self, message: String, now: Duration) {
+        self.notice = Some((message, now));
+        self.mark_input_notice();
     }
 
     fn append_footer(&self, frame: &mut Vec<String>, width: usize) {
@@ -1867,7 +1891,7 @@ impl ClusterUi {
                 if self.remote_composer_target.is_none() {
                     self.composer_target = None;
                 }
-                self.notice = Some(("draft cleared".into(), now));
+                self.set_input_notice("draft cleared".into(), now);
             }
             ComposerAction::Detach => {
                 self.partial_input_confirm_target = None;
@@ -1888,7 +1912,7 @@ impl ClusterUi {
                     } else if self.remote_target_may_be_partial(&node, &name, &instance_id) {
                         self.restore_draft(&bytes);
                         self.partial_input_confirm_target = Some(target);
-                        self.notice = Some((REMOTE_PARTIAL_INPUT_NOTICE.into(), now));
+                        self.set_input_notice(REMOTE_PARTIAL_INPUT_NOTICE.into(), now);
                     } else {
                         self.enqueue_remote_draft(bytes, now);
                     }
@@ -1913,7 +1937,7 @@ impl ClusterUi {
                 false
             } else {
                 self.composer.clear();
-                self.notice = Some((format!("draft for {node_label}/{name} discarded"), now));
+                self.set_input_notice(format!("draft for {node_label}/{name} discarded"), now);
                 true
             }
         } else {
@@ -1950,22 +1974,22 @@ impl ClusterUi {
         let target = self.composer_target.clone();
         let Some((name, instance_id)) = target else {
             self.restore_draft(&bytes);
-            self.notice = Some(("input unavailable: session identity is missing".into(), now));
+            self.set_input_notice("input unavailable: session identity is missing".into(), now);
             return;
         };
         let Some(session) = self.sessions.iter().find(|session| session.name == name) else {
             self.restore_draft(&bytes);
-            self.notice = Some(("input unavailable: session is no longer listed".into(), now));
+            self.set_input_notice("input unavailable: session is no longer listed".into(), now);
             return;
         };
         if session.instance_id.as_deref() != Some(instance_id.as_str()) {
             self.restore_draft(&bytes);
-            self.notice = Some(("input disabled: session restarted".into(), now));
+            self.set_input_notice("input disabled: session restarted".into(), now);
             return;
         }
         if !session.alive {
             self.restore_draft(&bytes);
-            self.notice = Some(("input disabled: session ended".into(), now));
+            self.set_input_notice("input disabled: session ended".into(), now);
             return;
         }
         match self.input_sender.enqueue_line(
@@ -1984,7 +2008,7 @@ impl ClusterUi {
             }
             Err(error) => {
                 self.restore_draft(&bytes);
-                self.notice = Some((format!("input not queued: {error}"), now));
+                self.set_input_notice(format!("input not queued: {error}"), now);
             }
         }
     }
@@ -1996,7 +2020,7 @@ impl ClusterUi {
         };
         if self.remote_control_disabled.contains(&node_key) {
             self.restore_draft(&bytes);
-            self.notice = Some((format!("remote control disabled on {node_label}"), now));
+            self.set_input_notice(format!("remote control disabled on {node_label}"), now);
             return;
         }
         let selection = RemoteSelection::Session {
@@ -2006,19 +2030,19 @@ impl ClusterUi {
         };
         let Some((_, session)) = self.remote_session(&selection) else {
             self.restore_draft(&bytes);
-            self.notice = Some((
+            self.set_input_notice(
                 format!("remote input unavailable: {node_label}/{name} is no longer listed"),
                 now,
-            ));
+            );
             return;
         };
         let wire_name = session.wire_name.clone();
         if !session.alive {
             self.restore_draft(&bytes);
-            self.notice = Some((
+            self.set_input_notice(
                 format!("remote input disabled: {node_label}/{name} has ended"),
                 now,
-            ));
+            );
             return;
         }
         match self.input_sender.enqueue_line(
@@ -2034,7 +2058,7 @@ impl ClusterUi {
             Ok(_) => self.notice = None,
             Err(error) => {
                 self.restore_draft(&bytes);
-                self.notice = Some((format!("remote input not queued: {error}"), now));
+                self.set_input_notice(format!("remote input not queued: {error}"), now);
             }
         }
     }
@@ -2063,7 +2087,7 @@ impl ClusterUi {
                     .as_ref()
                     .is_some_and(|(current, _)| current == &notice)
                 {
-                    self.notice = Some((notice, now));
+                    self.set_input_notice(notice, now);
                 }
             }
         }
@@ -2158,20 +2182,20 @@ impl ClusterUi {
                 if self.notice.as_ref().is_none_or(|(notice, _)| {
                     notice.starts_with("sending input to ") || notice == "Input sent"
                 }) {
-                    self.notice = Some(("Input sent".into(), now));
+                    self.set_input_notice("Input sent".into(), now);
                 }
             }
             Some(QueueEvent::Uncertain { .. }) => {
                 self.clear_sending_notice();
             }
             Some(QueueEvent::PasteAborted { .. }) => {
-                self.notice = Some((REMOTE_PASTE_FAILURE_NOTICE.into(), now));
+                self.set_input_notice(REMOTE_PASTE_FAILURE_NOTICE.into(), now);
             }
             Some(QueueEvent::RemoteTargetFailed { .. }) => {
-                self.notice = Some((REMOTE_PASTE_FAILURE_NOTICE.into(), now));
+                self.set_input_notice(REMOTE_PASTE_FAILURE_NOTICE.into(), now);
             }
             Some(QueueEvent::UnsupportedRequest { reason, .. }) => {
-                self.notice = Some((reason, now));
+                self.set_input_notice(reason, now);
             }
             Some(QueueEvent::Dropped { reason, .. }) | Some(QueueEvent::Failed { reason, .. }) => {
                 let mut draft_discarded = false;
@@ -2184,7 +2208,7 @@ impl ClusterUi {
                     }
                 }
                 if !draft_discarded {
-                    self.notice = Some((reason, now));
+                    self.set_input_notice(reason, now);
                 }
             }
             Some(QueueEvent::RemoteControlDisabled { node, .. }) => {
@@ -2196,7 +2220,7 @@ impl ClusterUi {
                     .find(|snapshot| snapshot.registry_key == node)
                     .map(|snapshot| snapshot.name.as_str())
                     .unwrap_or(&node);
-                self.notice = Some((format!("remote control disabled on {label}"), now));
+                self.set_input_notice(format!("remote control disabled on {label}"), now);
             }
             Some(QueueEvent::RetryScheduled { .. }) | None => {}
         }
@@ -3747,7 +3771,7 @@ mod tests {
     fn split_input_feedback_is_inside_content_pane() {
         let clock = ManualClock::new();
         let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
-        ui.notice = Some(("sending input to dev".into(), clock.now()));
+        ui.set_input_notice("sending input to dev".into(), clock.now());
         let frame = ui.render_text(100, 24, "pane", &clock);
         let line = frame
             .lines()
@@ -3758,7 +3782,7 @@ mod tests {
                 .is_some_and(|(_, right)| right.contains("sending input")),
             "{line}"
         );
-        ui.notice = Some(("Input sent".into(), clock.now()));
+        ui.set_input_notice("Input sent".into(), clock.now());
         let frame = ui.render_text(100, 24, "pane", &clock);
         let line = frame
             .lines()
@@ -3784,6 +3808,16 @@ mod tests {
         assert!(
             line.split_once('│')
                 .is_some_and(|(_, right)| right.contains("waiting")),
+            "{line}"
+        );
+        ui.notice = Some(("node disconnected".into(), clock.now()));
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let line = frame
+            .lines()
+            .find(|line| line.contains("node disconnected"))
+            .unwrap();
+        assert!(
+            line.starts_with("node disconnected") && !line.contains('│'),
             "{line}"
         );
     }
@@ -7760,9 +7794,9 @@ mod tests {
         let frame = ui.render_text(100, 24, "", &clock);
         let lines: Vec<&str> = frame.lines().collect();
         assert!(lines.last().unwrap().ends_with("? help"));
-        assert!(lines.iter().any(|l| l
-            .split_once('│')
-            .is_some_and(|(_, right)| right.contains("heads up"))));
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("heads up") && !l.contains('│')));
         assert!(lines.iter().all(|l| cell_width(l) <= 100));
         ui.remote_keys_mode = ui.remote_active.clone();
         let keys = ui.render_text(100, 24, "", &clock);
