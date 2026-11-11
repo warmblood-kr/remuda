@@ -149,6 +149,8 @@ pub struct ClusterUi {
     uncertain_visible_since: std::cell::RefCell<HashMap<QueueIdentity, Duration>>,
     notice: Option<(String, Duration)>,
     input_notice: Option<(String, Duration)>,
+    input_notice_target: Option<(Option<String>, String, String)>,
+    input_delivery_target: Option<(Option<String>, String, String)>,
     pending_close: Option<PendingClose>,
     remote_close_confirmation: Option<RemoteCloseTarget>,
     confirmation: Confirmation,
@@ -293,6 +295,8 @@ impl ClusterUi {
             uncertain_visible_since: std::cell::RefCell::new(HashMap::new()),
             notice: None,
             input_notice: None,
+            input_notice_target: None,
+            input_delivery_target: None,
             pending_close: None,
             remote_close_confirmation: None,
             confirmation: Confirmation::default(),
@@ -774,8 +778,9 @@ impl ClusterUi {
         let tree_start = 2;
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
         let divider = "─".repeat(width);
-        let queue_rows: Vec<&PendingBatch> = self.visible_queue(now).rev().take(3).collect();
-        let notice_lines = self.active_notice_lines(now, width);
+        let queue_rows: Vec<&PendingBatch> = self.visible_pane_queue(now).rev().take(3).collect();
+        let mut notice_lines = self.scoped_notice_lines(now, width, false);
+        notice_lines.extend(self.scoped_notice_lines(now, width, true));
         let footer_rows = self.footer_row_count(width);
         let composer = self.composer_lines(width);
         let tree_capacity = height.saturating_sub(
@@ -889,8 +894,9 @@ impl ClusterUi {
         let width = usize::from(cols);
         let height = usize::from(rows);
         let footer = self.footer_row_count(width);
-        let notices = self.active_notice_lines(now, width).len();
-        let queue = self.visible_queue(now).rev().take(3).count();
+        let notices = self.scoped_notice_lines(now, width, false).len()
+            + self.scoped_notice_lines(now, width, true).len();
+        let queue = self.visible_pane_queue(now).rev().take(3).count();
         let (pane_cols, pane_rows) = if self.remote_keys_mode.is_some() {
             let Some(target @ RemoteSelection::Session { .. }) = self.remote_keys_mode.as_ref()
             else {
@@ -915,7 +921,7 @@ impl ClusterUi {
             let notices = self.scoped_notice_lines(now, width, false).len()
                 + self.scoped_notice_lines(now, pane_width, true).len();
             let queue: usize = self
-                .visible_queue(now)
+                .visible_pane_queue(now)
                 .rev()
                 .take(3)
                 .map(|batch| wrap_to_two_lines(&queue_line(batch), pane_width).len())
@@ -1090,7 +1096,7 @@ impl ClusterUi {
         let notices = self.scoped_notice_lines(now, right_w, true);
         let global_notices = self.scoped_notice_lines(now, width, false);
         let queue: Vec<&PendingBatch> = self
-            .visible_queue(now)
+            .visible_pane_queue(now)
             .rev()
             .take(3)
             .collect::<Vec<_>>()
@@ -1105,9 +1111,14 @@ impl ClusterUi {
             .saturating_sub(self.footer_row_count(width) + global_notices.len())
             .max(1);
         let composer = self.composer_lines(right_w);
+        let reserved = 1 + composer.len();
+        let extra_rows = body_rows.saturating_sub(reserved);
         let screen_rows =
             body_rows.saturating_sub(1 + composer.len() + notices.len() + queue_lines);
         let mut right = vec![ellipsize(&pane_header, right_w)];
+        if body_rows <= composer.len() {
+            right.clear();
+        }
         right.extend(
             visible_remote_pane_lines(&pane_body, self.remote_active.is_some(), screen_rows)
                 .into_iter()
@@ -1117,12 +1128,17 @@ impl ClusterUi {
             body_rows.saturating_sub(composer.len() + notices.len() + queue_lines),
             String::new(),
         );
-        right.extend(notices);
+        right.extend(notices.into_iter().take(extra_rows));
         for batch in queue {
-            if right.len() < body_rows {
+            if right.len() < body_rows.saturating_sub(composer.len()) {
                 self.mark_uncertain_visible(batch, now);
             }
-            right.extend(wrap_to_two_lines(&queue_line(batch), right_w));
+            let available = body_rows.saturating_sub(composer.len() + right.len());
+            right.extend(
+                wrap_to_two_lines(&queue_line(batch), right_w)
+                    .into_iter()
+                    .take(available),
+            );
         }
         right.extend(composer);
         let mut left = self.tree_lines(left_w, now);
@@ -1249,7 +1265,11 @@ impl ClusterUi {
     }
 
     fn scoped_notice_lines(&self, now: Duration, width: usize, input: bool) -> Vec<String> {
-        if self.notice.is_some() && (self.notice == self.input_notice) == input {
+        let same_target = self.input_notice_target == self.active_input_target();
+        if self.notice.is_some()
+            && (self.notice == self.input_notice) == input
+            && (!input || same_target)
+        {
             self.active_notice_lines(now, width)
         } else {
             Vec::new()
@@ -1258,6 +1278,7 @@ impl ClusterUi {
 
     fn mark_input_notice(&mut self) {
         self.input_notice = self.notice.clone();
+        self.input_notice_target = self.active_input_target();
     }
 
     fn set_input_notice(&mut self, message: String, now: Duration) {
@@ -2075,6 +2096,11 @@ impl ClusterUi {
         self.input_sender
             .begin_due(&mut self.input_queue, Instant::now());
         if let Some(batch) = self.input_queue.sending_batch() {
+            self.input_delivery_target = Some((
+                batch.remote_node.clone(),
+                batch.name.clone(),
+                batch.instance_id.clone(),
+            ));
             if self.partial_input_confirm_target.is_none()
                 && !self
                     .notice
@@ -2177,6 +2203,7 @@ impl ClusterUi {
                 .items()
                 .any(|batch| batch.state == QueueState::Uncertain && queue_identity(batch) == *key)
         });
+        let has_event = event.is_some();
         match event {
             Some(QueueEvent::Sent { .. }) => {
                 if self.notice.as_ref().is_none_or(|(notice, _)| {
@@ -2224,6 +2251,31 @@ impl ClusterUi {
             }
             Some(QueueEvent::RetryScheduled { .. }) | None => {}
         }
+        if has_event && self.notice == self.input_notice {
+            self.input_notice_target = self.input_delivery_target.clone();
+        }
+    }
+
+    fn active_input_target(&self) -> Option<(Option<String>, String, String)> {
+        if let Some(active) = &self.remote_active {
+            let (node, session) = self.remote_session(active)?;
+            return Some((
+                Some(node.registry_key.clone()),
+                session.wire_name.clone(),
+                session.instance_id.clone(),
+            ));
+        }
+        let session = self.sessions.get(self.active)?;
+        Some((None, session.name.clone(), session.instance_id.clone()?))
+    }
+
+    fn visible_pane_queue(&self, now: Duration) -> impl DoubleEndedIterator<Item = &PendingBatch> {
+        let target = self.active_input_target();
+        self.visible_queue(now).filter(move |batch| {
+            target.as_ref().is_some_and(|(node, name, instance)| {
+                batch.remote_node == *node && batch.name == *name && batch.instance_id == *instance
+            })
+        })
     }
 
     fn visible_queue(&self, now: Duration) -> impl DoubleEndedIterator<Item = &PendingBatch> {
@@ -3823,6 +3875,103 @@ mod tests {
     }
 
     #[test]
+    fn review_other_session_input_not_in_selected_pane() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui(
+            "studio",
+            vec![session("alpha", true), session("bravo", true)],
+            clock.now(),
+        );
+        ui.input_sender
+            .enqueue(
+                &mut ui.input_queue,
+                "alpha",
+                "instance-alpha",
+                b"private-alpha\r".to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+        ui.selected = 1;
+        ui.active = 1;
+        let frame = ui.render_text(100, 24, "bravo screen", &clock);
+        assert!(
+            !frame.contains("private-alpha"),
+            "other session input shown in selected pane: {frame}"
+        );
+    }
+
+    #[test]
+    fn review_small_pane_keeps_composer_visible() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", vec![session("alpha", true)], clock.now());
+        ui.composer_focused = true;
+        ui.input_sender
+            .enqueue(
+                &mut ui.input_queue,
+                "alpha",
+                "instance-alpha",
+                b"first\r".to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+        ui.input_sender
+            .enqueue(
+                &mut ui.input_queue,
+                "alpha",
+                "instance-alpha",
+                b"second\r".to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+        ui.input_sender
+            .enqueue(
+                &mut ui.input_queue,
+                "alpha",
+                "instance-alpha",
+                b"third\r".to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+        let frame = ui.render_text(100, 4, "screen", &clock);
+        assert!(frame.contains("Remuda >"), "composer disappeared: {frame}");
+    }
+
+    #[test]
+    fn review_input_result_stays_with_its_session_after_switch() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui(
+            "studio",
+            vec![session("alpha", true), session("bravo", true)],
+            clock.now(),
+        );
+        ui.input_sender
+            .enqueue(
+                &mut ui.input_queue,
+                "alpha",
+                "instance-alpha",
+                b"hello\r".to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+        ui.start_pending(clock.now());
+        ui.active = 1;
+        ui.handle_send_event(
+            Some(QueueEvent::Sent {
+                seq: 1,
+                duplicate: false,
+            }),
+            clock.now(),
+        );
+        assert!(!ui
+            .render_text(100, 24, "bravo", &clock)
+            .contains("Input sent"));
+        ui.active = 0;
+        assert!(ui
+            .render_text(100, 24, "alpha", &clock)
+            .contains("Input sent"));
+    }
+
+    #[test]
     fn narrow_composer_stays_at_bottom_of_content_pane() {
         let clock = ManualClock::new();
         let mut ui = make_ui("studio", sessions(), clock.now());
@@ -4979,7 +5128,7 @@ mod tests {
     #[test]
     fn remote_input_error_status_is_safe_in_the_rendered_frame() {
         let clock = ManualClock::new();
-        let mut ui = make_ui("studio", sessions(), clock.now());
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
         let now = Instant::now();
         let hostile =
             "tail\rtext \u{1b}[31mred\u{1b}[0m \u{1b}]0;title\u{7} \u{1b}]2;title\u{1b}\\";
@@ -6394,9 +6543,13 @@ mod tests {
         let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
         for i in 0..4 {
             let now = Instant::now();
-            assert!(ui.input_queue.enqueue(
-                format!("session{i}"),
-                "instance".into(),
+            assert!(ui.input_queue.enqueue_target(
+                InputTarget {
+                    remote_node: Some("fp-laptop".into()),
+                    name: "build".into(),
+                    instance_id: "remote-instance".into(),
+                },
+                None,
                 "client".into(),
                 i,
                 format!("item{i}\r").into_bytes(),
