@@ -1232,10 +1232,11 @@ impl ClusterUi {
                         .remote_session(target)
                         .is_some_and(|(_, session)| session.alive)
             });
+            let detail = self.remote_active_detail().unwrap_or_default();
             if input {
-                String::new()
+                detail
             } else {
-                "Read-only".into()
+                format!("{detail} · Read-only")
             }
         } else if self.ended.is_some() {
             "Input disabled".into()
@@ -1284,7 +1285,14 @@ impl ClusterUi {
             .map(|index| {
                 let session = &self.sessions[index];
                 TreeRow {
-                    prefix: format!("{}    ", if index == self.selected { ">" } else { " " }),
+                    prefix: format!(
+                        "{}    ",
+                        if self.current_tree_selection() == TreeSelection::LocalSession(index) {
+                            ">"
+                        } else {
+                            " "
+                        }
+                    ),
                     label: session.name.clone(),
                     status: session_cell(session.alive, false, self.pending_count(session)),
                 }
@@ -1347,20 +1355,8 @@ impl ClusterUi {
     fn remote_pane(&self, local_header: String, local_screen: &str) -> (String, String) {
         match &self.remote_active {
             Some(active) => match self.remote_session(active) {
-                Some((node, session)) => (
-                    // State first: a narrow pane clips the tail, never the reachability.
-                    format!(
-                        "remote {} · {}{} · {} / {}",
-                        if session.alive { "live" } else { "ended" },
-                        remote_state_label(
-                            node.state,
-                            node.last_sync_age,
-                            node.last_error.as_deref()
-                        ),
-                        session_error_suffix(session.last_error.as_deref()),
-                        node.name,
-                        session.name
-                    ),
+                Some((_, session)) => (
+                    "Session".into(),
                     session
                         .screen
                         .as_ref()
@@ -1371,6 +1367,18 @@ impl ClusterUi {
             },
             None => (local_header, local_screen.into()),
         }
+    }
+
+    fn remote_active_detail(&self) -> Option<String> {
+        let (node, session) = self.remote_session(self.remote_active.as_ref()?)?;
+        Some(format!(
+            "remote {} · {}{} · {} / {}",
+            if session.alive { "live" } else { "ended" },
+            remote_state_label(node.state, node.last_sync_age, node.last_error.as_deref()),
+            session_error_suffix(session.last_error.as_deref()),
+            node.name,
+            session.name
+        ))
     }
 
     fn local_pane_header(&self, now: Duration) -> String {
@@ -3603,6 +3611,42 @@ mod tests {
         let mut ui = ClusterUi::new(node, sessions, at);
         ui.set_keymap(crate::keybindings::test_snapshot(""));
         ui
+    }
+
+    #[test]
+    fn node_selection_does_not_leave_a_local_session_cursor() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            None,
+        ))));
+        for selection in [
+            TreeSelection::LocalNode,
+            TreeSelection::RemoteNode("fp-laptop".into()),
+        ] {
+            ui.set_tree_selection(selection);
+            let frame = ui.render_text(100, 24, "pane", &clock);
+            let selected = tree_side(&frame)
+                .into_iter()
+                .filter(|line| line.starts_with('>'))
+                .count();
+            assert_eq!(selected, 1, "{frame}");
+        }
+    }
+
+    #[test]
+    fn active_remote_details_are_in_the_status_bar() {
+        let clock = ManualClock::new();
+        let ui = selected_remote_ui(&clock, remote_screen("remote-body"));
+        let frame = ui.render_text(100, 24, "", &clock);
+        let status = frame.lines().last().unwrap();
+        assert!(status.contains("remote live"), "{status}");
+        assert!(status.contains("reachable"), "{status}");
+        assert!(status.ends_with("? help"), "{status}");
+        let right = frame.lines().next().unwrap().split_once('│').unwrap().1;
+        assert!(!right.contains("reachable"), "{right}");
     }
 
     #[test]
@@ -6632,13 +6676,14 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('x'));
 
         let frame = ui.render_text(100, 24, "", &clock);
-        assert!(frame.contains("remote live · unreachable"));
-        assert!(frame.contains("laptop / build"));
         assert!(frame.contains("last good screen"));
         assert!(
             frame.contains("kill laptop(fp-lap)/build? y confirm · Y confirm · other key cancels")
         );
         ui.key(crossterm::event::KeyCode::Char('n'));
+        assert!(ui
+            .render_text(100, 24, "", &clock)
+            .contains("remote live · unreachable"));
         assert!(!ui
             .render_text(100, 24, "", &clock)
             .contains("kill laptop(fp-lap)/build?"));
@@ -7456,7 +7501,8 @@ mod tests {
         assert!(first.starts_with("remuda · cluster"), "{first}");
         let (left, right) = first.split_once('│').expect("divider on header row");
         assert!(left.chars().count() <= 48);
-        assert!(right.contains("laptop / build"), "{first}");
+        assert_eq!(right.trim(), "Session", "{first}");
+        assert!(lines.last().unwrap().contains("laptop / build"));
         assert!(lines
             .iter()
             .any(|l| l.contains('│') && l.contains("remote-body")));
@@ -7492,7 +7538,7 @@ mod tests {
     }
 
     #[test]
-    fn split_header_keeps_reachability_with_long_names() {
+    fn status_bar_keeps_reachability_with_long_names() {
         let clock = ManualClock::new();
         let mut ui = selected_remote_ui(&clock, remote_screen("remote-body"));
         ui.remote_snapshot.nodes[0].name = "a-very-long-remote-node-label".into();
@@ -7504,9 +7550,12 @@ mod tests {
         });
         for cols in [60, 80] {
             let first = ui.render_text(cols, 24, "", &clock);
-            let first = first.lines().next().unwrap();
-            assert!(first.contains("remote live · reachable"), "{cols}: {first}");
-            assert!(first.contains('…'), "{first}");
+            let status = first.lines().last().unwrap();
+            assert!(
+                status.contains("remote live · reachable"),
+                "{cols}: {status}"
+            );
+            assert!(status.contains('…'), "{status}");
         }
     }
 
@@ -7535,7 +7584,7 @@ mod tests {
         ui.notice = Some(("heads up".into(), clock.now()));
         let frame = ui.render_text(100, 24, "", &clock);
         let lines: Vec<&str> = frame.lines().collect();
-        assert!(lines.iter().any(|line| line.trim() == "? help"));
+        assert!(lines.last().unwrap().ends_with("? help"));
         assert!(lines
             .iter()
             .any(|l| l.starts_with("heads up") && !l.contains('│')));
@@ -7570,7 +7619,8 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('!'));
         ui.key(crossterm::event::KeyCode::Char('!'));
         assert_eq!(ui.selected, 1);
-        assert!(ui.render_text(80, 24, "", &clock).contains(">    ● shell"));
+        assert_eq!(ui.current_tree_selection(), TreeSelection::LocalNode);
+        assert!(ui.render_text(80, 24, "", &clock).contains(">▼ ● studio"));
     }
 
     #[test]
