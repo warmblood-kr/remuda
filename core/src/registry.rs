@@ -1114,16 +1114,42 @@ impl Registry {
     }
 
     pub fn refresh_instance(&self, name: &str, instance_id: &str) -> Option<Result<bool>> {
-        self.route(
-            name,
-            |session| session.refresh_instance(instance_id),
-            |handle| {
-                if handle.identity().instance != instance_id {
-                    return Ok(false);
-                }
-                handle.refresh().map(|()| true)
-            },
-        )
+        // These checks reject stale results without holding the registry across
+        // a potentially slow host request. Removal can still race the resize.
+        if let Some(session) = self.get(name) {
+            let current = || {
+                self.lock()
+                    .get(name)
+                    .is_some_and(|s| Arc::ptr_eq(s, &session))
+            };
+            if session.instance_id() != instance_id || !current() {
+                return Some(Ok(false));
+            }
+            let result = session.refresh_instance(instance_id);
+            return Some(if current() || result.is_err() {
+                result
+            } else {
+                Ok(false)
+            });
+        }
+        let handle = self.hosted(name)?;
+        let current = || {
+            self.hosted_lock()
+                .get(name)
+                .is_some_and(|h| Arc::ptr_eq(h, &handle))
+        };
+        if handle.identity().instance != instance_id || !current() {
+            return Some(Ok(false));
+        }
+        let result = handle
+            .refresh()
+            .map(|()| true)
+            .map_err(crate::session_operations::Error::into_agent);
+        Some(if current() || result.is_err() {
+            result
+        } else {
+            Ok(false)
+        })
     }
 
     pub fn resize(&self, name: &str, size: Size) -> Option<Result<()>> {
