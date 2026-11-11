@@ -96,21 +96,20 @@ pub fn render_badge(badge: Badge) -> &'static str {
     }
 }
 
-/// Single-cell ASCII marker for a remote node. ASCII keeps the status column
-/// fixed in terminals that draw East Asian Ambiguous glyphs two cells wide.
+/// Status marker for a remote node.
 pub fn status_glyph(state: RemoteState) -> char {
     match state {
-        RemoteState::Reachable => '@',
+        RemoteState::Reachable => '●',
         RemoteState::Stale => '?',
         RemoteState::Reconnecting => '~',
         RemoteState::Unreachable => 'x',
     }
 }
 
-/// Single-cell ASCII marker for a session.
+/// Status marker for a session.
 pub fn session_glyph(alive: bool) -> char {
     if alive {
-        '@'
+        '●'
     } else {
         '-'
     }
@@ -157,6 +156,7 @@ pub struct ClusterUi {
     remote_snapshot: RemoteSnapshot,
     remote_expanded: HashSet<String>,
     remote_selected: Option<RemoteSelection>,
+    local_node_selected: bool,
     remote_active: Option<RemoteSelection>,
     remote_keys_mode: Option<RemoteSelection>,
     remote_key_buffers: VecDeque<RemoteKeyBuffer>,
@@ -239,6 +239,7 @@ enum RemoteSelection {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TreeSelection {
+    LocalNode,
     LocalSession(usize),
     RemoteNode(String),
     RemoteSession {
@@ -298,6 +299,7 @@ impl ClusterUi {
             remote_snapshot: RemoteSnapshot::default(),
             remote_expanded: HashSet::new(),
             remote_selected: None,
+            local_node_selected: false,
             remote_active: None,
             remote_keys_mode: None,
             remote_key_buffers: VecDeque::new(),
@@ -425,17 +427,24 @@ impl ClusterUi {
                 name: name.clone(),
                 instance_id: instance_id.clone(),
             },
+            None if self.local_node_selected => TreeSelection::LocalNode,
             None => TreeSelection::LocalSession(self.selected),
         }
     }
 
     fn set_tree_selection(&mut self, selection: TreeSelection) {
         match selection {
+            TreeSelection::LocalNode => {
+                self.local_node_selected = true;
+                self.remote_selected = None;
+            }
             TreeSelection::LocalSession(index) => {
                 self.selected = index;
+                self.local_node_selected = false;
                 self.remote_selected = None;
             }
             TreeSelection::RemoteNode(name) => {
+                self.local_node_selected = false;
                 self.remote_selected = Some(RemoteSelection::Node(name));
             }
             TreeSelection::RemoteSession {
@@ -443,6 +452,7 @@ impl ClusterUi {
                 name,
                 instance_id,
             } => {
+                self.local_node_selected = false;
                 self.remote_selected = Some(RemoteSelection::Session {
                     node,
                     name,
@@ -453,7 +463,7 @@ impl ClusterUi {
     }
 
     fn visible_tree_rows(&self) -> Vec<TreeSelection> {
-        let mut rows = Vec::new();
+        let mut rows = vec![TreeSelection::LocalNode];
         if self.expanded {
             rows.extend(
                 self.visible_sessions()
@@ -470,8 +480,9 @@ impl ClusterUi {
                 .filter(|session| self.remote_session_visible(node, session, query))
                 .collect::<Vec<_>>();
             let node_attention = node.state != RemoteState::Reachable;
-            let node_visible = (!self.attention_only || node_attention)
-                && (node_matches || !visible_sessions.is_empty());
+            let node_visible =
+                (!self.attention_only || node_attention || !visible_sessions.is_empty())
+                    && (node_matches || !visible_sessions.is_empty());
             if !node_visible {
                 continue;
             }
@@ -791,7 +802,7 @@ impl ClusterUi {
     }
 
     /// Cluster header, local node and remote nodes as one virtual tree (first 2 rows are the header).
-    fn tree_lines(&self, width: usize, now: Duration) -> Vec<String> {
+    fn tree_lines(&self, width: usize, _now: Duration) -> Vec<String> {
         let mut frame = Vec::new();
         let reachable = 1 + self
             .remote_snapshot
@@ -805,25 +816,21 @@ impl ClusterUi {
         ));
         let local_rows = self.local_tree_rows();
         let remote_rows = self.remote_tree_rows();
-        let status_col = status_column(
-            local_rows
-                .iter()
-                .chain(remote_rows.iter())
-                .map(|row| row.label.as_str())
-                .chain(std::iter::once(self.node.as_str())),
-            width,
-        );
         frame.push(tree_label_line(
-            &format!("{} ", if self.expanded { "▼" } else { "▶" }),
+            &format!(
+                "{}{} ",
+                if self.local_node_selected { ">" } else { " " },
+                if self.expanded { "▼" } else { "▶" }
+            ),
             &self.node,
-            &format!("@ · sync {}s", age_seconds(now, self.synced_at)),
-            status_col,
+            "●",
             width,
         ));
         frame.extend(
-            local_rows.iter().chain(remote_rows.iter()).map(|row| {
-                tree_label_line(&row.prefix, &row.label, &row.status, status_col, width)
-            }),
+            local_rows
+                .iter()
+                .chain(remote_rows.iter())
+                .map(|row| tree_label_line(&row.prefix, &row.label, &row.status, width)),
         );
         if self.expanded && local_rows.is_empty() {
             let hint = if self.attention_only {
@@ -1678,17 +1685,20 @@ impl ClusterUi {
         } else if self.remote_selected.is_some() {
             self.remote_close_confirmation = None;
             self.notice = Some(("select a remote session to close".into(), now));
-        } else if let Some(session) = self.sessions.get(self.selected) {
-            if session.alive {
-                if let Some(instance_id) = session.instance_id.clone() {
-                    self.active = self.selected;
-                    self.remote_close_confirmation = None;
-                    self.confirmation.begin(session.name.clone(), instance_id);
+        } else if !self.local_node_selected {
+            if let Some(session) = self.sessions.get(self.selected) {
+                if session.alive {
+                    if let Some(instance_id) = session.instance_id.clone() {
+                        self.active = self.selected;
+                        self.remote_close_confirmation = None;
+                        self.confirmation.begin(session.name.clone(), instance_id);
+                    } else {
+                        self.notice =
+                            Some(("cannot close: session identity is missing".into(), now));
+                    }
                 } else {
-                    self.notice = Some(("cannot close: session identity is missing".into(), now));
+                    self.notice = Some((format!("{} has already ended.", session.name), now));
                 }
-            } else {
-                self.notice = Some((format!("{} has already ended.", session.name), now));
             }
         }
     }
@@ -1699,6 +1709,9 @@ impl ClusterUi {
             return;
         }
         match selection {
+            TreeSelection::LocalNode => {
+                self.expanded = true;
+            }
             TreeSelection::RemoteNode(name) => {
                 self.remote_expanded.insert(name);
             }
@@ -2168,7 +2181,12 @@ impl ClusterUi {
     fn select_first_visible(&mut self) {
         let visible = self.visible_tree_rows();
         if !visible.contains(&self.current_tree_selection()) {
-            if let Some(selection) = visible.first().cloned() {
+            if let Some(selection) = visible
+                .iter()
+                .find(|s| matches!(s, TreeSelection::LocalSession(_)))
+                .or_else(|| visible.first())
+                .cloned()
+            {
                 self.set_tree_selection(selection);
             }
         }
@@ -2191,7 +2209,10 @@ impl ClusterUi {
 
     fn collapse_tree_selection(&mut self) {
         match self.current_tree_selection() {
-            TreeSelection::LocalSession(_) => self.expanded = false,
+            TreeSelection::LocalNode | TreeSelection::LocalSession(_) => {
+                self.expanded = false;
+                self.set_tree_selection(TreeSelection::LocalNode);
+            }
             TreeSelection::RemoteNode(node) => {
                 self.remote_expanded.remove(&node);
             }
@@ -2204,6 +2225,7 @@ impl ClusterUi {
 
     fn expand_tree_selection(&mut self) {
         match self.current_tree_selection() {
+            TreeSelection::LocalNode => self.expanded = true,
             TreeSelection::LocalSession(_) => self.expanded = true,
             TreeSelection::RemoteNode(node) => {
                 self.remote_expanded.insert(node);
@@ -2279,7 +2301,7 @@ impl ClusterUi {
     /// header, where the active session already shows it.
     fn selection_detail(&self) -> Option<String> {
         match self.current_tree_selection() {
-            TreeSelection::LocalSession(_) => None,
+            TreeSelection::LocalNode | TreeSelection::LocalSession(_) => None,
             TreeSelection::RemoteNode(registry_key) => {
                 let node = self
                     .remote_snapshot
@@ -2378,6 +2400,8 @@ impl ClusterUi {
                 io::Error::other(format!("session {session} was not found on {node}"))
             })?;
         self.active = self.selected;
+        self.remote_selected = None;
+        self.local_node_selected = false;
         Ok(())
     }
 
@@ -2425,6 +2449,7 @@ impl ClusterUi {
     fn select_node(&mut self, node: &str) -> io::Result<()> {
         if self.local_targets.iter().any(|identity| identity == node) {
             self.expanded = true;
+            self.local_node_selected = false;
             self.remote_selected = None;
             return Ok(());
         }
@@ -2492,11 +2517,10 @@ impl ClusterUi {
             crate::cluster::node_label(fingerprint),
             fingerprint.into(),
         ];
-        self.node = if aliases.contains_key(fingerprint) {
-            crate::cluster::display_node_label(fingerprint, aliases)
-        } else {
-            hostname
-        };
+        self.node = aliases
+            .get(fingerprint)
+            .cloned()
+            .unwrap_or_else(|| crate::cluster::node_label(fingerprint));
     }
 }
 
@@ -2815,18 +2839,10 @@ fn pad_to(text: &str, width: usize) -> String {
     format!("{text}{}", " ".repeat(width.saturating_sub(w)))
 }
 
-fn tree_label_line(
-    prefix: &str,
-    label: &str,
-    status: &str,
-    status_col: usize,
-    width: usize,
-) -> String {
+fn tree_label_line(prefix: &str, label: &str, status: &str, width: usize) -> String {
     let prefix_width = UnicodeWidthStr::width(prefix);
     let available = width.saturating_sub(prefix_width + 1 + crate::tui::visible_width(status));
     let label = ellipsize(label, available);
-    let label_width = UnicodeWidthStr::width(label.as_str());
-    let padding = status_col.saturating_sub(prefix_width + label_width).max(1);
     let label = crate::text::strip_terminal_controls(&label);
     let label_style = if prefix.starts_with('>') {
         "\x1b[1;7;36m"
@@ -2837,16 +2853,13 @@ fn tree_label_line(
         || status.to_string(),
         |style| format!("{style}{status}\x1b[0m"),
     );
-    format!(
-        "{prefix}{label_style}{label}\x1b[0m{}{status}",
-        " ".repeat(padding)
-    )
+    format!("{prefix}{status} {label_style}{label}\x1b[0m")
 }
 
 /// Green for healthy, yellow for transition, red for stopped or unreachable.
 fn status_style(status: &str) -> Option<&'static str> {
     match status.chars().next()? {
-        '@' => Some("\x1b[32m"),
+        '●' => Some("\x1b[1;32m"),
         '~' | '?' => Some("\x1b[33m"),
         '!' | 'x' | '-' => Some("\x1b[31m"),
         _ => None,
@@ -2865,20 +2878,6 @@ fn session_cell(alive: bool, has_error: bool, pending: usize) -> String {
     } else {
         format!("{glyph} +{pending}")
     }
-}
-
-/// The column where every row's status glyph starts, shared by nodes and sessions.
-fn status_column<'a>(labels: impl Iterator<Item = &'a str>, width: usize) -> usize {
-    const INDENT: usize = 5;
-    const WIDEST: usize = 24;
-    let widest = labels
-        .map(crate::tui::visible_width)
-        .max()
-        .unwrap_or(0)
-        .min(WIDEST);
-    (INDENT + widest + 1)
-        .min(width.saturating_sub(1))
-        .max(INDENT + 1)
 }
 
 // Crossterm names the raw Ctrl-backslash byte Ctrl-4. Other command
@@ -2916,7 +2915,7 @@ fn remote_keys_hint(node: &str, session: &str, width: usize, help: &str) -> Vec<
 /// Status legend shared by the help screen, so a glyph is never a guess.
 pub fn legend_lines(width: usize) -> Vec<String> {
     wrap_help(
-        "@ live/reachable · ~ connecting/reconnecting · ! error · \
+        "● live/reachable · ~ connecting/reconnecting · ! error · \
          x unreachable · - ended · ? stale/unknown",
         width.saturating_sub(2),
     )
@@ -3506,9 +3505,9 @@ mod tests {
     use super::{
         help_lines, help_window, is_attention, legend_lines, normalized_terminal_size, present,
         remote_state_label, render_badge, resize_requires_full_repaint,
-        select_target_with_remote_wait, session_cell, session_glyph, status_column, status_glyph,
-        status_style, terminal_frame, AttentionSignals, Badge, ClusterUi, RemoteInputTransport,
-        RemoteSelection, RemoteSource, TreeSelection, ERROR_GLYPH,
+        select_target_with_remote_wait, session_cell, session_glyph, status_glyph, status_style,
+        terminal_frame, AttentionSignals, Badge, ClusterUi, RemoteInputTransport, RemoteSelection,
+        RemoteSource, TreeSelection, ERROR_GLYPH,
     };
     use crate::cluster_remote::{
         RemoteNodeSnapshot, RemoteSessionSnapshot, RemoteSnapshot, RemoteState,
@@ -4592,6 +4591,7 @@ mod tests {
                 .map(|label| std::collections::BTreeMap::from([(fingerprint.into(), label.into())]))
                 .unwrap_or_default();
             ui.set_local_identity(fingerprint, &aliases);
+            assert_eq!(ui.node, alias.unwrap_or(&node_id));
             for target in ["studio", node_id.as_str(), fingerprint] {
                 ui.select_target(Some(&format!("{target}/dev"))).unwrap();
                 assert!(ui.remote_active.is_none());
@@ -4923,15 +4923,15 @@ mod tests {
     }
 
     #[test]
-    fn status_glyphs_are_single_cell_ascii() {
-        assert_eq!(status_glyph(RemoteState::Reachable), '@');
+    fn status_glyphs_preserve_other_state_markers() {
+        assert_eq!(status_glyph(RemoteState::Reachable), '●');
         assert_eq!(status_glyph(RemoteState::Stale), '?');
         assert_eq!(status_glyph(RemoteState::Reconnecting), '~');
         assert_eq!(status_glyph(RemoteState::Unreachable), 'x');
-        assert_eq!(session_glyph(true), '@');
+        assert_eq!(session_glyph(true), '●');
         assert_eq!(session_glyph(false), '-');
         assert_eq!(ERROR_GLYPH, '!');
-        for glyph in ['@', '?', '~', 'x', '-', '!'] {
+        for glyph in ['?', '~', 'x', '-', '!'] {
             assert!(glyph.is_ascii(), "{glyph} must not be ambiguous-width");
             assert_eq!(crate::tui::visible_width(&glyph.to_string()), 1);
         }
@@ -4939,33 +4939,16 @@ mod tests {
 
     #[test]
     fn session_cell_keeps_the_glyph_first_and_adds_pending() {
-        assert_eq!(session_cell(true, false, 0), "@");
+        assert_eq!(session_cell(true, false, 0), "●");
         assert_eq!(session_cell(false, false, 0), "-");
         assert_eq!(session_cell(true, true, 0), "!");
-        assert_eq!(session_cell(true, false, 2), "@ +2");
+        assert_eq!(session_cell(true, false, 2), "● +2");
         assert_eq!(session_cell(false, true, 12), "! +12");
     }
 
     #[test]
-    fn status_column_is_shared_and_bounded() {
-        let widest = "a-much-longer-node-label";
-        assert_eq!(
-            status_column(["short", widest, "x"].into_iter(), 80),
-            5 + widest.len() + 1
-        );
-        assert_eq!(
-            status_column(["short"].into_iter(), 12),
-            5 + "short".len() + 1
-        );
-        let narrow = status_column(["long-enough-label"].into_iter(), 12);
-        assert!(narrow < 12, "column must leave room: {narrow}");
-        let capped = status_column([widest; 3].into_iter(), 80);
-        assert_eq!(capped, 5 + 24 + 1, "very long names cap the column");
-    }
-
-    #[test]
     fn status_style_marks_health_transition_and_failure() {
-        assert_eq!(status_style("@"), Some("\x1b[32m"));
+        assert_eq!(status_style("●"), Some("\x1b[1;32m"));
         assert_eq!(status_style("~ +1"), Some("\x1b[33m"));
         assert_eq!(status_style("?"), Some("\x1b[33m"));
         assert_eq!(status_style("x"), Some("\x1b[31m"));
@@ -4997,25 +4980,15 @@ mod tests {
             let frame = ui.render_text(width, 24, "", &clock);
             let rows = tree_side(&frame);
             let cases = [
-                ("studio", '@'),
-                ("dev", '@'),
+                ("studio", '●'),
+                ("dev", '●'),
                 ("laptop", '~'),
-                ("build", '@'),
+                ("build", '●'),
             ];
-            let mut expected = None;
             for (needle, glyph) in cases {
-                let line = rows
-                    .iter()
-                    .find(|line| line.contains(needle))
-                    .unwrap_or_else(|| panic!("{needle} row missing at {width}:\n{frame}"));
-                let column = glyph_column(line, glyph);
-                match expected {
-                    None => expected = Some(column),
-                    Some(expected) => assert_eq!(
-                        column, expected,
-                        "{needle} glyph sits at {column}, not {expected} at {width} columns:\n{frame}"
-                    ),
-                }
+                let line = rows.iter().find(|line| line.contains(needle)).unwrap();
+                let plain = crate::text::strip_terminal_controls(line);
+                assert!(plain.find(glyph).unwrap() < plain.find(needle).unwrap());
             }
         }
     }
@@ -5031,12 +5004,9 @@ mod tests {
         let frame = ui.render_text(80, 24, "", &clock);
         let rows = tree_side(&frame);
         let local = rows.iter().find(|line| line.contains("dev")).unwrap();
-        let remote = rows.iter().find(|line| line.contains('●')).unwrap();
-        assert_eq!(
-            glyph_column(local, '@'),
-            glyph_column(remote, '?'),
-            "an ambiguous-width node name moved the status column:\n{frame}"
-        );
+        let remote = rows.iter().find(|line| line.contains("lap●top")).unwrap();
+        assert!(glyph_column(local, '●') < local.find("dev").unwrap());
+        assert!(glyph_column(remote, '?') < remote.find("lap●top").unwrap());
     }
 
     #[test]
@@ -5084,7 +5054,7 @@ mod tests {
         ui.key(KeyCode::End);
         let bottom = ui.render_text(80, 24, "", &clock);
         assert!(
-            bottom.contains("@ live/reachable"),
+            bottom.contains("● live/reachable"),
             "legend is reachable by scrolling: {bottom}"
         );
         ui.key(KeyCode::Char('?'));
@@ -5129,7 +5099,7 @@ mod tests {
                     "{context} missing at {width}: {lines:?}"
                 );
             }
-            assert!(lines.iter().any(|line| line.contains("@ live/reachable")));
+            assert!(lines.iter().any(|line| line.contains("● live/reachable")));
             for line in &lines {
                 assert!(
                     crate::tui::visible_width(line) <= width,
@@ -5156,7 +5126,7 @@ mod tests {
     #[test]
     fn legend_is_wrapped_and_names_every_glyph() {
         let words = [
-            ('@', "live/reachable"),
+            ('●', "live/reachable"),
             ('~', "connecting"),
             ('!', "error"),
             ('x', "unreachable"),
@@ -5270,7 +5240,9 @@ mod tests {
         );
         assert!(node.chars().count() <= 40, "node row too wide: {node:?}");
         assert!(
-            frame.lines().any(|line| line.contains("… @")),
+            frame
+                .lines()
+                .any(|line| line.contains("…") && line.contains("build")),
             "session label was not elided: {frame}"
         );
     }
@@ -5727,19 +5699,64 @@ mod tests {
     }
 
     #[test]
+    fn local_node_can_be_selected_and_reopened_after_collapse() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            None,
+        ))));
+        ui.key(crossterm::event::KeyCode::Left);
+        assert!(!ui.expanded);
+        ui.key(crossterm::event::KeyCode::Down);
+        ui.key(crossterm::event::KeyCode::Up);
+        ui.key(crossterm::event::KeyCode::Char('x'));
+        assert!(
+            ui.confirmation.prompt(80, "").is_none(),
+            "node must not close a session"
+        );
+        ui.key(crossterm::event::KeyCode::Right);
+        assert!(
+            ui.expanded,
+            "the local node must remain selectable after collapse"
+        );
+    }
+
+    #[test]
+    fn nodes_are_peers_and_healthy_marker_precedes_the_name() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            None,
+        ))));
+        let frame = ui.render(40, 24, "", &clock);
+        let local = frame.lines().find(|line| line.contains("studio")).unwrap();
+        let remote = frame.lines().find(|line| line.contains("laptop")).unwrap();
+        assert_eq!(glyph_column(local, '●'), glyph_column(remote, '●'));
+        for (line, label) in [(local, "studio"), (remote, "laptop")] {
+            assert!(line.contains("\x1b[1;32m●"));
+            let plain = crate::text::strip_terminal_controls(line);
+            assert!(plain.find('●').unwrap() < plain.find(label).unwrap());
+        }
+    }
+
+    #[test]
     fn local_node_is_expanded_and_tree_header_names_selected_target() {
         let clock = ManualClock::new();
         let mut ui = make_ui("studio", sessions(), clock.now());
         ui.capture_completed(clock.now());
         let frame = ui.render_text(80, 24, "snapshot", &clock);
-        assert!(frame.contains("▼ studio"));
-        assert!(frame.contains("@ · sync 0s"));
+        assert!(frame.contains("▼ ● studio"));
+        assert!(frame.contains("● studio"));
         let dev_row = tree_side(&frame)
             .into_iter()
             .find(|line| line.contains("dev"))
             .expect("local session row");
         assert!(
-            dev_row.trim_end().ends_with('@'),
+            dev_row.contains("● dev"),
             "session status glyph: {dev_row:?}"
         );
         assert!(frame.contains("studio / dev · live · snapshot 0s ago"));
@@ -5785,7 +5802,7 @@ mod tests {
         ui.sync_completed(clock.now());
         clock.advance(Duration::from_secs(5));
         let frame = ui.render_text(80, 24, "snapshot", &clock);
-        assert!(frame.contains("@ · sync 5s"));
+        assert!(frame.contains("● studio"));
         assert!(frame.contains("studio / dev · live · snapshot 5s ago"));
     }
 
@@ -5802,7 +5819,7 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('h'));
         let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("shell"));
-        assert!(!frame.contains("    dev"));
+        assert!(!frame.contains("    ● dev"));
         assert!(frame.contains("search: sh"));
 
         let mut node_search = make_ui(
@@ -5813,8 +5830,8 @@ mod tests {
         node_search.key(crossterm::event::KeyCode::Char('/'));
         node_search.key(crossterm::event::KeyCode::Char('S'));
         let node_frame = node_search.render_text(80, 24, "", &clock);
-        assert!(node_frame.contains("    dev"));
-        assert!(node_frame.contains("    shell"));
+        assert!(node_frame.contains("    ● dev"));
+        assert!(node_frame.contains("    ● shell"));
     }
 
     #[test]
@@ -5843,14 +5860,14 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('d'));
         ui.key(crossterm::event::KeyCode::Backspace);
         let edited = ui.render_text(80, 24, "", &clock);
-        assert!(edited.contains("    dev"));
-        assert!(edited.contains("    shell"));
+        assert!(edited.contains("    ● dev"));
+        assert!(edited.contains("    ● shell"));
         assert!(edited.contains("search: "));
         ui.key(crossterm::event::KeyCode::Char('z'));
         ui.key(crossterm::event::KeyCode::Esc);
         let frame = ui.render_text(80, 24, "", &clock);
-        assert!(frame.contains("    dev"));
-        assert!(frame.contains("    shell"));
+        assert!(frame.contains("    ● dev"));
+        assert!(frame.contains("    ● shell"));
         assert!(!frame.contains("search:"));
     }
 
@@ -5865,7 +5882,7 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('!'));
         let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("ended"));
-        assert!(!frame.contains("    dev"));
+        assert!(!frame.contains("    ● dev"));
         assert!(frame.contains("attention · ? help"));
     }
 
@@ -6298,7 +6315,7 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('!'));
         let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("no sessions need attention"));
-        assert!(frame.contains("@ · sync 0s"));
+        assert!(frame.contains("● studio"));
         assert!(frame.contains("attention · ? help"));
     }
 
@@ -6343,14 +6360,14 @@ mod tests {
             clock.now(),
         );
         let frame = ui.render_text(80, 24, "", &clock);
-        assert!(frame.contains("@ · sync 0s"));
-        for (row, glyph) in [("dev", '@'), ("ended", '-')] {
+        assert!(frame.contains("● studio"));
+        for (row, glyph) in [("dev", '●'), ("ended", '-')] {
             let line = tree_side(&frame)
                 .into_iter()
                 .find(|line| line.contains(row))
                 .unwrap_or_else(|| panic!("{row} row missing from {frame}"));
             assert!(
-                line.trim_end().ends_with(glyph),
+                line.contains(glyph),
                 "{row} row should end with {glyph}: {line:?}"
             );
         }
@@ -6376,7 +6393,7 @@ mod tests {
             .find(|line| line.contains("laptop"))
             .unwrap_or_else(|| panic!("node row missing from {frame}"));
         assert!(
-            node_row.trim_end().ends_with('?'),
+            node_row.contains("? laptop"),
             "stale node should end in the stale glyph: {node_row:?}"
         );
         assert!(!frame.contains("build"));
@@ -7134,18 +7151,18 @@ mod tests {
 
         let frame = ui.render_text(100, 24, "", &clock);
         assert!(
-            frame.contains("@ +1"),
+            frame.contains("● +1"),
             "remote pending marker missing from frame:\n{frame}"
         );
 
         ui.start_pending(clock.now());
         let sending_frame = ui.render_text(100, 24, "", &clock);
-        assert!(sending_frame.contains("@ +1"));
+        assert!(sending_frame.contains("● +1"));
 
         ui.key(crossterm::event::KeyCode::Char('!'));
         let attention_frame = ui.render_text(100, 24, "", &clock);
         assert!(attention_frame.contains("build"));
-        assert!(attention_frame.contains("@ +1"));
+        assert!(attention_frame.contains("● +1"));
     }
 
     #[test]
@@ -7478,7 +7495,7 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('!'));
         ui.key(crossterm::event::KeyCode::Char('!'));
         assert_eq!(ui.selected, 1);
-        assert!(ui.render_text(80, 24, "", &clock).contains(">    shell"));
+        assert!(ui.render_text(80, 24, "", &clock).contains(">    ● shell"));
     }
 
     #[test]
@@ -7565,7 +7582,7 @@ mod tests {
             .into_iter()
             .find(|line| line.contains("dev"))
             .expect("local session row");
-        assert!(dev_row.contains("@ +1"), "pending glyph: {dev_row:?}");
+        assert!(dev_row.contains("● +1"), "pending glyph: {dev_row:?}");
     }
 
     #[test]
