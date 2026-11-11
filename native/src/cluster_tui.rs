@@ -766,8 +766,15 @@ impl ClusterUi {
         let queue_rows: Vec<&PendingBatch> = self.visible_queue(now).rev().take(3).collect();
         let notice_lines = self.active_notice_lines(now, width);
         let footer_rows = self.footer_row_count(width);
+        let composer = self.composer_lines(width);
         let tree_capacity = height.saturating_sub(
-            tree_start + 2 + queue_rows.len() + notice_lines.len() + footer_rows + 1,
+            tree_start
+                + 2
+                + queue_rows.len()
+                + notice_lines.len()
+                + footer_rows
+                + composer.len()
+                + 1,
         );
         let tree_rows = frame.len().saturating_sub(tree_start);
         if tree_rows > tree_capacity {
@@ -779,13 +786,17 @@ impl ClusterUi {
         }
         frame.push(divider);
         frame.push(pane_header);
-        let reserved = frame.len() + queue_rows.len() + notice_lines.len() + footer_rows;
+        let reserved =
+            frame.len() + queue_rows.len() + notice_lines.len() + footer_rows + composer.len();
         let screen_rows = height.saturating_sub(reserved);
+        let screen_end = frame.len() + screen_rows;
         frame.extend(
             visible_remote_pane_lines(&pane_body, self.remote_active.is_some(), screen_rows)
                 .into_iter()
                 .map(str::to_string),
         );
+        frame.resize(screen_end, String::new());
+        frame.extend(composer);
         frame.extend(notice_lines);
         for batch in queue_rows.into_iter().rev() {
             if frame.len() < height {
@@ -889,15 +900,19 @@ impl ClusterUi {
             );
             (width, height.saturating_sub(header.len()))
         } else if width >= SPLIT_MIN_COLS {
+            let pane_width = width - self.tree_width(width, now) - 1;
             (
-                width - self.tree_width(width, now) - 1,
+                pane_width,
                 height
-                    .saturating_sub(footer + notices + queue)
+                    .saturating_sub(
+                        footer + notices + queue + self.composer_lines(pane_width).len(),
+                    )
                     .max(1)
                     .saturating_sub(1),
             )
         } else {
-            let capacity = height.saturating_sub(2 + 2 + queue + notices + footer + 1);
+            let composer = self.composer_lines(width).len();
+            let capacity = height.saturating_sub(2 + 2 + queue + notices + footer + composer + 1);
             let tree = self.tree_lines(width, now).len();
             let shown_tree = if tree.saturating_sub(2) > capacity {
                 2 + capacity
@@ -906,7 +921,7 @@ impl ClusterUi {
             };
             (
                 width,
-                height.saturating_sub(shown_tree + 2 + queue + notices + footer),
+                height.saturating_sub(shown_tree + 2 + queue + notices + footer + composer),
             )
         };
         remuda_core::Size::for_viewport(pane_cols as u16, pane_rows as u16)
@@ -1065,13 +1080,16 @@ impl ClusterUi {
         let body_rows = height
             .saturating_sub(self.footer_row_count(width) + notices.len() + queue.len())
             .max(1);
-        let screen_rows = body_rows.saturating_sub(1);
+        let composer = self.composer_lines(right_w);
+        let screen_rows = body_rows.saturating_sub(1 + composer.len());
         let mut right = vec![ellipsize(&pane_header, right_w)];
         right.extend(
             visible_remote_pane_lines(&pane_body, self.remote_active.is_some(), screen_rows)
                 .into_iter()
                 .map(str::to_string),
         );
+        right.resize(body_rows.saturating_sub(composer.len()), String::new());
+        right.extend(composer);
         let mut left = self.tree_lines(left_w, now);
         if left.len() > body_rows {
             left.truncate(body_rows - 1);
@@ -1203,29 +1221,51 @@ impl ClusterUi {
 
     fn append_footer(&self, frame: &mut Vec<String>, width: usize) {
         let confirm_help = self.keymap.display_help("cluster.confirm", &[]);
-        let mut lines = if let Some(prompt) = self.confirmation.prompt(width, &confirm_help) {
-            wrap_help(&prompt, width)
-        } else if self.composer_focused {
-            self.composer
-                .display_lines(&self.composer_prefix(), width, 3)
-        } else if self.remote_active.is_some() {
+        if let Some(prompt) = self.confirmation.prompt(width, &confirm_help) {
+            frame.extend(wrap_help(&prompt, width));
+            return;
+        }
+        let mut detail = if self.remote_active.is_some() {
             let input = self.remote_active.as_ref().is_some_and(|target| {
                 self.remote_input_enabled
                     && self
                         .remote_session(target)
                         .is_some_and(|(_, session)| session.alive)
             });
-            let status = if input { "" } else { "Read-only · " };
-            wrap_help(&format!("{status}{}", self.help_hint()), width)
+            if input {
+                String::new()
+            } else {
+                "Read-only".into()
+            }
         } else if self.ended.is_some() {
-            wrap_help(&format!("Input disabled · {}", self.help_hint()), width)
+            "Input disabled".into()
         } else {
-            self.footer(width)
+            self.footer(width).join(" · ")
         };
         if let Some(diagnostic) = &self.keymap.diagnostic {
-            lines.extend(wrap_help(&format!("keymap config: {diagnostic}"), width));
+            detail = format!("keymap config: {diagnostic}");
         }
-        frame.extend(lines);
+        let hint = self.help_hint();
+        let room = width.saturating_sub(crate::tui::visible_width(&hint) + 1);
+        let left = ellipsize(&detail, room);
+        let line = if width > crate::tui::visible_width(&hint) {
+            format!(
+                "{}{hint}",
+                pad_to(&left, width - crate::tui::visible_width(&hint))
+            )
+        } else {
+            ellipsize(&hint, width)
+        };
+        frame.push(format!("\x1b[48;5;236m{line}\x1b[0m"));
+    }
+
+    fn composer_lines(&self, width: usize) -> Vec<String> {
+        if self.composer_focused {
+            self.composer
+                .display_lines(&self.composer_prefix(), width, 3)
+        } else {
+            Vec::new()
+        }
     }
 
     fn footer_row_count(&self, width: usize) -> usize {
@@ -2263,25 +2303,18 @@ impl ClusterUi {
     }
 
     fn footer(&self, width: usize) -> Vec<String> {
-        let hint = self.help_hint();
         if let Some(query) = &self.query {
-            let room = width.saturating_sub(8 + crate::tui::visible_width(&hint));
-            let mut line = format!("search: {}", ellipsize(query, room));
-            if !hint.is_empty() {
-                line.push_str(&format!(" · {hint}"));
-            }
-            return vec![line];
+            return vec![format!(
+                "search: {}",
+                ellipsize(query, width.saturating_sub(8))
+            )];
         }
         let mut lines = Vec::new();
         if let Some(detail) = self.selection_detail() {
             lines.extend(wrap_help(&format!("· {detail}"), width));
         }
-        let mut hint = hint;
         if self.attention_only {
-            hint = format!("attention · {hint}");
-        }
-        if !hint.is_empty() {
-            lines.extend(wrap_help(&hint, width));
+            lines.push("attention".into());
         }
         lines
     }
@@ -2341,17 +2374,7 @@ impl ClusterUi {
     }
 
     fn composer_prefix(&self) -> String {
-        let target = self.composer_target.as_ref().map_or_else(
-            || {
-                self.remote_composer_target
-                    .as_ref()
-                    .map_or_else(String::new, |(_, node_label, name, _)| {
-                        format!("{node_label}/{name}> ")
-                    })
-            },
-            |(name, _)| format!("{name}> "),
-        );
-        format!("$ {target}")
+        "Remuda > ".into()
     }
 
     #[cfg(test)]
@@ -3580,6 +3603,58 @@ mod tests {
         let mut ui = ClusterUi::new(node, sessions, at);
         ui.set_keymap(crate::keybindings::test_snapshot(""));
         ui
+    }
+
+    #[test]
+    fn status_bar_is_one_shaded_row_with_help_on_the_right() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            None,
+        ))));
+        ui.set_tree_selection(TreeSelection::RemoteNode("fp-laptop".into()));
+        assert_eq!(ui.footer_row_count(100), 1);
+        let raw = ui.render(100, 24, "pane", &clock);
+        let last = raw.lines().last().unwrap();
+        assert!(last.contains("\x1b["), "status should be shaded: {last:?}");
+        assert!(ui
+            .render_text(100, 24, "pane", &clock)
+            .lines()
+            .last()
+            .unwrap()
+            .ends_with("? help"));
+    }
+
+    #[test]
+    fn split_composer_is_inside_content_pane() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        ui.composer_focused = true;
+        ui.composer.restore_draft("hello");
+        let text = ui.render_text(100, 24, "pane", &clock);
+        let line = text.lines().find(|line| line.contains("hello")).unwrap();
+        assert!(
+            line.split_once('│')
+                .is_some_and(|(_, right)| right.contains("Remuda") && right.contains("hello")),
+            "{line}"
+        );
+        assert!(!line.contains("studio/"));
+        assert!(text.lines().last().unwrap().ends_with("? help"));
+    }
+
+    #[test]
+    fn narrow_composer_stays_at_bottom_of_content_pane() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        ui.composer_focused = true;
+        ui.composer.restore_draft("hello");
+        let text = ui.render_text(40, 24, "pane", &clock);
+        let lines = text.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 24);
+        assert!(lines[22].contains("Remuda > hello"));
+        assert!(lines[23].ends_with("? help"));
     }
 
     #[test]
@@ -4913,7 +4988,7 @@ mod tests {
         let mut ui = make_ui("studio", sessions(), clock.now());
         let frame = ui.render_text(40, 24, "", &clock);
         let footer = frame.lines().last().unwrap_or_default();
-        assert_eq!(footer.trim_end(), "? help", "default footer: {footer:?}");
+        assert_eq!(footer.trim(), "? help", "default footer: {footer:?}");
 
         ui.key(crossterm::event::KeyCode::Char('?'));
         let help = ui.render_text(40, 24, "", &clock);
@@ -5209,11 +5284,11 @@ mod tests {
         assert_eq!(ui.footer_row_count(100), 1);
         let plain = ui.pane_size(100, 40, clock.now());
         ui.set_tree_selection(TreeSelection::RemoteNode("fp-laptop".into()));
-        assert_eq!(ui.footer_row_count(100), 2, "detail line is one row");
+        assert_eq!(ui.footer_row_count(100), 1, "detail shares the status row");
         let detailed = ui.pane_size(100, 40, clock.now());
         assert_eq!(
             detailed.rows(),
-            plain.rows().saturating_sub(1),
+            plain.rows(),
             "the footer and pane must share the height"
         );
     }
@@ -5883,7 +5958,7 @@ mod tests {
         let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("ended"));
         assert!(!frame.contains("    ● dev"));
-        assert!(frame.contains("attention · ? help"));
+        assert!(frame.contains("attention") && frame.contains("? help"));
     }
 
     #[test]
@@ -6316,7 +6391,7 @@ mod tests {
         let frame = ui.render_text(80, 24, "", &clock);
         assert!(frame.contains("no sessions need attention"));
         assert!(frame.contains("● studio"));
-        assert!(frame.contains("attention · ? help"));
+        assert!(frame.contains("attention") && frame.contains("? help"));
     }
 
     #[test]
@@ -6497,7 +6572,7 @@ mod tests {
 
         let (_, clock, focused) = make_ui();
         assert!(
-            focused.contains("laptop/build>"),
+            focused.contains("Remuda >"),
             "composer line missing: {focused}"
         );
 
@@ -7460,7 +7535,7 @@ mod tests {
         ui.notice = Some(("heads up".into(), clock.now()));
         let frame = ui.render_text(100, 24, "", &clock);
         let lines: Vec<&str> = frame.lines().collect();
-        assert!(lines.iter().any(|line| line.trim_end() == "? help"));
+        assert!(lines.iter().any(|line| line.trim() == "? help"));
         assert!(lines
             .iter()
             .any(|l| l.starts_with("heads up") && !l.contains('│')));
@@ -7478,7 +7553,7 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('!'));
         ui.key(crossterm::event::KeyCode::Enter);
         let frame = ui.render_text(80, 24, "", &clock);
-        assert!(frame.contains("attention · ? help"));
+        assert!(frame.contains("attention") && frame.contains("? help"));
         assert!(frame.contains("no sessions need attention"));
         assert_eq!(ui.active, 0);
     }
@@ -7706,7 +7781,7 @@ mod tests {
         let frame = ui.render_text(80, 24, &ui.ended.as_ref().unwrap().screen, &clock);
         assert!(frame.contains("studio / dev · ended · final snapshot"));
         assert!(frame.contains("final output"));
-        assert!(frame.contains("Input disabled · ? help"));
+        assert!(frame.contains("Input disabled") && frame.contains("? help"));
         ui.key(crossterm::event::KeyCode::Char('x'));
         let frame = ui.render_text(80, 24, "", &clock);
         assert!(!frame.contains("studio / dev · ended"));
