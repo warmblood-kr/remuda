@@ -210,7 +210,10 @@ fn registry_targets_with_aliases(
             entry.state == crate::cluster::NodeState::Admitted && entry.node_fp != local_fingerprint
         })
         .map(|entry| RemoteTarget {
-            name: crate::cluster::display_node_label(&entry.node_fp, aliases),
+            name: aliases
+                .get(&entry.node_fp)
+                .cloned()
+                .unwrap_or_else(|| crate::cluster::node_label(&entry.node_fp)),
             registry_key: entry.node_fp.clone(),
             addr_override: None,
         })
@@ -1383,7 +1386,11 @@ mod tests {
         let aliases = BTreeMap::from([("admitted-fingerprint".into(), "macbook".into())]);
         let aliased = super::registry_targets_with_aliases(&registry, "local", &aliases);
         assert_eq!(aliased[0].registry_key, targets[0].registry_key);
-        assert_eq!(aliased[0].name, format!("macbook ({})", targets[0].name));
+        assert_eq!(aliased[0].name, "macbook");
+        assert_eq!(
+            targets[0].name,
+            crate::cluster::node_label("admitted-fingerprint")
+        );
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].registry_key, "admitted-fingerprint");
     }
