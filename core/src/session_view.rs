@@ -217,10 +217,7 @@ fn skip_sgr(line: &str, mut at: usize) -> Result<usize, &'static str> {
     Ok(at)
 }
 
-/// The status glyphs the list renderer puts before a name: the horse means a
-/// working program, the hollow circle a fresh idle one, `!` a program waiting
-/// for a human, and the filled dot the ordinary state. The cell is two
-/// terminal cells wide, so one-cell glyphs are padded before the separator.
+/// Working, idle, ordinary, and attention glyphs, padded to two cells.
 const STATUS_GLYPHS: [&str; 4] = ["🏇", "○", "●", "!"];
 /// The status cell and its separator, in terminal cells.
 const STATUS_PREFIX_CELLS: usize = 3;
