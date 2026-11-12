@@ -671,8 +671,8 @@ current implementation.
 The Lua image owns UI declarations and help metadata. The native UI takes one
 validated snapshot after user configuration finishes, then resolves keys and
 renders help from that same snapshot. Reopen the UI to pick up later changes.
-The session-list browse toggle, the line composer key (`m`,
-`session.compose`) and cluster command controls use the registry. The
+The session-list browse toggle, manual refresh (`r`, `session.refresh`), the
+line composer key (`m`, `session.compose`) and cluster command controls use the registry. The
 composer's editing keys are the `cluster.composer` bindings, shared by the
 session screen and the cluster tree.
 Other list/visual/attach/prompt controls still use existing handlers, pending
@@ -687,6 +687,23 @@ remuda.rebind("session.list.browse", "session.toggle_list", "M-l")
 
 This replaces the default `l` binding, and help shows `M-l list`. Plain `l`
 still moves right in visual mode and goes to the child in session focus.
+
+`session.refresh` re-reads the session list and runs the installed Lua list
+decorators, then forces a repaint. Other keys already trigger ordinary refreshes;
+`r` also repaints an unchanged frame. It applies only in list browse mode. In raw
+session focus, composer, prompt, confirmation and visual mode, `r` keeps its
+existing meaning. If the daemon is gone, `r` still offers daemon restart.
+For example, `remuda.rebind("session.list.browse", "session.refresh", "M-r")`
+moves refresh to `M-r`, including its help; `remuda.unbind("session.list.browse",
+"r")` removes the default binding.
+
+Refresh reads the evidence available to each decorator. Butler's Codex model
+label reads its status file and may fall back to the launch model or `?` when
+current evidence is absent. Refresh cannot make a stale source report a newer
+model. It does not change the session model, reload Lua configuration, or clear
+Butler's activity cache. A remote session screen repaints its latest received
+snapshot without forcing a network query. The cluster picker is unchanged.
+
 `remuda.unbind(context, key)` removes an effective binding. An unbound action
 can be declared again, with its help, using:
 

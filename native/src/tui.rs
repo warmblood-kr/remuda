@@ -71,6 +71,8 @@ pub enum Action {
     Nothing,
     Quit,
     Restart,
+    /// Re-read list evidence and repaint without sending session input.
+    Refresh,
     /// Bytes for the focused session's pty, already encoded.
     Type(Vec<u8>),
     Start(String),
@@ -684,9 +686,11 @@ impl Ui {
         if self.toggle_list_key(key) {
             return Some(Action::Nothing);
         }
-        (self.keymap.resolve(crate::keybindings::LIST_CONTEXT, key)
-            == Some(crate::keybindings::COMPOSE))
-        .then(|| self.open_composer())
+        match self.keymap.resolve(crate::keybindings::LIST_CONTEXT, key) {
+            Some(crate::keybindings::COMPOSE) => Some(self.open_composer()),
+            Some(crate::keybindings::REFRESH) => Some(Action::Refresh),
+            _ => None,
+        }
     }
 
     fn toggle_list_key(&mut self, key: KeyEvent) -> bool {
@@ -2708,6 +2712,15 @@ fn should_refresh(forced: bool, since_last: Duration, tick: Duration) -> bool {
     forced || since_last >= tick
 }
 
+/// Prepare the next immediate frame; only raw typing may reuse list evidence.
+fn prepare_refresh(action: &Action, notice: &mut Option<String>, painted: &mut String) -> bool {
+    if matches!(action, Action::Refresh) {
+        *notice = None;
+        painted.clear();
+    }
+    matches!(action, Action::Type(_))
+}
+
 /// The one expensive act of a frame: relist the herd, take or release the
 /// focus hold, capture the focused screen and repaint if that changed
 /// anything. `skip_list` skips the relist for a `Type`-forced wake. See steps/022.
@@ -3377,9 +3390,9 @@ pub fn run_port<P: SessionPort + ?Sized>(
                 }
             }
         }
-        skip_list = matches!(action, Action::Type(_));
+        skip_list = prepare_refresh(&action, &mut ui.notice, &mut painted);
         match action {
-            Action::Nothing => {}
+            Action::Nothing | Action::Refresh => {}
             Action::Quit => return Ok(()),
             Action::Restart if !path.restartable() => {
                 ui.notice = Some(format!("restart remuda on {} itself", path.label()));
@@ -4392,6 +4405,53 @@ mod composer_tests {
 
     fn type_text(ui: &mut Ui, text: &str) -> Vec<Action> {
         text.chars().map(|c| press(ui, KeyCode::Char(c))).collect()
+    }
+
+    #[test]
+    fn manual_refresh_is_confined_to_browse_and_preserves_other_r_input() {
+        let key = KeyCode::Char('r');
+        let mut ui = ui();
+        assert_eq!(press(&mut ui, key), Action::Refresh);
+        ui.visual = true;
+        assert_eq!(press(&mut ui, key), Action::Nothing);
+        assert!(ui.visual);
+        ui.visual = false;
+        ui.focus = Focus::Session;
+        assert_eq!(press(&mut ui, key), Action::Type(b"r".to_vec()));
+        ui.focus = Focus::List;
+        ui.mode = Mode::Prompt(String::new());
+        assert_eq!(press(&mut ui, key), Action::Nothing);
+        assert_eq!(ui.mode, Mode::Prompt("r".into()));
+        ui.mode = Mode::Confirm("agent".into());
+        assert_eq!(press(&mut ui, key), Action::Nothing);
+        assert_eq!(ui.mode, Mode::Browse);
+        press(&mut ui, KeyCode::Char('m'));
+        assert_eq!(press(&mut ui, key), Action::Nothing);
+        assert_eq!(ui.compose_text(), "r");
+        press(&mut ui, KeyCode::Esc);
+        ui.daemon_gone = Some("private.sock".into());
+        assert_eq!(press(&mut ui, key), Action::Restart);
+    }
+
+    #[test]
+    fn manual_refresh_rebind_and_unbind_change_dispatch_and_footer() {
+        let mut ui = ui();
+        ui.set_keymap(crate::keybindings::test_snapshot(
+            "remuda.rebind('session.list.browse', 'session.refresh', 'M-r')",
+        ));
+        assert_eq!(press(&mut ui, KeyCode::Char('r')), Action::Nothing);
+        assert_eq!(
+            ui.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
+            Action::Refresh
+        );
+        for stacked in [true, false] {
+            assert!(footer(&ui, "test", stacked, 80, 200).contains("M-r refresh"));
+        }
+        ui.set_keymap(crate::keybindings::test_snapshot(
+            "remuda.unbind('session.list.browse', 'r')",
+        ));
+        assert_eq!(press(&mut ui, KeyCode::Char('r')), Action::Nothing);
+        assert!(!footer(&ui, "test", false, 80, 200).contains("refresh"));
     }
 
     #[test]

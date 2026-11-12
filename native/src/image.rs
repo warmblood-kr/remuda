@@ -1627,6 +1627,56 @@ mod tests {
     }
 
     #[test]
+    fn local_list_growth_preserves_dense_order_selection_and_layout_header() {
+        let lua = lifecycle_lua();
+        lua.load(
+            r#"
+            local contents, compact = '', true
+            local sessions = {
+                {name='lead', alive=true}, {name='child', alive=true},
+            }
+            remuda.session = {list=function() return sessions end}
+            remuda.buffer = {new=function()
+                return {set=function(_, value) contents=value end}
+            end}
+            remuda.session_order = function()
+                return {{name='child', depth=1}, {name='lead'}, {name='third'}}
+            end
+            remuda.session_list_decorate = function()
+                return {layout=compact and 'compact' or 'stacked', description='model'}
+            end
+            for _, count in ipairs({2, 3}) do
+                if count == 3 then sessions[3] = {name='third', alive=true} end
+                for _, use_compact in ipairs({true, false}) do
+                    compact = use_compact
+                    remuda._refresh_sessions_buffer(80, 0, 'child')
+                    local lines = {}
+                    for line in (contents .. '\n'):gmatch('(.-)\n') do
+                        lines[#lines + 1] = line
+                    end
+                    local height = compact and 1 or 3
+                    assert(lines[1] == '\30' .. height, contents)
+                    local order = count == 2 and 'child\tlead' or 'child\tlead\tthird'
+                    assert(lines[2] == '\31' .. order, contents)
+                    assert(#lines == 2 + count * height, contents)
+                    for index, name in ipairs({'child', 'lead', 'third'}) do
+                        local _, occurrences = contents:gsub(name, '')
+                        assert(occurrences == (index <= count and 2 or 0), contents)
+                        if index <= count then
+                            assert(lines[3 + (index - 1) * height]:find(name, 1, true), contents)
+                        end
+                    end
+                    assert(lines[3]:find('  \27[1;7;36mchild', 1, true), contents)
+                    assert(not lines[3 + height]:find('\27[1;7;36m', 1, true), contents)
+                end
+            end
+        "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
     fn snapshot_hooks_cannot_mutate_nested_caller_data() {
         let lua = lifecycle_lua();
         lua.load(r#"
