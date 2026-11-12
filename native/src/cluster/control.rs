@@ -21,8 +21,9 @@ pub struct RevokedNotice {
 #[serde(deny_unknown_fields)]
 struct Settings {
     allow_remote_control: bool,
-    /// Sender-side rollout gate: authenticating the receiver is not enough
-    /// until managed panes are protected. Off by default.
+    /// Legacy sender-side gate from #908; inert after #941, because the guarded
+    /// peer write is the authorization. Kept so existing settings files keep
+    /// parsing under `deny_unknown_fields`; it is state, not policy.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     allow_remote_send: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -166,13 +167,15 @@ pub fn set_enabled(value: bool) -> io::Result<()> {
     set_enabled_at(&dir, value)
 }
 
-/// Whether this node may originate remote sends; missing setting is off.
+/// Whether this node may originate remote sends. Retained for settings
+/// compatibility and diagnostics; `cluster_api::send` no longer consults it.
 pub fn remote_send_enabled() -> io::Result<bool> {
     let dir = super::storage::cluster_state_dir()?.join("cluster");
     remote_send_enabled_at(&dir)
 }
 
-/// Persist this node's sender rollout gate.
+/// Persist the legacy sender setting. Nothing consults it; retained so
+/// existing settings files and diagnostics keep working.
 pub fn set_remote_send_enabled(value: bool) -> io::Result<()> {
     let dir = super::storage::cluster_state_dir()?.join("cluster");
     super::identity::load_identity_at(&dir)?;
@@ -284,8 +287,8 @@ pub fn enabled_at(dir: &Path) -> io::Result<bool> {
     Ok(settings_at(dir)?.allow_remote_control)
 }
 
-/// Whether this node may originate remote sends. Defaults to false until the
-/// sender rollout gate is explicitly opened.
+/// Read the legacy sender setting from one cluster state directory. Retained
+/// so existing settings files keep parsing; it is not send policy.
 pub fn remote_send_enabled_at(dir: &Path) -> io::Result<bool> {
     Ok(settings_at(dir)?.allow_remote_send)
 }
@@ -362,7 +365,7 @@ pub fn set_enabled_at(dir: &Path, value: bool) -> io::Result<()> {
     save_settings_at(dir, &settings)
 }
 
-/// Persist the sender rollout gate in one cluster state directory.
+/// Persist the legacy sender setting in one cluster state directory.
 pub fn set_remote_send_at(dir: &Path, value: bool) -> io::Result<()> {
     super::storage::verify_directory(dir)?;
     let _guard = super::storage::StateLock::acquire(dir)?;

@@ -557,7 +557,7 @@ fn frame() -> Vec<Value> {
                 "properties": {
                     "session": {"type": "string"},
                     "text": {"type": "string", "description": "One line, 1..=12288 UTF-8 bytes, with no CR, LF, ESC or other C0/C1 control; the receiver appends the single Return."},
-                    "node": {"type": "string", "description": "Cluster node alias, id, or fingerprint. Omit for this node; a node naming this node uses the local path. Peer send is off unless this node enabled `remuda cluster remote-send`; an `uncertain` refusal means bytes may have been typed, so do not call the tool again automatically (a new client id can duplicate the line)."},
+                    "node": {"type": "string", "description": "Cluster node alias, id, or fingerprint. Omit for this node; a node naming this node uses the local path. Peer sends use the authenticated cluster; an `uncertain` refusal means bytes may have been typed, so do not call the tool again automatically (a new client id can duplicate the line)."},
                 },
                 "required": ["session", "text"],
             },

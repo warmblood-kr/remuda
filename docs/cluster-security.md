@@ -142,12 +142,7 @@ outcome should be inspected before retrying. Hosted input acts currently have
 an 8 KiB limit, so larger pastes may be refused or interrupted; do not assume
 they are atomic. Existing in-process sessions cannot be converted in place.
 
-An MCP `send` with `node` is one line, never a stream. It is off by default on
-the sending node: `remuda cluster remote-send on` is the local rollout gate,
-and an operator should open it only after the Butler protection change is
-merged and deployed and the owner has verified the managed root/leader panes on
-every target node. The probe does not prove that a target's Butler actually
-marked those panes off; it only proves the core supports the flag. The setting is local and never replicated. It resolves the
+An MCP `send` with `node` is one line, never a stream. It resolves the
 peer with the same fail-closed rules as capture, probes `RemoteInputSupport` so
 an older peer that cannot parse the opt-out is refused rather than assumed safe,
 pins the exact live `instance_id` from the peer's `List`, and sends the typed
@@ -167,17 +162,14 @@ list are separate read-only requests, so their failure is known not to have
 written input. The probe is a UX preflight; the guarded write is what binds the
 capability requirement. A peer restarted or downgraded between probe and line
 still rejects `RemoteInputLine` rather than accepting it as an unguarded
-`InputLine`. Open the sender gate only while every peer runs a protected build,
-and close it before a downgrade. `Ack { duplicate: true }` means the same idempotency
+`InputLine`. `Ack { duplicate: true }` means the same idempotency
 scope already applied the line; it is not a new turn or a completion proof.
 
 `remuda cluster call NODE support` is a read-only protocol-surface probe: it
 sends exactly one `RemoteInputSupport` request and reports whether that peer
 implements the per-session opt-out. It does not prove that the peer's policy is
 configured correctly, and a successful probe is not authorization to send
-input; only the separate local `cluster remote-send` gate and the guarded
-`RemoteInputLine` write govern sends. Neither the support probe nor an MCP `ls`
-with `node` reads or changes that gate. A peer list is untrusted evidence,
+input; the guarded `RemoteInputLine` write governs sends. A peer list is untrusted evidence,
 bounded to 256 lines and 32 KiB with a `... [list truncated]` marker; an
 instance id that cannot be pinned is reported as `unpinnable=true` and must
 not be used as a send target.

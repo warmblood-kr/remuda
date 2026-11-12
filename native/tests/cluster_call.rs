@@ -952,7 +952,7 @@ fn cluster_call_refuses_a_local_target_without_listing_it() {
 }
 
 #[test]
-fn support_probe_reports_supported_without_touching_the_gate() {
+fn support_probe_reports_supported_without_touching_settings() {
     let client = Node::start("support-client");
     let peer = fake_peer(|request| match request {
         remuda_core::protocol::Request::RemoteInputSupport => {
@@ -1387,42 +1387,98 @@ fn mcp_ls_without_node_is_byte_identical() {
 }
 
 #[test]
-fn support_ok_does_not_open_the_mcp_send_gate() {
-    let client = Node::start("gate-separation-client");
+fn remote_send_attempts_peer_even_when_legacy_setting_is_off() {
+    let client = Node::start("legacy-send-off-client");
     let peer = fake_peer(|request| match request {
         remuda_core::protocol::Request::RemoteInputSupport => {
             FakeAnswer::Reply(remuda_core::protocol::Response::Ok)
         }
-        other => panic!("support must not send {other:?}"),
+        other => panic!("first request must probe support: {other:?}"),
     });
     let fingerprint = admit_peer(&client, &peer.public, Some(peer.address));
     let label = remuda_native::cluster::node_label(&fingerprint);
-
-    let support = client
-        .command()
-        .args(["cluster", "call", &label, "support"])
-        .output()
-        .unwrap();
-    assert!(support.status.success(), "support failed: {support:?}");
-
-    // The MCP send gate is a separate local setting and stays off. A successful
-    // probe must not be treated as authorization to type.
     let reply = mcp_call(
         &client,
         "send",
         serde_json::json!({"node": label, "session": "agent", "text": "hello"}),
     );
-    assert_eq!(reply["result"]["isError"], true, "{reply}");
-    let text = mcp_text(&reply);
-    assert!(
-        text.contains("remote send is disabled"),
-        "support leaked into the MCP gate: {text}"
+    assert_eq!(
+        reply["result"]["isError"], true,
+        "single-request peer cannot answer list: {reply}"
     );
-
     let requests = peer.task.join().unwrap();
     assert_eq!(
         requests,
         vec![remuda_core::protocol::Request::RemoteInputSupport],
-        "a refused send must not reach the peer"
+        "legacy default-off setting must not prevent the peer probe"
+    );
+}
+
+#[test]
+fn mcp_send_reaches_a_real_peer_with_the_legacy_setting_off() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let client = Node::start("real-send-client");
+    let server = Node::start("real-send-server");
+    admit_pair(&client, &server);
+    let (_listener, addr) = listener(&server);
+    let fingerprint = server.fingerprint();
+    set_endpoint(&client, &fingerprint, addr);
+    let label = remuda_native::cluster::node_label(&fingerprint);
+
+    // The old rollout gate was stored here and defaulted to off. It must be
+    // inert now: the guarded peer write is the authorization.
+    let settings = client.state.join("remuda/cluster/settings.json");
+    fs::write(
+        &settings,
+        serde_json::to_vec(&serde_json::json!({
+            "allow_remote_control": true,
+            "allow_remote_send": false,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&settings, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let start = server
+        .command()
+        .args([
+            "-e",
+            r#"remuda.new('echo', {'/bin/sh', '-c', 'while IFS= read -r line; do printf "got:%s\n" "$line"; done'})"#,
+        ])
+        .output()
+        .unwrap();
+    assert!(start.status.success(), "session start failed: {start:?}");
+
+    let reply = mcp_call(
+        &client,
+        "send",
+        serde_json::json!({"node": label, "session": "echo", "text": "hello"}),
+    );
+    assert_ne!(
+        reply["result"]["isError"], true,
+        "legacy setting blocked a guarded send: {reply}"
+    );
+
+    let address = addr.to_string();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut captured = String::new();
+    while Instant::now() < deadline {
+        let capture = client
+            .command()
+            .args([
+                "cluster", "call", &label, "capture", "echo", "--addr", &address,
+            ])
+            .output()
+            .unwrap();
+        captured = String::from_utf8_lossy(&capture.stdout).to_string();
+        if captured.contains("got:hello") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        captured.contains("got:hello"),
+        "the peer never received the line: {captured}"
     );
 }
