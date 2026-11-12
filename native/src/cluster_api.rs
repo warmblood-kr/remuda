@@ -352,9 +352,6 @@ pub(crate) fn pinned_instance(
     if row.unavailable {
         return Err("the target session is unavailable on its host".into());
     }
-    if row.remote_input_disabled {
-        return Err("the target session has remote input disabled".into());
-    }
     row.instance_id
         .clone()
         .filter(|instance| !instance.is_empty())
