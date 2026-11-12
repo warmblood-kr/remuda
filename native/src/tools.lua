@@ -2269,6 +2269,31 @@ local function session_copy(session)
   return copy(session, 0)
 end
 
+-- The status cell in front of every name: two terminal cells, then a
+-- separator. The horse means a working program; a hollow circle a fresh idle
+-- one; "!" a program waiting for a human. Everything else keeps the filled dot,
+-- green while alive and red when dead — liveness outranks advisory state, and
+-- the dot's colour is the only place the list says it. A decorator that still
+-- reports an activity keeps its meaning as an icon; its word is not drawn.
+local function status_cell(session, decoration)
+  local dot = session.alive and "\27[32m●\27[0m " or "\27[31m●\27[0m "
+  if not session.alive then return dot end
+  local state
+  if session.program_status_fresh == true and type(session.program_status) == "table" then
+    state = session.program_status.state
+  end
+  if state ~= "working" and state ~= "idle" and state ~= "blocked" then
+    local activity = type(decoration) == "table" and decoration.activity or nil
+    if activity == "working" then state = "working"
+    elseif activity == "idle" then state = "idle"
+    elseif activity == "needs you" then state = "blocked" end
+  end
+  if state == "working" then return "🏇" end
+  if state == "idle" then return "\27[32m○\27[0m " end
+  if state == "blocked" then return "\27[31m!\27[0m " end
+  return dot
+end
+
 local function render_session_snapshot(sessions, width, selected_name, selected_id, strict, selected_index)
   assert(type(sessions) == "table", "invalid session snapshot")
   if strict then
@@ -2336,29 +2361,34 @@ local function render_session_snapshot(sessions, width, selected_name, selected_
       if ok and type(value) == "table" then decoration = value end
     end
     local fields = {}
+    -- A decorator that reports only an activity still counts as decorated: its
+    -- word is no longer drawn, but the legacy detail hook must not fill the
+    -- gap with text the owner asked the list to stop showing.
+    local decorated = false
     if decoration then
       local activity = decoration.activity
-      if activity == "working" or activity == "idle" or activity == "other" or activity == "needs you" then fields[#fields + 1] = activity end
+      if activity == "working" or activity == "idle" or activity == "other" or activity == "needs you" then decorated = true end
       local kind = safe_text(decoration.agent_kind, 32)
       local description = safe_text(decoration.description, 160)
-      if kind then fields[#fields + 1] = kind end
-      if description then fields[#fields + 1] = description end
+      if kind then fields[#fields + 1] = kind; decorated = true end
+      if description then fields[#fields + 1] = description; decorated = true end
       if decoration.layout == "compact" then compact = true end
     end
-    if #fields == 0 and type(remuda.session_detail) == "function" then
+    if not decorated and type(remuda.session_detail) == "function" then
       local ok, value = pcall(remuda.session_detail, session_copy(entry.snapshot))
       if ok then local detail = safe_text(value, 256); if detail then fields[#fields + 1] = detail end end
     end
     entry.detail = #fields > 0 and table.concat(fields, " · ") or nil
+    entry.status = status_cell(entry.snapshot, decoration)
   end
   local height, entries = compact and 1 or 3, {}
   for index, entry in ipairs(ordered) do
-    local session, detail = entry.snapshot, entry.detail
+    local detail = entry.detail
     local selected = selected_name ~= nil and entry.name == selected_name and (selected_id == nil or entry.instance_id == selected_id)
       or selected_name == nil and selected_index ~= nil and index - 1 == selected_index
     local name_style = selected and "\27[1;7;36m" or "\27[1m"
-    local color, reset = session.alive and "\27[32m" or "\27[31m", "\27[0m"
-    local first = name_style .. entry.name .. reset .. " " .. color .. "●" .. reset .. (session.attached and " 🏇" or "")
+    local reset = "\27[0m"
+    local first = entry.status .. " " .. name_style .. entry.name .. reset
     local second = detail and ("\27[2m" .. detail .. reset) or ""
     local lines = compact and { first .. (detail and ("  " .. second) or "") } or { first, second, "" }
     local pad = string.rep(" ", 2 * entry.depth)

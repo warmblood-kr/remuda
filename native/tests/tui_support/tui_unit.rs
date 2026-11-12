@@ -1958,14 +1958,14 @@ fn render_styled_of_the_session_list_moves_the_brand_to_the_footer() {
     let mut ui = make_ui(vec![row("alpha", true, false), row("bravo", true, true)]);
     // What a real refresh() would have fetched from the "*sessions*"
     // buffer at this scenario's list width (16, per `layout(80, 80)`):
-    // unattached has no marker, and the attached horse stays on the name
-    // row. These rows model the live Lua buffer at width 16. This is the
+    // the status cell leads each name, and an attached human adds no row
+    // marker. These rows model the live Lua buffer at width 16. This is the
     // `render_styled` input that no longer comes from `ui.sessions` directly.
     ui.sessions_text = vec![
-        "alpha".into(),
+        "\x1b[32m●\x1b[0m  alpha".into(),
         String::new(),
         String::new(),
-        "bravo 🏇".into(),
+        "\x1b[32m●\x1b[0m  bravo".into(),
         String::new(),
         String::new(),
     ];
@@ -2061,16 +2061,16 @@ fn render_styled_of_the_session_list_moves_the_real_brand_to_the_footer() {
     let (list_w, _) = layout(80, widest(&ui));
     let (rows, lines, _) =
         sessions_buffer_lines(&path, list_w, 0, None).expect("refresh sessions buffer");
-    // tools.lua's three-row contract: bold name (cyan when selected) plus the
-    // attached marker, detail on row two, then a blank spacer row.
+    // tools.lua's three-row contract: status cell, separator, bold name
+    // (cyan when selected), detail on row two, then a blank spacer row.
     assert_eq!(rows, 3);
     assert_eq!(
         lines,
         vec![
-            "\x1b[1;7;36malpha\x1b[0m \x1b[32m●\x1b[0m".to_string(),
+            "\x1b[32m●\x1b[0m  \x1b[1;7;36malpha\x1b[0m".to_string(),
             String::new(),
             String::new(),
-            "\x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m 🏇".to_string(),
+            "\x1b[32m●\x1b[0m  \x1b[1mbravo\x1b[0m".to_string(),
             String::new(),
             String::new(),
         ],
@@ -2204,8 +2204,16 @@ fn typed_session_decorator_is_bounded_and_layout_override_is_whitelisted() {
     let (rows, lines, _) = sessions_buffer_lines(&path, 80, 0, None).expect("decorated list");
     assert_eq!(rows, 1, "compact layout is a one-row entry");
     assert!(
-        lines[0].contains("working · claude · safe [31m text"),
-        "controls are removed: {lines:?}"
+        lines[0].contains("claude · safe [31m text"),
+        "kind and description remain, the activity word does not: {lines:?}"
+    );
+    assert!(
+        !lines[0].contains("working"),
+        "the activity is an icon now, never a word: {lines:?}"
+    );
+    assert!(
+        lines[0].starts_with('🏇'),
+        "a working decorator leads with the horse: {lines:?}"
     );
     assert!(
         !lines[0].contains("\x1b[31m"),
@@ -2219,6 +2227,10 @@ fn typed_session_decorator_is_bounded_and_layout_override_is_whitelisted() {
     let (rows, lines, _) =
         sessions_buffer_lines(&path, 400, 0, None).expect("invalid fields fall back");
     assert_eq!(rows, 3, "unrecognized layout retains the base layout");
+    assert!(
+        lines[0].starts_with("\x1b[32m●\x1b[0m "),
+        "an unknown activity falls back to the ordinary dot: {lines:?}"
+    );
     assert!(
         lines[1].starts_with("\x1b[2m"),
         "bounded description remains available"
@@ -2251,15 +2263,16 @@ fn every_row_of_a_nested_entry_shares_one_offset() {
     assert_eq!(rows, 3);
     let block = |i: usize| &lines[i * 3..i * 3 + 3];
 
-    // Depth 0 is the local layout itself, byte-identical to the flat list.
-    assert_eq!(block(0), ["\x1b[1malpha\x1b[0m \x1b[32m●\x1b[0m", "", ""]);
+    // Depth 0 is the local layout itself, byte-identical to the flat list:
+    // a two-cell status cell, its separator, then the bold name.
+    assert_eq!(block(0), ["\x1b[32m●\x1b[0m  \x1b[1malpha\x1b[0m", "", ""]);
     // Every row of a deeper entry, blank spacer included, is that same
     // block shifted right by 2 * depth.
     for (i, depth) in [(1, 1), (2, 2)] {
         let pad = " ".repeat(2 * depth);
         let name = ["alpha", "bravo", "charlie"][i];
         let expected = [
-            format!("{pad}\x1b[1m{name}\x1b[0m \x1b[32m●\x1b[0m"),
+            format!("{pad}\x1b[32m●\x1b[0m  \x1b[1m{name}\x1b[0m"),
             pad.clone(),
             pad.clone(),
         ];
@@ -2300,18 +2313,22 @@ fn a_nested_entry_never_overflows_a_narrow_list() {
 }
 
 #[test]
-fn attached_horse_marker_joins_the_name_row_with_two_cell_width() {
-    // The dot carries live/dead, so row 2 spells neither. Each style is reset
-    // before the next begins: the selection style must not reach the dot,
-    // and the dot colour must not reach anything after it.
-    let path = scratch_socket("status-dot");
+fn the_status_cell_leads_the_name_row_and_names_the_state() {
+    // The cell carries live/dead and the three advisory states, so the detail
+    // row spells none of them. Each style is reset before the next begins:
+    // the selection style must not reach the cell, and the cell's colour must
+    // not reach the name.
+    let path = scratch_socket("status-cell");
     let _daemon = daemon_at(&path);
     eval(
         &path,
         r#"
             remuda.ls = function() return {
               { name = "plain", alive = true, attached = false },
-              { name = "busy", alive = true, attached = true },
+              { name = "busy", alive = true, attached = true, program_status = { state = "working" }, program_status_fresh = true },
+              { name = "resting", alive = true, attached = false, program_status = { state = "idle" }, program_status_fresh = true },
+              { name = "waiting", alive = true, attached = false, program_status = { state = "blocked" }, program_status_fresh = true },
+              { name = "stale", alive = true, attached = false, program_status = { state = "idle" }, program_status_fresh = false },
               { name = "agent", alive = true, attached = false },
               { name = "gone", alive = false, attached = false },
             } end
@@ -2324,44 +2341,119 @@ fn attached_horse_marker_joins_the_name_row_with_two_cell_width() {
     let entry = |i: usize| (lines[i * 3].as_str(), lines[i * 3 + 1].as_str());
     assert_eq!(
         entry(0),
-        ("\x1b[1;7;36mplain\x1b[0m \x1b[32m●\x1b[0m", ""),
-        "selected, live"
+        ("\x1b[32m●\x1b[0m  \x1b[1;7;36mplain\x1b[0m", ""),
+        "selected, live: the cell leads and the selection covers the name only"
     );
     assert_eq!(
         entry(1),
-        ("\x1b[1mbusy\x1b[0m \x1b[32m●\x1b[0m 🏇", ""),
-        "unselected, live, attached"
+        ("🏇 \x1b[1mbusy\x1b[0m", ""),
+        "working is the horse, and an attached human leaves no row marker"
+    );
+    assert_eq!(
+        entry(2),
+        ("\x1b[32m○\x1b[0m  \x1b[1mresting\x1b[0m", ""),
+        "a fresh idle program is a green hollow circle"
+    );
+    assert_eq!(
+        entry(3),
+        ("\x1b[31m!\x1b[0m  \x1b[1mwaiting\x1b[0m", ""),
+        "a blocked program is the one that needs a human"
+    );
+    assert_eq!(
+        entry(4),
+        ("\x1b[32m●\x1b[0m  \x1b[1mstale\x1b[0m", ""),
+        "a stale report falls back to the ordinary dot"
     );
     assert_eq!(
         visible_width("🏇"),
         2,
-        "the marker occupies two terminal cells"
+        "the horse occupies two terminal cells, the whole status cell"
     );
     assert_eq!(
         visible_width(entry(1).0),
-        9,
-        "the ANSI styled row includes both cells"
+        3 + visible_width("busy"),
+        "the horse row is the two-cell status cell, its separator, and the name"
     );
     assert_eq!(
         visible_width(&fit(entry(1).0, 16)),
         16,
         "fitting the row accounts for the horse's two display cells"
     );
+    for (index, glyph) in [(1usize, "🏇"), (2, "○"), (3, "!"), (4, "●")] {
+        let cell = visible_width(&entry(index).0[..entry(index).0.find(glyph).unwrap()]);
+        assert_eq!(cell, 0, "every status starts its own column");
+    }
     assert_eq!(
-        entry(2),
+        entry(5),
         (
-            "\x1b[1magent\x1b[0m \x1b[32m●\x1b[0m",
+            "\x1b[32m●\x1b[0m  \x1b[1magent\x1b[0m",
             "\x1b[2mclaude · opus · 12K\x1b[0m"
         ),
         "live detail is dim, like any other telemetry"
     );
     assert_eq!(
-        entry(3),
+        entry(6),
         (
-            "\x1b[1mgone\x1b[0m \x1b[31m●\x1b[0m",
+            "\x1b[31m●\x1b[0m  \x1b[1mgone\x1b[0m",
             "\x1b[2mclaude · opus · 12K\x1b[0m"
         ),
-        "dead is a red dot, not a word"
+        "dead keeps its red dot, not a word"
+    );
+}
+
+#[test]
+fn a_fresh_program_report_reaches_the_status_cell() {
+    // End to end through the real daemon: the child emits OSC 7501, the
+    // registry ages the report, and the list renders the horse.
+    let path = scratch_socket("program-status-cell");
+    let _daemon = daemon_at(&path);
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("worker".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf '\\033]7501;state=working\\033\\\\'; sleep 30".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("new");
+    assert!(matches!(response, Response::Value(_)));
+    let mut shown = Vec::new();
+    for _ in 0..100 {
+        shown = sessions_buffer_lines(&path, 40, 0, None)
+            .expect("refresh sessions buffer")
+            .1;
+        if shown[0].starts_with('🏇') {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("the working report never reached the list: {shown:?}");
+}
+
+#[test]
+fn a_legacy_activity_word_becomes_its_icon() {
+    let path = scratch_socket("legacy-activity");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "helper");
+    eval(
+        &path,
+        r#"
+            remuda.session_list_decorate = function() return { activity = "needs you" } end
+            remuda.session_detail = function() return "needs you" end
+        "#,
+    );
+    let (_, lines, _) = sessions_buffer_lines(&path, 40, 0, None).expect("decorated list");
+    assert_eq!(lines[0], "\x1b[31m!\x1b[0m  \x1b[1;7;36mhelper\x1b[0m");
+    assert!(
+        !lines[0].contains("needs you") && lines[1].is_empty(),
+        "the word is gone, the meaning is not, and the legacy detail hook \
+         must not put the word back: {lines:?}"
     );
 }
 
@@ -2380,14 +2472,15 @@ fn the_status_dot_counts_as_one_column() {
         } end"#,
     );
     let (_, lines, _) = sessions_buffer_lines(&path, 40, 0, None).expect("refresh sessions buffer");
-    assert_eq!(lines[0], "\x1b[1;7;36malpha\x1b[0m \x1b[32m●\x1b[0m");
-    assert_eq!(visible_width(&lines[0]), "alpha ●".chars().count());
+    assert_eq!(lines[0], "\x1b[32m●\x1b[0m  \x1b[1;7;36malpha\x1b[0m");
+    assert_eq!(visible_width(&lines[0]), "●  alpha".chars().count());
 }
 
 #[test]
 fn the_list_has_no_caret_column_at_any_depth() {
-    // The dot column stays fixed while the tree indentation consumes name
-    // space, with no gutter or caret column.
+    // The status cell leads each name and the tree indentation shifts both
+    // together, with no gutter or caret column. Within a depth the cell and
+    // the name keep one column, so names line up.
     let path = scratch_socket("no-caret");
     let _daemon = daemon_at(&path);
     for name in ["alpha", "bravo", "charlie"] {
@@ -2395,8 +2488,7 @@ fn the_list_has_no_caret_column_at_any_depth() {
     }
     eval(
         &path,
-        "remuda.session_order = function() return {{name = 'alpha', depth = 0}, \
-         {name = 'bravo', depth = 1}, {name = 'charlie', depth = 2}} end",
+        "remuda.session_order = function() return {{name = 'alpha', depth = 0},          {name = 'bravo', depth = 1}, {name = 'charlie', depth = 2}} end",
     );
     let width = 30;
     let (rows, lines, order) =
@@ -2409,16 +2501,27 @@ fn the_list_has_no_caret_column_at_any_depth() {
     apply_session_order(&mut ui, None, &order);
     ui.session_rows = rows;
     ui.sessions_text = lines.clone();
-    let mut dot_column = None;
     for (r, text) in lines.iter().enumerate() {
         let rendered = list_row(&ui, r, width);
-        if let Some(dot) = rendered.find('●') {
-            let column = visible_width(&rendered[..dot]);
-            assert_eq!(column, width as usize - 4, "row {r} dot column");
-            assert_eq!(dot_column.get_or_insert(column), &column);
-        } else {
+        let Some(depth) = (r / rows < 3).then(|| r / rows) else {
+            continue;
+        };
+        let name = ["alpha", "bravo", "charlie"][depth];
+        let Some(name_at) = rendered.find(name) else {
             assert_eq!(rendered, fit(text, width), "blank row {r}");
-        }
+            continue;
+        };
+        assert_eq!(
+            visible_width(&rendered[..name_at]),
+            2 * depth + 3,
+            "row {r} name column"
+        );
+        let dot = rendered.find('●').expect("status cell");
+        assert_eq!(
+            visible_width(&rendered[..dot]),
+            2 * depth,
+            "row {r} status column"
+        );
     }
 }
 
@@ -2509,7 +2612,7 @@ fn render_styled_of_the_empty_session_list_moves_the_real_brand_to_the_footer() 
 /// stays on the name row instead of occupying the detail row.
 // `alpha` unattached, `bravo` attached, both alive. Two Eval round trips.
 #[test]
-fn the_attached_marker_stays_on_the_name_row_at_narrow_widths() {
+fn the_status_cell_stays_on_the_name_row_at_narrow_widths() {
     let path = scratch_socket("e2e-live-dead-threshold");
     let _daemon = daemon_at(&path);
 
@@ -2530,17 +2633,23 @@ fn the_attached_marker_stays_on_the_name_row_at_narrow_widths() {
         assert_eq!(
             states,
             vec!["", ""],
-            "at width {width}, attached marker must not occupy the detail row"
+            "at width {width}, the status cell must not occupy the detail row"
         );
+        for row in [0, 3] {
+            assert!(
+                lines[row].starts_with("\x1b[32m●\x1b[0m  "),
+                "the status cell leads the name row, attached or not: {lines:?}"
+            );
+        }
         assert!(
-            lines[3].ends_with(" 🏇"),
-            "first row carries the attached marker: {lines:?}"
+            !lines.iter().any(|line| line.contains('🏇')),
+            "an attached human is no longer drawn in the row: {lines:?}"
         );
     }
 }
 
 #[test]
-fn long_names_keep_the_status_dot_aligned_and_attached_horse_visible() {
+fn long_names_keep_the_status_cell_and_ellipsize_the_name() {
     const ATTACHED: &str = "attached-name-abcdefghijklmnopqrstuvwxyz-한글";
     const PLAIN: &str = "plain-name-abcdefghijklmnopqrstuvwxyz-한글";
     let path = scratch_socket("attached-marker-long-name");
@@ -2562,34 +2671,27 @@ fn long_names_keep_the_status_dot_aligned_and_attached_horse_visible() {
         ui.session_rows = rows;
         ui.sessions_text = lines.clone();
 
-        let attached = list_row(&ui, 0, width);
-        assert!(
-            attached.ends_with(" 🏇"),
-            "the horse stays at the row end at width {width}: {attached:?}"
-        );
-        assert!(
-            attached.contains('→'),
-            "the long name is ellipsized: {attached:?}"
-        );
-        assert_eq!(visible_width(&attached), width as usize);
-
-        let plain = list_row(&ui, rows, width);
-        assert!(
-            plain.contains('→'),
-            "the long name is ellipsized: {plain:?}"
-        );
-        assert!(
-            plain.ends_with("\x1b[0m   "),
-            "dot column is reserved: {plain:?}"
-        );
-        assert_eq!(visible_width(&plain), width as usize);
-
-        let attached_dot = visible_width(&attached[..attached.find('●').unwrap()]);
-        let plain_dot = visible_width(&plain[..plain.find('●').unwrap()]);
-        assert_eq!(attached_dot, width as usize - 4, "attached dot column");
-        assert_eq!(plain_dot, attached_dot, "both rows align their dots");
-        assert!(attached.is_char_boundary(attached.find('●').unwrap()));
-        assert!(plain.is_char_boundary(plain.find('●').unwrap()));
+        for r in [0, rows] {
+            let rendered = list_row(&ui, r, width);
+            assert!(
+                rendered.starts_with("\x1b[32m●\x1b[0m  "),
+                "the status cell stays at the left at width {width}: {rendered:?}"
+            );
+            assert!(
+                rendered.contains('→'),
+                "the long name is ellipsized: {rendered:?}"
+            );
+            assert_eq!(visible_width(&rendered), width as usize);
+            let name_at = rendered
+                .find(['a', 'p'])
+                .expect("a name follows the status cell");
+            assert_eq!(
+                visible_width(&rendered[..name_at]),
+                3,
+                "both names start in the same column at width {width}"
+            );
+            assert!(rendered.is_char_boundary(name_at));
+        }
     }
 }
 

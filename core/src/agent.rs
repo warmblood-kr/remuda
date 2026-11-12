@@ -439,6 +439,18 @@ impl ProgramState {
             ProgramState::Unknown => "unknown",
         }
     }
+
+    /// Shared freshness limit for list and cluster tree; unknown is never fresh.
+    pub fn fresh_limit(self) -> Option<core::time::Duration> {
+        match self {
+            ProgramState::Working => Some(core::time::Duration::from_secs(600)),
+            ProgramState::Idle
+            | ProgramState::Blocked
+            | ProgramState::Done
+            | ProgramState::Error => Some(core::time::Duration::from_secs(3600)),
+            ProgramState::Unknown => None,
+        }
+    }
 }
 
 /// What a `blocked` program waits for; display only, never approval.

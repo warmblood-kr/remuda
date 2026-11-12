@@ -1371,7 +1371,7 @@ fn remote_node_pane_shows_the_peer_lua_decorated_session_list() {
     admit_pair(&client_node, &server_node);
     let listener = Listener::start(&server_node);
     server_node.start_named_session("proof", "sleep 30");
-    let config = server_node.command().args(["-e", "remuda.session_list_decorate = function(s) return {layout='compact', agent_kind='codex', description='MODELTEST'} end"]).output().unwrap();
+    let config = server_node.command().args(["-e", "remuda.session_list_decorate = function(s) return {layout='compact', activity='working', agent_kind='codex', description='MODELTEST'} end"]).output().unwrap();
     assert!(config.status.success(), "{config:?}");
     let path = client_node
         .state
@@ -1388,6 +1388,7 @@ fn remote_node_pane_shows_the_peer_lua_decorated_session_list() {
     tui.wait_for("proof", Duration::from_secs(10));
     tui.wait_for("MODELTEST", Duration::from_secs(10));
     assert!(tui.screen_text().contains("codex"));
+    assert!(tui.screen_text().contains("🏇"));
 }
 
 fn pane_pair(label: &str) -> (Node, Node) {
