@@ -1,5 +1,4 @@
 use remuda_core::agent::{AgentError, AgentProcess, Cursor, Result, Size};
-use remuda_core::input::InputError;
 use remuda_core::input::{
     validate_batch, InputBatch, InputDeduplicator, InputOutcome, INPUT_RATE_BYTES_PER_SECOND,
     INPUT_RING_CAPACITY, MAX_INPUT_BYTES,
@@ -484,21 +483,21 @@ fn assert_no_input_event(receiver: &mpsc::Receiver<Vec<u8>>) {
 }
 
 #[test]
-fn remote_input_opt_out_refuses_only_remote_input() {
+fn legacy_opt_out_does_not_block_trusted_remote_input() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let registry = Registry::new();
     let session = registry
         .register(input_session(Arc::clone(&writes), true))
         .expect("register");
     let instance = session.instance_id().to_string();
-    let remote = |bytes: &'static [u8]| InputBatch {
+    let remote = |seq, bytes: &'static [u8]| InputBatch {
         instance_id: &instance,
         client_id: [9; 16],
-        seq: 1,
+        seq,
         bytes,
     };
     assert!(matches!(
-        registry.apply_remote_input_batch("input-test", remote(b"a"), false),
+        registry.apply_remote_input_batch("input-test", remote(1, b"a"), false),
         Some(Ok(InputOutcome::Ack { duplicate: false }))
     ));
     assert_eq!(
@@ -506,13 +505,13 @@ fn remote_input_opt_out_refuses_only_remote_input() {
         Some(())
     );
     assert!(matches!(
-        registry.apply_remote_input_batch("input-test", remote(b"b"), false),
-        Some(Err(InputError::RemoteInputDisabled))
+        registry.apply_remote_input_batch("input-test", remote(2, b"b"), false),
+        Some(Ok(InputOutcome::Ack { duplicate: false }))
     ));
     assert!(registry
         .list()
         .iter()
-        .any(|row| row.name == "input-test" && row.remote_input_disabled));
+        .any(|row| row.name == "input-test" && !row.remote_input_disabled));
     let local = InputBatch {
         instance_id: &instance,
         client_id: [8; 16],
@@ -523,7 +522,7 @@ fn remote_input_opt_out_refuses_only_remote_input() {
         registry.apply_input_batch("input-test", local),
         Some(Ok(InputOutcome::Ack { duplicate: false }))
     ));
-    assert_eq!(writes.lock().unwrap().len(), 2);
+    assert_eq!(writes.lock().unwrap().len(), 3);
     assert_eq!(
         registry.set_remote_input_opt_out("input-test", "not-the-instance", false),
         None
@@ -531,7 +530,7 @@ fn remote_input_opt_out_refuses_only_remote_input() {
 }
 
 #[test]
-fn an_admitted_remote_line_finishes_after_opt_out_and_later_lines_are_refused() {
+fn legacy_opt_out_does_not_interrupt_or_block_later_input() {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let registry = Arc::new(Registry::new());
@@ -569,28 +568,25 @@ fn an_admitted_remote_line_finishes_after_opt_out_and_later_lines_are_refused() 
         Some(()),
         "off must not wait for an admitted write outside the registry lock"
     );
-    assert!(
-        matches!(
-            registry.apply_remote_input_batch(
-                "input-test",
-                InputBatch {
-                    instance_id: &instance,
-                    client_id: [5; 16],
-                    seq: 1,
-                    bytes: b"after",
-                },
-                false,
-            ),
-            Some(Err(InputError::RemoteInputDisabled))
-        ),
-        "a line admitted after the off store is refused"
-    );
     release_tx.send(()).expect("release writer");
     let outcome = admitted.join().unwrap();
-    assert!(
-        matches!(outcome, Some(Ok(InputOutcome::Ack { duplicate: false }))),
-        "admitted line outcome: {outcome:?}"
-    );
+    assert!(matches!(
+        outcome,
+        Some(Ok(InputOutcome::Ack { duplicate: false }))
+    ));
+    assert!(matches!(
+        registry.apply_remote_input_batch(
+            "input-test",
+            InputBatch {
+                instance_id: &instance,
+                client_id: [5; 16],
+                seq: 1,
+                bytes: b"after",
+            },
+            false
+        ),
+        Some(Ok(InputOutcome::Ack { duplicate: false }))
+    ));
 }
 
 #[test]
@@ -634,7 +630,7 @@ fn remote_input_line_adds_exactly_one_return_and_a_duplicate_adds_none() {
 }
 
 #[test]
-fn launch_time_protection_is_applied_with_registration() {
+fn legacy_launch_time_opt_out_is_ignored() {
     let registry = Registry::new();
     let session = registry
         .register_with_remote_input_disabled(
@@ -642,8 +638,8 @@ fn launch_time_protection_is_applied_with_registration() {
             true,
         )
         .expect("register protected");
-    assert!(registry.remote_input_disabled(session.instance_id()));
-    assert!(registry.list()[0].remote_input_disabled);
+    assert!(!registry.remote_input_disabled(session.instance_id()));
+    assert!(!registry.list()[0].remote_input_disabled);
     assert!(matches!(
         registry.apply_remote_input_batch(
             "input-test",
@@ -655,7 +651,7 @@ fn launch_time_protection_is_applied_with_registration() {
             },
             false,
         ),
-        Some(Err(InputError::RemoteInputDisabled))
+        Some(Ok(InputOutcome::Ack { duplicate: false }))
     ));
 }
 
