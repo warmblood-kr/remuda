@@ -169,13 +169,6 @@ fn valid_identity(value: &str) -> bool {
 /// Rebuild the locally selected name as one uninterrupted trusted style span.
 /// Validation has already bounded and checked every SGR sequence in `line`.
 fn highlight_name(line: &str, name: &str) -> Result<String, &'static str> {
-    fn skip_sgr(line: &str, mut at: usize) -> Result<usize, &'static str> {
-        while line[at..].starts_with('\x1b') {
-            let end = line[at..].find('m').ok_or("invalid style")?;
-            at += end + 1;
-        }
-        Ok(at)
-    }
     let mut at = 0;
     let mut indent = String::new();
     loop {
@@ -186,18 +179,92 @@ fn highlight_name(line: &str, name: &str) -> Result<String, &'static str> {
         indent.push(' ');
         at += 1;
     }
+    if let Some(highlighted) = select_name_at(&indent, line, at, name)? {
+        return Ok(highlighted);
+    }
+    let start = name_after_status(line).ok_or("displayed name mismatch")?;
+    select_name_at(&line[..start], line, start, name)?.ok_or("displayed name mismatch")
+}
+
+/// Rebuild `line` with the name at `start` selected. `None` when the name is
+/// not there; SGR between the name's characters is skipped so the renderer's
+/// own name style does not hide it.
+fn select_name_at(
+    prefix: &str,
+    line: &str,
+    start: usize,
+    name: &str,
+) -> Result<Option<String>, &'static str> {
+    let mut at = start;
     for ch in name.chars() {
         at = skip_sgr(line, at)?;
         if !line[at..].starts_with(ch) {
-            return Err("displayed name mismatch");
+            return Ok(None);
         }
         at += ch.len_utf8();
     }
-    Ok(format!("{indent}\x1b[1;7;36m{name}\x1b[0m{}", &line[at..]))
+    Ok(Some(format!(
+        "{prefix}\x1b[1;7;36m{name}\x1b[0m{}",
+        &line[at..]
+    )))
+}
+
+fn skip_sgr(line: &str, mut at: usize) -> Result<usize, &'static str> {
+    while line[at..].starts_with('\x1b') {
+        let end = line[at..].find('m').ok_or("invalid style")?;
+        at += end + 1;
+    }
+    Ok(at)
+}
+
+/// The status glyphs the list renderer puts before a name: the horse means a
+/// working program, the hollow circle a fresh idle one, `!` a program waiting
+/// for a human, and the filled dot the ordinary state. The cell is two
+/// terminal cells wide, so one-cell glyphs are padded before the separator.
+const STATUS_GLYPHS: [&str; 4] = ["🏇", "○", "●", "!"];
+/// The status cell and its separator, in terminal cells.
+const STATUS_PREFIX_CELLS: usize = 3;
+
+fn glyph_width(glyph: &str) -> usize {
+    glyph
+        .chars()
+        .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1))
+        .sum()
+}
+
+/// Byte offset where the name starts on a row with a status cell:
+/// indentation, a two-cell glyph, then the separator. `None` on a row without
+/// one, so an older peer's row keeps its own shape.
+fn name_after_status(line: &str) -> Option<usize> {
+    let mut at = 0;
+    loop {
+        at = skip_sgr(line, at).ok()?;
+        if !line[at..].starts_with(' ') {
+            break;
+        }
+        at += 1;
+    }
+    let glyph = STATUS_GLYPHS
+        .iter()
+        .find(|glyph| line[at..].starts_with(**glyph))?;
+    at = skip_sgr(line, at + glyph.len()).ok()?;
+    // One-cell glyphs are padded; the renderer never styles inside the cell,
+    // so the padding is plain spaces up to the separator.
+    for _ in glyph_width(glyph)..STATUS_PREFIX_CELLS {
+        if !line[at..].starts_with(' ') {
+            return None;
+        }
+        at += 1;
+    }
+    Some(at)
 }
 
 fn shows_name(plain: &str, name: &str) -> bool {
     let text = plain.trim_start_matches(' ');
+    name_at(text, name) || name_after_status(text).is_some_and(|at| name_at(&text[at..], name))
+}
+
+fn name_at(text: &str, name: &str) -> bool {
     text.strip_prefix(name)
         .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(' '))
 }
@@ -304,7 +371,9 @@ fn visible_width(text: &str) -> usize {
     }
     width
 }
-/// The same state-dot and attachment spacing as the local session pane.
+/// Fit a list row to `width`. The current renderer puts a two-cell status cell
+/// and a separator before the name, so the name shrinks while the mark stays;
+/// rows from an older peer keep the trailing dot and its reserved cells.
 pub fn fit_session_row(content: &str, width: u16) -> String {
     const MARKER: &str = " 🏇";
     const PLAIN_PAD: &str = "   ";
@@ -323,6 +392,21 @@ pub fn fit_session_row(content: &str, width: u16) -> String {
     if let Some(name) = content.strip_suffix(MARKER) {
         let name_width = width.saturating_sub(visible_width(MARKER) as u16);
         return format!("{}{}", fit(name, name_width), MARKER);
+    }
+    if let Some(at) = name_after_status(content) {
+        let prefix = &content[..at];
+        let name_width = width.saturating_sub(visible_width(prefix) as u16);
+        // A compact row joins the detail with two spaces and a dim style. The
+        // detail may be cut, but the name must survive whole when it can.
+        if let Some(dim) = content[at..].find("\x1b[2m") {
+            let head = &content[at..at + dim];
+            if visible_width(head) < usize::from(name_width) {
+                let rest = name_width - visible_width(head) as u16;
+                return format!("{prefix}{head}{}", fit(&content[at + dim..], rest));
+            }
+            return format!("{prefix}{}", fit(head.trim_end_matches(' '), name_width));
+        }
+        return format!("{prefix}{}", fit(&content[at..], name_width));
     }
     fit(content, width)
 }

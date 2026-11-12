@@ -2619,6 +2619,12 @@ fn set_program_status(
             value.set("progress", progress)?;
         }
         row.set("program_status", value)?;
+        // The list draws the same freshness rule the cluster tree uses; a
+        // missing age cannot be proven fresh, so it reads as no report.
+        let fresh = status.state.fresh_limit().is_some_and(|limit| {
+            age_ms.is_some_and(|age| core::time::Duration::from_millis(age) <= limit)
+        });
+        row.set("program_status_fresh", fresh)?;
     }
     if let Some(age) = age_ms {
         row.set("program_status_age", age as f64 / 1000.0)?;

@@ -439,6 +439,22 @@ impl ProgramState {
             ProgramState::Unknown => "unknown",
         }
     }
+
+    /// How long a report of this state stays believable. A working report is
+    /// renewed cheaply and goes stale fast; idle and terminal states are
+    /// quiet by nature, so they age slowly. `unknown` never counts as fresh,
+    /// and this is the only place the two limits are written down — the list
+    /// and the cluster tree must agree about what "fresh" means.
+    pub fn fresh_limit(self) -> Option<core::time::Duration> {
+        match self {
+            ProgramState::Working => Some(core::time::Duration::from_secs(600)),
+            ProgramState::Idle
+            | ProgramState::Blocked
+            | ProgramState::Done
+            | ProgramState::Error => Some(core::time::Duration::from_secs(3600)),
+            ProgramState::Unknown => None,
+        }
+    }
 }
 
 /// What a `blocked` program waits for; display only, never approval.

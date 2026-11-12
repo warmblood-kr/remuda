@@ -2560,9 +2560,9 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
     fit_session_row(&content, width)
 }
 
-/// Keep the status dot in one shared column on every row. Attached rows use
-/// the horse in the final three cells; other rows reserve the same cells.
-/// Only the styled name is shortened, one Unicode scalar at a time, by `fit`.
+/// Fit a row to the list width. The status cell and its separator keep their
+/// two/shared columns; only the styled name is shortened, one Unicode scalar at
+/// a time, by `fit`.
 fn fit_session_row(content: &str, width: u16) -> String {
     remuda_core::session_view::fit_session_row(content, width)
 }
@@ -5009,14 +5009,16 @@ mod peer_view_fit_acceptance {
     #[test]
     fn actual_fitting_gates_compact_wide_names_and_truncation() {
         let view = lua_view(true);
-        assert!(validated_peer_view(&view, 6, Some(("한글", "b"))).is_err());
-        assert!(validated_peer_view(&view, 8, Some(("한글", "b"))).is_ok());
+        // Two cells of indent, a two-cell status cell and its separator, then
+        // the four cells of 한글: eight is one short, nine is exact.
+        assert!(validated_peer_view(&view, 8, Some(("한글", "b"))).is_err());
+        assert!(validated_peer_view(&view, 9, Some(("한글", "b"))).is_ok());
     }
     #[test]
-    fn actual_fitting_accounts_for_stacked_status_dot_space() {
+    fn actual_fitting_accounts_for_stacked_status_cell_space() {
         let view = lua_view(false);
-        assert!(validated_peer_view(&view, 10, Some(("한글", "b"))).is_err());
-        assert!(validated_peer_view(&view, 11, Some(("한글", "b"))).is_ok());
+        assert!(validated_peer_view(&view, 8, Some(("한글", "b"))).is_err());
+        assert!(validated_peer_view(&view, 9, Some(("한글", "b"))).is_ok());
     }
     #[test]
     fn local_selection_survives_peer_resets_in_actual_fitted_output() {
@@ -5042,5 +5044,64 @@ mod peer_view_fit_acceptance {
         let checked = validated_peer_view(&view, 30, Some(("한글", "b"))).unwrap();
         assert!(checked.entries()[0].lines[0].contains("\x1b[1;7;36m한글\x1b[0m"));
         assert!(validated_peer_view(&view, 30, Some(("한글", "old"))).is_err());
+    }
+
+    #[test]
+    fn nested_selected_colored_status_row_survives_validation_and_fitting() {
+        // The row that exposed the parser gap: indented, colored status cell,
+        // selected name. It must validate through the real remote path, keep
+        // the cell, and truncate through the cell at narrow widths.
+        let lua = mlua::Lua::new();
+        let remuda = lua.create_table().unwrap();
+        remuda
+            .set("_registry", lua.create_table().unwrap())
+            .unwrap();
+        lua.globals().set("remuda", remuda).unwrap();
+        lua.load(include_str!("tools.lua")).exec().unwrap();
+        let view: mlua::Table = lua
+            .load(
+                r#"
+            remuda.session_order = function() return {{name='idle-child', depth=1}} end
+            remuda.session_list_decorate = function() return { agent_kind='codex', description='42%' } end
+            return remuda._render_sessions_snapshot({
+                {name='idle-child', instance_id='i', alive=true,
+                 program_status={state='idle'}, program_status_fresh=true},
+            }, 40, 'idle-child', 'i')
+        "#,
+            )
+            .eval()
+            .unwrap();
+        let entries: mlua::Table = view.get("entries").unwrap();
+        let entries = entries
+            .sequence_values::<mlua::Table>()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let lines: mlua::Table = entry.get("lines").unwrap();
+                ViewEntry {
+                    name: entry.get("name").unwrap(),
+                    instance_id: entry.get("instance_id").unwrap(),
+                    lines: lines
+                        .sequence_values::<String>()
+                        .map(Result::unwrap)
+                        .collect(),
+                }
+            })
+            .collect();
+        let view = SessionView::new(
+            vec![session("idle-child", "i")],
+            view.get("height").unwrap(),
+            entries,
+        );
+        let checked = validated_peer_view(&view, 40, Some(("idle-child", "i")))
+            .expect("nested colored row with a selection");
+        let line = &checked.entries()[0].lines[0];
+        assert!(line.contains("\x1b[1;7;36midle-child\x1b[0m"), "{line:?}");
+        assert!(line.contains("\x1b[32m○\x1b[0m"), "{line:?}");
+        let narrow = fit_session_row(line, 12);
+        assert!(narrow.starts_with("  \x1b[32m○\x1b[0m  "), "{narrow:?}");
+        assert!(narrow.ends_with('→'), "{narrow:?}");
+        assert_eq!(visible_width(&narrow), 12);
+        assert!(validated_peer_view(&view, 12, Some(("idle-child", "i"))).is_err());
+        assert!(validated_peer_view(&view, 16, Some(("idle-child", "i"))).is_ok());
     }
 }

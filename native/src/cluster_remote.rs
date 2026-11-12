@@ -1,6 +1,6 @@
 //! Bounded remote-node polling state, separate from the cluster tree renderer.
 
-use remuda_core::agent::{ProgramState, ProgramStatus, ScreenSnapshot};
+use remuda_core::agent::{ProgramStatus, ScreenSnapshot};
 use remuda_core::protocol::{expand_runs, Request, Response};
 use std::collections::{BTreeMap, HashSet};
 use std::io;
@@ -58,13 +58,8 @@ impl RemoteProgramStatus {
     }
 
     pub fn is_fresh_at(&self, now: Instant) -> bool {
-        let limit = match self.status.state {
-            ProgramState::Working => Duration::from_secs(600),
-            ProgramState::Idle
-            | ProgramState::Blocked
-            | ProgramState::Done
-            | ProgramState::Error => Duration::from_secs(3600),
-            ProgramState::Unknown => return false,
+        let Some(limit) = self.status.state.fresh_limit() else {
+            return false;
         };
         self.age_at(now) <= limit
     }
