@@ -9,11 +9,13 @@ pub const LIST_CONTEXT: &str = "session.list.browse";
 pub const TOGGLE_LIST: &str = "session.toggle_list";
 /// Open the line composer for the selected session.
 pub const COMPOSE: &str = "session.compose";
+/// Re-read the current session list and repaint its existing decorators.
+pub const REFRESH: &str = "session.refresh";
 
 /// The single native capability catalog. Keys and help belong to Lua.
 fn validate(context: &str, key: &str, action: Option<&str>) -> Result<String, String> {
     let actions: &[&str] = match context {
-        LIST_CONTEXT => &[TOGGLE_LIST, COMPOSE],
+        LIST_CONTEXT => &[TOGGLE_LIST, COMPOSE, REFRESH],
         "cluster.tree" => &[
             "cluster.detach",
             "cluster.close",
@@ -489,10 +491,56 @@ mod tests {
     }
 
     #[test]
+    fn session_refresh_default_rebind_unbind_and_help_share_the_registry() {
+        use super::{Snapshot, LIST_CONTEXT};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let lua = lua();
+        lua.globals()
+            .get::<mlua::Table>("remuda")
+            .unwrap()
+            .set("json", crate::json::bindings(&lua).unwrap())
+            .unwrap();
+        let snapshot = || {
+            let wire = lua
+                .load("return remuda.json.encode(remuda.keymap_snapshot())")
+                .eval::<String>()
+                .unwrap();
+            Snapshot::from_json(&wire).unwrap()
+        };
+        let key = |modifiers| KeyEvent::new(KeyCode::Char('r'), modifiers);
+        assert_eq!(
+            snapshot().resolve(LIST_CONTEXT, key(KeyModifiers::NONE)),
+            Some("session.refresh")
+        );
+        assert!(snapshot().help(LIST_CONTEXT).contains("r refresh"));
+        lua.load("remuda.rebind('session.list.browse', 'session.refresh', 'M-r')")
+            .exec()
+            .unwrap();
+        assert_eq!(
+            snapshot().resolve(LIST_CONTEXT, key(KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            snapshot().resolve(LIST_CONTEXT, key(KeyModifiers::ALT)),
+            Some("session.refresh")
+        );
+        assert!(snapshot().help(LIST_CONTEXT).contains("M-r refresh"));
+        lua.load("remuda.unbind('session.list.browse', 'M-r')")
+            .exec()
+            .unwrap();
+        assert_eq!(
+            snapshot().resolve(LIST_CONTEXT, key(KeyModifiers::ALT)),
+            None
+        );
+        assert!(!snapshot().help(LIST_CONTEXT).contains("refresh"));
+    }
+
+    #[test]
     fn keybindings_help_controls_are_rejected_before_committing() {
         lua().load(r#"
             remuda.unbind('session.list.browse', 'l')
             remuda.unbind('session.list.browse', 'm')
+            remuda.unbind('session.list.browse', 'r')
             local before = remuda.keymap_snapshot().generation
             for _, help in ipairs({'bad\0help', 'bad\27help', 'bad\194\128help', 'bad\194\159help'}) do
                 local ok = pcall(remuda.define_key, {context='session.list.browse', key='z', action='session.toggle_list', help=help})
@@ -672,7 +720,7 @@ mod native_tests {
         );
         let wire = lua.load("local s=remuda.keymap_snapshot(); s.rows=remuda.json.array(s.rows); return remuda.json.encode(s)").eval::<String>().unwrap();
         let map = Snapshot::from_json(&wire).unwrap();
-        assert_eq!(map.help(LIST_CONTEXT), "m message   l list");
+        assert_eq!(map.help(LIST_CONTEXT), "m message   r refresh   l list");
     }
 
     #[test]

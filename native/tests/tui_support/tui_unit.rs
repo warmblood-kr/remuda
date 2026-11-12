@@ -3515,6 +3515,122 @@ fn refresh_skips_the_herd_relist_only_when_asked() {
     );
 }
 
+fn refresh_from_manual_key<P: SessionPort + ?Sized>(
+    path: &P,
+    ui: &mut Ui,
+    held: &mut Option<(String, P::Keys)>,
+    painted: &mut String,
+    shown: &mut Option<ShownTarget>,
+) {
+    let action = ui.on_key(press(KeyCode::Char('r')));
+    assert_eq!(action, Action::Refresh);
+    let skip_list = prepare_refresh(&action, &mut ui.notice, painted);
+    assert!(!skip_list);
+    assert!(
+        painted.is_empty(),
+        "manual refresh forces a complete repaint"
+    );
+    assert!(
+        ui.notice.is_none(),
+        "a stale failure must not obscure fresh evidence"
+    );
+    refresh(path, "private", ui, held, painted, shown, skip_list, false).unwrap();
+}
+
+#[test]
+fn manual_refresh_rereads_file_backed_model_and_herd_through_private_daemon() {
+    let path = scratch_socket("manual-model-refresh");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "alpha");
+    new_session(&path, "bravo");
+    let evidence = path.parent().unwrap().join("model.txt");
+    std::fs::write(&evidence, "old-model").unwrap();
+    eval(
+        &path,
+        &format!(
+            r#"
+        remuda.session_order = function() return {{{{name='bravo'}}, {{name='alpha'}}}} end
+        remuda.session_list_decorate = function()
+            local file = assert(io.open({}, 'r'))
+            local model = file:read('*a'); file:close()
+            return {{layout='compact', description=model}}
+        end
+    "#,
+            mcp::lua_string(evidence.to_str().unwrap())
+        ),
+    );
+    let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+    ui.set_keymap(crate::keybindings::fetch(&path, Duration::from_secs(2)).unwrap());
+    let (mut held, mut painted, mut shown) = (None, String::new(), None);
+    refresh(
+        &path,
+        "private",
+        &mut ui,
+        &mut held,
+        &mut painted,
+        &mut shown,
+        false,
+        false,
+    )
+    .unwrap();
+    assert!(
+        painted.contains("old-model"),
+        "initial decorator evidence: {painted:?}"
+    );
+    let selected = ui.selected().unwrap().name.clone();
+    std::fs::write(&evidence, "new-model").unwrap();
+    new_session(&path, "charlie");
+    ui.notice = Some("previous refresh failed".into());
+    let before = request_counts(&path);
+    refresh_from_manual_key(&path, &mut ui, &mut held, &mut painted, &mut shown);
+    let after = request_counts(&path);
+    assert_eq!(after.0 - before.0, 1, "manual refresh really sends List");
+    assert!(after.1 > before.1, "manual refresh really sends Eval");
+    assert_eq!(
+        ui.sessions
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        ["bravo", "alpha", "charlie"]
+    );
+    assert_eq!(ui.selected().unwrap().name, selected);
+    assert_eq!(ui.session_rows, 1);
+    assert_eq!(ui.sessions_text.len(), 3);
+    assert!(ui
+        .sessions_text
+        .iter()
+        .all(|line| line.contains("new-model")));
+    assert!(!painted.contains("old-model"));
+    assert!(painted.contains("new-model"));
+    assert!(
+        held.is_none(),
+        "refresh never attaches or sends session input"
+    );
+
+    std::fs::write(&evidence, "?").unwrap();
+    refresh_from_manual_key(&path, &mut ui, &mut held, &mut painted, &mut shown);
+    assert!(ui.sessions_text.iter().all(|line| line.contains('?')));
+    assert!(
+        !painted.contains("new-model"),
+        "unknown evidence stays unknown"
+    );
+
+    eval(
+        &path,
+        "remuda._refresh_sessions_buffer = function() error('manual refresh failed') end",
+    );
+    refresh_from_manual_key(&path, &mut ui, &mut held, &mut painted, &mut shown);
+    assert!(ui
+        .notice
+        .as_deref()
+        .unwrap()
+        .contains("manual refresh failed"));
+    assert!(
+        painted.contains("manual refresh failed"),
+        "failure is visible: {painted:?}"
+    );
+}
+
 /// `request_counts()`'s three fields read back through one `Eval` — the
 /// same shape `native/tests/script.rs`'s sibling helper reads.
 fn request_counts(path: &std::path::Path) -> (u64, u64, u64) {

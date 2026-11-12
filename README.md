@@ -42,6 +42,14 @@ says which, always, which is the part tmux leaves in your head.
 ↑↓ select   ⏎ enter   n new   x kill   h/l pan a cropped preview   q quit
 ```
 
+Press `r` while browsing the session list to re-read the list and its Lua
+decorations, then repaint the screen. It does not send session input or restart
+the daemon. Model labels reflect the evidence the installed decorator can read;
+refresh does not change the model or reload configuration. On a remote session
+screen it redraws the latest received snapshot, without forcing a network query.
+See [UI key bindings](docs/lua.md#ui-key-bindings-session-list-and-cluster-ui)
+to rebind or remove the default `r refresh` control.
+
 One key rather than a prefix, because a prefix exists to open a *namespace* and
 there is exactly one command from inside a session. One keypress is also one
 byte, so it carries no inter-key timing for a stack of nested ttys to mangle.
