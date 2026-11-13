@@ -6886,8 +6886,8 @@ mod tests {
         assert_eq!(side.iter().filter(|line| line.starts_with('>')).count(), 1);
     }
 
-    fn stacked_ui(clock: &ManualClock) -> ClusterUi {
-        let sessions = (0..12)
+    fn stacked_ui(clock: &ManualClock, count: usize) -> ClusterUi {
+        let sessions = (0..count)
             .map(|index| session(&format!("s{index:02}"), true))
             .collect::<Vec<_>>();
         let mut ui = make_ui("studio", sessions.clone(), clock.now());
@@ -6910,7 +6910,7 @@ mod tests {
     #[test]
     fn stacked_rows_scroll_to_keep_the_selected_tail_row_visible() {
         let clock = ManualClock::new();
-        let mut ui = stacked_ui(&clock);
+        let mut ui = stacked_ui(&clock, 12);
         ui.selected = 11;
         ui.active = 11;
         let tree = ui.tree_lines(ui.tree_width(100, clock.now()), clock.now());
@@ -6930,7 +6930,7 @@ mod tests {
     #[test]
     fn stacked_rows_scroll_at_narrow_width_and_follow_keyboard_movement() {
         let clock = ManualClock::new();
-        let mut ui = stacked_ui(&clock);
+        let mut ui = stacked_ui(&clock, 12);
         ui.selected = 11;
         ui.active = 11;
         let frame = ui.render_text(40, 24, "pane", &clock);
@@ -6949,6 +6949,49 @@ mod tests {
                 .any(|line| line.starts_with('>') && line.contains("s10")),
             "{frame}"
         );
+    }
+
+    #[test]
+    fn stacked_rows_scroll_at_the_viewport_boundary() {
+        let clock = ManualClock::new();
+        for (count, indicator) in [(10, false), (11, true)] {
+            let mut ui = stacked_ui(&clock, count);
+            ui.selected = count - 1;
+            ui.active = count - 1;
+            let tree = ui.tree_lines(ui.tree_width(100, clock.now()), clock.now());
+            assert_eq!(tree.len(), 2 + count * 2, "count={count}");
+            let frame = ui.render_text(100, 24, "pane", &clock);
+            let side = tree_side(&frame);
+            let selected = format!("s{:02}", count - 1);
+            assert!(
+                side.iter()
+                    .any(|line| line.starts_with('>') && line.contains(&selected)),
+                "count={count}: {frame}"
+            );
+            assert_eq!(
+                side.iter().any(|line| line.contains("… earlier")),
+                indicator,
+                "count={count}: {frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn resize_keeps_the_selected_stacked_row_visible() {
+        let clock = ManualClock::new();
+        let mut ui = stacked_ui(&clock, 12);
+        ui.selected = 11;
+        ui.active = 11;
+        for (cols, rows) in [(120, 24), (40, 24), (100, 18), (100, 24)] {
+            let frame = ui.render_text(cols, rows, "pane", &clock);
+            assert!(frame.lines().count() <= usize::from(rows), "{cols}x{rows}");
+            assert!(
+                tree_side(&frame)
+                    .iter()
+                    .any(|line| line.starts_with('>') && line.contains("s11")),
+                "{cols}x{rows}: {frame}"
+            );
+        }
     }
 
     #[test]
