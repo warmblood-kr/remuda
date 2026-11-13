@@ -7124,6 +7124,55 @@ mod tests {
     }
 
     #[test]
+    fn remote_view_must_match_the_full_identity_set() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("body"));
+        let mut second = ui.remote_snapshot.nodes[0].sessions[0].clone();
+        second.name = "shell".into();
+        second.wire_name = "shell".into();
+        second.instance_id = "shell-instance".into();
+        ui.remote_snapshot.nodes[0].sessions.push(second);
+
+        // Partial set: one of the node's two identities is missing.
+        ui.remote_view_synced(
+            "fp-laptop",
+            remote_detail_view(&[("build", "remote-instance")]),
+            clock.now(),
+        );
+        assert!(ui.remote_view("fp-laptop", clock.now()).is_none());
+
+        // Exact set is accepted.
+        ui.remote_view_synced(
+            "fp-laptop",
+            remote_detail_view(&[("build", "remote-instance"), ("shell", "shell-instance")]),
+            clock.now(),
+        );
+        assert!(ui.remote_view("fp-laptop", clock.now()).is_some());
+
+        // The node's list changes: the old view is dropped instead of being
+        // reused for a different identity set.
+        ui.remote_snapshot.nodes[0].sessions.remove(1);
+        ui.retain_remote_views();
+        assert!(ui.remote_view("fp-laptop", clock.now()).is_none());
+
+        // Duplicate identity inside the view is rejected as a whole.
+        ui.remote_view_synced(
+            "fp-laptop",
+            remote_detail_view(&[("build", "remote-instance"), ("build", "remote-instance")]),
+            clock.now(),
+        );
+        assert!(ui.remote_view("fp-laptop", clock.now()).is_none());
+
+        // Extra identity not present in the node's List is rejected too.
+        ui.remote_view_synced(
+            "fp-laptop",
+            remote_detail_view(&[("build", "remote-instance"), ("ghost", "ghost-instance")]),
+            clock.now(),
+        );
+        assert!(ui.remote_view("fp-laptop", clock.now()).is_none());
+    }
+
+    #[test]
     fn remote_tree_order_follows_the_view_and_pending_rows_stay_plain() {
         let clock = ManualClock::new();
         let mut ui = selected_remote_ui(&clock, remote_screen("body"));
