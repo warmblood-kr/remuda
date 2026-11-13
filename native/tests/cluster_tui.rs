@@ -406,6 +406,45 @@ fn local_tree_frame_uses_daemon_registered_decorations_and_depth() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn typing_stays_responsive_while_the_local_view_decorator_is_slow() {
+    let mut daemon = PrivateDaemon::start_with_init(Some(
+        r#"
+        remuda.session_list_decorate = function()
+            os.execute("sleep 1")
+            return { agent_kind = "codex", description = "slow" }
+        end
+        "#,
+    ));
+    daemon.wait_ready();
+    let response = remuda_native::client::request(
+        &daemon.path(),
+        &Request::New {
+            name: Some("slow-session".into()),
+            command: vec!["sh".into(), "-c".into(), "sleep 30".into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .unwrap();
+    assert!(matches!(response, Response::Value(name) if name == "slow-session"));
+    let mut tui = TuiPty::start(&daemon.runtime);
+    tui.wait_for("slow-session", Duration::from_secs(5));
+    // The 250 ms view timeout is now in flight; a synchronous renderer call
+    // would hold this key for that long.
+    std::thread::sleep(Duration::from_millis(60));
+    let started = Instant::now();
+    tui.writer.write_all(b"?").unwrap();
+    tui.wait_for("remuda · cluster help", Duration::from_secs(2));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "typing latency {elapsed:?}"
+    );
+}
+
 fn strip_sgr(text: &str) -> String {
     let mut plain = String::new();
     let mut chars = text.chars();
