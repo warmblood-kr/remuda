@@ -837,7 +837,9 @@ impl ClusterUi {
                 wire_name: wire_name.clone(),
                 instance_id: instance_id.clone(),
             },
-            None if self.local_node_selected => TreeSelection::LocalNode,
+            None if self.local_node_selected || self.sessions.is_empty() => {
+                TreeSelection::LocalNode
+            }
             None => TreeSelection::LocalSession(self.selected),
         }
     }
@@ -7209,6 +7211,25 @@ mod tests {
             "a peer error must win over the decorated row: {row:?}"
         );
         assert!(row.contains('!'), "the error glyph is kept: {row:?}");
+    }
+
+    #[test]
+    fn down_moves_off_the_local_node_when_the_local_daemon_has_no_sessions() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", Vec::new(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            None,
+        ))));
+        assert_eq!(ui.current_tree_selection(), TreeSelection::LocalNode);
+        ui.key(crossterm::event::KeyCode::Down);
+        assert_eq!(
+            ui.current_tree_selection(),
+            TreeSelection::RemoteNode("fp-laptop".into())
+        );
+        ui.key(crossterm::event::KeyCode::Right);
+        assert!(ui.remote_expanded.contains("fp-laptop"));
     }
 
     #[test]
