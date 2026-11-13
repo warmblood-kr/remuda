@@ -318,7 +318,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ui.sessions.len(), 1);
-        assert!(ui.sessions_text.is_empty(), "plain names, no Lua buffer");
+        // A peer without Lua still renders its plain names through the text
+        // column; only the rendered-view request is unavailable.
+        assert_eq!(ui.sessions_text.len(), 1);
+        assert!(ui.sessions_text[0].contains("build"), "plain name row");
         assert!(
             matches!(&shown, Some(super::super::ShownTarget::Session(name)) if name == "build")
         );
