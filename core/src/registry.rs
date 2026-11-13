@@ -351,11 +351,22 @@ impl Registry {
         instance_id: &str,
         team: Option<SessionTeam>,
     ) -> Option<core::result::Result<(), &'static str>> {
+        // Setting metadata is an act on a live incarnation. A registered but
+        // exited instance is refused: otherwise a stale launch could publish a
+        // leader relation for a process that no longer exists. The registry
+        // forgets the entry when the instance is reaped or closed.
         let current = if let Some(session) = self.get(name) {
-            session.instance_id() == instance_id && session.is_alive()
+            session.instance_id() == instance_id && session.is_alive() && !session.is_closing()
         } else {
             let handle = self.hosted(name)?;
-            handle.identity().instance == instance_id
+            if handle.identity().instance != instance_id {
+                return Some(Err("stale session instance"));
+            }
+            matches!(
+                handle.inspect(),
+                Ok(observation)
+                    if observation.lifecycle == Lifecycle::Running && !observation.closing
+            )
         };
         if !current {
             return Some(Err("stale session instance"));

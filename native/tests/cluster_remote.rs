@@ -1770,6 +1770,258 @@ fn real_modern_peer_list_carries_bounded_team_metadata() {
     );
 }
 
+/// The real Butler producer, not a test-only setter call: boot the actual mod
+/// from a remuda-butler checkout, launch agents through its launch path, and
+/// read the structured team back over the cluster's List. Set
+/// `REMUDA_BUTLER_SRC` to the checkout root (the directory holding
+/// `extension.toml`). The test is skipped when it is unset so the ordinary
+/// suite does not depend on an external repository.
+#[test]
+#[allow(clippy::too_many_lines)] // One assembled path: boot, launch, reparent, remote list.
+fn real_butler_launch_publishes_team_metadata_to_a_remote_list() {
+    let Some(butler_src) = std::env::var_os("REMUDA_BUTLER_SRC").map(PathBuf::from) else {
+        eprintln!(
+            "skip: set REMUDA_BUTLER_SRC to the remuda-butler checkout with the team producer"
+        );
+        return;
+    };
+    assert!(
+        butler_src.join("extension.toml").is_file(),
+        "REMUDA_BUTLER_SRC has no extension.toml"
+    );
+    assert!(
+        butler_src.join("packages/butler/init.lua").is_file(),
+        "REMUDA_BUTLER_SRC has no packages/butler/init.lua"
+    );
+
+    let client_node = Node::start_with_env(
+        "team-live-client",
+        vec![("REMUDA_NO_UPDATE_CHECK".into(), "1".into())],
+    );
+    let mut server_node = Node::start_with_env(
+        "team-live-server",
+        vec![("REMUDA_NO_UPDATE_CHECK".into(), "1".into())],
+    );
+    install_butler_mod(&server_node, &butler_src);
+    server_node.restart_daemon();
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    point_client_at(&client_node, &server_node, &listener);
+
+    // The private argv seam keeps the launch path real (remuda.new, roster
+    // registration, producer) while the agent process is a harmless shell.
+    let boot = server_node
+        .command()
+        .args([
+            "-e",
+            "remuda._butler_argv = {'sh', '-c', 'while :; do sleep 1; done'}; \
+             remuda._butler_skip_relay = true",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        boot.status.success(),
+        "butler argv setup failed: {}",
+        String::from_utf8_lossy(&boot.stderr)
+    );
+    let exec = server_node
+        .command()
+        .args(["exec", "butler"])
+        .output()
+        .unwrap();
+    assert!(
+        exec.status.success(),
+        "butler boot failed: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+    wait_for("butler bus", Duration::from_secs(15), || {
+        eval_node(&server_node, "return remuda._butler_bus ~= nil") == "true"
+    });
+    wait_for("butler root instance", Duration::from_secs(30), || {
+        eval_node(
+            &server_node,
+            "local a = remuda._butler_bus.agents.butler; \
+             return type(a) == 'table' and type(a.instance_id) == 'string' and a.instance_id ~= ''",
+        ) == "true"
+    });
+
+    let socket = remuda_native::daemon::socket_path_in(&server_node.runtime, &server_node.name);
+    let rows = local_rows(&socket);
+    let root_instance = rows
+        .iter()
+        .find(|row| row.name == "butler")
+        .and_then(|row| row.instance_id.clone())
+        .expect("root instance");
+
+    eval_node(
+        &server_node,
+        "return remuda._butler_launch('codex', 'member', 'gpt-6.1', 'butler')",
+    );
+    wait_for("member team", Duration::from_secs(30), || {
+        local_rows(&socket)
+            .iter()
+            .any(|row| row.name == "member" && row.team.is_some())
+    });
+    let rows = local_rows(&socket);
+    let member = rows.iter().find(|row| row.name == "member").unwrap();
+    let member_instance = member.instance_id.clone().unwrap();
+    let member_team = member.team.as_ref().expect("member team");
+    assert_eq!(member_team.agent_kind.as_deref(), Some("codex"));
+    assert_eq!(member_team.model.as_deref(), Some("gpt-6.1"));
+    assert_eq!(member_team.depth, 1);
+    let leader = member_team.leader.as_ref().expect("member leader");
+    assert_eq!(leader.name, "butler");
+    assert_eq!(leader.instance_id, root_instance);
+    let root_team = rows
+        .iter()
+        .find(|row| row.name == "butler")
+        .and_then(|row| row.team.as_ref())
+        .expect("root team");
+    assert_eq!(root_team.depth, 0);
+    assert!(root_team.leader.is_none());
+
+    // A child inherits depth 2 and the member's exact instance.
+    eval_node(
+        &server_node,
+        "return remuda._butler_launch('codex', 'child', 'gpt-6.2', 'member')",
+    );
+    wait_for("child team", Duration::from_secs(30), || {
+        local_rows(&socket)
+            .iter()
+            .any(|row| row.name == "child" && row.team.is_some())
+    });
+    let rows = local_rows(&socket);
+    let child_team = rows
+        .iter()
+        .find(|row| row.name == "child")
+        .and_then(|row| row.team.as_ref())
+        .expect("child team");
+    assert_eq!(child_team.depth, 2);
+    assert_eq!(
+        child_team
+            .leader
+            .as_ref()
+            .map(|leader| leader.instance_id.as_str()),
+        Some(member_instance.as_str())
+    );
+
+    // Closing the leader reparents the child to the root; the exited instance
+    // must not keep a leader relation in the next list.
+    eval_node(&server_node, "return remuda.close('member')");
+    wait_for("member exit", Duration::from_secs(20), || {
+        !local_rows(&socket).iter().any(|row| row.name == "member")
+    });
+    let rows = local_rows(&socket);
+    assert!(
+        !rows.iter().any(|row| row.name == "member"),
+        "the closed member is still listed"
+    );
+    let child_team = rows
+        .iter()
+        .find(|row| row.name == "child")
+        .and_then(|row| row.team.as_ref())
+        .expect("child team after adoption");
+    assert_eq!(child_team.depth, 1);
+    let leader = child_team.leader.as_ref().expect("adopted child leader");
+    assert_eq!(leader.name, "butler");
+    assert_eq!(leader.instance_id, root_instance);
+
+    // The same snapshot survives the cluster boundary.
+    let peer = cluster_list(&client_node, &server_node, &listener);
+    let child_team = peer
+        .iter()
+        .find(|row| row.name == "child")
+        .and_then(|row| row.team.as_ref())
+        .expect("remote child team");
+    assert_eq!(child_team.depth, 1);
+    assert_eq!(
+        child_team
+            .leader
+            .as_ref()
+            .map(|leader| leader.instance_id.as_str()),
+        Some(root_instance.as_str())
+    );
+    assert!(!peer.iter().any(|row| row.name == "member"));
+}
+
+fn install_butler_mod(node: &Node, source: &Path) {
+    let root = node.root.join("data/remuda/mods/butler");
+    fs::create_dir_all(&root).unwrap();
+    fs::copy(source.join("extension.toml"), root.join("extension.toml")).unwrap();
+    copy_tree(&source.join("packages"), &root.join("packages"));
+}
+
+fn copy_tree(source: &Path, target: &Path) {
+    fs::create_dir_all(target).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let to = target.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &to);
+        } else {
+            fs::copy(entry.path(), to).unwrap();
+        }
+    }
+}
+
+fn eval_node(node: &Node, code: &str) -> String {
+    let output = node.command().args(["-e", code]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "eval failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn local_rows(socket: &Path) -> Vec<remuda_core::registry::SessionSummary> {
+    match remuda_native::client::request(socket, &Request::List).unwrap() {
+        Response::Sessions(rows) => rows,
+        other => panic!("unexpected local list: {other:?}"),
+    }
+}
+
+fn point_client_at(client_node: &Node, server_node: &Node, listener: &Listener) {
+    let path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server_node.fingerprint())
+        .unwrap()
+        .endpoint = Some(listener.address.to_string());
+    fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+}
+
+fn cluster_list(
+    client_node: &Node,
+    server_node: &Node,
+    listener: &Listener,
+) -> Vec<remuda_core::registry::SessionSummary> {
+    let client = ClusterClient::with_timeouts(
+        Arc::new(SystemWallClock::new()),
+        ClientTimeouts {
+            connect: Duration::from_secs(2),
+            read: Duration::from_secs(3),
+            total: Duration::from_secs(3),
+        },
+    );
+    match client
+        .request(
+            listener.address,
+            &server_node.public,
+            &client_node.private,
+            &Request::List,
+        )
+        .unwrap()
+    {
+        Response::Sessions(rows) => rows,
+        other => panic!("unexpected peer list: {other:?}"),
+    }
+}
+
 #[test]
 fn team_contract_is_additive_and_unknown_fields_are_ignored() {
     let summary = remuda_core::registry::SessionSummary {

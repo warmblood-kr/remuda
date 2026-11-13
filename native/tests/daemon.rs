@@ -3357,14 +3357,22 @@ fn remote_input_is_allowed_for_trusted_peers_even_when_opt_out_was_requested() {
 
 #[cfg(unix)]
 #[test]
-fn a_launch_flag_protects_the_instance_before_the_first_remote_request() {
-    let path = scratch("remote-input-launch-flag");
-    let _daemon = daemon_at(&path);
+fn a_launch_flag_is_advisory_and_does_not_block_trusted_peers() {
+    // #941: the per-session opt-out is accepted for compatibility but never
+    // enforced for a trusted peer. The list says so instead of pretending the
+    // launch flag protects an instance.
+    let dir = scratch_dir("rio2");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = Daemon::spawn(&dir);
     let response = client::request(
         &path,
         &Request::NewWithInstance {
             name: Some("protected".into()),
-            command: vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done".into(),
+            ],
             size: Size::new(80, 24),
             cwd: None,
             env: None,
@@ -3380,10 +3388,12 @@ fn a_launch_flag_protects_the_instance_before_the_first_remote_request() {
         Response::Sessions(rows) => rows,
         other => panic!("unexpected list: {other:?}"),
     };
-    assert!(listed
-        .iter()
-        .any(|row| row.name == name && row.remote_input_disabled));
-    assert_eq!(
+    let row = listed.iter().find(|row| row.name == name).expect("listed");
+    assert!(
+        !row.remote_input_disabled,
+        "the flag is not enforced policy"
+    );
+    assert!(matches!(
         client::request(
             &path,
             &Request::RemoteInput {
@@ -3391,13 +3401,14 @@ fn a_launch_flag_protects_the_instance_before_the_first_remote_request() {
                 instance_id: instance,
                 client_id: "00000000000000000000000000000004".into(),
                 seq: 1,
-                bytes: b"blocked".to_vec(),
+                bytes: b"admitted".to_vec(),
                 line: true,
             }
         )
         .expect("remote line"),
-        Response::RemoteControlDisabled
-    );
+        Response::Ack { duplicate: false }
+    ));
+    wait_for(&path, &name, "got:admitted");
     assert_eq!(
         client::request(
             &path,
@@ -3409,6 +3420,7 @@ fn a_launch_flag_protects_the_instance_before_the_first_remote_request() {
         .expect("local send"),
         Response::Ok
     );
+    wait_for(&path, &name, "got:local");
 }
 
 fn wait_for(path: &Path, name: &str, needle: &str) -> String {
