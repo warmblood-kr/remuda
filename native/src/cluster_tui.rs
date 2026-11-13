@@ -22,8 +22,8 @@ use sender::InputSender;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -284,6 +284,79 @@ struct LocalView {
     view: SessionView,
     at: Duration,
     order: Vec<(String, String)>,
+}
+
+/// One nonblocking local `RenderedSessionList` request at a time. A slow
+/// decorator delays only this reply, never key handling or painting.
+struct LocalViewLoader {
+    replies: mpsc::Receiver<(u64, Option<SessionView>)>,
+    sender: mpsc::Sender<(u64, Option<SessionView>)>,
+    finished: Arc<AtomicU64>,
+    next: u64,
+    in_flight: Option<u64>,
+}
+
+impl LocalViewLoader {
+    fn new() -> Self {
+        let (sender, replies) = mpsc::channel();
+        Self {
+            replies,
+            sender,
+            finished: Arc::new(AtomicU64::new(0)),
+            next: 0,
+            in_flight: None,
+        }
+    }
+
+    fn finished(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.finished)
+    }
+
+    fn idle(&self) -> bool {
+        self.in_flight.is_none()
+    }
+
+    fn request(&mut self, path: &Path) -> bool {
+        let path = path.to_path_buf();
+        self.request_with(move || local_session_view(&path, LOCAL_VIEW_WIDTH))
+    }
+
+    fn request_with<F>(&mut self, fetch: F) -> bool
+    where
+        F: FnOnce() -> Option<SessionView> + Send + 'static,
+    {
+        if !self.idle() {
+            return false;
+        }
+        let generation = self.next;
+        self.next = self.next.wrapping_add(1);
+        self.in_flight = Some(generation);
+        let sender = self.sender.clone();
+        let finished = Arc::clone(&self.finished);
+        let spawned = std::thread::Builder::new()
+            .name("cluster-tui-local-view".into())
+            .spawn(move || {
+                let result = fetch();
+                if sender.send((generation, result)).is_ok() {
+                    finished.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .is_ok();
+        if !spawned {
+            self.in_flight = None;
+        }
+        spawned
+    }
+
+    fn take_reply(&mut self) -> Option<Option<SessionView>> {
+        while let Ok((generation, result)) = self.replies.try_recv() {
+            if self.in_flight == Some(generation) {
+                self.in_flight = None;
+                return Some(result);
+            }
+        }
+        None
+    }
 }
 
 impl ClusterUi {
@@ -716,6 +789,8 @@ impl ClusterUi {
 
     fn local_order(&self, now: Option<Duration>) -> Option<&[(String, String)]> {
         let local = self.local_view.as_ref()?;
+        // A stale view falls back to registry order together with its plain
+        // rows; display and keyboard order must not diverge.
         if now.is_some_and(|now| now.saturating_sub(local.at) >= LOCAL_VIEW_TTL) {
             return None;
         }
@@ -3518,15 +3593,25 @@ fn local_session_view(path: &Path, width: u16) -> Option<SessionView> {
 
 /// Refresh the local name list and, when expanded, its decorated view. A node
 /// that just failed `List` does not spend a second timeout on the view.
-fn sync_local_list(ui: &mut ClusterUi, path: &Path, now: Duration) {
+fn sync_local_list(
+    ui: &mut ClusterUi,
+    path: &Path,
+    local_views: &mut LocalViewLoader,
+    now: Duration,
+) {
     match list(path) {
         Ok(current) => {
             ui.sessions_synced(current, now);
-            if ui.expanded && ui.local_view_due(now) {
-                ui.local_view_requested_at = Some(now);
-                match local_session_view(path, LOCAL_VIEW_WIDTH) {
+            if let Some(result) = local_views.take_reply() {
+                match result {
                     Some(view) => ui.local_view_synced(view, now),
                     None => ui.local_view_failed(),
+                }
+            }
+            if ui.expanded && ui.local_view_due(now) && local_views.idle() {
+                ui.local_view_requested_at = Some(now);
+                if !local_views.request(path) {
+                    ui.local_view_failed();
                 }
             }
         }
@@ -3756,13 +3841,18 @@ fn run_loop(
     let clock = runtime.clock;
     let mut remote_calls = remote_input.map(RemoteDispatcher::new);
     let replies = remote_calls.as_ref().map(RemoteDispatcher::finished);
-    // Moves when a remote poll lands or a remote call replies.
+    let mut local_views = LocalViewLoader::new();
+    let local_view_finished = local_views.finished();
+    // Moves when a remote poll, remote call or local view reply lands.
     let wake = || {
-        remote_source.generation().wrapping_add(
-            replies
-                .as_ref()
-                .map_or(0, |count| count.load(Ordering::SeqCst)),
-        )
+        remote_source
+            .generation()
+            .wrapping_add(
+                replies
+                    .as_ref()
+                    .map_or(0, |count| count.load(Ordering::SeqCst)),
+            )
+            .wrapping_add(local_view_finished.load(Ordering::SeqCst))
     };
     let mut ui = ClusterUi::with_sender(node, list(path)?, clock.now(), InputSender::random()?);
     if let Some((identity, _)) = crate::cluster::nodes()? {
@@ -3779,7 +3869,7 @@ fn run_loop(
     let mut last_full_repaint = clock.now();
     let mut frames = frame_writer()?;
     loop {
-        sync_local_list(&mut ui, path, clock.now());
+        sync_local_list(&mut ui, path, &mut local_views, clock.now());
         // Read before syncing: an update landing during sync/render wakes the wait.
         let seen = wake();
         ui.remote_synced(remote_source);
@@ -3925,9 +4015,9 @@ mod tests {
         help_lines, help_window, is_attention, legend_lines, normalized_terminal_size, present,
         remote_state_label, render_badge, resize_requires_full_repaint,
         select_target_with_remote_wait, session_cell, session_glyph, status_glyph, status_style,
-        terminal_frame, AttentionSignals, Badge, ClusterUi, EndedState, RemoteInputTransport,
-        RemoteSelection, RemoteSource, TreeSelection, ERROR_GLYPH, LOCAL_VIEW_REFRESH,
-        LOCAL_VIEW_TTL,
+        terminal_frame, AttentionSignals, Badge, ClusterUi, EndedState, LocalViewLoader,
+        RemoteInputTransport, RemoteSelection, RemoteSource, TreeSelection, ERROR_GLYPH,
+        LOCAL_VIEW_REFRESH, LOCAL_VIEW_TTL,
     };
     use crate::cluster_remote::{
         RemoteNodeSnapshot, RemoteSessionSnapshot, RemoteSnapshot, RemoteState,
@@ -6618,6 +6708,32 @@ mod tests {
     }
 
     #[test]
+    fn local_view_request_does_not_block_the_ui_loop() {
+        let mut loader = LocalViewLoader::new();
+        let started = Instant::now();
+        assert!(loader.request_with(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            None
+        }));
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "request blocked for {:?}",
+            started.elapsed()
+        );
+        assert!(loader.take_reply().is_none());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(result) = loader.take_reply() {
+                assert!(result.is_none());
+                break;
+            }
+            assert!(Instant::now() < deadline, "slow reply never arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(loader.idle());
+    }
+
+    #[test]
     fn sessions_sync_keeps_selected_and_active_identity_across_reorder() {
         let clock = ManualClock::new();
         let mut ui = make_ui(
@@ -6735,6 +6851,38 @@ mod tests {
         let side = tree_side(&frame);
         assert!(side.iter().any(|line| line.contains("codex · gpt-6.1")));
         assert_eq!(side.iter().filter(|line| line.starts_with('>')).count(), 1);
+    }
+
+    #[test]
+    fn stacked_rows_beyond_the_viewport_clip_the_selected_tail_row() {
+        // A1 scope: the tree has no scroll window. Stacked details (with the
+        // empty spacing line dropped) still outgrow a 24-row viewport once
+        // there are enough sessions; this characterizes that limit.
+        let clock = ManualClock::new();
+        let sessions = (0..12)
+            .map(|index| session(&format!("s{index:02}"), true))
+            .collect::<Vec<_>>();
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let entries = sessions
+            .iter()
+            .map(|session| ViewEntry {
+                name: session.name.clone(),
+                instance_id: session.instance_id.clone().unwrap(),
+                lines: vec![
+                    alive_row(&session.name),
+                    "\x1b[2mcodex · gpt-6.1\x1b[0m".into(),
+                    String::new(),
+                ],
+            })
+            .collect();
+        ui.local_view_synced(SessionView::new(sessions, 3, entries), clock.now());
+        ui.selected = 11;
+        ui.active = 11;
+        let tree = ui.tree_lines(ui.tree_width(100, clock.now()), clock.now());
+        assert_eq!(tree.len(), 26);
+        assert_eq!(tree.iter().position(|line| line.starts_with('>')), Some(24));
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(!tree_side(&frame).join("\n").contains("s11"));
     }
 
     #[test]
