@@ -1391,6 +1391,91 @@ fn remote_node_pane_shows_the_peer_lua_decorated_session_list() {
     assert!(tui.screen_text().contains("🏇"));
 }
 
+#[test]
+fn real_remote_cluster_tree_paints_the_peer_hierarchy_and_falls_back_on_fault() {
+    const DETAIL: &str = "R1DETAIL";
+    let client_node = Node::start("r1-client");
+    let mut server_node = Node::start("r1-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    let config = server_node
+        .command()
+        .args([
+            "-e",
+            r#"
+            remuda.session_order = function(rows)
+                local out = {}
+                for _, row in ipairs(rows) do
+                    if row.name == "tree-parent" then
+                        out[#out + 1] = { name = row.name, depth = 0 }
+                    end
+                end
+                for _, row in ipairs(rows) do
+                    if row.name ~= "tree-parent" then
+                        out[#out + 1] = { name = row.name, depth = 1 }
+                    end
+                end
+                return out
+            end
+            remuda.session_list_decorate = function()
+                return { layout = "compact", agent_kind = "codex", description = "R1DETAIL" }
+            end
+            "#,
+        ])
+        .output()
+        .unwrap();
+    assert!(config.status.success(), "{config:?}");
+    server_node.start_named_session("tree-parent", "sleep 30");
+    server_node.start_named_session("tree-child", "sleep 30");
+
+    let path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server_node.fingerprint())
+        .unwrap()
+        .endpoint = Some(listener.address.to_string());
+    fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+
+    let target = format!("{}/tree-parent", server_node.fingerprint());
+    let tui = RemoteTui::start(&client_node, Some(&target));
+    tui.wait_for(DETAIL, Duration::from_secs(15));
+    let screen = tui.screen_text();
+    assert_eq!(
+        screen.matches(DETAIL).count(),
+        2,
+        "both remote sessions paint the peer detail:\n{screen}"
+    );
+    let child = screen
+        .lines()
+        .find(|line| line.contains("tree-child"))
+        .unwrap();
+    assert!(
+        child.starts_with("       ●  tree-child"),
+        "remote depth is preserved: {child:?}"
+    );
+    assert!(
+        screen.find("tree-parent").unwrap() < screen.find("tree-child").unwrap(),
+        "remote order follows the peer view:\n{screen}"
+    );
+    assert!(
+        screen.contains("tree-parent"),
+        "the selected remote target is shown:\n{screen}"
+    );
+
+    // Fault: the peer goes away, the rendered view ages out and the tree
+    // falls back to plain List rows without dropping the known sessions.
+    server_node.stop_daemon();
+    wait_for("remote view fallback", Duration::from_secs(20), || {
+        let screen = tui.screen_text();
+        screen.contains("tree-parent") && !screen.contains(DETAIL)
+    });
+    assert!(tui.screen_text().contains("tree-child"));
+}
+
 fn pane_pair(label: &str) -> (Node, Node) {
     let client = Node::start(&format!("{label}-client"));
     let server = Node::start(&format!("{label}-server"));

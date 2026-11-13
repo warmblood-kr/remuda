@@ -61,8 +61,19 @@ const LOCAL_VIEW_TTL: Duration = Duration::from_secs(30);
 /// At most one synchronous local view request per second; the daemon `List`
 /// still runs every loop, so a stalled node does not get a second timeout.
 const LOCAL_VIEW_REFRESH: Duration = Duration::from_secs(1);
+
+/// Remote rendered views are display-only and refresh more slowly than the
+/// local daemon. A failed view keeps the last valid one until this TTL.
+const REMOTE_VIEW_WIDTH: u16 = 48;
+const REMOTE_VIEW_TTL: Duration = Duration::from_secs(5);
+const REMOTE_VIEW_REFRESH: Duration = Duration::from_secs(2);
+const REMOTE_VIEW_RETRY_BASE: Duration = Duration::from_secs(1);
+const REMOTE_VIEW_RETRY_MAX: Duration = Duration::from_secs(30);
+const REMOTE_VIEW_UNSUPPORTED_BACKOFF: Duration = Duration::from_secs(300);
 /// `">    "` / `"     "` before every local row's rendered content.
 const LOCAL_ROW_PREFIX_WIDTH: usize = 5;
+/// Remote session rows share the local `">    "` prefix width.
+const REMOTE_ROW_PREFIX_WIDTH: usize = LOCAL_ROW_PREFIX_WIDTH;
 const REMOTE_KEYS_COALESCE_INTERVAL: Duration = Duration::from_millis(40);
 const REMOTE_PASTE_FAILURE_NOTICE: &str =
     "remote input stopped after a failed chunk; remaining lines dropped";
@@ -170,14 +181,15 @@ pub struct ClusterUi {
     ended: Option<EndedState>,
     last_frame: Option<EndedState>,
     remote_snapshot: RemoteSnapshot,
+    remote_views: HashMap<String, RemoteNodeView>,
     remote_expanded: HashSet<String>,
     remote_selected: Option<RemoteSelection>,
     local_node_selected: bool,
     remote_active: Option<RemoteSelection>,
     remote_keys_mode: Option<RemoteSelection>,
     remote_key_buffers: VecDeque<RemoteKeyBuffer>,
-    // (registry fingerprint, display label, session name, instance id)
-    remote_composer_target: Option<(String, String, String, String)>,
+    // (registry fingerprint, display label, session name, wire name, instance id)
+    remote_composer_target: Option<(String, String, String, String, String)>,
     partial_input_confirm_target: Option<(String, String, String, String)>,
     remote_input_enabled: bool,
     last_resize: Option<PaneResize>,
@@ -248,7 +260,10 @@ enum RemoteSelection {
     Node(String),
     Session {
         node: String,
+        /// Sanitized label for display only.
         name: String,
+        /// Exact protocol name; the selection and all actions bind to this.
+        wire_name: String,
         instance_id: String,
     },
 }
@@ -261,6 +276,7 @@ enum TreeSelection {
     RemoteSession {
         node: String,
         name: String,
+        wire_name: String,
         instance_id: String,
     },
 }
@@ -276,6 +292,130 @@ enum TreeRow {
     /// A row painted from the shared local renderer. The first line is the
     /// selectable row; later lines are its details.
     View { prefix: String, lines: Vec<String> },
+}
+
+/// One remote node's validated rendered list, with the exact wire identity
+/// order the peer's own list used.
+struct RemoteNodeView {
+    view: SessionView,
+    at: Duration,
+    order: Vec<(String, String)>,
+}
+
+struct RemoteViewReply {
+    node: String,
+    generation: u64,
+    requested_at: Duration,
+    result: Option<SessionView>,
+    unsupported: bool,
+}
+
+/// One asynchronous `RenderedSessionList` request per expanded remote node.
+/// Old peers are backed off instead of being retried every UI tick.
+struct RemoteViewLoader {
+    transport: Option<Arc<dyn RemoteInputTransport>>,
+    replies: mpsc::Receiver<RemoteViewReply>,
+    sender: mpsc::Sender<RemoteViewReply>,
+    finished: Arc<AtomicU64>,
+    next: u64,
+    in_flight: HashMap<String, u64>,
+    retry_at: HashMap<String, Duration>,
+    backoff: HashMap<String, Duration>,
+}
+
+impl RemoteViewLoader {
+    fn new(transport: Option<Arc<dyn RemoteInputTransport>>) -> Self {
+        let (sender, replies) = mpsc::channel();
+        Self {
+            transport,
+            replies,
+            sender,
+            finished: Arc::new(AtomicU64::new(0)),
+            next: 0,
+            in_flight: HashMap::new(),
+            retry_at: HashMap::new(),
+            backoff: HashMap::new(),
+        }
+    }
+
+    fn finished(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.finished)
+    }
+
+    fn request(&mut self, node: &str, now: Duration) -> bool {
+        let Some(transport) = self.transport.clone() else {
+            return false;
+        };
+        if self.in_flight.contains_key(node) || self.retry_at.get(node).is_some_and(|at| now < *at)
+        {
+            return false;
+        }
+        let generation = self.next;
+        self.next = self.next.wrapping_add(1);
+        self.in_flight.insert(node.to_owned(), generation);
+        let sender = self.sender.clone();
+        let finished = Arc::clone(&self.finished);
+        let node_owned = node.to_owned();
+        let spawned = std::thread::Builder::new()
+            .name("cluster-tui-remote-view".into())
+            .spawn(move || {
+                let (result, unsupported) =
+                    match transport.send_view(&node_owned, REMOTE_VIEW_WIDTH) {
+                        Ok(Response::RenderedSessionList(view)) => (Some(view), false),
+                        Ok(Response::Error(reason)) => (None, view_unsupported(&reason)),
+                        Ok(_) => (None, false),
+                        Err(_) => (None, false),
+                    };
+                let reply = RemoteViewReply {
+                    node: node_owned,
+                    generation,
+                    requested_at: now,
+                    result,
+                    unsupported,
+                };
+                if sender.send(reply).is_ok() {
+                    finished.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .is_ok();
+        if !spawned {
+            self.in_flight.remove(node);
+        }
+        spawned
+    }
+
+    fn take_replies(&mut self, now: Duration) -> Vec<RemoteViewReply> {
+        let mut replies = Vec::new();
+        while let Ok(reply) = self.replies.try_recv() {
+            if self.in_flight.get(&reply.node).copied() != Some(reply.generation) {
+                continue;
+            }
+            self.in_flight.remove(&reply.node);
+            if reply.unsupported {
+                self.retry_at
+                    .insert(reply.node.clone(), now + REMOTE_VIEW_UNSUPPORTED_BACKOFF);
+                self.backoff.remove(&reply.node);
+            } else if reply.result.is_none() {
+                let delay = self
+                    .backoff
+                    .get(&reply.node)
+                    .copied()
+                    .unwrap_or(REMOTE_VIEW_RETRY_BASE);
+                self.retry_at.insert(reply.node.clone(), now + delay);
+                self.backoff
+                    .insert(reply.node.clone(), (delay * 2).min(REMOTE_VIEW_RETRY_MAX));
+            } else {
+                self.retry_at.remove(&reply.node);
+                self.backoff.remove(&reply.node);
+            }
+            replies.push(reply);
+        }
+        replies
+    }
+}
+
+fn view_unsupported(reason: &str) -> bool {
+    reason.contains("invalid remote request") || reason.contains("refuses RenderedSessionList")
 }
 
 /// The last local `RenderedSessionList` snapshot and the identity order it
@@ -405,6 +545,7 @@ impl ClusterUi {
             ended: None,
             last_frame: None,
             remote_snapshot: RemoteSnapshot::default(),
+            remote_views: HashMap::new(),
             remote_expanded: HashSet::new(),
             remote_selected: None,
             local_node_selected: false,
@@ -452,12 +593,14 @@ impl ClusterUi {
             RemoteSelection::Session {
                 node,
                 name,
+                wire_name,
                 instance_id,
             } => {
-                if self.has_remote_session(&node, &name, &instance_id) {
+                if self.has_remote_session(&node, &wire_name, &instance_id) {
                     Some(RemoteSelection::Session {
                         node,
                         name,
+                        wire_name,
                         instance_id,
                     })
                 } else if self
@@ -475,27 +618,175 @@ impl ClusterUi {
         self.remote_active = active.filter(|selection| match selection {
             RemoteSelection::Session {
                 node,
-                name,
+                wire_name,
                 instance_id,
-            } => self.has_remote_session(node, name, instance_id),
+                ..
+            } => self.has_remote_session(node, wire_name, instance_id),
             RemoteSelection::Node(_) => false,
         });
         self.remote_keys_mode = self.remote_keys_mode.take().filter(|selection| {
             self.remote_session(selection)
                 .is_some_and(|(_, session)| session.alive)
         });
+        self.retain_remote_views();
     }
 
-    fn has_remote_session(&self, node: &str, name: &str, instance_id: &str) -> bool {
+    fn remote_view_matches(&self, node_key: &str, view: &SessionView) -> bool {
+        let Some(node) = self
+            .remote_snapshot
+            .nodes
+            .iter()
+            .find(|node| node.registry_key == node_key)
+        else {
+            return false;
+        };
+        if node.sessions.len() != view.entries().len() {
+            return false;
+        }
+        let mut seen = HashSet::new();
+        view.entries().iter().all(|entry| {
+            node.sessions.iter().any(|session| {
+                session.wire_name == entry.name && session.instance_id == entry.instance_id
+            }) && seen.insert((entry.name.as_str(), entry.instance_id.as_str()))
+        }) && seen.len() == node.sessions.len()
+    }
+
+    fn remote_view_synced(&mut self, node_key: &str, view: SessionView, at: Duration) {
+        if view.validate().is_err() || !self.remote_view_matches(node_key, &view) {
+            self.remote_views.remove(node_key);
+            return;
+        }
+        self.remote_views.insert(
+            node_key.to_owned(),
+            RemoteNodeView {
+                at,
+                order: view
+                    .entries()
+                    .iter()
+                    .map(|entry| (entry.name.clone(), entry.instance_id.clone()))
+                    .collect(),
+                view,
+            },
+        );
+    }
+
+    fn remote_view_reply(
+        &mut self,
+        node_key: &str,
+        requested_at: Duration,
+        result: Option<SessionView>,
+        now: Duration,
+    ) {
+        if now.saturating_sub(requested_at) >= REMOTE_VIEW_TTL {
+            self.remote_views.remove(node_key);
+            return;
+        }
+        if let Some(view) = result {
+            self.remote_view_synced(node_key, view, requested_at);
+        }
+    }
+
+    fn retain_remote_views(&mut self) {
+        let keys: Vec<String> = self.remote_views.keys().cloned().collect();
+        for key in keys {
+            let stale = self
+                .remote_views
+                .get(&key)
+                .is_some_and(|view| !self.remote_view_matches(&key, &view.view));
+            if stale {
+                self.remote_views.remove(&key);
+            }
+        }
+    }
+
+    fn remote_view(&self, node_key: &str, now: Duration) -> Option<&RemoteNodeView> {
+        self.remote_views
+            .get(node_key)
+            .filter(|view| now.saturating_sub(view.at) < REMOTE_VIEW_TTL)
+    }
+
+    fn remote_view_due(&self, node_key: &str, now: Duration) -> bool {
+        self.remote_snapshot
+            .nodes
+            .iter()
+            .find(|node| node.registry_key == node_key)
+            .is_some_and(|node| node.state == RemoteState::Reachable)
+            && self
+                .remote_view(node_key, now)
+                .is_none_or(|view| now.saturating_sub(view.at) >= REMOTE_VIEW_REFRESH)
+    }
+
+    /// Expanded, reachable nodes whose rendered view should be requested now.
+    fn remote_view_targets(&self, now: Duration) -> Vec<String> {
+        self.remote_expanded
+            .iter()
+            .filter(|key| self.remote_view_due(key, now))
+            .cloned()
+            .collect()
+    }
+
+    fn remote_sessions_ordered<'a>(
+        &self,
+        node: &'a RemoteNodeSnapshot,
+        now: Duration,
+    ) -> Vec<&'a RemoteSessionSnapshot> {
+        let mut sessions: Vec<&RemoteSessionSnapshot> = node.sessions.iter().collect();
+        if let Some(view) = self.remote_view(&node.registry_key, now) {
+            if self.remote_view_matches(&node.registry_key, &view.view) {
+                let positions: HashMap<(&str, &str), usize> = view
+                    .order
+                    .iter()
+                    .enumerate()
+                    .map(|(position, (wire_name, instance))| {
+                        ((wire_name.as_str(), instance.as_str()), position)
+                    })
+                    .collect();
+                sessions.sort_by_key(|session| {
+                    positions
+                        .get(&(session.wire_name.as_str(), session.instance_id.as_str()))
+                        .copied()
+                        .unwrap_or(usize::MAX)
+                });
+            }
+        }
+        sessions
+    }
+
+    fn remote_selected_identity_in(&self, node_key: &str) -> Option<(&str, &str)> {
+        match &self.remote_selected {
+            Some(RemoteSelection::Session {
+                node,
+                wire_name,
+                instance_id,
+                ..
+            }) if node == node_key => Some((wire_name.as_str(), instance_id.as_str())),
+            _ => None,
+        }
+    }
+
+    fn remote_selected_is(&self, node: &str, wire_name: &str, instance_id: &str) -> bool {
+        matches!(
+            &self.remote_selected,
+            Some(RemoteSelection::Session {
+                node: selected_node,
+                wire_name: selected_wire,
+                instance_id: selected_instance,
+                ..
+            }) if selected_node == node
+                && selected_wire == wire_name
+                && selected_instance == instance_id
+        )
+    }
+
+    fn has_remote_session(&self, node: &str, wire_name: &str, instance_id: &str) -> bool {
         self.remote_snapshot
             .nodes
             .iter()
             .find(|snapshot| snapshot.registry_key == node)
             .is_some_and(|snapshot| {
-                snapshot
-                    .sessions
-                    .iter()
-                    .any(|session| session.name == name && session.instance_id == instance_id)
+                snapshot.sessions.iter().any(|session| {
+                    session.wire_name == wire_name && session.instance_id == instance_id
+                })
             })
     }
 
@@ -505,8 +796,9 @@ impl ClusterUi {
     ) -> Option<(&'a RemoteNodeSnapshot, &'a RemoteSessionSnapshot)> {
         let RemoteSelection::Session {
             node,
-            name,
+            wire_name,
             instance_id,
+            ..
         } = selection
         else {
             return None;
@@ -516,10 +808,9 @@ impl ClusterUi {
             .nodes
             .iter()
             .find(|snapshot| &snapshot.registry_key == node)?;
-        let session = snapshot
-            .sessions
-            .iter()
-            .find(|session| &session.name == name && &session.instance_id == instance_id)?;
+        let session = snapshot.sessions.iter().find(|session| {
+            &session.wire_name == wire_name && &session.instance_id == instance_id
+        })?;
         Some((snapshot, session))
     }
 
@@ -529,10 +820,12 @@ impl ClusterUi {
             Some(RemoteSelection::Session {
                 node,
                 name,
+                wire_name,
                 instance_id,
             }) => TreeSelection::RemoteSession {
                 node: node.clone(),
                 name: name.clone(),
+                wire_name: wire_name.clone(),
                 instance_id: instance_id.clone(),
             },
             None if self.local_node_selected => TreeSelection::LocalNode,
@@ -558,12 +851,14 @@ impl ClusterUi {
             TreeSelection::RemoteSession {
                 node,
                 name,
+                wire_name,
                 instance_id,
             } => {
                 self.local_node_selected = false;
                 self.remote_selected = Some(RemoteSelection::Session {
                     node,
                     name,
+                    wire_name,
                     instance_id,
                 });
             }
@@ -582,9 +877,9 @@ impl ClusterUi {
         let query = self.query.as_deref().unwrap_or_default();
         for node in &self.remote_snapshot.nodes {
             let node_matches = query.is_empty() || matches_query(query, &node.name);
-            let visible_sessions = node
-                .sessions
-                .iter()
+            let visible_sessions = self
+                .remote_sessions_ordered(node, now)
+                .into_iter()
                 .filter(|session| self.remote_session_visible(node, session, query))
                 .collect::<Vec<_>>();
             let node_attention = node.state != RemoteState::Reachable;
@@ -600,6 +895,7 @@ impl ClusterUi {
                     TreeSelection::RemoteSession {
                         node: node.registry_key.clone(),
                         name: session.name.clone(),
+                        wire_name: session.wire_name.clone(),
                         instance_id: session.instance_id.clone(),
                     }
                 }));
@@ -1068,7 +1364,7 @@ impl ClusterUi {
             self.remote_snapshot.nodes.len() + 1
         ));
         let local_rows = self.local_tree_rows(width, now);
-        let remote_rows = self.remote_tree_rows();
+        let remote_rows = self.remote_tree_rows(width, now);
         frame.push(tree_label_line(
             &format!(
                 "{}{} ",
@@ -1636,15 +1932,16 @@ impl ClusterUi {
             .collect()
     }
 
-    /// Remote node and session rows, in display order.
-    fn remote_tree_rows(&self) -> Vec<TreeRow> {
+    /// Remote node and session rows, in the peer's own rendered order when a
+    /// validated view exists, otherwise in List order.
+    fn remote_tree_rows(&self, width: usize, now: Duration) -> Vec<TreeRow> {
         let mut rows = Vec::new();
         let query = self.query.as_deref().unwrap_or_default();
         for node in &self.remote_snapshot.nodes {
             let node_matches = query.is_empty() || matches_query(query, &node.name);
-            let visible_sessions = node
-                .sessions
-                .iter()
+            let visible_sessions = self
+                .remote_sessions_ordered(node, now)
+                .into_iter()
                 .filter(|session| self.remote_session_visible(node, session, query))
                 .collect::<Vec<_>>();
             let node_attention = node.state != RemoteState::Reachable;
@@ -1666,26 +1963,59 @@ impl ClusterUi {
                 status: status_glyph(node.state).to_string(),
             });
             if is_expanded {
+                let content_width = u16::try_from(width.saturating_sub(REMOTE_ROW_PREFIX_WIDTH))
+                    .unwrap_or(u16::MAX);
+                let selected = self.remote_selected_identity_in(&node.registry_key);
+                let checked = self
+                    .remote_view(&node.registry_key, now)
+                    .filter(|view| self.remote_view_matches(&node.registry_key, &view.view))
+                    .and_then(|view| view.view.validate_for_display(selected, content_width).ok());
+                let entries: HashMap<(&str, &str), &ViewEntry> = checked
+                    .as_ref()
+                    .map(|view| {
+                        view.entries()
+                            .iter()
+                            .map(|entry| ((entry.name.as_str(), entry.instance_id.as_str()), entry))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 for session in visible_sessions {
-                    let is_selected = self.remote_selected
-                        == Some(RemoteSelection::Session {
-                            node: node.registry_key.clone(),
-                            name: session.name.clone(),
-                            instance_id: session.instance_id.clone(),
-                        });
-                    rows.push(TreeRow::Plain {
-                        prefix: format!("{}    ", if is_selected { ">" } else { " " }),
-                        label: session.name.clone(),
-                        status: remote_program_cell(
-                            session.alive,
-                            session.last_error.is_some(),
-                            self.remote_pending_count(node, session),
-                            (node.state == RemoteState::Reachable)
-                                .then_some(session.program_status.as_ref())
-                                .flatten(),
-                            std::time::Instant::now(),
-                        ),
-                    });
+                    let prefix = format!(
+                        "{}    ",
+                        if self.remote_selected_is(
+                            &node.registry_key,
+                            &session.wire_name,
+                            &session.instance_id,
+                        ) {
+                            ">"
+                        } else {
+                            " "
+                        }
+                    );
+                    let pending = self.remote_pending_count(node, session);
+                    let rendered = entries
+                        .get(&(session.wire_name.as_str(), session.instance_id.as_str()))
+                        .copied()
+                        .filter(|_| pending == 0);
+                    match rendered {
+                        Some(entry) => rows.push(TreeRow::View {
+                            prefix,
+                            lines: entry.lines.clone(),
+                        }),
+                        None => rows.push(TreeRow::Plain {
+                            prefix,
+                            label: session.name.clone(),
+                            status: remote_program_cell(
+                                session.alive,
+                                session.last_error.is_some(),
+                                pending,
+                                (node.state == RemoteState::Reachable)
+                                    .then_some(session.program_status.as_ref())
+                                    .flatten(),
+                                std::time::Instant::now(),
+                            ),
+                        }),
+                    }
                 }
             }
         }
@@ -1898,6 +2228,7 @@ impl ClusterUi {
         let TreeSelection::RemoteSession {
             node,
             name,
+            wire_name,
             instance_id,
         } = self.current_tree_selection()
         else {
@@ -1906,6 +2237,7 @@ impl ClusterUi {
         let target = RemoteSelection::Session {
             node,
             name,
+            wire_name,
             instance_id,
         };
         let Some((snapshot, session)) = self.remote_session(&target) else {
@@ -1935,12 +2267,7 @@ impl ClusterUi {
         bytes: Vec<u8>,
         now: Duration,
     ) {
-        let RemoteSelection::Session {
-            node,
-            name: _,
-            instance_id: _,
-        } = target
-        else {
+        let RemoteSelection::Session { node, .. } = target else {
             return;
         };
         if self.remote_control_disabled.contains(node) {
@@ -1995,6 +2322,7 @@ impl ClusterUi {
         let RemoteSelection::Session {
             node,
             name,
+            wire_name,
             instance_id,
         } = buffer.target
         else {
@@ -2003,6 +2331,7 @@ impl ClusterUi {
         let selection = RemoteSelection::Session {
             node: node.clone(),
             name,
+            wire_name,
             instance_id: instance_id.clone(),
         };
         let Some((node_label, session_name, wire_name, alive)) =
@@ -2040,12 +2369,14 @@ impl ClusterUi {
         } else if let Some(RemoteSelection::Session {
             node,
             name,
+            wire_name,
             instance_id,
         }) = self.remote_selected.clone()
         {
             let selected = self.remote_session(&RemoteSelection::Session {
                 node: node.clone(),
                 name: name.clone(),
+                wire_name: wire_name.clone(),
                 instance_id: instance_id.clone(),
             });
             if let Some((node_snapshot, session)) = selected {
@@ -2106,34 +2437,29 @@ impl ClusterUi {
             TreeSelection::RemoteSession {
                 node,
                 name,
+                wire_name,
                 instance_id,
             } => {
                 self.query = None;
                 self.composer_target = None;
-                let can_send = self.remote_input_enabled
-                    && self
-                        .remote_session(&RemoteSelection::Session {
-                            node: node.clone(),
-                            name: name.clone(),
-                            instance_id: instance_id.clone(),
-                        })
-                        .is_some_and(|(_, session)| session.alive);
-                self.remote_active = Some(RemoteSelection::Session {
+                let selection = RemoteSelection::Session {
                     node: node.clone(),
                     name: name.clone(),
+                    wire_name: wire_name.clone(),
                     instance_id: instance_id.clone(),
-                });
+                };
+                let can_send = self.remote_input_enabled
+                    && self
+                        .remote_session(&selection)
+                        .is_some_and(|(_, session)| session.alive);
+                self.remote_active = Some(selection.clone());
                 self.composer_focused = can_send;
                 let display_label = self
-                    .remote_session(&RemoteSelection::Session {
-                        node: node.clone(),
-                        name: name.clone(),
-                        instance_id: instance_id.clone(),
-                    })
+                    .remote_session(&selection)
                     .map(|(snapshot, _)| snapshot.name.clone())
                     .unwrap_or_else(|| node.clone());
                 self.set_remote_composer_target(
-                    can_send.then_some((node, display_label, name, instance_id)),
+                    can_send.then_some((node, display_label, name, wire_name, instance_id)),
                     now,
                 );
             }
@@ -2161,7 +2487,9 @@ impl ClusterUi {
             self.bind_composer_target();
         }
         let history_key = match (&self.remote_composer_target, &self.composer_target) {
-            (Some((node, _, name, instance)), _) => format!("remote\0{node}\0{name}\0{instance}"),
+            (Some((node, _, _, wire_name, instance)), _) => {
+                format!("remote\0{node}\0{wire_name}\0{instance}")
+            }
             (None, Some((name, instance))) => format!("local\0{name}\0{instance}"),
             (None, None) => String::new(),
         };
@@ -2188,18 +2516,20 @@ impl ClusterUi {
                 self.composer_focused = false;
             }
             ComposerAction::Submit(bytes) => {
-                if let Some((node, _, name, instance_id)) = self.remote_composer_target.clone() {
+                if let Some((node, _, _, wire_name, instance_id)) =
+                    self.remote_composer_target.clone()
+                {
                     let draft = bytes.strip_suffix(b"\r").unwrap_or(&bytes);
                     let target = (
                         node.clone(),
-                        name.clone(),
+                        wire_name.clone(),
                         instance_id.clone(),
                         String::from_utf8_lossy(draft).into_owned(),
                     );
                     if self.partial_input_confirm_target.as_ref() == Some(&target) {
                         self.partial_input_confirm_target = None;
                         self.enqueue_remote_draft(bytes, now);
-                    } else if self.remote_target_may_be_partial(&node, &name, &instance_id) {
+                    } else if self.remote_target_may_be_partial(&node, &wire_name, &instance_id) {
                         self.restore_draft(&bytes);
                         self.partial_input_confirm_target = Some(target);
                         self.set_input_notice(REMOTE_PARTIAL_INPUT_NOTICE.into(), now);
@@ -2215,14 +2545,14 @@ impl ClusterUi {
 
     fn set_remote_composer_target(
         &mut self,
-        target: Option<(String, String, String, String)>,
+        target: Option<(String, String, String, String, String)>,
         now: Duration,
     ) -> bool {
         if self.remote_composer_target == target {
             return false;
         }
         self.partial_input_confirm_target = None;
-        let discarded = if let Some((_, node_label, name, _)) = &self.remote_composer_target {
+        let discarded = if let Some((_, node_label, name, _, _)) = &self.remote_composer_target {
             if self.composer.text().is_empty() {
                 false
             } else {
@@ -2237,16 +2567,11 @@ impl ClusterUi {
         discarded
     }
 
-    fn remote_target_may_be_partial(&self, node: &str, name: &str, instance_id: &str) -> bool {
-        let selection = RemoteSelection::Session {
-            node: node.into(),
-            name: name.into(),
-            instance_id: instance_id.into(),
-        };
-        self.remote_session(&selection).is_some_and(|(_, session)| {
-            self.input_sender
-                .has_partial_input_warning_for(node, &session.wire_name, instance_id)
-        })
+    fn remote_target_may_be_partial(&self, node: &str, wire_name: &str, instance_id: &str) -> bool {
+        self.has_remote_session(node, wire_name, instance_id)
+            && self
+                .input_sender
+                .has_partial_input_warning_for(node, wire_name, instance_id)
     }
 
     fn bind_composer_target(&mut self) {
@@ -2304,7 +2629,8 @@ impl ClusterUi {
     }
 
     fn enqueue_remote_draft(&mut self, bytes: Vec<u8>, now: Duration) {
-        let Some((node_key, node_label, name, instance_id)) = self.remote_composer_target.clone()
+        let Some((node_key, node_label, name, wire_name, instance_id)) =
+            self.remote_composer_target.clone()
         else {
             return;
         };
@@ -2316,6 +2642,7 @@ impl ClusterUi {
         let selection = RemoteSelection::Session {
             node: node_key.clone(),
             name: name.clone(),
+            wire_name: wire_name.clone(),
             instance_id: instance_id.clone(),
         };
         let Some((_, session)) = self.remote_session(&selection) else {
@@ -2744,11 +3071,13 @@ impl ClusterUi {
             TreeSelection::RemoteSession {
                 node,
                 name,
+                wire_name,
                 instance_id,
             } => {
                 let selection = RemoteSelection::Session {
                     node,
                     name,
+                    wire_name,
                     instance_id,
                 };
                 let (node, session) = self.remote_session(&selection)?;
@@ -2802,6 +3131,7 @@ impl ClusterUi {
             let selection = RemoteSelection::Session {
                 node: remote.registry_key.clone(),
                 name: session.name.clone(),
+                wire_name: session.wire_name.clone(),
                 instance_id: session.instance_id.clone(),
             };
             self.remote_expanded.insert(remote.registry_key.clone());
@@ -2880,6 +3210,7 @@ impl ClusterUi {
             .map(|session| RemoteSelection::Session {
                 node: registry_key.clone(),
                 name: session.name.clone(),
+                wire_name: session.wire_name.clone(),
                 instance_id: session.instance_id.clone(),
             });
         self.expanded = false;
@@ -3904,11 +4235,13 @@ fn run_loop(
     runtime: &mut ClusterTuiRuntime<'_>,
 ) -> io::Result<()> {
     let clock = runtime.clock;
+    let mut remote_views = RemoteViewLoader::new(remote_input.clone());
+    let remote_view_finished = remote_views.finished();
     let mut remote_calls = remote_input.map(RemoteDispatcher::new);
     let replies = remote_calls.as_ref().map(RemoteDispatcher::finished);
     let mut local_views = LocalViewLoader::new();
     let local_view_finished = local_views.finished();
-    // Moves when a remote poll, remote call or local view reply lands.
+    // Moves when a remote poll, remote call, local view or remote view reply lands.
     let wake = || {
         remote_source
             .generation()
@@ -3918,6 +4251,7 @@ fn run_loop(
                     .map_or(0, |count| count.load(Ordering::SeqCst)),
             )
             .wrapping_add(local_view_finished.load(Ordering::SeqCst))
+            .wrapping_add(remote_view_finished.load(Ordering::SeqCst))
     };
     let mut ui = ClusterUi::with_sender(node, list(path)?, clock.now(), InputSender::random()?);
     if let Some((identity, _)) = crate::cluster::nodes()? {
@@ -3938,6 +4272,7 @@ fn run_loop(
         // Read before syncing: an update landing during sync/render wakes the wait.
         let seen = wake();
         ui.remote_synced(remote_source);
+        sync_remote_views(&mut ui, &mut remote_views, clock.now());
         if let Some(port) = remote_calls.as_mut() {
             ui.apply_remote_replies(port, clock.now());
         }
@@ -4004,6 +4339,16 @@ fn run_loop(
     }
 }
 
+/// Ask for rendered views of expanded reachable nodes and apply finished ones.
+fn sync_remote_views(ui: &mut ClusterUi, loader: &mut RemoteViewLoader, now: Duration) {
+    for node in ui.remote_view_targets(now) {
+        loader.request(&node, now);
+    }
+    for reply in loader.take_replies(now) {
+        ui.remote_view_reply(&reply.node, reply.requested_at, reply.result, now);
+    }
+}
+
 /// A remote session chosen on the command line starts with its composer focused.
 fn focus_initial_remote_composer(ui: &mut ClusterUi, now: Duration) {
     if !ui.remote_input_enabled {
@@ -4012,6 +4357,7 @@ fn focus_initial_remote_composer(ui: &mut ClusterUi, now: Duration) {
     let Some(RemoteSelection::Session {
         node,
         name,
+        wire_name,
         instance_id,
     }) = ui.remote_active.clone()
     else {
@@ -4021,11 +4367,15 @@ fn focus_initial_remote_composer(ui: &mut ClusterUi, now: Duration) {
         .remote_session(&RemoteSelection::Session {
             node: node.clone(),
             name: name.clone(),
+            wire_name: wire_name.clone(),
             instance_id: instance_id.clone(),
         })
         .map(|(snapshot, _)| snapshot.name.clone())
         .unwrap_or_else(|| node.clone());
-    ui.set_remote_composer_target(Some((node, display_label, name, instance_id)), now);
+    ui.set_remote_composer_target(
+        Some((node, display_label, name, wire_name, instance_id)),
+        now,
+    );
     ui.composer_focused = true;
 }
 
@@ -4081,8 +4431,9 @@ mod tests {
         remote_state_label, render_badge, resize_requires_full_repaint,
         select_target_with_remote_wait, session_cell, session_glyph, status_glyph, status_style,
         terminal_frame, AttentionSignals, Badge, ClusterUi, EndedState, LocalViewLoader,
-        RemoteInputTransport, RemoteSelection, RemoteSource, TreeSelection, ERROR_GLYPH,
-        LOCAL_VIEW_REFRESH, LOCAL_VIEW_TTL,
+        RemoteInputTransport, RemoteSelection, RemoteSource, RemoteViewLoader, TreeSelection,
+        ERROR_GLYPH, LOCAL_VIEW_REFRESH, LOCAL_VIEW_TTL, REMOTE_VIEW_RETRY_BASE, REMOTE_VIEW_TTL,
+        REMOTE_VIEW_UNSUPPORTED_BACKOFF,
     };
     use crate::cluster_remote::{
         RemoteNodeSnapshot, RemoteSessionSnapshot, RemoteSnapshot, RemoteState,
@@ -4092,7 +4443,7 @@ mod tests {
     use remuda_core::protocol::{Request, Response};
     use remuda_core::session_view::{SessionView, ViewEntry};
     use remuda_core::{SessionSummary, Size};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     fn parsed_frame(frame: &str, cols: u16, rows: u16) -> vt100::Parser {
@@ -5924,6 +6275,7 @@ mod tests {
         ui.set_tree_selection(TreeSelection::RemoteSession {
             node: "fp-laptop".into(),
             name: "build".into(),
+            wire_name: "build".into(),
             instance_id: "remote-instance".into(),
         });
         let session_frame = ui.render_text(100, 24, "", &clock);
@@ -6658,6 +7010,237 @@ mod tests {
         clock.advance(LOCAL_VIEW_TTL + Duration::from_secs(1));
         let frame = ui.render_text(100, 24, "pane", &clock);
         assert!(!frame.contains("codex"), "{frame}");
+    }
+
+    fn remote_summary(name: &str, instance: &str) -> SessionSummary {
+        let mut summary = session(name, true);
+        summary.instance_id = Some(instance.into());
+        summary
+    }
+
+    fn remote_detail_view(entries: &[(&str, &str)]) -> SessionView {
+        SessionView::new(
+            entries
+                .iter()
+                .map(|(name, instance)| remote_summary(name, instance))
+                .collect(),
+            1,
+            entries
+                .iter()
+                .map(|(name, instance)| {
+                    view_entry(
+                        name,
+                        instance,
+                        &[&format!(
+                            "\x1b[32m●\x1b[0m  {name}  \x1b[2midle · codex · gpt-6.1\x1b[0m"
+                        )],
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn remote_tree_paints_the_peers_validated_rows_with_exact_identity() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("body"));
+        ui.remote_snapshot.nodes[0].sessions[0].name = "Build Label".into();
+        ui.remote_snapshot.nodes[0].sessions[0].wire_name = "wire-build".into();
+        ui.remote_selected = Some(RemoteSelection::Session {
+            node: "fp-laptop".into(),
+            name: "Build Label".into(),
+            wire_name: "wire-build".into(),
+            instance_id: "remote-instance".into(),
+        });
+        ui.remote_view_synced(
+            "fp-laptop",
+            remote_detail_view(&[("wire-build", "remote-instance")]),
+            clock.now(),
+        );
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let side = tree_side(&frame);
+        let row = side
+            .iter()
+            .find(|line| line.contains("wire-build"))
+            .unwrap();
+        assert!(row.contains("idle · codex · gpt-6.1"), "{row:?}");
+        assert!(
+            row.starts_with(">    "),
+            "selected row keeps its cursor: {row:?}"
+        );
+        let styled = ui.tree_lines(100, clock.now());
+        let styled = styled
+            .iter()
+            .find(|line| line.contains("wire-build"))
+            .unwrap();
+        assert!(
+            styled.contains("\x1b[1;7;36mwire-build"),
+            "the peer row keeps the local selection highlight: {styled:?}"
+        );
+    }
+
+    #[test]
+    fn remote_tree_falls_back_when_the_view_identity_malformed_or_stale() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("body"));
+        ui.remote_snapshot.nodes[0].sessions[0].wire_name = "wire-build".into();
+        ui.remote_snapshot.nodes[0].sessions[0].name = "Build Label".into();
+        ui.remote_selected = Some(RemoteSelection::Session {
+            node: "fp-laptop".into(),
+            name: "Build Label".into(),
+            wire_name: "wire-build".into(),
+            instance_id: "remote-instance".into(),
+        });
+
+        // Display label is not the wire identity: a view keyed by it is refused.
+        ui.remote_view_synced(
+            "fp-laptop",
+            remote_detail_view(&[("Build Label", "remote-instance")]),
+            clock.now(),
+        );
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(!frame.contains("idle · codex"), "{frame}");
+
+        // Right identity, wrong instance: refused as a whole.
+        ui.remote_view_synced(
+            "fp-laptop",
+            remote_detail_view(&[("wire-build", "other-instance")]),
+            clock.now(),
+        );
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(!frame.contains("idle · codex"), "{frame}");
+
+        // Accept the exact identity, then let it age out.
+        ui.remote_view_synced(
+            "fp-laptop",
+            remote_detail_view(&[("wire-build", "remote-instance")]),
+            clock.now(),
+        );
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(frame.contains("idle · codex"), "{frame}");
+        clock.advance(REMOTE_VIEW_TTL + Duration::from_secs(1));
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(!frame.contains("idle · codex"), "{frame}");
+    }
+
+    #[test]
+    fn remote_tree_order_follows_the_view_and_pending_rows_stay_plain() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("body"));
+        let mut second = ui.remote_snapshot.nodes[0].sessions[0].clone();
+        second.name = "shell".into();
+        second.wire_name = "shell".into();
+        second.instance_id = "shell-instance".into();
+        ui.remote_snapshot.nodes[0].sessions.push(second.clone());
+
+        ui.remote_view_synced(
+            "fp-laptop",
+            remote_detail_view(&[("shell", "shell-instance"), ("build", "remote-instance")]),
+            clock.now(),
+        );
+        let rows = ui.visible_tree_rows(clock.now());
+        assert_eq!(
+            rows,
+            vec![
+                TreeSelection::LocalNode,
+                TreeSelection::LocalSession(0),
+                TreeSelection::RemoteNode("fp-laptop".into()),
+                TreeSelection::RemoteSession {
+                    node: "fp-laptop".into(),
+                    name: "shell".into(),
+                    wire_name: "shell".into(),
+                    instance_id: "shell-instance".into(),
+                },
+                TreeSelection::RemoteSession {
+                    node: "fp-laptop".into(),
+                    name: "build".into(),
+                    wire_name: "build".into(),
+                    instance_id: "remote-instance".into(),
+                },
+            ]
+        );
+
+        // A queued batch for the first row suppresses its rendered view only.
+        ui.remote_active = Some(RemoteSelection::Session {
+            node: "fp-laptop".into(),
+            name: "shell".into(),
+            wire_name: "shell".into(),
+            instance_id: "shell-instance".into(),
+        });
+        ui.remote_composer_target = Some((
+            "fp-laptop".into(),
+            "laptop".into(),
+            "shell".into(),
+            "shell".into(),
+            "shell-instance".into(),
+        ));
+        ui.enqueue_remote_draft(b"pending".to_vec(), clock.now());
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let side = tree_side(&frame);
+        let shell = side.iter().find(|line| line.contains("shell")).unwrap();
+        assert!(!shell.contains("idle · codex"), "{shell:?}");
+        let build = side.iter().find(|line| line.contains("build")).unwrap();
+        assert!(build.contains("idle · codex"), "{build:?}");
+    }
+
+    #[test]
+    fn remote_view_loader_backs_off_unsupported_and_failed_peers() {
+        let unsupported = Arc::new(FakeViewTransport::new(Response::Error(
+            "invalid remote request".into(),
+        )));
+        let mut loader = RemoteViewLoader::new(Some(unsupported.clone()));
+        assert!(loader.request("fp-laptop", Duration::ZERO));
+        let replies = wait_for_view_reply(&mut loader);
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].unsupported);
+        assert!(!loader.request("fp-laptop", Duration::from_secs(2)));
+        assert!(loader.request("fp-laptop", REMOTE_VIEW_UNSUPPORTED_BACKOFF));
+
+        let failing = Arc::new(FakeViewTransport::new(Response::Sessions(Vec::new())));
+        let mut loader = RemoteViewLoader::new(Some(failing));
+        assert!(loader.request("fp-laptop", Duration::ZERO));
+        let replies = wait_for_view_reply(&mut loader);
+        assert_eq!(replies.len(), 1);
+        assert!(!replies[0].unsupported);
+        assert!(!loader.request("fp-laptop", Duration::from_millis(500)));
+        assert!(loader.request("fp-laptop", Duration::ZERO + REMOTE_VIEW_RETRY_BASE));
+    }
+
+    /// Poll the loader for the asynchronous reply a fake transport sends.
+    fn wait_for_view_reply(loader: &mut RemoteViewLoader) -> Vec<super::RemoteViewReply> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let replies = loader.take_replies(Duration::ZERO);
+            if !replies.is_empty() || Instant::now() >= deadline {
+                return replies;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    struct FakeViewTransport {
+        response: Mutex<Response>,
+        calls: std::sync::atomic::AtomicU64,
+    }
+
+    impl FakeViewTransport {
+        fn new(response: Response) -> Self {
+            Self {
+                response: Mutex::new(response),
+                calls: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl RemoteInputTransport for FakeViewTransport {
+        fn send_input(&self, _node: &str, _request: &Request) -> std::io::Result<Response> {
+            Ok(Response::Error("unexpected input".into()))
+        }
+
+        fn send_view(&self, _node: &str, _width: u16) -> std::io::Result<Response> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.response.lock().unwrap().clone())
+        }
     }
 
     #[test]
@@ -7876,6 +8459,7 @@ mod tests {
         ui.remote_keys_mode = Some(RemoteSelection::Session {
             node: "fp-laptop".into(),
             name: "a-very-long-session-name-for-status-test".into(),
+            wire_name: "a-very-long-session-name-for-status-test".into(),
             instance_id: "remote-instance".into(),
         });
 
@@ -8045,6 +8629,7 @@ mod tests {
             Some(RemoteSelection::Session {
                 node: "fp-laptop".into(),
                 name: "build".into(),
+                wire_name: "build".into(),
                 instance_id: "remote-instance".into(),
             })
         );
@@ -8176,6 +8761,7 @@ mod tests {
         ui.remote_selected = Some(RemoteSelection::Session {
             node: "SHA256:RL+gtaJ8...".into(),
             name: "build".into(),
+            wire_name: "wire-build".into(),
             instance_id: "remote-instance".into(),
         });
 
@@ -8472,6 +9058,7 @@ mod tests {
         ui.remote_selected = Some(RemoteSelection::Session {
             node: "fp-laptop".into(),
             name: "build".into(),
+            wire_name: "build".into(),
             instance_id: "remote-instance".into(),
         });
         ui.enter_selected(clock.now());
@@ -8489,6 +9076,7 @@ mod tests {
         ui.set_tree_selection(super::TreeSelection::RemoteSession {
             node: "fp-laptop".into(),
             name: "shell".into(),
+            wire_name: "shell".into(),
             instance_id: "shell-instance".into(),
         });
         ui.enter_selected(clock.now());
@@ -8517,6 +9105,7 @@ mod tests {
         ui.remote_selected = Some(RemoteSelection::Session {
             node: "fp-laptop".into(),
             name: "build".into(),
+            wire_name: "build".into(),
             instance_id: "remote-instance".into(),
         });
         ui.enter_selected(clock.now());
@@ -8603,6 +9192,7 @@ mod tests {
         ui.remote_selected = Some(RemoteSelection::Session {
             node: "fp-laptop".into(),
             name: "build".into(),
+            wire_name: "build".into(),
             instance_id: "remote-instance".into(),
         });
         ui.enter_selected(clock.now());
@@ -8847,9 +9437,11 @@ mod tests {
         let mut ui = selected_remote_ui(&clock, remote_screen("remote-body"));
         ui.remote_snapshot.nodes[0].name = "a-very-long-remote-node-label".into();
         ui.remote_snapshot.nodes[0].sessions[0].name = "a-very-long-session-name".into();
+        ui.remote_snapshot.nodes[0].sessions[0].wire_name = "a-very-long-session-name".into();
         ui.remote_active = Some(RemoteSelection::Session {
             node: "fp-laptop".into(),
             name: "a-very-long-session-name".into(),
+            wire_name: "a-very-long-session-name".into(),
             instance_id: "remote-instance".into(),
         });
         for cols in [60, 80] {
