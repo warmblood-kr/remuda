@@ -289,8 +289,8 @@ struct LocalView {
 /// One nonblocking local `RenderedSessionList` request at a time. A slow
 /// decorator delays only this reply, never key handling or painting.
 struct LocalViewLoader {
-    replies: mpsc::Receiver<(u64, Option<SessionView>)>,
-    sender: mpsc::Sender<(u64, Option<SessionView>)>,
+    replies: mpsc::Receiver<(u64, Duration, Option<SessionView>)>,
+    sender: mpsc::Sender<(u64, Duration, Option<SessionView>)>,
     finished: Arc<AtomicU64>,
     next: u64,
     in_flight: Option<u64>,
@@ -316,12 +316,12 @@ impl LocalViewLoader {
         self.in_flight.is_none()
     }
 
-    fn request(&mut self, path: &Path) -> bool {
+    fn request(&mut self, path: &Path, at: Duration) -> bool {
         let path = path.to_path_buf();
-        self.request_with(move || local_session_view(&path, LOCAL_VIEW_WIDTH))
+        self.request_with(at, move || local_session_view(&path, LOCAL_VIEW_WIDTH))
     }
 
-    fn request_with<F>(&mut self, fetch: F) -> bool
+    fn request_with<F>(&mut self, at: Duration, fetch: F) -> bool
     where
         F: FnOnce() -> Option<SessionView> + Send + 'static,
     {
@@ -337,7 +337,7 @@ impl LocalViewLoader {
             .name("cluster-tui-local-view".into())
             .spawn(move || {
                 let result = fetch();
-                if sender.send((generation, result)).is_ok() {
+                if sender.send((generation, at, result)).is_ok() {
                     finished.fetch_add(1, Ordering::SeqCst);
                 }
             })
@@ -348,11 +348,11 @@ impl LocalViewLoader {
         spawned
     }
 
-    fn take_reply(&mut self) -> Option<Option<SessionView>> {
-        while let Ok((generation, result)) = self.replies.try_recv() {
+    fn take_reply(&mut self) -> Option<(Duration, Option<SessionView>)> {
+        while let Ok((generation, at, result)) = self.replies.try_recv() {
             if self.in_flight == Some(generation) {
                 self.in_flight = None;
-                return Some(result);
+                return Some((at, result));
             }
         }
         None
@@ -731,6 +731,24 @@ impl ClusterUi {
 
     pub fn local_view_failed(&mut self) {
         self.local_view = None;
+    }
+
+    /// Apply a reply that carries the time its request started. A reply left
+    /// queued through a long `List` failure must not gain a fresh TTL.
+    fn apply_local_view(
+        &mut self,
+        result: Option<SessionView>,
+        requested_at: Duration,
+        now: Duration,
+    ) {
+        if now.saturating_sub(requested_at) >= LOCAL_VIEW_TTL {
+            self.local_view_failed();
+            return;
+        }
+        match result {
+            Some(view) => self.local_view_synced(view, requested_at),
+            None => self.local_view_failed(),
+        }
     }
 
     fn local_view_due(&self, now: Duration) -> bool {
@@ -3242,12 +3260,29 @@ fn pad_to(text: &str, width: usize) -> String {
 /// header rows stay pinned; the body scrolls only as far as needed.
 fn scroll_tree_to_selection(lines: Vec<String>, rows: usize) -> Vec<String> {
     const HEADER: usize = 2;
-    if lines.len() <= rows || rows <= HEADER + 2 {
+    if lines.len() <= rows {
         return lines;
     }
     let Some(selected) = lines.iter().position(|line| line.starts_with('>')) else {
         return lines;
     };
+    if rows <= HEADER + 2 {
+        // Too short for both headers and a window: keep the selected row and
+        // spend any remaining row on an off-screen indicator.
+        if rows == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(rows);
+        if selected > 0 && rows >= 2 {
+            out.push("… earlier".into());
+        }
+        out.push(lines[selected].clone());
+        if selected + 1 < lines.len() && out.len() < rows {
+            out.push("… more".into());
+        }
+        out.truncate(rows);
+        return out;
+    }
     let body = &lines[HEADER..];
     let capacity = rows - HEADER - 2;
     if capacity == 0 {
@@ -3635,15 +3670,12 @@ fn sync_local_list(
     match list(path) {
         Ok(current) => {
             ui.sessions_synced(current, now);
-            if let Some(result) = local_views.take_reply() {
-                match result {
-                    Some(view) => ui.local_view_synced(view, now),
-                    None => ui.local_view_failed(),
-                }
+            if let Some((requested_at, result)) = local_views.take_reply() {
+                ui.apply_local_view(result, requested_at, now);
             }
             if ui.expanded && ui.local_view_due(now) && local_views.idle() {
                 ui.local_view_requested_at = Some(now);
-                if !local_views.request(path) {
+                if !local_views.request(path, now) {
                     ui.local_view_failed();
                 }
             }
@@ -6730,6 +6762,33 @@ mod tests {
     }
 
     #[test]
+    fn old_view_reply_after_long_list_failure_does_not_refresh_ttl() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("alpha", true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let view = SessionView::new(
+            sessions,
+            1,
+            vec![view_entry(
+                "alpha",
+                "instance-alpha",
+                &[&alive_row("alpha")],
+            )],
+        );
+        let requested_at = clock.now();
+        let recovered_at = requested_at + LOCAL_VIEW_TTL + Duration::from_secs(1);
+        ui.apply_local_view(Some(view.clone()), requested_at, recovered_at);
+        assert!(ui.local_view.is_none());
+        assert_eq!(
+            ui.visible_tree_rows(recovered_at),
+            vec![TreeSelection::LocalNode, TreeSelection::LocalSession(0)]
+        );
+
+        ui.apply_local_view(Some(view), recovered_at, recovered_at);
+        assert!(ui.local_view.is_some());
+    }
+
+    #[test]
     fn local_view_refresh_is_rate_limited() {
         let clock = ManualClock::new();
         let mut ui = make_ui("studio", sessions(), clock.now());
@@ -6743,8 +6802,9 @@ mod tests {
     #[test]
     fn local_view_request_does_not_block_the_ui_loop() {
         let mut loader = LocalViewLoader::new();
+        let requested_at = Duration::from_secs(5);
         let started = Instant::now();
-        assert!(loader.request_with(|| {
+        assert!(loader.request_with(requested_at, || {
             std::thread::sleep(Duration::from_millis(300));
             None
         }));
@@ -6756,7 +6816,8 @@ mod tests {
         assert!(loader.take_reply().is_none());
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            if let Some(result) = loader.take_reply() {
+            if let Some((at, result)) = loader.take_reply() {
+                assert_eq!(at, requested_at);
                 assert!(result.is_none());
                 break;
             }
@@ -6972,6 +7033,27 @@ mod tests {
                 side.iter().any(|line| line.contains("… earlier")),
                 indicator,
                 "count={count}: {frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_row_survives_a_four_row_viewport() {
+        let clock = ManualClock::new();
+        let mut ui = stacked_ui(&clock, 12);
+        ui.selected = 11;
+        ui.active = 11;
+        for rows in [3, 4] {
+            let frame = ui.render_text(100, rows, "pane", &clock);
+            assert!(
+                frame.lines().count() <= usize::from(rows),
+                "{rows}: {frame}"
+            );
+            let side = tree_side(&frame);
+            assert!(
+                side.iter()
+                    .any(|line| line.starts_with('>') && line.contains("s11")),
+                "{rows}: {frame}"
             );
         }
     }
