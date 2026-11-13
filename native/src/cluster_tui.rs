@@ -7855,6 +7855,80 @@ mod tests {
     }
 
     #[test]
+    fn remote_stacked_rows_scroll_with_keyboard_movement_at_narrow_width() {
+        let clock = ManualClock::new();
+        let names = (0..12)
+            .map(|index| format!("r{index:02}"))
+            .collect::<Vec<_>>();
+        let mut snapshot = remote_snapshot(RemoteState::Reachable, Duration::ZERO, None);
+        snapshot.nodes[0].sessions = names
+            .iter()
+            .map(|name| RemoteSessionSnapshot {
+                name: name.clone(),
+                wire_name: name.clone(),
+                instance_id: format!("inst-{name}"),
+                alive: true,
+                output_version: Some(1),
+                bracketed_paste: false,
+                screen: None,
+                last_error: None,
+                program_status: None,
+            })
+            .collect();
+        let mut ui = make_ui("studio", Vec::new(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        ui.remote_expanded.insert("fp-laptop".into());
+        let summaries = names
+            .iter()
+            .map(|name| remote_summary(name, &format!("inst-{name}")))
+            .collect::<Vec<_>>();
+        let entries = names
+            .iter()
+            .map(|name| ViewEntry {
+                name: name.clone(),
+                instance_id: format!("inst-{name}"),
+                lines: vec![
+                    alive_row(name),
+                    "\x1b[2mcodex · gpt-6.1\x1b[0m".into(),
+                    String::new(),
+                ],
+            })
+            .collect();
+        ui.remote_view_synced(
+            "fp-laptop",
+            SessionView::new(summaries, 3, entries),
+            clock.now(),
+        );
+        ui.remote_selected = Some(RemoteSelection::Session {
+            node: "fp-laptop".into(),
+            name: "r11".into(),
+            wire_name: "r11".into(),
+            instance_id: "inst-r11".into(),
+        });
+
+        let frame = ui.render_text(40, 24, "pane", &clock);
+        let side = tree_side(&frame);
+        assert!(
+            side.iter()
+                .any(|line| line.starts_with('>') && line.contains("r11")),
+            "{frame}"
+        );
+        assert!(
+            side.iter().any(|line| line.contains("… earlier")),
+            "{frame}"
+        );
+
+        ui.move_selection(false, clock.now());
+        let frame = ui.render_text(40, 24, "pane", &clock);
+        assert!(
+            tree_side(&frame)
+                .iter()
+                .any(|line| line.starts_with('>') && line.contains("r10")),
+            "{frame}"
+        );
+    }
+
+    #[test]
     fn resize_keeps_the_selected_stacked_row_visible() {
         let clock = ManualClock::new();
         let mut ui = stacked_ui(&clock, 12);
