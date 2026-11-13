@@ -981,7 +981,6 @@ impl ClusterUi {
         if width >= SPLIT_MIN_COLS {
             return self.render_split(width, height, screen, now);
         }
-        let mut frame = self.tree_lines(width, now);
         let tree_start = 2;
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
         let divider = "─".repeat(width);
@@ -999,6 +998,8 @@ impl ClusterUi {
                 + composer.len()
                 + 1,
         );
+        let mut frame =
+            scroll_tree_to_selection(self.tree_lines(width, now), tree_start + tree_capacity);
         let tree_rows = frame.len().saturating_sub(tree_start);
         if tree_rows > tree_capacity {
             let kept = tree_capacity.saturating_sub(1);
@@ -1345,7 +1346,7 @@ impl ClusterUi {
             );
         }
         right.extend(composer);
-        let mut left = self.tree_lines(left_w, now);
+        let mut left = scroll_tree_to_selection(self.tree_lines(left_w, now), body_rows);
         if left.len() > body_rows {
             left.truncate(body_rows - 1);
             left.push("… more".into());
@@ -3235,6 +3236,38 @@ fn truncate(text: &str, width: usize) -> String {
 fn pad_to(text: &str, width: usize) -> String {
     let w = crate::tui::visible_width(text);
     format!("{text}{}", " ".repeat(width.saturating_sub(w)))
+}
+
+/// Keep the selected tree row visible without redesigning the tree. The two
+/// header rows stay pinned; the body scrolls only as far as needed.
+fn scroll_tree_to_selection(lines: Vec<String>, rows: usize) -> Vec<String> {
+    const HEADER: usize = 2;
+    if lines.len() <= rows || rows <= HEADER + 2 {
+        return lines;
+    }
+    let Some(selected) = lines.iter().position(|line| line.starts_with('>')) else {
+        return lines;
+    };
+    let body = &lines[HEADER..];
+    let capacity = rows - HEADER - 2;
+    if capacity == 0 {
+        return lines;
+    }
+    let selected_body = selected.saturating_sub(HEADER);
+    let start = selected_body
+        .saturating_sub(capacity.saturating_sub(1))
+        .min(body.len().saturating_sub(capacity));
+    let end = (start + capacity).min(body.len());
+    let mut out = Vec::with_capacity(rows);
+    out.extend_from_slice(&lines[..HEADER]);
+    if start > 0 {
+        out.push("… earlier".into());
+    }
+    out.extend_from_slice(&body[start..end]);
+    if end < body.len() {
+        out.push("… more".into());
+    }
+    out
 }
 
 fn tree_row_lines(row: &TreeRow, width: usize) -> Vec<String> {
@@ -6853,12 +6886,7 @@ mod tests {
         assert_eq!(side.iter().filter(|line| line.starts_with('>')).count(), 1);
     }
 
-    #[test]
-    fn stacked_rows_beyond_the_viewport_clip_the_selected_tail_row() {
-        // A1 scope: the tree has no scroll window. Stacked details (with the
-        // empty spacing line dropped) still outgrow a 24-row viewport once
-        // there are enough sessions; this characterizes that limit.
-        let clock = ManualClock::new();
+    fn stacked_ui(clock: &ManualClock) -> ClusterUi {
         let sessions = (0..12)
             .map(|index| session(&format!("s{index:02}"), true))
             .collect::<Vec<_>>();
@@ -6876,13 +6904,51 @@ mod tests {
             })
             .collect();
         ui.local_view_synced(SessionView::new(sessions, 3, entries), clock.now());
+        ui
+    }
+
+    #[test]
+    fn stacked_rows_scroll_to_keep_the_selected_tail_row_visible() {
+        let clock = ManualClock::new();
+        let mut ui = stacked_ui(&clock);
         ui.selected = 11;
         ui.active = 11;
         let tree = ui.tree_lines(ui.tree_width(100, clock.now()), clock.now());
         assert_eq!(tree.len(), 26);
         assert_eq!(tree.iter().position(|line| line.starts_with('>')), Some(24));
         let frame = ui.render_text(100, 24, "pane", &clock);
-        assert!(!tree_side(&frame).join("\n").contains("s11"));
+        let side = tree_side(&frame);
+        assert!(side.iter().any(|line| line.contains("s11")), "{frame}");
+        assert!(
+            side.iter()
+                .any(|line| line.starts_with('>') && line.contains("s11")),
+            "{frame}"
+        );
+        assert!(side.iter().any(|line| line.contains("… earlier")));
+    }
+
+    #[test]
+    fn stacked_rows_scroll_at_narrow_width_and_follow_keyboard_movement() {
+        let clock = ManualClock::new();
+        let mut ui = stacked_ui(&clock);
+        ui.selected = 11;
+        ui.active = 11;
+        let frame = ui.render_text(40, 24, "pane", &clock);
+        assert!(
+            tree_side(&frame)
+                .iter()
+                .any(|line| line.starts_with('>') && line.contains("s11")),
+            "{frame}"
+        );
+        ui.move_selection(false, clock.now());
+        assert_eq!(ui.sessions[ui.selected].name, "s10");
+        let frame = ui.render_text(40, 24, "pane", &clock);
+        assert!(
+            tree_side(&frame)
+                .iter()
+                .any(|line| line.starts_with('>') && line.contains("s10")),
+            "{frame}"
+        );
     }
 
     #[test]
