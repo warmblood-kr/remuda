@@ -17,6 +17,7 @@ use remuda_core::agent::StyledCell;
 use remuda_core::clock::Clock;
 use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
+use remuda_core::session_view::{SessionView, ViewEntry};
 use sender::InputSender;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
@@ -52,6 +53,13 @@ pub mod close_request;
 /// Below this many columns there is no room for two panes: the tree stacks above the pane.
 const SPLIT_MIN_COLS: usize = 60;
 const UI_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// The local rendered list is fetched at the tree's maximum display width; the
+/// painter validates and fits it again at the width actually available.
+const LOCAL_VIEW_WIDTH: u16 = 48;
+const LOCAL_VIEW_TTL: Duration = Duration::from_secs(30);
+/// `">    "` / `"     "` before every local row's rendered content.
+const LOCAL_ROW_PREFIX_WIDTH: usize = 5;
 const REMOTE_KEYS_COALESCE_INTERVAL: Duration = Duration::from_millis(40);
 const REMOTE_PASTE_FAILURE_NOTICE: &str =
     "remote input stopped after a failed chunk; remaining lines dropped";
@@ -133,6 +141,7 @@ pub struct ClusterUi {
     node: String,
     local_targets: Vec<String>,
     sessions: Vec<SessionSummary>,
+    local_view: Option<LocalView>,
     selected: usize,
     active: usize,
     expanded: bool,
@@ -253,10 +262,24 @@ enum TreeSelection {
 }
 
 /// A ready-to-render tree row: prefix carries the selection/expander glyphs.
-struct TreeRow {
-    prefix: String,
-    label: String,
-    status: String,
+enum TreeRow {
+    /// Today's name-only row, used when no validated local view is available.
+    Plain {
+        prefix: String,
+        label: String,
+        status: String,
+    },
+    /// A row painted from the shared local renderer. The first line is the
+    /// selectable row; later lines are its details.
+    View { prefix: String, lines: Vec<String> },
+}
+
+/// The last local `RenderedSessionList` snapshot and the identity order it
+/// established. It is untrusted until `validate_for_display` at paint width.
+struct LocalView {
+    view: SessionView,
+    at: Duration,
+    order: Vec<(String, String)>,
 }
 
 impl ClusterUi {
@@ -279,6 +302,7 @@ impl ClusterUi {
             node: node.into(),
             local_targets: vec![node.into()],
             sessions,
+            local_view: None,
             selected: 0,
             active: 0,
             expanded: true,
@@ -589,7 +613,76 @@ impl ClusterUi {
             self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
             self.active = self.active.min(self.sessions.len().saturating_sub(1));
         }
+        self.retain_local_view();
         self.sync_completed(at);
+    }
+
+    /// Accept a rendered local list only when it binds exactly the sessions the
+    /// tree is showing. The rows stay untrusted until painted at the tree width.
+    pub fn local_view_synced(&mut self, view: SessionView, at: Duration) {
+        if !self.sessions_match_view(&view) {
+            self.local_view = None;
+            return;
+        }
+        self.local_view = Some(LocalView {
+            at,
+            order: view
+                .entries()
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.instance_id.clone()))
+                .collect(),
+            view,
+        });
+    }
+
+    pub fn local_view_failed(&mut self) {
+        self.local_view = None;
+    }
+
+    fn retain_local_view(&mut self) {
+        if self
+            .local_view
+            .as_ref()
+            .is_some_and(|local| !self.sessions_match_view(&local.view))
+        {
+            self.local_view = None;
+        }
+    }
+
+    fn sessions_match_view(&self, view: &SessionView) -> bool {
+        // A kept-ended session is shown with the live list but is no longer in
+        // the daemon's rendered snapshot; leave that row on the plain path
+        // instead of discarding the decorations of every other row.
+        let ended = self.ended.as_ref().map(|ended| {
+            (
+                ended.summary.name.as_str(),
+                ended.summary.instance_id.as_deref(),
+            )
+        });
+        let mut expected = HashMap::with_capacity(self.sessions.len());
+        for session in &self.sessions {
+            let identity = (session.name.as_str(), session.instance_id.as_deref());
+            if ended.is_some_and(|ended| ended == identity) {
+                continue;
+            }
+            let Some(instance) = session.instance_id.as_deref() else {
+                return false;
+            };
+            expected.insert(session.name.as_str(), instance);
+        }
+        expected.len() == view.entries().len()
+            && view.entries().iter().all(|entry| {
+                expected.get(entry.name.as_str()).copied() == Some(entry.instance_id.as_str())
+            })
+    }
+
+    fn local_identity(&self, index: usize) -> Option<(&str, &str)> {
+        let session = self.sessions.get(index)?;
+        Some((session.name.as_str(), session.instance_id.as_deref()?))
+    }
+
+    fn local_order(&self) -> Option<&[(String, String)]> {
+        self.local_view.as_ref().map(|view| view.order.as_slice())
     }
 
     fn set_ended(&mut self, ended: EndedState) {
@@ -603,6 +696,7 @@ impl ClusterUi {
         self.composer_target = None;
         self.composer_focused = false;
         self.ended = Some(ended);
+        self.retain_local_view();
     }
 
     fn clear_ended(&mut self) {
@@ -615,6 +709,7 @@ impl ClusterUi {
         self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
         self.active = self.active.min(self.sessions.len().saturating_sub(1));
         self.last_frame = None;
+        self.retain_local_view();
     }
 
     #[cfg(test)]
@@ -829,7 +924,7 @@ impl ClusterUi {
     }
 
     /// Cluster header, local node and remote nodes as one virtual tree (first 2 rows are the header).
-    fn tree_lines(&self, width: usize, _now: Duration) -> Vec<String> {
+    fn tree_lines(&self, width: usize, now: Duration) -> Vec<String> {
         let mut frame = Vec::new();
         let reachable = 1 + self
             .remote_snapshot
@@ -841,7 +936,7 @@ impl ClusterUi {
             "remuda · cluster ({reachable}/{} ok)",
             self.remote_snapshot.nodes.len() + 1
         ));
-        let local_rows = self.local_tree_rows();
+        let local_rows = self.local_tree_rows(width, now);
         let remote_rows = self.remote_tree_rows();
         frame.push(tree_label_line(
             &format!(
@@ -853,12 +948,9 @@ impl ClusterUi {
             "●",
             width,
         ));
-        frame.extend(
-            local_rows
-                .iter()
-                .chain(remote_rows.iter())
-                .map(|row| tree_label_line(&row.prefix, &row.label, &row.status, width)),
-        );
+        for row in local_rows.iter().chain(remote_rows.iter()) {
+            frame.extend(tree_row_lines(row, width));
+        }
         if self.expanded && local_rows.is_empty() {
             let hint = if self.attention_only {
                 "    no sessions need attention"
@@ -883,7 +975,7 @@ impl ClusterUi {
         let wanted = self
             .tree_lines(48, now)
             .iter()
-            .map(|l| crate::tui::visible_width(l))
+            .map(|l| crate::tui::visible_width(l.trim_end()))
             .max()
             .unwrap_or(0);
         (wanted + 1).clamp(24, (width / 2).min(48))
@@ -1343,25 +1435,71 @@ impl ClusterUi {
     }
 
     /// Local session rows, in display order; empty while the local node is collapsed.
-    fn local_tree_rows(&self) -> Vec<TreeRow> {
+    fn local_tree_rows(&self, width: usize, now: Duration) -> Vec<TreeRow> {
         if !self.expanded {
             return Vec::new();
         }
+        let selection = self.current_tree_selection();
+        let selected = match selection {
+            TreeSelection::LocalSession(index) => {
+                self.local_identity(index).filter(|identity| {
+                    self.local_view.as_ref().is_some_and(|local| {
+                        local.view.entries().iter().any(|entry| {
+                            entry.name == identity.0 && entry.instance_id == identity.1
+                        })
+                    })
+                })
+            }
+            _ => None,
+        };
+        let content_width =
+            u16::try_from(width.saturating_sub(LOCAL_ROW_PREFIX_WIDTH)).unwrap_or(u16::MAX);
+        let checked = self
+            .local_view
+            .as_ref()
+            .filter(|local| now.saturating_sub(local.at) < LOCAL_VIEW_TTL)
+            .and_then(|local| {
+                local
+                    .view
+                    .validate_for_display(selected, content_width)
+                    .ok()
+            });
+        let entries: HashMap<(&str, &str), &ViewEntry> = checked
+            .as_ref()
+            .map(|view| {
+                view.entries()
+                    .iter()
+                    .map(|entry| ((entry.name.as_str(), entry.instance_id.as_str()), entry))
+                    .collect()
+            })
+            .unwrap_or_default();
         self.visible_sessions()
             .into_iter()
             .map(|index| {
                 let session = &self.sessions[index];
-                TreeRow {
-                    prefix: format!(
-                        "{}    ",
-                        if self.current_tree_selection() == TreeSelection::LocalSession(index) {
-                            ">"
-                        } else {
-                            " "
-                        }
-                    ),
-                    label: session.name.clone(),
-                    status: session_cell(session.alive, false, self.pending_count(session)),
+                let prefix = format!(
+                    "{}    ",
+                    if selection == TreeSelection::LocalSession(index) {
+                        ">"
+                    } else {
+                        " "
+                    }
+                );
+                let pending = self.pending_count(session);
+                let rendered = self
+                    .local_identity(index)
+                    .and_then(|identity| entries.get(&identity).copied())
+                    .filter(|_| pending == 0);
+                match rendered {
+                    Some(entry) => TreeRow::View {
+                        prefix,
+                        lines: entry.lines.clone(),
+                    },
+                    None => TreeRow::Plain {
+                        prefix,
+                        label: session.name.clone(),
+                        status: session_cell(session.alive, false, pending),
+                    },
                 }
             })
             .collect()
@@ -1387,7 +1525,7 @@ impl ClusterUi {
             let is_expanded = self.remote_expanded.contains(&node.registry_key);
             let is_selected =
                 self.remote_selected == Some(RemoteSelection::Node(node.registry_key.clone()));
-            rows.push(TreeRow {
+            rows.push(TreeRow::Plain {
                 prefix: format!(
                     "{}{} ",
                     if is_selected { ">" } else { " " },
@@ -1404,7 +1542,7 @@ impl ClusterUi {
                             name: session.name.clone(),
                             instance_id: session.instance_id.clone(),
                         });
-                    rows.push(TreeRow {
+                    rows.push(TreeRow::Plain {
                         prefix: format!("{}    ", if is_selected { ">" } else { " " }),
                         label: session.name.clone(),
                         status: remote_program_cell(
@@ -2313,7 +2451,8 @@ impl ClusterUi {
     fn visible_sessions(&self) -> Vec<usize> {
         let query = self.query.as_deref().unwrap_or_default();
         let node_matches = query.is_empty() || matches_query(query, &self.node);
-        self.sessions
+        let mut visible: Vec<usize> = self
+            .sessions
             .iter()
             .enumerate()
             .filter(|(_, session)| {
@@ -2326,7 +2465,20 @@ impl ClusterUi {
                 (!self.attention_only || attention) && name_matches
             })
             .map(|(index, _)| index)
-            .collect()
+            .collect();
+        if let Some(order) = self.local_order() {
+            let positions: HashMap<(&str, &str), usize> = order
+                .iter()
+                .enumerate()
+                .map(|(position, (name, instance))| ((name.as_str(), instance.as_str()), position))
+                .collect();
+            visible.sort_by_key(|index| {
+                self.local_identity(*index)
+                    .and_then(|identity| positions.get(&identity).copied())
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        visible
     }
 
     fn select_first_visible(&mut self) {
@@ -2973,6 +3125,37 @@ fn pad_to(text: &str, width: usize) -> String {
     format!("{text}{}", " ".repeat(width.saturating_sub(w)))
 }
 
+fn tree_row_lines(row: &TreeRow, width: usize) -> Vec<String> {
+    match row {
+        TreeRow::Plain {
+            prefix,
+            label,
+            status,
+        } => vec![tree_label_line(prefix, label, status, width)],
+        TreeRow::View { prefix, lines } => {
+            let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+            let content_width =
+                u16::try_from(width.saturating_sub(prefix_width)).unwrap_or(u16::MAX);
+            let continuation = " ".repeat(prefix_width);
+            lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    let row_prefix = if index == 0 {
+                        prefix.as_str()
+                    } else {
+                        continuation.as_str()
+                    };
+                    format!(
+                        "{row_prefix}{}",
+                        remuda_core::session_view::fit_session_row(line, content_width)
+                    )
+                })
+                .collect()
+        }
+    }
+}
+
 fn tree_label_line(prefix: &str, label: &str, status: &str, width: usize) -> String {
     let prefix_width = UnicodeWidthStr::width(prefix);
     let available = width.saturating_sub(prefix_width + 1 + crate::tui::visible_width(status));
@@ -3280,6 +3463,36 @@ fn list(path: &Path) -> io::Result<Vec<SessionSummary>> {
     }
 }
 
+/// The same rendered list the herd TUI shows, including Butler decorations.
+/// Read-only and optional: a missing or unsupported view keeps plain rows.
+fn local_session_view(path: &Path, width: u16) -> Option<SessionView> {
+    match client::request_with_timeout(
+        path,
+        &Request::RenderedSessionList { width },
+        UI_REQUEST_TIMEOUT,
+    ) {
+        Ok(Response::RenderedSessionList(view)) => Some(view),
+        _ => None,
+    }
+}
+
+/// Refresh the local name list and, when expanded, its decorated view. A node
+/// that just failed `List` does not spend a second timeout on the view.
+fn sync_local_list(ui: &mut ClusterUi, path: &Path, now: Duration) {
+    match list(path) {
+        Ok(current) => {
+            ui.sessions_synced(current, now);
+            if ui.expanded {
+                match local_session_view(path, LOCAL_VIEW_WIDTH) {
+                    Some(view) => ui.local_view_synced(view, now),
+                    None => ui.local_view_failed(),
+                }
+            }
+        }
+        Err(_) => ui.local_view_failed(),
+    }
+}
+
 fn screen(
     path: &Path,
     name: &str,
@@ -3430,6 +3643,9 @@ pub fn read_frame(
     ui.set_keymap(
         crate::keybindings::fetch(path, Duration::from_secs(3)).map_err(io::Error::other)?,
     );
+    if let Some(view) = local_session_view(path, LOCAL_VIEW_WIDTH) {
+        ui.local_view_synced(view, clock.now());
+    }
     ui.select_target(target)?;
     let body = match ui.sessions.get(ui.active) {
         Some(session) => {
@@ -3521,9 +3737,7 @@ fn run_loop(
     let mut last_full_repaint = clock.now();
     let mut frames = frame_writer()?;
     loop {
-        if let Ok(current) = list(path) {
-            ui.sessions_synced(current, clock.now());
-        }
+        sync_local_list(&mut ui, path, clock.now());
         // Read before syncing: an update landing during sync/render wakes the wait.
         let seen = wake();
         ui.remote_synced(remote_source);
@@ -3669,8 +3883,8 @@ mod tests {
         help_lines, help_window, is_attention, legend_lines, normalized_terminal_size, present,
         remote_state_label, render_badge, resize_requires_full_repaint,
         select_target_with_remote_wait, session_cell, session_glyph, status_glyph, status_style,
-        terminal_frame, AttentionSignals, Badge, ClusterUi, RemoteInputTransport, RemoteSelection,
-        RemoteSource, TreeSelection, ERROR_GLYPH,
+        terminal_frame, AttentionSignals, Badge, ClusterUi, EndedState, RemoteInputTransport,
+        RemoteSelection, RemoteSource, TreeSelection, ERROR_GLYPH, LOCAL_VIEW_TTL,
     };
     use crate::cluster_remote::{
         RemoteNodeSnapshot, RemoteSessionSnapshot, RemoteSnapshot, RemoteState,
@@ -3678,6 +3892,7 @@ mod tests {
     use remuda_core::agent::{Color, Cursor, ScreenSnapshot, StyledCell};
     use remuda_core::clock::{Clock, ManualClock};
     use remuda_core::protocol::{Request, Response};
+    use remuda_core::session_view::{SessionView, ViewEntry};
     use remuda_core::{SessionSummary, Size};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -6155,6 +6370,239 @@ mod tests {
             instance_id: None,
             output_version: None,
         }]
+    }
+
+    fn alive_row(name: &str) -> String {
+        format!("\x1b[32m●\x1b[0m  {name}")
+    }
+
+    fn view_entry(name: &str, instance: &str, lines: &[&str]) -> ViewEntry {
+        ViewEntry {
+            name: name.into(),
+            instance_id: instance.into(),
+            lines: lines.iter().map(|line| (*line).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn local_tree_rows_use_shared_renderer_detail_and_depth() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("parent", true), session("child", true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let detail = "\x1b[2midle · codex · gpt-6.1\x1b[0m";
+        let view = SessionView::new(
+            sessions,
+            1,
+            vec![
+                view_entry(
+                    "parent",
+                    "instance-parent",
+                    &[&format!("\x1b[32m●\x1b[0m  parent  {detail}")],
+                ),
+                view_entry(
+                    "child",
+                    "instance-child",
+                    &[&format!("  \x1b[32m●\x1b[0m  child  {detail}")],
+                ),
+            ],
+        );
+        ui.local_view_synced(view, clock.now());
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let side = tree_side(&frame);
+        let parent = side.iter().find(|line| line.contains("parent")).unwrap();
+        assert!(parent.contains("idle · codex · gpt-6.1"), "{parent:?}");
+        let child = side.iter().find(|line| line.contains("child")).unwrap();
+        assert!(child.starts_with("       ●  child"), "{child:?}");
+        assert!(child.contains("idle · codex · gpt-6.1"), "{child:?}");
+    }
+
+    #[test]
+    fn local_tree_rows_fall_back_for_missing_mismatched_invalid_or_stale_views() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("dev", true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(!frame.contains("codex"), "{frame}");
+
+        let detail = "\x1b[2mcodex · gpt-6.1\x1b[0m";
+        let mismatched = SessionView::new(
+            sessions.clone(),
+            1,
+            vec![view_entry(
+                "dev",
+                "another-instance",
+                &[&format!("\x1b[32m●\x1b[0m  dev  {detail}")],
+            )],
+        );
+        ui.local_view_synced(mismatched, clock.now());
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(!frame.contains("codex"), "{frame}");
+
+        let invalid = SessionView::new(
+            sessions.clone(),
+            1,
+            vec![view_entry("dev", "instance-dev", &["\x1b[31mdev"])],
+        );
+        ui.local_view_synced(invalid, clock.now());
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(!frame.contains("codex"), "{frame}");
+
+        let stale = SessionView::new(
+            sessions,
+            1,
+            vec![view_entry(
+                "dev",
+                "instance-dev",
+                &[&format!("\x1b[32m●\x1b[0m  dev  {detail}")],
+            )],
+        );
+        ui.local_view_synced(stale, clock.now());
+        clock.advance(LOCAL_VIEW_TTL + Duration::from_secs(1));
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(!frame.contains("codex"), "{frame}");
+    }
+
+    #[test]
+    fn ended_row_stays_plain_without_clearing_live_row_decorations() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("alpha", true), session("bravo", true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let detail = "\x1b[2mcodex · gpt-6.1\x1b[0m";
+        ui.set_ended(EndedState::from_capture(
+            session("bravo", true),
+            "last frame".into(),
+            clock.now(),
+        ));
+        let live = SessionView::new(
+            vec![session("alpha", true)],
+            1,
+            vec![view_entry(
+                "alpha",
+                "instance-alpha",
+                &[&format!("\x1b[32m●\x1b[0m  alpha  {detail}")],
+            )],
+        );
+        ui.local_view_synced(live, clock.now());
+        assert!(ui.local_view.is_some());
+        assert_eq!(ui.sessions[ui.selected].name, "bravo");
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let side = tree_side(&frame);
+        let alpha = side.iter().find(|line| line.contains("alpha")).unwrap();
+        assert!(alpha.contains("codex · gpt-6.1"), "{alpha:?}");
+        let bravo = side.iter().find(|line| line.contains("bravo")).unwrap();
+        assert!(!bravo.contains("codex"), "{bravo:?}");
+    }
+
+    #[test]
+    fn local_view_order_drives_tree_and_keyboard_traversal_by_identity() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("alpha", true), session("bravo", true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let view = SessionView::new(
+            sessions,
+            1,
+            vec![
+                view_entry("bravo", "instance-bravo", &[&alive_row("bravo")]),
+                view_entry("alpha", "instance-alpha", &[&alive_row("alpha")]),
+            ],
+        );
+        ui.local_view_synced(view, clock.now());
+        assert_eq!(
+            ui.visible_tree_rows(),
+            vec![
+                TreeSelection::LocalNode,
+                TreeSelection::LocalSession(1),
+                TreeSelection::LocalSession(0),
+            ]
+        );
+        assert_eq!(ui.current_tree_selection(), TreeSelection::LocalSession(0));
+        ui.move_selection(false);
+        assert_eq!(ui.current_tree_selection(), TreeSelection::LocalSession(1));
+        assert_eq!(ui.sessions[ui.selected].name, "bravo");
+        ui.query = Some("alpha".into());
+        assert_eq!(
+            ui.visible_tree_rows(),
+            vec![TreeSelection::LocalNode, TreeSelection::LocalSession(0)]
+        );
+    }
+
+    #[test]
+    fn local_pending_indicator_survives_the_shared_view() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("dev", true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let detail = "\x1b[2mcodex · gpt-6.1\x1b[0m";
+        let view = SessionView::new(
+            sessions,
+            1,
+            vec![view_entry(
+                "dev",
+                "instance-dev",
+                &[&format!("\x1b[32m●\x1b[0m  dev  {detail}")],
+            )],
+        );
+        ui.local_view_synced(view, clock.now());
+        ui.input_sender
+            .enqueue(
+                &mut ui.input_queue,
+                "dev",
+                "instance-dev",
+                b"hello\r".to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let line = tree_side(&frame)
+            .into_iter()
+            .find(|line| line.contains("dev"))
+            .unwrap();
+        assert!(line.contains("● +1"), "{line:?}");
+    }
+
+    #[test]
+    fn local_stacked_rows_render_detail_lines_without_extra_selectable_rows() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("dev", true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let view = SessionView::new(
+            sessions,
+            3,
+            vec![view_entry(
+                "dev",
+                "instance-dev",
+                &[&alive_row("dev"), "\x1b[2mcodex · gpt-6.1\x1b[0m", ""],
+            )],
+        );
+        ui.local_view_synced(view, clock.now());
+        assert_eq!(
+            ui.visible_tree_rows(),
+            vec![TreeSelection::LocalNode, TreeSelection::LocalSession(0)]
+        );
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let side = tree_side(&frame);
+        assert!(side.iter().any(|line| line.contains("codex · gpt-6.1")));
+        assert_eq!(side.iter().filter(|line| line.starts_with('>')).count(), 1);
+    }
+
+    #[test]
+    fn narrow_tree_falls_back_instead_of_clipping_a_name() {
+        let clock = ManualClock::new();
+        let name = "a-very-long-session-name-that-does-not-fit";
+        let sessions = vec![session(name, true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let detail = "\x1b[2mcodex · gpt-6.1\x1b[0m";
+        let view = SessionView::new(
+            sessions,
+            1,
+            vec![view_entry(
+                name,
+                &format!("instance-{name}"),
+                &[&format!("\x1b[32m●\x1b[0m  {name}  {detail}")],
+            )],
+        );
+        ui.local_view_synced(view, clock.now());
+        let frame = ui.render_text(60, 24, "pane", &clock);
+        assert!(!frame.contains("codex"), "{frame}");
     }
 
     fn session(name: &str, alive: bool) -> SessionSummary {

@@ -24,6 +24,10 @@ struct PrivateDaemon {
 
 impl PrivateDaemon {
     fn start() -> Self {
+        Self::start_with_init(None)
+    }
+
+    fn start_with_init(init: Option<&str>) -> Self {
         let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         let runtime = root.join(format!(
             "cluster-tree-{}-{}",
@@ -34,6 +38,11 @@ impl PrivateDaemon {
         std::fs::create_dir_all(&runtime).unwrap();
         let home = runtime.join("home");
         std::fs::create_dir_all(&home).unwrap();
+        if let Some(init) = init {
+            let config = runtime.join("config").join("remuda");
+            std::fs::create_dir_all(&config).unwrap();
+            std::fs::write(config.join("init.lua"), init).unwrap();
+        }
         let child = Command::new(env!("CARGO_BIN_EXE_remuda"))
             .args(["-s", "cluster-tree", "daemon"])
             .env("REMUDA_RUNTIME_DIR", &runtime)
@@ -335,6 +344,83 @@ fn local_tree_lists_and_captures_a_session_from_a_private_daemon() {
     .unwrap();
     assert!(frame.contains("studio / tree-session · live · snapshot 0s ago"));
     assert!(frame.contains("tree-session"));
+}
+
+#[test]
+fn local_tree_frame_uses_daemon_registered_decorations_and_depth() {
+    let mut daemon = PrivateDaemon::start_with_init(Some(
+        r#"
+        remuda.session_order = function(rows)
+            local order = {}
+            for _, row in ipairs(rows) do
+                if row.name == "tree-parent" then
+                    order[#order + 1] = { name = row.name, depth = 0 }
+                end
+            end
+            for _, row in ipairs(rows) do
+                if row.name ~= "tree-parent" then
+                    order[#order + 1] = { name = row.name, depth = 1 }
+                end
+            end
+            return order
+        end
+        remuda.session_list_decorate = function()
+            return { agent_kind = "codex", description = "gpt-6.1-terra", layout = "compact" }
+        end
+        "#,
+    ));
+    daemon.wait_ready();
+    for name in ["tree-parent", "tree-child"] {
+        let response = remuda_native::client::request(
+            &daemon.path(),
+            &Request::New {
+                name: Some(name.into()),
+                command: vec!["sh".into(), "-c".into(), "sleep 30".into()],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(response, Response::Value(got) if got == name));
+    }
+
+    let frame = remuda_native::cluster_tui::read_frame(
+        &daemon.path(),
+        "studio",
+        Some("studio/tree-parent"),
+        100,
+        24,
+    )
+    .unwrap();
+    let plain = strip_sgr(&frame);
+    assert_eq!(plain.matches("codex · gpt-6.1-terra").count(), 2, "{plain}");
+    let child = plain
+        .lines()
+        .find(|line| line.contains("tree-child"))
+        .unwrap();
+    assert!(child.starts_with("       ●  tree-child"), "{child:?}");
+    assert!(
+        plain.find("tree-parent").unwrap() < plain.find("tree-child").unwrap(),
+        "{plain}"
+    );
+}
+
+fn strip_sgr(text: &str) -> String {
+    let mut plain = String::new();
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            for escape in chars.by_ref() {
+                if escape == 'm' {
+                    break;
+                }
+            }
+        } else {
+            plain.push(ch);
+        }
+    }
+    plain
 }
 
 #[test]

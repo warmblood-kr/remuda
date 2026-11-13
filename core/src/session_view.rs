@@ -63,6 +63,11 @@ impl SessionView {
         }
     }
 
+    /// Raw, untrusted rows exactly as received. Validate before display.
+    pub fn entries(&self) -> &[ViewEntry] {
+        &self.entries
+    }
+
     /// Validate identity and actual fitted output, then apply local selection.
     /// The UI must paint these rows using `fit_session_row` at this same width.
     pub fn validate_for_display(
