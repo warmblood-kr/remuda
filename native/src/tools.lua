@@ -667,7 +667,7 @@ register(
   "_take_due_schedules(now) -> table"
 )
 register("_run_schedule", "Run one schedule by handle (native tick only).", "_run_schedule(handle) -> boolean")
-
+register("_render_sessions_snapshot", "Render the bounded session-list rows used by the local client pane; display only.", "_render_sessions_snapshot(sessions, width, selected_name, selected_id) -> rows")
 -- A shallow copy, the same discipline `emit`'s own hook snapshot already
 -- keeps — a caller mutating what it was handed must never reach back into
 -- this table.

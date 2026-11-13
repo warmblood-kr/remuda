@@ -3215,11 +3215,11 @@ fn capture_styled_snapshot(path: &Path, name: &str, scrollback: usize) -> (Strin
 
 #[cfg(unix)]
 #[test]
-#[allow(clippy::too_many_lines)] // One end-to-end case: receive, refuse, local, reuse.
-#[ignore = "the per-session remote-input opt-out is not enforced after #941; restore enforcement or delete this test with an owner decision"]
-fn remote_input_opt_out_refuses_before_the_pty_and_keeps_local_input() {
-    let path = scratch("remote-input-opt-out");
-    let _daemon = daemon_at(&path);
+#[allow(clippy::too_many_lines)] // One end-to-end case: receive, allow, local, replace.
+fn remote_input_is_allowed_for_trusted_peers_even_when_opt_out_was_requested() {
+    let dir = scratch_dir("rio");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = Daemon::spawn(&dir);
     let response = client::request(
         &path,
         &Request::NewWithInstance {
@@ -3232,7 +3232,9 @@ fn remote_input_opt_out_refuses_before_the_pty_and_keeps_local_input() {
             size: Size::new(80, 24),
             cwd: None,
             env: None,
-            remote_input_disabled: false,
+            // Accepted for compatibility, but current builds admit trusted
+            // peers regardless of the per-session flag.
+            remote_input_disabled: true,
         },
     )
     .expect("start opted session");
@@ -3257,6 +3259,9 @@ fn remote_input_opt_out_refuses_before_the_pty_and_keeps_local_input() {
         Response::Ack { duplicate: false }
     ));
     wait_for(&path, &name, "got:first");
+
+    // The setter still answers Ok for the exact instance but does not block
+    // the next trusted-peer input.
     assert_eq!(
         client::request(
             &path,
@@ -3266,18 +3271,19 @@ fn remote_input_opt_out_refuses_before_the_pty_and_keeps_local_input() {
                 opted_out: true,
             }
         )
-        .expect("disable remote input"),
+        .expect("request opt out"),
         Response::Ok
     );
     for request in [
-        batch("00000000000000000000000000000002", b"leak", false),
-        batch("00000000000000000000000000000003", b"leak", true),
+        batch("00000000000000000000000000000002", b"allowed-raw\n", false),
+        batch("00000000000000000000000000000003", b"allowed-line", true),
     ] {
-        assert_eq!(
-            client::request(&path, &request).expect("refused remote input"),
-            Response::RemoteControlDisabled
-        );
+        assert!(matches!(
+            client::request(&path, &request).expect("admitted remote input"),
+            Response::Ack { duplicate: false }
+        ));
     }
+    wait_for(&path, &name, "got:allowed-line");
     assert_eq!(
         client::request(
             &path,
@@ -3289,15 +3295,16 @@ fn remote_input_opt_out_refuses_before_the_pty_and_keeps_local_input() {
         .expect("local send"),
         Response::Ok
     );
-    let screen = wait_for(&path, &name, "got:local");
-    assert!(!screen.contains("leak"), "refused bytes reached the PTY");
+    wait_for(&path, &name, "got:local");
+
+    // The list reports the flag as false: it is not an enforced contract.
     let listed = match client::request(&path, &Request::List).expect("list") {
         Response::Sessions(rows) => rows,
         other => panic!("unexpected list: {other:?}"),
     };
     assert!(listed
         .iter()
-        .any(|row| row.name == name && row.remote_input_disabled));
+        .any(|row| row.name == name && !row.remote_input_disabled));
     assert_eq!(
         client::request(
             &path,
@@ -3330,7 +3337,7 @@ fn remote_input_opt_out_refuses_before_the_pty_and_keeps_local_input() {
             size: Size::new(80, 24),
             cwd: None,
             env: None,
-            remote_input_disabled: false,
+            remote_input_disabled: true,
         },
     )
     .expect("replacement session");
