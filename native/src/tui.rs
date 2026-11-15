@@ -20,7 +20,7 @@ use crate::client;
 use crate::client::RawMode;
 use crate::mcp;
 use remuda_core::agent::{Color, Cursor, StyledCell};
-use remuda_core::protocol::{expand_runs, Request, Response};
+use remuda_core::protocol::{Request, Response};
 use remuda_core::registry::SessionSummary;
 use remuda_core::Size;
 use std::collections::HashMap;
@@ -3984,34 +3984,20 @@ fn capture_styled_for_instance<P: SessionPort + ?Sized>(
     expected: Option<&str>,
     scrollback: usize,
 ) -> Result<StyledCapture, String> {
-    match path.capture_instance(name, expected, scrollback) {
-        Ok(Response::StyledScreen {
-            rows,
-            wrapped,
-            cursor,
-            scrollback_len,
-            scrollback_total,
-            instance_id,
-            ..
-        }) => {
-            if path.remote_node().is_some()
-                && (expected.is_none() || instance_id.as_deref() != expected)
-            {
-                return Err("peer could not prove the selected preview instance".into());
-            }
-            let mut cells: Vec<Vec<StyledCell>> = rows.iter().map(|row| expand_runs(row)).collect();
-            if path.remote_node().is_some() {
-                for row in &mut cells {
-                    for cell in row {
-                        cell.text = crate::text::strip_terminal_controls(&cell.text).into_owned();
-                    }
-                }
-            }
-            Ok((cells, wrapped, cursor, scrollback_len, scrollback_total))
-        }
-        Ok(Response::Error(reason)) => Err(reason),
-        other => Err(format!("{other:?}")),
-    }
+    let frame = crate::session_preview::capture(
+        path,
+        name,
+        expected,
+        scrollback,
+        crate::session_preview::IdentityPolicy::TuiCompatible,
+    )?;
+    Ok((
+        frame.cells,
+        frame.wrapped,
+        frame.cursor,
+        frame.scrollback_len,
+        frame.scrollback_total,
+    ))
 }
 
 fn all_screen_text(cells: &[Vec<StyledCell>], wrapped: &[bool]) -> String {
