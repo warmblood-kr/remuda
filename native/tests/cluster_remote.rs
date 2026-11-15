@@ -30,10 +30,15 @@ struct Node {
     public: Vec<u8>,
     private: Vec<u8>,
     daemon: Child,
+    binary: PathBuf,
 }
 
 impl Node {
     fn start(label: &str) -> Self {
+        Self::start_with_binary(label, PathBuf::from(env!("CARGO_BIN_EXE_remuda")))
+    }
+
+    fn start_with_binary(label: &str, binary: PathBuf) -> Self {
         let serial = NEXT.fetch_add(1, Ordering::Relaxed);
         // The default macOS TMPDIR (/var/folders/...) leaves too little of the
         // 104-byte sun_path for runtime/remuda/<node>.sock.
@@ -50,7 +55,7 @@ impl Node {
             fs::create_dir_all(dir).unwrap();
         }
         let name = format!("{label}-{serial}");
-        let daemon = spawn_daemon(&name, &runtime, &root, &state);
+        let daemon = spawn_daemon(&binary, &name, &runtime, &root, &state);
         let mut node = Self {
             root,
             runtime,
@@ -59,6 +64,7 @@ impl Node {
             public: Vec::new(),
             private: Vec::new(),
             daemon,
+            binary,
         };
         node.wait_ready();
         let init = node
@@ -81,6 +87,7 @@ impl Node {
 
     fn command(&self) -> Command {
         command(
+            &self.binary,
             &self.name,
             &self.runtime,
             &self.root,
@@ -122,7 +129,13 @@ impl Node {
 
     fn restart_daemon(&mut self) {
         self.stop_daemon();
-        self.daemon = spawn_daemon(&self.name, &self.runtime, &self.root, &self.state);
+        self.daemon = spawn_daemon(
+            &self.binary,
+            &self.name,
+            &self.runtime,
+            &self.root,
+            &self.state,
+        );
         self.wait_ready();
     }
 }
@@ -137,8 +150,8 @@ impl Drop for Node {
     }
 }
 
-fn spawn_daemon(name: &str, runtime: &Path, root: &Path, state: &Path) -> Child {
-    command(name, runtime, root, state, &root.join("home"))
+fn spawn_daemon(binary: &Path, name: &str, runtime: &Path, root: &Path, state: &Path) -> Child {
+    command(binary, name, runtime, root, state, &root.join("home"))
         .args(["daemon"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -147,8 +160,15 @@ fn spawn_daemon(name: &str, runtime: &Path, root: &Path, state: &Path) -> Child 
         .unwrap()
 }
 
-fn command(name: &str, runtime: &Path, root: &Path, state: &Path, home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
+fn command(
+    binary: &Path,
+    name: &str,
+    runtime: &Path,
+    root: &Path,
+    state: &Path,
+    home: &Path,
+) -> Command {
+    let mut command = Command::new(binary);
     command
         .args(["-s", name])
         .env("REMUDA_RUNTIME_DIR", runtime)
@@ -1472,6 +1492,120 @@ fn real_remote_cluster_tree_paints_the_peer_hierarchy_and_falls_back_on_fault() 
         screen.contains("tree-parent") && !screen.contains(DETAIL)
     });
     assert!(tui.screen_text().contains("tree-child"));
+}
+
+#[test]
+#[cfg(unix)]
+fn real_remote_cluster_tree_selected_session_input_reaches_the_peer() {
+    // This checks the in-process path (docs/concepts/session-host-parity.md).
+    if remuda_native::session_host::hosting() {
+        eprintln!("skip: hosted remote input is fail-closed until its opt-out survives a daemon restart (core registry apply_hosted_remote_input_batch)");
+        return;
+    }
+    let client_node = Node::start("r1-input-client");
+    let server_node = Node::start("r1-input-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    let control = server_node
+        .command()
+        .args(["cluster", "control", "on"])
+        .output()
+        .unwrap();
+    assert!(
+        control.status.success(),
+        "cluster control failed: {control:?}"
+    );
+    server_node.start_named_session(
+        "proof",
+        "stty raw -echo; printf 'READY\\r\\n'; while :; do byte=$(dd bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d ' '); case \"$byte\" in 121) printf '\\r\\ngot=y\\r\\n' ;; esac; done",
+    );
+
+    let registry_path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry =
+        serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server_node.fingerprint())
+        .unwrap()
+        .endpoint = Some(listener.address.to_string());
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    // The session target selects and attaches deterministically, so this does
+    // not depend on tree navigation.
+    let target = format!("{}/proof", server_node.fingerprint());
+    let mut tui = RemoteTui::start(&client_node, Some(&target));
+    tui.wait_for("READY", Duration::from_secs(10));
+    tui.wait_for("remote live · reachable", Duration::from_secs(10));
+
+    let output_start = tui.output_len();
+    tui.writer.write_all(b"y\r").unwrap();
+    tui.wait_for_from(output_start, "got=y", Duration::from_secs(10));
+}
+
+#[test]
+fn real_old_peer_rejects_the_view_and_the_tree_falls_back_to_plain_rows() {
+    let Some(old) = std::env::var_os("REMUDA_OLD_PEER_BIN").map(PathBuf::from) else {
+        eprintln!("skip: set REMUDA_OLD_PEER_BIN to a build that predates RenderedSessionList");
+        return;
+    };
+    assert!(old.is_file(), "REMUDA_OLD_PEER_BIN is not a file");
+
+    let client_node = Node::start("old-view-client");
+    let server_node = Node::start_with_binary("old-view-server", old);
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    server_node.start_named_session("proof", "sleep 30");
+    let path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server_node.fingerprint())
+        .unwrap()
+        .endpoint = Some(listener.address.to_string());
+    fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+
+    // The old peer's refusal is exactly what RemoteViewLoader classifies as
+    // unsupported (long backoff), not a transient retry.
+    let client = ClusterClient::with_timeouts(
+        Arc::new(SystemWallClock::new()),
+        ClientTimeouts {
+            connect: Duration::from_secs(2),
+            read: Duration::from_secs(3),
+            total: Duration::from_secs(3),
+        },
+    );
+    let reply = client
+        .request(
+            listener.address,
+            &server_node.public,
+            &client_node.private,
+            &Request::RenderedSessionList { width: 48 },
+        )
+        .unwrap();
+    assert_eq!(
+        reply,
+        Response::Error("invalid remote request".into()),
+        "old peers must refuse the view as an unknown request"
+    );
+
+    let mut tui = RemoteTui::start(&client_node, Some(&server_node.fingerprint()));
+    tui.wait_for("proof", Duration::from_secs(10));
+    let screen = tui.screen_text();
+    assert!(screen.contains("proof"), "{screen}");
+    // The plain row is still actionable: x asks to close the selected peer
+    // session even though no rendered view exists.
+    tui.writer.write_all(b"x").unwrap();
+    tui.wait_for("kill proof?", Duration::from_secs(5));
 }
 
 fn pane_pair(label: &str) -> (Node, Node) {
