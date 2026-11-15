@@ -620,6 +620,17 @@ fn remote_list_line(session: &remuda_core::SessionSummary) -> String {
     if session.remote_input_disabled {
         line.push_str("\tremote_input_disabled=true");
     }
+    // Peer metadata is untrusted; only project a complete valid team record.
+    if let Some(team) = session.team.as_ref().filter(|team| team.validate().is_ok()) {
+        if let Some(kind) = &team.agent_kind {
+            line.push_str("\tagent_kind=");
+            line.push_str(kind);
+        }
+        if let Some(model) = &team.model {
+            line.push_str("\tmodel=");
+            line.push_str(model);
+        }
+    }
     line
 }
 
@@ -957,6 +968,27 @@ mod tests {
 
     fn list(rows: Vec<remuda_core::SessionSummary>) -> Response {
         Response::Sessions(rows)
+    }
+
+    #[test]
+    fn remote_list_projects_only_valid_structured_team_facts() {
+        let mut row = summary("member", Some("instance"));
+        let plain = remote_list_line(&row);
+        row.team = Some(remuda_core::registry::SessionTeam {
+            agent_kind: Some("codex".into()),
+            model: Some("gpt-6.1".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            remote_list_line(&row),
+            format!("{plain}\tagent_kind=codex\tmodel=gpt-6.1")
+        );
+        row.team.as_mut().unwrap().model = Some("bad\nmodel".into());
+        assert_eq!(remote_list_line(&row), plain);
+        row.team.as_mut().unwrap().model = Some("x".repeat(65));
+        assert_eq!(remote_list_line(&row), plain);
+        row.team = None;
+        assert_eq!(remote_list_line(&row), plain);
     }
 
     #[test]
