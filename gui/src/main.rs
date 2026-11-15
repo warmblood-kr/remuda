@@ -772,6 +772,18 @@ impl Render for LocalGui {
     }
 }
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--internal-build-id") {
+        use std::io::Write;
+        if std::env::args().len() != 2 {
+            std::process::exit(2);
+        }
+        let status = writeln!(
+            std::io::stdout().lock(),
+            "{}",
+            remuda_native::dist::BUILD_VERSION
+        );
+        std::process::exit(i32::from(status.is_err()));
+    }
     if std::env::args().nth(1).as_deref() == Some("--internal-input-worker") {
         std::process::exit(input_helper::worker(
             &std::env::args().skip(2).collect::<Vec<_>>(),

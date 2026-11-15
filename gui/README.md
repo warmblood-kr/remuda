@@ -20,6 +20,20 @@ scrollback navigation and IME are not available in this prototype.
 The current prototype has been built and exercised on macOS. Other platforms
 have not been validated for this GUI.
 
+The internal `remuda-gui --internal-build-id` probe prints the build identifier
+embedded by `remuda-native` and exits before opening a window or reading state.
+It identifies a build but does not authenticate the executable. Older GUI
+versions do not support this probe and may open a window for an unknown option;
+callers must establish compatibility and apply a timeout before invoking it.
+To test the build-ID contract against real CLI and host binaries, build them
+with the same `REMUDA_VERSION` and `REMUDA_BUILD` used for the GUI, then run:
+
+```sh
+REMUDA_GUI_BUILD_CLI=/absolute/path/to/remuda REMUDA_GUI_BUILD_HOST=/absolute/path/to/remuda-session-host cargo test --locked --manifest-path gui/Cargo.toml --test build_id gui_cli_and_host_identify_the_same_build -- --ignored --exact
+```
+
+Pass those same version/build variables to this test's Cargo invocation too.
+
 On macOS, `remuda gui` launches `remuda-gui` from the same directory as the
 resolved `remuda` executable. The GUI is not yet included in release archives:
 build it with `cargo build --release --locked --manifest-path gui/Cargo.toml`,
