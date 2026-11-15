@@ -951,6 +951,7 @@ mod tests {
             program_status: None,
             program_status_age_ms: None,
             remote_input_disabled: false,
+            team: None,
         }
     }
 

@@ -52,6 +52,7 @@ mod tests {
                 mouse_tracking: false,
                 unavailable: false,
                 remote_input_disabled: false,
+                team: None,
                 program_status: None,
                 program_status_age_ms: None,
             },
