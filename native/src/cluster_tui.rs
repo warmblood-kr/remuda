@@ -3883,8 +3883,8 @@ mod tests {
         help_lines, help_window, is_attention, legend_lines, normalized_terminal_size, present,
         remote_state_label, render_badge, resize_requires_full_repaint,
         select_target_with_remote_wait, session_cell, session_glyph, status_glyph, status_style,
-        terminal_frame, AttentionSignals, Badge, ClusterUi, RemoteInputTransport, RemoteSelection,
-        RemoteSource, TreeSelection, ERROR_GLYPH,
+        terminal_frame, AttentionSignals, Badge, ClusterUi, EndedState, RemoteInputTransport,
+        RemoteSelection, RemoteSource, TreeSelection, ERROR_GLYPH, LOCAL_VIEW_TTL,
     };
     use crate::cluster_remote::{
         RemoteNodeSnapshot, RemoteSessionSnapshot, RemoteSnapshot, RemoteState,
@@ -3892,6 +3892,7 @@ mod tests {
     use remuda_core::agent::{Color, Cursor, ScreenSnapshot, StyledCell};
     use remuda_core::clock::{Clock, ManualClock};
     use remuda_core::protocol::{Request, Response};
+    use remuda_core::session_view::{SessionView, ViewEntry};
     use remuda_core::{SessionSummary, Size};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -6369,6 +6370,239 @@ mod tests {
             instance_id: None,
             output_version: None,
         }]
+    }
+
+    fn alive_row(name: &str) -> String {
+        format!("\x1b[32m●\x1b[0m  {name}")
+    }
+
+    fn view_entry(name: &str, instance: &str, lines: &[&str]) -> ViewEntry {
+        ViewEntry {
+            name: name.into(),
+            instance_id: instance.into(),
+            lines: lines.iter().map(|line| (*line).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn local_tree_rows_use_shared_renderer_detail_and_depth() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("parent", true), session("child", true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let detail = "\x1b[2midle · codex · gpt-6.1\x1b[0m";
+        let view = SessionView::new(
+            sessions,
+            1,
+            vec![
+                view_entry(
+                    "parent",
+                    "instance-parent",
+                    &[&format!("\x1b[32m●\x1b[0m  parent  {detail}")],
+                ),
+                view_entry(
+                    "child",
+                    "instance-child",
+                    &[&format!("  \x1b[32m●\x1b[0m  child  {detail}")],
+                ),
+            ],
+        );
+        ui.local_view_synced(view, clock.now());
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let side = tree_side(&frame);
+        let parent = side.iter().find(|line| line.contains("parent")).unwrap();
+        assert!(parent.contains("idle · codex · gpt-6.1"), "{parent:?}");
+        let child = side.iter().find(|line| line.contains("child")).unwrap();
+        assert!(child.starts_with("       ●  child"), "{child:?}");
+        assert!(child.contains("idle · codex · gpt-6.1"), "{child:?}");
+    }
+
+    #[test]
+    fn local_tree_rows_fall_back_for_missing_mismatched_invalid_or_stale_views() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("dev", true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(!frame.contains("codex"), "{frame}");
+
+        let detail = "\x1b[2mcodex · gpt-6.1\x1b[0m";
+        let mismatched = SessionView::new(
+            sessions.clone(),
+            1,
+            vec![view_entry(
+                "dev",
+                "another-instance",
+                &[&format!("\x1b[32m●\x1b[0m  dev  {detail}")],
+            )],
+        );
+        ui.local_view_synced(mismatched, clock.now());
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(!frame.contains("codex"), "{frame}");
+
+        let invalid = SessionView::new(
+            sessions.clone(),
+            1,
+            vec![view_entry("dev", "instance-dev", &["\x1b[31mdev"])],
+        );
+        ui.local_view_synced(invalid, clock.now());
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(!frame.contains("codex"), "{frame}");
+
+        let stale = SessionView::new(
+            sessions,
+            1,
+            vec![view_entry(
+                "dev",
+                "instance-dev",
+                &[&format!("\x1b[32m●\x1b[0m  dev  {detail}")],
+            )],
+        );
+        ui.local_view_synced(stale, clock.now());
+        clock.advance(LOCAL_VIEW_TTL + Duration::from_secs(1));
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(!frame.contains("codex"), "{frame}");
+    }
+
+    #[test]
+    fn ended_row_stays_plain_without_clearing_live_row_decorations() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("alpha", true), session("bravo", true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let detail = "\x1b[2mcodex · gpt-6.1\x1b[0m";
+        ui.set_ended(EndedState::from_capture(
+            session("bravo", true),
+            "last frame".into(),
+            clock.now(),
+        ));
+        let live = SessionView::new(
+            vec![session("alpha", true)],
+            1,
+            vec![view_entry(
+                "alpha",
+                "instance-alpha",
+                &[&format!("\x1b[32m●\x1b[0m  alpha  {detail}")],
+            )],
+        );
+        ui.local_view_synced(live, clock.now());
+        assert!(ui.local_view.is_some());
+        assert_eq!(ui.sessions[ui.selected].name, "bravo");
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let side = tree_side(&frame);
+        let alpha = side.iter().find(|line| line.contains("alpha")).unwrap();
+        assert!(alpha.contains("codex · gpt-6.1"), "{alpha:?}");
+        let bravo = side.iter().find(|line| line.contains("bravo")).unwrap();
+        assert!(!bravo.contains("codex"), "{bravo:?}");
+    }
+
+    #[test]
+    fn local_view_order_drives_tree_and_keyboard_traversal_by_identity() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("alpha", true), session("bravo", true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let view = SessionView::new(
+            sessions,
+            1,
+            vec![
+                view_entry("bravo", "instance-bravo", &[&alive_row("bravo")]),
+                view_entry("alpha", "instance-alpha", &[&alive_row("alpha")]),
+            ],
+        );
+        ui.local_view_synced(view, clock.now());
+        assert_eq!(
+            ui.visible_tree_rows(),
+            vec![
+                TreeSelection::LocalNode,
+                TreeSelection::LocalSession(1),
+                TreeSelection::LocalSession(0),
+            ]
+        );
+        assert_eq!(ui.current_tree_selection(), TreeSelection::LocalSession(0));
+        ui.move_selection(false);
+        assert_eq!(ui.current_tree_selection(), TreeSelection::LocalSession(1));
+        assert_eq!(ui.sessions[ui.selected].name, "bravo");
+        ui.query = Some("alpha".into());
+        assert_eq!(
+            ui.visible_tree_rows(),
+            vec![TreeSelection::LocalNode, TreeSelection::LocalSession(0)]
+        );
+    }
+
+    #[test]
+    fn local_pending_indicator_survives_the_shared_view() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("dev", true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let detail = "\x1b[2mcodex · gpt-6.1\x1b[0m";
+        let view = SessionView::new(
+            sessions,
+            1,
+            vec![view_entry(
+                "dev",
+                "instance-dev",
+                &[&format!("\x1b[32m●\x1b[0m  dev  {detail}")],
+            )],
+        );
+        ui.local_view_synced(view, clock.now());
+        ui.input_sender
+            .enqueue(
+                &mut ui.input_queue,
+                "dev",
+                "instance-dev",
+                b"hello\r".to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let line = tree_side(&frame)
+            .into_iter()
+            .find(|line| line.contains("dev"))
+            .unwrap();
+        assert!(line.contains("● +1"), "{line:?}");
+    }
+
+    #[test]
+    fn local_stacked_rows_render_detail_lines_without_extra_selectable_rows() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("dev", true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let view = SessionView::new(
+            sessions,
+            3,
+            vec![view_entry(
+                "dev",
+                "instance-dev",
+                &[&alive_row("dev"), "\x1b[2mcodex · gpt-6.1\x1b[0m", ""],
+            )],
+        );
+        ui.local_view_synced(view, clock.now());
+        assert_eq!(
+            ui.visible_tree_rows(),
+            vec![TreeSelection::LocalNode, TreeSelection::LocalSession(0)]
+        );
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let side = tree_side(&frame);
+        assert!(side.iter().any(|line| line.contains("codex · gpt-6.1")));
+        assert_eq!(side.iter().filter(|line| line.starts_with('>')).count(), 1);
+    }
+
+    #[test]
+    fn narrow_tree_falls_back_instead_of_clipping_a_name() {
+        let clock = ManualClock::new();
+        let name = "a-very-long-session-name-that-does-not-fit";
+        let sessions = vec![session(name, true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let detail = "\x1b[2mcodex · gpt-6.1\x1b[0m";
+        let view = SessionView::new(
+            sessions,
+            1,
+            vec![view_entry(
+                name,
+                &format!("instance-{name}"),
+                &[&format!("\x1b[32m●\x1b[0m  {name}  {detail}")],
+            )],
+        );
+        ui.local_view_synced(view, clock.now());
+        let frame = ui.render_text(60, 24, "pane", &clock);
+        assert!(!frame.contains("codex"), "{frame}");
     }
 
     fn session(name: &str, alive: bool) -> SessionSummary {
