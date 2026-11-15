@@ -4401,7 +4401,7 @@ mod tests {
         select_target_with_remote_wait, session_cell, session_glyph, status_glyph, status_style,
         terminal_frame, AttentionSignals, Badge, ClusterUi, EndedState, LocalViewLoader,
         RemoteInputTransport, RemoteSelection, RemoteSource, TreeSelection, ERROR_GLYPH,
-        LOCAL_VIEW_REFRESH, LOCAL_VIEW_TTL,
+        LOCAL_VIEW_REFRESH, LOCAL_VIEW_TTL, REMOTE_VIEW_TTL,
     };
     use crate::cluster_remote::{
         RemoteNodeSnapshot, RemoteSessionSnapshot, RemoteSnapshot, RemoteState,
@@ -6978,6 +6978,177 @@ mod tests {
         clock.advance(LOCAL_VIEW_TTL + Duration::from_secs(1));
         let frame = ui.render_text(100, 24, "pane", &clock);
         assert!(!frame.contains("codex"), "{frame}");
+    }
+
+    fn remote_summary(name: &str, instance: &str) -> SessionSummary {
+        let mut summary = session(name, true);
+        summary.instance_id = Some(instance.into());
+        summary
+    }
+
+    fn remote_detail_view(entries: &[(&str, &str)]) -> SessionView {
+        SessionView::new(
+            entries
+                .iter()
+                .map(|(name, instance)| remote_summary(name, instance))
+                .collect(),
+            1,
+            entries
+                .iter()
+                .map(|(name, instance)| {
+                    view_entry(
+                        name,
+                        instance,
+                        &[&format!(
+                            "\x1b[32m●\x1b[0m  {name}  \x1b[2midle · codex · gpt-6.1\x1b[0m"
+                        )],
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn remote_tree_paints_the_peers_validated_rows_with_exact_identity() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("body"));
+        ui.remote_snapshot.nodes[0].sessions[0].name = "Build Label".into();
+        ui.remote_snapshot.nodes[0].sessions[0].wire_name = "wire-build".into();
+        ui.remote_selected = Some(RemoteSelection::Session {
+            node: "fp-laptop".into(),
+            name: "Build Label".into(),
+            wire_name: "wire-build".into(),
+            instance_id: "remote-instance".into(),
+        });
+        ui.remote_view_synced(
+            "fp-laptop",
+            remote_detail_view(&[("wire-build", "remote-instance")]),
+            clock.now(),
+        );
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let side = tree_side(&frame);
+        let row = side
+            .iter()
+            .find(|line| line.contains("wire-build"))
+            .unwrap();
+        assert!(row.contains("idle · codex · gpt-6.1"), "{row:?}");
+        assert!(
+            row.starts_with(">    "),
+            "selected row keeps its cursor: {row:?}"
+        );
+        let styled = ui.tree_lines(100, clock.now());
+        let styled = styled
+            .iter()
+            .find(|line| line.contains("wire-build"))
+            .unwrap();
+        assert!(
+            styled.contains("\x1b[1;7;36mwire-build"),
+            "the peer row keeps the local selection highlight: {styled:?}"
+        );
+    }
+
+    #[test]
+    fn remote_tree_falls_back_when_the_view_identity_malformed_or_stale() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("body"));
+        ui.remote_snapshot.nodes[0].sessions[0].wire_name = "wire-build".into();
+        ui.remote_snapshot.nodes[0].sessions[0].name = "Build Label".into();
+        ui.remote_selected = Some(RemoteSelection::Session {
+            node: "fp-laptop".into(),
+            name: "Build Label".into(),
+            wire_name: "wire-build".into(),
+            instance_id: "remote-instance".into(),
+        });
+
+        // Display label is not the wire identity: a view keyed by it is refused.
+        ui.remote_view_synced(
+            "fp-laptop",
+            remote_detail_view(&[("Build Label", "remote-instance")]),
+            clock.now(),
+        );
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(!frame.contains("idle · codex"), "{frame}");
+
+        // Right identity, wrong instance: refused as a whole.
+        ui.remote_view_synced(
+            "fp-laptop",
+            remote_detail_view(&[("wire-build", "other-instance")]),
+            clock.now(),
+        );
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(!frame.contains("idle · codex"), "{frame}");
+
+        // Accept the exact identity, then let it age out.
+        ui.remote_view_synced(
+            "fp-laptop",
+            remote_detail_view(&[("wire-build", "remote-instance")]),
+            clock.now(),
+        );
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(frame.contains("idle · codex"), "{frame}");
+        clock.advance(REMOTE_VIEW_TTL + Duration::from_secs(1));
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(!frame.contains("idle · codex"), "{frame}");
+    }
+
+    #[test]
+    fn remote_tree_order_follows_the_view_and_pending_rows_stay_plain() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("body"));
+        let mut second = ui.remote_snapshot.nodes[0].sessions[0].clone();
+        second.name = "shell".into();
+        second.wire_name = "shell".into();
+        second.instance_id = "shell-instance".into();
+        ui.remote_snapshot.nodes[0].sessions.push(second.clone());
+
+        ui.remote_view_synced(
+            "fp-laptop",
+            remote_detail_view(&[("shell", "shell-instance"), ("build", "remote-instance")]),
+            clock.now(),
+        );
+        let rows = ui.visible_tree_rows(clock.now());
+        assert_eq!(
+            rows,
+            vec![
+                TreeSelection::LocalNode,
+                TreeSelection::LocalSession(0),
+                TreeSelection::RemoteNode("fp-laptop".into()),
+                TreeSelection::RemoteSession {
+                    node: "fp-laptop".into(),
+                    name: "shell".into(),
+                    wire_name: "shell".into(),
+                    instance_id: "shell-instance".into(),
+                },
+                TreeSelection::RemoteSession {
+                    node: "fp-laptop".into(),
+                    name: "build".into(),
+                    wire_name: "build".into(),
+                    instance_id: "remote-instance".into(),
+                },
+            ]
+        );
+
+        // A queued batch for the first row suppresses its rendered view only.
+        ui.remote_active = Some(RemoteSelection::Session {
+            node: "fp-laptop".into(),
+            name: "shell".into(),
+            wire_name: "shell".into(),
+            instance_id: "shell-instance".into(),
+        });
+        ui.remote_composer_target = Some((
+            "fp-laptop".into(),
+            "laptop".into(),
+            "shell".into(),
+            "shell".into(),
+            "shell-instance".into(),
+        ));
+        ui.enqueue_remote_draft(b"pending".to_vec(), clock.now());
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        let side = tree_side(&frame);
+        let shell = side.iter().find(|line| line.contains("shell")).unwrap();
+        assert!(!shell.contains("idle · codex"), "{shell:?}");
+        let build = side.iter().find(|line| line.contains("build")).unwrap();
+        assert!(build.contains("idle · codex"), "{build:?}");
     }
 
     #[test]
