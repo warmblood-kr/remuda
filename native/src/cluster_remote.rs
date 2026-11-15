@@ -99,6 +99,12 @@ pub trait RemoteInputTransport: Send + Sync {
     fn send_close(&self, node: &str, request: &Request) -> io::Result<Response> {
         self.send_input(node, request)
     }
+
+    /// Read-only rendered list request, kept separate so a peer that rejects
+    /// the view can be backed off without affecting input.
+    fn send_view(&self, node: &str, width: u16) -> io::Result<Response> {
+        self.send_input(node, &Request::RenderedSessionList { width })
+    }
 }
 
 /// One-shot Noise client used by the remote composer.
@@ -157,6 +163,19 @@ impl RemoteInputTransport for ClusterRemoteInput {
                 &target.pinned_static_key,
                 &self.local_static_private,
                 request,
+            )
+            .map_err(io::Error::other)
+    }
+
+    fn send_view(&self, node: &str, width: u16) -> io::Result<Response> {
+        let target = (self.resolve)(node)?;
+        let client = self.client.with_request_timeout(Duration::from_secs(3));
+        client
+            .request(
+                target.address,
+                &target.pinned_static_key,
+                &self.local_static_private,
+                &Request::RenderedSessionList { width },
             )
             .map_err(io::Error::other)
     }

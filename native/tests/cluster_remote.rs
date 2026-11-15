@@ -1440,6 +1440,7 @@ fn real_remote_cluster_tree_paints_the_peer_hierarchy_and_falls_back_on_fault() 
     let target = format!("{}/tree-parent", server_node.fingerprint());
     let tui = RemoteTui::start(&client_node, Some(&target));
     tui.wait_for(DETAIL, Duration::from_secs(15));
+    tui.wait_for("remote live · reachable", Duration::from_secs(10));
     let screen = tui.screen_text();
     assert_eq!(
         screen.matches(DETAIL).count(),
