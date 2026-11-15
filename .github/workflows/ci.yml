@@ -345,6 +345,7 @@ jobs:
       - run: sh scripts/check-cold-install.sh
       - run: sh scripts/check-install-path-line.sh
       - run: sh scripts/check-install-pair.sh
+      - run: sh scripts/check-install-gui.sh
 
   cold-room:
     # cold-install above runs check-cold-install.sh directly on the runner,
