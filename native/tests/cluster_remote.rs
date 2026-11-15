@@ -1,6 +1,81 @@
 #![cfg(unix)]
 #![allow(clippy::disallowed_types)]
 
+// Run via gui/tests/peer_list_acceptance.sh; the GUI binary is built separately.
+#[test]
+#[ignore = "requires separately built GUI binary; use gui/tests/peer_list_acceptance.sh"]
+fn gui_peer_list_worker_reads_pinned_peer_and_reports_offline() {
+    let env = vec![("REMUDA_EXPERIMENTAL_SESSION_HOST".into(), "0".into())];
+    let mut client = Node::start_with_env("gui-client", env.clone());
+    client.bounded_inprocess_cleanup = true;
+    let mut server = Node::start_with_env("gui-server", env);
+    server.bounded_inprocess_cleanup = true;
+    admit_pair(&client, &server);
+    let listener = Listener::start(&server);
+    let path = client.state.join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|row| row.node_fp == server.fingerprint())
+        .unwrap()
+        .endpoint = Some(listener.address.to_string());
+    fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+    server.start_session("exec sleep 30");
+    let socket = remuda_native::daemon::socket_path_in(&server.runtime, &server.name);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let instance = loop {
+        let found = local_rows(&socket)
+            .into_iter()
+            .find(|s| s.name == "proof")
+            .and_then(|s| s.instance_id);
+        if let Some(id) = found {
+            break id;
+        }
+        assert!(Instant::now() < deadline, "session did not appear");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let gui = std::env::var_os("REMUDA_GUI_ACCEPTANCE_BIN").expect("set REMUDA_GUI_ACCEPTANCE_BIN");
+    let run = |target: &str, stage: &str| {
+        let mut child = Command::new(&gui)
+            .args(["--internal-peer-worker", target])
+            .env("XDG_STATE_HOME", &client.state)
+            .env("XDG_CONFIG_HOME", client.root.join("config"))
+            .env("XDG_DATA_HOME", client.root.join("data"))
+            .env("REMUDA_RUNTIME_DIR", &client.runtime)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let end = Instant::now() + Duration::from_secs(12);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= end {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("GUI worker exceeded deadline during {stage}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        child.wait_with_output().unwrap()
+    };
+    let output = run(&server.fingerprint(), "peer list");
+    assert!(output.status.success(), "peer worker failed: {output:?}");
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    let proof = rows.iter().find(|row| row["name"] == "proof").unwrap();
+    assert_eq!(proof["instance_id"].as_str(), Some(instance.as_str()));
+    assert!(!run("not-an-admitted-fingerprint", "invalid fingerprint")
+        .status
+        .success());
+    server.stop_daemon();
+    assert!(
+        !run(&server.fingerprint(), "offline peer").status.success(),
+        "offline peer appeared current"
+    );
+}
+
 #[path = "daemon_support/hosts.rs"]
 mod hosts;
 use remuda_core::protocol::{Request, Response};
@@ -32,6 +107,7 @@ struct Node {
     daemon: Child,
     binary: PathBuf,
     env: Vec<(String, String)>,
+    bounded_inprocess_cleanup: bool,
 }
 
 impl Node {
@@ -79,6 +155,7 @@ impl Node {
             daemon,
             binary,
             env,
+            bounded_inprocess_cleanup: false,
         };
         node.wait_ready();
         let init = node
@@ -159,9 +236,34 @@ impl Node {
 impl Drop for Node {
     fn drop(&mut self) {
         assert!(self.runtime.starts_with(&self.root));
-        let _ = self.command().args(["stop", "-f", "--yes"]).output();
+        if self.bounded_inprocess_cleanup {
+            if let Ok(mut stop) = self
+                .command()
+                .args(["stop", "-f", "--yes"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    match stop.try_wait() {
+                        Ok(Some(_)) | Err(_) => break,
+                        Ok(None) if Instant::now() >= deadline => {
+                            let _ = stop.kill();
+                            let _ = stop.wait();
+                            break;
+                        }
+                        Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                    }
+                }
+            }
+        } else {
+            let _ = self.command().args(["stop", "-f", "--yes"]).output();
+        }
         self.stop_daemon();
-        hosts::stop_hosts_under(&self.root);
+        if !self.bounded_inprocess_cleanup {
+            hosts::stop_hosts_under(&self.root);
+        }
         let _ = fs::remove_dir_all(&self.root);
     }
 }
