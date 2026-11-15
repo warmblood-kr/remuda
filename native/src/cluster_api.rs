@@ -201,9 +201,6 @@ pub fn send(target: &str, session: &str, text: &str) -> Result<Send, SendFailure
     else {
         return Ok(Send::Local);
     };
-    let enabled = cluster::control::remote_send_enabled()
-        .map_err(|_| refused("cluster settings are unreadable".to_owned()))?;
-    check_remote_send_enabled(enabled)?;
     validate_send_text(text).map_err(refused)?;
     let private_key = cluster::identity::load_static_private_key()
         .map_err(|_| refused("cluster identity is unavailable".to_owned()))?;
@@ -218,16 +215,6 @@ pub fn send(target: &str, session: &str, text: &str) -> Result<Send, SendFailure
         text,
         &mut call,
     )
-}
-
-fn check_remote_send_enabled(enabled: bool) -> Result<(), SendFailure> {
-    if enabled {
-        return Ok(());
-    }
-    Err(SendFailure::Refused(
-        "remote send is disabled on this node; run `remuda cluster remote-send on` after protected panes are verified"
-            .into(),
-    ))
 }
 
 /// One line of text, without the terminator the receiver adds. Control
@@ -972,13 +959,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_send_is_off_until_the_local_rollout_gate_is_open() {
-        let error = check_remote_send_enabled(false).unwrap_err();
-        assert!(error.message().contains("remote-send on"), "{error}");
-        assert!(check_remote_send_enabled(true).is_ok());
-    }
-
-    #[test]
     fn remote_send_probes_lists_and_sends_one_exact_line() {
         let address: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let mut seen = Vec::new();
@@ -1063,14 +1043,6 @@ mod tests {
                     vec![row]
                 },
                 "unavailable",
-            ),
-            (
-                {
-                    let mut row = summary("agent", Some("instance"));
-                    row.remote_input_disabled = true;
-                    vec![row]
-                },
-                "disabled",
             ),
             (
                 vec![summary("agent", Some("one")), summary("agent", Some("two"))],

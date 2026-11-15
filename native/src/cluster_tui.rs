@@ -8203,7 +8203,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_composer_path_does_not_consult_the_mcp_send_gate() {
+    fn tui_composer_queues_a_remote_line() {
         let clock = ManualClock::new();
         let mut ui = selected_remote_ui(&clock, remote_screen("body"));
         ui.remote_input_enabled = true;
@@ -8211,9 +8211,6 @@ mod tests {
         ui.enter_selected(clock.now());
         assert!(ui.composer_focused);
 
-        // The MCP `allow_remote_send` gate lives in cluster_api::send. The TUI
-        // composer is enabled by the remote dispatcher alone; support probing
-        // must not make it read or change that gate.
         ui.enqueue_remote_draft(b"typed line\r".to_vec(), clock.now());
         let batches: Vec<_> = ui.visible_queue(clock.now()).collect();
         assert_eq!(batches.len(), 1);
