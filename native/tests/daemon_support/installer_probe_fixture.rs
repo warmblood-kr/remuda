@@ -8,6 +8,17 @@ fn main() {
         std::fs::write(path, "started").unwrap();
     }
     match std::env::var("REMUDA_PROBE_MODE").unwrap().as_str() {
+        "role" => {
+            let arg = std::env::args().nth(1).unwrap();
+            if arg != std::env::var("REMUDA_PROBE_EXPECT_ARG").unwrap() {
+                std::process::exit(3);
+            }
+            if arg == "--version" {
+                println!("remuda build.1");
+            } else {
+                println!("build.1");
+            }
+        }
         "good" => println!("build.1"),
         "extra" => print!("build.1\nextra\n"),
         "no-newline" => print!("build.1"),

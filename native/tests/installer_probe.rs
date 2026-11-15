@@ -62,6 +62,66 @@ fn accepts_exact_identity_and_rejects_invalid_and_oversized_output() {
 }
 
 #[test]
+fn cli_host_and_gui_use_only_their_fixed_probe_protocols() {
+    for (flag, argument) in [
+        ("--verify", "--internal-build-id"),
+        ("--verify-cli", "--version"),
+        ("--verify-host", "version"),
+    ] {
+        let status = Command::new(env!("CARGO_BIN_EXE_remuda-installer-probe"))
+            .args([
+                flag,
+                "--verified-archive-v1",
+                env!("CARGO_BIN_EXE_installer_probe_fixture"),
+                "build.1",
+            ])
+            .env("REMUDA_PROBE_MODE", "role")
+            .env("REMUDA_PROBE_EXPECT_ARG", argument)
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{flag}");
+    }
+    let status = Command::new(env!("CARGO_BIN_EXE_remuda-installer-probe"))
+        .args([
+            "--verify-cli",
+            "--verified-archive-v1",
+            env!("CARGO_BIN_EXE_installer_probe_fixture"),
+            "build.1",
+        ])
+        .env("REMUDA_PROBE_MODE", "good")
+        .stdin(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        !status.success(),
+        "CLI protocol must reject host-style output"
+    );
+}
+
+#[test]
+#[ignore = "requires GUI, CLI and host binaries built with the same build ID"]
+fn verifies_actual_build_triple() {
+    let build = std::env::var("REMUDA_PROBE_BUILD").expect("build ID");
+    for (flag, var) in [
+        ("--verify", "REMUDA_PROBE_GUI"),
+        ("--verify-cli", "REMUDA_PROBE_CLI"),
+        ("--verify-host", "REMUDA_PROBE_HOST"),
+    ] {
+        let path = std::env::var_os(var).expect("absolute binary path");
+        let status = Command::new(env!("CARGO_BIN_EXE_remuda-installer-probe"))
+            .args([flag, "--verified-archive-v1"])
+            .arg(path)
+            .arg(&build)
+            .env_remove("REMUDA_PROBE_MODE")
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{flag}");
+    }
+}
+
+#[test]
 fn requires_explicit_verified_archive_contract_and_safe_key() {
     let scratch = Scratch::new("opt-in");
     let marker = scratch.0.join("started");
