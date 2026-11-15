@@ -31,14 +31,27 @@ struct Node {
     private: Vec<u8>,
     daemon: Child,
     binary: PathBuf,
+    env: Vec<(String, String)>,
 }
 
 impl Node {
     fn start(label: &str) -> Self {
-        Self::start_with_binary(label, PathBuf::from(env!("CARGO_BIN_EXE_remuda")))
+        Self::start_with_binary_env(
+            label,
+            PathBuf::from(env!("CARGO_BIN_EXE_remuda")),
+            Vec::new(),
+        )
+    }
+
+    fn start_with_env(label: &str, env: Vec<(String, String)>) -> Self {
+        Self::start_with_binary_env(label, PathBuf::from(env!("CARGO_BIN_EXE_remuda")), env)
     }
 
     fn start_with_binary(label: &str, binary: PathBuf) -> Self {
+        Self::start_with_binary_env(label, binary, Vec::new())
+    }
+
+    fn start_with_binary_env(label: &str, binary: PathBuf, env: Vec<(String, String)>) -> Self {
         let serial = NEXT.fetch_add(1, Ordering::Relaxed);
         // The default macOS TMPDIR (/var/folders/...) leaves too little of the
         // 104-byte sun_path for runtime/remuda/<node>.sock.
@@ -55,7 +68,7 @@ impl Node {
             fs::create_dir_all(dir).unwrap();
         }
         let name = format!("{label}-{serial}");
-        let daemon = spawn_daemon(&binary, &name, &runtime, &root, &state);
+        let daemon = spawn_daemon(&binary, &env, &name, &runtime, &root, &state);
         let mut node = Self {
             root,
             runtime,
@@ -65,6 +78,7 @@ impl Node {
             private: Vec::new(),
             daemon,
             binary,
+            env,
         };
         node.wait_ready();
         let init = node
@@ -88,6 +102,7 @@ impl Node {
     fn command(&self) -> Command {
         command(
             &self.binary,
+            &self.env,
             &self.name,
             &self.runtime,
             &self.root,
@@ -131,6 +146,7 @@ impl Node {
         self.stop_daemon();
         self.daemon = spawn_daemon(
             &self.binary,
+            &self.env,
             &self.name,
             &self.runtime,
             &self.root,
@@ -150,8 +166,15 @@ impl Drop for Node {
     }
 }
 
-fn spawn_daemon(binary: &Path, name: &str, runtime: &Path, root: &Path, state: &Path) -> Child {
-    command(binary, name, runtime, root, state, &root.join("home"))
+fn spawn_daemon(
+    binary: &Path,
+    env: &[(String, String)],
+    name: &str,
+    runtime: &Path,
+    root: &Path,
+    state: &Path,
+) -> Child {
+    command(binary, env, name, runtime, root, state, &root.join("home"))
         .args(["daemon"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -162,6 +185,7 @@ fn spawn_daemon(binary: &Path, name: &str, runtime: &Path, root: &Path, state: &
 
 fn command(
     binary: &Path,
+    env: &[(String, String)],
     name: &str,
     runtime: &Path,
     root: &Path,
@@ -178,6 +202,9 @@ fn command(
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("XDG_STATE_HOME", state);
+    for (key, value) in env {
+        command.env(key, value);
+    }
     command
 }
 
@@ -490,7 +517,7 @@ fn real_remote_tui_paints_the_selected_remote_session_screen() {
     tui.wait_for("proof", Duration::from_secs(10));
     tui.writer.write_all(b"\x1b[B\r").unwrap();
     tui.wait_for("remote live · reachable", Duration::from_secs(10));
-    tui.wait_for(&format!("$ {server_label}/proof>"), Duration::from_secs(3));
+    tui.wait_for("Remuda >", Duration::from_secs(3));
     tui.wait_for("PR8-MARKER", Duration::from_secs(10));
 }
 
@@ -671,7 +698,7 @@ fn real_ctrl_backslash_byte_returns_from_remote_composer_to_tree() {
     tui.wait_for("proof", Duration::from_secs(10));
     tui.writer.write_all(b"\x1b[B\r").unwrap();
     tui.wait_for("remote live · reachable", Duration::from_secs(10));
-    tui.wait_for(&format!("$ {server_label}/proof>"), Duration::from_secs(3));
+    tui.wait_for("Remuda >", Duration::from_secs(3));
 
     let output_start = tui.output_len();
     tui.writer.write_all(b"\x1c").unwrap();
@@ -681,13 +708,11 @@ fn real_ctrl_backslash_byte_returns_from_remote_composer_to_tree() {
 #[test]
 #[cfg(unix)]
 fn real_remote_keys_mode_forwards_character_escape_and_ctrl_c() {
-    // This checks the in-process path (docs/concepts/session-host-parity.md).
-    if remuda_native::session_host::hosting() {
-        eprintln!("skip: hosted remote input is fail-closed until its opt-out survives a daemon restart (core registry apply_hosted_remote_input_batch)");
-        return;
-    }
     let client_node = Node::start("keys-live-client");
-    let server_node = Node::start("keys-live-server");
+    let server_node = Node::start_with_env(
+        "keys-live-server",
+        vec![("REMUDA_EXPERIMENTAL_SESSION_HOST".into(), "1".into())],
+    );
     admit_pair(&client_node, &server_node);
     let listener = Listener::start(&server_node);
     let control = server_node
@@ -728,7 +753,7 @@ fn real_remote_keys_mode_forwards_character_escape_and_ctrl_c() {
     tui.wait_for("proof", Duration::from_secs(10));
     tui.writer.write_all(b"\x1b[B\r").unwrap();
     tui.wait_for("remote live · reachable", Duration::from_secs(10));
-    tui.wait_for(&format!("$ {server_label}/proof>"), Duration::from_secs(3));
+    tui.wait_for("Remuda >", Duration::from_secs(3));
     tui.writer.write_all(b"\x1c").unwrap();
     tui.writer.write_all(b"k").unwrap();
     tui.wait_for(
@@ -750,13 +775,11 @@ fn real_remote_keys_mode_forwards_character_escape_and_ctrl_c() {
 #[test]
 #[cfg(unix)]
 fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
-    // This checks the in-process path (docs/concepts/session-host-parity.md).
-    if remuda_native::session_host::hosting() {
-        eprintln!("skip: hosted remote input is fail-closed until its opt-out survives a daemon restart (core registry apply_hosted_remote_input_batch)");
-        return;
-    }
     let client_node = Node::start("paste-live-client");
-    let server_node = Node::start("paste-live-server");
+    let server_node = Node::start_with_env(
+        "paste-live-server",
+        vec![("REMUDA_EXPERIMENTAL_SESSION_HOST".into(), "1".into())],
+    );
     admit_pair(&client_node, &server_node);
     let listener = Listener::start(&server_node);
     let control = server_node
@@ -797,7 +820,7 @@ fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
     tui.wait_for("proof", Duration::from_secs(10));
     tui.writer.write_all(b"\x1b[B\r").unwrap();
     tui.wait_for("remote live · reachable", Duration::from_secs(10));
-    tui.wait_for(&format!("$ {server_label}/proof>"), Duration::from_secs(3));
+    tui.wait_for("Remuda >", Duration::from_secs(3));
     tui.writer.write_all(b"\x1c").unwrap();
     let keys_start = tui.output_len();
     tui.writer.write_all(b"k").unwrap();
@@ -885,7 +908,7 @@ fn real_remote_keys_mode_allows_input_when_cluster_control_off() {
     tui.wait_for("proof", Duration::from_secs(10));
     tui.writer.write_all(b"\x1b[B\r").unwrap();
     tui.wait_for("remote live · reachable", Duration::from_secs(10));
-    tui.wait_for(&format!("$ {server_label}/proof>"), Duration::from_secs(3));
+    tui.wait_for("Remuda >", Duration::from_secs(3));
     tui.writer.write_all(b"\x1c").unwrap();
     tui.writer.write_all(b"k").unwrap();
     tui.wait_for(
@@ -1497,15 +1520,31 @@ fn real_remote_cluster_tree_paints_the_peer_hierarchy_and_falls_back_on_fault() 
 #[test]
 #[cfg(unix)]
 fn real_remote_cluster_tree_selected_session_input_reaches_the_peer() {
-    // This checks the in-process path (docs/concepts/session-host-parity.md).
-    if remuda_native::session_host::hosting() {
-        eprintln!("skip: hosted remote input is fail-closed until its opt-out survives a daemon restart (core registry apply_hosted_remote_input_batch)");
-        return;
-    }
+    // The daemon is forced non-hosted below, so this test always runs on the
+    // in-process path even when hosting is the process default.
     let client_node = Node::start("r1-input-client");
-    let server_node = Node::start("r1-input-server");
-    admit_pair(&client_node, &server_node);
-    let listener = Listener::start(&server_node);
+    let server_node = Node::start_with_env(
+        "r1-input-server",
+        vec![("REMUDA_EXPERIMENTAL_SESSION_HOST".into(), "0".into())],
+    );
+    selected_session_input_case(&client_node, &server_node, false);
+}
+
+#[test]
+#[cfg(unix)]
+fn real_hosted_remote_cluster_tree_selected_session_input_reaches_the_peer() {
+    // No skip: hosted is the default backend and must accept selected input.
+    let client_node = Node::start("r1-hosted-input-client");
+    let server_node = Node::start_with_env(
+        "r1-hosted-input-server",
+        vec![("REMUDA_EXPERIMENTAL_SESSION_HOST".into(), "1".into())],
+    );
+    selected_session_input_case(&client_node, &server_node, true);
+}
+
+fn selected_session_input_case(client_node: &Node, server_node: &Node, hosted: bool) {
+    admit_pair(client_node, server_node);
+    let listener = Listener::start(server_node);
     let control = server_node
         .command()
         .args(["cluster", "control", "on"])
@@ -1519,6 +1558,19 @@ fn real_remote_cluster_tree_selected_session_input_reaches_the_peer() {
         "proof",
         "stty raw -echo; printf 'READY\\r\\n'; while :; do byte=$(dd bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d ' '); case \"$byte\" in 121) printf '\\r\\ngot=y\\r\\n' ;; esac; done",
     );
+    if hosted {
+        let socket = remuda_native::daemon::socket_path_in(&server_node.runtime, &server_node.name);
+        wait_for(
+            "hosted session registration",
+            Duration::from_secs(10),
+            || {
+                matches!(
+                    remuda_native::client::request(&socket, &Request::SessionHostBuilds),
+                    Ok(Response::SessionHostBuilds(builds)) if !builds.is_empty()
+                )
+            },
+        );
+    }
 
     let registry_path = client_node
         .state
@@ -1540,7 +1592,7 @@ fn real_remote_cluster_tree_selected_session_input_reaches_the_peer() {
     // The session target selects and attaches deterministically, so this does
     // not depend on tree navigation.
     let target = format!("{}/proof", server_node.fingerprint());
-    let mut tui = RemoteTui::start(&client_node, Some(&target));
+    let mut tui = RemoteTui::start(client_node, Some(&target));
     tui.wait_for("READY", Duration::from_secs(10));
     tui.wait_for("remote live · reachable", Duration::from_secs(10));
 
@@ -1606,6 +1658,200 @@ fn real_old_peer_rejects_the_view_and_the_tree_falls_back_to_plain_rows() {
     // session even though no rendered view exists.
     tui.writer.write_all(b"x").unwrap();
     tui.wait_for("kill proof?", Duration::from_secs(5));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One end-to-end contract case.
+fn real_modern_peer_list_carries_bounded_team_metadata() {
+    let client_node = Node::start("team-client");
+    let server_node = Node::start("team-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    server_node.start_named_session("proof", "sleep 30");
+    let path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server_node.fingerprint())
+        .unwrap()
+        .endpoint = Some(listener.address.to_string());
+    fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+
+    let socket = remuda_native::daemon::socket_path_in(&server_node.runtime, &server_node.name);
+    let Response::Sessions(listed) =
+        remuda_native::client::request(&socket, &Request::List).unwrap()
+    else {
+        panic!("local list failed");
+    };
+    let proof = listed.iter().find(|row| row.name == "proof").unwrap();
+    let instance = proof.instance_id.clone().unwrap();
+    let team = remuda_core::registry::SessionTeam {
+        agent_kind: Some("codex".into()),
+        model: Some("gpt-6.1".into()),
+        leader: Some(remuda_core::registry::TeamLeader {
+            name: "proof".into(),
+            instance_id: instance.clone(),
+        }),
+        depth: 1,
+    };
+    assert_eq!(
+        remuda_native::client::request(
+            &socket,
+            &Request::SetSessionTeam {
+                name: "proof".into(),
+                instance_id: instance.clone(),
+                team: Some(team.clone()),
+            }
+        )
+        .unwrap(),
+        Response::Ok
+    );
+
+    let client = ClusterClient::with_timeouts(
+        Arc::new(SystemWallClock::new()),
+        ClientTimeouts {
+            connect: Duration::from_secs(2),
+            read: Duration::from_secs(3),
+            total: Duration::from_secs(3),
+        },
+    );
+    let peer = client
+        .request(
+            listener.address,
+            &server_node.public,
+            &client_node.private,
+            &Request::List,
+        )
+        .unwrap();
+    let Response::Sessions(rows) = peer else {
+        panic!("unexpected peer list: {peer:?}");
+    };
+    let proof = rows.iter().find(|row| row.name == "proof").unwrap();
+    assert_eq!(proof.team, Some(team.clone()));
+
+    // Unknown/stale instances and malformed bounds never enter the list.
+    assert!(matches!(
+        remuda_native::client::request(
+            &socket,
+            &Request::SetSessionTeam {
+                name: "proof".into(),
+                instance_id: "stale".into(),
+                team: None,
+            }
+        )
+        .unwrap(),
+        Response::Error(_)
+    ));
+    assert!(matches!(
+        remuda_native::client::request(
+            &socket,
+            &Request::SetSessionTeam {
+                name: "proof".into(),
+                instance_id: instance,
+                team: Some(remuda_core::registry::SessionTeam {
+                    model: Some("x".repeat(65)),
+                    ..remuda_core::registry::SessionTeam::default()
+                }),
+            }
+        )
+        .unwrap(),
+        Response::Error(_)
+    ));
+    let Response::Sessions(rows) = remuda_native::client::request(&socket, &Request::List).unwrap()
+    else {
+        panic!("local list failed");
+    };
+    assert_eq!(
+        rows.iter().find(|row| row.name == "proof").unwrap().team,
+        Some(team)
+    );
+}
+
+#[test]
+fn team_contract_is_additive_and_unknown_fields_are_ignored() {
+    let summary = remuda_core::registry::SessionSummary {
+        id: "id".into(),
+        name: "proof".into(),
+        instance_id: Some("instance".into()),
+        output_version: None,
+        alive: true,
+        idle: Duration::ZERO,
+        output_idle: None,
+        size: remuda_core::Size::new(80, 24),
+        attached: false,
+        human_idle: None,
+        mouse_tracking: false,
+        unavailable: false,
+        program_status: None,
+        program_status_age_ms: None,
+        remote_input_disabled: false,
+        team: Some(remuda_core::registry::SessionTeam {
+            agent_kind: Some("codex".into()),
+            ..remuda_core::registry::SessionTeam::default()
+        }),
+    };
+    let mut value = serde_json::to_value(&summary).unwrap();
+    assert_eq!(value["team"]["agent_kind"], "codex");
+    let object = value.as_object_mut().unwrap();
+    object.remove("team");
+    object.insert("future_field".into(), serde_json::json!({ "x": 1 }));
+    let parsed: remuda_core::registry::SessionSummary = serde_json::from_value(value).unwrap();
+    assert!(parsed.team.is_none());
+
+    let mut cleared = summary;
+    cleared.team = None;
+    let value = serde_json::to_value(&cleared).unwrap();
+    assert!(value.get("team").is_none(), "{value}");
+}
+
+#[test]
+fn real_old_peer_omits_team_and_still_lists_cleanly() {
+    let Some(old) = std::env::var_os("REMUDA_OLD_PEER_BIN").map(PathBuf::from) else {
+        eprintln!("skip: set REMUDA_OLD_PEER_BIN to a build that predates team metadata");
+        return;
+    };
+    assert!(old.is_file(), "REMUDA_OLD_PEER_BIN is not a file");
+    let client_node = Node::start("old-team-client");
+    let server_node = Node::start_with_binary("old-team-server", old);
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    server_node.start_named_session("proof", "sleep 30");
+    let path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server_node.fingerprint())
+        .unwrap()
+        .endpoint = Some(listener.address.to_string());
+    fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+
+    let client = ClusterClient::with_timeouts(
+        Arc::new(SystemWallClock::new()),
+        ClientTimeouts {
+            connect: Duration::from_secs(2),
+            read: Duration::from_secs(3),
+            total: Duration::from_secs(3),
+        },
+    );
+    let Response::Sessions(rows) = client
+        .request(
+            listener.address,
+            &server_node.public,
+            &client_node.private,
+            &Request::List,
+        )
+        .unwrap()
+    else {
+        panic!("old peer list failed");
+    };
+    assert!(rows.iter().any(|row| row.name == "proof"));
+    assert!(rows.iter().all(|row| row.team.is_none()));
 }
 
 fn pane_pair(label: &str) -> (Node, Node) {
