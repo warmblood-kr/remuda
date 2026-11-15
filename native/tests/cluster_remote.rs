@@ -1774,17 +1774,15 @@ fn real_modern_peer_list_carries_bounded_team_metadata() {
 /// from a remuda-butler checkout, launch agents through its launch path, and
 /// read the structured team back over the cluster's List. Set
 /// `REMUDA_BUTLER_SRC` to the checkout root (the directory holding
-/// `extension.toml`). The test is skipped when it is unset so the ordinary
-/// suite does not depend on an external repository.
+/// `extension.toml`). Run explicitly with `cargo test --test cluster_remote
+/// real_butler_launch_publishes_team_metadata_to_a_remote_list -- --ignored`.
 #[test]
+#[ignore = "requires a separate remuda-butler checkout"]
 #[allow(clippy::too_many_lines)] // One assembled path: boot, launch, reparent, remote list.
 fn real_butler_launch_publishes_team_metadata_to_a_remote_list() {
-    let Some(butler_src) = std::env::var_os("REMUDA_BUTLER_SRC").map(PathBuf::from) else {
-        eprintln!(
-            "skip: set REMUDA_BUTLER_SRC to the remuda-butler checkout with the team producer"
-        );
-        return;
-    };
+    let butler_src = std::env::var_os("REMUDA_BUTLER_SRC")
+        .map(PathBuf::from)
+        .expect("set REMUDA_BUTLER_SRC to the remuda-butler checkout with the team producer");
     assert!(
         butler_src.join("extension.toml").is_file(),
         "REMUDA_BUTLER_SRC has no extension.toml"
