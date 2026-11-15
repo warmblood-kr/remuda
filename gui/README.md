@@ -18,8 +18,15 @@ live terminal. Session creation, attachment, keyboard input, terminal styling,
 scrollback navigation and IME are not available in this prototype.
 
 The current prototype has been built and exercised on macOS. Other platforms
-have not been validated for this GUI; the standalone command is separate from
-the existing Remuda CLI and TUI.
+have not been validated for this GUI.
+
+On macOS, `remuda gui` launches `remuda-gui` from the same directory as the
+resolved `remuda` executable. The GUI is not yet included in release archives:
+build it with `cargo build --release --locked --manifest-path gui/Cargo.toml`,
+then place `gui/target/release/remuda-gui` beside the installed `remuda`.
+The built-in GUI does not support named servers (`remuda -s NAME gui`) yet.
+An installed mod declaring the `gui` command keeps precedence; in that case,
+run the sibling `remuda-gui` executable directly to open this GUI.
 
 # Peer-list acceptance
 

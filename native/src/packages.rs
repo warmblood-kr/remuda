@@ -91,6 +91,48 @@ pub fn subcommand(name: &str) -> Result<Option<String>, String> {
         .map(|spec| spec.name))
 }
 
+/// Find an existing command without treating an unreadable mod as absent.
+/// A known owner retains precedence even when another mod is half-installed.
+pub fn subcommand_checked(name: &str) -> Result<Option<String>, String> {
+    let root = mods_dir()?;
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match fs::symlink_metadata(&root) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                _ => Err(format!("cannot inspect {}: {error}", root.display())),
+            };
+        }
+        Err(error) => return Err(format!("cannot inspect {}: {error}", root.display())),
+    };
+    let mut uncertain = None;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot inspect {}: {error}", root.display()))?;
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            continue;
+        }
+        match read_manifest(&entry.path().join("extension.toml")) {
+            Ok(spec) if spec.command.as_deref() == Some(name) => return Ok(Some(spec.name)),
+            Ok(_) => (),
+            Err(error) => {
+                uncertain.get_or_insert_with(|| {
+                    format!("cannot inspect mod at {}: {error}", entry.path().display())
+                });
+            }
+        }
+    }
+    if let Some(error) = uncertain {
+        if half_installed(name).is_none() {
+            return Err(error);
+        }
+    }
+    Ok(None)
+}
+
 pub fn has_subcommand(name: &str) -> bool {
     subcommand(name).ok().flatten().is_some()
 }
