@@ -48,6 +48,7 @@ pub mod script;
 #[doc(hidden)]
 pub mod session_host;
 pub mod session_job;
+pub mod session_preview;
 pub mod sqlite;
 pub(crate) mod sqlite_migrate;
 #[cfg(unix)]
