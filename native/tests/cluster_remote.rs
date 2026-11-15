@@ -1,6 +1,91 @@
 #![cfg(unix)]
 #![allow(clippy::disallowed_types)]
 
+// Each attempt is a read-only capture. A missing marker may mean the session
+// was registered before its shell produced output.
+fn wait_for_marker(mut capture: impl FnMut() -> bool, timeout: Duration, pause: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if capture() {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(pause.min(remaining));
+    }
+}
+
+#[test]
+fn marker_poll_retries_and_stops_at_deadline() {
+    let mut calls = 0;
+    assert!(wait_for_marker(
+        || {
+            calls += 1;
+            calls == 3
+        },
+        Duration::from_secs(1),
+        Duration::ZERO
+    ));
+    assert_eq!(calls, 3);
+    let mut calls = 0;
+    assert!(!wait_for_marker(
+        || {
+            calls += 1;
+            false
+        },
+        Duration::ZERO,
+        Duration::ZERO
+    ));
+    assert_eq!(calls, 1);
+}
+
+fn gui_preview(
+    gui: &std::ffi::OsStr,
+    node: &Node,
+    kind: &str,
+    fp: &str,
+    id: &str,
+) -> std::process::Output {
+    let mut child = Command::new(gui)
+        .args(["--internal-preview-worker", kind, fp, "proof", id])
+        .env("XDG_STATE_HOME", &node.state)
+        .env("XDG_CONFIG_HOME", node.root.join("config"))
+        .env("XDG_DATA_HOME", node.root.join("data"))
+        .env("REMUDA_RUNTIME_DIR", &node.runtime)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let end = Instant::now() + Duration::from_secs(12);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= end {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("preview timed out");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
+fn wait_for_session_output(gui: &std::ffi::OsStr, server: &Node, instance: &str) {
+    assert!(
+        wait_for_marker(
+            || {
+                let output = gui_preview(gui, server, "local", "", instance);
+                assert!(output.status.success(), "local preview failed: {output:?}");
+                let text: String = serde_json::from_slice(&output.stdout).unwrap();
+                text.contains("PREVIEW_MARKER")
+            },
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+        ),
+        "session output did not appear"
+    );
+}
+
 // Run via gui/tests/peer_list_acceptance.sh; the GUI binary is built separately.
 #[test]
 #[ignore = "requires separately built GUI binary; use gui/tests/peer_list_acceptance.sh"]
@@ -8,7 +93,12 @@ fn gui_peer_list_worker_reads_pinned_peer_and_reports_offline() {
     let env = vec![("REMUDA_EXPERIMENTAL_SESSION_HOST".into(), "0".into())];
     let mut client = Node::start_with_env("gui-client", env.clone());
     client.bounded_inprocess_cleanup = true;
-    let mut server = Node::start_with_env("gui-server", env);
+    let mut server = Node::start_with_binary_env_named(
+        "gui-server",
+        PathBuf::from(env!("CARGO_BIN_EXE_remuda")),
+        env,
+        Some("default"),
+    );
     server.bounded_inprocess_cleanup = true;
     admit_pair(&client, &server);
     let listener = Listener::start(&server);
@@ -21,7 +111,7 @@ fn gui_peer_list_worker_reads_pinned_peer_and_reports_offline() {
         .unwrap()
         .endpoint = Some(listener.address.to_string());
     fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
-    server.start_session("exec sleep 30");
+    server.start_session("printf PREVIEW_MARKER; exec sleep 30");
     let socket = remuda_native::daemon::socket_path_in(&server.runtime, &server.name);
     let deadline = Instant::now() + Duration::from_secs(10);
     let instance = loop {
@@ -66,10 +156,28 @@ fn gui_peer_list_worker_reads_pinned_peer_and_reports_offline() {
     let rows: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
     let proof = rows.iter().find(|row| row["name"] == "proof").unwrap();
     assert_eq!(proof["instance_id"].as_str(), Some(instance.as_str()));
+    wait_for_session_output(&gui, &server, &instance);
+    for (node, kind, fp) in [
+        (&server, "local", String::new()),
+        (&client, "peer", server.fingerprint()),
+    ] {
+        let output = gui_preview(&gui, node, kind, &fp, &instance);
+        assert!(output.status.success(), "preview failed: {output:?}");
+        let text: String = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(text.contains("PREVIEW_MARKER"), "missing screen: {text:?}");
+        assert!(!gui_preview(&gui, node, kind, &fp, "wrong-instance")
+            .status
+            .success());
+    }
     assert!(!run("not-an-admitted-fingerprint", "invalid fingerprint")
         .status
         .success());
     server.stop_daemon();
+    assert!(
+        !gui_preview(&gui, &client, "peer", &server.fingerprint(), &instance)
+            .status
+            .success()
+    );
     assert!(
         !run(&server.fingerprint(), "offline peer").status.success(),
         "offline peer appeared current"
@@ -128,6 +236,15 @@ impl Node {
     }
 
     fn start_with_binary_env(label: &str, binary: PathBuf, env: Vec<(String, String)>) -> Self {
+        Self::start_with_binary_env_named(label, binary, env, None)
+    }
+
+    fn start_with_binary_env_named(
+        label: &str,
+        binary: PathBuf,
+        env: Vec<(String, String)>,
+        server_name: Option<&str>,
+    ) -> Self {
         let serial = NEXT.fetch_add(1, Ordering::Relaxed);
         // The default macOS TMPDIR (/var/folders/...) leaves too little of the
         // 104-byte sun_path for runtime/remuda/<node>.sock.
@@ -143,7 +260,9 @@ impl Node {
         for dir in [&runtime, &state, &home] {
             fs::create_dir_all(dir).unwrap();
         }
-        let name = format!("{label}-{serial}");
+        let name = server_name
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{label}-{serial}"));
         let daemon = spawn_daemon(&binary, &env, &name, &runtime, &root, &state);
         let mut node = Self {
             root,
