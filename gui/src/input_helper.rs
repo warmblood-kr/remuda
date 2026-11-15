@@ -5,8 +5,8 @@ use remuda_native::strict_input::{
 };
 use std::{
     io::{Read, Write},
-    sync::mpsc,
-    time::Duration,
+    sync::{mpsc, Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 const DEADLINE: Duration = Duration::from_secs(8);
@@ -86,10 +86,322 @@ pub fn worker(args: &[String]) -> i32 {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum Event {
+    Applied,
+    NotAcknowledged,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub enum Submit {
+    Queued,
+    Busy,
+    Invalid,
+    Stopped,
+}
+struct State {
+    stopped: bool,
+    busy: bool,
+    completed: bool,
+}
+
+/// One helper and one outstanding batch, with no further buffered input.
+/// `stop` prevents future dispatch; bytes already handed to the pipe may land.
+/// Events never contain input bytes. Drop requests stop and cleanup is asynchronous.
+pub struct InputHelper {
+    tx: mpsc::SyncSender<Vec<u8>>,
+    state: Arc<Mutex<State>>,
+    event_tx: mpsc::SyncSender<Event>,
+    events: mpsc::Receiver<Event>,
+}
+
+impl InputHelper {
+    pub fn start(program: &std::path::Path, args: &[&str]) -> std::io::Result<Self> {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
+        let (events, results) = mpsc::sync_channel(1);
+        let state = Arc::new(Mutex::new(State {
+            stopped: false,
+            busy: false,
+            completed: false,
+        }));
+        let worker_state = state.clone();
+        let worker_events = events.clone();
+        std::thread::spawn(move || {
+            for bytes in rx {
+                {
+                    let s = worker_state.lock().unwrap();
+                    if s.stopped {
+                        break;
+                    }
+                }
+                let result = exchange(&mut stdin, &mut stdout, &bytes, &worker_state);
+                let mut s = worker_state.lock().unwrap();
+                if s.busy && !s.completed {
+                    s.completed = true;
+                    if !result {
+                        s.stopped = true;
+                    }
+                    let _ = worker_events.try_send(if result {
+                        Event::Applied
+                    } else {
+                        Event::NotAcknowledged
+                    });
+                }
+                if s.stopped {
+                    break;
+                }
+            }
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        Ok(Self {
+            tx,
+            state,
+            event_tx: events,
+            events: results,
+        })
+    }
+    pub fn submit(&self, bytes: &[u8]) -> Submit {
+        if bytes.is_empty() || bytes.len() > MAX_BATCH {
+            return Submit::Invalid;
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.stopped {
+            return Submit::Stopped;
+        }
+        if state.busy {
+            return Submit::Busy;
+        }
+        state.busy = true;
+        if self.tx.try_send(bytes.to_vec()).is_err() {
+            state.stopped = true;
+            return Submit::Stopped;
+        }
+        Submit::Queued
+    }
+    /// Consume the single completion before another batch can be submitted.
+    pub fn recv_event_timeout(&self, timeout: Duration) -> Result<Event, mpsc::RecvTimeoutError> {
+        let event = self.events.recv_timeout(timeout)?;
+        let mut state = self.state.lock().unwrap();
+        state.busy = false;
+        state.completed = false;
+        Ok(event)
+    }
+    pub fn stop(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.stopped = true;
+        if state.busy && !state.completed {
+            state.completed = true;
+            let _ = self.event_tx.try_send(Event::NotAcknowledged);
+        }
+        drop(state);
+        // Wake a worker waiting for its next batch.
+        let _ = self.tx.try_send(Vec::new());
+    }
+}
+impl Drop for InputHelper {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+// The descriptor is nonblocking. Holding this lock only for the actual write
+// orders every accepted byte before stop() returns; never sleep under it.
+#[cfg(unix)]
+fn guarded_write(
+    state: &Mutex<State>,
+    write: impl FnOnce() -> std::io::Result<usize>,
+) -> Option<std::io::Result<usize>> {
+    let guard = state.lock().unwrap();
+    if guard.stopped {
+        None
+    } else {
+        Some(write())
+    }
+}
+
+#[cfg(unix)]
+fn exchange(
+    input: &mut std::process::ChildStdin,
+    output: &mut std::process::ChildStdout,
+    bytes: &[u8],
+    state: &Mutex<State>,
+) -> bool {
+    use std::os::fd::AsRawFd;
+    let fds = [input.as_raw_fd(), output.as_raw_fd()];
+    for fd in fds {
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return false;
+            }
+        }
+    }
+    let mut frame = Vec::with_capacity(4 + bytes.len());
+    frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    frame.extend_from_slice(bytes);
+    let end = Instant::now() + DEADLINE;
+    let mut written = 0;
+    while written < frame.len() {
+        if Instant::now() >= end {
+            return false;
+        }
+        match guarded_write(state, || input.write(&frame[written..])) {
+            None => return false,
+            Some(Ok(0)) => return false,
+            Some(Ok(n)) => written += n,
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            Some(Err(_)) => return false,
+        }
+    }
+    loop {
+        if state.lock().unwrap().stopped || Instant::now() >= end {
+            return false;
+        }
+        let mut ack = [0];
+        match output.read(&mut ack) {
+            Ok(1) => return ack[0] == 1,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            _ => return false,
+        }
+    }
+}
+#[cfg(not(unix))]
+fn exchange(
+    _: &mut std::process::ChildStdin,
+    _: &mut std::process::ChildStdout,
+    _: &[u8],
+    _: &Mutex<State>,
+) -> bool {
+    false
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::time::Instant;
+    use std::path::Path;
+    #[test]
+    fn unconsumed_completion_blocks_further_batches() {
+        let helper = InputHelper::start(
+            Path::new("/bin/sh"),
+            &[
+                "-c",
+                "dd bs=1 count=5 of=/dev/null 2>/dev/null; printf '\\001'",
+            ],
+        )
+        .unwrap();
+        assert_eq!(helper.submit(b"x"), Submit::Queued);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !helper.state.lock().unwrap().completed {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        for _ in 0..1000 {
+            assert_eq!(helper.submit(b"y"), Submit::Busy);
+        }
+        assert_eq!(
+            helper.recv_event_timeout(Duration::ZERO).unwrap(),
+            Event::Applied
+        );
+    }
+    #[test]
+    fn stopped_queued_batch_has_exactly_one_completion() {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let (event_tx, events) = mpsc::sync_channel(1);
+        let helper = InputHelper {
+            tx,
+            state: Arc::new(Mutex::new(State {
+                stopped: false,
+                busy: false,
+                completed: false,
+            })),
+            event_tx,
+            events,
+        };
+        assert_eq!(helper.submit(b"x"), Submit::Queued);
+        helper.stop();
+        helper.stop();
+        assert_eq!(
+            helper.recv_event_timeout(Duration::ZERO).unwrap(),
+            Event::NotAcknowledged
+        );
+        assert!(helper.recv_event_timeout(Duration::ZERO).is_err());
+        assert_eq!(helper.submit(b"y"), Submit::Stopped);
+    }
+    #[test]
+    fn stop_between_prior_check_and_write_prevents_pipe_handoff() {
+        let helper = InputHelper::start(Path::new("/bin/sleep"), &["30"]).unwrap();
+        let state = helper.state.clone();
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            assert!(!state.lock().unwrap().stopped);
+            checked_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            guarded_write(&state, || panic!("write after stop"))
+        });
+        checked_rx.recv().unwrap();
+        helper.stop();
+        resume_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_none());
+    }
+    #[test]
+    fn serial_ack_and_invalid_batch() {
+        let helper = InputHelper::start(Path::new("/bin/sh"), &["-c", "dd bs=1 count=5 of=/dev/null 2>/dev/null; printf '\\001'; dd bs=1 count=5 of=/dev/null 2>/dev/null; printf '\\001'"]).unwrap();
+        assert_eq!(helper.submit(&[]), Submit::Invalid);
+        assert_eq!(helper.submit(&vec![0; MAX_BATCH + 1]), Submit::Invalid);
+        for _ in 0..2 {
+            assert_eq!(helper.submit(b"x"), Submit::Queued);
+            assert_eq!(
+                helper.recv_event_timeout(Duration::from_secs(3)).unwrap(),
+                Event::Applied
+            );
+        }
+    }
+    #[test]
+    fn stalled_child_is_bounded_and_stop_discards_further_input() {
+        let helper = InputHelper::start(Path::new("/bin/sleep"), &["30"]).unwrap();
+        assert_eq!(helper.submit(b"x"), Submit::Queued);
+        assert_eq!(helper.submit(b"y"), Submit::Busy);
+        helper.stop();
+        assert_eq!(helper.submit(b"z"), Submit::Stopped);
+        // Depending on the stop/dispatch race, work is discarded or its outcome
+        // is uncertain; no second input may be sent in either case.
+        assert_eq!(
+            helper
+                .recv_event_timeout(Duration::from_millis(500))
+                .unwrap(),
+            Event::NotAcknowledged
+        );
+        assert!(helper
+            .recv_event_timeout(Duration::from_millis(100))
+            .is_err());
+    }
+    #[test]
+    fn timed_out_transport_stops_without_retry() {
+        let helper = InputHelper::start(Path::new("/bin/sleep"), &["30"]).unwrap();
+        assert_eq!(helper.submit(b"x"), Submit::Queued);
+        assert_eq!(
+            helper
+                .recv_event_timeout(DEADLINE + Duration::from_secs(3))
+                .unwrap(),
+            Event::NotAcknowledged
+        );
+        assert_eq!(helper.submit(b"x"), Submit::Stopped);
+    }
     #[test]
     #[ignore = "child fixture for watchdog"]
     fn stalled_transport_fixture() {
@@ -182,5 +494,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(status.code(), Some(124));
+    }
+    #[test]
+    fn failed_child_is_terminal_and_never_retried() {
+        let helper = InputHelper::start(Path::new("/bin/sh"), &["-c", "exit 1"]).unwrap();
+        assert_eq!(helper.submit(b"x"), Submit::Queued);
+        assert_eq!(
+            helper.recv_event_timeout(Duration::from_secs(3)).unwrap(),
+            Event::NotAcknowledged
+        );
+        assert_eq!(helper.submit(b"x"), Submit::Stopped);
     }
 }
