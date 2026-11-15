@@ -5,6 +5,8 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 use std::{sync::mpsc, time::Duration};
 
+#[allow(dead_code)]
+mod input_helper;
 mod preview;
 mod provider;
 
@@ -702,6 +704,11 @@ impl Render for LocalGui {
     }
 }
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--internal-input-worker") {
+        std::process::exit(input_helper::worker(
+            &std::env::args().skip(2).collect::<Vec<_>>(),
+        ));
+    }
     if std::env::args().nth(1).as_deref() == Some("--internal-preview-worker") {
         std::process::exit(preview::worker(
             &std::env::args().skip(2).collect::<Vec<_>>(),
