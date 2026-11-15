@@ -22,8 +22,8 @@ use sender::InputSender;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -58,6 +58,9 @@ const UI_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 /// painter validates and fits it again at the width actually available.
 const LOCAL_VIEW_WIDTH: u16 = 48;
 const LOCAL_VIEW_TTL: Duration = Duration::from_secs(30);
+/// At most one synchronous local view request per second; the daemon `List`
+/// still runs every loop, so a stalled node does not get a second timeout.
+const LOCAL_VIEW_REFRESH: Duration = Duration::from_secs(1);
 /// `">    "` / `"     "` before every local row's rendered content.
 const LOCAL_ROW_PREFIX_WIDTH: usize = 5;
 const REMOTE_KEYS_COALESCE_INTERVAL: Duration = Duration::from_millis(40);
@@ -142,6 +145,7 @@ pub struct ClusterUi {
     local_targets: Vec<String>,
     sessions: Vec<SessionSummary>,
     local_view: Option<LocalView>,
+    local_view_requested_at: Option<Duration>,
     selected: usize,
     active: usize,
     expanded: bool,
@@ -282,6 +286,79 @@ struct LocalView {
     order: Vec<(String, String)>,
 }
 
+/// One nonblocking local `RenderedSessionList` request at a time. A slow
+/// decorator delays only this reply, never key handling or painting.
+struct LocalViewLoader {
+    replies: mpsc::Receiver<(u64, Option<SessionView>)>,
+    sender: mpsc::Sender<(u64, Option<SessionView>)>,
+    finished: Arc<AtomicU64>,
+    next: u64,
+    in_flight: Option<u64>,
+}
+
+impl LocalViewLoader {
+    fn new() -> Self {
+        let (sender, replies) = mpsc::channel();
+        Self {
+            replies,
+            sender,
+            finished: Arc::new(AtomicU64::new(0)),
+            next: 0,
+            in_flight: None,
+        }
+    }
+
+    fn finished(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.finished)
+    }
+
+    fn idle(&self) -> bool {
+        self.in_flight.is_none()
+    }
+
+    fn request(&mut self, path: &Path) -> bool {
+        let path = path.to_path_buf();
+        self.request_with(move || local_session_view(&path, LOCAL_VIEW_WIDTH))
+    }
+
+    fn request_with<F>(&mut self, fetch: F) -> bool
+    where
+        F: FnOnce() -> Option<SessionView> + Send + 'static,
+    {
+        if !self.idle() {
+            return false;
+        }
+        let generation = self.next;
+        self.next = self.next.wrapping_add(1);
+        self.in_flight = Some(generation);
+        let sender = self.sender.clone();
+        let finished = Arc::clone(&self.finished);
+        let spawned = std::thread::Builder::new()
+            .name("cluster-tui-local-view".into())
+            .spawn(move || {
+                let result = fetch();
+                if sender.send((generation, result)).is_ok() {
+                    finished.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .is_ok();
+        if !spawned {
+            self.in_flight = None;
+        }
+        spawned
+    }
+
+    fn take_reply(&mut self) -> Option<Option<SessionView>> {
+        while let Ok((generation, result)) = self.replies.try_recv() {
+            if self.in_flight == Some(generation) {
+                self.in_flight = None;
+                return Some(result);
+            }
+        }
+        None
+    }
+}
+
 impl ClusterUi {
     pub fn new(node: &str, sessions: Vec<SessionSummary>, synced_at: Duration) -> Self {
         Self::with_sender(
@@ -303,6 +380,7 @@ impl ClusterUi {
             local_targets: vec![node.into()],
             sessions,
             local_view: None,
+            local_view_requested_at: None,
             selected: 0,
             active: 0,
             expanded: true,
@@ -492,11 +570,11 @@ impl ClusterUi {
         }
     }
 
-    fn visible_tree_rows(&self) -> Vec<TreeSelection> {
+    fn visible_tree_rows(&self, now: Duration) -> Vec<TreeSelection> {
         let mut rows = vec![TreeSelection::LocalNode];
         if self.expanded {
             rows.extend(
-                self.visible_sessions()
+                self.visible_sessions(Some(now))
                     .into_iter()
                     .map(TreeSelection::LocalSession),
             );
@@ -560,6 +638,10 @@ impl ClusterUi {
             .sessions
             .get(self.selected)
             .map(|session| (session.name.clone(), session.instance_id.clone()));
+        let active = self
+            .sessions
+            .get(self.active)
+            .map(|session| (session.name.clone(), session.instance_id.clone()));
         if self.ended.is_none() {
             if let Some(previous) = previous {
                 let same_start = sessions.iter().any(|session| {
@@ -610,6 +692,18 @@ impl ClusterUi {
                 .unwrap_or(ended_index);
             self.active = ended_index;
         } else {
+            let selected_index = selected.and_then(|(name, instance_id)| {
+                self.sessions
+                    .iter()
+                    .position(|session| session.name == name && session.instance_id == instance_id)
+            });
+            let active_index = active.and_then(|(name, instance_id)| {
+                self.sessions
+                    .iter()
+                    .position(|session| session.name == name && session.instance_id == instance_id)
+            });
+            self.selected = selected_index.unwrap_or(self.selected);
+            self.active = active_index.unwrap_or(self.active);
             self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
             self.active = self.active.min(self.sessions.len().saturating_sub(1));
         }
@@ -620,7 +714,7 @@ impl ClusterUi {
     /// Accept a rendered local list only when it binds exactly the sessions the
     /// tree is showing. The rows stay untrusted until painted at the tree width.
     pub fn local_view_synced(&mut self, view: SessionView, at: Duration) {
-        if !self.sessions_match_view(&view) {
+        if view.validate().is_err() || !self.sessions_match_view(&view) {
             self.local_view = None;
             return;
         }
@@ -639,6 +733,11 @@ impl ClusterUi {
         self.local_view = None;
     }
 
+    fn local_view_due(&self, now: Duration) -> bool {
+        self.local_view_requested_at
+            .is_none_or(|at| now.saturating_sub(at) >= LOCAL_VIEW_REFRESH)
+    }
+
     fn retain_local_view(&mut self) {
         if self
             .local_view
@@ -646,6 +745,9 @@ impl ClusterUi {
             .is_some_and(|local| !self.sessions_match_view(&local.view))
         {
             self.local_view = None;
+            // A different session set is a real reason to fetch now rather
+            // than wait out the normal refresh interval.
+            self.local_view_requested_at = None;
         }
     }
 
@@ -670,10 +772,14 @@ impl ClusterUi {
             };
             expected.insert(session.name.as_str(), instance);
         }
-        expected.len() == view.entries().len()
-            && view.entries().iter().all(|entry| {
-                expected.get(entry.name.as_str()).copied() == Some(entry.instance_id.as_str())
-            })
+        if expected.len() != view.entries().len() {
+            return false;
+        }
+        let mut seen = HashSet::with_capacity(view.entries().len());
+        view.entries().iter().all(|entry| {
+            expected.get(entry.name.as_str()).copied() == Some(entry.instance_id.as_str())
+                && seen.insert(entry.name.as_str())
+        })
     }
 
     fn local_identity(&self, index: usize) -> Option<(&str, &str)> {
@@ -681,8 +787,14 @@ impl ClusterUi {
         Some((session.name.as_str(), session.instance_id.as_deref()?))
     }
 
-    fn local_order(&self) -> Option<&[(String, String)]> {
-        self.local_view.as_ref().map(|view| view.order.as_slice())
+    fn local_order(&self, now: Option<Duration>) -> Option<&[(String, String)]> {
+        let local = self.local_view.as_ref()?;
+        // A stale view falls back to registry order together with its plain
+        // rows; display and keyboard order must not diverge.
+        if now.is_some_and(|now| now.saturating_sub(local.at) >= LOCAL_VIEW_TTL) {
+            return None;
+        }
+        Some(local.order.as_slice())
     }
 
     fn set_ended(&mut self, ended: EndedState) {
@@ -1473,7 +1585,7 @@ impl ClusterUi {
                     .collect()
             })
             .unwrap_or_default();
-        self.visible_sessions()
+        self.visible_sessions(Some(now))
             .into_iter()
             .map(|index| {
                 let session = &self.sessions[index];
@@ -1729,21 +1841,21 @@ impl ClusterUi {
             Some("cluster.search") => self.query = Some(String::new()),
             Some("cluster.attention") => {
                 self.attention_only = !self.attention_only;
-                self.select_first_visible();
+                self.select_first_visible(now);
             }
             Some("cluster.remote.keys") => self.enter_remote_keys_mode(now),
             Some("cluster.search.clear") => {
                 self.query = None;
-                self.select_first_visible();
+                self.select_first_visible(now);
             }
             Some("cluster.search.delete") => {
                 if let Some(query) = self.query.as_mut() {
                     query.pop();
                 }
-                self.select_first_visible();
+                self.select_first_visible(now);
             }
-            Some("cluster.up") => self.move_selection(false),
-            Some("cluster.down") => self.move_selection(true),
+            Some("cluster.up") => self.move_selection(false, now),
+            Some("cluster.down") => self.move_selection(true, now),
             Some("cluster.left") => self.collapse_tree_selection(),
             Some("cluster.right") => self.expand_tree_selection(),
             Some("cluster.select") => self.enter_selected(now),
@@ -1755,7 +1867,7 @@ impl ClusterUi {
                     (self.query.as_mut(), event.code)
                 {
                     query.push(ch);
-                    self.select_first_visible();
+                    self.select_first_visible(now);
                 }
             }
             _ => {}
@@ -1962,7 +2074,7 @@ impl ClusterUi {
 
     fn enter_selected(&mut self, now: Duration) {
         let selection = self.current_tree_selection();
-        if !self.visible_tree_rows().contains(&selection) {
+        if !self.visible_tree_rows(now).contains(&selection) {
             return;
         }
         match selection {
@@ -2448,7 +2560,7 @@ impl ClusterUi {
         }
     }
 
-    fn visible_sessions(&self) -> Vec<usize> {
+    fn visible_sessions(&self, now: Option<Duration>) -> Vec<usize> {
         let query = self.query.as_deref().unwrap_or_default();
         let node_matches = query.is_empty() || matches_query(query, &self.node);
         let mut visible: Vec<usize> = self
@@ -2466,7 +2578,7 @@ impl ClusterUi {
             })
             .map(|(index, _)| index)
             .collect();
-        if let Some(order) = self.local_order() {
+        if let Some(order) = self.local_order(now) {
             let positions: HashMap<(&str, &str), usize> = order
                 .iter()
                 .enumerate()
@@ -2481,8 +2593,8 @@ impl ClusterUi {
         visible
     }
 
-    fn select_first_visible(&mut self) {
-        let visible = self.visible_tree_rows();
+    fn select_first_visible(&mut self, now: Duration) {
+        let visible = self.visible_tree_rows(now);
         if !visible.contains(&self.current_tree_selection()) {
             if let Some(selection) = visible
                 .iter()
@@ -2495,11 +2607,11 @@ impl ClusterUi {
         }
     }
 
-    fn move_selection(&mut self, down: bool) {
-        let visible = self.visible_tree_rows();
+    fn move_selection(&mut self, down: bool, now: Duration) {
+        let visible = self.visible_tree_rows(now);
         let current = self.current_tree_selection();
         let Some(position) = visible.iter().position(|selection| *selection == current) else {
-            self.select_first_visible();
+            self.select_first_visible(now);
             return;
         };
         let next = if down {
@@ -3137,21 +3249,24 @@ fn tree_row_lines(row: &TreeRow, width: usize) -> Vec<String> {
             let content_width =
                 u16::try_from(width.saturating_sub(prefix_width)).unwrap_or(u16::MAX);
             let continuation = " ".repeat(prefix_width);
-            lines
-                .iter()
-                .enumerate()
-                .map(|(index, line)| {
-                    let row_prefix = if index == 0 {
-                        prefix.as_str()
-                    } else {
-                        continuation.as_str()
-                    };
-                    format!(
-                        "{row_prefix}{}",
-                        remuda_core::session_view::fit_session_row(line, content_width)
-                    )
-                })
-                .collect()
+            let mut rendered = Vec::with_capacity(lines.len());
+            for (index, line) in lines.iter().enumerate() {
+                // A stacked view's trailing blank line is spacing for the herd
+                // list, not a tree row; keeping it would crowd out selection.
+                if index > 0 && line.is_empty() {
+                    continue;
+                }
+                let row_prefix = if rendered.is_empty() {
+                    prefix.as_str()
+                } else {
+                    continuation.as_str()
+                };
+                rendered.push(format!(
+                    "{row_prefix}{}",
+                    remuda_core::session_view::fit_session_row(line, content_width)
+                ));
+            }
+            rendered
         }
     }
 }
@@ -3478,17 +3593,29 @@ fn local_session_view(path: &Path, width: u16) -> Option<SessionView> {
 
 /// Refresh the local name list and, when expanded, its decorated view. A node
 /// that just failed `List` does not spend a second timeout on the view.
-fn sync_local_list(ui: &mut ClusterUi, path: &Path, now: Duration) {
+fn sync_local_list(
+    ui: &mut ClusterUi,
+    path: &Path,
+    local_views: &mut LocalViewLoader,
+    now: Duration,
+) {
     match list(path) {
         Ok(current) => {
             ui.sessions_synced(current, now);
-            if ui.expanded {
-                match local_session_view(path, LOCAL_VIEW_WIDTH) {
+            if let Some(result) = local_views.take_reply() {
+                match result {
                     Some(view) => ui.local_view_synced(view, now),
                     None => ui.local_view_failed(),
                 }
             }
+            if ui.expanded && ui.local_view_due(now) && local_views.idle() {
+                ui.local_view_requested_at = Some(now);
+                if !local_views.request(path) {
+                    ui.local_view_failed();
+                }
+            }
         }
+        // `List` already waited; do not add a second timeout on a stalled node.
         Err(_) => ui.local_view_failed(),
     }
 }
@@ -3714,13 +3841,18 @@ fn run_loop(
     let clock = runtime.clock;
     let mut remote_calls = remote_input.map(RemoteDispatcher::new);
     let replies = remote_calls.as_ref().map(RemoteDispatcher::finished);
-    // Moves when a remote poll lands or a remote call replies.
+    let mut local_views = LocalViewLoader::new();
+    let local_view_finished = local_views.finished();
+    // Moves when a remote poll, remote call or local view reply lands.
     let wake = || {
-        remote_source.generation().wrapping_add(
-            replies
-                .as_ref()
-                .map_or(0, |count| count.load(Ordering::SeqCst)),
-        )
+        remote_source
+            .generation()
+            .wrapping_add(
+                replies
+                    .as_ref()
+                    .map_or(0, |count| count.load(Ordering::SeqCst)),
+            )
+            .wrapping_add(local_view_finished.load(Ordering::SeqCst))
     };
     let mut ui = ClusterUi::with_sender(node, list(path)?, clock.now(), InputSender::random()?);
     if let Some((identity, _)) = crate::cluster::nodes()? {
@@ -3737,7 +3869,7 @@ fn run_loop(
     let mut last_full_repaint = clock.now();
     let mut frames = frame_writer()?;
     loop {
-        sync_local_list(&mut ui, path, clock.now());
+        sync_local_list(&mut ui, path, &mut local_views, clock.now());
         // Read before syncing: an update landing during sync/render wakes the wait.
         let seen = wake();
         ui.remote_synced(remote_source);
@@ -3883,8 +4015,9 @@ mod tests {
         help_lines, help_window, is_attention, legend_lines, normalized_terminal_size, present,
         remote_state_label, render_badge, resize_requires_full_repaint,
         select_target_with_remote_wait, session_cell, session_glyph, status_glyph, status_style,
-        terminal_frame, AttentionSignals, Badge, ClusterUi, EndedState, RemoteInputTransport,
-        RemoteSelection, RemoteSource, TreeSelection, ERROR_GLYPH, LOCAL_VIEW_TTL,
+        terminal_frame, AttentionSignals, Badge, ClusterUi, EndedState, LocalViewLoader,
+        RemoteInputTransport, RemoteSelection, RemoteSource, TreeSelection, ERROR_GLYPH,
+        LOCAL_VIEW_REFRESH, LOCAL_VIEW_TTL,
     };
     use crate::cluster_remote::{
         RemoteNodeSnapshot, RemoteSessionSnapshot, RemoteSnapshot, RemoteState,
@@ -5626,7 +5759,7 @@ mod tests {
                 });
             ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot.clone())));
             ui.remote_expanded.insert("fp-laptop".into());
-            let visible = ui.visible_tree_rows().iter().any(
+            let visible = ui.visible_tree_rows(clock.now()).iter().any(
                 |row| matches!(row, TreeSelection::RemoteSession { name, .. } if name == "build"),
             );
             assert_eq!(visible, expected, "state={state:?} age={age}");
@@ -5635,7 +5768,7 @@ mod tests {
         }
         snapshot.nodes[0].state = RemoteState::Unreachable;
         ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
-        assert!(ui.visible_tree_rows().iter().any(
+        assert!(ui.visible_tree_rows(clock.now()).iter().any(
             |row| matches!(row, TreeSelection::RemoteSession { name, .. } if name == "build")
         ));
     }
@@ -6494,7 +6627,44 @@ mod tests {
     }
 
     #[test]
-    fn local_view_order_drives_tree_and_keyboard_traversal_by_identity() {
+    fn duplicate_or_invalid_view_cannot_change_local_order() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("alpha", true), session("bravo", true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let plain_order = vec![
+            TreeSelection::LocalNode,
+            TreeSelection::LocalSession(0),
+            TreeSelection::LocalSession(1),
+        ];
+        assert_eq!(ui.visible_tree_rows(clock.now()), plain_order);
+
+        let duplicate = SessionView::new(
+            sessions.clone(),
+            1,
+            vec![
+                view_entry("alpha", "instance-alpha", &[&alive_row("alpha")]),
+                view_entry("alpha", "instance-alpha", &[&alive_row("alpha")]),
+            ],
+        );
+        ui.local_view_synced(duplicate, clock.now());
+        assert!(ui.local_view.is_none());
+        assert_eq!(ui.visible_tree_rows(clock.now()), plain_order);
+
+        let invalid = SessionView::new(
+            sessions,
+            1,
+            vec![
+                view_entry("alpha", "instance-alpha", &["\x1b[31malpha"]),
+                view_entry("bravo", "instance-bravo", &[&alive_row("bravo")]),
+            ],
+        );
+        ui.local_view_synced(invalid, clock.now());
+        assert!(ui.local_view.is_none());
+        assert_eq!(ui.visible_tree_rows(clock.now()), plain_order);
+    }
+
+    #[test]
+    fn stale_view_cannot_change_local_order() {
         let clock = ManualClock::new();
         let sessions = vec![session("alpha", true), session("bravo", true)];
         let mut ui = make_ui("studio", sessions.clone(), clock.now());
@@ -6508,7 +6678,105 @@ mod tests {
         );
         ui.local_view_synced(view, clock.now());
         assert_eq!(
-            ui.visible_tree_rows(),
+            ui.visible_tree_rows(clock.now()),
+            vec![
+                TreeSelection::LocalNode,
+                TreeSelection::LocalSession(1),
+                TreeSelection::LocalSession(0),
+            ]
+        );
+        clock.advance(LOCAL_VIEW_TTL + Duration::from_secs(1));
+        assert_eq!(
+            ui.visible_tree_rows(clock.now()),
+            vec![
+                TreeSelection::LocalNode,
+                TreeSelection::LocalSession(0),
+                TreeSelection::LocalSession(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn local_view_refresh_is_rate_limited() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        assert!(ui.local_view_due(clock.now()));
+        ui.local_view_requested_at = Some(clock.now());
+        assert!(!ui.local_view_due(clock.now()));
+        clock.advance(LOCAL_VIEW_REFRESH);
+        assert!(ui.local_view_due(clock.now()));
+    }
+
+    #[test]
+    fn local_view_request_does_not_block_the_ui_loop() {
+        let mut loader = LocalViewLoader::new();
+        let started = Instant::now();
+        assert!(loader.request_with(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            None
+        }));
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "request blocked for {:?}",
+            started.elapsed()
+        );
+        assert!(loader.take_reply().is_none());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(result) = loader.take_reply() {
+                assert!(result.is_none());
+                break;
+            }
+            assert!(Instant::now() < deadline, "slow reply never arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(loader.idle());
+    }
+
+    #[test]
+    fn sessions_sync_keeps_selected_and_active_identity_across_reorder() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui(
+            "studio",
+            vec![session("alpha", true), session("bravo", true)],
+            clock.now(),
+        );
+        ui.selected = 1;
+        ui.active = 0;
+        ui.sessions_synced(
+            vec![
+                session("bravo", true),
+                session("alpha", true),
+                session("charlie", true),
+            ],
+            clock.now(),
+        );
+        assert_eq!(ui.sessions[ui.selected].name, "bravo");
+        assert_eq!(
+            ui.sessions[ui.selected].instance_id.as_deref(),
+            Some("instance-bravo")
+        );
+        assert_eq!(ui.sessions[ui.active].name, "alpha");
+    }
+
+    #[test]
+    fn local_view_order_drives_tree_and_keyboard_traversal_by_identity() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("alpha", true), session("bravo", true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let view = SessionView::new(
+            sessions,
+            1,
+            vec![
+                view_entry("bravo", "instance-bravo", &[&alive_row("bravo")]),
+                view_entry("alpha", "instance-alpha", &[&alive_row("alpha")]),
+            ],
+        );
+        ui.local_view_synced(view, clock.now());
+        assert_eq!(ui.sessions[ui.selected].name, "alpha");
+        assert_eq!(ui.sessions[ui.active].name, "alpha");
+        assert_eq!(
+            ui.visible_tree_rows(clock.now()),
             vec![
                 TreeSelection::LocalNode,
                 TreeSelection::LocalSession(1),
@@ -6516,12 +6784,13 @@ mod tests {
             ]
         );
         assert_eq!(ui.current_tree_selection(), TreeSelection::LocalSession(0));
-        ui.move_selection(false);
+        ui.move_selection(false, clock.now());
         assert_eq!(ui.current_tree_selection(), TreeSelection::LocalSession(1));
         assert_eq!(ui.sessions[ui.selected].name, "bravo");
+        assert_eq!(ui.sessions[ui.active].name, "alpha");
         ui.query = Some("alpha".into());
         assert_eq!(
-            ui.visible_tree_rows(),
+            ui.visible_tree_rows(clock.now()),
             vec![TreeSelection::LocalNode, TreeSelection::LocalSession(0)]
         );
     }
@@ -6575,13 +6844,45 @@ mod tests {
         );
         ui.local_view_synced(view, clock.now());
         assert_eq!(
-            ui.visible_tree_rows(),
+            ui.visible_tree_rows(clock.now()),
             vec![TreeSelection::LocalNode, TreeSelection::LocalSession(0)]
         );
         let frame = ui.render_text(100, 24, "pane", &clock);
         let side = tree_side(&frame);
         assert!(side.iter().any(|line| line.contains("codex · gpt-6.1")));
         assert_eq!(side.iter().filter(|line| line.starts_with('>')).count(), 1);
+    }
+
+    #[test]
+    fn stacked_rows_beyond_the_viewport_clip_the_selected_tail_row() {
+        // A1 scope: the tree has no scroll window. Stacked details (with the
+        // empty spacing line dropped) still outgrow a 24-row viewport once
+        // there are enough sessions; this characterizes that limit.
+        let clock = ManualClock::new();
+        let sessions = (0..12)
+            .map(|index| session(&format!("s{index:02}"), true))
+            .collect::<Vec<_>>();
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let entries = sessions
+            .iter()
+            .map(|session| ViewEntry {
+                name: session.name.clone(),
+                instance_id: session.instance_id.clone().unwrap(),
+                lines: vec![
+                    alive_row(&session.name),
+                    "\x1b[2mcodex · gpt-6.1\x1b[0m".into(),
+                    String::new(),
+                ],
+            })
+            .collect();
+        ui.local_view_synced(SessionView::new(sessions, 3, entries), clock.now());
+        ui.selected = 11;
+        ui.active = 11;
+        let tree = ui.tree_lines(ui.tree_width(100, clock.now()), clock.now());
+        assert_eq!(tree.len(), 26);
+        assert_eq!(tree.iter().position(|line| line.starts_with('>')), Some(24));
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(!tree_side(&frame).join("\n").contains("s11"));
     }
 
     #[test]
