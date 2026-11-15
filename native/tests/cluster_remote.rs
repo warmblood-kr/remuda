@@ -86,6 +86,62 @@ fn wait_for_session_output(gui: &std::ffi::OsStr, server: &Node, instance: &str)
     );
 }
 
+fn exercise_gui_input(gui: &std::ffi::OsStr, node: &Node, kind: &str, fp: &str, instance: &str) {
+    let mut child = Command::new(gui)
+        .args(["--internal-input-worker", kind, fp, "proof", instance])
+        .env("XDG_STATE_HOME", &node.state)
+        .env("XDG_CONFIG_HOME", node.root.join("config"))
+        .env("XDG_DATA_HOME", node.root.join("data"))
+        .env("REMUDA_RUNTIME_DIR", &node.runtime)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = child.stdout.take().unwrap();
+    for suffix in ["one", "two"] {
+        let text = format!("{kind}-{suffix}\r");
+        input.write_all(&(text.len() as u32).to_be_bytes()).unwrap();
+        input.write_all(text.as_bytes()).unwrap();
+        input.flush().unwrap();
+        let mut ack = [0];
+        output.read_exact(&mut ack).unwrap();
+        assert_eq!(ack, [1]);
+    }
+    drop(input);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("input helper did not exit after parent pipe closed");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(child.wait().unwrap().success());
+}
+
+fn check_gui_inputs(
+    gui: &std::ffi::OsStr,
+    server: &Node,
+    client: &Node,
+    socket: &Path,
+    instance: &str,
+) {
+    for (node, kind, fp) in [
+        (server, "local", String::new()),
+        (client, "peer", server.fingerprint()),
+    ] {
+        exercise_gui_input(gui, node, kind, &fp, instance);
+    }
+    wait_for(
+        "GUI input markers",
+        Duration::from_secs(10),
+        || matches!(remuda_native::client::request(socket, &Request::Capture { name: "proof".into() }), Ok(Response::Screen(text)) if text.contains("INPUT:local-one") && text.contains("INPUT:local-two") && text.contains("INPUT:peer-one") && text.contains("INPUT:peer-two")),
+    );
+}
+
 // Run via gui/tests/peer_list_acceptance.sh; the GUI binary is built separately.
 #[test]
 #[ignore = "requires separately built GUI binary; use gui/tests/peer_list_acceptance.sh"]
@@ -111,7 +167,7 @@ fn gui_peer_list_worker_reads_pinned_peer_and_reports_offline() {
         .unwrap()
         .endpoint = Some(listener.address.to_string());
     fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
-    server.start_session("printf PREVIEW_MARKER; exec sleep 30");
+    server.start_session("stty -echo; printf PREVIEW_MARKER; while IFS= read -r line; do printf ' INPUT:%s' \"$line\"; done");
     let socket = remuda_native::daemon::socket_path_in(&server.runtime, &server.name);
     let deadline = Instant::now() + Duration::from_secs(10);
     let instance = loop {
@@ -157,6 +213,7 @@ fn gui_peer_list_worker_reads_pinned_peer_and_reports_offline() {
     let proof = rows.iter().find(|row| row["name"] == "proof").unwrap();
     assert_eq!(proof["instance_id"].as_str(), Some(instance.as_str()));
     wait_for_session_output(&gui, &server, &instance);
+    check_gui_inputs(&gui, &server, &client, &socket, &instance);
     for (node, kind, fp) in [
         (&server, "local", String::new()),
         (&client, "peer", server.fingerprint()),
