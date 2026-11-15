@@ -424,7 +424,7 @@ fn the_bound_surface_is_exactly_the_protocols() {
         for key in pairs(remuda.session) do session_names[#session_names + 1] = key end
         table.sort(session_names)
         local session_got = table.concat(session_names, ",")
-        local session_want = "attach,close,list,new,remote_input,resize"
+        local session_want = "attach,close,list,new,remote_input,resize,team"
         if session_got ~= session_want then
           error("session namespace is " .. session_got .. ", expected " .. session_want)
         end
@@ -1834,5 +1834,53 @@ fn fs_realpath_and_is_symlink_on_windows() {
             junction = lua_path(&junction),
             target = lua_path(&dir.join("target")),
         ),
+    );
+}
+
+#[test]
+fn team_metadata_round_trips_through_the_lua_setter() {
+    run_lua(
+        "team-metadata",
+        r#"
+        local name, instance = remuda.session.new("team-lua", {"/bin/sh", "-c", "sleep 30"})
+        assert(name == "team-lua", "session.new name")
+        assert(type(instance) == "string" and #instance > 0, "session.new instance")
+        assert(remuda.session.team(name, instance, {
+          agent_kind = "codex",
+          model = "gpt-6.1",
+          leader = { name = name, instance_id = instance },
+          depth = 1,
+        }))
+
+        local function row_named(wanted)
+          for _, item in ipairs(remuda.session.list()) do
+            if item.name == wanted then return item end
+          end
+        end
+        local row = row_named(name)
+        assert(row and row.team, "team missing from session.list")
+        assert(row.team.agent_kind == "codex")
+        assert(row.team.model == "gpt-6.1")
+        assert(row.team.leader.name == name and row.team.leader.instance_id == instance)
+        assert(row.team.depth == 1)
+
+        local ok, err = remuda.session.team(name, "stale-instance", { model = "x" })
+        assert(ok == nil and type(err) == "string", "stale instance must be refused")
+        local ok2, err2 = remuda.session.team(name, instance, { depth = 21 })
+        assert(ok2 == nil and type(err2) == "string", "depth 21 must be refused")
+
+        assert(remuda.session.team(name, instance, {
+          model = "gpt-6.2",
+          leader = { name = "ghost", instance_id = "ghost" },
+          depth = 2,
+        }))
+        row = row_named(name)
+        assert(row.team.model == "gpt-6.2")
+        assert(row.team.leader == nil, "stale leader must be omitted")
+
+        assert(remuda.session.team(name, instance, nil))
+        row = row_named(name)
+        assert(row.team == nil, "cleared team must be absent")
+        "#,
     );
 }
