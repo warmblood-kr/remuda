@@ -122,6 +122,35 @@ fn exercise_gui_input(gui: &std::ffi::OsStr, node: &Node, kind: &str, fp: &str, 
     assert!(child.wait().unwrap().success());
 }
 
+fn exercise_gui_bridge(node: &Node, kind: &str, fp: &str, instance: &str) {
+    let program =
+        std::env::var_os("REMUDA_GUI_BRIDGE_ACCEPTANCE_BIN").expect("set bridge acceptance binary");
+    let mut child = Command::new(program)
+        .args([kind, fp, instance])
+        .env("XDG_STATE_HOME", &node.state)
+        .env("XDG_CONFIG_HOME", node.root.join("config"))
+        .env("XDG_DATA_HOME", node.root.join("data"))
+        .env("REMUDA_RUNTIME_DIR", &node.runtime)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("bridge acceptance timed out");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "bridge acceptance failed: {output:?}"
+    );
+}
+
 fn check_gui_inputs(
     gui: &std::ffi::OsStr,
     server: &Node,
@@ -134,11 +163,12 @@ fn check_gui_inputs(
         (client, "peer", server.fingerprint()),
     ] {
         exercise_gui_input(gui, node, kind, &fp, instance);
+        exercise_gui_bridge(node, kind, &fp, instance);
     }
     wait_for(
         "GUI input markers",
         Duration::from_secs(10),
-        || matches!(remuda_native::client::request(socket, &Request::Capture { name: "proof".into() }), Ok(Response::Screen(text)) if text.contains("INPUT:local-one") && text.contains("INPUT:local-two") && text.contains("INPUT:peer-one") && text.contains("INPUT:peer-two")),
+        || matches!(remuda_native::client::request(socket, &Request::Capture { name: "proof".into() }), Ok(Response::Screen(text)) if text.contains("INPUT:local-one") && text.contains("INPUT:local-two") && text.contains("INPUT:peer-one") && text.contains("INPUT:peer-two") && text.contains("INPUT:bridge-local-one") && text.contains("INPUT:bridge-local-two") && text.contains("INPUT:bridge-peer-one") && text.contains("INPUT:bridge-peer-two") && !text.contains("bridge-wrong") && !text.contains("bridge-retry")),
     );
 }
 
