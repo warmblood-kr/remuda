@@ -10,6 +10,7 @@ mod provider;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Session {
     name: String,
+    instance_id: Option<String>,
     alive: bool,
     unavailable: bool,
 }
@@ -41,11 +42,74 @@ fn worker() -> i32 {
         .into_iter()
         .map(|s| Session {
             name: s.name,
+            instance_id: s.instance_id,
             alive: s.alive,
             unavailable: s.unavailable,
         })
         .collect();
     i32::from(serde_json::to_writer(std::io::stdout(), &sessions).is_err())
+}
+
+fn peer_is_unique(peers: &[Peer], fingerprint: &str) -> bool {
+    !fingerprint.is_empty()
+        && peers
+            .iter()
+            .filter(|p| p.fingerprint == fingerprint)
+            .count()
+            == 1
+        && peers
+            .iter()
+            .any(|p| p.fingerprint == fingerprint && p.admitted)
+}
+
+// A fingerprint is resolved again immediately before the authenticated request.
+fn peer_worker(fingerprint: &str) -> i32 {
+    use remuda_core::protocol::{Request, Response};
+    use remuda_native::{
+        cluster,
+        cluster_api::{resolve_call, ResolvedCall},
+        net::cluster_client::ClusterClient,
+    };
+    worker_deadline();
+    let list = || -> Result<Vec<Session>, ()> {
+        if !peer_is_unique(&discover_peers().map_err(|_| ())?, fingerprint) {
+            return Err(());
+        }
+        let ResolvedCall::Remote {
+            fingerprint: resolved,
+            address,
+            pinned_static_key,
+        } = resolve_call(fingerprint, None).map_err(|_| ())?
+        else {
+            return Err(());
+        };
+        if resolved != fingerprint {
+            return Err(());
+        }
+        let private = cluster::identity::load_static_private_key().map_err(|_| ())?;
+        let Response::Sessions(rows) = ClusterClient::system()
+            .request(address, &pinned_static_key, &private, &Request::List)
+            .map_err(|_| ())?
+        else {
+            return Err(());
+        };
+        if !peer_is_unique(&discover_peers().map_err(|_| ())?, fingerprint) {
+            return Err(());
+        }
+        Ok(rows
+            .into_iter()
+            .map(|s| Session {
+                name: s.name,
+                instance_id: s.instance_id,
+                alive: s.alive,
+                unavailable: s.unavailable,
+            })
+            .collect())
+    };
+    match list() {
+        Ok(rows) => i32::from(serde_json::to_writer(std::io::stdout(), &rows).is_err()),
+        Err(()) => 1,
+    }
 }
 
 // A missing cluster is the normal local-only case; other errors are not.
@@ -100,6 +164,8 @@ fn label(value: &str) -> String {
     text
 }
 
+type RemoteResult = (u64, u64, String, Result<Vec<Session>, String>);
+
 struct LocalGui {
     sessions: Vec<Session>,
     error: bool,
@@ -118,11 +184,20 @@ struct LocalGui {
     nodes_pending: bool,
     nodes_sender: mpsc::Sender<(u64, Result<Vec<Peer>, String>)>,
     nodes_results: mpsc::Receiver<(u64, Result<Vec<Peer>, String>)>,
+    remote_sessions: Vec<Session>,
+    remote_error: bool,
+    remote_loading: bool,
+    remote_generation: u64,
+    remote_busy: bool,
+    remote_pending: Option<(u64, u64, String)>,
+    remote_sender: mpsc::Sender<RemoteResult>,
+    remote_results: mpsc::Receiver<RemoteResult>,
 }
 impl LocalGui {
     fn new() -> Self {
         let (sender, results) = mpsc::channel();
         let (nodes_sender, nodes_results) = mpsc::channel();
+        let (remote_sender, remote_results) = mpsc::channel();
         Self {
             sessions: vec![],
             error: false,
@@ -141,9 +216,18 @@ impl LocalGui {
             nodes_pending: false,
             nodes_sender,
             nodes_results,
+            remote_sessions: vec![],
+            remote_error: false,
+            remote_loading: false,
+            remote_generation: 0,
+            remote_busy: false,
+            remote_pending: None,
+            remote_sender,
+            remote_results,
         }
     }
     fn refresh_nodes(&mut self) {
+        self.invalidate_remote();
         self.nodes_generation = self
             .nodes_generation
             .checked_add(1)
@@ -171,24 +255,68 @@ impl LocalGui {
         });
     }
     fn peer_current(&self, fingerprint: &str) -> bool {
-        !self.nodes_loading
-            && !self.nodes_error
-            && !fingerprint.is_empty()
-            && self
-                .peers
-                .iter()
-                .filter(|peer| peer.fingerprint == fingerprint)
-                .count()
-                == 1
-            && self
-                .peers
-                .iter()
-                .any(|peer| peer.fingerprint == fingerprint && peer.admitted)
+        !self.nodes_loading && !self.nodes_error && peer_is_unique(&self.peers, fingerprint)
     }
     fn select_peer(&mut self, fingerprint: String) {
         if self.peer_current(&fingerprint) {
+            if self.selected_peer.as_ref() != Some(&fingerprint) {
+                self.remote_sessions.clear();
+            }
             self.selected_peer = Some(fingerprint);
+            self.refresh_peer();
         }
+    }
+    fn invalidate_remote(&mut self) {
+        self.remote_generation = self
+            .remote_generation
+            .checked_add(1)
+            .expect("generation exhausted");
+        self.remote_pending = None;
+        self.remote_loading = false;
+        if self.selected_peer.is_some() {
+            self.remote_error = true;
+        }
+    }
+    fn refresh_peer(&mut self) {
+        let Some(fp) = self
+            .selected_peer
+            .clone()
+            .filter(|fp| self.peer_current(fp))
+        else {
+            return;
+        };
+        self.remote_generation = self
+            .remote_generation
+            .checked_add(1)
+            .expect("generation exhausted");
+        self.remote_loading = true;
+        self.remote_pending = Some((self.remote_generation, self.nodes_generation, fp));
+        self.launch_peer();
+    }
+    fn launch_peer(&mut self) {
+        if self.remote_busy {
+            return;
+        }
+        let Some((generation, directory, fp)) = self.remote_pending.take() else {
+            return;
+        };
+        if directory != self.nodes_generation
+            || self.selected_peer.as_ref() != Some(&fp)
+            || !self.peer_current(&fp)
+        {
+            return;
+        }
+        self.remote_busy = true;
+        let sender = self.remote_sender.clone();
+        std::thread::spawn(move || {
+            let result = std::env::current_exe()
+                .map_err(|e| e.to_string())
+                .and_then(|path| {
+                    provider::output(&path, &["--internal-peer-worker", &fp], provider::TIMEOUT)
+                })
+                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()));
+            let _ = sender.send((generation, directory, fp, result));
+        });
     }
     fn refresh(&mut self) {
         self.generation = self
@@ -250,14 +378,39 @@ impl LocalGui {
                 {
                     self.selected_peer = None;
                 }
+                if !self.nodes_error && self.selected_peer.is_some() {
+                    self.refresh_peer();
+                }
             }
             self.launch_nodes();
+        }
+        while let Ok((generation, directory, fp, result)) = self.remote_results.try_recv() {
+            self.remote_busy = false;
+            if generation == self.remote_generation
+                && directory == self.nodes_generation
+                && self.selected_peer.as_ref() == Some(&fp)
+                && self.peer_current(&fp)
+            {
+                self.remote_loading = false;
+                match result {
+                    Ok(rows) => {
+                        self.remote_sessions = rows;
+                        self.remote_error = false;
+                    }
+                    Err(_) => self.remote_error = true,
+                }
+            }
+            self.launch_peer();
         }
     }
 }
 impl Render for LocalGui {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = if self.selected_peer.is_some() {
+        let title = if self.selected_peer.is_some() && self.remote_loading {
+            "PEER SESSIONS · LOADING"
+        } else if self.selected_peer.is_some() && self.remote_error {
+            "PEER SESSIONS · STALE"
+        } else if self.selected_peer.is_some() {
             "PEER SESSIONS"
         } else if self.loading {
             "LOCAL SESSIONS · LOADING"
@@ -296,6 +449,7 @@ impl Render for LocalGui {
                             .cursor_pointer()
                             .child("This device")
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.invalidate_remote();
                                 this.selected_peer = None;
                                 cx.notify();
                             })),
@@ -328,23 +482,29 @@ impl Render for LocalGui {
                     }))
                     .child(div().pt_4().text_sm().child(title))
                     .children(
-                        self.sessions
-                            .clone()
-                            .into_iter()
-                            .filter(|_| self.selected_peer.is_none())
-                            .map(|session| {
-                                let status = if session.unavailable {
-                                    "unavailable"
-                                } else if session.alive {
-                                    "running"
-                                } else {
-                                    "exited"
-                                };
-                                div()
-                                    .py_2()
-                                    .child(div().child(label(&session.name)))
-                                    .child(div().text_sm().text_color(rgb(0x8a95a5)).child(status))
-                            }),
+                        (if self.selected_peer.is_some() {
+                            &self.remote_sessions
+                        } else {
+                            &self.sessions
+                        })
+                        .clone()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, session)| {
+                            let status = if session.unavailable {
+                                "unavailable"
+                            } else if session.alive {
+                                "running"
+                            } else {
+                                "exited"
+                            };
+                            div()
+                                .id(SharedString::from(format!("session-{index}")))
+                                .debug_selector(move || format!("session-{index}"))
+                                .py_2()
+                                .child(div().child(label(&session.name)))
+                                .child(div().text_sm().text_color(rgb(0x8a95a5)).child(status))
+                        }),
                     ),
             )
             .child(
@@ -352,11 +512,18 @@ impl Render for LocalGui {
                     .flex_1()
                     .p_4()
                     .child(div().child(if self.selected_peer.is_some() {
-                        "Peer session listing is not available yet."
+                        "Read-only peer session list"
                     } else {
                         "Read-only local session list"
                     }))
-                    .when(self.error, |d| {
+                    .when(self.selected_peer.is_some() && self.remote_error, |d| {
+                        d.child(
+                            div()
+                                .text_color(rgb(0xf28787))
+                                .child("Peer unavailable; listed sessions may be stale."),
+                        )
+                    })
+                    .when(self.selected_peer.is_none() && self.error, |d| {
                         d.child(
                             div()
                                 .text_color(rgb(0xf28787))
@@ -385,6 +552,9 @@ fn main() {
     }
     if std::env::args().nth(1).as_deref() == Some("--internal-nodes-worker") {
         std::process::exit(nodes_worker());
+    }
+    if std::env::args().nth(1).as_deref() == Some("--internal-peer-worker") {
+        std::process::exit(std::env::args().nth(2).map_or(1, |fp| peer_worker(&fp)));
     }
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1000.), px(650.)), cx);
@@ -458,6 +628,7 @@ mod tests {
     #[test]
     fn peer_selection_requires_unique_current_full_fingerprint() {
         let mut gui = LocalGui::new();
+        gui.remote_busy = true;
         gui.peers = vec![peer("full-a", "same"), peer("full-b", "same")];
         gui.select_peer("full-a".into());
         assert_eq!(gui.selected_peer.as_deref(), Some("full-a"));
@@ -477,6 +648,108 @@ mod tests {
             ..peer("full-b", "revoked duplicate")
         });
         assert!(!gui.peer_current("full-b"));
+    }
+    #[test]
+    fn late_peer_reply_is_discarded_when_directory_or_selection_changes() {
+        let mut gui = LocalGui::new();
+        gui.peers = vec![peer("a", "a"), peer("b", "b")];
+        gui.remote_busy = true;
+        gui.select_peer("a".into());
+        let (old, directory, fp) = gui.remote_pending.take().unwrap();
+        gui.select_peer("b".into());
+        assert!(gui.remote_sessions.is_empty());
+        gui.remote_pending = None;
+        gui.remote_sender
+            .send((old, directory, fp, Ok(vec![row("wrong")])))
+            .unwrap();
+        gui.drain();
+        assert!(gui.remote_sessions.is_empty());
+        gui.remote_busy = true;
+        gui.select_peer("b".into());
+        let (old, directory, fp) = gui.remote_pending.take().unwrap();
+        gui.nodes_busy = true;
+        gui.refresh_nodes();
+        gui.nodes_pending = false;
+        gui.remote_sender
+            .send((old, directory, fp, Ok(vec![row("wrong")])))
+            .unwrap();
+        gui.drain();
+        assert!(gui.remote_sessions.is_empty());
+        assert!(gui.remote_error);
+    }
+    #[test]
+    fn peer_failure_retains_stale_rows_and_exact_instance_identity() {
+        let mut gui = LocalGui::new();
+        gui.peers = vec![peer("a", "a")];
+        gui.remote_busy = true;
+        gui.select_peer("a".into());
+        let (generation, directory, fp) = gui.remote_pending.take().unwrap();
+        gui.remote_sender
+            .send((generation, directory, fp, Ok(vec![row("proof")])))
+            .unwrap();
+        gui.drain();
+        assert_eq!(
+            gui.remote_sessions[0].instance_id.as_deref(),
+            Some("instance")
+        );
+        gui.remote_busy = true;
+        gui.refresh_peer();
+        let (generation, directory, fp) = gui.remote_pending.take().unwrap();
+        gui.remote_sender
+            .send((generation, directory, fp, Err("offline".into())))
+            .unwrap();
+        gui.drain();
+        assert!(gui.remote_error && !gui.remote_loading);
+        assert_eq!(gui.remote_sessions[0].name, "proof");
+    }
+    #[test]
+    fn queued_peer_work_is_not_dispatched_after_revocation_or_duplicate() {
+        for duplicate in [false, true] {
+            let mut gui = LocalGui::new();
+            gui.peers = vec![peer("a", "a")];
+            gui.remote_busy = true;
+            gui.select_peer("a".into());
+            if duplicate {
+                gui.peers.push(peer("a", "duplicate"));
+            } else {
+                gui.peers[0].admitted = false;
+            }
+            gui.remote_sender
+                .send((0, 0, "old".into(), Ok(vec![])))
+                .unwrap();
+            gui.drain();
+            assert!(!gui.remote_busy && gui.remote_pending.is_none());
+            assert!(gui.remote_sessions.is_empty());
+        }
+    }
+    #[gpui::test]
+    fn peer_rows_render_and_local_navigation_restores_local_rows(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new();
+            gui.remote_busy = true;
+            gui.peers = vec![peer("a", "a")];
+            gui.sessions = vec![row("local")];
+            gui
+        });
+        let peer = cx.debug_bounds("node-peer-0").unwrap();
+        cx.simulate_click(peer.center(), gpui::Modifiers::none());
+        view.update(cx, |gui, cx| {
+            gui.remote_sessions = vec![row("remote-1"), row("remote-2")];
+            gui.remote_loading = false;
+            cx.notify();
+        });
+        assert!(
+            cx.debug_bounds("session-1").is_some(),
+            "both remote rows rendered"
+        );
+        let local = cx.debug_bounds("node-local").unwrap();
+        cx.simulate_click(local.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("session-0").is_some());
+        assert!(cx.read(|app| view.read(app).selected_peer.is_none()));
+        assert_eq!(
+            cx.read(|app| view.read(app).sessions[0].name.clone()),
+            "local"
+        );
     }
     #[test]
     fn node_replies_reject_old_generations_and_mark_errors_stale() {
@@ -508,6 +781,7 @@ mod tests {
     fn row(name: &str) -> Session {
         Session {
             name: name.into(),
+            instance_id: Some("instance".into()),
             alive: true,
             unavailable: false,
         }
@@ -551,6 +825,7 @@ mod tests {
     fn node_selection_navigates_locally_and_refuses_stale_peers(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, _| {
             let mut gui = LocalGui::new();
+            gui.remote_busy = true;
             gui.peers = vec![peer("full-a", "peer")];
             gui.sessions = vec![row("local")];
             gui
