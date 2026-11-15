@@ -3157,3 +3157,228 @@ fn gui_preview_adapter_real_local_and_pinned_peer() {
     assert!(preview_adapter::preview(&socket, "proof", "stale").is_err());
     assert!(preview_adapter::preview(&peer, "proof", "stale").is_err());
 }
+
+// Run production peer discovery in a child with the client's isolated XDG state.
+#[test]
+#[ignore = "invoked by strict input loopback fixture"]
+fn strict_input_peer_process() {
+    use remuda_native::strict_input::{InputResult, PeerInput, StrictInput};
+    let fp = std::env::var("STRICT_TEST_FP").unwrap();
+    let instance = std::env::var("STRICT_TEST_INSTANCE").unwrap();
+    let expected = std::env::var("STRICT_TEST_EXPECT").unwrap();
+    if expected == "revoked" {
+        assert!(remuda_native::cluster_api::resolve_call(&fp, None).is_err());
+    } else {
+        assert!(
+            matches!(remuda_native::cluster_api::resolve_call(&fp, None), Ok(remuda_native::cluster_api::ResolvedCall::Remote { fingerprint, .. }) if fingerprint == fp)
+        );
+    }
+    let mut input =
+        StrictInput::new(PeerInput::new(fp).unwrap(), "proof".into(), instance).unwrap();
+    let text = format!("{expected}-peer\r");
+    let result = input.send(text.as_bytes());
+    if expected == "applied" {
+        assert_eq!(result, InputResult::Applied);
+    } else {
+        assert_eq!(result, InputResult::NotAcknowledged);
+        assert_eq!(input.send(b"retry\r"), InputResult::Stopped);
+    }
+}
+
+fn run_strict_peer_process(client: &Node, fp: &str, instance: &str, expected: &str) {
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "strict_input_peer_process"])
+        .env("XDG_STATE_HOME", &client.state)
+        .env("XDG_CONFIG_HOME", client.root.join("config"))
+        .env("XDG_DATA_HOME", client.root.join("data"))
+        .env("REMUDA_RUNTIME_DIR", &client.runtime)
+        .env("STRICT_TEST_FP", fp)
+        .env("STRICT_TEST_INSTANCE", instance)
+        .env("STRICT_TEST_EXPECT", expected)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("strict peer process timed out");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "strict peer process failed: {output:?}"
+    );
+}
+
+// Pinned test transport uses the actual authenticated listener, with fixture
+// keys rather than modifying process-global cluster configuration.
+struct StrictTestPeer<'a> {
+    address: SocketAddr,
+    server_key: &'a [u8],
+    client_key: &'a [u8],
+}
+impl remuda_native::strict_input::InputTransport for StrictTestPeer<'_> {
+    fn send(&mut self, request: &Request) -> std::io::Result<Response> {
+        ClusterClient::system()
+            .request(self.address, self.server_key, self.client_key, request)
+            .map_err(std::io::Error::other)
+    }
+}
+
+fn verify_rejected_peers(
+    client: &Node,
+    server: &Node,
+    registry: &Registry,
+    registry_path: &Path,
+    socket: &Path,
+    instance: &str,
+) {
+    // A revoked entry must be rejected before an input attempt.
+    let mut revoked = registry.clone();
+    revoked
+        .authorized_nodes
+        .iter_mut()
+        .find(|row| row.node_fp == server.fingerprint())
+        .unwrap()
+        .state = NodeState::Revoked;
+    fs::write(registry_path, serde_json::to_vec_pretty(&revoked).unwrap()).unwrap();
+    run_strict_peer_process(client, &server.fingerprint(), instance, "revoked");
+    // Keep fingerprint/key consistent, but point this valid different pin at
+    // the real server endpoint: authenticated Noise must reject the mismatch.
+    let params = "Noise_KK_25519_ChaChaPoly_SHA256".parse().unwrap();
+    let wrong_key = snow::Builder::new(params)
+        .generate_keypair()
+        .unwrap()
+        .public;
+    let wrong_fp = encoding::fingerprint(&wrong_key);
+    let mut wrong_pin = registry.clone();
+    let entry = wrong_pin
+        .authorized_nodes
+        .iter_mut()
+        .find(|row| row.node_fp == server.fingerprint())
+        .unwrap();
+    entry.node_fp = wrong_fp.clone();
+    entry.static_pubkey = encoding::encode_base64(&wrong_key);
+    fs::write(
+        registry_path,
+        serde_json::to_vec_pretty(&wrong_pin).unwrap(),
+    )
+    .unwrap();
+    run_strict_peer_process(client, &wrong_fp, instance, "wrong-pin");
+    let screen = remuda_native::client::request(
+        socket,
+        &Request::Capture {
+            name: "proof".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(screen, Response::Screen(text) if !text.contains("revoked-peer") && !text.contains("wrong-pin-peer") && !text.contains("retry"))
+    );
+    fs::write(registry_path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+}
+
+#[test]
+fn strict_input_real_local_and_peer_reject_replaced_session() {
+    use remuda_native::strict_input::{InputResult, LocalInput, StrictInput};
+    let env = vec![("REMUDA_EXPERIMENTAL_SESSION_HOST".into(), "0".into())];
+    let mut client = Node::start_with_env("strict-client", env.clone());
+    client.bounded_inprocess_cleanup = true;
+    let mut server = Node::start_with_env("strict-server", env);
+    server.bounded_inprocess_cleanup = true;
+    admit_pair(&client, &server);
+    let listener = Listener::start(&server);
+    let registry_path = client.state.join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry =
+        serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|row| row.node_fp == server.fingerprint())
+        .unwrap()
+        .endpoint = Some(listener.address.to_string());
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+    let socket = remuda_native::daemon::socket_path_in(&server.runtime, &server.name);
+    let start = || {
+        let response = remuda_native::client::request(&socket, &Request::NewWithInstance {
+            name: Some("proof".into()),
+            command: vec!["/bin/sh".into(), "-c".into(),
+                "stty -echo; printf 'READY\\n'; while IFS= read -r x; do printf 'RECV:%s\\n' \"$x\"; done".into()],
+            size: remuda_core::Size::new(80, 24), cwd: None, env: None, remote_input_disabled: false,
+        }).unwrap();
+        let Response::SessionStarted { instance_id, .. } = response else {
+            panic!("start failed: {response:?}")
+        };
+        wait_for(
+            "ready",
+            Duration::from_secs(10),
+            || matches!(remuda_native::client::request(&socket, &Request::Capture { name: "proof".into() }), Ok(Response::Screen(text)) if text.contains("READY")),
+        );
+        instance_id
+    };
+    let old = start();
+    verify_rejected_peers(&client, &server, &registry, &registry_path, &socket, &old);
+    let peer = || StrictTestPeer {
+        address: listener.address,
+        server_key: &server.public,
+        client_key: &client.private,
+    };
+    let mut local =
+        StrictInput::new(LocalInput(socket.clone()), "proof".into(), old.clone()).unwrap();
+    let mut remote = StrictInput::new(peer(), "proof".into(), old.clone()).unwrap();
+    assert_eq!(local.send(b"local-word\r"), InputResult::Applied);
+    assert_eq!(remote.send(b"peer-word\r"), InputResult::Applied);
+    run_strict_peer_process(&client, &server.fingerprint(), &old, "applied");
+    wait_for(
+        "both inputs",
+        Duration::from_secs(10),
+        || matches!(remuda_native::client::request(&socket, &Request::Capture { name: "proof".into() }), Ok(Response::Screen(text)) if text.contains("RECV:local-word") && text.contains("RECV:peer-word") && text.contains("RECV:applied-peer")),
+    );
+    let screen = remuda_native::client::request(
+        &socket,
+        &Request::Capture {
+            name: "proof".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(screen, Response::Screen(text) if !text.contains("revoked-peer") && !text.contains("wrong-pin-peer") && !text.contains("retry"))
+    );
+    assert!(matches!(
+        remuda_native::client::request(
+            &socket,
+            &Request::Close {
+                name: "proof".into(),
+                instance_id: Some(old.clone()),
+                confirm: Some(true)
+            }
+        ),
+        Ok(Response::Ok)
+    ));
+    let new = start();
+    assert_ne!(old, new);
+    run_strict_peer_process(&client, &server.fingerprint(), &old, "stale");
+    assert_eq!(local.send(b"stale-local\r"), InputResult::NotAcknowledged);
+    assert_eq!(remote.send(b"stale-peer\r"), InputResult::NotAcknowledged);
+    assert_eq!(local.send(b"retry\r"), InputResult::Stopped);
+    assert_eq!(remote.send(b"retry\r"), InputResult::Stopped);
+    let screen = remuda_native::client::request(
+        &socket,
+        &Request::Capture {
+            name: "proof".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(screen, Response::Screen(text) if !text.contains("stale-") && !text.contains("retry") && !text.contains("stale-peer"))
+    );
+}
