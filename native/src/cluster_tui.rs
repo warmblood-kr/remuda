@@ -3886,7 +3886,7 @@ mod tests {
     use remuda_core::protocol::{Request, Response};
     use remuda_core::session_view::{SessionView, ViewEntry};
     use remuda_core::{SessionSummary, Size};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     fn parsed_frame(frame: &str, cols: u16, rows: u16) -> vt100::Parser {
@@ -8612,6 +8612,99 @@ mod tests {
             );
             assert!(ui.remote_view_due("fp-laptop", clock.now() + wait));
         }
+    }
+
+    #[test]
+    fn same_session_name_on_two_nodes_does_not_share_a_view() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", Vec::new(), clock.now());
+        let mut snapshot = remote_snapshot(RemoteState::Reachable, Duration::ZERO, None);
+        let mut other = snapshot.nodes[0].clone();
+        other.registry_key = "fp-desktop".into();
+        other.name = "desktop".into();
+        snapshot.nodes.push(other);
+        ui.remote_snapshot = snapshot;
+        ui.remote_expanded.insert("fp-laptop".into());
+        ui.remote_expanded.insert("fp-desktop".into());
+
+        assert!(ui.remote_view_synced(
+            "fp-laptop",
+            peer_view(&[("build", "remote-instance")], "idle · codex"),
+            clock.now()
+        ));
+        let frame = ui.tree_lines(100, clock.now());
+        let rows: Vec<_> = frame.iter().filter(|line| line.contains("build")).collect();
+        assert_eq!(rows.len(), 2, "{frame:?}");
+        assert_eq!(
+            rows.iter().filter(|row| row.contains("codex")).count(),
+            1,
+            "{rows:?}"
+        );
+    }
+
+    #[derive(Default)]
+    struct SlowViewTransport {
+        seen: Mutex<Vec<(String, Request)>>,
+    }
+
+    impl RemoteInputTransport for SlowViewTransport {
+        fn send_input(&self, node: &str, request: &Request) -> std::io::Result<Response> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((node.to_owned(), request.clone()));
+            match request {
+                Request::RenderedSessionList { .. } => {
+                    std::thread::sleep(Duration::from_millis(400));
+                    Ok(Response::Error("slow view".into()))
+                }
+                _ => Ok(Response::Ack { duplicate: false }),
+            }
+        }
+    }
+
+    #[test]
+    fn slow_view_does_not_delay_input_on_the_same_node() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        ui.remote_expanded.insert("fp-laptop".into());
+        let transport = Arc::new(SlowViewTransport::default());
+        let mut dispatcher =
+            super::RemoteDispatcher::new(Arc::clone(&transport) as Arc<dyn RemoteInputTransport>);
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        key_event(&mut ui, KeyCode::Char('a'), KeyModifiers::NONE, clock.now());
+        std::thread::sleep(Duration::from_millis(50));
+        ui.start_pending(clock.now());
+        let path = std::path::Path::new("unused");
+
+        super::sync_remote_views(&mut ui, Some(&mut dispatcher), clock.now());
+        let started = Instant::now();
+        ui.send_pending_via(path, clock.now(), Some(&mut dispatcher));
+        while ui.input_queue.sending_batch().is_some() {
+            assert!(
+                started.elapsed() < Duration::from_millis(250),
+                "input waited behind a slow view on the same node"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            ui.apply_remote_replies(&mut dispatcher, clock.now() + started.elapsed());
+        }
+        assert!(started.elapsed() < Duration::from_millis(250));
+        let seen = transport.seen.lock().unwrap();
+        assert!(
+            seen.iter().any(|(node, request)| {
+                node == "fp-laptop" && matches!(request, Request::RenderedSessionList { .. })
+            }),
+            "the view must target the node, not its worker key: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|(node, request)| {
+                node == "fp-laptop"
+                    && matches!(request, Request::Input { bytes, .. } if bytes == b"a")
+            }),
+            "the input must reach the same node while its view is stalled: {seen:?}"
+        );
     }
 
     #[test]

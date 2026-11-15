@@ -235,6 +235,37 @@ mod tests {
     }
 
     #[test]
+    fn a_view_and_its_input_target_the_real_node() {
+        #[derive(Default)]
+        struct Seen(Mutex<Vec<String>>);
+
+        impl RemoteInputTransport for Seen {
+            fn send_input(&self, node: &str, _request: &Request) -> io::Result<Response> {
+                self.0.lock().unwrap().push(node.into());
+                Ok(Response::Ok)
+            }
+        }
+
+        let seen = Arc::new(Seen::default());
+        let mut dispatcher = RemoteDispatcher::new(seen.clone());
+        let (call, request) = resize_call("peer");
+        dispatcher.submit("peer", call, request);
+        dispatcher.submit_view(
+            "peer",
+            RemoteCall::View("peer".into()),
+            Request::RenderedSessionList { width: 48 },
+        );
+        let mut replies = wait_for_reply(&mut dispatcher);
+        while replies.len() < 2 {
+            replies.extend(wait_for_reply(&mut dispatcher));
+        }
+        assert_eq!(replies.len(), 2);
+        let mut nodes = seen.0.lock().unwrap().clone();
+        nodes.sort();
+        assert_eq!(nodes, ["peer", "peer"]);
+    }
+
+    #[test]
     fn a_stalled_peer_blocks_neither_submit_nor_other_nodes() {
         let gate = Arc::new(Gate::default());
         let mut dispatcher = RemoteDispatcher::new(gate.clone());
