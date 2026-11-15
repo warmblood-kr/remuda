@@ -1902,18 +1902,20 @@ remuda.session = {
   attach = function(...) return call_flat("attach", ...) end,
   resize = function(...) return remuda._session_resize(...) end,
   remote_input = function(...) return remuda._session_remote_input(...) end,
+  team = function(...) return remuda._session_team(...) end,
 }
 setmetatable(remuda.session, {
   __call = function(_, name) return session_handle(name) end,
 })
-register("session", "Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach, resize and remote_input.",
-  "session(name) -> handle; table {list, new, close, attach, resize, remote_input}")
+register("session", "Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach, resize, remote_input and team.",
+  "session(name) -> handle; table {list, new, close, attach, resize, remote_input, team}")
 register("session.list", "List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.", "session.list() -> {session...}")
-register("session.new", "Start a session and return its name and registered instance_id. The options table can set remote_input_disabled=true to protect the exact instance at registration.",
+register("session.new", "Start a session and return its name and registered instance_id. remote_input_disabled is accepted for compatibility, but current builds do not enforce the per-session opt-out (see docs/cluster-security.md).",
   "session.new(name?, argv?, cwd?, env?, options?) -> name, instance_id")
 register("session.close", "End a session, live or already self-exited.", "session.close(name) -> nil")
 register("session.attach", "Enter raw mode on a session.", "session.attach(name) -> nil")
 register("session.resize", "Resize a session's terminal (cols 20..1000, rows 24..500).", "session.resize(name, cols, rows) -> true | nil, err")
+register("session.team", "Set optional advisory team metadata (agent_kind, model, leader, depth) for one exact live instance. Invalid metadata is refused as a whole and never grants authority.", "session.team(name, instance_id, team | nil) -> true | nil, err")
 
 remuda.ls = deprecated_alias("ls", "list", flat_session_words.ls)
 remuda.new = deprecated_alias("new", "new", flat_session_words.new)
