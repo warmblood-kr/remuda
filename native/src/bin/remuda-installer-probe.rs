@@ -2,6 +2,7 @@
 //! This is not wired into the installer or shipped in a release yet.
 //! It cleans its private process group on timeout, parent exit, and completion.
 //! Escaped descendants and forced guardian death are outside this guarantee; the marker is a caller assertion.
+//! The fixed `--verify`, `--verify-cli`, and `--verify-host` modes query GUI, CLI, and host IDs respectively.
 
 #[cfg(target_os = "macos")]
 mod mac {
@@ -20,11 +21,40 @@ mod mac {
     const OUT_LIMIT: usize = 256;
     const ERR_LIMIT: usize = 4096;
 
+    #[derive(Clone, Copy)]
+    enum Role {
+        Gui,
+        Cli,
+        Host,
+    }
+    impl Role {
+        fn guard_flag(self) -> &'static str {
+            match self {
+                Self::Gui => "--guard",
+                Self::Cli => "--guard-cli",
+                Self::Host => "--guard-host",
+            }
+        }
+        fn probe_arg(self) -> &'static str {
+            match self {
+                Self::Gui => "--internal-build-id",
+                Self::Cli => "--version",
+                Self::Host => "version",
+            }
+        }
+        fn expected(self, build: &str) -> String {
+            match self {
+                Self::Cli => format!("remuda {build}\n"),
+                _ => format!("{build}\n"),
+            }
+        }
+    }
+
     pub fn main() -> ExitCode {
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         if args.len() != 4 || args[1] != "--verified-archive-v1" {
             eprintln!(
-                "installer probe: expected --verify --verified-archive-v1 ABSOLUTE_PATH BUILD"
+                "installer probe: expected --verify[|-cli|-host] --verified-archive-v1 ABSOLUTE_PATH BUILD"
             );
             return ExitCode::FAILURE;
         }
@@ -42,20 +72,24 @@ mod mac {
             return ExitCode::FAILURE;
         }
         match args[0].to_str() {
-            Some("--verify") => parent(&args[2], expected),
-            Some("--guard") => guard(&args[2], expected),
+            Some("--verify") => parent(&args[2], expected, Role::Gui),
+            Some("--verify-cli") => parent(&args[2], expected, Role::Cli),
+            Some("--verify-host") => parent(&args[2], expected, Role::Host),
+            Some("--guard") => guard(&args[2], expected, Role::Gui),
+            Some("--guard-cli") => guard(&args[2], expected, Role::Cli),
+            Some("--guard-host") => guard(&args[2], expected, Role::Host),
             _ => ExitCode::FAILURE,
         }
     }
 
-    fn parent(program: &std::ffi::OsStr, expected: &str) -> ExitCode {
+    fn parent(program: &std::ffi::OsStr, expected: &str, role: Role) -> ExitCode {
         let exe = match std::env::current_exe() {
             Ok(path) => path,
             Err(_) => return ExitCode::FAILURE,
         };
         let mut command = Command::new(exe);
         command
-            .args(["--guard", "--verified-archive-v1"])
+            .args([role.guard_flag(), "--verified-archive-v1"])
             .arg(program)
             .arg(expected)
             .stdin(Stdio::piped())
@@ -97,7 +131,7 @@ mod mac {
         }
     }
 
-    fn guard(program: &std::ffi::OsStr, expected: &str) -> ExitCode {
+    fn guard(program: &std::ffi::OsStr, expected: &str, role: Role) -> ExitCode {
         let pid = unsafe { libc::getpid() };
         // A directly invoked guard must never signal the caller's group.
         if unsafe { libc::getpgrp() } != pid || unsafe { libc::getsid(0) } != pid {
@@ -112,7 +146,7 @@ mod mac {
             std::thread::sleep(DEADLINE);
             kill_owned_group(pid);
         });
-        let result = u8::from(verify(program, expected).is_ok());
+        let result = u8::from(verify(program, expected, role).is_ok());
         let _ = io::stdout().write_all(&[result]);
         let _ = io::stdout().flush();
         // The result is sent first; terminating our anchored private group
@@ -121,9 +155,9 @@ mod mac {
         ExitCode::FAILURE
     }
 
-    fn verify(program: &std::ffi::OsStr, expected: &str) -> Result<(), ()> {
+    fn verify(program: &std::ffi::OsStr, expected: &str, role: Role) -> Result<(), ()> {
         let mut child = Command::new(program)
-            .arg("--internal-build-id")
+            .arg(role.probe_arg())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -155,7 +189,7 @@ mod mac {
                     if out_done && err_done {
                         return if status.success()
                             && err.is_empty()
-                            && out == format!("{expected}\n").as_bytes()
+                            && out == role.expected(expected).as_bytes()
                         {
                             Ok(())
                         } else {
