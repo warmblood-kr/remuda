@@ -1354,6 +1354,104 @@ fn hosted_remote_reconnect_preserves_instance_and_rejects_stale_close() {
 }
 
 #[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_lines)] // Keep the live-viewer lifecycle in one acceptance scenario.
+fn live_remote_tui_recovers_same_hosted_session_after_peer_restart() {
+    let client_node = Node::start("live-view-client");
+    let mut server_node = Node::start_with_env(
+        "live-view-server",
+        vec![("REMUDA_EXPERIMENTAL_SESSION_HOST".into(), "1".into())],
+    );
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    let control = server_node
+        .command()
+        .args(["cluster", "control", "on"])
+        .output()
+        .unwrap();
+    assert!(
+        control.status.success(),
+        "cluster control failed: {control:?}"
+    );
+    let marker = server_node.root.join("post-restart");
+    server_node.start_session(&format!(
+        "stty -echo; printf 'BEFORE_LIVE\\n'; while [ ! -e '{}' ]; do sleep 0.05; done; printf 'AFTER_LIVE\\n'; while IFS= read -r line; do printf 'ECHO_LIVE:%s\\n' \"$line\"; done",
+        marker.display()
+    ));
+    let socket = remuda_native::daemon::socket_path_in(&server_node.runtime, &server_node.name);
+    let instance = || {
+        let Response::Sessions(rows) =
+            remuda_native::client::request(&socket, &Request::List).unwrap()
+        else {
+            panic!("local list failed")
+        };
+        rows.into_iter()
+            .find(|s| s.name == "proof")
+            .and_then(|s| s.instance_id)
+            .unwrap()
+    };
+    let original = instance();
+    assert!(!original.is_empty());
+    let registry_path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry =
+        serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|n| n.node_fp == server_node.fingerprint())
+        .unwrap()
+        .endpoint = Some(listener.address.to_string());
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    let target = format!("{}/proof", server_node.fingerprint());
+    let mut tui = RemoteTui::start(&client_node, Some(&target));
+    let tui_pid = tui.pid;
+    tui.wait_for("BEFORE_LIVE", Duration::from_secs(15));
+    tui.wait_for("remote live · reachable", Duration::from_secs(10));
+    tui.wait_for("Remuda >", Duration::from_secs(5));
+
+    server_node.stop_daemon();
+    tui.wait_for("remote live · unreachable", Duration::from_secs(20));
+    assert!(
+        tui.screen_text().contains("BEFORE_LIVE"),
+        "last screen was not retained"
+    );
+    assert_eq!(tui.child.process_id(), Some(tui_pid));
+    assert!(
+        tui.child.try_wait().unwrap().is_none(),
+        "viewer exited while peer was down"
+    );
+
+    server_node.restart_daemon();
+    listener.restart(&server_node);
+    assert_eq!(instance(), original, "hosted session changed instance");
+    let offset = tui.output_len();
+    fs::write(&marker, b"go").unwrap();
+    tui.wait_for_from(offset, "AFTER_LIVE", Duration::from_secs(25));
+    tui.wait_for("remote live · reachable", Duration::from_secs(20));
+    assert_eq!(tui.child.process_id(), Some(tui_pid));
+    assert!(
+        tui.child.try_wait().unwrap().is_none(),
+        "viewer exited during recovery"
+    );
+
+    let offset = tui.output_len();
+    tui.writer.write_all(b"once-after-recovery\r").unwrap();
+    tui.wait_for_from(
+        offset,
+        "ECHO_LIVE:once-after-recovery",
+        Duration::from_secs(15),
+    );
+    assert_eq!(instance(), original);
+}
+
+#[test]
 fn selected_remote_session_with_hangul_text_syncs_within_the_frame_limit() {
     const HANGUL: &str = "안녕하세요 한글 패널 내용";
     let client_node = Node::start("hangul-client");
