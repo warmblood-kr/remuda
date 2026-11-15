@@ -413,7 +413,7 @@ fn input_error_message(response: &Response) -> &'static str {
         Response::RateLimited => "session input rate limit exceeded",
         Response::Busy => crate::BUSY_RETRY_MESSAGE,
         Response::WriteTimeout => "session PTY write timed out; delivery may be partial or late",
-        Response::RemoteControlDisabled => "remote control is disabled on the target node",
+        Response::RemoteControlDisabled => "the target refused the remote write",
         _ => "input was refused",
     }
 }

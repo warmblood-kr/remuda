@@ -94,18 +94,23 @@ you, SYSTEM or Administrators owns `%LOCALAPPDATA%\remuda` or may write to it.
 A managed machine that adds a write entry for a domain group on profile
 directories is refused for that reason; the message names the SID.
 
-## Remote control
+## Remote input, resize and close
+
+Remote input is always accepted from an admitted peer. The per-session
+`remote_input_disabled` flag is advisory after #941 and is reported by
+`remuda ls --json`; it does not stop a trusted peer. Input keeps the 256 KiB/s
+aggregate limit per peer across sessions and client IDs, in addition to the
+existing per-session limit.
 
 Each node stores its local `allow_remote_control` setting in the private
 `$XDG_STATE_HOME/remuda/cluster/settings.json` file (or
 `$HOME/.local/state/remuda/cluster/settings.json` when `XDG_STATE_HOME` is
-unset). `remuda cluster control on|off` changes only this node; the setting is
-never replicated. A missing setting defaults to enabled,
-which matches the approved all-viewers-may-write cluster behavior. While
-enabled, admitted nodes may send input, with a 256 KiB/s aggregate limit per
-peer across sessions and client IDs in addition to the existing per-session
-limit. `remuda cluster` status shows whether remote control is enabled and
-warns that a compromised admitted node can type into and close every session.
+unset). This setting now gates only `ResizeSession` and `Close`.
+`remuda cluster control on|off` changes only this node; the setting is never
+replicated. A missing setting defaults to enabled, which matches the approved
+all-viewers-may-write cluster behavior. `remuda cluster` status shows whether
+remote resize and close is enabled and warns that an admitted node can always
+type into every session and, while enabled, can also resize or close them.
 
 Remote Input uses only the idempotent client ID and sequence batch path. The
 remote front accepts at most 12 KiB (12,288 bytes) in one batch; remote
@@ -113,28 +118,26 @@ senders split larger input into sequential batches at this limit. This keeps
 the JSON byte-array encoding below the listener body cap, including batches of
 three-digit byte values. An oversized batch receives a typed error before
 dispatch. The peer aggregate budget is charged before dispatch; the local daemon
-also enforces its per-session byte budget. A disabled node returns the typed
-`RemoteControlDisabled` response for both remote Input and remote Close. A
+also enforces its per-session byte budget. A disabled node returns the typed `RemoteControlDisabled` response for remote
+Resize and confirmed remote Close; remote Input is still dispatched. A
 remote Close is accepted only with the current session `instance_id` and
 `confirm: true`; a missing confirmation or stale instance is refused. Turning
-remote control off refuses both remote Input and confirmed remote Close.
+remote control off refuses remote Resize and confirmed remote Close, never
+remote Input.
 
-A session may additionally opt out of remote Input. A launcher can request the
-opt-out atomically with `remuda.session.new(name, argv, cwd, env,
-{ remote_input_disabled = true })`. The post-launch setter is
-`remuda.session.remote_input(name, instance_id, enabled)` or
-`remuda remote-input NAME INSTANCE on|off`. The flag is bound to the exact
-session instance and is refused by the remote front. Local send, attach and
-resize are unaffected. `remuda ls --json` and Lua `remuda.session.list()`
-report `remote_input_disabled`.
+A per-session `remote_input_disabled` flag is still accepted for compatibility.
+A launcher can set it atomically with `remuda.session.new(name, argv, cwd, env,
+{ remote_input_disabled = true })`, and the Lua setter remains
+`remuda.session.remote_input(name, instance_id, enabled)`. The `remote-input`
+CLI was removed. The flag is bound to the exact session instance and reported
+by `remuda ls --json` and Lua `remuda.session.list()`, but it is advisory: a
+trusted peer is not blocked by it. Local send, attach and resize are
+unaffected.
 
-Host-backed sessions persist this policy through daemon reload and restart.
-A previously created host without the policy metadata is recovered with remote
-input disabled. To allow it, inspect its instance ID and explicitly run
-`remuda remote-input NAME INSTANCE on`. Malformed or unknown policy metadata
-also fails closed. If a policy update returns `Uncertain`, the running daemon
-locally disables remote input, but the stored setting may differ and may be
-recovered on restart.
+Hosted policy metadata is retained only for compatibility and reporting. A
+previously created host without the policy metadata, a malformed or unknown
+value, or an `Uncertain` policy update no longer disables remote input; the
+stored flag may differ but it is not enforcement.
 
 Remote hosted input uses the existing in-memory request deduplication. A retry
 with the same request ID after daemon restart can write again; an uncertain
@@ -268,12 +271,13 @@ record plaintext = data
 
 ## Threat model
 
-An admitted peer can submit bounded Input batches to any session while remote
-control is enabled. The listener enforces a 256 KiB/s peer-wide aggregate
-budget, and the local daemon enforces its per-session cap. PTY writes have a
-bounded timeout. The local flag defaults to enabled because joining a cluster
-is a trust decision; disabling it refuses remote Input and Close. A compromised
-admitted node can type into and close every session while the setting is on.
+An admitted peer can always submit bounded Input batches to any session. The
+listener enforces a 256 KiB/s peer-wide aggregate budget, and the local daemon
+enforces its per-session cap. PTY writes have a bounded timeout. The local
+`allow_remote_control` flag defaults to enabled because joining a cluster is a
+trust decision; disabling it refuses remote Resize and Close, not Input. A
+compromised admitted node can always type into every session, and can resize
+or close them while the setting is on.
 
 These controls do not protect against a compromised local account or host,
 which can read the local cluster keys and change the setting.

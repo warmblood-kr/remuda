@@ -822,7 +822,7 @@ fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
 
 #[test]
 #[cfg(unix)]
-fn real_remote_keys_mode_respects_cluster_control_off() {
+fn real_remote_keys_mode_allows_input_when_cluster_control_off() {
     let client_node = Node::start("keys-denied-client");
     let server_node = Node::start("keys-denied-server");
     admit_pair(&client_node, &server_node);
@@ -875,11 +875,8 @@ fn real_remote_keys_mode_respects_cluster_control_off() {
 
     let input_start = tui.output_len();
     tui.writer.write_all(b"y").unwrap();
-    std::thread::sleep(Duration::from_secs(2));
-    assert!(
-        !tui.any_screen_contains_from(input_start, &["got=y"]),
-        "server accepted input while cluster control was disabled on an intermediate screen"
-    );
+    // Input is never gated by the resize/close control setting.
+    tui.wait_for_from(input_start, "got=y", Duration::from_secs(5));
 }
 
 #[test]

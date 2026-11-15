@@ -1134,7 +1134,7 @@ fn cluster_cli_spec() -> remuda_native::cli_parse::Spec {
             verb("alias", "Set or clear a cluster-wide display alias for a node. Example: remuda cluster alias node-abcd1234 macbook",
                 vec![arg("TARGET", "Node id, alias or fingerprint", false, true), arg("ALIAS", "Local display alias; omit when using --clear", false, false)],
                 vec![option("clear", None, "Clear the cluster-wide display alias", false)], "remuda cluster alias TARGET ALIAS | alias TARGET --clear"),
-            verb("control", "Enable or disable remote control. Example: remuda cluster control off",
+            verb("control", "Enable or disable remote resize and close. Remote input stays enabled. Example: remuda cluster control off",
                 vec![arg("MODE", "on or off", false, true)], vec![], "remuda cluster control on|off"),
             verb("revoke", "Revoke a node or fingerprint; prompt before revoking unless --yes is used. Example: remuda cluster revoke node-abcd1234",
                 vec![arg("TARGET", "Node id, alias or fingerprint", false, true)],
@@ -1456,7 +1456,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         ClusterCommand::Control(enabled) => {
             match remuda_native::cluster::control::set_enabled(enabled) {
                 Ok(()) => {
-                    println!("Remote control {}.", remote_control_label(enabled));
+                    println!("Remote resize and close {}.", remote_control_label(enabled));
                     ExitCode::SUCCESS
                 }
                 Err(error) => fail(format!("cluster control: {error}")),
@@ -2965,13 +2965,13 @@ fn remote_control_label(enabled: bool) -> &'static str {
 
 fn remote_control_status_lines(enabled: bool) -> (&'static str, &'static str) {
     let setting = if enabled {
-        "Remote control: enabled"
+        "Remote resize and close: enabled"
     } else {
-        "Remote control: disabled"
+        "Remote resize and close: disabled"
     };
     (
         setting,
-        "Trust if enabled: a compromised admitted node can type into and close every session.",
+        "Admitted nodes can always type into every session; this setting only refuses remote resize and close.",
     )
 }
 
@@ -3138,7 +3138,7 @@ fn cluster_call_support(
         }
         Ok(Response::Error(reason)) => support_refused(&reason, json),
         Ok(Response::RemoteControlDisabled) => {
-            support_refused("remote control is disabled on the target node", json)
+            support_refused("the target refused the support probe", json)
         }
         Ok(_) => support_protocol("peer returned an unexpected response", json),
         Err(error) => match error {
@@ -5250,12 +5250,12 @@ mod cluster_cli_tests {
     #[test]
     fn cluster_status_explains_remote_control_trust() {
         let (setting, trust) = remote_control_status_lines(true);
-        assert_eq!(setting, "Remote control: enabled");
-        assert!(trust.contains("compromised admitted node"));
-        assert!(trust.contains("close every session"));
+        assert_eq!(setting, "Remote resize and close: enabled");
+        assert!(trust.contains("always type into"));
+        assert!(trust.contains("resize and close"));
         assert_eq!(
             remote_control_status_lines(false).0,
-            "Remote control: disabled"
+            "Remote resize and close: disabled"
         );
     }
 

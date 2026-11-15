@@ -235,9 +235,10 @@ You should see three rows in state `admitted`; `*` marks this machine
  node-egrdsjir   SHA256:EgrD...    admitted 1        SHA256:BwWl...
 ```
 
-`remuda cluster` shows `Remote control: enabled` by default. An admitted
-machine can type into and close every session, so join only machines you
-trust. To turn remote control off: `remuda cluster control off`.
+`remuda cluster` shows `Remote resize and close: enabled` by default. An
+admitted machine can always type into any session, and can resize or close
+sessions while enabled, so join only machines you trust. To turn remote resize
+and close off: `remuda cluster control off`.
 [cluster-demo.md](cluster-demo.md) also covers remote input and revoke.
 [vfs.md](vfs.md) covers files shared across the cluster (`remuda vfs`).
 

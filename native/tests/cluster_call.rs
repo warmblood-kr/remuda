@@ -1415,6 +1415,77 @@ fn remote_send_attempts_peer_even_when_legacy_setting_is_off() {
 }
 
 #[test]
+fn mcp_send_reaches_a_real_peer_with_receiver_control_off() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let client = Node::start("receiver-off-client");
+    let server = Node::start("receiver-off-server");
+    admit_pair(&client, &server);
+    let (_listener, addr) = listener(&server);
+    let fingerprint = server.fingerprint();
+    set_endpoint(&client, &fingerprint, addr);
+    let label = remuda_native::cluster::node_label(&fingerprint);
+
+    // Both legacy gates are explicitly off: the sender's old remote-send
+    // setting and the receiver's resize/close control. Input must still pass.
+    for (node, setting) in [
+        (&client, "allow_remote_send"),
+        (&server, "allow_remote_control"),
+    ] {
+        let settings = node.state.join("remuda/cluster/settings.json");
+        let mut value = serde_json::json!({
+            "allow_remote_control": true,
+            "allow_remote_send": true,
+        });
+        value[setting] = serde_json::json!(false);
+        fs::write(&settings, serde_json::to_vec(&value).unwrap()).unwrap();
+        fs::set_permissions(&settings, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let start = server
+        .command()
+        .args([
+            "-e",
+            r#"remuda.new('echo', {'/bin/sh', '-c', 'while IFS= read -r line; do printf "got:%s\n" "$line"; done'})"#,
+        ])
+        .output()
+        .unwrap();
+    assert!(start.status.success(), "session start failed: {start:?}");
+
+    let reply = mcp_call(
+        &client,
+        "send",
+        serde_json::json!({"node": label, "session": "echo", "text": "hello"}),
+    );
+    assert_ne!(
+        reply["result"]["isError"], true,
+        "receiver control off blocked input: {reply}"
+    );
+
+    let address = addr.to_string();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut captured = String::new();
+    while Instant::now() < deadline {
+        let capture = client
+            .command()
+            .args([
+                "cluster", "call", &label, "capture", "echo", "--addr", &address,
+            ])
+            .output()
+            .unwrap();
+        captured = String::from_utf8_lossy(&capture.stdout).to_string();
+        if captured.contains("got:hello") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        captured.contains("got:hello"),
+        "the peer never received the line: {captured}"
+    );
+}
+
+#[test]
 fn mcp_send_reaches_a_real_peer_with_the_legacy_setting_off() {
     use std::os::unix::fs::PermissionsExt;
 
