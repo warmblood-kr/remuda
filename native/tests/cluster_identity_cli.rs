@@ -77,21 +77,23 @@ fn init_and_status_never_print_private_key_material() {
     let status = run(&["cluster"]);
     assert!(status.status.success());
     let default_status = String::from_utf8_lossy(&status.stdout);
-    assert!(default_status.contains("Remote control: enabled"));
-    assert!(default_status.contains("compromised admitted node"));
-    assert!(default_status.contains("close every session"));
+    assert!(default_status.contains("Remote resize and close: enabled"));
+    assert!(default_status.contains("always type into"));
+    assert!(default_status.contains("resize and close"));
     let disabled = run(&["cluster", "control", "off"]);
     assert!(disabled.status.success());
-    assert!(String::from_utf8_lossy(&disabled.stdout).contains("Remote control disabled"));
+    assert!(String::from_utf8_lossy(&disabled.stdout).contains("Remote resize and close disabled"));
     let settings = fs::read_to_string(state.join("remuda/cluster/settings.json")).unwrap();
     assert!(settings.contains("\"allow_remote_control\":false"));
     let disabled_status = run(&["cluster"]);
     assert!(disabled_status.status.success());
-    assert!(String::from_utf8_lossy(&disabled_status.stdout).contains("Remote control: disabled"));
+    assert!(String::from_utf8_lossy(&disabled_status.stdout)
+        .contains("Remote resize and close: disabled"));
     let enabled = run(&["cluster", "control", "on"]);
     assert!(enabled.status.success());
     let enabled_status = run(&["cluster"]);
-    assert!(String::from_utf8_lossy(&enabled_status.stdout).contains("Remote control: enabled"));
+    assert!(String::from_utf8_lossy(&enabled_status.stdout)
+        .contains("Remote resize and close: enabled"));
 
     let mut transcript = initialized.stdout;
     transcript.extend(initialized.stderr);

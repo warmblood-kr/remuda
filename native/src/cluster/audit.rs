@@ -39,7 +39,7 @@ pub enum Outcome {
     Done,
     /// Forwarded to the daemon, which answered with an error or timed out.
     Failed,
-    /// Refused before dispatch by policy (remote control off, allowlist).
+    /// Refused before dispatch by policy (resize/close control off, allowlist).
     Refused,
     /// Refused before dispatch by a rate or capacity limit.
     Limited,

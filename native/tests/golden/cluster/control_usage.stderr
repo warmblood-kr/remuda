@@ -1,5 +1,5 @@
 remuda: cluster control: expected on or off
-Enable or disable remote control. Example: remuda cluster control off
+Enable or disable remote resize and close. Remote input stays enabled. Example: remuda cluster control off
 
 Usage: remuda cluster control on|off
 

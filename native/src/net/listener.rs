@@ -1101,25 +1101,22 @@ fn authorize_remote_request(request: &Request) -> io::Result<()> {
         .map_err(|reason| io::Error::new(io::ErrorKind::PermissionDenied, reason))
 }
 
+/// Remote input is always admitted for an authenticated peer; the per-session
+/// opt-out is advisory after #941. `cluster control` now gates only the
+/// destructive pane operations, remote resize and close.
 fn authorize_remote_request_with_source(
     request: &Request,
     control_source: &ControlSource,
 ) -> Result<(), Response> {
     let enabled = if matches!(
         request,
-        Request::Input { .. }
-            | Request::InputLine { .. }
-            | Request::RemoteInputLine { .. }
-            | Request::ResizeSession { .. }
-            | Request::Close { .. }
+        Request::ResizeSession { .. } | Request::Close { .. }
     ) {
         control_source.enabled().map_err(|_| {
-            let operation = match request {
-                Request::Input { .. }
-                | Request::InputLine { .. }
-                | Request::RemoteInputLine { .. } => "Input",
-                Request::ResizeSession { .. } => "ResizeSession",
-                _ => "Close",
+            let operation = if matches!(request, Request::ResizeSession { .. }) {
+                "ResizeSession"
+            } else {
+                "Close"
             };
             Response::error(format!(
                 "remote control setting unavailable; refusing {operation}"
@@ -1136,11 +1133,6 @@ fn authorize_remote_request_with_control(
     allow_remote_control: bool,
 ) -> Result<(), Response> {
     match request {
-        Request::Input { .. } | Request::InputLine { .. } | Request::RemoteInputLine { .. }
-            if !allow_remote_control =>
-        {
-            return Err(Response::RemoteControlDisabled);
-        }
         Request::ResizeSession { .. } if !allow_remote_control => {
             return Err(Response::RemoteControlDisabled);
         }
@@ -2922,7 +2914,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn socket_setting_off_returns_disabled_without_dispatch() {
+    fn socket_control_off_allows_input_and_refuses_resize_without_dispatch() {
         let settings = TestControlSettings::new(br#"{"allow_remote_control":false}"#);
         let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
             .generate_keypair()
@@ -2942,21 +2934,40 @@ mod tests {
             }),
             settings.source(),
         );
-        let request = Request::Input {
+        let input = Request::Input {
             name: "session".into(),
             instance_id: "id".into(),
             client_id: "00000000000000000000000000000001".into(),
             seq: 1,
             bytes: b"x".to_vec(),
         };
-        let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&request).unwrap());
+        let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&input).unwrap());
+        let (status, response) = server.exchange(sealed);
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Response>(&response).unwrap(),
+            Response::Ok,
+            "input is not gated by cluster control"
+        );
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+
+        let resize = Request::ResizeSession {
+            name: "session".into(),
+            instance_id: "id".into(),
+            size: remuda_core::Size::new(80, 24),
+        };
+        let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&resize).unwrap());
         let (status, response) = server.exchange(sealed);
         assert_eq!(status, 200);
         assert_eq!(
             serde_json::from_slice::<Response>(&response).unwrap(),
             Response::RemoteControlDisabled
         );
-        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            dispatched.load(Ordering::SeqCst),
+            1,
+            "a refused resize must not reach dispatch"
+        );
     }
 
     #[cfg(unix)]
@@ -3046,7 +3057,11 @@ mod tests {
         let (_, entries) = audited_exchange(
             br#"{"allow_remote_control":false}"#,
             &[
-                audited_input(b"x"),
+                Request::ResizeSession {
+                    name: "session".into(),
+                    instance_id: "id".into(),
+                    size: remuda_core::Size::new(80, 24),
+                },
                 Request::New {
                     name: Some("new".into()),
                     command: vec!["sh".into()],
@@ -3063,7 +3078,7 @@ mod tests {
         assert_eq!(
             summary,
             [
-                (Op::Input, Outcome::Refused),
+                (Op::Resize, Outcome::Refused),
                 (Op::Create, Outcome::Refused)
             ]
         );
@@ -3072,6 +3087,43 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn socket_malformed_setting_errors_without_dispatch() {
+        let settings = TestControlSettings::new(br#"{"allow_remote_control":no}"#);
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let seen = dispatched.clone();
+        let server = SocketTestServer::start_production_with_control_source(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Ok(())),
+            Arc::new(move |_, _| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::to_vec(&Response::Ok).unwrap())
+            }),
+            settings.source(),
+        );
+        let request = Request::ResizeSession {
+            name: "session".into(),
+            instance_id: "id".into(),
+            size: remuda_core::Size::new(80, 24),
+        };
+        let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&request).unwrap());
+        let (status, response) = server.exchange(sealed);
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Response>(&response).unwrap(),
+            Response::Error("remote control setting unavailable; refusing ResizeSession".into())
+        );
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_input_ignores_an_unreadable_control_setting() {
         let settings = TestControlSettings::new(br#"{"allow_remote_control":no}"#);
         let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
             .generate_keypair()
@@ -3103,9 +3155,10 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(
             serde_json::from_slice::<Response>(&response).unwrap(),
-            Response::Error("remote control setting unavailable; refusing Input".into())
+            Response::Ok,
+            "input must not read the resize/close setting"
         );
-        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3157,24 +3210,42 @@ mod tests {
     }
 
     #[test]
-    fn input_line_obeys_remote_control_setting() {
-        let request = Request::InputLine {
-            name: "dev".into(),
-            instance_id: "instance".into(),
-            client_id: "00000000000000000000000000000000".into(),
-            seq: 1,
-            bytes: b"hello\r".to_vec(),
-        };
-        assert_eq!(
-            authorize_remote_request_with_control(&request, false),
-            Err(Response::RemoteControlDisabled)
-        );
-        assert!(authorize_remote_request_with_control(&request, true).is_ok());
+    fn input_requests_ignore_remote_control_setting() {
+        let client_id = "00000000000000000000000000000000".to_owned();
+        for request in [
+            Request::Input {
+                name: "dev".into(),
+                instance_id: "instance".into(),
+                client_id: client_id.clone(),
+                seq: 1,
+                bytes: b"hello".to_vec(),
+            },
+            Request::InputLine {
+                name: "dev".into(),
+                instance_id: "instance".into(),
+                client_id: client_id.clone(),
+                seq: 1,
+                bytes: b"hello\r".to_vec(),
+            },
+            Request::RemoteInputLine {
+                name: "dev".into(),
+                instance_id: "instance".into(),
+                client_id,
+                seq: 1,
+                bytes: b"hello\r".to_vec(),
+            },
+        ] {
+            assert!(
+                authorize_remote_request_with_control(&request, false).is_ok(),
+                "input must stay admitted with control off: {request:?}"
+            );
+            assert!(authorize_remote_request_with_control(&request, true).is_ok());
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn remote_input_obeys_local_control_setting_and_close_stays_refused() {
+    fn remote_input_ignores_local_control_setting_while_close_stays_gated() {
         let settings = TestControlSettings::new(br#"{"allow_remote_control":true}"#);
         let source = settings.source();
         assert!(authorize_remote_request_with_source(&Request::List, &source).is_ok());
@@ -3186,20 +3257,26 @@ mod tests {
             bytes: b"hello\r".to_vec(),
         };
         assert!(authorize_remote_request_with_source(&input, &source).is_ok());
+        assert!(authorize_remote_request_with_control(&input, false).is_ok());
+        let close = Request::Close {
+            name: "session".into(),
+            instance_id: Some("instance".into()),
+            confirm: Some(true),
+        };
         assert_eq!(
-            authorize_remote_request_with_control(&input, false),
+            authorize_remote_request_with_control(&close, false),
             Err(Response::RemoteControlDisabled)
         );
-        let close = Request::Close {
+        assert!(authorize_remote_request_with_control(&close, true).is_ok());
+        let unconfirmed = Request::Close {
             name: "session".into(),
             instance_id: None,
             confirm: None,
         };
         assert_eq!(
-            authorize_remote_request_with_source(&close, &source),
+            authorize_remote_request_with_source(&unconfirmed, &source),
             Err(Response::error("remote front refuses Close"))
         );
-        assert_eq!(authorize_remote_request_with_control(&input, true), Ok(()));
         let wire = serde_json::to_vec(&Response::RemoteControlDisabled).unwrap();
         assert_eq!(
             serde_json::from_slice::<Response>(&wire).unwrap(),
@@ -3208,7 +3285,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_registry_verbs_are_admitted_while_input_remains_control_gated() {
+    fn cluster_registry_verbs_are_admitted_and_input_is_not_control_gated() {
         let sync = Request::ClusterRegistrySync {
             digest: None,
             offset: 0,
@@ -3229,10 +3306,7 @@ mod tests {
             authorize_remote_request_with_control(&update, false),
             Ok(())
         );
-        assert_eq!(
-            authorize_remote_request_with_control(&input, false),
-            Err(Response::RemoteControlDisabled)
-        );
+        assert_eq!(authorize_remote_request_with_control(&input, false), Ok(()));
     }
 
     #[test]
@@ -5531,7 +5605,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn socket_remote_input_is_refused_without_dispatch() {
+    fn socket_input_is_admitted_with_control_off() {
         let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
             .generate_keypair()
             .unwrap();
@@ -5562,8 +5636,8 @@ mod tests {
         let (status, response) = server.exchange(sealed);
         assert_eq!(status, 200);
         let response: Response = serde_json::from_slice(&response).unwrap();
-        assert_eq!(response, Response::RemoteControlDisabled);
-        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+        assert_eq!(response, Response::Ack { duplicate: false });
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(unix)]

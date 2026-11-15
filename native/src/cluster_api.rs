@@ -291,7 +291,7 @@ fn send_remote(
         )),
         Ok(Response::RemoteControlDisabled) => Err(refused(
             &label,
-            "the target session has remote input disabled",
+            "the target refused the remote line",
         )),
         Ok(Response::RateLimited) => Err(known_not_written(
             &label,
@@ -1099,7 +1099,7 @@ mod tests {
         );
         for (response, needle) in [
             (Response::WrongInstance, "instance changed"),
-            (Response::RemoteControlDisabled, "remote input disabled"),
+            (Response::RemoteControlDisabled, "refused the remote line"),
             (Response::RateLimited, "rate limit"),
             (Response::Busy, "in flight"),
             (Response::Uncertain, "uncertain"),
