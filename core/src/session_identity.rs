@@ -8,10 +8,9 @@ pub enum SelectionIdentity {
     Ambiguous,
 }
 
-/// Reconciliation of one prior selection against one fresh node snapshot.
-/// `index` is the first exact name/instance match, including a missing
-/// instance. `identity` is absent when either prior field is absent; callers
-/// must not treat it as permission to operate on a session.
+/// One snapshot: `index` is the first exact match, even with a missing instance.
+/// `identity` is absent when either prior field is absent. Neither field
+/// grants permission to operate on a session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SelectionReconciliation {
     pub index: Option<usize>,
