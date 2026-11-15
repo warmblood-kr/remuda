@@ -30,7 +30,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 115] = [
+pub const BINDINGS: [&str; 116] = [
     "_advice_reattach",
     "_call",
     "_caller_live",
@@ -68,6 +68,7 @@ pub const BINDINGS: [&str; 115] = [
     "_session_refresh",
     "_session_remote_input",
     "_session_resize",
+    "_session_team",
     "_sync_window_shown",
     "_take_due_schedules",
     "advice_list",
@@ -280,6 +281,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_session_remote_input",
         "Set the local-only remote-input opt-out for one exact session instance. Unknown, exited or mismatched instances are refused; references do not inherit it.",
         "_session_remote_input(name, instance_id, enabled) -> true, nil | nil, error",
+    ),
+    (
+        "_session_team",
+        "Set optional advisory team metadata for one exact live session instance. Invalid or oversized metadata is refused as a whole; it never grants authority.",
+        "_session_team(name, instance_id, team | nil) -> true, nil | nil, error",
     ),
     (
         "http",
@@ -1255,6 +1261,7 @@ pub(crate) fn bindings(
     session_resize_binding(lua, &table, at())?;
     session_refresh_binding(lua, &table, at())?;
     session_remote_input_binding(lua, &table, at())?;
+    session_team_binding(lua, &table, at())?;
 
     new_binding(lua, &table, at())?;
 
@@ -1484,6 +1491,92 @@ fn session_remote_input_binding(
             },
         )?,
     )
+}
+
+fn session_team_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
+    table.set(
+        "_session_team",
+        lua.create_function(
+            move |_, (name, instance_id, team): (String, String, Option<Table>)| {
+                if instance_id.is_empty() {
+                    return Ok((
+                        Value::Nil,
+                        Some("instance_id must not be empty".to_string()),
+                    ));
+                }
+                let team = match team {
+                    Some(table) => match team_from_table(table) {
+                        Ok(team) => Some(team),
+                        Err(reason) => return Ok((Value::Nil, Some(reason))),
+                    },
+                    None => None,
+                };
+                match ask(
+                    &path,
+                    Request::SetSessionTeam {
+                        name,
+                        instance_id,
+                        team,
+                    },
+                )? {
+                    Response::Ok => Ok((Value::Boolean(true), None)),
+                    Response::Error(reason) => Ok((Value::Nil, Some(reason))),
+                    other => Ok((Value::Nil, Some(format!("unexpected response: {other:?}")))),
+                }
+            },
+        )?,
+    )
+}
+
+/// Parse a Lua team table strictly; invalid metadata is refused as a whole.
+fn team_from_table(table: Table) -> Result<remuda_core::registry::SessionTeam, String> {
+    use remuda_core::registry::{SessionTeam, TeamLeader};
+    let mut team = SessionTeam::default();
+    for pair in table.pairs::<mlua::Value, mlua::Value>() {
+        let (key, value) = pair.map_err(|error| error.to_string())?;
+        let key = key
+            .as_string()
+            .ok_or("team keys must be strings")?
+            .to_str()
+            .map_err(|error| error.to_string())?;
+        match &*key {
+            "agent_kind" => team.agent_kind = Some(team_string(value, "agent_kind")?),
+            "model" => team.model = Some(team_string(value, "model")?),
+            "leader" => {
+                let mlua::Value::Table(leader) = value else {
+                    return Err("team.leader must be a table".into());
+                };
+                let name = team_string(
+                    leader.get("name").map_err(|error| error.to_string())?,
+                    "leader.name",
+                )?;
+                let instance_id = team_string(
+                    leader
+                        .get("instance_id")
+                        .map_err(|error| error.to_string())?,
+                    "leader.instance_id",
+                )?;
+                team.leader = Some(TeamLeader { name, instance_id });
+            }
+            "depth" => {
+                let depth = value.as_i64().ok_or("team.depth must be an integer")?;
+                team.depth = u16::try_from(depth).map_err(|_| "team.depth out of range")?;
+            }
+            other => return Err(format!("unknown team key: {other}")),
+        }
+    }
+    team.validate().map_err(|reason| reason.to_string())?;
+    Ok(team)
+}
+
+fn team_string(value: mlua::Value, field: &str) -> Result<String, String> {
+    match value {
+        mlua::Value::String(text) => text
+            .to_str()
+            .map(|text| text.to_string())
+            .map_err(|error| error.to_string()),
+        _ => Err(format!("team.{field} must be a string")),
+    }
 }
 
 fn requested_size(cols: i64, rows: i64) -> Result<remuda_core::Size, String> {
@@ -2582,6 +2675,25 @@ pub(crate) fn session_rows(
         row.set("rows", session.size.rows())?;
         row.set("attached", session.attached)?;
         row.set("remote_input_disabled", session.remote_input_disabled)?;
+        if let Some(team) = session.team {
+            let table = lua.create_table()?;
+            if let Some(kind) = team.agent_kind {
+                table.set("agent_kind", kind)?;
+            }
+            if let Some(model) = team.model {
+                table.set("model", model)?;
+            }
+            if let Some(leader) = team.leader {
+                let leader_table = lua.create_table()?;
+                leader_table.set("name", leader.name)?;
+                leader_table.set("instance_id", leader.instance_id)?;
+                table.set("leader", leader_table)?;
+            }
+            if team.depth != 0 {
+                table.set("depth", team.depth)?;
+            }
+            row.set("team", table)?;
+        }
         row.set(
             "human_idle",
             session
@@ -2815,9 +2927,9 @@ mod binding_tests {
                     mouse_tracking: false,
                     unavailable: false,
                     remote_input_disabled: false,
+                    team: None,
                     program_status: None,
                     program_status_age_ms: None,
-                    team: None,
                 }]),
                 other => panic!("unexpected test request: {other:?}"),
             };

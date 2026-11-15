@@ -174,7 +174,7 @@
 <h2 id="send">send</h2>
 <p><code>send(name, text) -&gt; nil</code> — Deliver a line of text to a session, with Enter appended.</p>
 <h2 id="session">session</h2>
-<p><code>session(name) -&gt; handle; table {list, new, close, attach, resize, remote_input}</code> — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach, resize and remote_input.</p>
+<p><code>session(name) -&gt; handle; table {list, new, close, attach, resize, remote_input, team}</code> — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach, resize, remote_input and team.</p>
 <h2 id="session.attach">session.attach</h2>
 <p><code>session.attach(name) -&gt; nil</code> — Enter raw mode on a session.</p>
 <h2 id="session.close">session.close</h2>
@@ -182,9 +182,11 @@
 <h2 id="session.list">session.list</h2>
 <p><code>session.list() -&gt; {session...}</code> — List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.</p>
 <h2 id="session.new">session.new</h2>
-<p><code>session.new(name?, argv?, cwd?, env?, options?) -&gt; name, instance_id</code> — Start a session and return its name and registered instance_id. The options table can set remote_input_disabled=true to protect the exact instance at registration.</p>
+<p><code>session.new(name?, argv?, cwd?, env?, options?) -&gt; name, instance_id</code> — Start a session and return its name and registered instance_id. remote_input_disabled is accepted for compatibility, but current builds do not enforce the per-session opt-out (see docs/cluster-security.md).</p>
 <h2 id="session.resize">session.resize</h2>
 <p><code>session.resize(name, cols, rows) -&gt; true | nil, err</code> — Resize a session's terminal (cols 20..1000, rows 24..500).</p>
+<h2 id="session.team">session.team</h2>
+<p><code>session.team(name, instance_id, team | nil) -&gt; true | nil, err</code> — Set optional advisory team metadata (agent_kind, model, leader, depth) for one exact live instance. Invalid metadata is refused as a whole and never grants authority.</p>
 <h2 id="storage">storage</h2>
 <p><code>table</code> — Namespace for resolving per-user config, data, state and cache directories.</p>
 <h2 id="storage.dir">storage.dir</h2>
