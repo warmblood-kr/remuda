@@ -1858,6 +1858,7 @@ fn malicious_duplicate_names_never_close_or_focus_an_ambiguous_instance() {
                 program_status: None,
                 program_status_age_ms: None,
                 remote_input_disabled: false,
+                team: None,
             };
             let response = match request {
                 Request::List => Response::Sessions(vec![row("first"), row("second")]),

@@ -1518,6 +1518,7 @@ mod visual_mode_tests {
                 mouse_tracking: false,
                 unavailable: false,
                 remote_input_disabled: false,
+                team: None,
                 program_status: None,
                 program_status_age_ms: None,
             }],
@@ -4305,6 +4306,7 @@ mod keybindings_adopter_tests {
             mouse_tracking: false,
             unavailable: false,
             remote_input_disabled: false,
+            team: None,
             program_status: None,
             program_status_age_ms: None,
         }];
@@ -4367,6 +4369,7 @@ mod composer_tests {
             mouse_tracking: false,
             unavailable: false,
             remote_input_disabled: false,
+            team: None,
             program_status: None,
             program_status_age_ms: None,
         }
@@ -4632,6 +4635,7 @@ mod peer_view_fit_acceptance {
             program_status: None,
             program_status_age_ms: None,
             remote_input_disabled: false,
+            team: None,
         }
     }
     fn lua_view(compact: bool) -> SessionView {

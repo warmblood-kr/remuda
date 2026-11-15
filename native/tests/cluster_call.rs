@@ -380,6 +380,7 @@ fn fake_summary(name: &str, instance: Option<&str>) -> remuda_core::SessionSumma
         program_status: None,
         program_status_age_ms: None,
         remote_input_disabled: false,
+        team: None,
     }
 }
 

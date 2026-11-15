@@ -19,6 +19,7 @@ fn session(name: &str, instance: &str) -> SessionSummary {
         program_status: None,
         program_status_age_ms: None,
         remote_input_disabled: false,
+        team: None,
     }
 }
 fn entry(name: &str, instance: &str, line: &str) -> ViewEntry {

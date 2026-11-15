@@ -116,6 +116,76 @@ pub struct SessionSummary {
     /// input. Default false for older listings and new instances.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub remote_input_disabled: bool,
+    /// Optional structured team metadata for non-TUI consumers. Additive:
+    /// older daemons omit it and older readers ignore it. Display code must
+    /// keep using the rendered view; this is never authority or routing data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<SessionTeam>,
+}
+
+/// The leader of a session's team, on the same daemon.
+#[derive(Clone, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct TeamLeader {
+    pub name: String,
+    pub instance_id: String,
+}
+
+/// Bounded, advisory team metadata. Unknown parts stay `None`.
+#[derive(Clone, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionTeam {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leader: Option<TeamLeader>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub depth: u16,
+}
+
+fn is_zero(value: &u16) -> bool {
+    *value == 0
+}
+
+impl SessionTeam {
+    /// Reject malformed or oversized metadata as a whole.
+    pub fn validate(&self) -> core::result::Result<(), &'static str> {
+        if let Some(kind) = &self.agent_kind {
+            bounded_team_text(kind, 32)?;
+        }
+        if let Some(model) = &self.model {
+            bounded_team_text(model, 64)?;
+        }
+        if let Some(leader) = &self.leader {
+            bounded_team_text(&leader.name, 256)?;
+            bounded_team_text(&leader.instance_id, 256)?;
+        }
+        if self.depth > 20 {
+            return Err("team depth out of range");
+        }
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.agent_kind.is_none()
+            && self.model.is_none()
+            && self.leader.is_none()
+            && self.depth == 0
+    }
+}
+
+fn bounded_team_text(value: &str, limit: usize) -> core::result::Result<(), &'static str> {
+    if value.is_empty()
+        || value.len() > limit
+        || value.trim() != value
+        || value
+            .chars()
+            .any(|ch| ch.is_control() || (ch.is_whitespace() && ch != ' '))
+    {
+        return Err("invalid team text");
+    }
+    Ok(())
 }
 
 /// A session name from a program's argv[0]: basename, lowercased, anything
@@ -163,6 +233,9 @@ pub struct Registry {
     /// Local-only remote-input opt-out, keyed by exact session instance so a
     /// reused name never inherits it.
     remote_input_policy: Mutex<HashMap<String, bool>>,
+    /// Optional team metadata, keyed by exact session instance. Advisory only;
+    /// never consulted for input, routing or authority.
+    team_metadata: Mutex<HashMap<String, SessionTeam>>,
 }
 
 #[derive(Default)]
@@ -265,6 +338,50 @@ impl Registry {
 
     fn forget_remote_input_policy(&self, instance_id: &str) {
         self.remote_input_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(instance_id);
+    }
+
+    /// Set advisory team metadata for one exact live instance. `None` means the
+    /// name/instance is not current. Stale metadata is never stored.
+    pub fn set_session_team(
+        &self,
+        name: &str,
+        instance_id: &str,
+        team: Option<SessionTeam>,
+    ) -> Option<core::result::Result<(), &'static str>> {
+        let current = if let Some(session) = self.get(name) {
+            session.instance_id() == instance_id && session.is_alive()
+        } else {
+            let handle = self.hosted(name)?;
+            handle.identity().instance == instance_id
+        };
+        if !current {
+            return Some(Err("stale session instance"));
+        }
+        if let Some(team) = &team {
+            if let Err(reason) = team.validate() {
+                return Some(Err(reason));
+            }
+        }
+        let mut teams = self
+            .team_metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match team {
+            Some(team) if !team.is_empty() => {
+                teams.insert(instance_id.to_owned(), team);
+            }
+            _ => {
+                teams.remove(instance_id);
+            }
+        }
+        Some(Ok(()))
+    }
+
+    fn forget_team(&self, instance_id: &str) {
+        self.team_metadata
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(instance_id);
@@ -498,6 +615,7 @@ impl Registry {
         if let Some(handle) = &removed {
             self.forget_hosted_input(handle);
             self.forget_remote_input_policy(&handle.identity().instance);
+            self.forget_team(&handle.identity().instance);
         }
         removed
     }
@@ -688,10 +806,15 @@ impl Registry {
     /// A snapshot of every session, sorted by name so callers can diff two
     /// listings without sorting first.
     pub fn list(&self) -> Vec<SessionSummary> {
-        let (mut out, _policy): (Vec<_>, HashMap<_, _>) = {
+        let (mut out, _policy, teams): (Vec<_>, HashMap<_, _>, HashMap<_, _>) = {
             let sessions = self.lock();
             let policy = self
                 .remote_input_policy
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let teams = self
+                .team_metadata
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
@@ -716,18 +839,21 @@ impl Registry {
                         program_status_age_ms: program
                             .map(|o| o.age.as_millis().try_into().unwrap_or(u64::MAX)),
                         remote_input_disabled: false,
+                        team: teams.get(s.instance_id()).cloned(),
                     }
                 })
                 .collect();
-            (out, policy)
+            (out, policy, teams)
         };
         let hosted: Vec<_> = self.hosted_lock().values().map(Arc::clone).collect();
         for handle in hosted {
             let mut summary = hosted_summary(&handle);
             summary.remote_input_disabled = false;
+            summary.team = teams.get(&handle.identity().instance).cloned();
             out.push(summary);
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
+        drop_stale_leaders(&mut out);
         out
     }
 
@@ -738,6 +864,7 @@ impl Registry {
         let removed = self.lock().remove(name);
         if let Some(session) = &removed {
             self.forget_remote_input_policy(session.instance_id());
+            self.forget_team(session.instance_id());
         }
         removed
     }
@@ -775,6 +902,7 @@ impl Registry {
         for (name, _, _, _, _) in &dead {
             if let Some(session) = sessions.remove(name) {
                 self.forget_remote_input_policy(session.instance_id());
+                self.forget_team(session.instance_id());
             }
         }
         drop(sessions);
@@ -818,6 +946,7 @@ impl Registry {
                 }
                 hosted.remove(&identity.name);
                 self.forget_remote_input_policy(&identity.instance);
+                self.forget_team(&identity.instance);
                 let closed = self.closing_hosted_lock().remove(&identity.instance);
                 let reason = if closing || closed {
                     "closed"
@@ -908,6 +1037,24 @@ fn hosted_instance_ready(
     }
 }
 
+/// A leader that is no longer listed (or was replaced) is stale metadata:
+/// keep the rest of the team and drop the relation.
+fn drop_stale_leaders(out: &mut [SessionSummary]) {
+    let listed: std::collections::HashSet<(String, String)> = out
+        .iter()
+        .filter_map(|summary| Some((summary.name.clone(), summary.instance_id.clone()?)))
+        .collect();
+    for summary in out {
+        if let Some(team) = &mut summary.team {
+            if let Some(leader) = &team.leader {
+                if !listed.contains(&(leader.name.clone(), leader.instance_id.clone())) {
+                    team.leader = None;
+                }
+            }
+        }
+    }
+}
+
 /// One host Inspect cut. An unreachable host stays listed as not exited and
 /// marked `unavailable`: the inventory says it is registered; its operations
 /// answer Unavailable.
@@ -929,6 +1076,7 @@ fn hosted_summary(handle: &SessionHandle) -> SessionSummary {
         program_status: None,
         program_status_age_ms: None,
         remote_input_disabled: false,
+        team: None,
     };
     let Ok(observation) = handle.inspect() else {
         summary.unavailable = true;
@@ -1200,6 +1348,7 @@ impl Registry {
         let removed = sessions.remove(name);
         if let Some(session) = &removed {
             self.forget_remote_input_policy(session.instance_id());
+            self.forget_team(session.instance_id());
         }
         Some(Ok(removed.is_some()))
     }
@@ -1236,6 +1385,7 @@ impl Registry {
             drop(hosted);
             self.forget_hosted_input(&handle);
             self.forget_remote_input_policy(&handle.identity().instance);
+            self.forget_team(&handle.identity().instance);
         }
         // Lock order: `hosted`, then `closing_hosted`, as in the reaper.
         self.closing_hosted_lock()
@@ -1472,5 +1622,158 @@ mod launch_policy_tests {
         registrar.join().unwrap();
         let session = registry.get("launch-policy").expect("registered");
         assert!(!registry.remote_input_disabled(session.instance_id()));
+    }
+}
+
+#[cfg(test)]
+mod team_tests {
+    use super::*;
+    use crate::agent::{AgentProcess, Cursor, Size};
+    use crate::clock::ManualClock;
+    use crate::session::Session;
+    use std::sync::Arc;
+
+    struct Quiet;
+
+    impl AgentProcess for Quiet {
+        fn write(&mut self, _: &[u8]) -> crate::agent::Result<()> {
+            Ok(())
+        }
+        fn screen_text(&mut self) -> crate::agent::Result<String> {
+            Ok(String::new())
+        }
+        fn cursor(&mut self) -> crate::agent::Result<Cursor> {
+            Ok(Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            })
+        }
+        fn is_alive(&mut self) -> bool {
+            true
+        }
+        fn terminate(&mut self) -> crate::agent::Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> Size {
+            Size::new(80, 24)
+        }
+    }
+
+    fn registry_with(name: &str) -> (Registry, String) {
+        let registry = Registry::new();
+        let session = Session::new(name, Box::new(Quiet), Arc::new(ManualClock::new()));
+        let session = registry.register(session).expect("register");
+        let instance = session.instance_id().to_string();
+        (registry, instance)
+    }
+
+    #[test]
+    fn team_is_optional_identity_bound_and_version_safe() {
+        let (registry, instance) = registry_with("alpha");
+        let team = SessionTeam {
+            agent_kind: Some("codex".into()),
+            model: Some("gpt-6.1".into()),
+            leader: Some(TeamLeader {
+                name: "lead".into(),
+                instance_id: "lead-instance".into(),
+            }),
+            depth: 1,
+        };
+        assert_eq!(
+            registry.set_session_team("alpha", &instance, Some(team.clone())),
+            Some(Ok(()))
+        );
+        let listed = registry.list();
+        let alpha = listed.iter().find(|row| row.name == "alpha").unwrap();
+        // The leader is not listed, so the stale relation is dropped while the
+        // rest of the team survives.
+        let mut expected = team;
+        expected.leader = None;
+        assert_eq!(alpha.team, Some(expected));
+        assert!(alpha
+            .team
+            .as_ref()
+            .and_then(|team| team.leader.as_ref())
+            .is_none());
+
+        // Stale instance is refused and never overwrites current metadata.
+        assert_eq!(
+            registry.set_session_team("alpha", "stale-instance", Some(SessionTeam::default())),
+            Some(Err("stale session instance"))
+        );
+        assert!(registry.list()[0].team.is_some());
+
+        // Invalid bounds are rejected as a whole.
+        assert!(registry
+            .set_session_team(
+                "alpha",
+                &instance,
+                Some(SessionTeam {
+                    agent_kind: Some("x".repeat(33)),
+                    ..SessionTeam::default()
+                })
+            )
+            .unwrap()
+            .is_err());
+        assert!(registry
+            .set_session_team(
+                "alpha",
+                &instance,
+                Some(SessionTeam {
+                    depth: 21,
+                    ..SessionTeam::default()
+                })
+            )
+            .unwrap()
+            .is_err());
+
+        // Clearing removes the optional field entirely.
+        assert_eq!(
+            registry.set_session_team("alpha", &instance, None),
+            Some(Ok(()))
+        );
+        let listed = registry.list();
+        let alpha = listed.iter().find(|row| row.name == "alpha").unwrap();
+        assert!(alpha.team.is_none());
+    }
+
+    #[test]
+    fn a_valid_leader_relation_survives_when_both_instances_are_listed() {
+        let (registry, leader_instance) = registry_with("lead");
+        let session = Session::new("member", Box::new(Quiet), Arc::new(ManualClock::new()));
+        let member = registry.register(session).expect("register member");
+        let member_instance = member.instance_id().to_string();
+        assert_eq!(
+            registry.set_session_team(
+                "member",
+                &member_instance,
+                Some(SessionTeam {
+                    agent_kind: Some("codex".into()),
+                    leader: Some(TeamLeader {
+                        name: "lead".into(),
+                        instance_id: leader_instance,
+                    }),
+                    depth: 1,
+                    ..SessionTeam::default()
+                })
+            ),
+            Some(Ok(()))
+        );
+        let listed = registry.list();
+        let member = listed.iter().find(|row| row.name == "member").unwrap();
+        assert_eq!(
+            member.team.as_ref().and_then(|team| team.leader.as_ref()),
+            Some(&TeamLeader {
+                name: "lead".into(),
+                instance_id: listed
+                    .iter()
+                    .find(|row| row.name == "lead")
+                    .unwrap()
+                    .instance_id
+                    .clone()
+                    .unwrap(),
+            })
+        );
     }
 }
