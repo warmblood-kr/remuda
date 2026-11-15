@@ -2852,6 +2852,7 @@ fn refresh<P: SessionPort + ?Sized>(
     Ok((cols, rows))
 }
 
+/// Reconcile a peer's ordered snapshot without changing local selection rules.
 fn sync_remote_selection<P: SessionPort + ?Sized>(
     path: &P,
     ui: &mut Ui,
@@ -2859,59 +2860,35 @@ fn sync_remote_selection<P: SessionPort + ?Sized>(
     name: Option<&str>,
     instance: Option<&str>,
 ) {
-    reselect_remote_session(path, ui, name, instance);
-    release_changed_remote_selection(path, ui, held, name, instance);
-}
-
-/// Keep the same selected instance when the peer returns a different order.
-fn reselect_remote_session<P: SessionPort + ?Sized>(
-    path: &P,
-    ui: &mut Ui,
-    name: Option<&str>,
-    instance: Option<&str>,
-) {
     if path.remote_node().is_none() {
         return;
     }
-    if let Some(name) = name {
-        if let Some(index) = ui
-            .sessions
+    use remuda_core::session_identity::{reconcile_selection, SelectionIdentity};
+    let result = reconcile_selection(
+        ui.sessions
             .iter()
-            .position(|s| s.name == name && s.instance_id.as_deref() == instance)
-        {
-            ui.selected = index;
+            .map(|s| (s.name.as_str(), s.instance_id.as_deref())),
+        name,
+        instance,
+    );
+    if let Some(index) = result.index {
+        ui.selected = index;
+    }
+    match result.identity {
+        Some(SelectionIdentity::Ambiguous) => {
+            *held = None;
+            ui.focus = Focus::List;
+            ui.notice = Some("duplicate session names; action refused".into());
         }
-    }
-}
-
-/// A reused or vanished peer session must never retain an old focused hold.
-fn release_changed_remote_selection<P: SessionPort + ?Sized>(
-    path: &P,
-    ui: &mut Ui,
-    held: &mut Option<(String, P::Keys)>,
-    name: Option<&str>,
-    instance: Option<&str>,
-) {
-    if path.remote_node().is_none() {
-        return;
-    }
-    let (Some(name), Some(instance)) = (name, instance) else {
-        return;
-    };
-    let name_count = ui.sessions.iter().filter(|s| s.name == name).count();
-    let same = name_count == 1
-        && ui
-            .sessions
-            .iter()
-            .any(|s| s.name == name && s.instance_id.as_deref() == Some(instance));
-    if !same {
-        *held = None;
-        ui.focus = Focus::List;
-        ui.notice = Some(if name_count > 1 {
-            "duplicate session names; action refused".into()
-        } else {
-            format!("{name}: session instance changed or ended; select again")
-        });
+        Some(SelectionIdentity::ChangedOrMissing) => {
+            *held = None;
+            ui.focus = Focus::List;
+            ui.notice = Some(format!(
+                "{}: session instance changed or ended; select again",
+                name.expect("classification requires a name")
+            ));
+        }
+        Some(SelectionIdentity::Same) | None => {}
     }
 }
 
@@ -5004,10 +4981,99 @@ mod peer_view_fit_acceptance {
             let mut ui = Ui::new(sessions, "sh", None);
             ui.focus = Focus::Session;
             let mut held = Some(("한글".into(), Keys));
-            release_changed_remote_selection(&Peer, &mut ui, &mut held, Some("한글"), Some("old"));
+            sync_remote_selection(&Peer, &mut ui, &mut held, Some("한글"), Some("old"));
             assert!(held.is_none());
             assert!(ui.focus == Focus::List);
         }
+        let mut ui = Ui::new(vec![session("한글", "old")], "sh", None);
+        ui.focus = Focus::Session;
+        let mut held = Some(("한글".into(), Keys));
+        sync_remote_selection(&Peer, &mut ui, &mut held, Some("한글"), Some("old"));
+        assert!(held.is_some());
+        assert!(ui.focus == Focus::Session);
+
+        ui.sessions.push(session("한글", "new"));
+        sync_remote_selection(&Peer, &mut ui, &mut held, Some("한글"), Some("old"));
+        assert!(held.is_none());
+        assert!(ui.focus == Focus::List);
+        assert_eq!(
+            ui.notice.as_deref(),
+            Some("duplicate session names; action refused")
+        );
+    }
+
+    #[test]
+    fn remote_reconciliation_preserves_order_none_and_local_behavior() {
+        struct Keys;
+        impl super::port::KeyStream for Keys {
+            fn keys(&self, _: &[u8]) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        struct Port(bool);
+        impl super::port::SessionPort for Port {
+            type Keys = Keys;
+            fn request(&self, _: &Request) -> std::io::Result<Response> {
+                Ok(Response::Sessions(vec![]))
+            }
+            fn hold(&self, _: &str) -> std::io::Result<Keys> {
+                Ok(Keys)
+            }
+            fn probe(&self) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn probe_verdict(&self, _: &std::io::Error) -> (bool, bool) {
+                (false, false)
+            }
+            fn label(&self) -> String {
+                "node".into()
+            }
+            fn remote_node(&self) -> Option<String> {
+                self.0.then(|| "peer".into())
+            }
+        }
+        let mut ui = Ui::new(
+            vec![session("other", "x"), session("proof", "old")],
+            "sh",
+            None,
+        );
+        ui.focus = Focus::Session;
+        let mut held = Some(("proof".into(), Keys));
+        sync_remote_selection(&Port(true), &mut ui, &mut held, Some("proof"), Some("old"));
+        assert_eq!(ui.selected, 1);
+        assert!(held.is_some());
+        assert!(ui.focus == Focus::Session);
+        ui.sessions.push(session("proof", "old"));
+        ui.selected = 0;
+        sync_remote_selection(&Port(true), &mut ui, &mut held, Some("proof"), Some("old"));
+        assert_eq!(
+            ui.selected, 1,
+            "first exact row is selected before ambiguity is reported"
+        );
+        assert!(held.is_none());
+        assert_eq!(
+            ui.notice.as_deref(),
+            Some("duplicate session names; action refused")
+        );
+        let mut unknown = session("proof", "old");
+        unknown.instance_id = None;
+        ui.sessions = vec![session("other", "x"), unknown];
+        ui.selected = 0;
+        ui.focus = Focus::Session;
+        ui.notice = Some("previous notice".into());
+        held = Some(("proof".into(), Keys));
+        sync_remote_selection(&Port(true), &mut ui, &mut held, Some("proof"), None);
+        assert_eq!(ui.selected, 1);
+        assert!(held.is_some());
+        assert!(ui.focus == Focus::Session);
+        assert_eq!(ui.notice.as_deref(), Some("previous notice"));
+        ui.selected = 0;
+        sync_remote_selection(&Port(false), &mut ui, &mut held, Some("proof"), None);
+        assert_eq!(ui.selected, 0, "local selection is unchanged");
+        assert!(held.is_some());
+        sync_remote_selection(&Port(true), &mut ui, &mut held, None, Some("old"));
+        assert_eq!(ui.selected, 0, "missing name leaves selection unchanged");
+        assert!(held.is_some());
     }
 
     #[test]
