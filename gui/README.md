@@ -1,6 +1,26 @@
-# Local session list
+# Remuda GUI
 
-`cargo run --manifest-path gui/Cargo.toml` opens a read-only list from the existing default local daemon. No cluster initialization, attachment, or input is performed. Refresh updates the list; an offline result retains and marks old rows stale.
+From the repository root, run the standalone GPUI prototype:
+
+```sh
+cargo run --locked --manifest-path gui/Cargo.toml
+```
+
+The GUI reads sessions from the existing default local daemon. It also lists
+known cluster nodes; select an admitted peer to see its sessions, then select
+an available session with a known instance ID to see a read-only text snapshot.
+Local-only use does not require cluster initialization. Remote access uses the
+existing cluster membership and authenticated peer transport.
+
+Refresh updates the lists and clears the current preview. Offline or failed
+requests are shown as stale or unavailable; the preview is a snapshot, not a
+live terminal. Session creation, attachment, keyboard input, terminal styling,
+scrollback navigation and IME are not available in this prototype.
+
+The current prototype has been built and exercised on macOS. Other platforms
+have not been validated for this GUI; the standalone command is separate from
+the existing Remuda CLI and TUI.
+
 # Peer-list acceptance
 
 Run `sh gui/tests/peer_list_acceptance.sh` from the repository. It builds the
