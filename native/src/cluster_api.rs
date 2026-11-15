@@ -1071,6 +1071,30 @@ mod tests {
             assert!(error.message().contains(needle), "{needle}: {error:?}");
             assert_eq!(line_calls, 0, "no line request for {needle}");
         }
+
+        // #941 made the per-session flag advisory: a trusted peer is admitted,
+        // and the list reports the flag rather than enforcing it here.
+        let mut row = summary("agent", Some("instance"));
+        row.remote_input_disabled = true;
+        let mut line_calls = 0;
+        let sent = send_remote(
+            "SHA256:peer",
+            "127.0.0.1:9".parse().unwrap(),
+            b"key",
+            "agent",
+            "x",
+            &mut |_, _, request| match request {
+                Request::RemoteInputSupport => Ok(Response::Ok),
+                Request::List => Ok(list(vec![row.clone()])),
+                _ => {
+                    line_calls += 1;
+                    Ok(Response::Ack { duplicate: false })
+                }
+            },
+        )
+        .expect("a trusted peer is admitted despite the advisory flag");
+        assert!(matches!(sent, Send::Remote { duplicate: false }));
+        assert_eq!(line_calls, 1);
     }
 
     #[test]

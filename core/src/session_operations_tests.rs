@@ -25,6 +25,7 @@ struct Shared {
     unavailable: AtomicBool,
     unknown_input: AtomicBool,
     changed_instance: AtomicBool,
+    exited: AtomicBool,
     forgotten: AtomicBool,
     generation: AtomicU64,
     active: AtomicU64,
@@ -37,6 +38,7 @@ impl Shared {
             unavailable: AtomicBool::new(false),
             unknown_input: AtomicBool::new(false),
             changed_instance: AtomicBool::new(false),
+            exited: AtomicBool::new(false),
             forgotten: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             active: AtomicU64::new(0),
@@ -112,7 +114,11 @@ impl SessionOperations for Remote {
         }
         Ok(Observation {
             identity: id,
-            lifecycle: Lifecycle::Running,
+            lifecycle: if self.shared.exited.load(Ordering::SeqCst) {
+                Lifecycle::Exited(None)
+            } else {
+                Lifecycle::Running
+            },
             cut: ObservationCut::Host { revision: 42 },
             size: Size::new(90, 25),
             pid: Some(1234),
@@ -697,4 +703,41 @@ fn legacy_hosted_policy_updates_are_noops() {
         registry.set_remote_input_opt_out_result("fixture", &instance, true),
         Some(Ok(()))
     ));
+}
+
+#[test]
+fn team_metadata_refuses_a_registered_but_exited_hosted_instance() {
+    let registry = crate::Registry::new();
+    let shared = Shared::new();
+    let hosted = handle(&shared);
+    let instance = hosted.identity().instance.clone();
+    assert!(registry.register_hosted(hosted).is_ok());
+    let team = Some(crate::registry::SessionTeam {
+        agent_kind: Some("codex".into()),
+        model: Some("gpt-6.1".into()),
+        depth: 1,
+        ..crate::registry::SessionTeam::default()
+    });
+    assert_eq!(
+        registry.set_session_team("fixture", &instance, team.clone()),
+        Some(Ok(()))
+    );
+
+    // The handle stays registered after its child exits, but a write must not
+    // accept it: a late producer would otherwise publish metadata for a dead
+    // incarnation. Clearing is refused by the same boundary.
+    shared.exited.store(true, Ordering::SeqCst);
+    assert_eq!(
+        registry.set_session_team("fixture", &instance, team.clone()),
+        Some(Err("stale session instance"))
+    );
+    assert_eq!(
+        registry.set_session_team("fixture", &instance, None),
+        Some(Err("stale session instance"))
+    );
+    assert!(registry.hosted("fixture").is_some());
+    assert_eq!(
+        registry.set_session_team("fixture", "replacement", team),
+        Some(Err("stale session instance"))
+    );
 }
