@@ -17,6 +17,7 @@ pub enum RemoteCall {
     Input(Box<RemoteStarted>),
     Close(super::PendingClose),
     Resize(super::ResizeAttempt),
+    View(String),
 }
 
 pub struct RemoteReply {
@@ -41,7 +42,9 @@ fn call(
 ) -> io::Result<Response> {
     match call {
         RemoteCall::Close(_) => transport.send_close(node, request),
-        RemoteCall::Input(_) | RemoteCall::Resize(_) => transport.send_input(node, request),
+        RemoteCall::Input(_) | RemoteCall::Resize(_) | RemoteCall::View(_) => {
+            transport.send_input(node, request)
+        }
     }
 }
 
@@ -106,8 +109,8 @@ impl RemoteDispatcher {
         Arc::clone(&self.finished)
     }
 
-    fn worker(&mut self, node: &str) -> io::Result<mpsc::Sender<Job>> {
-        if let Some(worker) = self.workers.get(node) {
+    fn worker(&mut self, key: &str, node: &str) -> io::Result<mpsc::Sender<Job>> {
+        if let Some(worker) = self.workers.get(key) {
             return Ok(worker.clone());
         }
         let (jobs_tx, jobs_rx) = mpsc::channel::<Job>();
@@ -131,7 +134,7 @@ impl RemoteDispatcher {
                     finished.fetch_add(1, Ordering::SeqCst);
                 }
             })?;
-        self.workers.insert(node.to_owned(), jobs_tx.clone());
+        self.workers.insert(key.to_owned(), jobs_tx.clone());
         Ok(jobs_tx)
     }
 
@@ -145,20 +148,31 @@ impl RemoteDispatcher {
     }
 }
 
-impl RemotePort for RemoteDispatcher {
-    fn submit(&mut self, node: &str, remote_call: RemoteCall, request: Request) {
-        let worker = match self.worker(node) {
+impl RemoteDispatcher {
+    /// A view probe gets its own worker so it cannot queue ahead of input.
+    pub fn submit_view(&mut self, node: &str, remote_call: RemoteCall, request: Request) {
+        self.submit_on(&format!("view:{node}"), node, remote_call, request);
+    }
+
+    fn submit_on(&mut self, key: &str, node: &str, remote_call: RemoteCall, request: Request) {
+        let worker = match self.worker(key, node) {
             Ok(worker) => worker,
             Err(error) => return self.fail(remote_call, request, error),
         };
         if let Err(mpsc::SendError((remote_call, request))) = worker.send((remote_call, request)) {
-            self.workers.remove(node);
+            self.workers.remove(key);
             self.fail(
                 remote_call,
                 request,
                 io::Error::other("remote call worker stopped"),
             );
         }
+    }
+}
+
+impl RemotePort for RemoteDispatcher {
+    fn submit(&mut self, node: &str, remote_call: RemoteCall, request: Request) {
+        self.submit_on(node, node, remote_call, request);
     }
 
     fn take_replies(&mut self) -> Vec<RemoteReply> {
