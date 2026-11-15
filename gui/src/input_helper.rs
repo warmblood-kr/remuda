@@ -10,6 +10,7 @@ use std::{
 };
 
 const DEADLINE: Duration = Duration::from_secs(8);
+const READY: &[u8] = b"remuda-input-v1\n";
 
 // One watchdog bounds startup and any partially read frame or active write.
 // An idle helper waits for a first byte and exits on parent pipe closure.
@@ -28,9 +29,16 @@ fn watchdog() -> mpsc::Sender<bool> {
     watch
 }
 fn serve<T: InputTransport>(mut input: StrictInput<T>, watch: mpsc::Sender<bool>) -> i32 {
-    let _ = watch.send(false);
     let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
+    if stdout
+        .write_all(READY)
+        .and_then(|()| stdout.flush())
+        .is_err()
+    {
+        return 1;
+    }
+    let _ = watch.send(false);
     loop {
         let mut header = [0; 4];
         if stdin.read_exact(&mut header[..1]).is_err() {
@@ -135,6 +143,7 @@ impl InputHelper {
         let worker_state = state.clone();
         let worker_events = events.clone();
         std::thread::spawn(move || {
+            let mut ready = false;
             for bytes in rx {
                 {
                     let s = worker_state.lock().unwrap();
@@ -142,7 +151,7 @@ impl InputHelper {
                         break;
                     }
                 }
-                let result = exchange(&mut stdin, &mut stdout, &bytes, &worker_state);
+                let result = exchange(&mut stdin, &mut stdout, &bytes, &worker_state, &mut ready);
                 let mut s = worker_state.lock().unwrap();
                 if s.busy && !s.completed {
                     s.completed = true;
@@ -235,6 +244,7 @@ fn exchange(
     output: &mut std::process::ChildStdout,
     bytes: &[u8],
     state: &Mutex<State>,
+    ready: &mut bool,
 ) -> bool {
     use std::os::fd::AsRawFd;
     let fds = [input.as_raw_fd(), output.as_raw_fd()];
@@ -246,10 +256,27 @@ fn exchange(
             }
         }
     }
+    let end = Instant::now() + DEADLINE;
+    let mut received = 0;
+    while !*ready {
+        if state.lock().unwrap().stopped || Instant::now() >= end {
+            return false;
+        }
+        let mut buf = [0; 1];
+        match output.read(&mut buf) {
+            Ok(1) if buf[0] == READY[received] => {
+                received += 1;
+                *ready = received == READY.len();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => return false,
+        }
+    }
     let mut frame = Vec::with_capacity(4 + bytes.len());
     frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     frame.extend_from_slice(bytes);
-    let end = Instant::now() + DEADLINE;
     let mut written = 0;
     while written < frame.len() {
         if Instant::now() >= end {
@@ -285,6 +312,7 @@ fn exchange(
     _: &mut std::process::ChildStdout,
     _: &[u8],
     _: &Mutex<State>,
+    _: &mut bool,
 ) -> bool {
     false
 }
@@ -299,7 +327,7 @@ mod tests {
             Path::new("/bin/sh"),
             &[
                 "-c",
-                "dd bs=1 count=5 of=/dev/null 2>/dev/null; printf '\\001'",
+                "printf 'remuda-input-v1\\n'; dd bs=1 count=5 of=/dev/null 2>/dev/null; printf '\\001'",
             ],
         )
         .unwrap();
@@ -360,7 +388,7 @@ mod tests {
     }
     #[test]
     fn serial_ack_and_invalid_batch() {
-        let helper = InputHelper::start(Path::new("/bin/sh"), &["-c", "dd bs=1 count=5 of=/dev/null 2>/dev/null; printf '\\001'; dd bs=1 count=5 of=/dev/null 2>/dev/null; printf '\\001'"]).unwrap();
+        let helper = InputHelper::start(Path::new("/bin/sh"), &["-c", "printf 'remuda-input-v1\\n'; dd bs=1 count=5 of=/dev/null 2>/dev/null; printf '\\001'; dd bs=1 count=5 of=/dev/null 2>/dev/null; printf '\\001'"]).unwrap();
         assert_eq!(helper.submit(&[]), Submit::Invalid);
         assert_eq!(helper.submit(&vec![0; MAX_BATCH + 1]), Submit::Invalid);
         for _ in 0..2 {
@@ -389,6 +417,71 @@ mod tests {
         assert!(helper
             .recv_event_timeout(Duration::from_millis(100))
             .is_err());
+    }
+    #[test]
+    fn legacy_worker_receives_no_input_before_ready() {
+        let sink = std::env::temp_dir().join(format!("remuda-legacy-sink-{}", std::process::id()));
+        let _ = std::fs::remove_file(&sink);
+        let helper = InputHelper::start(
+            Path::new("/bin/sh"),
+            &[
+                "-c",
+                "dd bs=1 count=1 of=\"$1\" 2>/dev/null; printf '\\001'",
+                "sh",
+                sink.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(helper.submit(b"private payload"), Submit::Queued);
+        assert_eq!(
+            helper
+                .recv_event_timeout(DEADLINE + Duration::from_secs(3))
+                .unwrap(),
+            Event::NotAcknowledged
+        );
+        assert_eq!(helper.submit(b"again"), Submit::Stopped);
+        drop(helper);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(std::fs::read(&sink).unwrap_or_default(), b"");
+        let _ = std::fs::remove_file(sink);
+    }
+    #[test]
+    #[ignore = "requires a separately built pre-fence GUI binary"]
+    fn actual_legacy_input_worker_receives_no_payload() {
+        let old = std::env::var("REMUDA_GUI_OLD_BINARY").expect("old binary path");
+        let root = std::env::temp_dir().join(format!("remuda-old-input-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("remuda")).unwrap();
+        let socket = root.join("remuda/default.sock");
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let runtime = format!("REMUDA_RUNTIME_DIR={}", root.display());
+        let helper = InputHelper::start(
+            Path::new("/usr/bin/env"),
+            &[
+                &runtime,
+                &old,
+                "--internal-input-worker",
+                "local",
+                "",
+                "session",
+                "instance",
+            ],
+        )
+        .unwrap();
+        assert_eq!(helper.submit(b"private payload"), Submit::Queued);
+        assert_eq!(
+            helper
+                .recv_event_timeout(DEADLINE + Duration::from_secs(3))
+                .unwrap(),
+            Event::NotAcknowledged
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(helper);
+        drop(listener);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn timed_out_transport_stops_without_retry() {

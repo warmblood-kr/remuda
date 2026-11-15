@@ -65,7 +65,7 @@ fn fetch(s: &Selection) -> Result<String, String> {
     result
 }
 
-pub fn worker(args: &[String]) -> i32 {
+pub fn worker(args: &[String], tagged: bool) -> i32 {
     if args.len() != 4 || args[2].is_empty() || args[3].is_empty() {
         return 1;
     }
@@ -81,7 +81,7 @@ pub fn worker(args: &[String]) -> i32 {
         instance: args[3].clone(),
     };
     match fetch(&s) {
-        Ok(text) => i32::from(serde_json::to_writer(std::io::stdout(), &text).is_err()),
+        Ok(text) => super::write_worker_reply(&text, tagged),
         Err(_) => 1,
     }
 }

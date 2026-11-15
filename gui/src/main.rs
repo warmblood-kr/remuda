@@ -10,6 +10,39 @@ mod input_helper;
 mod preview;
 mod provider;
 
+const WORKER_ABI: &str = "--remuda-gui-worker-abi-1";
+const STALE_HELPER: &str = "GUI helper version changed; restart the GUI";
+
+#[derive(Serialize, Deserialize)]
+struct WorkerReply<T> {
+    abi: String,
+    payload: T,
+}
+
+fn write_worker_reply<T: Serialize>(payload: &T, tagged: bool) -> i32 {
+    let result = if tagged {
+        serde_json::to_writer(
+            std::io::stdout(),
+            &WorkerReply {
+                abi: WORKER_ABI.to_owned(),
+                payload,
+            },
+        )
+    } else {
+        serde_json::to_writer(std::io::stdout(), payload)
+    };
+    i32::from(result.is_err())
+}
+
+fn read_worker_reply<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    let reply: WorkerReply<T> =
+        serde_json::from_slice(bytes).map_err(|_| STALE_HELPER.to_string())?;
+    if reply.abi != WORKER_ABI {
+        return Err(STALE_HELPER.to_string());
+    }
+    Ok(reply.payload)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Session {
     name: String,
@@ -34,7 +67,7 @@ fn worker_deadline() {
 
 // This worker makes only a List request. Its own deadline survives GUI exit,
 // including when native IPC setup stalls before the client's read timeout.
-fn worker() -> i32 {
+fn worker(tagged: bool) -> i32 {
     worker_deadline();
     let path = remuda_native::daemon::socket_path("default");
     let rows = match remuda_native::client::request(&path, &remuda_core::protocol::Request::List) {
@@ -50,7 +83,7 @@ fn worker() -> i32 {
             unavailable: s.unavailable,
         })
         .collect();
-    i32::from(serde_json::to_writer(std::io::stdout(), &sessions).is_err())
+    write_worker_reply(&sessions, tagged)
 }
 
 fn peer_is_unique(peers: &[Peer], fingerprint: &str) -> bool {
@@ -66,7 +99,7 @@ fn peer_is_unique(peers: &[Peer], fingerprint: &str) -> bool {
 }
 
 // A fingerprint is resolved again immediately before the authenticated request.
-fn peer_worker(fingerprint: &str) -> i32 {
+fn peer_worker(fingerprint: &str, tagged: bool) -> i32 {
     use remuda_core::protocol::{Request, Response};
     use remuda_native::{
         cluster,
@@ -110,7 +143,7 @@ fn peer_worker(fingerprint: &str) -> i32 {
             .collect())
     };
     match list() {
-        Ok(rows) => i32::from(serde_json::to_writer(std::io::stdout(), &rows).is_err()),
+        Ok(rows) => write_worker_reply(&rows, tagged),
         Err(()) => 1,
     }
 }
@@ -142,10 +175,10 @@ fn peers_from_snapshot(snapshot: Option<remuda_native::cluster::ClusterSnapshot>
         .collect()
 }
 
-fn nodes_worker() -> i32 {
+fn nodes_worker(tagged: bool) -> i32 {
     worker_deadline();
     match discover_peers() {
-        Ok(rows) => i32::from(serde_json::to_writer(std::io::stdout(), &rows).is_err()),
+        Ok(rows) => write_worker_reply(&rows, tagged),
         Err(_) => 1,
     }
 }
@@ -178,6 +211,7 @@ type PreviewResult = (u64, Selection, Result<String, String>);
 type RemoteResult = (u64, u64, String, Result<Vec<Session>, String>);
 
 struct LocalGui {
+    helper_changed: bool,
     selection: Option<Selection>,
     preview: Option<String>,
     preview_generation: u64,
@@ -218,6 +252,7 @@ impl LocalGui {
         let (nodes_sender, nodes_results) = mpsc::channel();
         let (remote_sender, remote_results) = mpsc::channel();
         Self {
+            helper_changed: false,
             selection: None,
             preview: None,
             preview_generation: 0,
@@ -330,13 +365,12 @@ impl LocalGui {
                             peer,
                             &selection.name,
                             &selection.instance,
+                            WORKER_ABI,
                         ],
                         provider::TIMEOUT,
                     )
                 })
-                .and_then(|bytes| {
-                    serde_json::from_slice::<String>(&bytes).map_err(|e| e.to_string())
-                })
+                .and_then(|bytes| read_worker_reply::<String>(&bytes))
                 .and_then(|s| {
                     if s.len() <= 65_536 {
                         Ok(s)
@@ -370,9 +404,13 @@ impl LocalGui {
             let result = std::env::current_exe()
                 .map_err(|e| e.to_string())
                 .and_then(|path| {
-                    provider::output(&path, &["--internal-nodes-worker"], provider::TIMEOUT)
+                    provider::output(
+                        &path,
+                        &["--internal-nodes-worker", WORKER_ABI],
+                        provider::TIMEOUT,
+                    )
                 })
-                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()));
+                .and_then(|bytes| read_worker_reply(&bytes));
             let _ = sender.send((generation, result));
         });
     }
@@ -436,9 +474,13 @@ impl LocalGui {
             let result = std::env::current_exe()
                 .map_err(|e| e.to_string())
                 .and_then(|path| {
-                    provider::output(&path, &["--internal-peer-worker", &fp], provider::TIMEOUT)
+                    provider::output(
+                        &path,
+                        &["--internal-peer-worker", &fp, WORKER_ABI],
+                        provider::TIMEOUT,
+                    )
                 })
-                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()));
+                .and_then(|bytes| read_worker_reply(&bytes));
             let _ = sender.send((generation, directory, fp, result));
         });
     }
@@ -471,9 +513,13 @@ impl LocalGui {
             let result = executable
                 .map_err(|e| e.to_string())
                 .and_then(|path| {
-                    provider::output(&path, &["--internal-list-worker"], provider::TIMEOUT)
+                    provider::output(
+                        &path,
+                        &["--internal-list-worker", WORKER_ABI],
+                        provider::TIMEOUT,
+                    )
                 })
-                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()));
+                .and_then(|bytes| read_worker_reply(&bytes));
             let _ = sender.send((generation, result));
         });
     }
@@ -484,7 +530,12 @@ impl LocalGui {
                 && self.selection.as_ref() == Some(&selection)
                 && self.selection_current(&selection)
             {
-                self.preview = Some(result.unwrap_or_else(|_| "Preview unavailable".into()));
+                self.preview = Some(result.unwrap_or_else(|error| {
+                    if error == STALE_HELPER {
+                        self.helper_changed = true;
+                    }
+                    "Preview unavailable; if the GUI was updated, restart it".into()
+                }));
             }
             self.launch_preview();
         }
@@ -497,7 +548,10 @@ impl LocalGui {
                         self.sessions = rows;
                         self.error = false;
                     }
-                    Err(_) => self.error = true,
+                    Err(error) => {
+                        self.helper_changed |= error == STALE_HELPER;
+                        self.error = true;
+                    }
                 }
             }
             self.launch();
@@ -511,7 +565,10 @@ impl LocalGui {
                         self.peers = peers;
                         self.nodes_error = false;
                     }
-                    Err(_) => self.nodes_error = true,
+                    Err(error) => {
+                        self.helper_changed |= error == STALE_HELPER;
+                        self.nodes_error = true;
+                    }
                 }
                 if self
                     .selected_peer
@@ -539,7 +596,10 @@ impl LocalGui {
                         self.remote_sessions = rows;
                         self.remote_error = false;
                     }
-                    Err(_) => self.remote_error = true,
+                    Err(error) => {
+                        self.helper_changed |= error == STALE_HELPER;
+                        self.remote_error = true;
+                    }
                 }
             }
             self.launch_peer();
@@ -576,6 +636,14 @@ impl Render for LocalGui {
                     .bg(rgb(0x191d24))
                     .p_4()
                     .child(div().text_lg().child("REMUDA"))
+                    .when(self.helper_changed, |d| {
+                        d.child(
+                            div()
+                                .id("helper-changed")
+                                .debug_selector(|| "helper-changed".into())
+                                .child(STALE_HELPER),
+                        )
+                    })
                     .child(div().pt_4().text_sm().child(if self.nodes_loading {
                         "NODES · LOADING"
                     } else if self.nodes_error {
@@ -710,18 +778,30 @@ fn main() {
         ));
     }
     if std::env::args().nth(1).as_deref() == Some("--internal-preview-worker") {
-        std::process::exit(preview::worker(
-            &std::env::args().skip(2).collect::<Vec<_>>(),
-        ));
+        let mut args = std::env::args().skip(2).collect::<Vec<_>>();
+        let tagged = args.len() == 5 && args.last().map(String::as_str) == Some(WORKER_ABI);
+        if tagged {
+            args.pop();
+        }
+        std::process::exit(preview::worker(&args, tagged));
     }
     if std::env::args().nth(1).as_deref() == Some("--internal-list-worker") {
-        std::process::exit(worker());
+        std::process::exit(worker(
+            std::env::args().nth(2).as_deref() == Some(WORKER_ABI),
+        ));
     }
     if std::env::args().nth(1).as_deref() == Some("--internal-nodes-worker") {
-        std::process::exit(nodes_worker());
+        std::process::exit(nodes_worker(
+            std::env::args().nth(2).as_deref() == Some(WORKER_ABI),
+        ));
     }
     if std::env::args().nth(1).as_deref() == Some("--internal-peer-worker") {
-        std::process::exit(std::env::args().nth(2).map_or(1, |fp| peer_worker(&fp)));
+        let tagged = std::env::args().nth(3).as_deref() == Some(WORKER_ABI);
+        std::process::exit(
+            std::env::args()
+                .nth(2)
+                .map_or(1, |fp| peer_worker(&fp, tagged)),
+        );
     }
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1000.), px(650.)), cx);
@@ -760,6 +840,39 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_reply_rejects_legacy_and_wrong_abi() {
+        assert_eq!(
+            read_worker_reply::<Vec<String>>(br#"["old"]"#).unwrap_err(),
+            STALE_HELPER
+        );
+        assert_eq!(
+            read_worker_reply::<Vec<String>>(br#"{"abi":"wrong","payload":[]}"#).unwrap_err(),
+            STALE_HELPER
+        );
+        let bytes = serde_json::to_vec(&WorkerReply {
+            abi: WORKER_ABI.to_owned(),
+            payload: vec!["ok"],
+        })
+        .unwrap();
+        assert_eq!(
+            read_worker_reply::<Vec<String>>(&bytes).unwrap(),
+            vec!["ok"]
+        );
+    }
+    #[gpui::test]
+    fn helper_abi_error_shows_restart_notice(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| LocalGui::new());
+        view.update(cx, |gui, cx| {
+            gui.sender
+                .send((gui.generation, Err(STALE_HELPER.into())))
+                .unwrap();
+            gui.drain();
+            cx.notify();
+        });
+        assert!(cx.read(|app| view.read(app).helper_changed));
+        assert!(cx.debug_bounds("helper-changed").is_some());
+    }
     #[gpui::test]
     #[ignore = "run the isolated real-daemon acceptance supervisor"]
     fn real_local_daemon_reaches_session_row(cx: &mut gpui::TestAppContext) {
@@ -770,6 +883,7 @@ mod tests {
             gui
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let expect_stale = std::env::var_os("REMUDA_GUI_EXPECT_STALE").is_some();
         loop {
             view.update(cx, |gui, cx| {
                 gui.drain();
@@ -777,10 +891,14 @@ mod tests {
             });
             cx.run_until_parked();
             let found = cx.read(|app| {
-                view.read(app)
-                    .sessions
-                    .iter()
-                    .any(|row| row.name == "local-gui-proof" && row.alive)
+                let gui = view.read(app);
+                if expect_stale {
+                    gui.helper_changed
+                } else {
+                    gui.sessions
+                        .iter()
+                        .any(|row| row.name == "local-gui-proof" && row.alive)
+                }
             });
             if found {
                 break;
@@ -790,6 +908,11 @@ mod tests {
                 "real session did not reach the GUI model"
             );
             std::thread::sleep(Duration::from_millis(20));
+        }
+        if expect_stale {
+            assert!(cx.debug_bounds("helper-changed").is_some());
+            assert!(cx.read(|app| view.read(app).sessions.is_empty()));
+            return;
         }
         assert!(cx.read(|app| view.read(app).selected_peer.is_none()));
         assert_eq!(
