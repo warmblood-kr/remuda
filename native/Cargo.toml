@@ -18,6 +18,12 @@ path = "tests/daemon_support/sighup_disposition_probe.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "gui_path_probe"
+path = "tests/daemon_support/gui_path_probe.rs"
+test = false
+bench = false
+
 # Everything that touches the operating system lives here: the real clock now,
 # the pty backend and terminal emulation next. This crate may depend on
 # `remuda-core`; the reverse is rejected by cargo, and that one-way arrow is the

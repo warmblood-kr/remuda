@@ -49,7 +49,186 @@ impl Drop for Scratch {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
-    use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+    use std::{
+        io::{BufRead, Write},
+        os::unix::{
+            fs::{symlink, PermissionsExt},
+            process::ExitStatusExt,
+        },
+    };
+
+    fn managed(scratch: &Scratch) -> PathBuf {
+        scratch
+            .0
+            .join(".remuda-gui/builds")
+            .join(format!("build-{}", remuda_native::dist::BUILD_VERSION))
+            .join("remuda-gui")
+    }
+
+    #[test]
+    fn managed_gui_stays_on_physical_build_path_during_cli_replacement() {
+        let scratch = Scratch::new("managed-running");
+        scratch.install_cli();
+        let selected = managed(&scratch);
+        std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
+        std::fs::copy(env!("CARGO_BIN_EXE_gui_path_probe"), &selected).unwrap();
+        let mut child = scratch
+            .command()
+            .arg("gui")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut before = String::new();
+        output.read_line(&mut before).unwrap();
+        assert_eq!(
+            PathBuf::from(before.trim()),
+            selected.canonicalize().unwrap()
+        );
+        let other = scratch.0.join(".remuda-gui/builds/build-other/remuda-gui");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::copy(env!("CARGO_BIN_EXE_gui_path_probe"), other).unwrap();
+        std::fs::rename(scratch.0.join("remuda"), scratch.0.join("remuda.prev")).unwrap();
+        scratch.install_cli();
+        child.stdin.take().unwrap().write_all(b"x").unwrap();
+        let mut after = String::new();
+        output.read_line(&mut after).unwrap();
+        assert_eq!(before, after);
+        assert!(child.wait().unwrap().success());
+        scratch.assert_untouched();
+    }
+
+    #[test]
+    #[ignore = "requires two separately built CLI binaries"]
+    fn actual_distinct_builds_preserve_running_gui_and_rollback() {
+        let a = PathBuf::from(std::env::var_os("REMUDA_GUI_CLI_A").expect("build A"));
+        let b = PathBuf::from(std::env::var_os("REMUDA_GUI_CLI_B").expect("build B"));
+        let version = |binary: &PathBuf| {
+            let out = Command::new(binary).arg("--version").output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .trim()
+                .strip_prefix("remuda ")
+                .unwrap()
+                .to_owned()
+        };
+        let (build_a, build_b) = (version(&a), version(&b));
+        assert_ne!(build_a, build_b);
+        let scratch = Scratch::new("real-rollback");
+        let path = |build: &str| {
+            scratch
+                .0
+                .join(".remuda-gui/builds")
+                .join(format!("build-{build}/remuda-gui"))
+        };
+        for build in [&build_a, &build_b] {
+            let file = path(build);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::copy(env!("CARGO_BIN_EXE_gui_path_probe"), file).unwrap();
+        }
+        let install = |source: &PathBuf| {
+            let incoming = scratch.0.join(".remuda.incoming");
+            std::fs::copy(source, &incoming).unwrap();
+            std::fs::rename(incoming, scratch.0.join("remuda")).unwrap();
+        };
+        let launch = || {
+            let mut child = scratch
+                .command()
+                .arg("gui")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            output.read_line(&mut line).unwrap();
+            (child, output, line)
+        };
+        install(&a);
+        let (mut running_a, mut out_a, first_a) = launch();
+        assert_eq!(
+            PathBuf::from(first_a.trim()),
+            path(&build_a).canonicalize().unwrap()
+        );
+        install(&b);
+        let (mut running_b, mut out_b, first_b) = launch();
+        assert_eq!(
+            PathBuf::from(first_b.trim()),
+            path(&build_b).canonicalize().unwrap()
+        );
+        install(&a);
+        let (mut rolled_back, mut out_rollback, first_rollback) = launch();
+        assert_eq!(first_a, first_rollback);
+        for (child, output, expected) in [
+            (&mut running_a, &mut out_a, first_a),
+            (&mut running_b, &mut out_b, first_b),
+            (&mut rolled_back, &mut out_rollback, first_rollback),
+        ] {
+            child.stdin.take().unwrap().write_all(b"x").unwrap();
+            let mut after = String::new();
+            output.read_line(&mut after).unwrap();
+            assert_eq!(after, expected);
+            assert!(child.wait().unwrap().success());
+        }
+        scratch.assert_untouched();
+    }
+
+    #[test]
+    fn managed_path_refuses_symlinks_and_corrupt_entries() {
+        for index in 0..4 {
+            let scratch = Scratch::new(&format!("managed-link-{index}"));
+            scratch.install_cli();
+            let path = managed(&scratch);
+            let chain = [
+                scratch.0.join(".remuda-gui"),
+                scratch.0.join(".remuda-gui/builds"),
+                path.parent().unwrap().to_path_buf(),
+                path.clone(),
+            ];
+            std::fs::create_dir_all(chain[index].parent().unwrap()).unwrap();
+            let outside = scratch.0.join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            symlink(&outside, &chain[index]).unwrap();
+            let output = scratch.command().arg("gui").output().unwrap();
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("invalid managed GUI entry"));
+            scratch.assert_untouched();
+        }
+        let scratch = Scratch::new("managed-corrupt");
+        scratch.install_cli();
+        std::fs::write(scratch.0.join(".remuda-gui"), "not a directory").unwrap();
+        let output = scratch.command().arg("gui").output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("invalid managed GUI entry"));
+    }
+
+    #[test]
+    fn manual_sibling_wins_even_if_managed_gui_exists_or_sibling_is_dangling() {
+        let scratch = Scratch::new("managed-manual");
+        scratch.install_cli();
+        let selected = managed(&scratch);
+        std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
+        std::fs::write(&selected, "#!/bin/sh\nexit 38\n").unwrap();
+        std::fs::set_permissions(&selected, std::fs::Permissions::from_mode(0o700)).unwrap();
+        sibling(&scratch, "#!/bin/sh\nexit 37\n");
+        assert_eq!(
+            scratch.command().arg("gui").status().unwrap().code(),
+            Some(37)
+        );
+        std::fs::remove_file(scratch.0.join("remuda-gui")).unwrap();
+        symlink(scratch.0.join("missing"), scratch.0.join("remuda-gui")).unwrap();
+        assert_ne!(
+            scratch.command().arg("gui").status().unwrap().code(),
+            Some(38)
+        );
+        assert!(std::fs::symlink_metadata(scratch.0.join("remuda-gui"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        scratch.assert_untouched();
+    }
     fn sibling(scratch: &Scratch, contents: &str) {
         let path = scratch.0.join("remuda-gui");
         std::fs::write(&path, contents).unwrap();
@@ -172,6 +351,19 @@ mod macos {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+        std::fs::remove_file(scratch.0.join("remuda-gui")).unwrap();
+        let selected = managed(&scratch);
+        std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
+        std::fs::write(&selected, "#!/bin/sh\nexit 38\n").unwrap();
+        std::fs::set_permissions(&selected, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = scratch
+            .command()
+            .args(["-s", "other", "gui"])
+            .env("REMUDA_NO_AUTOSTART", "1")
+            .output()
+            .unwrap();
+        assert_ne!(output.status.code(), Some(38));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("no daemon running"));
         assert!(!scratch.0.join("runtime").exists());
     }
     #[test]
