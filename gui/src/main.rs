@@ -5,6 +5,7 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 use std::{sync::mpsc, time::Duration};
 
+mod preview;
 mod provider;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,9 +165,24 @@ fn label(value: &str) -> String {
     text
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Selection {
+    peer: Option<String>,
+    name: String,
+    instance: String,
+}
+type PreviewResult = (u64, Selection, Result<String, String>);
+
 type RemoteResult = (u64, u64, String, Result<Vec<Session>, String>);
 
 struct LocalGui {
+    selection: Option<Selection>,
+    preview: Option<String>,
+    preview_generation: u64,
+    preview_busy: bool,
+    preview_pending: Option<(u64, Selection)>,
+    preview_sender: mpsc::Sender<PreviewResult>,
+    preview_results: mpsc::Receiver<PreviewResult>,
     sessions: Vec<Session>,
     error: bool,
     loading: bool,
@@ -195,10 +211,18 @@ struct LocalGui {
 }
 impl LocalGui {
     fn new() -> Self {
+        let (preview_sender, preview_results) = mpsc::channel();
         let (sender, results) = mpsc::channel();
         let (nodes_sender, nodes_results) = mpsc::channel();
         let (remote_sender, remote_results) = mpsc::channel();
         Self {
+            selection: None,
+            preview: None,
+            preview_generation: 0,
+            preview_busy: false,
+            preview_pending: None,
+            preview_sender,
+            preview_results,
             sessions: vec![],
             error: false,
             loading: false,
@@ -226,7 +250,103 @@ impl LocalGui {
             remote_results,
         }
     }
+    fn clear_preview(&mut self) {
+        self.preview_generation = self
+            .preview_generation
+            .checked_add(1)
+            .expect("generation exhausted");
+        self.selection = None;
+        self.preview = None;
+        self.preview_pending = None;
+    }
+    fn selection_current(&self, s: &Selection) -> bool {
+        if s.peer != self.selected_peer {
+            return false;
+        }
+        let rows = if let Some(fp) = &s.peer {
+            if !self.peer_current(fp) || self.remote_loading || self.remote_error {
+                return false;
+            }
+            &self.remote_sessions
+        } else {
+            if self.loading || self.error {
+                return false;
+            }
+            &self.sessions
+        };
+        let matching: Vec<_> = rows.iter().filter(|r| r.name == s.name).collect();
+        matching.len() == 1
+            && matching[0].alive
+            && !matching[0].unavailable
+            && !s.instance.is_empty()
+            && matching[0].instance_id.as_deref() == Some(s.instance.as_str())
+    }
+    fn select_session(&mut self, row: Session) {
+        self.clear_preview();
+        let Some(instance) = row.instance_id else {
+            return;
+        };
+        let s = Selection {
+            peer: self.selected_peer.clone(),
+            name: row.name,
+            instance,
+        };
+        if !self.selection_current(&s) {
+            return;
+        }
+        self.selection = Some(s.clone());
+        self.preview_pending = Some((self.preview_generation, s));
+        self.launch_preview();
+    }
+    fn launch_preview(&mut self) {
+        if self.preview_busy {
+            return;
+        }
+        let Some((generation, selection)) = self.preview_pending.take() else {
+            return;
+        };
+        if self.selection.as_ref() != Some(&selection) || !self.selection_current(&selection) {
+            return;
+        }
+        self.preview_busy = true;
+        let sender = self.preview_sender.clone();
+        std::thread::spawn(move || {
+            let peer = selection.peer.as_deref().unwrap_or("");
+            let kind = if selection.peer.is_some() {
+                "peer"
+            } else {
+                "local"
+            };
+            let result = std::env::current_exe()
+                .map_err(|e| e.to_string())
+                .and_then(|path| {
+                    provider::output(
+                        &path,
+                        &[
+                            "--internal-preview-worker",
+                            kind,
+                            peer,
+                            &selection.name,
+                            &selection.instance,
+                        ],
+                        provider::TIMEOUT,
+                    )
+                })
+                .and_then(|bytes| {
+                    serde_json::from_slice::<String>(&bytes).map_err(|e| e.to_string())
+                })
+                .and_then(|s| {
+                    if s.len() <= 65_536 {
+                        Ok(s)
+                    } else {
+                        Err("too large".into())
+                    }
+                });
+            let _ = sender.send((generation, selection, result));
+        });
+    }
     fn refresh_nodes(&mut self) {
+        self.clear_preview();
         self.invalidate_remote();
         self.nodes_generation = self
             .nodes_generation
@@ -267,6 +387,7 @@ impl LocalGui {
         }
     }
     fn invalidate_remote(&mut self) {
+        self.clear_preview();
         self.remote_generation = self
             .remote_generation
             .checked_add(1)
@@ -278,6 +399,7 @@ impl LocalGui {
         }
     }
     fn refresh_peer(&mut self) {
+        self.clear_preview();
         let Some(fp) = self
             .selected_peer
             .clone()
@@ -319,6 +441,7 @@ impl LocalGui {
         });
     }
     fn refresh(&mut self) {
+        self.clear_preview();
         self.generation = self
             .generation
             .checked_add(1)
@@ -353,6 +476,16 @@ impl LocalGui {
         });
     }
     fn drain(&mut self) {
+        while let Ok((generation, selection, result)) = self.preview_results.try_recv() {
+            self.preview_busy = false;
+            if generation == self.preview_generation
+                && self.selection.as_ref() == Some(&selection)
+                && self.selection_current(&selection)
+            {
+                self.preview = Some(result.unwrap_or_else(|_| "Preview unavailable".into()));
+            }
+            self.launch_preview();
+        }
         while let Ok((generation, result)) = self.results.try_recv() {
             self.busy = false;
             if generation == self.generation {
@@ -505,8 +638,13 @@ impl Render for LocalGui {
                             } else {
                                 "exited"
                             };
+                            let selected = session.clone();
                             div()
                                 .id(SharedString::from(format!("session-{index}")))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_session(selected.clone());
+                                    cx.notify();
+                                }))
                                 .debug_selector(move || format!("session-{index}"))
                                 .py_2()
                                 .child(div().child(label(&session.name)))
@@ -539,6 +677,16 @@ impl Render for LocalGui {
                     })
                     .child(
                         div()
+                            .id("preview")
+                            .debug_selector(|| "preview".into())
+                            .pt_4()
+                            .overflow_hidden()
+                            .child(self.preview.clone().unwrap_or_else(|| {
+                                "Select a session for a read-only snapshot.".into()
+                            })),
+                    )
+                    .child(
+                        div()
                             .id("refresh")
                             .debug_selector(|| "refresh".into())
                             .pt_4()
@@ -554,6 +702,11 @@ impl Render for LocalGui {
     }
 }
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--internal-preview-worker") {
+        std::process::exit(preview::worker(
+            &std::env::args().skip(2).collect::<Vec<_>>(),
+        ));
+    }
     if std::env::args().nth(1).as_deref() == Some("--internal-list-worker") {
         std::process::exit(worker());
     }
@@ -867,6 +1020,88 @@ mod tests {
         gui.drain();
         assert!(!gui.error);
         assert!(gui.sessions.is_empty());
+    }
+    #[test]
+    fn preview_requires_current_unique_instance_and_fences_late_replies() {
+        let mut gui = LocalGui::new();
+        gui.preview_busy = true;
+        gui.sessions = vec![row("one"), row("two")];
+        gui.select_session(row("one"));
+        let (old, selected) = gui.preview_pending.take().unwrap();
+        gui.select_session(row("two"));
+        gui.preview_pending = None;
+        gui.preview_sender
+            .send((old, selected, Ok("stale".into())))
+            .unwrap();
+        gui.drain();
+        assert!(gui.preview.is_none());
+        gui.preview_busy = true;
+        gui.select_session(row("one"));
+        let (generation, selection) = gui.preview_pending.take().unwrap();
+        gui.sessions[0].instance_id = Some("replacement".into());
+        gui.preview_sender
+            .send((generation, selection, Ok("stale".into())))
+            .unwrap();
+        gui.drain();
+        assert!(gui.preview.is_none());
+        gui.sessions = vec![row("one"), row("one")];
+        gui.select_session(row("one"));
+        assert!(gui.selection.is_none());
+        gui.sessions = vec![row("one")];
+        gui.error = true;
+        gui.select_session(row("one"));
+        assert!(gui.selection.is_none());
+    }
+    #[gpui::test]
+    fn clicking_session_displays_current_snapshot(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new();
+            gui.preview_busy = true;
+            gui.sessions = vec![row("local")];
+            gui
+        });
+        let session = cx.debug_bounds("session-0").unwrap();
+        cx.simulate_click(session.center(), gpui::Modifiers::none());
+        view.update(cx, |gui, cx| {
+            let (generation, selection) = gui.preview_pending.take().unwrap();
+            gui.preview_sender
+                .send((generation, selection, Ok("screen text".into())))
+                .unwrap();
+            gui.drain();
+            cx.notify();
+        });
+        assert!(cx.debug_bounds("preview").is_some());
+        assert_eq!(
+            cx.read(|app| view.read(app).preview.clone()).as_deref(),
+            Some("screen text")
+        );
+    }
+    #[test]
+    fn preview_peer_revocation_and_refresh_discard_queued_work() {
+        let mut gui = LocalGui::new();
+        gui.preview_busy = true;
+        gui.peers = vec![peer("full", "peer")];
+        gui.selected_peer = Some("full".into());
+        gui.remote_sessions = vec![row("one")];
+        gui.select_session(row("one"));
+        gui.peers[0].admitted = false;
+        gui.preview_sender
+            .send((
+                0,
+                Selection {
+                    peer: None,
+                    name: "old".into(),
+                    instance: "old".into(),
+                },
+                Ok("old".into()),
+            ))
+            .unwrap();
+        gui.drain();
+        assert!(!gui.preview_busy && gui.preview_pending.is_none());
+        assert!(gui.preview.is_none());
+        gui.nodes_busy = true;
+        gui.refresh_nodes();
+        assert!(gui.selection.is_none());
     }
     #[test]
     fn labels_escape_controls_and_literal_escapes() {
