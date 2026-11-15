@@ -56,3 +56,32 @@ assert physical window pixels, fonts or OS input. The normal GUI test suite
 includes cancellation and failure-path checks. Commands run in separate
 sessions and cleanup signals only their owned process groups; a descendant that
 creates a new session is outside that scope.
+
+# Worker compatibility
+
+Read-only GUI workers accept legacy requests as well as ABI-tagged requests.
+New GUI windows require a matching response envelope and show a restart notice
+on an incompatible response. The input bridge requires its ready greeting
+before sending bytes; input is not connected to the GUI yet. These markers
+identify a protocol revision, not an exact executable build. Changes to either
+protocol must update the marker and exercise both directions of compatibility.
+An already-running pre-fence GUI cannot be retroactively protected; do not use
+this mechanism as evidence that replacing its executable preserves its window.
+
+To check actual pre-fence and current node-worker formats, build the GUI from
+commit `76cd7fa`, then run from this checkout:
+
+```sh
+REMUDA_GUI_OLD_BINARY=/absolute/path/to/old/remuda-gui cargo test --locked --manifest-path gui/Cargo.toml --test worker_abi_transition -- --ignored
+REMUDA_GUI_OLD_BINARY=/absolute/path/to/old/remuda-gui cargo test --locked --manifest-path gui/Cargo.toml --bin remuda-gui input_helper::tests::actual_legacy_input_worker_receives_no_payload -- --ignored --exact
+```
+
+These exercise real subprocesses against isolated empty cluster state and a
+private fake daemon socket; they do not test an upgrade installer or input
+delivery to a live session.
+For the real-daemon local view supervisor above, setting
+`REMUDA_GUI_EXPECT_STALE=1` and pointing `REMUDA_GUI_ACCEPTANCE_WORKER` to the
+pre-fence binary checks that a new TestWindow rejects its legacy list response
+and lays out the restart notice. Run the supervisor from the old checkout with
+the new worker to check the opposite direction. Neither test replaces a running
+executable or exercises a physical window.
