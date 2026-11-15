@@ -336,7 +336,14 @@ impl LocalGui {
         let generation = self.generation;
         let sender = self.sender.clone();
         std::thread::spawn(move || {
-            let result = std::env::current_exe()
+            #[cfg(test)]
+            let executable = std::env::var_os("REMUDA_GUI_ACCEPTANCE_WORKER")
+                .map(std::path::PathBuf::from)
+                .map(Ok)
+                .unwrap_or_else(std::env::current_exe);
+            #[cfg(not(test))]
+            let executable = std::env::current_exe();
+            let result = executable
                 .map_err(|e| e.to_string())
                 .and_then(|path| {
                     provider::output(&path, &["--internal-list-worker"], provider::TIMEOUT)
@@ -593,6 +600,52 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    #[ignore = "run the isolated real-daemon acceptance supervisor"]
+    fn real_local_daemon_reaches_session_row(cx: &mut gpui::TestAppContext) {
+        assert!(std::env::var_os("REMUDA_GUI_ACCEPTANCE_WORKER").is_some());
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new();
+            gui.refresh();
+            gui
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            view.update(cx, |gui, cx| {
+                gui.drain();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let found = cx.read(|app| {
+                view.read(app)
+                    .sessions
+                    .iter()
+                    .any(|row| row.name == "local-gui-proof" && row.alive)
+            });
+            if found {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real session did not reach the GUI model"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(cx.read(|app| view.read(app).selected_peer.is_none()));
+        assert_eq!(
+            cx.read(|app| view.read(app).sessions.len()),
+            1,
+            "fixture must have exactly one local session"
+        );
+        assert_eq!(
+            cx.read(|app| view.read(app).sessions[0].name.clone()),
+            "local-gui-proof"
+        );
+        assert!(
+            cx.debug_bounds("session-0").is_some(),
+            "exact local session row was not laid out"
+        );
+    }
     fn peer(fp: &str, name: &str) -> Peer {
         Peer {
             fingerprint: fp.into(),
