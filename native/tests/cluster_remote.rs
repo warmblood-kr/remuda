@@ -462,8 +462,10 @@ impl RemoteTui {
 impl Drop for RemoteTui {
     fn drop(&mut self) {
         assert_eq!(self.child.process_id(), Some(self.pid));
-        unsafe {
-            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+        if self.child.try_wait().ok().flatten().is_none() {
+            unsafe {
+                libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+            }
         }
         let _ = self.child.wait();
         if let Some(reader) = self.reader.take() {
@@ -1058,7 +1060,11 @@ fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_res
     const AFTER_RECONNECT: &str = "REMOTE_AFTER_RECONNECT";
 
     let client_node = Node::start("remote-client");
-    let mut server_node = Node::start("remote-server");
+    // This legacy test requires sessions to exit with the daemon.
+    let mut server_node = Node::start_with_env(
+        "remote-server",
+        vec![("REMUDA_EXPERIMENTAL_SESSION_HOST".into(), "0".into())],
+    );
     admit_pair(&client_node, &server_node);
     let listener = Listener::start(&server_node);
     let marker_before_down = server_node.root.join("emit-before-down");
@@ -1176,6 +1182,174 @@ fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_res
                     && !session_text(&session).contains("REMOTE_AFTER_RECONNECT")
             })
         },
+    );
+}
+
+// Hosted sessions survive daemon loss; reconnect must preserve the instance,
+// while an explicit close followed by name reuse must reject the stale target.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_lines)]
+fn hosted_remote_reconnect_preserves_instance_and_rejects_stale_close() {
+    let client_node = Node::start("host-reconnect-client");
+    let mut server_node = Node::start_with_env(
+        "host-reconnect-server",
+        vec![("REMUDA_EXPERIMENTAL_SESSION_HOST".into(), "1".into())],
+    );
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    let marker = server_node.root.join("after-reconnect");
+    server_node.start_session(&format!(
+        "printf HOST_BEFORE; while [ ! -e '{}' ]; do sleep 0.05; done; printf HOST_AFTER; sleep 60",
+        marker.display(),
+    ));
+    server_node.start_named_session("unselected", "printf OTHER_SCREEN; sleep 60");
+    let socket = remuda_native::daemon::socket_path_in(&server_node.runtime, &server_node.name);
+    wait_for("host registration", Duration::from_secs(10), || {
+        matches!(remuda_native::client::request(&socket, &Request::SessionHostBuilds),
+            Ok(Response::SessionHostBuilds(builds)) if builds.iter().any(|b| b.name == "proof"))
+    });
+    let address = listener.address;
+    let server_key = server_node.public.clone();
+    let transport = Arc::new(ClusterRemoteTransport::with_client(
+        Zeroizing::new(client_node.private.clone()),
+        ClusterClient::system(),
+        move |_| {
+            Ok(ResolvedTarget {
+                address,
+                pinned_static_key: server_key.clone(),
+            })
+        },
+    ));
+    let fingerprint = server_node.fingerprint();
+    let target = RemoteTarget {
+        name: remuda_native::cluster::node_label(&fingerprint),
+        registry_key: fingerprint.clone(),
+        addr_override: Some(address),
+    };
+    let poller = RemotePoller::new(vec![target], transport);
+    let source = poller.source();
+    poller.selection().select(fingerprint.clone(), "proof");
+    poller.start().unwrap();
+    wait_for("hosted initial screen", Duration::from_secs(15), || {
+        proof_session(source.as_ref()).is_some_and(|s| session_text(&s).contains("HOST_BEFORE"))
+    });
+    let original = proof_session(source.as_ref()).unwrap().instance_id;
+    assert!(!original.is_empty());
+    assert!(source.snapshot().nodes[0]
+        .sessions
+        .iter()
+        .any(|s| s.name == "unselected" && s.screen.is_none()));
+
+    // A real remote TUI viewer may exit without ending the hosted session.
+    let registry_path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry =
+        serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|n| n.node_fp == fingerprint)
+        .unwrap()
+        .endpoint = Some(address.to_string());
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+    {
+        let mut tui = RemoteTui::start(&client_node, Some(&format!("{fingerprint}/proof")));
+        tui.wait_for("HOST_BEFORE", Duration::from_secs(15));
+        tui.wait_for("Remuda >", Duration::from_secs(5));
+        tui.writer.write_all(b"\x1c").unwrap();
+        wait_for("remote tree focused", Duration::from_secs(5), || {
+            !tui.screen_text().contains("Remuda >")
+        });
+        tui.writer.write_all(b"q").unwrap();
+        wait_for("remote viewer detached", Duration::from_secs(5), || {
+            tui.child.try_wait().unwrap().is_some()
+        });
+    }
+    let Response::Sessions(rows) = remuda_native::client::request(&socket, &Request::List).unwrap()
+    else {
+        panic!("local list failed")
+    };
+    assert!(rows
+        .iter()
+        .any(|s| s.name == "proof" && s.alive && s.instance_id.as_deref() == Some(&original)));
+
+    server_node.stop_daemon();
+    wait_for("host node unreachable", Duration::from_secs(10), || {
+        source
+            .snapshot()
+            .nodes
+            .first()
+            .is_some_and(|n| n.state == RemoteState::Unreachable)
+    });
+    assert!(proof_session(source.as_ref())
+        .is_some_and(|s| s.instance_id == original && session_text(&s).contains("HOST_BEFORE")));
+    server_node.restart_daemon();
+    listener.restart(&server_node);
+    fs::write(marker, b"go").unwrap();
+    wait_for(
+        "same hosted instance resumed output",
+        Duration::from_secs(20),
+        || {
+            source
+                .snapshot()
+                .nodes
+                .first()
+                .is_some_and(|n| n.state == RemoteState::Reachable)
+                && proof_session(source.as_ref()).is_some_and(|s| {
+                    s.instance_id == original && session_text(&s).contains("HOST_AFTER")
+                })
+        },
+    );
+    assert!(source.snapshot().nodes[0]
+        .sessions
+        .iter()
+        .any(|s| s.name == "unselected" && s.screen.is_none()));
+
+    let close = Request::Close {
+        name: "proof".into(),
+        instance_id: Some(original.clone()),
+        confirm: Some(true),
+    };
+    assert_eq!(
+        remuda_native::client::request(&socket, &close).unwrap(),
+        Response::Ok
+    );
+    wait_for(
+        "closed instance disappears",
+        Duration::from_secs(15),
+        || proof_session(source.as_ref()).is_none(),
+    );
+    server_node.start_session("printf HOST_NEW; sleep 60");
+    wait_for("new instance screen", Duration::from_secs(20), || {
+        proof_session(source.as_ref()).is_some_and(|s| {
+            s.instance_id != original
+                && session_text(&s).contains("HOST_NEW")
+                && !session_text(&s).contains("HOST_BEFORE")
+        })
+    });
+    let replacement = proof_session(source.as_ref()).unwrap().instance_id;
+    let stale = ClusterClient::system()
+        .request(address, &server_node.public, &client_node.private, &close)
+        .unwrap();
+    assert!(
+        matches!(&stale, Response::Error(reason) if reason.contains("session restarted")),
+        "stale close must be refused due to replacement: {stale:?}"
+    );
+    let Response::Sessions(rows) = remuda_native::client::request(&socket, &Request::List).unwrap()
+    else {
+        panic!("local list failed")
+    };
+    assert!(
+        rows.iter().any(|s| s.name == "proof"
+            && s.alive
+            && s.instance_id.as_deref() == Some(&replacement)),
+        "stale close must not kill replacement"
     );
 }
 
