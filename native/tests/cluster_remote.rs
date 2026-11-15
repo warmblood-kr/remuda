@@ -2864,3 +2864,75 @@ fn hosted_remote_pane_multiline_paste_reaches_session() {
     tui.wait_for_from(at, "PASTE_RECEIVED:first-line", Duration::from_secs(10));
     tui.wait_for_from(at, "PASTE_RECEIVED:second-line", Duration::from_secs(10));
 }
+
+#[path = "daemon_support/preview_adapter.rs"]
+mod preview_adapter;
+
+// Test-only port uses the real authenticated ClusterClient directly, rather than
+// RemotePort's cached poller. No input or attachment is issued.
+struct PreviewPeer<'a> {
+    address: SocketAddr,
+    server_key: &'a [u8],
+    client_key: &'a [u8],
+}
+impl remuda_native::tui::SessionPort for PreviewPeer<'_> {
+    type Keys = remuda_native::client::Hold;
+    fn request(&self, request: &Request) -> std::io::Result<Response> {
+        ClusterClient::system()
+            .request(self.address, self.server_key, self.client_key, request)
+            .map_err(std::io::Error::other)
+    }
+    fn hold(&self, _: &str) -> std::io::Result<Self::Keys> {
+        Err(std::io::Error::other("disabled"))
+    }
+    fn probe(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn probe_verdict(&self, _: &std::io::Error) -> (bool, bool) {
+        (false, false)
+    }
+    fn label(&self) -> String {
+        "peer".into()
+    }
+    fn remote_node(&self) -> Option<String> {
+        Some("peer".into())
+    }
+}
+
+#[test]
+fn gui_preview_adapter_real_local_and_pinned_peer() {
+    let client_node = Node::start("preview-client");
+    let server_node = Node::start("preview-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    server_node.start_session("printf PREVIEW_REAL_MARKER; sleep 60");
+    let socket = remuda_native::daemon::socket_path_in(&server_node.runtime, &server_node.name);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let instance = loop {
+        assert!(Instant::now() < deadline, "session instance missing");
+        let rows = local_rows(&socket);
+        if let Some(id) = rows
+            .iter()
+            .find(|row| row.name == "proof")
+            .and_then(|row| row.instance_id.clone())
+        {
+            break id;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    };
+    let peer = PreviewPeer {
+        address: listener.address,
+        server_key: &server_node.public,
+        client_key: &client_node.private,
+    };
+    wait_for("local preview marker", Duration::from_secs(10), || {
+        preview_adapter::preview(&socket, "proof", &instance)
+            .is_ok_and(|frame| frame.contains("PREVIEW_REAL_MARKER"))
+    });
+    wait_for("peer preview marker", Duration::from_secs(10), || {
+        preview_adapter::preview(&peer, "proof", &instance)
+            .is_ok_and(|frame| frame.contains("PREVIEW_REAL_MARKER"))
+    });
+    assert!(preview_adapter::preview(&socket, "proof", "stale").is_err());
+    assert!(preview_adapter::preview(&peer, "proof", "stale").is_err());
+}
