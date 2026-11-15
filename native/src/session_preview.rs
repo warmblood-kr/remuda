@@ -11,6 +11,124 @@ pub enum IdentityPolicy {
     Strict,
 }
 
+pub struct PreviewFrame {
+    pub cells: Vec<Vec<StyledCell>>,
+    pub wrapped: Vec<bool>,
+    pub cursor: Cursor,
+    pub scrollback_len: usize,
+    pub scrollback_total: usize,
+    pub instance_id: Option<String>,
+    pub output_version: Option<u64>,
+}
+
+/// Capture a frame from the same local or authenticated peer port as the TUI.
+/// Use a background worker: the port may wait for I/O. Identity verification
+/// describes this frame only and does not authorize later input or attachment.
+pub fn capture<P: SessionPort + ?Sized>(
+    port: &P,
+    name: &str,
+    expected: Option<&str>,
+    scrollback: usize,
+    policy: IdentityPolicy,
+) -> Result<PreviewFrame, String> {
+    match port.capture_instance(name, expected, scrollback) {
+        Ok(Response::StyledScreen {
+            rows,
+            wrapped,
+            cursor,
+            scrollback_len,
+            scrollback_total,
+            instance_id,
+            output_version,
+        }) => {
+            let remote = port.remote_node().is_some();
+            let rejected = match policy {
+                IdentityPolicy::TuiCompatible => {
+                    remote && (expected.is_none() || instance_id.as_deref() != expected)
+                }
+                IdentityPolicy::Strict => expected
+                    .filter(|id| !id.is_empty())
+                    .is_none_or(|id| instance_id.as_deref() != Some(id)),
+            };
+            if rejected {
+                return Err(if policy == IdentityPolicy::TuiCompatible {
+                    "peer could not prove the selected preview instance"
+                } else {
+                    "could not prove the selected preview instance"
+                }
+                .into());
+            }
+            if policy == IdentityPolicy::Strict {
+                const MAX_ROWS: usize = 512;
+                const MAX_ROW_COLUMNS: usize = 512;
+                const MAX_CELLS: usize = 65_536;
+                const MAX_RUNS: usize = 65_536;
+                const MAX_TEXT_BYTES: usize = 262_144;
+                let mut runs = 0usize;
+                let mut bytes = 0usize;
+                let mut cells = 0usize;
+                // Older peers can omit wrapped metadata; otherwise it must
+                // describe every returned row.
+                if rows.len() > MAX_ROWS || (!wrapped.is_empty() && wrapped.len() != rows.len()) {
+                    return Err("Preview exceeds display limits".into());
+                }
+                for row in &rows {
+                    runs = runs.saturating_add(row.len());
+                    let mut columns = 0usize;
+                    for run in row {
+                        bytes = bytes.saturating_add(run.text.len());
+                        let count = run.text.chars().count();
+                        cells = cells.saturating_add(count);
+                        for ch in run.text.chars() {
+                            let width = unicode_width::UnicodeWidthChar::width(ch)
+                                .unwrap_or(1)
+                                .max(if run.wide { 2 } else { 1 });
+                            columns = columns.saturating_add(width);
+                        }
+                    }
+                    if columns > MAX_ROW_COLUMNS {
+                        return Err("Preview exceeds display limits".into());
+                    }
+                }
+                if runs > MAX_RUNS || bytes > MAX_TEXT_BYTES || cells > MAX_CELLS {
+                    return Err("Preview exceeds display limits".into());
+                }
+            }
+            let mut cells: Vec<Vec<StyledCell>> = rows.iter().map(|row| expand_runs(row)).collect();
+            if remote || policy == IdentityPolicy::Strict {
+                for row in &mut cells {
+                    for cell in row {
+                        cell.text = crate::text::strip_terminal_controls(&cell.text).into_owned();
+                    }
+                }
+            }
+            Ok(PreviewFrame {
+                cells,
+                wrapped,
+                // Strict previews are currently text-only. The wire cursor is
+                // untrusted and its scrollback/display-column mapping has not
+                // been established here, so do not pass it to GUI consumers.
+                cursor: if policy == IdentityPolicy::Strict {
+                    Cursor {
+                        row: 0,
+                        col: 0,
+                        visible: false,
+                    }
+                } else {
+                    cursor
+                },
+                scrollback_len,
+                scrollback_total,
+                instance_id,
+                output_version,
+            })
+        }
+        Ok(Response::Error(reason)) if policy == IdentityPolicy::TuiCompatible => Err(reason),
+        other if policy == IdentityPolicy::TuiCompatible => Err(format!("{other:?}")),
+        _ => Err("Preview unavailable".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,123 +371,5 @@ mod tests {
                 .collect::<String>(),
             "ab"
         );
-    }
-}
-
-pub struct PreviewFrame {
-    pub cells: Vec<Vec<StyledCell>>,
-    pub wrapped: Vec<bool>,
-    pub cursor: Cursor,
-    pub scrollback_len: usize,
-    pub scrollback_total: usize,
-    pub instance_id: Option<String>,
-    pub output_version: Option<u64>,
-}
-
-/// Capture a frame from the same local or authenticated peer port as the TUI.
-/// Use a background worker: the port may wait for I/O. Identity verification
-/// describes this frame only and does not authorize later input or attachment.
-pub fn capture<P: SessionPort + ?Sized>(
-    port: &P,
-    name: &str,
-    expected: Option<&str>,
-    scrollback: usize,
-    policy: IdentityPolicy,
-) -> Result<PreviewFrame, String> {
-    match port.capture_instance(name, expected, scrollback) {
-        Ok(Response::StyledScreen {
-            rows,
-            wrapped,
-            cursor,
-            scrollback_len,
-            scrollback_total,
-            instance_id,
-            output_version,
-        }) => {
-            let remote = port.remote_node().is_some();
-            let rejected = match policy {
-                IdentityPolicy::TuiCompatible => {
-                    remote && (expected.is_none() || instance_id.as_deref() != expected)
-                }
-                IdentityPolicy::Strict => expected
-                    .filter(|id| !id.is_empty())
-                    .is_none_or(|id| instance_id.as_deref() != Some(id)),
-            };
-            if rejected {
-                return Err(if policy == IdentityPolicy::TuiCompatible {
-                    "peer could not prove the selected preview instance"
-                } else {
-                    "could not prove the selected preview instance"
-                }
-                .into());
-            }
-            if policy == IdentityPolicy::Strict {
-                const MAX_ROWS: usize = 512;
-                const MAX_ROW_COLUMNS: usize = 512;
-                const MAX_CELLS: usize = 65_536;
-                const MAX_RUNS: usize = 65_536;
-                const MAX_TEXT_BYTES: usize = 262_144;
-                let mut runs = 0usize;
-                let mut bytes = 0usize;
-                let mut cells = 0usize;
-                // Older peers can omit wrapped metadata; otherwise it must
-                // describe every returned row.
-                if rows.len() > MAX_ROWS || (!wrapped.is_empty() && wrapped.len() != rows.len()) {
-                    return Err("Preview exceeds display limits".into());
-                }
-                for row in &rows {
-                    runs = runs.saturating_add(row.len());
-                    let mut columns = 0usize;
-                    for run in row {
-                        bytes = bytes.saturating_add(run.text.len());
-                        let count = run.text.chars().count();
-                        cells = cells.saturating_add(count);
-                        for ch in run.text.chars() {
-                            let width = unicode_width::UnicodeWidthChar::width(ch)
-                                .unwrap_or(1)
-                                .max(if run.wide { 2 } else { 1 });
-                            columns = columns.saturating_add(width);
-                        }
-                    }
-                    if columns > MAX_ROW_COLUMNS {
-                        return Err("Preview exceeds display limits".into());
-                    }
-                }
-                if runs > MAX_RUNS || bytes > MAX_TEXT_BYTES || cells > MAX_CELLS {
-                    return Err("Preview exceeds display limits".into());
-                }
-            }
-            let mut cells: Vec<Vec<StyledCell>> = rows.iter().map(|row| expand_runs(row)).collect();
-            if remote || policy == IdentityPolicy::Strict {
-                for row in &mut cells {
-                    for cell in row {
-                        cell.text = crate::text::strip_terminal_controls(&cell.text).into_owned();
-                    }
-                }
-            }
-            Ok(PreviewFrame {
-                cells,
-                wrapped,
-                // Strict previews are currently text-only. The wire cursor is
-                // untrusted and its scrollback/display-column mapping has not
-                // been established here, so do not pass it to GUI consumers.
-                cursor: if policy == IdentityPolicy::Strict {
-                    Cursor {
-                        row: 0,
-                        col: 0,
-                        visible: false,
-                    }
-                } else {
-                    cursor
-                },
-                scrollback_len,
-                scrollback_total,
-                instance_id,
-                output_version,
-            })
-        }
-        Ok(Response::Error(reason)) if policy == IdentityPolicy::TuiCompatible => Err(reason),
-        other if policy == IdentityPolicy::TuiCompatible => Err(format!("{other:?}")),
-        _ => Err("Preview unavailable".into()),
     }
 }
