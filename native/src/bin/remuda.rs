@@ -3228,6 +3228,18 @@ fn sanitize_peer_response(
                 // OSC enrichment rather than publish a stale snapshot as fresh.
                 session.program_status = None;
                 session.program_status_age_ms = None;
+                if let Some(team) = &mut session.team {
+                    if let Some(kind) = &mut team.agent_kind {
+                        strip(kind);
+                    }
+                    if let Some(model) = &mut team.model {
+                        strip(model);
+                    }
+                    if let Some(leader) = &mut team.leader {
+                        strip(&mut leader.name);
+                        strip(&mut leader.instance_id);
+                    }
+                }
             }
         }
         Response::Screen(text) | Response::Value(text) | Response::Error(text) => strip(text),
@@ -8213,6 +8225,7 @@ mod cluster_call_tests {
             mouse_tracking: false,
             unavailable: false,
             remote_input_disabled: false,
+            team: None,
             program_status: None,
             program_status_age_ms: None,
         }]));
@@ -8809,6 +8822,7 @@ mod tests {
             mouse_tracking: false,
             unavailable: false,
             remote_input_disabled: false,
+            team: None,
             program_status: None,
             program_status_age_ms: None,
         }

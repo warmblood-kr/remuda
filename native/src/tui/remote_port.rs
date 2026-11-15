@@ -544,6 +544,7 @@ mod tests {
                     program_status: None,
                     program_status_age_ms: None,
                     remote_input_disabled: false,
+                    team: None,
                 }])),
                 Request::CaptureStyled { .. } => Ok(Response::Error("no such session".into())),
                 _ => {
@@ -589,6 +590,7 @@ mod tests {
                         program_status: None,
                         program_status_age_ms: None,
                         remote_input_disabled: false,
+                        team: None,
                     }])),
                     Request::CaptureStyled { .. } => Ok(Response::StyledScreen {
                         rows: vec![],

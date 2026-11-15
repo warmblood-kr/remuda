@@ -282,6 +282,14 @@ pub enum Request {
         instance_id: String,
         opted_out: bool,
     },
+    /// Set advisory team metadata for one exact live instance. Local-only:
+    /// the remote front refuses it, and the data never grants authority.
+    SetSessionTeam {
+        name: String,
+        instance_id: String,
+        #[serde(default)]
+        team: Option<crate::registry::SessionTeam>,
+    },
     /// Deliver a burst of input bytes as an indivisible act, appending nothing —
     /// the primitive [`Request::SendLine`] is made of. Indivisible is the
     /// load-bearing word; an attached terminal does not block it.

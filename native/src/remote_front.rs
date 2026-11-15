@@ -333,6 +333,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::RenderedSessionList { .. } => Err("invalid rendered list width".into()),
         Request::RemoteInput { .. } => Err(refusal("RemoteInput")),
         Request::SetRemoteInputOptOut { .. } => Err(refusal("SetRemoteInputOptOut")),
+        Request::SetSessionTeam { .. } => Err(refusal("SetSessionTeam")),
         Request::New { .. } => Err(refusal("New")),
         Request::NewWithInstance { .. } => Err(refusal("NewWithInstance")),
         Request::SendLine { .. } => Err(refusal("SendLine")),

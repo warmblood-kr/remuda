@@ -2817,6 +2817,7 @@ mod binding_tests {
                     remote_input_disabled: false,
                     program_status: None,
                     program_status_age_ms: None,
+                    team: None,
                 }]),
                 other => panic!("unexpected test request: {other:?}"),
             };

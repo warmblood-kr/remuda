@@ -2342,6 +2342,19 @@ fn handle_request(
             ),
         },
 
+        Request::SetSessionTeam {
+            name,
+            instance_id,
+            team,
+        } => match registry.set_session_team(&name, &instance_id, team) {
+            None => reply(
+                &stream,
+                &Response::error(format!("no such session: {name}")),
+            ),
+            Some(Ok(())) => reply(&stream, &Response::Ok),
+            Some(Err(reason)) => reply(&stream, &Response::error(reason)),
+        },
+
         Request::Send { name, bytes } => {
             respond(&stream, &name, registry.send(&name, &bytes), |()| {
                 Response::Ok
