@@ -309,6 +309,11 @@ pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     crate::fs_atomic::write_atomic_exact_mode(path, bytes, 0o600)
 }
 
+/// Verify an existing private directory without creating it.
+pub(crate) fn verify_existing_directory(dir: &Path) -> io::Result<()> {
+    verify_directory(dir)
+}
+
 /// Create `dir` private (0700, or the owner-only DACL) if missing, then verify it.
 pub(crate) fn private_directory(dir: &Path) -> io::Result<()> {
     create_private_directory(dir)?;
@@ -332,6 +337,13 @@ pub(crate) fn private_file(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
+    check_existing_private_file(path)
+}
+
+/// Check an existing file without creating or opening it on Unix. Closing an
+/// extra descriptor would drop this process's fcntl locks, SQLite's included.
+#[cfg(not(windows))]
+pub(crate) fn check_existing_private_file(path: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if !meta.file_type().is_file() {
         return Err(io::Error::new(
@@ -354,6 +366,11 @@ pub(crate) fn private_file(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
+    check_existing_private_file(path)
+}
+
+#[cfg(windows)]
+pub(crate) fn check_existing_private_file(path: &Path) -> io::Result<()> {
     let file = super::windows_security::open_for_check(path, false, true)?;
     check_private_file(&file, "database file", path)
 }

@@ -76,11 +76,12 @@ pub(crate) fn register(lua: &Lua, remuda: &Table) -> mlua::Result<()> {
             |lua, (owner, name, opts): (String, String, Option<Table>)| {
                 let limits = limits_from(opts.as_ref())?;
                 let migrations = migrations_from(opts.as_ref())?;
+                let must_exist = must_exist_from(opts.as_ref())?;
                 let root = match db_root() {
                     Ok(root) => root,
                     Err(error) => return failure(lua, format!("io: {error}")),
                 };
-                open_answer(lua, &root, &owner, &name, limits, migrations)
+                open_answer(lua, &root, &owner, &name, limits, migrations, must_exist)
             },
         )?,
     )
@@ -99,6 +100,7 @@ fn open_answer(
     name: &str,
     limits: Limits,
     migrations: Migrations,
+    must_exist: bool,
 ) -> mlua::Result<(Value, Value)> {
     check_identifier("mod", owner, true)?;
     check_identifier("database", name, false)?;
@@ -110,7 +112,7 @@ fn open_answer(
             Err(reason) => return failure(lua, reason),
         },
     };
-    match open_db(&root.join(owner), name, limits, &steps) {
+    match open_db(&root.join(owner), name, limits, &steps, must_exist) {
         Ok(db) => Ok((Value::UserData(lua.create_userdata(db)?), Value::Nil)),
         Err(reason) => failure(lua, reason),
     }
@@ -141,6 +143,11 @@ pub enum Migrations {
     None,
     Files,
     Steps(Vec<sqlite_migrate::Step>),
+}
+
+fn must_exist_from(opts: Option<&Table>) -> mlua::Result<bool> {
+    let Some(opts) = opts else { return Ok(false) };
+    Ok(opts.get::<Option<bool>>("must_exist")?.unwrap_or(false))
 }
 
 fn migrations_from(opts: Option<&Table>) -> mlua::Result<Migrations> {
@@ -222,9 +229,15 @@ fn open_db(
     name: &str,
     limits: Limits,
     steps: &sqlite_migrate::StepSet,
+    must_exist: bool,
 ) -> Result<Db, String> {
     let file = format!("{name}.db");
-    let mut conn = crate::sqlite::open(dir, &file).map_err(|e| format!("io: {e}"))?;
+    let mut conn = if must_exist {
+        crate::sqlite::open_existing(dir, &file)
+    } else {
+        crate::sqlite::open(dir, &file)
+    }
+    .map_err(|e| format!("io: {e}"))?;
     let page_size: i64 = conn
         .query_row("PRAGMA page_size", [], |row| row.get(0))
         .map_err(reason)?;

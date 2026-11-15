@@ -220,6 +220,20 @@ A handle has `query(sql, params) -> rows`, `exec(sql, params) -> changes`,
 that is not UTF-8 is stored as a blob. Rows are tables keyed by column name,
 and SQL NULL is a missing key.
 
+`opts.must_exist = true` opens an existing database and returns
+`nil, "io: database file ... is missing; refusing to create it"` when the main
+file is absent. It never creates the main file or its directory, and the open
+uses no-CREATE so a file removed after the check also fails instead of being
+recreated. The check and open are not one atomic operation: no-CREATE does not
+stop another writer from replacing the path with a symlink between the check
+and the open; directory ownership/permissions and the private-file checks are
+the boundary. The
+`-wal`/`-shm` sidecars may be created when the main file exists.
+`remuda.db.capabilities()` returns `{ must_exist = true }` on a core that
+supports the option. A core without that function predates the capability
+query and may ignore an unknown `must_exist` key; check the capability before
+treating the option as protection.
+
 The files are private (0600 in a 0700 directory; the owner-only ACL on
 Windows) and in WAL mode. Lua is not a sandbox, so the limits guard against
 mistakes that would stall or bloat the daemon, not against hostile code:
