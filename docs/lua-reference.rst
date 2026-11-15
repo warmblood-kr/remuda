@@ -434,7 +434,7 @@ send
 session
 -------
 
-``session(name) -> handle; table {list, new, close, attach, resize, remote_input}`` — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach, resize and remote_input.
+``session(name) -> handle; table {list, new, close, attach, resize, remote_input, team}`` — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach, resize, remote_input and team.
 
 session.attach
 --------------
@@ -454,12 +454,17 @@ session.list
 session.new
 -----------
 
-``session.new(name?, argv?, cwd?, env?, options?) -> name, instance_id`` — Start a session and return its name and registered instance_id. The options table can set remote_input_disabled=true to protect the exact instance at registration.
+``session.new(name?, argv?, cwd?, env?, options?) -> name, instance_id`` — Start a session and return its name and registered instance_id. remote_input_disabled is accepted for compatibility, but current builds do not enforce the per-session opt-out (see docs/cluster-security.md).
 
 session.resize
 --------------
 
 ``session.resize(name, cols, rows) -> true | nil, err`` — Resize a session's terminal (cols 20..1000, rows 24..500).
+
+session.team
+------------
+
+``session.team(name, instance_id, team | nil) -> true | nil, err`` — Set optional advisory team metadata (agent_kind, model, leader, depth) for one exact live instance. Invalid metadata is refused as a whole and never grants authority.
 
 storage
 -------
