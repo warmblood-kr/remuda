@@ -155,6 +155,72 @@ fi
 install_dir="${REMUDA_INSTALL_DIR:-$install_dir_default}"
 mkdir -p "$install_dir" "$data_dir"
 
+# A new macOS GUI archive must opt into a bounded build-ID probe. Old archives
+# have none of these members and keep the original installation path.
+stage_gui() {
+	[ "$target" = aarch64-apple-darwin ] || return 0
+	present=no
+	for f in remuda-gui remuda-gui.contract remuda-gui.build remuda-installer-probe; do
+		if [ -e "$f" ] || [ -L "$f" ]; then present=yes; fi
+	done
+	[ "$present" = yes ] || return 0
+	for f in remuda remuda-session-host remuda-gui remuda-installer-probe; do
+		[ -f "$f" ] && [ ! -L "$f" ] && [ -x "$f" ] || die "GUI archive has invalid $f"
+	done
+	for f in remuda-gui.contract remuda-gui.build; do
+		[ -f "$f" ] && [ ! -L "$f" ] || die "GUI archive has invalid $f"
+	done
+	printf '%s\n' remuda-gui-archive-v1 >"$tmp/gui-contract-expected"
+	cmp -s remuda-gui.contract "$tmp/gui-contract-expected" || die "unsupported GUI archive contract"
+	[ "$(wc -c < remuda-gui.build)" -le 201 ] || die "invalid GUI build identifier"
+	gui_build=$(cat remuda-gui.build)
+	printf '%s\n' "$gui_build" >"$tmp/gui-build-expected"
+	cmp -s remuda-gui.build "$tmp/gui-build-expected" || die "invalid GUI build identifier"
+	printf '%s\n' "$gui_build" | LC_ALL=C grep -Eq '^[A-Za-z0-9._+-]+$' || die "invalid GUI build identifier"
+	case "$gui_build" in "$version"+?*) ;; *) die "GUI build does not match release version" ;; esac
+	for spec in "--verify-cli:remuda" "--verify-host:remuda-session-host" "--verify:remuda-gui"; do
+		mode=${spec%%:*}
+		file=${spec#*:}
+		REMUDA_RUNTIME_DIR="$tmp/probe-runtime" XDG_CONFIG_HOME="$tmp/probe-config" \
+			XDG_DATA_HOME="$tmp/probe-data" XDG_STATE_HOME="$tmp/probe-state" \
+			XDG_CACHE_HOME="$tmp/probe-cache" REMUDA_NO_UPDATE_CHECK=1 \
+			"$tmp/remuda-installer-probe" "$mode" --verified-archive-v1 "$tmp/$file" "$gui_build" || die "GUI archive build verification failed ($file)"
+	done
+
+	# Do not follow managed-directory symlinks or overwrite any published entry.
+	store="$install_dir/.remuda-gui"
+	builds="$store/builds"
+	slot="$builds/build-$gui_build"
+	slot_new=no
+	for dir in "$store" "$builds" "$slot"; do
+		[ ! -L "$dir" ] || die "managed GUI path is a symlink: $dir"
+		if [ -e "$dir" ]; then
+			[ -d "$dir" ] || die "managed GUI path is not a directory: $dir"
+		else
+			mkdir "$dir" || die "cannot create managed GUI directory: $dir"
+			[ "$dir" != "$slot" ] || slot_new=yes
+		fi
+	done
+	installed="$slot/remuda-gui"
+	if [ "$slot_new" = no ] || [ -e "$installed" ] || [ -L "$installed" ]; then
+		[ -f "$installed" ] && [ ! -L "$installed" ] && [ -x "$installed" ] && cmp -s remuda-gui "$installed" || die "managed GUI collision or incomplete slot; inspect before retry: $slot"
+		return 0
+	fi
+	stage=$(mktemp "$slot/.incoming.XXXXXXXX") || die "cannot stage managed GUI: $slot"
+	if ! cp remuda-gui "$stage" || ! chmod 755 "$stage"; then
+		rm -f "$stage"
+		die "cannot prepare managed GUI: $slot"
+	fi
+	if ! ln "$stage" "$installed" 2>/dev/null; then
+		rm -f "$stage"
+		# Another cooperating installer may have published the same bytes.
+		[ -f "$installed" ] && [ ! -L "$installed" ] && [ -x "$installed" ] && cmp -s remuda-gui "$installed" || die "managed GUI collision or incomplete slot; inspect before retry: $slot"
+		return 0
+	fi
+	rm -f "$stage"
+}
+stage_gui
+
 # remuda and remuda-session-host are one pair: the daemon starts the host from
 # beside itself. A release older than the pair has no host, and then no host
 # from a different build may stay beside the new daemon either.
