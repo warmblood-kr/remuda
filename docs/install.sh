@@ -186,11 +186,73 @@ stage_gui() {
 			XDG_CACHE_HOME="$tmp/probe-cache" REMUDA_NO_UPDATE_CHECK=1 \
 			"$tmp/remuda-installer-probe" "$mode" --verified-archive-v1 "$tmp/$file" "$gui_build" || die "GUI archive build verification failed ($file)"
 	done
+	# A retained host named for this build must not silently hide different bits.
+	kept_host="$install_dir/remuda-session-host-$gui_build"
+	if [ -e "$kept_host" ] || [ -L "$kept_host" ]; then
+		[ -f "$kept_host" ] && [ ! -L "$kept_host" ] && cmp -s remuda-session-host "$kept_host" || die "retained host build collision: $kept_host"
+	fi
+	# Identical current CLI or host bytes establish one side of the installed pair.
+	if [ -f "$install_dir/remuda" ] && [ ! -L "$install_dir/remuda" ] && cmp -s remuda "$install_dir/remuda" && { [ -e "$install_dir/remuda-session-host" ] || [ -L "$install_dir/remuda-session-host" ]; }; then
+		[ -f "$install_dir/remuda-session-host" ] && [ ! -L "$install_dir/remuda-session-host" ] && cmp -s remuda-session-host "$install_dir/remuda-session-host" || die "installed host conflicts with this CLI build"
+	fi
+	if [ -f "$install_dir/remuda-session-host" ] && [ ! -L "$install_dir/remuda-session-host" ] && cmp -s remuda-session-host "$install_dir/remuda-session-host" && { [ -e "$install_dir/remuda" ] || [ -L "$install_dir/remuda" ]; }; then
+		[ -f "$install_dir/remuda" ] && [ ! -L "$install_dir/remuda" ] && cmp -s remuda "$install_dir/remuda" || die "installed CLI conflicts with this host build"
+	fi
+	gui_hash_file() {
+		sha256 <"$1" >"$tmp/gui-hash" || return 1
+		gui_hash=$(awk 'NR == 1 { print $1 }' "$tmp/gui-hash")
+		[ "${#gui_hash}" -eq 64 ] && printf '%s\n' "$gui_hash" | LC_ALL=C grep -Eq '^[0-9a-f]{64}$' || return 1
+		printf '%s\n' "$gui_hash"
+	}
+	provenance="$tmp/gui-provenance"
+	printf 'remuda-gui-provenance-v1\nbuild %s\n' "$gui_build" >"$provenance"
+	for file in remuda remuda-session-host remuda-gui; do
+		gui_hash=$(gui_hash_file "$file") || die "cannot hash $file"
+		printf '%s %s\n' "$file" "$gui_hash" >>"$provenance"
+	done
 
 	# Do not follow managed-directory symlinks or overwrite any published entry.
 	store="$install_dir/.remuda-gui"
 	builds="$store/builds"
 	slot="$builds/build-$gui_build"
+	old_present=no
+	old_known=no
+	for file in remuda remuda-session-host; do
+		if [ -e "$install_dir/$file" ] || [ -L "$install_dir/$file" ]; then
+			old_present=yes
+			if [ -f "$install_dir/$file" ] && [ ! -L "$install_dir/$file" ] && cmp -s "$file" "$install_dir/$file"; then old_known=yes; fi
+		fi
+	done
+	# Previous managed manifests identify matching old pairs without executing them.
+	if [ "$old_present" = yes ] && [ "$old_known" = no ] && [ -d "$builds" ] && [ ! -L "$store" ] && [ ! -L "$builds" ] && [ -f "$install_dir/remuda" ] && [ ! -L "$install_dir/remuda" ] && [ -f "$install_dir/remuda-session-host" ] && [ ! -L "$install_dir/remuda-session-host" ]; then
+		old_cli_hash=$(gui_hash_file "$install_dir/remuda") || old_cli_hash=
+		old_host_hash=$(gui_hash_file "$install_dir/remuda-session-host") || old_host_hash=
+		checked=0
+		for prior in "$builds"/build-*; do
+			[ -n "$old_cli_hash" ] && [ -n "$old_host_hash" ] || break
+			[ -e "$prior" ] || [ -L "$prior" ] || continue
+			checked=$((checked + 1))
+			[ "$checked" -le 256 ] || break
+			[ -d "$prior" ] && [ ! -L "$prior" ] && [ -f "$prior/provenance" ] && [ ! -L "$prior/provenance" ] && [ -f "$prior/remuda-gui" ] && [ ! -L "$prior/remuda-gui" ] && [ -x "$prior/remuda-gui" ] || continue
+			[ "$(wc -c < "$prior/provenance")" -le 512 ] || continue
+			prior_build=${prior##*/build-}
+			[ "${#prior_build}" -le 200 ] && printf '%s\n' "$prior_build" | LC_ALL=C grep -Eq '^[A-Za-z0-9._+-]+$' || continue
+			printf 'remuda-gui-provenance-v1\nbuild %s\nremuda %s\nremuda-session-host %s\n' "$prior_build" "$old_cli_hash" "$old_host_hash" >"$tmp/old-gui-header"
+			head -n 4 "$prior/provenance" >"$tmp/prior-header" || continue
+			cmp -s "$tmp/old-gui-header" "$tmp/prior-header" || continue
+			old_gui_hash=$(gui_hash_file "$prior/remuda-gui") || continue
+			cat "$tmp/old-gui-header" >"$tmp/old-gui-provenance"
+			printf 'remuda-gui %s\n' "$old_gui_hash" >>"$tmp/old-gui-provenance"
+			if cmp -s "$tmp/old-gui-provenance" "$prior/provenance"; then old_known=yes; break; fi
+		done
+	fi
+	if [ "$old_present" = yes ] && [ "$old_known" = no ]; then
+		[ ! -e "$slot" ] && [ ! -L "$slot" ] || die "cannot safely select existing GUI slot for an unverified installed pair: $slot"
+		echo "install.sh: GUI deferred — installed CLI/host provenance is unknown; continuing core-only upgrade" >&2
+		echo "install.sh: existing core host handling still applies; build-key identity remains unverified" >&2
+		echo "install.sh: retry while this channel still points to the same release; inspect any retained-host collision" >&2
+		return 0
+	fi
 	slot_new=no
 	for dir in "$store" "$builds" "$slot"; do
 		[ ! -L "$dir" ] || die "managed GUI path is a symlink: $dir"
@@ -202,10 +264,17 @@ stage_gui() {
 		fi
 	done
 	installed="$slot/remuda-gui"
+	manifest="$slot/provenance"
 	if [ "$slot_new" = no ] || [ -e "$installed" ] || [ -L "$installed" ]; then
-		[ -f "$installed" ] && [ ! -L "$installed" ] && [ -x "$installed" ] && cmp -s remuda-gui "$installed" || die "managed GUI collision or incomplete slot; inspect before retry: $slot"
+		[ -f "$manifest" ] && [ ! -L "$manifest" ] && cmp -s "$provenance" "$manifest" && [ -f "$installed" ] && [ ! -L "$installed" ] && [ -x "$installed" ] && cmp -s remuda-gui "$installed" || die "managed GUI collision or incomplete slot; inspect before retry: $slot"
 		return 0
 	fi
+	manifest_stage=$(mktemp "$slot/.manifest.XXXXXXXX") || die "cannot stage GUI provenance: $slot"
+	if ! cp "$provenance" "$manifest_stage" || ! chmod 644 "$manifest_stage" || ! ln "$manifest_stage" "$manifest" 2>/dev/null; then
+		rm -f "$manifest_stage"
+		die "cannot publish GUI provenance; inspect before retry: $slot"
+	fi
+	rm -f "$manifest_stage"
 	stage=$(mktemp "$slot/.incoming.XXXXXXXX") || die "cannot stage managed GUI: $slot"
 	if ! cp remuda-gui "$stage" || ! chmod 755 "$stage"; then
 		rm -f "$stage"
@@ -214,7 +283,7 @@ stage_gui() {
 	if ! ln "$stage" "$installed" 2>/dev/null; then
 		rm -f "$stage"
 		# Another cooperating installer may have published the same bytes.
-		[ -f "$installed" ] && [ ! -L "$installed" ] && [ -x "$installed" ] && cmp -s remuda-gui "$installed" || die "managed GUI collision or incomplete slot; inspect before retry: $slot"
+		[ -f "$manifest" ] && [ ! -L "$manifest" ] && cmp -s "$provenance" "$manifest" && [ -f "$installed" ] && [ ! -L "$installed" ] && [ -x "$installed" ] && cmp -s remuda-gui "$installed" || die "managed GUI collision or incomplete slot; inspect before retry: $slot"
 		return 0
 	fi
 	rm -f "$stage"

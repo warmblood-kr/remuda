@@ -10,7 +10,6 @@ export XDG_DATA_HOME="$tmp/data" XDG_CONFIG_HOME="$tmp/config" XDG_STATE_HOME="$
 export REMUDA_RUNTIME_DIR="$tmp/runtime" REMUDA_INSTALL_DIR="$tmp/bin" REMUDA_CHANNEL=nightly
 export FAKE_DIR="$tmp" FAKE_VERSION=0.1.0-nightly.20260101000000.abcdef1 FAKE_INSTALLER="$root/docs/install.sh"
 unset REMUDA_INSTALL_BUTLER
-
 cat >"$tmp/shim/uname" <<'SH'
 #!/bin/sh
 case "$1" in -s) echo Darwin ;; -m) echo arm64 ;; -o) exit 1 ;; *) exit 1 ;; esac
@@ -31,6 +30,11 @@ SH
 cat >"$tmp/shim/ln" <<'SH'
 #!/bin/sh
 case "$2" in
+  */.remuda-gui/builds/*/provenance)
+    case "${FAKE_LINK_MODE:-}" in
+      crash-manifest-before) kill -KILL "$PPID"; exit 1 ;;
+      crash-manifest-after) /bin/ln "$@"; kill -KILL "$PPID"; exit 1 ;;
+    esac ;;
   */.remuda-gui/builds/*/remuda-gui)
     case "${FAKE_LINK_MODE:-}" in
       fail) exit 1 ;;
@@ -51,7 +55,6 @@ pack() {
 	sum=$(sha256 "$tmp/asset" | awk '{print $1}')
 	printf '%s  remuda-%s-aarch64-apple-darwin.tar.gz\n' "$sum" "$FAKE_VERSION" >"$tmp/SHA256SUMS"
 }
-
 # Build a checksummed release. The fake supervisor checks the requested
 # protocol and logs each invocation; the real bounded supervisor has its own
 # macOS process-lifecycle tests.
@@ -85,12 +88,10 @@ SH
 	[ ! -f "$tmp/pkg/remuda-gui" ] || chmod +x "$tmp/pkg/remuda-gui" "$tmp/pkg/remuda-installer-probe"
 	pack
 }
-
 install_ok() { sh "$root/docs/install.sh" >"$tmp/out" 2>&1 || { cat "$tmp/out"; exit 1; }; }
 install_fails() { if sh "$root/docs/install.sh" >"$tmp/out" 2>&1; then cat "$tmp/out"; exit 1; fi; }
-slot() { printf '%s/.remuda-gui/builds/build-%s+%s/remuda-gui' "$tmp/bin" "$FAKE_VERSION" "$1"; }
+slot() { printf '%s/.remuda-gui/builds/build-%s+%s/remuda-gui' "$REMUDA_INSTALL_DIR" "$FAKE_VERSION" "$1"; }
 same() { cmp -s "$1" "$2" || { echo "different: $1 $2" >&2; exit 1; }; }
-
 # A manual sibling and an installed mod are outside the managed layout.
 printf 'manual GUI\n' >"$tmp/bin/remuda-gui"
 mkdir -p "$tmp/data/remuda/mods/gui"
@@ -101,14 +102,14 @@ same "$tmp/pkg/remuda-gui" "$(slot a)"
 [ "$(cat "$tmp/bin/remuda-gui")" = 'manual GUI' ]
 [ "$(cat "$tmp/data/remuda/mods/gui/sentinel")" = 'existing mod' ]
 [ "$(wc -l < "$tmp/probes")" -eq 3 ]
-
 # Reinstalling exactly the same bytes must not replace the managed inode.
 if stat -f '%i %Lp %m' "$(slot a)" >/dev/null 2>&1; then stamp() { stat -f '%i %Lp %m' "$1"; }
 else stamp() { stat -c '%i %a %Y' "$1"; }; fi
 before=$(stamp "$(slot a)")
+cp "$(dirname "$(slot a)")/provenance" "$tmp/provenance"
 install_ok
 [ "$(stamp "$(slot a)")" = "$before" ]
-
+same "$(dirname "$(slot a)")/provenance" "$tmp/provenance"
 # Same key with different bytes refuses before any current or .prev changes.
 cp "$tmp/bin/remuda" "$tmp/current"
 cp "$tmp/bin/remuda.prev" "$tmp/previous"
@@ -117,6 +118,98 @@ install_fails
 same "$tmp/bin/remuda" "$tmp/current"
 same "$tmp/bin/remuda.prev" "$tmp/previous"
 [ "$(stamp "$(slot a)")" = "$before" ]
+# The same key and GUI cannot silently change the CLI or host bytes either.
+for file in remuda remuda-session-host; do
+	publish a
+	printf '# changed %s\n' "$file" >>"$tmp/pkg/$file"
+	pack
+	install_fails
+	same "$tmp/bin/remuda" "$tmp/current"
+	same "$tmp/bin/remuda.prev" "$tmp/previous"
+	same "$(dirname "$(slot a)")/provenance" "$tmp/provenance"
+done
+# A retained host whose name asserts this build must match before any swap.
+publish h
+kept="$tmp/bin/remuda-session-host-$FAKE_VERSION+h"
+printf 'unrelated retained host\n' >"$kept"
+install_fails
+[ "$(cat "$kept")" = 'unrelated retained host' ]
+same "$tmp/bin/remuda" "$tmp/current"
+# An identical installed component establishes that its paired component must
+# also match, without executing the old CLI or host.
+for changed in remuda remuda-session-host; do
+	publish u
+	install_root="$tmp/unmanaged-$changed"
+	mkdir "$install_root"
+	cp "$tmp/pkg/remuda" "$install_root/remuda"
+	cp "$tmp/pkg/remuda-session-host" "$install_root/remuda-session-host"
+	printf '# local change\n' >>"$install_root/$changed"
+	cp "$install_root/$changed" "$tmp/unmanaged-before"
+	REMUDA_INSTALL_DIR="$install_root"
+	export REMUDA_INSTALL_DIR
+	install_fails
+	REMUDA_INSTALL_DIR="$tmp/bin"
+	export REMUDA_INSTALL_DIR
+	same "$install_root/$changed" "$tmp/unmanaged-before"
+	[ ! -e "$install_root/.remuda-gui" ]
+done
+# Unknown old pair: publish only core, report deferral, and preserve manual GUI.
+publish u
+install_root="$tmp/unknown path \$(literal)"
+mkdir "$install_root"
+printf '#!/bin/sh\nprintf old-cli-executed >"$FAKE_DIR/old-cli-called"\n' >"$install_root/remuda"
+printf '#!/bin/sh\nprintf old-host-executed >"$FAKE_DIR/old-host-called"\nprintf "old-build\\n"\n' >"$install_root/remuda-session-host"
+chmod +x "$install_root/remuda" "$install_root/remuda-session-host"
+printf 'manual GUI\n' >"$install_root/remuda-gui"
+REMUDA_INSTALL_DIR="$install_root"
+export REMUDA_INSTALL_DIR
+install_ok
+grep -q 'GUI deferred.*provenance is unknown' "$tmp/out"
+grep -q 'build-key identity remains unverified' "$tmp/out"
+[ ! -e "$(slot u)" ]
+[ "$(cat "$install_root/remuda-gui")" = 'manual GUI' ]
+[ ! -e "$tmp/old-cli-called" ]
+[ -e "$tmp/old-host-called" ] # Existing core-only keep_versioned behavior.
+same "$install_root/remuda" "$tmp/pkg/remuda"
+install_ok
+same "$(slot u)" "$tmp/pkg/remuda-gui"
+[ "$(cat "$install_root/remuda-gui")" = 'manual GUI' ]
+REMUDA_INSTALL_DIR="$tmp/bin"
+export REMUDA_INSTALL_DIR
+# Corrupt prior provenance cannot establish a managed old pair.
+publish b
+install_root="$tmp/corrupt-prior"
+mkdir -p "$install_root/.remuda-gui/builds"
+cp "$tmp/bin/remuda" "$install_root/remuda"
+cp "$tmp/bin/remuda-session-host" "$install_root/remuda-session-host"
+cp -R "$tmp/bin/.remuda-gui/builds/build-$FAKE_VERSION+a" "$install_root/.remuda-gui/builds/"
+printf 'corrupt\n' >"$install_root/.remuda-gui/builds/build-$FAKE_VERSION+a/provenance"
+REMUDA_INSTALL_DIR="$install_root"
+export REMUDA_INSTALL_DIR
+install_ok
+grep -q 'GUI deferred.*provenance is unknown' "$tmp/out"
+[ ! -e "$(slot b)" ]
+REMUDA_INSTALL_DIR="$tmp/bin"
+export REMUDA_INSTALL_DIR
+
+# A matching target slot cannot be selected when the old pair is unknown.
+publish a
+install_root="$tmp/unknown-slot"
+mkdir -p "$install_root/.remuda-gui/builds"
+cp -R "$tmp/bin/.remuda-gui/builds/build-$FAKE_VERSION+a" "$install_root/.remuda-gui/builds/"
+printf '#!/bin/sh\nprintf called >"$FAKE_DIR/old-cli-called"\n' >"$install_root/remuda"
+printf '#!/bin/sh\nprintf called >"$FAKE_DIR/old-host-called"\n' >"$install_root/remuda-session-host"
+chmod +x "$install_root/remuda" "$install_root/remuda-session-host"
+cp "$install_root/remuda" "$tmp/unknown-before"
+rm -f "$tmp/old-host-called" "$tmp/old-cli-called"
+REMUDA_INSTALL_DIR="$install_root"
+export REMUDA_INSTALL_DIR
+install_fails
+same "$install_root/remuda" "$tmp/unknown-before"
+[ ! -e "$tmp/old-host-called" ]
+[ ! -e "$tmp/old-cli-called" ]
+REMUDA_INSTALL_DIR="$tmp/bin"
+export REMUDA_INSTALL_DIR
 
 # Probe mismatch and an invalid checksum must fail before staging or core swap.
 publish b
@@ -157,6 +250,15 @@ mkdir -p "$(dirname "$(slot c)")"
 install_fails
 [ ! -e "$(slot c)" ]
 same "$tmp/bin/remuda" "$tmp/current"
+for partial in manifest-only gui-only; do
+	publish "$partial"
+	partial_slot=$(dirname "$(slot "$partial")")
+	mkdir -p "$partial_slot"
+	if [ "$partial" = manifest-only ]; then cp "$tmp/provenance" "$partial_slot/provenance"; else cp "$tmp/pkg/remuda-gui" "$partial_slot/remuda-gui"; fi
+	install_fails
+	if [ "$partial" = manifest-only ]; then same "$partial_slot/provenance" "$tmp/provenance"; else same "$partial_slot/remuda-gui" "$tmp/pkg/remuda-gui"; fi
+	same "$tmp/bin/remuda" "$tmp/current"
+done
 publish g
 mkdir -p "$(dirname "$(slot g)")"
 cp "$tmp/pkg/remuda-gui" "$(slot g)"
@@ -166,14 +268,18 @@ same "$tmp/pkg/remuda-gui" "$(slot g)"
 [ ! -x "$(slot g)" ]
 same "$tmp/bin/remuda" "$tmp/current"
 publish c
-for part in store builds slot file; do
+for part in store builds slot file manifest; do
 	install_root="$tmp/link-$part"
 	mkdir -p "$install_root" "$tmp/outside-$part"
 	case "$part" in
 	store) link="$install_root/.remuda-gui" ;;
 	builds) mkdir "$install_root/.remuda-gui"; link="$install_root/.remuda-gui/builds" ;;
 	slot) mkdir -p "$install_root/.remuda-gui/builds"; link="$install_root/.remuda-gui/builds/build-$FAKE_VERSION+c" ;;
-	file) mkdir -p "$install_root/.remuda-gui/builds/build-$FAKE_VERSION+c"; link="$install_root/.remuda-gui/builds/build-$FAKE_VERSION+c/remuda-gui" ;;
+	file) mkdir -p "$install_root/.remuda-gui/builds/build-$FAKE_VERSION+c"; link="$install_root/.remuda-gui/builds/build-$FAKE_VERSION+c/remuda-gui"
+		manifest_file="$(dirname "$link")/provenance"
+		printf 'remuda-gui-provenance-v1\nbuild %s+c\n' "$FAKE_VERSION" >"$manifest_file"
+		for file in remuda remuda-session-host remuda-gui; do printf '%s %s\n' "$file" "$(sha256 "$tmp/pkg/$file" | awk '{print $1}')" >>"$manifest_file"; done ;;
+	manifest) mkdir -p "$install_root/.remuda-gui/builds/build-$FAKE_VERSION+c"; link="$install_root/.remuda-gui/builds/build-$FAKE_VERSION+c/provenance" ;;
 	esac
 	ln -s "$tmp/outside-$part" "$link"
 	REMUDA_INSTALL_DIR="$install_root"
@@ -190,20 +296,31 @@ export FAKE_LINK_MODE=fail
 install_fails
 unset FAKE_LINK_MODE
 same "$tmp/bin/remuda" "$tmp/current"
-for phase in crash-before crash-after; do
+for phase in crash-manifest-before crash-manifest-after crash-before crash-after; do
 	build="e-$phase"
 	publish "$build"
 	export FAKE_LINK_MODE="$phase"
 	install_fails
 	unset FAKE_LINK_MODE
 	same "$tmp/bin/remuda" "$tmp/current"
-	if [ "$phase" = crash-before ]; then [ ! -e "$(slot "$build")" ]; else same "$tmp/pkg/remuda-gui" "$(slot "$build")"; fi
+	case "$phase" in
+	crash-after) same "$tmp/pkg/remuda-gui" "$(slot "$build")" ;;
+	*) [ ! -e "$(slot "$build")" ]; install_fails; same "$tmp/bin/remuda" "$tmp/current" ;;
+	esac
 done
 
 # A later build keeps A; restoring the previous CLI/host pair keeps both GUIs.
 publish b
 install_ok
 [ -f "$(slot a)" ] && [ -f "$(slot b)" ]
+cp "$tmp/bin/remuda" "$tmp/build-b-current"
+for file in remuda remuda-session-host; do
+	publish a
+	printf '# changed %s\n' "$file" >>"$tmp/pkg/$file"
+	pack
+	install_fails
+	same "$tmp/bin/remuda" "$tmp/build-b-current"
+done
 cp "$tmp/bin/remuda.prev" "$tmp/bin/.rollback-remuda"
 cp "$tmp/bin/remuda-session-host.prev" "$tmp/bin/.rollback-host"
 mv "$tmp/bin/.rollback-host" "$tmp/bin/remuda-session-host"
@@ -221,7 +338,8 @@ install_ok
 # Optional macOS assembled-path test using real, identically built binaries.
 if [ -n "${REMUDA_TEST_REAL_PROBE:-}" ]; then
 	FAKE_VERSION=9.8.7
-	export FAKE_VERSION
+	REMUDA_INSTALL_DIR="$tmp/real-bin"
+	export FAKE_VERSION REMUDA_INSTALL_DIR
 	publish stage-proof.001
 	cp "$REMUDA_TEST_REAL_PROBE" "$tmp/pkg/remuda-installer-probe"
 	cp "$REMUDA_TEST_REAL_GUI" "$tmp/pkg/remuda-gui"
