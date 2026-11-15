@@ -171,6 +171,22 @@ fn run_cli(args: Vec<String>) -> ExitCode {
         |code| vec!["-e", code],
     );
 
+    // GUI is a client of an existing daemon; launching it must not probe,
+    // start, reload, or initialize the daemon or cluster.
+    if argv.first() == Some(&"gui") {
+        match remuda_native::packages::subcommand_checked("gui") {
+            Ok(Some(_)) => (), // Preserve an installed mod's existing command.
+            Ok(None) if remuda_native::packages::half_installed("gui").is_some() => (),
+            Ok(None) => {
+                if stdin_enabled {
+                    return fail("--stdin is not supported for remuda gui");
+                }
+                return gui_command(server, &argv[1..]);
+            }
+            Err(error) => return fail(format!("cannot determine whether a mod owns gui: {error}")),
+        }
+    }
+
     if let Some(exit) = preflight_command(&argv) {
         return exit;
     }
@@ -183,6 +199,39 @@ fn run_cli(args: Vec<String>) -> ExitCode {
     };
 
     dispatch_cli_command(server, &path, skew, &argv, stdin_enabled, eval_code)
+}
+
+fn gui_command(server: &str, args: &[&str]) -> ExitCode {
+    if let Err(code) = ensure_no_args("gui", args) {
+        return code;
+    }
+    if server != "default" {
+        return fail("remuda gui currently supports only the default server");
+    }
+    launch_gui()
+}
+
+#[cfg(target_os = "macos")]
+fn launch_gui() -> ExitCode {
+    use std::os::unix::process::CommandExt;
+    let sibling = match std::env::current_exe() {
+        Ok(path) => path.with_file_name("remuda-gui"),
+        Err(error) => return fail(format!("cannot locate remuda-gui: {error}")),
+    };
+    let error = std::process::Command::new(&sibling).exec();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        fail(format!("GUI executable is not installed beside remuda at {}. Build it with `cargo build --release --locked --manifest-path gui/Cargo.toml` and install it beside remuda.", sibling.display()))
+    } else {
+        fail(format!(
+            "cannot launch GUI at {}: {error}",
+            sibling.display()
+        ))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launch_gui() -> ExitCode {
+    fail("remuda gui is currently supported on macOS only")
 }
 
 /// Hidden native verbs are not user-facing CLI commands. One role function
@@ -338,6 +387,7 @@ fn ensure_no_args(verb: &str, args: &[&str]) -> Result<(), ExitCode> {
         "help" => "Show Remuda commands and quick examples. Example: remuda help",
         "version" => "Print the version of this CLI binary. Example: remuda version",
         "daemon" => "Run the background daemon in this process",
+        "gui" => "Open the separately built read-only GUI for the default server",
         "ls" => "List sessions for the selected server. Example: remuda ls",
         "repl" => {
             "Evaluate Lua in the persistent daemon image, one line at a time. Example: remuda repl"
@@ -846,6 +896,7 @@ const USAGE: &str = "\
 remuda — terminal orchestration for coding agents
 
   remuda                         open the session screen
+  remuda gui                     open the separately built macOS GUI
   remuda run [-n NAME] COMMAND   start and enter a session
   remuda attach NAME             enter a session; Ctrl-\\ detaches (exit 2 if attached elsewhere)
                                  Ctrl-] toggles mouse; wheel scrolls history
