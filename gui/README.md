@@ -28,6 +28,28 @@ The built-in GUI does not support named servers (`remuda -s NAME gui`) yet.
 An installed mod declaring the `gui` command keeps precedence; in that case,
 run the sibling `remuda-gui` executable directly to open this GUI.
 
+The launcher can also use a managed GUI at
+`<install-dir>/.remuda-gui/builds/build-<build>/remuda-gui`, where `<build>` is
+the complete build string printed after `remuda ` by `remuda --version`. A
+manual `remuda-gui` sibling takes precedence. Managed build entries must never
+be modified or removed while a window may be running; the launcher starts the
+build-specific path so that window's helper processes keep the same executable.
+No installer currently creates or prunes this layout. A window opened earlier
+from a mutable sibling is not retroactively pinned by this launcher.
+Selection checks the existing path components, but does not protect against
+another process replacing them concurrently; future installation must keep
+managed entries stable, including while a GUI is starting or running.
+
+To run the macOS launcher rollback test, build `remuda` twice from the same
+checkout with distinct `REMUDA_BUILD` values, save both binaries, and run:
+
+```sh
+REMUDA_GUI_CLI_A=/absolute/path/to/first/remuda REMUDA_GUI_CLI_B=/absolute/path/to/second/remuda cargo test --locked -p remuda-native --test gui_launcher macos::actual_distinct_builds_preserve_running_gui_and_rollback -- --ignored --exact
+```
+
+The test starts executable probes at both managed paths and swaps only files
+inside its disposable directory; it does not test an installer or GPUI window.
+
 # Peer-list acceptance
 
 Run `sh gui/tests/peer_list_acceptance.sh` from the repository. It builds the

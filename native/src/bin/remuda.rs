@@ -60,6 +60,9 @@ mod codex_native;
 mod codex_tui;
 #[path = "remuda/codex_tunnel.rs"]
 mod codex_tunnel;
+#[cfg(target_os = "macos")]
+#[path = "remuda/gui_managed.rs"]
+mod gui_managed;
 #[path = "remuda/opencode_adopt.rs"]
 mod opencode_adopt;
 #[path = "remuda/opencode_tui.rs"]
@@ -214,9 +217,14 @@ fn gui_command(server: &str, args: &[&str]) -> ExitCode {
 #[cfg(target_os = "macos")]
 fn launch_gui() -> ExitCode {
     use std::os::unix::process::CommandExt;
-    let sibling = match std::env::current_exe() {
-        Ok(path) => path.with_file_name("remuda-gui"),
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
         Err(error) => return fail(format!("cannot locate remuda-gui: {error}")),
+    };
+    let sibling = match gui_managed::choose(&executable, dist::BUILD_VERSION) {
+        Ok(Some(path)) => path,
+        Ok(None) => executable.with_file_name("remuda-gui"),
+        Err(error) => return fail(format!("cannot locate managed GUI: {error}")),
     };
     let error = std::process::Command::new(&sibling).exec();
     if error.kind() == std::io::ErrorKind::NotFound {
