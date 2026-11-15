@@ -6,7 +6,8 @@ mod hosts;
 use remuda_core::protocol::{Request, Response};
 use remuda_native::cluster::{encoding, AuthorizedNode, NodeState, Registry, ResolvedTarget};
 use remuda_native::cluster_remote::{
-    ClusterRemoteTransport, RemotePoller, RemoteSource, RemoteState, RemoteTarget,
+    ClusterRemoteInput, ClusterRemoteTransport, RemoteInputTransport, RemotePoller, RemoteSource,
+    RemoteState, RemoteTarget,
 };
 use remuda_native::net::cluster_client::{ClientTimeouts, ClusterClient};
 use remuda_native::SystemWallClock;
@@ -34,6 +35,10 @@ struct Node {
 
 impl Node {
     fn start(label: &str) -> Self {
+        Self::start_with_config(label, None)
+    }
+
+    fn start_with_config(label: &str, config: Option<&str>) -> Self {
         let serial = NEXT.fetch_add(1, Ordering::Relaxed);
         // The default macOS TMPDIR (/var/folders/...) leaves too little of the
         // 104-byte sun_path for runtime/remuda/<node>.sock.
@@ -48,6 +53,11 @@ impl Node {
         let home = root.join("home");
         for dir in [&runtime, &state, &home] {
             fs::create_dir_all(dir).unwrap();
+        }
+        if let Some(config) = config {
+            let dir = root.join("config/remuda");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("init.lua"), config).unwrap();
         }
         let name = format!("{label}-{serial}");
         let daemon = spawn_daemon(&name, &runtime, &root, &state);
@@ -1874,4 +1884,189 @@ fn hosted_remote_pane_multiline_paste_reaches_session() {
         .unwrap();
     tui.wait_for_from(at, "PASTE_RECEIVED:first-line", Duration::from_secs(10));
     tui.wait_for_from(at, "PASTE_RECEIVED:second-line", Duration::from_secs(10));
+}
+
+#[test]
+fn real_peer_rendered_view_validates_and_carries_the_session_row() {
+    let client_node = Node::start("deco-view-client");
+    let server_node = Node::start("deco-view-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    server_node.start_named_session("proof", "sleep 30");
+
+    let peer = ClusterClient::system();
+    let reply = peer
+        .request(
+            listener.address,
+            &server_node.public,
+            &client_node.private,
+            &Request::RenderedSessionList { width: 48 },
+        )
+        .unwrap();
+    let Response::RenderedSessionList(view) = reply else {
+        panic!("peer did not answer a rendered view: {reply:?}");
+    };
+    assert!(view.validate().is_ok(), "a real peer view must validate");
+    assert!(
+        view.entries()
+            .iter()
+            .any(|entry| entry.name.contains("proof")),
+        "the peer view must carry the live session row: {:?}",
+        view.entries()
+    );
+}
+
+#[test]
+fn cluster_tree_renders_a_real_peers_decorated_view() {
+    let config = r#"
+remuda.session_list_decorate = function(session)
+  if session.name == "proof" then
+    return { activity = "working", agent_kind = "DECO_AGENT", description = "deco-marker", layout = "compact" }
+  end
+end
+"#;
+    let client = Node::start("deco-tree-client");
+    let server = Node::start_with_config("deco-tree-server", Some(config));
+    admit_pair(&client, &server);
+    let listener = Listener::start(&server);
+    server.start_named_session("proof", "sleep 30");
+
+    let registry_path = client.state.join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry =
+        serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server.fingerprint())
+        .unwrap()
+        .endpoint = Some(listener.address.to_string());
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    let server_label = remuda_native::cluster::node_label(&server.fingerprint());
+    // Selecting the remote session expands its node, which asks for a view.
+    let tui = RemoteTui::start(&client, Some(&format!("{server_label}/proof")));
+    tui.wait_for("deco-marker", Duration::from_secs(20));
+}
+
+struct SlowViewTransport {
+    inner: Arc<ClusterRemoteInput>,
+    started: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+impl RemoteInputTransport for SlowViewTransport {
+    fn send_input(&self, node: &str, request: &Request) -> std::io::Result<Response> {
+        if matches!(request, Request::RenderedSessionList { .. }) {
+            if let Some(started) = self.started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        self.inner.send_input(node, request)
+    }
+}
+
+#[test]
+fn real_peer_delivers_input_while_its_view_is_slow() {
+    use remuda_native::cluster_tui::remote_calls::{RemoteCall, RemoteDispatcher};
+
+    let client = Node::start("deco-slow-client");
+    let server = Node::start("deco-slow-server");
+    admit_pair(&client, &server);
+    let listener = Listener::start(&server);
+    server.start_named_session(
+        "proof",
+        "stty -echo; while IFS= read -r line; do printf 'GOT:%s\\n' \"$line\"; done",
+    );
+    let socket = remuda_native::daemon::socket_path_in(&server.runtime, &server.name);
+    let instance = match remuda_native::client::request(&socket, &Request::List).unwrap() {
+        Response::Sessions(list) => list
+            .into_iter()
+            .find(|session| session.name == "proof")
+            .and_then(|session| session.instance_id)
+            .expect("proof instance id"),
+        other => panic!("failed to list sessions: {other:?}"),
+    };
+
+    let server_public = server.public.clone();
+    let address = listener.address;
+    let inner = Arc::new(ClusterRemoteInput::with_client(
+        Zeroizing::new(client.private.clone()),
+        ClusterClient::with_timeouts(
+            Arc::new(SystemWallClock::new()),
+            ClientTimeouts {
+                connect: Duration::from_secs(2),
+                read: Duration::from_secs(25),
+                total: Duration::from_secs(25),
+            },
+        ),
+        move |_node| {
+            Ok(ResolvedTarget {
+                address,
+                pinned_static_key: server_public.clone(),
+            })
+        },
+    ));
+    let (started, view_blocked) = std::sync::mpsc::channel();
+    let transport = Arc::new(SlowViewTransport {
+        inner,
+        started: std::sync::Mutex::new(Some(started)),
+    });
+    let mut dispatcher =
+        RemoteDispatcher::new(Arc::clone(&transport) as Arc<dyn RemoteInputTransport>);
+    let node = server.fingerprint();
+    dispatcher.submit_view(
+        &node,
+        RemoteCall::View(node.clone()),
+        Request::RenderedSessionList { width: 48 },
+    );
+    view_blocked
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the view probe never reached the transport");
+
+    let begun = Instant::now();
+    let reply = transport
+        .send_input(
+            &node,
+            &Request::Input {
+                name: "proof".into(),
+                instance_id: instance,
+                client_id: "3".repeat(32),
+                seq: 1,
+                bytes: b"hello\n".to_vec(),
+            },
+        )
+        .unwrap();
+    let elapsed = begun.elapsed();
+    assert!(matches!(reply, Response::Ack { .. }), "{reply:?}");
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "input waited behind the slow view: {elapsed:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen = match remuda_native::client::request(
+            &socket,
+            &Request::Capture {
+                name: "proof".into(),
+            },
+        )
+        .unwrap()
+        {
+            Response::Screen(text) => text,
+            other => panic!("failed to capture proof: {other:?}"),
+        };
+        if screen.contains("GOT:hello") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "input did not reach the session: {screen:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
