@@ -2008,6 +2008,68 @@ fn a_mod_opens_databases_in_its_own_namespace_and_eval_code_gets_none() {
 }
 
 #[test]
+fn a_mod_can_require_an_existing_database_without_creating_it() {
+    let home = DataHome::new();
+    let state_var = if cfg!(windows) {
+        "LOCALAPPDATA"
+    } else {
+        "XDG_STATE_HOME"
+    };
+    let old_state = std::env::var_os(state_var);
+    std::env::set_var(state_var, home.root.join("state"));
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    write_entry(
+        &home.entry(),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function(state)
+            local caps = assert(remuda.db.capabilities())
+            assert(caps.must_exist == true)
+            local db, why = remuda.db.open("missing", { must_exist = true })
+            assert(db == nil, "must_exist opened a missing database")
+            assert(why:find("refusing to create", 1, true), why)
+            state.why = why
+          end,
+          tools = {{ name = "sample_why",
+            about = "Return the must_exist refusal.",
+            run = function(state) return state.why end }},
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-must-exist.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(&image, "remuda.exec('sample')");
+    let why = read_value(&image, "return remuda.tools.sample_why()");
+    let caps = read_value(
+        &image,
+        "local c = remuda.db.capabilities(); return tostring(c and c.must_exist)",
+    );
+    let dir = home.root.join("state/remuda/db/sample");
+    let exists = dir.join("missing.db").exists();
+    let wal = dir.join("missing.db-wal").exists();
+    let shm = dir.join("missing.db-shm").exists();
+    match old_state {
+        Some(old) => std::env::set_var(state_var, old),
+        None => std::env::remove_var(state_var),
+    }
+    assert!(why.contains("missing"), "{why}");
+    assert_eq!(caps, "true");
+    assert!(!exists, "must_exist created the main database");
+    assert!(!wal, "must_exist created a WAL file");
+    assert!(!shm, "must_exist created a SHM file");
+}
+
+#[test]
 fn a_mod_applies_its_shipped_migration_files_on_open() {
     let home = DataHome::new();
     let state_var = if cfg!(windows) {

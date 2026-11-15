@@ -25,17 +25,91 @@ const SIDE_SUFFIXES: [&str; 3] = ["", "-wal", "-shm"];
 /// Open (creating if needed) `dir/file_name` in WAL mode with private files.
 /// `file_name` is a plain name such as `index.db`, never a path.
 pub fn open(dir: &Path, file_name: &str) -> io::Result<Connection> {
+    open_mode(dir, file_name, true)
+}
+
+/// Open an existing `dir/file_name` without creating the main database file.
+/// Sidecars may be created; a missing main file is an error, never an empty
+/// database.
+pub fn open_existing(dir: &Path, file_name: &str) -> io::Result<Connection> {
+    open_mode(dir, file_name, false)
+}
+
+fn open_mode(dir: &Path, file_name: &str, create: bool) -> io::Result<Connection> {
+    open_mode_with(dir, file_name, create, |_| Ok(()))
+}
+
+fn open_mode_with<F>(
+    dir: &Path,
+    file_name: &str,
+    create: bool,
+    before_final_secure: F,
+) -> io::Result<Connection>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
     check_file_name(file_name)?;
-    storage::private_directory(dir)?;
+    if create {
+        storage::private_directory(dir)?;
+    } else {
+        storage::verify_existing_directory(dir).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "database directory {} is missing; refusing to create it",
+                        dir.display()
+                    ),
+                )
+            } else {
+                error
+            }
+        })?;
+    }
     let path = dir.join(file_name);
-    secure_files(&path)?;
+    if create {
+        secure_files(&path)?;
+    } else {
+        check_existing_database(&path)?;
+        secure_existing_files(&path)?;
+    }
     // No SQLITE_OPEN_NOFOLLOW: it rejects a symlink anywhere in the path
-    // (macOS /var, a linked home). `secure_files` refuses a linked file itself.
-    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags(&path, flags).map_err(sql_error)?;
+    // (macOS /var, a linked home). The secure helpers refuse a linked file.
+    // Check/open is not atomic: no-CREATE stops recreating a missing file, not
+    // a symlink swapped in between; see docs/lua.md for the boundary.
+    let conn = connect(&path)?;
     configure(&conn)?;
-    secure_files(&path)?;
+    before_final_secure(&path)?;
+    if create {
+        secure_files(&path)?;
+    } else {
+        secure_existing_files(&path)?;
+    }
     Ok(conn)
+}
+
+/// Refuse a missing, linked or non-regular main database file without creating
+/// it. The no-CREATE open below is the atomic backstop if it disappears after
+/// this check.
+fn check_existing_database(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "database file {} is missing; refusing to create it",
+                path.display()
+            ),
+        )),
+        Err(error) => Err(error),
+        Ok(_) => storage::check_existing_private_file(path),
+    }
+}
+
+fn secure_existing_files(path: &Path) -> io::Result<()> {
+    let mut sidecars = files(path).into_iter();
+    let main = sidecars.next().expect("the main database path");
+    check_existing_database(&main)?;
+    sidecars.try_for_each(|file| storage::private_file(&file))
 }
 
 /// The database file and the two files SQLite keeps next to it.
@@ -51,6 +125,11 @@ fn secure_files(path: &Path) -> io::Result<()> {
     files(path)
         .iter()
         .try_for_each(|file| storage::private_file(file))
+}
+
+fn connect(path: &Path) -> io::Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    Connection::open_with_flags(path, flags).map_err(sql_error)
 }
 
 fn configure(conn: &Connection) -> io::Result<()> {
@@ -284,6 +363,95 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("dms held"), "{stdout}");
         drop((first, second));
+    }
+
+    #[test]
+    fn open_existing_refuses_a_missing_database_without_creating_files() {
+        let tmp = TempDir::new("must-exist-missing");
+        let dir = tmp.0.join("db");
+        let error = open_existing(&dir, "index.db").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+        assert!(error.to_string().contains("refusing to create"), "{error}");
+        assert!(!dir.exists(), "must_exist created the database directory");
+        for file in files(&dir.join("index.db")) {
+            assert!(!file.exists(), "{} was created", file.display());
+        }
+    }
+
+    #[test]
+    fn a_no_create_open_does_not_recreate_a_file_removed_after_the_check() {
+        let tmp = TempDir::new("must-exist-race");
+        let dir = tmp.0.join("db");
+        drop(open(&dir, "index.db").unwrap());
+        let path = dir.join("index.db");
+        check_existing_database(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let error = connect(&path).unwrap_err();
+        assert!(error.to_string().contains("unable to open"), "{error}");
+        assert!(!path.exists(), "the no-create open recreated the file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_existing_refuses_a_loose_database_before_opening_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new("must-exist-loose");
+        let dir = tmp.0.join("db");
+        storage::private_directory(&dir).unwrap();
+        let path = dir.join("index.db");
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = open_existing(&dir, "index.db").unwrap_err();
+        assert!(error.to_string().contains("loose permissions"), "{error}");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "the refused file was modified");
+        for sidecar in files(&path).iter().skip(1) {
+            assert!(!sidecar.exists(), "{} was created", sidecar.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_no_create_open_does_not_recreate_a_file_removed_after_connect() {
+        let tmp = TempDir::new("must-exist-after-connect");
+        let dir = tmp.0.join("db");
+        drop(open(&dir, "index.db").unwrap());
+        let path = dir.join("index.db");
+        let error = open_mode_with(&dir, "index.db", false, |path| {
+            std::fs::remove_file(path)?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("missing"), "{error}");
+        assert!(!path.exists(), "the final secure step recreated the file");
+    }
+
+    #[test]
+    fn open_existing_opens_an_existing_database() {
+        let tmp = TempDir::new("must-exist-present");
+        let dir = tmp.0.join("db");
+        let first = open(&dir, "index.db").unwrap();
+        write_rows(&first);
+        drop(first);
+        let second = open_existing(&dir, "index.db").unwrap();
+        let value: String = second
+            .query_row("SELECT v FROM t WHERE k = 'a'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "secret");
+        assert_private(&dir, &dir.join("index.db"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_existing_refuses_a_symlinked_database() {
+        let tmp = TempDir::new("must-exist-symlink");
+        let dir = tmp.0.join("db");
+        let target = dir.join("real.db");
+        drop(open(&dir, "real.db").unwrap());
+        std::os::unix::fs::symlink(&target, dir.join("link.db")).unwrap();
+        let error = open_existing(&dir, "link.db").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
     }
 
     #[test]

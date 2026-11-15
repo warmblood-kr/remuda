@@ -29,7 +29,8 @@ fn lua_at(root: &Path) -> Lua {
             move |lua, (owner, name, opts): (String, String, Option<Table>)| {
                 let limits = limits_from(opts.as_ref())?;
                 let migrations = migrations_from(opts.as_ref())?;
-                open_answer(lua, &root, &owner, &name, limits, migrations)
+                let must_exist = must_exist_from(opts.as_ref())?;
+                open_answer(lua, &root, &owner, &name, limits, migrations, must_exist)
             },
         )
         .unwrap();
@@ -303,4 +304,37 @@ fn a_failed_migration_returns_its_reason_and_changes_nothing() {
     );
     assert!(got.starts_with("nil|denied:"), "{got}");
     assert!(got.ends_with("|0"), "{got}");
+}
+
+#[test]
+fn must_exist_refuses_a_missing_database_without_creating_it() {
+    let scratch = Scratch::new();
+    let lua = lua_at(&scratch.0);
+    let why = run(
+        &lua,
+        r#"
+        local db, reason = open("butler", "missing", { must_exist = true })
+        assert(db == nil, "must_exist opened a missing database")
+        assert(reason:find("refusing to create", 1, true), reason)
+        return reason
+    "#,
+    );
+    assert!(why.contains("missing"), "{why}");
+    assert!(!scratch.0.join("butler/missing.db").exists());
+    assert!(!scratch.0.join("butler/missing.db-wal").exists());
+    assert!(!scratch.0.join("butler/missing.db-shm").exists());
+}
+
+#[test]
+fn the_default_still_creates_a_missing_database() {
+    let scratch = Scratch::new();
+    let lua = lua_at(&scratch.0);
+    run(
+        &lua,
+        r#"
+        local db = assert(open("butler", "fresh"))
+        return tostring(db ~= nil)
+    "#,
+    );
+    assert!(scratch.0.join("butler/fresh.db").is_file());
 }
