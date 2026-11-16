@@ -72,6 +72,9 @@ pub struct Browser {
     address: Option<(String, usize)>,
 }
 impl Browser {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
     pub fn new(socket: PathBuf) -> Self {
         let mut browser = Self {
             page: Page::empty(Location::Directory(String::new())),
