@@ -263,14 +263,14 @@ fn stopped_daemon_input_becomes_uncertain_and_later_input_recovers() {
     let mut tui = TuiPty::start(&daemon.runtime);
     tui.wait_for("tui-session", Duration::from_secs(5));
     tui.writer.write_all(b"\r").unwrap();
-    tui.wait_for("$ tui-session> ", Duration::from_secs(3));
+    tui.wait_for("Remuda > ", Duration::from_secs(3));
     tui.writer.write_all(b"first line").unwrap();
     tui.wait_for("first line", Duration::from_secs(5));
 
     daemon.stop();
     let redraw_start = tui.output_len();
     tui.writer.write_all(b"\r").unwrap();
-    tui.wait_for("sending   · first line", Duration::from_secs(3));
+    tui.wait_for("sending · first line", Duration::from_secs(3));
     let started = Instant::now();
     // InputLine gets an eight-second response budget and three bounded retries.
     let uncertain_bound = Duration::from_secs(36);
@@ -281,7 +281,7 @@ fn stopped_daemon_input_becomes_uncertain_and_later_input_recovers() {
         if screen.contains("delivery uncertain") {
             break screen;
         }
-        if screen.contains("sending   ·") {
+        if screen.contains("sending ·") {
             progress_screens.insert(screen.clone());
         }
         assert!(
@@ -403,6 +403,104 @@ fn local_tree_frame_uses_daemon_registered_decorations_and_depth() {
     assert!(
         plain.find("tree-parent").unwrap() < plain.find("tree-child").unwrap(),
         "{plain}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn documents_browse_plain_text_and_return_without_sending_browser_input() {
+    use base64::Engine;
+    use std::io::Write;
+    let mut daemon = PrivateDaemon::start();
+    daemon.wait_ready();
+    let init = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "cluster-tree", "cluster", "init", "--no-listen"])
+        .env("REMUDA_RUNTIME_DIR", &daemon.runtime)
+        .env("HOME", daemon.runtime.join("home"))
+        .env("XDG_CONFIG_HOME", daemon.runtime.join("config"))
+        .env("XDG_DATA_HOME", daemon.runtime.join("data"))
+        .env("XDG_CACHE_HOME", daemon.runtime.join("cache"))
+        .env("XDG_STATE_HOME", daemon.runtime.join("state"))
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    let put = remuda_native::client::request(
+        &daemon.path(),
+        &Request::Vfs {
+            args: vec!["put".into(), "-".into(), "remuda:///docs/one.txt".into()],
+            input_base64: Some(
+                base64::engine::general_purpose::STANDARD.encode(b"BROWSER_FIXTURE\nsecond line\n"),
+            ),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(put, Response::CommandResult { exit_code: 0, .. }),
+        "{put:?}"
+    );
+    let new = remuda_native::client::request(
+        &daemon.path(),
+        &Request::New {
+            name: Some("doc-session".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                r#"stty -echo; while IFS= read -r line; do printf 'got:%s\n' "$line"; done"#.into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .unwrap();
+    assert!(matches!(new, Response::Value(_)), "{new:?}");
+    let mut tui = TuiPty::start(&daemon.runtime);
+    tui.wait_for("doc-session", Duration::from_secs(5));
+    tui.writer.write_all(b"\rsaved-draft").unwrap();
+    tui.wait_for("saved-draft", Duration::from_secs(3));
+    tui.writer.write_all(b"\x1bd").unwrap(); // Alt-d preserves the composer.
+    let root = tui.wait_for("docs/", Duration::from_secs(5));
+    assert!(
+        root.contains("Documents") && !root.contains("one.txt"),
+        "{root}"
+    );
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("one.txt", Duration::from_secs(5));
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("BROWSER_FIXTURE", Duration::from_secs(5));
+    tui.writer
+        .write_all(b"\x1b[200~DO_NOT_SEND\r\x1b[201~xyk\r")
+        .unwrap();
+    tui.writer.write_all(b"\x1b").unwrap();
+    tui.wait_for("> docs/one.txt", Duration::from_secs(3));
+    // A pending daemon read must not put the document back after Back.
+    daemon.stop();
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("Loading", Duration::from_secs(3));
+    tui.writer.write_all(b"\x1b").unwrap();
+    tui.wait_for("> docs/one.txt", Duration::from_secs(3));
+    daemon.resume();
+    std::thread::sleep(Duration::from_millis(700));
+    let after_reply = tui.screen_text();
+    assert!(
+        after_reply.contains("> docs/one.txt") && !after_reply.contains("BROWSER_FIXTURE"),
+        "{after_reply}"
+    );
+    tui.writer.write_all(b"q").unwrap();
+    let returned = tui.wait_for("saved-draft", Duration::from_secs(3));
+    assert!(!returned.contains("Documents"), "{returned}");
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("got:saved-draft", Duration::from_secs(5));
+    let capture = remuda_native::client::request(
+        &daemon.path(),
+        &Request::Capture {
+            name: "doc-session".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(capture, Response::Screen(ref s) if !s.contains("DO_NOT_SEND")),
+        "{capture:?}"
     );
 }
 

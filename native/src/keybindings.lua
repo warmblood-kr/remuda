@@ -120,6 +120,14 @@ return function(owner, validate, config_status, validate_help)
   api.define_key{context="cluster.search", key="<right>", action="cluster.right", help="expand"}
   api.define_key{context="cluster.search", key="RET", action="cluster.select", help="select"}
   api.define_key{context="cluster.tree", key="q", action="cluster.detach", help="detach"}
+  api.define_key{context="cluster.tree", key="d", action="cluster.documents", help="documents"}
+  api.define_key{context="cluster.composer", key="M-d", action="cluster.documents", help="documents"}
+  api.define_key{context="cluster.documents", key="<up>", action="documents.up", help="up"}
+  api.define_key{context="cluster.documents", key="<down>", action="documents.down", help="down"}
+  api.define_key{context="cluster.documents", key="RET", action="documents.open", help="open"}
+  api.define_key{context="cluster.documents", key="ESC", action="documents.back", help="back"}
+  api.define_key{context="cluster.documents", key="q", action="documents.close", help="sessions"}
+  api.define_key{context="cluster.documents", key="r", action="documents.refresh", help="retry"}
   api.define_key{context="cluster.tree", key="x", action="cluster.close", help="close"}
   api.define_key{context="cluster.tree", key="/", action="cluster.search", help="search"}
   api.define_key{context="cluster.tree", key="!", action="cluster.attention", help="attention"}
