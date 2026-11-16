@@ -269,6 +269,7 @@ type RemoteResult = (u64, u64, String, Result<Vec<Session>, String>);
 struct LocalGui {
     documents: Option<documents::Pane>,
     documents_focus: Option<FocusHandle>,
+    attach_confirm: Option<Selection>,
     terminal: Option<terminal::Terminal>,
     terminal_status: String,
     input_focus: Option<FocusHandle>,
@@ -328,6 +329,7 @@ impl LocalGui {
         Self {
             documents: None,
             documents_focus: None,
+            attach_confirm: None,
             terminal: None,
             terminal_status: String::new(),
             input_focus: None,
@@ -379,6 +381,7 @@ impl LocalGui {
         }
     }
     fn clear_preview(&mut self) {
+        self.attach_confirm = None;
         self.terminal = None;
         self.terminal_status.clear();
         self.input_text.clear();
@@ -461,10 +464,39 @@ impl LocalGui {
             })
         });
     }
+    fn request_attach(&mut self) {
+        let Some(selection) = self.selection.clone() else {
+            return;
+        };
+        if selection.peer.is_some()
+            || !self.selection_current(&selection)
+            || self.input_helper.is_some()
+            || self.input_stopped
+        {
+            self.terminal_status =
+                "Select a current local session and wait for pending input.".into();
+            return;
+        }
+        self.terminal_status = format!(
+            "Confirm attach for {}; this takes over any current terminal.",
+            selection_label(&selection)
+        );
+        self.attach_confirm = Some(selection);
+    }
+    fn cancel_attach(&mut self) {
+        self.attach_confirm = None;
+        self.terminal_status = "Attach cancelled.".into();
+    }
     fn attach_selected(&mut self) {
         let Some(selection) = self.selection.clone() else {
             return;
         };
+        if self.attach_confirm.as_ref() != Some(&selection) {
+            self.terminal_status =
+                "Confirm attach for the selected session first.".into();
+            return;
+        }
+        self.attach_confirm = None;
         if selection.peer.is_some()
             || !self.selection_current(&selection)
             || self.input_helper.is_some()
@@ -889,7 +921,16 @@ impl LocalGui {
     }
 }
 impl Render for LocalGui {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let viewport = window.viewport_size();
+        let viewport_width: f32 = viewport.width.into();
+        let viewport_height: f32 = viewport.height.into();
+        let sidebar_width = (viewport_width * 0.28).clamp(150.0, 300.0);
+        let content_width = (viewport_width - sidebar_width - 32.0).max(40.0);
+        let document_columns =
+            ((content_width / 8.0) as usize).clamp(20, documents::MAX_COLUMNS);
+        let document_rows =
+            (((viewport_height - 300.0) / 17.0) as usize).clamp(4, documents::MAX_ROWS);
         let input_focus = self
             .input_focus
             .get_or_insert_with(|| cx.focus_handle())
@@ -922,7 +963,8 @@ impl Render for LocalGui {
             .font_family("Menlo")
             .child(
                 div()
-                    .w(px(300.))
+                    .w(px(sidebar_width))
+                    .min_w(px(sidebar_width))
                     .h_full()
                     .flex()
                     .flex_col()
@@ -1023,7 +1065,10 @@ impl Render for LocalGui {
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.))
                     .p_4()
+                    .flex()
+                    .flex_col()
                     .child(
                         div()
                             .id("documents-toggle")
@@ -1051,6 +1096,10 @@ impl Render for LocalGui {
                             div()
                                 .id("document-pane")
                                 .debug_selector(|| "document-pane".into())
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_h(px(0.))
                                 .child(
                                     div()
                                         .id("document-status")
@@ -1062,6 +1111,9 @@ impl Render for LocalGui {
                                     div()
                                         .id("document-frame")
                                         .debug_selector(|| "document-frame".into())
+                                        .flex_1()
+                                        .min_h(px(0.))
+                                        .overflow_y_scroll()
                                         .track_focus(&documents_focus)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             if let Some(focus) = &this.documents_focus {
@@ -1095,12 +1147,18 @@ impl Render for LocalGui {
                                         .overflow_hidden()
                                         .py_2()
                                         .children(
-                                            pane.frame(120, 30)
+                                            pane.frame(document_columns, document_rows)
                                                 .into_iter()
                                                 .map(|line| div().child(line)),
                                         ),
                                 )
-                                .children(
+                                .child(
+                                    div()
+                                        .id("document-controls")
+                                        .debug_selector(|| "document-controls".into())
+                                        .flex()
+                                        .flex_wrap()
+                                        .children(
                                     [
                                         ("doc-up", "Up", 0u8),
                                         ("doc-down", "Down", 1),
@@ -1136,6 +1194,7 @@ impl Render for LocalGui {
                                                 cx.notify();
                                             }))
                                     }),
+                                        ),
                                 ),
                         )
                     })
@@ -1163,14 +1222,29 @@ impl Render for LocalGui {
                         )
                     })
                     .when(self.sync_error, |d| d.child(div().id("sync-error").debug_selector(|| "sync-error".into()).text_color(rgb(0xf28787)).child("Live output unavailable; retrying.")))
-                    .when(self.selection.as_ref().is_some_and(|s| s.peer.is_none() && self.selection_current(s)), |d| {
+                    .when(!documents_open && self.selection.as_ref().is_some_and(|s| s.peer.is_none() && self.selection_current(s)), |d| {
+                        let confirming = self.attach_confirm.as_ref() == self.selection.as_ref();
                         d.child(div().pt_4().child(format!("Terminal target: {}", selection_label(self.selection.as_ref().unwrap()))))
                             .child(div().child("Attach takes over any current terminal. If this name is recreated during attach, the new session may be selected."))
-                            .child(div().id("attach-terminal").debug_selector(|| "attach-terminal".into()).py_2().px_2().bg(rgb(0x34445a)).child("Attach interactive terminal").on_click(cx.listener(|this, _, window, cx| {
-                                this.attach_selected();
-                                if let Some(focus) = &this.input_focus { focus.focus(window); }
-                                cx.notify();
-                            })))
+                            .when(confirming, |d| {
+                                d.child(div().id("attach-confirm").debug_selector(|| "attach-confirm".into()).child("Confirm attach for this exact target?"))
+                                    .child(div().id("confirm-attach").debug_selector(|| "confirm-attach".into()).py_2().px_2().bg(rgb(0x34445a)).cursor_pointer().child("Confirm attach").on_click(cx.listener(|this, _, window, cx| {
+                                        this.attach_selected();
+                                        if let Some(focus) = &this.input_focus { focus.focus(window); }
+                                        cx.notify();
+                                    })))
+                                    .child(div().id("cancel-attach").debug_selector(|| "cancel-attach".into()).py_2().cursor_pointer().child("Cancel").on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_attach();
+                                        cx.notify();
+                                    })))
+                            })
+                            .when(!confirming, |d| {
+                                d.child(div().id("attach-terminal").debug_selector(|| "attach-terminal".into()).py_2().px_2().bg(rgb(0x34445a)).cursor_pointer().child("Attach interactive terminal").on_click(cx.listener(|this, _, window, cx| {
+                                    this.request_attach();
+                                    if let Some(focus) = &this.input_focus { focus.focus(window); }
+                                    cx.notify();
+                                })))
+                            })
                             .child(div().id("terminal-status").debug_selector(|| "terminal-status".into()).child(self.terminal_status.clone()))
                     })
                     .when(self.terminal.is_some() && !documents_open, |d| {
@@ -1781,6 +1855,120 @@ mod tests {
             vec!["ok"]
         );
     }
+    #[test]
+    fn attach_requires_confirmation_for_the_exact_target() {
+        let mut gui = LocalGui::new();
+        gui.sessions = vec![row("one"), row("two")];
+        gui.preview_busy = true;
+        gui.select_session(row("one"));
+        gui.attach_selected();
+        assert!(gui.terminal.is_none(), "attach started without confirmation");
+        assert!(gui.terminal_status.contains("Confirm attach"), "{}", gui.terminal_status);
+        gui.request_attach();
+        assert_eq!(gui.attach_confirm, gui.selection);
+        assert!(gui.terminal.is_none());
+        gui.cancel_attach();
+        assert!(gui.attach_confirm.is_none());
+        gui.request_attach();
+        gui.select_session(row("one"));
+        assert!(
+            gui.attach_confirm.is_none(),
+            "a selection change must clear the attach confirmation"
+        );
+    }
+
+    #[gpui::test]
+    fn documents_pane_is_laid_out_and_operable_at_default_and_small_sizes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let socket = std::env::temp_dir().join(format!(
+            "gui-documents-layout-{}",
+            std::process::id()
+        ));
+        // The pane is present from the first frame: gpui's debug-bounds map
+        // accumulates across frames, so absence is only meaningful for an
+        // element that was never painted in this window.
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new();
+            gui.preview_busy = true;
+            gui.sessions = vec![row("one")];
+            gui.select_session(row("one"));
+            gui.documents = Some(documents::Pane::new(socket.clone()));
+            gui
+        });
+        assert!(cx.debug_bounds("document-pane").is_some());
+        assert!(
+            cx.debug_bounds("attach-terminal").is_none(),
+            "attach must not be offered in document mode"
+        );
+        assert!(cx.debug_bounds("attach-confirm").is_none());
+        for size in [None, Some(gpui::size(px(420.), px(320.)))] {
+            if let Some(size) = size {
+                cx.simulate_resize(size);
+            }
+            assert!(cx.debug_bounds("document-frame").is_some(), "frame missing");
+            assert!(
+                cx.debug_bounds("document-controls").is_some(),
+                "controls missing"
+            );
+            for id in [
+                "doc-up",
+                "doc-down",
+                "doc-open",
+                "doc-back",
+                "doc-prev-link",
+                "doc-next-link",
+                "doc-refresh",
+            ] {
+                let bounds = cx.debug_bounds(id).unwrap_or_else(|| panic!("{id} missing"));
+                assert!(bounds.size.width > px(0.), "{id} has no clickable width");
+                cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            }
+        }
+        let toggle = cx.debug_bounds("documents-toggle").unwrap();
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+        view.update(cx, |gui, _| assert!(gui.documents.is_none()));
+        // Session UI that could not paint while the pane was open is painted now:
+        // presence here is the restoration evidence.
+        assert!(cx.debug_bounds("attach-terminal").is_some());
+        assert!(cx.debug_bounds("input-target").is_some());
+        assert!(cx.debug_bounds("preview-target").is_some());
+    }
+
+    #[gpui::test]
+    fn attach_confirmation_targets_the_selected_session(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new();
+            gui.preview_busy = true;
+            gui.sessions = vec![row("one")];
+            gui
+        });
+        let bounds = cx.debug_bounds("session-0").unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        let attach = cx.debug_bounds("attach-terminal").unwrap();
+        cx.simulate_click(attach.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("attach-confirm").is_some());
+        assert!(cx.debug_bounds("confirm-attach").is_some());
+        let state = cx.read(|app| {
+            let gui = view.read(app);
+            (
+                gui.attach_confirm.clone().map(|s| s.name),
+                gui.selection.clone().map(|s| s.name),
+            )
+        });
+        assert_eq!(state, (Some("one".into()), Some("one".into())));
+        let cancel = cx.debug_bounds("cancel-attach").unwrap();
+        cx.simulate_click(cancel.center(), gpui::Modifiers::none());
+        let (confirm, status) = cx.read(|app| {
+            let gui = view.read(app);
+            (gui.attach_confirm.is_some(), gui.terminal_status.clone())
+        });
+        assert!(!confirm);
+        assert_eq!(status, "Attach cancelled.");
+        let terminal_open = cx.read(|app| view.read(app).terminal.is_some());
+        assert!(!terminal_open);
+    }
+
     #[gpui::test]
     fn helper_abi_error_shows_restart_notice(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, _| LocalGui::new());
@@ -1928,6 +2116,10 @@ mod tests {
                 .debug_bounds("attach-terminal")
                 .expect("attach button visible");
             cx.simulate_click(button.center(), gpui::Modifiers::none());
+            let confirm = cx
+                .debug_bounds("confirm-attach")
+                .expect("attach confirmation visible");
+            cx.simulate_click(confirm.center(), gpui::Modifiers::none());
             let deadline = std::time::Instant::now() + Duration::from_secs(12);
             loop {
                 view.update(cx, |gui, cx| {

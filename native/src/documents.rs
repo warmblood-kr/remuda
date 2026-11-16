@@ -516,7 +516,7 @@ fn fetch(socket: &Path, location: &Location) -> Reply {
             .to_string(),
         ],
     };
-    let response = crate::client::request_with_timeout(
+    let response = crate::client::request_with_deadline(
         socket,
         &Request::Vfs {
             args,

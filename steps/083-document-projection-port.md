@@ -16,8 +16,12 @@ HTML and Markdown as inert, bounded text with local links.
 ## Expected
 
 `native/src/documents.rs`, `document_html` (+`links`) and `document_markdown`
-are copied from a06e6e5c, with one call-site adaptation: the candidate exposes
-`client::request_with_timeout` instead of `request_with_deadline`. The pinned
+are copied from a06e6e5c, and `client/deadline.rs` is ported too so the
+document path keeps one bounded connect/write/read deadline. This tree's
+`request_with_timeout` starts its timer after a blocking connect, which a
+saturated listener can hold; `request_with_deadline` bounds the whole trip and
+its blocked-connector, saturated-listener and zero-budget tests come with it.
+`documents.rs` therefore calls `request_with_deadline`, not `request_with_timeout`. The pinned
 `scraper 0.29.0` dependency is added with default features disabled and `MPL-2.0`
 is added to the closed license allow-list in `deny.toml` (step 086 did the same
 on the other line). Plain text keeps its 1 MiB read cap; HTML keeps its 128 KiB
@@ -37,9 +41,12 @@ test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 1941 filtered out; 
 cargo test --offline -p remuda-native --lib document_html:: -- --test-threads=1
 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 1948 filtered out; finished in 0.06s
 
+cargo test --offline -p remuda-native --lib client::deadline -- --test-threads=1
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 1953 filtered out; finished in 0.63s
+
 cargo clippy --offline --workspace --all-targets -- -D warnings \
   -A clippy::type_complexity -A clippy::cognitive_complexity -A clippy::too_many_lines
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.22s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.01s
 ```
 
 The three allowed lints fire only in files this port does not touch
