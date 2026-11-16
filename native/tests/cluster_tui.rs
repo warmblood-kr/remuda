@@ -408,6 +408,56 @@ fn local_tree_frame_uses_daemon_registered_decorations_and_depth() {
 
 #[cfg(unix)]
 #[test]
+fn local_tree_keeps_decorations_during_daemon_timeout_and_recovers() {
+    let mut daemon = PrivateDaemon::start_with_init(Some(
+        r#"remuda.session_list_decorate = function() return { agent_kind = 'codex', description = 'timeout-proof', layout = 'compact' } end"#,
+    ));
+    daemon.wait_ready();
+    let response = remuda_native::client::request(
+        &daemon.path(),
+        &Request::New {
+            name: Some("timeout-session".into()),
+            command: vec!["sh".into(), "-c".into(), "sleep 30".into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(&response, Response::Value(name) if name == "timeout-session"),
+        "{response:?}"
+    );
+    let tui = TuiPty::start(&daemon.runtime);
+    tui.wait_for("timeout-proof", Duration::from_secs(5));
+    daemon.stop();
+    tui.wait_for("stale", Duration::from_secs(5));
+    let screen = tui.screen_text();
+    assert!(screen.contains("timeout-proof"), "{screen}");
+    daemon.resume();
+    let update = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "cluster-tree", "-e", "remuda.session_list_decorate = function() return { agent_kind = 'codex', description = 'updated-proof', layout = 'compact' } end"])
+        .env("REMUDA_RUNTIME_DIR", &daemon.runtime)
+        .env("HOME", daemon.runtime.join("home"))
+        .env("XDG_CONFIG_HOME", daemon.runtime.join("config"))
+        .env("XDG_DATA_HOME", daemon.runtime.join("data"))
+        .env("XDG_CACHE_HOME", daemon.runtime.join("cache"))
+        .env("XDG_STATE_HOME", daemon.runtime.join("state"))
+        .output().unwrap();
+    assert!(update.status.success(), "{update:?}");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let screen = tui.screen_text();
+        if screen.contains("updated-proof") && !screen.contains("stale") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{screen}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn typing_stays_responsive_while_the_local_view_decorator_is_slow() {
     let mut daemon = PrivateDaemon::start_with_init(Some(
         r#"

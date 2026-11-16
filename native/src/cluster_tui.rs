@@ -156,6 +156,7 @@ pub struct ClusterUi {
     local_targets: Vec<String>,
     sessions: Vec<SessionSummary>,
     local_view: Option<LocalView>,
+    local_view_stale: bool,
     local_view_requested_at: Option<Duration>,
     selected: usize,
     active: usize,
@@ -434,14 +435,22 @@ struct LocalView {
     order: Vec<(String, String)>,
 }
 
+enum LocalViewResult {
+    View(SessionView),
+    Timeout,
+    Rejected,
+}
+
 /// One nonblocking local `RenderedSessionList` request at a time. A slow
 /// decorator delays only this reply, never key handling or painting.
 struct LocalViewLoader {
-    replies: mpsc::Receiver<(u64, Duration, Option<SessionView>)>,
-    sender: mpsc::Sender<(u64, Duration, Option<SessionView>)>,
+    replies: mpsc::Receiver<(u64, Duration, LocalViewResult)>,
+    sender: mpsc::Sender<(u64, Duration, LocalViewResult)>,
     finished: Arc<AtomicU64>,
     next: u64,
     in_flight: Option<u64>,
+    roster: Option<Vec<(String, Option<String>, bool, bool, bool)>>,
+    flight_invalid: bool,
 }
 
 impl LocalViewLoader {
@@ -453,7 +462,29 @@ impl LocalViewLoader {
             finished: Arc::new(AtomicU64::new(0)),
             next: 0,
             in_flight: None,
+            roster: None,
+            flight_invalid: false,
         }
+    }
+
+    fn observe_roster(&mut self, sessions: &[SessionSummary]) {
+        let mut roster: Vec<_> = sessions
+            .iter()
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    s.instance_id.clone(),
+                    s.alive,
+                    s.unavailable,
+                    s.remote_input_disabled,
+                )
+            })
+            .collect();
+        roster.sort();
+        if self.roster.as_ref().is_some_and(|old| *old != roster) && self.in_flight.is_some() {
+            self.flight_invalid = true;
+        }
+        self.roster = Some(roster);
     }
 
     fn finished(&self) -> Arc<AtomicU64> {
@@ -466,12 +497,14 @@ impl LocalViewLoader {
 
     fn request(&mut self, path: &Path, at: Duration) -> bool {
         let path = path.to_path_buf();
-        self.request_with(at, move || local_session_view(&path, LOCAL_VIEW_WIDTH))
+        self.request_with(at, move || {
+            local_session_view_result(&path, LOCAL_VIEW_WIDTH)
+        })
     }
 
     fn request_with<F>(&mut self, at: Duration, fetch: F) -> bool
     where
-        F: FnOnce() -> Option<SessionView> + Send + 'static,
+        F: FnOnce() -> LocalViewResult + Send + 'static,
     {
         if !self.idle() {
             return false;
@@ -479,6 +512,7 @@ impl LocalViewLoader {
         let generation = self.next;
         self.next = self.next.wrapping_add(1);
         self.in_flight = Some(generation);
+        self.flight_invalid = false;
         let sender = self.sender.clone();
         let finished = Arc::clone(&self.finished);
         let spawned = std::thread::Builder::new()
@@ -496,10 +530,13 @@ impl LocalViewLoader {
         spawned
     }
 
-    fn take_reply(&mut self) -> Option<(Duration, Option<SessionView>)> {
+    fn take_reply(&mut self) -> Option<(Duration, LocalViewResult)> {
         while let Ok((generation, at, result)) = self.replies.try_recv() {
             if self.in_flight == Some(generation) {
                 self.in_flight = None;
+                if std::mem::take(&mut self.flight_invalid) {
+                    return None;
+                }
                 return Some((at, result));
             }
         }
@@ -528,6 +565,7 @@ impl ClusterUi {
             local_targets: vec![node.into()],
             sessions,
             local_view: None,
+            local_view_stale: false,
             local_view_requested_at: None,
             selected: 0,
             active: 0,
@@ -1023,8 +1061,10 @@ impl ClusterUi {
     pub fn local_view_synced(&mut self, view: SessionView, at: Duration) {
         if view.validate().is_err() || !self.sessions_match_view(&view) {
             self.local_view = None;
+            self.local_view_stale = false;
             return;
         }
+        self.local_view_stale = false;
         self.local_view = Some(LocalView {
             at,
             order: view
@@ -1037,7 +1077,12 @@ impl ClusterUi {
     }
 
     pub fn local_view_failed(&mut self) {
+        self.local_view_stale = self.local_view.is_some();
+    }
+
+    fn clear_local_view(&mut self) {
         self.local_view = None;
+        self.local_view_stale = false;
     }
 
     /// Apply a reply that carries the time its request started. A reply left
@@ -1069,7 +1114,7 @@ impl ClusterUi {
             .as_ref()
             .is_some_and(|local| !self.sessions_match_view(&local.view))
         {
-            self.local_view = None;
+            self.clear_local_view();
             // A different session set is a real reason to fetch now rather
             // than wait out the normal refresh interval.
             self.local_view_requested_at = None;
@@ -1086,6 +1131,20 @@ impl ClusterUi {
                 ended.summary.instance_id.as_deref(),
             )
         });
+        let Ok(checked) = view.validate_for_display(None, LOCAL_VIEW_WIDTH) else {
+            return false;
+        };
+        if !checked.sessions().iter().all(|candidate| {
+            self.sessions.iter().any(|current| {
+                current.name == candidate.name
+                    && current.instance_id == candidate.instance_id
+                    && current.alive == candidate.alive
+                    && current.unavailable == candidate.unavailable
+                    && current.remote_input_disabled == candidate.remote_input_disabled
+            })
+        }) {
+            return false;
+        }
         let mut expected = HashMap::with_capacity(self.sessions.len());
         for session in &self.sessions {
             let identity = (session.name.as_str(), session.instance_id.as_deref());
@@ -1383,7 +1442,16 @@ impl ClusterUi {
                 if self.expanded { "▼" } else { "▶" }
             ),
             &self.node,
-            "●",
+            if self.local_view_stale
+                || self
+                    .local_view
+                    .as_ref()
+                    .is_some_and(|view| now.saturating_sub(view.at) >= LOCAL_VIEW_TTL)
+            {
+                "● stale"
+            } else {
+                "●"
+            },
             width,
         ));
         for row in local_rows.iter().chain(remote_rows.iter()) {
@@ -3977,9 +4045,7 @@ fn session_status(status: &str, pending_count: usize) -> String {
 }
 
 fn list(path: &Path) -> io::Result<Vec<SessionSummary>> {
-    match client::request_with_timeout(path, &Request::List, UI_REQUEST_TIMEOUT)
-        .map_err(io::Error::other)?
-    {
+    match client::request_with_timeout(path, &Request::List, UI_REQUEST_TIMEOUT)? {
         Response::Sessions(sessions) => Ok(sessions),
         Response::Error(error) => Err(io::Error::other(error)),
         other => Err(io::Error::other(format!(
@@ -3990,13 +4056,25 @@ fn list(path: &Path) -> io::Result<Vec<SessionSummary>> {
 
 /// The same rendered list the herd TUI shows, including Butler decorations.
 /// Read-only and optional: a missing or unsupported view keeps plain rows.
-fn local_session_view(path: &Path, width: u16) -> Option<SessionView> {
-    match client::request_with_timeout(
+fn classify_local_view(result: io::Result<Response>) -> LocalViewResult {
+    match result {
+        Ok(Response::RenderedSessionList(view)) => LocalViewResult::View(view),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => LocalViewResult::Timeout,
+        _ => LocalViewResult::Rejected,
+    }
+}
+
+fn local_session_view_result(path: &Path, width: u16) -> LocalViewResult {
+    classify_local_view(client::request_with_timeout(
         path,
         &Request::RenderedSessionList { width },
         UI_REQUEST_TIMEOUT,
-    ) {
-        Ok(Response::RenderedSessionList(view)) => Some(view),
+    ))
+}
+
+fn local_session_view(path: &Path, width: u16) -> Option<SessionView> {
+    match local_session_view_result(path, width) {
+        LocalViewResult::View(view) => Some(view),
         _ => None,
     }
 }
@@ -4009,21 +4087,48 @@ fn sync_local_list(
     local_views: &mut LocalViewLoader,
     now: Duration,
 ) {
-    match list(path) {
+    sync_local_list_with(ui, local_views, now, list(path), |loader, now| {
+        loader.request(path, now)
+    });
+}
+
+fn sync_local_list_with(
+    ui: &mut ClusterUi,
+    local_views: &mut LocalViewLoader,
+    now: Duration,
+    listed: io::Result<Vec<SessionSummary>>,
+    request: impl FnOnce(&mut LocalViewLoader, Duration) -> bool,
+) {
+    if ui
+        .local_view
+        .as_ref()
+        .is_some_and(|view| now.saturating_sub(view.at) >= LOCAL_VIEW_TTL)
+    {
+        ui.clear_local_view();
+    }
+    match listed {
         Ok(current) => {
+            local_views.observe_roster(&current);
             ui.sessions_synced(current, now);
             if let Some((requested_at, result)) = local_views.take_reply() {
-                ui.apply_local_view(result, requested_at, now);
+                match result {
+                    LocalViewResult::View(view) => {
+                        ui.apply_local_view(Some(view), requested_at, now)
+                    }
+                    LocalViewResult::Timeout => ui.local_view_failed(),
+                    LocalViewResult::Rejected => ui.clear_local_view(),
+                }
             }
             if ui.expanded && ui.local_view_due(now) && local_views.idle() {
                 ui.local_view_requested_at = Some(now);
-                if !local_views.request(path, now) {
-                    ui.local_view_failed();
+                if !request(local_views, now) {
+                    ui.clear_local_view();
                 }
             }
         }
         // `List` already waited; do not add a second timeout on a stalled node.
-        Err(_) => ui.local_view_failed(),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => ui.local_view_failed(),
+        Err(_) => ui.clear_local_view(),
     }
 }
 
@@ -7586,6 +7691,230 @@ mod tests {
     }
 
     #[test]
+    fn local_tree_keeps_decorated_row_through_failed_refresh_then_updates() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("alpha", true)];
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        let view = |detail: &str| {
+            SessionView::new(
+                sessions.clone(),
+                1,
+                vec![view_entry(
+                    "alpha",
+                    "instance-alpha",
+                    &[&format!("{} {detail}", alive_row("alpha"))],
+                )],
+            )
+        };
+        ui.local_view_synced(view("OLD-DETAIL"), clock.now());
+        let mut loader = LocalViewLoader::new();
+        assert!(loader.request_with(clock.now(), || super::LocalViewResult::Timeout));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while loader.finished().load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        ui.local_view_requested_at = Some(clock.now());
+        super::sync_local_list_with(
+            &mut ui,
+            &mut loader,
+            clock.now(),
+            Ok(sessions.clone()),
+            |_, _| false,
+        );
+        assert!(ui
+            .render_text(100, 24, "pane", &clock)
+            .contains("OLD-DETAIL"));
+        let updated = view("NEW-DETAIL");
+        assert!(loader.request_with(clock.now(), move || super::LocalViewResult::View(updated)));
+        while loader.finished().load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        super::sync_local_list_with(&mut ui, &mut loader, clock.now(), Ok(sessions), |_, _| {
+            false
+        });
+        assert!(ui
+            .render_text(100, 24, "pane", &clock)
+            .contains("NEW-DETAIL"));
+    }
+
+    #[test]
+    fn local_refresh_failure_is_marked_stale_and_roster_changes_invalidate_view() {
+        let clock = ManualClock::new();
+        for change in 0..5 {
+            let sessions = vec![session("alpha", true)];
+            let mut ui = make_ui("studio", sessions.clone(), clock.now());
+            let view = SessionView::new(
+                sessions.clone(),
+                1,
+                vec![view_entry("alpha", "instance-alpha", &["alpha DETAIL"])],
+            );
+            ui.local_view_synced(view, clock.now());
+            let mut loader = LocalViewLoader::new();
+            super::sync_local_list_with(
+                &mut ui,
+                &mut loader,
+                clock.now(),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "List failed",
+                )),
+                |_, _| false,
+            );
+            let frame = ui.render_text(100, 24, "pane", &clock);
+            assert!(
+                frame.contains("DETAIL") && frame.contains("stale"),
+                "{frame}"
+            );
+            let mut changed = sessions;
+            match change {
+                0 => changed.clear(),
+                1 => changed[0].instance_id = Some("new".into()),
+                2 => changed[0].alive = false,
+                3 => changed[0].unavailable = true,
+                _ => changed[0].remote_input_disabled = true,
+            }
+            ui.sessions_synced(changed, clock.now());
+            assert!(ui.local_view.is_none());
+        }
+    }
+
+    #[test]
+    fn local_explicit_rejection_and_non_timeout_list_failure_clear_cached_view() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("alpha", true)];
+        let view = SessionView::new(
+            sessions.clone(),
+            1,
+            vec![view_entry("alpha", "instance-alpha", &["alpha DETAIL"])],
+        );
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        ui.local_view_synced(view.clone(), clock.now());
+        let mut loader = LocalViewLoader::new();
+        assert!(loader.request_with(clock.now(), || super::LocalViewResult::Rejected));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while loader.finished().load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        ui.local_view_requested_at = Some(clock.now());
+        super::sync_local_list_with(&mut ui, &mut loader, clock.now(), Ok(sessions), |_, _| {
+            false
+        });
+        assert!(ui.local_view.is_none());
+        ui.local_view_synced(view, clock.now());
+        super::sync_local_list_with(
+            &mut ui,
+            &mut loader,
+            clock.now(),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied",
+            )),
+            |_, _| false,
+        );
+        assert!(ui.local_view.is_none());
+    }
+
+    #[test]
+    fn local_inflight_view_is_discarded_after_roster_aba() {
+        let clock = ManualClock::new();
+        let a = vec![session("alpha", true)];
+        let mut b = a.clone();
+        b[0].remote_input_disabled = true;
+        let mut ui = make_ui("studio", a.clone(), clock.now());
+        let mut loader = LocalViewLoader::new();
+        loader.observe_roster(&a);
+        let view = SessionView::new(
+            a.clone(),
+            1,
+            vec![view_entry("alpha", "instance-alpha", &["alpha OLD"])],
+        );
+        let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let worker_gate = gate.clone();
+        assert!(loader.request_with(clock.now(), move || {
+            let (lock, changed) = &*worker_gate;
+            let ready = lock.lock().unwrap();
+            let _ready = changed.wait_while(ready, |ready| !*ready).unwrap();
+            super::LocalViewResult::View(view)
+        }));
+        super::sync_local_list_with(&mut ui, &mut loader, clock.now(), Ok(b), |_, _| false);
+        super::sync_local_list_with(&mut ui, &mut loader, clock.now(), Ok(a.clone()), |_, _| {
+            false
+        });
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while loader.finished().load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        super::sync_local_list_with(&mut ui, &mut loader, clock.now(), Ok(a), |_, _| false);
+        assert!(
+            ui.local_view.is_none(),
+            "old A reply must not survive A→B→A"
+        );
+    }
+
+    #[test]
+    fn local_stale_indicator_clears_with_rejection_invalidation_and_expiry() {
+        let clock = ManualClock::new();
+        let sessions = vec![session("alpha", true)];
+        let view = SessionView::new(
+            sessions.clone(),
+            1,
+            vec![view_entry("alpha", "instance-alpha", &["alpha DETAIL"])],
+        );
+        let mut ui = make_ui("studio", sessions.clone(), clock.now());
+        ui.local_view_failed();
+        assert!(!ui.local_view_stale);
+        ui.local_view_synced(view.clone(), clock.now());
+        ui.local_view_failed();
+        ui.sessions_synced(vec![], clock.now());
+        assert!(!ui.local_view_stale && ui.local_view.is_none());
+        ui.sessions_synced(sessions, clock.now());
+        ui.local_view_synced(view, clock.now());
+        ui.local_view_failed();
+        clock.advance(LOCAL_VIEW_TTL + Duration::from_secs(1));
+        let mut loader = LocalViewLoader::new();
+        super::sync_local_list_with(
+            &mut ui,
+            &mut loader,
+            clock.now(),
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout")),
+            |_, _| false,
+        );
+        assert!(!ui.local_view_stale && ui.local_view.is_none());
+        assert!(!ui.render_text(100, 24, "pane", &clock).contains("stale"));
+    }
+
+    #[test]
+    fn local_view_classifies_only_timeouts_as_retainable() {
+        use super::{classify_local_view, LocalViewResult};
+        let timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout");
+        assert!(matches!(
+            classify_local_view(Err(timeout)),
+            LocalViewResult::Timeout
+        ));
+        assert!(matches!(
+            classify_local_view(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "malformed"
+            ))),
+            LocalViewResult::Rejected
+        ));
+        assert!(matches!(
+            classify_local_view(Ok(Response::Error("unsupported".into()))),
+            LocalViewResult::Rejected
+        ));
+        assert!(matches!(
+            classify_local_view(Ok(Response::Sessions(vec![]))),
+            LocalViewResult::Rejected
+        ));
+    }
+
+    #[test]
     fn local_view_refresh_is_rate_limited() {
         let clock = ManualClock::new();
         let mut ui = make_ui("studio", sessions(), clock.now());
@@ -7603,7 +7932,7 @@ mod tests {
         let started = Instant::now();
         assert!(loader.request_with(requested_at, || {
             std::thread::sleep(Duration::from_millis(300));
-            None
+            super::LocalViewResult::Timeout
         }));
         assert!(
             started.elapsed() < Duration::from_millis(150),
@@ -7615,7 +7944,7 @@ mod tests {
         loop {
             if let Some((at, result)) = loader.take_reply() {
                 assert_eq!(at, requested_at);
-                assert!(result.is_none());
+                assert!(matches!(result, super::LocalViewResult::Timeout));
                 break;
             }
             assert!(Instant::now() < deadline, "slow reply never arrived");
