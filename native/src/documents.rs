@@ -264,6 +264,13 @@ impl Browser {
         // ASCII escapes make every code point inspectable even in a one-column
         // terminal, without changing the address used for navigation.
         let escaped: String = path.chars().flat_map(char::escape_default).collect();
+        // Freeze the inspected selection as well as its displayed URI. A late
+        // refresh must not make Enter act on another item after inspection.
+        let paused = self.loading || self.pending;
+        self.cancel();
+        if paused {
+            self.page.error = Some("Refresh paused for address inspection; r to refresh".into());
+        }
         self.address = Some((format!("remuda:///{escaped}"), 0));
     }
 
@@ -520,6 +527,64 @@ fn decode(location: &Location, value: &Value) -> Reply {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn inspection_fences_refresh_reordering_or_removal_before_enter() {
+        for (reply_before_close, queued) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
+            for new_paths in [vec!["docs/B", "docs/A"], vec!["docs/B"]] {
+                let (send, receive) = mpsc::sync_channel(1);
+                let mut page = Page::empty(Location::Directory("docs/".into()));
+                page.entries = ["docs/A", "docs/B"]
+                    .into_iter()
+                    .map(|path| Entry {
+                        path: path.into(),
+                        directory: false,
+                    })
+                    .collect();
+                let mut browser = Browser {
+                    page,
+                    loading: true,
+                    socket: PathBuf::new(),
+                    history: Vec::new(),
+                    generation: if queued { 2 } else { 1 },
+                    pending: queued,
+                    flight: Some((1, receive)),
+                    rendered_count: Cell::new(0),
+                    address: None,
+                };
+                browser.inspect_address();
+                assert_eq!(browser.address.as_ref().unwrap().0, "remuda:///docs/A");
+                let mut replacement = Page::empty(Location::Directory("docs/".into()));
+                replacement.entries = new_paths
+                    .into_iter()
+                    .map(|path| Entry {
+                        path: path.into(),
+                        directory: false,
+                    })
+                    .collect();
+                if !reply_before_close {
+                    assert!(!browser.back());
+                }
+                send.send(Ok(replacement)).unwrap();
+                browser.poll();
+                if reply_before_close {
+                    assert!(!browser.back());
+                }
+                assert_eq!(browser.page.entries[browser.page.position].path, "docs/A");
+                assert!(!browser.loading);
+                assert!(browser
+                    .page
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .contains("Refresh paused"));
+                assert!(browser.flight.is_none() && !browser.pending);
+                browser.open_selected();
+                assert_eq!(browser.page.location, Location::Document("docs/A".into()));
+            }
+        }
+    }
     #[test]
     fn narrow_address_inspection_reveals_the_full_selected_identity() {
         let prefix = "docs/".to_owned() + &"long-name-".repeat(20);
