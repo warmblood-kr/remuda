@@ -40,6 +40,8 @@ allow = [
     "Unlicense",
     # Required by the TLS stack.
     "ISC",
+    # HTML parser's selectors/cssparser dependencies (no GPL-family licenses).
+    "MPL-2.0",
     "CDLA-Permissive-2.0",
     # foldhash, via rusqlite's statement cache (hashlink), #778.
     "Zlib",

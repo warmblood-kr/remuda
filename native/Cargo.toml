@@ -91,6 +91,7 @@ rustyline = "14.0.0"
 # width judgment can never disagree with vt100's. See steps/023.
 unicode-width = "0.2"
 unicode-segmentation = "1.13"
+scraper = { version = "=0.29.0", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28.0", features = ["socket"] }
