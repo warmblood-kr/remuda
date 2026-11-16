@@ -38,15 +38,29 @@ reason. Images become `[image]` / `[image: alt]`; embedded HTML is left literal,
 never executed or parsed.
 
 Limits: the existing 1 MiB document read cap, 4092 output rows (explicit error,
-matching HTML's block cap) and 128 links. Terminal controls and bidi overrides
-are stripped before display; no new dependency, protocol, listener or CLI is
-added.
+matching HTML's block cap) and 128 links. Inline scanning carries a per-line work
+budget of eight inspected characters per input character, so unmatched `[`,
+backtick and emphasis scans cannot become quadratic; when the budget runs out
+the rest of that line stays literal instead of being parsed. A thematic break
+requires three or more of one marker and nothing but whitespace, so
+`- keep --- text` is a list item, not a vanished line. Reference definitions are
+collected only outside fenced blocks, so `[id]: target` inside code cannot
+resolve a reference outside the fence. Terminal controls and bidi overrides are
+stripped before display; no new dependency, protocol, listener or CLI is added.
+
+The GUI seam is dry-fitted, not implemented: `gui/` is a separate workspace
+crate that depends on `remuda-native`, so `cargo check` there proves the
+`Page.html` → `Page.projection` rename compiles for its existing consumers
+(none construct `Page` or read `.html`), and `gui/tests/document_projection_seam.rs`
+consumes the Markdown/HTML projection and the shared resolver from the GUI
+crate. `gui/src` still has no document view, so it neither renders a document
+nor emits a presentation receipt.
 
 ## Actual
 
 ```text
 cargo test --offline -p remuda-native --lib document_markdown -- --test-threads=1
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1946 filtered out
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 1946 filtered out
 
 cargo test --offline -p remuda-native --lib documents:: -- --test-threads=1
 test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 1938 filtered out
@@ -59,9 +73,16 @@ test documents_read_markdown_as_prose_and_follow_its_local_link ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out
 
 env TMPDIR=/private/tmp cargo test --offline -p remuda-native --test cluster_tui -- --test-threads=1
-test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; finished in 54.33s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; finished in 54.39s
 
-cargo fmt --all -- --check: passed
+cd gui && cargo check --offline
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.44s
+
+cd gui && cargo test --offline --test document_projection_seam
+test gui_can_consume_the_shared_markdown_and_html_projection ... ok
+test result: ok. 1 passed; 0 failed
+
+cargo fmt --all -- --check (workspace and gui): passed
 cargo clippy --offline --workspace --all-targets -- -D warnings: passed
 ```
 
@@ -73,14 +94,19 @@ screen, selected the link with Tab (status showed
 pressed Esc to return to the guide before closing the browser. The unit tests
 cover heading/fence/quote/list projection, inline and reference links including
 a blocked `javascript:` target and an image placeholder, literal fallbacks,
-control/bidi stripping, and both limits. In the end-to-end test and the model
+control/bidi stripping, both limits, malformed and nested labels, thematic-break
+boundaries, a fenced definition that must not resolve outside its block, and
+four adversarial long lines (600 KB each of unmatched `*`, `[`, backtick and
+mixed delimiters) that finish in 0.18s for the whole module suite instead of
+scanning the suffix per delimiter. In the end-to-end test and the model
 test, the guide and its target share one directory so selection does not depend
 on directory-first ordering.
 
 Limitations, stated plainly: this is not CommonMark — setext headings, tables,
 task-list checkboxes and HTML blocks are left literal; emphasis pairs must match
 in delimiter length and do not cross a code span; an image is a placeholder, not
-a preview; no GUI/WebView is included, and a GUI must project and acknowledge
-its own frame. Runtime evidence is macOS only. The prior checkout, live
+a preview; malformed lines beyond the work budget stay literal. No GUI/WebView
+document view is included: the seam compiles and is tested from the GUI crate,
+but rendering and frame acknowledgement remain the GUI adapter's own work. Runtime evidence is macOS only. The prior checkout, live
 sessions, shared daemon and user screen were not touched, and nothing was
 merged, deployed or published.

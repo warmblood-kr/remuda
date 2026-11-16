@@ -13,6 +13,8 @@ use std::collections::HashMap;
 const MAX_LINES: usize = 4092;
 const MAX_LINKS: usize = 128;
 const MAX_DEPTH: usize = 8;
+/// Scan work allowed per input character on one line.
+const INLINE_WORK: usize = 8;
 
 /// Project Markdown source into inert title, text lines and typed local links.
 pub fn parse(path: &str, source: &str) -> Result<Document, String> {
@@ -162,6 +164,12 @@ fn inline(
         path,
         definitions,
         document,
+        budget: text
+            .chars()
+            .count()
+            .saturating_mul(INLINE_WORK)
+            .saturating_add(1024),
+        exhausted: false,
     }
     .render(text, &mut out, 0)?;
     Ok(out)
@@ -171,9 +179,78 @@ struct Inline<'a> {
     path: &'a str,
     definitions: &'a HashMap<String, String>,
     document: &'a mut Document,
+    /// Characters this line may still inspect. Malformed input must not turn
+    /// repeated delimiter scans into quadratic work, so the total scan work per
+    /// line is bounded; when it runs out the rest of the line stays literal.
+    budget: usize,
+    exhausted: bool,
 }
 
 impl Inline<'_> {
+    fn tick(&mut self, step: usize) -> bool {
+        if self.exhausted || self.budget < step {
+            self.exhausted = true;
+            return false;
+        }
+        self.budget -= step;
+        true
+    }
+
+    fn run_len(&mut self, chars: &[char], index: usize, ch: char) -> usize {
+        let mut count = 0;
+        while index + count < chars.len() && chars[index + count] == ch {
+            if !self.tick(1) {
+                break;
+            }
+            count += 1;
+        }
+        count
+    }
+
+    fn bracket(&mut self, chars: &[char], index: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (offset, ch) in chars[index..].iter().enumerate() {
+            if !self.tick(1) {
+                return None;
+            }
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(index + offset);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn parenthesized(&mut self, chars: &[char], index: usize) -> Option<(usize, String)> {
+        if chars.get(index) != Some(&'(') {
+            return None;
+        }
+        let mut depth = 0usize;
+        for (offset, ch) in chars[index..].iter().enumerate() {
+            if !self.tick(1) {
+                return None;
+            }
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        let inner = chars[index + 1..index + offset].iter().collect();
+                        return Some((index + offset, inner));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     fn render(&mut self, text: &str, out: &mut String, depth: usize) -> Result<(), String> {
         if depth > MAX_DEPTH {
             out.push_str(text);
@@ -182,6 +259,10 @@ impl Inline<'_> {
         let chars: Vec<char> = text.chars().collect();
         let mut index = 0;
         while index < chars.len() {
+            if self.exhausted {
+                out.extend(&chars[index..]);
+                return Ok(());
+            }
             let ch = chars[index];
             if ch == '\\'
                 && chars
@@ -191,9 +272,9 @@ impl Inline<'_> {
                 out.push(chars[index + 1]);
                 index += 2;
             } else if ch == '`' {
-                index = code_span(&chars, index, out);
+                index = self.code_span(&chars, index, out);
             } else if ch == '!' && chars.get(index + 1) == Some(&'[') {
-                index = image(&chars, index, out);
+                index = self.image(&chars, index, out);
             } else if ch == '[' {
                 index = self.link(&chars, index, out, depth)?;
             } else if ch == '*' || ch == '_' {
@@ -215,7 +296,7 @@ impl Inline<'_> {
         out: &mut String,
         depth: usize,
     ) -> Result<usize, String> {
-        let Some(label_end) = bracket(chars, index) else {
+        let Some(label_end) = self.bracket(chars, index) else {
             out.push('[');
             return Ok(index + 1);
         };
@@ -245,8 +326,13 @@ impl Inline<'_> {
         Ok(consumed)
     }
 
-    fn destination(&self, chars: &[char], label_end: usize, raw: &str) -> Option<(String, usize)> {
-        if let Some((target_end, destination)) = parenthesized(chars, label_end + 1) {
+    fn destination(
+        &mut self,
+        chars: &[char],
+        label_end: usize,
+        raw: &str,
+    ) -> Option<(String, usize)> {
+        if let Some((target_end, destination)) = self.parenthesized(chars, label_end + 1) {
             let destination = destination
                 .split_whitespace()
                 .next()?
@@ -258,7 +344,7 @@ impl Inline<'_> {
             let destination = self.definitions.get(&raw.trim().to_ascii_lowercase())?;
             return Some((destination.clone(), label_end + 1));
         }
-        let end = bracket(chars, label_end + 1)?;
+        let end = self.bracket(chars, label_end + 1)?;
         let id: String = chars[label_end + 2..end].iter().collect();
         let id = if id.is_empty() { raw } else { &id };
         let destination = self.definitions.get(&id.trim().to_ascii_lowercase())?;
@@ -273,7 +359,11 @@ impl Inline<'_> {
         depth: usize,
     ) -> Result<usize, String> {
         let ch = chars[index];
-        let open = run(chars, index, ch);
+        let open = self.run_len(chars, index, ch);
+        if open == 0 {
+            out.push(ch);
+            return Ok(index + 1);
+        }
         let intraword = ch == '_' && index > 0 && chars[index - 1].is_alphanumeric();
         if open > 3 || intraword || chars.get(index + open).is_none_or(|c| c.is_whitespace()) {
             repeat(out, ch, open);
@@ -281,11 +371,14 @@ impl Inline<'_> {
         }
         let mut cursor = index + open;
         while cursor < chars.len() {
+            if !self.tick(1) {
+                break;
+            }
             if chars[cursor] != ch {
                 cursor += 1;
                 continue;
             }
-            let close = run(chars, cursor, ch);
+            let close = self.run_len(chars, cursor, ch);
             let closes = close == open
                 && !chars[cursor - 1].is_whitespace()
                 && (ch != '_'
@@ -302,91 +395,60 @@ impl Inline<'_> {
         repeat(out, ch, open);
         Ok(index + open)
     }
+
+    fn code_span(&mut self, chars: &[char], index: usize, out: &mut String) -> usize {
+        let open = self.run_len(chars, index, '`');
+        if open == 0 {
+            out.push('`');
+            return index + 1;
+        }
+        let mut cursor = index + open;
+        while cursor < chars.len() {
+            if !self.tick(1) {
+                break;
+            }
+            if chars[cursor] != '`' {
+                cursor += 1;
+                continue;
+            }
+            let close = self.run_len(chars, cursor, '`');
+            if close == open {
+                out.extend(&chars[index + open..cursor]);
+                return cursor + close;
+            }
+            cursor += close.max(1);
+        }
+        repeat(out, '`', open);
+        index + open
+    }
+
+    fn image(&mut self, chars: &[char], index: usize, out: &mut String) -> usize {
+        let label_start = index + 1;
+        let Some(label_end) = self.bracket(chars, label_start) else {
+            out.push('!');
+            return index + 1;
+        };
+        let Some((target_end, _)) = self.parenthesized(chars, label_end + 1) else {
+            out.push('!');
+            return index + 1;
+        };
+        let alt: String = chars[label_start + 1..label_end].iter().collect();
+        image_placeholder(&alt, out);
+        target_end + 1
+    }
 }
 
 fn repeat(out: &mut String, ch: char, count: usize) {
     out.extend(std::iter::repeat_n(ch, count));
 }
 
-fn run(chars: &[char], index: usize, ch: char) -> usize {
-    chars[index..].iter().take_while(|c| **c == ch).count()
-}
-
-fn code_span(chars: &[char], index: usize, out: &mut String) -> usize {
-    let open = run(chars, index, '`');
-    let mut cursor = index + open;
-    while cursor < chars.len() {
-        if chars[cursor] != '`' {
-            cursor += 1;
-            continue;
-        }
-        let close = run(chars, cursor, '`');
-        if close == open {
-            out.extend(&chars[index + open..cursor]);
-            return cursor + close;
-        }
-        cursor += close;
-    }
-    repeat(out, '`', open);
-    index + open
-}
-
-fn bracket(chars: &[char], index: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (offset, ch) in chars[index..].iter().enumerate() {
-        match ch {
-            '[' => depth += 1,
-            ']' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(index + offset);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn parenthesized(chars: &[char], index: usize) -> Option<(usize, String)> {
-    if chars.get(index) != Some(&'(') {
-        return None;
-    }
-    let mut depth = 0usize;
-    for (offset, ch) in chars[index..].iter().enumerate() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    let inner = chars[index + 1..index + offset].iter().collect();
-                    return Some((index + offset, inner));
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn image(chars: &[char], index: usize, out: &mut String) -> usize {
-    let label_start = index + 1;
-    let Some(label_end) = bracket(chars, label_start) else {
-        out.push('!');
-        return index + 1;
-    };
-    let Some((target_end, _)) = parenthesized(chars, label_end + 1) else {
-        out.push('!');
-        return index + 1;
-    };
-    let alt: String = chars[label_start + 1..label_end].iter().collect();
+fn image_placeholder(alt: &str, out: &mut String) {
     let alt = alt.trim();
     if alt.is_empty() {
         out.push_str("[image]");
     } else {
         out.push_str(&format!("[image: {alt}]"));
     }
-    target_end + 1
 }
 
 fn opens_fence(line: &str) -> Option<(char, usize)> {
@@ -417,8 +479,28 @@ fn definition(line: &str) -> Option<(String, String)> {
     (!id.is_empty() && !destination.is_empty()).then(|| (id, destination.to_owned()))
 }
 
+/// Definitions inside a fenced block are code, not document markup: they must
+/// neither resolve a reference outside the fence nor disappear from the block.
 fn definitions(source: &str) -> HashMap<String, String> {
-    source.lines().filter_map(definition).collect()
+    let mut fence: Option<(char, usize)> = None;
+    let mut map = HashMap::new();
+    for line in source.lines() {
+        if let Some((ch, size)) = fence {
+            if closes_fence(line, ch, size) {
+                fence = None;
+            }
+            continue;
+        }
+        match opens_fence(line) {
+            Some(open) => fence = Some(open),
+            None => {
+                if let Some((id, destination)) = definition(line) {
+                    map.insert(id, destination);
+                }
+            }
+        }
+    }
+    map
 }
 
 #[cfg(test)]
@@ -489,6 +571,56 @@ mod tests {
             .contains(&"<script>alert(1)</script>".to_owned()));
         assert!(document.lines.contains(&"[31msnake_case_name".to_owned()));
         assert!(document.links.is_empty());
+    }
+
+    #[test]
+    fn adversarial_lines_do_not_turn_delimiter_scans_into_quadratic_work() {
+        let started = std::time::Instant::now();
+        for source in [
+            "*a ".repeat(200_000),
+            "[ ".repeat(200_000),
+            "`a ".repeat(200_000),
+            "**a [".repeat(100_000),
+        ] {
+            let document = parse("x.md", &source).unwrap();
+            assert!(!document.lines.is_empty());
+            assert!(document.links.is_empty());
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "elapsed {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn thematic_breaks_accept_only_markers_and_whitespace() {
+        let document = parse("x.md", "- keep --- text\n* * *\n___\n- - -\n").unwrap();
+        assert_eq!(
+            document.lines,
+            vec!["- keep --- text".to_owned(), String::new()]
+        );
+    }
+
+    #[test]
+    fn definitions_inside_fenced_code_do_not_resolve_outside_references() {
+        let document = parse("docs/x.md", "```\n[id]: ../evil.md\n```\n\nSee [id].\n").unwrap();
+        assert!(document.lines.contains(&"[id]: ../evil.md".to_owned()));
+        assert!(document.lines.contains(&"See [id].".to_owned()));
+        assert!(document.links.is_empty());
+    }
+
+    #[test]
+    fn malformed_and_nested_syntax_falls_back_without_losing_text() {
+        for (source, expected) in [
+            ("[a](b\n", "[a](b"),
+            ("**a\n", "**a"),
+            ("`a\n", "`a"),
+            ("[[a]](b)\n", "[a] [1]"),
+        ] {
+            let document = parse("docs/x.md", source).unwrap();
+            assert_eq!(document.lines[0], expected, "{source}");
+        }
     }
 
     #[test]
