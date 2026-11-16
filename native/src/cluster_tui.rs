@@ -4403,6 +4403,11 @@ impl ClusterUi {
 
     fn document_key(&mut self, event: crossterm::event::KeyEvent) {
         match self.keymap.resolve("cluster.documents", event) {
+            Some(action @ ("documents.link.next" | "documents.link.previous")) => {
+                if let Some(browser) = &mut self.documents {
+                    browser.select_link(action == "documents.link.next");
+                }
+            }
             Some("documents.address") => {
                 if let Some(browser) = &mut self.documents {
                     browser.inspect_address();

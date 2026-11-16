@@ -407,10 +407,8 @@ fn local_tree_frame_uses_daemon_registered_decorations_and_depth() {
 }
 
 #[cfg(unix)]
-#[test]
-fn documents_browse_plain_text_and_return_without_sending_browser_input() {
+fn document_test_daemon(fixtures: &[(&str, &str)]) -> PrivateDaemon {
     use base64::Engine;
-    use std::io::Write;
     let mut daemon = PrivateDaemon::start();
     daemon.wait_ready();
     let init = Command::new(env!("CARGO_BIN_EXE_remuda"))
@@ -424,20 +422,20 @@ fn documents_browse_plain_text_and_return_without_sending_browser_input() {
         .output()
         .unwrap();
     assert!(init.status.success(), "{init:?}");
-    let put = remuda_native::client::request(
-        &daemon.path(),
-        &Request::Vfs {
-            args: vec!["put".into(), "-".into(), "remuda:///docs/one.txt".into()],
-            input_base64: Some(
-                base64::engine::general_purpose::STANDARD.encode(b"BROWSER_FIXTURE\nsecond line\n"),
-            ),
-        },
-    )
-    .unwrap();
-    assert!(
-        matches!(put, Response::CommandResult { exit_code: 0, .. }),
-        "{put:?}"
-    );
+    for (path, text) in fixtures {
+        let put = remuda_native::client::request(
+            &daemon.path(),
+            &Request::Vfs {
+                args: vec!["put".into(), "-".into(), format!("remuda:///{path}")],
+                input_base64: Some(base64::engine::general_purpose::STANDARD.encode(text)),
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(put, Response::CommandResult { exit_code: 0, .. }),
+            "{put:?}"
+        );
+    }
     let new = remuda_native::client::request(
         &daemon.path(),
         &Request::New {
@@ -454,6 +452,14 @@ fn documents_browse_plain_text_and_return_without_sending_browser_input() {
     )
     .unwrap();
     assert!(matches!(new, Response::Value(_)), "{new:?}");
+    daemon
+}
+
+#[cfg(unix)]
+#[test]
+fn documents_browse_plain_text_and_return_without_sending_browser_input() {
+    use std::io::Write;
+    let mut daemon = document_test_daemon(&[("docs/one.txt", "BROWSER_FIXTURE\nsecond line\n")]);
     let mut tui = TuiPty::start(&daemon.runtime);
     tui.wait_for("doc-session", Duration::from_secs(5));
     tui.writer.write_all(b"\rsaved-draft").unwrap();
@@ -519,6 +525,53 @@ fn assert_document_address(tui: &mut TuiPty) {
     tui.wait_for("remuda:///docs/one.txt", Duration::from_secs(3));
     tui.writer.write_all(b"\x1b").unwrap();
     tui.wait_for("BROWSER_FIXTURE", Duration::from_secs(3));
+}
+
+#[cfg(unix)]
+#[test]
+fn html_relative_link_round_trip_preserves_document_and_session_state() {
+    use std::io::Write;
+    let daemon = document_test_daemon(&[
+        ("docs/index.html", "<title>HTML_GUIDE</title><p>First &amp; paragraph</p><script>NEVER_EXECUTED</script><a href='sub/next.html'>Next document</a><a href='#missing'>Unsupported fragment</a>"),
+        ("docs/sub/next.html", "<title>NEXT_PAGE</title><p>Second document</p>"),
+    ]);
+    let mut tui = TuiPty::start(&daemon.runtime);
+    tui.wait_for("doc-session", Duration::from_secs(5));
+    tui.writer.write_all(b"\rhtml-draft").unwrap();
+    tui.wait_for("html-draft", Duration::from_secs(3));
+    tui.writer.write_all(b"\x1bd").unwrap();
+    tui.wait_for("> docs/", Duration::from_secs(5));
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("docs/index.html", Duration::from_secs(5));
+    tui.writer.write_all(b"\x1b[B").unwrap();
+    tui.wait_for("> docs/index.html", Duration::from_secs(5));
+    tui.writer.write_all(b"\r").unwrap();
+    let html = tui.wait_for("HTML_GUIDE", Duration::from_secs(5));
+    assert!(
+        html.contains("First & paragraph") && !html.contains("NEVER_EXECUTED"),
+        "{html}"
+    );
+    tui.writer.write_all(b"\t").unwrap();
+    tui.wait_for("[1] Next document", Duration::from_secs(3));
+    tui.writer.write_all(b"a").unwrap();
+    tui.wait_for("VFS address (escaped)", Duration::from_secs(3));
+    tui.wait_for("remuda:///docs/sub/next.html", Duration::from_secs(3));
+    tui.writer.write_all(b"\x1b").unwrap();
+    tui.wait_for("HTML_GUIDE", Duration::from_secs(3));
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("NEXT_PAGE", Duration::from_secs(5));
+    tui.writer.write_all(b"\x1b").unwrap();
+    let restored = tui.wait_for("HTML_GUIDE", Duration::from_secs(3));
+    assert!(restored.contains("[1] Next document"), "{restored}");
+    tui.writer.write_all(b"\t\r").unwrap();
+    let blocked = tui.wait_for("Fragment links are not supported", Duration::from_secs(3));
+    assert!(blocked.contains("HTML_GUIDE"), "{blocked}");
+    tui.writer
+        .write_all(b"\x1b[200~HTML_DO_NOT_SEND\x1b[201~")
+        .unwrap();
+    tui.writer.write_all(b"q\r").unwrap();
+    let returned = tui.wait_for("got:html-draft", Duration::from_secs(5));
+    assert!(!returned.contains("HTML_DO_NOT_SEND"), "{returned}");
 }
 
 #[cfg(unix)]

@@ -68,6 +68,8 @@ fn validate(context: &str, key: &str, action: Option<&str>) -> Result<String, St
             "documents.close",
             "documents.refresh",
             "documents.address",
+            "documents.link.next",
+            "documents.link.previous",
         ],
         "cluster.runtime" => &["cluster.redraw"],
         "cluster.help" => &[

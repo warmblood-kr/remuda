@@ -41,6 +41,8 @@ pub struct Page {
     pub position: usize,
     pub identity: Option<(u64, String)>,
     pub error: Option<String>,
+    pub html: Option<crate::document_html::Document>,
+    pub selected_link: Option<usize>,
 }
 impl Page {
     fn empty(location: Location) -> Self {
@@ -51,6 +53,8 @@ impl Page {
             position: 0,
             identity: None,
             error: None,
+            html: None,
+            selected_link: None,
         }
     }
 }
@@ -127,6 +131,18 @@ impl Browser {
         if self.loading || self.address.is_some() {
             return;
         }
+        if let Some(link) = self.selected_link() {
+            use crate::document_html::Target;
+            match link.target.clone() {
+                Target::Vfs(path) => self.navigate(if path.is_empty() || path.ends_with('/') {
+                    Location::Directory(path)
+                } else {
+                    Location::Document(path)
+                }),
+                Target::Blocked(reason) => self.page.error = Some(reason),
+            }
+            return;
+        }
         let Some(entry) = self.page.entries.get(self.page.position) else {
             return;
         };
@@ -136,6 +152,25 @@ impl Browser {
             Location::Document(entry.path.clone())
         };
         self.navigate(location);
+    }
+    pub fn select_link(&mut self, next: bool) {
+        if self.loading || self.address.is_some() {
+            return;
+        }
+        let count = self.page.html.as_ref().map_or(0, |html| html.links.len());
+        if count == 0 {
+            return;
+        }
+        self.page.selected_link = Some(match self.page.selected_link {
+            Some(index) if next => (index + 1) % count,
+            Some(index) => (index + count - 1) % count,
+            None if next => 0,
+            None => count - 1,
+        });
+        self.page.error = None;
+    }
+    fn selected_link(&self) -> Option<&crate::document_html::Link> {
+        self.page.html.as_ref()?.links.get(self.page.selected_link?)
     }
     pub fn navigate(&mut self, location: Location) {
         let path = match &location {
@@ -237,11 +272,7 @@ impl Browser {
             }
         }
         lines.resize(height.saturating_sub(2).max(1), String::new());
-        lines.push(if self.loading {
-            "Loading…".into()
-        } else {
-            self.page.error.clone().unwrap_or_default()
-        });
+        lines.push(mark_clip(&self.status(), width));
         lines.push(
             "a full address · ↑↓ scroll · Enter open · Esc back · r retry · q sessions".into(),
         );
@@ -251,16 +282,47 @@ impl Browser {
             .map(|line| clip(&line, width))
             .collect()
     }
+    fn status(&self) -> String {
+        if self.loading {
+            return "Loading…".into();
+        }
+        if let Some(error) = &self.page.error {
+            return error.clone();
+        }
+        if let Some(link) = self.selected_link() {
+            let target = match &link.target {
+                crate::document_html::Target::Vfs(path) => {
+                    format!("remuda:///{}", path_label(path))
+                }
+                crate::document_html::Target::Blocked(reason) => format!("blocked: {reason}"),
+            };
+            return format!(
+                "[{}] {} → {target}",
+                self.page.selected_link.unwrap_or(0) + 1,
+                link.label
+            );
+        }
+        String::new()
+    }
     pub fn inspect_address(&mut self) {
         if self.address.take().is_some() {
             return;
         }
-        let path = self
-            .page
-            .entries
-            .get(self.page.position)
-            .filter(|_| matches!(self.page.location, Location::Directory(_)))
-            .map_or(self.page.location.path(), |entry| entry.path.as_str());
+        let path = if let Some(link) = self.selected_link() {
+            match &link.target {
+                crate::document_html::Target::Vfs(path) => path.as_str(),
+                crate::document_html::Target::Blocked(reason) => {
+                    self.page.error = Some(reason.clone());
+                    return;
+                }
+            }
+        } else {
+            self.page
+                .entries
+                .get(self.page.position)
+                .filter(|_| matches!(self.page.location, Location::Directory(_)))
+                .map_or(self.page.location.path(), |entry| entry.path.as_str())
+        };
         // ASCII escapes make every code point inspectable even in a one-column
         // terminal, without changing the address used for navigation.
         let escaped: String = path.chars().flat_map(char::escape_default).collect();
@@ -413,11 +475,16 @@ fn fetch(socket: &Path, location: &Location) -> Reply {
     let uri = format!("remuda:///{}", location.path());
     let args = match location {
         Location::Directory(_) => vec!["ls".into(), uri, "--json".into()],
-        Location::Document(_) => vec![
+        Location::Document(path) => vec![
             "read".into(),
             uri,
             "--max-bytes".into(),
-            MAX_BYTES.to_string(),
+            if html_path(path) {
+                crate::document_html::MAX_HTML_BYTES
+            } else {
+                MAX_BYTES
+            }
+            .to_string(),
         ],
     };
     let response = crate::client::request_with_deadline(
@@ -513,9 +580,15 @@ fn decode(location: &Location, value: &Value) -> Reply {
             if text.contains('\0') {
                 return Err("Document is binary".into());
             }
-            page.text = text.lines().take(MAX_LINES).map(str::to_owned).collect();
-            if text.lines().count() > MAX_LINES {
-                page.text.push("[… line limit reached]".into());
+            if html_path(path) {
+                let html = crate::document_html::parse(path, &text)?;
+                page.text = html.lines.clone();
+                page.html = Some(html);
+            } else {
+                page.text = text.lines().take(MAX_LINES).map(str::to_owned).collect();
+                if text.lines().count() > MAX_LINES {
+                    page.text.push("[… line limit reached]".into());
+                }
             }
             page.identity = Some((version, hash.to_owned()));
         }
@@ -523,10 +596,128 @@ fn decode(location: &Location, value: &Value) -> Reply {
     Ok(page)
 }
 
+fn html_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    path.ends_with(".html") || path.ends_with(".htm")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    fn html_page(path: &str, text: &str) -> Page {
+        decode(
+            &Location::Document(path.into()),
+            &json!({
+                "ok":true,"path":path,"sha256":"a".repeat(64),"version":1,
+                "size":text.len(),"content":BASE64.encode(text)
+            }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn html_links_inspection_and_back_share_the_same_target_and_history() {
+        let (_send, receive) = mpsc::sync_channel(1);
+        let mut browser = Browser {
+            page: html_page(
+                "docs/index.HTML",
+                "<title>Guide</title><p>Intro</p><a href='sub/next.html'>Next</a>",
+            ),
+            loading: false,
+            socket: PathBuf::new(),
+            history: Vec::new(),
+            generation: 1,
+            pending: false,
+            flight: Some((0, receive)),
+            rendered_count: Cell::new(0),
+            address: None,
+        };
+        browser.page.position = 2;
+        browser.select_link(true);
+        assert!(browser.status().contains("remuda:///docs/sub/next.html"));
+        browser.inspect_address();
+        assert_eq!(
+            browser.address.as_ref().unwrap().0,
+            "remuda:///docs/sub/next.html"
+        );
+        browser.open_selected();
+        assert_eq!(
+            browser.page.location,
+            Location::Document("docs/index.HTML".into())
+        );
+        assert!(!browser.back());
+        browser.open_selected();
+        assert_eq!(
+            browser.page.location,
+            Location::Document("docs/sub/next.html".into())
+        );
+        assert!(!browser.back());
+        assert_eq!(browser.page.position, 2);
+        assert_eq!(browser.page.selected_link, Some(0));
+        assert_eq!(browser.page.html.as_ref().unwrap().title, "Guide");
+    }
+
+    #[test]
+    fn unsupported_html_links_are_visible_but_do_not_navigate_or_fetch() {
+        let mut browser = Browser {
+            page: html_page(
+                "docs/index.html",
+                "<a href='#part'>Fragment</a><a href='https://example.com'>External</a>",
+            ),
+            loading: false,
+            socket: PathBuf::new(),
+            history: Vec::new(),
+            generation: 1,
+            pending: false,
+            flight: None,
+            rendered_count: Cell::new(0),
+            address: None,
+        };
+        browser.select_link(false);
+        assert_eq!(browser.page.selected_link, Some(1));
+        browser.select_link(true);
+        assert_eq!(browser.page.selected_link, Some(0));
+        assert!(browser.status().contains("blocked: Fragment"));
+        browser.open_selected();
+        browser.inspect_address();
+        assert!(browser.page.error.as_ref().unwrap().contains("Fragment"));
+        assert!(browser.address.is_none() && browser.flight.is_none() && !browser.pending);
+        assert!(browser.history.is_empty());
+        assert_eq!(browser.generation, 1);
+        assert_eq!(
+            browser.page.location,
+            Location::Document("docs/index.html".into())
+        );
+    }
+    #[test]
+    fn html_refresh_cannot_replace_the_link_that_was_inspected() {
+        let (send, receive) = mpsc::sync_channel(1);
+        let mut page = html_page("docs/index.html", "<a href='A.html'>A</a>");
+        page.selected_link = Some(0);
+        let mut browser = Browser {
+            page,
+            loading: true,
+            socket: PathBuf::new(),
+            history: Vec::new(),
+            generation: 1,
+            pending: false,
+            flight: Some((1, receive)),
+            rendered_count: Cell::new(0),
+            address: None,
+        };
+        browser.inspect_address();
+        assert_eq!(browser.address.as_ref().unwrap().0, "remuda:///docs/A.html");
+        send.send(Ok(html_page("docs/index.html", "<a href='B.html'>B</a>")))
+            .unwrap();
+        browser.poll();
+        assert!(!browser.back());
+        browser.open_selected();
+        assert_eq!(
+            browser.page.location,
+            Location::Document("docs/A.html".into())
+        );
+    }
     #[test]
     fn inspection_fences_refresh_reordering_or_removal_before_enter() {
         for (reply_before_close, queued) in

@@ -223,7 +223,12 @@ mod tests {
     #[test]
     fn source_structure_and_link_limits_are_explicit_errors() {
         assert!(parse("x.html", &"x".repeat(MAX_HTML_BYTES + 1)).is_err());
-        assert!(parse("x.html", &"<i></i>".repeat(MAX_NODES)).is_err());
+        assert!(parse("x.html", &"<br>".repeat(MAX_NODES))
+            .unwrap_err()
+            .contains("nodes"));
         assert!(parse("x.html", &"<a href='x'>x</a>".repeat(MAX_LINKS + 1)).is_err());
+        assert!(parse("x.html", &"<p>x</p>".repeat(2100))
+            .unwrap_err()
+            .contains("text blocks"));
     }
 }
