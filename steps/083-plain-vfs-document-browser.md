@@ -24,8 +24,10 @@ state independently of the TUI adapter. Cap documents at 1 MiB, history at 32
 pages and visible text at 4096 rows with a limit marker. Display read errors
 and offer back/retry. Preserve existing session navigation and delivery.
 
-The browser is read-only; fetching a remote blob may cache it locally. A
-three-second UI request deadline does not cancel work already in the daemon.
+The browser is read-only; fetching a remote blob may cache it locally. The
+Unix transport deadline and Windows unsupported boundary are defined in step
+084; the original reply timeout did not include connect. A UI deadline does
+not cancel work already in the daemon.
 HTML/Markdown are displayed as source; image rendering is not implemented.
 
 ## Actual

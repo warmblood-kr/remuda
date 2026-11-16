@@ -323,7 +323,7 @@ fn fetch(socket: &Path, location: &Location) -> Reply {
             MAX_BYTES.to_string(),
         ],
     };
-    let response = crate::client::request_with_timeout(
+    let response = crate::client::request_with_deadline(
         socket,
         &Request::Vfs {
             args,
@@ -430,6 +430,43 @@ fn decode(location: &Location, value: &Value) -> Reply {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn retries_coalesce_behind_one_flight_and_recover_after_it_settles() {
+        let (send, receive) = mpsc::sync_channel(1);
+        let mut browser = Browser {
+            page: Page::empty(Location::Directory(String::new())),
+            loading: true,
+            socket: PathBuf::from("/missing-document-test-socket"),
+            history: Vec::new(),
+            generation: 1,
+            pending: false,
+            flight: Some((1, receive)),
+            rendered_count: Cell::new(0),
+        };
+        for _ in 0..32 {
+            browser.refresh();
+            assert_eq!(browser.flight.as_ref().unwrap().0, 1);
+            assert!(browser.pending);
+            browser.cancel();
+            browser.poll();
+            assert_eq!(browser.flight.as_ref().unwrap().0, 1);
+        }
+        browser.refresh();
+        let generation = browser.generation;
+        send.send(Err("obsolete timeout".into())).unwrap();
+        browser.poll();
+        assert_eq!(browser.flight.as_ref().unwrap().0, generation);
+        assert!(!browser.pending);
+        assert!(browser.page.error.is_none());
+        let limit = std::time::Instant::now() + Duration::from_secs(1);
+        while browser.flight.is_some() && std::time::Instant::now() < limit {
+            browser.poll();
+            std::thread::yield_now();
+        }
+        assert!(browser.flight.is_none());
+        assert!(!browser.loading);
+        assert!(browser.page.error.is_some());
+    }
     #[test]
     fn path_labels_escape_controls_without_changing_navigation_identity() {
         let raw = "docs/a\u{202e}b";

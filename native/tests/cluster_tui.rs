@@ -486,6 +486,15 @@ fn documents_browse_plain_text_and_return_without_sending_browser_input() {
         after_reply.contains("> docs/one.txt") && !after_reply.contains("BROWSER_FIXTURE"),
         "{after_reply}"
     );
+    // A completed deadline releases single-flight capacity for a real retry.
+    daemon.stop();
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("deadline exceeded", Duration::from_secs(6));
+    daemon.resume();
+    for _ in 0..3 {
+        tui.writer.write_all(b"r").unwrap();
+        tui.wait_for("BROWSER_FIXTURE", Duration::from_secs(5));
+    }
     tui.writer.write_all(b"q").unwrap();
     let returned = tui.wait_for("saved-draft", Duration::from_secs(3));
     assert!(!returned.contains("Documents"), "{returned}");
