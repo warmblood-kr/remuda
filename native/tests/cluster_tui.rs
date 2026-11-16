@@ -549,6 +549,40 @@ fn documents_browse_plain_text_and_return_without_sending_browser_input() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn documents_read_markdown_as_prose_and_follow_its_local_link() {
+    use std::io::Write;
+    let daemon = document_test_daemon(&[
+        (
+            "docs/guide.md",
+            "# Guide\n\nRead **this** [next](next.md).\n\n- one\n",
+        ),
+        ("docs/next.md", "# Next\n\nSecond page prose.\n"),
+    ]);
+    let mut tui = TuiPty::start(&daemon.runtime);
+    tui.wait_for("doc-session", Duration::from_secs(5));
+    tui.writer.write_all(b"d").unwrap();
+    tui.wait_for("docs/", Duration::from_secs(5));
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("guide.md", Duration::from_secs(5));
+    tui.writer.write_all(b"\r").unwrap();
+    let shown = tui.wait_for("Read this next [1].", Duration::from_secs(5));
+    assert!(shown.contains("Guide"), "{shown}");
+    assert!(
+        !shown.contains("**this**") && !shown.contains("# Guide"),
+        "{shown}"
+    );
+    tui.writer.write_all(b"\t").unwrap();
+    tui.wait_for("remuda:///docs/next.md", Duration::from_secs(3));
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("Second page prose.", Duration::from_secs(5));
+    tui.writer.write_all(b"\x1b").unwrap();
+    tui.wait_for("Read this next [1].", Duration::from_secs(3));
+    tui.writer.write_all(b"q").unwrap();
+    tui.wait_for("doc-session", Duration::from_secs(3));
+}
+
 fn assert_document_address(tui: &mut TuiPty) {
     use std::io::Write;
     tui.writer.write_all(b"a").unwrap();

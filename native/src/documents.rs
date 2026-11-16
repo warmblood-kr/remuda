@@ -41,7 +41,8 @@ pub struct Page {
     pub position: usize,
     pub identity: Option<(u64, String)>,
     pub error: Option<String>,
-    pub html: Option<crate::document_html::Document>,
+    /// Text/link projection for HTML and Markdown; `None` for plain text.
+    pub projection: Option<crate::document_html::Document>,
     pub selected_link: Option<usize>,
 }
 impl Page {
@@ -53,7 +54,7 @@ impl Page {
             position: 0,
             identity: None,
             error: None,
-            html: None,
+            projection: None,
             selected_link: None,
         }
     }
@@ -160,7 +161,11 @@ impl Browser {
         if self.loading || self.address.is_some() {
             return;
         }
-        let count = self.page.html.as_ref().map_or(0, |html| html.links.len());
+        let count = self
+            .page
+            .projection
+            .as_ref()
+            .map_or(0, |doc| doc.links.len());
         if count == 0 {
             return;
         }
@@ -173,7 +178,11 @@ impl Browser {
         self.page.error = None;
     }
     fn selected_link(&self) -> Option<&crate::document_html::Link> {
-        self.page.html.as_ref()?.links.get(self.page.selected_link?)
+        self.page
+            .projection
+            .as_ref()?
+            .links
+            .get(self.page.selected_link?)
     }
     pub fn navigate(&mut self, location: Location) {
         let path = match &location {
@@ -603,7 +612,11 @@ fn decode(location: &Location, value: &Value) -> Reply {
             if html_path(path) {
                 let html = crate::document_html::parse(path, &text)?;
                 page.text = html.lines.clone();
-                page.html = Some(html);
+                page.projection = Some(html);
+            } else if markdown_path(path) {
+                let markdown = crate::document_markdown::parse(path, &text)?;
+                page.text = markdown.lines.clone();
+                page.projection = Some(markdown);
             } else {
                 page.text = text.lines().take(MAX_LINES).map(str::to_owned).collect();
                 if text.lines().count() > MAX_LINES {
@@ -619,6 +632,11 @@ fn decode(location: &Location, value: &Value) -> Reply {
 fn html_path(path: &str) -> bool {
     let path = path.to_ascii_lowercase();
     path.ends_with(".html") || path.ends_with(".htm")
+}
+
+fn markdown_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    path.ends_with(".md") || path.ends_with(".markdown")
 }
 
 #[cfg(test)]
@@ -710,7 +728,44 @@ mod tests {
         assert!(!browser.back());
         assert_eq!(browser.page.position, 2);
         assert_eq!(browser.page.selected_link, Some(0));
-        assert_eq!(browser.page.html.as_ref().unwrap().title, "Guide");
+        assert_eq!(browser.page.projection.as_ref().unwrap().title, "Guide");
+    }
+
+    #[test]
+    fn markdown_pages_read_as_prose_and_their_local_links_navigate() {
+        let mut browser = Browser {
+            page: html_page(
+                "docs/guide.md",
+                "# Guide\n\nRead **this** [next](sub/next.md).\n\n- one\n",
+            ),
+            loading: false,
+            socket: PathBuf::new(),
+            history: Vec::new(),
+            generation: 1,
+            pending: false,
+            flight: None,
+            rendered_count: Cell::new(0),
+            address: None,
+        };
+        let text = browser.page.text.join("\n");
+        assert!(!text.contains('#') && !text.contains("**"), "{text}");
+        assert!(text.contains("Guide") && text.contains("Read this next [1]."));
+        let frame = browser.lines(80, 12).join("\n");
+        assert!(frame.contains("Read this next [1]."), "{frame}");
+        assert!(browser.body_in_frame(&frame));
+        browser.select_link(true);
+        assert!(browser.status().contains("remuda:///docs/sub/next.md"));
+        browser.open_selected();
+        assert_eq!(
+            browser.page.location,
+            Location::Document("docs/sub/next.md".into())
+        );
+        assert!(!browser.back());
+        assert_eq!(
+            browser.page.location,
+            Location::Document("docs/guide.md".into())
+        );
+        assert_eq!(browser.page.selected_link, Some(0));
     }
 
     #[test]
