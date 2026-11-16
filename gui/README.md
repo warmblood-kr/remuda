@@ -23,8 +23,17 @@ Only one line can be in flight, including across selection changes. A failure
 can leave delivery uncertain; the GUI identifies the original session and
 disables further input. Check it before restarting the GUI. This uses
 instance-bound input and does not attach or reserve the session. Remote input,
-session creation, interactive terminal keys, terminal styling, scrollback
-navigation and IME are not available in this prototype.
+session creation and peer terminal input are not available in this prototype.
+
+Select a current local session and choose **Attach interactive terminal** to
+use the existing attach client inside the GUI. Attach takes over an existing
+terminal holder. The worker checks the selected instance immediately before
+attaching, but the existing attach protocol addresses the session by name: a
+same-name recreation in between may attach the replacement. Selecting another
+session, refreshing, closing the GUI, or choosing **Detach terminal** ends this
+GUI's attach. The terminal currently displays an 80×24 plain-text screen and
+supports ordinary text, Enter, arrows and common control keys. Color styling,
+IME, scrollback, mouse reporting and automatic resize are not yet supported.
 
 The current prototype has been built and exercised on macOS. Other platforms
 have not been validated for this GUI.
@@ -98,7 +107,9 @@ The supervisor uses temporary runtime, config, data and state directories, start
 an in-process-backend local daemon, and stops it on exit. It verifies an actual
 session reaches the GPUI model, its row is laid out, and a simulated click and
 line submission produce output from the isolated shell. TestWindow does not
-assert physical window pixels, fonts or OS input. The normal GUI test suite
+verify physical OS keyboard events or screen pixels. The same acceptance also
+clicks Attach, types a command through the embedded PTY, checks its shell output,
+and verifies that changing selection releases the attach. The normal GUI test suite
 includes cancellation and failure-path checks. Commands run in separate
 sessions and cleanup signals only their owned process groups; a descendant that
 creates a new session is outside that scope.

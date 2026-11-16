@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 gpui = { version = "=0.2.2", default-features = false }
 libc = "0.2"
+portable-pty = "=0.9.0"
+vt100 = "=0.16.2"
 remuda-core = { path = "../core" }
 remuda-native = { path = "../native" }
 serde = { version = "1", features = ["derive"] }

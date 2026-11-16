@@ -4849,10 +4849,12 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "libc",
+ "portable-pty",
  "remuda-core",
  "remuda-native",
  "serde",
  "serde_json",
+ "vt100",
 ]
 
 [[package]]

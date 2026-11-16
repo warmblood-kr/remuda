@@ -9,6 +9,7 @@ use std::{sync::mpsc, time::Duration};
 mod input_helper;
 mod preview;
 mod provider;
+mod terminal;
 
 const WORKER_ABI: &str = "--remuda-gui-worker-abi-1";
 const STALE_HELPER: &str = "GUI helper version changed; restart the GUI";
@@ -92,6 +93,39 @@ fn worker(tagged: bool) -> i32 {
         })
         .collect();
     write_worker_reply(&sessions, tagged)
+}
+
+fn terminal_worker(name: &str, instance: &str) -> i32 {
+    use remuda_core::protocol::{Request, Response};
+    let path = remuda_native::daemon::socket_path("default");
+    let current = match remuda_native::client::request_with_timeout(
+        &path,
+        &Request::List,
+        Duration::from_secs(3),
+    ) {
+        Ok(Response::Sessions(rows)) => {
+            let matching: Vec<_> = rows.iter().filter(|row| row.name == name).collect();
+            matching.len() == 1
+                && matching[0].alive
+                && !matching[0].unavailable
+                && matching[0].instance_id.as_deref() == Some(instance)
+        }
+        _ => false,
+    };
+    if !current {
+        eprintln!("Session changed or is unavailable; attach refused.");
+        return 1;
+    }
+    match remuda_native::client::attach_with_mouse(&path, name, false) {
+        Ok(_) => {
+            eprintln!("\r\nTerminal detached.");
+            0
+        }
+        Err(error) => {
+            eprintln!("\r\nAttach failed: {error}");
+            1
+        }
+    }
 }
 
 fn peer_is_unique(peers: &[Peer], fingerprint: &str) -> bool {
@@ -232,6 +266,8 @@ type SyncResult = (u64, Selection, Result<preview::SyncFrame, String>);
 type RemoteResult = (u64, u64, String, Result<Vec<Session>, String>);
 
 struct LocalGui {
+    terminal: Option<terminal::Terminal>,
+    terminal_status: String,
     input_focus: Option<FocusHandle>,
     input_text: String,
     input_status: String,
@@ -287,6 +323,8 @@ impl LocalGui {
         let (nodes_sender, nodes_results) = mpsc::channel();
         let (remote_sender, remote_results) = mpsc::channel();
         Self {
+            terminal: None,
+            terminal_status: String::new(),
             input_focus: None,
             input_text: String::new(),
             input_status: String::new(),
@@ -336,6 +374,8 @@ impl LocalGui {
         }
     }
     fn clear_preview(&mut self) {
+        self.terminal = None;
+        self.terminal_status.clear();
         self.input_text.clear();
         self.sync_tick = 0;
         self.sync_version = 0;
@@ -409,6 +449,33 @@ impl LocalGui {
                 )
             })
         });
+    }
+    fn attach_selected(&mut self) {
+        let Some(selection) = self.selection.clone() else {
+            return;
+        };
+        if selection.peer.is_some()
+            || !self.selection_current(&selection)
+            || self.input_helper.is_some()
+            || self.input_stopped
+        {
+            self.terminal_status =
+                "Select a current local session and wait for pending input.".into();
+            return;
+        }
+        self.terminal = None;
+        match worker_executable()
+            .map_err(|e| e.to_string())
+            .and_then(|path| {
+                terminal::Terminal::start(&path, &selection.name, &selection.instance, WORKER_ABI)
+            }) {
+            Ok(terminal) => {
+                self.terminal = Some(terminal);
+                self.terminal_status =
+                    "Opening terminal. Click it to type; Ctrl-\\ detaches.".into();
+            }
+            Err(error) => self.terminal_status = format!("Could not open terminal: {error}"),
+        }
     }
     fn submit_local_line_with(
         &mut self,
@@ -668,6 +735,13 @@ impl LocalGui {
         });
     }
     fn drain(&mut self) {
+        if self
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.ended())
+        {
+            self.terminal_status = "Terminal ended. Inspect its output or attach again.".into();
+        }
         let input_event = self
             .input_helper
             .as_ref()
@@ -931,7 +1005,7 @@ impl Render for LocalGui {
                     .child(div().child(if self.selected_peer.is_some() {
                         "Read-only peer session list"
                     } else {
-                        "Read-only local session list"
+                        "Local session"
                     }))
                     .children(self.input_warnings.iter().map(|s| div().id("input-warning").debug_selector(|| "input-warning".into()).text_color(rgb(0xf28787)).child(format!("Delivery uncertain for {}. Check this session before restarting the GUI; input is disabled.", selection_label(s)))))
                     .when_some(self.input_target.as_ref(), |d, target| d.child(div().id("input-result-target").debug_selector(|| "input-result-target".into()).child(format!("{}: {}", self.input_status, selection_label(target)))))
@@ -951,6 +1025,29 @@ impl Render for LocalGui {
                     })
                     .when(self.sync_error, |d| d.child(div().id("sync-error").debug_selector(|| "sync-error".into()).text_color(rgb(0xf28787)).child("Live output unavailable; retrying.")))
                     .when(self.selection.as_ref().is_some_and(|s| s.peer.is_none() && self.selection_current(s)), |d| {
+                        d.child(div().pt_4().child(format!("Terminal target: {}", selection_label(self.selection.as_ref().unwrap()))))
+                            .child(div().child("Attach takes over any current terminal. If this name is recreated during attach, the new session may be selected."))
+                            .child(div().id("attach-terminal").debug_selector(|| "attach-terminal".into()).py_2().px_2().bg(rgb(0x34445a)).child("Attach interactive terminal").on_click(cx.listener(|this, _, window, cx| {
+                                this.attach_selected();
+                                if let Some(focus) = &this.input_focus { focus.focus(window); }
+                                cx.notify();
+                            })))
+                            .child(div().id("terminal-status").debug_selector(|| "terminal-status".into()).child(self.terminal_status.clone()))
+                    })
+                    .when(self.terminal.is_some(), |d| {
+                        let screen = self.terminal.as_ref().map(|terminal| terminal.screen()).unwrap_or_default();
+                        d.child(div().id("detach-terminal").debug_selector(|| "detach-terminal".into()).py_2().child("Detach terminal").on_click(cx.listener(|this, _, _, cx| { this.terminal = None; this.terminal_status = "Terminal detached.".into(); cx.notify(); })))
+                        .child(div().id("terminal-screen").debug_selector(|| "terminal-screen".into()).track_focus(&input_focus)
+                            .on_click(cx.listener(|this, _, window, cx| { if let Some(focus) = &this.input_focus { focus.focus(window); } cx.notify(); }))
+                            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                                if let (Some(terminal), Some(bytes)) = (&this.terminal, terminal::key_bytes(&event.keystroke)) {
+                                    if let Err(error) = terminal.send(bytes) { this.terminal_status = error.into(); }
+                                }
+                                cx.notify();
+                            }))
+                            .font_family("monospace").text_sm().whitespace_nowrap().overflow_hidden().py_2().child(screen))
+                    })
+                    .when(self.terminal.is_none() && self.selection.as_ref().is_some_and(|s| s.peer.is_none() && self.selection_current(s)), |d| {
                         d.child(div().id("input-target").debug_selector(|| "input-target".into()).pt_4().child(format!("Input target: {}", selection_label(self.selection.as_ref().unwrap()))))
                             .child(div().child("Local line input (ASCII; Enter sends; no terminal attach)"))
                             .child(div()
@@ -978,8 +1075,8 @@ impl Render for LocalGui {
                                 .py_2()
                                 .child(format!("> {}", self.input_text)))
                     })
-                    .when_some(self.selection.as_ref().filter(|s| self.selection_current(s)), |d, s| d.child(div().id("preview-target").debug_selector(|| "preview-target".into()).child(format!("Snapshot: {}", selection_label(s)))))
-                    .child(
+                    .when_some(self.selection.as_ref().filter(|s| self.terminal.is_none() && self.selection_current(s)), |d, s| d.child(div().id("preview-target").debug_selector(|| "preview-target".into()).child(format!("Snapshot: {}", selection_label(s)))))
+                    .when(self.terminal.is_none(), |d| d.child(
                         div()
                             .id("preview")
                             .debug_selector(|| "preview".into())
@@ -1001,7 +1098,7 @@ impl Render for LocalGui {
                                 this.refresh_nodes();
                                 cx.notify();
                             })),
-                    ),
+                    )),
             )
     }
 }
@@ -1025,6 +1122,17 @@ fn main() {
     }
     if std::env::args().nth(1).as_deref() == Some("--internal-preview-worker") {
         let mut args = std::env::args().skip(2).collect::<Vec<_>>();
+        if args.len() == 7
+            && args[0] == "local"
+            && args[1].is_empty()
+            && !args[2].is_empty()
+            && !args[3].is_empty()
+            && args[4] == "--terminal"
+            && args[5] == "--attach-v1"
+            && args[6] == WORKER_ABI
+        {
+            std::process::exit(terminal_worker(&args[2], &args[3]));
+        }
         if args.len() == 7
             && args.last().map(String::as_str) == Some(WORKER_ABI)
             && args[4] == "--sync"
@@ -1459,6 +1567,63 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(150));
             }
+            // Drive the GUI's attach button and PTY with the isolated shell.
+            let button = cx
+                .debug_bounds("attach-terminal")
+                .expect("attach button visible");
+            cx.simulate_click(button.center(), gpui::Modifiers::none());
+            let deadline = std::time::Instant::now() + Duration::from_secs(12);
+            loop {
+                view.update(cx, |gui, cx| {
+                    gui.drain();
+                    cx.notify();
+                });
+                cx.run_until_parked();
+                let attached = matches!(remuda_native::client::request(&remuda_native::daemon::socket_path("default"), &remuda_core::protocol::Request::List), Ok(remuda_core::protocol::Response::Sessions(rows)) if rows.iter().any(|row| row.name == "local-gui-proof" && row.attached));
+                if attached {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "terminal did not attach"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let terminal = cx
+                .debug_bounds("terminal-screen")
+                .expect("terminal visible");
+            cx.simulate_click(terminal.center(), gpui::Modifiers::none());
+            cx.simulate_keystrokes("h->h o->o s->s t->t n->n a->a m->m e->e enter");
+            let hostname = String::from_utf8(
+                std::process::Command::new("hostname")
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(12);
+            loop {
+                view.update(cx, |gui, cx| {
+                    gui.drain();
+                    cx.notify();
+                });
+                cx.run_until_parked();
+                if cx.read(|app| {
+                    view.read(app).terminal.as_ref().is_some_and(|terminal| {
+                        terminal
+                            .screen()
+                            .lines()
+                            .any(|line| line.trim() == hostname.trim())
+                    })
+                }) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "typed terminal command output not visible"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
             // The daemon must reject a stale row with the wrong instance.
             view.update(cx, |gui, cx| {
                 let mut stale = gui.sessions[0].clone();
@@ -1469,6 +1634,18 @@ mod tests {
                 gui.submit_local_line();
                 cx.notify();
             });
+            let detach_deadline = std::time::Instant::now() + Duration::from_secs(8);
+            loop {
+                let attached = matches!(remuda_native::client::request(&remuda_native::daemon::socket_path("default"), &remuda_core::protocol::Request::List), Ok(remuda_core::protocol::Response::Sessions(rows)) if rows.iter().any(|row| row.name == "local-gui-proof" && row.attached));
+                if !attached {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < detach_deadline,
+                    "selection change did not release terminal"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             loop {
                 view.update(cx, |gui, cx| {
