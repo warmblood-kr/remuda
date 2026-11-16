@@ -4461,6 +4461,66 @@ impl ClusterUi {
     }
 }
 
+fn apply_document_request(
+    ui: &mut ClusterUi,
+    inbox: &mut Option<crate::document_open::Inbox>,
+    path: &Path,
+) {
+    if let Some(inbox) = inbox {
+        if let Some(request) = inbox.take() {
+            ui.documents_open = true;
+            let browser = ui
+                .documents
+                .get_or_insert_with(|| crate::documents::Browser::new(path.to_owned()));
+            browser.cancel();
+            browser.navigate(crate::documents::Location::Document(
+                request.uri[10..].to_owned(),
+            ));
+            inbox.track(request, browser.generation());
+        }
+    }
+}
+
+fn present_frame(
+    frame: &str,
+    previous: &mut Option<vt100::Parser>,
+    size: (u16, u16),
+    now: Duration,
+    last_full_repaint: &mut Duration,
+    frames: &mut impl Write,
+) -> io::Result<()> {
+    let (rows, cols) = size;
+    let mut next = vt100::Parser::new(rows, cols, 0);
+    next.process(format!("\x1b[H\x1b[2J{}", terminal_frame(frame)).as_bytes());
+    let output = present_with_recovery(
+        previous.as_ref().map(vt100::Parser::screen),
+        next.screen(),
+        now,
+        last_full_repaint,
+    );
+    if !output.is_empty() {
+        // Anything another writer left in stdout's buffer goes first.
+        io::stdout().flush()?;
+        write_frame(frames, &output)?;
+    }
+    *previous = Some(next);
+    Ok(())
+}
+
+fn document_presented(
+    ui: &ClusterUi,
+    inbox: &mut Option<crate::document_open::Inbox>,
+    size: (u16, u16),
+) {
+    if let Some(inbox) = inbox {
+        inbox.presented(
+            ui.documents.as_ref(),
+            ui.documents_open,
+            size.0 >= 3 && size.1 > 0,
+        );
+    }
+}
+
 fn run_loop(
     path: &Path,
     node: &str,
@@ -4503,8 +4563,10 @@ fn run_loop(
     let mut previous = None;
     let mut last_full_repaint = clock.now();
     let mut frames = frame_writer()?;
+    let mut document_inbox = crate::document_open::Inbox::from_env(path)?;
     loop {
         sync_local_list(&mut ui, path, &mut local_views, clock.now());
+        apply_document_request(&mut ui, &mut document_inbox, path);
         // Read before syncing: an update landing during sync/render wakes the wait.
         let seen = wake();
         ui.remote_synced(remote_source);
@@ -4535,20 +4597,15 @@ fn run_loop(
         let captured = capture_local_pane(&mut ui, path, clock);
         let body = captured.unwrap_or_default();
         let frame = ui.render(cols, rows, &body, clock);
-        let mut next = vt100::Parser::new(rows, cols, 0);
-        next.process(format!("\x1b[H\x1b[2J{}", terminal_frame(&frame)).as_bytes());
-        let output = present_with_recovery(
-            previous.as_ref().map(vt100::Parser::screen),
-            next.screen(),
+        present_frame(
+            &frame,
+            &mut previous,
+            (rows, cols),
             clock.now(),
             &mut last_full_repaint,
-        );
-        if !output.is_empty() {
-            // Anything another writer left in stdout's buffer goes first.
-            io::stdout().flush()?;
-            write_frame(&mut frames, &output)?;
-        }
-        previous = Some(next);
+            &mut frames,
+        )?;
+        document_presented(&ui, &mut document_inbox, (rows, cols));
         ui.send_close_pending_via(path, port(&mut remote_calls), clock.now());
         ui.send_pending_via(path, clock.now(), port(&mut remote_calls));
         ui.start_pending(clock.now());
