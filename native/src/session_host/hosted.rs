@@ -394,6 +394,9 @@ fn checked(entry: &Entry) -> CheckedState {
                 build: info.host_build,
             }
         }
+        Ok(super::api::Response::Error { code }) => {
+            CheckedState::Unreachable(format!("host refused inspect: {code}"))
+        }
         Ok(other) => CheckedState::Unreachable(format!("unexpected reply {}", reply_kind(&other))),
         Err(error) => CheckedState::Unreachable(error.to_string()),
     }
