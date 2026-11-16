@@ -38,7 +38,9 @@ reason. Images become `[image]` / `[image: alt]`; embedded HTML is left literal,
 never executed or parsed.
 
 Limits: the existing 1 MiB document read cap, 4092 output rows (explicit error,
-matching HTML's block cap) and 128 links. Inline scanning carries a per-line work
+matching HTML's block cap) and 128 links. `document_markdown::parse` has no
+inherent byte cap of its own — the TUI read path enforces 1 MiB, and any GUI
+adapter must bound the source before calling it, as its doc comment says. Inline scanning carries a per-line work
 budget of eight inspected characters per input character, so unmatched `[`,
 backtick and emphasis scans cannot become quadratic; when the budget runs out
 the rest of that line stays literal instead of being parsed. A thematic break
@@ -110,7 +112,8 @@ on directory-first ordering.
 Limitations, stated plainly: this is not CommonMark — setext headings, tables,
 task-list checkboxes and HTML blocks are left literal; emphasis pairs must match
 in delimiter length and do not cross a code span; an image is a placeholder, not
-a preview; malformed lines beyond the work budget stay literal. Bracket matching
+a preview; malformed lines beyond the work budget stay literal; `parse` assumes a bounded
+source, so a GUI caller must enforce its own byte limit first. Bracket matching
 counts nesting but does not interpret escapes, so an unbalanced `[` inside a
 malformed label (including a raw `ESC[31m`-style sequence) can let an inner
 balanced pair become the link instead; the bytes are never executed and the

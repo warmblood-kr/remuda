@@ -6,6 +6,10 @@
 //! images as an explicit placeholder, and local links with the same `Target`
 //! semantics as the HTML projection. Anything it does not recognise stays
 //! literal, and no embedded HTML, script or resource load is executed.
+//!
+//! Input size is the caller's responsibility: [`parse`] has no inherent byte
+//! cap. The TUI read path (`documents::fetch`) enforces the 1 MiB document
+//! limit; a GUI or any other adapter must bound the source before calling.
 
 use crate::document_html::{resolve, Document, Link};
 use std::collections::HashMap;
@@ -17,6 +21,7 @@ const MAX_DEPTH: usize = 8;
 const INLINE_WORK: usize = 8;
 
 /// Project Markdown source into inert title, text lines and typed local links.
+/// Callers must bound `source`; this parser has no inherent byte cap.
 pub fn parse(path: &str, source: &str) -> Result<Document, String> {
     let definitions = definitions(source);
     let mut document = Document::default();
