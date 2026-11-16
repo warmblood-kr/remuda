@@ -233,7 +233,7 @@ impl Browser {
             ),
             width,
         )];
-        let room = height.saturating_sub(3);
+        let room = body_room(height);
         match self.page.location {
             Location::Directory(_) => {
                 if self.page.entries.is_empty() && !self.loading {
@@ -285,6 +285,19 @@ impl Browser {
             .map(|line| clip(&line, width))
             .collect()
     }
+    /// Inspect the final document frame, excluding its header/status/help rows.
+    /// Address inspection and clipped/blank body rows are not document evidence.
+    pub fn body_in_frame(&self, frame: &str) -> bool {
+        if self.address.is_some() || !matches!(self.page.location, Location::Document(_)) {
+            return false;
+        }
+        let rows: Vec<_> = frame.split('\n').collect();
+        rows.iter()
+            .skip(1)
+            .take(body_room(rows.len()))
+            .any(|row| unicode_width::UnicodeWidthStr::width(row.trim()) > 0)
+    }
+
     fn status(&self) -> String {
         if self.loading {
             return "Loading…".into();
@@ -410,6 +423,10 @@ impl Browser {
             }
         }
     }
+}
+
+fn body_room(height: usize) -> usize {
+    height.saturating_sub(3)
 }
 
 fn wrap_text(lines: &[String], width: usize) -> Vec<String> {
@@ -617,6 +634,41 @@ mod tests {
             }),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn presentation_requires_a_visible_body_glyph_in_the_final_frame() {
+        let mut browser = Browser {
+            page: html_page("docs/small.html", "<p>界</p>"),
+            loading: false,
+            socket: PathBuf::new(),
+            history: Vec::new(),
+            generation: 1,
+            pending: false,
+            flight: None,
+            rendered_count: Cell::new(0),
+            address: None,
+        };
+        for (width, height, expected) in [
+            (100, 0, false),
+            (100, 3, false),
+            (100, 4, true),
+            (0, 4, false),
+            (1, 4, true), // The existing renderer shows '?' for an over-wide glyph.
+            (2, 4, true),
+        ] {
+            let frame = browser.lines(width, height).join("\n");
+            assert_eq!(
+                browser.body_in_frame(&frame),
+                expected,
+                "{width}×{height}: {frame:?}"
+            );
+        }
+        browser.inspect_address();
+        assert!(!browser.body_in_frame(&browser.lines(100, 4).join("\n")));
+        browser.address = None;
+        browser.page.text = vec![String::new()];
+        assert!(!browser.body_in_frame(&browser.lines(100, 4).join("\n")));
     }
 
     #[test]

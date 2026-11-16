@@ -120,6 +120,8 @@ impl Drop for PrivateDaemon {
 
 #[cfg(unix)]
 struct TuiPty {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    rows: u16,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     pid: u32,
     writer: Box<dyn std::io::Write + Send>,
@@ -134,10 +136,18 @@ impl TuiPty {
     }
 
     fn start_document_target(runtime: &std::path::Path, target: Option<&str>) -> Self {
+        Self::start_document_target_rows(runtime, target, 24)
+    }
+
+    fn start_document_target_rows(
+        runtime: &std::path::Path,
+        target: Option<&str>,
+        rows: u16,
+    ) -> Self {
         use std::io::Read;
         let pty = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize {
-                rows: 24,
+                rows,
                 cols: 100,
                 pixel_width: 0,
                 pixel_height: 0,
@@ -174,6 +184,8 @@ impl TuiPty {
             }
         });
         Self {
+            master: pty.master,
+            rows,
             child,
             pid,
             writer,
@@ -184,13 +196,25 @@ impl TuiPty {
 
     fn screen_text(&self) -> String {
         let output = self.output.lock().unwrap();
-        let mut parser = vt100::Parser::new(24, 100, 0);
+        let mut parser = vt100::Parser::new(self.rows, 100, 0);
         parser.process(&output);
         parser.screen().contents()
     }
 
     fn output_len(&self) -> usize {
         self.output.lock().unwrap().len()
+    }
+
+    fn resize_rows(&mut self, rows: u16) {
+        self.master
+            .resize(portable_pty::PtySize {
+                rows,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        self.rows = rows;
     }
 
     fn screens_from(&self, offset: usize) -> (String, String) {
@@ -610,6 +634,40 @@ fn wait_document_mailbox(
         );
         std::thread::sleep(Duration::from_millis(40));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_open_waits_for_body_after_three_to_four_row_resize() {
+    use serde_json::json;
+    let daemon =
+        document_test_daemon(&[("docs/small.html", "<title>ACTUAL_BODY</title><p>Design</p>")]);
+    let mut tui = TuiPty::start_document_target_rows(&daemon.runtime, Some("owner"), 3);
+    let ready = wait_document_mailbox(&daemon, "ready", "mode", &json!("direct"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let request = json!({"instance":ready["instance"],"seq":1,"uri":"remuda:///docs/small.html","expires":now+60});
+    document_mailbox(&daemon, "request", Some(&request));
+    wait_document_mailbox(&daemon, "result", "seq", &json!(1));
+    tui.wait_for("Documents", Duration::from_secs(5));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let result = document_mailbox(&daemon, "result", None);
+        assert_eq!(
+            result["status"], "received",
+            "false presentation acknowledgement: {result}"
+        );
+        assert!(!tui.screen_text().contains("ACTUAL_BODY"));
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    tui.resize_rows(4);
+    tui.wait_for("ACTUAL_BODY", Duration::from_secs(5));
+    let rendered = wait_document_mailbox(&daemon, "result", "status", &json!("rendered"));
+    assert_eq!(rendered["seq"], 1);
+    assert_eq!(rendered["instance"], ready["instance"]);
+    assert_eq!(rendered["uri"], request["uri"]);
 }
 
 #[cfg(unix)]

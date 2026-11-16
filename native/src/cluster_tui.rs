@@ -4510,13 +4510,15 @@ fn present_frame(
 fn document_presented(
     ui: &ClusterUi,
     inbox: &mut Option<crate::document_open::Inbox>,
-    size: (u16, u16),
+    frame: &str,
 ) {
     if let Some(inbox) = inbox {
         inbox.presented(
             ui.documents.as_ref(),
             ui.documents_open,
-            size.0 >= 3 && size.1 > 0,
+            ui.documents
+                .as_ref()
+                .is_some_and(|browser| browser.body_in_frame(frame)),
         );
     }
 }
@@ -4605,7 +4607,7 @@ fn run_loop(
             &mut last_full_repaint,
             &mut frames,
         )?;
-        document_presented(&ui, &mut document_inbox, (rows, cols));
+        document_presented(&ui, &mut document_inbox, &frame);
         ui.send_close_pending_via(path, port(&mut remote_calls), clock.now());
         ui.send_pending_via(path, clock.now(), port(&mut remote_calls));
         ui.start_pending(clock.now());
