@@ -1,6 +1,6 @@
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, SharedString, Window,
-    WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, FocusHandle, SharedString,
+    Window, WindowBounds, WindowOptions,
 };
 use serde::{Deserialize, Serialize};
 use std::{sync::mpsc, time::Duration};
@@ -63,6 +63,14 @@ fn worker_deadline() {
         std::thread::sleep(provider::TIMEOUT);
         std::process::exit(124);
     });
+}
+
+fn worker_executable() -> std::io::Result<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("REMUDA_GUI_ACCEPTANCE_WORKER") {
+        return Ok(path.into());
+    }
+    std::env::current_exe()
 }
 
 // This worker makes only a List request. Its own deadline survives GUI exit,
@@ -206,11 +214,31 @@ struct Selection {
     name: String,
     instance: String,
 }
+fn selection_label(selection: &Selection) -> String {
+    let node = selection.peer.as_ref().map_or_else(
+        || "This device".to_string(),
+        |peer| format!("Peer {}", label(peer)),
+    );
+    format!(
+        "{} / {} · instance {}",
+        node,
+        label(&selection.name),
+        label(&selection.instance)
+    )
+}
 type PreviewResult = (u64, Selection, Result<String, String>);
 
 type RemoteResult = (u64, u64, String, Result<Vec<Session>, String>);
 
 struct LocalGui {
+    input_focus: Option<FocusHandle>,
+    input_text: String,
+    input_status: String,
+    input_warnings: Vec<Selection>,
+    input_helper: Option<input_helper::InputHelper>,
+    input_target: Option<Selection>,
+    input_stopped: bool,
+    preview_tick: u8,
     helper_changed: bool,
     selection: Option<Selection>,
     preview: Option<String>,
@@ -252,6 +280,14 @@ impl LocalGui {
         let (nodes_sender, nodes_results) = mpsc::channel();
         let (remote_sender, remote_results) = mpsc::channel();
         Self {
+            input_focus: None,
+            input_text: String::new(),
+            input_status: String::new(),
+            input_warnings: Vec::new(),
+            input_helper: None,
+            input_target: None,
+            input_stopped: false,
+            preview_tick: 0,
             helper_changed: false,
             selection: None,
             preview: None,
@@ -288,6 +324,7 @@ impl LocalGui {
         }
     }
     fn clear_preview(&mut self) {
+        self.input_text.clear();
         self.preview_generation = self
             .preview_generation
             .checked_add(1)
@@ -295,6 +332,13 @@ impl LocalGui {
         self.selection = None;
         self.preview = None;
         self.preview_pending = None;
+    }
+    fn warn_input_target(&mut self) {
+        if let Some(selection) = self.input_target.clone() {
+            if !self.input_warnings.contains(&selection) {
+                self.input_warnings.push(selection);
+            }
+        }
     }
     fn selection_current(&self, s: &Selection) -> bool {
         if s.peer != self.selected_peer {
@@ -335,6 +379,54 @@ impl LocalGui {
         self.preview_pending = Some((self.preview_generation, s));
         self.launch_preview();
     }
+    fn submit_local_line(&mut self) {
+        self.submit_local_line_with(|selection| {
+            worker_executable().and_then(|path| {
+                input_helper::InputHelper::start(
+                    &path,
+                    &[
+                        "--internal-input-worker",
+                        "local",
+                        "",
+                        &selection.name,
+                        &selection.instance,
+                    ],
+                )
+            })
+        });
+    }
+    fn submit_local_line_with(
+        &mut self,
+        start: impl FnOnce(&Selection) -> std::io::Result<input_helper::InputHelper>,
+    ) {
+        let Some(selection) = self.selection.clone() else {
+            return;
+        };
+        if selection.peer.is_some() || !self.selection_current(&selection) || self.input_stopped {
+            return;
+        }
+        if self.input_helper.is_some() {
+            self.input_status = "Input pending; wait for the result".into();
+            return;
+        }
+        if self.input_text.is_empty() {
+            return;
+        }
+        let mut bytes = self.input_text.as_bytes().to_vec();
+        bytes.push(b'\r');
+        self.input_target = Some(selection.clone());
+        match start(&selection) {
+            Ok(helper) => match helper.submit(&bytes) {
+                input_helper::Submit::Queued => {
+                    self.input_text.clear();
+                    self.input_status = "Sending…".into();
+                    self.input_helper = Some(helper);
+                }
+                _ => self.input_status = "Input could not be queued".into(),
+            },
+            Err(_) => self.input_status = "Input helper unavailable".into(),
+        }
+    }
     fn launch_preview(&mut self) {
         if self.preview_busy {
             return;
@@ -354,7 +446,7 @@ impl LocalGui {
             } else {
                 "local"
             };
-            let result = std::env::current_exe()
+            let result = worker_executable()
                 .map_err(|e| e.to_string())
                 .and_then(|path| {
                     provider::output(
@@ -524,6 +616,35 @@ impl LocalGui {
         });
     }
     fn drain(&mut self) {
+        let input_event = self
+            .input_helper
+            .as_ref()
+            .and_then(|helper| helper.recv_event_timeout(Duration::ZERO).ok());
+        if let Some(event) = input_event {
+            self.input_helper = None;
+            match event {
+                input_helper::Event::Applied => self.input_status = "Sent".into(),
+                input_helper::Event::NotAcknowledged => {
+                    self.warn_input_target();
+                    self.input_stopped = true;
+                    self.input_status = "Delivery uncertain; input disabled".into();
+                }
+            }
+        }
+        self.preview_tick = self.preview_tick.saturating_add(1);
+        if self.preview_tick >= 7 {
+            self.preview_tick = 0;
+            if let Some(selection) = self
+                .selection
+                .clone()
+                .filter(|s| s.peer.is_none() && self.selection_current(s))
+            {
+                if !self.preview_busy {
+                    self.preview_pending = Some((self.preview_generation, selection));
+                    self.launch_preview();
+                }
+            }
+        }
         while let Ok((generation, selection, result)) = self.preview_results.try_recv() {
             self.preview_busy = false;
             if generation == self.preview_generation
@@ -608,6 +729,10 @@ impl LocalGui {
 }
 impl Render for LocalGui {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let input_focus = self
+            .input_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
         let title = if self.selected_peer.is_some() && self.remote_loading {
             "PEER SESSIONS · LOADING"
         } else if self.selected_peer.is_some() && self.remote_error {
@@ -709,6 +834,10 @@ impl Render for LocalGui {
                                 "exited"
                             };
                             let selected = session.clone();
+                            let is_selected = self.selection.as_ref().is_some_and(|s| {
+                                self.selection_current(s) && s.peer == self.selected_peer && s.name == session.name
+                                    && session.instance_id.as_deref() == Some(s.instance.as_str())
+                            });
                             div()
                                 .id(SharedString::from(format!("session-{index}")))
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -717,6 +846,7 @@ impl Render for LocalGui {
                                 }))
                                 .debug_selector(move || format!("session-{index}"))
                                 .py_2()
+                                .when(is_selected, |d| d.bg(rgb(0x34445a)).child(div().id("selected-session").debug_selector(|| "selected-session".into()).child("SELECTED")))
                                 .child(div().child(label(&session.name)))
                                 .child(div().text_sm().text_color(rgb(0x8a95a5)).child(status))
                         }),
@@ -731,6 +861,8 @@ impl Render for LocalGui {
                     } else {
                         "Read-only local session list"
                     }))
+                    .children(self.input_warnings.iter().map(|s| div().id("input-warning").debug_selector(|| "input-warning".into()).text_color(rgb(0xf28787)).child(format!("Delivery uncertain for {}. Check this session before restarting the GUI; input is disabled.", selection_label(s)))))
+                    .when_some(self.input_target.as_ref(), |d, target| d.child(div().id("input-result-target").debug_selector(|| "input-result-target".into()).child(format!("{}: {}", self.input_status, selection_label(target)))))
                     .when(self.selected_peer.is_some() && self.remote_error, |d| {
                         d.child(
                             div()
@@ -745,6 +877,35 @@ impl Render for LocalGui {
                                 .child("Local daemon unavailable; listed sessions may be stale."),
                         )
                     })
+                    .when(self.selection.as_ref().is_some_and(|s| s.peer.is_none() && self.selection_current(s)), |d| {
+                        d.child(div().id("input-target").debug_selector(|| "input-target".into()).pt_4().child(format!("Input target: {}", selection_label(self.selection.as_ref().unwrap()))))
+                            .child(div().child("Local line input (ASCII; Enter sends; no terminal attach)"))
+                            .child(div()
+                                .id("line-input")
+                                .debug_selector(|| "line-input".into())
+                                .track_focus(&input_focus)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    if let Some(focus) = &this.input_focus { focus.focus(window); }
+                                    cx.notify();
+                                }))
+                                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                                    let key = &event.keystroke;
+                                    if key.modifiers.control || key.modifiers.platform || key.modifiers.alt || key.modifiers.function { return; }
+                                    match key.key.as_str() {
+                                        "enter" => this.submit_local_line(),
+                                        "backspace" => { this.input_text.pop(); },
+                                        _ => if let Some(text) = &key.key_char {
+                                            if text.bytes().all(|b| (b' '..=b'~').contains(&b)) && this.input_text.len() + text.len() < remuda_native::strict_input::MAX_BATCH {
+                                                this.input_text.push_str(text);
+                                            }
+                                        }
+                                    }
+                                    cx.notify();
+                                }))
+                                .py_2()
+                                .child(format!("> {}", self.input_text)))
+                    })
+                    .when_some(self.selection.as_ref().filter(|s| self.selection_current(s)), |d, s| d.child(div().id("preview-target").debug_selector(|| "preview-target".into()).child(format!("Snapshot: {}", selection_label(s)))))
                     .child(
                         div()
                             .id("preview")
@@ -853,6 +1014,137 @@ fn main() {
 mod tests {
     use super::*;
     #[test]
+    fn input_requires_current_local_instance() {
+        let mut gui = LocalGui::new();
+        gui.sessions = vec![row("proof")];
+        gui.preview_busy = true;
+        gui.select_session(row("proof"));
+        gui.input_text = "do-not-send".into();
+        gui.sessions[0].instance_id = Some("replacement".into());
+        gui.submit_local_line();
+        assert!(gui.input_helper.is_none());
+        assert_eq!(gui.input_text, "do-not-send");
+    }
+    #[gpui::test]
+    fn immediate_input_failure_is_shown_against_the_attempted_target(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new();
+            gui.sessions = vec![row("one"), row("two")];
+            gui.preview_busy = true;
+            gui
+        });
+        for name in ["one", "two"] {
+            view.update(cx, |gui, cx| {
+                gui.select_session(row(name));
+                gui.input_text = "test".into();
+                gui.submit_local_line_with(|_| Err(std::io::Error::other("fixture spawn failure")));
+                assert_eq!(gui.input_target.as_ref().unwrap().name, name);
+                assert_eq!(gui.input_status, "Input helper unavailable");
+                assert_eq!(gui.input_text, "test");
+                cx.notify();
+            });
+            assert!(cx.debug_bounds("input-result-target").is_some());
+        }
+    }
+    #[test]
+    fn immediate_queue_rejection_is_attributed_to_the_attempted_target() {
+        let mut gui = LocalGui::new();
+        gui.sessions = vec![row("one"), row("two")];
+        gui.preview_busy = true;
+        gui.select_session(row("one"));
+        gui.input_target = gui.selection.clone();
+        gui.input_status = "Sent".into();
+        gui.select_session(row("two"));
+        gui.input_text = "x".repeat(remuda_native::strict_input::MAX_BATCH);
+        gui.submit_local_line_with(|_| {
+            input_helper::InputHelper::start(std::path::Path::new("/bin/sleep"), &["30"])
+        });
+        assert_eq!(gui.input_target.as_ref().unwrap().name, "two");
+        assert_eq!(gui.input_status, "Input could not be queued");
+        assert!(gui.input_helper.is_none());
+    }
+    #[test]
+    fn selection_changes_do_not_allow_overlapping_input_and_uncertainty_stays_blocked() {
+        let mut gui = LocalGui::new();
+        gui.sessions = vec![row("one"), row("two")];
+        gui.preview_busy = true;
+        gui.select_session(row("one"));
+        let original = gui.selection.clone().unwrap();
+        let helper =
+            input_helper::InputHelper::start(std::path::Path::new("/bin/sleep"), &["30"]).unwrap();
+        assert_eq!(helper.submit(b"test\r"), input_helper::Submit::Queued);
+        gui.input_target = Some(original.clone());
+        gui.input_helper = Some(helper);
+        for next in ["one", "two", "one"] {
+            gui.select_session(row(next));
+            gui.input_text = "second".into();
+            gui.submit_local_line();
+            assert_eq!(gui.input_target.as_ref(), Some(&original));
+            assert!(gui.input_helper.is_some());
+            assert_eq!(gui.input_text, "second");
+        }
+        gui.input_helper.as_ref().unwrap().stop();
+        gui.drain();
+        assert!(gui.input_helper.is_none());
+        assert!(gui.input_stopped);
+        assert_eq!(gui.input_warnings, vec![original]);
+        gui.select_session(row("two"));
+        gui.input_text = "third".into();
+        gui.submit_local_line();
+        assert!(gui.input_helper.is_none());
+        assert_eq!(gui.input_text, "third");
+    }
+    #[test]
+    fn delayed_ack_is_attributed_to_original_target_before_new_input_is_allowed() {
+        let mut gui = LocalGui::new();
+        gui.sessions = vec![row("one"), row("two")];
+        gui.preview_busy = true;
+        gui.select_session(row("one"));
+        let original = gui.selection.clone().unwrap();
+        let helper = input_helper::InputHelper::start(
+            std::path::Path::new("/bin/sh"),
+            &["-c", "printf 'remuda-input-v1\\n'; dd bs=1 count=5 of=/dev/null 2>/dev/null; sleep 0.3; printf '\\001'"],
+        ).unwrap();
+        assert_eq!(helper.submit(b"test\r"), input_helper::Submit::Queued);
+        gui.input_target = Some(original.clone());
+        gui.input_helper = Some(helper);
+        gui.select_session(row("two"));
+        gui.input_text = "second".into();
+        gui.submit_local_line();
+        assert_eq!(gui.input_target.as_ref(), Some(&original));
+        assert!(gui.input_helper.is_some());
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while gui.input_helper.is_some() {
+            gui.drain();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(gui.input_target.as_ref(), Some(&original));
+        assert_eq!(gui.input_status, "Sent");
+        assert!(!gui.input_stopped);
+        assert!(gui.input_warnings.is_empty());
+    }
+    #[gpui::test]
+    fn selected_session_and_exact_input_target_are_laid_out(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new();
+            gui.preview_busy = true;
+            gui.sessions = vec![row("one"), row("two")];
+            gui
+        });
+        let bounds = cx.debug_bounds("session-1").unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("selected-session").is_some());
+        assert!(cx.debug_bounds("input-target").is_some());
+        assert!(cx.debug_bounds("preview-target").is_some());
+        assert_eq!(
+            cx.read(|app| selection_label(view.read(app).selection.as_ref().unwrap())),
+            "This device / \"two\" · instance \"instance\""
+        );
+    }
+    #[test]
     fn worker_reply_rejects_legacy_and_wrong_abi() {
         assert_eq!(
             read_worker_reply::<Vec<String>>(br#"["old"]"#).unwrap_err(),
@@ -940,6 +1232,66 @@ mod tests {
             cx.debug_bounds("session-0").is_some(),
             "exact local session row was not laid out"
         );
+        if std::env::var_os("REMUDA_GUI_ACCEPTANCE_INPUT").is_some() {
+            let row = cx.debug_bounds("session-0").unwrap();
+            cx.simulate_click(row.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            let field = cx.debug_bounds("line-input").expect("line input visible");
+            cx.simulate_click(field.center(), gpui::Modifiers::none());
+            cx.simulate_keystrokes("i->i d->d enter");
+            let deadline = std::time::Instant::now() + Duration::from_secs(12);
+            loop {
+                view.update(cx, |gui, cx| {
+                    gui.drain();
+                    cx.notify();
+                });
+                cx.run_until_parked();
+                if cx.read(|app| {
+                    view.read(app).preview.as_deref().is_some_and(|s| {
+                        s.lines().any(|line| line.trim_start().starts_with("uid="))
+                    })
+                }) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "input was not observed in session output"
+                );
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            assert_eq!(cx.read(|app| view.read(app).input_status.clone()), "Sent");
+            // The daemon must reject a stale row with the wrong instance.
+            view.update(cx, |gui, cx| {
+                let mut stale = gui.sessions[0].clone();
+                stale.instance_id = Some("wrong-instance".into());
+                gui.sessions = vec![stale.clone()];
+                gui.select_session(stale);
+                gui.input_text = "id".into();
+                gui.submit_local_line();
+                cx.notify();
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                view.update(cx, |gui, cx| {
+                    gui.drain();
+                    cx.notify();
+                });
+                if cx.read(|app| view.read(app).input_stopped) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "wrong instance was not rejected"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            view.update(cx, |gui, _| {
+                assert_eq!(gui.input_warnings.len(), 1);
+                gui.input_text = "id".into();
+                gui.submit_local_line();
+                assert!(gui.input_helper.is_none());
+            });
+        }
     }
     fn peer(fp: &str, name: &str) -> Peer {
         Peer {
