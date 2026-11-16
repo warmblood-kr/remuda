@@ -31,7 +31,48 @@ pub fn capture<P: SessionPort + ?Sized>(
     scrollback: usize,
     policy: IdentityPolicy,
 ) -> Result<PreviewFrame, String> {
-    match port.capture_instance(name, expected, scrollback) {
+    decode_frame(
+        port.capture_instance(name, expected, scrollback),
+        expected,
+        policy,
+        port.remote_node().is_some(),
+    )
+}
+
+/// Decode a Sync response through the same strict identity and display bounds
+/// as capture. A successful result is read-only and is not an attach grant.
+pub fn decode_sync(response: Response, expected: &str) -> Result<PreviewFrame, String> {
+    let Response::Sync {
+        instance_id,
+        output_version,
+        snapshot,
+    } = response
+    else {
+        return Err("Sync unavailable".into());
+    };
+    decode_frame(
+        Ok(Response::StyledScreen {
+            rows: snapshot.rows,
+            wrapped: snapshot.wrapped,
+            cursor: snapshot.cursor,
+            scrollback_len: snapshot.scrollback_len,
+            scrollback_total: snapshot.scrollback_total,
+            instance_id: Some(instance_id),
+            output_version: Some(output_version),
+        }),
+        Some(expected),
+        IdentityPolicy::Strict,
+        false,
+    )
+}
+
+fn decode_frame(
+    response: std::io::Result<Response>,
+    expected: Option<&str>,
+    policy: IdentityPolicy,
+    remote: bool,
+) -> Result<PreviewFrame, String> {
+    match response {
         Ok(Response::StyledScreen {
             rows,
             wrapped,
@@ -41,7 +82,6 @@ pub fn capture<P: SessionPort + ?Sized>(
             instance_id,
             output_version,
         }) => {
-            let remote = port.remote_node().is_some();
             let rejected = match policy {
                 IdentityPolicy::TuiCompatible => {
                     remote && (expected.is_none() || instance_id.as_deref() != expected)
@@ -212,6 +252,40 @@ mod tests {
     }
     fn strict(port: &Port) -> Result<PreviewFrame, String> {
         capture(port, "session", Some("one"), 0, IdentityPolicy::Strict)
+    }
+    #[test]
+    fn sync_requires_matching_instance_and_enforces_strict_frame_limits() {
+        let sync = |instance: &str, text: &str| Response::Sync {
+            instance_id: instance.into(),
+            output_version: 42,
+            snapshot: remuda_core::protocol::StyledScreen {
+                rows: vec![vec![run(text, false)]],
+                wrapped: vec![false],
+                cursor: Cursor {
+                    row: 5,
+                    col: 3,
+                    visible: true,
+                },
+                scrollback_len: 0,
+                scrollback_total: 0,
+                bracketed_paste: false,
+            },
+        };
+        let frame = decode_sync(sync("one", "a\u{1b}b"), "one").unwrap();
+        assert_eq!(frame.output_version, Some(42));
+        assert!(!frame.cursor.visible);
+        assert_eq!(
+            frame.cells[0]
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<String>(),
+            "ab"
+        );
+        assert!(decode_sync(sync("two", "x"), "one").is_err());
+        assert!(decode_sync(sync("", "x"), "").is_err());
+        assert!(decode_sync(sync("one", &"x".repeat(513)), "one").is_err());
+        assert!(decode_sync(Response::WrongInstance, "one").is_err());
+        assert!(decode_sync(Response::SyncAtCapacity, "one").is_err());
     }
     #[test]
     fn strict_requires_nonempty_matching_instance_on_either_node() {

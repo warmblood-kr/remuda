@@ -2,6 +2,13 @@ use crate::{discover_peers, peer_is_unique, worker_deadline, Selection};
 use remuda_native::session_preview::{capture, IdentityPolicy, PreviewFrame};
 use std::time::{Duration, Instant};
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SyncFrame {
+    pub text: String,
+    pub version: u64,
+    pub instance: String,
+}
+
 fn plain(frame: PreviewFrame) -> Result<String, String> {
     let mut text = String::new();
     for row in frame.cells {
@@ -86,10 +93,62 @@ pub fn worker(args: &[String], tagged: bool) -> i32 {
     }
 }
 
+/// A separate bounded worker keeps daemon waits and decoding off the GUI thread.
+/// The existing preview command rejects these extended arguments on older builds.
+pub fn sync_worker(args: &[String]) -> i32 {
+    if args.len() != 6
+        || args[0] != "local"
+        || !args[1].is_empty()
+        || args[2].is_empty()
+        || args[3].is_empty()
+        || args[4] != "--sync"
+    {
+        return 1;
+    }
+    let Ok(since) = args[5].parse::<u64>() else {
+        return 1;
+    };
+    worker_deadline();
+    let path = remuda_native::daemon::socket_path("default");
+    let request = remuda_core::protocol::Request::Sync {
+        name: args[2].clone(),
+        instance_id: Some(args[3].clone()),
+        since,
+        timeout_ms: 750,
+    };
+    let result =
+        remuda_native::client::request_with_timeout(&path, &request, Duration::from_secs(3))
+            .map_err(|_| ())
+            .and_then(|r| remuda_native::session_preview::decode_sync(r, &args[3]).map_err(|_| ()))
+            .and_then(|f| {
+                let version = f.output_version.ok_or(())?;
+                if version < since {
+                    return Err(());
+                }
+                let instance = f.instance_id.clone().ok_or(())?;
+                plain(f)
+                    .map(|text| SyncFrame {
+                        text,
+                        version,
+                        instance,
+                    })
+                    .map_err(|_| ())
+            });
+    match result {
+        Ok(frame) => super::write_worker_reply(&frame, true),
+        Err(()) => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use remuda_core::agent::{Cursor, StyledCell};
+    #[test]
+    fn extended_sync_arguments_are_not_accepted_as_legacy_preview() {
+        let args = ["local", "", "session", "instance", "--sync", "0", "abi"].map(str::to_string);
+        assert_eq!(worker(&args, false), 1);
+    }
     #[test]
     fn text_removes_controls_and_directional_formatting() {
         let frame = PreviewFrame {

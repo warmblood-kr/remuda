@@ -227,6 +227,7 @@ fn selection_label(selection: &Selection) -> String {
     )
 }
 type PreviewResult = (u64, Selection, Result<String, String>);
+type SyncResult = (u64, Selection, Result<preview::SyncFrame, String>);
 
 type RemoteResult = (u64, u64, String, Result<Vec<Session>, String>);
 
@@ -238,7 +239,12 @@ struct LocalGui {
     input_helper: Option<input_helper::InputHelper>,
     input_target: Option<Selection>,
     input_stopped: bool,
-    preview_tick: u8,
+    sync_tick: u8,
+    sync_busy: bool,
+    sync_version: u64,
+    sync_error: bool,
+    sync_sender: mpsc::Sender<SyncResult>,
+    sync_results: mpsc::Receiver<SyncResult>,
     helper_changed: bool,
     selection: Option<Selection>,
     preview: Option<String>,
@@ -276,6 +282,7 @@ struct LocalGui {
 impl LocalGui {
     fn new() -> Self {
         let (preview_sender, preview_results) = mpsc::channel();
+        let (sync_sender, sync_results) = mpsc::channel();
         let (sender, results) = mpsc::channel();
         let (nodes_sender, nodes_results) = mpsc::channel();
         let (remote_sender, remote_results) = mpsc::channel();
@@ -287,7 +294,12 @@ impl LocalGui {
             input_helper: None,
             input_target: None,
             input_stopped: false,
-            preview_tick: 0,
+            sync_tick: 0,
+            sync_busy: false,
+            sync_version: 0,
+            sync_error: false,
+            sync_sender,
+            sync_results,
             helper_changed: false,
             selection: None,
             preview: None,
@@ -325,6 +337,9 @@ impl LocalGui {
     }
     fn clear_preview(&mut self) {
         self.input_text.clear();
+        self.sync_tick = 0;
+        self.sync_version = 0;
+        self.sync_error = false;
         self.preview_generation = self
             .preview_generation
             .checked_add(1)
@@ -470,6 +485,43 @@ impl LocalGui {
                         Err("too large".into())
                     }
                 });
+            let _ = sender.send((generation, selection, result));
+        });
+    }
+    fn launch_sync(&mut self, selection: Selection) {
+        if self.sync_busy
+            || self.preview_busy
+            || self.preview_pending.is_some()
+            || selection.peer.is_some()
+            || self.selection.as_ref() != Some(&selection)
+            || !self.selection_current(&selection)
+        {
+            return;
+        }
+        self.sync_busy = true;
+        let generation = self.preview_generation;
+        let since = self.sync_version;
+        let sender = self.sync_sender.clone();
+        std::thread::spawn(move || {
+            let result = worker_executable()
+                .map_err(|e| e.to_string())
+                .and_then(|path| {
+                    provider::output(
+                        &path,
+                        &[
+                            "--internal-preview-worker",
+                            "local",
+                            "",
+                            &selection.name,
+                            &selection.instance,
+                            "--sync",
+                            &since.to_string(),
+                            WORKER_ABI,
+                        ],
+                        provider::TIMEOUT,
+                    )
+                })
+                .and_then(|bytes| read_worker_reply::<preview::SyncFrame>(&bytes));
             let _ = sender.send((generation, selection, result));
         });
     }
@@ -631,18 +683,38 @@ impl LocalGui {
                 }
             }
         }
-        self.preview_tick = self.preview_tick.saturating_add(1);
-        if self.preview_tick >= 7 {
-            self.preview_tick = 0;
+        while let Ok((generation, selection, result)) = self.sync_results.try_recv() {
+            self.sync_busy = false;
+            if generation == self.preview_generation
+                && self.selection.as_ref() == Some(&selection)
+                && self.selection_current(&selection)
+            {
+                match result {
+                    Ok(frame)
+                        if frame.instance == selection.instance
+                            && frame.version >= self.sync_version
+                            && frame.text.len() <= 65_536 =>
+                    {
+                        self.sync_version = frame.version;
+                        self.preview = Some(frame.text);
+                        self.sync_error = false;
+                    }
+                    _ => {
+                        self.preview = None;
+                        self.sync_error = true;
+                    }
+                }
+            }
+        }
+        self.sync_tick = self.sync_tick.saturating_add(1);
+        if self.sync_tick >= if self.sync_error { 14 } else { 1 } {
+            self.sync_tick = 0;
             if let Some(selection) = self
                 .selection
                 .clone()
                 .filter(|s| s.peer.is_none() && self.selection_current(s))
             {
-                if !self.preview_busy {
-                    self.preview_pending = Some((self.preview_generation, selection));
-                    self.launch_preview();
-                }
+                self.launch_sync(selection);
             }
         }
         while let Ok((generation, selection, result)) = self.preview_results.try_recv() {
@@ -877,6 +949,7 @@ impl Render for LocalGui {
                                 .child("Local daemon unavailable; listed sessions may be stale."),
                         )
                     })
+                    .when(self.sync_error, |d| d.child(div().id("sync-error").debug_selector(|| "sync-error".into()).text_color(rgb(0xf28787)).child("Live output unavailable; retrying.")))
                     .when(self.selection.as_ref().is_some_and(|s| s.peer.is_none() && self.selection_current(s)), |d| {
                         d.child(div().id("input-target").debug_selector(|| "input-target".into()).pt_4().child(format!("Input target: {}", selection_label(self.selection.as_ref().unwrap()))))
                             .child(div().child("Local line input (ASCII; Enter sends; no terminal attach)"))
@@ -952,6 +1025,13 @@ fn main() {
     }
     if std::env::args().nth(1).as_deref() == Some("--internal-preview-worker") {
         let mut args = std::env::args().skip(2).collect::<Vec<_>>();
+        if args.len() == 7
+            && args.last().map(String::as_str) == Some(WORKER_ABI)
+            && args[4] == "--sync"
+        {
+            args.pop();
+            std::process::exit(preview::sync_worker(&args));
+        }
         let tagged = args.len() == 5 && args.last().map(String::as_str) == Some(WORKER_ABI);
         if tagged {
             args.pop();
@@ -1013,6 +1093,88 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sync_results_are_bound_to_selection_generation_identity_and_version() {
+        let mut gui = LocalGui::new();
+        gui.sessions = vec![row("one"), row("two")];
+        gui.preview_busy = true;
+        gui.select_session(row("one"));
+        let original = gui.selection.clone().unwrap();
+        let generation = gui.preview_generation;
+        gui.sync_busy = true;
+        gui.sync_sender
+            .send((
+                generation,
+                original.clone(),
+                Ok(preview::SyncFrame {
+                    text: "new".into(),
+                    version: 4,
+                    instance: original.instance.clone(),
+                }),
+            ))
+            .unwrap();
+        gui.drain();
+        assert_eq!(gui.preview.as_deref(), Some("new"));
+        assert_eq!(gui.sync_version, 4);
+        gui.select_session(row("two"));
+        gui.select_session(row("one"));
+        gui.sync_sender
+            .send((
+                generation,
+                original.clone(),
+                Ok(preview::SyncFrame {
+                    text: "late".into(),
+                    version: 5,
+                    instance: original.instance.clone(),
+                }),
+            ))
+            .unwrap();
+        gui.drain();
+        assert!(gui.preview.is_none());
+        let current = gui.preview_generation;
+        gui.sync_sender
+            .send((
+                current,
+                original.clone(),
+                Ok(preview::SyncFrame {
+                    text: "wrong".into(),
+                    version: 6,
+                    instance: "replacement".into(),
+                }),
+            ))
+            .unwrap();
+        gui.drain();
+        assert!(gui.preview.is_none() && gui.sync_error);
+        let selection = gui.selection.clone().unwrap();
+        gui.sync_sender
+            .send((
+                current,
+                selection.clone(),
+                Ok(preview::SyncFrame {
+                    text: "recovered".into(),
+                    version: 9,
+                    instance: selection.instance,
+                }),
+            ))
+            .unwrap();
+        gui.drain();
+        assert_eq!(gui.preview.as_deref(), Some("recovered"));
+        assert!(!gui.sync_error);
+        gui.sync_version = 8;
+        gui.sync_sender
+            .send((
+                current,
+                original.clone(),
+                Ok(preview::SyncFrame {
+                    text: "old".into(),
+                    version: 7,
+                    instance: original.instance,
+                }),
+            ))
+            .unwrap();
+        gui.drain();
+        assert!(gui.preview.is_none() && gui.sync_error);
+    }
     #[test]
     fn input_requires_current_local_instance() {
         let mut gui = LocalGui::new();
@@ -1260,6 +1422,43 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(150));
             }
             assert_eq!(cx.read(|app| view.read(app).input_status.clone()), "Sent");
+            let selected = cx.read(|app| view.read(app).selection.clone().unwrap());
+            let before = cx.read(|app| view.read(app).sync_version);
+            let mut external = remuda_native::strict_input::StrictInput::new(
+                remuda_native::strict_input::LocalInput(remuda_native::daemon::socket_path(
+                    "default",
+                )),
+                selected.name.clone(),
+                selected.instance.clone(),
+            )
+            .unwrap();
+            assert_eq!(
+                external.send(b"printf 'external-proof\\n'\r"),
+                remuda_native::strict_input::InputResult::Applied
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(12);
+            loop {
+                view.update(cx, |gui, cx| {
+                    gui.drain();
+                    cx.notify();
+                });
+                cx.run_until_parked();
+                if cx.read(|app| {
+                    let gui = view.read(app);
+                    gui.sync_version > before
+                        && gui
+                            .preview
+                            .as_deref()
+                            .is_some_and(|s| s.lines().any(|line| line.trim() == "external-proof"))
+                }) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "external output did not reach the GUI through Sync"
+                );
+                std::thread::sleep(Duration::from_millis(150));
+            }
             // The daemon must reject a stale row with the wrong instance.
             view.update(cx, |gui, cx| {
                 let mut stale = gui.sessions[0].clone();

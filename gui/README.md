@@ -15,7 +15,10 @@ existing cluster membership and authenticated peer transport.
 Refresh updates the lists and clears the current preview. Offline or failed
 requests are shown as stale or unavailable; the preview is a snapshot, not a
 live terminal. For a current local session, click the line input and type an
-ASCII line, then press Enter to send it. The snapshot refreshes periodically.
+ASCII line, then press Enter to send it. For a selected local session, bounded
+versioned Sync requests update its text snapshot as output changes. If Sync
+fails, the GUI clears the snapshot and retries with a delay. This read-only
+observation checks the session instance but does not grant input or attachment.
 Only one line can be in flight, including across selection changes. A failure
 can leave delivery uncertain; the GUI identifies the original session and
 disables further input. Check it before restarting the GUI. This uses
