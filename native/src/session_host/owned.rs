@@ -207,6 +207,7 @@ impl Owned {
                     .attach_owned_expected(expected)
                     .map_err(|refusal| match refusal {
                         AttachRefusal::Stale { .. } => GrantError::Stale,
+                        AttachRefusal::Occupied => GrantError::Conflict,
                         AttachRefusal::Exhausted => GrantError::Exhausted,
                     })?;
                 let generation = guard.generation();

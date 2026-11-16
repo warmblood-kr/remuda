@@ -304,3 +304,44 @@ fn concurrent_same_expectation_admits_exactly_one_grant() {
     assert_eq!(winners.iter().filter(|grant| grant.is_some()).count(), 1);
     assert_eq!(session.attach_high_water(), 1);
 }
+
+#[test]
+fn idle_checked_grant_preserves_holder_and_requires_current_generation() {
+    let session = session();
+    let holder = session.attach().unwrap();
+    assert_eq!(
+        session.attach_owned_if_idle_expected(1).err(),
+        Some(AttachRefusal::Occupied)
+    );
+    assert!(!holder.is_displaced());
+    holder.write_raw(b"still held").unwrap();
+    drop(holder);
+    assert_eq!(
+        session.attach_owned_if_idle_expected(0).err(),
+        Some(AttachRefusal::Stale { current: 1 })
+    );
+    let next = session.attach_owned_if_idle_expected(1).unwrap();
+    assert_eq!(next.generation(), 2);
+    drop(next);
+    assert!(!session.is_attached());
+}
+
+#[test]
+fn concurrent_idle_claims_grant_only_one_holder() {
+    let session = session();
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let grants: Vec<_> = (0..8)
+        .map(|_| {
+            let (session, barrier) = (session.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                session.attach_owned_if_idle_expected(0).ok()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert_eq!(grants.iter().filter(|grant| grant.is_some()).count(), 1);
+    assert_eq!(session.attach_high_water(), 1);
+}

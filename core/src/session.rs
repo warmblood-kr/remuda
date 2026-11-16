@@ -2015,7 +2015,21 @@ impl Session {
         self: &Arc<Self>,
         expected: u64,
     ) -> std::result::Result<OwnedAttached, AttachRefusal> {
-        let (generation, displaced) = self.claim_checked(Some(expected))?;
+        let (generation, displaced) = self.claim_checked(Some(expected), false)?;
+        Ok(Attachment {
+            session: Arc::clone(self),
+            generation,
+            displaced,
+        })
+    }
+
+    /// Claim an idle slot only if the observed high-water is still current.
+    /// The comparison, idle check, and grant share the attachment slot lock.
+    pub fn attach_owned_if_idle_expected(
+        self: &Arc<Self>,
+        expected: u64,
+    ) -> std::result::Result<OwnedAttached, AttachRefusal> {
+        let (generation, displaced) = self.claim_checked(Some(expected), true)?;
         Ok(Attachment {
             session: Arc::clone(self),
             generation,
@@ -2030,18 +2044,22 @@ impl Session {
     }
 
     fn claim_attachment(&self) -> Result<(u64, Arc<AtomicBool>)> {
-        self.claim_checked(None)
+        self.claim_checked(None, false)
             .map_err(|_| AgentError::Io("attachment generation exhausted".into()))
     }
 
     fn claim_checked(
         &self,
         expected: Option<u64>,
+        require_idle: bool,
     ) -> std::result::Result<(u64, Arc<AtomicBool>), AttachRefusal> {
         let mut slot = self.attach_slot.lock().unwrap_or_else(|p| p.into_inner());
         let current = self.last_attach_generation.load(Ordering::SeqCst);
         if expected.is_some_and(|expected| expected != current) {
             return Err(AttachRefusal::Stale { current });
+        }
+        if require_idle && slot.is_some() {
+            return Err(AttachRefusal::Occupied);
         }
         let generation = current.checked_add(1).ok_or(AttachRefusal::Exhausted)?;
         self.last_attach_generation
@@ -2123,6 +2141,7 @@ pub type OwnedAttached = Attachment<Arc<Session>>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachRefusal {
     Stale { current: u64 },
+    Occupied,
     Exhausted,
 }
 

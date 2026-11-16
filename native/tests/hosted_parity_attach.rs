@@ -255,6 +255,32 @@ fn a_second_attach_takes_over_the_first_in_both_backends() {
 }
 
 #[test]
+fn recreating_a_name_ends_the_old_attachment_in_both_backends() {
+    for mode in MODES {
+        let daemon = Parity::start(mode);
+        let old_instance = daemon.shell("sh");
+        let mut old = Viewer::attach(&daemon, "sh");
+        old.type_keys(b"exit\r");
+        old.wait_ended();
+        let deadline = Instant::now() + PATIENCE;
+        while matches!(daemon.request(&Request::List), Response::Sessions(s) if s.iter().any(|s| s.name == "sh"))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "{mode:?}: exited session still listed"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let new_instance = daemon.shell("sh");
+        assert_ne!(old_instance, new_instance, "{mode:?}");
+        let mut new = Viewer::attach(&daemon, "sh");
+        new.type_keys(b"echo RECREATED:$((4+5))\r");
+        new.wait_for("RECREATED:9");
+        assert!(attached(&daemon, "sh"), "{mode:?}");
+    }
+}
+
+#[test]
 fn mouse_state_follows_the_child_in_both_backends() {
     for mode in MODES {
         let daemon = Parity::start(mode);
