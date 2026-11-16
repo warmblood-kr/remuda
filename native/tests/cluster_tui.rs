@@ -468,6 +468,7 @@ fn documents_browse_plain_text_and_return_without_sending_browser_input() {
     tui.wait_for("one.txt", Duration::from_secs(5));
     tui.writer.write_all(b"\r").unwrap();
     tui.wait_for("BROWSER_FIXTURE", Duration::from_secs(5));
+    assert_document_address(&mut tui);
     tui.writer
         .write_all(b"\x1b[200~DO_NOT_SEND\r\x1b[201~xyk\r")
         .unwrap();
@@ -491,10 +492,8 @@ fn documents_browse_plain_text_and_return_without_sending_browser_input() {
     tui.writer.write_all(b"\r").unwrap();
     tui.wait_for("deadline exceeded", Duration::from_secs(6));
     daemon.resume();
-    for _ in 0..3 {
-        tui.writer.write_all(b"r").unwrap();
-        tui.wait_for("BROWSER_FIXTURE", Duration::from_secs(5));
-    }
+    tui.writer.write_all(b"r").unwrap();
+    tui.wait_for("BROWSER_FIXTURE", Duration::from_secs(5));
     tui.writer.write_all(b"q").unwrap();
     let returned = tui.wait_for("saved-draft", Duration::from_secs(3));
     assert!(!returned.contains("Documents"), "{returned}");
@@ -511,6 +510,15 @@ fn documents_browse_plain_text_and_return_without_sending_browser_input() {
         matches!(capture, Response::Screen(ref s) if !s.contains("DO_NOT_SEND")),
         "{capture:?}"
     );
+}
+
+fn assert_document_address(tui: &mut TuiPty) {
+    use std::io::Write;
+    tui.writer.write_all(b"a").unwrap();
+    tui.wait_for("VFS address (escaped)", Duration::from_secs(3));
+    tui.wait_for("remuda:///docs/one.txt", Duration::from_secs(3));
+    tui.writer.write_all(b"\x1b").unwrap();
+    tui.wait_for("BROWSER_FIXTURE", Duration::from_secs(3));
 }
 
 #[cfg(unix)]

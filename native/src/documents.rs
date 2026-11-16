@@ -65,6 +65,7 @@ pub struct Browser {
     pending: bool,
     flight: Option<(u64, mpsc::Receiver<Reply>)>,
     rendered_count: Cell<usize>,
+    address: Option<(String, usize)>,
 }
 impl Browser {
     pub fn new(socket: PathBuf) -> Self {
@@ -77,16 +78,21 @@ impl Browser {
             pending: false,
             flight: None,
             rendered_count: Cell::new(0),
+            address: None,
         };
         browser.refresh();
         browser
     }
     pub fn cancel(&mut self) {
+        self.address = None;
         self.generation = self.generation.wrapping_add(1);
         self.pending = false;
         self.loading = false;
     }
     pub fn refresh(&mut self) {
+        if self.address.is_some() {
+            return;
+        }
         self.cancel();
         self.loading = true;
         self.pending = true;
@@ -94,6 +100,16 @@ impl Browser {
         self.poll();
     }
     pub fn move_selection(&mut self, down: bool) {
+        if let Some((_, position)) = &mut self.address {
+            let last = self.rendered_count.get().saturating_sub(1);
+            let current = (*position).min(last);
+            *position = if down {
+                current.saturating_add(1).min(last)
+            } else {
+                current.saturating_sub(1)
+            };
+            return;
+        }
         let count = match self.page.location {
             Location::Directory(_) => self.page.entries.len(),
             Location::Document(_) => self.rendered_count.get(),
@@ -108,7 +124,7 @@ impl Browser {
         };
     }
     pub fn open_selected(&mut self) {
-        if self.loading {
+        if self.loading || self.address.is_some() {
             return;
         }
         let Some(entry) = self.page.entries.get(self.page.position) else {
@@ -147,6 +163,9 @@ impl Browser {
     }
     /// True when Back leaves the root and should restore session focus.
     pub fn back(&mut self) -> bool {
+        if self.address.take().is_some() {
+            return false;
+        }
         self.cancel();
         match self.history.pop() {
             Some(page) => {
@@ -160,15 +179,21 @@ impl Browser {
         if height == 0 {
             return Vec::new();
         }
+        if let Some((address, position)) = &self.address {
+            return self.address_lines(address, *position, width, height);
+        }
         let identity = self
             .page
             .identity
             .as_ref()
             .map(|(v, hash)| format!(" · v{v} {}", hash.get(..12).unwrap_or(hash)))
             .unwrap_or_default();
-        let mut lines = vec![format!(
-            "Documents remuda:///{}{identity}",
-            path_label(self.page.location.path())
+        let mut lines = vec![mark_clip(
+            &format!(
+                "Documents remuda:///{}{identity}",
+                path_label(self.page.location.path())
+            ),
+            width,
         )];
         let room = height.saturating_sub(3);
         match self.page.location {
@@ -185,10 +210,13 @@ impl Browser {
                         .skip(start)
                         .take(room)
                         .map(|(i, entry)| {
-                            format!(
-                                "{} {}",
-                                if i == self.page.position { ">" } else { " " },
-                                path_label(&entry.path)
+                            mark_clip(
+                                &format!(
+                                    "{} {}",
+                                    if i == self.page.position { ">" } else { " " },
+                                    path_label(&entry.path)
+                                ),
+                                width,
                             )
                         }),
                 );
@@ -214,12 +242,64 @@ impl Browser {
         } else {
             self.page.error.clone().unwrap_or_default()
         });
-        lines.push("↑↓ scroll · Enter open · Esc/Backspace back · r retry · q sessions".into());
+        lines.push(
+            "a full address · ↑↓ scroll · Enter open · Esc back · r retry · q sessions".into(),
+        );
         lines
             .into_iter()
             .take(height)
             .map(|line| clip(&line, width))
             .collect()
+    }
+    pub fn inspect_address(&mut self) {
+        if self.address.take().is_some() {
+            return;
+        }
+        let path = self
+            .page
+            .entries
+            .get(self.page.position)
+            .filter(|_| matches!(self.page.location, Location::Directory(_)))
+            .map_or(self.page.location.path(), |entry| entry.path.as_str());
+        // ASCII escapes make every code point inspectable even in a one-column
+        // terminal, without changing the address used for navigation.
+        let escaped: String = path.chars().flat_map(char::escape_default).collect();
+        self.address = Some((format!("remuda:///{escaped}"), 0));
+    }
+
+    fn address_lines(
+        &self,
+        address: &str,
+        position: usize,
+        width: usize,
+        height: usize,
+    ) -> Vec<String> {
+        let rows: Vec<_> = address
+            .as_bytes()
+            .chunks(width.max(1))
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect();
+        self.rendered_count.set(rows.len());
+        let position = position.min(rows.len().saturating_sub(1));
+        let mut lines = Vec::new();
+        if height >= 3 {
+            lines.push(clip(
+                &format!("VFS address (escaped) · {}/{}", position + 1, rows.len()),
+                width,
+            ));
+        }
+        let room = if height >= 3 { height - 2 } else { 1 };
+        lines.extend(
+            rows.into_iter()
+                .skip(position)
+                .take(room)
+                .map(|line| clip(&line, width)),
+        );
+        lines.resize(height.saturating_sub(1).max(1), String::new());
+        if height > 1 {
+            lines.push(clip("↑↓ scroll · a/Esc back", width));
+        }
+        lines
     }
     pub fn poll(&mut self) {
         if let Some((generation, receiver)) = &self.flight {
@@ -310,6 +390,16 @@ fn clip(text: &str, width: usize) -> String {
             used <= width
         })
         .collect()
+}
+
+fn mark_clip(text: &str, width: usize) -> String {
+    if unicode_width::UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    format!("{}…", clip(text, width - 1))
 }
 
 fn fetch(socket: &Path, location: &Location) -> Reply {
@@ -431,6 +521,70 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
+    fn narrow_address_inspection_reveals_the_full_selected_identity() {
+        let prefix = "docs/".to_owned() + &"long-name-".repeat(20);
+        let paths = [format!("{prefix}A"), format!("{prefix}界\u{202e}B")];
+        let mut browser = Browser {
+            page: Page::empty(Location::Directory("docs/".into())),
+            loading: false,
+            socket: PathBuf::new(),
+            history: Vec::new(),
+            generation: 0,
+            pending: false,
+            flight: None,
+            rendered_count: Cell::new(0),
+            address: None,
+        };
+        browser.page.entries = paths
+            .iter()
+            .map(|path| Entry {
+                path: path.clone(),
+                directory: false,
+            })
+            .collect();
+        let listing = browser.lines(12, 8);
+        assert!(listing[1].ends_with('…') && listing[2].ends_with('…'));
+        for (selected, path) in paths.iter().enumerate() {
+            browser.page.position = selected;
+            let expected = format!(
+                "remuda:///{}",
+                path.chars()
+                    .flat_map(char::escape_default)
+                    .collect::<String>()
+            );
+            for width in [1, 2, 8, 20] {
+                for height in [1, 2, 3] {
+                    browser.inspect_address();
+                    let mut reconstructed = String::new();
+                    for _ in 0..expected.len().div_ceil(width) {
+                        let rows = browser.lines(width, height);
+                        reconstructed.push_str(&rows[usize::from(height >= 3)]);
+                        browser.move_selection(true);
+                    }
+                    assert_eq!(reconstructed, expected, "width={width}, height={height}");
+                    browser.open_selected();
+                    browser.refresh();
+                    assert!(!browser.back());
+                    assert_eq!(browser.page.position, selected);
+                    assert_eq!(browser.page.entries[selected].path, *path);
+                    assert!(
+                        browser.flight.is_none() && !browser.pending && browser.history.is_empty()
+                    );
+                }
+            }
+        }
+        browser.page = Page::empty(Location::Document(paths[1].clone()));
+        browser.inspect_address();
+        assert!(browser
+            .address
+            .as_ref()
+            .unwrap()
+            .0
+            .ends_with(r"\u{754c}\u{202e}B"));
+        assert!(browser.lines(0, 0).is_empty());
+        assert!(browser.lines(0, 3).iter().all(String::is_empty));
+    }
+    #[test]
     fn retries_coalesce_behind_one_flight_and_recover_after_it_settles() {
         let (send, receive) = mpsc::sync_channel(1);
         let mut browser = Browser {
@@ -442,6 +596,7 @@ mod tests {
             pending: false,
             flight: Some((1, receive)),
             rendered_count: Cell::new(0),
+            address: None,
         };
         for _ in 0..32 {
             browser.refresh();
@@ -501,6 +656,7 @@ mod tests {
             pending: false,
             flight: Some((1, receive)),
             rendered_count: Cell::new(0),
+            address: None,
         };
         assert!(!browser.back());
         send.send(Ok(Page::empty(Location::Document("x".into()))))

@@ -122,6 +122,7 @@ return function(owner, validate, config_status, validate_help)
   api.define_key{context="cluster.tree", key="q", action="cluster.detach", help="detach"}
   api.define_key{context="cluster.tree", key="d", action="cluster.documents", help="documents"}
   api.define_key{context="cluster.composer", key="M-d", action="cluster.documents", help="documents"}
+  api.define_key{context="cluster.documents", key="a", action="documents.address", help="full address"}
   api.define_key{context="cluster.documents", key="<up>", action="documents.up", help="up"}
   api.define_key{context="cluster.documents", key="<down>", action="documents.down", help="down"}
   api.define_key{context="cluster.documents", key="RET", action="documents.open", help="open"}
