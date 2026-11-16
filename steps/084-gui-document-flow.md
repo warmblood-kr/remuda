@@ -31,6 +31,11 @@ target; "Confirm attach" performs it and "Cancel" clears it. A selection change
 clears the confirmation, and `attach_selected` refuses unless the confirmation
 still matches the current selection. `attach_confirm` is the tested state.
 
+Opening the pane moves keyboard focus to the document frame, so arrows,
+Enter, Esc, Tab and `r` work without a second click; closing returns focus to
+the session line input. `Pane::note_key`/`key_events` record that a key event
+actually reached the pane, which the TestWindow test uses as focus evidence.
+
 Layout is responsive instead of hard-coded: the sidebar is 28% of the viewport
 clamped to 150-300 px, the right pane is a flex column, the document frame is a
 flexible vertically scrollable body, and the control row wraps in a footer, so
@@ -54,7 +59,7 @@ test gui_document_pane_lists_opens_follows_a_link_and_returns ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; finished in 0.32s
 
 cargo test --offline --manifest-path gui/Cargo.toml --bin remuda-gui -- --test-threads=1
-test result: ok. 46 passed; 0 failed; 5 ignored; 0 measured; finished in 41.29s
+test result: ok. 47 passed; 0 failed; 5 ignored; 0 measured; finished in 41.30s
 
 cargo test --offline -p remuda-native --lib document -- --test-threads=1
 test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 1930 filtered out; finished in 0.33s
@@ -80,5 +85,18 @@ preview) is painted again. `attach_confirmation_targets_the_selected_session`
 clicks Attach once, sees the confirmation row, and cancels back to the initial
 state; `attach_requires_confirmation_for_the_exact_target` (unit) proves attach
 does nothing without a matching confirmation and that a selection change clears
-it. The window was not opened on a user desktop: the remaining evidence is the
+it. `opening_documents_focuses_the_pane_and_closing_restores_session_input` opens
+Documents with a click, asserts the pane's focus handle is focused, sends a
+`down` keystroke and observes the pane handled it without another click, closes
+the pane, asserts focus returned to the session input, then clicks the line
+input and types `x` to prove session input still works after documents.
+
+Regression acceptance on this checkout: `gui/tests/peer_live_smoke.py` (two
+isolated daemons, no real desktop) printed PASS: GUI node/session clicks, live
+output and guarded input reached the isolated peer; wrong instance, unadmitted
+and revoked peers were refused. `gui/tests/peer_list_acceptance.sh` fails at
+`ack == [1]` (got 114) on this machine, and the same failure reproduces on an
+unmodified copy of the candidate, so it is pre-existing and not caused by this
+change. The window was not opened on a user desktop (`CGGetActiveDisplayList=0`
+per the leader), so pixel smoke was not possible; the remaining evidence is the
 built binary and the same `Pane::frame` rows the view renders.

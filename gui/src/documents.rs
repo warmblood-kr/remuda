@@ -17,6 +17,7 @@ pub const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
 
 pub struct Pane {
     browser: Browser,
+    key_events: usize,
 }
 
 impl Pane {
@@ -24,7 +25,17 @@ impl Pane {
     pub fn new(socket: PathBuf) -> Self {
         Self {
             browser: Browser::new(socket),
+            key_events: 0,
         }
+    }
+
+    /// Record that one key event reached this pane (focus evidence for tests).
+    pub fn note_key(&mut self) {
+        self.key_events = self.key_events.saturating_add(1);
+    }
+
+    pub fn key_events(&self) -> usize {
+        self.key_events
     }
 
     pub fn poll(&mut self) {

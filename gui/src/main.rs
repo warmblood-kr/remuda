@@ -270,6 +270,8 @@ struct LocalGui {
     documents: Option<documents::Pane>,
     documents_focus: Option<FocusHandle>,
     attach_confirm: Option<Selection>,
+    #[cfg(test)]
+    documents_socket: Option<std::path::PathBuf>,
     terminal: Option<terminal::Terminal>,
     terminal_status: String,
     input_focus: Option<FocusHandle>,
@@ -330,6 +332,8 @@ impl LocalGui {
             documents: None,
             documents_focus: None,
             attach_confirm: None,
+            #[cfg(test)]
+            documents_socket: None,
             terminal: None,
             terminal_status: String::new(),
             input_focus: None,
@@ -1080,14 +1084,24 @@ impl Render for LocalGui {
                             } else {
                                 "Documents"
                             })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.documents = if this.documents.is_some() {
-                                    None
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if this.documents.is_some() {
+                                    this.documents = None;
+                                    if let Some(focus) = &this.input_focus {
+                                        focus.focus(window);
+                                    }
                                 } else {
-                                    Some(documents::Pane::new(
-                                        remuda_native::daemon::socket_path("default"),
-                                    ))
-                                };
+                                    #[cfg(test)]
+                                    let socket = this.documents_socket.clone().unwrap_or_else(|| {
+                                        remuda_native::daemon::socket_path("default")
+                                    });
+                                    #[cfg(not(test))]
+                                    let socket = remuda_native::daemon::socket_path("default");
+                                    this.documents = Some(documents::Pane::new(socket));
+                                    if let Some(focus) = &this.documents_focus {
+                                        focus.focus(window);
+                                    }
+                                }
                                 cx.notify();
                             })),
                     )
@@ -1125,6 +1139,7 @@ impl Render for LocalGui {
                                             |this, event: &gpui::KeyDownEvent, _, cx| {
                                                 let key = &event.keystroke;
                                                 if let Some(pane) = &mut this.documents {
+                                                    pane.note_key();
                                                     match key.key.as_str() {
                                                         "up" => pane.move_selection(false),
                                                         "down" => pane.move_selection(true),
@@ -1933,6 +1948,59 @@ mod tests {
         assert!(cx.debug_bounds("attach-terminal").is_some());
         assert!(cx.debug_bounds("input-target").is_some());
         assert!(cx.debug_bounds("preview-target").is_some());
+    }
+
+    #[gpui::test]
+    fn opening_documents_focuses_the_pane_and_closing_restores_session_input(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let socket = std::env::temp_dir().join(format!(
+            "gui-documents-focus-{}",
+            std::process::id()
+        ));
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new();
+            gui.preview_busy = true;
+            gui.sessions = vec![row("one")];
+            gui.documents_socket = Some(socket.clone());
+            gui
+        });
+        let session = cx.debug_bounds("session-0").unwrap();
+        cx.simulate_click(session.center(), gpui::Modifiers::none());
+        let toggle = cx.debug_bounds("documents-toggle").unwrap();
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+        let focused = cx.update(|window, app| {
+            view.read(app)
+                .documents_focus
+                .as_ref()
+                .is_some_and(|focus| focus.is_focused(window))
+        });
+        assert!(focused, "opening documents must focus the pane");
+        cx.simulate_keystrokes("down");
+        let keys = cx.read(|app| {
+            view.read(app)
+                .documents
+                .as_ref()
+                .map_or(0, documents::Pane::key_events)
+        });
+        assert_eq!(keys, 1, "a keystroke must reach the focused pane");
+        let toggle = cx.debug_bounds("documents-toggle").unwrap();
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+        let (open, input_focused) = cx.update(|window, app| {
+            let gui = view.read(app);
+            (
+                gui.documents.is_some(),
+                gui.input_focus
+                    .as_ref()
+                    .is_some_and(|focus| focus.is_focused(window)),
+            )
+        });
+        assert!(!open);
+        assert!(input_focused, "closing must return focus to session input");
+        let line = cx.debug_bounds("line-input").unwrap();
+        cx.simulate_click(line.center(), gpui::Modifiers::none());
+        cx.simulate_keystrokes("x");
+        assert_eq!(cx.read(|app| view.read(app).input_text.clone()), "x");
     }
 
     #[gpui::test]
