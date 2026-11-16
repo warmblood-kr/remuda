@@ -1,0 +1,462 @@
+//! Read-only VFS navigation, independent of session input and renderer choice.
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use remuda_core::{
+    protocol::{Request, Response},
+    vfs,
+};
+use serde_json::Value;
+use std::{
+    cell::Cell,
+    path::{Path, PathBuf},
+    sync::mpsc,
+    time::Duration,
+};
+
+const MAX_BYTES: usize = 1024 * 1024;
+const MAX_LINES: usize = 4096;
+const MAX_HISTORY: usize = 32;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Location {
+    Directory(String),
+    Document(String),
+}
+impl Location {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Directory(path) | Self::Document(path) => path,
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub struct Entry {
+    pub path: String,
+    pub directory: bool,
+}
+#[derive(Clone, Debug)]
+pub struct Page {
+    pub location: Location,
+    pub entries: Vec<Entry>,
+    pub text: Vec<String>,
+    pub position: usize,
+    pub identity: Option<(u64, String)>,
+    pub error: Option<String>,
+}
+impl Page {
+    fn empty(location: Location) -> Self {
+        Self {
+            location,
+            entries: Vec::new(),
+            text: Vec::new(),
+            position: 0,
+            identity: None,
+            error: None,
+        }
+    }
+}
+type Reply = Result<Page, String>;
+/// One worker at a time; navigation replaces only the queued desired request.
+pub struct Browser {
+    pub page: Page,
+    pub loading: bool,
+    socket: PathBuf,
+    history: Vec<Page>,
+    generation: u64,
+    pending: bool,
+    flight: Option<(u64, mpsc::Receiver<Reply>)>,
+    rendered_count: Cell<usize>,
+}
+impl Browser {
+    pub fn new(socket: PathBuf) -> Self {
+        let mut browser = Self {
+            page: Page::empty(Location::Directory(String::new())),
+            loading: false,
+            socket,
+            history: Vec::new(),
+            generation: 0,
+            pending: false,
+            flight: None,
+            rendered_count: Cell::new(0),
+        };
+        browser.refresh();
+        browser
+    }
+    pub fn cancel(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = false;
+        self.loading = false;
+    }
+    pub fn refresh(&mut self) {
+        self.cancel();
+        self.loading = true;
+        self.pending = true;
+        self.page.error = None;
+        self.poll();
+    }
+    pub fn move_selection(&mut self, down: bool) {
+        let count = match self.page.location {
+            Location::Directory(_) => self.page.entries.len(),
+            Location::Document(_) => self.rendered_count.get(),
+        };
+        self.page.position = if down {
+            self.page
+                .position
+                .saturating_add(1)
+                .min(count.saturating_sub(1))
+        } else {
+            self.page.position.saturating_sub(1)
+        };
+    }
+    pub fn open_selected(&mut self) {
+        if self.loading {
+            return;
+        }
+        let Some(entry) = self.page.entries.get(self.page.position) else {
+            return;
+        };
+        let location = if entry.directory {
+            Location::Directory(entry.path.clone())
+        } else {
+            Location::Document(entry.path.clone())
+        };
+        self.navigate(location);
+    }
+    pub fn navigate(&mut self, location: Location) {
+        let path = match &location {
+            Location::Directory(path) => path.strip_suffix('/').unwrap_or(path),
+            Location::Document(path) => path,
+        };
+        if !(path.is_empty() && matches!(location, Location::Directory(_)))
+            && vfs::validate_path(path).is_err()
+        {
+            self.page.error = Some("Invalid VFS address".into());
+            return;
+        }
+        let location = match location {
+            Location::Directory(path) if !path.is_empty() => {
+                Location::Directory(format!("{}/", path.trim_end_matches('/')))
+            }
+            other => other,
+        };
+        if self.history.len() == MAX_HISTORY {
+            self.history.remove(0);
+        }
+        self.history.push(self.page.clone());
+        self.page = Page::empty(location);
+        self.refresh();
+    }
+    /// True when Back leaves the root and should restore session focus.
+    pub fn back(&mut self) -> bool {
+        self.cancel();
+        match self.history.pop() {
+            Some(page) => {
+                self.page = page;
+                false
+            }
+            None => true,
+        }
+    }
+    pub fn lines(&self, width: usize, height: usize) -> Vec<String> {
+        if height == 0 {
+            return Vec::new();
+        }
+        let identity = self
+            .page
+            .identity
+            .as_ref()
+            .map(|(v, hash)| format!(" · v{v} {}", hash.get(..12).unwrap_or(hash)))
+            .unwrap_or_default();
+        let mut lines = vec![format!(
+            "Documents remuda:///{}{identity}",
+            self.page.location.path()
+        )];
+        let room = height.saturating_sub(3);
+        match self.page.location {
+            Location::Directory(_) => {
+                if self.page.entries.is_empty() && !self.loading {
+                    lines.push("(empty)".into());
+                }
+                let start = self.page.position.saturating_sub(room.saturating_sub(1));
+                lines.extend(
+                    self.page
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .skip(start)
+                        .take(room)
+                        .map(|(i, entry)| {
+                            format!(
+                                "{} {}",
+                                if i == self.page.position { ">" } else { " " },
+                                entry.path
+                            )
+                        }),
+                );
+            }
+            Location::Document(_) => {
+                let wrapped = wrap_text(&self.page.text, width.max(1));
+                self.rendered_count.set(wrapped.len());
+                lines.extend(
+                    wrapped
+                        .into_iter()
+                        .skip(
+                            self.page
+                                .position
+                                .min(self.rendered_count.get().saturating_sub(1)),
+                        )
+                        .take(room),
+                );
+            }
+        }
+        lines.resize(height.saturating_sub(2).max(1), String::new());
+        lines.push(if self.loading {
+            "Loading…".into()
+        } else {
+            self.page.error.clone().unwrap_or_default()
+        });
+        lines.push("↑↓ scroll · Enter open · Esc/Backspace back · r retry · q sessions".into());
+        lines
+            .into_iter()
+            .take(height)
+            .map(|line| clip(&line, width))
+            .collect()
+    }
+    pub fn poll(&mut self) {
+        if let Some((generation, receiver)) = &self.flight {
+            let reply = match receiver.try_recv() {
+                Ok(reply) => Some(reply),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("Document worker stopped".into()))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(reply) = reply {
+                if *generation == self.generation {
+                    self.loading = false;
+                    match reply {
+                        Ok(page) => self.page = page,
+                        Err(error) => self.page.error = Some(error),
+                    }
+                }
+                self.flight = None;
+            }
+        }
+        if self.flight.is_none() && std::mem::take(&mut self.pending) {
+            let socket = self.socket.clone();
+            let location = self.page.location.clone();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            match std::thread::Builder::new()
+                .name("vfs-document".into())
+                .spawn(move || {
+                    let _ = sender.send(fetch(&socket, &location));
+                }) {
+                Ok(_) => self.flight = Some((self.generation, receiver)),
+                Err(error) => {
+                    self.loading = false;
+                    self.page.error = Some(error.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn wrap_text(lines: &[String], width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in lines {
+        let mut row = String::new();
+        let mut used = 0;
+        for ch in crate::text::strip_terminal_controls(line).chars() {
+            let size = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + size > width && !row.is_empty() {
+                out.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            if out.len() == MAX_LINES {
+                out.push("[… display limit reached]".into());
+                return out;
+            }
+            row.push(if size > width { '?' } else { ch });
+            used += size.min(width);
+        }
+        out.push(row);
+        if out.len() >= MAX_LINES {
+            out.push("[… display limit reached]".into());
+            break;
+        }
+    }
+    out
+}
+
+fn clip(text: &str, width: usize) -> String {
+    let clean = crate::text::strip_terminal_controls(text);
+    let mut used = 0;
+    clean
+        .chars()
+        .take_while(|ch| {
+            used += unicode_width::UnicodeWidthChar::width(*ch).unwrap_or(0);
+            used <= width
+        })
+        .collect()
+}
+
+fn fetch(socket: &Path, location: &Location) -> Reply {
+    let uri = format!("remuda:///{}", location.path());
+    let args = match location {
+        Location::Directory(_) => vec!["ls".into(), uri, "--json".into()],
+        Location::Document(_) => vec![
+            "read".into(),
+            uri,
+            "--max-bytes".into(),
+            MAX_BYTES.to_string(),
+        ],
+    };
+    let response = crate::client::request_with_timeout(
+        socket,
+        &Request::Vfs {
+            args,
+            input_base64: None,
+        },
+        Duration::from_secs(3),
+    )
+    .map_err(|error| error.to_string())?;
+    let Response::CommandResult {
+        exit_code,
+        stdout_base64,
+        stderr_base64,
+    } = response
+    else {
+        return Err("Daemon does not support document reads".into());
+    };
+    if exit_code != 0 {
+        return Err(
+            String::from_utf8_lossy(&BASE64.decode(stderr_base64).unwrap_or_default()).into_owned(),
+        );
+    }
+    if stdout_base64.len() > 4 * MAX_BYTES {
+        return Err("Document response is too large".into());
+    }
+    let bytes = BASE64
+        .decode(stdout_base64)
+        .map_err(|_| "Invalid document response")?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| "Invalid document JSON")?;
+    decode(location, &value)
+}
+
+fn decode(location: &Location, value: &Value) -> Reply {
+    let mut page = Page::empty(location.clone());
+    match location {
+        Location::Directory(prefix) => {
+            let rows = value.as_array().ok_or("Invalid directory listing")?;
+            if rows.len() > 10_000 {
+                return Err("Directory listing is too large".into());
+            }
+            for row in rows {
+                let path = row["path"].as_str().ok_or("Missing VFS path")?;
+                let directory = match row["kind"].as_str() {
+                    Some("dir") => true,
+                    Some("file") => false,
+                    _ => return Err("Invalid VFS entry kind".into()),
+                };
+                vfs::validate_path(path.trim_end_matches('/')).map_err(|_| "Invalid VFS path")?;
+                let child = path
+                    .strip_prefix(prefix)
+                    .ok_or("Entry outside directory")?
+                    .trim_end_matches('/');
+                if child.is_empty() || child.contains('/') || directory != path.ends_with('/') {
+                    return Err("Entry is not an immediate child".into());
+                }
+                page.entries.push(Entry {
+                    path: path.to_owned(),
+                    directory,
+                });
+            }
+        }
+        Location::Document(path) => {
+            if value["ok"].as_bool() != Some(true) {
+                return Err(format!(
+                    "{}: {}",
+                    value["code"].as_str().unwrap_or("io"),
+                    value["detail"].as_str().unwrap_or("Read failed")
+                ));
+            }
+            if value["path"].as_str() != Some(path) {
+                return Err("Document identity changed".into());
+            }
+            let hash = value["sha256"].as_str().ok_or("Missing document hash")?;
+            vfs::validate_sha256(hash).map_err(|_| "Invalid document hash")?;
+            let version = value["version"]
+                .as_u64()
+                .ok_or("Missing document version")?;
+            let content = value["content"]
+                .as_str()
+                .ok_or("Missing document content")?;
+            if content.len() > MAX_BYTES.div_ceil(3) * 4 {
+                return Err("Document exceeds 1 MiB".into());
+            }
+            let bytes = BASE64
+                .decode(content)
+                .map_err(|_| "Invalid document encoding")?;
+            if bytes.len() > MAX_BYTES || value["size"].as_u64() != Some(bytes.len() as u64) {
+                return Err("Invalid document size".into());
+            }
+            let text = String::from_utf8(bytes).map_err(|_| "Document is not UTF-8 text")?;
+            if text.contains('\0') {
+                return Err("Document is binary".into());
+            }
+            page.text = text.lines().take(MAX_LINES).map(str::to_owned).collect();
+            if text.lines().count() > MAX_LINES {
+                page.text.push("[… line limit reached]".into());
+            }
+            page.identity = Some((version, hash.to_owned()));
+        }
+    }
+    Ok(page)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn back_fences_a_late_reply_and_restores_selection() {
+        let root = Page::empty(Location::Directory(String::new()));
+        let (send, receive) = mpsc::sync_channel(1);
+        let mut browser = Browser {
+            page: Page::empty(Location::Document("x".into())),
+            loading: true,
+            socket: PathBuf::new(),
+            history: vec![root],
+            generation: 1,
+            pending: false,
+            flight: Some((1, receive)),
+            rendered_count: Cell::new(0),
+        };
+        assert!(!browser.back());
+        send.send(Ok(Page::empty(Location::Document("x".into()))))
+            .unwrap();
+        browser.poll();
+        assert_eq!(browser.page.location, Location::Directory(String::new()));
+        assert!(!browser.loading);
+        assert!(browser.back());
+    }
+    #[test]
+    fn read_refusal_binary_and_large_content_are_errors() {
+        let location = Location::Document("x".into());
+        assert!(decode(&location, &json!({"ok":false,"code":"too_large"}))
+            .unwrap_err()
+            .contains("too_large"));
+        for bytes in [vec![0], vec![255], vec![b'x'; MAX_BYTES + 1]] {
+            let value = json!({"ok":true,"path":"x","sha256":"a".repeat(64),"version":1,"size":bytes.len(),"content":BASE64.encode(bytes)});
+            assert!(decode(&location, &value).is_err());
+        }
+    }
+    #[test]
+    fn listing_and_text_display_cannot_escape_their_boundaries() {
+        let location = Location::Directory("docs/".into());
+        assert!(decode(&location, &json!([{"kind":"file","path":"docs/sub/x"}])).is_err());
+        assert!(decode(&location, &json!([{"kind":"file","path":"other/x"}])).is_err());
+        assert_eq!(clip("ab\x1b[2J界z", 6), "ab[2J");
+        assert_eq!(clip("界界z", 4), "界界");
+        assert_eq!(wrap_text(&["abcdefgh".into()], 3), ["abc", "def", "gh"]);
+    }
+}
