@@ -168,7 +168,7 @@ impl Browser {
             .unwrap_or_default();
         let mut lines = vec![format!(
             "Documents remuda:///{}{identity}",
-            self.page.location.path()
+            path_label(self.page.location.path())
         )];
         let room = height.saturating_sub(3);
         match self.page.location {
@@ -188,7 +188,7 @@ impl Browser {
                             format!(
                                 "{} {}",
                                 if i == self.page.position { ">" } else { " " },
-                                entry.path
+                                path_label(&entry.path)
                             )
                         }),
                 );
@@ -285,6 +285,19 @@ fn wrap_text(lines: &[String], width: usize) -> Vec<String> {
         }
     }
     out
+}
+
+// Labels preserve distinctions that are intentionally suppressed in body text.
+fn path_label(path: &str) -> String {
+    path.chars()
+        .flat_map(|ch| {
+            if crate::text::is_terminal_control(ch) || ch == '\\' {
+                ch.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![ch]
+            }
+        })
+        .collect()
 }
 
 fn clip(text: &str, width: usize) -> String {
@@ -417,6 +430,27 @@ fn decode(location: &Location, value: &Value) -> Reply {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn path_labels_escape_controls_without_changing_navigation_identity() {
+        let raw = "docs/a\u{202e}b";
+        let page = decode(
+            &Location::Directory("docs/".into()),
+            &json!([
+                {"kind":"file","path":"docs/ab"},
+                {"kind":"file","path":raw},
+                {"kind":"dir","path":"docs/a\u{2066}b/"}
+            ]),
+        )
+        .unwrap();
+        assert!(page.entries.iter().any(|entry| entry.path == raw));
+        let labels: Vec<_> = page.entries.iter().map(|e| path_label(&e.path)).collect();
+        assert!(labels.contains(&"docs/ab".to_owned()));
+        assert!(labels.contains(&r"docs/a\u{202e}b".to_owned()));
+        assert!(labels.contains(&r"docs/a\u{2066}b/".to_owned()));
+        assert_eq!(path_label("a\nb\x1b\u{009b}\\"), r"a\nb\u{1b}\u{9b}\\");
+        assert_ne!(path_label(raw), path_label(r"docs/a\u{202e}b"));
+        assert_eq!(clip(raw, 100), "docs/ab");
+    }
     #[test]
     fn back_fences_a_late_reply_and_restores_selection() {
         let root = Page::empty(Location::Directory(String::new()));
