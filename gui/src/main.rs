@@ -7,6 +7,7 @@ use std::{sync::mpsc, time::Duration};
 
 #[allow(dead_code)]
 mod input_helper;
+use remuda_gui::documents;
 mod preview;
 mod provider;
 mod terminal;
@@ -266,6 +267,8 @@ type SyncResult = (u64, Selection, Result<preview::SyncFrame, String>);
 type RemoteResult = (u64, u64, String, Result<Vec<Session>, String>);
 
 struct LocalGui {
+    documents: Option<documents::Pane>,
+    documents_focus: Option<FocusHandle>,
     terminal: Option<terminal::Terminal>,
     terminal_status: String,
     input_focus: Option<FocusHandle>,
@@ -323,6 +326,8 @@ impl LocalGui {
         let (nodes_sender, nodes_results) = mpsc::channel();
         let (remote_sender, remote_results) = mpsc::channel();
         Self {
+            documents: None,
+            documents_focus: None,
             terminal: None,
             terminal_status: String::new(),
             input_focus: None,
@@ -437,12 +442,18 @@ impl LocalGui {
     fn submit_local_line(&mut self) {
         self.submit_local_line_with(|selection| {
             worker_executable().and_then(|path| {
+                let kind = if selection.peer.is_some() {
+                    "peer"
+                } else {
+                    "local"
+                };
+                let peer = selection.peer.as_deref().unwrap_or("");
                 input_helper::InputHelper::start(
                     &path,
                     &[
                         "--internal-input-worker",
-                        "local",
-                        "",
+                        kind,
+                        peer,
                         &selection.name,
                         &selection.instance,
                     ],
@@ -484,7 +495,7 @@ impl LocalGui {
         let Some(selection) = self.selection.clone() else {
             return;
         };
-        if selection.peer.is_some() || !self.selection_current(&selection) || self.input_stopped {
+        if !self.selection_current(&selection) || self.input_stopped {
             return;
         }
         if self.input_helper.is_some() {
@@ -559,7 +570,6 @@ impl LocalGui {
         if self.sync_busy
             || self.preview_busy
             || self.preview_pending.is_some()
-            || selection.peer.is_some()
             || self.selection.as_ref() != Some(&selection)
             || !self.selection_current(&selection)
         {
@@ -570,6 +580,12 @@ impl LocalGui {
         let since = self.sync_version;
         let sender = self.sync_sender.clone();
         std::thread::spawn(move || {
+            let kind = if selection.peer.is_some() {
+                "peer"
+            } else {
+                "local"
+            };
+            let peer = selection.peer.as_deref().unwrap_or("");
             let result = worker_executable()
                 .map_err(|e| e.to_string())
                 .and_then(|path| {
@@ -577,8 +593,8 @@ impl LocalGui {
                         &path,
                         &[
                             "--internal-preview-worker",
-                            "local",
-                            "",
+                            kind,
+                            peer,
                             &selection.name,
                             &selection.instance,
                             "--sync",
@@ -612,7 +628,7 @@ impl LocalGui {
         let generation = self.nodes_generation;
         let sender = self.nodes_sender.clone();
         std::thread::spawn(move || {
-            let result = std::env::current_exe()
+            let result = worker_executable()
                 .map_err(|e| e.to_string())
                 .and_then(|path| {
                     provider::output(
@@ -682,7 +698,7 @@ impl LocalGui {
         self.remote_busy = true;
         let sender = self.remote_sender.clone();
         std::thread::spawn(move || {
-            let result = std::env::current_exe()
+            let result = worker_executable()
                 .map_err(|e| e.to_string())
                 .and_then(|path| {
                     provider::output(
@@ -735,6 +751,9 @@ impl LocalGui {
         });
     }
     fn drain(&mut self) {
+        if let Some(pane) = &mut self.documents {
+            pane.poll();
+        }
         if self
             .terminal
             .as_ref()
@@ -783,11 +802,7 @@ impl LocalGui {
         self.sync_tick = self.sync_tick.saturating_add(1);
         if self.sync_tick >= if self.sync_error { 14 } else { 1 } {
             self.sync_tick = 0;
-            if let Some(selection) = self
-                .selection
-                .clone()
-                .filter(|s| s.peer.is_none() && self.selection_current(s))
-            {
+            if let Some(selection) = self.selection.clone().filter(|s| self.selection_current(s)) {
                 self.launch_sync(selection);
             }
         }
@@ -879,7 +894,14 @@ impl Render for LocalGui {
             .input_focus
             .get_or_insert_with(|| cx.focus_handle())
             .clone();
-        let title = if self.selected_peer.is_some() && self.remote_loading {
+        let documents_open = self.documents.is_some();
+        let documents_focus = self
+            .documents_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+        let title = if documents_open {
+            "DOCUMENTS"
+        } else if self.selected_peer.is_some() && self.remote_loading {
             "PEER SESSIONS · LOADING"
         } else if self.selected_peer.is_some() && self.remote_error {
             "PEER SESSIONS · STALE"
@@ -1002,8 +1024,125 @@ impl Render for LocalGui {
                 div()
                     .flex_1()
                     .p_4()
-                    .child(div().child(if self.selected_peer.is_some() {
-                        "Read-only peer session list"
+                    .child(
+                        div()
+                            .id("documents-toggle")
+                            .debug_selector(|| "documents-toggle".into())
+                            .py_2()
+                            .cursor_pointer()
+                            .child(if documents_open {
+                                "Close documents"
+                            } else {
+                                "Documents"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.documents = if this.documents.is_some() {
+                                    None
+                                } else {
+                                    Some(documents::Pane::new(
+                                        remuda_native::daemon::socket_path("default"),
+                                    ))
+                                };
+                                cx.notify();
+                            })),
+                    )
+                    .when_some(self.documents.as_ref(), |d, pane| {
+                        d.child(
+                            div()
+                                .id("document-pane")
+                                .debug_selector(|| "document-pane".into())
+                                .child(
+                                    div()
+                                        .id("document-status")
+                                        .debug_selector(|| "document-status".into())
+                                        .text_color(rgb(0x8a95a5))
+                                        .child(pane.status()),
+                                )
+                                .child(
+                                    div()
+                                        .id("document-frame")
+                                        .debug_selector(|| "document-frame".into())
+                                        .track_focus(&documents_focus)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            if let Some(focus) = &this.documents_focus {
+                                                focus.focus(window);
+                                            }
+                                            cx.notify();
+                                        }))
+                                        .on_key_down(cx.listener(
+                                            |this, event: &gpui::KeyDownEvent, _, cx| {
+                                                let key = &event.keystroke;
+                                                if let Some(pane) = &mut this.documents {
+                                                    match key.key.as_str() {
+                                                        "up" => pane.move_selection(false),
+                                                        "down" => pane.move_selection(true),
+                                                        "enter" => pane.open_selected(),
+                                                        "escape" => {
+                                                            pane.back();
+                                                        }
+                                                        "tab" => pane.select_link(true),
+                                                        "backtab" => pane.select_link(false),
+                                                        "r" => pane.refresh(),
+                                                        _ => {}
+                                                    }
+                                                }
+                                                cx.notify();
+                                            },
+                                        ))
+                                        .font_family("monospace")
+                                        .text_sm()
+                                        .whitespace_nowrap()
+                                        .overflow_hidden()
+                                        .py_2()
+                                        .children(
+                                            pane.frame(120, 30)
+                                                .into_iter()
+                                                .map(|line| div().child(line)),
+                                        ),
+                                )
+                                .children(
+                                    [
+                                        ("doc-up", "Up", 0u8),
+                                        ("doc-down", "Down", 1),
+                                        ("doc-open", "Open", 2),
+                                        ("doc-back", "Back", 3),
+                                        ("doc-prev-link", "Prev link", 4),
+                                        ("doc-next-link", "Next link", 5),
+                                        ("doc-refresh", "Refresh document", 6),
+                                    ]
+                                    .into_iter()
+                                    .map(|(id, text, action)| {
+                                        div()
+                                            .id(id)
+                                            .debug_selector(move || id.to_string())
+                                            .py_2()
+                                            .pr_4()
+                                            .cursor_pointer()
+                                            .child(text)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(pane) = &mut this.documents {
+                                                    match action {
+                                                        0 => pane.move_selection(false),
+                                                        1 => pane.move_selection(true),
+                                                        2 => pane.open_selected(),
+                                                        3 => {
+                                                            pane.back();
+                                                        }
+                                                        4 => pane.select_link(false),
+                                                        5 => pane.select_link(true),
+                                                        _ => pane.refresh(),
+                                                    }
+                                                }
+                                                cx.notify();
+                                            }))
+                                    }),
+                                ),
+                        )
+                    })
+                    .child(div().child(if documents_open {
+                        "Document browser"
+                    } else if self.selected_peer.is_some() {
+                        "Peer session · live screen"
                     } else {
                         "Local session"
                     }))
@@ -1034,7 +1173,7 @@ impl Render for LocalGui {
                             })))
                             .child(div().id("terminal-status").debug_selector(|| "terminal-status".into()).child(self.terminal_status.clone()))
                     })
-                    .when(self.terminal.is_some(), |d| {
+                    .when(self.terminal.is_some() && !documents_open, |d| {
                         let screen = self.terminal.as_ref().map(|terminal| terminal.screen()).unwrap_or_default();
                         d.child(div().id("detach-terminal").debug_selector(|| "detach-terminal".into()).py_2().child("Detach terminal").on_click(cx.listener(|this, _, _, cx| { this.terminal = None; this.terminal_status = "Terminal detached.".into(); cx.notify(); })))
                         .child(div().id("terminal-screen").debug_selector(|| "terminal-screen".into()).track_focus(&input_focus)
@@ -1047,9 +1186,9 @@ impl Render for LocalGui {
                             }))
                             .font_family("monospace").text_sm().whitespace_nowrap().overflow_hidden().py_2().child(screen))
                     })
-                    .when(self.terminal.is_none() && self.selection.as_ref().is_some_and(|s| s.peer.is_none() && self.selection_current(s)), |d| {
+                    .when(!documents_open && self.terminal.is_none() && self.selection.as_ref().is_some_and(|s| self.selection_current(s)), |d| {
                         d.child(div().id("input-target").debug_selector(|| "input-target".into()).pt_4().child(format!("Input target: {}", selection_label(self.selection.as_ref().unwrap()))))
-                            .child(div().child("Local line input (ASCII; Enter sends; no terminal attach)"))
+                            .child(div().child(if self.selected_peer.is_some() { "Peer line input (ASCII; Enter sends to this admitted peer; may append to its current prompt)" } else { "Local line input (ASCII; Enter sends; no terminal attach)" }))
                             .child(div()
                                 .id("line-input")
                                 .debug_selector(|| "line-input".into())
@@ -1076,7 +1215,7 @@ impl Render for LocalGui {
                                 .child(format!("> {}", self.input_text)))
                     })
                     .when_some(self.selection.as_ref().filter(|s| self.terminal.is_none() && self.selection_current(s)), |d, s| d.child(div().id("preview-target").debug_selector(|| "preview-target".into()).child(format!("Snapshot: {}", selection_label(s)))))
-                    .when(self.terminal.is_none(), |d| d.child(
+                    .when(self.terminal.is_none() && !documents_open, |d| d.child(
                         div()
                             .id("preview")
                             .debug_selector(|| "preview".into())
@@ -1283,6 +1422,190 @@ mod tests {
         gui.drain();
         assert!(gui.preview.is_none() && gui.sync_error);
     }
+    #[gpui::test]
+    fn peer_selection_shows_instance_bound_sync_and_fences_late_update(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new();
+            gui.peers = vec![peer("peer-full-fingerprint", "Peer")];
+            gui.remote_busy = true;
+            gui.preview_busy = true;
+            gui
+        });
+        let node = cx.debug_bounds("node-peer-0").unwrap();
+        cx.simulate_click(node.center(), gpui::Modifiers::none());
+        view.update(cx, |gui, cx| {
+            gui.remote_loading = false;
+            gui.remote_error = false;
+            gui.remote_sessions = vec![row("remote")];
+            cx.notify();
+        });
+        let session = cx.debug_bounds("session-0").unwrap();
+        cx.simulate_click(session.center(), gpui::Modifiers::none());
+        view.update(cx, |gui, cx| {
+            let selection = gui.selection.clone().unwrap();
+            assert_eq!(selection.peer.as_deref(), Some("peer-full-fingerprint"));
+            let generation = gui.preview_generation;
+            gui.sync_busy = true;
+            gui.sync_sender
+                .send((
+                    generation,
+                    selection.clone(),
+                    Ok(preview::SyncFrame {
+                        text: "peer frame".into(),
+                        version: 2,
+                        instance: selection.instance.clone(),
+                    }),
+                ))
+                .unwrap();
+            gui.drain();
+            assert_eq!(gui.preview.as_deref(), Some("peer frame"));
+            gui.clear_preview();
+            gui.sync_sender
+                .send((
+                    generation,
+                    selection,
+                    Ok(preview::SyncFrame {
+                        text: "late frame".into(),
+                        version: 3,
+                        instance: "instance".into(),
+                    }),
+                ))
+                .unwrap();
+            gui.drain();
+            assert!(gui.preview.is_none());
+            cx.notify();
+        });
+        assert!(cx.debug_bounds("preview").is_some());
+    }
+    #[gpui::test]
+    #[ignore = "run with gui/tests/peer_live_smoke.py and its isolated peers"]
+    fn real_peer_live_view_reaches_gui(cx: &mut gpui::TestAppContext) {
+        let fingerprint = std::env::var("REMUDA_GUI_TEST_PEER_FP").unwrap();
+        let expected_instance = std::env::var("REMUDA_GUI_TEST_PEER_INSTANCE").unwrap();
+        assert!(std::env::var_os("REMUDA_GUI_ACCEPTANCE_WORKER").is_some());
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new();
+            gui.refresh_nodes();
+            gui
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        loop {
+            view.update(cx, |gui, cx| {
+                gui.drain();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            if cx.read(|app| {
+                view.read(app)
+                    .peers
+                    .iter()
+                    .any(|p| p.fingerprint == fingerprint && p.admitted)
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "peer did not reach GUI"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let node = cx.debug_bounds("node-peer-0").expect("peer row laid out");
+        cx.simulate_click(node.center(), gpui::Modifiers::none());
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        loop {
+            view.update(cx, |gui, cx| {
+                gui.drain();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            if cx.read(|app| {
+                view.read(app).remote_sessions.iter().any(|row| {
+                    row.name == "proof"
+                        && row.instance_id.as_deref() == Some(expected_instance.as_str())
+                })
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "peer session did not reach GUI"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let session = cx
+            .debug_bounds("session-0")
+            .expect("peer session row laid out");
+        cx.simulate_click(session.center(), gpui::Modifiers::none());
+        let deadline = std::time::Instant::now() + Duration::from_secs(24);
+        let mut saw_initial = false;
+        loop {
+            view.update(cx, |gui, cx| {
+                gui.drain();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let frame = cx.read(|app| view.read(app).preview.clone().unwrap_or_default());
+            if frame.contains("REMOTE_START") && !frame.contains("REMOTE_LATER") {
+                saw_initial = true;
+            }
+            if saw_initial && frame.contains("REMOTE_LATER") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "peer output did not reach GUI; first={saw_initial}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(cx.debug_bounds("preview").is_some());
+        assert!(
+            cx.read(|app| view
+                .read(app)
+                .selection
+                .as_ref()
+                .is_some_and(|s| s.peer.as_deref() == Some(fingerprint.as_str())
+                    && s.instance == expected_instance))
+        );
+        let field = cx
+            .debug_bounds("line-input")
+            .expect("peer input control not laid out");
+        cx.simulate_click(field.center(), gpui::Modifiers::none());
+        cx.simulate_keystrokes("p->p r->r o->o o->o f->f enter");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            view.update(cx, |gui, cx| {
+                gui.drain();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            if cx.read(|app| {
+                view.read(app).input_status == "Sent"
+                    && view
+                        .read(app)
+                        .preview
+                        .as_deref()
+                        .is_some_and(|text| text.contains("INPUT:proof"))
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "guarded peer input not observed: {}",
+                cx.read(|app| view.read(app).input_status.clone())
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            cx.read(|app| view
+                .read(app)
+                .input_target
+                .as_ref()
+                .is_some_and(|s| s.peer.as_deref() == Some(fingerprint.as_str())
+                    && s.instance == expected_instance))
+        );
+    }
     #[test]
     fn input_requires_current_local_instance() {
         let mut gui = LocalGui::new();
@@ -1294,6 +1617,30 @@ mod tests {
         gui.submit_local_line();
         assert!(gui.input_helper.is_none());
         assert_eq!(gui.input_text, "do-not-send");
+    }
+    #[test]
+    fn peer_input_refuses_stale_selection_before_starting_helper() {
+        for invalid in ["revoked", "replaced", "offline"] {
+            let mut gui = LocalGui::new();
+            gui.peers = vec![peer("fingerprint", "peer")];
+            gui.selected_peer = Some("fingerprint".into());
+            gui.remote_sessions = vec![row("peer-session")];
+            gui.preview_busy = true;
+            gui.select_session(row("peer-session"));
+            gui.input_text = "preserve draft".into();
+            match invalid {
+                "revoked" => gui.peers[0].admitted = false,
+                "replaced" => gui.remote_sessions[0].instance_id = Some("replacement".into()),
+                _ => gui.remote_error = true,
+            }
+            let started = std::cell::Cell::new(false);
+            gui.submit_local_line_with(|_| {
+                started.set(true);
+                Err(std::io::Error::other("must not start"))
+            });
+            assert!(!started.get(), "{invalid} peer started input helper");
+            assert_eq!(gui.input_text, "preserve draft");
+        }
     }
     #[gpui::test]
     fn immediate_input_failure_is_shown_against_the_attempted_target(
@@ -1375,7 +1722,7 @@ mod tests {
         let original = gui.selection.clone().unwrap();
         let helper = input_helper::InputHelper::start(
             std::path::Path::new("/bin/sh"),
-            &["-c", "printf 'remuda-input-v1\\n'; dd bs=1 count=5 of=/dev/null 2>/dev/null; sleep 0.3; printf '\\001'"],
+            &["-c", "printf 'remuda-input-v2\\n'; dd bs=1 count=5 of=/dev/null 2>/dev/null; sleep 0.3; printf '\\001'"],
         ).unwrap();
         assert_eq!(helper.submit(b"test\r"), input_helper::Submit::Queued);
         gui.input_target = Some(original.clone());
@@ -1451,6 +1798,15 @@ mod tests {
     #[ignore = "run the isolated real-daemon acceptance supervisor"]
     fn real_local_daemon_reaches_session_row(cx: &mut gpui::TestAppContext) {
         assert!(std::env::var_os("REMUDA_GUI_ACCEPTANCE_WORKER").is_some());
+        let root = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
+            .parent()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            std::env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from),
+            Some(root.join("state")),
+            "test state must be isolated"
+        );
         let (view, cx) = cx.add_window_view(|_, _| {
             let mut gui = LocalGui::new();
             gui.refresh();

@@ -10,7 +10,7 @@ use std::{
 };
 
 const DEADLINE: Duration = Duration::from_secs(8);
-const READY: &[u8] = b"remuda-input-v1\n";
+const READY: &[u8] = b"remuda-input-v2\n";
 
 // One watchdog bounds startup and any partially read frame or active write.
 // An idle helper waits for a first byte and exits on parent pipe closure.
@@ -72,6 +72,47 @@ fn serve<T: InputTransport>(mut input: StrictInput<T>, watch: mpsc::Sender<bool>
     }
 }
 
+// Peer lines use the guarded remote variant. A peer must prove support
+// before any user bytes are sent; an ambiguous outcome is never retried.
+struct GuardedPeer<T> {
+    transport: T,
+    supported: bool,
+}
+impl<T: InputTransport> InputTransport for GuardedPeer<T> {
+    fn send(
+        &mut self,
+        request: &remuda_core::protocol::Request,
+    ) -> std::io::Result<remuda_core::protocol::Response> {
+        use remuda_core::protocol::{Request, Response};
+        if !self.supported {
+            if !matches!(
+                self.transport.send(&Request::RemoteInputSupport)?,
+                Response::Ok
+            ) {
+                return Err(std::io::Error::other("peer does not support guarded input"));
+            }
+            self.supported = true;
+        }
+        let Request::Input {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+        } = request
+        else {
+            return Err(std::io::Error::other("unexpected input request"));
+        };
+        self.transport.send(&Request::RemoteInputLine {
+            name: name.clone(),
+            instance_id: instance_id.clone(),
+            client_id: client_id.clone(),
+            seq: *seq,
+            bytes: bytes.clone(),
+        })
+    }
+}
+
 pub fn worker(args: &[String]) -> i32 {
     if args.len() != 4 || args[2].is_empty() || args[3].is_empty() {
         return 1;
@@ -88,7 +129,16 @@ pub fn worker(args: &[String]) -> i32 {
         )
         .map_or(1, |input| serve(input, watch)),
         "peer" if !args[1].is_empty() => PeerInput::new(args[1].clone())
-            .and_then(|peer| StrictInput::new(peer, name, instance))
+            .and_then(|peer| {
+                StrictInput::new(
+                    GuardedPeer {
+                        transport: peer,
+                        supported: false,
+                    },
+                    name,
+                    instance,
+                )
+            })
             .map_or(1, |input| serve(input, watch)),
         _ => 1,
     }
@@ -322,12 +372,55 @@ mod tests {
     use super::*;
     use std::path::Path;
     #[test]
+    fn guarded_peer_checks_support_before_sending_instance_bound_line() {
+        use remuda_core::protocol::{Request, Response};
+        struct Fake {
+            seen: Arc<Mutex<Vec<Request>>>,
+            support: bool,
+        }
+        impl InputTransport for Fake {
+            fn send(&mut self, request: &Request) -> std::io::Result<Response> {
+                self.seen.lock().unwrap().push(request.clone());
+                match request {
+                    Request::RemoteInputSupport if self.support => Ok(Response::Ok),
+                    Request::RemoteInputSupport => Err(std::io::Error::other("unsupported")),
+                    Request::RemoteInputLine { .. } => Ok(Response::Ack { duplicate: false }),
+                    _ => panic!("unexpected request"),
+                }
+            }
+        }
+        for supported in [false, true] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let transport = GuardedPeer {
+                transport: Fake {
+                    seen: seen.clone(),
+                    support: supported,
+                },
+                supported: false,
+            };
+            let mut input =
+                StrictInput::new(transport, "peer-session".into(), "instance-1".into()).unwrap();
+            let result = input.send(b"test\r");
+            let seen = seen.lock().unwrap();
+            assert!(matches!(seen.first(), Some(Request::RemoteInputSupport)));
+            if supported {
+                assert_eq!(result, InputResult::Applied);
+                assert!(
+                    matches!(&seen[1], Request::RemoteInputLine { name, instance_id, bytes, .. } if name == "peer-session" && instance_id == "instance-1" && bytes == b"test\r")
+                );
+            } else {
+                assert_eq!(result, InputResult::NotAcknowledged);
+                assert_eq!(seen.len(), 1, "unsupported peer must see no user input");
+            }
+        }
+    }
+    #[test]
     fn unconsumed_completion_blocks_further_batches() {
         let helper = InputHelper::start(
             Path::new("/bin/sh"),
             &[
                 "-c",
-                "printf 'remuda-input-v1\\n'; dd bs=1 count=5 of=/dev/null 2>/dev/null; printf '\\001'",
+                "printf 'remuda-input-v2\\n'; dd bs=1 count=5 of=/dev/null 2>/dev/null; printf '\\001'",
             ],
         )
         .unwrap();
@@ -388,7 +481,7 @@ mod tests {
     }
     #[test]
     fn serial_ack_and_invalid_batch() {
-        let helper = InputHelper::start(Path::new("/bin/sh"), &["-c", "printf 'remuda-input-v1\\n'; dd bs=1 count=5 of=/dev/null 2>/dev/null; printf '\\001'; dd bs=1 count=5 of=/dev/null 2>/dev/null; printf '\\001'"]).unwrap();
+        let helper = InputHelper::start(Path::new("/bin/sh"), &["-c", "printf 'remuda-input-v2\\n'; dd bs=1 count=5 of=/dev/null 2>/dev/null; printf '\\001'; dd bs=1 count=5 of=/dev/null 2>/dev/null; printf '\\001'"]).unwrap();
         assert_eq!(helper.submit(&[]), Submit::Invalid);
         assert_eq!(helper.submit(&vec![0; MAX_BATCH + 1]), Submit::Invalid);
         for _ in 0..2 {
@@ -417,6 +510,37 @@ mod tests {
         assert!(helper
             .recv_event_timeout(Duration::from_millis(100))
             .is_err());
+    }
+    #[test]
+    fn old_v1_worker_receives_no_input_after_peer_protocol_change() {
+        let sink = std::env::temp_dir().join(format!("remuda-v1-sink-{}", std::process::id()));
+        let marker = sink.with_extension("started");
+        let _ = std::fs::remove_file(&sink);
+        let _ = std::fs::remove_file(&marker);
+        let helper = InputHelper::start(
+            Path::new("/bin/sh"),
+            &[
+                "-c",
+                "printf started > \"$2\"; printf 'remuda-input-v1\\n'; dd bs=1 count=1 of=\"$1\" 2>/dev/null",
+                "sh",
+                sink.to_str().unwrap(),
+                marker.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(helper.submit(b"private payload"), Submit::Queued);
+        assert_eq!(
+            helper
+                .recv_event_timeout(DEADLINE + Duration::from_secs(3))
+                .unwrap(),
+            Event::NotAcknowledged
+        );
+        drop(helper);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"started");
+        assert_eq!(std::fs::read(&sink).unwrap_or_default(), b"");
+        let _ = std::fs::remove_file(sink);
+        let _ = std::fs::remove_file(marker);
     }
     #[test]
     fn legacy_worker_receives_no_input_before_ready() {

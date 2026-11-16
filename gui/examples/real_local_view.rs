@@ -95,7 +95,14 @@ pub(crate) mod mac {
             .env("XDG_DATA_HOME", root.join("data"))
             .env("XDG_CACHE_HOME", root.join("cache"))
             .env("XDG_STATE_HOME", root.join("state"))
-            .env("REMUDA_EXPERIMENTAL_SESSION_HOST", "0");
+            .env(
+                "REMUDA_EXPERIMENTAL_SESSION_HOST",
+                if std::env::var_os("REMUDA_GUI_ACCEPTANCE_HOST").is_some() {
+                    "1"
+                } else {
+                    "0"
+                },
+            );
         cmd
     }
     fn bounded(cmd: &mut Command, timeout: Duration, cancellable: bool) -> io::Result<()> {
@@ -141,6 +148,15 @@ pub(crate) mod mac {
         for dir in ["runtime", "config", "data", "cache", "state"] {
             std::fs::create_dir(scratch.0.join(dir))?;
         }
+        let cargo_config = scratch.0.join("cargo-acceptance.toml");
+        std::fs::write(
+            &cargo_config,
+            format!(
+                "[env]\nXDG_STATE_HOME = {{ value = {:?}, force = true }}\n",
+                scratch.0.join("state").to_string_lossy()
+            ),
+        )?;
+        let cargo_config_arg = cargo_config.to_string_lossy();
         let mut daemon_cmd = command(&remuda, &["daemon"], &scratch.0);
         daemon_cmd.stdout(Stdio::null()).stderr(Stdio::null());
         let mut daemon = Group::spawn(&mut daemon_cmd)?;
@@ -164,6 +180,16 @@ pub(crate) mod mac {
                 Duration::from_secs(10),
                 true,
             )?;
+            if std::env::var_os("REMUDA_GUI_ACCEPTANCE_HOST").is_some()
+                && !scratch
+                    .0
+                    .join("runtime/remuda/default.sock.hosts/inventory")
+                    .exists()
+            {
+                return Err(io::Error::other(
+                    "host-backed fixture did not create its private inventory",
+                ));
+            }
             bounded(
                 command(
                     &cargo,
@@ -172,6 +198,8 @@ pub(crate) mod mac {
                         "--locked",
                         "--manifest-path",
                         "gui/Cargo.toml",
+                        "--config",
+                        &cargo_config_arg,
                         "--bin",
                         "remuda-gui",
                         "tests::real_local_daemon_reaches_session_row",
@@ -187,13 +215,13 @@ pub(crate) mod mac {
             )
         })();
         // Stop gracefully when possible, but never wait indefinitely.
-        let _ = bounded(
+        let stop = bounded(
             &mut command(&remuda, &["stop", "-f", "--yes"], &scratch.0),
-            Duration::from_secs(2),
+            Duration::from_secs(10),
             false,
         );
-        let _ = daemon.finish();
-        result
+        let daemon_end = daemon.finish();
+        result.and(stop).and(daemon_end.map(|_| ()))
     }
 }
 #[cfg(target_os = "macos")]

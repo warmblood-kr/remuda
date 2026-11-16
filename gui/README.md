@@ -1,29 +1,42 @@
 # Remuda GUI
 
-From the repository root, run the standalone GPUI prototype:
+From the repository root, build and run the standalone GPUI prototype:
 
 ```sh
-cargo run --locked --manifest-path gui/Cargo.toml
+cargo build --locked --manifest-path gui/Cargo.toml --bin remuda-gui
+./gui/target/debug/remuda-gui
 ```
+
+Run the binary directly so it inherits the intended node's state directory.
+This repository's Cargo configuration forces a separate test state directory
+for `cargo run`; a custom Cargo target directory changes the binary path.
 
 The GUI reads sessions from the existing default local daemon. It also lists
 known cluster nodes; select an admitted peer to see its sessions, then select
-an available session with a known instance ID to see a read-only text snapshot.
+an available session with a known instance ID to see its read-only live text screen.
 Local-only use does not require cluster initialization. Remote access uses the
 existing cluster membership and authenticated peer transport.
 
 Refresh updates the lists and clears the current preview. Offline or failed
 requests are shown as stale or unavailable; the preview is a snapshot, not a
 live terminal. For a current local session, click the line input and type an
-ASCII line, then press Enter to send it. For a selected local session, bounded
+ASCII line, then press Enter to send it. The selected admitted peer also has a
+line input: it identifies the full fingerprint, session and instance, checks
+protocol support, and sends one guarded line. A line can append to text already
+at the remote prompt. On this revision admitted peers may send input regardless
+of the advisory per-session opt-out or the node's remote-control setting. For
+a selected local session, bounded
 versioned Sync requests update its text snapshot as output changes. If Sync
-fails, the GUI clears the snapshot and retries with a delay. This read-only
-observation checks the session instance but does not grant input or attachment.
+fails, the GUI clears the snapshot and retries with a delay. The same bounded,
+instance-checked Sync path refreshes an admitted peer's selected screen; peer
+membership and pin are rechecked around each request. This read-only observation
+checks the session instance but does not grant input or attachment.
 Only one line can be in flight, including across selection changes. A failure
 can leave delivery uncertain; the GUI identifies the original session and
 disables further input. Check it before restarting the GUI. This uses
-instance-bound input and does not attach or reserve the session. Remote input,
-session creation and peer terminal input are not available in this prototype.
+instance-bound input and does not attach or reserve the session. Session
+creation and interactive peer terminal attachment are not available in this
+prototype.
 
 Select a current local session and choose **Attach interactive terminal** to
 use the existing attach client inside the GUI. Attach takes over an existing
@@ -91,6 +104,27 @@ The ignored integration test starts isolated local daemons and uses loopback;
 it checks the authenticated peer worker, session instance, invalid target and
 offline peer. It does not exercise a real GPUI window or a physical network.
 
+# Peer live view and input acceptance
+
+From an isolated checkout on macOS, build the CLI and GUI, then build the GUI
+unit-test executable without running it:
+
+```sh
+cargo build --locked -p remuda-native --bin remuda
+cargo build --locked --manifest-path gui/Cargo.toml --bin remuda-gui
+cargo test --locked --manifest-path gui/Cargo.toml --bin remuda-gui --no-run
+REMUDA_GUI_ACCEPTANCE_REMUDA="$PWD/target/debug/remuda" \
+REMUDA_GUI_PEER_TEST_BIN="ABSOLUTE_TEST_EXECUTABLE_PRINTED_ABOVE" \
+python3 gui/tests/peer_live_smoke.py
+```
+
+The smoke creates two temporary XDG states and private runtimes without
+changing HOME, binds one listener to loopback, creates an automatically writing
+test session and cleans up its own daemons. It exercises actual GUI TestWindow
+node/session clicks through pinned peer Sync to two output frames, and rejects
+wrong-instance, unadmitted and revoked peers for viewing. It sends a line only
+to its own disposable peer shell and takes no terminal attachment. Physical keyboard events and pixels are not tested.
+
 # Local view acceptance
 
 On macOS, to run the explicitly ignored real-daemon GPUI acceptance test, build
@@ -118,8 +152,9 @@ creates a new session is outside that scope.
 
 Read-only GUI workers accept legacy requests as well as ABI-tagged requests.
 New GUI windows require a matching response envelope and show a restart notice
-on an incompatible response. The input bridge requires its ready greeting
-before sending bytes; input is not connected to the GUI yet. These markers
+on an incompatible response. The input bridge requires its version 2 ready greeting before sending bytes;
+version 1 workers are refused without receiving input because peer line semantics
+changed. Local and admitted-peer line input are connected to the GUI. These markers
 identify a protocol revision, not an exact executable build. Changes to either
 protocol must update the marker and exercise both directions of compatibility.
 An already-running pre-fence GUI cannot be retroactively protected; do not use

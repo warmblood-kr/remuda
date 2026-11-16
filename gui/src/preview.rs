@@ -97,8 +97,8 @@ pub fn worker(args: &[String], tagged: bool) -> i32 {
 /// The existing preview command rejects these extended arguments on older builds.
 pub fn sync_worker(args: &[String]) -> i32 {
     if args.len() != 6
-        || args[0] != "local"
-        || !args[1].is_empty()
+        || !((args[0] == "local" && args[1].is_empty())
+            || (args[0] == "peer" && !args[1].is_empty()))
         || args[2].is_empty()
         || args[3].is_empty()
         || args[4] != "--sync"
@@ -116,24 +116,52 @@ pub fn sync_worker(args: &[String]) -> i32 {
         since,
         timeout_ms: 750,
     };
-    let result =
+    let response = if args[0] == "local" {
         remuda_native::client::request_with_timeout(&path, &request, Duration::from_secs(3))
             .map_err(|_| ())
-            .and_then(|r| remuda_native::session_preview::decode_sync(r, &args[3]).map_err(|_| ()))
-            .and_then(|f| {
-                let version = f.output_version.ok_or(())?;
-                if version < since {
-                    return Err(());
-                }
-                let instance = f.instance_id.clone().ok_or(())?;
-                plain(f)
-                    .map(|text| SyncFrame {
-                        text,
-                        version,
-                        instance,
-                    })
-                    .map_err(|_| ())
-            });
+    } else {
+        let fingerprint = &args[1];
+        let current = || discover_peers().is_ok_and(|peers| peer_is_unique(&peers, fingerprint));
+        if !current() {
+            return 1;
+        }
+        let (address, pinned_static_key) =
+            match remuda_native::cluster_api::resolve_call(fingerprint, None) {
+                Ok(remuda_native::cluster_api::ResolvedCall::Remote {
+                    fingerprint: resolved,
+                    address,
+                    pinned_static_key,
+                }) if resolved == *fingerprint => (address, pinned_static_key),
+                _ => return 1,
+            };
+        let private = match remuda_native::cluster::identity::load_static_private_key() {
+            Ok(key) => key,
+            Err(_) => return 1,
+        };
+        let response = remuda_native::net::cluster_client::ClusterClient::system()
+            .request(address, &pinned_static_key, &private, &request)
+            .map_err(|_| ());
+        if !current() {
+            return 1;
+        }
+        response
+    };
+    let result = response
+        .and_then(|r| remuda_native::session_preview::decode_sync(r, &args[3]).map_err(|_| ()))
+        .and_then(|f| {
+            let version = f.output_version.ok_or(())?;
+            if version < since {
+                return Err(());
+            }
+            let instance = f.instance_id.clone().ok_or(())?;
+            plain(f)
+                .map(|text| SyncFrame {
+                    text,
+                    version,
+                    instance,
+                })
+                .map_err(|_| ())
+        });
     match result {
         Ok(frame) => super::write_worker_reply(&frame, true),
         Err(()) => 1,
