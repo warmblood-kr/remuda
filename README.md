@@ -197,17 +197,12 @@ daemon and leaves host-backed sessions running for the next one (in-process
 sessions still end). A daemon older than this change ignores the flag and
 keeps the old behaviour: its `stop` leaves host-backed sessions running.
 
-The shutdown guard refuses a stop from one of this daemon's sessions and refuses
-when it cannot verify the caller's ancestry. `-f` and `--yes` only skip the
-confirmation prompt. If this is the intended daemon, use the same server and
-runtime selection with `remuda -s NAME stop -f --yes --i-am-inside`; this
-intentionally ends its sessions. The guard is advisory, not authentication:
-it does not authenticate the caller or make same-user access an authorization
-boundary, and it claims no isolation. A caller whose parent has already exited
-reads as outside, so that loss of ancestry is accepted and the stop proceeds;
-a caller whose ancestry cannot be read is unverifiable and is refused.
+`remuda stop` works from inside or outside a session. `-f` skips the
+confirmation and ends the daemon's sessions; `--keep-sessions` preserves
+host-backed sessions. The former `--i-am-inside` option is accepted for
+compatibility and is no longer needed.
 
-If the daemon is responsive, use that override rather than killing it. For a
+If the daemon is responsive, use `remuda stop` rather than killing it. For a
 stuck Unix daemon, verify its PID first, then `kill -CONT PID` if it is stopped
 or `kill PID` to request graceful termination; `kill -KILL PID` is a last resort
 that can skip cleanup. On Windows, identify the process in Task Manager or

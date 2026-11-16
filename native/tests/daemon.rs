@@ -6378,7 +6378,7 @@ fn stop_refuses_to_kill_a_live_session_without_being_told_twice() {
 
 #[cfg(unix)]
 #[test]
-fn a_session_cannot_force_stop_its_own_daemon_without_an_explicit_override() {
+fn a_session_can_force_stop_its_own_daemon() {
     let dir = scratch_dir("stop-inside");
     let path = daemon::socket_path_in(&dir, "s");
     let mut daemon = Daemon::spawn(&dir);
@@ -6393,41 +6393,17 @@ fn a_session_cannot_force_stop_its_own_daemon_without_an_explicit_override() {
         &path,
         &Request::New {
             name: Some("inside".into()),
-            command: vec![
-                "sh".into(),
-                "-c".into(),
-                format!("'{binary}' -s s stop -f --yes; sleep 30"),
-            ],
+            command: vec!["sh".into(), "-c".into(), "sleep 30".into()],
             size: Size::new(100, 30),
             cwd: None,
             env: Some(env),
         },
     )
     .expect("create managed session");
-    assert!(matches!(response, Response::Value(_)));
+    assert!(matches!(response, Response::Value(_)), "{response:?}");
 
     assert_session_shutdown_identity_is_refused(&path, daemon.0.id());
 
-    let deadline = Instant::now() + PATIENCE;
-    let screen = loop {
-        let screen = capture(&path, "inside");
-        if screen.contains("cannot stop this daemon") {
-            break screen;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "stop command did not report its refusal: {screen}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert!(
-        screen.contains("--i-am-inside"),
-        "missing explicit override guidance: {screen}"
-    );
-    assert!(
-        remuda_native::ipc::connect(&path).is_ok(),
-        "the daemon died"
-    );
     let stopped = client::request(
         &path,
         &Request::New {
@@ -6438,8 +6414,6 @@ fn a_session_cannot_force_stop_its_own_daemon_without_an_explicit_override() {
                 "s".into(),
                 "stop".into(),
                 "-f".into(),
-                "--yes".into(),
-                "--i-am-inside".into(),
             ],
             size: Size::new(100, 30),
             cwd: None,
@@ -6450,7 +6424,7 @@ fn a_session_cannot_force_stop_its_own_daemon_without_an_explicit_override() {
     assert!(matches!(stopped, Response::Value(_)));
     assert!(
         daemon.left_on_its_own(),
-        "daemon did not exit after override"
+        "daemon did not exit after force stop"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -6508,12 +6482,7 @@ fn shutdown_uses_peer_ancestry_when_session_environment_is_stripped() {
     let runtime = dir.to_string_lossy();
     let path_text = path.to_string_lossy();
     let path_value = std::env::var("PATH").unwrap_or_default();
-    let binary = env!("CARGO_BIN_EXE_remuda");
     let test_binary = std::env::current_exe().expect("integration test binary path");
-    let cli = format!(
-        "/usr/bin/env -i PATH='{}' REMUDA_RUNTIME_DIR='{}' '{}' -s s stop -f --yes; sleep 30",
-        path_value, runtime, binary
-    );
     let raw = format!(
         "/usr/bin/env -i PATH='{}' REMUDA_RUNTIME_DIR='{}' REMUDA_TEST_RAW_SHUTDOWN_SOCKET='{}' '{}' --exact raw_shutdown_descendant_helper --nocapture; sleep 30",
         path_value,
@@ -6521,7 +6490,7 @@ fn shutdown_uses_peer_ancestry_when_session_environment_is_stripped() {
         path_text,
         test_binary.display()
     );
-    for (name, command) in [("env-stop", cli), ("raw-stop", raw)] {
+    for (name, command) in [("raw-stop", raw)] {
         let response = client::request(
             &path,
             &Request::New {
@@ -6538,20 +6507,6 @@ fn shutdown_uses_peer_ancestry_when_session_environment_is_stripped() {
         .expect("start descendant requester");
         assert!(matches!(response, Response::Value(_)));
     }
-
-    let deadline = Instant::now() + PATIENCE;
-    let cli_screen = loop {
-        let screen = capture(&path, "env-stop");
-        if screen.contains("cannot stop this daemon") {
-            break screen;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "env -i requester was not refused: {screen}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert!(cli_screen.contains("--i-am-inside"), "{cli_screen}");
 
     let deadline = Instant::now() + PATIENCE;
     let raw_screen = loop {

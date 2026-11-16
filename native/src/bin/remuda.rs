@@ -849,8 +849,7 @@ remuda — a pty manager you can attach to
   remuda stop [-f] [--yes] [--keep-sessions] [--i-am-inside]  stop the daemon;
                                   its sessions and Lua image end with it.
                                   --keep-sessions leaves host-backed sessions
-                                  running. Unverifiable callers are refused;
-                                  --i-am-inside overrides the guard.
+                                  running. --i-am-inside is accepted for compatibility.
   remuda --version              the version this binary was built with
 
 Four verbs, not ten. A verb is here only if it needs a terminal, must survive
@@ -915,7 +914,7 @@ remuda — terminal orchestration for coding agents
   remuda reload [--check]        move the daemon onto this build; host-backed sessions keep running
   remuda stop [-f] [--yes] [--keep-sessions] [--i-am-inside]  stop the daemon (sessions end;
                                   --keep-sessions keeps host-backed ones running)
-                                  --i-am-inside overrides hosted or unverifiable identity checks.
+                                  --i-am-inside is accepted for compatibility.
 
   remuda mod install OWNER/REPO  install a mod from GitHub
   remuda mod list | info NAME    inspect installed mods
@@ -5781,7 +5780,6 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     };
     let force = cli_flag(&values, "force");
     let yes = cli_flag(&values, "yes");
-    let inside_override = cli_flag(&values, "i-am-inside");
     let keep_sessions = cli_flag(&values, "keep-sessions");
     match remuda_native::ipc::connect(path) {
         Ok(_) => {}
@@ -5817,7 +5815,7 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         requester_daemon_id: std::env::var("REMUDA_DAEMON_ID").ok(),
         requester_session_id: std::env::var("REMUDA_SESSION_ID").ok(),
         requester_session_name: std::env::var("REMUDA_SESSION_NAME").ok(),
-        override_hosted: inside_override,
+        override_hosted: true,
         keep_sessions,
     };
     match stop_daemon(path, shutdown) {
@@ -5828,7 +5826,7 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) if e.starts_with("cannot stop this daemon") => fail(format!(
-            "{e}\nNext: to stop it intentionally, run `remuda -s {server} stop -f --yes --i-am-inside` using the same runtime directory. This intentionally ends its sessions."
+            "{e}\nNext: to stop it intentionally, run `remuda -s {server} stop -f` using the same runtime directory. This intentionally ends its sessions."
         )),
         Err(e) => fail(e),
     }
@@ -5850,7 +5848,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
                     long: "force".into(),
                     short: Some('f'),
                     value: None,
-                    help: "Skip confirmation; identity checks still apply".into(),
+                    help: "Skip confirmation".into(),
                     global: false,
                     required: false,
                     repeat_policy: Default::default(),
@@ -5859,7 +5857,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
                     long: "yes".into(),
                     short: None,
                     value: None,
-                    help: "Confirm ending all sessions; identity checks still apply".into(),
+                    help: "Confirm ending all sessions".into(),
                     global: false,
                     required: false,
                     repeat_policy: Default::default(),
@@ -5877,8 +5875,7 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
                     long: "i-am-inside".into(),
                     short: None,
                     value: None,
-                    help: "Override hosted or unverifiable identity checks; ends all sessions"
-                        .into(),
+                    help: "Accepted for compatibility; no longer needed".into(),
                     global: false,
                     required: false,
                     repeat_policy: Default::default(),
