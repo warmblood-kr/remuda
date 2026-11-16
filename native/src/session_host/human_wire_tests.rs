@@ -102,6 +102,307 @@ fn code(response: Response) -> String {
     }
 }
 
+fn idle(client: &mut Client, id: u8, expected: u64) -> Response {
+    client
+        .request(&Request::HumanIdleGrant {
+            request: [id; 16],
+            expected,
+            recovery_secret: [id; 32],
+        })
+        .unwrap()
+}
+
+/// Exercise the host over its private wire, including the ownership attached
+/// to a connection rather than merely a successful RPC response.
+fn exercise_idle_contract(path: &std::path::Path, identity: super::super::api::Identity) -> Client {
+    let mut first = Client::open_idle_human(path, identity.clone()).unwrap();
+    let mut other = Client::open_idle_human(path, identity.clone()).unwrap();
+    assert!(matches!(
+        idle(&mut first, 1, 0),
+        Response::HumanIdleGranted { grant: 1 }
+    ));
+    assert_eq!(code(idle(&mut other, 2, 1)), "human_grant_occupied");
+    assert_eq!(code(idle(&mut other, 1, 0)), "human_grant_not_owner");
+    assert!(matches!(
+        idle(&mut first, 1, 0),
+        Response::HumanIdleGranted { grant: 1 }
+    ));
+    // A request ID from another grant mode cannot turn a takeover receipt
+    // into evidence that an idle-only claim succeeded.
+    assert_eq!(code(grant(&mut first, 1, 0, 1)), "human_grant_conflict");
+    assert!(matches!(
+        grant(&mut other, 3, 1, 3),
+        Response::HumanGranted {
+            grant: 2,
+            state: GrantState::Current
+        }
+    ));
+    assert_eq!(code(idle(&mut first, 1, 0)), "human_grant_stale");
+    drop(first); // stale cleanup must not release the successor
+    let mut contender = Client::open_idle_human(path, identity.clone()).unwrap();
+    assert_eq!(code(idle(&mut contender, 4, 2)), "human_grant_occupied");
+    drop(other);
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        match idle(&mut contender, 5, 2) {
+            Response::HumanIdleGranted { grant: 3 } => break,
+            Response::Error { code } if code == "human_grant_occupied" => {}
+            other => panic!("unexpected release outcome: {other:?}"),
+        }
+        assert!(std::time::Instant::now() < deadline, "holder not released");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(contender);
+    let mut observer = Client::open_observer(path, identity.clone()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        if matches!(observer.request(&Request::Inspect).unwrap(), Response::Info { info } if info.activity.as_ref().is_some_and(|activity| !activity.attached))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "idle grant not released"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut replay = Client::open_idle_human(path, identity.clone()).unwrap();
+    assert_eq!(code(idle(&mut replay, 5, 2)), "human_grant_not_owner");
+    drop(replay);
+    // Two concurrent requests for the same observed generation: one wins.
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let workers: Vec<_> = (6..8)
+        .map(|id| {
+            let mut client = Client::open_idle_human(path, identity.clone()).unwrap();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let response = idle(&mut client, id, 3);
+                (client, response)
+            })
+        })
+        .collect();
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|(_, r)| matches!(r, Response::HumanIdleGranted { grant: 4 }))
+            .count(),
+        1
+    );
+    assert_eq!(results.iter().filter(|(_, r)| matches!(r, Response::Error { code } if code == "human_grant_stale" || code == "human_grant_occupied")).count(), 1);
+    drop(results);
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        if matches!(observer.request(&Request::Inspect).unwrap(), Response::Info { info } if info.activity.as_ref().is_some_and(|activity| !activity.attached))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "race winner not released"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // The host granted, but this connection never reads its reply. Closing it
+    // must release that grant before a later client can claim the slot.
+    let mut lost = Client::open_idle_human(path, identity.clone()).unwrap();
+    lost.send_fixture(&Request::HumanIdleGrant {
+        request: [8; 16],
+        expected: 4,
+        recovery_secret: [8; 32],
+    })
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        if matches!(observer.request(&Request::Inspect).unwrap(), Response::Info { info } if info.human.as_ref().is_some_and(|human| human.high_water == 5))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "unread grant was not processed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(lost);
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        if matches!(observer.request(&Request::Inspect).unwrap(), Response::Info { info } if info.activity.as_ref().is_some_and(|activity| !activity.attached))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "unread grant not released"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (holder, grant) = Client::open_idle_human(path, identity)
+        .unwrap()
+        .claim_idle(5)
+        .unwrap();
+    assert_eq!(grant, 6);
+    holder
+}
+
+#[test]
+fn idle_grant_wire_preserves_owner_and_bounds_replay() {
+    let fixture = Fixture::new();
+    drop(exercise_idle_contract(
+        &fixture.path(),
+        fixture.host.identity(),
+    ));
+}
+
+#[test]
+fn idle_client_fails_closed_on_old_host_and_uncertain_reply() {
+    use super::super::api::{Identity, Open};
+    let root = std::env::temp_dir().join(format!(
+        "rm-idle-mock-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .unwrap();
+    let identity = Identity {
+        host: [9; 16],
+        session: "test".into(),
+        instance: "one".into(),
+    };
+    for scenario in 0..3 {
+        let path = root.join(format!("host-{scenario}"));
+        let endpoint = Endpoint::bind(&path).unwrap();
+        let expected_identity = identity.clone();
+        let server = std::thread::spawn(move || {
+            let mut channel = endpoint.accept().unwrap();
+            let open: Open = serde_json::from_slice(&channel.receive().unwrap()).unwrap();
+            assert!(open
+                .protocol
+                .required
+                .iter()
+                .any(|cap| cap == super::super::api::HUMAN_IDLE_GRANT));
+            if scenario == 0 {
+                // An older host refuses the required unknown capability.
+                channel
+                    .send(
+                        &serde_json::to_vec(&Response::Error {
+                            code: "unsupported_protocol_or_capability".into(),
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+                assert!(
+                    channel.receive().is_err(),
+                    "client sent a grant to the old host"
+                );
+                return;
+            }
+            channel
+                .send(
+                    &serde_json::to_vec(&Response::Opened {
+                        identity: expected_identity,
+                        minor: 0,
+                        capabilities: vec![
+                            "inspect".into(),
+                            super::super::api::HUMAN_INPUT.into(),
+                            super::super::api::HUMAN_IDLE_GRANT.into(),
+                        ],
+                        max_payload: 65_519,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            let request: Request = serde_json::from_slice(&channel.receive().unwrap()).unwrap();
+            assert!(matches!(
+                request,
+                Request::HumanIdleGrant { expected: 0, .. }
+            ));
+            if scenario == 2 {
+                channel
+                    .send(&serde_json::to_vec(&Response::Ok).unwrap())
+                    .unwrap();
+                assert!(
+                    channel.receive().is_err(),
+                    "client retained an unproven grant"
+                );
+            }
+            // Scenario 1 closes without a reply, making the outcome uncertain.
+        });
+        let opened = Client::open_idle_human(&path, identity.clone());
+        if scenario == 0 {
+            assert!(opened.is_err());
+        } else {
+            assert!(opened.unwrap().claim_idle(0).is_err());
+        }
+        server.join().unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Run explicitly with REMUDA_TEST_HOST_BIN pointing at the freshly built
+/// standalone host. This covers a real host process rather than a server thread.
+#[test]
+#[ignore = "requires a freshly built standalone host in REMUDA_TEST_HOST_BIN"]
+fn idle_grant_against_standalone_host_process() {
+    use std::process::{Command, Stdio};
+    struct Process(std::process::Child, PathBuf);
+    impl Drop for Process {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    let base = "/private/tmp";
+    #[cfg(not(target_os = "macos"))]
+    let base = "/tmp";
+    let root = PathBuf::from(base).join(format!(
+        "rm-idle-process-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .unwrap();
+    let endpoint = root.join("host");
+    let child = Command::new(std::env::var_os("REMUDA_TEST_HOST_BIN").expect("host binary"))
+        .arg("run")
+        .arg(&endpoint)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut process = Process(child, root.clone());
+    let launch = serde_json::json!({"name":"idle-test", "argv":["/bin/sh"], "cwd":root, "agent":"synthetic", "rows":24, "cols":80, "env":[["PATH","/usr/bin:/bin"]]});
+    super::super::wire::write_bootstrap(
+        process.0.stdin.as_mut().unwrap(),
+        &serde_json::to_vec(&launch).unwrap(),
+    )
+    .unwrap();
+    let _ = super::super::wire::read_frame(process.0.stdout.as_mut().unwrap(), 8192).unwrap();
+    let identity = super::super::entry::manifest(&endpoint).unwrap().identity;
+    let mut holder = exercise_idle_contract(&endpoint, identity);
+    assert!(
+        process.0.try_wait().unwrap().is_none(),
+        "host exited during test"
+    );
+    process.0.kill().unwrap();
+    process.0.wait().unwrap();
+    assert!(
+        holder.request(&Request::Inspect).is_err(),
+        "dead host must not look like a live grant"
+    );
+}
+
 #[test]
 fn human_role_needs_negotiated_capability_and_view_cannot_grant() {
     let fixture = Fixture::new();
@@ -111,12 +412,14 @@ fn human_role_needs_negotiated_capability_and_view_cannot_grant() {
     let mut view =
         Client::open_expected(&fixture.path(), Role::View, fixture.host.identity()).unwrap();
     assert_eq!(code(grant(&mut view, 1, 0, 1)), "human_role_required");
+    assert_eq!(code(idle(&mut view, 1, 0)), "human_role_required");
     assert_eq!(
         code(view.request(&Request::RawCut { last: 1 }).unwrap()),
         "raw_outcome_not_visible"
     );
     let mut control = fixture.control();
     assert_eq!(code(grant(&mut control, 1, 0, 1)), "human_role_required");
+    assert_eq!(code(idle(&mut control, 1, 0)), "human_role_required");
 }
 
 #[test]

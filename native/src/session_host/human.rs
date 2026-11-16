@@ -13,6 +13,7 @@ pub(crate) struct GrantRequest {
     pub request: [u8; 16],
     pub expected: u64,
     pub recovery: [u8; 32],
+    pub idle_only: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum GrantState {
@@ -24,6 +25,8 @@ pub(crate) enum GrantState {
 pub(crate) enum GrantError {
     Stale,
     Conflict,
+    Occupied,
+    NotOwner,
     Exhausted,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

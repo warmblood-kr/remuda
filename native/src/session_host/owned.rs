@@ -217,6 +217,37 @@ impl Owned {
         drop(displaced);
         result
     }
+    /// Claim an idle slot and return authority only to the owning connection.
+    /// A replay on another connection is evidence, not a transfer.
+    pub fn grant_human_idle(
+        &self,
+        connection: ConnectionId,
+        request: GrantRequest,
+    ) -> Result<u64, Error> {
+        let mut displaced = None;
+        let mut coordinator = self.coordinator.lock().unwrap();
+        let (grant, state) = coordinator.grant_with(connection, request, |expected| {
+            let guard = self
+                .session
+                .attach_owned_if_idle_expected(expected)
+                .map_err(|error| match error {
+                    AttachRefusal::Stale { .. } => GrantError::Stale,
+                    AttachRefusal::Occupied => GrantError::Occupied,
+                    AttachRefusal::Exhausted => GrantError::Exhausted,
+                })?;
+            let generation = guard.generation();
+            displaced = self.human.lock().unwrap().replace(Arc::new(guard));
+            Ok(generation)
+        })?;
+        let owns = state == GrantState::Current && coordinator.holds_grant(connection, grant);
+        drop(coordinator);
+        drop(displaced);
+        if owns {
+            Ok(grant)
+        } else {
+            Err(Error::Grant(GrantError::NotOwner))
+        }
+    }
     fn release_guard(&self, grant: u64) -> Option<Arc<OwnedAttached>> {
         let mut slot = self.human.lock().unwrap();
         slot.take_if(|guard| guard.generation() == grant)

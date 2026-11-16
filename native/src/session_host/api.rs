@@ -12,6 +12,8 @@ pub(crate) const TYPED_VIEW: &str = "typed-terminal-view-v1";
 pub(crate) const SCOPED_BIRTH: &str = "scoped-host-publisher-v1";
 /// Human role is refused unless the client required this capability first.
 pub(crate) const HUMAN_INPUT: &str = "human-input-v1";
+/// Supports a connection-bound idle-only grant, without legacy takeover.
+pub(crate) const HUMAN_IDLE_GRANT: &str = "human-idle-grant-v1";
 /// Inspect carries Session activity; absent on older hosts, never read as zero.
 pub(crate) const ACTIVITY: &str = "activity-v1";
 /// `ViewportDeep` is understood: a viewport reaching the host's full history
@@ -196,6 +198,12 @@ pub(crate) enum Request {
         expected: u64,
         recovery_secret: [u8; 32],
     },
+    /// Claim only an idle attachment slot; never displaces a holder.
+    HumanIdleGrant {
+        request: [u8; 16],
+        expected: u64,
+        recovery_secret: [u8; 32],
+    },
     RevokeHuman {
         grant: u64,
     },
@@ -306,6 +314,11 @@ pub(crate) enum Response {
     HumanGranted {
         grant: u64,
         state: GrantState,
+    },
+    /// The requesting connection held this grant when the host processed the
+    /// request. A later legacy attach can immediately take it over.
+    HumanIdleGranted {
+        grant: u64,
     },
     Revoked {
         revoked: bool,

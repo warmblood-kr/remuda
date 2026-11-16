@@ -21,6 +21,7 @@ const BIG: usize = super::super::wire::MAX_INPUT;
 
 fn request(id: u8, expected: u64) -> GrantRequest {
     GrantRequest {
+        idle_only: false,
         request: [id; 16],
         expected,
         recovery: [id; 32],

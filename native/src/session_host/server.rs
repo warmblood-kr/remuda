@@ -22,6 +22,7 @@ const CAPS: &[&str] = &[
     super::api::RETAINED_LEDGER,
     super::api::TYPED_VIEW,
     super::api::HUMAN_INPUT,
+    super::api::HUMAN_IDLE_GRANT,
     super::api::ACTIVITY,
     super::api::WRITER_FENCE,
     super::api::DEEP_HISTORY,
@@ -276,6 +277,7 @@ impl Connection {
                     | Request::Refresh
                     | Request::Close
                     | Request::HumanGrant { .. }
+                    | Request::HumanIdleGrant { .. }
                     | Request::HumanInput { .. }
             )
         {
@@ -391,9 +393,27 @@ impl Connection {
                     request,
                     expected,
                     recovery: Sha256::digest(recovery_secret).into(),
+                    idle_only: false,
                 };
                 let (grant, state) = host.grant_human(self.id, request).map_err(control_error)?;
                 Ok(Response::HumanGranted { grant, state })
+            }
+            Request::HumanIdleGrant {
+                request,
+                expected,
+                recovery_secret,
+            } => {
+                self.human()?;
+                let request = GrantRequest {
+                    request,
+                    expected,
+                    recovery: Sha256::digest(recovery_secret).into(),
+                    idle_only: true,
+                };
+                let grant = host
+                    .grant_human_idle(self.id, request)
+                    .map_err(control_error)?;
+                Ok(Response::HumanIdleGranted { grant })
             }
             Request::HumanInput {
                 grant,
@@ -716,6 +736,8 @@ fn control_error(error: super::coordinator::Error) -> String {
         Error::Retained => "host_raw_retention_pending",
         Error::Grant(super::human::GrantError::Stale) => "human_grant_stale",
         Error::Grant(super::human::GrantError::Conflict) => "human_grant_conflict",
+        Error::Grant(super::human::GrantError::Occupied) => "human_grant_occupied",
+        Error::Grant(super::human::GrantError::NotOwner) => "human_grant_not_owner",
         Error::Grant(super::human::GrantError::Exhausted) => "human_grant_exhausted",
     }
     .into()

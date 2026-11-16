@@ -208,6 +208,36 @@ impl Client {
     pub fn open_human(path: &Path, expected: super::api::Identity) -> io::Result<Self> {
         Self::open_with_capabilities(path, Role::Human, expected, &[super::api::HUMAN_INPUT])
     }
+    /// Refuses old hosts before sending any grant request.
+    pub fn open_idle_human(path: &Path, expected: super::api::Identity) -> io::Result<Self> {
+        Self::open_with_capabilities(
+            path,
+            Role::Human,
+            expected,
+            &[super::api::HUMAN_INPUT, super::api::HUMAN_IDLE_GRANT],
+        )
+    }
+    /// Consume the connection so any refusal or uncertain response closes it.
+    /// Success proves a grant at processing time, not continued ownership.
+    pub fn claim_idle(mut self, expected: u64) -> io::Result<(Self, u64)> {
+        if !self.offers(super::api::HUMAN_IDLE_GRANT) {
+            return Err(invalid("host does not support idle grant"));
+        }
+        let mut request = [0; 16];
+        let mut recovery_secret = [0; 32];
+        getrandom::fill(&mut request).map_err(invalid)?;
+        getrandom::fill(&mut recovery_secret).map_err(invalid)?;
+        match self.request(&Request::HumanIdleGrant {
+            request,
+            expected,
+            recovery_secret,
+        })? {
+            Response::HumanIdleGranted { grant } if expected.checked_add(1) == Some(grant) => {
+                Ok((self, grant))
+            }
+            _ => Err(invalid("idle grant refused or uncertain")),
+        }
+    }
     #[cfg(test)]
     pub fn open_human_without_capability(
         path: &Path,
