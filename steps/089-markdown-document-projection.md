@@ -45,7 +45,12 @@ the rest of that line stays literal instead of being parsed. A thematic break
 requires three or more of one marker and nothing but whitespace, so
 `- keep --- text` is a list item, not a vanished line. Reference definitions are
 collected only outside fenced blocks, so `[id]: target` inside code cannot
-resolve a reference outside the fence. Terminal controls and bidi overrides are
+resolve a reference outside the fence; when an id is defined twice the first
+destination wins, matching Markdown's first-definition rule. Link labels are
+shared data for any adapter, so they are stripped of terminal controls and bidi
+overrides and have whitespace collapsed before they reach `Document.links`,
+matching the HTML projection's existing cleaning rather than relying on a
+particular TUI to clip them later. Terminal controls and bidi overrides are
 stripped before display; no new dependency, protocol, listener or CLI is added.
 
 The GUI seam is dry-fitted, not implemented: `gui/` is a separate workspace
@@ -60,7 +65,7 @@ nor emits a presentation receipt.
 
 ```text
 cargo test --offline -p remuda-native --lib document_markdown -- --test-threads=1
-test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 1946 filtered out
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 1946 filtered out
 
 cargo test --offline -p remuda-native --lib documents:: -- --test-threads=1
 test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 1938 filtered out
@@ -73,7 +78,7 @@ test documents_read_markdown_as_prose_and_follow_its_local_link ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out
 
 env TMPDIR=/private/tmp cargo test --offline -p remuda-native --test cluster_tui -- --test-threads=1
-test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; finished in 54.39s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; finished in 50.86s
 
 cd gui && cargo check --offline
 Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.44s
@@ -105,7 +110,11 @@ on directory-first ordering.
 Limitations, stated plainly: this is not CommonMark — setext headings, tables,
 task-list checkboxes and HTML blocks are left literal; emphasis pairs must match
 in delimiter length and do not cross a code span; an image is a placeholder, not
-a preview; malformed lines beyond the work budget stay literal. No GUI/WebView
+a preview; malformed lines beyond the work budget stay literal. Bracket matching
+counts nesting but does not interpret escapes, so an unbalanced `[` inside a
+malformed label (including a raw `ESC[31m`-style sequence) can let an inner
+balanced pair become the link instead; the bytes are never executed and the
+label is still sanitized before it is shared. No GUI/WebView
 document view is included: the seam compiles and is tested from the GUI crate,
 but rendering and frame acknowledgement remain the GUI adapter's own work. Runtime evidence is macOS only. The prior checkout, live
 sessions, shared daemon and user screen were not touched, and nothing was

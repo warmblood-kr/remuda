@@ -313,13 +313,9 @@ impl Inline<'_> {
         }
         let mut label = String::new();
         self.render(&raw, &mut label, depth + 1)?;
-        let label = if label.trim().is_empty() {
-            "(link)".to_owned()
-        } else {
-            label
-        };
+        let label = shared_label(&label);
         self.document.links.push(Link {
-            label: label.chars().take(512).collect(),
+            label: label.clone(),
             target: resolve(self.path, &destination),
         });
         out.push_str(&format!("{label} [{}]", self.document.links.len()));
@@ -442,6 +438,19 @@ fn repeat(out: &mut String, ch: char, count: usize) {
     out.extend(std::iter::repeat_n(ch, count));
 }
 
+/// `Dispatch` and `Browser` sanitize their own frames, but a label is shared
+/// data: strip controls/bidi and collapse whitespace before any adapter,
+/// including a GUI, can read it directly.
+fn shared_label(label: &str) -> String {
+    let clean = crate::text::strip_terminal_controls(label);
+    let collapsed = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        "(link)".to_owned()
+    } else {
+        collapsed.chars().take(512).collect()
+    }
+}
+
 fn image_placeholder(alt: &str, out: &mut String) {
     let alt = alt.trim();
     if alt.is_empty() {
@@ -495,7 +504,8 @@ fn definitions(source: &str) -> HashMap<String, String> {
             Some(open) => fence = Some(open),
             None => {
                 if let Some((id, destination)) = definition(line) {
-                    map.insert(id, destination);
+                    // CommonMark: the first definition of an id is the one used.
+                    map.entry(id).or_insert(destination);
                 }
             }
         }
@@ -621,6 +631,43 @@ mod tests {
             let document = parse("docs/x.md", source).unwrap();
             assert_eq!(document.lines[0], expected, "{source}");
         }
+    }
+
+    #[test]
+    fn duplicate_reference_definitions_keep_the_first_destination() {
+        let document = parse(
+            "docs/x.md",
+            "Read [a][id] and [b][id].\n\n[id]: one.md\n[id]: two.md\n",
+        )
+        .unwrap();
+        assert_eq!(document.lines[0], "Read a [1] and b [2].");
+        assert_eq!(
+            document
+                .links
+                .iter()
+                .map(|link| &link.target)
+                .collect::<Vec<_>>(),
+            vec![
+                &crate::document_html::Target::Vfs("docs/one.md".into()),
+                &crate::document_html::Target::Vfs("docs/one.md".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_link_labels_carry_no_terminal_controls_or_bidi_overrides() {
+        let document = parse(
+            "docs/x.md",
+            "[bad\u{202e}\u{1b}label](next.md) and [two\u{2066}](next.md)\n",
+        )
+        .unwrap();
+        assert_eq!(document.links[0].label, "badlabel");
+        assert_eq!(document.links[1].label, "two");
+        assert!(document
+            .links
+            .iter()
+            .all(|link| !link.label.chars().any(crate::text::is_terminal_control)));
+        assert!(document.lines[0].contains("badlabel [1]"));
     }
 
     #[test]
