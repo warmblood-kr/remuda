@@ -91,7 +91,8 @@ impl ValidatedView {
         &self.entries
     }
     /// Structured rows in the same order as `entries`; empty for an older
-    /// peer that predates the semantic sidecar.
+    /// peer that predates the sidecar, and also when the sidecar could not be
+    /// represented safely. Rendered rows are always preserved.
     pub fn semantics(&self) -> &[ViewSemantics] {
         &self.semantics
     }
@@ -126,6 +127,22 @@ impl SessionView {
     pub fn with_semantics(mut self, semantics: Vec<ViewSemantics>) -> Self {
         self.semantics = semantics;
         self
+    }
+
+    /// Drop the optional sidecar and keep the validated rendered rows. Used
+    /// when the sidecar alone would exceed a bounded transport.
+    pub fn without_semantics(mut self) -> Self {
+        self.semantics.clear();
+        self
+    }
+
+    /// True when every optional field can be shown as received. Structural
+    /// problems are rejected by `validate`; this only decides whether the
+    /// optional sidecar may be kept.
+    pub fn semantics_representable(&self) -> bool {
+        self.semantics
+            .iter()
+            .all(|semantic| semantic.detail.as_deref().is_none_or(valid_detail))
     }
 
     /// Raw, untrusted rows exactly as received. Validate before display.
@@ -179,7 +196,11 @@ impl SessionView {
         Ok(ValidatedView {
             sessions,
             entries,
-            semantics: self.semantics.clone(),
+            semantics: if self.semantics_representable() {
+                self.semantics.clone()
+            } else {
+                Vec::new()
+            },
             height: self.height,
             width,
             selected: selected.map(|(name, instance)| (name.to_owned(), instance.to_owned())),
@@ -255,25 +276,26 @@ fn validate_semantics(
         {
             return Err("semantics identity mismatch");
         }
-        if semantic
-            .detail
-            .as_deref()
-            .is_some_and(|detail| !valid_detail(detail))
-        {
-            return Err("unsafe semantics detail");
-        }
     }
     Ok(())
 }
 
+/// Characters a validated row may carry as plain text. SGR is handled
+/// separately; combining marks, joiners and variation selectors are ordinary
+/// text here, exactly as `safe_line` allows them in a rendered row.
+fn plain_text_char(ch: char) -> bool {
+    !ch.is_control()
+        && !matches!(
+            ch,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// A detail the sidecar may carry. It is the same text the renderer writes
+/// into the row, so it accepts the same characters as `safe_line`; only the
+/// sidecar's own byte bound is added.
 fn valid_detail(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 256
-        && !value.chars().any(|ch| {
-            ch.is_control()
-                || unicode_width::UnicodeWidthChar::width(ch) == Some(0)
-                || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        })
+    !value.is_empty() && value.len() <= 256 && value.chars().all(plain_text_char)
 }
 
 fn valid_identity(value: &str) -> bool {
@@ -408,9 +430,7 @@ fn safe_line(line: &str) -> Option<String> {
                 return None;
             }
             styled = params != "0";
-        } else if ch.is_control()
-            || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        {
+        } else if !plain_text_char(ch) {
             return None;
         } else {
             plain.push(ch);

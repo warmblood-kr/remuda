@@ -67,7 +67,7 @@ fn accepts_semantics_bound_to_the_same_entries_and_order() {
 }
 
 #[test]
-fn rejects_semantics_that_are_unbound_out_of_range_or_unsafe() {
+fn rejects_semantics_that_are_unbound_or_out_of_range() {
     let snapshot = vec![session("one", "a"), session("two", "b")];
     let rows = vec![entry("one", "a", "one"), entry("two", "b", "two")];
     for bad in [
@@ -80,16 +80,65 @@ fn rejects_semantics_that_are_unbound_out_of_range_or_unsafe() {
             semantics("one", "a", 21, ViewState::Alive, None),
             semantics("two", "b", 0, ViewState::Alive, None),
         ],
-        vec![
-            semantics("one", "a", 0, ViewState::Alive, Some("bad\u{200b}detail")),
-            semantics("two", "b", 0, ViewState::Alive, None),
-        ],
     ] {
         assert!(SessionView::new(snapshot.clone(), 1, rows.clone())
             .with_semantics(bad)
             .validate()
             .is_err());
     }
+}
+
+#[test]
+fn accepts_combining_marks_and_joined_emoji_in_details() {
+    // The renderer writes these into the row too, so the sidecar must not be
+    // stricter than `safe_line`: a decomposed accent, a ZWJ family and a
+    // variation selector are ordinary text.
+    let detail = "e\u{301}cole 👨\u{200d}👩\u{200d}👧 🏇\u{fe0f}";
+    let view = SessionView::new(vec![session("one", "a")], 1, vec![entry("one", "a", "one")])
+        .with_semantics(vec![semantics(
+            "one",
+            "a",
+            0,
+            ViewState::Working,
+            Some(detail),
+        )]);
+    let checked = view.validate_for_display(None, 80).unwrap();
+    assert_eq!(checked.semantics().len(), 1);
+    assert_eq!(checked.semantics()[0].detail.as_deref(), Some(detail));
+}
+
+#[test]
+fn unrepresentable_detail_drops_only_the_sidecar() {
+    // A control or bidi character cannot be shown, but the validated rendered
+    // rows must survive: losing the optional structure is not a view failure.
+    for detail in ["bad\u{7}detail", "bad\u{202e}detail"] {
+        let view = SessionView::new(vec![session("one", "a")], 1, vec![entry("one", "a", "one")])
+            .with_semantics(vec![semantics(
+                "one",
+                "a",
+                0,
+                ViewState::Alive,
+                Some(detail),
+            )]);
+        let checked = view.validate_for_display(None, 80).unwrap();
+        assert!(checked.semantics().is_empty());
+        assert_eq!(checked.entries().len(), 1);
+        assert_eq!(checked.entries()[0].lines, vec!["one".to_string()]);
+    }
+}
+
+#[test]
+fn mismatched_binding_still_fails_closed_with_a_bad_detail() {
+    let view = SessionView::new(vec![session("one", "a")], 1, vec![entry("one", "a", "one")])
+        .with_semantics(vec![semantics(
+            "one",
+            "wrong",
+            0,
+            ViewState::Alive,
+            Some("bad\u{202e}detail"),
+        )]);
+    assert!(view.validate().is_err());
+    assert!(view.validate_for_display(None, 80).is_err());
 }
 
 #[test]

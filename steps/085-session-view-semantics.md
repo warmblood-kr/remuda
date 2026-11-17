@@ -17,7 +17,9 @@ One renderer emits both the painted row and a structured semantic row bound to
 the same `(name, instance_id)`. A consumer that cannot paint ANSI reads the
 structured row, gets exactly the hierarchy and status the TUI shows, and never
 invents a field the renderer did not produce. Replaced same-name instances stay
-distinct because binding is by instance id, not name.
+distinct because binding is by instance id, not name. The optional sidecar must
+never cost an existing view: a view that was acceptable before this change is
+still acceptable, with or without the sidecar.
 
 ## Expected
 
@@ -28,10 +30,19 @@ distinct because binding is by instance id, not name.
   optional on the wire.
 - `SessionView.semantics` (skipped when empty) and
   `SessionView::with_semantics`; `ValidatedView::semantics()`.
-- `validate_semantics` requires the same length and order as `entries`, the
-  same `(name, instance_id)` at each index, no duplicates, `depth <= 20`, and a
-  detail that is non-empty, `<= 256` bytes, control-free and zero-width-free.
-  An empty sidecar is accepted so older peers still validate.
+- Two different failure classes:
+  - **Structure — fail closed.** `validate_semantics` requires the same length
+    and order as `entries`, the same `(name, instance_id)` at each index, no
+    duplicates, and `depth <= 20`. A partial or unbound sidecar rejects the
+    view as before.
+  - **Representation — drop the sidecar only.** `semantics_representable`
+    requires each detail to be non-empty, `<= 256` bytes, and made of the same
+    plain characters `safe_line` accepts (controls and bidi marks rejected;
+    combining marks, joiners and variation selectors are ordinary text). When
+    that fails, `validate_for_display` returns the same validated entries and
+    sessions with `semantics()` empty. Rendered rows are never lost.
+- `safe_line` and `valid_detail` share `plain_text_char`, so the sidecar can
+  never be stricter than the row it accompanies.
 
 `native/src/tools.lua`: `status_cell` also returns the plain state (`exited`
 before liveness, then the fresh program status, then decorator activity, then
@@ -39,8 +50,11 @@ before liveness, then the fresh program status, then decorator activity, then
 with the already-computed `depth`, `state` and `detail`.
 
 `native/src/image.rs`: `render_session_view` reads the optional table, rejects
-an unknown state or an out-of-range depth, attaches the rows, and still applies
-`validate()` plus the 32 KiB serialized cap.
+an unknown state or out-of-range depth, and validates the view as before.
+`serialize_bounded_view` keeps the 32 KiB wire cap and the same fail-closed
+result for rows that are themselves too large, but if only the sidecar pushes
+the serialized view over the cap, it re-serializes the validated rows without
+the sidecar. The cap and the existing protocol limits are unchanged.
 
 ## Actual
 
@@ -53,26 +67,36 @@ Tests added but not yet run:
 
 - `core/tests/session_view_contract.rs`
   - `accepts_semantics_bound_to_the_same_entries_and_order`
-  - `rejects_semantics_that_are_unbound_out_of_range_or_unsafe` (count,
-    duplicate/mismatched identity, depth 21, zero-width detail)
+  - `rejects_semantics_that_are_unbound_or_out_of_range` (count, duplicate or
+    mismatched identity, depth 21)
+  - `accepts_combining_marks_and_joined_emoji_in_details` (decomposed accent,
+    ZWJ family, variation selector)
+  - `unrepresentable_detail_drops_only_the_sidecar` (C0 control and bidi mark:
+    rows and entries preserved, `semantics()` empty)
+  - `mismatched_binding_still_fails_closed_with_a_bad_detail`
   - `view_without_semantics_still_validates_and_reports_none`
 - `native/src/image.rs`
   - `rendered_session_view_carries_instance_bound_semantics` drives the real
     renderer through `render_session_view`: reordered depth 1, `blocked` from
     decorator activity, `alive` with no detail, `exited` outranking activity.
-  - `session_view_json_without_semantics_decodes_for_older_peers` serializes a
-    view without the sidecar, asserts the field is absent, and decodes it back.
+  - `session_view_json_without_semantics_decodes_for_older_peers`
+  - `sidecar_is_dropped_when_it_alone_overflows_the_wire_cap` (70 rows: rows
+    fit, rows+sidecar do not; decoded result keeps all rows and no sidecar)
+  - `view_whose_rows_alone_overflow_the_wire_cap_still_fails` (unchanged
+    `session view too large`)
 
-Acceptance at the slot: those five tests, the existing `session_view_contract`
-suite, `native` document/TUI tests that render the list, and the GUI session
-list tests. GUI consumption is step 086.
+Acceptance at the slot: those eight tests, the existing
+`session_view_contract` suite, `native` document/TUI tests that render the
+list, and the GUI session-list tests. GUI consumption is step 086.
 
 ## Limitations
 
-- The 32 KiB cap in `render_session_view` counts the serialized view, so the
-  sidecar reduces the largest household that fits. Typical crews are far below
-  it; a very large list now fails closed with "session view too large" instead
-  of dropping fields.
+- A view whose rendered rows alone exceed 32 KiB still fails, exactly as before;
+  the sidecar no longer causes that failure by itself.
+- A single unrepresentable detail drops the whole optional sidecar for that
+  view. That is deliberate: a partial sidecar would mix trusted and untrusted
+  structure. Consumers must treat empty semantics as "no structured data", not
+  as a reason to parse the row.
 - The TUI still paints `lines`; it does not read the sidecar, so its behavior is
   unchanged.
 - No GUI file changes here: `sessions_from_view` keeps parsing for now and is

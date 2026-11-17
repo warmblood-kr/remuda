@@ -1261,7 +1261,22 @@ fn render_session_view(
     let view = remuda_core::session_view::SessionView::new(sessions.to_vec(), height, entries)
         .with_semantics(semantics);
     view.validate().map_err(str::to_owned)?;
-    let result = serde_json::to_string(&view).map_err(|error| error.to_string())?;
+    serialize_bounded_view(view)
+}
+
+/// Serialize a validated view within the wire cap. The optional semantic
+/// sidecar is dropped rather than failing an otherwise acceptable view, and a
+/// view whose rendered rows alone exceed the cap still fails as before.
+fn serialize_bounded_view(view: remuda_core::session_view::SessionView) -> Result<String, String> {
+    if view.semantics_representable() {
+        let result = serde_json::to_string(&view).map_err(|error| error.to_string())?;
+        if result.len() <= 32768 {
+            return Ok(result);
+        }
+    }
+    let rows = view.without_semantics();
+    rows.validate().map_err(str::to_owned)?;
+    let result = serde_json::to_string(&rows).map_err(|error| error.to_string())?;
     if result.len() > 32768 {
         return Err("session view too large".into());
     }
@@ -1697,6 +1712,69 @@ mod tests {
             .unwrap()
             .semantics()
             .is_empty());
+    }
+
+    #[test]
+    fn sidecar_is_dropped_when_it_alone_overflows_the_wire_cap() {
+        use remuda_core::session_view::{SessionView, ViewEntry, ViewSemantics, ViewState};
+        let detail = "d".repeat(256);
+        let mut sessions = Vec::new();
+        let mut entries = Vec::new();
+        let mut semantics = Vec::new();
+        for index in 0..70 {
+            let name = format!("s{index:02}");
+            let instance = format!("i{index:02}");
+            sessions.push(summary(&name, &instance, true));
+            entries.push(ViewEntry {
+                name: name.clone(),
+                instance_id: instance.clone(),
+                lines: vec![
+                    format!("{name} {}", "x".repeat(37)),
+                    "detail".into(),
+                    String::new(),
+                ],
+            });
+            semantics.push(ViewSemantics {
+                name,
+                instance_id: instance,
+                depth: 0,
+                state: Some(ViewState::Alive),
+                detail: Some(detail.clone()),
+            });
+        }
+        let rows = SessionView::new(sessions.clone(), 3, entries.clone());
+        assert!(serde_json::to_string(&rows).unwrap().len() < 32768);
+        let with_sidecar = SessionView::new(sessions, 3, entries).with_semantics(semantics);
+        assert!(serde_json::to_string(&with_sidecar).unwrap().len() > 32768);
+        let json = super::serialize_bounded_view(with_sidecar).unwrap();
+        let decoded: SessionView = serde_json::from_str(&json).unwrap();
+        let checked = decoded.validate_for_display(None, 80).unwrap();
+        assert!(checked.semantics().is_empty());
+        assert_eq!(checked.entries().len(), 70);
+        assert_eq!(checked.entries()[0].lines[1], "detail");
+    }
+
+    #[test]
+    fn view_whose_rows_alone_overflow_the_wire_cap_still_fails() {
+        use remuda_core::session_view::{SessionView, ViewEntry};
+        let mut sessions = Vec::new();
+        let mut entries = Vec::new();
+        for index in 0..200 {
+            let name = format!("s{index:03}");
+            let instance = format!("i{index:03}");
+            sessions.push(summary(&name, &instance, true));
+            entries.push(ViewEntry {
+                name: name.clone(),
+                instance_id: instance,
+                lines: vec![name, String::new(), String::new()],
+            });
+        }
+        let view = SessionView::new(sessions, 3, entries);
+        assert!(serde_json::to_string(&view).unwrap().len() > 32768);
+        assert_eq!(
+            super::serialize_bounded_view(view).unwrap_err(),
+            "session view too large"
+        );
     }
 
     #[test]
