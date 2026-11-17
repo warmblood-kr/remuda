@@ -67,12 +67,26 @@ native documents::tests 16 passed; 0 failed
 
 The final binary's SHA-256 and build id are in the delivery report. The 520
 viewport test exercises the 260 panel / 102 px content split. The product's
-160 px panel is reachable (minimum document fraction or narrow mode), so a
-source-only follow-up adds `split_images_fit_and_scroll_at_the_160px_product_panel`
-with real GPUI bounds and vertical scroll; it is not yet compiled or run. The
-model assertion `pane_content_width(160, true) == 52` also remains. The framebuffer evidence
-remains a forced fixture; physical M1 and the Markdown inline path were checked
-in the assembled GPUI TestWindow, not on a physical display.
+160 px panel is reachable when `0.18 * viewport <= 160` (Home key or dragging
+the divider to the minimum), so
+`split_images_fit_and_scroll_at_the_160px_product_panel` drives the panel at
+exactly 160 px and checks real GPUI bounds plus vertical scrolling.
+
+First run at combined `03ec7e95` failed that test: it sent a positive Y scroll
+delta at offset 0, and the existing VFS listing test shows positive scrolls
+toward the top, so the assertion could never move. The delta is now `-800` and
+the test is a test-only fix; no production code changed.
+
+```text
+# combined source c2f26817 (03ec7e95 + this test fix)
+split_images_fit_and_scroll_at_the_160px_product_panel ... ok (0.33s)
+split_images_fit_in_a_260px_panel ... ok (0.21s)
+```
+
+The model assertion `pane_content_width(160, true) == 52` also remains. The
+framebuffer evidence remains a forced fixture; physical M1 and the Markdown
+inline path were checked in the assembled GPUI TestWindow, not on a physical
+display.
 
 ## Limitations
 
