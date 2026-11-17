@@ -253,6 +253,72 @@ mod tests {
     fn strict(port: &Port) -> Result<PreviewFrame, String> {
         capture(port, "session", Some("one"), 0, IdentityPolicy::Strict)
     }
+    /// v1 keeps its historical one-cell-per-scalar expansion. Combining and ZWJ
+    /// text splits into scalar cells but the TUI's rendered bytes are unchanged;
+    /// the GUI's opt-in ABI 2 decoder is what reassembles clusters.
+    #[test]
+    fn legacy_run_expansion_keeps_scalar_cells_and_same_tui_bytes() {
+        let family = "👨\u{200D}👩\u{200D}👧";
+        let port = frame(
+            false,
+            Some("one"),
+            vec![vec![
+                run("e\u{301}", false),
+                run("한", true),
+                run(family, false),
+                run("!", false),
+            ]],
+            vec![false],
+            Cursor {
+                row: 0,
+                col: 0,
+                visible: false,
+            },
+        );
+        let frame = strict(&port).unwrap();
+        let row = &frame.cells[0];
+        assert_eq!(row.len(), 9, "v1 stays one cell per scalar: {row:?}");
+        assert_eq!(row[0].text, "e");
+        assert_eq!(row[1].text, "\u{301}");
+        assert_eq!(row[2].text, "한");
+        assert!(row[2].wide);
+        assert_eq!(row[3].text, "👨");
+        assert_eq!(row[8].text, "!");
+        assert_eq!(
+            crate::tui::render_styled_row(row),
+            "e\u{301}한👨\u{200D}👩\u{200D}👧!",
+            "legacy rendered bytes are unchanged"
+        );
+    }
+
+    /// An existing v1 `StyledScreen` JSON fixture keeps the pre-change scalar
+    /// expansion and the identical TUI output; no global wire meaning moved.
+    #[test]
+    fn existing_styled_screen_json_keeps_legacy_scalar_cells() {
+        let json = r#"{"StyledScreen":{"rows":[[
+            {"text":"e\u0301","fg":"Default","bg":"Default","bold":false,"dim":false,"italic":false,"underline":false,"inverse":false,"wide":false},
+            {"text":"한","fg":"Default","bg":"Default","bold":false,"dim":false,"italic":false,"underline":false,"inverse":false,"wide":true},
+            {"text":"👨\u200D👩\u200D👧","fg":"Default","bg":"Default","bold":false,"dim":false,"italic":false,"underline":false,"inverse":false,"wide":false}
+        ]],"wrapped":[false],"scrollback_len":0,"scrollback_total":0,
+        "cursor":{"row":0,"col":0,"visible":false},
+        "instance_id":"one","output_version":5}}"#;
+        let response: Response = serde_json::from_str(json).unwrap();
+        let Response::StyledScreen { rows, .. } = response else {
+            panic!("expected a styled screen");
+        };
+        let cells = expand_runs(&rows[0]);
+        assert_eq!(cells.len(), 8, "v1 scalar cells: {cells:?}");
+        assert_eq!(cells[0].text, "e");
+        assert_eq!(cells[1].text, "\u{301}");
+        assert_eq!(cells[2].text, "한");
+        assert!(cells[2].wide);
+        assert_eq!(cells[3].text, "👨");
+        assert_eq!(
+            crate::tui::render_styled_row(&cells),
+            "e\u{301}한👨\u{200D}👩\u{200D}👧"
+        );
+    }
+
     #[test]
     fn sync_requires_matching_instance_and_enforces_strict_frame_limits() {
         let sync = |instance: &str, text: &str| Response::Sync {

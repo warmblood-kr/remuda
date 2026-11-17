@@ -3,8 +3,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub const TIMEOUT: Duration = Duration::from_secs(8);
-const STDOUT_LIMIT: usize = 1024 * 1024;
+pub const STDOUT_LIMIT: usize = 1024 * 1024;
 const STDERR_LIMIT: usize = 64 * 1024;
+const MAX_READS_PER_PIPE_TURN: usize = 16;
 
 #[cfg(unix)]
 pub fn output(
@@ -50,7 +51,7 @@ pub fn output(
                 }
                 let mut buf = [0; 8192];
                 // A bounded number of reads per turn keeps timeout and the other pipe responsive.
-                for _ in 0..16 {
+                for _ in 0..MAX_READS_PER_PIPE_TURN {
                     match reader.read(&mut buf) {
                         Ok(0) => {
                             *done = true;

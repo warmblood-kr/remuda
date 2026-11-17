@@ -15,6 +15,7 @@ use std::{
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_LINES: usize = 4096;
 const MAX_HISTORY: usize = 32;
+const MAX_HISTORY_SOURCE_BYTES: usize = 2 * MAX_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Location {
@@ -43,6 +44,11 @@ pub struct Page {
     pub error: Option<String>,
     /// Text/link projection for HTML and Markdown; `None` for plain text.
     pub projection: Option<crate::document_html::Document>,
+    /// Original Markdown source for a styled GUI reader. Shared by history
+    /// clones so a back stack does not copy the same 1 MiB source per entry.
+    pub markdown_source: Option<std::sync::Arc<str>>,
+    /// The bounded original UTF-8 document, shared by history snapshots.
+    pub source_text: Option<std::sync::Arc<str>>,
     pub selected_link: Option<usize>,
 }
 impl Page {
@@ -55,6 +61,8 @@ impl Page {
             identity: None,
             error: None,
             projection: None,
+            markdown_source: None,
+            source_text: None,
             selected_link: None,
         }
     }
@@ -205,6 +213,17 @@ impl Browser {
             self.history.remove(0);
         }
         self.history.push(self.page.clone());
+        // Retain small historical documents for rich Back navigation while
+        // bounding raw source independently per pane. Oldest evictions retain
+        // projection/identity and never silently fetch a newer version.
+        let mut retained: usize = self.history.iter().map(|page| page.source_text.as_ref().map_or(0, |s| s.len())).sum();
+        for historical in &mut self.history {
+            if retained <= MAX_HISTORY_SOURCE_BYTES { break; }
+            if let Some(source) = historical.source_text.take() {
+                retained -= source.len();
+                historical.markdown_source = None;
+            }
+        }
         self.page = Page::empty(location);
         self.refresh();
     }
@@ -217,6 +236,15 @@ impl Browser {
         match self.history.pop() {
             Some(page) => {
                 self.page = page;
+                // Keep the historical projection and identity unchanged.
+                // Refetch only on explicit Refresh, since the current VFS
+                // version may differ or the daemon may be unavailable.
+                if matches!(self.page.location, Location::Document(_))
+                    && self.page.source_text.is_none()
+                    && self.page.error.is_none()
+                {
+                    self.page.error = Some("Historical source evicted; Refresh loads the current version".into());
+                }
                 false
             }
             None => true,
@@ -396,6 +424,13 @@ impl Browser {
         lines
     }
     pub fn poll(&mut self) {
+        let _ = self.poll_changed();
+    }
+
+    /// Poll and report whether the visible page changed. Callers that repaint
+    /// on a timer use this to skip a rebuild when nothing arrived.
+    pub fn poll_changed(&mut self) -> bool {
+        let mut changed = false;
         if let Some((generation, receiver)) = &self.flight {
             let reply = match receiver.try_recv() {
                 Ok(reply) => Some(reply),
@@ -411,6 +446,7 @@ impl Browser {
                         Ok(page) => self.page = page,
                         Err(error) => self.page.error = Some(error),
                     }
+                    changed = true;
                 }
                 self.flight = None;
             }
@@ -428,9 +464,11 @@ impl Browser {
                 Err(error) => {
                     self.loading = false;
                     self.page.error = Some(error.to_string());
+                    changed = true;
                 }
             }
         }
+        changed
     }
 }
 
@@ -465,8 +503,8 @@ fn wrap_text(lines: &[String], width: usize) -> Vec<String> {
     out
 }
 
-// Labels preserve distinctions that are intentionally suppressed in body text.
-fn path_label(path: &str) -> String {
+/// Escape controls and backslashes while preserving the original navigation identity.
+pub fn path_label(path: &str) -> String {
     path.chars()
         .flat_map(|ch| {
             if crate::text::is_terminal_control(ch) || ch == '\\' {
@@ -548,6 +586,74 @@ fn fetch(socket: &Path, location: &Location) -> Reply {
     decode(location, &value)
 }
 
+/// Read bounded binary media (an image) from the VFS. The caller decides the
+/// format and pixel limits; this function only enforces the byte bound and the
+/// same identity/size checks as a text read.
+pub fn read_media(socket: &Path, path: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+    vfs::validate_path(path).map_err(|_| "Invalid VFS address")?;
+    let uri = format!("remuda:///{path}");
+    let response = crate::client::request_with_deadline(
+        socket,
+        &Request::Vfs {
+            args: vec![
+                "read".into(),
+                uri,
+                "--max-bytes".into(),
+                max_bytes.to_string(),
+            ],
+            input_base64: None,
+        },
+        Duration::from_secs(3),
+    )
+    .map_err(|error| error.to_string())?;
+    let Response::CommandResult {
+        exit_code,
+        stdout_base64,
+        stderr_base64,
+    } = response
+    else {
+        return Err("Daemon does not support document reads".into());
+    };
+    if exit_code != 0 {
+        return Err(
+            String::from_utf8_lossy(&BASE64.decode(stderr_base64).unwrap_or_default()).into_owned(),
+        );
+    }
+    // The VFS reply is JSON, its `content` is base64 of the binary, and the
+    // whole JSON is base64 again on stdout. Size the outer bound for both
+    // encodings plus metadata instead of comparing it to the binary limit.
+    let inner_base64 = max_bytes.div_ceil(3).saturating_mul(4);
+    let json = inner_base64.saturating_add(64 * 1024);
+    let outer_base64 = json.div_ceil(3).saturating_mul(4).saturating_add(64 * 1024);
+    if stdout_base64.len() > outer_base64 {
+        return Err("Media response is too large".into());
+    }
+    let bytes = BASE64
+        .decode(stdout_base64)
+        .map_err(|_| "Invalid media response")?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| "Invalid media JSON")?;
+    if value["ok"].as_bool() != Some(true) {
+        return Err(format!(
+            "{}: {}",
+            value["code"].as_str().unwrap_or("io"),
+            value["detail"].as_str().unwrap_or("Read failed")
+        ));
+    }
+    if value["path"].as_str() != Some(path) {
+        return Err("Media identity changed".into());
+    }
+    let hash = value["sha256"].as_str().ok_or("Missing media hash")?;
+    vfs::validate_sha256(hash).map_err(|_| "Invalid media hash")?;
+    let content = value["content"].as_str().ok_or("Missing media content")?;
+    let decoded = BASE64
+        .decode(content)
+        .map_err(|_| "Invalid media encoding")?;
+    if decoded.len() > max_bytes || value["size"].as_u64() != Some(decoded.len() as u64) {
+        return Err("Invalid media size".into());
+    }
+    Ok(decoded)
+}
+
 fn decode(location: &Location, value: &Value) -> Reply {
     let mut page = Page::empty(location.clone());
     match location {
@@ -609,6 +715,7 @@ fn decode(location: &Location, value: &Value) -> Reply {
             if text.contains('\0') {
                 return Err("Document is binary".into());
             }
+            page.source_text = Some(text.as_str().into());
             if html_path(path) {
                 let html = crate::document_html::parse(path, &text)?;
                 page.text = html.lines.clone();
@@ -617,6 +724,7 @@ fn decode(location: &Location, value: &Value) -> Reply {
                 let markdown = crate::document_markdown::parse(path, &text)?;
                 page.text = markdown.lines.clone();
                 page.projection = Some(markdown);
+                page.markdown_source = page.source_text.clone();
             } else {
                 page.text = text.lines().take(MAX_LINES).map(str::to_owned).collect();
                 if text.lines().count() > MAX_LINES {
@@ -652,6 +760,118 @@ mod tests {
             }),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn small_markdown_history_restores_source_and_links_across_two_back_steps() {
+        let (_send, receive) = mpsc::sync_channel(1);
+        let original = "# Original\n[guide](guide.md) ![diagram](image.png)\n";
+        let mut browser = Browser {
+            page: html_page("a.md", original), loading: false,
+            socket: PathBuf::from("/unavailable-test-only"), history: Vec::new(),
+            generation: 1, pending: false, flight: Some((1, receive)),
+            rendered_count: Cell::new(0), address: None,
+        };
+        browser.navigate(Location::Document("b.md".into()));
+        browser.page = html_page("b.md", "# B");
+        browser.navigate(Location::Document("c.md".into()));
+        browser.page = html_page("c.md", "# C");
+        assert!(!browser.back());
+        assert!(!browser.back());
+        assert_eq!(browser.page.markdown_source.as_deref(), Some(original));
+        assert_eq!(browser.page.source_text.as_deref(), Some(original));
+        assert!(browser.page.projection.as_ref().unwrap().links.iter().any(|link| matches!(&link.target, crate::document_html::Target::Vfs(path) if path == "guide.md")));
+        assert!(browser.page.error.is_none());
+        assert!(!browser.loading && !browser.pending);
+    }
+
+    #[test]
+    fn history_bounds_sources_and_never_silently_refetches_evicted_entries() {
+        for stale_reply in [Ok(html_page("a.md", "# changed")), Err("daemon unavailable".into())] {
+            let (send, receive) = mpsc::sync_channel(1);
+            let mut browser = Browser {
+                page: html_page("a.md", "# original"), loading: false,
+                socket: PathBuf::from("/unavailable-test-only"), history: Vec::new(),
+                generation: 1, pending: false, flight: Some((1, receive)),
+                rendered_count: Cell::new(0), address: None,
+            };
+            let raw: std::sync::Arc<str> = "a".repeat(MAX_BYTES).into();
+            browser.page.source_text = Some(raw.clone());
+            browser.page.markdown_source = Some(raw);
+            browser.navigate(Location::Document("b.md".into()));
+            assert!(browser.history[0].source_text.is_some());
+            browser.page = html_page("b.md", "# second");
+            browser.navigate(Location::Document("c.md".into()));
+            browser.page = html_page("c.md", "# third");
+            let raw: std::sync::Arc<str> = "c".repeat(MAX_BYTES).into();
+            browser.page.source_text = Some(raw.clone());
+            browser.page.markdown_source = Some(raw);
+            browser.navigate(Location::Document("d.md".into()));
+            assert_eq!(browser.history.iter().filter(|p| p.source_text.is_some()).count(), 2);
+            assert!(browser.history[0].markdown_source.is_none());
+            browser.page = html_page("d.md", "# fourth");
+            assert!(!browser.back());
+            assert_eq!(browser.page.location, Location::Document("c.md".into()));
+            assert!(!browser.back());
+            assert_eq!(browser.page.source_text.as_deref(), Some("# second"));
+            assert!(!browser.back());
+            assert_eq!(browser.page.location, Location::Document("a.md".into()));
+            assert_eq!(browser.page.identity, Some((1, "a".repeat(64))));
+            assert!(browser.page.source_text.is_none());
+            assert!(browser.page.error.as_deref().unwrap().contains("Refresh loads the current version"));
+            assert!(browser.page.text.join(" ").contains("original"));
+            assert!(!browser.loading && !browser.pending);
+            send.send(stale_reply).unwrap();
+            browser.poll();
+            assert_eq!(browser.page.identity, Some((1, "a".repeat(64))));
+            assert!(browser.page.text.join(" ").contains("original"));
+            browser.refresh(); // Only an explicit user refresh starts I/O.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while browser.loading && std::time::Instant::now() < deadline {
+                browser.poll();
+                std::thread::yield_now();
+            }
+            assert!(!browser.loading);
+            assert!(browser.page.error.is_some());
+            assert_eq!(browser.page.identity, Some((1, "a".repeat(64))));
+            assert!(browser.page.text.join(" ").contains("original"));
+            assert!(browser.page.source_text.is_none());
+        }
+    }
+
+    #[test]
+    fn sixteen_panes_retain_at_most_three_megabytes_of_raw_source_each() {
+        const TEST_PANE_COUNT: usize = 16;
+        const RETAINED_SOURCES_PER_PANE: usize = 3;
+        let mut browsers = Vec::new();
+        let mut senders = Vec::new();
+        for _ in 0..TEST_PANE_COUNT {
+            let (send, receive) = mpsc::sync_channel(1);
+            let mut page = Page::empty(Location::Document("a.md".into()));
+            let raw: std::sync::Arc<str> = "a".repeat(MAX_BYTES).into();
+            page.source_text = Some(raw.clone());
+            page.markdown_source = Some(raw);
+            let mut browser = Browser {
+                page, loading: false, socket: PathBuf::from("/unavailable-test-only"),
+                history: Vec::new(), generation: 1, pending: false,
+                flight: Some((1, receive)), rendered_count: Cell::new(0), address: None,
+            };
+            browser.navigate(Location::Document("b.md".into()));
+            browser.page.source_text = Some("b".repeat(MAX_BYTES).into());
+            browser.navigate(Location::Document("c.md".into()));
+            browser.page.source_text = Some("c".repeat(MAX_BYTES).into());
+            browser.navigate(Location::Document("d.md".into()));
+            browser.page.source_text = Some("d".repeat(MAX_BYTES).into());
+            senders.push(send);
+            browsers.push(browser);
+        }
+        let retained: usize = browsers.iter().map(|browser| {
+            browser.page.source_text.as_ref().map_or(0, |s| s.len()) +
+                browser.history.iter().map(|page| page.source_text.as_ref().map_or(0, |s| s.len())).sum::<usize>()
+        }).sum();
+        assert_eq!(retained, TEST_PANE_COUNT * RETAINED_SOURCES_PER_PANE * MAX_BYTES);
+        assert!(browsers.iter().all(|browser| browser.history[0].markdown_source.is_none()));
+        drop(senders);
     }
 
     #[test]
@@ -952,6 +1172,7 @@ mod tests {
     }
     #[test]
     fn retries_coalesce_behind_one_flight_and_recover_after_it_settles() {
+        const RETRY_STRESS_ITERATIONS: usize = 32;
         let (send, receive) = mpsc::sync_channel(1);
         let mut browser = Browser {
             page: Page::empty(Location::Directory(String::new())),
@@ -964,7 +1185,7 @@ mod tests {
             rendered_count: Cell::new(0),
             address: None,
         };
-        for _ in 0..32 {
+        for _ in 0..RETRY_STRESS_ITERATIONS {
             browser.refresh();
             assert_eq!(browser.flight.as_ref().unwrap().0, 1);
             assert!(browser.pending);
@@ -1043,6 +1264,18 @@ mod tests {
             assert!(decode(&location, &value).is_err());
         }
     }
+    #[test]
+    fn markdown_pages_carry_their_source_for_a_styled_reader() {
+        let page = html_page("docs/guide.md", "# Title\n\nUse `code`.\n");
+        assert_eq!(
+            page.markdown_source.as_deref(),
+            Some("# Title\n\nUse `code`.\n")
+        );
+        assert_eq!(page.projection.as_ref().unwrap().title, "Title");
+        let plain = html_page("docs/notes.txt", "plain text");
+        assert!(plain.markdown_source.is_none());
+    }
+
     #[test]
     fn listing_and_text_display_cannot_escape_their_boundaries() {
         let location = Location::Directory("docs/".into());

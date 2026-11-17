@@ -193,9 +193,14 @@ fn gui_document_pane_lists_opens_follows_a_link_and_returns() {
     assert!(pane.status().starts_with("ERROR"), "{}", pane.status());
 
     pane.open_document("image.png");
-    settle(&mut pane);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pane.status().contains("loading") {
+        pane.poll();
+        assert!(Instant::now() < deadline, "image state did not settle");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(
-        pane.status().contains("image preview is not implemented"),
+        pane.status().starts_with("IMAGE ·"),
         "{}",
         pane.status()
     );
