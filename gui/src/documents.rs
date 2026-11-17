@@ -26,6 +26,31 @@ pub const MAX_IMAGES_PER_PANE: usize = 8;
 pub const MAX_WORKSPACE_IMAGE_BYTES: usize = 128 * 1024 * 1024;
 /// Image entries (loaded or failed) shared by every pane in a workspace.
 pub const MAX_WORKSPACE_IMAGE_ENTRIES: usize = 32;
+/// Why an image request was refused, kept separate so the GUI can name the
+/// actual limit and the action that releases it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageLimit {
+    PaneEntries,
+    WorkspaceEntries,
+    WorkspaceBytes,
+}
+
+impl ImageLimit {
+    pub fn message(self) -> String {
+        match self {
+            Self::PaneEntries => format!(
+                "this tab already holds {MAX_IMAGES_PER_PANE} images; open a document with fewer images"
+            ),
+            Self::WorkspaceEntries => format!(
+                "workspace image cache is full ({MAX_WORKSPACE_IMAGE_ENTRIES} entries); close another image tab or refresh this document"
+            ),
+            Self::WorkspaceBytes => format!(
+                "workspace decoded-image memory is full ({} MiB); close another image tab or refresh this document",
+                MAX_WORKSPACE_IMAGE_BYTES / (1024 * 1024)
+            ),
+        }
+    }
+}
 /// Image reads/decode in flight per pane; the budget serializes actual decodes.
 const MAX_CONCURRENT_IMAGE_LOADS: usize = 2;
 
@@ -145,7 +170,7 @@ pub struct Pane {
     image_flights: Vec<ImageFlight>,
     image_queue: std::collections::VecDeque<String>,
     image_revision: u64,
-    image_limited: bool,
+    image_limit: Option<ImageLimit>,
     image_scan: Option<String>,
 }
 
@@ -171,7 +196,7 @@ impl Pane {
             image_flights: Vec::new(),
             image_queue: std::collections::VecDeque::new(),
             image_revision: 0,
-            image_limited: false,
+            image_limit: None,
             image_scan: None,
         }
     }
@@ -199,14 +224,14 @@ impl Pane {
         if document_changed { self.invalidate_selection(); }
         let before = (
             self.images.len(),
-            self.image_limited,
+            self.image_limited(),
             self.images.values().filter(|state| !matches!(state, ImageState::Loading)).count(),
         );
         self.poll_images();
         self.schedule_images();
         let after = (
             self.images.len(),
-            self.image_limited,
+            self.image_limited(),
             self.images.values().filter(|state| !matches!(state, ImageState::Loading)).count(),
         );
         document_changed || before != after
@@ -298,10 +323,15 @@ impl Pane {
         if self.images.contains_key(path) {
             return;
         }
-        if self.images.len() >= MAX_IMAGES_PER_PANE || !self.budget.reserve_entry() {
-            self.image_limited = true;
+        if self.images.len() >= MAX_IMAGES_PER_PANE {
+            self.image_limit = Some(ImageLimit::PaneEntries);
             return;
         }
+        if !self.budget.reserve_entry() {
+            self.image_limit = Some(ImageLimit::WorkspaceEntries);
+            return;
+        }
+        self.image_limit = None;
         self.images.insert(path.to_owned(), ImageState::Loading);
         self.image_queue.push_back(path.to_owned());
         self.pump_images();
@@ -338,7 +368,7 @@ impl Pane {
                             .saturating_mul(decoded.height as usize)
                             .saturating_mul(4);
                         if !budget.reserve_bytes(bytes) {
-                            let _ = sender.send(Err("workspace image budget reached".into()));
+                            let _ = sender.send(Err(ImageLimit::WorkspaceBytes.message()));
                         } else {
                             let reservation = ImageReservation {
                                 budget: budget.clone(),
@@ -370,7 +400,7 @@ impl Pane {
         self.images.clear();
         self.reservations.clear();
         self.image_queue.clear();
-        self.image_limited = false;
+        self.image_limit = None;
         self.image_revision = self.image_revision.wrapping_add(1);
         self.image_scan = None;
     }
@@ -382,7 +412,12 @@ impl Pane {
 
     /// True when a request was refused by the pane/workspace image budget.
     pub fn image_limited(&self) -> bool {
-        self.image_limited
+        self.image_limit.is_some()
+    }
+
+    /// The exact refusal, for an actionable message and tests.
+    pub fn image_limit(&self) -> Option<ImageLimit> {
+        self.image_limit
     }
 
     /// Number of cached image entries; bounded by pane and workspace budgets.
@@ -453,6 +488,7 @@ impl Pane {
 
     pub fn open_selected(&mut self) {
         self.invalidate_selection();
+        self.release_images();
         self.browser.open_selected();
     }
 
@@ -461,7 +497,12 @@ impl Pane {
     }
 
     pub fn back(&mut self) -> bool {
-        let changed = self.browser.back(); if changed { self.invalidate_selection(); } changed
+        let changed = self.browser.back();
+        if changed {
+            self.invalidate_selection();
+            self.release_images();
+        }
+        changed
     }
 
     pub fn refresh(&mut self) {
@@ -473,6 +514,7 @@ impl Pane {
     /// Open one local VFS document by address (`docs/guide.md`).
     pub fn open_document(&mut self, path: &str) {
         self.invalidate_selection();
+        self.release_images();
         self.browser.navigate(Location::Document(path.to_owned()));
     }
 
@@ -480,6 +522,7 @@ impl Pane {
     pub fn open_path(&mut self, path: &str) {
         if path.is_empty() || path.ends_with('/') {
             self.invalidate_selection();
+            self.release_images();
             self.browser.navigate(Location::Directory(path.to_owned()));
         } else {
             self.open_document(path);
@@ -808,6 +851,36 @@ mod polling_tests {
         assert!(failed.contains("last refresh failed"));
         assert!(failed.contains("v7"));
         assert!(!failed.contains("private detail"));
+    }
+
+    #[test]
+    fn navigation_releases_cached_images_and_clears_the_limit() {
+        let budget = Arc::new(ImageBudget::with_limits(4096, 2));
+        let mut pane =
+            Pane::new_with_budget(PathBuf::from("/nonexistent-vfs.sock"), budget.clone());
+        assert!(budget.reserve_entry());
+        pane.images.insert(
+            "old.png".into(),
+            ImageState::Failed("old failure".into()),
+        );
+        pane.image_limit = Some(ImageLimit::PaneEntries);
+        pane.image_scan = Some("old.png".into());
+        pane.open_document("new.png");
+        assert_eq!(pane.image_entry_count(), 0);
+        assert!(!pane.image_limited());
+        assert_eq!(pane.image_limit(), None);
+        assert_eq!(budget.usage(), (0, 0));
+        pane.cancel();
+    }
+
+    #[test]
+    fn image_limit_messages_name_the_limit_and_an_action() {
+        let pane = ImageLimit::PaneEntries.message();
+        assert!(pane.contains("8 images") && pane.contains("fewer images"), "{pane}");
+        let entries = ImageLimit::WorkspaceEntries.message();
+        assert!(entries.contains("32 entries") && entries.contains("close another image tab"), "{entries}");
+        let bytes = ImageLimit::WorkspaceBytes.message();
+        assert!(bytes.contains("128 MiB") && bytes.contains("close another image tab"), "{bytes}");
     }
 
     #[test]

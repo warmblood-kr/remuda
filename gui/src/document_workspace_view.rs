@@ -11,7 +11,7 @@ use gpui::{
     HighlightStyle, ImageSource, KeyDownEvent, Pixels, SharedString, Size, StyledText, Window,
     UnderlineStyle,
 };
-use remuda_gui::documents::{ImageState, Pane, Workspace, MAX_COLUMNS, MAX_ROWS};
+use remuda_gui::documents::{ImageLimit, ImageState, Pane, Workspace, MAX_COLUMNS, MAX_ROWS};
 use remuda_gui::{highlight, markdown, media};
 use remuda_native::document_html::Target;
 use std::ops::Range;
@@ -645,8 +645,9 @@ fn image_body(pane: &Pane, tag: &'static str) -> AnyElement {
             .into_any_element(),
         Some(ImageState::Loading) | None if pane.image_limited() => div()
             .child(format!(
-                "IMAGE · {} — workspace image budget reached",
-                pane.location()
+                "IMAGE · {} — {}",
+                pane.location(),
+                pane.image_limit().unwrap_or(ImageLimit::WorkspaceEntries).message()
             ))
             .into_any_element(),
         Some(ImageState::Loading) | None => div()
@@ -701,7 +702,8 @@ fn image_span_element(
                     .text_sm()
                     .text_color(rgb(0x6c7086))
                     .child(format!(
-                        "[image: {alt}] unavailable: workspace image budget reached"
+                        "[image: {alt}] unavailable: {}",
+                        pane.image_limit().unwrap_or(ImageLimit::WorkspaceEntries).message()
                     ))
                     .into_any_element()
             }
@@ -1438,6 +1440,117 @@ mod tests {
                 .usage()
         });
         assert_eq!(usage, (0, 0));
+    }
+
+    #[gpui::test]
+    fn navigating_to_a_second_large_image_releases_the_first_reservation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let _guard = DAEMON_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let bin = remuda_bin();
+        let daemon = Daemon::start(&bin);
+        daemon.put(&bin, "a.png", &png_bytes(1000, 1000));
+        daemon.put(&bin, "b.png", &png_bytes(1000, 1000));
+        let budget = std::sync::Arc::new(ImageBudget::with_limits(4 * 1024 * 1024, 4));
+        let socket = daemon.socket();
+        let budget_for_view = budget.clone();
+        let (view, cx) = cx.add_window_view(|_, cx| TestHost {
+            rich_selections: Default::default(),
+            documents: Some(Workspace::with_budget(socket, budget_for_view)),
+            focus: cx.focus_handle(),
+        });
+        view.update(cx, |host, cx| {
+            host.documents.as_mut().unwrap().open_in_active("a.png");
+            cx.notify();
+        });
+        settle(&view, cx);
+        wait_for_image(&view, cx, "a.png");
+        let first_usage = budget.usage();
+        assert!(first_usage.0 >= 4_000_000, "large image did not reserve memory: {first_usage:?}");
+
+        view.update(cx, |host, cx| {
+            host.documents.as_mut().unwrap().open_in_active("b.png");
+            cx.notify();
+        });
+        assert_eq!(budget.usage(), (0, 0), "navigation must release the old image first");
+        settle(&view, cx);
+        wait_for_image(&view, cx, "b.png");
+        let (usage, old, ready) = cx.read(|app| {
+            let workspace = view.read(app).documents.as_ref().unwrap();
+            (
+                workspace.image_budget().usage(),
+                workspace.active().image("a.png").is_some(),
+                matches!(
+                    workspace.active().image("b.png"),
+                    Some(ImageState::Ready { .. })
+                ),
+            )
+        });
+        assert!(usage.0 <= 4 * 1024 * 1024, "{usage:?}");
+        assert!(usage.1 <= 1, "{usage:?}");
+        assert!(!old, "the old image stayed cached after navigation");
+        assert!(ready, "the second large image did not load");
+    }
+
+    #[gpui::test]
+    fn navigating_after_the_pane_image_cap_reopens_the_new_image(cx: &mut gpui::TestAppContext) {
+        let _guard = DAEMON_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let bin = remuda_bin();
+        let daemon = Daemon::start(&bin);
+        let mut source = String::from("# Many\n\n");
+        for index in 0..12 {
+            source.push_str(&format!("![m{index}](missing-{index}.png)\n\n"));
+        }
+        daemon.put(&bin, "many.md", source.as_bytes());
+        daemon.put(&bin, "later.png", &png_bytes(3, 2));
+        let (view, cx) = host(daemon.socket(), cx);
+        view.update(cx, |host, cx| {
+            host.documents.as_mut().unwrap().open_in_active("many.md");
+            cx.notify();
+        });
+        settle(&view, cx);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            view.update(cx, |host, cx| {
+                if let Some(workspace) = host.documents.as_mut() {
+                    workspace.poll();
+                }
+                cx.notify();
+            });
+            cx.run_until_parked();
+            if cx.read(|app| {
+                view.read(app).documents.as_ref().is_some_and(|workspace| {
+                    let pane = workspace.active();
+                    pane.image_entry_count() == MAX_IMAGES_PER_PANE && pane.image_limited()
+                })
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "pane image cap did not settle");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        view.update(cx, |host, cx| {
+            host.documents.as_mut().unwrap().open_in_active("later.png");
+            cx.notify();
+        });
+        settle(&view, cx);
+        wait_for_image(&view, cx, "later.png");
+        let (limited, ready) = cx.read(|app| {
+            let workspace = view.read(app).documents.as_ref().unwrap();
+            (
+                workspace.active().image_limited(),
+                matches!(
+                    workspace.active().image("later.png"),
+                    Some(ImageState::Ready { .. })
+                ),
+            )
+        });
+        assert!(!limited, "navigation kept the old pane image limit");
+        assert!(ready, "the new image was still blocked after navigation");
     }
 
     #[gpui::test]
