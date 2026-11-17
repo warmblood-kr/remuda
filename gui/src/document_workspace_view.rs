@@ -11,7 +11,7 @@ use gpui::{
     HighlightStyle, ImageSource, KeyDownEvent, Pixels, SharedString, Size, StyledText, Window,
     UnderlineStyle,
 };
-use remuda_gui::documents::{ImageState, Pane, Workspace, MAX_COLUMNS, MAX_ROWS};
+use remuda_gui::documents::{ImageLimit, ImageState, Pane, Workspace, MAX_COLUMNS, MAX_ROWS};
 use remuda_gui::{highlight, markdown, media};
 use remuda_native::document_html::Target;
 use std::ops::Range;
@@ -70,6 +70,9 @@ pub fn render<T: DocumentHost + 'static>(
     }
     let tabs = render_tabs(workspace, cx);
     let controls = render_controls(narrow, cx);
+    // Root padding plus a small scrollbar allowance. Images fit inside this
+    // width and never extend under a vertical scrollbar.
+    let pane_width = pane_content_width(width, split.is_some());
     let can_select_source = workspace.active().is_document() && !workspace.active().is_image();
     let has_source = workspace.active().source_text().is_some();
     let mut panes = div()
@@ -84,6 +87,7 @@ pub fn render<T: DocumentHost + 'static>(
             "left",
             columns,
             if split.is_some() { rows / 2 } else { rows },
+            pane_width,
             focus,
             selection_map.clone(),
             cx,
@@ -95,6 +99,7 @@ pub fn render<T: DocumentHost + 'static>(
             "right",
             columns,
             rows / 2,
+            pane_width,
             focus,
             selection_map.clone(),
             cx,
@@ -337,6 +342,7 @@ fn render_pane<T: DocumentHost + 'static>(
     tag: &'static str,
     columns: usize,
     rows: usize,
+    pane_width: f32,
     focus: &FocusHandle,
     selection_map: Option<SelectionMap>,
     cx: &mut Context<T>,
@@ -366,7 +372,7 @@ fn render_pane<T: DocumentHost + 'static>(
         selection.borrow_mut().begin_document(key.clone());
         (selection, key)
     }));
-    let body = pane_body(pane, index, tag, columns, rows, selection.clone(), cx);
+    let body = pane_body(pane, index, tag, columns, rows, pane_width, selection.clone(), cx);
     let pane_focus = focus.clone();
     let move_selection = selection.clone();
     div()
@@ -416,6 +422,7 @@ fn pane_body<T: DocumentHost + 'static>(
     tag: &'static str,
     columns: usize,
     rows: usize,
+    pane_width: f32,
     selection: Option<(Rc<RefCell<Selection>>, DocumentKey)>,
     cx: &mut Context<T>,
 ) -> AnyElement {
@@ -443,10 +450,11 @@ fn pane_body<T: DocumentHost + 'static>(
         return div().id(SharedString::from(format!("vfs-list-{tag}"))).size_full().overflow_y_scroll().track_scroll(&pane.directory_scroll()).flex().flex_col().text_sm().when(rows.is_empty(), |d| d.child("(empty)")).children(rows).into_any_element();
     }
     if pane.is_image() {
-        return image_body(pane, tag);
+        return image_body(pane, tag, pane_width);
     }
     if let Some(source) = pane.markdown_source() {
-        return markdown_body(source, pane, pane_index, tag, selection, cx).into_any_element();
+        return markdown_body(source, pane, pane_index, tag, selection, cx, pane_width)
+            .into_any_element();
     }
     let language = pane.language();
     if let (Some(source), Some(selection)) = (pane.source_text(), selection.clone()) {
@@ -483,6 +491,7 @@ fn markdown_body<T: DocumentHost + 'static>(
     tag: &'static str,
     selection: Option<(Rc<RefCell<Selection>>, DocumentKey)>,
     cx: &mut Context<T>,
+    pane_width: f32,
 ) -> Div {
     let blocks = selection.as_ref().map(|(state,_)| state.borrow_mut().blocks(source)).unwrap_or_else(|| markdown::parse(source));
     let total = blocks.len();
@@ -492,7 +501,7 @@ fn markdown_body<T: DocumentHost + 'static>(
         .enumerate()
         .map(|(index, block)| {
             if index > 0 { if let Some((state,_)) = &selection { state.borrow_mut().add_piece("\n"); } }
-            markdown_block(pane, pane_index, tag, index, &block, selection.clone(), cx)
+            markdown_block(pane, pane_index, tag, index, &block, selection.clone(), cx, pane_width)
         })
         .collect();
     if total > VIEW_MAX_BLOCKS {
@@ -517,6 +526,7 @@ fn markdown_block<T: DocumentHost + 'static>(
     block: &markdown::Block,
     selection: Option<(Rc<RefCell<Selection>>, DocumentKey)>,
     cx: &mut Context<T>,
+    pane_width: f32,
 ) -> AnyElement {
     match &block.kind {
         markdown::BlockKind::Heading(level) => {
@@ -535,7 +545,7 @@ fn markdown_block<T: DocumentHost + 'static>(
                 _ => heading.text_sm(),
             };
             heading
-                .child(render_spans(&block.spans, pane, pane_index, tag, index, selection.clone(), cx))
+                .child(render_spans(&block.spans, pane, pane_index, tag, index, selection.clone(), cx, pane_width))
                 .into_any_element()
         }
         markdown::BlockKind::Paragraph => {
@@ -543,11 +553,12 @@ fn markdown_block<T: DocumentHost + 'static>(
             div()
                 .id(SharedString::from(selector.clone()))
                 .debug_selector(move || selector.clone())
-                .child(render_spans(&block.spans, pane, pane_index, tag, index, selection.clone(), cx))
+                .child(render_spans(&block.spans, pane, pane_index, tag, index, selection.clone(), cx, pane_width))
                 .into_any_element()
         }
         markdown::BlockKind::List { level, .. } => {
             let selector = format!("md-list-{tag}-{index}");
+            let content_width = (pane_width - 12.0 * *level as f32 - 24.0).max(1.0);
             let mut row = div()
                 .id(SharedString::from(selector.clone()))
                 .debug_selector(move || selector.clone())
@@ -559,18 +570,19 @@ fn markdown_block<T: DocumentHost + 'static>(
                     .text_color(rgb(0x8a95a5))
                     .child(selectable_text(format!("{} ",block.marker), vec![], selection.clone(), pane_index, cx)),
             );
-            row.child(render_spans(&block.spans, pane, pane_index, tag, index, selection.clone(), cx))
+            row.child(render_spans(&block.spans, pane, pane_index, tag, index, selection.clone(), cx, content_width))
                 .into_any_element()
         }
         markdown::BlockKind::Quote => {
             let selector = format!("md-quote-{tag}-{index}");
+            let content_width = (pane_width - 8.0).max(1.0);
             div()
                 .id(SharedString::from(selector.clone()))
                 .debug_selector(move || selector.clone())
                 .pl_2()
                 .bg(rgb(0x1b2028))
                 .text_color(rgb(0xb7c0cc))
-                .child(render_spans(&block.spans, pane, pane_index, tag, index, selection.clone(), cx))
+                .child(render_spans(&block.spans, pane, pane_index, tag, index, selection.clone(), cx, content_width))
                 .into_any_element()
         }
         markdown::BlockKind::Code { language } => {
@@ -628,25 +640,72 @@ fn code_line(tag: &'static str, line: &str, language: Option<&str>, row: usize) 
         .into_any_element()
 }
 
-fn image_body(pane: &Pane, tag: &'static str) -> AnyElement {
+/// Content width available inside one document pane. The floor must not turn
+/// a genuinely narrow split pane wider than the space it actually has.
+fn pane_content_width(panel_width: f32, split: bool) -> f32 {
+    let inner_width = (panel_width - 32.0).max(120.0);
+    if split {
+        ((inner_width - 8.0) / 2.0 - 8.0).max(1.0)
+    } else {
+        inner_width
+    }
+}
+
+/// Display size for one image. It fits the available pane width, never upscales
+/// the decoded image and preserves the decoded aspect ratio. Height is free so
+/// a tall image scrolls vertically instead of being clipped horizontally.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DisplaySize {
+    width: f32,
+    height: f32,
+}
+
+fn fit_image(
+    natural_width: u32,
+    natural_height: u32,
+    available_width: f32,
+    max_width: f32,
+) -> DisplaySize {
+    if natural_width == 0 || natural_height == 0 {
+        return DisplaySize {
+            width: 0.0,
+            height: 0.0,
+        };
+    }
+    let width = (natural_width as f32)
+        .min(available_width.max(1.0))
+        .min(max_width.max(1.0));
+    DisplaySize {
+        width,
+        height: width * natural_height as f32 / natural_width as f32,
+    }
+}
+
+fn image_body(pane: &Pane, tag: &'static str, pane_width: f32) -> AnyElement {
     let selector = format!("document-image-{tag}");
     match pane.image(pane.location()) {
-        Some(ImageState::Ready { image, .. }) => div()
-            .id(SharedString::from(selector.clone()))
-            .debug_selector(move || selector.clone())
-            .child(
-                img(ImageSource::from(image.clone()))
-                    .max_w(px(680.))
-                    .max_h(px(480.)),
-            )
-            .into_any_element(),
+        Some(ImageState::Ready { image, width, height }) => {
+            let size = fit_image(*width, *height, pane_width, 680.0);
+            div()
+                .id(SharedString::from(selector.clone()))
+                .debug_selector(move || selector.clone())
+                .w(px(size.width))
+                .h(px(size.height))
+                .child(
+                    img(ImageSource::from(image.clone()))
+                        .w(px(size.width))
+                        .h(px(size.height)),
+                )
+                .into_any_element()
+        }
         Some(ImageState::Failed(error)) => div()
             .child(format!("IMAGE · {} — {error}", pane.location()))
             .into_any_element(),
         Some(ImageState::Loading) | None if pane.image_limited() => div()
             .child(format!(
-                "IMAGE · {} — workspace image budget reached",
-                pane.location()
+                "IMAGE · {} — {}",
+                pane.location(),
+                pane.image_limit().unwrap_or(ImageLimit::WorkspaceEntries).message()
             ))
             .into_any_element(),
         Some(ImageState::Loading) | None => div()
@@ -662,6 +721,7 @@ fn image_span_element(
     tag: &'static str,
     block_index: usize,
     span_index: usize,
+    pane_width: f32,
 ) -> AnyElement {
     let alt = placeholder
         .strip_prefix("[image: ")
@@ -669,17 +729,18 @@ fn image_span_element(
         .unwrap_or(placeholder);
     match remuda_native::document_html::resolve(pane.location(), destination) {
         Target::Vfs(path) if media::extension_is_image(&path) => match pane.image(&path) {
-            Some(ImageState::Ready { image, .. }) => {
+            Some(ImageState::Ready { image, width, height }) => {
                 let selector = format!("md-image-{tag}-{block_index}-{span_index}");
+                let size = fit_image(*width, *height, pane_width, 240.0);
                 div()
                     .id(SharedString::from(selector.clone()))
                     .debug_selector(move || selector.clone())
-                    .max_w(px(240.))
-                    .max_h(px(180.))
+                    .w(px(size.width))
+                    .h(px(size.height))
                     .child(
                         img(ImageSource::from(image.clone()))
-                            .max_w(px(240.))
-                            .max_h(px(180.)),
+                            .w(px(size.width))
+                            .h(px(size.height)),
                     )
                     .into_any_element()
             }
@@ -701,7 +762,8 @@ fn image_span_element(
                     .text_sm()
                     .text_color(rgb(0x6c7086))
                     .child(format!(
-                        "[image: {alt}] unavailable: workspace image budget reached"
+                        "[image: {alt}] unavailable: {}",
+                        pane.image_limit().unwrap_or(ImageLimit::WorkspaceEntries).message()
                     ))
                     .into_any_element()
             }
@@ -737,6 +799,7 @@ fn render_spans<T: DocumentHost + 'static>(
     block_index: usize,
     selection: Option<(Rc<RefCell<Selection>>, DocumentKey)>,
     cx: &mut Context<T>,
+    pane_width: f32,
 ) -> AnyElement {
     if spans.iter().all(|span| span.target.is_none()) {
         let text = spans.iter().map(|s| s.text.as_str()).collect::<String>();
@@ -760,6 +823,7 @@ fn render_spans<T: DocumentHost + 'static>(
                 tag,
                 block_index,
                 span_index,
+                pane_width,
             ));
             continue;
         }
@@ -904,6 +968,7 @@ mod tests {
         rich_selections: SelectionMap,
         documents: Option<Workspace>,
         focus: FocusHandle,
+        panel_width: Option<f32>,
     }
 
     impl DocumentHost for TestHost {
@@ -921,7 +986,9 @@ mod tests {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let viewport = window.viewport_size();
             let focus = self.focus.clone();
-            let width = (f32::from(viewport.width) * 0.42).clamp(260.0, 720.0);
+            let width = self.panel_width.unwrap_or_else(|| {
+                (f32::from(viewport.width) * 0.42).clamp(260.0, 720.0)
+            });
             div().size_full().when(self.documents.is_some(), |d| {
                 d.child(render(self, &focus, &focus, width, viewport, false, focus.is_focused(window), cx))
             })
@@ -1211,6 +1278,7 @@ mod tests {
             rich_selections: Default::default(),
             documents: Some(Workspace::new(socket)),
             focus: cx.focus_handle(),
+            panel_width: None,
         })
     }
 
@@ -1242,6 +1310,52 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(image.font_style, Some(FontStyle::Italic));
+    }
+
+    #[test]
+    fn image_fit_preserves_aspect_ratio_and_avoids_upscaling() {
+        assert_eq!(
+            fit_image(480, 300, 296.0, 680.0),
+            DisplaySize {
+                width: 296.0,
+                height: 185.0
+            }
+        );
+        assert_eq!(
+            fit_image(200, 100, 296.0, 680.0),
+            DisplaySize {
+                width: 200.0,
+                height: 100.0
+            }
+        );
+        assert_eq!(
+            fit_image(1000, 500, 900.0, 680.0),
+            DisplaySize {
+                width: 680.0,
+                height: 340.0
+            }
+        );
+        assert_eq!(
+            fit_image(480, 300, 100.0, 680.0),
+            DisplaySize {
+                width: 100.0,
+                height: 62.5
+            }
+        );
+        assert_eq!(
+            fit_image(0, 300, 296.0, 680.0),
+            DisplaySize {
+                width: 0.0,
+                height: 0.0
+            }
+        );
+        assert_eq!(pane_content_width(160.0, false), 128.0);
+        assert_eq!(pane_content_width(160.0, true), 52.0);
+        assert!(
+            pane_content_width(160.0, true) <= 60.0,
+            "a narrow split must not claim more width than the pane has"
+        );
+        assert_eq!(pane_content_width(900.0, true), 422.0);
     }
 
     #[test]
@@ -1363,6 +1477,7 @@ mod tests {
             rich_selections: Default::default(),
             documents: Some(Workspace::with_budget(socket, budget_for_view)),
             focus: cx.focus_handle(),
+            panel_width: None,
         });
         view.update(cx, |host, cx| {
             let workspace = host.documents.as_mut().unwrap();
@@ -1438,6 +1553,178 @@ mod tests {
                 .usage()
         });
         assert_eq!(usage, (0, 0));
+    }
+
+    #[gpui::test]
+    fn navigating_to_a_second_large_image_releases_the_first_reservation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let _guard = DAEMON_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let bin = remuda_bin();
+        let daemon = Daemon::start(&bin);
+        daemon.put(&bin, "a.png", &png_bytes(1000, 1000));
+        daemon.put(&bin, "b.png", &png_bytes(1000, 1000));
+        let budget = std::sync::Arc::new(ImageBudget::with_limits(4 * 1024 * 1024, 4));
+        let socket = daemon.socket();
+        let budget_for_view = budget.clone();
+        let (view, cx) = cx.add_window_view(|_, cx| TestHost {
+            rich_selections: Default::default(),
+            documents: Some(Workspace::with_budget(socket, budget_for_view)),
+            focus: cx.focus_handle(),
+            panel_width: None,
+        });
+        view.update(cx, |host, cx| {
+            host.documents.as_mut().unwrap().open_in_active("a.png");
+            cx.notify();
+        });
+        settle(&view, cx);
+        wait_for_image(&view, cx, "a.png");
+        let first_usage = budget.usage();
+        assert!(first_usage.0 >= 4_000_000, "large image did not reserve memory: {first_usage:?}");
+
+        view.update(cx, |host, cx| {
+            host.documents.as_mut().unwrap().open_in_active("b.png");
+            cx.notify();
+        });
+        assert_eq!(budget.usage(), (0, 0), "navigation must release the old image first");
+        settle(&view, cx);
+        wait_for_image(&view, cx, "b.png");
+        let (usage, old, ready) = cx.read(|app| {
+            let workspace = view.read(app).documents.as_ref().unwrap();
+            (
+                workspace.image_budget().usage(),
+                workspace.active().image("a.png").is_some(),
+                matches!(
+                    workspace.active().image("b.png"),
+                    Some(ImageState::Ready { .. })
+                ),
+            )
+        });
+        assert!(usage.0 <= 4 * 1024 * 1024, "{usage:?}");
+        assert!(usage.1 <= 1, "{usage:?}");
+        assert!(!old, "the old image stayed cached after navigation");
+        assert!(ready, "the second large image did not load");
+    }
+
+    #[gpui::test]
+    fn navigation_in_one_tab_keeps_the_other_tabs_image(cx: &mut gpui::TestAppContext) {
+        let _guard = DAEMON_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let bin = remuda_bin();
+        let daemon = Daemon::start(&bin);
+        for path in ["a.png", "b.png", "c.png"] {
+            daemon.put(&bin, path, &png_bytes(1000, 1000));
+        }
+        let budget = std::sync::Arc::new(ImageBudget::with_limits(8 * 1024 * 1024, 4));
+        let socket = daemon.socket();
+        let budget_for_view = budget.clone();
+        let (view, cx) = cx.add_window_view(|_, cx| TestHost {
+            rich_selections: Default::default(),
+            documents: Some(Workspace::with_budget(socket, budget_for_view)),
+            focus: cx.focus_handle(),
+            panel_width: None,
+        });
+        view.update(cx, |host, cx| {
+            host.documents.as_mut().unwrap().open_in_active("a.png");
+            cx.notify();
+        });
+        settle(&view, cx);
+        wait_for_image(&view, cx, "a.png");
+        view.update(cx, |host, cx| {
+            host.documents.as_mut().unwrap().open_in_new_tab("b.png");
+            cx.notify();
+        });
+        settle(&view, cx);
+        wait_for_image(&view, cx, "b.png");
+        view.update(cx, |host, cx| {
+            let workspace = host.documents.as_mut().unwrap();
+            workspace.activate(0);
+            workspace.open_in_active("c.png");
+            cx.notify();
+        });
+        settle(&view, cx);
+        wait_for_image(&view, cx, "c.png");
+        let (usage, first_ready, second_ready, first_has_a) = cx.read(|app| {
+            let workspace = view.read(app).documents.as_ref().unwrap();
+            (
+                workspace.image_budget().usage(),
+                matches!(
+                    workspace.tabs()[0].image("c.png"),
+                    Some(ImageState::Ready { .. })
+                ),
+                matches!(
+                    workspace.tabs()[1].image("b.png"),
+                    Some(ImageState::Ready { .. })
+                ),
+                workspace.tabs()[0].image("a.png").is_some(),
+            )
+        });
+        assert!(usage.0 <= 8 * 1024 * 1024, "{usage:?}");
+        assert!(!first_has_a, "the active tab kept its old image");
+        assert!(first_ready, "the active tab did not load its new image");
+        assert!(second_ready, "navigation in the active tab released the other tab's image");
+    }
+
+    #[gpui::test]
+    fn navigating_after_the_pane_image_cap_reopens_the_new_image(cx: &mut gpui::TestAppContext) {
+        let _guard = DAEMON_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let bin = remuda_bin();
+        let daemon = Daemon::start(&bin);
+        let mut source = String::from("# Many\n\n");
+        for index in 0..12 {
+            source.push_str(&format!("![m{index}](missing-{index}.png)\n\n"));
+        }
+        daemon.put(&bin, "many.md", source.as_bytes());
+        daemon.put(&bin, "later.png", &png_bytes(3, 2));
+        let (view, cx) = host(daemon.socket(), cx);
+        view.update(cx, |host, cx| {
+            host.documents.as_mut().unwrap().open_in_active("many.md");
+            cx.notify();
+        });
+        settle(&view, cx);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            view.update(cx, |host, cx| {
+                if let Some(workspace) = host.documents.as_mut() {
+                    workspace.poll();
+                }
+                cx.notify();
+            });
+            cx.run_until_parked();
+            if cx.read(|app| {
+                view.read(app).documents.as_ref().is_some_and(|workspace| {
+                    let pane = workspace.active();
+                    pane.image_entry_count() == MAX_IMAGES_PER_PANE && pane.image_limited()
+                })
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "pane image cap did not settle");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        view.update(cx, |host, cx| {
+            host.documents.as_mut().unwrap().open_in_active("later.png");
+            cx.notify();
+        });
+        settle(&view, cx);
+        wait_for_image(&view, cx, "later.png");
+        let (limited, ready) = cx.read(|app| {
+            let workspace = view.read(app).documents.as_ref().unwrap();
+            (
+                workspace.active().image_limited(),
+                matches!(
+                    workspace.active().image("later.png"),
+                    Some(ImageState::Ready { .. })
+                ),
+            )
+        });
+        assert!(!limited, "navigation kept the old pane image limit");
+        assert!(ready, "the new image was still blocked after navigation");
     }
 
     #[gpui::test]
@@ -1852,6 +2139,259 @@ mod tests {
         wait_for_selector(cx, "md-image-blocked-left-3-0");
         wait_for_image(&view, cx, "missing.png");
         wait_for_selector(cx, "md-image-failed-left-2-0");
+    }
+
+    #[gpui::test]
+    fn images_fit_the_pane_width_in_standalone_and_markdown_paths(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let _guard = DAEMON_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let bin = remuda_bin();
+        let daemon = Daemon::start(&bin);
+        daemon.put(&bin, "wide.png", &png_bytes(480, 300));
+        daemon.put(&bin, "small.png", &png_bytes(3, 2));
+        daemon.put(&bin, "wide.md", b"![wide](wide.png)\n");
+        daemon.put(
+            &bin,
+            "blocks.md",
+            b"- outer\n  - inner ![wide](wide.png)\n\n> quote ![wide](wide.png)\n",
+        );
+        let (view, cx) = host(daemon.socket(), cx);
+        cx.simulate_resize(gpui::size(px(520.), px(600.)));
+
+        view.update(cx, |host, cx| {
+            host.documents.as_mut().unwrap().open_in_active("wide.png");
+            cx.notify();
+        });
+        settle(&view, cx);
+        wait_for_image(&view, cx, "wide.png");
+        let image = cx.debug_bounds("document-image-left").unwrap();
+        let frame = cx.debug_bounds("document-frame-left").unwrap();
+        assert!(
+            f32::from(image.size.width) <= f32::from(frame.size.width) + 0.5,
+            "standalone image {image:?} overflows frame {frame:?}"
+        );
+        let ratio = f32::from(image.size.width) / f32::from(image.size.height);
+        assert!(
+            (ratio - 480.0 / 300.0).abs() < 0.01,
+            "standalone image lost its aspect ratio: {image:?}"
+        );
+        assert!(
+            f32::from(image.size.width) < 480.0,
+            "standalone image was not fitted: {image:?}"
+        );
+
+        view.update(cx, |host, cx| {
+            host.documents.as_mut().unwrap().open_in_active("small.png");
+            cx.notify();
+        });
+        settle(&view, cx);
+        wait_for_image(&view, cx, "small.png");
+        let small = cx.debug_bounds("document-image-left").unwrap();
+        assert!(
+            f32::from(small.size.width) <= 3.5,
+            "small image was upscaled: {small:?}"
+        );
+
+        view.update(cx, |host, cx| {
+            host.documents.as_mut().unwrap().open_in_active("wide.md");
+            cx.notify();
+        });
+        settle(&view, cx);
+        wait_for_image(&view, cx, "wide.png");
+        wait_for_selector(cx, "md-image-left-0-0");
+        let inline = cx.debug_bounds("md-image-left-0-0").unwrap();
+        let frame = cx.debug_bounds("document-frame-left").unwrap();
+        assert!(
+            f32::from(inline.size.width) <= f32::from(frame.size.width) + 0.5,
+            "markdown image {inline:?} overflows frame {frame:?}"
+        );
+        let ratio = f32::from(inline.size.width) / f32::from(inline.size.height);
+        assert!(
+            (ratio - 480.0 / 300.0).abs() < 0.01,
+            "markdown image lost its aspect ratio: {inline:?}"
+        );
+        assert!(
+            f32::from(inline.size.width) <= 240.5,
+            "markdown image ignored its display cap: {inline:?}"
+        );
+
+        view.update(cx, |host, cx| {
+            host.documents.as_mut().unwrap().open_in_active("blocks.md");
+            cx.notify();
+        });
+        settle(&view, cx);
+        wait_for_image(&view, cx, "wide.png");
+        wait_for_selector(cx, "md-image-left-1-1");
+        wait_for_selector(cx, "md-image-left-2-1");
+        let nested = cx.debug_bounds("md-image-left-1-1").unwrap();
+        let quote = cx.debug_bounds("md-image-left-2-1").unwrap();
+        assert!(
+            (f32::from(nested.size.width) - 192.0).abs() < 1.5,
+            "nested list image ignored indent/marker: {nested:?}"
+        );
+        assert!(
+            (f32::from(quote.size.width) - 220.0).abs() < 1.5,
+            "quote image ignored quote padding: {quote:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn split_images_fit_in_a_260px_panel(cx: &mut gpui::TestAppContext) {
+        let _guard = DAEMON_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let bin = remuda_bin();
+        let daemon = Daemon::start(&bin);
+        daemon.put(&bin, "a.png", &png_bytes(480, 300));
+        daemon.put(&bin, "b.png", &png_bytes(480, 300));
+        let (view, cx) = host(daemon.socket(), cx);
+        cx.simulate_resize(gpui::size(px(520.), px(600.)));
+        view.update(cx, |host, cx| {
+            let workspace = host.documents.as_mut().unwrap();
+            workspace.open_in_active("a.png");
+            workspace.open_in_new_tab("b.png");
+            workspace.split_with(0);
+            cx.notify();
+        });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            view.update(cx, |host, cx| {
+                if let Some(workspace) = host.documents.as_mut() {
+                    workspace.poll();
+                }
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let ready = cx.read(|app| {
+                let workspace = view.read(app).documents.as_ref().unwrap();
+                workspace.tabs().len() >= 2
+                    && matches!(
+                        workspace.tabs()[0].image("a.png"),
+                        Some(ImageState::Ready { .. })
+                    )
+                    && matches!(
+                        workspace.tabs()[1].image("b.png"),
+                        Some(ImageState::Ready { .. })
+                    )
+            });
+            if ready {
+                break;
+            }
+            assert!(Instant::now() < deadline, "split images did not settle");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for (image_id, frame_id) in [
+            ("document-image-left", "document-frame-left"),
+            ("document-image-right", "document-frame-right"),
+        ] {
+            let image = cx.debug_bounds(image_id).unwrap();
+            let frame = cx.debug_bounds(frame_id).unwrap();
+            assert!(
+                f32::from(image.size.width) <= f32::from(frame.size.width) + 0.5,
+                "{image_id} {image:?} overflows {frame_id} {frame:?}"
+            );
+            let ratio = f32::from(image.size.width) / f32::from(image.size.height);
+            assert!(
+                (ratio - 480.0 / 300.0).abs() < 0.01,
+                "{image_id} lost its aspect ratio: {image:?}"
+            );
+            assert!(
+                (f32::from(image.size.width) - 102.0).abs() < 1.5,
+                "{image_id} ignored the narrow split width: {image:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn split_images_fit_and_scroll_at_the_160px_product_panel(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let _guard = DAEMON_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let bin = remuda_bin();
+        let daemon = Daemon::start(&bin);
+        daemon.put(&bin, "a.png", &png_bytes(480, 300));
+        daemon.put(&bin, "tall.png", &png_bytes(100, 4000));
+        let (view, cx) = cx.add_window_view(|_, cx| TestHost {
+            rich_selections: Default::default(),
+            documents: Some(Workspace::new(daemon.socket())),
+            focus: cx.focus_handle(),
+            panel_width: Some(160.0),
+        });
+        cx.simulate_resize(gpui::size(px(400.), px(600.)));
+        view.update(cx, |host, cx| {
+            let workspace = host.documents.as_mut().unwrap();
+            workspace.open_in_active("a.png");
+            workspace.open_in_new_tab("tall.png");
+            workspace.split_with(0);
+            cx.notify();
+        });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            view.update(cx, |host, cx| {
+                if let Some(workspace) = host.documents.as_mut() {
+                    workspace.poll();
+                }
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let ready = cx.read(|app| {
+                let workspace = view.read(app).documents.as_ref().unwrap();
+                workspace.tabs().len() >= 2
+                    && matches!(
+                        workspace.tabs()[0].image("a.png"),
+                        Some(ImageState::Ready { .. })
+                    )
+                    && matches!(
+                        workspace.tabs()[1].image("tall.png"),
+                        Some(ImageState::Ready { .. })
+                    )
+            });
+            if ready {
+                break;
+            }
+            assert!(Instant::now() < deadline, "minimum-panel images did not settle");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let tall = cx.debug_bounds("document-image-left").unwrap();
+        let tall_frame = cx.debug_bounds("document-frame-left").unwrap();
+        let normal = cx.debug_bounds("document-image-right").unwrap();
+        let normal_frame = cx.debug_bounds("document-frame-right").unwrap();
+        for (image, frame) in [(tall, tall_frame), (normal, normal_frame)] {
+            assert!(
+                f32::from(image.size.width) <= f32::from(frame.size.width) + 0.5,
+                "minimum-panel image {image:?} overflows {frame:?}"
+            );
+            assert!(
+                (f32::from(image.size.width) - 52.0).abs() < 1.5,
+                "minimum-panel image ignored the 52px content width: {image:?}"
+            );
+        }
+        assert!(
+            (f32::from(tall.size.width) / f32::from(tall.size.height) - 100.0 / 4000.0).abs()
+                < 0.001,
+            "tall image lost its aspect ratio: {tall:?}"
+        );
+        assert!(
+            tall.size.height > tall_frame.size.height,
+            "tall image should overflow the frame vertically: {tall:?} {tall_frame:?}"
+        );
+        let before = tall.top();
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: tall_frame.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(800.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        let after = cx.debug_bounds("document-image-left").unwrap().top();
+        assert!(
+            after < before,
+            "tall image did not scroll vertically: before {before:?} after {after:?}"
+        );
     }
 
     #[gpui::test]
