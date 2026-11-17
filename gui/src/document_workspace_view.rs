@@ -2381,9 +2381,12 @@ mod tests {
             "tall image should overflow the frame vertically: {tall:?} {tall_frame:?}"
         );
         let before = tall.top();
+        // Negative Y scrolls toward the end of the content (the VFS listing
+        // test uses the same convention); a positive delta at offset 0 cannot
+        // move anything.
         cx.simulate_event(gpui::ScrollWheelEvent {
             position: tall_frame.center(),
-            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(800.))),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-800.))),
             ..Default::default()
         });
         cx.run_until_parked();
