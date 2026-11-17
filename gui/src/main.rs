@@ -22,6 +22,8 @@ const MIN_DOCUMENT_FRACTION: f32 = 0.18;
 const MAX_DOCUMENT_FRACTION: f32 = 0.62;
 const DOCUMENT_KEY_STEP_PX: f32 = 16.0;
 const TERMINAL_LINE_HEIGHT_PX: f32 = 16.0;
+/// Pointer travel that turns a preview click into a drag selection.
+const DRAG_THRESHOLD_PX: f32 = 3.0;
 const WORKER_REPLY_HEADROOM_BYTES: usize = 16 * 1024;
 const DEFAULT_DOCUMENT_PANEL_FRACTION: f32 = 0.32;
 /// Structured preview is allowed to be smaller than the provider cap, leaving
@@ -344,6 +346,9 @@ struct LocalGui {
     preview_selection: Option<PreviewSelection>,
     preview_revision: u64,
     preview_drag_start: Option<gpui::Point<gpui::Pixels>>,
+    preview_dragged: bool,
+    /// Identity at mouse-down; release must match it before focusing input.
+    preview_press: Option<Selection>,
     preview_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     preview_focus: Option<FocusHandle>,
     show_session_identity: bool,
@@ -436,6 +441,8 @@ impl LocalGui {
             preview_selection: None,
             preview_revision: 0,
             preview_drag_start: None,
+            preview_dragged: false,
+            preview_press: None,
             preview_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             preview_focus: None,
             show_session_identity: false,
@@ -554,6 +561,8 @@ impl LocalGui {
         self.show_session_identity = false;
         self.invalidate_preview_selection();
         self.preview_drag_start = None;
+        self.preview_dragged = false;
+        self.preview_press = None;
         self.terminal_selection = None;
         self.attach_confirm = None;
         self.terminal = None;
@@ -1001,7 +1010,9 @@ impl LocalGui {
                     .id("preview-grid").debug_selector(|| "preview-grid".into()).w_full().flex_1().min_h(px(0.)).track_focus(focus)
                     .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
                         this.preview_selection = None;
-                        this.preview_drag_start = None;
+                        this.preview_drag_start = Some(event.position);
+                        this.preview_dragged = false;
+                        this.preview_press = this.selection.clone().filter(|s| this.selection_current(s));
                         if let (Some(frame), Some(identity), Some(bounds)) = (this.preview_frame(), this.selection.clone(), this.preview_bounds.get()) {
                             if this.selection_current(&identity) && preview_drag_available(&frame) {
                                 let (w, h) = terminal_metrics(window);
@@ -1015,6 +1026,12 @@ impl LocalGui {
                         cx.notify();
                     }))
                     .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
+                        if event.pressed_button == Some(gpui::MouseButton::Left) {
+                            if let Some(start) = this.preview_drag_start {
+                                let dx = f32::from(event.position.x - start.x); let dy = f32::from(event.position.y - start.y);
+                                this.preview_dragged |= dx.abs() + dy.abs() >= DRAG_THRESHOLD_PX;
+                            }
+                        }
                         if !this.preview_selection_current() { this.preview_selection = None; return; }
                         if let (Some(selection), Some(bounds)) = (&mut this.preview_selection, this.preview_bounds.get()) {
                             if selection.grid.dragging && event.pressed_button == Some(gpui::MouseButton::Left) {
@@ -1023,11 +1040,23 @@ impl LocalGui {
                                     selection.grid.end = pos;
                                     if let Some(start) = this.preview_drag_start {
                                         let dx = f32::from(event.position.x - start.x); let dy = f32::from(event.position.y - start.y);
-                                        selection.grid.moved |= dx.abs() + dy.abs() >= 3.;
+                                        selection.grid.moved |= dx.abs() + dy.abs() >= DRAG_THRESHOLD_PX;
                                     }
                                     cx.notify();
                                 }
                             }
+                        }
+                    }))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let dragged = this.preview_dragged || this.preview_selection.as_ref().is_some_and(|selection| selection.grid.moved);
+                        this.preview_dragged = false;
+                        let press = this.preview_press.take();
+                        let current = this.selection.as_ref();
+                        let current_ok = current.is_some_and(|s| this.selection_current(s));
+                        if preview_click_focus_allowed(press.as_ref(), current, dragged, current_ok) {
+                            this.preview_selection = None;
+                            if let Some(focus) = &this.input_focus { focus.focus(window); }
+                            cx.notify();
                         }
                     }))
                     .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
@@ -1042,7 +1071,33 @@ impl LocalGui {
                     }))
                     .child(div().size_full().flex().flex_col().children(rows))
             ))
-            .when(!has_rows, |d| d.child(div().id("preview-text").debug_selector(|| "preview-text".into()).child(self.preview.clone().unwrap_or_else(|| "Select a session for a read-only snapshot.".into()))))
+            .when(!has_rows, |d| d.child(div().id("preview-text").debug_selector(|| "preview-text".into()).track_focus(focus)
+                .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, window, _| {
+                    this.preview_drag_start = Some(event.position);
+                    this.preview_dragged = false;
+                    this.preview_press = this.selection.clone().filter(|s| this.selection_current(s));
+                    if let Some(focus) = &this.preview_focus { focus.focus(window); }
+                }))
+                .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, _| {
+                    if event.pressed_button == Some(gpui::MouseButton::Left) {
+                        if let Some(start) = this.preview_drag_start {
+                            let dx = f32::from(event.position.x - start.x); let dy = f32::from(event.position.y - start.y);
+                            this.preview_dragged |= dx.abs() + dy.abs() >= DRAG_THRESHOLD_PX;
+                        }
+                    }
+                }))
+                .child(self.preview.clone().unwrap_or_else(|| "Select a session for a read-only snapshot.".into()))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    let dragged = this.preview_dragged;
+                    this.preview_dragged = false;
+                    let press = this.preview_press.take();
+                    let current = this.selection.as_ref();
+                    let current_ok = current.is_some_and(|s| this.selection_current(s));
+                    if preview_click_focus_allowed(press.as_ref(), current, dragged, current_ok) {
+                        if let Some(focus) = &this.input_focus { focus.focus(window); }
+                        cx.notify();
+                    }
+                }))))
     }
 
     /// The keyboard's flat view of the tree, in display order.
@@ -1544,6 +1599,17 @@ fn preview_runs<'a>(row: &'a [terminal::Cell], row_index: usize, selection: Opti
         runs.push((cell, selected, value.to_owned(), if cell.wide { 2 } else { 1 }));
     }
     runs
+}
+
+/// A plain preview click focuses input only when the release is the exact
+/// selection pressed and that selection is still current.
+fn preview_click_focus_allowed(
+    press: Option<&Selection>,
+    current: Option<&Selection>,
+    dragged: bool,
+    current_ok: bool,
+) -> bool {
+    !dragged && press.is_some() && press == current && current_ok
 }
 
 fn preview_drag_available(frame: &terminal::Frame) -> bool {
@@ -2709,6 +2775,8 @@ mod tests {
         cx.simulate_mouse_move(gpui::point(bounds.center().x + px(20.), bounds.center().y), Some(gpui::MouseButton::Left), gpui::Modifiers::none());
         cx.simulate_mouse_up(gpui::point(bounds.center().x + px(20.), bounds.center().y), gpui::MouseButton::Left, gpui::Modifiers::none());
         assert!(cx.read(|app| { let gui = view.read(app); gui.preview_selection.is_none() && gui.terminal.is_none() && gui.input_helper.is_none() }));
+        cx.simulate_keystrokes("x->x");
+        assert_eq!(cx.read(|app| view.read(app).input_text.clone()), "", "a blocked drag must not focus input");
         view.update(cx, |gui, cx| {
             gui.invalidate_preview_selection();
             gui.preview_cells = Some(vec![vec![remuda_core::agent::StyledCell { text: "A".into(), ..Default::default() }; 10]]);
@@ -2790,6 +2858,145 @@ mod tests {
         for col in [2.1, 3.1, 4.1] { cx.simulate_mouse_move(point(col), Some(gpui::MouseButton::Left), gpui::Modifiers::none()); }
         println!("3 at-limit drag events and repaints ({count} runs): {:?}", started.elapsed());
         cx.simulate_mouse_up(point(4.1), gpui::MouseButton::Left, gpui::Modifiers::none());
+    }
+
+    #[gpui::test]
+    fn preview_click_allows_typing_in_selected_peer_line_input(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new(); gui.preview_busy = true;
+            let session = row("one");
+            gui.peers = vec![peer("peer-fingerprint", "Peer")];
+            gui.selected_peer = Some("peer-fingerprint".into());
+            gui.peer_sessions.insert("peer-fingerprint".into(), vec![session.clone()]);
+            gui.remote_sessions = vec![session.clone()]; gui.select_session(session);
+            gui.preview = Some("HELLO".into());
+            gui.preview_cells = Some(vec![vec![remuda_core::agent::StyledCell { text: "A".into(), ..Default::default() }; 10]]);
+            gui
+        });
+        let preview = cx.debug_bounds("preview-grid").unwrap();
+        cx.simulate_click(preview.center(), gpui::Modifiers::none());
+        cx.simulate_keystrokes("p->p");
+        assert_eq!(cx.read(|app| view.read(app).input_text.clone()), "p");
+        assert!(cx.read(|app| { let gui = view.read(app); gui.terminal.is_none() && gui.input_helper.is_none() }));
+        view.update(cx, |gui, cx| { gui.peer_sessions.get_mut("peer-fingerprint").unwrap()[0].instance_id = Some("replacement".into()); cx.notify(); });
+        let preview = cx.debug_bounds("preview-grid").unwrap();
+        cx.simulate_click(preview.center(), gpui::Modifiers::none());
+        cx.simulate_keystrokes("x->x enter");
+        assert!(cx.read(|app| { let gui = view.read(app); gui.input_text == "p" && gui.terminal.is_none() && gui.input_helper.is_none() }), "stale peer must not receive focus or input");
+    }
+
+    #[gpui::test]
+    fn text_only_preview_click_focuses_line_input(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new(); gui.preview_busy = true; gui.sessions = vec![row("one")]; gui.select_session(row("one")); gui.preview = Some("legacy text".into()); gui
+        });
+        cx.update(|window, app| view.read(app).tree_focus.as_ref().unwrap().focus(window));
+        let preview = cx.debug_bounds("preview-text").unwrap(); cx.simulate_click(preview.center(), gpui::Modifiers::none());
+        cx.simulate_keystrokes("p->p");
+        assert!(cx.read(|app| { let gui = view.read(app); gui.input_text == "p" && gui.terminal.is_none() && gui.input_helper.is_none() }));
+    }
+
+    #[test]
+    fn preview_click_requires_the_same_press_and_release_selection() {
+        let one = Selection { peer: None, name: "one".into(), instance: "i1".into() };
+        let two = Selection { peer: None, name: "two".into(), instance: "i2".into() };
+        assert!(preview_click_focus_allowed(Some(&one), Some(&one), false, true));
+        assert!(!preview_click_focus_allowed(Some(&one), Some(&two), false, true), "release on a new target must not focus");
+        assert!(!preview_click_focus_allowed(Some(&one), Some(&one), false, false), "a stale selection must not focus");
+        assert!(!preview_click_focus_allowed(Some(&one), Some(&one), true, true), "a drag must not focus");
+        assert!(!preview_click_focus_allowed(None, Some(&one), false, true), "a release without a press must not focus");
+    }
+
+    #[gpui::test]
+    fn preview_release_after_replacement_does_not_focus_the_new_target(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new(); gui.preview_busy = true;
+            let session = row("one");
+            gui.peers = vec![peer("peer-fingerprint", "Peer")];
+            gui.selected_peer = Some("peer-fingerprint".into());
+            gui.peer_sessions.insert("peer-fingerprint".into(), vec![session.clone()]);
+            gui.remote_sessions = vec![session.clone()];
+            gui.select_session(session);
+            gui.preview = Some("HELLO".into());
+            gui.preview_cells = Some(vec![vec![remuda_core::agent::StyledCell { text: "A".into(), ..Default::default() }; 10]]);
+            gui
+        });
+        let preview = cx.debug_bounds("preview-grid").unwrap();
+        cx.simulate_mouse_down(preview.center(), gpui::MouseButton::Left, gpui::Modifiers::none());
+        view.update(cx, |gui, cx| {
+            gui.peer_sessions.get_mut("peer-fingerprint").unwrap()[0].instance_id = Some("replacement".into());
+            cx.notify();
+        });
+        cx.simulate_mouse_up(preview.center(), gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_keystrokes("x->x");
+        assert!(cx.read(|app| view.read(app).input_text.is_empty()), "a replaced peer must not receive the release focus");
+    }
+
+    #[gpui::test]
+    fn preview_release_after_peer_revocation_does_not_focus_input(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new(); gui.preview_busy = true;
+            let session = row("one");
+            gui.peers = vec![peer("peer-fingerprint", "Peer")];
+            gui.selected_peer = Some("peer-fingerprint".into());
+            gui.peer_sessions.insert("peer-fingerprint".into(), vec![session.clone()]);
+            gui.remote_sessions = vec![session.clone()];
+            gui.select_session(session);
+            gui.preview = Some("HELLO".into());
+            gui.preview_cells = Some(vec![vec![remuda_core::agent::StyledCell { text: "A".into(), ..Default::default() }; 10]]);
+            gui
+        });
+        let preview = cx.debug_bounds("preview-grid").unwrap();
+        cx.simulate_mouse_down(preview.center(), gpui::MouseButton::Left, gpui::Modifiers::none());
+        view.update(cx, |gui, cx| { gui.peers[0].admitted = false; cx.notify(); });
+        cx.simulate_mouse_up(preview.center(), gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_keystrokes("x->x");
+        assert!(cx.read(|app| view.read(app).input_text.is_empty()), "a revoked peer must not receive the release focus");
+    }
+
+    #[gpui::test]
+    fn text_preview_release_after_replacement_does_not_focus_the_new_target(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new(); gui.preview_busy = true; gui.sessions = vec![row("one")]; gui.select_session(row("one")); gui.preview = Some("legacy text".into()); gui
+        });
+        cx.update(|window, app| view.read(app).tree_focus.as_ref().unwrap().focus(window));
+        let preview = cx.debug_bounds("preview-text").unwrap();
+        cx.simulate_mouse_down(preview.center(), gpui::MouseButton::Left, gpui::Modifiers::none());
+        view.update(cx, |gui, cx| { gui.sessions[0].instance_id = Some("replacement".into()); cx.notify(); });
+        cx.simulate_mouse_up(preview.center(), gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_keystrokes("x->x");
+        assert!(cx.read(|app| view.read(app).input_text.is_empty()), "a replaced local session must not receive the release focus");
+    }
+
+    #[gpui::test]
+    fn text_preview_drag_does_not_focus_input(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new(); gui.preview_busy = true; gui.sessions = vec![row("one")]; gui.select_session(row("one")); gui.preview = Some("legacy text".into()); gui
+        });
+        cx.update(|window, app| view.read(app).tree_focus.as_ref().unwrap().focus(window));
+        let preview = cx.debug_bounds("preview-text").unwrap();
+        cx.simulate_mouse_down(preview.center(), gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(gpui::point(preview.center().x + px(20.), preview.center().y), Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        cx.simulate_mouse_up(gpui::point(preview.center().x + px(20.), preview.center().y), gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_keystrokes("x->x");
+        assert!(cx.read(|app| view.read(app).input_text.is_empty()), "a text-preview drag must not focus input");
+    }
+
+    #[gpui::test]
+    fn text_preview_drag_takes_focus_from_line_input_and_does_not_type(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new(); gui.preview_busy = true; gui.sessions = vec![row("one")]; gui.select_session(row("one")); gui.preview = Some("legacy text".into()); gui
+        });
+        cx.update(|window, app| view.read(app).input_focus.as_ref().unwrap().focus(window));
+        assert!(cx.update(|window, app| view.read(app).input_focus.as_ref().is_some_and(|f| f.is_focused(window))));
+        let preview = cx.debug_bounds("preview-text").unwrap();
+        cx.simulate_mouse_down(preview.center(), gpui::MouseButton::Left, gpui::Modifiers::none());
+        assert!(cx.update(|window, app| view.read(app).preview_focus.as_ref().is_some_and(|f| f.is_focused(window))), "text preview mouse-down must focus its preview handle");
+        cx.simulate_mouse_move(gpui::point(preview.center().x + px(20.), preview.center().y), Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        cx.simulate_mouse_up(gpui::point(preview.center().x + px(20.), preview.center().y), gpui::MouseButton::Left, gpui::Modifiers::none());
+        assert!(cx.update(|window, app| !view.read(app).input_focus.as_ref().is_some_and(|f| f.is_focused(window))), "a text drag must move focus off the input");
+        cx.simulate_keystrokes("x->x");
+        assert!(cx.read(|app| view.read(app).input_text.is_empty()), "a text drag must not type into the previously focused input");
     }
 
     #[gpui::test]
@@ -3256,8 +3463,9 @@ mod tests {
         cx.simulate_keystrokes("cmd-c");
         assert_eq!(cx.read(|app| app.read_from_clipboard().and_then(|item| item.text())).as_deref(), Some("REMOTE"));
         assert!(cx.read(|app| { let gui = view.read(app); gui.terminal.is_none() && gui.input_helper.is_none() }));
-        let field = cx.debug_bounds("line-input").unwrap();
-        cx.simulate_click(field.center(), gpui::Modifiers::none());
+        let screen = cx.debug_bounds("preview-grid").unwrap();
+        cx.simulate_click(screen.center(), gpui::Modifiers::none());
+        assert!(cx.update(|window, app| view.read(app).input_focus.as_ref().is_some_and(|f| f.is_focused(window))), "clicking preview must focus current peer input");
         cx.simulate_keystrokes("p->p r->r o->o o->o f->f enter");
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
