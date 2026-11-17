@@ -41,6 +41,12 @@ still acceptable, with or without the sidecar.
     combining marks, joiners and variation selectors are ordinary text). When
     that fails, `validate_for_display` returns the same validated entries and
     sessions with `semantics()` empty. Rendered rows are never lost.
+  - **Liveness — drop the sidecar only.** `semantics_consistent` compares each
+    state with the authoritative `SessionSummary.alive` for the same
+    `(name, instance_id)`: an exited session may only claim `exited`, and a
+    live session may claim anything but `exited`. A peer that claims activity
+    for a dead instance (or death for a live one) loses the sidecar, never the
+    rows. State is display-only and is never identity or authorization.
 - `safe_line` and `valid_detail` share `plain_text_char`, so the sidecar can
   never be stricter than the row it accompanies.
 
@@ -51,10 +57,13 @@ with the already-computed `depth`, `state` and `detail`.
 
 `native/src/image.rs`: `render_session_view` reads the optional table, rejects
 an unknown state or out-of-range depth, and validates the view as before.
-`serialize_bounded_view` keeps the 32 KiB wire cap and the same fail-closed
-result for rows that are themselves too large, but if only the sidecar pushes
-the serialized view over the cap, it re-serializes the validated rows without
-the sidecar. The cap and the existing protocol limits are unchanged.
+`serialize_bounded_view` measures the exact peer body: the daemon wraps the view
+in `Response::RenderedSessionList` and appends a newline, and a remote peer
+rejects that plaintext above 32768 bytes (`view_wire_len`). If the sidecar (or
+its liveness contradiction) is the only reason the body is too large, the
+validated rows are re-serialized without it; a body whose rows alone exceed
+32768 still fails with `session view too large`. The cap and the existing
+protocol limits are unchanged.
 
 ## Actual
 
@@ -73,6 +82,8 @@ Tests added but not yet run:
     ZWJ family, variation selector)
   - `unrepresentable_detail_drops_only_the_sidecar` (C0 control and bidi mark:
     rows and entries preserved, `semantics()` empty)
+  - `semantics_state_must_agree_with_authoritative_liveness` (dead+working and
+    live+exited drop the sidecar; dead+exited and live+idle keep it)
   - `mismatched_binding_still_fails_closed_with_a_bad_detail`
   - `view_without_semantics_still_validates_and_reports_none`
 - `native/src/image.rs`
@@ -80,10 +91,16 @@ Tests added but not yet run:
     renderer through `render_session_view`: reordered depth 1, `blocked` from
     decorator activity, `alive` with no detail, `exited` outranking activity.
   - `session_view_json_without_semantics_decodes_for_older_peers`
-  - `sidecar_is_dropped_when_it_alone_overflows_the_wire_cap` (70 rows: rows
-    fit, rows+sidecar do not; decoded result keeps all rows and no sidecar)
+  - `sidecar_is_dropped_when_it_alone_overflows_the_wire_cap` (70 rows: the
+    wrapped body fits without the sidecar and not with it; decoded result keeps
+    all rows and no sidecar)
   - `view_whose_rows_alone_overflow_the_wire_cap_still_fails` (unchanged
     `session view too large`)
+  - `view_wire_len_counts_the_wrapped_response_and_newline` (equality with
+    `serde_json::to_vec(Response::RenderedSessionList)` plus the newline, and
+    strictly larger than the inner view)
+  - `sidecar_contradicting_summary_liveness_is_dropped` (small view, so size is
+    not the cause)
 
 Acceptance at the slot: those eight tests, the existing
 `session_view_contract` suite, `native` document/TUI tests that render the

@@ -15,9 +15,9 @@ pub struct ViewEntry {
     pub lines: Vec<String>,
 }
 
-/// A structured, instance-bound row semantic emitted by the same renderer that
-/// produced `ViewEntry::lines`. Consumers that cannot paint ANSI text (the GUI)
-/// use this instead of reverse-parsing the rendered row.
+/// A display-only, instance-bound row semantic from the renderer that produced
+/// `ViewEntry::lines`. Liveness is authoritative in `SessionSummary.alive`; this
+/// state never identifies or authorizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ViewState {
@@ -58,6 +58,8 @@ pub struct ViewSemantics {
     pub instance_id: String,
     #[serde(default)]
     pub depth: u8,
+    /// Advisory activity for display. It must agree with `SessionSummary.alive`
+    /// or the whole sidecar is dropped; it never identifies or authorizes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<ViewState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,6 +147,27 @@ impl SessionView {
             .all(|semantic| semantic.detail.as_deref().is_none_or(valid_detail))
     }
 
+    /// True when no state contradicts `SessionSummary.alive` for its instance:
+    /// exited only for dead sessions, never `exited` for live ones. A mismatch
+    /// drops the sidecar; the validated rendered rows remain.
+    pub fn semantics_consistent(&self) -> bool {
+        self.semantics.iter().all(|semantic| {
+            let alive = self
+                .sessions
+                .iter()
+                .find(|session| {
+                    session.name == semantic.name
+                        && session.instance_id.as_deref() == Some(semantic.instance_id.as_str())
+                })
+                .map(|session| session.alive);
+            match (alive, semantic.state) {
+                (Some(true), Some(ViewState::Exited)) => false,
+                (Some(false), Some(state)) => state == ViewState::Exited,
+                _ => true,
+            }
+        })
+    }
+
     /// Raw, untrusted rows exactly as received. Validate before display.
     pub fn entries(&self) -> &[ViewEntry] {
         &self.entries
@@ -196,7 +219,7 @@ impl SessionView {
         Ok(ValidatedView {
             sessions,
             entries,
-            semantics: if self.semantics_representable() {
+            semantics: if self.semantics_representable() && self.semantics_consistent() {
                 self.semantics.clone()
             } else {
                 Vec::new()

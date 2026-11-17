@@ -1264,23 +1264,29 @@ fn render_session_view(
     serialize_bounded_view(view)
 }
 
-/// Serialize a validated view within the wire cap. The optional semantic
-/// sidecar is dropped rather than failing an otherwise acceptable view, and a
-/// view whose rendered rows alone exceed the cap still fails as before.
+/// Exact peer body size: the view in `Response::RenderedSessionList` plus the
+/// daemon's trailing newline. The remote view cap applies to that plaintext,
+/// not to the inner view.
+fn view_wire_len(view: &remuda_core::session_view::SessionView) -> Result<usize, String> {
+    let response = remuda_core::protocol::Response::RenderedSessionList(view.clone());
+    let body = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
+    Ok(body.len() + 1)
+}
+
+/// Serialize within the peer's view-body cap. A sidecar that cannot be shown
+/// (text, liveness, or size) is dropped instead of failing the view; rows that
+/// alone exceed the cap still fail as before.
 fn serialize_bounded_view(view: remuda_core::session_view::SessionView) -> Result<String, String> {
-    if view.semantics_representable() {
-        let result = serde_json::to_string(&view).map_err(|error| error.to_string())?;
-        if result.len() <= 32768 {
-            return Ok(result);
-        }
+    let sidecar_ok = view.semantics_representable() && view.semantics_consistent();
+    if sidecar_ok && view_wire_len(&view)? <= 32768 {
+        return serde_json::to_string(&view).map_err(|error| error.to_string());
     }
     let rows = view.without_semantics();
     rows.validate().map_err(str::to_owned)?;
-    let result = serde_json::to_string(&rows).map_err(|error| error.to_string())?;
-    if result.len() > 32768 {
+    if view_wire_len(&rows)? > 32768 {
         return Err("session view too large".into());
     }
-    Ok(result)
+    serde_json::to_string(&rows).map_err(|error| error.to_string())
 }
 
 /// Evaluate one chunk, expression-first: `return <code>` is tried before plain
@@ -1743,9 +1749,9 @@ mod tests {
             });
         }
         let rows = SessionView::new(sessions.clone(), 3, entries.clone());
-        assert!(serde_json::to_string(&rows).unwrap().len() < 32768);
+        assert!(super::view_wire_len(&rows).unwrap() < 32768);
         let with_sidecar = SessionView::new(sessions, 3, entries).with_semantics(semantics);
-        assert!(serde_json::to_string(&with_sidecar).unwrap().len() > 32768);
+        assert!(super::view_wire_len(&with_sidecar).unwrap() > 32768);
         let json = super::serialize_bounded_view(with_sidecar).unwrap();
         let decoded: SessionView = serde_json::from_str(&json).unwrap();
         let checked = decoded.validate_for_display(None, 80).unwrap();
@@ -1770,11 +1776,67 @@ mod tests {
             });
         }
         let view = SessionView::new(sessions, 3, entries);
-        assert!(serde_json::to_string(&view).unwrap().len() > 32768);
+        assert!(super::view_wire_len(&view).unwrap() > 32768);
         assert_eq!(
             super::serialize_bounded_view(view).unwrap_err(),
             "session view too large"
         );
+    }
+
+    #[test]
+    fn view_wire_len_counts_the_wrapped_response_and_newline() {
+        use remuda_core::session_view::{SessionView, ViewEntry};
+        let view = SessionView::new(
+            vec![summary("lead", "lead-1", true)],
+            1,
+            vec![ViewEntry {
+                name: "lead".into(),
+                instance_id: "lead-1".into(),
+                lines: vec!["lead".into()],
+            }],
+        );
+        let inner = serde_json::to_string(&view).unwrap().len();
+        let body = serde_json::to_vec(&remuda_core::protocol::Response::RenderedSessionList(
+            view.clone(),
+        ))
+        .unwrap();
+        assert_eq!(super::view_wire_len(&view).unwrap(), body.len() + 1);
+        assert!(super::view_wire_len(&view).unwrap() > inner);
+    }
+
+    #[test]
+    fn sidecar_contradicting_summary_liveness_is_dropped() {
+        use remuda_core::session_view::{SessionView, ViewEntry, ViewSemantics, ViewState};
+        for (alive, state) in [(false, ViewState::Working), (true, ViewState::Exited)] {
+            let name = "gone";
+            let instance = "gone-1";
+            let view = SessionView::new(
+                vec![summary(name, instance, alive)],
+                1,
+                vec![ViewEntry {
+                    name: name.into(),
+                    instance_id: instance.into(),
+                    lines: vec![name.into()],
+                }],
+            )
+            .with_semantics(vec![ViewSemantics {
+                name: name.into(),
+                instance_id: instance.into(),
+                depth: 0,
+                state: Some(state),
+                detail: None,
+            }]);
+            assert!(super::view_wire_len(&view).unwrap() < 32768);
+            assert!(!view.semantics_consistent());
+            let json = super::serialize_bounded_view(view).unwrap();
+            let decoded: SessionView = serde_json::from_str(&json).unwrap();
+            assert!(decoded
+                .validate_for_display(None, 80)
+                .unwrap()
+                .semantics()
+                .is_empty());
+            assert_eq!(decoded.entries().len(), 1);
+        }
     }
 
     #[test]

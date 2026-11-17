@@ -22,6 +22,11 @@ fn session(name: &str, instance: &str) -> SessionSummary {
         team: None,
     }
 }
+fn dead_session(name: &str, instance: &str) -> SessionSummary {
+    let mut summary = session(name, instance);
+    summary.alive = false;
+    summary
+}
 fn entry(name: &str, instance: &str, line: &str) -> ViewEntry {
     ViewEntry {
         name: name.into(),
@@ -124,6 +129,54 @@ fn unrepresentable_detail_drops_only_the_sidecar() {
         assert!(checked.semantics().is_empty());
         assert_eq!(checked.entries().len(), 1);
         assert_eq!(checked.entries()[0].lines, vec!["one".to_string()]);
+    }
+}
+
+#[test]
+fn semantics_state_must_agree_with_authoritative_liveness() {
+    // An untrusted peer cannot claim activity for an exited instance: the
+    // authoritative liveness is `SessionSummary.alive`, so the sidecar is
+    // dropped and the validated rows survive.
+    let view = SessionView::new(
+        vec![dead_session("gone", "a")],
+        1,
+        vec![entry("gone", "a", "gone")],
+    )
+    .with_semantics(vec![semantics("gone", "a", 0, ViewState::Working, None)]);
+    assert!(view.validate().is_ok());
+    let checked = view.validate_for_display(None, 80).unwrap();
+    assert!(checked.semantics().is_empty());
+    assert_eq!(checked.entries().len(), 1);
+
+    // Nor exit for a live one.
+    let view = SessionView::new(
+        vec![session("live", "a")],
+        1,
+        vec![entry("live", "a", "live")],
+    )
+    .with_semantics(vec![semantics("live", "a", 0, ViewState::Exited, None)]);
+    assert!(view
+        .validate_for_display(None, 80)
+        .unwrap()
+        .semantics()
+        .is_empty());
+
+    // Agreement keeps it.
+    for (summary, state) in [
+        (dead_session("gone", "a"), ViewState::Exited),
+        (session("live", "a"), ViewState::Idle),
+    ] {
+        let name = summary.name.clone();
+        let instance = summary.instance_id.clone().unwrap();
+        let view = SessionView::new(vec![summary], 1, vec![entry(&name, &instance, &name)])
+            .with_semantics(vec![semantics(&name, &instance, 0, state, None)]);
+        assert_eq!(
+            view.validate_for_display(None, 80)
+                .unwrap()
+                .semantics()
+                .len(),
+            1
+        );
     }
 }
 
