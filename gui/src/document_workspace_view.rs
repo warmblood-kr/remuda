@@ -1495,6 +1495,65 @@ mod tests {
     }
 
     #[gpui::test]
+    fn navigation_in_one_tab_keeps_the_other_tabs_image(cx: &mut gpui::TestAppContext) {
+        let _guard = DAEMON_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let bin = remuda_bin();
+        let daemon = Daemon::start(&bin);
+        for path in ["a.png", "b.png", "c.png"] {
+            daemon.put(&bin, path, &png_bytes(1000, 1000));
+        }
+        let budget = std::sync::Arc::new(ImageBudget::with_limits(8 * 1024 * 1024, 4));
+        let socket = daemon.socket();
+        let budget_for_view = budget.clone();
+        let (view, cx) = cx.add_window_view(|_, cx| TestHost {
+            rich_selections: Default::default(),
+            documents: Some(Workspace::with_budget(socket, budget_for_view)),
+            focus: cx.focus_handle(),
+        });
+        view.update(cx, |host, cx| {
+            host.documents.as_mut().unwrap().open_in_active("a.png");
+            cx.notify();
+        });
+        settle(&view, cx);
+        wait_for_image(&view, cx, "a.png");
+        view.update(cx, |host, cx| {
+            host.documents.as_mut().unwrap().open_in_new_tab("b.png");
+            cx.notify();
+        });
+        settle(&view, cx);
+        wait_for_image(&view, cx, "b.png");
+        view.update(cx, |host, cx| {
+            let workspace = host.documents.as_mut().unwrap();
+            workspace.activate(0);
+            workspace.open_in_active("c.png");
+            cx.notify();
+        });
+        settle(&view, cx);
+        wait_for_image(&view, cx, "c.png");
+        let (usage, first_ready, second_ready, first_has_a) = cx.read(|app| {
+            let workspace = view.read(app).documents.as_ref().unwrap();
+            (
+                workspace.image_budget().usage(),
+                matches!(
+                    workspace.tabs()[0].image("c.png"),
+                    Some(ImageState::Ready { .. })
+                ),
+                matches!(
+                    workspace.tabs()[1].image("b.png"),
+                    Some(ImageState::Ready { .. })
+                ),
+                workspace.tabs()[0].image("a.png").is_some(),
+            )
+        });
+        assert!(usage.0 <= 8 * 1024 * 1024, "{usage:?}");
+        assert!(!first_has_a, "the active tab kept its old image");
+        assert!(first_ready, "the active tab did not load its new image");
+        assert!(second_ready, "navigation in the active tab released the other tab's image");
+    }
+
+    #[gpui::test]
     fn navigating_after_the_pane_image_cap_reopens_the_new_image(cx: &mut gpui::TestAppContext) {
         let _guard = DAEMON_TEST_LOCK
             .lock()

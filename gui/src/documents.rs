@@ -58,6 +58,7 @@ const MAX_CONCURRENT_IMAGE_LOADS: usize = 2;
 struct BudgetState {
     bytes: usize,
     entries: usize,
+    stale_flights: usize,
 }
 
 /// A workspace-wide admission budget for decoded images. Entries are reserved
@@ -104,6 +105,12 @@ impl ImageBudget {
         true
     }
 
+    /// Whether `bytes` would fit once the current stale reservations drain.
+    fn could_reserve(&self, bytes: usize) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.bytes.saturating_add(bytes) <= self.max_bytes
+    }
+
     fn release(&self, bytes: usize, entries: usize) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.bytes = state.bytes.saturating_sub(bytes);
@@ -114,6 +121,23 @@ impl ImageBudget {
         self.decode
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn mark_stale(&self, count: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.stale_flights = state.stale_flights.saturating_add(count);
+    }
+
+    fn clear_stale(&self, count: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.stale_flights = state.stale_flights.saturating_sub(count);
+    }
+
+    fn stale_flights(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .stale_flights
     }
 
     /// `(decoded bytes, entries)` currently reserved. Test/diagnostic evidence.
@@ -142,8 +166,20 @@ pub enum ImageState {
     Failed(String),
 }
 
-type DecodedResult = Result<(media::Decoded, ImageReservation), String>;
-type ImageFlight = (u64, String, mpsc::Receiver<DecodedResult>);
+enum ImageLoadResult {
+    Ready(media::Decoded, ImageReservation),
+    Retry { bytes: usize },
+    Failed(String),
+}
+
+type DecodedResult = ImageLoadResult;
+
+struct ImageFlight {
+    revision: u64,
+    path: String,
+    receiver: mpsc::Receiver<DecodedResult>,
+    stale: bool,
+}
 
 /// Holds decoded bytes against the workspace budget until the state is dropped.
 struct ImageReservation {
@@ -172,6 +208,7 @@ pub struct Pane {
     image_revision: u64,
     image_limit: Option<ImageLimit>,
     image_scan: Option<String>,
+    image_retries: std::collections::HashSet<String>,
 }
 
 impl Pane {
@@ -198,6 +235,7 @@ impl Pane {
             image_revision: 0,
             image_limit: None,
             image_scan: None,
+            image_retries: std::collections::HashSet::new(),
         }
     }
 
@@ -245,25 +283,28 @@ impl Pane {
 
     fn poll_images(&mut self) {
         let mut results = Vec::new();
-        for (index, (revision, path, receiver)) in self.image_flights.iter().enumerate() {
-            match receiver.try_recv() {
-                Ok(result) => results.push((index, *revision, path.clone(), result)),
+        for (index, flight) in self.image_flights.iter().enumerate() {
+            match flight.receiver.try_recv() {
+                Ok(result) => results.push((index, flight.revision, flight.path.clone(), result)),
                 Err(mpsc::TryRecvError::Disconnected) => results.push((
                     index,
-                    *revision,
-                    path.clone(),
-                    Err("image worker stopped".into()),
+                    flight.revision,
+                    flight.path.clone(),
+                    ImageLoadResult::Failed("image worker stopped".into()),
                 )),
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
         for (index, revision, path, result) in results.into_iter().rev() {
-            self.image_flights.remove(index);
+            let flight = self.image_flights.remove(index);
+            if flight.stale {
+                self.budget.clear_stale(1);
+            }
             if revision != self.image_revision {
                 continue;
             }
             let state = match result {
-                Ok((decoded, reservation)) => match media::render_image(decoded) {
+                ImageLoadResult::Ready(decoded, reservation) => match media::render_image(decoded) {
                     Some((image, width, height)) => {
                         self.reservations.insert(path.clone(), reservation);
                         ImageState::Ready {
@@ -274,8 +315,36 @@ impl Pane {
                     }
                     None => ImageState::Failed("image could not be uploaded".into()),
                 },
-                Err(error) => ImageState::Failed(error),
+                ImageLoadResult::Retry { bytes } => {
+                    // `bytes == 0` means the worker exited before decoding, so
+                    // this is a scheduling retry, not a memory refusal. It
+                    // must not consume the one transient memory retry.
+                    if bytes == 0 {
+                        self.image_queue.push_back(path.clone());
+                        continue;
+                    }
+                    // While a stale reservation exists, the refusal is
+                    // temporary; pump stays gated, so requeueing here is a
+                    // state transition, not a busy loop. It may happen again
+                    // if another tab becomes stale during a later attempt.
+                    if self.budget.stale_flights() > 0 {
+                        self.image_queue.push_back(path.clone());
+                        continue;
+                    }
+                    // No stale reservation: retry once only if memory is free
+                    // now. Otherwise this is a persistent cap and the exact
+                    // 128 MiB failure is final for this document.
+                    if self.image_retries.insert(path.clone()) && self.budget.could_reserve(bytes) {
+                        self.image_queue.push_back(path.clone());
+                        continue;
+                    }
+                    ImageState::Failed(ImageLimit::WorkspaceBytes.message())
+                }
+                ImageLoadResult::Failed(error) => ImageState::Failed(error),
             };
+            if let ImageState::Ready { .. } = &state {
+                self.image_retries.remove(&path);
+            }
             self.images.insert(path, state);
         }
         self.pump_images();
@@ -338,6 +407,17 @@ impl Pane {
     }
 
     fn pump_images(&mut self) {
+        // A stale worker may still reserve decoded bytes before its result is
+        // polled. Do not start a new decode beside it: that can make the new
+        // image fail on a budget the stale reservation is about to return.
+        if self
+            .image_flights
+            .iter()
+            .any(|flight| flight.revision != self.image_revision)
+            || self.budget.stale_flights() > 0
+        {
+            return;
+        }
         while self.image_flights.len() < MAX_CONCURRENT_IMAGE_LOADS {
             let Some(path) = self.image_queue.pop_front() else {
                 return;
@@ -355,35 +435,26 @@ impl Pane {
         let worker = std::thread::Builder::new()
             .name("vfs-image".into())
             .spawn(move || {
-                let _guard = budget.decode_guard();
-                let result = remuda_native::documents::read_media(
-                    &socket,
-                    &worker_path,
-                    media::MAX_MEDIA_BYTES,
+                Self::run_image_worker(
+                    budget,
+                    || {
+                        remuda_native::documents::read_media(
+                            &socket,
+                            &worker_path,
+                            media::MAX_MEDIA_BYTES,
+                        )
+                        .and_then(|bytes| media::decode(&bytes))
+                    },
+                    sender,
                 )
-                .and_then(|bytes| media::decode(&bytes));
-                match result {
-                    Ok(decoded) => {
-                        let bytes = (decoded.width as usize)
-                            .saturating_mul(decoded.height as usize)
-                            .saturating_mul(4);
-                        if !budget.reserve_bytes(bytes) {
-                            let _ = sender.send(Err(ImageLimit::WorkspaceBytes.message()));
-                        } else {
-                            let reservation = ImageReservation {
-                                budget: budget.clone(),
-                                bytes,
-                            };
-                            let _ = sender.send(Ok((decoded, reservation)));
-                        }
-                    }
-                    Err(error) => {
-                        let _ = sender.send(Err(error));
-                    }
-                }
             });
         match worker {
-            Ok(_) => self.image_flights.push((revision, path, receiver)),
+            Ok(_) => self.image_flights.push(ImageFlight {
+                revision,
+                path,
+                receiver,
+                stale: false,
+            }),
             Err(error) => {
                 self.images.insert(
                     path,
@@ -393,14 +464,73 @@ impl Pane {
         }
     }
 
+    /// Run one image read/decode and decide whether its memory may be kept.
+    /// The decode lock covers the read, the reservation decision and the
+    /// result send, so a closed pane drops its buffered reservation before
+    /// another worker can decode or reserve. The send is non-blocking (one
+    /// result per one-slot channel); nothing waits for another tab's stale
+    /// reservation while holding the lock.
+    fn run_image_worker(
+        budget: Arc<ImageBudget>,
+        read: impl FnOnce() -> Result<media::Decoded, String>,
+        sender: mpsc::SyncSender<ImageLoadResult>,
+    ) {
+        // A stale reservation has not been polled yet. Decode nothing: the
+        // image will be requeued once that reservation drains, which also
+        // keeps a released large image from spending decode time.
+        if budget.stale_flights() > 0 {
+            let _ = sender.send(ImageLoadResult::Retry { bytes: 0 });
+            return;
+        }
+        // Keep the one-decoded-buffer peak and close the closed-pane race: the
+        // read, the reservation decision, dropping a refused buffer and the
+        // send all happen under the decode lock. The send cannot block (one
+        // result fits the one-slot channel), so this still never waits for
+        // another tab's stale reservation.
+        {
+            let _guard = budget.decode_guard();
+            let result = match read() {
+                Ok(decoded) => {
+                    let bytes = (decoded.width as usize)
+                        .saturating_mul(decoded.height as usize)
+                        .saturating_mul(4);
+                    if budget.reserve_bytes(bytes) {
+                        let reservation = ImageReservation {
+                            budget: budget.clone(),
+                            bytes,
+                        };
+                        ImageLoadResult::Ready(decoded, reservation)
+                    } else {
+                        // `decoded` is dropped here, still under the lock, so a
+                        // refused buffer cannot overlap the next decode.
+                        ImageLoadResult::Retry { bytes }
+                    }
+                }
+                Err(error) => ImageLoadResult::Failed(error),
+            };
+            // If the pane closed and dropped the receiver, the failed send
+            // drops a Ready reservation here, still under the decode lock.
+            let _ = sender.send(result);
+        }
+    }
+
     /// Drop cached image state and ignore results from older reads. Called by an
     /// explicit refresh so a changed file cannot keep its old pixels.
     fn release_images(&mut self) {
+        let mut newly_stale = 0;
+        for flight in &mut self.image_flights {
+            if flight.revision == self.image_revision && !flight.stale {
+                flight.stale = true;
+                newly_stale += 1;
+            }
+        }
+        self.budget.mark_stale(newly_stale);
         self.budget.release(0, self.images.len());
         self.images.clear();
         self.reservations.clear();
         self.image_queue.clear();
         self.image_limit = None;
+        self.image_retries.clear();
         self.image_revision = self.image_revision.wrapping_add(1);
         self.image_scan = None;
     }
@@ -452,8 +582,11 @@ impl Pane {
         match &self.browser.page.error {
             Some(error) if error.contains("binary") || error.contains("not UTF-8 text") => {
                 format!(
-                    "UNSUPPORTED · {error} — this pane reads text, Markdown and HTML; \
-                 image preview is not implemented"
+                    "UNSUPPORTED · {error} — this pane reads text, Markdown and HTML, \
+                 plus PNG/JPEG within the {} MiB, {} px and {} pixel limits",
+                    media::MAX_MEDIA_BYTES / (1024 * 1024),
+                    media::MAX_DIMENSION,
+                    media::MAX_PIXELS
                 )
             }
             Some(error) => format!("ERROR · {error}"),
@@ -487,9 +620,12 @@ impl Pane {
     }
 
     pub fn open_selected(&mut self) {
+        let generation = self.browser.generation();
         self.invalidate_selection();
-        self.release_images();
         self.browser.open_selected();
+        if self.browser.generation() != generation {
+            self.release_images();
+        }
     }
 
     pub fn select_link(&mut self, next: bool) {
@@ -497,33 +633,42 @@ impl Pane {
     }
 
     pub fn back(&mut self) -> bool {
-        let changed = self.browser.back();
-        if changed {
+        let (root, moved) = self.browser.back_with_move();
+        if moved {
             self.invalidate_selection();
             self.release_images();
         }
-        changed
+        root
     }
 
     pub fn refresh(&mut self) {
+        let generation = self.browser.generation();
         self.invalidate_selection();
-        self.release_images();
         self.browser.refresh();
+        if self.browser.generation() != generation {
+            self.release_images();
+        }
     }
 
     /// Open one local VFS document by address (`docs/guide.md`).
     pub fn open_document(&mut self, path: &str) {
+        let generation = self.browser.generation();
         self.invalidate_selection();
-        self.release_images();
         self.browser.navigate(Location::Document(path.to_owned()));
+        if self.browser.generation() != generation {
+            self.release_images();
+        }
     }
 
     /// Follow a resolved VFS link. A trailing slash means directory.
     pub fn open_path(&mut self, path: &str) {
         if path.is_empty() || path.ends_with('/') {
+            let generation = self.browser.generation();
             self.invalidate_selection();
-            self.release_images();
             self.browser.navigate(Location::Directory(path.to_owned()));
+            if self.browser.generation() != generation {
+                self.release_images();
+            }
         } else {
             self.open_document(path);
         }
@@ -608,7 +753,14 @@ impl Pane {
 
 impl Drop for Pane {
     fn drop(&mut self) {
+        let stale = self.image_flights.iter().filter(|flight| flight.stale).count();
+        // Drop receivers and buffered results while the stale count still
+        // gates other panes. Any reservation in a channel is released before
+        // another worker can see stale == 0 and fail against those bytes.
+        self.image_flights.clear();
+        self.reservations.clear();
         self.budget.release(0, self.images.len());
+        self.budget.clear_stale(stale);
     }
 }
 
@@ -874,6 +1026,383 @@ mod polling_tests {
     }
 
     #[test]
+    fn no_op_navigation_and_cancelled_address_keep_the_current_images() {
+        let budget = Arc::new(ImageBudget::with_limits(4096, 4));
+        let mut pane =
+            Pane::new_with_budget(PathBuf::from("/nonexistent-vfs.sock"), budget.clone());
+        assert!(budget.reserve_entry());
+        pane.images.insert(
+            "old.png".into(),
+            ImageState::Failed("old failure".into()),
+        );
+        pane.image_limit = Some(ImageLimit::PaneEntries);
+        pane.open_document("../invalid");
+        assert_eq!(pane.image_entry_count(), 1);
+        assert_eq!(budget.usage(), (0, 1));
+        assert!(pane.image_limited());
+        pane.browser.loading = true;
+        pane.open_selected();
+        assert_eq!(pane.image_entry_count(), 1);
+        pane.browser.inspect_address();
+        pane.refresh();
+        assert_eq!(pane.image_entry_count(), 1);
+        let _ = pane.back();
+        assert_eq!(pane.image_entry_count(), 1);
+        assert_eq!(budget.usage(), (0, 1));
+        pane.cancel();
+    }
+
+    #[test]
+    fn history_back_releases_the_previous_document_images() {
+        let budget = Arc::new(ImageBudget::with_limits(4096, 4));
+        let mut pane =
+            Pane::new_with_budget(PathBuf::from("/nonexistent-vfs.sock"), budget.clone());
+        pane.open_document("a.png");
+        pane.open_document("b.png");
+        assert!(budget.reserve_entry());
+        pane.images.insert(
+            "b.png".into(),
+            ImageState::Failed("old failure".into()),
+        );
+        assert!(!pane.back(), "back should restore history without leaving the root");
+        assert_eq!(pane.image_entry_count(), 0);
+        assert_eq!(budget.usage(), (0, 0));
+        pane.cancel();
+    }
+
+    #[test]
+    fn stale_flight_blocks_new_decode_until_it_is_polled() {
+        let budget = Arc::new(ImageBudget::with_limits(4096, 4));
+        let mut pane =
+            Pane::new_with_budget(PathBuf::from("/nonexistent-vfs.sock"), budget.clone());
+        pane.cancel();
+        pane.image_revision = 7;
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        pane.image_flights.push(ImageFlight {
+            revision: 6,
+            path: "stale.png".into(),
+            receiver,
+            stale: false,
+        });
+        pane.image_queue.push_back("new.png".into());
+        pane.pump_images();
+        assert_eq!(pane.image_queue.len(), 1, "new decode started beside a stale flight");
+        assert_eq!(pane.image_flights.len(), 1);
+        pane.image_flights.clear();
+        pane.pump_images();
+        assert!(pane.image_queue.is_empty());
+        pane.cancel();
+    }
+
+    #[test]
+    fn stale_flight_in_one_tab_blocks_decodes_in_another_tab() {
+        let budget = Arc::new(ImageBudget::with_limits(4096, 4));
+        let mut first =
+            Pane::new_with_budget(PathBuf::from("/nonexistent-vfs.sock"), budget.clone());
+        let mut second =
+            Pane::new_with_budget(PathBuf::from("/nonexistent-vfs.sock"), budget.clone());
+        first.cancel();
+        second.cancel();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        first.image_flights.push(ImageFlight {
+            revision: first.image_revision,
+            path: "old.png".into(),
+            receiver,
+            stale: false,
+        });
+        first.release_images();
+        assert_eq!(budget.stale_flights(), 1);
+        second.image_queue.push_back("new.png".into());
+        second.pump_images();
+        assert_eq!(second.image_queue.len(), 1, "another tab decoded beside a stale reservation");
+        sender.send(ImageLoadResult::Failed("stale".into())).unwrap();
+        first.poll_images();
+        assert_eq!(budget.stale_flights(), 0);
+        second.pump_images();
+        assert!(second.image_queue.is_empty());
+        first.cancel();
+        second.cancel();
+    }
+
+    #[test]
+    fn retry_result_is_requeued_and_admitted_after_stale_clears() {
+        let budget = Arc::new(ImageBudget::with_limits(100, 2));
+        assert!(budget.reserve_entry());
+        assert!(budget.reserve_bytes(80));
+        budget.mark_stale(1);
+        let mut pane =
+            Pane::new_with_budget(PathBuf::from("/nonexistent-vfs.sock"), budget.clone());
+        pane.cancel();
+        pane.images
+            .insert("new.png".into(), ImageState::Loading);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(ImageLoadResult::Retry { bytes: 50 })
+            .unwrap();
+        pane.image_flights.push(ImageFlight {
+            revision: pane.image_revision,
+            path: "new.png".into(),
+            receiver,
+            stale: false,
+        });
+        pane.poll_images();
+        assert!(matches!(pane.image("new.png"), Some(ImageState::Loading)));
+        assert_eq!(pane.image_queue.len(), 1, "the retry was not queued");
+        assert!(
+            !pane.image_retries.contains("new.png"),
+            "a stale-dependent retry consumed the one transient retry"
+        );
+        // A later attempt that meets another tab's new stale reservation must
+        // requeue again instead of turning into a permanent failure.
+        pane.image_queue.clear();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(ImageLoadResult::Retry { bytes: 50 })
+            .unwrap();
+        pane.image_flights.push(ImageFlight {
+            revision: pane.image_revision,
+            path: "new.png".into(),
+            receiver,
+            stale: false,
+        });
+        pane.poll_images();
+        assert_eq!(pane.image_queue.len(), 1, "a second stale retry was dropped");
+        budget.release(80, 0);
+        budget.clear_stale(1);
+        pane.pump_images();
+        assert!(pane.image_queue.is_empty(), "the retry was never admitted");
+        assert_eq!(pane.image_flights.len(), 1);
+        pane.cancel();
+    }
+
+    #[test]
+    fn started_worker_returns_retry_without_waiting_for_its_own_stale_count() {
+        let budget = Arc::new(ImageBudget::with_limits(100, 4));
+        assert!(budget.reserve_entry());
+        // 97 used + a 1x1 RGBA (4 bytes) exceeds 100, so the worker takes the
+        // Retry branch instead of reserving successfully.
+        assert!(budget.reserve_bytes(97));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker_budget = budget.clone();
+        let worker = std::thread::spawn(move || {
+            Pane::run_image_worker(
+                worker_budget,
+                move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(media::Decoded {
+                        width: 1,
+                        height: 1,
+                        bgra: vec![0; 4],
+                    })
+                },
+                sender,
+            )
+        });
+        started_rx.recv().unwrap();
+        // The worker is already decoding under the lock; its tab becomes stale
+        // now. It must finish instead of waiting for its own stale count.
+        budget.mark_stale(1);
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        match receiver.try_recv() {
+            Ok(ImageLoadResult::Retry { bytes }) => assert_eq!(bytes, 4),
+            _ => panic!("a started worker waited for its own stale reservation"),
+        }
+        assert_eq!(budget.usage(), (97, 1));
+        assert_eq!(budget.stale_flights(), 1);
+        budget.release(97, 0);
+        budget.clear_stale(1);
+        assert_eq!(budget.stale_flights(), 0);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        Pane::run_image_worker(
+            budget.clone(),
+            || {
+                Ok(media::Decoded {
+                    width: 1,
+                    height: 1,
+                    bgra: vec![0; 4],
+                })
+            },
+            sender,
+        );
+        match receiver.try_recv() {
+            Ok(ImageLoadResult::Ready(_, reservation)) => {
+                assert_eq!(reservation.bytes, 4);
+                assert_eq!(budget.usage(), (4, 1));
+            }
+            _ => panic!("the retry was not admitted after the stale reservation drained"),
+        }
+    }
+
+    #[test]
+    fn stale_worker_exits_before_decoding() {
+        let budget = Arc::new(ImageBudget::with_limits(100, 4));
+        budget.mark_stale(1);
+        let decoded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = decoded.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        Pane::run_image_worker(
+            budget.clone(),
+            move || {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(media::Decoded {
+                    width: 1,
+                    height: 1,
+                    bgra: vec![0; 4],
+                })
+            },
+            sender,
+        );
+        assert!(
+            !decoded.load(std::sync::atomic::Ordering::SeqCst),
+            "a stale worker spent time decoding an image that will be dropped"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ImageLoadResult::Retry { bytes: 0 })
+        ));
+        assert_eq!(budget.usage(), (0, 0));
+    }
+
+    #[test]
+    fn reservation_is_taken_under_the_decode_lock_before_the_next_read() {
+        let budget = Arc::new(ImageBudget::with_limits(100, 4));
+        let (first_read_tx, first_read_rx) = mpsc::channel();
+        let (first_done_tx, first_done_rx) = mpsc::channel();
+        let (second_read_tx, second_read_rx) = mpsc::channel();
+        let (second_seen_tx, second_seen_rx) = mpsc::channel();
+        let (first_sender, first_receiver) = mpsc::sync_channel(1);
+        let first_budget = budget.clone();
+        let first = std::thread::spawn(move || {
+            Pane::run_image_worker(
+                first_budget,
+                move || {
+                    first_read_tx.send(()).unwrap();
+                    first_done_rx.recv().unwrap();
+                    Ok(media::Decoded {
+                        width: 1,
+                        height: 1,
+                        bgra: vec![0; 4],
+                    })
+                },
+                first_sender,
+            )
+        });
+        first_read_rx.recv().unwrap();
+        let (second_sender, second_receiver) = mpsc::sync_channel(1);
+        let second_budget = budget.clone();
+        let seen_budget = budget.clone();
+        let second = std::thread::spawn(move || {
+            Pane::run_image_worker(
+                second_budget,
+                move || {
+                    second_read_tx.send(()).unwrap();
+                    // The first worker must have reserved its bytes before
+                    // this second read starts, even though it has not sent its
+                    // result yet.
+                    second_seen_tx.send(seen_budget.usage()).unwrap();
+                    Ok(media::Decoded {
+                        width: 1,
+                        height: 1,
+                        bgra: vec![0; 4],
+                    })
+                },
+                second_sender,
+            )
+        });
+        assert!(
+            second_read_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "a second read entered while the first held the decode lock"
+        );
+        first_done_tx.send(()).unwrap();
+        second_read_rx.recv().unwrap();
+        assert_eq!(second_seen_rx.recv().unwrap(), (4, 0));
+        first.join().unwrap();
+        second.join().unwrap();
+        let first_result = first_receiver.try_recv().unwrap();
+        let second_result = second_receiver.try_recv().unwrap();
+        assert!(matches!(&first_result, ImageLoadResult::Ready(_, _)));
+        assert!(matches!(&second_result, ImageLoadResult::Ready(_, _)));
+        assert_eq!(budget.usage(), (8, 0));
+        drop((first_result, second_result));
+        assert_eq!(budget.usage(), (0, 0));
+    }
+
+    #[test]
+    fn pane_drop_releases_a_buffered_reservation_and_the_stale_gate() {
+        let budget = Arc::new(ImageBudget::with_limits(4096, 4));
+        let mut pane =
+            Pane::new_with_budget(PathBuf::from("/nonexistent-vfs.sock"), budget.clone());
+        pane.cancel();
+        assert!(budget.reserve_bytes(128));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let reservation = ImageReservation {
+            budget: budget.clone(),
+            bytes: 128,
+        };
+        sender
+            .send(ImageLoadResult::Ready(
+                media::Decoded {
+                    width: 1,
+                    height: 1,
+                    bgra: vec![0; 4],
+                },
+                reservation,
+            ))
+            .unwrap();
+        pane.image_flights.push(ImageFlight {
+            revision: pane.image_revision,
+            path: "closing.png".into(),
+            receiver,
+            stale: true,
+        });
+        budget.mark_stale(1);
+        drop(pane);
+        assert_eq!(budget.stale_flights(), 0);
+        assert_eq!(budget.usage(), (0, 0));
+    }
+
+    #[test]
+    fn stale_reservation_is_released_when_its_result_is_polled() {
+        let budget = Arc::new(ImageBudget::with_limits(4096, 4));
+        let mut pane =
+            Pane::new_with_budget(PathBuf::from("/nonexistent-vfs.sock"), budget.clone());
+        pane.cancel();
+        assert!(budget.reserve_bytes(128));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let reservation = ImageReservation {
+            budget: budget.clone(),
+            bytes: 128,
+        };
+        sender
+            .send(ImageLoadResult::Ready(
+                media::Decoded {
+                    width: 1,
+                    height: 1,
+                    bgra: vec![0; 4],
+                },
+                reservation,
+            ))
+            .unwrap();
+        pane.image_revision = 3;
+        pane.image_flights.push(ImageFlight {
+            revision: 2,
+            path: "stale.png".into(),
+            receiver,
+            stale: false,
+        });
+        pane.poll_images();
+        assert!(pane.image_flights.is_empty());
+        assert_eq!(budget.usage(), (0, 0));
+        pane.cancel();
+    }
+
+    #[test]
     fn image_limit_messages_name_the_limit_and_an_action() {
         let pane = ImageLimit::PaneEntries.message();
         assert!(pane.contains("8 images") && pane.contains("fewer images"), "{pane}");
@@ -892,8 +1421,13 @@ mod polling_tests {
             let path = format!("image-{index}.png");
             pane.images.insert(path.clone(), ImageState::Loading);
             let (sender, receiver) = mpsc::sync_channel(1);
-            sender.send(Err("fixture error".into())).unwrap();
-            pane.image_flights.push((pane.image_revision, path, receiver));
+            sender.send(ImageLoadResult::Failed("fixture error".into())).unwrap();
+            pane.image_flights.push(ImageFlight {
+                revision: pane.image_revision,
+                path,
+                receiver,
+                stale: false,
+            });
         }
 
         assert!(workspace.poll_changed(), "image completion must repaint");

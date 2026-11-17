@@ -229,8 +229,15 @@ impl Browser {
     }
     /// True when Back leaves the root and should restore session focus.
     pub fn back(&mut self) -> bool {
+        self.back_with_move().0
+    }
+
+    /// `(root, moved)`: `root` keeps the existing focus behavior, while
+    /// `moved` says a history page was actually restored. A cancelled address
+    /// or empty history changes nothing.
+    pub fn back_with_move(&mut self) -> (bool, bool) {
         if self.address.take().is_some() {
-            return false;
+            return (false, false);
         }
         self.cancel();
         match self.history.pop() {
@@ -245,9 +252,9 @@ impl Browser {
                 {
                     self.page.error = Some("Historical source evicted; Refresh loads the current version".into());
                 }
-                false
+                (false, true)
             }
-            None => true,
+            None => (true, false),
         }
     }
     pub fn lines(&self, width: usize, height: usize) -> Vec<String> {
