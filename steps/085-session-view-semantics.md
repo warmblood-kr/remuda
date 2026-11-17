@@ -57,13 +57,15 @@ with the already-computed `depth`, `state` and `detail`.
 
 `native/src/image.rs`: `render_session_view` reads the optional table, rejects
 an unknown state or out-of-range depth, and validates the view as before.
-`serialize_bounded_view` measures the exact peer body: the daemon wraps the view
-in `Response::RenderedSessionList` and appends a newline, and a remote peer
-rejects that plaintext above 32768 bytes (`view_wire_len`). If the sidecar (or
-its liveness contradiction) is the only reason the body is too large, the
-validated rows are re-serialized without it; a body whose rows alone exceed
-32768 still fails with `session view too large`. The cap and the existing
-protocol limits are unchanged.
+`serialize_bounded_view` keeps two separate limits: `VIEW_INNER_CAP` (32768)
+still bounds a rows-only view exactly as before the sidecar existed, and
+`VIEW_WIRE_CAP` (32768) bounds the peer body (`view_wire_len` = the view wrapped
+in `Response::RenderedSessionList` plus the daemon's newline). The wire cap
+decides only whether the sidecar may travel: if the wrapped body would exceed
+it, the validated rows are re-serialized without the sidecar. A rows-only view
+whose own JSON fits `VIEW_INNER_CAP` still succeeds locally even when its
+wrapped body is larger, so pre-sidecar output is preserved; rows whose own JSON
+exceeds the inner cap still fail with `session view too large`.
 
 ## Actual
 
@@ -94,8 +96,13 @@ Tests added but not yet run:
   - `sidecar_is_dropped_when_it_alone_overflows_the_wire_cap` (70 rows: the
     wrapped body fits without the sidecar and not with it; decoded result keeps
     all rows and no sidecar)
-  - `view_whose_rows_alone_overflow_the_wire_cap_still_fails` (unchanged
+  - `rows_whose_inner_view_exceeds_the_cap_still_fail` (unchanged
     `session view too large`)
+  - `rows_only_keeps_the_old_inner_cap_beyond_the_peer_wire_cap` (own JSON fits,
+    wrapped body does not: still succeeds locally)
+  - `sidecar_is_kept_only_when_the_peer_body_fits` (same view, wire cap minus
+    one byte: rows kept, sidecar dropped)
+  - `rows_over_the_inner_cap_still_fail` (inner cap alone fails it)
   - `view_wire_len_counts_the_wrapped_response_and_newline` (equality with
     `serde_json::to_vec(Response::RenderedSessionList)` plus the newline, and
     strictly larger than the inner view)
@@ -108,8 +115,10 @@ list, and the GUI session-list tests. GUI consumption is step 086.
 
 ## Limitations
 
-- A view whose rendered rows alone exceed 32 KiB still fails, exactly as before;
-  the sidecar no longer causes that failure by itself.
+- A rows-only view whose own JSON exceeds 32 KiB still fails, exactly as before;
+  the sidecar no longer causes that failure by itself. A rows-only view whose
+  wrapped body exceeds the peer cap is still rejected by a remote peer, as it
+  was before the sidecar existed; local clients keep accepting it.
 - A single unrepresentable detail drops the whole optional sidecar for that
   view. That is deliberate: a partial sidecar would mix trusted and untrusted
   structure. Consumers must treat empty semantics as "no structured data", not
