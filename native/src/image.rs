@@ -1201,7 +1201,11 @@ fn render_session_view(
     sessions: &[remuda_core::SessionSummary],
     width: u16,
 ) -> Result<String, String> {
-    let render = || -> mlua::Result<(usize, Vec<remuda_core::session_view::ViewEntry>)> {
+    let render = || -> mlua::Result<(
+        usize,
+        Vec<remuda_core::session_view::ViewEntry>,
+        Vec<remuda_core::session_view::ViewSemantics>,
+    )> {
         let remuda: mlua::Table = lua.globals().get("remuda")?;
         let function: mlua::Function = remuda.get("_render_sessions_snapshot")?;
         let rows = crate::script::session_rows(lua, sessions.to_vec())?;
@@ -1226,10 +1230,36 @@ fn render_session_view(
                     .collect::<mlua::Result<Vec<_>>>()?,
             });
         }
-        Ok((height, entries))
+        let mut semantics = Vec::new();
+        if let Some(items) = result.get::<Option<mlua::Table>>("semantics")? {
+            for item in items.sequence_values::<mlua::Table>() {
+                let item = item?;
+                let state: Option<String> = item.get("state")?;
+                let state = match state {
+                    Some(state) => Some(
+                        remuda_core::session_view::ViewState::from_name(&state).ok_or_else(
+                            || mlua::Error::runtime("invalid view state"),
+                        )?,
+                    ),
+                    None => None,
+                };
+                let depth: Option<i64> = item.get("depth")?;
+                let depth = u8::try_from(depth.unwrap_or(0))
+                    .map_err(|_| mlua::Error::runtime("view depth out of range"))?;
+                semantics.push(remuda_core::session_view::ViewSemantics {
+                    name: item.get("name")?,
+                    instance_id: item.get("instance_id")?,
+                    depth,
+                    state,
+                    detail: item.get::<Option<String>>("detail")?,
+                });
+            }
+        }
+        Ok((height, entries, semantics))
     };
-    let (height, entries) = render().map_err(|error| error.to_string())?;
-    let view = remuda_core::session_view::SessionView::new(sessions.to_vec(), height, entries);
+    let (height, entries, semantics) = render().map_err(|error| error.to_string())?;
+    let view = remuda_core::session_view::SessionView::new(sessions.to_vec(), height, entries)
+        .with_semantics(semantics);
     view.validate().map_err(str::to_owned)?;
     let result = serde_json::to_string(&view).map_err(|error| error.to_string())?;
     if result.len() > 32768 {
@@ -1579,6 +1609,94 @@ mod tests {
         )
         .exec()
         .unwrap();
+    }
+
+    fn summary(name: &str, instance: &str, alive: bool) -> remuda_core::SessionSummary {
+        remuda_core::SessionSummary {
+            id: format!("id-{name}"),
+            name: name.into(),
+            instance_id: Some(instance.into()),
+            output_version: None,
+            alive,
+            idle: std::time::Duration::ZERO,
+            output_idle: None,
+            size: remuda_core::Size::new(80, 24),
+            attached: false,
+            human_idle: None,
+            mouse_tracking: false,
+            unavailable: false,
+            program_status: None,
+            program_status_age_ms: None,
+            remote_input_disabled: false,
+            team: None,
+        }
+    }
+
+    #[test]
+    fn rendered_session_view_carries_instance_bound_semantics() {
+        use remuda_core::session_view::ViewState;
+        let lua = lifecycle_lua();
+        lua.load(
+            r#"
+            remuda.session_order = function()
+                return {{name='child', depth=1}, {name='lead', depth=0}, {name='gone', depth=0}}
+            end
+            remuda.session_list_decorate = function(session)
+                if session.name == 'child' then
+                    return {layout='compact', activity='needs you', description='codex · 42%'}
+                end
+                if session.name == 'gone' then return {activity='working'} end
+            end
+        "#,
+        )
+        .exec()
+        .unwrap();
+        let sessions = vec![
+            summary("lead", "lead-1", true),
+            summary("child", "child-1", true),
+            summary("gone", "gone-1", false),
+        ];
+        let json = super::render_session_view(&lua, &sessions, 80).unwrap();
+        let view: remuda_core::session_view::SessionView = serde_json::from_str(&json).unwrap();
+        let checked = view.validate_for_display(None, 80).unwrap();
+        let semantics = checked.semantics();
+        assert_eq!(semantics.len(), 3);
+        assert_eq!(
+            (
+                semantics[0].name.as_str(),
+                semantics[0].instance_id.as_str()
+            ),
+            ("child", "child-1")
+        );
+        assert_eq!(semantics[0].depth, 1);
+        assert_eq!(semantics[0].state, Some(ViewState::Blocked));
+        assert_eq!(semantics[0].detail.as_deref(), Some("codex · 42%"));
+        assert_eq!(semantics[1].state, Some(ViewState::Alive));
+        assert_eq!(semantics[1].depth, 0);
+        assert_eq!(semantics[1].detail, None);
+        // Liveness outranks advisory activity, as in the TUI status cell.
+        assert_eq!(semantics[2].state, Some(ViewState::Exited));
+    }
+
+    #[test]
+    fn session_view_json_without_semantics_decodes_for_older_peers() {
+        let view = remuda_core::session_view::SessionView::new(
+            vec![summary("lead", "lead-1", true)],
+            1,
+            vec![remuda_core::session_view::ViewEntry {
+                name: "lead".into(),
+                instance_id: "lead-1".into(),
+                lines: vec!["lead".into()],
+            }],
+        );
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("semantics"), "{json}");
+        let decoded: remuda_core::session_view::SessionView = serde_json::from_str(&json).unwrap();
+        assert!(decoded
+            .validate_for_display(None, 80)
+            .unwrap()
+            .semantics()
+            .is_empty());
     }
 
     #[test]

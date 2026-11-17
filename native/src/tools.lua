@@ -2283,7 +2283,7 @@ end
 -- reports an activity keeps its meaning as an icon; its word is not drawn.
 local function status_cell(session, decoration)
   local dot = session.alive and "\27[32m●\27[0m " or "\27[31m●\27[0m "
-  if not session.alive then return dot end
+  if not session.alive then return dot, "exited" end
   local state
   if session.program_status_fresh == true and type(session.program_status) == "table" then
     state = session.program_status.state
@@ -2294,10 +2294,10 @@ local function status_cell(session, decoration)
     elseif activity == "idle" then state = "idle"
     elseif activity == "needs you" then state = "blocked" end
   end
-  if state == "working" then return "🏇" end
-  if state == "idle" then return "\27[32m○\27[0m " end
-  if state == "blocked" then return "\27[31m!\27[0m " end
-  return dot
+  if state == "working" then return "🏇", "working" end
+  if state == "idle" then return "\27[32m○\27[0m ", "idle" end
+  if state == "blocked" then return "\27[31m!\27[0m ", "blocked" end
+  return dot, "alive"
 end
 
 local function render_session_snapshot(sessions, width, selected_name, selected_id, strict, selected_index)
@@ -2385,7 +2385,7 @@ local function render_session_snapshot(sessions, width, selected_name, selected_
       if ok then local detail = safe_text(value, 256); if detail then fields[#fields + 1] = detail end end
     end
     entry.detail = #fields > 0 and table.concat(fields, " · ") or nil
-    entry.status = status_cell(entry.snapshot, decoration)
+    entry.status, entry.state = status_cell(entry.snapshot, decoration)
   end
   local height, entries = compact and 1 or 3, {}
   for index, entry in ipairs(ordered) do
@@ -2401,7 +2401,17 @@ local function render_session_snapshot(sessions, width, selected_name, selected_
     for i, line in ipairs(lines) do lines[i] = pad .. line end
     entries[#entries + 1] = { name = entry.name, instance_id = entry.instance_id, lines = lines }
   end
-  return { height = height, entries = entries, has_order = has_order }
+  local semantics = {}
+  for _, entry in ipairs(ordered) do
+    semantics[#semantics + 1] = {
+      name = entry.name,
+      instance_id = entry.instance_id,
+      depth = entry.depth,
+      state = entry.state,
+      detail = entry.detail,
+    }
+  end
+  return { height = height, entries = entries, semantics = semantics, has_order = has_order }
 end
 
 function remuda._render_sessions_snapshot(sessions, width, selected_name, selected_id)
