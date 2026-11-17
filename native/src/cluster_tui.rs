@@ -2568,8 +2568,11 @@ impl ClusterUi {
                 let clamped = self.scrollback.min(scrollback_len);
                 self.scrollback = clamped;
                 if clamped == 0 {
+                    // The peer returned no retained rows. An older peer that
+                    // ignores the offset fails closed here: stay live and say
+                    // there is nothing to scroll, never paint live as history.
                     self.scroll_snapshot = None;
-                    self.notice = Some(("oldest captured screen".into(), now));
+                    self.notice = Some(("no screen history to scroll".into(), now));
                 } else {
                     self.scroll_snapshot = Some(ScrollSnapshot { target: key, body });
                 }
@@ -4750,7 +4753,10 @@ fn capture_local_pane(ui: &mut ClusterUi, path: &Path, clock: &dyn Clock) -> Opt
             // At the oldest retained row; the next frame reads that offset.
             ui.scrollback = history;
             if history == 0 {
-                ui.notice = Some(("oldest captured screen".into(), clock.now()));
+                // No history at all: an old daemon that ignores the offset and
+                // a session that never scrolled look identical here. Say what
+                // is true rather than implying the top of a history exists.
+                ui.notice = Some(("no screen history to scroll".into(), clock.now()));
             }
         }
         return Some(captured);
@@ -11393,6 +11399,34 @@ mod tests {
         assert!(!ui.wants_mouse_capture());
         ui.help_open.set(false);
         assert!(ui.wants_mouse_capture());
+    }
+
+    #[test]
+    fn a_peer_without_scrollback_fails_closed_and_stays_live() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("live-body"));
+        let transport =
+            QueuedRemoteInput::new(vec![history_response("live-body", "remote-instance", 0)]);
+        let mut port = super::remote_calls::InlinePort::new(&transport);
+        let _ = ui.render_text(100, 24, "", &clock);
+        let rect = ui.pane_rect.get().unwrap();
+        ui.handle_event(
+            wheel_event((rect.left + 2) as u16, rect.top as u16, true),
+            clock.now(),
+        );
+        ui.send_scroll_capture(Some(&mut port as &mut dyn super::RemotePort));
+        ui.apply_remote_replies(&mut port as &mut dyn super::RemotePort, clock.now());
+        assert_eq!(ui.scrollback, 0);
+        assert!(ui.scroll_snapshot.is_none());
+        assert!(
+            ui.notice
+                .as_ref()
+                .is_some_and(|(text, _)| text == "no screen history to scroll"),
+            "{:?}",
+            ui.notice
+        );
+        let frame = ui.render_text(100, 24, "", &clock);
+        assert!(frame.contains("live-body"), "{frame}");
     }
 
     #[test]

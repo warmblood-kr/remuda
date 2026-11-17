@@ -2181,6 +2181,119 @@ fn selected_session_input_case(client_node: &Node, server_node: &Node, hosted: b
     tui.wait_for_from(output_start, "got=y", Duration::from_secs(10));
 }
 
+/// The numbered session rows painted on the right of the split layout.
+fn pane_numbers(screen: &str) -> Vec<u32> {
+    let mut numbers = Vec::new();
+    for line in screen.lines() {
+        let Some((_, right)) = line.split_once('│') else {
+            continue;
+        };
+        let right = right.trim();
+        if !right.is_empty() && right.bytes().all(|byte| byte.is_ascii_digit()) {
+            if let Ok(number) = right.parse() {
+                numbers.push(number);
+            }
+        }
+    }
+    numbers
+}
+
+#[test]
+#[cfg(unix)]
+fn real_remote_cluster_tree_wheel_scrolls_the_peer_session_history() {
+    // The wheel reads the peer's scrolled capture over the real transport; a
+    // non-hosted peer keeps this test on the daemon capture path.
+    let client_node = Node::start("r2-wheel-client");
+    let server_node = Node::start_with_env(
+        "r2-wheel-server",
+        vec![("REMUDA_EXPERIMENTAL_SESSION_HOST".into(), "0".into())],
+    );
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    let control = server_node
+        .command()
+        .args(["cluster", "control", "on"])
+        .output()
+        .unwrap();
+    assert!(
+        control.status.success(),
+        "cluster control failed: {control:?}"
+    );
+    server_node.start_named_session("lines", "seq 1 200; sleep 120");
+
+    let registry_path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry =
+        serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server_node.fingerprint())
+        .unwrap()
+        .endpoint = Some(listener.address.to_string());
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    let target = format!("{}/lines", server_node.fingerprint());
+    let mut tui = RemoteTui::start(&client_node, Some(&target));
+    tui.wait_for("Remuda >", Duration::from_secs(10));
+    assert!(
+        wait_for_marker(
+            || pane_numbers(&tui.screen_text()).len() >= 8,
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+        ),
+        "the remote pane never showed numbered rows:\n{}",
+        tui.screen_text()
+    );
+    let before = pane_numbers(&tui.screen_text());
+
+    tui.writer.write_all(b"\x1b[<64;60;10M").unwrap();
+    assert!(
+        wait_for_marker(
+            || tui.screen_text().contains("scrollback 3 rows"),
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+        ),
+        "the wheel did not scroll the peer session:\n{}",
+        tui.screen_text()
+    );
+    std::thread::sleep(Duration::from_millis(250));
+    let scrolled_screen = tui.screen_text();
+    let scrolled = pane_numbers(&scrolled_screen);
+    let expected: Vec<u32> = before
+        .iter()
+        .map(|number| number.saturating_sub(3))
+        .collect();
+    assert_eq!(
+        scrolled, expected,
+        "the pane did not move to the peer's older rows:\n{scrolled_screen}"
+    );
+    let composer = scrolled_screen
+        .lines()
+        .find(|line| line.contains("Remuda >"))
+        .expect("the remote composer line is painted");
+    assert!(
+        composer.trim_end().ends_with("Remuda >"),
+        "the wheel recalled a line into the composer: {composer:?}"
+    );
+
+    tui.writer.write_all(b"\x1b[<65;60;10M").unwrap();
+    assert!(
+        wait_for_marker(
+            || pane_numbers(&tui.screen_text()) == before,
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+        ),
+        "wheel down did not return to the live rows:\n{}",
+        tui.screen_text()
+    );
+}
+
 #[test]
 fn real_old_peer_rejects_the_view_and_the_tree_falls_back_to_plain_rows() {
     let Some(old) = std::env::var_os("REMUDA_OLD_PEER_BIN").map(PathBuf::from) else {
