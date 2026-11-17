@@ -48,13 +48,18 @@ is raised.
   one-decoded-buffer peak is unchanged; only the result send and retry
   queuing happen outside it.
 - An exit-before-decode Retry carries no bytes and does not consume the one
-  transient memory retry. A Retry seen while a stale reservation exists is
-  requeued as a state transition (pump stays gated, so it cannot
-  busy-loop), and it also does not consume that retry. After the stale reservations drain, the
-  image starts again. If it still fails with no stale reservation and the
-  bytes do not fit, the exact 128 MiB failure is final for this document.
-  A late stale reservation is dropped when its result is drained, so a stale
-  worker never waits for its own stale count or blocks a started decode.
+  transient memory retry. Every Retry also carries the refusal cause captured
+  with the reservation decision: a stale-caused refusal is requeued even if
+  the stale reservation drains before the poll, so repeated cross-tab races do
+  not consume that retry. A Retry seen while a stale reservation exists is
+  likewise a state transition (pump stays gated, so it cannot busy-loop).
+  After the stale reservations drain, the image starts again. If a live-bytes
+  refusal still cannot fit with no stale reservation, the exact 128 MiB
+  failure is final for this document. A late stale result is dropped, and its
+  reservation released, before the stale gate is decremented; another worker
+  can therefore never observe `stale == 0` while those bytes are still
+  reserved. A stale worker never waits for its own stale count or blocks a
+  started decode.
 - `refresh` also compares the browser generation: refreshing while address
   inspection is active is a no-op and preserves the current images.
 - No PNG/JPEG bound or VFS transfer bound changes. The image worker still
@@ -68,7 +73,7 @@ display), shared target reused with `CARGO_INCREMENTAL=0`.
 
 ```text
 cargo test --lib (gui)
-test result: ok. 28 passed; 0 failed; 0 ignored
+test result: ok. 31 passed; 0 failed; 0 ignored
 
 cargo test --bin remuda-gui -- --test-threads=1
 test result: ok. 131 passed; 0 failed; 8 ignored; finished in 77.84s
@@ -98,6 +103,9 @@ test result: ok. 16 passed; 0 failed; 0 ignored
 # reservation_is_taken_under_the_decode_lock_before_the_next_read
 # stale_reservation_is_released_when_its_result_is_polled
 # pane_drop_releases_a_buffered_reservation_and_the_stale_gate
+# reservation_refusal_keeps_its_failure_time_cause
+# stale_caused_retry_survives_the_stale_drain_before_poll_twice
+# stale_drain_releases_bytes_before_clearing_the_gate
 # image_limit_messages_name_the_limit_and_an_action
 # navigation_in_one_tab_keeps_the_other_tabs_image
 # navigating_to_a_second_large_image_releases_the_first_reservation
@@ -116,16 +124,27 @@ test result: ok. 1 passed; 0 failed; 0 ignored; finished in 34.76s
 ```
 
 The delivered image-budget binary's SHA-256 and internal build id are in the
-delivery report. The two review blockers were reproduced as failing tests and
-then fixed: the first was an assertion that dropped the reservations it was
-counting; the second was a closed-pane flight that could hold bytes after the
-stale gate cleared. The worker now sends its result under the decode lock and
-pane drop releases flights/reservations before the stale gate.
+delivery report. The review blockers were reproduced as failing tests and
+then fixed: an assertion dropped the reservations it was counting; a
+closed-pane flight could hold bytes after the stale gate cleared; and a
+stale-caused retry lost that cause before the poll. The worker sends its
+result under the decode lock, pane drop releases flights/reservations before
+the gate, the refusal cause travels with the retry, and a stale result's
+reservation is dropped before the gate is decremented.
 
 Source provenance: 743ef218982e is the delivered candidate binary's SHA-256
 prefix (build 0.1.0+git.56f99a02ede3-dirty, mtime 15:44), not a git commit.
 The recorded staging snapshot 5e6db270 is 16:35, so exact source identity with
 the 15:44 binary is not claimed.
+
+VERIFIED on the cause/ordering follow-up: the three new tests
+`reservation_refusal_keeps_its_failure_time_cause`,
+`stale_caused_retry_survives_the_stale_drain_before_poll_twice` and
+`stale_drain_releases_bytes_before_clearing_the_gate` passed, along with GUI
+lib 31, GUI bin 131/8 ignored, both flows and native documents 16. The clean
+binary's SHA-256/internal build id and its private smoke are in the delivery
+report; the smoke timings above are from the immediately preceding verified
+binary.
 
 ## Limitations
 

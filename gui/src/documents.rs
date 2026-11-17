@@ -96,13 +96,25 @@ impl ImageBudget {
         true
     }
 
+    #[cfg(test)]
     fn reserve_bytes(&self, bytes: usize) -> bool {
+        self.reserve_bytes_or_cause(bytes).is_ok()
+    }
+
+    /// Reserve decoded bytes or report the cause at refusal time. Both the
+    /// stale count and the live bytes are read under one lock, so a poll that
+    /// runs after the stale reservation drains cannot lose that evidence.
+    fn reserve_bytes_or_cause(&self, bytes: usize) -> Result<(), RetryCause> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.bytes.saturating_add(bytes) > self.max_bytes {
-            return false;
+        if state.bytes.saturating_add(bytes) <= self.max_bytes {
+            state.bytes = state.bytes.saturating_add(bytes);
+            return Ok(());
         }
-        state.bytes = state.bytes.saturating_add(bytes);
-        true
+        if state.stale_flights > 0 {
+            Err(RetryCause::Stale)
+        } else {
+            Err(RetryCause::Bytes)
+        }
     }
 
     /// Whether `bytes` would fit once the current stale reservations drain.
@@ -166,13 +178,31 @@ pub enum ImageState {
     Failed(String),
 }
 
+/// Why an image could not reserve workspace memory. Captured with the
+/// refusal so a later poll cannot misclassify a stale-caused race.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryCause {
+    /// A stale flight still held bytes when the reservation was refused.
+    Stale,
+    /// The live image set left no room; only a later release can help.
+    Bytes,
+}
+
 enum ImageLoadResult {
     Ready(media::Decoded, ImageReservation),
-    Retry { bytes: usize },
+    Retry { bytes: usize, cause: RetryCause },
     Failed(String),
 }
 
 type DecodedResult = ImageLoadResult;
+
+/// Test-only observation point between dropping a stale result and opening the
+/// stale gate. It proves the ordering without injecting a retry cause.
+#[cfg(test)]
+thread_local! {
+    static STALE_DRAIN_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
 
 struct ImageFlight {
     revision: u64,
@@ -297,11 +327,25 @@ impl Pane {
         }
         for (index, revision, path, result) in results.into_iter().rev() {
             let flight = self.image_flights.remove(index);
+            if revision != self.image_revision {
+                // Drop the stale result first: a Ready reservation releases
+                // its bytes here. Only then open the stale gate, so another
+                // worker cannot observe stale == 0 while these bytes are
+                // still reserved and misclassify them as a live cap.
+                drop(result);
+                #[cfg(test)]
+                STALE_DRAIN_PROBE.with(|probe| {
+                    if let Some(probe) = probe.borrow_mut().take() {
+                        probe();
+                    }
+                });
+                if flight.stale {
+                    self.budget.clear_stale(1);
+                }
+                continue;
+            }
             if flight.stale {
                 self.budget.clear_stale(1);
-            }
-            if revision != self.image_revision {
-                continue;
             }
             let state = match result {
                 ImageLoadResult::Ready(decoded, reservation) => match media::render_image(decoded) {
@@ -315,7 +359,7 @@ impl Pane {
                     }
                     None => ImageState::Failed("image could not be uploaded".into()),
                 },
-                ImageLoadResult::Retry { bytes } => {
+                ImageLoadResult::Retry { bytes, cause } => {
                     // `bytes == 0` means the worker exited before decoding, so
                     // this is a scheduling retry, not a memory refusal. It
                     // must not consume the one transient memory retry.
@@ -323,15 +367,15 @@ impl Pane {
                         self.image_queue.push_back(path.clone());
                         continue;
                     }
-                    // While a stale reservation exists, the refusal is
-                    // temporary; pump stays gated, so requeueing here is a
-                    // state transition, not a busy loop. It may happen again
-                    // if another tab becomes stale during a later attempt.
-                    if self.budget.stale_flights() > 0 {
+                    // A refusal caused by a stale reservation stays temporary
+                    // even if that reservation drained before this poll. The
+                    // pump gate keeps the requeue asleep until it is safe, so
+                    // this is a state transition, not a busy loop.
+                    if cause == RetryCause::Stale || self.budget.stale_flights() > 0 {
                         self.image_queue.push_back(path.clone());
                         continue;
                     }
-                    // No stale reservation: retry once only if memory is free
+                    // A live-bytes refusal retries once only if memory is free
                     // now. Otherwise this is a persistent cap and the exact
                     // 128 MiB failure is final for this document.
                     if self.image_retries.insert(path.clone()) && self.budget.could_reserve(bytes) {
@@ -479,7 +523,7 @@ impl Pane {
         // image will be requeued once that reservation drains, which also
         // keeps a released large image from spending decode time.
         if budget.stale_flights() > 0 {
-            let _ = sender.send(ImageLoadResult::Retry { bytes: 0 });
+            let _ = sender.send(ImageLoadResult::Retry { bytes: 0, cause: RetryCause::Stale });
             return;
         }
         // Keep the one-decoded-buffer peak and close the closed-pane race: the
@@ -494,16 +538,20 @@ impl Pane {
                     let bytes = (decoded.width as usize)
                         .saturating_mul(decoded.height as usize)
                         .saturating_mul(4);
-                    if budget.reserve_bytes(bytes) {
-                        let reservation = ImageReservation {
-                            budget: budget.clone(),
-                            bytes,
-                        };
-                        ImageLoadResult::Ready(decoded, reservation)
-                    } else {
-                        // `decoded` is dropped here, still under the lock, so a
-                        // refused buffer cannot overlap the next decode.
-                        ImageLoadResult::Retry { bytes }
+                    match budget.reserve_bytes_or_cause(bytes) {
+                        Ok(()) => {
+                            let reservation = ImageReservation {
+                                budget: budget.clone(),
+                                bytes,
+                            };
+                            ImageLoadResult::Ready(decoded, reservation)
+                        }
+                        Err(cause) => {
+                            // `decoded` is dropped here, still under the lock,
+                            // so a refused buffer cannot overlap the next
+                            // decode. The cause travels with the result.
+                            ImageLoadResult::Retry { bytes, cause }
+                        }
                     }
                 }
                 Err(error) => ImageLoadResult::Failed(error),
@@ -1125,6 +1173,72 @@ mod polling_tests {
     }
 
     #[test]
+    fn reservation_refusal_keeps_its_failure_time_cause() {
+        let budget = ImageBudget::with_limits(100, 4);
+        assert!(budget.reserve_bytes(97));
+        assert_eq!(budget.reserve_bytes_or_cause(4), Err(RetryCause::Bytes));
+        budget.mark_stale(1);
+        assert_eq!(budget.reserve_bytes_or_cause(4), Err(RetryCause::Stale));
+        budget.clear_stale(1);
+        budget.release(97, 0);
+        assert_eq!(budget.reserve_bytes_or_cause(4), Ok(()));
+        assert_eq!(budget.usage(), (4, 0));
+    }
+
+    #[test]
+    fn stale_caused_retry_survives_the_stale_drain_before_poll_twice() {
+        let budget = Arc::new(ImageBudget::with_limits(100, 4));
+        let mut pane =
+            Pane::new_with_budget(PathBuf::from("/nonexistent-vfs.sock"), budget.clone());
+        pane.cancel();
+        pane.images
+            .insert("new.png".into(), ImageState::Loading);
+        // Keep the two-flight limit full so the requeued image remains visible
+        // in the queue instead of spawning another worker in this test.
+        let mut dummy_senders: Vec<mpsc::SyncSender<ImageLoadResult>> = Vec::new();
+        for _ in 0..MAX_CONCURRENT_IMAGE_LOADS {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            dummy_senders.push(sender);
+            pane.image_flights.push(ImageFlight {
+                revision: pane.image_revision,
+                path: "dummy.png".into(),
+                receiver,
+                stale: false,
+            });
+        }
+        for round in 0..2 {
+            assert_eq!(budget.stale_flights(), 0, "round {round}");
+            let (sender, receiver) = mpsc::sync_channel(1);
+            sender
+                .send(ImageLoadResult::Retry {
+                    bytes: 50,
+                    cause: RetryCause::Stale,
+                })
+                .unwrap();
+            pane.image_flights.push(ImageFlight {
+                revision: pane.image_revision,
+                path: "new.png".into(),
+                receiver,
+                stale: false,
+            });
+            pane.poll_images();
+            assert!(
+                matches!(pane.image("new.png"), Some(ImageState::Loading)),
+                "round {round}: stale-caused retry became a failure"
+            );
+            assert_eq!(pane.image_queue.len(), 1, "round {round}");
+            assert!(
+                !pane.image_retries.contains("new.png"),
+                "round {round}: a drained stale race consumed the memory retry"
+            );
+            pane.image_queue.clear();
+        }
+        assert_eq!(pane.image_flights.len(), MAX_CONCURRENT_IMAGE_LOADS);
+        drop(dummy_senders);
+        pane.cancel();
+    }
+
+    #[test]
     fn retry_result_is_requeued_and_admitted_after_stale_clears() {
         let budget = Arc::new(ImageBudget::with_limits(100, 2));
         assert!(budget.reserve_entry());
@@ -1137,7 +1251,10 @@ mod polling_tests {
             .insert("new.png".into(), ImageState::Loading);
         let (sender, receiver) = mpsc::sync_channel(1);
         sender
-            .send(ImageLoadResult::Retry { bytes: 50 })
+            .send(ImageLoadResult::Retry {
+                bytes: 50,
+                cause: RetryCause::Stale,
+            })
             .unwrap();
         pane.image_flights.push(ImageFlight {
             revision: pane.image_revision,
@@ -1157,7 +1274,10 @@ mod polling_tests {
         pane.image_queue.clear();
         let (sender, receiver) = mpsc::sync_channel(1);
         sender
-            .send(ImageLoadResult::Retry { bytes: 50 })
+            .send(ImageLoadResult::Retry {
+                bytes: 50,
+                cause: RetryCause::Stale,
+            })
             .unwrap();
         pane.image_flights.push(ImageFlight {
             revision: pane.image_revision,
@@ -1208,7 +1328,10 @@ mod polling_tests {
         release_tx.send(()).unwrap();
         worker.join().unwrap();
         match receiver.try_recv() {
-            Ok(ImageLoadResult::Retry { bytes }) => assert_eq!(bytes, 4),
+            Ok(ImageLoadResult::Retry { bytes, cause }) => {
+                assert_eq!(bytes, 4);
+                assert_eq!(cause, RetryCause::Stale);
+            }
             _ => panic!("a started worker waited for its own stale reservation"),
         }
         assert_eq!(budget.usage(), (97, 1));
@@ -1262,7 +1385,7 @@ mod polling_tests {
         );
         assert!(matches!(
             receiver.try_recv(),
-            Ok(ImageLoadResult::Retry { bytes: 0 })
+            Ok(ImageLoadResult::Retry { bytes: 0, .. })
         ));
         assert_eq!(budget.usage(), (0, 0));
     }
@@ -1365,6 +1488,62 @@ mod polling_tests {
         drop(pane);
         assert_eq!(budget.stale_flights(), 0);
         assert_eq!(budget.usage(), (0, 0));
+    }
+
+    #[test]
+    fn stale_drain_releases_bytes_before_clearing_the_gate() {
+        let budget = Arc::new(ImageBudget::with_limits(100, 4));
+        let mut pane =
+            Pane::new_with_budget(PathBuf::from("/nonexistent-vfs.sock"), budget.clone());
+        pane.cancel();
+        assert!(budget.reserve_bytes(80));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        pane.image_flights.push(ImageFlight {
+            revision: pane.image_revision,
+            path: "old.png".into(),
+            receiver,
+            stale: false,
+        });
+        pane.release_images();
+        assert_eq!(budget.stale_flights(), 1);
+        sender
+            .send(ImageLoadResult::Ready(
+                media::Decoded {
+                    width: 1,
+                    height: 1,
+                    bgra: vec![0; 4],
+                },
+                ImageReservation {
+                    budget: budget.clone(),
+                    bytes: 80,
+                },
+            ))
+            .unwrap();
+        let checked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_budget = budget.clone();
+        let probe_checked = checked.clone();
+        STALE_DRAIN_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move || {
+                // This runs in poll_images after the stale result (and its
+                // reservation) is dropped but before clear_stale. The real
+                // classifier must be admitted, not told Bytes.
+                assert_eq!(probe_budget.usage().0, 0, "stale bytes were still reserved");
+                assert_eq!(probe_budget.stale_flights(), 1, "gate cleared before the drop");
+                assert_eq!(probe_budget.reserve_bytes_or_cause(50), Ok(()));
+                probe_budget.release(50, 0);
+                probe_checked.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+        });
+        pane.poll_images();
+        STALE_DRAIN_PROBE.with(|probe| {
+            probe.borrow_mut().take();
+        });
+        assert!(
+            checked.load(std::sync::atomic::Ordering::SeqCst),
+            "the stale drain probe did not run"
+        );
+        assert_eq!(budget.stale_flights(), 0);
+        assert_eq!(budget.usage().0, 0);
     }
 
     #[test]
