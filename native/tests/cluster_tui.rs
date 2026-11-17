@@ -348,6 +348,40 @@ fn stopped_daemon_input_becomes_uncertain_and_later_input_recovers() {
     assert!(matches!(close, Response::Ok));
 }
 
+/// Wait until the composer line satisfies `check`, returning the screen.
+fn wait_for_composer(tui: &TuiPty, timeout: Duration, check: impl Fn(&str) -> bool) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let screen = tui.screen_text();
+        let composer = screen.lines().find(|line| line.contains("Remuda > "));
+        if composer.is_some_and(&check) {
+            return screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the composer did not reach the expected state:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The numbered session rows painted on the right of the split layout.
+fn pane_numbers(screen: &str) -> Vec<u32> {
+    let mut numbers = Vec::new();
+    for line in screen.lines() {
+        let Some((_, right)) = line.split_once('│') else {
+            continue;
+        };
+        let right = right.trim();
+        if !right.is_empty() && right.bytes().all(|byte| byte.is_ascii_digit()) {
+            if let Ok(number) = right.parse() {
+                numbers.push(number);
+            }
+        }
+    }
+    numbers
+}
+
 #[cfg(unix)]
 #[test]
 fn wheel_over_the_content_scrolls_the_session_instead_of_line_history() {
@@ -383,54 +417,63 @@ fn wheel_over_the_content_scrolls_the_session_instead_of_line_history() {
     tui.wait_for("Remuda > ", Duration::from_secs(3));
     // `seq 1 200` fills the screen and leaves retained history behind it.
     tui.wait_for("19", Duration::from_secs(5));
-    // Submit a line so Up has history to recall; the shell ignores input, so
-    // the text can only reappear through the composer.
-    tui.writer.write_all(b"draft line\r").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while Instant::now() < deadline {
-        let composer = tui
-            .screen_text()
-            .lines()
-            .find(|line| line.contains("Remuda > "))
-            .unwrap_or("")
-            .to_owned();
-        if !composer.contains("draft line") {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let before = pane_numbers(&tui.screen_text());
+    assert!(
+        before.len() >= 8,
+        "the pane did not show numbered rows: {:?}",
+        tui.screen_text()
+    );
 
     // Wheel up with the pointer over the content pane (right of the divider).
     tui.writer.write_all(b"\x1b[<64;60;10M").unwrap();
     let screen = tui.wait_for("scrollback 3 rows", Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(250));
+    let scrolled = pane_numbers(&tui.screen_text());
+    let expected: Vec<u32> = before
+        .iter()
+        .map(|number| number.saturating_sub(3))
+        .collect();
+    assert_eq!(
+        scrolled, expected,
+        "the pane did not move to the session's older rows"
+    );
     let composer = screen
         .lines()
         .find(|line| line.contains("Remuda > "))
         .unwrap_or("")
         .to_owned();
     assert!(
-        !composer.contains("draft line"),
-        "the wheel recalled a line instead of scrolling: {composer:?}\n{screen}"
+        composer.trim_end().ends_with("Remuda >"),
+        "the wheel typed into the composer instead of scrolling: {composer:?}\n{screen}"
     );
 
-    // Up is still the composer's line history, and any key returns to live.
-    tui.writer.write_all(b"\x1b[A").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // Wheel down returns to the exact live rows.
+    tui.writer.write_all(b"\x1b[<65;60;10M").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let screen = tui.screen_text();
-        let recalled = screen
-            .lines()
-            .find(|line| line.contains("Remuda > "))
-            .is_some_and(|line| line.contains("draft line"));
-        if recalled {
+        if pane_numbers(&tui.screen_text()) == before {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "Up did not recall the submitted line:\n{screen}"
+            "wheel down did not return to the live rows:\n{}",
+            tui.screen_text()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+
+    // Submit a line so Up has history to recall; the shell ignores input, so
+    // the text can only reappear through the composer.
+    tui.writer.write_all(b"draft line\r").unwrap();
+    wait_for_composer(&tui, Duration::from_secs(8), |line| {
+        !line.contains("draft line")
+    });
+
+    // Up is still the composer's line history, and any key returns to live.
+    tui.writer.write_all(b"\x1b[A").unwrap();
+    wait_for_composer(&tui, Duration::from_secs(3), |line| {
+        line.contains("draft line")
+    });
     tui.writer.write_all(b"\x1b[C").unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
