@@ -202,7 +202,53 @@ pub struct ClusterUi {
     // `render` is &self, so the help mode keeps its state in cells.
     help_open: std::cell::Cell<bool>,
     help_scroll: std::cell::Cell<usize>,
+    // The wheel must know where the session content was painted. `render` is
+    // &self, so the rect of the last frame lives in a cell.
+    pane_rect: std::cell::Cell<Option<PaneRect>>,
+    /// Rows scrolled back from the live screen of `scroll_target`.
+    scrollback: usize,
+    /// Session the offset belongs to: wheeling a different one starts live.
+    scroll_target: Option<String>,
+    /// A frozen history capture. The remote poller only reads the live
+    /// screen, so a remote scroll keeps the peer's scrolled capture here.
+    scroll_snapshot: Option<ScrollSnapshot>,
+    /// One capture waiting for the remote port, set by the wheel.
+    pending_scroll: Option<(String, RemoteCall, Request)>,
+    /// Monotonic request id. A reply (success or error) only applies to the
+    /// exact wheel action that asked for it.
+    scroll_generation: u64,
+    /// The generation of the one remote capture in flight, if any. Further
+    /// wheel notches coalesce into `pending_scroll` instead of queuing reads
+    /// ahead of input on a slow peer.
+    scroll_in_flight: Option<u64>,
 }
+
+/// Where the selected session's screen was painted, in 0-based terminal cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaneRect {
+    top: usize,
+    bottom: usize,
+    left: usize,
+    right: usize,
+}
+
+impl PaneRect {
+    fn contains(&self, column: usize, row: usize) -> bool {
+        (self.left..self.right).contains(&column) && (self.top..self.bottom).contains(&row)
+    }
+}
+
+/// One scrolled remote capture, tagged with the session it belongs to.
+struct ScrollSnapshot {
+    target: String,
+    body: String,
+}
+
+/// Rows one wheel notch moves, matching the local TUI.
+const WHEEL_ROWS: usize = 3;
+/// The capture protocol accepts an arbitrary offset; this keeps a held wheel
+/// from asking for an unbounded one.
+const MAX_SCROLLBACK_ROWS: usize = 10_000;
 
 struct PaneResize {
     attempt: ResizeAttempt,
@@ -613,6 +659,13 @@ impl ClusterUi {
             remote_control_disabled: HashSet::new(),
             help_open: std::cell::Cell::new(false),
             help_scroll: std::cell::Cell::new(0),
+            pane_rect: std::cell::Cell::new(None),
+            scrollback: 0,
+            scroll_target: None,
+            scroll_snapshot: None,
+            pending_scroll: None,
+            scroll_generation: 0,
+            scroll_in_flight: None,
         }
     }
 
@@ -1294,6 +1347,12 @@ impl ClusterUi {
                     self.resize_in_flight = false;
                     self.resize_finished(attempt, &reply.request, reply.result, now);
                 }
+                RemoteCall::Scroll {
+                    key,
+                    offset,
+                    generation,
+                    ..
+                } => self.scroll_reply(key, offset, generation, reply.result, now),
             }
         }
     }
@@ -1361,6 +1420,8 @@ impl ClusterUi {
         let (cols, rows) = normalized_terminal_size(cols, rows);
         let width = usize::from(cols.max(1));
         let height = usize::from(rows.max(1));
+        // Only the session pane takes the wheel; the other modes clear it.
+        self.pane_rect.set(None);
         if self.documents_open {
             return self.render_documents(width, height);
         }
@@ -1407,6 +1468,14 @@ impl ClusterUi {
             frame.len() + queue_rows.len() + notice_lines.len() + footer_rows + composer.len();
         let screen_rows = height.saturating_sub(reserved);
         let screen_end = frame.len() + screen_rows;
+        if screen_rows > 0 {
+            self.pane_rect.set(Some(PaneRect {
+                top: screen_end - screen_rows,
+                bottom: screen_end,
+                left: 0,
+                right: width,
+            }));
+        }
         frame.extend(
             visible_remote_pane_lines(&pane_body, self.remote_active.is_some(), screen_rows)
                 .into_iter()
@@ -1725,6 +1794,13 @@ impl ClusterUi {
         let mut right = vec![ellipsize(&pane_header, right_w)];
         if body_rows <= composer.len() {
             right.clear();
+        } else if screen_rows > 0 {
+            self.pane_rect.set(Some(PaneRect {
+                top: 1,
+                bottom: 1 + screen_rows,
+                left: left_w + 1,
+                right: width,
+            }));
         }
         right.extend(
             visible_remote_pane_lines(&pane_body, self.remote_active.is_some(), screen_rows)
@@ -1920,6 +1996,13 @@ impl ClusterUi {
         if let Some(diagnostic) = &self.keymap.diagnostic {
             detail = format!("keymap config: {diagnostic}");
         }
+        if self.scrollback > 0 {
+            // First on the line, so a narrow footer still says where the pane is.
+            detail = format!(
+                "scrollback {} rows · any key returns · {detail}",
+                self.scrollback
+            );
+        }
         let hint = self.help_hint();
         let room = width.saturating_sub(crate::tui::visible_width(&hint) + 1);
         let left = ellipsize(&detail, room);
@@ -2113,18 +2196,24 @@ impl ClusterUi {
     fn remote_pane(&self, local_header: String, local_screen: &str) -> (String, String) {
         match &self.remote_active {
             Some(active) => match self.remote_session(active) {
-                Some((_, session)) => (
-                    "Session".into(),
-                    session
-                        .screen
-                        .as_ref()
-                        .map(remote_screen_text)
-                        .unwrap_or_default(),
-                ),
+                Some((_, session)) => {
+                    let live = session.screen.as_ref().map(remote_screen_text);
+                    let body = self.scrolled_body().or(live).unwrap_or_default();
+                    ("Session".into(), body)
+                }
                 None => (local_header, local_screen.into()),
             },
             None => (local_header, local_screen.into()),
         }
+    }
+
+    /// The peer capture the wheel selected, if it still belongs to the pane.
+    fn scrolled_body(&self) -> Option<String> {
+        let snapshot = self.scroll_snapshot.as_ref()?;
+        (self.scrollback > 0
+            && self.scroll_target.as_deref() == Some(snapshot.target.as_str())
+            && self.pane_target().as_deref() == Some(snapshot.target.as_str()))
+        .then(|| snapshot.body.clone())
     }
 
     fn remote_active_detail(&self) -> Option<String> {
@@ -2184,6 +2273,7 @@ impl ClusterUi {
             {
                 self.key_event(key, now)
             }
+            crossterm::event::Event::Mouse(event) => self.mouse_event(event, now),
             crossterm::event::Event::Paste(text) => {
                 if self.composer_focused && self.remote_keys_mode.is_none() {
                     if self.composer_target.is_none() && self.remote_composer_target.is_none() {
@@ -2213,6 +2303,9 @@ impl ClusterUi {
     }
 
     fn key_event(&mut self, event: crossterm::event::KeyEvent, now: Duration) -> bool {
+        // Like the local TUI, any key returns to the live screen; Up/Down stay
+        // the composer's line history.
+        self.return_to_live();
         if self.documents_open {
             self.document_key(event);
             return false;
@@ -2269,6 +2362,238 @@ impl ClusterUi {
             return true;
         }
         false
+    }
+
+    /// A wheel over the session's content scrolls its own screen history. The
+    /// terminal reports this as a real wheel event only because the mouse is
+    /// captured; otherwise the alternate screen turns it into Up/Down, which
+    /// the composer reads as line-input history.
+    /// The mouse is captured, so every mouse event stops here: the terminal
+    /// no longer scrolls itself and text selection needs the usual modifier
+    /// (Option-drag on macOS, Shift-drag elsewhere — same as the local TUI).
+    /// Clicks and drags have no action here (the cluster TUI has none today).
+    fn mouse_event(&mut self, event: crossterm::event::MouseEvent, now: Duration) -> bool {
+        let up = match event.kind {
+            crossterm::event::MouseEventKind::ScrollUp => true,
+            crossterm::event::MouseEventKind::ScrollDown => false,
+            _ => return false,
+        };
+        let Some(rect) = self.pane_rect.get() else {
+            return false;
+        };
+        let (column, row) = (usize::from(event.column), usize::from(event.row));
+        if rect.contains(column, row) {
+            self.scroll_pane(WHEEL_ROWS, !up);
+        } else if rect.left > 0 && (rect.top..rect.bottom).contains(&row) && column < rect.left {
+            // Beside the content is the tree: one row per notch, like the list
+            // in the local TUI. The composer, notices and footer ignore it.
+            self.move_selection(!up, now);
+        }
+        false
+    }
+
+    fn scroll_pane(&mut self, rows: usize, down: bool) {
+        let Some(target) = self.pane_target() else {
+            return;
+        };
+        if self.scroll_target.as_deref() != Some(target.as_str()) {
+            self.scroll_target = Some(target.clone());
+            self.scrollback = 0;
+            self.scroll_snapshot = None;
+        }
+        let next = if down {
+            self.scrollback.saturating_sub(rows)
+        } else {
+            self.scrollback
+                .saturating_add(rows)
+                .min(MAX_SCROLLBACK_ROWS)
+        };
+        if next == self.scrollback {
+            return;
+        }
+        self.scrollback = next;
+        self.notice = None;
+        if next == 0 {
+            self.scroll_snapshot = None;
+            self.pending_scroll = None;
+            return;
+        }
+        if let Some((node, wire_name, instance_id)) = self.remote_scroll_target() {
+            self.scroll_generation = self.scroll_generation.wrapping_add(1);
+            self.pending_scroll = Some((
+                node,
+                RemoteCall::Scroll {
+                    key: target,
+                    instance_id,
+                    offset: next,
+                    generation: self.scroll_generation,
+                },
+                Request::CaptureStyled {
+                    name: wire_name,
+                    scrollback: next,
+                },
+            ));
+        }
+    }
+
+    /// The session whose screen the content pane paints. A remote node row
+    /// falls back to the local pane, so it scrolls the local session.
+    fn pane_target(&self) -> Option<String> {
+        if let Some(active) = &self.remote_active {
+            if self.remote_session(active).is_some() {
+                if let RemoteSelection::Session {
+                    node,
+                    wire_name,
+                    instance_id,
+                    ..
+                } = active
+                {
+                    return Some(format!("remote\0{node}\0{wire_name}\0{instance_id}"));
+                }
+            }
+        }
+        // The local pane paints the ended frame or a live capture, never
+        // history, so those panes have no scroll target.
+        if self.ended.is_some() {
+            return None;
+        }
+        let session = self.sessions.get(self.active)?;
+        if !session.alive {
+            return None;
+        }
+        session
+            .instance_id
+            .as_ref()
+            .map(|instance| format!("local\0{}\0{instance}", session.name))
+    }
+
+    fn remote_scroll_target(&self) -> Option<(String, String, String)> {
+        match &self.remote_active {
+            Some(RemoteSelection::Session {
+                node,
+                wire_name,
+                instance_id,
+                ..
+            }) => Some((node.clone(), wire_name.clone(), instance_id.clone())),
+            _ => None,
+        }
+    }
+
+    fn return_to_live(&mut self) {
+        self.pending_scroll = None;
+        if self.scrollback > 0 || self.scroll_snapshot.is_some() {
+            self.scrollback = 0;
+            self.scroll_snapshot = None;
+        }
+    }
+
+    /// The wheel only needs the mouse while the session pane is the main view.
+    /// Help, documents and remote-keys screens let the terminal own the mouse
+    /// again, so drag-to-select keeps working there without a modifier.
+    fn wants_mouse_capture(&self) -> bool {
+        !self.documents_open && !self.help_open.get() && self.remote_keys_mode.is_none()
+    }
+
+    /// A session change that did not arrive as a key press (a registry sync
+    /// removing, restarting or reordering rows) must not keep an offset that
+    /// belongs to the old target.
+    fn reconcile_scroll_target(&mut self) {
+        if self.scrollback > 0 && self.scroll_target.as_deref() != self.pane_target().as_deref() {
+            self.return_to_live();
+        }
+    }
+
+    /// Ask the peer for the scrolled capture the wheel selected. At most one
+    /// read is outstanding per peer: a slow node delays input by one capture,
+    /// not by a backlog, and intermediate offsets are dropped.
+    fn send_scroll_capture(&mut self, port: Option<&mut dyn RemotePort>) {
+        if self.scroll_in_flight.is_some() {
+            return;
+        }
+        let Some((node, call, request)) = self.pending_scroll.take() else {
+            return;
+        };
+        let generation = match &call {
+            RemoteCall::Scroll { generation, .. } => *generation,
+            _ => 0,
+        };
+        match port {
+            Some(port) => {
+                self.scroll_in_flight = Some(generation);
+                port.submit(&node, call, request);
+            }
+            None => self.return_to_live(),
+        }
+    }
+
+    fn scroll_reply(
+        &mut self,
+        key: String,
+        offset: usize,
+        generation: u64,
+        result: io::Result<Response>,
+        now: Duration,
+    ) {
+        if self.scroll_in_flight == Some(generation) {
+            self.scroll_in_flight = None;
+        }
+        // Nothing from an older wheel may change this pane, including an error:
+        // 3 -> 6 -> 3 visits the same key and offset, so only the generation
+        // tells the replies apart.
+        if generation != self.scroll_generation
+            || self.scrollback != offset
+            || self.scroll_target.as_deref() != Some(key.as_str())
+        {
+            return;
+        }
+        match result {
+            Ok(Response::StyledScreen {
+                rows,
+                instance_id,
+                scrollback_len,
+                ..
+            }) => {
+                if let Some(expected) = self.remote_instance(&key) {
+                    if instance_id.as_deref() != Some(expected.as_str()) {
+                        self.return_to_live();
+                        self.notice = Some(("session restarted; scrollback reset".into(), now));
+                        return;
+                    }
+                }
+                let body = rows
+                    .iter()
+                    .map(|row| styled_screen_row(&expand_runs(row)))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let clamped = self.scrollback.min(scrollback_len);
+                self.scrollback = clamped;
+                if clamped == 0 {
+                    self.scroll_snapshot = None;
+                    self.notice = Some(("oldest captured screen".into(), now));
+                } else {
+                    self.scroll_snapshot = Some(ScrollSnapshot { target: key, body });
+                }
+            }
+            Ok(Response::Error(error)) => {
+                self.return_to_live();
+                self.notice = Some((format!("scrollback unavailable: {error}"), now));
+            }
+            Err(error) => {
+                self.return_to_live();
+                self.notice = Some((format!("scrollback failed: {error}"), now));
+            }
+            _ => {}
+        }
+    }
+
+    /// Instance id the scrolled key names, so a restarted session's capture
+    /// cannot be painted under the old one.
+    fn remote_instance(&self, key: &str) -> Option<String> {
+        self.remote_scroll_target()
+            .and_then(|(node, wire_name, instance_id)| {
+                (key == format!("remote\0{node}\0{wire_name}\0{instance_id}").as_str())
+                    .then_some(instance_id)
+            })
     }
 
     fn browse_key(&mut self, event: crossterm::event::KeyEvent, now: Duration) -> bool {
@@ -3931,6 +4256,18 @@ pub fn help_lines(keymap: &crate::keybindings::Snapshot, width: usize) -> Vec<St
         }
     }
     lines.push(String::new());
+    lines.push("mouse".into());
+    for line in [
+        "wheel over the session screen  scroll that session's output",
+        "wheel over the tree            move the selection",
+        "any key                        return to the live screen",
+        "drag                           select text with Option (macOS) or Shift",
+    ] {
+        for wrapped in wrap_help(line, width.saturating_sub(4)) {
+            lines.push(format!("    {wrapped}"));
+        }
+    }
+    lines.push(String::new());
     lines.push("status".into());
     lines.extend(legend_lines(width));
     lines
@@ -4176,12 +4513,13 @@ fn screen(
     path: &Path,
     name: &str,
     clock: &dyn Clock,
-) -> io::Result<(String, Duration, Option<String>)> {
+    scrollback: usize,
+) -> io::Result<(String, Duration, Option<String>, usize)> {
     let response = client::request_with_timeout(
         path,
         &Request::CaptureStyled {
             name: name.into(),
-            scrollback: 0,
+            scrollback,
         },
         UI_REQUEST_TIMEOUT,
     )
@@ -4189,7 +4527,10 @@ fn screen(
     let captured_at = clock.now();
     match response {
         Response::StyledScreen {
-            rows, instance_id, ..
+            rows,
+            instance_id,
+            scrollback_len,
+            ..
         } => Ok((
             rows.iter()
                 .map(|row| {
@@ -4200,6 +4541,7 @@ fn screen(
                 .join("\n"),
             captured_at,
             instance_id,
+            scrollback_len,
         )),
         Response::Error(error) => Err(io::Error::other(error)),
         other => Err(io::Error::other(format!(
@@ -4285,6 +4627,7 @@ pub fn run_with_remote_selection_and_input(
     remote_input: Option<Arc<dyn RemoteInputTransport>>,
 ) -> io::Result<()> {
     let terminal_mode = RawMode::enable()?;
+    let mouse_mode = MouseCapture::enable()?;
     let sync_reset = SyncReset(io::stdout());
     let mut paste_capture = crate::tui::BracketedPasteCapture::new(io::stdout());
     let clock = crate::SystemClock::new();
@@ -4305,6 +4648,7 @@ pub fn run_with_remote_selection_and_input(
     };
     drop(paste_capture);
     drop(sync_reset);
+    drop(mouse_mode);
     drop(terminal_mode);
     result
 }
@@ -4328,7 +4672,7 @@ pub fn read_frame(
     ui.select_target(target)?;
     let body = match ui.sessions.get(ui.active) {
         Some(session) => {
-            let (body, captured_at, _) = screen(path, &session.name, &clock)?;
+            let (body, captured_at, _, _) = screen(path, &session.name, &clock, 0)?;
             ui.capture_completed(captured_at);
             body
         }
@@ -4337,12 +4681,47 @@ pub fn read_frame(
     Ok(ui.render(cols, rows, &body, &clock))
 }
 
+/// Follow the current screen: capture while the session pane is shown, then
+/// release the mouse so help/documents keep terminal drag selection.
+fn sync_mouse_capture(frames: &mut impl Write, want: bool, captured: &mut bool) -> io::Result<()> {
+    if want == *captured {
+        return Ok(());
+    }
+    if want {
+        crossterm::execute!(frames, crossterm::event::EnableMouseCapture)?;
+    } else {
+        crossterm::execute!(frames, crossterm::event::DisableMouseCapture)?;
+    }
+    frames.flush()?;
+    *captured = want;
+    Ok(())
+}
+
+/// Wheel events only reach the UI as wheel events while the mouse is captured.
+/// Without this the alternate screen turns a wheel into Up/Down, which the
+/// composer reads as its line-input history.
+struct MouseCapture;
+
+impl MouseCapture {
+    fn enable() -> io::Result<Self> {
+        crossterm::execute!(io::stdout(), crossterm::event::EnableMouseCapture)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for MouseCapture {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture);
+    }
+}
+
 struct ClusterTuiRuntime<'a> {
     clock: &'a dyn Clock,
     paste_capture: &'a mut crate::tui::BracketedPasteCapture<io::Stdout>,
 }
 
 fn capture_local_pane(ui: &mut ClusterUi, path: &Path, clock: &dyn Clock) -> Option<String> {
+    ui.reconcile_scroll_target();
     if ui.documents_open {
         return None;
     }
@@ -4353,16 +4732,32 @@ fn capture_local_pane(ui: &mut ClusterUi, path: &Path, clock: &dyn Clock) -> Opt
         return None;
     }
     let session = ui.sessions.get(ui.active)?.clone();
-    let (captured, captured_at, instance_id) = screen(path, &session.name, clock).ok()?;
-    if instance_id == session.instance_id
-        && ui.record_capture(&session, captured.clone(), captured_at)
-    {
-        Some(captured)
-    } else {
+    let offset = ui.scrollback;
+    let (captured, captured_at, instance_id, history) =
+        screen(path, &session.name, clock, offset).ok()?;
+    if instance_id != session.instance_id {
         ui.notice = Some((
             format!("{} restarted; screen was not refreshed", session.name),
             clock.now(),
         ));
+        return None;
+    }
+    if offset > 0 {
+        // A scrolled capture is a view, not the session's final frame: it must
+        // not become the frame `ended` replays after a close.
+        ui.snapshot_at = Some(captured_at);
+        if history < offset {
+            // At the oldest retained row; the next frame reads that offset.
+            ui.scrollback = history;
+            if history == 0 {
+                ui.notice = Some(("oldest captured screen".into(), clock.now()));
+            }
+        }
+        return Some(captured);
+    }
+    if ui.record_capture(&session, captured.clone(), captured_at) {
+        Some(captured)
+    } else {
         None
     }
 }
@@ -4523,6 +4918,8 @@ fn document_presented(
     }
 }
 
+// One cohesive event loop: sync, capture, render, present, flush pending calls.
+#[allow(clippy::too_many_lines)]
 fn run_loop(
     path: &Path,
     node: &str,
@@ -4565,6 +4962,7 @@ fn run_loop(
     let mut previous = None;
     let mut last_full_repaint = clock.now();
     let mut frames = frame_writer()?;
+    let mut mouse_captured = true;
     let mut document_inbox = crate::document_open::Inbox::from_env(path)?;
     loop {
         sync_local_list(&mut ui, path, &mut local_views, clock.now());
@@ -4596,6 +4994,7 @@ fn run_loop(
             rows,
             clock.now(),
         );
+        sync_mouse_capture(&mut frames, ui.wants_mouse_capture(), &mut mouse_captured)?;
         let captured = capture_local_pane(&mut ui, path, clock);
         let body = captured.unwrap_or_default();
         let frame = ui.render(cols, rows, &body, clock);
@@ -4610,6 +5009,7 @@ fn run_loop(
         document_presented(&ui, &mut document_inbox, &frame);
         ui.send_close_pending_via(path, port(&mut remote_calls), clock.now());
         ui.send_pending_via(path, clock.now(), port(&mut remote_calls));
+        ui.send_scroll_capture(port(&mut remote_calls));
         ui.start_pending(clock.now());
         if wait_for_input_or_remote(
             clock,
@@ -4730,7 +5130,7 @@ mod tests {
         sync_remote_views, terminal_frame, AttentionSignals, Badge, ClusterUi, EndedState,
         LocalViewLoader, RemoteInputTransport, RemoteSelection, RemoteSource, RemoteViewLoader,
         TreeSelection, ERROR_GLYPH, LOCAL_VIEW_REFRESH, LOCAL_VIEW_TTL, REMOTE_VIEW_RETRY_BASE,
-        REMOTE_VIEW_TTL, REMOTE_VIEW_UNSUPPORTED_BACKOFF,
+        REMOTE_VIEW_TTL, REMOTE_VIEW_UNSUPPORTED_BACKOFF, WHEEL_ROWS,
     };
     use crate::cluster_remote::{
         RemoteNodeSnapshot, RemoteSessionSnapshot, RemoteSnapshot, RemoteState,
@@ -4740,6 +5140,7 @@ mod tests {
     use remuda_core::protocol::{Request, Response};
     use remuda_core::session_view::{SessionView, ViewEntry};
     use remuda_core::{SessionSummary, Size};
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -10556,6 +10957,442 @@ mod tests {
         let frame = ui.render_text(80, 24, "", &clock);
         assert!(!frame.contains("studio / dev · ended"));
         assert!(frame.contains("studio · no sessions"));
+    }
+
+    fn wheel_event(column: u16, row: u16, up: bool) -> crossterm::event::Event {
+        crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+            kind: if up {
+                crossterm::event::MouseEventKind::ScrollUp
+            } else {
+                crossterm::event::MouseEventKind::ScrollDown
+            },
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        })
+    }
+
+    fn history_response(text: &str, instance: &str, scrollback_len: usize) -> Response {
+        Response::StyledScreen {
+            rows: vec![vec![remuda_core::protocol::StyledRun {
+                text: text.into(),
+                fg: Color::Default,
+                bg: Color::Default,
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                inverse: false,
+                wide: false,
+            }]],
+            instance_id: Some(instance.into()),
+            output_version: Some(1),
+            wrapped: vec![false],
+            scrollback_len,
+            scrollback_total: 100,
+            cursor: Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            },
+        }
+    }
+
+    #[test]
+    fn wheel_over_content_scrolls_history_and_up_down_keep_line_history() {
+        use crossterm::event::KeyCode;
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
+        ui.composer_focused = true;
+        ui.bind_composer_target();
+        for ch in "first line".chars() {
+            ui.key(KeyCode::Char(ch));
+        }
+        ui.key(KeyCode::Enter);
+        assert_eq!(ui.composer.text(), "");
+        let _ = ui.render_text(100, 24, "body", &clock);
+        let rect = ui.pane_rect.get().expect("the content pane was painted");
+
+        ui.handle_event(
+            wheel_event((rect.left + 2) as u16, rect.top as u16, true),
+            clock.now(),
+        );
+        assert_eq!(ui.scrollback, WHEEL_ROWS);
+        assert_eq!(
+            ui.composer.text(),
+            "",
+            "the wheel must not recall a line into the composer"
+        );
+
+        // Up is still line-input history, and it returns to the live screen.
+        ui.key(KeyCode::Up);
+        assert_eq!(ui.composer.text(), "first line");
+        assert_eq!(ui.scrollback, 0);
+    }
+
+    #[test]
+    fn wheel_outside_the_content_pane_does_not_scroll_the_session() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
+        let _ = ui.render_text(100, 24, "body", &clock);
+        let rect = ui.pane_rect.get().expect("the content pane was painted");
+
+        // The tree column is left alone: no session scroll, no selection move.
+        let before = ui.selected;
+        ui.handle_event(wheel_event(1, rect.top as u16, true), clock.now());
+        assert_eq!(ui.scrollback, 0);
+        assert_eq!(ui.selected, before);
+
+        ui.handle_event(
+            wheel_event((rect.left + 2) as u16, rect.top as u16, true),
+            clock.now(),
+        );
+        assert_eq!(ui.scrollback, WHEEL_ROWS);
+
+        for _ in 0..2 {
+            ui.handle_event(
+                wheel_event((rect.left + 2) as u16, rect.top as u16, false),
+                clock.now(),
+            );
+        }
+        assert_eq!(
+            ui.scrollback, 0,
+            "scrolling down returns to the live screen"
+        );
+    }
+
+    #[test]
+    fn stacked_layout_wheel_also_targets_the_content() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
+        let _ = ui.render_text(40, 24, "body", &clock);
+        let rect = ui.pane_rect.get().expect("the content pane was painted");
+        assert_eq!(rect.left, 0);
+        ui.handle_event(wheel_event(1, rect.top as u16, true), clock.now());
+        assert_eq!(ui.scrollback, WHEEL_ROWS);
+    }
+
+    #[test]
+    fn scrolled_pane_says_so_and_any_key_returns_to_live() {
+        use crossterm::event::KeyCode;
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", vec![session("dev", true)], clock.now());
+        let _ = ui.render_text(100, 24, "body", &clock);
+        let rect = ui.pane_rect.get().unwrap();
+        ui.handle_event(
+            wheel_event((rect.left + 2) as u16, rect.top as u16, true),
+            clock.now(),
+        );
+        let frame = ui.render_text(100, 24, "body", &clock);
+        assert!(
+            frame.contains("scrollback 3 rows"),
+            "a scrolled pane must say so: {frame}"
+        );
+        ui.key(KeyCode::Esc);
+        let frame = ui.render_text(100, 24, "body", &clock);
+        assert!(!frame.contains("scrollback"));
+        assert_eq!(ui.scrollback, 0);
+    }
+
+    #[test]
+    fn help_mode_clears_the_content_rect_so_the_wheel_cannot_scroll() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        ui.help_open.set(true);
+        let _ = ui.render_text(100, 24, "body", &clock);
+        assert!(ui.pane_rect.get().is_none());
+        ui.handle_event(wheel_event(60, 5, true), clock.now());
+        assert_eq!(ui.scrollback, 0);
+    }
+
+    #[test]
+    fn wheel_over_a_remote_session_paints_the_peer_capture_then_keys_return_live() {
+        use crossterm::event::KeyCode;
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("live-body"));
+        let transport = FakeRemoteInput::new(history_response("old-body", "remote-instance", 9));
+        let mut port = super::remote_calls::InlinePort::new(&transport);
+        let _ = ui.render_text(100, 24, "", &clock);
+        let rect = ui.pane_rect.get().expect("the content pane was painted");
+
+        ui.handle_event(
+            wheel_event((rect.left + 2) as u16, rect.top as u16, true),
+            clock.now(),
+        );
+        assert_eq!(ui.scrollback, WHEEL_ROWS);
+        ui.send_scroll_capture(Some(&mut port as &mut dyn super::RemotePort));
+        {
+            let requests = transport.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].0, "fp-laptop");
+            match &requests[0].1 {
+                Request::CaptureStyled { name, scrollback } => {
+                    assert_eq!(name.as_str(), "build");
+                    assert_eq!(*scrollback, WHEEL_ROWS);
+                }
+                other => panic!("expected a scrolled capture, got {other:?}"),
+            }
+        }
+        ui.apply_remote_replies(&mut port as &mut dyn super::RemotePort, clock.now());
+
+        let frame = ui.render_text(100, 24, "", &clock);
+        assert!(frame.contains("old-body"), "{frame}");
+        assert!(!frame.contains("live-body"), "{frame}");
+        assert!(frame.contains("scrollback 3 rows"), "{frame}");
+
+        ui.key(KeyCode::Esc);
+        let frame = ui.render_text(100, 24, "", &clock);
+        assert!(frame.contains("live-body"), "{frame}");
+        assert_eq!(ui.scrollback, 0);
+    }
+
+    struct QueuedRemoteInput {
+        responses: Mutex<VecDeque<Response>>,
+        requests: Mutex<Vec<(String, Request)>>,
+    }
+
+    impl QueuedRemoteInput {
+        fn new(responses: Vec<Response>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<Request> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, request)| request.clone())
+                .collect()
+        }
+    }
+
+    impl RemoteInputTransport for QueuedRemoteInput {
+        fn send_input(&self, node: &str, request: &Request) -> std::io::Result<Response> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((node.into(), request.clone()));
+            Ok(self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("one queued response per request"))
+        }
+    }
+
+    fn scroll_offsets(requests: &[Request]) -> Vec<usize> {
+        requests
+            .iter()
+            .filter_map(|request| match request {
+                Request::CaptureStyled { scrollback, .. } => Some(*scrollback),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn continuous_wheel_keeps_one_capture_in_flight_and_coalesces() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("live-body"));
+        let _ = ui.render_text(100, 24, "", &clock);
+        let rect = ui.pane_rect.get().unwrap();
+        let wheel = |ui: &mut ClusterUi, up: bool| {
+            ui.handle_event(
+                wheel_event((rect.left + 2) as u16, rect.top as u16, up),
+                clock.now(),
+            )
+        };
+        let transport = QueuedRemoteInput::new(vec![
+            history_response("three", "remote-instance", 9),
+            history_response("six", "remote-instance", 9),
+        ]);
+        let mut port = super::remote_calls::InlinePort::new(&transport);
+
+        wheel(&mut ui, true);
+        wheel(&mut ui, true);
+        // Only the newest pending notch is sent, not one request per notch.
+        ui.send_scroll_capture(Some(&mut port as &mut dyn super::RemotePort));
+        assert_eq!(scroll_offsets(&transport.requests()), vec![2 * WHEEL_ROWS]);
+        // A further notch while that read is in flight does not queue a second
+        // capture ahead of input.
+        wheel(&mut ui, true);
+        ui.send_scroll_capture(Some(&mut port as &mut dyn super::RemotePort));
+        assert_eq!(scroll_offsets(&transport.requests()), vec![2 * WHEEL_ROWS]);
+        ui.apply_remote_replies(&mut port as &mut dyn super::RemotePort, clock.now());
+
+        // The stale first reply is dropped; the newest offset is asked for next.
+        assert_eq!(ui.scroll_snapshot.as_ref().map(|s| s.body.as_str()), None);
+        ui.send_scroll_capture(Some(&mut port as &mut dyn super::RemotePort));
+        assert_eq!(
+            scroll_offsets(&transport.requests()),
+            vec![2 * WHEEL_ROWS, 3 * WHEEL_ROWS]
+        );
+        ui.apply_remote_replies(&mut port as &mut dyn super::RemotePort, clock.now());
+        assert_eq!(ui.scrollback, 3 * WHEEL_ROWS);
+        let frame = ui.render_text(100, 24, "", &clock);
+        assert!(frame.contains("six"), "{frame}");
+    }
+
+    #[test]
+    fn same_offset_revisited_ignores_the_earlier_reply() {
+        // 3 -> 6 -> 3 visits the same key and offset; only the generation can
+        // tell the first reply from the last.
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("live-body"));
+        let _ = ui.render_text(100, 24, "", &clock);
+        let rect = ui.pane_rect.get().unwrap();
+        let wheel = |ui: &mut ClusterUi, up: bool| {
+            ui.handle_event(
+                wheel_event((rect.left + 2) as u16, rect.top as u16, up),
+                clock.now(),
+            )
+        };
+        let transport = QueuedRemoteInput::new(vec![
+            history_response("old-three", "remote-instance", 9),
+            history_response("new-three", "remote-instance", 9),
+        ]);
+        let mut port = super::remote_calls::InlinePort::new(&transport);
+
+        wheel(&mut ui, true);
+        ui.send_scroll_capture(Some(&mut port as &mut dyn super::RemotePort));
+        wheel(&mut ui, true);
+        wheel(&mut ui, false);
+        assert_eq!(ui.scrollback, WHEEL_ROWS);
+        ui.apply_remote_replies(&mut port as &mut dyn super::RemotePort, clock.now());
+        // The first 3-row reply is stale even though key and offset match now.
+        assert!(ui.scroll_snapshot.is_none());
+        ui.send_scroll_capture(Some(&mut port as &mut dyn super::RemotePort));
+        assert_eq!(scroll_offsets(&transport.requests()), vec![3, 3]);
+        ui.apply_remote_replies(&mut port as &mut dyn super::RemotePort, clock.now());
+        let frame = ui.render_text(100, 24, "", &clock);
+        assert!(frame.contains("new-three"), "{frame}");
+        assert!(!frame.contains("old-three"), "{frame}");
+    }
+
+    #[test]
+    fn a_stale_scroll_error_does_not_cancel_a_newer_scroll() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("live-body"));
+        let _ = ui.render_text(100, 24, "", &clock);
+        let rect = ui.pane_rect.get().unwrap();
+        let wheel = |ui: &mut ClusterUi, up: bool| {
+            ui.handle_event(
+                wheel_event((rect.left + 2) as u16, rect.top as u16, up),
+                clock.now(),
+            )
+        };
+        let transport = QueuedRemoteInput::new(vec![
+            Response::Error("peer is busy".into()),
+            history_response("six", "remote-instance", 9),
+        ]);
+        let mut port = super::remote_calls::InlinePort::new(&transport);
+
+        wheel(&mut ui, true);
+        ui.send_scroll_capture(Some(&mut port as &mut dyn super::RemotePort));
+        wheel(&mut ui, true);
+        // The failed first read is stale: it must not clear the newer offset.
+        ui.apply_remote_replies(&mut port as &mut dyn super::RemotePort, clock.now());
+        assert_eq!(ui.scrollback, 2 * WHEEL_ROWS);
+        assert!(ui.notice.is_none(), "{:?}", ui.notice);
+        ui.send_scroll_capture(Some(&mut port as &mut dyn super::RemotePort));
+        ui.apply_remote_replies(&mut port as &mut dyn super::RemotePort, clock.now());
+        let frame = ui.render_text(100, 24, "", &clock);
+        assert!(frame.contains("six"), "{frame}");
+    }
+
+    #[test]
+    fn wheel_beside_the_content_moves_the_tree_and_non_wheel_mouse_is_ignored() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let clock = ManualClock::new();
+        let mut ui = make_ui(
+            "studio",
+            vec![session("dev", true), session("shell", true)],
+            clock.now(),
+        );
+        let _ = ui.render_text(100, 24, "body", &clock);
+        let rect = ui.pane_rect.get().expect("the content pane was painted");
+        assert_eq!(ui.selected, 0);
+        ui.handle_event(wheel_event(1, rect.top as u16, false), clock.now());
+        assert_eq!(ui.selected, 1, "a wheel over the tree moves its selection");
+        assert_eq!(ui.scrollback, 0);
+        // A click or drag has no action; it must not scroll or select anything.
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            ui.handle_event(
+                crossterm::event::Event::Mouse(MouseEvent {
+                    kind,
+                    column: (rect.left + 2) as u16,
+                    row: rect.top as u16,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                }),
+                clock.now(),
+            );
+        }
+        assert_eq!(ui.scrollback, 0);
+        assert_eq!(ui.selected, 1);
+    }
+
+    #[test]
+    fn scroll_target_resets_when_the_active_session_is_removed_or_restarted() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui(
+            "studio",
+            vec![session("dev", true), session("shell", true)],
+            clock.now(),
+        );
+        let _ = ui.render_text(100, 24, "body", &clock);
+        let rect = ui.pane_rect.get().unwrap();
+        let wheel_once = |ui: &mut ClusterUi| {
+            ui.handle_event(
+                wheel_event((rect.left + 2) as u16, rect.top as u16, true),
+                clock.now(),
+            );
+        };
+
+        // The same active session in a new position keeps its offset.
+        wheel_once(&mut ui);
+        assert_eq!(ui.scrollback, WHEEL_ROWS);
+        ui.sessions_synced(
+            vec![session("shell", true), session("dev", true)],
+            clock.now(),
+        );
+        ui.reconcile_scroll_target();
+        assert_eq!(ui.scrollback, WHEEL_ROWS);
+
+        // A same-name restart is a different instance and starts live.
+        let mut restarted = session("dev", true);
+        restarted.instance_id = Some("instance-dev-2".into());
+        ui.sessions_synced(vec![restarted], clock.now());
+        ui.reconcile_scroll_target();
+        assert_eq!(ui.scrollback, 0);
+
+        // Removing the active session leaves no offset for its neighbour.
+        wheel_once(&mut ui);
+        assert_eq!(ui.scrollback, WHEEL_ROWS);
+        ui.sessions_synced(vec![session("shell", true)], clock.now());
+        ui.reconcile_scroll_target();
+        assert_eq!(ui.scrollback, 0);
+    }
+
+    #[test]
+    fn mouse_capture_is_only_wanted_while_the_session_view_is_shown() {
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        assert!(ui.wants_mouse_capture());
+        ui.documents_open = true;
+        assert!(!ui.wants_mouse_capture());
+        ui.documents_open = false;
+        ui.help_open.set(true);
+        assert!(!ui.wants_mouse_capture());
+        ui.help_open.set(false);
+        assert!(ui.wants_mouse_capture());
     }
 
     #[test]

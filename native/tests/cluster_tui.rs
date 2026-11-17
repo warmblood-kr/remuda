@@ -348,6 +348,104 @@ fn stopped_daemon_input_becomes_uncertain_and_later_input_recovers() {
     assert!(matches!(close, Response::Ok));
 }
 
+#[cfg(unix)]
+#[test]
+fn wheel_over_the_content_scrolls_the_session_instead_of_line_history() {
+    use std::io::Write;
+    let mut daemon = PrivateDaemon::start();
+    daemon.wait_ready();
+    let response = remuda_native::client::request(
+        &daemon.path(),
+        &Request::New {
+            name: Some("wheel-session".into()),
+            command: vec!["sh".into(), "-c".into(), "seq 1 200; sleep 60".into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .unwrap();
+    assert!(matches!(response, Response::Value(name) if name == "wheel-session"));
+
+    let mut tui = TuiPty::start(&daemon.runtime);
+    tui.wait_for("wheel-session", Duration::from_secs(5));
+    // Without the capture request the alternate screen turns the wheel into
+    // Up/Down, which is the reported defect.
+    let captured = {
+        let output = tui.output.lock().unwrap();
+        output
+            .windows(b"\x1b[?1000h".len())
+            .any(|window| window == b"\x1b[?1000h")
+    };
+    assert!(captured, "the cluster TUI did not enable mouse capture");
+
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("Remuda > ", Duration::from_secs(3));
+    // `seq 1 200` fills the screen and leaves retained history behind it.
+    tui.wait_for("19", Duration::from_secs(5));
+    // Submit a line so Up has history to recall; the shell ignores input, so
+    // the text can only reappear through the composer.
+    tui.writer.write_all(b"draft line\r").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        let composer = tui
+            .screen_text()
+            .lines()
+            .find(|line| line.contains("Remuda > "))
+            .unwrap_or("")
+            .to_owned();
+        if !composer.contains("draft line") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Wheel up with the pointer over the content pane (right of the divider).
+    tui.writer.write_all(b"\x1b[<64;60;10M").unwrap();
+    let screen = tui.wait_for("scrollback 3 rows", Duration::from_secs(5));
+    let composer = screen
+        .lines()
+        .find(|line| line.contains("Remuda > "))
+        .unwrap_or("")
+        .to_owned();
+    assert!(
+        !composer.contains("draft line"),
+        "the wheel recalled a line instead of scrolling: {composer:?}\n{screen}"
+    );
+
+    // Up is still the composer's line history, and any key returns to live.
+    tui.writer.write_all(b"\x1b[A").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let screen = tui.screen_text();
+        let recalled = screen
+            .lines()
+            .find(|line| line.contains("Remuda > "))
+            .is_some_and(|line| line.contains("draft line"));
+        if recalled {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Up did not recall the submitted line:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    tui.writer.write_all(b"\x1b[C").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let screen = tui.screen_text();
+        if !screen.contains("scrollback") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the scrollback footer did not clear after a key:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn local_tree_lists_and_captures_a_session_from_a_private_daemon() {
     let mut daemon = PrivateDaemon::start();

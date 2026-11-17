@@ -17,6 +17,15 @@ pub enum RemoteCall {
     Input(Box<RemoteStarted>),
     Close(super::PendingClose),
     Resize(super::ResizeAttempt),
+    /// Read-only scrolled capture for the wheel; carries the target the reply
+    /// must still match before it is painted.
+    Scroll {
+        key: String,
+        instance_id: String,
+        offset: usize,
+        /// Monotonic per-UI request id; a stale reply (even an error) is ignored.
+        generation: u64,
+    },
 }
 
 pub struct RemoteReply {
@@ -41,7 +50,9 @@ fn call(
 ) -> io::Result<Response> {
     match call {
         RemoteCall::Close(_) => transport.send_close(node, request),
-        RemoteCall::Input(_) | RemoteCall::Resize(_) => transport.send_input(node, request),
+        RemoteCall::Input(_) | RemoteCall::Resize(_) | RemoteCall::Scroll { .. } => {
+            transport.send_input(node, request)
+        }
     }
 }
 
