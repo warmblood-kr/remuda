@@ -27,9 +27,10 @@ const TERMINAL_LINE_HEIGHT_PX: f32 = 16.0;
 const TREE_INDENT_PX: f32 = 12.0;
 /// Detail lines sit under the identity glyph, one step past the name.
 const TREE_DETAIL_OFFSET_PX: f32 = 3.0;
-/// Sidebar children before the local node: title and section label. The local
-/// node is the first tree entry, so a reveal index is `2 + helper notice`.
-const TREE_FIXED_HEADER_CHILDREN: usize = 2;
+/// Sidebar children before the local node: title, section label and the
+/// full-name focus line. The local node is the first tree entry, so a reveal
+/// index is `3 + helper notice`.
+const TREE_FIXED_HEADER_CHILDREN: usize = 3;
 /// Pointer travel that turns a preview click into a drag selection.
 const DRAG_THRESHOLD_PX: f32 = 3.0;
 const WORKER_REPLY_HEADROOM_BYTES: usize = 16 * 1024;
@@ -1289,6 +1290,28 @@ impl LocalGui {
         entries
     }
 
+    /// The full name of the row under the keyboard cursor. Rows stay one line;
+    /// this focus line wraps instead, so a narrow sidebar still exposes the
+    /// complete name without changing selection identity.
+    fn tree_focus_label(&self) -> Option<String> {
+        match self.tree_entries().get(self.tree_cursor)? {
+            TreeEntry::Node(None) => Some("This device".into()),
+            TreeEntry::Node(Some(fingerprint)) => self
+                .peers
+                .iter()
+                .find(|peer| &peer.fingerprint == fingerprint)
+                .map(|peer| plain_label(&peer.label))
+                .or_else(|| Some(fingerprint.clone())),
+            TreeEntry::Session(peer, index) => {
+                let rows = match peer.as_deref() {
+                    None => self.sessions.as_slice(),
+                    Some(fingerprint) => self.peer_rows(fingerprint)?,
+                };
+                rows.get(*index).map(|session| plain_label(&session.name))
+            }
+        }
+    }
+
     /// Direct sidebar children in the same order as `tree_entries`, including
     /// the conditional notice/empty rows that are not keyboard targets.
     fn sidebar_child_indices(&self) -> Vec<usize> {
@@ -1448,6 +1471,12 @@ impl LocalGui {
                 div()
                     .id(SharedString::from(id.clone()))
                     .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(position) = this.tree_entries().iter().position(|entry| {
+                            matches!(entry, TreeEntry::Session(p, i) if *i == index && p == &click_peer)
+                        }) {
+                            this.tree_cursor = position;
+                            this.reveal_tree_cursor();
+                        }
                         this.activate_session(click_peer.clone(), selected.clone());
                         if this.session_input_visible() {
                             if f32::from(window.viewport_size().width) < 700. { this.narrow_view = NarrowView::Session; }
@@ -2099,6 +2128,17 @@ impl Render for LocalGui {
                     } else {
                         "NODES"
                     }))
+                    .when_some(self.tree_focus_label(), |d, label| {
+                        d.child(
+                            div()
+                                .id("tree-focus-name")
+                                .debug_selector(|| "tree-focus-name".into())
+                                .pb_2()
+                                .text_sm()
+                                .text_color(rgb(0xc9d4e4))
+                                .child(label),
+                        )
+                    })
                     .child(
                         div()
                             .id("node-local")
@@ -5482,6 +5522,44 @@ mod tests {
         assert!(view.read_with(cx,|gui,_| gui.selection.as_ref().is_some_and(|s|s.name=="child" && s.instance=="c-1")));
     }
     #[test]
+    fn tree_focus_name_is_the_full_identity_and_follows_the_cursor() {
+        let long = "a-session-name-long-enough-to-be-clipped-by-a-narrow-row";
+        let mut gui = LocalGui::new();
+        gui.sessions = vec![row(long), row("short")];
+        gui.peers = vec![peer("p", "Peer Label")];
+        gui.expanded_nodes.insert("p".into());
+        gui.peer_sessions.insert("p".into(), vec![row("remote")]);
+        assert_eq!(gui.tree_focus_label().as_deref(), Some("This device"));
+        gui.tree_cursor = 1;
+        assert_eq!(gui.tree_focus_label().as_deref(), Some(long));
+        gui.tree_cursor = 3;
+        assert_eq!(gui.tree_focus_label().as_deref(), Some("Peer Label"));
+        gui.tree_cursor = 4;
+        assert_eq!(gui.tree_focus_label().as_deref(), Some("remote"));
+    }
+    #[gpui::test]
+    fn sidebar_focus_line_wraps_the_full_long_name_and_follows_mouse(cx: &mut gpui::TestAppContext) {
+        let long="긴이름".repeat(12);
+        let (view,cx)=cx.add_window_view(|_,_| { let mut gui=LocalGui::new(); gui.preview_busy=true;
+            gui.sessions=vec![row(&long), row("second")]; gui });
+        cx.simulate_resize(gpui::size(px(1000.),px(650.)));cx.run_until_parked();
+        cx.update(|window, app| view.read(app).tree_focus.as_ref().unwrap().focus(window));
+        cx.simulate_keystrokes("down");cx.run_until_parked();
+        let (cursor, label)=cx.read(|app| { let gui=view.read(app); (gui.tree_cursor, gui.tree_focus_label()) });
+        assert_eq!(cursor, 1);
+        assert_eq!(label.as_deref(), Some(long.as_str()), "the focus line keeps the full name");
+        let line=cx.debug_bounds("tree-focus-name").unwrap();
+        let sidebar=cx.debug_bounds("sidebar").unwrap();
+        assert!(line.size.height > px(24.), "a long name wraps instead of clipping: {line:?}");
+        assert!(line.left() >= sidebar.left() && line.right() <= sidebar.right() + px(1.), "focus line stays in the sidebar");
+        // Clicking the second session moves the cursor and the focus name.
+        let second=cx.debug_bounds("session-1").unwrap();
+        cx.simulate_click(second.center(),gpui::Modifiers::none());cx.run_until_parked();
+        let (cursor, label)=cx.read(|app| { let gui=view.read(app); (gui.tree_cursor, gui.tree_focus_label()) });
+        assert_eq!(cursor, 2);
+        assert_eq!(label.as_deref(), Some("second"));
+    }
+    #[test]
     fn tree_session_at_never_uses_local_rows_for_a_peer() {
         let mut gui = LocalGui::new();
         gui.sessions = vec![row("local")];
@@ -5503,8 +5581,8 @@ mod tests {
         gui.expanded_nodes.insert("p".into());
         gui.peer_sessions.insert("p".into(), plain_sessions(vec![summary_for_view("r","r-1")]));
         assert_eq!(gui.tree_entries().len(), gui.sidebar_child_indices().len());
-        // title+label 0-1, local node 2, local note+row, peer node, peer note+row
-        assert_eq!(gui.sidebar_child_indices(), vec![2, 4, 5, 7]);
+        // title+label+focus 0-2, local node 3, local note+row, peer node, peer note+row
+        assert_eq!(gui.sidebar_child_indices(), vec![3, 5, 6, 8]);
     }
     #[cfg(unix)]
     #[test]
