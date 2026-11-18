@@ -250,11 +250,13 @@ impl Pane {
     /// A pane that shares one workspace image budget.
     pub fn new_with_budget(socket: PathBuf, budget: Arc<ImageBudget>) -> Self {
         static NEXT_PANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let mut browser = Browser::new(socket.clone());
+        browser.enable_parent_navigation();
         Self {
             selection_id: NEXT_PANE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             selection_epoch: 0,
             directory_scroll: gpui::ScrollHandle::new(),
-            browser: Browser::new(socket.clone()),
+            browser,
             socket,
             budget,
             key_events: 0,

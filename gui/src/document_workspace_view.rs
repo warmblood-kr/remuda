@@ -430,7 +430,7 @@ fn pane_body<T: DocumentHost + 'static>(
         let directory = directory.to_owned();
         let rows = entries.iter().enumerate().map(|(index, entry)| {
             let path = entry.path.clone();
-            let shown = remuda_native::documents::path_label(&path);
+            let shown = entry.display_label();
             let is_directory = entry.directory;
             let parent = directory.clone();
             div().id(SharedString::from(format!("vfs-entry-{tag}-{index}")))
@@ -1747,6 +1747,41 @@ mod tests {
     }
 
     #[gpui::test]
+    fn parent_row_moves_up_one_level_and_stops_at_root(cx: &mut gpui::TestAppContext) {
+        let _guard=DAEMON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let bin=remuda_bin(); let daemon=Daemon::start(&bin);
+        daemon.put(&bin,"docs/guide/note.md",b"note"); daemon.put(&bin,"docs/readme.md",b"readme");
+        let (view,cx)=host(daemon.socket(),cx); cx.simulate_resize(gpui::size(px(900.),px(600.))); settle(&view,cx);
+        // The root itself has no parent row.
+        assert!(view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().directory_entries().unwrap().2.iter().all(|e| e.label.is_none())));
+        let docs=view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().directory_entries().unwrap().2.iter().position(|e| e.path=="docs/").unwrap());
+        let docs_id: &'static str=Box::leak(format!("vfs-entry-left-{docs}").into_boxed_str());
+        let row=cx.debug_bounds(docs_id).unwrap(); cx.simulate_click(row.center(),gpui::Modifiers::none()); settle(&view,cx);
+        let (label, first, position)=view.read_with(cx,|h,_| {
+            let (_,_,entries,position)=h.documents.as_ref().unwrap().active().directory_entries().unwrap();
+            (entries[0].label.clone(), entries[1].path.clone(), position)
+        });
+        assert_eq!(label.as_deref(), Some(".."));
+        assert_eq!(first, "docs/guide/");
+        assert_eq!(position, 1, "the first real entry stays selected");
+        // Click `..` once: docs -> root.
+        let parent=cx.debug_bounds("vfs-entry-left-0").unwrap(); cx.simulate_click(parent.center(),gpui::Modifiers::none()); settle(&view,cx);
+        assert_eq!(view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().location().to_owned()), "");
+        // Root -> docs -> guide, then keyboard Up + Enter goes to the parent.
+        let row=cx.debug_bounds(docs_id).unwrap(); cx.simulate_click(row.center(),gpui::Modifiers::none()); settle(&view,cx);
+        let guide=cx.debug_bounds("vfs-entry-left-1").unwrap(); cx.simulate_click(guide.center(),gpui::Modifiers::none()); settle(&view,cx);
+        assert_eq!(view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().location().to_owned()), "docs/guide/");
+        view.update(cx,|h,_| { h.documents.as_mut().unwrap().active_mut().move_selection(false); });
+        cx.run_until_parked();
+        view.update(cx,|h,cx| { h.documents.as_mut().unwrap().active_mut().open_selected(); cx.notify(); }); settle(&view,cx);
+        assert_eq!(view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().location().to_owned()), "docs/");
+        // A second `..` stops at the root instead of leaving it.
+        let parent=cx.debug_bounds("vfs-entry-left-0").unwrap(); cx.simulate_click(parent.center(),gpui::Modifiers::none()); settle(&view,cx);
+        assert_eq!(view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().location().to_owned()), "");
+        assert!(view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().directory_entries().unwrap().2.iter().all(|e| e.label.is_none())));
+    }
+
+    #[gpui::test]
     fn vfs_long_listing_scroll_click_and_history(cx: &mut gpui::TestAppContext) {
         let _guard=DAEMON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let bin=remuda_bin(); let daemon=Daemon::start(&bin);
@@ -1776,7 +1811,7 @@ mod tests {
         cx.simulate_event(gpui::ScrollWheelEvent { position:frame.center(), delta:gpui::ScrollDelta::Pixels(gpui::point(px(0.),px(10000.))), ..Default::default() }); cx.run_until_parked();
         let folder=cx.debug_bounds(folder_id).unwrap(); cx.simulate_click(folder.center(),gpui::Modifiers::none()); settle(&view,cx);
         assert!(view.read_with(cx,|h,_|h.documents.as_ref().unwrap().active().location().contains("zfolder")));
-        let file=cx.debug_bounds("vfs-entry-left-0").unwrap(); cx.simulate_click(file.center(),gpui::Modifiers::none()); settle(&view,cx);
+        let file=cx.debug_bounds("vfs-entry-left-1").unwrap(); cx.simulate_click(file.center(),gpui::Modifiers::none()); settle(&view,cx);
         assert!(view.read_with(cx,|h,_|h.documents.as_ref().unwrap().active().location().ends_with("inside.md")));
         view.update(cx,|h,cx| {h.documents.as_mut().unwrap().active_mut().back();cx.notify();}); settle(&view,cx);
         assert!(view.read_with(cx,|h,_|h.documents.as_ref().unwrap().active().location().contains("zfolder")));

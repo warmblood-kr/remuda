@@ -33,6 +33,17 @@ impl Location {
 pub struct Entry {
     pub path: String,
     pub directory: bool,
+    /// Display override. The synthetic parent row shows `..` while its path
+    /// stays the real parent address used for navigation.
+    pub label: Option<String>,
+}
+impl Entry {
+    /// The row label: the override when present, otherwise the escaped path.
+    pub fn display_label(&self) -> String {
+        self.label
+            .clone()
+            .unwrap_or_else(|| path_label(&self.path))
+    }
 }
 #[derive(Clone, Debug)]
 pub struct Page {
@@ -78,11 +89,51 @@ pub struct Browser {
     pending: bool,
     flight: Option<(u64, mpsc::Receiver<Reply>)>,
     rendered_count: Cell<usize>,
+    /// Opt-in `..` row for directory listings.
+    parent_navigation: bool,
     address: Option<(String, usize)>,
 }
 impl Browser {
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+    /// Show a `..` row at the top of a non-root directory listing. Off by
+    /// default so a document listing keeps its earlier shape until it opts in.
+    pub fn enable_parent_navigation(&mut self) {
+        self.parent_navigation = true;
+        self.inject_parent_row();
+    }
+    /// Prepend the parent row after a listing arrives. A restored page keeps
+    /// its own rows, so Back shows the same layout it left.
+    fn inject_parent_row(&mut self) {
+        if !self.parent_navigation {
+            return;
+        }
+        let Location::Directory(path) = &self.page.location else {
+            return;
+        };
+        let Some(parent) = parent_directory(path) else {
+            return;
+        };
+        if self
+            .page
+            .entries
+            .first()
+            .is_some_and(|entry| entry.label.is_some())
+        {
+            return;
+        }
+        let had_entries = !self.page.entries.is_empty();
+        self.page.entries.insert(
+            0,
+            Entry {
+                path: parent,
+                directory: true,
+                label: Some("..".into()),
+            },
+        );
+        // Keep the earlier behavior of selecting the first real entry.
+        self.page.position = usize::from(had_entries);
     }
     pub fn new(socket: PathBuf) -> Self {
         let mut browser = Self {
@@ -94,6 +145,7 @@ impl Browser {
             pending: false,
             flight: None,
             rendered_count: Cell::new(0),
+            parent_navigation: false,
             address: None,
         };
         browser.refresh();
@@ -296,7 +348,7 @@ impl Browser {
                                 &format!(
                                     "{} {}",
                                     if i == self.page.position { ">" } else { " " },
-                                    path_label(&entry.path)
+                                    entry.display_label()
                                 ),
                                 width,
                             )
@@ -450,7 +502,10 @@ impl Browser {
                 if *generation == self.generation {
                     self.loading = false;
                     match reply {
-                        Ok(page) => self.page = page,
+                        Ok(page) => {
+                            self.page = page;
+                            self.inject_parent_row();
+                        }
                         Err(error) => self.page.error = Some(error),
                     }
                     changed = true;
@@ -477,6 +532,19 @@ impl Browser {
         }
         changed
     }
+}
+
+/// The lexical parent of a VFS directory path, or `None` at the root. The
+/// root is the empty path; every answer is a path `navigate` re-validates.
+pub fn parent_directory(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(match trimmed.rfind('/') {
+        Some(index) => format!("{}/", &trimmed[..index]),
+        None => String::new(),
+    })
 }
 
 fn body_room(height: usize) -> usize {
@@ -686,7 +754,7 @@ fn decode(location: &Location, value: &Value) -> Reply {
                 }
                 page.entries.push(Entry {
                     path: path.to_owned(),
-                    directory,
+                    directory, label: None,
                 });
             }
         }
@@ -758,6 +826,15 @@ fn markdown_path(path: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn parent_directory_stops_at_the_root() {
+        assert_eq!(parent_directory(""), None);
+        assert_eq!(parent_directory("/"), None);
+        assert_eq!(parent_directory("docs"), Some(String::new()));
+        assert_eq!(parent_directory("docs/"), Some(String::new()));
+        assert_eq!(parent_directory("docs/guide/"), Some("docs/".into()));
+        assert_eq!(parent_directory("a/b/c/"), Some("a/b/".into()));
+    }
     fn html_page(path: &str, text: &str) -> Page {
         decode(
             &Location::Document(path.into()),
@@ -777,7 +854,7 @@ mod tests {
             page: html_page("a.md", original), loading: false,
             socket: PathBuf::from("/unavailable-test-only"), history: Vec::new(),
             generation: 1, pending: false, flight: Some((1, receive)),
-            rendered_count: Cell::new(0), address: None,
+            rendered_count: Cell::new(0), address: None, parent_navigation: false,
         };
         browser.navigate(Location::Document("b.md".into()));
         browser.page = html_page("b.md", "# B");
@@ -800,7 +877,7 @@ mod tests {
                 page: html_page("a.md", "# original"), loading: false,
                 socket: PathBuf::from("/unavailable-test-only"), history: Vec::new(),
                 generation: 1, pending: false, flight: Some((1, receive)),
-                rendered_count: Cell::new(0), address: None,
+                rendered_count: Cell::new(0), address: None, parent_navigation: false,
             };
             let raw: std::sync::Arc<str> = "a".repeat(MAX_BYTES).into();
             browser.page.source_text = Some(raw.clone());
@@ -861,7 +938,7 @@ mod tests {
             let mut browser = Browser {
                 page, loading: false, socket: PathBuf::from("/unavailable-test-only"),
                 history: Vec::new(), generation: 1, pending: false,
-                flight: Some((1, receive)), rendered_count: Cell::new(0), address: None,
+                flight: Some((1, receive)), rendered_count: Cell::new(0), address: None, parent_navigation: false,
             };
             browser.navigate(Location::Document("b.md".into()));
             browser.page.source_text = Some("b".repeat(MAX_BYTES).into());
@@ -892,6 +969,7 @@ mod tests {
             pending: false,
             flight: None,
             rendered_count: Cell::new(0),
+            parent_navigation: false,
             address: None,
         };
         for (width, height, expected) in [
@@ -931,6 +1009,7 @@ mod tests {
             pending: false,
             flight: Some((0, receive)),
             rendered_count: Cell::new(0),
+            parent_navigation: false,
             address: None,
         };
         browser.page.position = 2;
@@ -972,6 +1051,7 @@ mod tests {
             pending: false,
             flight: None,
             rendered_count: Cell::new(0),
+            parent_navigation: false,
             address: None,
         };
         let text = browser.page.text.join("\n");
@@ -1009,6 +1089,7 @@ mod tests {
             pending: false,
             flight: None,
             rendered_count: Cell::new(0),
+            parent_navigation: false,
             address: None,
         };
         browser.select_link(false);
@@ -1041,6 +1122,7 @@ mod tests {
             pending: false,
             flight: Some((1, receive)),
             rendered_count: Cell::new(0),
+            parent_navigation: false,
             address: None,
         };
         browser.inspect_address();
@@ -1068,6 +1150,8 @@ mod tests {
                     .map(|path| Entry {
                         path: path.into(),
                         directory: false,
+
+                        label: None,
                     })
                     .collect();
                 let mut browser = Browser {
@@ -1079,6 +1163,7 @@ mod tests {
                     pending: queued,
                     flight: Some((1, receive)),
                     rendered_count: Cell::new(0),
+                    parent_navigation: false,
                     address: None,
                 };
                 browser.inspect_address();
@@ -1089,6 +1174,8 @@ mod tests {
                     .map(|path| Entry {
                         path: path.into(),
                         directory: false,
+
+                        label: None,
                     })
                     .collect();
                 if !reply_before_close {
@@ -1126,6 +1213,7 @@ mod tests {
             pending: false,
             flight: None,
             rendered_count: Cell::new(0),
+            parent_navigation: false,
             address: None,
         };
         browser.page.entries = paths
@@ -1133,6 +1221,8 @@ mod tests {
             .map(|path| Entry {
                 path: path.clone(),
                 directory: false,
+
+                label: None,
             })
             .collect();
         let listing = browser.lines(12, 8);
@@ -1190,6 +1280,7 @@ mod tests {
             pending: false,
             flight: Some((1, receive)),
             rendered_count: Cell::new(0),
+            parent_navigation: false,
             address: None,
         };
         for _ in 0..RETRY_STRESS_ITERATIONS {
@@ -1250,6 +1341,7 @@ mod tests {
             pending: false,
             flight: Some((1, receive)),
             rendered_count: Cell::new(0),
+            parent_navigation: false,
             address: None,
         };
         assert!(!browser.back());
