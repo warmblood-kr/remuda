@@ -168,6 +168,8 @@ pub struct ClusterUi {
     composer: LineComposer,
     keymap: crate::keybindings::Snapshot,
     composer_focused: bool,
+    documents_open: bool,
+    documents: Option<crate::documents::Browser>,
     composer_target: Option<(String, String)>,
     input_sender: InputSender,
     input_queue: InputQueue,
@@ -441,6 +443,8 @@ enum LocalViewResult {
     Rejected,
 }
 
+type LocalRoster = Vec<(String, Option<String>, bool, bool, bool)>;
+
 /// One nonblocking local `RenderedSessionList` request at a time. A slow
 /// decorator delays only this reply, never key handling or painting.
 struct LocalViewLoader {
@@ -449,7 +453,7 @@ struct LocalViewLoader {
     finished: Arc<AtomicU64>,
     next: u64,
     in_flight: Option<u64>,
-    roster: Option<Vec<(String, Option<String>, bool, bool, bool)>>,
+    roster: Option<LocalRoster>,
     flight_invalid: bool,
 }
 
@@ -577,6 +581,8 @@ impl ClusterUi {
             composer: LineComposer::default(),
             keymap: crate::keybindings::Snapshot::default(),
             composer_focused: false,
+            documents_open: false,
+            documents: None,
             composer_target: None,
             input_sender,
             input_queue: InputQueue::default(),
@@ -1355,6 +1361,9 @@ impl ClusterUi {
         let (cols, rows) = normalized_terminal_size(cols, rows);
         let width = usize::from(cols.max(1));
         let height = usize::from(rows.max(1));
+        if self.documents_open {
+            return self.render_documents(width, height);
+        }
         if self.help_open.get() {
             return self.render_help_mode(width, height);
         }
@@ -2166,6 +2175,9 @@ impl ClusterUi {
     }
 
     fn handle_event(&mut self, event: crossterm::event::Event, now: Duration) -> bool {
+        if self.documents_open && matches!(event, crossterm::event::Event::Paste(_)) {
+            return false;
+        }
         match event {
             crossterm::event::Event::Key(key)
                 if key.kind == crossterm::event::KeyEventKind::Press =>
@@ -2201,6 +2213,16 @@ impl ClusterUi {
     }
 
     fn key_event(&mut self, event: crossterm::event::KeyEvent, now: Duration) -> bool {
+        if self.documents_open {
+            self.document_key(event);
+            return false;
+        }
+        if self.composer_focused
+            && self.keymap.resolve("cluster.composer", event) == Some("cluster.documents")
+        {
+            self.open_documents();
+            return false;
+        }
         if self.partial_input_confirm_target.is_some()
             && !self
                 .notice
@@ -2209,6 +2231,17 @@ impl ClusterUi {
         {
             self.partial_input_confirm_target = None;
         }
+        if self.handle_confirmation_key(event, now) {
+            return false;
+        }
+        self.browse_key(event, now)
+    }
+
+    fn handle_confirmation_key(
+        &mut self,
+        event: crossterm::event::KeyEvent,
+        now: Duration,
+    ) -> bool {
         if let Some(decision) = self.confirmation.handle(matches!(
             self.keymap.resolve("cluster.confirm", event),
             Some("cluster.confirm.accept" | "cluster.confirm.accept_upper")
@@ -2233,8 +2266,12 @@ impl ClusterUi {
                     self.notice = Some(("close cancelled".into(), now));
                 }
             }
-            return false;
+            return true;
         }
+        false
+    }
+
+    fn browse_key(&mut self, event: crossterm::event::KeyEvent, now: Duration) -> bool {
         if let Some(target) = self.remote_keys_mode.clone() {
             if self.keymap.resolve("cluster.remote.keys", event) == Some("cluster.remote.back") {
                 self.remote_keys_mode = None;
@@ -2260,6 +2297,7 @@ impl ClusterUi {
             "cluster.tree"
         };
         match self.keymap.resolve(context, event) {
+            Some("cluster.documents") => self.open_documents(),
             Some("cluster.detach") => return true,
             Some("cluster.help") => {
                 self.help_open.set(true);
@@ -3865,7 +3903,7 @@ pub fn legend_lines(width: usize) -> Vec<String> {
 
 /// Every cluster binding plus the status legend, wrapped for `width`.
 pub fn help_lines(keymap: &crate::keybindings::Snapshot, width: usize) -> Vec<String> {
-    const CONTEXTS: [&str; 7] = [
+    const CONTEXTS: [&str; 8] = [
         "cluster.tree",
         "cluster.search",
         "cluster.composer",
@@ -3873,6 +3911,7 @@ pub fn help_lines(keymap: &crate::keybindings::Snapshot, width: usize) -> Vec<St
         "cluster.remote.keys",
         "cluster.runtime",
         "cluster.help",
+        "cluster.documents",
     ];
     let mut lines = vec![
         "remuda · cluster help".to_string(),
@@ -4087,6 +4126,7 @@ fn sync_local_list(
     local_views: &mut LocalViewLoader,
     now: Duration,
 ) {
+    ui.sync_documents(path);
     sync_local_list_with(ui, local_views, now, list(path), |loader, now| {
         loader.request(path, now)
     });
@@ -4303,6 +4343,9 @@ struct ClusterTuiRuntime<'a> {
 }
 
 fn capture_local_pane(ui: &mut ClusterUi, path: &Path, clock: &dyn Clock) -> Option<String> {
+    if ui.documents_open {
+        return None;
+    }
     if let Some(ended) = &ui.ended {
         return Some(ended.screen.clone());
     }
@@ -4339,6 +4382,145 @@ fn resize_active_pane(
         remote_calls.map(|port| port as &mut dyn RemotePort),
         |request| client::request_with_timeout(path, request, UI_REQUEST_TIMEOUT),
     );
+}
+
+impl ClusterUi {
+    fn open_documents(&mut self) {
+        self.documents_open = true;
+        if let Some(browser) = &mut self.documents {
+            browser.refresh();
+        }
+    }
+
+    fn sync_documents(&mut self, path: &Path) {
+        if self.documents_open && self.documents.is_none() {
+            self.documents = Some(crate::documents::Browser::new(path.to_owned()));
+        }
+        if let Some(browser) = &mut self.documents {
+            browser.poll();
+        }
+    }
+
+    fn document_key(&mut self, event: crossterm::event::KeyEvent) {
+        match self.keymap.resolve("cluster.documents", event) {
+            Some(action @ ("documents.link.next" | "documents.link.previous")) => {
+                if let Some(browser) = &mut self.documents {
+                    browser.select_link(action == "documents.link.next");
+                }
+            }
+            Some("documents.address") => {
+                if let Some(browser) = &mut self.documents {
+                    browser.inspect_address();
+                }
+            }
+            Some("documents.close") => {
+                if let Some(browser) = &mut self.documents {
+                    browser.cancel();
+                }
+                self.documents_open = false;
+            }
+            Some("documents.back") => {
+                if self.documents.as_mut().is_none_or(|browser| browser.back()) {
+                    self.documents_open = false;
+                }
+            }
+            Some(action @ ("documents.up" | "documents.down")) => {
+                if let Some(browser) = &mut self.documents {
+                    browser.move_selection(action == "documents.down");
+                }
+            }
+            Some("documents.open") => {
+                if let Some(browser) = &mut self.documents {
+                    browser.open_selected();
+                }
+            }
+            Some("documents.refresh") => {
+                if let Some(browser) = &mut self.documents {
+                    browser.refresh();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn render_documents(&self, width: usize, height: usize) -> String {
+        let mut lines = self.documents.as_ref().map_or_else(
+            || vec!["Documents · loading".into()],
+            |browser| browser.lines(width, height),
+        );
+        lines.resize(height, String::new());
+        if height > 1 {
+            lines[height - 1] = self.keymap.display_help("cluster.documents", &[]);
+        }
+        lines
+            .into_iter()
+            .take(height)
+            .map(|line| truncate(&line, width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn apply_document_request(
+    ui: &mut ClusterUi,
+    inbox: &mut Option<crate::document_open::Inbox>,
+    path: &Path,
+) {
+    if let Some(inbox) = inbox {
+        if let Some(request) = inbox.take() {
+            ui.documents_open = true;
+            let browser = ui
+                .documents
+                .get_or_insert_with(|| crate::documents::Browser::new(path.to_owned()));
+            browser.cancel();
+            browser.navigate(crate::documents::Location::Document(
+                request.uri[10..].to_owned(),
+            ));
+            inbox.track(request, browser.generation());
+        }
+    }
+}
+
+fn present_frame(
+    frame: &str,
+    previous: &mut Option<vt100::Parser>,
+    size: (u16, u16),
+    now: Duration,
+    last_full_repaint: &mut Duration,
+    frames: &mut impl Write,
+) -> io::Result<()> {
+    let (rows, cols) = size;
+    let mut next = vt100::Parser::new(rows, cols, 0);
+    next.process(format!("\x1b[H\x1b[2J{}", terminal_frame(frame)).as_bytes());
+    let output = present_with_recovery(
+        previous.as_ref().map(vt100::Parser::screen),
+        next.screen(),
+        now,
+        last_full_repaint,
+    );
+    if !output.is_empty() {
+        // Anything another writer left in stdout's buffer goes first.
+        io::stdout().flush()?;
+        write_frame(frames, &output)?;
+    }
+    *previous = Some(next);
+    Ok(())
+}
+
+fn document_presented(
+    ui: &ClusterUi,
+    inbox: &mut Option<crate::document_open::Inbox>,
+    frame: &str,
+) {
+    if let Some(inbox) = inbox {
+        inbox.presented(
+            ui.documents.as_ref(),
+            ui.documents_open,
+            ui.documents
+                .as_ref()
+                .is_some_and(|browser| browser.body_in_frame(frame)),
+        );
+    }
 }
 
 fn run_loop(
@@ -4383,8 +4565,10 @@ fn run_loop(
     let mut previous = None;
     let mut last_full_repaint = clock.now();
     let mut frames = frame_writer()?;
+    let mut document_inbox = crate::document_open::Inbox::from_env(path)?;
     loop {
         sync_local_list(&mut ui, path, &mut local_views, clock.now());
+        apply_document_request(&mut ui, &mut document_inbox, path);
         // Read before syncing: an update landing during sync/render wakes the wait.
         let seen = wake();
         ui.remote_synced(remote_source);
@@ -4394,7 +4578,7 @@ fn run_loop(
         }
         runtime
             .paste_capture
-            .set(ui.remote_keys_mode.is_some() || ui.composer_focused)?;
+            .set(ui.documents_open || ui.remote_keys_mode.is_some() || ui.composer_focused)?;
         if let Some(RemoteSelection::Session { node, name, .. }) = &ui.remote_active {
             remote_selection.select(node.clone(), name.clone());
         } else {
@@ -4415,20 +4599,15 @@ fn run_loop(
         let captured = capture_local_pane(&mut ui, path, clock);
         let body = captured.unwrap_or_default();
         let frame = ui.render(cols, rows, &body, clock);
-        let mut next = vt100::Parser::new(rows, cols, 0);
-        next.process(format!("\x1b[H\x1b[2J{}", terminal_frame(&frame)).as_bytes());
-        let output = present_with_recovery(
-            previous.as_ref().map(vt100::Parser::screen),
-            next.screen(),
+        present_frame(
+            &frame,
+            &mut previous,
+            (rows, cols),
             clock.now(),
             &mut last_full_repaint,
-        );
-        if !output.is_empty() {
-            // Anything another writer left in stdout's buffer goes first.
-            io::stdout().flush()?;
-            write_frame(&mut frames, &output)?;
-        }
-        previous = Some(next);
+            &mut frames,
+        )?;
+        document_presented(&ui, &mut document_inbox, &frame);
         ui.send_close_pending_via(path, port(&mut remote_calls), clock.now());
         ui.send_pending_via(path, clock.now(), port(&mut remote_calls));
         ui.start_pending(clock.now());
@@ -4625,6 +4804,32 @@ mod tests {
         let mut ui = ClusterUi::new(node, sessions, at);
         ui.set_keymap(crate::keybindings::test_snapshot(""));
         ui
+    }
+
+    #[test]
+    fn documents_capture_keys_and_paste_then_restore_session_draft() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        ui.composer.insert_text("saved draft");
+        let selected = ui.selected;
+        ui.key(KeyCode::Char('d'));
+        assert!(ui.render_text(80, 24, "pane", &clock).contains("Documents"));
+        ui.composer_focused = true; // Focus below Documents must still receive nothing.
+        ui.handle_event(Event::Paste("do not send".into()), clock.now());
+        for code in [KeyCode::Enter, KeyCode::Char('x'), KeyCode::Char('y')] {
+            ui.key(code);
+        }
+        assert_eq!(ui.composer.text(), "saved draft");
+        assert!(ui.input_queue.items().next().is_none());
+        ui.key(KeyCode::Char('q'));
+        assert!(!ui.render_text(80, 24, "pane", &clock).contains("Documents"));
+        assert_eq!(ui.selected, selected);
+        assert!(ui.composer_focused);
+        key_event(&mut ui, KeyCode::Char('d'), KeyModifiers::ALT, clock.now());
+        assert!(ui.render_text(80, 24, "pane", &clock).contains("Documents"));
+        ui.key(KeyCode::Esc);
+        assert_eq!(ui.composer.text(), "saved draft");
     }
 
     #[test]

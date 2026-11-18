@@ -120,6 +120,8 @@ impl Drop for PrivateDaemon {
 
 #[cfg(unix)]
 struct TuiPty {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    rows: u16,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     pid: u32,
     writer: Box<dyn std::io::Write + Send>,
@@ -130,10 +132,22 @@ struct TuiPty {
 #[cfg(unix)]
 impl TuiPty {
     fn start(runtime: &std::path::Path) -> Self {
+        Self::start_document_target(runtime, None)
+    }
+
+    fn start_document_target(runtime: &std::path::Path, target: Option<&str>) -> Self {
+        Self::start_document_target_rows(runtime, target, 24)
+    }
+
+    fn start_document_target_rows(
+        runtime: &std::path::Path,
+        target: Option<&str>,
+        rows: u16,
+    ) -> Self {
         use std::io::Read;
         let pty = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize {
-                rows: 24,
+                rows,
                 cols: 100,
                 pixel_width: 0,
                 pixel_height: 0,
@@ -147,6 +161,9 @@ impl TuiPty {
         command.env("XDG_DATA_HOME", runtime.join("data"));
         command.env("XDG_CACHE_HOME", runtime.join("cache"));
         command.env("XDG_STATE_HOME", runtime.join("state"));
+        if let Some(target) = target {
+            command.env("REMUDA_DOCUMENT_TARGET", target);
+        }
         let child = pty.slave.spawn_command(command).expect("spawn cluster TUI");
         let pid = child.process_id().expect("cluster TUI child PID");
         drop(pty.slave);
@@ -167,6 +184,8 @@ impl TuiPty {
             }
         });
         Self {
+            master: pty.master,
+            rows,
             child,
             pid,
             writer,
@@ -177,13 +196,25 @@ impl TuiPty {
 
     fn screen_text(&self) -> String {
         let output = self.output.lock().unwrap();
-        let mut parser = vt100::Parser::new(24, 100, 0);
+        let mut parser = vt100::Parser::new(self.rows, 100, 0);
         parser.process(&output);
         parser.screen().contents()
     }
 
     fn output_len(&self) -> usize {
         self.output.lock().unwrap().len()
+    }
+
+    fn resize_rows(&mut self, rows: u16) {
+        self.master
+            .resize(portable_pty::PtySize {
+                rows,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        self.rows = rows;
     }
 
     fn screens_from(&self, offset: usize) -> (String, String) {
@@ -263,14 +294,14 @@ fn stopped_daemon_input_becomes_uncertain_and_later_input_recovers() {
     let mut tui = TuiPty::start(&daemon.runtime);
     tui.wait_for("tui-session", Duration::from_secs(5));
     tui.writer.write_all(b"\r").unwrap();
-    tui.wait_for("$ tui-session> ", Duration::from_secs(3));
+    tui.wait_for("Remuda > ", Duration::from_secs(3));
     tui.writer.write_all(b"first line").unwrap();
     tui.wait_for("first line", Duration::from_secs(5));
 
     daemon.stop();
     let redraw_start = tui.output_len();
     tui.writer.write_all(b"\r").unwrap();
-    tui.wait_for("sending   · first line", Duration::from_secs(3));
+    tui.wait_for("sending · first line", Duration::from_secs(3));
     let started = Instant::now();
     // InputLine gets an eight-second response budget and three bounded retries.
     let uncertain_bound = Duration::from_secs(36);
@@ -281,7 +312,7 @@ fn stopped_daemon_input_becomes_uncertain_and_later_input_recovers() {
         if screen.contains("delivery uncertain") {
             break screen;
         }
-        if screen.contains("sending   ·") {
+        if screen.contains("sending ·") {
             progress_screens.insert(screen.clone());
         }
         assert!(
@@ -404,6 +435,380 @@ fn local_tree_frame_uses_daemon_registered_decorations_and_depth() {
         plain.find("tree-parent").unwrap() < plain.find("tree-child").unwrap(),
         "{plain}"
     );
+}
+
+#[cfg(unix)]
+fn document_test_daemon(fixtures: &[(&str, &str)]) -> PrivateDaemon {
+    use base64::Engine;
+    let mut daemon = PrivateDaemon::start();
+    daemon.wait_ready();
+    let init = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "cluster-tree", "cluster", "init", "--no-listen"])
+        .env("REMUDA_RUNTIME_DIR", &daemon.runtime)
+        .env("HOME", daemon.runtime.join("home"))
+        .env("XDG_CONFIG_HOME", daemon.runtime.join("config"))
+        .env("XDG_DATA_HOME", daemon.runtime.join("data"))
+        .env("XDG_CACHE_HOME", daemon.runtime.join("cache"))
+        .env("XDG_STATE_HOME", daemon.runtime.join("state"))
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    for (path, text) in fixtures {
+        let put = remuda_native::client::request(
+            &daemon.path(),
+            &Request::Vfs {
+                args: vec!["put".into(), "-".into(), format!("remuda:///{path}")],
+                input_base64: Some(base64::engine::general_purpose::STANDARD.encode(text)),
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(put, Response::CommandResult { exit_code: 0, .. }),
+            "{put:?}"
+        );
+    }
+    let new = remuda_native::client::request(
+        &daemon.path(),
+        &Request::New {
+            name: Some("doc-session".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                r#"stty -echo; while IFS= read -r line; do printf 'got:%s\n' "$line"; done"#.into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .unwrap();
+    assert!(matches!(new, Response::Value(_)), "{new:?}");
+    daemon
+}
+
+#[cfg(unix)]
+#[test]
+fn documents_browse_plain_text_and_return_without_sending_browser_input() {
+    use std::io::Write;
+    let mut daemon = document_test_daemon(&[("docs/one.txt", "BROWSER_FIXTURE\nsecond line\n")]);
+    let mut tui = TuiPty::start(&daemon.runtime);
+    tui.wait_for("doc-session", Duration::from_secs(5));
+    tui.writer.write_all(b"\rsaved-draft").unwrap();
+    tui.wait_for("saved-draft", Duration::from_secs(3));
+    tui.writer.write_all(b"\x1bd").unwrap(); // Alt-d preserves the composer.
+    let root = tui.wait_for("docs/", Duration::from_secs(5));
+    assert!(
+        root.contains("Documents") && !root.contains("one.txt"),
+        "{root}"
+    );
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("one.txt", Duration::from_secs(5));
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("BROWSER_FIXTURE", Duration::from_secs(5));
+    assert_document_address(&mut tui);
+    tui.writer
+        .write_all(b"\x1b[200~DO_NOT_SEND\r\x1b[201~xyk\r")
+        .unwrap();
+    tui.writer.write_all(b"\x1b").unwrap();
+    tui.wait_for("> docs/one.txt", Duration::from_secs(3));
+    // A pending daemon read must not put the document back after Back.
+    daemon.stop();
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("Loading", Duration::from_secs(3));
+    tui.writer.write_all(b"\x1b").unwrap();
+    tui.wait_for("> docs/one.txt", Duration::from_secs(3));
+    daemon.resume();
+    std::thread::sleep(Duration::from_millis(700));
+    let after_reply = tui.screen_text();
+    assert!(
+        after_reply.contains("> docs/one.txt") && !after_reply.contains("BROWSER_FIXTURE"),
+        "{after_reply}"
+    );
+    // A completed deadline releases single-flight capacity for a real retry.
+    daemon.stop();
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("deadline exceeded", Duration::from_secs(6));
+    daemon.resume();
+    tui.writer.write_all(b"r").unwrap();
+    tui.wait_for("BROWSER_FIXTURE", Duration::from_secs(5));
+    tui.writer.write_all(b"q").unwrap();
+    let returned = tui.wait_for("saved-draft", Duration::from_secs(3));
+    assert!(!returned.contains("Documents"), "{returned}");
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("got:saved-draft", Duration::from_secs(5));
+    let capture = remuda_native::client::request(
+        &daemon.path(),
+        &Request::Capture {
+            name: "doc-session".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(capture, Response::Screen(ref s) if !s.contains("DO_NOT_SEND")),
+        "{capture:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn documents_read_markdown_as_prose_and_follow_its_local_link() {
+    use std::io::Write;
+    let daemon = document_test_daemon(&[
+        (
+            "docs/guide.md",
+            "# Guide\n\nRead **this** [next](next.md).\n\n- one\n",
+        ),
+        ("docs/next.md", "# Next\n\nSecond page prose.\n"),
+    ]);
+    let mut tui = TuiPty::start(&daemon.runtime);
+    tui.wait_for("doc-session", Duration::from_secs(5));
+    tui.writer.write_all(b"d").unwrap();
+    tui.wait_for("docs/", Duration::from_secs(5));
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("guide.md", Duration::from_secs(5));
+    tui.writer.write_all(b"\r").unwrap();
+    let shown = tui.wait_for("Read this next [1].", Duration::from_secs(5));
+    assert!(shown.contains("Guide"), "{shown}");
+    assert!(
+        !shown.contains("**this**") && !shown.contains("# Guide"),
+        "{shown}"
+    );
+    tui.writer.write_all(b"\t").unwrap();
+    tui.wait_for("remuda:///docs/next.md", Duration::from_secs(3));
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("Second page prose.", Duration::from_secs(5));
+    tui.writer.write_all(b"\x1b").unwrap();
+    tui.wait_for("Read this next [1].", Duration::from_secs(3));
+    tui.writer.write_all(b"q").unwrap();
+    tui.wait_for("doc-session", Duration::from_secs(3));
+}
+
+fn assert_document_address(tui: &mut TuiPty) {
+    use std::io::Write;
+    tui.writer.write_all(b"a").unwrap();
+    tui.wait_for("VFS address (escaped)", Duration::from_secs(3));
+    tui.wait_for("remuda:///docs/one.txt", Duration::from_secs(3));
+    tui.writer.write_all(b"\x1b").unwrap();
+    tui.wait_for("BROWSER_FIXTURE", Duration::from_secs(3));
+}
+
+#[cfg(unix)]
+fn document_mailbox(
+    daemon: &PrivateDaemon,
+    file: &str,
+    body: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    let listing = remuda_native::client::request(
+        &daemon.path(),
+        &Request::Vfs {
+            args: vec!["ls".into(), "remuda:///ade-open/".into(), "--json".into()],
+            input_base64: None,
+        },
+    )
+    .unwrap();
+    let Response::CommandResult { stdout_base64, .. } = listing else {
+        panic!("{listing:?}")
+    };
+    let listing: serde_json::Value =
+        serde_json::from_slice(&BASE64.decode(stdout_base64).unwrap()).unwrap();
+    let Some(prefix) = listing[0]["path"].as_str() else {
+        return serde_json::Value::Null;
+    };
+    let uri = format!("remuda:///{prefix}owner/{file}.json");
+    let args = if body.is_some() {
+        vec!["put".into(), "-".into(), uri]
+    } else {
+        vec!["read".into(), uri, "--max-bytes".into(), "4096".into()]
+    };
+    let reply = remuda_native::client::request(
+        &daemon.path(),
+        &Request::Vfs {
+            args,
+            input_base64: body.map(|v| BASE64.encode(v.to_string())),
+        },
+    )
+    .unwrap();
+    let Response::CommandResult {
+        exit_code: 0,
+        stdout_base64,
+        ..
+    } = reply
+    else {
+        panic!("{reply:?}")
+    };
+    if body.is_some() {
+        return serde_json::Value::Null;
+    }
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&BASE64.decode(stdout_base64).unwrap()).unwrap();
+    envelope["content"]
+        .as_str()
+        .and_then(|s| BASE64.decode(s).ok())
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn wait_document_mailbox(
+    daemon: &PrivateDaemon,
+    file: &str,
+    field: &str,
+    expected: &serde_json::Value,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let value = document_mailbox(daemon, file, None);
+        if value[field] == *expected {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mailbox {file}: {value}, expected {field}={expected}"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_open_waits_for_body_after_three_to_four_row_resize() {
+    use serde_json::json;
+    let daemon =
+        document_test_daemon(&[("docs/small.html", "<title>ACTUAL_BODY</title><p>Design</p>")]);
+    let mut tui = TuiPty::start_document_target_rows(&daemon.runtime, Some("owner"), 3);
+    let ready = wait_document_mailbox(&daemon, "ready", "mode", &json!("direct"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let request = json!({"instance":ready["instance"],"seq":1,"uri":"remuda:///docs/small.html","expires":now+60});
+    document_mailbox(&daemon, "request", Some(&request));
+    wait_document_mailbox(&daemon, "result", "seq", &json!(1));
+    tui.wait_for("Documents", Duration::from_secs(5));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let result = document_mailbox(&daemon, "result", None);
+        assert_eq!(
+            result["status"], "received",
+            "false presentation acknowledgement: {result}"
+        );
+        assert!(!tui.screen_text().contains("ACTUAL_BODY"));
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    tui.resize_rows(4);
+    tui.wait_for("ACTUAL_BODY", Duration::from_secs(5));
+    let rendered = wait_document_mailbox(&daemon, "result", "status", &json!("rendered"));
+    assert_eq!(rendered["seq"], 1);
+    assert_eq!(rendered["instance"], ready["instance"]);
+    assert_eq!(rendered["uri"], request["uri"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_document_request_renders_exact_viewer_and_preserves_draft() {
+    use serde_json::json;
+    use std::io::Write;
+    let daemon = document_test_daemon(&[(
+        "docs/design.html",
+        "<title>DIRECT_DESIGN</title><p>Published design document</p>",
+    )]);
+    let mut tui = TuiPty::start_document_target(&daemon.runtime, Some("owner"));
+    let other = TuiPty::start(&daemon.runtime);
+    tui.wait_for("doc-session", Duration::from_secs(5));
+    other.wait_for("doc-session", Duration::from_secs(5));
+    tui.writer.write_all(b"\rdirect-draft").unwrap();
+    tui.wait_for("direct-draft", Duration::from_secs(3));
+    let ready = wait_document_mailbox(&daemon, "ready", "mode", &json!("direct"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut request = json!({"instance":"wrong-viewer","seq":1,"uri":"remuda:///docs/design.html","expires":now+60});
+    document_mailbox(&daemon, "request", Some(&request));
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(tui.screen_text().contains("direct-draft"));
+    request["instance"] = ready["instance"].clone();
+    document_mailbox(&daemon, "request", Some(&request));
+    let shown = tui.wait_for("DIRECT_DESIGN", Duration::from_secs(8));
+    assert!(shown.contains("Published design document"), "{shown}");
+    let rendered = wait_document_mailbox(&daemon, "result", "status", &json!("rendered"));
+    assert_eq!(rendered["instance"], ready["instance"]);
+    assert_eq!(rendered["seq"], 1);
+    assert_eq!(rendered["uri"], request["uri"]);
+    assert_eq!(rendered["identity"][1].as_str().unwrap().len(), 64);
+    assert!(!other.screen_text().contains("DIRECT_DESIGN"));
+    tui.writer.write_all(b"a").unwrap();
+    tui.wait_for("VFS address (escaped)", Duration::from_secs(3));
+    request["seq"] = json!(2);
+    document_mailbox(&daemon, "request", Some(&request));
+    tui.wait_for("DIRECT_DESIGN", Duration::from_secs(8));
+    wait_document_mailbox(&daemon, "result", "seq", &json!(2));
+    wait_document_mailbox(&daemon, "result", "status", &json!("rendered"));
+    tui.writer.write_all(b"q").unwrap();
+    tui.wait_for("direct-draft", Duration::from_secs(3));
+    document_mailbox(&daemon, "request", Some(&request));
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(!tui.screen_text().contains("DIRECT_DESIGN"));
+    request["seq"] = json!(3);
+    request["expires"] = json!(now - 1);
+    document_mailbox(&daemon, "request", Some(&request));
+    wait_document_mailbox(&daemon, "result", "status", &json!("expired"));
+    assert!(!tui.screen_text().contains("DIRECT_DESIGN"));
+    request["seq"] = json!(4);
+    request["expires"] = json!(now + 60);
+    request["uri"] = json!("remuda:///docs/missing.html");
+    document_mailbox(&daemon, "request", Some(&request));
+    wait_document_mailbox(&daemon, "result", "status", &json!("load_failed"));
+    tui.writer.write_all(b"q\r").unwrap();
+    tui.wait_for("got:direct-draft", Duration::from_secs(5));
+}
+
+#[cfg(unix)]
+#[test]
+fn html_relative_link_round_trip_preserves_document_and_session_state() {
+    use std::io::Write;
+    let daemon = document_test_daemon(&[
+        ("docs/index.html", "<title>HTML_GUIDE</title><p>First &amp; paragraph</p><script>NEVER_EXECUTED</script><a href='sub/next.html'>Next document</a><a href='#missing'>Unsupported fragment</a>"),
+        ("docs/sub/next.html", "<title>NEXT_PAGE</title><p>Second document</p>"),
+    ]);
+    let mut tui = TuiPty::start(&daemon.runtime);
+    tui.wait_for("doc-session", Duration::from_secs(5));
+    tui.writer.write_all(b"\rhtml-draft").unwrap();
+    tui.wait_for("html-draft", Duration::from_secs(3));
+    tui.writer.write_all(b"\x1bd").unwrap();
+    tui.wait_for("> docs/", Duration::from_secs(5));
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("docs/index.html", Duration::from_secs(5));
+    tui.writer.write_all(b"\x1b[B").unwrap();
+    tui.wait_for("> docs/index.html", Duration::from_secs(5));
+    tui.writer.write_all(b"\r").unwrap();
+    let html = tui.wait_for("HTML_GUIDE", Duration::from_secs(5));
+    assert!(
+        html.contains("First & paragraph") && !html.contains("NEVER_EXECUTED"),
+        "{html}"
+    );
+    tui.writer.write_all(b"\t").unwrap();
+    tui.wait_for("[1] Next document", Duration::from_secs(3));
+    tui.writer.write_all(b"a").unwrap();
+    tui.wait_for("VFS address (escaped)", Duration::from_secs(3));
+    tui.wait_for("remuda:///docs/sub/next.html", Duration::from_secs(3));
+    tui.writer.write_all(b"\x1b").unwrap();
+    tui.wait_for("HTML_GUIDE", Duration::from_secs(3));
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("NEXT_PAGE", Duration::from_secs(5));
+    tui.writer.write_all(b"\x1b").unwrap();
+    let restored = tui.wait_for("HTML_GUIDE", Duration::from_secs(3));
+    assert!(restored.contains("[1] Next document"), "{restored}");
+    tui.writer.write_all(b"\t\r").unwrap();
+    let blocked = tui.wait_for("Fragment links are not supported", Duration::from_secs(3));
+    assert!(blocked.contains("HTML_GUIDE"), "{blocked}");
+    tui.writer
+        .write_all(b"\x1b[200~HTML_DO_NOT_SEND\x1b[201~")
+        .unwrap();
+    tui.writer.write_all(b"q\r").unwrap();
+    let returned = tui.wait_for("got:html-draft", Duration::from_secs(5));
+    assert!(!returned.contains("HTML_DO_NOT_SEND"), "{returned}");
 }
 
 #[cfg(unix)]

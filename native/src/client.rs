@@ -1,5 +1,8 @@
 //! Talking to a daemon, including handing your terminal over to one.
 
+mod deadline;
+pub use deadline::request_with_deadline;
+
 use crate::ipc::{self, Stream, TryClone};
 use crate::reply_limit::max_reply_wire_bytes;
 #[cfg(unix)]
@@ -460,9 +463,6 @@ fn trace_input_read(path: Option<&Path>, bytes: &[u8]) {
 }
 
 /// Send one request and read one response.
-mod deadline;
-pub use deadline::request_with_deadline;
-
 pub fn request(path: &Path, request: &Request) -> std::io::Result<Response> {
     let stream = ipc::connect(path)?;
     send(&stream, request)?;
