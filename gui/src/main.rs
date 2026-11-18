@@ -27,8 +27,9 @@ const TERMINAL_LINE_HEIGHT_PX: f32 = 16.0;
 const TREE_INDENT_PX: f32 = 12.0;
 /// Detail lines sit under the identity glyph, one step past the name.
 const TREE_DETAIL_OFFSET_PX: f32 = 3.0;
-/// Sidebar children before the first tree entry: title, section label, local node.
-const TREE_FIXED_HEADER_CHILDREN: usize = 3;
+/// Sidebar children before the local node: title and section label. The local
+/// node is the first tree entry, so a reveal index is `2 + helper notice`.
+const TREE_FIXED_HEADER_CHILDREN: usize = 2;
 /// Pointer travel that turns a preview click into a drag selection.
 const DRAG_THRESHOLD_PX: f32 = 3.0;
 const WORKER_REPLY_HEADROOM_BYTES: usize = 16 * 1024;
@@ -143,6 +144,23 @@ const SESSION_VIEW_REQUEST_COLUMNS: u16 = 512;
 /// under the 8 s worker watchdog, so a silent older daemon still reaches the
 /// flat `List` fallback instead of killing the worker first.
 const VIEW_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// Whole peer fetch including the view and its flat fallback. Kept below the
+/// 8 s worker watchdog so a slow old peer keeps the previous rows instead of
+/// being killed mid-fallback.
+const PEER_REQUEST_BUDGET: Duration = Duration::from_secs(6);
+
+/// Run one blocking call under a whole-call budget. The worker is a
+/// short-lived process, so a timed-out call cannot outlive its reply.
+fn bounded_call<T: Send + 'static>(
+    budget: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    rx.recv_timeout(budget).ok()
+}
 
 /// Bound the whole local request; a stuck connect must not outlive the worker.
 fn bounded_request(
@@ -288,7 +306,9 @@ fn peer_worker(fingerprint: &str, tagged: bool) -> i32 {
         net::cluster_client::ClusterClient,
     };
     worker_deadline();
-    let list = || -> Result<Vec<Session>, ()> {
+    let fingerprint = fingerprint.to_owned();
+    let list = move || -> Result<Vec<Session>, ()> {
+        let fingerprint = fingerprint.as_str();
         if !peer_is_unique(&discover_peers().map_err(|_| ())?, fingerprint) {
             return Err(());
         }
@@ -332,9 +352,9 @@ fn peer_worker(fingerprint: &str, tagged: bool) -> i32 {
         }
         Ok(rows)
     };
-    match list() {
-        Ok(rows) => write_worker_reply(&rows, tagged),
-        Err(()) => 1,
+    match bounded_call(PEER_REQUEST_BUDGET, list) {
+        Some(Ok(rows)) => write_worker_reply(&rows, tagged),
+        _ => 1,
     }
 }
 
@@ -5448,10 +5468,21 @@ mod tests {
         gui.expanded_nodes.insert("p".into());
         gui.peer_sessions.insert("p".into(), plain_sessions(vec![summary_for_view("r","r-1")]));
         assert_eq!(gui.tree_entries().len(), gui.sidebar_child_indices().len());
-        // header 3, local note+row, peer node, peer note+row
-        assert_eq!(gui.sidebar_child_indices(), vec![3, 5, 6, 8]);
+        // title+label 0-1, local node 2, local note+row, peer node, peer note+row
+        assert_eq!(gui.sidebar_child_indices(), vec![2, 4, 5, 7]);
     }
     #[cfg(unix)]
+    #[test]
+    fn peer_budget_gives_up_before_the_worker_watchdog() {
+        assert!(PEER_REQUEST_BUDGET < provider::TIMEOUT);
+        let started = std::time::Instant::now();
+        let result = bounded_call(Duration::from_millis(150), || {
+            std::thread::sleep(Duration::from_secs(5));
+            7
+        });
+        assert!(result.is_none(), "a slow peer must not hold the worker");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
     #[test]
     fn bounded_request_gives_up_before_the_worker_watchdog() {
         use std::os::unix::net::UnixListener;
@@ -5479,6 +5510,11 @@ mod tests {
     fn keyboard_cursor_is_visible_and_scrolls_into_view(cx: &mut gpui::TestAppContext) {
         let (view,cx)=cx.add_window_view(|_,_| {let mut gui=LocalGui::new();gui.preview_busy=true;gui.sessions=(0..40).map(|i| row(&format!("s{i:02}"))).collect();gui});
         cx.simulate_resize(gpui::size(px(900.),px(300.)));cx.run_until_parked();
+        // The reveal index must name the same direct child the tree paints.
+        let node_index=cx.read(|app| view.read(app).sidebar_child_indices()[0]);
+        let node=cx.debug_bounds("node-local").unwrap();
+        let node_item=cx.read(|app| view.read(app).sidebar_scroll.bounds_for_item(node_index)).unwrap();
+        assert_eq!(node_item.top(), node.top(), "local node is sidebar child {node_index}");
         cx.update(|window, app| view.read(app).tree_focus.as_ref().unwrap().focus(window));
         let keys=(0..30).map(|_| "down").collect::<Vec<_>>().join(" ");
         cx.simulate_keystrokes(&keys);cx.run_until_parked();
@@ -5488,6 +5524,12 @@ mod tests {
         let row=cx.debug_bounds("session-29").unwrap();
         let sidebar=cx.debug_bounds("sidebar").unwrap();
         assert!(row.top() >= sidebar.top() && row.bottom() <= sidebar.bottom(), "keyboard cursor must be revealed: {row:?} {sidebar:?}");
+        // The cursor's reveal index names the cursor row's direct child slot.
+        let cursor_index=cx.read(|app| view.read(app).sidebar_child_indices()[cursor]);
+        let cursor_item=cx.read(|app| view.read(app).sidebar_scroll.bounds_for_item(cursor_index)).unwrap();
+        let cursor_row=cx.debug_bounds("session-29").unwrap();
+        let offset=cx.read(|app| view.read(app).sidebar_scroll.offset()).y;
+        assert_eq!(cursor_item.top(), cursor_row.top()-offset, "cursor row is sidebar child {cursor_index}");
         let before=cx.read(|app| view.read(app).sidebar_scroll.offset());
         cx.simulate_event(gpui::ScrollWheelEvent { position: sidebar.center(), delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.),px(-200.))), ..Default::default() });
         cx.run_until_parked();
