@@ -22,6 +22,13 @@ const MIN_DOCUMENT_FRACTION: f32 = 0.18;
 const MAX_DOCUMENT_FRACTION: f32 = 0.62;
 const DOCUMENT_KEY_STEP_PX: f32 = 16.0;
 const TERMINAL_LINE_HEIGHT_PX: f32 = 16.0;
+/// One hierarchy level, in logical pixels. The tree uses `text_sm`; a smaller
+/// step collapses into the row text, and this stays visible at a 420 px window.
+const TREE_INDENT_PX: f32 = 12.0;
+/// Detail lines sit under the identity glyph, one step past the name.
+const TREE_DETAIL_OFFSET_PX: f32 = 3.0;
+/// Sidebar children before the first tree entry: title, section label, local node.
+const TREE_FIXED_HEADER_CHILDREN: usize = 3;
 /// Pointer travel that turns a preview click into a drag selection.
 const DRAG_THRESHOLD_PX: f32 = 3.0;
 const WORKER_REPLY_HEADROOM_BYTES: usize = 16 * 1024;
@@ -129,9 +136,28 @@ fn worker_executable() -> std::io::Result<std::path::PathBuf> {
     std::env::current_exe()
 }
 
-// This worker makes only a List request. Its own deadline survives GUI exit,
-// including when native IPC setup stalls before the client's read timeout.
+// The view request falls back to a List request on an older daemon. Each
+// request is bounded, and the worker's own deadline survives GUI exit.
 const SESSION_VIEW_REQUEST_COLUMNS: u16 = 512;
+/// Whole connect/send/read budget for one local request. Two of these stay
+/// under the 8 s worker watchdog, so a silent older daemon still reaches the
+/// flat `List` fallback instead of killing the worker first.
+const VIEW_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Bound the whole local request; a stuck connect must not outlive the worker.
+fn bounded_request(
+    path: &std::path::Path,
+    request: &remuda_core::protocol::Request,
+    timeout: Duration,
+) -> Option<remuda_core::protocol::Response> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let path = path.to_path_buf();
+    let request = request.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(remuda_native::client::request(&path, &request));
+    });
+    rx.recv_timeout(timeout).ok().and_then(Result::ok)
+}
 
 fn sessions_from_view(view: remuda_core::session_view::SessionView) -> Option<Vec<Session>> {
     let checked = view
@@ -180,9 +206,11 @@ fn worker(tagged: bool) -> i32 {
     use remuda_core::protocol::{Request, Response};
     worker_deadline();
     let path = remuda_native::daemon::socket_path("default");
-    let sessions = view_request(&path).or_else(|| match remuda_native::client::request(&path, &Request::List) {
-        Ok(Response::Sessions(rows)) => Some(plain_sessions(rows)),
-        _ => None,
+    let sessions = view_request(&path).or_else(|| {
+        match bounded_request(&path, &Request::List, VIEW_REQUEST_TIMEOUT) {
+            Some(Response::Sessions(rows)) => Some(plain_sessions(rows)),
+            _ => None,
+        }
     });
     match sessions {
         Some(rows) => write_worker_reply(&rows, tagged),
@@ -194,13 +222,14 @@ fn worker(tagged: bool) -> i32 {
 /// to the flat session list so the GUI stays usable.
 fn view_request(path: &std::path::Path) -> Option<Vec<Session>> {
     use remuda_core::protocol::{Request, Response};
-    match remuda_native::client::request(
+    match bounded_request(
         path,
         &Request::RenderedSessionList {
             width: SESSION_VIEW_REQUEST_COLUMNS,
         },
+        VIEW_REQUEST_TIMEOUT,
     ) {
-        Ok(Response::RenderedSessionList(view)) => sessions_from_view(view),
+        Some(Response::RenderedSessionList(view)) => sessions_from_view(view),
         _ => None,
     }
 }
@@ -514,6 +543,7 @@ struct LocalGui {
     expanded_nodes: std::collections::HashSet<String>,
     tree_focus: Option<FocusHandle>,
     tree_cursor: usize,
+    sidebar_scroll: gpui::ScrollHandle,
     remote_error: bool,
     remote_loading: bool,
     remote_generation: u64,
@@ -604,6 +634,7 @@ impl LocalGui {
             expanded_nodes: ["".to_string()].into_iter().collect(),
             tree_focus: None,
             tree_cursor: 0,
+            sidebar_scroll: gpui::ScrollHandle::new(),
             remote_error: false,
             remote_loading: false,
             remote_generation: 0,
@@ -1196,6 +1227,31 @@ impl LocalGui {
     }
 
     /// The keyboard's flat view of the tree, in display order.
+    /// Cached rows for this exact fingerprint; the selected peer may still be
+    /// in `remote_sessions` before the cache insert. Never another node's rows.
+    fn peer_rows(&self, fingerprint: &str) -> Option<&[Session]> {
+        self.peer_sessions
+            .get(fingerprint)
+            .map(Vec::as_slice)
+            .or_else(|| {
+                (self.selected_peer.as_deref() == Some(fingerprint))
+                    .then_some(self.remote_sessions.as_slice())
+            })
+    }
+
+    /// The row a tree key at `index` names. A peer miss refuses instead of
+    /// indexing the local list with a remote index.
+    fn tree_session_at(&self, peer: Option<&str>, index: usize) -> Option<Session> {
+        let rows = match peer {
+            None => self.sessions.as_slice(),
+            Some(fingerprint) if self.peer_current(fingerprint) => {
+                self.peer_rows(fingerprint)?
+            }
+            Some(_) => return None,
+        };
+        rows.get(index).cloned()
+    }
+
     fn tree_entries(&self) -> Vec<TreeEntry> {
         let mut entries = vec![TreeEntry::Node(None)];
         if self.expanded_nodes.contains("") {
@@ -1204,20 +1260,57 @@ impl LocalGui {
         for peer in &self.peers {
             entries.push(TreeEntry::Node(Some(peer.fingerprint.clone())));
             if self.expanded_nodes.contains(&peer.fingerprint) {
-                let count = self
-                    .peer_sessions
-                    .get(&peer.fingerprint)
-                    .or_else(|| {
-                        (self.selected_peer.as_ref() == Some(&peer.fingerprint))
-                            .then_some(&self.remote_sessions)
-                    })
-                    .map_or(0, Vec::len);
+                let count = self.peer_rows(&peer.fingerprint).map_or(0, <[Session]>::len);
                 entries.extend(
                     (0..count).map(|i| TreeEntry::Session(Some(peer.fingerprint.clone()), i)),
                 );
             }
         }
         entries
+    }
+
+    /// Direct sidebar children in the same order as `tree_entries`, including
+    /// the conditional notice/empty rows that are not keyboard targets.
+    fn sidebar_child_indices(&self) -> Vec<usize> {
+        let mut child = TREE_FIXED_HEADER_CHILDREN + usize::from(self.helper_changed);
+        let mut indices = vec![child];
+        child += 1;
+        if self.expanded_nodes.contains("") {
+            if self.sessions.iter().any(|row| !row.structured) {
+                child += 1;
+            }
+            for _ in &self.sessions {
+                indices.push(child);
+                child += 1;
+            }
+        }
+        for peer in &self.peers {
+            indices.push(child);
+            child += 1;
+            if !self.expanded_nodes.contains(&peer.fingerprint) {
+                continue;
+            }
+            let rows = self.peer_rows(&peer.fingerprint);
+            if rows.is_some_and(|rows| rows.iter().any(|row| !row.structured)) {
+                child += 1;
+            }
+            if rows.is_none_or(<[Session]>::is_empty) {
+                child += 1;
+            }
+            if let Some(rows) = rows {
+                for _ in rows {
+                    indices.push(child);
+                    child += 1;
+                }
+            }
+        }
+        indices
+    }
+
+    fn reveal_tree_cursor(&self) {
+        if let Some(index) = self.sidebar_child_indices().get(self.tree_cursor) {
+            self.sidebar_scroll.scroll_to_item(*index);
+        }
     }
 
     fn tree_key(&mut self, key: &gpui::Keystroke) {
@@ -1230,8 +1323,14 @@ impl LocalGui {
         }
         self.tree_cursor = self.tree_cursor.min(entries.len() - 1);
         match key.key.as_str() {
-            "down" => self.tree_cursor = (self.tree_cursor + 1).min(entries.len() - 1),
-            "up" => self.tree_cursor = self.tree_cursor.saturating_sub(1),
+            "down" => {
+                self.tree_cursor = (self.tree_cursor + 1).min(entries.len() - 1);
+                self.reveal_tree_cursor();
+            }
+            "up" => {
+                self.tree_cursor = self.tree_cursor.saturating_sub(1);
+                self.reveal_tree_cursor();
+            }
             "left" => {
                 if let Some(key) = entries[..=self.tree_cursor].iter().rev().find_map(|entry| {
                     if let TreeEntry::Node(key) = entry {
@@ -1259,11 +1358,8 @@ impl LocalGui {
                     self.select_node(key);
                 }
                 Some(TreeEntry::Session(peer, index)) => {
-                    let rows = peer
-                        .as_ref()
-                        .and_then(|fp| self.peer_sessions.get(fp).cloned())
-                        .unwrap_or_else(|| self.sessions.clone());
-                    if let Some(row) = rows.get(*index).cloned() {
+                    let row = self.tree_session_at(peer.as_deref(), *index);
+                    if let Some(row) = row {
                         self.activate_session(peer.clone(), row);
                     }
                 }
@@ -1284,6 +1380,7 @@ impl LocalGui {
         cx: &mut Context<Self>,
         prefix: &str,
     ) -> Vec<Stateful<Div>> {
+        let entries = self.tree_entries();
         rows.iter()
             .cloned()
             .enumerate()
@@ -1317,10 +1414,12 @@ impl LocalGui {
                     format!("{prefix}-session-{index}")
                 };
                 let marker = session_marker(&session).to_string();
-                let indent = usize::from(session.depth.min(20)) * 2;
+                let indent = f32::from(session.depth.min(20)) * TREE_INDENT_PX;
                 let detail = session.detail.clone();
                 let name_id = format!("{id}-name");
                 let detail_id = format!("{id}-detail");
+                let cursor_id = format!("{id}-cursor");
+                let cursor = matches!(entries.get(self.tree_cursor), Some(TreeEntry::Session(p, i)) if *i == index && p == &peer);
                 div()
                     .id(SharedString::from(id.clone()))
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -1343,11 +1442,17 @@ impl LocalGui {
                                 .child("SELECTED"),
                         )
                     })
+                    .when(cursor, |d| d.border_1().border_color(rgb(0x91b9ef)))
                     .child(div().id(SharedString::from(name_id.clone())).debug_selector(move || name_id.clone())
-                        .ml(px(indent as f32)).child(format!("{}  {}", marker, plain_label(&session.name))))
+                        .ml(px(indent)).child(div().flex()
+                            .when(cursor, |d| d.child(
+                                div().id(SharedString::from(cursor_id.clone()))
+                                    .debug_selector(move || cursor_id.clone())
+                                    .w(px(2.)).h(px(2.)).bg(rgb(0x91b9ef))))
+                            .child(format!("{}  {}", marker, plain_label(&session.name)))))
                     .when_some(detail, |d, detail| d.child(
                         div().id(SharedString::from(detail_id.clone())).debug_selector(move || detail_id.clone())
-                            .pl(px((indent + 3) as f32)).text_sm().text_color(rgb(0x8a95a5))
+                            .pl(px(indent + TREE_DETAIL_OFFSET_PX)).text_sm().text_color(rgb(0x8a95a5))
                             .child(format!("↳ {}", plain_label(&detail)))))
                     .child(div().text_sm().text_color(rgb(0x8a95a5)).child(status))
             })
@@ -1929,6 +2034,8 @@ impl Render for LocalGui {
                     .flex_col()
                     .bg(rgb(0x191d24))
                     .p_4()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.sidebar_scroll)
                     .track_focus(&tree_focus)
                     .on_click(cx.listener(|this, _, window, cx| {
                         if let Some(focus) = &this.tree_focus {
@@ -1985,6 +2092,9 @@ impl Render for LocalGui {
                                     })),
                             ),
                     )
+                    .when(self.expanded_nodes.contains("") && self.sessions.iter().any(|row| !row.structured), |d| d.child(
+                        div().id("local-hierarchy-fallback").debug_selector(|| "local-hierarchy-fallback".into())
+                            .pl_4().text_xs().child("Hierarchy unavailable · flat session list")))
                     .children(if self.expanded_nodes.contains("") {
                         self.session_rows(None, &self.sessions, self.selected_peer.is_none(), cx, "local")
                     } else {
@@ -2000,13 +2110,8 @@ impl Render for LocalGui {
                         let debug = format!("node-peer-{index}");
                         let click_peer = fingerprint.clone();
                         let rows = self
-                            .peer_sessions
-                            .get(&fingerprint)
-                            .or_else(|| {
-                                (self.selected_peer.as_ref() == Some(&fingerprint))
-                                    .then_some(&self.remote_sessions)
-                            })
-                            .cloned()
+                            .peer_rows(&fingerprint)
+                            .map(<[Session]>::to_vec)
                             .unwrap_or_default();
                         let selected_node = self.selected_peer.as_ref() == Some(&fingerprint);
                         let children = if expanded {
@@ -2061,6 +2166,13 @@ impl Render for LocalGui {
                                 )
                                 .into_any_element(),
                         ];
+                        if expanded && rows.iter().any(|row| !row.structured) {
+                            let fallback_id = format!("peer-{index}-hierarchy-fallback");
+                            nodes.push(div().id(SharedString::from(fallback_id.clone()))
+                                .debug_selector(move || fallback_id.clone())
+                                .pl_4().text_xs().child("Hierarchy unavailable · flat session list")
+                                .into_any_element());
+                        }
                         if expanded && rows.is_empty() {
                             nodes.push(div().pl_4().text_sm().text_color(rgb(0x8a95a5)).child(
                                 if selected_node && self.remote_loading {
@@ -5312,6 +5424,118 @@ mod tests {
         let row=cx.debug_bounds("session-1").unwrap();
         cx.simulate_click(row.center(),gpui::Modifiers::none());
         assert!(view.read_with(cx,|gui,_| gui.selection.as_ref().is_some_and(|s|s.name=="child" && s.instance=="c-1")));
+    }
+    #[test]
+    fn tree_session_at_never_uses_local_rows_for_a_peer() {
+        let mut gui = LocalGui::new();
+        gui.sessions = vec![row("local")];
+        gui.peers = vec![peer("p", "Peer")];
+        gui.expanded_nodes.insert("p".into());
+        assert!(gui.tree_session_at(Some("p"), 0).is_none(), "cache miss must refuse");
+        gui.selected_peer = Some("p".into());
+        gui.remote_sessions = vec![row("remote")];
+        assert_eq!(gui.tree_session_at(Some("p"), 0).unwrap().name, "remote");
+        gui.peer_sessions.insert("p".into(), vec![row("cached")]);
+        assert_eq!(gui.tree_session_at(Some("p"), 0).unwrap().name, "cached");
+        assert_eq!(gui.tree_session_at(None, 0).unwrap().name, "local");
+    }
+    #[test]
+    fn sidebar_child_indices_match_conditional_rows() {
+        let mut gui = LocalGui::new();
+        gui.sessions = plain_sessions(vec![summary_for_view("flat","f-1")]);
+        gui.peers = vec![peer("p","Peer")];
+        gui.expanded_nodes.insert("p".into());
+        gui.peer_sessions.insert("p".into(), plain_sessions(vec![summary_for_view("r","r-1")]));
+        assert_eq!(gui.tree_entries().len(), gui.sidebar_child_indices().len());
+        // header 3, local note+row, peer node, peer note+row
+        assert_eq!(gui.sidebar_child_indices(), vec![3, 5, 6, 8]);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn bounded_request_gives_up_before_the_worker_watchdog() {
+        use std::os::unix::net::UnixListener;
+        let root = if std::path::Path::new("/private/tmp").is_dir() {
+            std::path::PathBuf::from("/private/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let dir = root.join(format!("gui-bound-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("silent.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+        let started = std::time::Instant::now();
+        assert!(bounded_request(&path, &remuda_core::protocol::Request::List, Duration::from_millis(200)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[gpui::test]
+    fn keyboard_cursor_is_visible_and_scrolls_into_view(cx: &mut gpui::TestAppContext) {
+        let (view,cx)=cx.add_window_view(|_,_| {let mut gui=LocalGui::new();gui.preview_busy=true;gui.sessions=(0..40).map(|i| row(&format!("s{i:02}"))).collect();gui});
+        cx.simulate_resize(gpui::size(px(900.),px(300.)));cx.run_until_parked();
+        cx.update(|window, app| view.read(app).tree_focus.as_ref().unwrap().focus(window));
+        let keys=(0..30).map(|_| "down").collect::<Vec<_>>().join(" ");
+        cx.simulate_keystrokes(&keys);cx.run_until_parked();
+        let cursor=cx.read(|app| view.read(app).tree_cursor);
+        assert_eq!(cursor, 30);
+        assert!(cx.debug_bounds("session-29-cursor").is_some(), "cursor row needs a visible indicator");
+        let row=cx.debug_bounds("session-29").unwrap();
+        let sidebar=cx.debug_bounds("sidebar").unwrap();
+        assert!(row.top() >= sidebar.top() && row.bottom() <= sidebar.bottom(), "keyboard cursor must be revealed: {row:?} {sidebar:?}");
+        let before=cx.read(|app| view.read(app).sidebar_scroll.offset());
+        cx.simulate_event(gpui::ScrollWheelEvent { position: sidebar.center(), delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.),px(-200.))), ..Default::default() });
+        cx.run_until_parked();
+        let after=cx.read(|app| view.read(app).sidebar_scroll.offset());
+        assert_ne!(before, after, "wheel must scroll the sidebar");
+    }
+    #[gpui::test]
+    fn narrow_tree_indent_keeps_levels_visible(cx: &mut gpui::TestAppContext) {
+        let (view,cx)=cx.add_window_view(|_,_| {let mut gui=LocalGui::new();gui.preview_busy=true;gui.sessions=sessions_from_view(nested_view()).unwrap();gui.narrow_view=NarrowView::Nodes;gui});
+        cx.simulate_resize(gpui::size(px(420.),px(600.)));cx.run_until_parked();
+        let parent=cx.debug_bounds("session-0-name").unwrap();
+        let child=cx.debug_bounds("session-1-name").unwrap();
+        let grand=cx.debug_bounds("session-2-name").unwrap();
+        let step=f32::from(child.left()-parent.left());
+        assert!((step-TREE_INDENT_PX).abs() < 0.5, "one level must be {TREE_INDENT_PX}px, got {step}");
+        assert!((f32::from(grand.left()-child.left())-TREE_INDENT_PX).abs() < 0.5);
+        for name in [parent, child, grand] {
+            assert!(name.width > px(0.) && name.right() <= px(420.), "narrow name must stay visible: {name:?}");
+        }
+    }
+    #[gpui::test]
+    fn flat_fallback_notice_is_shown_for_unstructured_rows(cx: &mut gpui::TestAppContext) {
+        let (view,cx)=cx.add_window_view(|_,_| {
+            let mut gui=LocalGui::new(); gui.preview_busy=true;
+            gui.sessions=plain_sessions(vec![summary_for_view("flat","f-1")]);
+            gui.peers=vec![peer("p","Peer")];
+            gui.peer_sessions.insert("p".into(),plain_sessions(vec![summary_for_view("r","r-1")]));
+            gui.expanded_nodes.insert("p".into()); gui
+        });
+        cx.simulate_resize(gpui::size(px(1000.),px(650.)));cx.run_until_parked();
+        assert!(cx.debug_bounds("local-hierarchy-fallback").is_some());
+        assert!(cx.debug_bounds("peer-0-hierarchy-fallback").is_some());
+        let structured=sessions_from_view(sample_semantic_view()).unwrap();
+        view.update(cx,|gui,cx| { gui.sessions=structured; gui.peer_sessions.clear(); cx.notify(); });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("local-hierarchy-fallback").is_none());
+    }
+    fn nested_view() -> remuda_core::session_view::SessionView {
+        use remuda_core::session_view::{SessionView,ViewEntry,ViewSemantics,ViewState};
+        let names: [(&str,&str,u8); 3] = [("parent","p-1",0),("child","c-1",1),("grand","g-1",2)];
+        let sessions = names.iter().map(|row| summary_for_view(row.0, row.1)).collect();
+        let entries = names.iter().map(|row| ViewEntry {
+            name: row.0.into(), instance_id: row.1.into(), lines: vec![row.0.to_string()],
+        }).collect();
+        let semantics = names.iter().map(|row| ViewSemantics {
+            name: row.0.into(), instance_id: row.1.into(), depth: row.2,
+            state: Some(ViewState::Idle), detail: None,
+        }).collect();
+        SessionView::new(sessions, 1, entries).with_semantics(semantics)
     }
     #[gpui::test]
     fn forged_tui_rows_never_become_details(cx: &mut gpui::TestAppContext) {
