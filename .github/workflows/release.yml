@@ -176,6 +176,30 @@ jobs:
           [ "$got" = "remuda ${{ needs.plan.outputs.version }}+gha.${{ github.run_number }}.${{ github.run_attempt }}.${{ github.sha }}" ] \
             || { echo "::error::--version said '$got'"; exit 1; }
 
+      - name: build macOS GUI and installer probe
+        if: matrix.target == 'aarch64-apple-darwin' && needs.plan.outputs.channel == 'nightly'
+        env:
+          REMUDA_VERSION: ${{ needs.plan.outputs.version }}
+          REMUDA_BUILD: gha.${{ github.run_number }}.${{ github.run_attempt }}.${{ github.sha }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          set -eu
+          cargo build --release --locked --target "${{ matrix.target }}" --features installer-probe-experimental --bin remuda-installer-probe
+          cargo build --release --locked --target "${{ matrix.target }}" --manifest-path gui/Cargo.toml --bin remuda-gui
+
+      - name: verify macOS GUI build identity
+        if: matrix.target == 'aarch64-apple-darwin' && needs.plan.outputs.channel == 'nightly'
+        env:
+          BUILD_ID: ${{ needs.plan.outputs.version }}+gha.${{ github.run_number }}.${{ github.run_attempt }}.${{ github.sha }}
+        run: |
+          set -eu
+          dir="$GITHUB_WORKSPACE/target/${{ matrix.target }}/release"
+          for spec in '--verify-cli:remuda' '--verify-host:remuda-session-host' '--verify:remuda-gui'; do
+            mode=${spec%%:*}
+            bin=${spec#*:}
+            "$dir/remuda-installer-probe" "$mode" --verified-archive-v1 "$dir/$bin" "$BUILD_ID"
+          done
+
       - name: set up QEMU for Termux smoke
         if: matrix.target == 'aarch64-linux-android'
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
@@ -197,12 +221,20 @@ jobs:
           set -eu
           name="remuda-${{ needs.plan.outputs.version }}-${{ matrix.target }}"
           mkdir -p dist
-          tar -czf "dist/$name.tar.gz" -C "target/${{ matrix.target }}/release" \
-            ${{ matrix.bin }} ${{ matrix.host }}
+          if [ "${{ matrix.target }}" = aarch64-apple-darwin ] && [ "${{ needs.plan.outputs.channel }}" = nightly ]; then
+            dir="target/${{ matrix.target }}/release"
+            printf '%s\n' remuda-gui-archive-v1 > "$dir/remuda-gui.contract"
+            printf '%s\n' '${{ needs.plan.outputs.version }}+gha.${{ github.run_number }}.${{ github.run_attempt }}.${{ github.sha }}' > "$dir/remuda-gui.build"
+            tar -czf "dist/$name.tar.gz" -C "$dir" \
+              ${{ matrix.bin }} ${{ matrix.host }} remuda-gui remuda-installer-probe remuda-gui.contract remuda-gui.build
+            want=$(printf '%s\n' ${{ matrix.bin }} ${{ matrix.host }} remuda-gui remuda-installer-probe remuda-gui.contract remuda-gui.build | sort | tr '\n' ' ')
+          else
+            tar -czf "dist/$name.tar.gz" -C "target/${{ matrix.target }}/release" ${{ matrix.bin }} ${{ matrix.host }}
+            want=$(printf '%s\n' ${{ matrix.bin }} ${{ matrix.host }} | sort | tr '\n' ' ')
+          fi
           # A tarball missing either half of the pair is a release that fails
           # only later, on the opt-in host path, in a user's terminal.
           listed=$(tar -tzf "dist/$name.tar.gz" | sort | tr '\n' ' ')
-          want=$(printf '%s\n' ${{ matrix.bin }} ${{ matrix.host }} | sort | tr '\n' ' ')
           [ "$listed" = "$want" ] || { echo "::error::$name.tar.gz holds '$listed', want '$want'"; exit 1; }
           # Binary size per target, so a dependency's cost is a number (#778).
           size=$(wc -c < "target/${{ matrix.target }}/release/${{ matrix.bin }}" | tr -d ' ')
