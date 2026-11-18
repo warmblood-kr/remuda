@@ -23,9 +23,13 @@ and scroll/reveal behavior are unchanged.
 - Session status is `running`, `exited` or `unavailable`, plus `·A` when
   attached; the eight-character instance stays in the selection identity, not
   in the visual row.
-- Name and status share one flex line; the name takes the remaining width with
-  `min_w(0)`, `whitespace_nowrap` and `text_ellipsis`; status may shrink and
-  ellipsize but stays inside the sidebar.
+- Name and status share one flex line; the name keeps a readable `min_w(56)`
+  while status shrinks to at most 96 px, both `whitespace_nowrap` and
+  `text_ellipsis`; the first own-framebuffer capture showed that `min_w(0)`
+  starved the name to zero width and hard-clipped it, so this is now bounded.
+- The peer node shows its label and state on one line; the fingerprint stays in
+  the tree/routing key and is no longer a visual column. While nodes are
+  loading the state reads `loading`, not `unavailable`.
 - The indent moves to the row padding (`16 + depth × TREE_INDENT_PX`) so the
   flex row has a real width; the detail line aligns under the name.
 - `selected-session` remains a small marker inside the selected row, so the
@@ -38,8 +42,10 @@ and scroll/reveal behavior are unchanged.
 
 ## Actual
 
-Built and run in this stage: the two new tests and the semantic, cursor,
-indent, fallback and focus filters pass; full-suite numbers are reported with
-the stage-C checkpoint. Visual comparison uses the headless GPUI bounds
-evidence available in this candidate; a real framebuffer capture needs the
-separate capture wrapper and is reported separately.
+Built and run in this stage: full GUI bin suite **160 passed / 0 failed /
+8 ignored** (79.70 s) after the legibility fix, plus the semantic, cursor,
+indent, fallback and focus filters. An own-framebuffer capture with the
+instrumented GPUI fork (`/private/tmp/gui-capture-fac8f202`, non-release)
+confirmed one-line density and exposed the zero-width name clipping fixed
+above; the corrected capture is kept in `/private/tmp/capture-fac8f202.png`.
+The capture is app-framebuffer evidence, not a physical-display or input test.

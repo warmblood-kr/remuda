@@ -1466,12 +1466,12 @@ impl LocalGui {
                                 .w(px(2.)).h(px(2.)).bg(rgb(0xc9d4e4))))
                         .child(div().id(SharedString::from(text_id.clone()))
                             .debug_selector(move || text_id.clone())
-                            .flex_1().min_w(px(0.)).overflow_hidden()
+                            .flex_1().min_w(px(56.)).overflow_hidden()
                             .whitespace_nowrap().text_ellipsis()
                             .child(format!("{}  {}", marker, plain_label(&session.name))))
                         .child(div().id(SharedString::from(status_id.clone()))
                             .debug_selector(move || status_id.clone())
-                            .flex_shrink().min_w(px(0.)).pl_2().text_sm()
+                            .flex_shrink().min_w(px(0.)).max_w(px(96.)).pl_2().text_sm()
                             .text_color(rgb(0x8a95a5)).whitespace_nowrap().text_ellipsis()
                             .child(status)))
                     .when_some(detail, |d, detail| d.child(
@@ -2128,9 +2128,10 @@ impl Render for LocalGui {
                         let enabled = self.peer_current(&fingerprint);
                         let expanded = self.expanded_nodes.contains(&fingerprint);
                         let name = label(&peer.label);
-                        let identity: String = peer.fingerprint.chars().take(8).collect();
                         let state = if !peer.admitted {
                             "revoked"
+                        } else if self.nodes_loading {
+                            "loading"
                         } else if enabled {
                             "admitted"
                         } else {
@@ -2185,13 +2186,11 @@ impl Render for LocalGui {
                                         .min_w(px(0.))
                                         .flex()
                                         .items_center()
-                                        .child(div().flex_1().min_w(px(0.)).overflow_hidden()
+                                        .child(div().flex_1().min_w(px(56.)).overflow_hidden()
                                             .whitespace_nowrap().text_ellipsis().child(name))
-                                        .child(div().pl_2().text_xs().text_color(rgb(0x8a95a5))
-                                            .whitespace_nowrap().text_ellipsis().child(identity))
                                         .child(div().id(SharedString::from(state_id.clone()))
                                             .debug_selector(move || state_id.clone())
-                                            .pl_2().text_xs()
+                                            .pl_2().text_xs().max_w(px(96.))
                                             .text_color(if peer.admitted { rgb(0x7f9f7f) } else { rgb(0xd08b8b) })
                                             .whitespace_nowrap().text_ellipsis().child(state))
                                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -5563,6 +5562,7 @@ mod tests {
         let name=cx.debug_bounds("session-0-text").unwrap();
         let status=cx.debug_bounds("session-0-status").unwrap();
         assert!(name.top() < status.bottom() && status.top() < name.bottom(), "name and status share a line: {name:?} {status:?}");
+        assert!(name.size.width >= px(56.), "the name keeps a readable width: {name:?}");
         let selected_row=cx.debug_bounds("session-0").unwrap();
         let plain_row=cx.debug_bounds("session-1").unwrap();
         assert!(selected_row.size.height < px(48.), "one text line per session row: row={selected_row:?} name={:?} text={:?} status={:?} plain={plain_row:?}", cx.debug_bounds("session-0-name"), cx.debug_bounds("session-0-text"), cx.debug_bounds("session-0-status"));
@@ -5573,6 +5573,8 @@ mod tests {
         let label=cx.debug_bounds("node-peer-label-0").unwrap();
         let state=cx.debug_bounds("node-peer-state-0").unwrap();
         assert!(label.top() < state.bottom() && state.top() < label.bottom(), "node name and state share a line");
+        let node_name=cx.debug_bounds("node-peer-label-0").unwrap();
+        assert!(node_name.size.width >= px(56.), "peer label keeps a readable width: {node_name:?}");
     }
     #[gpui::test]
     fn narrow_long_session_name_keeps_status_inside_the_sidebar(cx: &mut gpui::TestAppContext) {
