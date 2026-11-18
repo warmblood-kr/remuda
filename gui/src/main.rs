@@ -149,6 +149,9 @@ const VIEW_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// 8 s worker watchdog so a slow old peer keeps the previous rows instead of
 /// being killed mid-fallback.
 const PEER_REQUEST_BUDGET: Duration = Duration::from_secs(6);
+/// One peer view request may use at most this much of the whole budget, so a
+/// slow view still leaves a measured slice for the flat fallback.
+const PEER_VIEW_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Run one blocking call under a whole-call budget. The worker is a
 /// short-lived process, so a timed-out call cannot outlive its reply.
@@ -325,24 +328,44 @@ fn peer_worker(fingerprint: &str, tagged: bool) -> i32 {
             return Err(());
         }
         let private = cluster::identity::load_static_private_key().map_err(|_| ())?;
-        let rendered = match ClusterClient::system().request(
-            address,
-            &pinned_static_key,
-            &private,
-            &Request::RenderedSessionList {
-                width: SESSION_VIEW_REQUEST_COLUMNS,
-            },
-        ) {
-            Ok(Response::RenderedSessionList(view)) => sessions_from_view(view),
-            _ => None,
+        let started = std::time::Instant::now();
+        let view_budget =
+            PEER_VIEW_TIMEOUT.min(PEER_REQUEST_BUDGET.saturating_sub(started.elapsed()));
+        let rendered = if view_budget.is_zero() {
+            None
+        } else {
+            let pinned = pinned_static_key.clone();
+            let private = private.clone();
+            bounded_call(view_budget, move || {
+                match ClusterClient::system().request(
+                    address,
+                    &pinned,
+                    &private,
+                    &Request::RenderedSessionList {
+                        width: SESSION_VIEW_REQUEST_COLUMNS,
+                    },
+                ) {
+                    Ok(Response::RenderedSessionList(view)) => sessions_from_view(view),
+                    _ => None,
+                }
+            })
+            .flatten()
         };
         let rows = match rendered {
             Some(rows) => rows,
             None => {
-                let Response::Sessions(rows) = ClusterClient::system()
-                    .request(address, &pinned_static_key, &private, &Request::List)
-                    .map_err(|_| ())?
-                else {
+                let remaining = PEER_REQUEST_BUDGET.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(());
+                }
+                let pinned = pinned_static_key.clone();
+                let private = private.clone();
+                let reply = bounded_call(remaining, move || {
+                    ClusterClient::system()
+                        .request(address, &pinned, &private, &Request::List)
+                        .ok()
+                });
+                let Some(Some(Response::Sessions(rows))) = reply else {
                     return Err(());
                 };
                 plain_sessions(rows)
@@ -1334,6 +1357,12 @@ impl LocalGui {
                 continue;
             }
             let rows = self.peer_rows(&peer.fingerprint);
+            if self.selected_peer.as_ref() == Some(&peer.fingerprint)
+                && self.remote_error
+                && rows.is_some_and(|rows| !rows.is_empty())
+            {
+                child += 1;
+            }
             if rows.is_some_and(|rows| rows.iter().any(|row| !row.structured)) {
                 child += 1;
             }
@@ -1817,9 +1846,16 @@ impl LocalGui {
                     }
                     Err(error) => {
                         self.helper_changed |= error == STALE_HELPER;
-                        self.peer_sessions.remove(&fp);
-                        self.remote_sessions.clear();
-                        self.remote_error = true;
+                        // A timeout means the peer never answered, not that it
+                        // refused. Keep the last rows and mark them stale; a
+                        // definite failure still invalidates the cache.
+                        if error.contains("timed out") && self.peer_sessions.contains_key(&fp) {
+                            self.remote_error = true;
+                        } else {
+                            self.peer_sessions.remove(&fp);
+                            self.remote_sessions.clear();
+                            self.remote_error = true;
+                        }
                     }
                 }
             }
@@ -2261,6 +2297,14 @@ impl Render for LocalGui {
                                 )
                                 .into_any_element(),
                         ];
+                        if expanded && selected_node && self.remote_error && !rows.is_empty() {
+                            let stale_id = format!("peer-{index}-stale");
+                            nodes.push(div().id(SharedString::from(stale_id.clone()))
+                                .debug_selector(move || stale_id.clone())
+                                .pl_4().text_xs().text_color(rgb(0xd0a15b))
+                                .child("cached · refresh failed")
+                                .into_any_element());
+                        }
                         if expanded && rows.iter().any(|row| !row.structured) {
                             let fallback_id = format!("peer-{index}-hierarchy-fallback");
                             nodes.push(div().id(SharedString::from(fallback_id.clone()))
@@ -5585,6 +5629,82 @@ mod tests {
         assert_eq!(gui.sidebar_child_indices(), vec![3, 5, 6, 8]);
     }
     #[cfg(unix)]
+    #[test]
+    fn slow_view_leaves_a_measured_fallback_budget() {
+        assert!(PEER_VIEW_TIMEOUT < PEER_REQUEST_BUDGET);
+        assert!(PEER_REQUEST_BUDGET < provider::TIMEOUT);
+        let total = Duration::from_secs(2);
+        let view_limit = total / 2;
+        let view_sleep = total / 3;
+        let started = std::time::Instant::now();
+        let view = bounded_call(view_limit, move || {
+            std::thread::sleep(view_sleep);
+            Some(vec![1])
+        });
+        assert_eq!(view.flatten(), Some(vec![1]));
+        let remaining = total.saturating_sub(started.elapsed());
+        assert!(
+            remaining > Duration::from_millis(500),
+            "the fallback keeps a real budget: {remaining:?}"
+        );
+        let fallback = bounded_call(remaining, || {
+            std::thread::sleep(Duration::from_millis(150));
+            Some(vec![2])
+        });
+        assert_eq!(fallback.flatten(), Some(vec![2]));
+    }
+    #[test]
+    fn peer_timeout_keeps_cached_rows_and_marks_them_stale() {
+        let mut gui = LocalGui::new();
+        gui.peers = vec![peer("a", "a")];
+        gui.remote_busy = true;
+        gui.select_peer("a".into());
+        let (generation, directory, fp) = gui.remote_pending.take().unwrap();
+        gui.remote_sender
+            .send((generation, directory, fp, Ok(vec![row("proof")])))
+            .unwrap();
+        gui.drain();
+        assert_eq!(gui.remote_sessions.len(), 1);
+        gui.remote_busy = true;
+        gui.refresh_peer();
+        let (generation, directory, fp) = gui.remote_pending.take().unwrap();
+        gui.remote_sender
+            .send((
+                generation,
+                directory,
+                fp,
+                Err("Provider request timed out".into()),
+            ))
+            .unwrap();
+        gui.drain();
+        assert!(gui.remote_error && !gui.remote_loading);
+        assert_eq!(gui.remote_sessions.len(), 1, "a timeout keeps the last rows");
+        assert_eq!(gui.peer_sessions.get("a").map(Vec::len), Some(1));
+    }
+    #[test]
+    fn stale_peer_notice_keeps_reveal_indices_aligned() {
+        let mut gui = LocalGui::new();
+        gui.peers = vec![peer("p", "Peer")];
+        gui.expanded_nodes.insert("p".into());
+        gui.peer_sessions.insert("p".into(), vec![row("r")]);
+        gui.selected_peer = Some("p".into());
+        gui.remote_sessions = vec![row("r")];
+        gui.remote_error = true;
+        assert_eq!(gui.tree_entries().len(), gui.sidebar_child_indices().len());
+    }
+    #[gpui::test]
+    fn peer_timeout_shows_cached_rows_with_a_stale_notice(cx: &mut gpui::TestAppContext) {
+        let (view,cx)=cx.add_window_view(|_,_| { let mut gui=LocalGui::new();
+            gui.preview_busy=true; gui.peers=vec![peer("p","Peer")];
+            gui.expanded_nodes.insert("p".into());
+            gui.peer_sessions.insert("p".into(), vec![row("remote")]);
+            gui.selected_peer=Some("p".into()); gui.remote_sessions=vec![row("remote")];
+            gui.remote_error=true; gui });
+        cx.simulate_resize(gpui::size(px(1000.),px(650.)));cx.run_until_parked();
+        assert!(cx.debug_bounds("session-0").is_some(), "cached peer rows stay visible");
+        assert!(cx.debug_bounds("peer-0-stale").is_some(), "stale rows are marked");
+    }
+
     #[test]
     fn peer_budget_gives_up_before_the_worker_watchdog() {
         assert!(PEER_REQUEST_BUDGET < provider::TIMEOUT);
