@@ -15,11 +15,64 @@ pub struct ViewEntry {
     pub lines: Vec<String>,
 }
 
+/// A display-only, instance-bound row semantic from the renderer that produced
+/// `ViewEntry::lines`. Liveness is authoritative in `SessionSummary.alive`; this
+/// state never identifies or authorizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewState {
+    Alive,
+    Exited,
+    Working,
+    Idle,
+    Blocked,
+}
+
+impl ViewState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Alive => "alive",
+            Self::Exited => "exited",
+            Self::Working => "working",
+            Self::Idle => "idle",
+            Self::Blocked => "blocked",
+        }
+    }
+    pub fn from_name(value: &str) -> Option<Self> {
+        Some(match value {
+            "alive" => Self::Alive,
+            "exited" => Self::Exited,
+            "working" => Self::Working,
+            "idle" => Self::Idle,
+            "blocked" => Self::Blocked,
+            _ => return None,
+        })
+    }
+}
+
+/// One semantic row. It is accepted only when it is bound to the same
+/// `(name, instance_id)` and order as the validated `ViewEntry`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewSemantics {
+    pub name: String,
+    pub instance_id: String,
+    #[serde(default)]
+    pub depth: u8,
+    /// Advisory activity for display. It must agree with `SessionSummary.alive`
+    /// or the whole sidecar is dropped; it never identifies or authorizes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<ViewState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionView {
     sessions: Vec<SessionSummary>,
     height: usize,
     entries: Vec<ViewEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    semantics: Vec<ViewSemantics>,
 }
 
 /// A view whose displayed targets and local selection were validated.
@@ -27,6 +80,7 @@ pub struct SessionView {
 pub struct ValidatedView {
     sessions: Vec<SessionSummary>,
     entries: Vec<ViewEntry>,
+    semantics: Vec<ViewSemantics>,
     height: usize,
     width: u16,
     selected: Option<(String, String)>,
@@ -37,6 +91,12 @@ impl ValidatedView {
     }
     pub fn entries(&self) -> &[ViewEntry] {
         &self.entries
+    }
+    /// Structured rows in the same order as `entries`; empty for an older
+    /// peer that predates the sidecar, and also when the sidecar could not be
+    /// represented safely. Rendered rows are always preserved.
+    pub fn semantics(&self) -> &[ViewSemantics] {
+        &self.semantics
     }
     pub fn height(&self) -> usize {
         self.height
@@ -60,7 +120,52 @@ impl SessionView {
             sessions,
             height,
             entries,
+            semantics: Vec::new(),
         }
+    }
+
+    /// Attach the renderer's structured rows. They are still untrusted until
+    /// `validate` binds each one to the matching validated entry.
+    pub fn with_semantics(mut self, semantics: Vec<ViewSemantics>) -> Self {
+        self.semantics = semantics;
+        self
+    }
+
+    /// Drop the optional sidecar and keep the validated rendered rows. Used
+    /// when the sidecar alone would exceed a bounded transport.
+    pub fn without_semantics(mut self) -> Self {
+        self.semantics.clear();
+        self
+    }
+
+    /// True when every optional field can be shown as received. Structural
+    /// problems are rejected by `validate`; this only decides whether the
+    /// optional sidecar may be kept.
+    pub fn semantics_representable(&self) -> bool {
+        self.semantics
+            .iter()
+            .all(|semantic| semantic.detail.as_deref().is_none_or(valid_detail))
+    }
+
+    /// True when no state contradicts `SessionSummary.alive` for its instance:
+    /// exited only for dead sessions, never `exited` for live ones. A mismatch
+    /// drops the sidecar; the validated rendered rows remain.
+    pub fn semantics_consistent(&self) -> bool {
+        self.semantics.iter().all(|semantic| {
+            let alive = self
+                .sessions
+                .iter()
+                .find(|session| {
+                    session.name == semantic.name
+                        && session.instance_id.as_deref() == Some(semantic.instance_id.as_str())
+                })
+                .map(|session| session.alive);
+            match (alive, semantic.state) {
+                (Some(true), Some(ViewState::Exited)) => false,
+                (Some(false), Some(state)) => state == ViewState::Exited,
+                _ => true,
+            }
+        })
     }
 
     /// Raw, untrusted rows exactly as received. Validate before display.
@@ -114,6 +219,11 @@ impl SessionView {
         Ok(ValidatedView {
             sessions,
             entries,
+            semantics: if self.semantics_representable() && self.semantics_consistent() {
+                self.semantics.clone()
+            } else {
+                Vec::new()
+            },
             height: self.height,
             width,
             selected: selected.map(|(name, instance)| (name.to_owned(), instance.to_owned())),
@@ -162,8 +272,53 @@ impl SessionView {
                 }
             }
         }
+        validate_semantics(&self.entries, &self.semantics)?;
         Ok(())
     }
+}
+
+/// Bind each optional semantic row to the validated entry at the same index.
+/// An older peer sends no sidecar; consumers then get no structured state
+/// rather than a guess derived from the painted row.
+fn validate_semantics(
+    entries: &[ViewEntry],
+    semantics: &[ViewSemantics],
+) -> Result<(), &'static str> {
+    if semantics.is_empty() {
+        return Ok(());
+    }
+    if semantics.len() != entries.len() {
+        return Err("semantics count mismatch");
+    }
+    let mut seen = HashSet::new();
+    for (semantic, entry) in semantics.iter().zip(entries) {
+        if semantic.name != entry.name
+            || semantic.instance_id != entry.instance_id
+            || semantic.depth > 20
+            || !seen.insert((semantic.name.as_str(), semantic.instance_id.as_str()))
+        {
+            return Err("semantics identity mismatch");
+        }
+    }
+    Ok(())
+}
+
+/// Characters a validated row may carry as plain text. SGR is handled
+/// separately; combining marks, joiners and variation selectors are ordinary
+/// text here, exactly as `safe_line` allows them in a rendered row.
+fn plain_text_char(ch: char) -> bool {
+    !ch.is_control()
+        && !matches!(
+            ch,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// A detail the sidecar may carry. It is the same text the renderer writes
+/// into the row, so it accepts the same characters as `safe_line`; only the
+/// sidecar's own byte bound is added.
+fn valid_detail(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && value.chars().all(plain_text_char)
 }
 
 fn valid_identity(value: &str) -> bool {
@@ -298,9 +453,7 @@ fn safe_line(line: &str) -> Option<String> {
                 return None;
             }
             styled = params != "0";
-        } else if ch.is_control()
-            || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        {
+        } else if !plain_text_char(ch) {
             return None;
         } else {
             plain.push(ch);

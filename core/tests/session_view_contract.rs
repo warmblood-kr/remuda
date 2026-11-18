@@ -1,4 +1,4 @@
-use remuda_core::session_view::{SessionView, ViewEntry};
+use remuda_core::session_view::{SessionView, ViewEntry, ViewSemantics, ViewState};
 use remuda_core::{SessionSummary, Size};
 use std::time::Duration;
 
@@ -22,6 +22,11 @@ fn session(name: &str, instance: &str) -> SessionSummary {
         team: None,
     }
 }
+fn dead_session(name: &str, instance: &str) -> SessionSummary {
+    let mut summary = session(name, instance);
+    summary.alive = false;
+    summary
+}
 fn entry(name: &str, instance: &str, line: &str) -> ViewEntry {
     ViewEntry {
         name: name.into(),
@@ -29,6 +34,175 @@ fn entry(name: &str, instance: &str, line: &str) -> ViewEntry {
         lines: vec![line.into()],
     }
 }
+fn semantics(
+    name: &str,
+    instance: &str,
+    depth: u8,
+    state: ViewState,
+    detail: Option<&str>,
+) -> ViewSemantics {
+    ViewSemantics {
+        name: name.into(),
+        instance_id: instance.into(),
+        depth,
+        state: Some(state),
+        detail: detail.map(str::to_owned),
+    }
+}
+
+#[test]
+fn accepts_semantics_bound_to_the_same_entries_and_order() {
+    let view = SessionView::new(
+        vec![session("lead", "a"), session("child", "b")],
+        1,
+        vec![entry("lead", "a", "lead"), entry("child", "b", "  child")],
+    )
+    .with_semantics(vec![
+        semantics("lead", "a", 0, ViewState::Working, Some("codex · 42%")),
+        semantics("child", "b", 1, ViewState::Idle, None),
+    ]);
+    let checked = view.validate_for_display(None, 80).unwrap();
+    assert_eq!(checked.semantics().len(), 2);
+    assert_eq!(checked.semantics()[1].depth, 1);
+    assert_eq!(checked.semantics()[1].state, Some(ViewState::Idle));
+    assert_eq!(
+        checked.semantics()[0].detail.as_deref(),
+        Some("codex · 42%")
+    );
+}
+
+#[test]
+fn rejects_semantics_that_are_unbound_or_out_of_range() {
+    let snapshot = vec![session("one", "a"), session("two", "b")];
+    let rows = vec![entry("one", "a", "one"), entry("two", "b", "two")];
+    for bad in [
+        vec![semantics("one", "wrong", 0, ViewState::Alive, None)],
+        vec![
+            semantics("one", "a", 0, ViewState::Alive, None),
+            semantics("one", "a", 0, ViewState::Alive, None),
+        ],
+        vec![
+            semantics("one", "a", 21, ViewState::Alive, None),
+            semantics("two", "b", 0, ViewState::Alive, None),
+        ],
+    ] {
+        assert!(SessionView::new(snapshot.clone(), 1, rows.clone())
+            .with_semantics(bad)
+            .validate()
+            .is_err());
+    }
+}
+
+#[test]
+fn accepts_combining_marks_and_joined_emoji_in_details() {
+    // The renderer writes these into the row too, so the sidecar must not be
+    // stricter than `safe_line`: a decomposed accent, a ZWJ family and a
+    // variation selector are ordinary text.
+    let detail = "e\u{301}cole 👨\u{200d}👩\u{200d}👧 🏇\u{fe0f}";
+    let view = SessionView::new(vec![session("one", "a")], 1, vec![entry("one", "a", "one")])
+        .with_semantics(vec![semantics(
+            "one",
+            "a",
+            0,
+            ViewState::Working,
+            Some(detail),
+        )]);
+    let checked = view.validate_for_display(None, 80).unwrap();
+    assert_eq!(checked.semantics().len(), 1);
+    assert_eq!(checked.semantics()[0].detail.as_deref(), Some(detail));
+}
+
+#[test]
+fn unrepresentable_detail_drops_only_the_sidecar() {
+    // A control or bidi character cannot be shown, but the validated rendered
+    // rows must survive: losing the optional structure is not a view failure.
+    for detail in ["bad\u{7}detail", "bad\u{202e}detail"] {
+        let view = SessionView::new(vec![session("one", "a")], 1, vec![entry("one", "a", "one")])
+            .with_semantics(vec![semantics(
+                "one",
+                "a",
+                0,
+                ViewState::Alive,
+                Some(detail),
+            )]);
+        let checked = view.validate_for_display(None, 80).unwrap();
+        assert!(checked.semantics().is_empty());
+        assert_eq!(checked.entries().len(), 1);
+        assert_eq!(checked.entries()[0].lines, vec!["one".to_string()]);
+    }
+}
+
+#[test]
+fn semantics_state_must_agree_with_authoritative_liveness() {
+    // An untrusted peer cannot claim activity for an exited instance: the
+    // authoritative liveness is `SessionSummary.alive`, so the sidecar is
+    // dropped and the validated rows survive.
+    let view = SessionView::new(
+        vec![dead_session("gone", "a")],
+        1,
+        vec![entry("gone", "a", "gone")],
+    )
+    .with_semantics(vec![semantics("gone", "a", 0, ViewState::Working, None)]);
+    assert!(view.validate().is_ok());
+    let checked = view.validate_for_display(None, 80).unwrap();
+    assert!(checked.semantics().is_empty());
+    assert_eq!(checked.entries().len(), 1);
+
+    // Nor exit for a live one.
+    let view = SessionView::new(
+        vec![session("live", "a")],
+        1,
+        vec![entry("live", "a", "live")],
+    )
+    .with_semantics(vec![semantics("live", "a", 0, ViewState::Exited, None)]);
+    assert!(view
+        .validate_for_display(None, 80)
+        .unwrap()
+        .semantics()
+        .is_empty());
+
+    // Agreement keeps it.
+    for (summary, state) in [
+        (dead_session("gone", "a"), ViewState::Exited),
+        (session("live", "a"), ViewState::Idle),
+    ] {
+        let name = summary.name.clone();
+        let instance = summary.instance_id.clone().unwrap();
+        let view = SessionView::new(vec![summary], 1, vec![entry(&name, &instance, &name)])
+            .with_semantics(vec![semantics(&name, &instance, 0, state, None)]);
+        assert_eq!(
+            view.validate_for_display(None, 80)
+                .unwrap()
+                .semantics()
+                .len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn mismatched_binding_still_fails_closed_with_a_bad_detail() {
+    let view = SessionView::new(vec![session("one", "a")], 1, vec![entry("one", "a", "one")])
+        .with_semantics(vec![semantics(
+            "one",
+            "wrong",
+            0,
+            ViewState::Alive,
+            Some("bad\u{202e}detail"),
+        )]);
+    assert!(view.validate().is_err());
+    assert!(view.validate_for_display(None, 80).is_err());
+}
+
+#[test]
+fn view_without_semantics_still_validates_and_reports_none() {
+    // This is the state an older peer produces after decode: the sidecar is
+    // optional, so consumers must handle an empty list without inventing data.
+    let view = SessionView::new(vec![session("one", "a")], 1, vec![entry("one", "a", "one")]);
+    let checked = view.validate_for_display(None, 80).unwrap();
+    assert!(checked.semantics().is_empty());
+}
+
 #[test]
 fn accepts_complete_reordered_snapshot_and_lua_styles() {
     let view = SessionView::new(
