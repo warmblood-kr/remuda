@@ -692,6 +692,38 @@ fn documents_browse_plain_text_and_return_without_sending_browser_input() {
 
 #[cfg(unix)]
 #[test]
+fn documents_listing_offers_the_parent_row_and_opens_it() {
+    use std::io::Write;
+    let daemon =
+        document_test_daemon(&[("docs/top.txt", "TOP\n"), ("docs/sub/one.txt", "NESTED\n")]);
+    let mut tui = TuiPty::start(&daemon.runtime);
+    tui.wait_for("doc-session", Duration::from_secs(5));
+    tui.writer.write_all(b"\rsaved-draft").unwrap();
+    tui.wait_for("saved-draft", Duration::from_secs(3));
+    tui.writer.write_all(b"\x1bd").unwrap(); // Alt-d opens Documents at the root.
+    tui.wait_for("docs/", Duration::from_secs(5));
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("sub/", Duration::from_secs(5));
+    tui.writer.write_all(b"\r").unwrap();
+    let nested = tui.wait_for("one.txt", Duration::from_secs(5));
+    assert!(
+        nested.contains(".."),
+        "the listing has no parent row like the GUI: {nested}"
+    );
+    // The selection stays on the first real entry, so Up reaches the parent
+    // row and Enter leaves the directory without Back.
+    tui.writer.write_all(b"\x1b[A").unwrap();
+    tui.writer.write_all(b"\r").unwrap();
+    let up = tui.wait_for("top.txt", Duration::from_secs(5));
+    assert!(
+        !up.contains("one.txt") && up.contains("remuda:///docs/"),
+        "the parent row did not leave docs/sub: {up}"
+    );
+    tui.writer.write_all(b"q").unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn documents_read_markdown_as_prose_and_follow_its_local_link() {
     use std::io::Write;
     let daemon = document_test_daemon(&[

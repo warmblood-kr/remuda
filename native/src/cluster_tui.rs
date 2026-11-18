@@ -4795,7 +4795,7 @@ impl ClusterUi {
 
     fn sync_documents(&mut self, path: &Path) {
         if self.documents_open && self.documents.is_none() {
-            self.documents = Some(crate::documents::Browser::new(path.to_owned()));
+            self.documents = Some(document_browser(path));
         }
         if let Some(browser) = &mut self.documents {
             browser.poll();
@@ -4862,6 +4862,14 @@ impl ClusterUi {
     }
 }
 
+/// The TUI listing offers the same parent row as the GUI document pane, so a
+/// nested directory can be left upward as well as with Back.
+fn document_browser(path: &Path) -> crate::documents::Browser {
+    let mut browser = crate::documents::Browser::new(path.to_owned());
+    browser.enable_parent_navigation();
+    browser
+}
+
 fn apply_document_request(
     ui: &mut ClusterUi,
     inbox: &mut Option<crate::document_open::Inbox>,
@@ -4870,9 +4878,7 @@ fn apply_document_request(
     if let Some(inbox) = inbox {
         if let Some(request) = inbox.take() {
             ui.documents_open = true;
-            let browser = ui
-                .documents
-                .get_or_insert_with(|| crate::documents::Browser::new(path.to_owned()));
+            let browser = ui.documents.get_or_insert_with(|| document_browser(path));
             browser.cancel();
             browser.navigate(crate::documents::Location::Document(
                 request.uri[10..].to_owned(),
