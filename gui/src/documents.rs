@@ -728,6 +728,14 @@ impl Pane {
         self.browser.page.location.path()
     }
 
+    /// True when the pane shows a directory listing.
+    pub fn is_directory(&self) -> bool {
+        matches!(
+            self.browser.page.location,
+            remuda_native::documents::Location::Directory(_)
+        )
+    }
+
     /// The original Markdown source for a styled reader, when the current
     /// document has one. Bounded by the browser's 1 MiB read limit.
     pub fn markdown_source(&self) -> Option<&str> {

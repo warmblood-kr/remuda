@@ -38,11 +38,19 @@ pub struct Entry {
     pub label: Option<String>,
 }
 impl Entry {
-    /// The row label: the override when present, otherwise the escaped path.
+    /// The row label with its full identity: the override when present,
+    /// otherwise the escaped path. The TUI listing uses this.
     pub fn display_label(&self) -> String {
         self.label
             .clone()
             .unwrap_or_else(|| path_label(&self.path))
+    }
+    /// The compact row label: the override when present, otherwise the
+    /// escaped last path component. Selection and opening still use `path`.
+    pub fn display_name(&self) -> String {
+        self.label
+            .clone()
+            .unwrap_or_else(|| basename_label(&self.path))
     }
 }
 #[derive(Clone, Debug)]
@@ -534,6 +542,14 @@ impl Browser {
     }
 }
 
+/// The last component of a VFS path, escaped for display. Directory paths end
+/// with `/`; a root or empty path has no component.
+pub fn basename_label(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    let name = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    path_label(name)
+}
+
 /// The lexical parent of a VFS directory path, or `None` at the root. The
 /// root is the empty path; every answer is a path `navigate` re-validates.
 pub fn parent_directory(path: &str) -> Option<String> {
@@ -826,6 +842,34 @@ fn markdown_path(path: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn basename_label_keeps_the_last_component_only() {
+        assert_eq!(basename_label(""), "");
+        assert_eq!(basename_label("docs/"), "docs");
+        assert_eq!(basename_label("docs/readme.md"), "readme.md");
+        assert_eq!(basename_label("readme.md"), "readme.md");
+        assert_eq!(basename_label("docs/한글 폴더/노트.md"), "노트.md");
+        assert_eq!(basename_label(r"docs/a\b.md"), r"a\\b.md");
+        assert_eq!(basename_label("docs/a\u{202e}b.md"), r"a\u{202e}b.md");
+    }
+    #[test]
+    fn entry_display_name_is_compact_but_keeps_the_full_path() {
+        let entry = Entry {
+            path: "docs/guide/note.md".into(),
+            directory: false,
+            label: None,
+        };
+        assert_eq!(entry.display_name(), "note.md");
+        assert_eq!(entry.display_label(), "docs/guide/note.md");
+        assert_eq!(entry.path, "docs/guide/note.md");
+        let parent = Entry {
+            path: "docs/".into(),
+            directory: true,
+            label: Some("..".into()),
+        };
+        assert_eq!(parent.display_name(), "..");
+        assert_eq!(parent.display_label(), "..");
+    }
     #[test]
     fn parent_directory_stops_at_the_root() {
         assert_eq!(parent_directory(""), None);

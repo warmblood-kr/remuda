@@ -373,6 +373,10 @@ fn render_pane<T: DocumentHost + 'static>(
         (selection, key)
     }));
     let body = pane_body(pane, index, tag, columns, rows, pane_width, selection.clone(), cx);
+    let location_id = format!("vfs-location-{tag}");
+    let directory_location = pane
+        .is_directory()
+        .then(|| format!("remuda:///{}", remuda_native::documents::path_label(pane.location())));
     let pane_focus = focus.clone();
     let move_selection = selection.clone();
     div()
@@ -383,6 +387,17 @@ fn render_pane<T: DocumentHost + 'static>(
         .flex_1()
         .min_w(px(0.))
         .min_h(px(0.))
+        .when_some(directory_location, |d, location| {
+            d.child(
+                div()
+                    .id(SharedString::from(location_id.clone()))
+                    .debug_selector(move || location_id.clone())
+                    .text_sm()
+                    .text_color(rgb(0xc9d4e4))
+                    .pb_1()
+                    .child(location),
+            )
+        })
         .child(
             div()
                 .text_sm()
@@ -416,6 +431,12 @@ fn render_pane<T: DocumentHost + 'static>(
         .into_any_element()
 }
 
+/// A directory row shows only the file or folder name; identity stays in
+/// `Entry::path`, which click, Enter and stale checks use.
+fn vfs_row_label(entry: &remuda_native::documents::Entry) -> String {
+    entry.display_name()
+}
+
 fn pane_body<T: DocumentHost + 'static>(
     pane: &Pane,
     pane_index: usize,
@@ -430,7 +451,7 @@ fn pane_body<T: DocumentHost + 'static>(
         let directory = directory.to_owned();
         let rows = entries.iter().enumerate().map(|(index, entry)| {
             let path = entry.path.clone();
-            let shown = entry.display_label();
+            let shown = vfs_row_label(entry);
             let is_directory = entry.directory;
             let parent = directory.clone();
             div().id(SharedString::from(format!("vfs-entry-{tag}-{index}")))
@@ -1779,6 +1800,61 @@ mod tests {
         let parent=cx.debug_bounds("vfs-entry-left-0").unwrap(); cx.simulate_click(parent.center(),gpui::Modifiers::none()); settle(&view,cx);
         assert_eq!(view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().location().to_owned()), "");
         assert!(view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().directory_entries().unwrap().2.iter().all(|e| e.label.is_none())));
+    }
+
+    #[test]
+    fn vfs_rows_show_basenames_and_parent_keeps_full_identity() {
+        use remuda_native::documents::Entry;
+        let file = Entry { path: "docs/guide/note.md".into(), directory: false, label: None };
+        assert_eq!(vfs_row_label(&file), "note.md");
+        assert_eq!(file.path, "docs/guide/note.md");
+        let folder = Entry { path: "docs/한글 폴더/".into(), directory: true, label: None };
+        assert_eq!(vfs_row_label(&folder), "한글 폴더");
+        let parent = Entry { path: "docs/".into(), directory: true, label: Some("..".into()) };
+        assert_eq!(vfs_row_label(&parent), "..");
+        let long = Entry { path: format!("docs/{}", "긴이름".repeat(20)), directory: false, label: None };
+        assert!(vfs_row_label(&long).starts_with("긴이름"));
+    }
+
+    #[gpui::test]
+    fn directory_header_and_duplicate_basenames_keep_full_identity(cx: &mut gpui::TestAppContext) {
+        let _guard=DAEMON_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let bin=remuda_bin(); let daemon=Daemon::start(&bin);
+        daemon.put(&bin,"a/note.md",b"a"); daemon.put(&bin,"b/note.md",b"b");
+        daemon.put(&bin,"docs/한글 폴더/아주 긴 이름의 문서.md",b"note");
+        let (view,cx)=host(daemon.socket(),cx); cx.simulate_resize(gpui::size(px(900.),px(600.))); settle(&view,cx);
+        // The root header names the VFS root, and there is no parent row.
+        assert!(cx.debug_bounds("vfs-location-left").is_some());
+        // Enter `a/`, then open its note by mouse: the row label is `note.md`
+        // while click validation and the target use `a/note.md`.
+        let a=view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().directory_entries().unwrap().2.iter().position(|e| e.path=="a/").unwrap());
+        let a_id: &'static str=Box::leak(format!("vfs-entry-left-{a}").into_boxed_str());
+        let row=cx.debug_bounds(a_id).unwrap(); cx.simulate_click(row.center(),gpui::Modifiers::none()); settle(&view,cx);
+        assert_eq!(view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().location().to_owned()), "a/");
+        assert!(cx.debug_bounds("vfs-location-left").is_some());
+        let note=cx.debug_bounds("vfs-entry-left-1").unwrap(); cx.simulate_click(note.center(),gpui::Modifiers::none()); settle(&view,cx);
+        assert_eq!(view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().location().to_owned()), "a/note.md");
+        // Back to `a/`, then Back to the root.
+        for _ in 0..2 { view.update(cx,|h,cx| { h.documents.as_mut().unwrap().active_mut().back(); cx.notify(); }); settle(&view,cx); }
+        assert_eq!(view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().location().to_owned()), "");
+        // Enter `b/` and open the same basename with Enter; it must reach b/note.md.
+        let b=view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().directory_entries().unwrap().2.iter().position(|e| e.path=="b/").unwrap());
+        let b_id: &'static str=Box::leak(format!("vfs-entry-left-{b}").into_boxed_str());
+        let row=cx.debug_bounds(b_id).unwrap(); cx.simulate_click(row.center(),gpui::Modifiers::none()); settle(&view,cx);
+        view.update(cx,|h,cx| { h.documents.as_mut().unwrap().active_mut().open_selected(); cx.notify(); }); settle(&view,cx);
+        assert_eq!(view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().location().to_owned()), "b/note.md");
+        // A unicode folder keeps the header identity and a visible long row.
+        for _ in 0..2 { view.update(cx,|h,cx| { h.documents.as_mut().unwrap().active_mut().back(); cx.notify(); }); settle(&view,cx); }
+        let docs=view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().directory_entries().unwrap().2.iter().position(|e| e.path=="docs/").unwrap());
+        let docs_id: &'static str=Box::leak(format!("vfs-entry-left-{docs}").into_boxed_str());
+        let row=cx.debug_bounds(docs_id).unwrap(); cx.simulate_click(row.center(),gpui::Modifiers::none()); settle(&view,cx);
+        let folder=view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().directory_entries().unwrap().2.iter().position(|e| e.path=="docs/한글 폴더/").unwrap());
+        let folder_id: &'static str=Box::leak(format!("vfs-entry-left-{folder}").into_boxed_str());
+        let row=cx.debug_bounds(folder_id).unwrap(); cx.simulate_click(row.center(),gpui::Modifiers::none()); settle(&view,cx);
+        assert_eq!(view.read_with(cx,|h,_| h.documents.as_ref().unwrap().active().location().to_owned()), "docs/한글 폴더/");
+        assert!(cx.debug_bounds("vfs-location-left").is_some());
+        let long=cx.debug_bounds("vfs-entry-left-1").unwrap();
+        assert!(long.size.width > px(0.) && long.right() <= px(900.), "long unicode row must stay in the pane: {long:?}");
     }
 
     #[gpui::test]
