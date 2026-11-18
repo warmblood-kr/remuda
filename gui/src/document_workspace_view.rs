@@ -2546,6 +2546,10 @@ mod tests {
                 alive: true,
                 unavailable: false,
                 attached: false,
+                depth: 0,
+                state: None,
+                detail: None,
+                structured: true,
             }];
             gui.select_session(gui.sessions[0].clone());
             gui.documents = Some(Workspace::new(socket.clone()));

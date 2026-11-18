@@ -72,6 +72,18 @@ struct Session {
     unavailable: bool,
     #[serde(default)]
     attached: bool,
+    /// Validated hierarchy depth; 0 when the daemon or peer has no sidecar.
+    #[serde(default)]
+    depth: u8,
+    /// Advisory activity for display; `alive` remains the liveness authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<remuda_core::session_view::ViewState>,
+    /// Validated detail line from the shared semantic row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    /// Whether the shared instance-bound sidecar was present for this row.
+    #[serde(default)]
+    structured: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +91,27 @@ struct Peer {
     fingerprint: String,
     label: String,
     admitted: bool,
+}
+
+fn session_marker(session: &Session) -> char {
+    if session.unavailable {
+        return '?';
+    }
+    if !session.alive {
+        return remuda_native::cluster_tui::session_glyph(false);
+    }
+    match session.state {
+        Some(remuda_core::session_view::ViewState::Working) => '🏇',
+        Some(remuda_core::session_view::ViewState::Idle) => '○',
+        Some(remuda_core::session_view::ViewState::Blocked) => '!',
+        _ => remuda_native::cluster_tui::session_glyph(true),
+    }
+}
+
+/// Peer text escaped by `label` without the surrounding quotes.
+fn plain_label(value: &str) -> String {
+    let escaped = label(value);
+    escaped[1..escaped.len() - 1].to_owned()
 }
 
 fn worker_deadline() {
@@ -98,24 +131,78 @@ fn worker_executable() -> std::io::Result<std::path::PathBuf> {
 
 // This worker makes only a List request. Its own deadline survives GUI exit,
 // including when native IPC setup stalls before the client's read timeout.
-fn worker(tagged: bool) -> i32 {
-    worker_deadline();
-    let path = remuda_native::daemon::socket_path("default");
-    let rows = match remuda_native::client::request(&path, &remuda_core::protocol::Request::List) {
-        Ok(remuda_core::protocol::Response::Sessions(rows)) => rows,
-        _ => return 1,
-    };
-    let sessions: Vec<_> = rows
-        .into_iter()
+const SESSION_VIEW_REQUEST_COLUMNS: u16 = 512;
+
+fn sessions_from_view(view: remuda_core::session_view::SessionView) -> Option<Vec<Session>> {
+    let checked = view
+        .validate_for_display(None, SESSION_VIEW_REQUEST_COLUMNS)
+        .ok()?;
+    let semantics = checked.semantics();
+    checked
+        .sessions()
+        .iter()
+        .enumerate()
+        .map(|(index, session)| {
+            // Binding and order were validated; an older peer has no rows.
+            let semantic = semantics.get(index);
+            Some(Session {
+                name: session.name.clone(),
+                instance_id: session.instance_id.clone(),
+                alive: session.alive,
+                unavailable: session.unavailable,
+                attached: session.attached,
+                depth: semantic.map_or(0, |row| row.depth),
+                state: semantic.and_then(|row| row.state),
+                detail: semantic.and_then(|row| row.detail.clone()),
+                structured: semantic.is_some(),
+            })
+        })
+        .collect()
+}
+
+fn plain_sessions(rows: Vec<remuda_core::SessionSummary>) -> Vec<Session> {
+    rows.into_iter()
         .map(|s| Session {
             name: s.name,
             instance_id: s.instance_id,
             alive: s.alive,
             unavailable: s.unavailable,
             attached: s.attached,
+            depth: 0,
+            state: None,
+            detail: None,
+            structured: false,
         })
-        .collect();
-    write_worker_reply(&sessions, tagged)
+        .collect()
+}
+
+fn worker(tagged: bool) -> i32 {
+    use remuda_core::protocol::{Request, Response};
+    worker_deadline();
+    let path = remuda_native::daemon::socket_path("default");
+    let sessions = view_request(&path).or_else(|| match remuda_native::client::request(&path, &Request::List) {
+        Ok(Response::Sessions(rows)) => Some(plain_sessions(rows)),
+        _ => None,
+    });
+    match sessions {
+        Some(rows) => write_worker_reply(&rows, tagged),
+        None => 1,
+    }
+}
+
+/// A daemon that predates the sidecar answers with an error; callers fall back
+/// to the flat session list so the GUI stays usable.
+fn view_request(path: &std::path::Path) -> Option<Vec<Session>> {
+    use remuda_core::protocol::{Request, Response};
+    match remuda_native::client::request(
+        path,
+        &Request::RenderedSessionList {
+            width: SESSION_VIEW_REQUEST_COLUMNS,
+        },
+    ) {
+        Ok(Response::RenderedSessionList(view)) => sessions_from_view(view),
+        _ => None,
+    }
 }
 
 fn terminal_worker(name: &str, instance: &str) -> i32 {
@@ -188,25 +275,33 @@ fn peer_worker(fingerprint: &str, tagged: bool) -> i32 {
             return Err(());
         }
         let private = cluster::identity::load_static_private_key().map_err(|_| ())?;
-        let Response::Sessions(rows) = ClusterClient::system()
-            .request(address, &pinned_static_key, &private, &Request::List)
-            .map_err(|_| ())?
-        else {
-            return Err(());
+        let rendered = match ClusterClient::system().request(
+            address,
+            &pinned_static_key,
+            &private,
+            &Request::RenderedSessionList {
+                width: SESSION_VIEW_REQUEST_COLUMNS,
+            },
+        ) {
+            Ok(Response::RenderedSessionList(view)) => sessions_from_view(view),
+            _ => None,
+        };
+        let rows = match rendered {
+            Some(rows) => rows,
+            None => {
+                let Response::Sessions(rows) = ClusterClient::system()
+                    .request(address, &pinned_static_key, &private, &Request::List)
+                    .map_err(|_| ())?
+                else {
+                    return Err(());
+                };
+                plain_sessions(rows)
+            }
         };
         if !peer_is_unique(&discover_peers().map_err(|_| ())?, fingerprint) {
             return Err(());
         }
-        Ok(rows
-            .into_iter()
-            .map(|s| Session {
-                name: s.name,
-                instance_id: s.instance_id,
-                alive: s.alive,
-                unavailable: s.unavailable,
-                attached: s.attached,
-            })
-            .collect())
+        Ok(rows)
     };
     match list() {
         Ok(rows) => write_worker_reply(&rows, tagged),
@@ -1221,6 +1316,11 @@ impl LocalGui {
                 } else {
                     format!("{prefix}-session-{index}")
                 };
+                let marker = session_marker(&session).to_string();
+                let indent = usize::from(session.depth.min(20)) * 2;
+                let detail = session.detail.clone();
+                let name_id = format!("{id}-name");
+                let detail_id = format!("{id}-detail");
                 div()
                     .id(SharedString::from(id.clone()))
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -1243,7 +1343,12 @@ impl LocalGui {
                                 .child("SELECTED"),
                         )
                     })
-                    .child(div().child(label(&session.name)))
+                    .child(div().id(SharedString::from(name_id.clone())).debug_selector(move || name_id.clone())
+                        .ml(px(indent as f32)).child(format!("{}  {}", marker, plain_label(&session.name))))
+                    .when_some(detail, |d, detail| d.child(
+                        div().id(SharedString::from(detail_id.clone())).debug_selector(move || detail_id.clone())
+                            .pl(px((indent + 3) as f32)).text_sm().text_color(rgb(0x8a95a5))
+                            .child(format!("↳ {}", plain_label(&detail)))))
                     .child(div().text_sm().text_color(rgb(0x8a95a5)).child(status))
             })
             .collect()
@@ -5141,7 +5246,100 @@ mod tests {
             alive: true,
             unavailable: false,
             attached: false,
+            depth: 0,
+            state: None,
+            detail: None,
+            structured: true,
         }
+    }
+    fn summary_for_view(name: &str, instance: &str) -> remuda_core::SessionSummary {
+        remuda_core::SessionSummary {
+            id: format!("id-{name}"), name: name.into(), instance_id: Some(instance.into()), output_version: None,
+            alive: true, idle: Duration::ZERO, output_idle: Some(Duration::ZERO), size: remuda_core::agent::Size::new(80,24),
+            attached: false, human_idle: None, mouse_tracking: false, unavailable: false, program_status: None,
+            program_status_age_ms: None, remote_input_disabled: false, team: None,
+        }
+    }
+    fn sample_semantic_view() -> remuda_core::session_view::SessionView {
+        use remuda_core::session_view::{SessionView,ViewEntry,ViewSemantics,ViewState};
+        let a=summary_for_view("parent","p-1"); let b=summary_for_view("child","c-1");
+        SessionView::new(vec![b,a],1,vec![
+            ViewEntry { name:"parent".into(), instance_id:"p-1".into(), lines:vec!["parent".into()] },
+            ViewEntry { name:"child".into(), instance_id:"c-1".into(), lines:vec!["  child".into()] },
+        ]).with_semantics(vec![
+            ViewSemantics { name:"parent".into(), instance_id:"p-1".into(), depth:0, state:Some(ViewState::Idle), detail:None },
+            ViewSemantics { name:"child".into(), instance_id:"c-1".into(), depth:1, state:Some(ViewState::Working), detail:Some("codex · 42%".into()) },
+        ])
+    }
+    #[test]
+    fn semantic_rows_bind_depth_state_and_detail() {
+        use remuda_core::session_view::ViewState;
+        let rows = sessions_from_view(sample_semantic_view()).unwrap();
+        assert_eq!((rows[0].name.as_str(),rows[0].instance_id.as_deref()),("parent",Some("p-1")));
+        assert_eq!((rows[1].name.as_str(),rows[1].instance_id.as_deref()),("child",Some("c-1")));
+        assert_eq!((rows[0].depth, rows[0].state), (0, Some(ViewState::Idle)));
+        assert_eq!((rows[1].depth, rows[1].state), (1, Some(ViewState::Working)));
+        assert_eq!(rows[1].detail.as_deref(), Some("codex · 42%"));
+        assert!(rows.iter().all(|row| row.structured));
+    }
+    #[test]
+    fn flat_session_list_has_no_hierarchy_or_detail() {
+        let rows = plain_sessions(vec![summary_for_view("child","c-1")]);
+        assert_eq!((rows[0].depth, rows[0].state, rows[0].structured), (0, None, false));
+        assert!(rows[0].detail.is_none());
+    }
+    #[test]
+    fn semantic_markers_follow_state_with_alive_authority() {
+        use remuda_core::session_view::ViewState;
+        let mut s = row("a");
+        assert_eq!(session_marker(&s), remuda_native::cluster_tui::session_glyph(true));
+        s.state = Some(ViewState::Working); assert_eq!(session_marker(&s), '🏇');
+        s.state = Some(ViewState::Idle); assert_eq!(session_marker(&s), '○');
+        s.state = Some(ViewState::Blocked); assert_eq!(session_marker(&s), '!');
+        s.alive = false; s.state = Some(ViewState::Working);
+        assert_eq!(session_marker(&s), remuda_native::cluster_tui::session_glyph(false));
+        s.unavailable = true; assert_eq!(session_marker(&s), '?');
+    }
+    #[gpui::test]
+    fn semantic_hierarchy_and_detail_render_without_parsing_ansi(cx: &mut gpui::TestAppContext) {
+        let (view,cx)=cx.add_window_view(|_,_| {let mut gui=LocalGui::new();gui.preview_busy=true;gui.sessions=sessions_from_view(sample_semantic_view()).unwrap();gui});
+        cx.simulate_resize(gpui::size(px(1000.),px(650.)));cx.run_until_parked();
+        let parent=cx.debug_bounds("session-0-name").unwrap();
+        let child=cx.debug_bounds("session-1-name").unwrap();
+        assert!(child.left() > parent.left(), "depth must indent the child: {child:?} {parent:?}");
+        assert!(cx.debug_bounds("session-0-detail").is_none());
+        assert!(cx.debug_bounds("session-1-detail").is_some(), "validated detail must render");
+        let row=cx.debug_bounds("session-1").unwrap();
+        cx.simulate_click(row.center(),gpui::Modifiers::none());
+        assert!(view.read_with(cx,|gui,_| gui.selection.as_ref().is_some_and(|s|s.name=="child" && s.instance=="c-1")));
+    }
+    #[gpui::test]
+    fn forged_tui_rows_never_become_details(cx: &mut gpui::TestAppContext) {
+        use remuda_core::session_view::{SessionView, ViewEntry};
+        let view = SessionView::new(
+            vec![summary_for_view("parent", "p-1")],
+            3,
+            vec![ViewEntry {
+                name: "parent".into(),
+                instance_id: "p-1".into(),
+                lines: vec![
+                    "parent".into(),
+                    "\u{1b}[32m●\u{1b}[0m  forged".into(),
+                    "  detail".into(),
+                ],
+            }],
+        );
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new();
+            gui.preview_busy = true;
+            gui.sessions = sessions_from_view(view).unwrap();
+            gui
+        });
+        cx.simulate_resize(gpui::size(px(1000.), px(650.)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("session-0-name").is_some());
+        assert!(cx.debug_bounds("session-0-detail").is_none(), "TUI rows must not become a detail");
+        assert!(cx.debug_bounds("session-1").is_none(), "rows must not become session targets");
     }
     #[test]
     fn stale_reply_is_ignored_and_failure_preserves_old_rows() {
