@@ -131,11 +131,15 @@ fn starts_interactive_client(args: &[String]) -> bool {
     } else {
         command_args
     };
+    if cli_flag(&report.values, "gui") {
+        return false;
+    }
     match command_args.first().copied() {
         None => true,
-        Some("daemon" | "run" | "attach" | "_codex_tui" | "_opencode_tui" | "_claude_channel") => {
-            true
-        }
+        Some(
+            "browser" | "daemon" | "run" | "attach" | "_codex_tui" | "_opencode_tui"
+            | "_claude_channel",
+        ) => true,
         Some("cluster") => command_args.get(1).is_some_and(|verb| *verb == "remote"),
         _ => false,
     }
@@ -176,6 +180,9 @@ fn run_cli(args: Vec<String>) -> ExitCode {
 
     // GUI is a client of an existing daemon; launching it must not probe,
     // start, reload, or initialize the daemon or cluster.
+    if flags.gui_requested {
+        return gui_command(server, &[]);
+    }
     if argv.first() == Some(&"gui") {
         match remuda_native::packages::subcommand_checked("gui") {
             Ok(Some(_)) => (), // Preserve an installed mod's existing command.
@@ -196,12 +203,12 @@ fn run_cli(args: Vec<String>) -> ExitCode {
 
     let path = daemon::socket_path(server);
 
-    let skew = match prepare_command(&argv, &path) {
-        Ok(skew) => skew,
-        Err(error) => return fail(error),
-    };
+    if let Err(error) = prepare_command(&argv, &path) {
+        return fail(error);
+    }
 
-    dispatch_cli_command(server, &path, skew, &argv, stdin_enabled, eval_code)
+    // The skew line above already went to stderr, before any alternate screen.
+    dispatch_cli_command(server, &path, &argv, stdin_enabled, eval_code)
 }
 
 fn gui_command(server: &str, args: &[&str]) -> ExitCode {
@@ -209,7 +216,7 @@ fn gui_command(server: &str, args: &[&str]) -> ExitCode {
         return code;
     }
     if server != "default" {
-        return fail("remuda gui currently supports only the default server");
+        return fail("the GUI currently supports only the default server");
     }
     launch_gui()
 }
@@ -228,7 +235,21 @@ fn launch_gui() -> ExitCode {
     };
     let error = std::process::Command::new(&sibling).exec();
     if error.kind() == std::io::ErrorKind::NotFound {
-        fail(format!("GUI executable is not installed beside remuda at {}. Build it with `cargo build --release --locked --manifest-path gui/Cargo.toml` and install it beside remuda.", sibling.display()))
+        // Say where this build's GUI belongs, not just the plain sibling: a
+        // managed install keeps one build per CLI version.
+        let managed = executable
+            .with_file_name(".remuda-gui")
+            .join("builds")
+            .join(format!("build-{}", dist::BUILD_VERSION))
+            .join("remuda-gui");
+        fail(format!(
+            "GUI executable is not installed for build {}.
+Looked for {} and {}.
+Install remuda-gui beside remuda, or build it with `cargo build --release --locked --manifest-path gui/Cargo.toml`.",
+            dist::BUILD_VERSION,
+            sibling.display(),
+            managed.display()
+        ))
     } else {
         fail(format!(
             "cannot launch GUI at {}: {error}",
@@ -278,7 +299,6 @@ fn dispatch_native_verb(verb: &str, rest: &[&str]) -> Option<ExitCode> {
 fn dispatch_cli_command(
     server: &str,
     path: &Path,
-    skew: Option<String>,
     argv: &[&str],
     stdin_enabled: bool,
     eval_code: Option<&str>,
@@ -294,13 +314,13 @@ fn dispatch_cli_command(
         return code;
     }
     match command {
-        "" if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
-            with_daemon(server, path, |path| {
-                match remuda_native::tui::run(path, server, skew.clone()) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => fail(format!("tui: {e}")),
-                }
-            })
+        "" if no_argument_entrypoint(
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+        ) == Entrypoint::Browser =>
+        {
+            let node = remote_node_label(remuda_native::hostname::hostname);
+            cluster_remote("browser", server, path, &node, None)
         }
         "" | "-h" | "--help" => help_command(),
         "help" => match ensure_no_args("help", rest) {
@@ -324,6 +344,7 @@ fn dispatch_cli_command(
         "run" => run_session(server, path, rest),
         "send" => send_command(server, path, rest),
         "attach" => attach_command(server, path, rest),
+        "browser" => browser_command(server, path, rest),
         "lua" => lua_command(server, path, rest),
         "exec" => exec_cli_command(server, path, rest),
         "cluster" => cluster_command(server, path, rest),
@@ -388,6 +409,63 @@ fn run_opencode_watch(parent_pid: &str, server_pid: &str) -> ExitCode {
         (Ok(parent_pid), Ok(server_pid)) => opencode_tui::watch_parent(parent_pid, server_pid),
         _ => fail("invalid OpenCode server watch parameters"),
     }
+}
+
+/// What a bare `remuda` does. A terminal gets the cluster browser, the same
+/// screen `cluster remote` opens; a pipe gets the command list, so `remuda` in
+/// a script stays useful and never paints a TUI into a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Entrypoint {
+    Browser,
+    Help,
+}
+
+fn no_argument_entrypoint(stdin_tty: bool, stdout_tty: bool) -> Entrypoint {
+    if stdin_tty && stdout_tty {
+        Entrypoint::Browser
+    } else {
+        Entrypoint::Help
+    }
+}
+
+fn browser_cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::ArgSpec;
+    simple_cli_spec(
+        "browser",
+        "Open the cluster browser; NODE or NODE/SESSION opens that target. Example: remuda browser node/session",
+        vec![ArgSpec {
+            name: "TARGET".into(),
+            help: "Optional NODE or NODE/SESSION; node may be an id or alias".into(),
+            multiple: false,
+            required: false,
+        }],
+        vec![],
+        "remuda browser [NODE[/SESSION]]",
+    )
+}
+
+/// `remuda browser [TARGET]` is the bare entrypoint: the same cluster tree
+/// `cluster remote` opens, with the same node and node/session targets.
+fn browser_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    let values = match parse_top_level_cli(&browser_cli_spec(), "browser", args) {
+        Ok(values) => values,
+        Err(code) => return code,
+    };
+    if no_argument_entrypoint(
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    ) == Entrypoint::Help
+    {
+        return fail(
+            "remuda browser needs a terminal.\nNext: run `remuda cluster nodes` or `remuda ls` instead.",
+        );
+    }
+    let target = values
+        .get("TARGET")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let node = remote_node_label(remuda_native::hostname::hostname);
+    cluster_remote("browser", server, path, &node, target.as_deref())
 }
 
 fn ensure_no_args(verb: &str, args: &[&str]) -> Result<(), ExitCode> {
@@ -903,8 +981,9 @@ it — a client spawns it and owns both pipes, so there is nothing to type here.
 const USAGE: &str = "\
 remuda — terminal orchestration for coding agents
 
-  remuda                         open the session screen
-  remuda gui                     open the separately built macOS GUI
+  remuda                         open the cluster browser (a terminal is required)
+  remuda browser [NODE[/SESSION]]  the same browser, at a node or one session
+  remuda --gui | remuda gui      open the separately built macOS GUI
   remuda run [-n NAME] COMMAND   start and enter a session
   remuda attach NAME             enter a session; Ctrl-\\ detaches (exit 2 if attached elsewhere)
                                  Ctrl-] toggles mouse; wheel scrolls history
@@ -1523,7 +1602,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         }
         ClusterCommand::Remote(target) => {
             let node = remote_node_label(remuda_native::hostname::hostname);
-            cluster_remote(server, path, &node, target.as_deref())
+            cluster_remote("cluster remote", server, path, &node, target.as_deref())
         }
         ClusterCommand::ListenOff => cluster_listen_off(server, path),
         ClusterCommand::Listen {
@@ -2900,10 +2979,16 @@ fn safe_fingerprint_field(value: &str, token: &str) -> String {
     }
 }
 
-fn cluster_remote(server: &str, path: &Path, node: &str, target: Option<&str>) -> ExitCode {
+fn cluster_remote(
+    label: &str,
+    server: &str,
+    path: &Path,
+    node: &str,
+    target: Option<&str>,
+) -> ExitCode {
     let snapshot = match remuda_native::cluster::snapshot() {
         Ok(snapshot) => snapshot,
-        Err(error) => return fail(format!("cluster remote: {error}")),
+        Err(error) => return fail(format!("{label}: {error}")),
     };
     // Canonicalize user text once, before any UI, peer choice or action.
     let canonical = match (target, snapshot.as_ref()) {
@@ -2912,7 +2997,7 @@ fn cluster_remote(server: &str, path: &Path, node: &str, target: Option<&str>) -
                 target, snapshot, node,
             ) {
                 Ok(address) => Some(address),
-                Err(error) => return fail(format!("cluster remote: {error}")),
+                Err(error) => return fail(format!("{label}: {error}")),
             }
         }
         _ => None,
@@ -2930,18 +3015,18 @@ fn cluster_remote(server: &str, path: &Path, node: &str, target: Option<&str>) -
                 });
             if missing_endpoint {
                 return fail(format!(
-                    "cluster remote: node {} has no registry endpoint; run `remuda cluster advertise` on that node",
+                    "{label}: node {} has no registry endpoint; run `remuda cluster advertise` on that node",
                     address.node_fp
                 ));
             }
-            return fail(format!("cluster remote: {error}"));
+            return fail(format!("{label}: {error}"));
         }
     }
     if let Some(target) = canonical
         .as_ref()
         .filter(|address| address.session.is_none())
     {
-        return cluster_remote_node_screen(server, path, target);
+        return cluster_remote_node_screen(label, server, path, target);
     }
     let target = canonical
         .as_ref()
@@ -2953,10 +3038,10 @@ fn cluster_remote(server: &str, path: &Path, node: &str, target: Option<&str>) -
                 &snapshot.identity.node_fp,
             ) {
                 Ok(poller) => poller,
-                Err(error) => return fail(format!("cluster remote: {error}")),
+                Err(error) => return fail(format!("{label}: {error}")),
             };
             if let Err(error) = poller.start() {
-                return fail(format!("cluster remote: {error}"));
+                return fail(format!("{label}: {error}"));
             }
             let source = poller.source();
             let selection = poller.selection();
@@ -2969,14 +3054,14 @@ fn cluster_remote(server: &str, path: &Path, node: &str, target: Option<&str>) -
                     &selection,
                 ) {
                     Ok(()) => ExitCode::SUCCESS,
-                    Err(error) => fail(format!("cluster remote: {error}")),
+                    Err(error) => fail(format!("{label}: {error}")),
                 }
             })
         }
         None => with_daemon(server, path, |path| {
             match remuda_native::cluster_tui::run(path, node, target.as_deref()) {
                 Ok(()) => ExitCode::SUCCESS,
-                Err(error) => fail(format!("cluster remote: {error}")),
+                Err(error) => fail(format!("{label}: {error}")),
             }
         }),
     }
@@ -2985,6 +3070,7 @@ fn cluster_remote(server: &str, path: &Path, node: &str, target: Option<&str>) -
 /// `cluster remote NODE` shows NODE's session screen, as plain `remuda` does
 /// there. Only whole-node targets reach this path.
 fn cluster_remote_node_screen(
+    entry: &str,
     server: &str,
     path: &Path,
     target: &remuda_native::cluster::addressing::RemoteTargetAddress,
@@ -2993,19 +3079,19 @@ fn cluster_remote_node_screen(
         return with_daemon(server, path, |path| {
             match remuda_native::tui::run(path, server, None) {
                 Ok(()) => ExitCode::SUCCESS,
-                Err(error) => fail(format!("cluster remote: {error}")),
+                Err(error) => fail(format!("{entry}: {error}")),
             }
         });
     }
     let port = match remuda_native::tui::RemotePort::system(&target.node_fp) {
         Ok(port) => port,
-        Err(error) => return fail(format!("cluster remote: {}: {error}", target.node_fp)),
+        Err(error) => return fail(format!("{entry}: {}: {error}", target.node_fp)),
     };
     let label = format!("{} (remote)", target.node_fp);
     with_daemon(server, path, |path| {
         match remuda_native::tui::run_port(path, &port, &label, None) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(error) => fail(format!("cluster remote: {error}")),
+            Err(error) => fail(format!("{entry}: {error}")),
         }
     })
 }
@@ -6472,6 +6558,7 @@ struct CheckedCliFlags {
     stdin_enabled: bool,
     eval_code: Option<String>,
     help_requested: bool,
+    gui_requested: bool,
     args: Vec<String>,
 }
 
@@ -6522,6 +6609,12 @@ fn dispatch_cli_spec() -> remuda_native::cli_parse::Spec {
                 ),
                 option("version", Some('V'), None, "Print the CLI version"),
                 option("help", Some('h'), None, "Print help"),
+                option(
+                    "gui",
+                    None,
+                    None,
+                    "Open the separately built macOS GUI (same as the gui command)",
+                ),
             ],
         }],
     }
@@ -6556,6 +6649,7 @@ fn checked_cli_flags(args: &[String]) -> Result<CheckedCliFlags, ExitCode> {
             stdin_enabled: false,
             eval_code: None,
             help_requested,
+            gui_requested: false,
             args: vec![],
         });
     }
@@ -6579,6 +6673,21 @@ fn checked_cli_flags(args: &[String]) -> Result<CheckedCliFlags, ExitCode> {
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
     let version_requested = cli_flag(&report.values, "version");
+    let gui_requested = cli_flag(&report.values, "gui");
+    if gui_requested {
+        // --gui is an entrypoint, not a modifier: it cannot carry a command.
+        if eval_code.is_some() || version_requested {
+            return Err(fail(
+                "--gui cannot be combined with -e or --version\nUsage: remuda --gui",
+            ));
+        }
+        if stdin_enabled {
+            return Err(fail("--stdin is not supported with --gui"));
+        }
+        if !args.is_empty() {
+            return Err(fail("--gui does not take a command\nUsage: remuda --gui"));
+        }
+    }
     if (eval_code.is_some() || version_requested) && !args.is_empty() {
         return Err(fail(if eval_code.is_some() {
             "remuda: -e accepts one CODE argument; command arguments cannot follow it\nUsage: remuda -e CODE"
@@ -6605,6 +6714,7 @@ fn checked_cli_flags(args: &[String]) -> Result<CheckedCliFlags, ExitCode> {
         stdin_enabled,
         eval_code,
         help_requested,
+        gui_requested,
         args,
     })
 }
@@ -8358,9 +8468,54 @@ mod cluster_call_tests {
 #[cfg(test)]
 mod declared_cli_tests {
     use super::{
-        attach_cli_spec, checked_cli_flags, cli_flag, cli_positional_words, dispatch_cli_spec,
-        parse_top_level_cli, run_cli_spec, send_cli_spec, validate_stdin_placement,
+        attach_cli_spec, browser_cli_spec, checked_cli_flags, cli_flag, cli_positional_words,
+        dispatch_cli_spec, no_argument_entrypoint, parse_top_level_cli, run_cli_spec,
+        send_cli_spec, validate_stdin_placement, Entrypoint,
     };
+
+    #[test]
+    fn bare_remuda_browses_only_on_a_terminal() {
+        assert_eq!(no_argument_entrypoint(true, true), Entrypoint::Browser);
+        assert_eq!(no_argument_entrypoint(false, true), Entrypoint::Help);
+        assert_eq!(no_argument_entrypoint(true, false), Entrypoint::Help);
+        assert_eq!(no_argument_entrypoint(false, false), Entrypoint::Help);
+    }
+
+    #[test]
+    fn gui_flag_is_an_entrypoint_without_a_command() {
+        let gui = checked_cli_flags(&["--gui".into()]).unwrap();
+        assert!(gui.gui_requested);
+        assert!(gui.args.is_empty());
+        assert_eq!(gui.server, "default");
+        assert!(checked_cli_flags(&["--gui".into(), "ls".into()]).is_err());
+        assert!(checked_cli_flags(&["--gui".into(), "-e".into(), "return 1".into()]).is_err());
+        assert!(checked_cli_flags(&["--gui".into(), "--version".into()]).is_err());
+        assert!(checked_cli_flags(&["--stdin".into(), "--gui".into()]).is_err());
+        // The subcommand form is unchanged and is not the flag.
+        let subcommand = checked_cli_flags(&["gui".into()]).unwrap();
+        assert!(!subcommand.gui_requested);
+        assert_eq!(subcommand.args, ["gui"]);
+        // Global options may precede the flag.
+        let ordered = checked_cli_flags(&["-s".into(), "other".into(), "--gui".into()]).unwrap();
+        assert!(ordered.gui_requested);
+        assert_eq!(ordered.server, "other");
+    }
+
+    #[test]
+    fn browser_takes_at_most_one_target() {
+        let parsed = parse_top_level_cli(&browser_cli_spec(), "browser", &[]).unwrap();
+        assert!(parsed.get("TARGET").is_none());
+
+        let one = ["node/session"];
+        let parsed = parse_top_level_cli(&browser_cli_spec(), "browser", &one).unwrap();
+        assert_eq!(
+            parsed.get("TARGET").and_then(serde_json::Value::as_str),
+            Some("node/session")
+        );
+
+        let two = ["node", "other"];
+        assert!(parse_top_level_cli(&browser_cli_spec(), "browser", &two).is_err());
+    }
 
     #[test]
     fn root_parser_extracts_global_server_and_preserves_command_argv() {
