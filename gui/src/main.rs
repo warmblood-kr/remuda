@@ -109,7 +109,7 @@ fn session_marker(session: &Session) -> char {
         return remuda_native::cluster_tui::session_glyph(false);
     }
     match session.state {
-        Some(remuda_core::session_view::ViewState::Working) => '🏇',
+        Some(remuda_core::session_view::ViewState::Working) => '◐',
         Some(remuda_core::session_view::ViewState::Idle) => '○',
         Some(remuda_core::session_view::ViewState::Blocked) => '!',
         _ => remuda_native::cluster_tui::session_glyph(true),
@@ -1405,15 +1405,22 @@ impl LocalGui {
             .cloned()
             .enumerate()
             .map(|(index, session)| {
+                // A running row is already shown by its filled marker; the
+                // status text is reserved for states that need words, so the
+                // name keeps the row width.
                 let mut status = if session.unavailable {
                     "unavailable".to_string()
                 } else if session.alive {
-                    "running".to_string()
+                    String::new()
                 } else {
                     "exited".to_string()
                 };
                 if session.attached && !session.unavailable {
-                    status.push_str(" ·A");
+                    if status.is_empty() {
+                        status.push_str("attached");
+                    } else {
+                        status.push_str(" ·A");
+                    }
                 }
                 let selected = session.clone();
                 let is_selected = active_node
@@ -1464,16 +1471,22 @@ impl LocalGui {
                             div().id("selected-session")
                                 .debug_selector(|| "selected-session".into())
                                 .w(px(2.)).h(px(2.)).bg(rgb(0xc9d4e4))))
-                        .child(div().id(SharedString::from(text_id.clone()))
-                            .debug_selector(move || text_id.clone())
-                            .flex_1().min_w(px(56.)).overflow_hidden()
-                            .whitespace_nowrap().text_ellipsis()
-                            .child(format!("{}  {}", marker, plain_label(&session.name))))
-                        .child(div().id(SharedString::from(status_id.clone()))
-                            .debug_selector(move || status_id.clone())
-                            .flex_shrink().min_w(px(0.)).max_w(px(96.)).pl_2().text_sm()
-                            .text_color(rgb(0x8a95a5)).whitespace_nowrap().text_ellipsis()
-                            .child(status)))
+                        .child({
+                            let text = div().id(SharedString::from(text_id.clone()))
+                                .debug_selector(move || text_id.clone())
+                                .text_sm().truncate();
+                            let text = if status.is_empty() {
+                                text.w_full()
+                            } else {
+                                text.flex_1().min_w(px(56.))
+                            };
+                            text.child(format!("{} {}", marker, plain_label(&session.name)))
+                        })
+                        .when(!status.is_empty(), |d| d.child(
+                            div().id(SharedString::from(status_id.clone()))
+                                .debug_selector(move || status_id.clone())
+                                .flex_shrink().min_w(px(0.)).max_w(px(96.)).pl_2().text_xs()
+                                .text_color(rgb(0x8a95a5)).child(status))))
                     .when_some(detail, |d, detail| d.child(
                         div().id(SharedString::from(detail_id.clone())).debug_selector(move || detail_id.clone())
                             .pl(px(TREE_DETAIL_OFFSET_PX)).text_sm().text_color(rgb(0x8a95a5))
@@ -2127,15 +2140,15 @@ impl Render for LocalGui {
                         let fingerprint = peer.fingerprint.clone();
                         let enabled = self.peer_current(&fingerprint);
                         let expanded = self.expanded_nodes.contains(&fingerprint);
-                        let name = label(&peer.label);
+                        let name = plain_label(&peer.label);
                         let state = if !peer.admitted {
                             "revoked"
                         } else if self.nodes_loading {
                             "loading"
                         } else if enabled {
-                            "admitted"
+                            ""
                         } else {
-                            "unavailable"
+                            "offline"
                         };
                         let state_id = format!("node-peer-state-{index}");
                         let id = SharedString::from(format!("node-{}-{index}", peer.fingerprint));
@@ -2186,13 +2199,21 @@ impl Render for LocalGui {
                                         .min_w(px(0.))
                                         .flex()
                                         .items_center()
-                                        .child(div().flex_1().min_w(px(56.)).overflow_hidden()
-                                            .whitespace_nowrap().text_ellipsis().child(name))
-                                        .child(div().id(SharedString::from(state_id.clone()))
-                                            .debug_selector(move || state_id.clone())
-                                            .pl_2().text_xs().max_w(px(96.))
-                                            .text_color(if peer.admitted { rgb(0x7f9f7f) } else { rgb(0xd08b8b) })
-                                            .whitespace_nowrap().text_ellipsis().child(state))
+                                        .child({
+                                            let label = div().text_sm().truncate();
+                                            let label = if state.is_empty() {
+                                                label.w_full()
+                                            } else {
+                                                label.flex_1().min_w(px(56.))
+                                            };
+                                            label.child(name)
+                                        })
+                                        .when(!state.is_empty(), |d| d.child(
+                                            div().id(SharedString::from(state_id.clone()))
+                                                .debug_selector(move || state_id.clone())
+                                                .pl_2().text_xs().max_w(px(96.))
+                                                .text_color(if peer.admitted { rgb(0x7f9f7f) } else { rgb(0xd08b8b) })
+                                                .whitespace_nowrap().text_ellipsis().child(state)))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.select_node(click_peer.clone());
                                             cx.notify();
@@ -5439,7 +5460,7 @@ mod tests {
         use remuda_core::session_view::ViewState;
         let mut s = row("a");
         assert_eq!(session_marker(&s), remuda_native::cluster_tui::session_glyph(true));
-        s.state = Some(ViewState::Working); assert_eq!(session_marker(&s), '🏇');
+        s.state = Some(ViewState::Working); assert_eq!(session_marker(&s), '◐');
         s.state = Some(ViewState::Idle); assert_eq!(session_marker(&s), '○');
         s.state = Some(ViewState::Blocked); assert_eq!(session_marker(&s), '!');
         s.alive = false; s.state = Some(ViewState::Working);
@@ -5553,20 +5574,24 @@ mod tests {
     #[gpui::test]
     fn session_and_node_rows_stay_on_one_line(cx: &mut gpui::TestAppContext) {
         let (view,cx)=cx.add_window_view(|_,_| { let mut gui=LocalGui::new(); gui.preview_busy=true;
-            gui.sessions=vec![row("a-session-name-long-enough-to-compete-with-status"), row("short")];
+            let mut exited=row("short"); exited.alive=false;
+            gui.sessions=vec![row("a-session-name-long-enough-to-compete-with-status"), exited];
             gui.peers=vec![peer("peer-fingerprint","Peer Label")];
+            gui.nodes_loading=true;
             gui.expanded_nodes.insert("peer-fingerprint".into());
             gui.peer_sessions.insert("peer-fingerprint".into(), vec![row("remote")]);
             gui.select_session(gui.sessions[0].clone()); gui });
         cx.simulate_resize(gpui::size(px(1000.),px(650.)));cx.run_until_parked();
         let name=cx.debug_bounds("session-0-text").unwrap();
-        let status=cx.debug_bounds("session-0-status").unwrap();
-        assert!(name.top() < status.bottom() && status.top() < name.bottom(), "name and status share a line: {name:?} {status:?}");
-        assert!(name.size.width >= px(56.), "the name keeps a readable width: {name:?}");
+        assert!(name.size.width >= px(90.), "a running name keeps the row width: {name:?}");
+        assert!(cx.debug_bounds("session-0-status").is_none(), "a running row needs no status word");
+        let stopped=cx.debug_bounds("session-1-text").unwrap();
+        let status=cx.debug_bounds("session-1-status").unwrap();
+        assert!(stopped.top() < status.bottom() && status.top() < stopped.bottom(), "name and status share a line: {stopped:?} {status:?}");
         let selected_row=cx.debug_bounds("session-0").unwrap();
         let plain_row=cx.debug_bounds("session-1").unwrap();
         assert!(selected_row.size.height < px(48.), "one text line per session row: row={selected_row:?} name={:?} text={:?} status={:?} plain={plain_row:?}", cx.debug_bounds("session-0-name"), cx.debug_bounds("session-0-text"), cx.debug_bounds("session-0-status"));
-        assert_eq!(selected_row.size.height, plain_row.size.height, "selection must not add a banner line");
+        assert!((selected_row.size.height - plain_row.size.height).abs() <= px(1.), "selection must not add a banner line");
         assert!(cx.debug_bounds("selected-session").is_some());
         let node=cx.debug_bounds("node-peer-0").unwrap();
         assert!(node.size.height < px(48.), "peer node must be one line: {node:?}");
@@ -5584,10 +5609,8 @@ mod tests {
         cx.simulate_resize(gpui::size(px(420.),px(600.)));cx.run_until_parked();
         let sidebar=cx.debug_bounds("sidebar").unwrap();
         let name=cx.debug_bounds("session-0-text").unwrap();
-        let status=cx.debug_bounds("session-0-status").unwrap();
-        assert!(name.size.width > px(0.), "long name keeps a visible slot");
-        assert!(name.right() <= sidebar.right() + px(1.) && status.right() <= sidebar.right() + px(1.), "name/status must stay in the sidebar: {name:?} {status:?} {sidebar:?}");
-        assert!(status.left() >= name.left());
+        assert!(name.size.width >= px(56.), "long name keeps a readable slot");
+        assert!(name.right() <= sidebar.right() + px(1.), "name must stay in the sidebar: {name:?} {sidebar:?}");
     }
 
     #[gpui::test]

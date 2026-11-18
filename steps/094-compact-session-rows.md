@@ -20,16 +20,18 @@ and scroll/reveal behavior are unchanged.
 
 ## Expected
 
-- Session status is `running`, `exited` or `unavailable`, plus `·A` when
-  attached; the eight-character instance stays in the selection identity, not
-  in the visual row.
+- The marker carries the common states (`◐` working, `○` idle, `●` running,
+  `-` exited, `!` blocked); a word is shown only when it adds information
+  (`exited`, `unavailable`, `attached`, `loading`, `offline`, `revoked`). The
+  eight-character instance stays in the selection identity, not in the visual
+  row. A running session therefore gives its whole row to the name.
 - Name and status share one flex line; the name keeps a readable `min_w(56)`
   while status shrinks to at most 96 px, both `whitespace_nowrap` and
   `text_ellipsis`; the first own-framebuffer capture showed that `min_w(0)`
   starved the name to zero width and hard-clipped it, so this is now bounded.
-- The peer node shows its label and state on one line; the fingerprint stays in
-  the tree/routing key and is no longer a visual column. While nodes are
-  loading the state reads `loading`, not `unavailable`.
+- The peer node shows its label and, only for an exceptional state, a word
+  (`loading`, `offline`, `revoked`); connected is quiet. The fingerprint stays
+  in the tree/routing key and is no longer a visual column.
 - The indent moves to the row padding (`16 + depth × TREE_INDENT_PX`) so the
   flex row has a real width; the detail line aligns under the name.
 - `selected-session` remains a small marker inside the selected row, so the
@@ -46,6 +48,12 @@ Built and run in this stage: full GUI bin suite **160 passed / 0 failed /
 8 ignored** (79.70 s) after the legibility fix, plus the semantic, cursor,
 indent, fallback and focus filters. An own-framebuffer capture with the
 instrumented GPUI fork (`/private/tmp/gui-capture-fac8f202`, non-release)
-confirmed one-line density and exposed the zero-width name clipping fixed
-above; the corrected capture is kept in `/private/tmp/capture-fac8f202.png`.
-The capture is app-framebuffer evidence, not a physical-display or input test.
+confirmed one-line density and exposed two clipping problems: a zero-width
+name slot and an emoji marker that consumed the row. The corrected capture
+(`/private/tmp/capture-fac8f202.png`) shows node `macbook-m3-pro`, session
+`refactor-runtime`, `docs-update`, `agent-router`, and `indexing exited` on one
+line each, plus `remuda:///` and the `docs` basename row in the document pane.
+Limitation: at the 200 px default sidebar an extreme 16-character name is
+clipped at the pane edge without a measured ellipsis; the 56 px minimum keeps
+a readable name, and the 260 px cap shows it in full. The capture is
+app-framebuffer evidence, not a physical-display or input test.
