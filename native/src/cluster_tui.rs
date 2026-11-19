@@ -5713,6 +5713,7 @@ mod tests {
                     program_status: None,
                 }],
             }],
+            sampled_at: None,
         }
     }
 

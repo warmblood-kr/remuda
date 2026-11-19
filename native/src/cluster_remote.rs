@@ -101,6 +101,9 @@ impl RemoteNodeSnapshot {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RemoteSnapshot {
     pub nodes: Vec<RemoteNodeSnapshot>,
+    /// Wall clock sampled when this view was built. Expiry and any displayed
+    /// age read this one value, so they cannot disagree within a frame.
+    pub sampled_at: Option<SystemTime>,
 }
 
 /// Read-only view consumed by the cluster tree and replaceable by a test fake.
@@ -617,7 +620,10 @@ impl RemoteTreeState {
             .values()
             .map(|node| node.snapshot_at(now))
             .collect();
-        RemoteSnapshot { nodes }
+        RemoteSnapshot {
+            nodes,
+            sampled_at: None,
+        }
     }
 
     /// Snapshot every node against an explicit wall clock; suspend and a
@@ -630,7 +636,10 @@ impl RemoteTreeState {
             .values()
             .map(|node| node.snapshot_at_wall(now, Some(wall_now)))
             .collect();
-        RemoteSnapshot { nodes }
+        RemoteSnapshot {
+            nodes,
+            sampled_at: Some(wall_now),
+        }
     }
 }
 
@@ -1888,6 +1897,27 @@ mod tests {
     }
 
     #[test]
+    fn a_collection_snapshot_carries_the_wall_clock_it_expired_against() {
+        let start = Instant::now();
+        let state = RemoteTreeState::default();
+        let mut node = RemoteNode::new("laptop", start);
+        node.poll_succeeded_at(Vec::new(), start, SystemTime::now());
+        state.insert_node(node);
+
+        let snapshot = state.snapshot();
+        let sampled = snapshot
+            .sampled_at
+            .expect("a live snapshot samples the wall clock once");
+        assert!(!snapshot.nodes[0].expired);
+        assert!(
+            snapshot.nodes[0]
+                .last_updated_age_at(sampled)
+                .is_some_and(|age| age < REMOTE_RETENTION),
+            "expiry and the displayed age read the same sample"
+        );
+    }
+
+    #[test]
     fn a_new_node_identity_does_not_inherit_the_old_nodes_list() {
         let start = Instant::now();
         let state = RemoteTreeState::default();
@@ -2663,6 +2693,7 @@ mod tests {
         node.poll_failed(start + Duration::from_secs(1));
         let fake = FakeSource(RemoteSnapshot {
             nodes: vec![node.snapshot_at(start + Duration::from_secs(3))],
+            sampled_at: None,
         });
         let snapshot = fake.snapshot();
         assert_eq!(snapshot.nodes[0].state, RemoteState::Stale);
