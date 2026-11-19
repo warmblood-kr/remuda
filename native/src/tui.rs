@@ -26,7 +26,11 @@ use remuda_core::Size;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+use crate::native_permissions::Scan;
+use crate::permission_overlay::Overlay;
 
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -175,6 +179,11 @@ pub struct Ui {
     compose_target: Option<(String, String)>,
     /// Unsent drafts of other sessions, kept when the composer moves away.
     compose_drafts: HashMap<String, String>,
+    /// Read-only pending permissions overlay; `None` when closed.
+    permissions: Option<Overlay>,
+    permissions_loading: bool,
+    permissions_error: Option<String>,
+    permissions_rx: Option<mpsc::Receiver<Scan>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -233,6 +242,10 @@ impl Ui {
             composer: Default::default(),
             compose_target: None,
             compose_drafts: HashMap::new(),
+            permissions: None,
+            permissions_loading: false,
+            permissions_error: None,
+            permissions_rx: None,
         }
     }
 
@@ -684,9 +697,104 @@ impl Ui {
         if self.toggle_list_key(key) {
             return Some(Action::Nothing);
         }
+        if self.keymap.resolve(crate::keybindings::LIST_CONTEXT, key)
+            == Some(crate::keybindings::PERMISSIONS)
+        {
+            self.toggle_permissions();
+            return Some(Action::Nothing);
+        }
         (self.keymap.resolve(crate::keybindings::LIST_CONTEXT, key)
             == Some(crate::keybindings::COMPOSE))
         .then(|| self.open_composer())
+    }
+
+    fn permissions_open(&self) -> bool {
+        self.permissions.is_some() || self.permissions_loading || self.permissions_error.is_some()
+    }
+
+    /// Toggle the read-only list. Opening starts one background scan; the
+    /// overlay never sends a decision.
+    fn toggle_permissions(&mut self) {
+        if self.permissions_open() {
+            self.permissions = None;
+            self.permissions_loading = false;
+            self.permissions_error = None;
+            self.permissions_rx = None;
+            return;
+        }
+        self.refresh_permissions();
+    }
+
+    fn refresh_permissions(&mut self) {
+        if self.permissions_rx.is_some() {
+            return;
+        }
+        self.permissions_loading = true;
+        self.permissions_error = None;
+        let (tx, rx) = mpsc::channel();
+        self.permissions_rx = Some(rx);
+        std::thread::spawn(move || {
+            let scan = crate::native_permissions::default_root()
+                .map(|root| crate::native_permissions::scan(&root))
+                .unwrap_or_else(|| {
+                    crate::native_permissions::scan(Path::new("/nonexistent/bindings"))
+                });
+            let _ = tx.send(scan);
+        });
+    }
+
+    /// Receive one finished scan. Returns true when the frame changed.
+    fn poll_permissions(&mut self) -> bool {
+        let result = self.permissions_rx.as_ref().map(|rx| rx.try_recv());
+        match result {
+            Some(Ok(scan)) => {
+                self.permissions = Some(Overlay::new(scan));
+                self.permissions_loading = false;
+                self.permissions_rx = None;
+                true
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.permissions_loading = false;
+                self.permissions_error = Some("permission scan stopped".into());
+                self.permissions_rx = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn permissions_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.permissions = None;
+                self.permissions_loading = false;
+                self.permissions_error = None;
+                self.permissions_rx = None;
+            }
+            KeyCode::Char('r') => self.refresh_permissions(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(overlay) = self.permissions.as_mut() {
+                    overlay.move_selection(1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(overlay) = self.permissions.as_mut() {
+                    overlay.move_selection(-1);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(overlay) = self.permissions.as_mut() {
+                    overlay.move_selection(10);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(overlay) = self.permissions.as_mut() {
+                    overlay.move_selection(-10);
+                }
+            }
+            _ => {}
+        }
+        Action::Nothing
     }
 
     fn toggle_list_key(&mut self, key: KeyEvent) -> bool {
@@ -700,6 +808,7 @@ impl Ui {
     }
 
     fn browse_key(&mut self, key: KeyEvent) -> Action {
+        if self.permissions_open() { return self.permissions_key(key); }
         if self.daemon_gone.is_some() {
             return match key.code {
                 KeyCode::Char('r') | KeyCode::Char('R') => Action::Restart,
@@ -1926,6 +2035,74 @@ mod visual_mode_tests {
         press(&mut ui, "v");
         assert!(super::render(&ui, "hello world", "s", 120, 30).contains("visual: selecting"));
     }
+
+    fn permission_scan(rows: Vec<crate::native_permissions::Row>, unavailable: bool) -> crate::native_permissions::Scan {
+        let mut bindings = vec![crate::native_permissions::BindingStatus {
+            session: "agent".into(),
+            status: "ok",
+            reason: None,
+        }];
+        if unavailable {
+            bindings.push(crate::native_permissions::BindingStatus {
+                session: "stale".into(),
+                status: "unavailable",
+                reason: Some("server_pid"),
+            });
+        }
+        crate::native_permissions::Scan { bindings, rows }
+    }
+
+    fn permission_row(id: &str, action: &str) -> crate::native_permissions::Row {
+        crate::native_permissions::Row {
+            id: id.into(),
+            session: "agent".into(),
+            opencode_session: "ses_abc".into(),
+            action: action.into(),
+            resources: vec!["echo hi".into()],
+            message: None,
+            status: "pending",
+            decision: "once | reject",
+        }
+    }
+
+    #[test]
+    fn permissions_overlay_renders_a_read_only_list() {
+        let mut ui = ui();
+        ui.permissions = Some(crate::permission_overlay::Overlay::new(permission_scan(
+            vec![permission_row("per_1", "bash")],
+            false,
+        )));
+        let frame = super::render(&ui, "hello world", "s", 100, 30);
+        assert!(frame.contains("Permissions (read-only)"));
+        assert!(frame.contains("per_1"));
+        assert!(frame.contains("read-only (no approval)"));
+        assert!(!frame.contains("password"));
+    }
+
+    #[test]
+    fn permissions_unavailable_is_not_an_empty_list() {
+        let mut ui = ui();
+        ui.permissions = Some(crate::permission_overlay::Overlay::new(permission_scan(
+            Vec::new(),
+            true,
+        )));
+        let frame = super::render(&ui, "hello world", "s", 100, 30);
+        assert!(frame.contains("unavailable"));
+        assert!(!frame.contains("No pending permission requests"));
+    }
+
+    #[test]
+    fn permissions_keys_move_and_close() {
+        let mut ui = ui();
+        ui.permissions = Some(crate::permission_overlay::Overlay::new(permission_scan(
+            vec![permission_row("per_1", "bash"), permission_row("per_2", "edit")],
+            false,
+        )));
+        ui.permissions_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(ui.permissions.as_ref().unwrap().selected(), 1);
+        ui.permissions_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!ui.permissions_open());
+    }
 }
 
 #[cfg(test)]
@@ -2066,6 +2243,9 @@ fn fit(text: &str, width: u16) -> String {
 /// The whole frame as one string of text and ANSI cursor moves. Pure on
 /// purpose: this is the part a test can read without owning a terminal.
 pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> String {
+    if ui.permissions_open() {
+        return render_permissions(ui, cols, rows);
+    }
     let (list_w, preview_w) = ui_layout(ui, cols);
     let body = rows.saturating_sub(1);
     // The border, and the only thing on screen that is always saying where the
@@ -2104,6 +2284,42 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
 
     out.push_str(&format!("\x1b[{};1H", rows));
     out.push_str(&footer(ui, server, cut, preview_w, cols));
+    out
+}
+
+/// The read-only permissions frame. It shares the same cursor-move protocol as
+/// `render`, so tests can read it without a terminal.
+fn render_permissions(ui: &Ui, cols: u16, rows: u16) -> String {
+    let height = rows.saturating_sub(1) as usize;
+    let mut lines: Vec<String> = vec!["Permissions (read-only)".into()];
+    if let Some(error) = &ui.permissions_error {
+        lines.push(format!("error: {error}"));
+    }
+    if let Some(overlay) = &ui.permissions {
+        lines.push(overlay.summary());
+        lines.push(String::new());
+        let list_height = height.saturating_sub(lines.len() + 8).clamp(1, 64);
+        lines.extend(overlay.lines(list_height, cols as usize));
+        lines.push(String::new());
+        lines.extend(overlay.detail());
+    } else if ui.permissions_loading {
+        lines.push("Loading pending permissions...".into());
+    }
+    if ui.permissions_loading && ui.permissions.is_some() {
+        lines.push("(refreshing)".into());
+    }
+    let mut out = String::from("\x1b[H\x1b[2J");
+    for (row, line) in lines.iter().take(height).enumerate() {
+        out.push_str(&format!("\x1b[{};1H{}", row + 1, fit(line, cols)));
+    }
+    out.push_str(&format!(
+        "\x1b[{};1H{}",
+        rows,
+        fit(
+            "Esc close · j/k move · r refresh · read-only (no approval)",
+            cols
+        )
+    ));
     out
 }
 
@@ -2726,6 +2942,7 @@ fn refresh<P: SessionPort + ?Sized>(
     skip_list: bool,
     selection_moved: bool,
 ) -> std::io::Result<(u16, u16)> {
+    let _ = ui.poll_permissions();
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     ui.node_stale = path.staleness().filter(|age| *age > STALE_AFTER);
     ui.preview_rows = rows.saturating_sub(1).max(1);

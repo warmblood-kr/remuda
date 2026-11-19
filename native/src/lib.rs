@@ -39,6 +39,7 @@ pub mod native_permissions;
 pub mod net;
 pub mod packages;
 pub mod pending;
+pub mod permission_overlay;
 pub mod process;
 mod process_ancestry;
 pub mod program_status;
