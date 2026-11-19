@@ -412,21 +412,21 @@ impl Pane {
             targets.push(location);
         } else if let Some(source) = self.markdown_source() {
             for block in markdown::parse(source) {
-                for span in block.spans {
+                block.visit_spans(&mut |span| {
                     if !span.style.image {
-                        continue;
+                        return;
                     }
-                    let Some(destination) = span.target else {
-                        continue;
+                    let Some(destination) = span.target.as_deref() else {
+                        return;
                     };
                     if let Target::Vfs(path) =
-                        remuda_native::document_html::resolve(self.location(), &destination)
+                        remuda_native::document_html::resolve(self.location(), destination)
                     {
                         if media::extension_is_image(&path) {
                             targets.push(path);
                         }
                     }
-                }
+                });
             }
         }
         for path in targets {
