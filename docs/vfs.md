@@ -145,6 +145,8 @@ each copied file.
   files removed from the source: run `remuda drive rm` for those explicitly.
 - A store file cannot also be a directory. A local tree that would create that
   collision is reported and skipped, not written.
+- A store prefix with no files is an error, so a mistyped prefix is caught; an
+  empty local directory copies nothing.
 - The store does not keep Unix modes, so a file restored from it gets the
   process's default permissions.
 - `remuda vfs sync SRC DST` is the same command. `remuda drive sync` with no
