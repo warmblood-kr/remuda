@@ -668,8 +668,7 @@ fn launch(request: &NewHosted<'_>) -> Result<Launch, String> {
 /// The host of this daemon's own build, beside the daemon's executable.
 fn host_executable() -> Result<PathBuf, String> {
     let daemon = std::env::current_exe().map_err(|e| e.to_string())?;
-    #[cfg(test)]
-    let daemon = super::host_build::test_profile_daemon(&daemon).unwrap_or(daemon);
+    let daemon = super::host_build::profile_daemon(&daemon).unwrap_or(daemon);
     super::host_build::choose(
         &daemon,
         crate::dist::BUILD_VERSION,
