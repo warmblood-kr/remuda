@@ -9,9 +9,9 @@ words flipped `● → ? → x → ●` for one blip. Retained rows never expire
 an outage that lasted days kept showing the last list under an `x` glyph, with
 no boundary between "a blip" and "no data".
 
-The TUI half is the stacked follow-up PR on this branch: it consumes these
-fields, renders the retained rows, keeps their view, and refuses stale
-actions.
+The TUI half is the stacked follow-up PRs on this branch: they consume these
+fields, render the retained rows, keep their view, refuse stale actions, and
+harden the close/keys boundary.
 
 ## Desired outcome
 
@@ -56,9 +56,11 @@ starts with no inherited rows.
   close confirmation and the confirmed close on `Reachable`. A node that has
   disappeared from the snapshot is refused too, so a confirmation begun before
   it vanished cannot send. Keys buffered while reachable are re-checked at
-  flush; if the node went stale meanwhile the buffer is dropped, keys mode ends
-  and the notice says why. A refusal restores the composer draft and says which
-  node is stale and for how long.
+  flush; if the node went stale meanwhile every buffer for that node is
+  dropped, keys mode ends and the notice says why. A refusal restores the
+  composer draft and says which node is stale and for how long. The displayed
+  age and expiry read the snapshot's single wall sample, so they cannot
+  disagree within a frame.
 - `remote_synced` clears a composer target whose exact session is gone, so
   expiry cannot leave a reusable authorization behind.
 
