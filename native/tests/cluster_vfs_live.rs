@@ -613,6 +613,142 @@ fn drive_is_primary_and_the_vfs_alias_reads_the_same_store() {
 }
 
 #[test]
+fn sync_copies_a_directory_one_way_and_never_deletes() {
+    let _serial = live_test_guard();
+    let node = Node::start();
+    successful(
+        node.run(&["drive", "config", "--replicas", "1"]),
+        "drive config",
+    );
+    let source = node.root.join("sync-src");
+    std::fs::create_dir_all(source.join("sub")).unwrap();
+    std::fs::write(source.join("a.txt"), b"a1").unwrap();
+    std::fs::write(source.join("sub/b.txt"), b"b1").unwrap();
+    let source = source.to_str().unwrap();
+
+    let first = successful(
+        node.run(&["drive", "sync", source, "remuda:///sync-dir"]),
+        "sync up",
+    );
+    assert!(first.contains("Copied 2 files"), "{first}");
+    assert_eq!(
+        successful(
+            node.run(&["drive", "get", "remuda:///sync-dir/a.txt"]),
+            "get a"
+        ),
+        "a1"
+    );
+    let again = successful(
+        node.run(&["drive", "sync", source, "remuda:///sync-dir"]),
+        "sync up again",
+    );
+    assert!(again.contains("Copied 0 files"), "{again}");
+
+    std::fs::write(source_path(source, "a.txt"), b"a2").unwrap();
+    std::fs::write(source_path(source, "new.txt"), b"n").unwrap();
+    let dry = successful(
+        node.run(&["drive", "sync", source, "remuda:///sync-dir", "--dry-run"]),
+        "sync dry run",
+    );
+    assert!(dry.contains("Would copy 2 files"), "{dry}");
+    assert!(
+        !node
+            .run(&["drive", "get", "remuda:///sync-dir/new.txt"])
+            .status
+            .success(),
+        "a dry run must not write"
+    );
+    let changed = successful(
+        node.run(&["drive", "sync", source, "remuda:///sync-dir"]),
+        "sync changed",
+    );
+    assert!(changed.contains("Copied 2 files"), "{changed}");
+
+    let dest = node.root.join("sync-dst");
+    let down = successful(
+        node.run(&[
+            "drive",
+            "sync",
+            "remuda:///sync-dir",
+            dest.to_str().unwrap(),
+        ]),
+        "sync down",
+    );
+    assert!(down.contains("Copied 3 files"), "{down}");
+    assert_eq!(std::fs::read(dest.join("sub/b.txt")).unwrap(), b"b1");
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"a2");
+
+    std::fs::write(dest.join("extra.txt"), b"keep").unwrap();
+    successful(
+        node.run(&["drive", "rm", "remuda:///sync-dir/sub/b.txt"]),
+        "remove in store",
+    );
+    let no_delete = successful(
+        node.run(&[
+            "drive",
+            "sync",
+            "remuda:///sync-dir",
+            dest.to_str().unwrap(),
+        ]),
+        "sync down without delete",
+    );
+    assert!(no_delete.contains("Copied 0 files"), "{no_delete}");
+    assert!(dest.join("sub/b.txt").exists());
+    assert!(dest.join("extra.txt").exists());
+
+    successful(node.run(&["drive", "sync"]), "cluster sync");
+
+    refuses_a_symlinked_destination_directory(&node);
+
+    let store = node.root.join("state/remuda/cluster/vfs");
+    let overlap = node.run(&[
+        "drive",
+        "sync",
+        store.to_str().unwrap(),
+        "remuda:///overlap",
+    ]);
+    assert!(
+        !overlap.status.success(),
+        "the store itself must be refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&overlap.stderr).contains("overlaps the remuda VFS store"),
+        "{}",
+        String::from_utf8_lossy(&overlap.stderr)
+    );
+}
+
+fn refuses_a_symlinked_destination_directory(node: &Node) {
+    let outside = node.root.join("sync-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let linked = node.root.join("sync-link-dst");
+    std::fs::create_dir_all(&linked).unwrap();
+    std::os::unix::fs::symlink(&outside, linked.join("link")).unwrap();
+    successful(
+        node.run_with_stdin(
+            &["drive", "put", "-", "remuda:///sync-dir/link/secret.txt"],
+            Some(b"secret"),
+        ),
+        "put under a link name",
+    );
+    let escaped = node.run(&[
+        "drive",
+        "sync",
+        "remuda:///sync-dir",
+        linked.to_str().unwrap(),
+    ]);
+    assert!(!escaped.status.success(), "a symlinked directory must fail");
+    assert!(
+        !outside.join("secret.txt").exists(),
+        "wrote outside the destination"
+    );
+}
+
+fn source_path(root: &str, relative: &str) -> std::path::PathBuf {
+    std::path::Path::new(root).join(relative)
+}
+
+#[test]
 fn grep_reads_text_from_vfs_without_a_mount() {
     let _serial = live_test_guard();
     let (a, b, _c) = three_nodes();

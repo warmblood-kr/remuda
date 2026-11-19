@@ -145,8 +145,12 @@ fn spec(command: &str) -> Spec {
                              option("include-resolved", None, "Also give back copies `vfs resolve` pinned for a tool"),
                              option("json", None, "Print JSON")],
                 "remuda drive release [--dry-run] [--older-than SECS] [--json]"),
-            verb(command, "sync", "Pull indexes from peers and repair missing copies now. Example: remuda drive sync",
-                vec![], vec![], "remuda drive sync"),
+            verb(command, "sync", "Pull indexes from peers and repair copies, or copy one directory one way between a local path and remuda:///. Example: remuda drive sync remuda:///dir-a ~/shared-a",
+                vec![arg("SOURCE", "Local directory or remuda:/// prefix; omit both for the cluster sync", false),
+                     arg("DEST", "The other side; exactly one side must be remuda:///", false)],
+                vec![option("dry-run", None, "Show what would be copied without writing"),
+                     option("verbose", None, "Name every copied file")],
+                "remuda drive sync [SOURCE DEST] [--dry-run] [--verbose]"),
             verb(command, "status", "Show files, conflicts, copies here and each peer at a glance. Example: remuda drive status --copies",
                 vec![], vec![option("copies", None, "Also ask the nodes which copies they hold; exit 75 if a file is short"),
                              option("json", None, "Print JSON")],
@@ -214,6 +218,50 @@ fn alias_stderr(command: &str, verb: &str, stderr: &[u8]) -> Vec<u8> {
     )
     .replace("remuda drive ", "remuda vfs ")
     .into_bytes()
+}
+
+/// `remuda drive sync SRC DST`: one-way directory copy, with the local side
+/// in this process and the store side over `Request::Vfs`.
+fn sync_files(socket: &Path, command: &str, values: &Map<String, Value>, mut out: Out) -> ExitCode {
+    let source = value(values, "SOURCE");
+    let dest = value(values, "DEST");
+    let options = crate::vfs_sync_files::Options {
+        dry_run: flag(values, "dry-run"),
+        verbose: flag(values, "verbose"),
+    };
+    let (Some(source), Some(dest)) = (source, dest) else {
+        let detail = if options.dry_run || options.verbose {
+            "the two-path form needs both SOURCE and DEST; the cluster sync takes neither"
+        } else {
+            "give both SOURCE and DEST, or neither for the cluster sync"
+        };
+        warn!(out, "remuda: {command} sync: {detail}");
+        return finish(out, 2);
+    };
+    let report = match crate::vfs_sync_files::run(socket, source, dest, options) {
+        Ok(report) => report,
+        Err(error) if error.is_usage() => {
+            warn!(out, "remuda: {command} sync: {}", error.detail());
+            return finish(out, 2);
+        }
+        Err(error) => {
+            warn!(out, "remuda: {command} sync: {}", error.detail());
+            return finish(out, 1);
+        }
+    };
+    for line in report.lines() {
+        say!(out, "{line}");
+    }
+    for failure in &report.failed {
+        warn!(out, "  failed: {}: {}", failure.path, failure.detail);
+    }
+    if !report.failed.is_empty() {
+        warn!(
+            out,
+            "Next: run the same command again; files already copied are skipped."
+        );
+    }
+    finish(out, report.exit_code())
 }
 
 fn fail(out: &mut Out, verb: &str, error: impl std::fmt::Display) -> u8 {
@@ -326,6 +374,14 @@ pub fn run(server: &str, socket: &Path, args: &[&str], command: &str) -> ExitCod
         );
         return ExitCode::FAILURE;
     }
+    if verb == "sync"
+        && (value(&values, "SOURCE").is_some()
+            || value(&values, "DEST").is_some()
+            || flag(&values, "dry-run")
+            || flag(&values, "verbose"))
+    {
+        return sync_files(socket, command, &values, out);
+    }
     if verb == "publish" {
         // One `put` per file, so the loop lives here and the daemon only sees
         // the request it already knows.
@@ -427,7 +483,8 @@ fn forward(verb: &str, values: &Map<String, Value>) -> Vec<String> {
     let mut args = vec![verb.to_owned()];
     for arg in &command.args {
         match (arg.name.as_str(), value(values, &arg.name)) {
-            ("SOURCE", _) => args.push("-".into()),
+            // Only `put` reads stdin; its content travels as input.
+            ("SOURCE", _) if verb == "put" => args.push("-".into()),
             ("DEST", _) | (_, None) => {}
             (_, Some(text)) => args.push(text.to_owned()),
         }
@@ -493,7 +550,7 @@ fn publish_prefix(text: &str) -> Result<String, String> {
 
 /// One `Request::Vfs` on its own connection. Returns the command's exit code,
 /// stdout and a one-line stderr.
-fn daemon_call(
+pub(crate) fn daemon_call(
     socket: &Path,
     args: Vec<String>,
     input: Option<Vec<u8>>,
@@ -1054,6 +1111,17 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
         ),
         "release" => release(values, out),
         "sync" => {
+            if value(values, "SOURCE").is_some()
+                || value(values, "DEST").is_some()
+                || flag(values, "dry-run")
+                || flag(values, "verbose")
+            {
+                return fail(
+                    out,
+                    "sync",
+                    "the two-path form runs in the CLI process; run `remuda drive sync SRC DST` there",
+                );
+            }
             let report = vfs_sync::sync_once(true);
             say!(out, "{report}");
             0
@@ -2486,6 +2554,23 @@ mod tests {
         assert!(text.contains("remuda: vfs get"), "{text}");
         assert!(text.contains("remuda vfs ls"), "{text}");
         assert!(!text.contains("remuda drive"), "{text}");
+    }
+
+    #[test]
+    fn sync_help_names_the_two_path_form() {
+        let help = usage_for("drive", "sync");
+        assert!(help.contains("SOURCE"), "{help}");
+        assert!(help.contains("DEST"), "{help}");
+        assert!(help.contains("--dry-run"), "{help}");
+        assert!(help.contains("--verbose"), "{help}");
+    }
+
+    #[test]
+    fn cluster_sync_is_forwarded_without_a_positional() {
+        let mut out = Out::default();
+        let (verb, values) = parse(&["sync"], &mut out).unwrap();
+        assert_eq!(verb, "sync");
+        assert_eq!(forward("sync", &values), ["sync"]);
     }
 
     #[test]
