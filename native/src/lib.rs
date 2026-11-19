@@ -23,6 +23,7 @@ pub mod db_cli;
 pub(crate) mod db_lua;
 pub mod dist;
 pub mod document_html;
+pub mod document_markdown;
 pub mod find_command;
 pub(crate) mod fs_atomic;
 pub mod fs_lock;
