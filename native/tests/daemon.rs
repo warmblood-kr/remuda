@@ -2254,7 +2254,9 @@ fn attach_eof_drains_input_already_read_by_the_key_pump() {
 fn attach_during_stalled_send_preserves_human_input_before_and_after_timeout() {
     let runtime = unique_scratch_dir("probe-attach-stall");
     let socket = daemon::socket_path_in(&runtime, "s");
-    let _daemon = daemon_at(&socket);
+    // In-process contract: the megabyte Send must fill the PTY, and hosted
+    // input acts are capped at 8 KiB (docs/concepts/session-host-parity.md).
+    let _daemon = spawn::Daemon::spawn_in_process(&runtime);
     let marker = runtime.join("start-reader");
     let capture_path = runtime.join("typed-bytes");
     let mut env = std::collections::HashMap::new();
