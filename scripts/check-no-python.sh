@@ -136,7 +136,11 @@ scan_invocations() {
 		cmd = sep "[ \t]*(" runner "[ \t]+" args ")?" path tokonly "([^A-Za-z0-9_.-]|$)"
 		qcmd = sep "[ \t]*[\"\047]([^\"\047]*/)?" tokonly "([\"\047]|[ \t])"
 		arm = sep "[ \t]*[\"\047][^\"\047]*" tokonly "[^\"\047]*[\"\047][ \t]*(\\||=>)"
-		word = "([^A-Za-z0-9_-]|^)" tokonly "([^A-Za-z0-9_-]|$)"
+		word = "([^A-Za-z0-9_.-]|^)" tokonly "([^A-Za-z0-9_.-]|$)"
+		# A command substitution inside double quotes still executes. The token
+		# must be inside the substitution, so a literal beside it stays data.
+		dqsub = "\"\\$\\([^)\"]*" tokonly
+		btq = "\"[^\"`]*`[^`]*" tokonly
 	}
 	# Blank quoted text in place, preserving length, so an unquoted token is
 	# still seen next to a quote while a literal inside one is not.
@@ -184,6 +188,9 @@ scan_invocations() {
 		# block-comment continuation line that starts with *.
 		if (line ~ /^[ \t]*(#|\/\/|--|\/\*|\*)/) next
 		if (tolower(line) ~ sink && line ~ tokre) { print n ":" line; next }
+		# A command substitution inside double quotes still executes; a
+		# single-quoted one is a literal and stays data.
+		if (line ~ dqsub || line ~ btq) { print n ":" line; next }
 		if (line ~ executor && line ~ tokre) { print n ":" line; next }
 		if (line ~ setupre) { print n ":" line; next }
 		if (line ~ qcmd && line !~ arm) { print n ":" line; next }

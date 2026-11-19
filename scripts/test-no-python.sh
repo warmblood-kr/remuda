@@ -200,6 +200,27 @@ for line in "nice -n 5 $py -c 1" "timeout -s KILL 5 $py -c 1" "setsid $py -c 1";
 	expect_rejected "runner wrapper: $line" 'Python invocation at scripts/probe.sh:1'
 done
 
+# 9. A command substitution inside double quotes executes. A single-quoted one
+# is a literal and stays data, as does a dotted file name.
+reset_fixture
+printf 'echo "$(%s -c 1)"\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'quoted $() substitution' 'Python invocation at scripts/probe.sh:1'
+reset_fixture
+printf 'value="$(%s -c 1)"\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'assigned quoted $() substitution' 'Python invocation at scripts/probe.sh:1'
+reset_fixture
+printf 'echo "`%s -c 1`"\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'quoted backtick substitution' 'Python invocation at scripts/probe.sh:1'
+reset_fixture
+printf 'literal=\047$(%s -c 1)\047\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_ok
+reset_fixture
+printf 'cp uv.lock dist/\n' >"$fixture/repo/scripts/probe.sh"
+expect_ok
+reset_fixture
+printf 'path: pip.conf\n' >"$fixture/repo/.github/workflows/probe.yml"
+expect_ok
+
 # The old checker accepted these; they must stay accepted. python3-config is a
 # different program whose hyphen is a word character, not an invocation.
 reset_fixture
