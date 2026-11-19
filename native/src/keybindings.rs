@@ -28,17 +28,7 @@ fn validate(context: &str, key: &str, action: Option<&str>) -> Result<String, St
             "cluster.select",
             "cluster.help",
         ],
-        "cluster.documents" => &[
-            "documents.up",
-            "documents.down",
-            "documents.open",
-            "documents.back",
-            "documents.close",
-            "documents.refresh",
-            "documents.address",
-            "documents.link.next",
-            "documents.link.previous",
-        ],
+        "cluster.documents" => remuda_core::document_commands::ALL,
         "cluster.search" => &[
             "cluster.search.clear",
             "cluster.search.delete",
@@ -305,6 +295,13 @@ impl Snapshot {
 
     pub fn resolve(&self, context: &str, event: KeyEvent) -> Option<&str> {
         let key = canonical_event(event)?;
+        self.resolve_canonical(context, &key)
+    }
+
+    /// Resolve an already-canonical key (`TAB`, `RET`, `<up>`, `C-a`): the TUI
+    /// arrives from a terminal event, the GUI canonicalizes its own keystroke,
+    /// and both hit the same row, so one declaration reaches both.
+    pub fn resolve_canonical(&self, context: &str, key: &str) -> Option<&str> {
         self.rows
             .iter()
             .find(|row| row.context == context && row.key == key)
@@ -378,20 +375,38 @@ fn key_label(key: &str) -> String {
     }
 }
 
+fn lua_with_tools() -> mlua::Result<mlua::Lua> {
+    let lua = mlua::Lua::new();
+    let table = lua.create_table()?;
+    install(&lua, &table, || (true, None))?;
+    table.set("_registry", lua.create_table()?)?;
+    table.set("json", crate::json::bindings(&lua)?)?;
+    lua.globals().set("remuda", table)?;
+    lua.load(include_str!("tools.lua")).exec()?;
+    Ok(lua)
+}
+
+fn encode(lua: &mlua::Lua) -> Result<Snapshot, String> {
+    let wire = lua
+        .load("local s=remuda.keymap_snapshot(); s.rows=remuda.json.array(s.rows); return remuda.json.encode(s)")
+        .eval::<String>()
+        .map_err(|error| error.to_string())?;
+    Snapshot::from_json(&wire)
+}
+
+/// The declarations embedded in the binary, without a daemon.
+///
+/// A renderer without a daemon, and any test, resolves these and never a copy.
+pub fn built_in_defaults() -> Result<Snapshot, String> {
+    let lua = lua_with_tools().map_err(|error| error.to_string())?;
+    encode(&lua)
+}
+
 #[cfg(test)]
 pub(crate) fn test_snapshot(overrides: &str) -> Snapshot {
-    let lua = mlua::Lua::new();
-    let table = lua.create_table().unwrap();
-    install(&lua, &table, || (true, None)).unwrap();
-    table.set("_registry", lua.create_table().unwrap()).unwrap();
-    table
-        .set("json", crate::json::bindings(&lua).unwrap())
-        .unwrap();
-    lua.globals().set("remuda", table).unwrap();
-    lua.load(include_str!("tools.lua")).exec().unwrap();
+    let lua = lua_with_tools().unwrap();
     lua.load(overrides).exec().unwrap();
-    let wire = lua.load("local s=remuda.keymap_snapshot(); s.rows=remuda.json.array(s.rows); return remuda.json.encode(s)").eval::<String>().unwrap();
-    Snapshot::from_json(&wire).unwrap()
+    encode(&lua).unwrap()
 }
 
 /// A bounded client-side readiness wait; neither the listener nor Lua thread
@@ -736,6 +751,28 @@ mod native_tests {
             canonical_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)).as_deref(),
             Some("<backtab>")
         );
+    }
+
+    #[test]
+    fn keybindings_named_resolution_matches_the_terminal_event_path() {
+        // The GUI has no crossterm event; it canonicalizes its keystroke and
+        // asks the same snapshot. Both spellings must name the same action.
+        let snapshot = test_snapshot("");
+        for (spec, event) in [
+            ("TAB", KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            ("RET", KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ("<up>", KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        ] {
+            let canonical = canonical_key(spec).unwrap();
+            let named = snapshot.resolve_canonical("cluster.documents", &canonical);
+            assert_eq!(
+                named,
+                snapshot.resolve("cluster.documents", event),
+                "{spec}"
+            );
+            assert!(named.is_some(), "{spec} should be declared for documents");
+        }
+        assert_eq!(snapshot.resolve_canonical("cluster.documents", "M-z"), None);
     }
 
     #[test]

@@ -21,6 +21,7 @@
 
 pub mod agent;
 pub mod clock;
+pub mod document_commands;
 pub mod input;
 pub mod keys;
 pub mod protocol;
