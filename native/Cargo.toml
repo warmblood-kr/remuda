@@ -90,6 +90,7 @@ rustyline = "14.0.0"
 # `Cell::is_wide` — pinned to the same major version so a rendered row's own
 # width judgment can never disagree with vt100's. See steps/023.
 unicode-width = "0.2"
+scraper = { version = "=0.29.0", default-features = false }
 unicode-segmentation = "1.13"
 
 [target.'cfg(unix)'.dependencies]
