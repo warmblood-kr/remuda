@@ -137,10 +137,14 @@ each copied file.
 - A missing local destination directory is created. Local writes go to a
   temporary file beside the target and are renamed into place, so a reader
   never sees a partial file and a failure leaves the old file.
+- The destination is walked without following symlinks. A symlink in any
+  component is refused, and the write is made relative to the directory that
+  was opened, so replacing a component cannot redirect it outside the tree.
 - Store writes are ordinary `put`s, so the usual replication rules apply.
   Exit 75 means the files are stored here but not on every wanted node yet.
 - Symlinks, special files and non-UTF-8 names are skipped and named. Empty
-  local directories are not represented in the store.
+  local directories are not represented in the store. A file over 64 MiB is
+  a per-file failure and the other files continue.
 - Files that exist only on the destination are never deleted. This includes
   files removed from the source: run `remuda drive rm` for those explicitly.
 - A store file cannot also be a directory. A local tree that would create that

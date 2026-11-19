@@ -698,6 +698,8 @@ fn sync_copies_a_directory_one_way_and_never_deletes() {
 
     successful(node.run(&["drive", "sync"]), "cluster sync");
 
+    refuses_a_symlinked_destination_directory(&node);
+
     let store = node.root.join("state/remuda/cluster/vfs");
     let overlap = node.run(&[
         "drive",
@@ -713,6 +715,32 @@ fn sync_copies_a_directory_one_way_and_never_deletes() {
         String::from_utf8_lossy(&overlap.stderr).contains("overlaps the remuda VFS store"),
         "{}",
         String::from_utf8_lossy(&overlap.stderr)
+    );
+}
+
+fn refuses_a_symlinked_destination_directory(node: &Node) {
+    let outside = node.root.join("sync-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let linked = node.root.join("sync-link-dst");
+    std::fs::create_dir_all(&linked).unwrap();
+    std::os::unix::fs::symlink(&outside, linked.join("link")).unwrap();
+    successful(
+        node.run_with_stdin(
+            &["drive", "put", "-", "remuda:///sync-dir/link/secret.txt"],
+            Some(b"secret"),
+        ),
+        "put under a link name",
+    );
+    let escaped = node.run(&[
+        "drive",
+        "sync",
+        "remuda:///sync-dir",
+        linked.to_str().unwrap(),
+    ]);
+    assert!(!escaped.status.success(), "a symlinked directory must fail");
+    assert!(
+        !outside.join("secret.txt").exists(),
+        "wrote outside the destination"
     );
 }
 

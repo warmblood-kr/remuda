@@ -11,8 +11,18 @@ use crate::cluster::vfs::{sha256_hex, VfsStore, MAX_BLOB_BYTES};
 use remuda_core::vfs::VfsUri;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+#[cfg(unix)]
+use std::ffi::CString;
+use std::fs;
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::io::Read;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -232,12 +242,14 @@ struct LocalFile {
 struct Walk {
     files: Vec<LocalFile>,
     skipped: Vec<String>,
+    failed: Vec<Failure>,
 }
 
 fn walk_local(root: &Path) -> Result<Walk, SyncError> {
     let mut walk = Walk {
         files: Vec::new(),
         skipped: Vec::new(),
+        failed: Vec::new(),
     };
     walk_dir(root, "", &mut walk)?;
     walk.files
@@ -288,12 +300,16 @@ fn walk_dir(dir: &Path, prefix: &str, walk: &mut Walk) -> Result<(), SyncError> 
             walk_dir(&path, &relative, walk)?;
         } else if metadata.is_file() {
             if metadata.len() > MAX_BLOB_BYTES {
-                return Err(SyncError::Failed(format!(
-                    "{relative} is {} bytes; a stored file may be at most {MAX_BLOB_BYTES}",
-                    metadata.len()
-                )));
+                walk.failed.push(Failure {
+                    path: relative.clone(),
+                    detail: format!(
+                        "{} bytes is over the {MAX_BLOB_BYTES}-byte limit; skipped",
+                        metadata.len()
+                    ),
+                });
+            } else {
+                walk.files.push(LocalFile { relative, path });
             }
-            walk.files.push(LocalFile { relative, path });
         } else {
             walk.skipped.push(relative);
         }
@@ -390,6 +406,7 @@ fn local_to_vfs(
     let walk = walk_local(&root)?;
     let mut report = Report::new(source, dest, Direction::LocalToVfs, options);
     report.skipped = walk.skipped;
+    report.failed = walk.failed;
     for file in walk.files {
         copy_one_to_vfs(socket, &prefix, &known, &file, &mut report);
     }
@@ -540,40 +557,18 @@ fn vfs_to_local(
 }
 
 fn copy_one_to_local(socket: &Path, prefix: &str, root: &Path, row: &VfsRow, report: &mut Report) {
-    let target = match safe_join(root, &row.relative) {
-        Ok(target) => target,
+    match read_existing(root, &row.relative) {
+        Ok(Some(bytes)) if bytes.len() as u64 == row.size && sha256_hex(&bytes) == row.sha256 => {
+            report.unchanged += 1;
+            return;
+        }
+        Ok(_) => {}
         Err(detail) => {
             report.failed.push(Failure {
                 path: row.relative.clone(),
                 detail,
             });
             return;
-        }
-    };
-    if let Ok(metadata) = fs::symlink_metadata(&target) {
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            report.failed.push(Failure {
-                path: row.relative.clone(),
-                detail: format!(
-                    "{} is not a regular file; not writing through it",
-                    target.display()
-                ),
-            });
-            return;
-        }
-        match fs::read(&target) {
-            Ok(bytes) if bytes.len() as u64 == row.size && sha256_hex(&bytes) == row.sha256 => {
-                report.unchanged += 1;
-                return;
-            }
-            Ok(_) => {}
-            Err(error) => {
-                report.failed.push(Failure {
-                    path: row.relative.clone(),
-                    detail: format!("cannot read {}: {error}", target.display()),
-                });
-                return;
-            }
         }
     }
     if report.dry_run {
@@ -597,7 +592,7 @@ fn copy_one_to_local(socket: &Path, prefix: &str, root: &Path, row: &VfsRow, rep
             return;
         }
     };
-    match write_atomic(&target, &bytes) {
+    match write_atomic(root, &row.relative, &bytes) {
         Ok(()) => {
             report.copied += 1;
             report.bytes = report.bytes.saturating_add(bytes.len() as u64);
@@ -700,73 +695,403 @@ fn validate_relative(relative: &str) -> Result<(), SyncError> {
     Ok(())
 }
 
-fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, String> {
-    validate_relative(relative).map_err(|error| error.detail().to_owned())?;
-    Ok(root.join(relative))
+/// Read a destination file without following a symlink in any component.
+/// `None` means the file (or a parent) is absent.
+#[cfg(unix)]
+fn read_existing(root: &Path, relative: &str) -> Result<Option<Vec<u8>>, String> {
+    let Some((parent, name)) = open_parent(root, relative, false)? else {
+        return Ok(None);
+    };
+    let display = root.join(relative);
+    let fd = match open_at(
+        &parent,
+        &name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+        0,
+    ) {
+        Ok(fd) => fd,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(format!(
+                "{} is a symlink; not following it",
+                display.display()
+            ))
+        }
+        Err(error) => return Err(format!("cannot open {}: {error}", display.display())),
+    };
+    let mut file = std::fs::File::from(fd);
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", display.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", display.display()));
+    }
+    if metadata.len() > MAX_BLOB_BYTES {
+        return Err(format!(
+            "{} is {} bytes; over the {MAX_BLOB_BYTES}-byte limit",
+            display.display(),
+            metadata.len()
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", display.display()))?;
+    Ok(Some(bytes))
 }
 
-/// Write a file beside its target, then rename. A reader never sees a partly
-/// written file, and a failed write leaves the old file in place.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-    let temporary = temporary_name(parent);
+/// Write a file beside its target, then rename. The parent directory is held
+/// open and each component is opened with `O_NOFOLLOW`, so replacing a path
+/// with a symlink after the check cannot redirect the write outside `root`.
+#[cfg(unix)]
+fn write_atomic(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), String> {
+    let Some((parent, name)) = open_parent(root, relative, true)? else {
+        return Err(format!("destination {} is missing", root.display()));
+    };
+    let display = root.join(relative);
+    check_final(&parent, &name, &display)?;
+    let temporary = temporary_name();
+    let fd = open_at(
+        &parent,
+        &temporary,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0o600,
+    )
+    .map_err(|error| {
+        format!(
+            "cannot create a temporary file beside {}: {error}",
+            display.display()
+        )
+    })?;
+    let mut file = std::fs::File::from(fd);
+    let written = file.write_all(bytes).and_then(|_| file.sync_all());
+    drop(file);
+    if let Err(error) = written {
+        unlink_at(&parent, &temporary);
+        return Err(format!("cannot write {}: {error}", display.display()));
+    }
+    if let Err(error) = rename_at(&parent, &temporary, &name) {
+        unlink_at(&parent, &temporary);
+        return Err(format!("cannot replace {}: {error}", display.display()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_root(root: &Path) -> Result<Option<OwnedFd>, String> {
+    let name = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| format!("{} contains NUL", root.display()))?;
+    let fd = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(format!("cannot open {}: {error}", root.display()));
+    }
+    Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+#[cfg(unix)]
+fn open_parent(
+    root: &Path,
+    relative: &str,
+    create: bool,
+) -> Result<Option<(OwnedFd, String)>, String> {
+    validate_relative(relative).map_err(|error| error.detail().to_owned())?;
+    let Some(mut parent) = open_root(root)? else {
+        return Ok(None);
+    };
+    let display = root.join(relative);
+    let mut parts: Vec<&str> = relative.split('/').collect();
+    let name = parts
+        .pop()
+        .ok_or_else(|| format!("{} has no file name", display.display()))?
+        .to_owned();
+    for part in parts {
+        match open_at(
+            &parent,
+            part,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        ) {
+            Ok(next) => parent = next,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !create {
+                    return Ok(None);
+                }
+                match mkdir_at(&parent, part) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot create a directory for {}: {error}",
+                            display.display()
+                        ))
+                    }
+                }
+                parent = open_at(
+                    &parent,
+                    part,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0,
+                )
+                .map_err(|error| {
+                    format!("cannot open a directory for {}: {error}", display.display())
+                })?;
+            }
+            Err(error)
+                if error.raw_os_error() == Some(libc::ELOOP)
+                    || error.raw_os_error() == Some(libc::ENOTDIR) =>
+            {
+                return Err(format!(
+                    "{} has a symlink or non-directory component; refusing to follow it",
+                    display.display()
+                ))
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot open a directory for {}: {error}",
+                    display.display()
+                ))
+            }
+        }
+    }
+    Ok(Some((parent, name)))
+}
+
+#[cfg(unix)]
+fn open_at(
+    parent: &OwnedFd,
+    name: &str,
+    flags: i32,
+    mode: libc::mode_t,
+) -> std::io::Result<OwnedFd> {
+    let name = CString::new(name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "name contains NUL"))?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags,
+            mode as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
+fn mkdir_at(parent: &OwnedFd, name: &str) -> std::io::Result<()> {
+    let name = CString::new(name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "name contains NUL"))?;
+    let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn unlink_at(parent: &OwnedFd, name: &str) {
+    if let Ok(name) = CString::new(name) {
+        let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+    }
+}
+
+#[cfg(unix)]
+fn rename_at(parent: &OwnedFd, from: &str, to: &str) -> std::io::Result<()> {
+    let from = CString::new(from)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "name contains NUL"))?;
+    let to = CString::new(to)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "name contains NUL"))?;
+    let result = unsafe {
+        libc::renameat(
+            parent.as_raw_fd(),
+            from.as_ptr(),
+            parent.as_raw_fd(),
+            to.as_ptr(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Refuse a final symlink or directory. A rename replaces a symlink rather
+/// than following it, so a race after this check still cannot escape `root`.
+#[cfg(unix)]
+fn check_final(parent: &OwnedFd, name: &str, display: &Path) -> Result<(), String> {
+    let name = CString::new(name).map_err(|_| format!("{} contains NUL", display.display()))?;
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(format!("cannot inspect {}: {error}", display.display()));
+    }
+    let kind = stat.st_mode & libc::S_IFMT;
+    if kind == libc::S_IFLNK {
+        return Err(format!(
+            "{} is a symlink; not writing through it",
+            display.display()
+        ));
+    }
+    if kind == libc::S_IFDIR {
+        return Err(format!("{} is a directory", display.display()));
+    }
+    if kind != libc::S_IFREG {
+        return Err(format!("{} is not a regular file", display.display()));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn read_existing(root: &Path, relative: &str) -> Result<Option<Vec<u8>>, String> {
+    validate_relative(relative).map_err(|error| error.detail().to_owned())?;
+    let mut current = root.to_path_buf();
+    let parts: Vec<&str> = relative.split('/').collect();
+    let (name, directories) = parts
+        .split_last()
+        .ok_or_else(|| "a destination path has no file name".to_owned())?;
+    for part in directories {
+        current.push(*part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "{} has a symlink component; refusing to follow it",
+                    current.display()
+                ))
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(format!("{} is not a directory", current.display()))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot inspect {}: {error}", current.display())),
+        }
+    }
+    let target = current.join(*name);
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "{} is a symlink; not following it",
+            target.display()
+        )),
+        Ok(metadata) if !metadata.is_file() => {
+            Err(format!("{} is not a regular file", target.display()))
+        }
+        Ok(metadata) if metadata.len() > MAX_BLOB_BYTES => Err(format!(
+            "{} is {} bytes; over the {MAX_BLOB_BYTES}-byte limit",
+            target.display(),
+            metadata.len()
+        )),
+        Ok(_) => fs::read(&target)
+            .map(Some)
+            .map_err(|error| format!("cannot read {}: {error}", target.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot inspect {}: {error}", target.display())),
+    }
+}
+
+/// Windows has no portable `openat`; check every existing component and
+/// refuse symlinks, then write beside the target and rename. This is best
+/// effort against a concurrent replacement, unlike the Unix fd walk.
+#[cfg(not(unix))]
+fn write_atomic(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), String> {
+    validate_relative(relative).map_err(|error| error.detail().to_owned())?;
+    let mut current = root.to_path_buf();
+    let parts: Vec<&str> = relative.split('/').collect();
+    let (name, directories) = parts
+        .split_last()
+        .ok_or_else(|| "a destination path has no file name".to_owned())?;
+    for part in directories {
+        current.push(*part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "{} has a symlink component; refusing to follow it",
+                    current.display()
+                ))
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(format!("{} is not a directory", current.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current)
+                    .map_err(|error| format!("cannot create {}: {error}", current.display()))?;
+            }
+            Err(error) => return Err(format!("cannot inspect {}: {error}", current.display())),
+        }
+    }
+    let target = current.join(*name);
+    if let Ok(metadata) = fs::symlink_metadata(&target) {
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "{} is a symlink; not writing through it",
+                target.display()
+            ));
+        }
+        if metadata.is_dir() {
+            return Err(format!("{} is a directory", target.display()));
+        }
+    }
+    let temporary = current.join(temporary_name());
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)
         .map_err(|error| format!("cannot create {}: {error}", temporary.display()))?;
-    let written = file
-        .write_all(bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|error| format!("cannot write {}: {error}", temporary.display()));
+    let written = file.write_all(bytes).and_then(|_| file.sync_all());
     drop(file);
-    if let Err(detail) = written {
+    if let Err(error) = written {
         let _ = fs::remove_file(&temporary);
-        return Err(detail);
+        return Err(format!("cannot write {}: {error}", target.display()));
     }
-    if let Err(error) = replace_file(&temporary, path) {
+    if let Err(error) = replace_file(&temporary, &target) {
         let _ = fs::remove_file(&temporary);
-        return Err(format!(
-            "cannot replace {} with {}: {error}",
-            path.display(),
-            temporary.display()
-        ));
+        return Err(format!("cannot replace {}: {error}", target.display()));
     }
     Ok(())
 }
 
-/// A rename replaces atomically on Unix. Windows refuses an existing target,
-/// so remove it first there; that path is not atomic, but it is still better
-/// than leaving a partial file.
+#[cfg(not(unix))]
 fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
     match fs::rename(temporary, path) {
         Ok(()) => Ok(()),
-        Err(error) => {
-            #[cfg(windows)]
-            {
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-                ) {
-                    fs::remove_file(path)?;
-                    return fs::rename(temporary, path);
-                }
-            }
-            Err(error)
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            fs::remove_file(path)?;
+            fs::rename(temporary, path)
         }
+        Err(error) => Err(error),
     }
 }
 
-fn temporary_name(parent: &Path) -> PathBuf {
+fn temporary_name() -> String {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    parent.join(format!(
-        ".remuda-sync-{}-{sequence}.tmp",
-        std::process::id()
-    ))
+    format!(".remuda-sync-{}-{sequence}.tmp", std::process::id())
 }
 
 #[cfg(test)]
@@ -865,14 +1190,105 @@ mod tests {
         let target = root.join("dir/a.txt");
         fs::create_dir_all(root.join("dir")).unwrap();
         fs::write(&target, b"old").unwrap();
-        write_atomic(&target, b"new").unwrap();
+        write_atomic(&root, "dir/a.txt", b"new").unwrap();
+        write_atomic(&root, "new/sub/b.txt", b"b").unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert_eq!(fs::read(root.join("new/sub/b.txt")).unwrap(), b"b");
         let leftovers: Vec<_> = fs::read_dir(root.join("dir"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .filter(|name| name.to_string_lossy().starts_with(".remuda-sync-"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_intermediate_symlink_cannot_redirect_a_write() {
+        let root = scratch("link-intermediate");
+        let outside = scratch("link-intermediate-outside");
+        fs::write(outside.join("secret.txt"), b"old").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let error = write_atomic(&root, "link/secret.txt", b"new").unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert_eq!(fs::read(outside.join("secret.txt")).unwrap(), b"old");
+        assert!(!outside.join("new.txt").exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_final_symlink_is_not_followed() {
+        let root = scratch("link-final");
+        let outside = scratch("link-final-outside");
+        fs::write(outside.join("secret.txt"), b"old").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("secret.txt")).unwrap();
+        let error = write_atomic(&root, "secret.txt", b"new").unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert_eq!(fs::read(outside.join("secret.txt")).unwrap(), b"old");
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_parent_cannot_redirect_an_open_handle() {
+        use std::io::Write as _;
+        let root = scratch("link-race");
+        let outside = scratch("link-race-outside");
+        fs::create_dir(root.join("real")).unwrap();
+        let (parent, _name) = open_parent(&root, "real/file.txt", true).unwrap().unwrap();
+        fs::rename(root.join("real"), root.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("real")).unwrap();
+        let fd = open_at(
+            &parent,
+            "probe",
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+        .unwrap();
+        let mut file = std::fs::File::from(fd);
+        file.write_all(b"x").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        rename_at(&parent, "probe", "file.txt").unwrap();
+        assert!(root.join("moved/file.txt").exists());
+        assert!(!outside.join("file.txt").exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn a_missing_destination_reads_as_absent() {
+        let root = scratch("missing");
+        assert_eq!(read_existing(&root.join("gone"), "a/b").unwrap(), None);
+        assert_eq!(read_existing(&root, "a/b").unwrap(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_oversize_file_is_a_per_file_failure() {
+        let root = scratch("oversize");
+        fs::write(root.join("ok.txt"), b"ok").unwrap();
+        let big = fs::File::create(root.join("big.bin")).unwrap();
+        big.set_len(MAX_BLOB_BYTES + 1).unwrap();
+        let walk = walk_local(&root).unwrap();
+        assert_eq!(walk.files.len(), 1);
+        assert_eq!(walk.failed.len(), 1);
+        assert!(walk.failed[0].detail.contains("limit"), "{:?}", walk.failed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_oversize_destination_is_not_read() {
+        let root = scratch("oversize-dest");
+        fs::create_dir(root.join("dest")).unwrap();
+        let big = fs::File::create(root.join("dest/big.bin")).unwrap();
+        big.set_len(MAX_BLOB_BYTES + 1).unwrap();
+        let error = read_existing(&root, "dest/big.bin").unwrap_err();
+        assert!(error.contains("limit"), "{error}");
         fs::remove_dir_all(root).unwrap();
     }
 

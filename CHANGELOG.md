@@ -4,7 +4,9 @@
   one way between a local path and a `remuda:///` prefix. Exactly one side is
   the store; missing or changed files are copied by size and SHA-256, and
   destination-only files are never deleted. Symlinks, special files and
-  non-UTF-8 names are skipped and named; local writes are temp-file + rename.
+  non-UTF-8 names are skipped and named; local writes are temp-file + rename
+  through a no-follow directory walk, so a symlink component cannot redirect
+  a write. A file over 64 MiB is a per-file failure and the rest continue.
   Exit 75 means stored here but not on every wanted node. `remuda drive sync`
   with no paths keeps the cluster index sync.
 - VFS: `remuda vfs ls` now lists a directory's immediate children: a
