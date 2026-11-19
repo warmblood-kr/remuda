@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub const MAX_REMOTE_WORKERS: usize = 8;
 pub const REMOTE_SYNC_TIMEOUT: Duration = Duration::from_secs(20);
@@ -19,6 +19,10 @@ const SELECTED_SYNC_SPACING: Duration = Duration::from_millis(150);
 const SELECTED_SYNC_WAIT: Duration = POLL_INTERVAL;
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// How long a node's last successful list survives failing collection. A blip
+/// keeps rows labelled stale; past this window they drop so old rows cannot
+/// pass for live ones. The poller retries every 2 s, backing off to 30 s.
+pub const REMOTE_RETENTION: Duration = Duration::from_secs(180);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RemoteState {
@@ -73,8 +77,25 @@ pub struct RemoteNodeSnapshot {
     pub name: String,
     pub state: RemoteState,
     pub last_sync_age: Option<Duration>,
+    /// Absolute wall-clock time of the last successful collection (UTC once
+    /// formatted); `None` means none ever succeeded. Display age is derived
+    /// from this, while retention uses the separate monotonic instant.
+    pub last_updated_at: Option<SystemTime>,
+    /// True once the monotonic `last_sync` is older than the node's retention
+    /// window: the retained sessions are dropped and the state reads
+    /// unreachable.
+    pub expired: bool,
     pub last_error: Option<String>,
     pub sessions: Vec<RemoteSessionSnapshot>,
+}
+
+impl RemoteNodeSnapshot {
+    /// Age of `last_updated_at` at `now`; a future timestamp (clock skew)
+    /// clamps to zero. `None` still means no collection ever succeeded.
+    pub fn last_updated_age_at(&self, now: SystemTime) -> Option<Duration> {
+        self.last_updated_at
+            .map(|at| now.duration_since(at).unwrap_or(Duration::ZERO))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -306,9 +327,15 @@ pub struct RemoteNode {
     name: String,
     state: RemoteState,
     sessions: Vec<RemoteSessionSnapshot>,
+    /// Monotonic collection time: retention and expiry are measured from this,
+    /// so a wall-clock jump cannot extend or cut the window.
     last_sync: Option<Instant>,
+    /// Absolute collection time: the canonical `last_updated_at` consumers see.
+    last_sync_wall: Option<SystemTime>,
     failure_count: u32,
     last_error: Option<String>,
+    /// How long the last successful list survives failing collections.
+    retention: Duration,
     next_poll: Instant,
     next_list: Instant,
     polling: bool,
@@ -330,13 +357,23 @@ impl RemoteNode {
             state: RemoteState::Unreachable,
             sessions: Vec::new(),
             last_sync: None,
+            last_sync_wall: None,
             failure_count: 0,
             last_error: None,
+            retention: REMOTE_RETENTION,
             next_poll: now,
             next_list: now,
             polling: false,
             published: (RemoteState::Unreachable, None, None),
         }
+    }
+
+    /// Keep the last successful list for `retention` instead of the default.
+    /// Callers may shorten it; tests use a short window to exercise expiry
+    /// without waiting three minutes.
+    pub fn with_retention(mut self, retention: Duration) -> Self {
+        self.retention = retention;
+        self
     }
 
     pub fn begin_poll(&mut self, now: Instant) -> bool {
@@ -351,13 +388,35 @@ impl RemoteNode {
     }
 
     pub fn poll_succeeded(&mut self, sessions: Vec<RemoteSessionSnapshot>, now: Instant) {
-        self.poll_delivered(sessions.into(), now, None);
+        self.poll_succeeded_at(sessions, now, SystemTime::now());
+    }
+
+    /// Record a successful collection with an explicit wall-clock instant.
+    /// Production passes `SystemTime::now()`; tests use a fixed value so the
+    /// absolute `last_updated_at` stays deterministic.
+    fn poll_succeeded_at(
+        &mut self,
+        sessions: Vec<RemoteSessionSnapshot>,
+        now: Instant,
+        wall_now: SystemTime,
+    ) {
+        self.poll_delivered_at(sessions.into(), now, wall_now, None);
     }
 
     /// Record a poll whose List succeeded. A selected session synced without
     /// error is polled again after the spacing; one whose read failed backs off
     /// like a failed poll (the fresh List is kept); anything else waits the interval.
     pub fn poll_delivered(&mut self, poll: RemotePoll, now: Instant, selected: Option<&str>) {
+        self.poll_delivered_at(poll, now, SystemTime::now(), selected);
+    }
+
+    fn poll_delivered_at(
+        &mut self,
+        poll: RemotePoll,
+        now: Instant,
+        wall_now: SystemTime,
+        selected: Option<&str>,
+    ) {
         let RemotePoll {
             sessions,
             selected_error,
@@ -372,6 +431,7 @@ impl RemoteNode {
         let follow = selected_session.is_some_and(|session| should_sync(Some(session)));
         self.sessions = sessions;
         self.last_sync = Some(now);
+        self.last_sync_wall = Some(wall_now);
         self.polling = false;
         self.state = RemoteState::Reachable;
         if let Some(error) = selected_error {
@@ -416,12 +476,13 @@ impl RemoteNode {
         self.last_error = reason;
         self.next_poll = now + retry_backoff(self.failure_count);
         self.polling = false;
+        // A known node stays *stale*, not unreachable, for as long as its last
+        // list is retained. The first blip used to flip a reachable node to
+        // "unreachable" within two failures and back on the next success;
+        // retention turns that flicker into one honest "stale" label, and
+        // `snapshot_at` escalates to unreachable only at the expiry boundary.
         self.state = if self.last_sync.is_some() {
-            if self.failure_count >= 2 {
-                RemoteState::Unreachable
-            } else {
-                RemoteState::Stale
-            }
+            RemoteState::Stale
         } else {
             RemoteState::Unreachable
         };
@@ -441,15 +502,30 @@ impl RemoteNode {
     }
 
     fn snapshot_at(&self, now: Instant) -> RemoteNodeSnapshot {
+        let last_sync_age = self
+            .last_sync
+            .map(|last| now.saturating_duration_since(last));
+        let expired = last_sync_age.is_some_and(|age| age >= self.retention);
         RemoteNodeSnapshot {
             registry_key: self.key.clone(),
             name: self.name.clone(),
-            state: self.state,
-            last_sync_age: self
-                .last_sync
-                .map(|last| now.saturating_duration_since(last)),
+            // Expiry is a display rule, not extra bookkeeping: the wall clock
+            // decides it every frame, so a stalled poller cannot keep old rows
+            // looking fresh.
+            state: if expired {
+                RemoteState::Unreachable
+            } else {
+                self.state
+            },
+            last_sync_age,
+            last_updated_at: self.last_sync_wall,
+            expired,
             last_error: self.last_error.clone(),
-            sessions: self.sessions.clone(),
+            sessions: if expired {
+                Vec::new()
+            } else {
+                self.sessions.clone()
+            },
         }
     }
 }
@@ -1200,8 +1276,11 @@ fn schedule_remote_poll(
                 selected => transport.poll_node(&target, selected, &previous).map(Some),
             };
             let now = Instant::now();
+            let wall_now = SystemTime::now();
             let _ = state.record(&target.registry_key, |node| match result {
-                Ok(Some(poll)) => node.poll_delivered(poll, now, selected_session.as_deref()),
+                Ok(Some(poll)) => {
+                    node.poll_delivered_at(poll, now, wall_now, selected_session.as_deref())
+                }
                 Ok(None) => node.poll_needs_list(now),
                 Err(error) => node.poll_failed_with_reason(now, Some(error.to_string())),
             });
@@ -1603,6 +1682,147 @@ mod tests {
             retry_at = node.retry_at();
         }
         assert_eq!(last_backoff, BACKOFF_MAX);
+    }
+
+    #[test]
+    fn a_blip_keeps_the_last_list_and_a_fresh_success_replaces_it() {
+        let start = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut node = RemoteNode::new("field-laptop", start);
+        node.poll_succeeded_at(vec![session("dev", "first")], start, wall);
+        let failed_at = start + Duration::from_secs(2);
+        assert!(node.begin_poll(failed_at));
+        node.poll_failed_with_reason(failed_at, Some("timed out".into()));
+
+        let stale = node.snapshot_at(start + Duration::from_secs(3));
+        assert_eq!(stale.state, RemoteState::Stale);
+        assert!(!stale.expired);
+        assert_eq!(stale.last_updated_at, Some(wall));
+        assert_eq!(stale.sessions.len(), 1, "the last good list is kept");
+        assert_eq!(stale.sessions[0].name, "dev");
+
+        let fresh_at = start + Duration::from_secs(4);
+        let fresh_wall = wall + Duration::from_secs(4);
+        assert!(node.begin_poll(fresh_at));
+        node.poll_succeeded_at(vec![session("proof", "second")], fresh_at, fresh_wall);
+        let fresh = node.snapshot_at(fresh_at);
+        assert_eq!(fresh.state, RemoteState::Reachable);
+        assert_eq!(fresh.last_updated_at, Some(fresh_wall));
+        assert_eq!(fresh.sessions.len(), 1, "a fresh list replaces, not merges");
+        assert_eq!(fresh.sessions[0].name, "proof");
+        assert!(fresh.last_error.is_none());
+    }
+
+    #[test]
+    fn an_empty_success_is_not_a_failed_collection() {
+        let start = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut empty = RemoteNode::new("quiet", start);
+        empty.poll_succeeded_at(Vec::new(), start, wall);
+        let answered = empty.snapshot_at(start + Duration::from_secs(1));
+        assert_eq!(answered.state, RemoteState::Reachable);
+        assert_eq!(answered.last_updated_at, Some(wall));
+        assert!(answered.sessions.is_empty());
+        assert!(!answered.expired);
+
+        let mut silent = RemoteNode::new("silent", start);
+        assert!(silent.begin_poll(start));
+        silent.poll_failed_with_reason(start, Some("connection refused".into()));
+        let failed = silent.snapshot_at(start + Duration::from_secs(1));
+        assert_eq!(failed.state, RemoteState::Unreachable);
+        assert_eq!(failed.last_updated_at, None, "no collection ever succeeded");
+        assert_eq!(failed.last_error.as_deref(), Some("connection refused"));
+    }
+
+    #[test]
+    fn last_updated_at_is_absolute_and_age_clamps_future_or_missing() {
+        let start = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut node = RemoteNode::new("clocked", start);
+        node.poll_succeeded_at(Vec::new(), start, wall);
+        let snapshot = node.snapshot_at(start);
+        assert_eq!(snapshot.last_updated_at, Some(wall));
+        assert_eq!(
+            snapshot.last_updated_age_at(wall + Duration::from_secs(5)),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            snapshot.last_updated_age_at(wall - Duration::from_secs(60)),
+            Some(Duration::ZERO),
+            "a future timestamp (clock skew) must clamp to zero, not panic"
+        );
+
+        let silent = RemoteNode::new("silent", start).snapshot_at(start);
+        assert_eq!(silent.last_updated_at, None);
+        assert_eq!(silent.last_updated_age_at(wall), None);
+    }
+
+    #[test]
+    fn retained_rows_expire_at_the_window_and_only_a_success_brings_them_back() {
+        let start = Instant::now();
+        let retention = Duration::from_secs(30);
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut node = RemoteNode::new("field-laptop", start).with_retention(retention);
+        node.poll_succeeded_at(vec![session("dev", "frame")], start, wall);
+        let failed_at = start + Duration::from_secs(2);
+        assert!(node.begin_poll(failed_at));
+        node.poll_failed(failed_at);
+
+        let before = node.snapshot_at(start + retention - Duration::from_secs(1));
+        assert_eq!(before.state, RemoteState::Stale);
+        assert!(!before.expired);
+        assert_eq!(before.sessions.len(), 1);
+
+        let expired = node.snapshot_at(start + retention);
+        assert!(expired.expired);
+        assert_eq!(expired.state, RemoteState::Unreachable);
+        assert!(
+            expired.sessions.is_empty(),
+            "expired rows must not pass for live rows"
+        );
+        assert_eq!(expired.last_updated_at, Some(wall));
+        assert_eq!(expired.last_sync_age, Some(retention));
+
+        let later = start + retention + Duration::from_secs(1);
+        assert!(node.begin_poll(later));
+        node.poll_failed(later);
+        assert!(
+            node.snapshot_at(later + Duration::from_secs(1))
+                .sessions
+                .is_empty(),
+            "a later failure does not resurrect expired rows"
+        );
+    }
+
+    #[test]
+    fn a_new_node_identity_does_not_inherit_the_old_nodes_list() {
+        let start = Instant::now();
+        let state = RemoteTreeState::default();
+        let mut old = RemoteNode::with_key("old-fingerprint".into(), "laptop".into(), start);
+        old.poll_succeeded(vec![session("dev", "frame")], start);
+        state.insert_node(old);
+
+        let mut targets = Vec::new();
+        reconcile_registry_targets(
+            &state,
+            &mut targets,
+            vec![RemoteTarget {
+                name: "laptop".into(),
+                registry_key: "new-fingerprint".into(),
+                addr_override: None,
+            }],
+        );
+        let snapshot = state.snapshot_at(start + Duration::from_secs(1));
+        assert_eq!(snapshot.nodes.len(), 1);
+        assert_eq!(snapshot.nodes[0].registry_key, "new-fingerprint");
+        assert_eq!(
+            snapshot.nodes[0].last_updated_at, None,
+            "a new identity starts with no data"
+        );
+        assert!(
+            snapshot.nodes[0].sessions.is_empty(),
+            "old rows must not retarget the new identity"
+        );
     }
 
     #[test]
