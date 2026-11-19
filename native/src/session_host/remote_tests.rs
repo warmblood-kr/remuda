@@ -647,6 +647,45 @@ fn teardown_retires_an_entry_whose_host_was_stopped_before_a_crash() {
         .contains_key("synthetic"));
 }
 
+/// The host dies with no exit published (panic, poisoned reader, SIGKILL) and
+/// nothing left to settle: teardown must retire the entry, or its name is held
+/// forever.
+#[test]
+fn teardown_retires_an_entry_whose_host_died_without_an_exit() {
+    let mut fixture = Fixture::new();
+    let session = adapter(&fixture.root);
+    assert!(matches!(
+        session.owner.index().unwrap().entries["synthetic"].phase,
+        Phase::Registered
+    ));
+    // The host process dies hard: no Stop, no exit publication.
+    let host = fixture.host.as_mut().unwrap();
+    host.0.kill().unwrap();
+    let _ = host.0.wait();
+    eventually(
+        "endpoint refuses",
+        || match std::os::unix::net::UnixStream::connect(session.endpoint.join("socket")) {
+            Ok(_) => None,
+            Err(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            )
+            .then_some(()),
+        },
+    );
+    let fresh = adapter(&fixture.root);
+    fresh.teardown(Duration::from_secs(10)).unwrap();
+    assert!(
+        !fresh
+            .owner
+            .index()
+            .unwrap()
+            .entries
+            .contains_key("synthetic"),
+        "a host that died without publishing an exit left its entry behind"
+    );
+}
+
 #[test]
 fn a_reclaim_fences_a_newer_claimant_at_the_store_and_at_the_host() {
     use crate::session_host::hosted::Hosting;

@@ -316,8 +316,23 @@ impl HostSession {
             return Ok(true);
         }
         if !matches!(entry.phase, Phase::Exited { .. }) {
-            // A gone host never publishes an exit; nothing more can settle.
-            return Ok(self.host_gone());
+            // A gone host never publishes an exit, and the store refuses a
+            // plain Retire without one, so the entry would hold its name
+            // forever. Retire it here when the listener is really absent and
+            // nothing is left to settle; a pending act or an unacked result is
+            // not ours to drop, so those stay and the caller reports them.
+            if !self.host_gone() {
+                return Ok(false);
+            }
+            let keep =
+                entry.pending.is_some() || entry.streams.iter().any(|s| !s.results.is_empty());
+            let target = self.target();
+            drop(index);
+            if keep {
+                return Ok(false);
+            }
+            self.owner.retire_absent(target).map_err(store)?;
+            return Ok(true);
         }
         if let Some(pending) = &entry.pending {
             self.owner
