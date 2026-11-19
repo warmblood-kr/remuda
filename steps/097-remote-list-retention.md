@@ -31,8 +31,13 @@ with no inherited rows.
   `expired`. `Some` with no sessions is a successful empty answer; `None` means
   no collection ever succeeded. Display age is derived from it at render time;
   a future timestamp from a clock adjustment clamps to `0s`.
-- Retention and expiry use a separate monotonic `Instant`, so a wall-clock jump
-  cannot change the window.
+- Retention and expiry use a separate monotonic `Instant`, plus the absolute
+  collection time as a second bound. While the machine runs the monotonic
+  window is authoritative; across suspend (where the monotonic clock stalls on
+  some platforms) or a forward wall jump the older absolute time expires the
+  rows early. A backward jump can never extend the monotonic window. This is
+  deliberately fail-closed: retained rows never authorize an action, and a
+  forward jump only hides rows until the next poll succeeds.
 - A failed poll keeps `Stale` while the list is retained; at or past retention
   `snapshot_at` reports `Unreachable`, clears `sessions`, and keeps the
   absolute timestamp so the row can say how old the data is.

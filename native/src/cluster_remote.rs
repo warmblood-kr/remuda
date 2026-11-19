@@ -328,7 +328,7 @@ pub struct RemoteNode {
     state: RemoteState,
     sessions: Vec<RemoteSessionSnapshot>,
     /// Monotonic collection time: retention and expiry are measured from this,
-    /// so a wall-clock jump cannot extend or cut the window.
+    /// so a backward wall-clock jump cannot extend the window.
     last_sync: Option<Instant>,
     /// Absolute collection time: the canonical `last_updated_at` consumers see.
     last_sync_wall: Option<SystemTime>,
@@ -502,10 +502,29 @@ impl RemoteNode {
     }
 
     fn snapshot_at(&self, now: Instant) -> RemoteNodeSnapshot {
+        self.snapshot_at_wall(now, None)
+    }
+
+    /// Snapshot against an optional wall clock. Production passes
+    /// `SystemTime::now()`; tests may pass a fixed pair to model suspend and
+    /// clock jumps deterministically.
+    fn snapshot_at_wall(&self, now: Instant, wall_now: Option<SystemTime>) -> RemoteNodeSnapshot {
         let last_sync_age = self
             .last_sync
             .map(|last| now.saturating_duration_since(last));
-        let expired = last_sync_age.is_some_and(|age| age >= self.retention);
+        // The monotonic clock is authoritative while the machine runs, but it
+        // stalls across suspend on some platforms, so the absolute collection
+        // time also bounds retention. A forward jump expires early (fail
+        // closed); a backward one can never extend past the monotonic window.
+        let wall_expired = self
+            .last_sync_wall
+            .zip(wall_now)
+            .is_some_and(|(last, wall_now)| {
+                wall_now
+                    .duration_since(last)
+                    .is_ok_and(|age| age >= self.retention)
+            });
+        let expired = last_sync_age.is_some_and(|age| age >= self.retention) || wall_expired;
         RemoteNodeSnapshot {
             registry_key: self.key.clone(),
             name: self.name.clone(),
@@ -600,11 +619,24 @@ impl RemoteTreeState {
             .collect();
         RemoteSnapshot { nodes }
     }
+
+    /// Snapshot every node against an explicit wall clock; suspend and a
+    /// forward clock jump age rows out even when the monotonic clock stalled.
+    pub fn snapshot_at_wall(&self, now: Instant, wall_now: SystemTime) -> RemoteSnapshot {
+        let nodes = self
+            .nodes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|node| node.snapshot_at_wall(now, Some(wall_now)))
+            .collect();
+        RemoteSnapshot { nodes }
+    }
 }
 
 impl RemoteSource for RemoteTreeState {
     fn snapshot(&self) -> RemoteSnapshot {
-        self.snapshot_at(Instant::now())
+        self.snapshot_at_wall(Instant::now(), SystemTime::now())
     }
 
     fn generation(&self) -> u64 {
@@ -1791,6 +1823,67 @@ mod tests {
                 .sessions
                 .is_empty(),
             "a later failure does not resurrect expired rows"
+        );
+    }
+
+    #[test]
+    fn a_suspend_or_forward_wall_jump_expires_rows_the_monotonic_clock_missed() {
+        let start = Instant::now();
+        let retention = Duration::from_secs(30);
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut node = RemoteNode::new("field-laptop", start).with_retention(retention);
+        node.poll_succeeded_at(vec![session("dev", "frame")], start, wall);
+
+        let awake = node.snapshot_at_wall(
+            start + Duration::from_secs(2),
+            Some(wall + Duration::from_secs(2)),
+        );
+        assert!(!awake.expired);
+        assert_eq!(awake.state, RemoteState::Reachable);
+        assert_eq!(awake.sessions.len(), 1);
+
+        // Suspend: the monotonic clock advances a few seconds, wall time hours.
+        let slept = node.snapshot_at_wall(
+            start + Duration::from_secs(3),
+            Some(wall + Duration::from_secs(8 * 3600)),
+        );
+        assert!(slept.expired, "hours-old rows must not pass for live rows");
+        assert_eq!(slept.state, RemoteState::Unreachable);
+        assert!(slept.sessions.is_empty());
+        assert_eq!(slept.last_updated_at, Some(wall));
+
+        // A forward clock jump past the window also expires early, fail closed.
+        let jumped = node.snapshot_at_wall(
+            start + Duration::from_secs(2),
+            Some(wall + retention + Duration::from_secs(1)),
+        );
+        assert!(jumped.expired);
+    }
+
+    #[test]
+    fn a_backward_wall_jump_cannot_extend_the_monotonic_window() {
+        let start = Instant::now();
+        let retention = Duration::from_secs(30);
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut node = RemoteNode::new("field-laptop", start).with_retention(retention);
+        node.poll_succeeded_at(vec![session("dev", "frame")], start, wall);
+
+        let behind = node.snapshot_at_wall(
+            start + Duration::from_secs(1),
+            Some(wall - Duration::from_secs(3600)),
+        );
+        assert!(!behind.expired, "a backward jump does not expire or extend");
+        assert_eq!(behind.sessions.len(), 1);
+        assert_eq!(
+            behind.last_updated_age_at(wall - Duration::from_secs(3600)),
+            Some(Duration::ZERO)
+        );
+
+        let expired =
+            node.snapshot_at_wall(start + retention, Some(wall - Duration::from_secs(3600)));
+        assert!(
+            expired.expired,
+            "the monotonic window still expires rows after a backward jump"
         );
     }
 
