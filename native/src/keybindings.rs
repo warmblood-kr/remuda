@@ -9,11 +9,13 @@ pub const LIST_CONTEXT: &str = "session.list.browse";
 pub const TOGGLE_LIST: &str = "session.toggle_list";
 /// Open the line composer for the selected session.
 pub const COMPOSE: &str = "session.compose";
+/// Open the read-only pending-permission list.
+pub const PERMISSIONS: &str = "session.permissions";
 
 /// The single native capability catalog. Keys and help belong to Lua.
 fn validate(context: &str, key: &str, action: Option<&str>) -> Result<String, String> {
     let actions: &[&str] = match context {
-        LIST_CONTEXT => &[TOGGLE_LIST, COMPOSE],
+        LIST_CONTEXT => &[TOGGLE_LIST, COMPOSE, PERMISSIONS],
         "cluster.tree" => &[
             "cluster.detach",
             "cluster.close",
@@ -493,6 +495,7 @@ mod tests {
         lua().load(r#"
             remuda.unbind('session.list.browse', 'l')
             remuda.unbind('session.list.browse', 'm')
+            remuda.unbind('session.list.browse', 'a')
             local before = remuda.keymap_snapshot().generation
             for _, help in ipairs({'bad\0help', 'bad\27help', 'bad\194\128help', 'bad\194\159help'}) do
                 local ok = pcall(remuda.define_key, {context='session.list.browse', key='z', action='session.toggle_list', help=help})
@@ -672,7 +675,7 @@ mod native_tests {
         );
         let wire = lua.load("local s=remuda.keymap_snapshot(); s.rows=remuda.json.array(s.rows); return remuda.json.encode(s)").eval::<String>().unwrap();
         let map = Snapshot::from_json(&wire).unwrap();
-        assert_eq!(map.help(LIST_CONTEXT), "m message   l list");
+        assert_eq!(map.help(LIST_CONTEXT), "m message   a approvals   l list");
     }
 
     #[test]

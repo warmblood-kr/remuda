@@ -26,7 +26,13 @@ use remuda_core::Size;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use crate::native_permissions::Scan;
+use crate::permission_overlay::Overlay;
 
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -175,6 +181,14 @@ pub struct Ui {
     compose_target: Option<(String, String)>,
     /// Unsent drafts of other sessions, kept when the composer moves away.
     compose_drafts: HashMap<String, String>,
+    /// Read-only pending permissions overlay; `None` when closed.
+    permissions: Option<Overlay>,
+    permissions_loading: bool,
+    permissions_error: Option<String>,
+    permissions_rx: Option<mpsc::Receiver<Scan>>,
+    /// Set when the overlay closes, so a scan in flight stops early instead of
+    /// asking every remaining binding for a list nobody will read.
+    permissions_cancel: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -233,6 +247,11 @@ impl Ui {
             composer: Default::default(),
             compose_target: None,
             compose_drafts: HashMap::new(),
+            permissions: None,
+            permissions_loading: false,
+            permissions_error: None,
+            permissions_rx: None,
+            permissions_cancel: None,
         }
     }
 
@@ -352,6 +371,12 @@ impl Ui {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
+        // Defence in depth for the modal list: whatever still holds focus, a
+        // key pressed while the overlay is open belongs to the overlay, never
+        // to a session's pty.
+        if self.permissions_open() {
+            return self.permissions_key(key);
+        }
         let selected = self.selected;
         // Whatever left focus on the list, step from the viewport that is drawn.
         if self.focus == Focus::List && self.list_first_visible.is_some() {
@@ -378,6 +403,12 @@ impl Ui {
     /// another one already has focus. A press in the session pane forwards
     /// as a real click to the child instead. See steps/030.
     pub fn on_mouse(&mut self, event: MouseEvent, cols: u16, rows: u16) -> Action {
+        // The permissions overlay is modal and read-only: a click must not
+        // move keyboard focus to a session behind it, or the next keystroke
+        // would be typed into that session's pty unseen.
+        if self.permissions_open() {
+            return Action::Nothing;
+        }
         if self.daemon_gone.is_some() {
             return Action::Nothing;
         }
@@ -684,9 +715,120 @@ impl Ui {
         if self.toggle_list_key(key) {
             return Some(Action::Nothing);
         }
+        if self.keymap.resolve(crate::keybindings::LIST_CONTEXT, key)
+            == Some(crate::keybindings::PERMISSIONS)
+        {
+            self.toggle_permissions();
+            return Some(Action::Nothing);
+        }
         (self.keymap.resolve(crate::keybindings::LIST_CONTEXT, key)
             == Some(crate::keybindings::COMPOSE))
         .then(|| self.open_composer())
+    }
+
+    fn permissions_open(&self) -> bool {
+        self.permissions.is_some() || self.permissions_loading || self.permissions_error.is_some()
+    }
+
+    /// Close the overlay and stop any scan still running for it.
+    fn close_permissions(&mut self) {
+        if let Some(cancel) = self.permissions_cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        self.permissions = None;
+        self.permissions_loading = false;
+        self.permissions_error = None;
+        self.permissions_rx = None;
+    }
+
+    /// Toggle the read-only list. Opening starts one background scan; the
+    /// overlay never sends a decision.
+    fn toggle_permissions(&mut self) {
+        if self.permissions_open() {
+            self.close_permissions();
+            return;
+        }
+        self.refresh_permissions();
+    }
+
+    fn refresh_permissions(&mut self) {
+        if self.permissions_rx.is_some() {
+            return;
+        }
+        self.permissions_loading = true;
+        self.permissions_error = None;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.permissions_cancel = Some(cancel.clone());
+        let (tx, rx) = mpsc::channel();
+        self.permissions_rx = Some(rx);
+        std::thread::spawn(move || {
+            let scan = crate::native_permissions::default_root()
+                .map(|root| {
+                    crate::native_permissions::scan_cancellable(&root, Some(cancel.as_ref()))
+                })
+                .unwrap_or_else(|| {
+                    crate::native_permissions::scan(Path::new("/nonexistent/bindings"))
+                });
+            let _ = tx.send(scan);
+        });
+    }
+
+    /// Receive one finished scan. Returns true when the frame changed.
+    fn poll_permissions(&mut self) -> bool {
+        let result = self.permissions_rx.as_ref().map(|rx| rx.try_recv());
+        match result {
+            Some(Ok(scan)) => {
+                self.permissions = Some(Overlay::new(scan));
+                self.permissions_loading = false;
+                self.permissions_rx = None;
+                self.permissions_cancel = None;
+                true
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.permissions_loading = false;
+                self.permissions_error = Some("permission scan stopped".into());
+                self.permissions_rx = None;
+                self.permissions_cancel = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn permissions_key(&mut self, key: KeyEvent) -> Action {
+        // The overlay takes every key, so the one global escape hatch has to
+        // be honoured here too: a modal list must never trap the terminal.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        {
+            return Action::Quit;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_permissions(),
+            KeyCode::Char('r') => self.refresh_permissions(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(overlay) = self.permissions.as_mut() {
+                    overlay.move_selection(1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(overlay) = self.permissions.as_mut() {
+                    overlay.move_selection(-1);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(overlay) = self.permissions.as_mut() {
+                    overlay.move_selection(10);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(overlay) = self.permissions.as_mut() {
+                    overlay.move_selection(-10);
+                }
+            }
+            _ => {}
+        }
+        Action::Nothing
     }
 
     fn toggle_list_key(&mut self, key: KeyEvent) -> bool {
@@ -700,6 +842,8 @@ impl Ui {
     }
 
     fn browse_key(&mut self, key: KeyEvent) -> Action {
+        // The modal permissions list is handled in `on_key`; this map only
+        // runs while the list is free to act.
         if self.daemon_gone.is_some() {
             return match key.code {
                 KeyCode::Char('r') | KeyCode::Char('R') => Action::Restart,
@@ -708,46 +852,7 @@ impl Ui {
             };
         }
         if self.visual {
-            if self.visual_g_pending {
-                self.visual_g_pending = false;
-                if key.code == KeyCode::Char('g') {
-                    self.move_visual_to(TextPoint { row: 0, col: 0 });
-                    return Action::Nothing;
-                }
-            }
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.leave_visual(),
-                // Yank and leave in one key; with no anchor there is nothing
-                // to copy, so it only leaves (tmux's copy-selection-and-cancel).
-                KeyCode::Char('y') => {
-                    let anchored = self.anchored();
-                    self.visual = false;
-                    self.selecting_text = false;
-                    if anchored {
-                        return self.copy_action();
-                    }
-                    self.text_selection = None;
-                }
-                KeyCode::Char('v') if self.anchored() => self.text_selection = None,
-                KeyCode::Char('v') | KeyCode::Char(' ') => self.anchor_visual(),
-                KeyCode::Char('h') | KeyCode::Left => self.move_visual(-1, 0),
-                KeyCode::Char('j') | KeyCode::Down => self.move_visual(0, 1),
-                KeyCode::Char('k') | KeyCode::Up => self.move_visual(0, -1),
-                KeyCode::Char('l') | KeyCode::Right => self.move_visual(1, 0),
-                KeyCode::Char('0') => self.move_visual_to(TextPoint {
-                    row: self.visual_line_start_row(self.visual_cursor.row),
-                    col: 0,
-                }),
-                KeyCode::Char('$') => self.visual_line_end(),
-                KeyCode::Char('^') => self.visual_first_nonblank(),
-                KeyCode::Char('w') => self.visual_word_forward(),
-                KeyCode::Char('b') => self.visual_word_backward(),
-                KeyCode::Char('e') => self.visual_word_end(),
-                KeyCode::Char('g') => self.visual_g_pending = true,
-                KeyCode::Char('G') => self.visual_bottom(),
-                _ => {}
-            }
-            return Action::Nothing;
+            return self.visual_key(key);
         }
         if let Some(action) = self.list_binding(key) {
             return action;
@@ -801,6 +906,51 @@ impl Ui {
             KeyCode::Enter | KeyCode::Char('i') => self.focus_session(),
             _ => Action::Nothing,
         }
+    }
+
+    /// Visual mode's keys, split out so neither this map nor `browse_key`
+    /// grows past the unit-shape limits CI enforces.
+    fn visual_key(&mut self, key: KeyEvent) -> Action {
+        if self.visual_g_pending {
+            self.visual_g_pending = false;
+            if key.code == KeyCode::Char('g') {
+                self.move_visual_to(TextPoint { row: 0, col: 0 });
+                return Action::Nothing;
+            }
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.leave_visual(),
+            // Yank and leave in one key; with no anchor there is nothing
+            // to copy, so it only leaves (tmux's copy-selection-and-cancel).
+            KeyCode::Char('y') => {
+                let anchored = self.anchored();
+                self.visual = false;
+                self.selecting_text = false;
+                if anchored {
+                    return self.copy_action();
+                }
+                self.text_selection = None;
+            }
+            KeyCode::Char('v') if self.anchored() => self.text_selection = None,
+            KeyCode::Char('v') | KeyCode::Char(' ') => self.anchor_visual(),
+            KeyCode::Char('h') | KeyCode::Left => self.move_visual(-1, 0),
+            KeyCode::Char('j') | KeyCode::Down => self.move_visual(0, 1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_visual(0, -1),
+            KeyCode::Char('l') | KeyCode::Right => self.move_visual(1, 0),
+            KeyCode::Char('0') => self.move_visual_to(TextPoint {
+                row: self.visual_line_start_row(self.visual_cursor.row),
+                col: 0,
+            }),
+            KeyCode::Char('$') => self.visual_line_end(),
+            KeyCode::Char('^') => self.visual_first_nonblank(),
+            KeyCode::Char('w') => self.visual_word_forward(),
+            KeyCode::Char('b') => self.visual_word_backward(),
+            KeyCode::Char('e') => self.visual_word_end(),
+            KeyCode::Char('g') => self.visual_g_pending = true,
+            KeyCode::Char('G') => self.visual_bottom(),
+            _ => {}
+        }
+        Action::Nothing
     }
 
     fn copy_action(&self) -> Action {
@@ -1496,8 +1646,10 @@ mod visual_mode_tests {
     //! Visual mode on the tmux copy-mode-vi model: `v` gives a movable
     //! cursor and no selection; `v`/Space anchors; motions extend; `y` yanks
     //! and leaves; Esc/`q` cancel; `v` while anchored clears the anchor.
-    use super::{capture_styled, selected_screen_text, Action, TextPoint, Ui};
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use super::{capture_styled, selected_screen_text, Action, Focus, TextPoint, Ui};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use remuda_core::agent::{Cursor, StyledCell};
     use remuda_core::{SessionSummary, Size};
     use std::time::Duration;
@@ -1926,6 +2078,123 @@ mod visual_mode_tests {
         press(&mut ui, "v");
         assert!(super::render(&ui, "hello world", "s", 120, 30).contains("visual: selecting"));
     }
+
+    fn permission_scan(
+        rows: Vec<crate::native_permissions::Row>,
+        unavailable: bool,
+    ) -> crate::native_permissions::Scan {
+        let mut bindings = vec![crate::native_permissions::BindingStatus {
+            session: "agent".into(),
+            status: "ok",
+            reason: None,
+        }];
+        if unavailable {
+            bindings.push(crate::native_permissions::BindingStatus {
+                session: "stale".into(),
+                status: "unavailable",
+                reason: Some("server_pid"),
+            });
+        }
+        crate::native_permissions::Scan { bindings, rows }
+    }
+
+    fn permission_row(id: &str, action: &str) -> crate::native_permissions::Row {
+        crate::native_permissions::Row {
+            id: id.into(),
+            session: "agent".into(),
+            opencode_session: "ses_abc".into(),
+            action: action.into(),
+            resources: vec!["echo hi".into()],
+            message: None,
+            status: "pending",
+            decision: "once | reject",
+        }
+    }
+
+    #[test]
+    fn permissions_overlay_renders_a_read_only_list() {
+        let mut ui = ui();
+        ui.permissions = Some(crate::permission_overlay::Overlay::new(permission_scan(
+            vec![permission_row("per_1", "bash")],
+            false,
+        )));
+        let frame = super::render(&ui, "hello world", "s", 100, 30);
+        assert!(frame.contains("Permissions (read-only)"));
+        assert!(frame.contains("per_1"));
+        assert!(frame.contains("read-only (no approval)"));
+        assert!(!frame.contains("password"));
+    }
+
+    #[test]
+    fn permissions_unavailable_is_not_an_empty_list() {
+        let mut ui = ui();
+        ui.permissions = Some(crate::permission_overlay::Overlay::new(permission_scan(
+            Vec::new(),
+            true,
+        )));
+        let frame = super::render(&ui, "hello world", "s", 100, 30);
+        assert!(frame.contains("unavailable"));
+        assert!(!frame.contains("No pending permission requests"));
+    }
+
+    #[test]
+    fn permissions_keys_move_and_close() {
+        let mut ui = ui();
+        ui.permissions = Some(crate::permission_overlay::Overlay::new(permission_scan(
+            vec![
+                permission_row("per_1", "bash"),
+                permission_row("per_2", "edit"),
+            ],
+            false,
+        )));
+        ui.permissions_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(ui.permissions.as_ref().unwrap().selected(), 1);
+        ui.permissions_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!ui.permissions_open());
+    }
+
+    #[test]
+    fn permissions_overlay_still_quits_on_ctrl_c() {
+        let mut ui = ui();
+        ui.permissions = Some(crate::permission_overlay::Overlay::new(permission_scan(
+            vec![permission_row("per_1", "bash")],
+            false,
+        )));
+        let action = ui.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(action, Action::Quit);
+        assert!(
+            ui.permissions_open(),
+            "quitting must not depend on closing first"
+        );
+    }
+
+    #[test]
+    fn permissions_overlay_is_modal_for_the_mouse() {
+        let mut ui = ui();
+        ui.focus = Focus::List;
+        ui.permissions = Some(crate::permission_overlay::Overlay::new(permission_scan(
+            vec![permission_row("per_1", "bash")],
+            false,
+        )));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(ui.on_mouse(click, 100, 30), Action::Nothing);
+        assert_eq!(
+            ui.focus,
+            Focus::List,
+            "a click must not focus a hidden session"
+        );
+        assert!(ui.permissions_open());
+        // Even if focus somehow moved, the key must not reach a pty.
+        ui.focus = Focus::Session;
+        let action = ui.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(action, Action::Nothing);
+        assert_eq!(ui.permissions.as_ref().unwrap().selected(), 0);
+    }
 }
 
 #[cfg(test)]
@@ -2066,6 +2335,9 @@ fn fit(text: &str, width: u16) -> String {
 /// The whole frame as one string of text and ANSI cursor moves. Pure on
 /// purpose: this is the part a test can read without owning a terminal.
 pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> String {
+    if ui.permissions_open() {
+        return render_permissions(ui, cols, rows);
+    }
     let (list_w, preview_w) = ui_layout(ui, cols);
     let body = rows.saturating_sub(1);
     // The border, and the only thing on screen that is always saying where the
@@ -2104,6 +2376,46 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
 
     out.push_str(&format!("\x1b[{};1H", rows));
     out.push_str(&footer(ui, server, cut, preview_w, cols));
+    out
+}
+
+/// The read-only permissions frame. It shares the same cursor-move protocol as
+/// `render`, so tests can read it without a terminal.
+fn render_permissions(ui: &Ui, cols: u16, rows: u16) -> String {
+    let height = rows.saturating_sub(1) as usize;
+    let mut lines: Vec<String> = vec!["Permissions (read-only)".into()];
+    if let Some(error) = &ui.permissions_error {
+        lines.push(format!("error: {error}"));
+    }
+    if let Some(overlay) = &ui.permissions {
+        lines.push(overlay.summary());
+        lines.push(String::new());
+        let list_height = height.saturating_sub(lines.len() + 8).clamp(1, 64);
+        lines.extend(overlay.lines(list_height, cols as usize));
+        if !overlay.is_empty() {
+            // A partial list must say which bindings are missing from it.
+            lines.extend(overlay.unavailable_lines(3));
+        }
+        lines.push(String::new());
+        lines.extend(overlay.detail());
+    } else if ui.permissions_loading {
+        lines.push("Loading pending permissions...".into());
+    }
+    if ui.permissions_loading && ui.permissions.is_some() {
+        lines.push("(refreshing)".into());
+    }
+    let mut out = String::from("\x1b[H\x1b[2J");
+    for (row, line) in lines.iter().take(height).enumerate() {
+        out.push_str(&format!("\x1b[{};1H{}", row + 1, fit(line, cols)));
+    }
+    out.push_str(&format!(
+        "\x1b[{};1H{}",
+        rows,
+        fit(
+            "Esc close · j/k move · r refresh · read-only (no approval)",
+            cols
+        )
+    ));
     out
 }
 
@@ -2726,6 +3038,7 @@ fn refresh<P: SessionPort + ?Sized>(
     skip_list: bool,
     selection_moved: bool,
 ) -> std::io::Result<(u16, u16)> {
+    let _ = ui.poll_permissions();
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     ui.node_stale = path.staleness().filter(|age| *age > STALE_AFTER);
     ui.preview_rows = rows.saturating_sub(1).max(1);
