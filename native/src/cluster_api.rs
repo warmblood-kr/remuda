@@ -989,8 +989,8 @@ mod tests {
             "a peer listing must not publish an agent title: {json}"
         );
         assert!(
-            json.contains("program_status_last_updated_at_ms"),
-            "the report time is listing metadata like the age: {json}"
+            !json.contains("program_status_last_updated_at_ms"),
+            "the report time must not reach the wire at all: {json}"
         );
     }
 

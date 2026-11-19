@@ -112,10 +112,10 @@ pub struct SessionSummary {
     /// client and JSON listings cannot republish an agent's own words.
     #[serde(skip)]
     pub program_title: Option<String>,
-    /// UTC Unix timestamp (ms) of the report behind `program_status`; the age
-    /// is derived from it at every render. Local listing data: the peer path
-    /// withholds it with the status and title.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// UTC Unix timestamp (ms) of the report behind `program_status`; display
+    /// only, and never serialized. The peer path cannot receive it even before
+    /// a sanitiser runs; freshness uses the monotonic age, never this value.
+    #[serde(skip)]
     pub program_status_last_updated_at_ms: Option<u64>,
     /// Age at copy time, derived from `program_status_last_updated_at_ms`.
     /// Compatibility value only: re-derive from the timestamp when rendering,
