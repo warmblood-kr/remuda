@@ -63,9 +63,11 @@ const LOCAL_VIEW_TTL: Duration = Duration::from_secs(30);
 const LOCAL_VIEW_REFRESH: Duration = Duration::from_secs(1);
 
 /// Remote rendered views are display-only and refresh more slowly than the
-/// local daemon. A failed view keeps the last valid one until this TTL.
+/// local daemon. A failed view keeps the last valid one for as long as its
+/// rows still match the node's retained list; the node's retention window,
+/// not a separate view TTL, decides when a view and its rows expire. A fresh
+/// success replaces the view on the next refresh.
 const REMOTE_VIEW_WIDTH: u16 = 48;
-const REMOTE_VIEW_TTL: Duration = Duration::from_secs(5);
 const REMOTE_VIEW_REFRESH: Duration = Duration::from_secs(2);
 const REMOTE_VIEW_RETRY_BASE: Duration = Duration::from_secs(1);
 const REMOTE_VIEW_RETRY_MAX: Duration = Duration::from_secs(30);
@@ -125,6 +127,20 @@ pub fn status_glyph(state: RemoteState) -> char {
         RemoteState::Stale => '?',
         RemoteState::Reconnecting => '~',
         RemoteState::Unreachable => 'x',
+    }
+}
+
+/// The status cell for a node row: the state glyph, plus how old the retained
+/// list is when the node is not reachable. The age is what makes a stale row
+/// honest instead of a live-looking row with a different glyph.
+fn remote_node_status(node: &RemoteNodeSnapshot) -> String {
+    let glyph = status_glyph(node.state);
+    match (node.state, node.last_sync_age) {
+        (RemoteState::Stale, Some(age)) => format!("{glyph} {}s", age.as_secs()),
+        (RemoteState::Unreachable, Some(age)) if node.expired => {
+            format!("{glyph} {}s", age.as_secs())
+        }
+        _ => glyph.to_string(),
     }
 }
 
@@ -636,6 +652,16 @@ impl ClusterUi {
             self.remote_session(selection)
                 .is_some_and(|(_, session)| session.alive)
         });
+        // A composer target is an authorization to send: once the exact
+        // session is gone (removal, instance change or retention expiry) the
+        // target is stale and must not be reused for a later key.
+        let composer_target = self.remote_composer_target.clone();
+        if composer_target.is_some_and(|(node, _, _, wire_name, instance_id)| {
+            !self.has_remote_session(&node, &wire_name, &instance_id)
+        }) {
+            self.remote_composer_target = None;
+            self.composer_focused = false;
+        }
         self.retain_remote_views();
     }
 
@@ -681,17 +707,17 @@ impl ClusterUi {
 
     /// Returns whether the reply produced a usable view. A `false` result makes
     /// the loader back off so invalid responses are not retried every tick.
+    /// A slow reply that still matches the retained list is accepted: its rows
+    /// are the same identities the tree is already showing, so dropping it
+    /// would only make the rows fall back to plain text while the node is
+    /// briefly unreachable.
     fn remote_view_reply(
         &mut self,
         node_key: &str,
         requested_at: Duration,
         result: Option<SessionView>,
-        now: Duration,
+        _now: Duration,
     ) -> bool {
-        if now.saturating_sub(requested_at) >= REMOTE_VIEW_TTL {
-            self.remote_views.remove(node_key);
-            return false;
-        }
         result.is_some_and(|view| self.remote_view_synced(node_key, view, requested_at))
     }
 
@@ -708,10 +734,11 @@ impl ClusterUi {
         }
     }
 
-    fn remote_view(&self, node_key: &str, now: Duration) -> Option<&RemoteNodeView> {
-        self.remote_views
-            .get(node_key)
-            .filter(|view| now.saturating_sub(view.at) < REMOTE_VIEW_TTL)
+    /// The last validated rendered list for a node. Callers still check
+    /// `remote_view_matches`, which drops the view as soon as the node's
+    /// retained identities change, including at retention expiry.
+    fn remote_view(&self, node_key: &str, _now: Duration) -> Option<&RemoteNodeView> {
+        self.remote_views.get(node_key)
     }
 
     fn remote_view_due(&self, node_key: &str, now: Duration) -> bool {
@@ -797,6 +824,27 @@ impl ClusterUi {
                     session.wire_name == wire_name && session.instance_id == instance_id
                 })
             })
+    }
+
+    /// Why an action must not go to this node right now, if it must not.
+    /// Retained rows are for reading: only a node whose last collection
+    /// succeeded may authorize input or a close, so a stale display can never
+    /// send a keystroke or a close to an instance the user cannot see fresh.
+    fn stale_action_refusal(&self, node_key: &str) -> Option<String> {
+        let node = self
+            .remote_snapshot
+            .nodes
+            .iter()
+            .find(|node| node.registry_key == node_key)?;
+        if node.state == RemoteState::Reachable {
+            return None;
+        }
+        let state = match (node.expired, node.last_sync_age) {
+            (true, Some(age)) => format!("unreachable, last updated {}s ago", age.as_secs()),
+            (false, Some(age)) => format!("stale, last updated {}s ago", age.as_secs()),
+            _ => "not connected".to_owned(),
+        };
+        Some(format!("{} is {state}", node.name))
     }
 
     fn remote_session<'a>(
@@ -1175,6 +1223,12 @@ impl ClusterUi {
         let Some(pending) = self.pending_close.take() else {
             return;
         };
+        if let Some((registry_key, _)) = pending.remote_target.as_ref() {
+            if let Some(refusal) = self.stale_action_refusal(registry_key) {
+                self.notice = Some((format!("close not sent: {refusal}"), now));
+                return;
+            }
+        }
         let request = confirmed_close(pending.name.clone(), pending.instance_id.clone());
         let remote_node = pending.remote_target.as_ref().map(|(key, _)| key.clone());
         let response = match (remote_node, port) {
@@ -1971,7 +2025,7 @@ impl ClusterUi {
                     if is_expanded { "▼" } else { "▶" },
                 ),
                 label: node.name.clone(),
-                status: status_glyph(node.state).to_string(),
+                status: remote_node_status(node),
             });
             if is_expanded {
                 let content_width = u16::try_from(width.saturating_sub(REMOTE_ROW_PREFIX_WIDTH))
@@ -2265,6 +2319,12 @@ impl ClusterUi {
             ));
             return;
         }
+        if let RemoteSelection::Session { node, .. } = &target {
+            if let Some(refusal) = self.stale_action_refusal(node) {
+                self.notice = Some((format!("remote input not sent: {refusal}"), now));
+                return;
+            }
+        }
         self.remote_active = Some(target.clone());
         self.remote_keys_mode = Some(target);
         self.composer_focused = false;
@@ -2283,6 +2343,11 @@ impl ClusterUi {
         };
         if self.remote_control_disabled.contains(node) {
             self.notice = Some(("remote control disabled on this node".into(), now));
+            return;
+        }
+        if let Some(refusal) = self.stale_action_refusal(node) {
+            self.remote_keys_mode = None;
+            self.notice = Some((format!("remote input stopped: {refusal}"), now));
             return;
         }
         let Some((node_label, session_name, alive)) =
@@ -2396,6 +2461,8 @@ impl ClusterUi {
                         format!("{}/{} has already ended", node_snapshot.name, name),
                         now,
                     ));
+                } else if let Some(refusal) = self.stale_action_refusal(&node) {
+                    self.notice = Some((format!("close not requested: {refusal}"), now));
                 } else {
                     let label = node_snapshot.name.clone();
                     let fingerprint = node.strip_prefix("SHA256:").unwrap_or(&node);
@@ -2460,9 +2527,15 @@ impl ClusterUi {
                     instance_id: instance_id.clone(),
                 };
                 let can_send = self.remote_input_enabled
+                    && self.stale_action_refusal(&node).is_none()
                     && self
                         .remote_session(&selection)
                         .is_some_and(|(_, session)| session.alive);
+                if self.remote_input_enabled {
+                    if let Some(refusal) = self.stale_action_refusal(&node) {
+                        self.notice = Some((format!("remote input not sent: {refusal}"), now));
+                    }
+                }
                 self.remote_active = Some(selection.clone());
                 self.composer_focused = can_send;
                 let display_label = self
@@ -2648,6 +2721,11 @@ impl ClusterUi {
         if self.remote_control_disabled.contains(&node_key) {
             self.restore_draft(&bytes);
             self.set_input_notice(format!("remote control disabled on {node_label}"), now);
+            return;
+        }
+        if let Some(refusal) = self.stale_action_refusal(&node_key) {
+            self.restore_draft(&bytes);
+            self.set_input_notice(format!("remote input not sent: {refusal}"), now);
             return;
         }
         let selection = RemoteSelection::Session {
@@ -3517,7 +3595,16 @@ fn remote_state_label(
                 )
             },
         ),
-        RemoteState::Unreachable => format!("unreachable{}", reason_suffix(reason.as_deref())),
+        RemoteState::Unreachable => last_sync_age.map_or_else(
+            || format!("unreachable{}", reason_suffix(reason.as_deref())),
+            |age| {
+                format!(
+                    "unreachable · no fresh data for {}s{}",
+                    age.as_secs(),
+                    reason_suffix(reason.as_deref())
+                )
+            },
+        ),
     }
 }
 
@@ -4446,7 +4533,7 @@ mod tests {
         sync_remote_views, terminal_frame, AttentionSignals, Badge, ClusterUi, EndedState,
         LocalViewLoader, RemoteInputTransport, RemoteSelection, RemoteSource, RemoteViewLoader,
         TreeSelection, ERROR_GLYPH, LOCAL_VIEW_REFRESH, LOCAL_VIEW_TTL, REMOTE_VIEW_RETRY_BASE,
-        REMOTE_VIEW_TTL, REMOTE_VIEW_UNSUPPORTED_BACKOFF,
+        REMOTE_VIEW_UNSUPPORTED_BACKOFF,
     };
     use crate::cluster_remote::{
         RemoteNodeSnapshot, RemoteSessionSnapshot, RemoteSnapshot, RemoteState,
@@ -5698,6 +5785,8 @@ mod tests {
                 name: "laptop".into(),
                 state,
                 last_sync_age: Some(age),
+                last_updated_at: Instant::now().checked_sub(age),
+                expired: false,
                 last_error: None,
                 sessions: vec![RemoteSessionSnapshot {
                     name: "build".into(),
@@ -6281,7 +6370,7 @@ mod tests {
         ui.set_tree_selection(TreeSelection::RemoteNode("fp-laptop".into()));
         let node_frame = ui.render_text(100, 24, "", &clock);
         assert!(
-            node_frame.contains("laptop · unreachable · no address known"),
+            node_frame.contains("laptop · unreachable · no fresh data for 23s · no address known"),
             "node detail missing:\n{node_frame}"
         );
 
@@ -6293,7 +6382,9 @@ mod tests {
         });
         let session_frame = ui.render_text(100, 24, "", &clock);
         assert!(
-            session_frame.contains("laptop/build · live · unreachable · no address known"),
+            session_frame.contains(
+                "laptop/build · live · unreachable · no fresh data for 23s · no address known"
+            ),
             "session detail missing:\n{session_frame}"
         );
     }
@@ -7127,7 +7218,8 @@ mod tests {
         let frame = ui.render_text(100, 24, "pane", &clock);
         assert!(!frame.contains("idle · codex"), "{frame}");
 
-        // Accept the exact identity, then let it age out.
+        // Accept the exact identity; a gap in refreshes keeps it, because the
+        // retained rows are the same identities the view was validated against.
         ui.remote_view_synced(
             "fp-laptop",
             remote_detail_view(&[("wire-build", "remote-instance")]),
@@ -7135,7 +7227,17 @@ mod tests {
         );
         let frame = ui.render_text(100, 24, "pane", &clock);
         assert!(frame.contains("idle · codex"), "{frame}");
-        clock.advance(REMOTE_VIEW_TTL + Duration::from_secs(1));
+        clock.advance(Duration::from_secs(60));
+        let frame = ui.render_text(100, 24, "pane", &clock);
+        assert!(
+            frame.contains("idle · codex"),
+            "a view is not dropped just because a refresh failed: {frame}"
+        );
+
+        // Expiry drops the node's rows and the view that described them.
+        ui.remote_snapshot.nodes[0].sessions.clear();
+        ui.remote_snapshot.nodes[0].expired = true;
+        ui.retain_remote_views();
         let frame = ui.render_text(100, 24, "pane", &clock);
         assert!(!frame.contains("idle · codex"), "{frame}");
     }
@@ -8692,8 +8794,8 @@ mod tests {
             .find(|line| line.contains("laptop"))
             .unwrap_or_else(|| panic!("node row missing from {frame}"));
         assert!(
-            node_row.contains("? laptop"),
-            "stale node should end in the stale glyph: {node_row:?}"
+            node_row.contains("? 17s laptop"),
+            "stale node should show the stale glyph and the data age: {node_row:?}"
         );
         assert!(!frame.contains("build"));
     }
@@ -8859,15 +8961,148 @@ mod tests {
         let frame = ui.render_text(100, 24, "", &clock);
         assert!(frame.contains("last good screen"));
         assert!(
-            frame.contains("kill laptop(fp-lap)/build? y confirm · Y confirm · other key cancels")
+            !frame.contains("kill laptop(fp-lap)/build?"),
+            "a stale node must not start a close confirmation:\n{frame}"
         );
-        ui.key(crossterm::event::KeyCode::Char('n'));
+        assert!(
+            frame.contains("close not requested: laptop is "),
+            "the refusal names the stale node:\n{frame}"
+        );
         assert!(ui
             .render_text(100, 24, "", &clock)
             .contains("remote live · unreachable"));
+    }
+
+    #[test]
+    fn a_stale_node_keeps_its_rows_and_a_fresh_success_replaces_them() {
+        let clock = ManualClock::new();
+        let source = FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("first screen")),
+        )));
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        ui.remote_synced(&source);
+        ui.remote_expanded.insert("fp-laptop".into());
+        let fresh = ui.render_text(100, 24, "", &clock);
+        assert!(fresh.contains("build"), "the fresh row is shown:\n{fresh}");
+
+        // One failed collection: rows stay, and the node says how old they are.
+        source.replace(remote_snapshot(
+            RemoteState::Stale,
+            Duration::from_secs(20),
+            Some(remote_screen("first screen")),
+        ));
+        ui.remote_synced(&source);
+        let stale = ui.render_text(100, 24, "", &clock);
+        assert!(
+            stale.contains("build"),
+            "a transient failure keeps the last rows:\n{stale}"
+        );
+        assert!(
+            stale.contains("? 20s laptop"),
+            "the stale row carries its data age:\n{stale}"
+        );
+
+        // A fresh success replaces the whole list, not merges into it.
+        let mut replaced = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("second screen")),
+        );
+        let session = &mut replaced.nodes[0].sessions[0];
+        session.name = "proof".into();
+        session.wire_name = "proof".into();
+        session.instance_id = "proof-instance".into();
+        source.replace(replaced);
+        ui.remote_synced(&source);
+        let after = ui.render_text(100, 24, "", &clock);
+        assert!(after.contains("proof"), "the fresh list is shown:\n{after}");
+        assert!(
+            !after.contains("build"),
+            "the replaced identity must disappear:\n{after}"
+        );
+    }
+
+    #[test]
+    fn a_stale_node_does_not_authorize_input_and_expiry_clears_the_target() {
+        let clock = ManualClock::new();
+        let source = FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("body")),
+        )));
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        ui.remote_input_enabled = true;
+        ui.remote_synced(&source);
+        ui.remote_composer_target = Some((
+            "fp-laptop".into(),
+            "laptop".into(),
+            "build".into(),
+            "build".into(),
+            "remote-instance".into(),
+        ));
+        ui.composer_focused = true;
+
+        source.replace(remote_snapshot(
+            RemoteState::Stale,
+            Duration::from_secs(21),
+            Some(remote_screen("body")),
+        ));
+        ui.remote_synced(&source);
+
+        // A composed line is not sent and the draft is restored.
+        ui.enqueue_remote_draft(b"ls\r".to_vec(), clock.now());
+        assert!(ui.input_queue.sending_batch().is_none());
+        assert_eq!(ui.composer.text(), "ls");
+        assert!(
+            ui.notice
+                .as_ref()
+                .is_some_and(|(notice, _)| notice.contains("remote input not sent")
+                    && notice.contains("stale")),
+            "the refusal says why: {:?}",
+            ui.notice
+        );
+
+        // Keys mode does not accept keystrokes either.
+        let selection = RemoteSelection::Session {
+            node: "fp-laptop".into(),
+            name: "build".into(),
+            wire_name: "build".into(),
+            instance_id: "remote-instance".into(),
+        };
+        ui.remote_keys_mode = Some(selection.clone());
+        ui.enqueue_remote_key_bytes(&selection, b"x".to_vec(), clock.now());
+        assert!(ui.remote_keys_mode.is_none());
+        assert!(ui.remote_key_buffers.is_empty());
+
+        // A close confirmation cannot even begin from stale rows.
+        ui.remote_selected = Some(selection);
+        ui.handle_close_key(clock.now());
+        assert!(ui.remote_close_confirmation.is_none());
         assert!(!ui
             .render_text(100, 24, "", &clock)
             .contains("kill laptop(fp-lap)/build?"));
+
+        // Expiry drops the rows and the exact identity they authorized.
+        let expired = remote_snapshot(RemoteState::Unreachable, Duration::from_secs(200), None);
+        let mut expired = expired;
+        expired.nodes[0].sessions.clear();
+        expired.nodes[0].expired = true;
+        expired.nodes[0].last_updated_at =
+            std::time::Instant::now().checked_sub(Duration::from_secs(200));
+        source.replace(expired);
+        ui.remote_synced(&source);
+        assert!(matches!(
+            ui.remote_selected,
+            Some(RemoteSelection::Node(ref node)) if node == "fp-laptop"
+        ));
+        assert!(ui.remote_active.is_none());
+        assert!(ui.remote_composer_target.is_none());
+        assert!(!ui.composer_focused);
+        let frame = ui.render_text(100, 24, "", &clock);
+        assert!(!frame.contains("build"), "expired rows are gone:\n{frame}");
+        assert!(frame.contains("x 200s laptop"), "{frame}");
     }
 
     #[test]

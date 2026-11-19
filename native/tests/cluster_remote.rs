@@ -1441,14 +1441,14 @@ fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_res
 
     server_node.stop_daemon();
     wait_for(
-        "daemon stop becomes unreachable",
+        "daemon stop becomes stale with retained rows",
         Duration::from_secs(6),
         || {
             source
                 .snapshot()
                 .nodes
                 .first()
-                .is_some_and(|node| node.state == RemoteState::Unreachable)
+                .is_some_and(|node| node.state == RemoteState::Stale && !node.expired)
         },
     );
     assert!(proof_session(source.as_ref())
@@ -1588,12 +1588,12 @@ fn hosted_remote_reconnect_preserves_instance_and_rejects_stale_close() {
         .any(|s| s.name == "proof" && s.alive && s.instance_id.as_deref() == Some(&original)));
 
     server_node.stop_daemon();
-    wait_for("host node unreachable", Duration::from_secs(10), || {
+    wait_for("host node stale", Duration::from_secs(10), || {
         source
             .snapshot()
             .nodes
             .first()
-            .is_some_and(|n| n.state == RemoteState::Unreachable)
+            .is_some_and(|n| n.state == RemoteState::Stale && !n.expired)
     });
     assert!(proof_session(source.as_ref())
         .is_some_and(|s| s.instance_id == original && session_text(&s).contains("HOST_BEFORE")));
@@ -1725,7 +1725,7 @@ fn live_remote_tui_recovers_same_hosted_session_after_peer_restart() {
     tui.wait_for("Remuda >", Duration::from_secs(5));
 
     server_node.stop_daemon();
-    tui.wait_for("remote live · unreachable", Duration::from_secs(20));
+    tui.wait_for("remote live · stale", Duration::from_secs(20));
     assert!(
         tui.screen_text().contains("BEFORE_LIVE"),
         "last screen was not retained"
@@ -2087,12 +2087,15 @@ fn real_remote_cluster_tree_paints_the_peer_hierarchy_and_falls_back_on_fault() 
         "the selected remote target is shown:\n{screen}"
     );
 
-    // Fault: the peer goes away, the rendered view ages out and the tree
-    // falls back to plain List rows without dropping the known sessions.
+    // Fault: the peer goes away. The last rows and their rendered view are
+    // retained and labelled stale with their age; a brief outage must not
+    // degrade the rows to a plain fallback and then repaint them.
     server_node.stop_daemon();
-    wait_for("remote view fallback", Duration::from_secs(20), || {
+    wait_for("remote stale label", Duration::from_secs(20), || {
         let screen = tui.screen_text();
-        screen.contains("tree-parent") && !screen.contains(DETAIL)
+        screen.contains("tree-parent")
+            && screen.contains(DETAIL)
+            && screen.contains("remote live · stale")
     });
     assert!(tui.screen_text().contains("tree-child"));
 }
