@@ -203,13 +203,33 @@ mod unix {
             server.join().unwrap();
         }
 
+        fn backlog_listener(path: &std::path::Path) -> std::os::unix::net::UnixListener {
+            use nix::sys::socket::{
+                bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, UnixAddr,
+            };
+            use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+            let fd = socket(
+                AddressFamily::Unix,
+                SockType::Stream,
+                SockFlag::empty(),
+                None,
+            )
+            .unwrap();
+            bind(fd.as_raw_fd(), &UnixAddr::new(path).unwrap()).unwrap();
+            listen(&fd, Backlog::new(1).unwrap()).unwrap();
+            unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd.into_raw_fd()) }
+        }
+
         #[test]
         fn saturated_unix_listener_fails_boundedly_then_recovers() {
             let endpoint = Endpoint::new();
-            let listener = std::os::unix::net::UnixListener::bind(&endpoint.0).unwrap();
+            // std uses listen(-1), which Linux caps to net.core.somaxconn
+            // (4096 since Linux 5.4). Bind with backlog 1 so saturation is
+            // deterministic without opening thousands of descriptors.
+            let listener = backlog_listener(&endpoint.0);
             let mut queued = Vec::new();
             let mut saturated = false;
-            for _ in 0..512 {
+            for _ in 0..8 {
                 let start = Instant::now();
                 let result = connect(&endpoint.0, &Deadline(start + Duration::from_millis(30)));
                 assert!(start.elapsed() < Duration::from_secs(1));
@@ -221,16 +241,32 @@ mod unix {
                     }
                 }
             }
-            assert!(saturated, "test did not fill the kernel listener queue");
+            assert!(saturated, "a backlog-1 listener did not saturate");
             let start = Instant::now();
             assert!(request(&endpoint.0, &Request::Version, Duration::from_millis(30)).is_err());
             assert!(start.elapsed() < Duration::from_secs(1));
-            for _ in 0..queued.len() {
-                drop(listener.accept().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let drain = Instant::now() + Duration::from_secs(1);
+            while !queued.is_empty() && Instant::now() < drain {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        drop(stream);
+                        queued.pop();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
             }
-            drop(queued);
+            assert!(queued.is_empty(), "queued connections did not arrive");
+            listener.set_nonblocking(false).unwrap();
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                std::io::BufReader::new(&stream)
+                    .read_line(&mut request)
+                    .unwrap();
                 stream
                     .write_all(b"{\"Value\":\"capacity restored\"}\n")
                     .unwrap();
