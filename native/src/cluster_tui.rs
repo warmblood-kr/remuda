@@ -2142,6 +2142,43 @@ impl ClusterUi {
         }
     }
 
+    /// True when the key answered an open confirmation, so the caller stops
+    /// routing it to the tree. Split from `key_event` to keep that dispatcher
+    /// inside the workspace line cap.
+    fn handle_confirmation_key(
+        &mut self,
+        event: crossterm::event::KeyEvent,
+        now: Duration,
+    ) -> bool {
+        let Some(decision) = self.confirmation.handle(matches!(
+            self.keymap.resolve("cluster.confirm", event),
+            Some("cluster.confirm.accept" | "cluster.confirm.accept_upper")
+        )) else {
+            return false;
+        };
+        match decision {
+            Decision::Confirmed { name, instance_id } => {
+                let remote = self.remote_close_confirmation.take();
+                self.pending_close = Some(PendingClose {
+                    remote_target: remote
+                        .as_ref()
+                        .map(|target| (target.registry_key.clone(), target.label.clone())),
+                    name: remote
+                        .as_ref()
+                        .map_or_else(|| name.clone(), |target| target.wire_name.clone()),
+                    display_name: name.clone(),
+                    instance_id,
+                });
+                self.notice = Some((format!("closing {name}"), now));
+            }
+            Decision::Cancelled => {
+                self.remote_close_confirmation = None;
+                self.notice = Some(("close cancelled".into(), now));
+            }
+        }
+        true
+    }
+
     fn key_event(&mut self, event: crossterm::event::KeyEvent, now: Duration) -> bool {
         if self.documents_open {
             self.document_key(event);
@@ -2161,30 +2198,7 @@ impl ClusterUi {
         {
             self.partial_input_confirm_target = None;
         }
-        if let Some(decision) = self.confirmation.handle(matches!(
-            self.keymap.resolve("cluster.confirm", event),
-            Some("cluster.confirm.accept" | "cluster.confirm.accept_upper")
-        )) {
-            match decision {
-                Decision::Confirmed { name, instance_id } => {
-                    let remote = self.remote_close_confirmation.take();
-                    self.pending_close = Some(PendingClose {
-                        remote_target: remote
-                            .as_ref()
-                            .map(|target| (target.registry_key.clone(), target.label.clone())),
-                        name: remote
-                            .as_ref()
-                            .map_or_else(|| name.clone(), |target| target.wire_name.clone()),
-                        display_name: name.clone(),
-                        instance_id,
-                    });
-                    self.notice = Some((format!("closing {name}"), now));
-                }
-                Decision::Cancelled => {
-                    self.remote_close_confirmation = None;
-                    self.notice = Some(("close cancelled".into(), now));
-                }
-            }
+        if self.handle_confirmation_key(event, now) {
             return false;
         }
         if let Some(target) = self.remote_keys_mode.clone() {
