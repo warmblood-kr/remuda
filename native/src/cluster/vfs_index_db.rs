@@ -98,7 +98,7 @@ pub(crate) fn schema_on_disk() -> Result<Option<u32>, String> {
         .map_err(|_| format!("user_version {version} is not a step number"))
 }
 
-/// Set by `remuda vfs index-downgrade`: this process must not upgrade again.
+/// Set by `remuda drive index-downgrade`: this process must not upgrade again.
 static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(super) fn hold_schema() {

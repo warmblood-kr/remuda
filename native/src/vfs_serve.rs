@@ -1,4 +1,4 @@
-//! `remuda vfs serve`: a read-only HTTP bridge from a browser to the cluster
+//! `remuda drive serve`: a read-only HTTP bridge from a browser to the cluster
 //! file store (#742). One page, one prefix, loopback by default.
 //!
 //! The server runs in the CLI process, not the daemon: it blocks for as long as
@@ -605,7 +605,7 @@ pub fn resolve_target(target: &str, root: &str) -> Result<Target, BadRequest> {
     } else {
         format!("{root}/{request}")
     };
-    // The same rules `remuda vfs put` applies: no empty, `.` or `..` component,
+    // The same rules `remuda drive put` applies: no empty, `.` or `..` component,
     // no `\`, NUL or control character, at most 1024 bytes. Segments above were
     // already split, so this is the second, authoritative check. An empty path
     // is the whole store, which has no path of its own.
@@ -947,9 +947,9 @@ fn render_listing(request_path: &str, config: &Config, prefix: &str, entries: &[
         format!("/{}/", href_path(request_path))
     };
     let title = if request_path.is_empty() {
-        format!("remuda vfs /{}", config.root)
+        format!("remuda drive /{}", config.root)
     } else {
-        format!("remuda vfs /{request_path}")
+        format!("remuda drive /{request_path}")
     };
     let mut body = String::new();
     body.push_str("<!doctype html>\n<meta charset=\"utf-8\">\n");
@@ -1208,32 +1208,36 @@ fn bind_address(addr: &str, allow_remote: bool) -> Result<SocketAddr, String> {
     Ok(requested)
 }
 
-/// `remuda vfs serve` from the CLI. Returns the process exit code.
+/// `remuda drive serve` (or its `remuda drive` alias) from the CLI. Returns
+/// the process exit code.
 pub fn run(
     socket: &Path,
     addr: &str,
     root: &str,
     allow_scripts: bool,
     allow_remote: bool,
+    command: &str,
 ) -> std::process::ExitCode {
     use std::process::ExitCode;
     let config = match Config::new(root, allow_scripts) {
         Ok(config) => Arc::new(config),
         Err(error) => {
-            eprintln!("remuda: vfs serve: {error}");
+            eprintln!("remuda: {command} serve: {error}");
             return ExitCode::FAILURE;
         }
     };
     let requested = match bind_address(addr, allow_remote) {
         Ok(addr) => addr,
         Err(detail) => {
-            eprintln!("remuda: vfs serve: {detail}");
+            eprintln!("remuda: {command} serve: {detail}");
             return ExitCode::FAILURE;
         }
     };
     let source = DaemonSource::new(socket.to_path_buf());
     if let Err(detail) = source.probe() {
-        eprintln!("remuda: vfs serve: the daemon did not answer `remuda vfs read`: {detail}");
+        eprintln!(
+            "remuda: {command} serve: the daemon did not answer `remuda {command} read`: {detail}"
+        );
         eprintln!(
             "Next: run `remuda reload` so the daemon is this build, or check that it is running."
         );
@@ -1242,14 +1246,14 @@ pub fn run(
     let listener = match TcpListener::bind(requested) {
         Ok(listener) => listener,
         Err(error) => {
-            eprintln!("remuda: vfs serve: cannot listen on {requested}: {error}");
+            eprintln!("remuda: {command} serve: cannot listen on {requested}: {error}");
             return ExitCode::FAILURE;
         }
     };
     let bound = match listener.local_addr() {
         Ok(bound) => bound,
         Err(error) => {
-            eprintln!("remuda: vfs serve: cannot read the bound address: {error}");
+            eprintln!("remuda: {command} serve: cannot read the bound address: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -1269,7 +1273,7 @@ pub fn run(
     match serve(listener, config, source, origin, stop) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("remuda: vfs serve: {error}");
+            eprintln!("remuda: {command} serve: {error}");
             ExitCode::FAILURE
         }
     }

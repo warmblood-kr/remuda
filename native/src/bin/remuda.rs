@@ -327,7 +327,8 @@ fn dispatch_cli_command(
         "lua" => lua_command(server, path, rest),
         "exec" => exec_cli_command(server, path, rest),
         "cluster" => cluster_command(server, path, rest),
-        "vfs" => remuda_native::vfs_cli::run(server, path, rest),
+        "drive" => remuda_native::vfs_cli::run(server, path, rest, "drive"),
+        "vfs" => remuda_native::vfs_cli::run(server, path, rest, "vfs"),
         "db" => remuda_native::db_cli::run(server, path, rest),
         "mod" => match rest.first().copied() {
             Some("install") => mod_install_command(server, path, &rest[1..]),
@@ -833,9 +834,10 @@ remuda — a pty manager you can attach to
   remuda cluster listen [--bind ADDR] [--allow-public] configure the daemon listener
                                   --foreground holds the listener in this terminal
                                   [::] may accept IPv4 too on dual-stack systems
-  remuda vfs put|get|ls|stat|rm|resolve  cluster file store at remuda:// URIs
-  remuda vfs serve [--root PATH]  read-only browser view of the store on a
+  remuda drive put|get|ls|stat|rm|resolve  cluster file store at remuda:// URIs
+  remuda drive serve [--root PATH]  read-only browser view of the store on a
                                   loopback port; scripts blocked by default
+  remuda vfs ...                  the same commands (compatibility alias)
   remuda db status|upgrade|downgrade  schema migrations of mod databases
   remuda doc [--format F]        print live Lua documentation (rst by default)
   remuda -e <code>              evaluate one chunk in that same image
@@ -935,9 +937,10 @@ remuda — terminal orchestration for coding agents
   remuda cluster listen [--bind ADDR] [--allow-public] configure the daemon listener
                                   --foreground holds the listener in this terminal
                                   [::] may accept IPv4 too on dual-stack systems
-  remuda vfs put|get|ls|stat|rm|resolve  cluster file store at remuda:// URIs
-  remuda vfs serve [--root PATH]  read-only browser view of the store on a
+  remuda drive put|get|ls|stat|rm|resolve  cluster file store at remuda:// URIs
+  remuda drive serve [--root PATH]  read-only browser view of the store on a
                                   loopback port; scripts blocked by default
+  remuda vfs ...                  the same commands (compatibility alias)
   remuda db status|upgrade|downgrade  schema migrations of mod databases
 
   remuda doc | repl | -e CODE    use the persistent Lua runtime
@@ -1049,7 +1052,7 @@ fn suggest_command(word: &str) -> Option<String> {
 
     const TOP_LEVEL_VERBS: &[&str] = &[
         "run", "attach", "ls", "send", "resize", "stop", "mod", "doc", "repl", "lua", "exec",
-        "mcp", "upgrade", "cluster", "vfs", "db",
+        "mcp", "upgrade", "cluster", "drive", "vfs", "db",
     ];
     closest_word(word, TOP_LEVEL_VERBS).map(str::to_owned)
 }
@@ -8871,6 +8874,14 @@ fn print_lines(n: &str, delay_ms: &str) -> ExitCode {
 mod tests {
     use super::*;
     use remuda_core::agent::Size;
+
+    #[test]
+    fn help_lists_drive_as_primary_and_vfs_as_alias() {
+        for text in [USAGE, DETAILED_USAGE] {
+            assert!(text.contains("remuda drive put|get"), "{text}");
+            assert!(text.contains("remuda vfs ..."), "{text}");
+        }
+    }
 
     fn session_summary(id: &str, name: &str, instance: Option<&str>) -> SessionSummary {
         SessionSummary {

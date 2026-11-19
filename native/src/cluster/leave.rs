@@ -45,7 +45,7 @@ fn check_and_revoke(caller: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     if !copies.short.is_empty() {
         return Err(format!(
-            "{} files would be short of copies without {label}; run `remuda vfs drain` there first",
+            "{} files would be short of copies without {label}; run `remuda drive drain` there first",
             copies.short.len()
         ));
     }

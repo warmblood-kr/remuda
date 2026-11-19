@@ -1,4 +1,4 @@
-//! `remuda vfs …`: the cluster virtual file store from the command line
+//! `remuda drive …`: the cluster virtual file store from the command line
 //! (#742). The daemon owns the store (#778): the CLI parses, reads `put`'s
 //! source and writes `get`'s destination, and the daemon runs the command
 //! (`Request::Vfs`). With no daemon running, it fails with one line.
@@ -64,112 +64,126 @@ fn arg(name: &str, help: &str, required: bool) -> ArgSpec {
 }
 
 fn verb(
+    command: &str,
     name: &str,
     about: &str,
     args: Vec<ArgSpec>,
     options: Vec<OptionSpec>,
     next: &str,
 ) -> VerbSpec {
+    let next = next.replacen("remuda drive ", &format!("remuda {command} "), 1);
     VerbSpec {
         name: name.into(),
         about: about.into(),
-        usage: next.strip_prefix("remuda vfs ").map(str::to_owned),
+        usage: next
+            .strip_prefix(&format!("remuda {command} "))
+            .map(str::to_owned),
         args,
         options,
-        next: next.into(),
+        next,
     }
 }
 
-fn spec() -> Spec {
+fn spec(command: &str) -> Spec {
     Spec {
-        name: "remuda vfs".into(),
+        name: format!("remuda {command}"),
         options: vec![],
         verbs: vec![
-            verb("put", "Store a local file (or - for stdin) at a remuda:// URI. Example: remuda vfs put notes.md remuda:///notes.md",
+            verb(command, "put", "Store a local file (or - for stdin) at a remuda:// URI. Example: remuda drive put notes.md remuda:///notes.md",
                 vec![arg("SOURCE", "Local file, or - for stdin", true), arg("URI", "remuda://CLUSTER/PATH or remuda:///PATH", true)],
                 vec![option("replicas", Some("N"), "Copies to keep (1-16; default from vfs settings)"),
                      option("wait", None, "Wait until the copies exist on their nodes"),
                      option("min-copies", Some("K"), "Wait until K nodes hold it, this one included; exit 75 if not in 60 s")],
-                "remuda vfs put SOURCE URI [--replicas N] [--wait | --min-copies K]"),
-            verb("get", "Print a file, or write it to DEST. Example: remuda vfs get remuda:///notes.md notes.md",
+                "remuda drive put SOURCE URI [--replicas N] [--wait | --min-copies K]"),
+            verb(command, "get", "Print a file, or write it to DEST. Example: remuda drive get remuda:///notes.md notes.md",
                 vec![arg("URI", "remuda:// URI", true), arg("DEST", "Local file; omit or - for stdout", false)],
                 vec![option("local", None, "Do not ask other nodes")],
-                "remuda vfs get URI [DEST] [--local]"),
-            verb("resolve", "Keep a copy on this node and print its local path. Example: remuda vfs resolve remuda:///notes.md",
+                "remuda drive get URI [DEST] [--local]"),
+            verb(command, "resolve", "Keep a copy on this node and print its local path. Example: remuda drive resolve remuda:///notes.md",
                 vec![arg("URI", "remuda:// URI", true)], vec![option("local", None, "Do not ask other nodes")],
-                "remuda vfs resolve URI [--local]"),
-            verb("publish", "Upload a directory as one release and mark it complete last. Example: remuda vfs publish site remuda:///design --release 2026-11-04",
+                "remuda drive resolve URI [--local]"),
+            verb(command, "publish", "Upload a directory as one release and mark it complete last. Example: remuda drive publish site remuda:///design --release 2026-11-04",
                 vec![arg("DIR", "Local directory to upload", true), arg("PREFIX", "remuda:// URI prefix to publish into", true)],
                 vec![OptionSpec { required: true, ..option("release", Some("NAME"), "Release name; one path component, never reused once complete") },
                      option("dry-run", None, "Show what would be uploaded, then stop"),
                      option("min-copies", Some("K"), "Wait for K copies of each file and of the completion marker"),
                      option("pointer", None, "After the marker, point PREFIX/CURRENT at this release")],
-                "remuda vfs publish DIR PREFIX --release NAME [--dry-run] [--min-copies K] [--pointer]"),
-            verb("read", "Read a file as one JSON envelope for tools. Example: remuda vfs read remuda:///notes.md --max-bytes 1000",
+                "remuda drive publish DIR PREFIX --release NAME [--dry-run] [--min-copies K] [--pointer]"),
+            verb(command, "read", "Read a file as one JSON envelope for tools. Example: remuda drive read remuda:///notes.md --max-bytes 1000",
                 vec![arg("URI", "remuda:// URI", true)],
                 vec![option("max-bytes", Some("N"), "Answer too_large without reading when the file is bigger than N bytes")],
-                "remuda vfs read URI [--max-bytes N]"),
-            verb("serve", "Render the store in a browser over a read-only loopback HTTP port. Example: remuda vfs serve --root design",
+                "remuda drive read URI [--max-bytes N]"),
+            verb(command, "serve", "Render the store in a browser over a read-only loopback HTTP port. Example: remuda drive serve --root design",
                 vec![], vec![option("addr", Some("ADDR:PORT"), "Loopback address to listen on (default 127.0.0.1:0, an ephemeral port)"),
                              option("root", Some("PATH"), "Cluster path to publish (default /, the whole store)"),
                              option("allow-scripts", None, "Let stored HTML run its own script, same origin only; off by default"),
                              option("allow-remote", None, "Permit a non-loopback --addr; publishes cluster files to the network")],
-                "remuda vfs serve [--addr ADDR:PORT] [--root PATH] [--allow-scripts] [--allow-remote]"),
-            verb("stat", "Show one file's version, hash, size and copies. Example: remuda vfs stat remuda:///notes.md",
+                "remuda drive serve [--addr ADDR:PORT] [--root PATH] [--allow-scripts] [--allow-remote]"),
+            verb(command, "stat", "Show one file's version, hash, size and copies. Example: remuda drive stat remuda:///notes.md",
                 vec![arg("URI", "remuda:// URI", true)], vec![option("json", None, "Print JSON")],
-                "remuda vfs stat URI [--json]"),
-            verb("ls", "List a directory's immediate children. Example: remuda vfs ls remuda:///butler/",
+                "remuda drive stat URI [--json]"),
+            verb(command, "ls", "List a directory's immediate children. Example: remuda drive ls remuda:///butler/",
                 vec![arg("PREFIX", "remuda:// URI prefix; omit for the store root", false)],
                 vec![flag_option("recursive", 'R', "List every descendant file, not just the immediate children"),
                      option("json", None, "Print JSON"),
                      option("conflicts", None, "Paths with kept concurrent writes under PREFIX; deleted ones too")],
-                "remuda vfs ls [PREFIX] [-R] [--json] [--conflicts]"),
-            verb("grep", "Search using a Rust regular expression (or -F for a literal). Exit 0 for matches, 1 for none, 2 for incomplete results. Files over 1 MiB, binary files and conflicts are skipped; output is bounded.",
+                "remuda drive ls [PREFIX] [-R] [--json] [--conflicts]"),
+            verb(command, "grep", "Search using a Rust regular expression (or -F for a literal). Exit 0 for matches, 1 for none, 2 for incomplete results. Files over 1 MiB, binary files and conflicts are skipped; output is bounded.",
                 vec![arg("PATTERN", "Regular expression to find", true), arg("PREFIX", "File or directory URI (default: entire VFS)", false)],
                 vec![flag_option("invert-match", 'v', "Select nonmatching lines"), flag_option("fixed-strings", 'F', "Match a literal string"), option("local", None, "Do not fetch missing files from peers"), option("json", None, "Print structured results")],
-                "remuda vfs grep [-v] [-F] PATTERN [PREFIX] [--local] [--json]"),
-            verb("resolve-conflict", "Settle a path's conflicts by writing one side again. Example: remuda vfs resolve-conflict remuda:///notes.md --keep winner",
+                "remuda drive grep [-v] [-F] PATTERN [PREFIX] [--local] [--json]"),
+            verb(command, "resolve-conflict", "Settle a path's conflicts by writing one side again. Example: remuda drive resolve-conflict remuda:///notes.md --keep winner",
                 vec![arg("URI", "remuda:// URI", true)],
-                vec![OptionSpec { required: true, ..option("keep", Some("WHICH"), "winner, or the VERSION of a conflict from `remuda vfs ls --conflicts`") }],
-                "remuda vfs resolve-conflict URI --keep winner|VERSION"),
-            verb("rm", "Delete a file everywhere. Example: remuda vfs rm remuda:///notes.md",
-                vec![arg("URI", "remuda:// URI", true)], vec![], "remuda vfs rm URI"),
-            verb("release", "Give back copies this node fetched to read and does not need to keep. Example: remuda vfs release --dry-run",
+                vec![OptionSpec { required: true, ..option("keep", Some("WHICH"), "winner, or the VERSION of a conflict from `remuda drive ls --conflicts`") }],
+                "remuda drive resolve-conflict URI --keep winner|VERSION"),
+            verb(command, "rm", "Delete a file everywhere. Example: remuda drive rm remuda:///notes.md",
+                vec![arg("URI", "remuda:// URI", true)], vec![], "remuda drive rm URI"),
+            verb(command, "release", "Give back copies this node fetched to read and does not need to keep. Example: remuda drive release --dry-run",
                 vec![], vec![option("dry-run", None, "Count what would go without deleting anything"),
                              option("older-than", Some("SECS"), "Keep copies fetched more recently than this (default 0, no grace)"),
                              option("include-resolved", None, "Also give back copies `vfs resolve` pinned for a tool"),
                              option("json", None, "Print JSON")],
-                "remuda vfs release [--dry-run] [--older-than SECS] [--json]"),
-            verb("sync", "Pull indexes from peers and repair missing copies now. Example: remuda vfs sync",
-                vec![], vec![], "remuda vfs sync"),
-            verb("status", "Show files, conflicts, copies here and each peer at a glance. Example: remuda vfs status --copies",
+                "remuda drive release [--dry-run] [--older-than SECS] [--json]"),
+            verb(command, "sync", "Pull indexes from peers and repair missing copies now. Example: remuda drive sync",
+                vec![], vec![], "remuda drive sync"),
+            verb(command, "status", "Show files, conflicts, copies here and each peer at a glance. Example: remuda drive status --copies",
                 vec![], vec![option("copies", None, "Also ask the nodes which copies they hold; exit 75 if a file is short"),
                              option("json", None, "Print JSON")],
-                "remuda vfs status [--copies] [--json]"),
-            verb("drain", "Before this node leaves, have the other nodes take copies of what it holds. Example: remuda vfs drain",
+                "remuda drive status [--copies] [--json]"),
+            verb(command, "drain", "Before this node leaves, have the other nodes take copies of what it holds. Example: remuda drive drain",
                 vec![], vec![option("timeout", Some("SECS"), "Give up after this long (1-110; default 100); run drain again to go on")],
-                "remuda vfs drain [--timeout SECS]"),
-            verb("config", "Show or set the cluster name and default replicas. Example: remuda vfs config --cluster home --replicas 2",
+                "remuda drive drain [--timeout SECS]"),
+            verb(command, "config", "Show or set the cluster name and default replicas. Example: remuda drive config --cluster home --replicas 2",
                 vec![], vec![option("cluster", Some("NAME"), "Cluster name used in remuda://NAME/ URIs"),
                              option("replicas", Some("N"), "Default copies for new files (1-16)"),
                              option("tombstone-days", Some("DAYS"), "Forget a delete this many days after every node has it (1-3650; default 7)"),
                              option("stale-days", Some("DAYS"), "Stop waiting for a node that has not pulled for this long (1-3650; default 30)")],
-                "remuda vfs config [--cluster NAME] [--replicas N] [--tombstone-days DAYS] [--stale-days DAYS]"),
-            verb("export-index", "Write index.json for an older remuda, before a downgrade. Example: remuda vfs export-index",
-                vec![], vec![], "remuda vfs export-index"),
-            verb("index-downgrade", "Step index.db back to schema VERSION for an older remuda, after a backup. Example: remuda vfs index-downgrade 1 --yes",
+                "remuda drive config [--cluster NAME] [--replicas N] [--tombstone-days DAYS] [--stale-days DAYS]"),
+            verb(command, "export-index", "Write index.json for an older remuda, before a downgrade. Example: remuda drive export-index",
+                vec![], vec![], "remuda drive export-index"),
+            verb(command, "index-downgrade", "Step index.db back to schema VERSION for an older remuda, after a backup. Example: remuda drive index-downgrade 1 --yes",
                 vec![arg("VERSION", "Schema version the older remuda knows", true)],
                 vec![option("yes", None, "Run it; without this, only print what would be undone")],
-                "remuda vfs index-downgrade VERSION [--yes]"),
-            verb("help", "Print help for a vfs command", vec![arg("COMMAND", "vfs command name", false)], vec![], "remuda vfs help [COMMAND]"),
+                "remuda drive index-downgrade VERSION [--yes]"),
+            verb(command, "help", "Print help for a drive command", vec![arg("COMMAND", "drive command name", false)], vec![], "remuda drive help [COMMAND]"),
         ],
     }
 }
 
+/// The primary command name. `remuda vfs` is the compatibility alias.
+pub const PRIMARY: &str = "drive";
+
+/// Usage for the primary name. Kept for callers that predate the alias.
 pub fn usage(verb: &str) -> String {
-    let spec = spec();
+    usage_for(PRIMARY, verb)
+}
+
+pub fn usage_for(command: &str, verb: &str) -> String {
+    let spec = spec(command);
     if verb.is_empty() {
-        let mut output = "Usage: remuda vfs <COMMAND>\n\nCluster file store: files any node can read, kept on several nodes.\n\nCommands:\n".to_owned();
+        let mut output = format!(
+            "Usage: remuda {command} <COMMAND>\n\nCluster file store: files any node can read, kept on several nodes.\n\nCommands:\n"
+        );
         for command in &spec.verbs {
             output.push_str(&format!("  {:<8} {}\n", command.name, command.about));
         }
@@ -187,20 +201,22 @@ fn flag(values: &Map<String, Value>, key: &str) -> bool {
 }
 
 fn fail(out: &mut Out, verb: &str, error: impl std::fmt::Display) -> u8 {
-    warn!(out, "remuda: vfs {verb}: {error}");
+    let command = command_name(out).to_owned();
+    warn!(out, "remuda: {command} {verb}: {error}");
     1
 }
 
 fn fail_vfs(out: &mut Out, verb: &str, error: &VfsError) -> u8 {
-    warn!(out, "remuda: vfs {verb}: {error}");
+    let command = command_name(out).to_owned();
+    warn!(out, "remuda: {command} {verb}: {error}");
     let next = match error.kind {
         VfsErrorKind::NoCluster => Some("run `remuda cluster init` or `remuda cluster join` first"),
-        VfsErrorKind::NotFound => Some("run `remuda vfs ls` to see stored files"),
+        VfsErrorKind::NotFound => Some("run `remuda drive ls` to see stored files"),
         VfsErrorKind::Unreachable => {
             Some("start the nodes that hold it, or check `remuda cluster nodes`")
         }
         VfsErrorKind::WrongCluster => {
-            Some("use remuda:///PATH for this cluster, or check `remuda vfs config`")
+            Some("use remuda:///PATH for this cluster, or check `remuda drive config`")
         }
         _ => None,
     };
@@ -225,8 +241,18 @@ fn or_fail<T>(out: &mut Out, verb: &str, result: Result<T, VfsError>) -> Option<
 /// CLI copies it to its own stdout and stderr.
 #[derive(Default)]
 pub struct Out {
+    /// The command name the user invoked: `drive` or the `vfs` alias.
+    command: String,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+fn command_name(out: &Out) -> &str {
+    if out.command.is_empty() {
+        PRIMARY
+    } else {
+        &out.command
+    }
 }
 
 /// Parse `args`. `Err` carries the exit code once help or a parse error
@@ -238,21 +264,26 @@ fn parse(args: &[&str], out: &mut Out) -> Result<(String, Map<String, Value>), u
         Some(_) => args,
     };
     let verb = args[0];
-    let spec = spec();
+    let command = command_name(out).to_owned();
+    let spec = spec(&command);
     if !spec.verbs.iter().any(|known| known.name == verb) {
-        warn!(out, "remuda: unknown vfs command '{}'", verb.escape_debug());
-        let _ = write!(out.stderr, "{}", usage(""));
+        warn!(
+            out,
+            "remuda: unknown {command} command '{}'",
+            verb.escape_debug()
+        );
+        let _ = write!(out.stderr, "{}", usage_for(&command, ""));
         return Err(2);
     }
     let report = cli_parse::parse(&spec, args);
     if verb == "help" {
         let topic = value(&report.values, "COMMAND").filter(|topic| *topic != "help");
-        let _ = write!(out.stdout, "{}", usage(topic.unwrap_or("")));
+        let _ = write!(out.stdout, "{}", usage_for(&command, topic.unwrap_or("")));
         return Err(0);
     }
     if !report.ok {
         if report.kind.as_deref() == Some("help") {
-            let _ = write!(out.stdout, "{}", usage(verb));
+            let _ = write!(out.stdout, "{}", usage_for(&command, verb));
             return Err(0);
         }
         warn!(out, "{}", report.text.trim_end());
@@ -261,24 +292,28 @@ fn parse(args: &[&str], out: &mut Out) -> Result<(String, Map<String, Value>), u
     Ok((verb.to_owned(), report.values))
 }
 
-/// Run `remuda vfs ARGS…` from the CLI: parse here, run in the daemon of
-/// `server` (socket `socket`), which owns the index. Never starts a daemon.
-pub fn run(server: &str, socket: &Path, args: &[&str]) -> ExitCode {
-    let mut out = Out::default();
+/// Run `remuda drive ARGS…` (or its `remuda drive` alias) from the CLI: parse
+/// here, run in the daemon of `server` (socket `socket`), which owns the
+/// index. Never starts a daemon.
+pub fn run(server: &str, socket: &Path, args: &[&str], command: &str) -> ExitCode {
+    let mut out = Out {
+        command: command.to_owned(),
+        ..Out::default()
+    };
     let (verb, values) = match parse(args, &mut out) {
         Ok(parsed) => parsed,
         Err(code) => return finish(out, code),
     };
     if crate::ipc::connect(socket).is_err() {
         eprintln!(
-            "remuda: vfs {verb} needs the remuda daemon, and none is running for {server:?}; start it with `remuda run ...` or `remuda -e 1`, then retry"
+            "remuda: {command} {verb} needs the remuda daemon, and none is running for {server:?}; start it with `remuda run ...` or `remuda -e 1`, then retry"
         );
         return ExitCode::FAILURE;
     }
     if verb == "publish" {
         // One `put` per file, so the loop lives here and the daemon only sees
         // the request it already knows.
-        return publish(socket, &values);
+        return publish(socket, &values, command);
     }
     if verb == "serve" {
         // The one verb that does not run in the daemon: it binds a port in this
@@ -289,6 +324,7 @@ pub fn run(server: &str, socket: &Path, args: &[&str]) -> ExitCode {
             value(&values, "root").unwrap_or("/"),
             flag(&values, "allow-scripts"),
             flag(&values, "allow-remote"),
+            command,
         );
     }
     let mut input = None;
@@ -296,7 +332,9 @@ pub fn run(server: &str, socket: &Path, args: &[&str]) -> ExitCode {
         let source = value(&values, "SOURCE").unwrap_or_default();
         match read_source(source) {
             Ok(bytes) => input = Some(BASE64.encode(bytes)),
-            Err(error) => return finish_fail(&verb, format!("cannot read {source}: {error}")),
+            Err(error) => {
+                return finish_fail(command, &verb, format!("cannot read {source}: {error}"))
+            }
         }
     }
     let request = Request::Vfs {
@@ -313,16 +351,24 @@ pub fn run(server: &str, socket: &Path, args: &[&str]) -> ExitCode {
             BASE64.decode(stdout_base64).unwrap_or_default(),
             BASE64.decode(stderr_base64).unwrap_or_default(),
         ),
-        Ok(Response::Error(error)) => return finish_fail(&verb, error),
-        Ok(other) => return finish_fail(&verb, format!("unexpected daemon answer: {other:?}")),
-        Err(error) => return finish_fail(&verb, format!("daemon request failed: {error}")),
+        Ok(Response::Error(error)) => return finish_fail(command, &verb, error),
+        Ok(other) => {
+            return finish_fail(
+                command,
+                &verb,
+                format!("unexpected daemon answer: {other:?}"),
+            )
+        }
+        Err(error) => {
+            return finish_fail(command, &verb, format!("daemon request failed: {error}"))
+        }
     };
     let _ = std::io::stderr().lock().write_all(&stderr);
     if verb == "get" && code == 0 {
         if let Some(dest) = value(&values, "DEST").filter(|dest| *dest != "-") {
             return match std::fs::write(dest, &stdout) {
                 Ok(()) => ExitCode::SUCCESS,
-                Err(error) => finish_fail(&verb, error),
+                Err(error) => finish_fail(command, &verb, error),
             };
         }
     }
@@ -330,7 +376,7 @@ pub fn run(server: &str, socket: &Path, args: &[&str]) -> ExitCode {
     ExitCode::from(code)
 }
 
-/// Run `remuda vfs drain` in the daemon at `socket` and print what it said;
+/// Run `remuda drive drain` in the daemon at `socket` and print what it said;
 /// `remuda cluster leave` uses it. Returns drain's exit code.
 pub fn drain_in_daemon(socket: &Path) -> Result<u8, String> {
     let timeout = DRAIN_TIMEOUT.as_secs().to_string();
@@ -357,7 +403,7 @@ pub fn drain_in_daemon(socket: &Path) -> Result<u8, String> {
 /// `verb` and its parsed `values` as daemon arguments, in spec order. SOURCE
 /// becomes `-` (the content travels as input) and DEST stays with the CLI.
 fn forward(verb: &str, values: &Map<String, Value>) -> Vec<String> {
-    let spec = spec();
+    let spec = spec(PRIMARY);
     let Some(command) = spec.verbs.iter().find(|command| command.name == verb) else {
         return vec![verb.to_owned()];
     };
@@ -401,8 +447,11 @@ fn finish(out: Out, code: u8) -> ExitCode {
     ExitCode::from(code)
 }
 
-fn finish_fail(verb: &str, error: impl std::fmt::Display) -> ExitCode {
-    let mut out = Out::default();
+fn finish_fail(command: &str, verb: &str, error: impl std::fmt::Display) -> ExitCode {
+    let mut out = Out {
+        command: command.to_owned(),
+        ..Out::default()
+    };
     let code = fail(&mut out, verb, error);
     finish(out, code)
 }
@@ -678,7 +727,7 @@ fn write_complete_with(
             let (what, detail) = marker_words(&error);
             warn!(out, "remuda: publish incomplete: every file is in remuda:///{}/, but COMPLETE {what}: {detail}", finished.base);
             if matches!(error, MarkerError::Unconfirmed(_)) {
-                warn!(out, "Next: check `remuda vfs stat remuda:///{}/COMPLETE`; if it is missing, publish a new --release name.", finished.base);
+                warn!(out, "Next: check `remuda drive stat remuda:///{}/COMPLETE`; if it is missing, publish a new --release name.", finished.base);
             }
             Err(1)
         }
@@ -711,7 +760,7 @@ fn write_pointer_with(
                 "remuda: publish: the release is complete, but CURRENT {what}: {detail}"
             );
             if matches!(error, MarkerError::Unconfirmed(_)) {
-                warn!(out, "Next: check `remuda vfs stat remuda:///{prefix}CURRENT`; if it is missing, publish a new --release name.");
+                warn!(out, "Next: check `remuda drive stat remuda:///{prefix}CURRENT`; if it is missing, publish a new --release name.");
             }
             Err(1)
         }
@@ -734,6 +783,7 @@ fn say_published(finished: &Finished<'_>, out: &mut Out) {
 }
 
 fn say_pointer_and_reader(finished: &Finished<'_>, out: &mut Out) {
+    let command = command_name(out).to_owned();
     let prefix = if finished.prefix.is_empty() {
         String::new()
     } else {
@@ -741,12 +791,12 @@ fn say_pointer_and_reader(finished: &Finished<'_>, out: &mut Out) {
     };
     say!(
         out,
-        "  CURRENT names {}; `remuda vfs get remuda:///{prefix}CURRENT` shows it (the bridge does not resolve it).",
+        "  CURRENT names {}; `remuda {command} get remuda:///{prefix}CURRENT` shows it (the bridge does not resolve it).",
         finished.release
     );
     say!(
         out,
-        "  Read it with `remuda vfs serve --root {}`.",
+        "  Read it with `remuda {command} serve --root {}`.",
         if finished.prefix.is_empty() {
             finished.release
         } else {
@@ -779,7 +829,7 @@ fn finish_with(call: &DaemonCall<'_>, finished: Finished<'_>, pointer: bool, out
         );
         warn!(
             out,
-            "Next: wait for the peers, or check `remuda vfs status --copies`."
+            "Next: wait for the peers, or check `remuda drive status --copies`."
         );
     }
     say_published(&finished, out);
@@ -802,9 +852,10 @@ fn finish_with(call: &DaemonCall<'_>, finished: Finished<'_>, pointer: bool, out
         }
         say_pointer_and_reader(&finished, out);
     } else {
+        let command = command_name(out).to_owned();
         say!(
             out,
-            "  Read it with `remuda vfs serve --root {}`.",
+            "  Read it with `remuda {command} serve --root {}`.",
             if finished.prefix.is_empty() {
                 finished.release
             } else {
@@ -889,17 +940,20 @@ fn say_upload_failure(prepared: &Prepared, uploaded: &Uploaded, detail: &str, ou
         "  COMPLETE was not written, so this release is not finished; {} was uploaded.",
         vfs_publish::bytes_text(uploaded.bytes)
     );
-    warn!(out, "Next: fix the source, then publish a new --release name; `remuda vfs ls remuda:///{}/` shows what is there.", prepared.base);
+    warn!(out, "Next: fix the source, then publish a new --release name; `remuda drive ls remuda:///{}/` shows what is there.", prepared.base);
 }
 
-/// `remuda vfs publish`: one ordinary `put` per file, then a completion marker.
+/// `remuda drive publish`: one ordinary `put` per file, then a completion marker.
 /// The loop lives in the CLI so the daemon contract does not change.
-fn publish(socket: &Path, values: &Map<String, Value>) -> ExitCode {
+fn publish(socket: &Path, values: &Map<String, Value>, command: &str) -> ExitCode {
     let prepared = match prepare(socket, values) {
         Ok(prepared) => prepared,
-        Err(error) => return finish_fail("publish", error),
+        Err(error) => return finish_fail(command, "publish", error),
     };
-    let mut out = Out::default();
+    let mut out = Out {
+        command: command.to_owned(),
+        ..Out::default()
+    };
     if flag(values, "dry-run") {
         say_plan(&prepared, &mut out);
         return finish(out, 0);
@@ -979,7 +1033,7 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
         "serve" => fail(
             out,
             "serve",
-            "runs in the CLI process, not the daemon; run `remuda vfs serve` there",
+            "runs in the CLI process, not the daemon; run `remuda drive serve` there",
         ),
         "release" => release(values, out),
         "sync" => {
@@ -990,7 +1044,7 @@ fn serve(args: &[&str], input: &[u8], out: &mut Out) -> u8 {
         "publish" => fail(
             out,
             "publish",
-            "runs in the CLI process, not the daemon; run `remuda vfs publish` there",
+            "runs in the CLI process, not the daemon; run `remuda drive publish` there",
         ),
         "drain" => drain(values, out),
         "status" => status(values, out),
@@ -1155,7 +1209,7 @@ fn release_reasons(report: &crate::cluster::vfs_release::ReleaseReport) -> Vec<S
     let mut lines = Vec::new();
     if report.unconfirmed > 0 {
         lines.push(format!(
-            "Next: {} kept because a node that should hold {} did not confirm a copy; try `remuda vfs status --copies`.",
+            "Next: {} kept because a node that should hold {} did not confirm a copy; try `remuda drive status --copies`.",
             report.unconfirmed,
             if report.unconfirmed == 1 { "it" } else { "them" }
         ));
@@ -1284,7 +1338,7 @@ fn old_stores_line(report: &StatusReport) -> Option<String> {
     ))
 }
 
-/// The text form of `remuda vfs status`.
+/// The text form of `remuda drive status`.
 fn status_lines(report: &StatusReport) -> Vec<String> {
     use crate::cluster::vfs::{MAX_ENTRIES, MAX_INDEX_ENTRIES};
     let mut lines = vec![
@@ -1296,7 +1350,7 @@ fn status_lines(report: &StatusReport) -> Vec<String> {
         ),
         match report.conflict_paths {
             0 => "Conflicts: none".to_owned(),
-            n => format!("Conflicts: {n} paths (remuda vfs ls --conflicts)"),
+            n => format!("Conflicts: {n} paths (remuda drive ls --conflicts)"),
         },
         format!(
             "This node ({}): {} copies, {}; {} copies waiting to retry",
@@ -1376,7 +1430,7 @@ fn status_lines(report: &StatusReport) -> Vec<String> {
             ));
         }
     } else {
-        lines.push("Copies: run `remuda vfs status --copies` to ask the nodes.".to_owned());
+        lines.push("Copies: run `remuda drive status --copies` to ask the nodes.".to_owned());
     }
     lines
 }
@@ -1461,7 +1515,7 @@ fn drain_outcome(report: &DrainReport) -> (Vec<String>, u8) {
             report.too_old.join(", ")
         ));
     } else {
-        lines.push("Next: run `remuda vfs drain` again; peers are still copying.".into());
+        lines.push("Next: run `remuda drive drain` again; peers are still copying.".into());
     }
     (lines, EXIT_TEMPFAIL)
 }
@@ -2213,7 +2267,7 @@ fn say_conflict_report(
     }
     say!(
         out,
-        "Next: remuda vfs resolve-conflict URI --keep winner|VERSION."
+        "Next: remuda drive resolve-conflict URI --keep winner|VERSION."
     );
     0
 }
@@ -2395,10 +2449,25 @@ mod tests {
 
     #[test]
     fn every_verb_has_help() {
-        for verb in spec().verbs {
+        for verb in spec(PRIMARY).verbs {
             assert!(usage(&verb.name).contains("Usage"), "{}", verb.name);
         }
         assert!(usage("").contains("resolve"));
+    }
+
+    #[test]
+    fn drive_is_primary_and_vfs_names_its_own_help() {
+        assert_eq!(spec(PRIMARY).name, "remuda drive");
+        assert_eq!(spec("vfs").name, "remuda vfs");
+        let drive = usage_for("drive", "");
+        assert!(drive.contains("Usage: remuda drive <COMMAND>"), "{drive}");
+        assert!(!drive.contains("remuda vfs"), "{drive}");
+        let vfs = usage_for("vfs", "");
+        assert!(vfs.contains("Usage: remuda vfs <COMMAND>"), "{vfs}");
+        let drive_put = usage_for("drive", "put");
+        assert!(drive_put.contains("Usage: remuda drive put"), "{drive_put}");
+        let vfs_put = usage_for("vfs", "put");
+        assert!(vfs_put.contains("Usage: remuda vfs put"), "{vfs_put}");
     }
 
     fn prepared(names: &[&str]) -> Prepared {
@@ -2744,7 +2813,7 @@ mod tests {
         assert_eq!(code, 1);
         assert_eq!(seen.borrow().len(), 1);
         assert!(error.contains("could not be confirmed"), "{error}");
-        assert!(error.contains("vfs stat"), "{error}");
+        assert!(error.contains("drive stat"), "{error}");
     }
 
     #[test]
@@ -3239,13 +3308,13 @@ mod tests {
         for want in [
             "Old stores: 1 set aside by `cluster leave` or `init --new-identity`, 2.0 MiB; delete each once you no longer need it: /s/cluster.left-20261022/vfs",
             "Files: 12 live of 10000; index 15 of 30000 entries (3 deletes remembered)",
-            "Conflicts: 2 paths (remuda vfs ls --conflicts)",
+            "Conflicts: 2 paths (remuda drive ls --conflicts)",
             "This node (node-me): 9 copies, 1.5 MiB; 2 copies waiting to retry",
             "  node-a         up; pulled from here 2m ago; caps: take",
             "  node-b         down 3h; never pulled from here; holds back 3 deletes",
             "  node-c         old build; pulled from here 2m ago; stale (over 30 days): no longer holds deletes back",
             "Settings: replicas 3, tombstone-days 7, stale-days 30",
-            "Copies: run `remuda vfs status --copies` to ask the nodes.",
+            "Copies: run `remuda drive status --copies` to ask the nodes.",
         ] {
             assert!(text.contains(want), "missing {want:?} in:\n{text}");
         }

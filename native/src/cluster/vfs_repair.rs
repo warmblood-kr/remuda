@@ -19,7 +19,7 @@ pub(super) struct RepairQueue {
 
 impl RepairQueue {
     /// Up to `limit` of `wanted` to try now: new ones first, then the longest
-    /// waiting. `force` ignores the wait, as `remuda vfs sync` does.
+    /// waiting. `force` ignores the wait, as `remuda drive sync` does.
     pub(super) fn due(
         &mut self,
         wanted: &[String],
