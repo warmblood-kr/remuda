@@ -44,7 +44,7 @@ every update is a reload.
    - `warning: index.db is at schema N but BUILD reads up to M`: you are
      going back to an older build. Sessions are fine, but its VFS refuses
      every call until you reload forward again. To use the VFS on it, run
-     `remuda vfs index-downgrade M --yes` first (it backs up the index).
+     `remuda drive index-downgrade M --yes` first (it backs up the index).
 6. If you edited `init.lua` since the daemon started, check it loads. The
    new daemon runs it again, and a broken one is reported after the reload,
    when it can no longer be undone.

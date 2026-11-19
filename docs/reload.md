@@ -43,7 +43,7 @@ sessions and the socket:
 - modules are stopped, and their stop hooks run.
 
 Code that must survive a reload keeps its state outside the image: in the
-file store (`remuda vfs`), in a file, or in a session.
+file store (`remuda drive`), in a file, or in a session.
 
 ## Refused, nothing changes
 
