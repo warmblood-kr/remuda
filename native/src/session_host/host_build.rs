@@ -141,11 +141,9 @@ fn probe_uncached(path: &Path) -> Option<String> {
     (status.success() && !build.is_empty() && !build.contains('\n')).then(|| build.to_owned())
 }
 
-/// A test daemon runs from a Cargo test binary, not from the shipped `remuda`:
-/// normally `target/<profile>/deps/`, but a harness built beside a build script
-/// lives under `target/<profile>/build/<crate>/<hash>/out/`. The real `remuda`
-/// and its host sit at the profile root. Production markers are neither `deps`
-/// nor `out`, so an installed daemon keeps its own directory.
+/// A test daemon runs from a Cargo test binary under `target/<profile>/deps/`
+/// or `build/<crate>/<hash>/out/`; the real `remuda` sits at the profile root.
+/// Production is neither, so an installed daemon keeps its own directory.
 pub(super) fn profile_daemon(daemon: &Path) -> Option<PathBuf> {
     let parent = daemon.parent()?;
     let marker = parent.file_name()?.to_str()?;
