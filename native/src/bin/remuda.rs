@@ -67,6 +67,8 @@ mod gui_managed;
 mod opencode_adopt;
 #[path = "remuda/opencode_tui.rs"]
 mod opencode_tui;
+#[path = "remuda/native_permissions.rs"]
+mod permissions_cli;
 #[path = "remuda/private_dir.rs"]
 mod private_dir;
 
@@ -268,6 +270,7 @@ fn dispatch_native_verb(verb: &str, rest: &[&str]) -> Option<ExitCode> {
             ExitCode::SUCCESS
         }
         "_agent_notice" => agent_notice::run(rest),
+        "_native_permissions" => permissions_cli::run(rest),
         "_codex_notice" => codex_native::run(rest),
         "_codex_adopt" => codex_native::run_adopt(rest),
         "_opencode_watch" => run_opencode_watch_cli(rest),

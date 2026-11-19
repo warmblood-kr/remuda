@@ -34,6 +34,7 @@ pub mod json;
 pub mod keybindings;
 pub mod mcp;
 pub mod mouse;
+pub mod native_permissions;
 #[allow(clippy::disallowed_types)]
 pub mod net;
 pub mod packages;
