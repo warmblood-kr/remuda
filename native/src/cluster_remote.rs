@@ -394,7 +394,7 @@ impl RemoteNode {
     /// Record a successful collection with an explicit wall-clock instant.
     /// Production passes `SystemTime::now()`; tests use a fixed value so the
     /// absolute `last_updated_at` stays deterministic.
-    pub fn poll_succeeded_at(
+    fn poll_succeeded_at(
         &mut self,
         sessions: Vec<RemoteSessionSnapshot>,
         now: Instant,
@@ -410,7 +410,7 @@ impl RemoteNode {
         self.poll_delivered_at(poll, now, SystemTime::now(), selected);
     }
 
-    pub fn poll_delivered_at(
+    fn poll_delivered_at(
         &mut self,
         poll: RemotePoll,
         now: Instant,
