@@ -167,6 +167,8 @@ pub struct ClusterUi {
     composer: LineComposer,
     keymap: crate::keybindings::Snapshot,
     composer_focused: bool,
+    documents_open: bool,
+    documents: Option<crate::documents::Browser>,
     composer_target: Option<(String, String)>,
     input_sender: InputSender,
     input_queue: InputQueue,
@@ -539,6 +541,8 @@ impl ClusterUi {
             composer: LineComposer::default(),
             keymap: crate::keybindings::Snapshot::default(),
             composer_focused: false,
+            documents_open: false,
+            documents: None,
             composer_target: None,
             input_sender,
             input_queue: InputQueue::default(),
@@ -1296,6 +1300,9 @@ impl ClusterUi {
         let (cols, rows) = normalized_terminal_size(cols, rows);
         let width = usize::from(cols.max(1));
         let height = usize::from(rows.max(1));
+        if self.documents_open {
+            return self.render_documents(width, height);
+        }
         if self.help_open.get() {
             return self.render_help_mode(width, height);
         }
@@ -2098,6 +2105,9 @@ impl ClusterUi {
     }
 
     fn handle_event(&mut self, event: crossterm::event::Event, now: Duration) -> bool {
+        if self.documents_open && matches!(event, crossterm::event::Event::Paste(_)) {
+            return false;
+        }
         match event {
             crossterm::event::Event::Key(key)
                 if key.kind == crossterm::event::KeyEventKind::Press =>
@@ -2133,6 +2143,16 @@ impl ClusterUi {
     }
 
     fn key_event(&mut self, event: crossterm::event::KeyEvent, now: Duration) -> bool {
+        if self.documents_open {
+            self.document_key(event);
+            return false;
+        }
+        if self.composer_focused
+            && self.keymap.resolve("cluster.composer", event) == Some("cluster.documents")
+        {
+            self.open_documents();
+            return false;
+        }
         if self.partial_input_confirm_target.is_some()
             && !self
                 .notice
@@ -2192,6 +2212,7 @@ impl ClusterUi {
             "cluster.tree"
         };
         match self.keymap.resolve(context, event) {
+            Some("cluster.documents") => self.open_documents(),
             Some("cluster.detach") => return true,
             Some("cluster.help") => {
                 self.help_open.set(true);
@@ -4009,6 +4030,7 @@ fn sync_local_list(
     local_views: &mut LocalViewLoader,
     now: Duration,
 ) {
+    ui.sync_documents(path);
     match list(path) {
         Ok(current) => {
             ui.sessions_synced(current, now);
@@ -4434,6 +4456,91 @@ fn select_target_with_remote_wait(
         }
         Err(error) => Err(error),
     }
+}
+
+impl ClusterUi {
+    fn open_documents(&mut self) {
+        self.documents_open = true;
+        if let Some(browser) = &mut self.documents {
+            browser.refresh();
+        }
+    }
+
+    fn sync_documents(&mut self, path: &Path) {
+        if self.documents_open && self.documents.is_none() {
+            self.documents = Some(document_browser(path));
+        }
+        if let Some(browser) = &mut self.documents {
+            browser.poll();
+        }
+    }
+
+    fn document_key(&mut self, event: crossterm::event::KeyEvent) {
+        match self.keymap.resolve("cluster.documents", event) {
+            Some(action @ ("documents.link.next" | "documents.link.previous")) => {
+                if let Some(browser) = &mut self.documents {
+                    browser.select_link(action == "documents.link.next");
+                }
+            }
+            Some("documents.address") => {
+                if let Some(browser) = &mut self.documents {
+                    browser.inspect_address();
+                }
+            }
+            Some("documents.close") => {
+                if let Some(browser) = &mut self.documents {
+                    browser.cancel();
+                }
+                self.documents_open = false;
+            }
+            Some("documents.back") => {
+                if self.documents.as_mut().is_none_or(|browser| browser.back()) {
+                    self.documents_open = false;
+                }
+            }
+            Some(action @ ("documents.up" | "documents.down")) => {
+                if let Some(browser) = &mut self.documents {
+                    browser.move_selection(action == "documents.down");
+                }
+            }
+            Some("documents.open") => {
+                if let Some(browser) = &mut self.documents {
+                    browser.open_selected();
+                }
+            }
+            Some("documents.refresh") => {
+                if let Some(browser) = &mut self.documents {
+                    browser.refresh();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn render_documents(&self, width: usize, height: usize) -> String {
+        let mut lines = self.documents.as_ref().map_or_else(
+            || vec!["Documents · loading".into()],
+            |browser| browser.lines(width, height),
+        );
+        lines.resize(height, String::new());
+        if height > 1 {
+            lines[height - 1] = self.keymap.display_help("cluster.documents", &[]);
+        }
+        lines
+            .into_iter()
+            .take(height)
+            .map(|line| truncate(&line, width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// The TUI listing offers the same parent row as the GUI document pane, so a
+/// nested directory can be left upward as well as with Back.
+fn document_browser(path: &Path) -> crate::documents::Browser {
+    let mut browser = crate::documents::Browser::new(path.to_owned());
+    browser.enable_parent_navigation();
+    browser
 }
 
 #[cfg(test)]
@@ -5823,6 +5930,32 @@ mod tests {
         now: Duration,
     ) {
         ui.key_event(crossterm::event::KeyEvent::new(code, modifiers), now);
+    }
+
+    #[test]
+    fn documents_capture_keys_and_paste_then_restore_session_draft() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+        let clock = ManualClock::new();
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        ui.composer.restore_draft("saved draft");
+        let selected = ui.selected;
+        ui.key(KeyCode::Char('d'));
+        assert!(ui.render_text(80, 24, "pane", &clock).contains("Documents"));
+        ui.composer_focused = true; // Focus below Documents must still receive nothing.
+        ui.handle_event(Event::Paste("do not send".into()), clock.now());
+        for code in [KeyCode::Enter, KeyCode::Char('x'), KeyCode::Char('y')] {
+            ui.key(code);
+        }
+        assert_eq!(ui.composer.text(), "saved draft");
+        assert!(ui.input_queue.items().next().is_none());
+        ui.key(KeyCode::Char('q'));
+        assert!(!ui.render_text(80, 24, "pane", &clock).contains("Documents"));
+        assert_eq!(ui.selected, selected);
+        assert!(ui.composer_focused);
+        key_event(&mut ui, KeyCode::Char('d'), KeyModifiers::ALT, clock.now());
+        assert!(ui.render_text(80, 24, "pane", &clock).contains("Documents"));
+        ui.key(KeyCode::Esc);
+        assert_eq!(ui.composer.text(), "saved draft");
     }
 
     #[test]
