@@ -2616,6 +2616,7 @@ fn team_contract_is_additive_and_unknown_fields_are_ignored() {
         mouse_tracking: false,
         unavailable: false,
         program_status: None,
+        program_title: None,
         program_status_age_ms: None,
         remote_input_disabled: false,
         team: Some(remuda_core::registry::SessionTeam {
@@ -2929,6 +2930,7 @@ fn malicious_duplicate_names_never_close_or_focus_an_ambiguous_instance() {
                 mouse_tracking: false,
                 unavailable: false,
                 program_status: None,
+                program_title: None,
                 program_status_age_ms: None,
                 remote_input_disabled: false,
                 team: None,

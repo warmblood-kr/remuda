@@ -960,6 +960,7 @@ mod tests {
             mouse_tracking: false,
             unavailable: false,
             program_status: None,
+            program_title: None,
             program_status_age_ms: None,
             remote_input_disabled: false,
             team: None,
@@ -968,6 +969,23 @@ mod tests {
 
     fn list(rows: Vec<remuda_core::SessionSummary>) -> Response {
         Response::Sessions(rows)
+    }
+
+    #[test]
+    fn agent_title_is_not_serialized_in_a_peer_listing() {
+        let mut row = summary("member", Some("instance"));
+        row.program_status = Some(remuda_core::agent::ProgramStatus {
+            state: remuda_core::agent::ProgramState::Working,
+            app: Some("opencode".into()),
+            kind: None,
+            progress: None,
+        });
+        row.program_title = Some("private work summary".into());
+        let json = serde_json::to_string(&list(vec![row])).expect("serialize listing");
+        assert!(
+            !json.contains("private work summary") && !json.contains("program_title"),
+            "a peer listing must not publish an agent title: {json}"
+        );
     }
 
     #[test]

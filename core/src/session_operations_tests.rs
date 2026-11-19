@@ -134,6 +134,7 @@ impl SessionOperations for Remote {
             attached: self.shared.active.load(Ordering::SeqCst) != 0,
             closing: false,
             program_status: None,
+            program_title: None,
             program_status_age_ms: None,
             host_build: Some("test-host".into()),
             attach_generation: None,

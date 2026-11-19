@@ -100,7 +100,7 @@ fn session_list_exposes_bounded_program_status() {
         vec![
             "sh".into(),
             "-c".into(),
-            "printf '\\033]7501;state=working:app=codex:msg=c2VjcmV0\\033\\\\'; sleep 5".into(),
+            "printf '\\033]7501;state=working:app=codex:title=UmV2aWV3IE9TQyB0YXNr:msg=c2VjcmV0\\033\\\\'; sleep 5".into(),
         ]
     };
     new_with_instance(&path, "status", command).expect("new status session");
@@ -111,7 +111,8 @@ fn session_list_exposes_bounded_program_status() {
             assert(type(row.program_status) == "table", "status must be present")
             assert(row.program_status.state == "working", "state is typed")
             assert(row.program_status.app == "codex", "app is bounded metadata")
-            assert(row.program_status.msg == nil, "free text is never exposed")
+            assert(row.program_status.title == "Review OSC task", "title is bounded display text")
+            assert(row.program_status.msg == nil, "message text is never exposed")
             assert(type(row.program_status_age) == "number", "age is monotonic")
             return
           end

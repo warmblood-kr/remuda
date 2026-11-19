@@ -136,6 +136,7 @@ impl Owned {
             backend_fault,
             active_connections: 0,
             program_status: program.as_ref().map(|o| Box::new(o.status.clone())),
+            program_title: program.as_ref().and_then(|o| o.title.clone()),
             program_status_age_ms: program
                 .map(|o| o.age.as_millis().try_into().unwrap_or(u64::MAX)),
             activity: Some(super::api::Activity {

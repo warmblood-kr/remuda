@@ -110,6 +110,10 @@ pub(crate) struct Info {
     /// Additive advisory OSC 7501 report. Older hosts omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_status: Option<Box<remuda_core::agent::ProgramStatus>>,
+    /// Bounded, control-free task title that arrived with the same report.
+    /// Local host protocol only; the daemon maps it to a local-only summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_title: Option<String>,
     /// Monotonic age at Inspect time; never refreshed by a read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_status_age_ms: Option<u64>,

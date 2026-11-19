@@ -1380,6 +1380,7 @@ mod tests {
             remote_input_disabled: false,
             team: None,
             program_status: None,
+            program_title: None,
             program_status_age_ms: None,
         };
         assert!(previous_session(&listed, std::slice::from_ref(&old)).is_none());
@@ -1408,6 +1409,7 @@ mod tests {
             remote_input_disabled: false,
             team: None,
             program_status: None,
+            program_title: None,
             program_status_age_ms: None,
         };
         let retained =
@@ -1991,6 +1993,7 @@ mod tests {
             remote_input_disabled: false,
             team: None,
             program_status: None,
+            program_title: None,
             program_status_age_ms: None,
         }
     }

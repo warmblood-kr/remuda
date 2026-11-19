@@ -250,6 +250,7 @@ mod tests {
                     remote_input_disabled: false,
                     team: None,
                     program_status: None,
+                    program_title: None,
                     program_status_age_ms: None,
                 }]),
                 Request::CaptureStyled { .. } => Response::StyledScreen {

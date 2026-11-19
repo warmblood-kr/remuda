@@ -176,6 +176,9 @@ pub struct Observation {
     /// Advisory OSC 7501 report and its monotonic age. Additive: older hosts
     /// and sessions without a report leave both `None`.
     pub program_status: Option<crate::agent::ProgramStatus>,
+    /// Bounded, control-free task title from the same OSC report. Local
+    /// display only; it is never identity or authority.
+    pub program_title: Option<String>,
     pub program_status_age_ms: Option<u64>,
     /// The build of the session host serving it; `None` for an in-process
     /// session, which runs the daemon's own build (#713).
@@ -449,6 +452,7 @@ impl SessionOperations for Session {
             attached: self.is_attached(),
             closing: self.is_closing(),
             program_status: program.as_ref().map(|o| o.status.clone()),
+            program_title: program.as_ref().and_then(|o| o.title.clone()),
             program_status_age_ms: program
                 .map(|o| o.age.as_millis().try_into().unwrap_or(u64::MAX)),
             host_build: None,

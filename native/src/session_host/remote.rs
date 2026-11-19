@@ -689,6 +689,7 @@ impl SessionOperations for HostSession {
             attached: activity.attached,
             closing: activity.closing,
             program_status: info.program_status.map(|status| *status),
+            program_title: info.program_title,
             program_status_age_ms: info.program_status_age_ms,
             host_build: Some(info.host_build),
             attach_generation: info.human.map(|human| human.high_water),

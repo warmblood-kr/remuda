@@ -1520,6 +1520,7 @@ mod visual_mode_tests {
                 remote_input_disabled: false,
                 team: None,
                 program_status: None,
+                program_title: None,
                 program_status_age_ms: None,
             }],
             "sh",
@@ -4271,6 +4272,7 @@ mod keybindings_adopter_tests {
             remote_input_disabled: false,
             team: None,
             program_status: None,
+            program_title: None,
             program_status_age_ms: None,
         }];
         let mut ui = Ui::new(sessions, "sh", None);
@@ -4334,6 +4336,7 @@ mod composer_tests {
             remote_input_disabled: false,
             team: None,
             program_status: None,
+            program_title: None,
             program_status_age_ms: None,
         }
     }
@@ -4596,6 +4599,7 @@ mod peer_view_fit_acceptance {
             mouse_tracking: false,
             unavailable: false,
             program_status: None,
+            program_title: None,
             program_status_age_ms: None,
             remote_input_disabled: false,
             team: None,
