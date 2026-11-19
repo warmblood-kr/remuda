@@ -492,6 +492,10 @@ pub struct ProgramStatus {
 pub struct ProgramStatusObservation {
     pub status: ProgramStatus,
     pub age: core::time::Duration,
+    /// Bounded, control-free local display text from the same report.
+    /// Kept outside [`ProgramStatus`]: that type is serialized in listings,
+    /// while an agent's words must not reach a peer or another machine.
+    pub title: Option<String>,
 }
 
 /// A live agent process: a screen we can read, a keyboard we can type on.
