@@ -128,18 +128,18 @@ pub fn status_glyph(state: RemoteState) -> char {
     }
 }
 
-/// Derive display age from the absolute collection timestamp on every render;
-/// the snapshot's `last_sync_age` is monotonic bookkeeping, not the public time.
-fn last_updated_age(node: &RemoteNodeSnapshot) -> Option<Duration> {
-    node.last_updated_age_at(SystemTime::now())
+/// Derive display age from the absolute collection timestamp. `now` is the
+/// wall sample carried by the snapshot, so the row's age and its expiry agree.
+fn last_updated_age(node: &RemoteNodeSnapshot, now: SystemTime) -> Option<Duration> {
+    node.last_updated_age_at(now)
 }
 
 /// The status cell for a node row: the state glyph, plus how old the retained
 /// list is when the node is not reachable. The age is what makes a stale row
 /// honest instead of a live-looking row with a different glyph.
-fn remote_node_status(node: &RemoteNodeSnapshot) -> String {
+fn remote_node_status(node: &RemoteNodeSnapshot, now: SystemTime) -> String {
     let glyph = status_glyph(node.state);
-    match (node.state, last_updated_age(node)) {
+    match (node.state, last_updated_age(node, now)) {
         (RemoteState::Stale, Some(age)) => format!("{glyph} {}s", age.as_secs()),
         (RemoteState::Unreachable, Some(age)) if node.expired => {
             format!("{glyph} {}s", age.as_secs())
@@ -827,19 +827,30 @@ impl ClusterUi {
             })
     }
 
+    /// The wall instant this snapshot was built against; fake snapshots built
+    /// without one fall back to the current clock.
+    fn snapshot_wall(&self) -> SystemTime {
+        self.remote_snapshot
+            .sampled_at
+            .unwrap_or_else(SystemTime::now)
+    }
+
     /// Why an action must not go to this node right now, if it must not.
     /// Retained rows are for reading: only a node whose last collection
     /// succeeded authorizes input or a close, so stale rows cannot act.
     fn stale_action_refusal(&self, node_key: &str) -> Option<String> {
-        let node = self
+        let Some(node) = self
             .remote_snapshot
             .nodes
             .iter()
-            .find(|node| node.registry_key == node_key)?;
+            .find(|node| node.registry_key == node_key)
+        else {
+            return Some("the selected node is no longer connected".to_owned());
+        };
         if node.state == RemoteState::Reachable {
             return None;
         }
-        let state = match (node.expired, last_updated_age(node)) {
+        let state = match (node.expired, last_updated_age(node, self.snapshot_wall())) {
             (true, Some(age)) => format!("unreachable, last updated {}s ago", age.as_secs()),
             (false, Some(age)) => format!("stale, last updated {}s ago", age.as_secs()),
             _ => "not connected".to_owned(),
@@ -2025,7 +2036,7 @@ impl ClusterUi {
                     if is_expanded { "▼" } else { "▶" },
                 ),
                 label: node.name.clone(),
-                status: remote_node_status(node),
+                status: remote_node_status(node, self.snapshot_wall()),
             });
             if is_expanded {
                 let content_width = u16::try_from(width.saturating_sub(REMOTE_ROW_PREFIX_WIDTH))
@@ -2111,7 +2122,7 @@ impl ClusterUi {
             if session.alive { "live" } else { "ended" },
             remote_state_label(
                 node.state,
-                last_updated_age(node),
+                last_updated_age(node, self.snapshot_wall()),
                 node.last_error.as_deref()
             ),
             session_error_suffix(session.last_error.as_deref()),
@@ -2408,6 +2419,19 @@ impl ClusterUi {
         else {
             return;
         };
+        // Keys may have been buffered while the node was Reachable; the flush
+        // can land after it turned stale, so re-check before sending.
+        if let Some(refusal) = self.stale_action_refusal(&node) {
+            self.remote_key_buffers.retain(|buffer| {
+                !matches!(
+                    &buffer.target,
+                    RemoteSelection::Session { node: queued, .. } if queued == &node
+                )
+            });
+            self.remote_keys_mode = None;
+            self.notice = Some((format!("remote input stopped: {refusal}"), ui_now));
+            return;
+        }
         let selection = RemoteSelection::Session {
             node: node.clone(),
             name,
@@ -3160,7 +3184,7 @@ impl ClusterUi {
                     node.name,
                     remote_state_label(
                         node.state,
-                        last_updated_age(node),
+                        last_updated_age(node, self.snapshot_wall()),
                         node.last_error.as_deref()
                     )
                 ))
@@ -3189,7 +3213,7 @@ impl ClusterUi {
                     session_error_suffix(session.last_error.as_deref()),
                     remote_state_label(
                         node.state,
-                        last_updated_age(node),
+                        last_updated_age(node, self.snapshot_wall()),
                         node.last_error.as_deref()
                     )
                 ))
@@ -6935,6 +6959,66 @@ mod tests {
     }
 
     #[test]
+    fn remote_keys_drop_buffer_when_node_goes_stale_before_flush() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let source = FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        )));
+        let mut ui = make_ui("studio", sessions(), clock.now());
+        ui.remote_synced(&source);
+        ui.remote_input_enabled = true;
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        ui.handle_event(
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            )),
+            clock.now(),
+        );
+        assert_eq!(ui.remote_key_buffers.len(), 1);
+        // A second session on the same node also has buffered keys; an expiry
+        // must drop every buffer for that node, not only the front one.
+        ui.remote_key_buffers.push_back(super::RemoteKeyBuffer {
+            target: RemoteSelection::Session {
+                node: "fp-laptop".into(),
+                name: "other".into(),
+                wire_name: "other".into(),
+                instance_id: "other-instance".into(),
+            },
+            bytes: b"z".to_vec(),
+            first_input_at: Instant::now(),
+        });
+
+        // The node turns stale while the keys are still coalescing.
+        let stale = remote_snapshot(
+            RemoteState::Stale,
+            Duration::from_secs(9),
+            Some(remote_screen("remote")),
+        );
+        source.replace(stale);
+        ui.remote_synced(&source);
+        ui.flush_remote_key_buffer(
+            Instant::now() + super::REMOTE_KEYS_COALESCE_INTERVAL,
+            clock.now(),
+        );
+
+        assert!(ui.remote_key_buffers.is_empty());
+        assert_eq!(ui.input_queue.items().count(), 0);
+        assert!(
+            ui.notice.as_ref().is_some_and(|(notice, _)| {
+                notice.contains("remote input stopped") && notice.contains("stale")
+            }),
+            "the flush refusal says why: {:?}",
+            ui.notice
+        );
+    }
+
+    #[test]
     fn remote_keys_drop_buffer_when_session_is_replaced_before_flush() {
         use crossterm::event::{Event, KeyCode, KeyModifiers};
 
@@ -9163,6 +9247,38 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_close_is_refused_when_the_node_disappears_before_send() {
+        use crossterm::event::KeyCode;
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("body"));
+
+        ui.key(KeyCode::Char('x'));
+        ui.key(KeyCode::Char('y'));
+        assert!(ui.pending_close.is_some(), "close was confirmed");
+        // The node vanished from the snapshot between the confirmation and
+        // the send; an absent node must refuse, not fall through to a close.
+        ui.remote_snapshot.nodes.clear();
+        let transport = FakeRemoteInput::new(Response::Ok);
+        ui.send_close_pending(
+            std::path::Path::new("unused"),
+            Some(&transport),
+            clock.now(),
+        );
+
+        assert!(
+            transport.requests.lock().unwrap().is_empty(),
+            "a missing node must not receive a close"
+        );
+        assert!(
+            ui.notice.as_ref().is_some_and(|(notice, _)| {
+                notice.contains("close not sent") && notice.contains("no longer connected")
+            }),
+            "the close refusal says why: {:?}",
+            ui.notice
+        );
+    }
+
+    #[test]
     fn remote_target_waits_for_first_session_list() {
         let source = std::sync::Arc::new(FakeRemoteSource(Mutex::new(RemoteSnapshot::default())));
         let producer = std::sync::Arc::clone(&source);
@@ -9575,24 +9691,39 @@ mod tests {
         let node = &mut snapshot.nodes[0];
         node.last_updated_at = now.checked_sub(Duration::from_secs(12));
         assert_eq!(
-            remote_node_status(node),
+            remote_node_status(node, SystemTime::now()),
             "? 12s",
             "display must use last_updated_at, not the 999s monotonic copy"
         );
 
         node.last_updated_at = now.checked_add(Duration::from_secs(60));
         assert_eq!(
-            remote_node_status(node),
+            remote_node_status(node, SystemTime::now()),
             "? 0s",
             "future timestamps clamp to zero"
         );
 
         node.last_updated_at = None;
         assert_eq!(
-            remote_node_status(node),
+            remote_node_status(node, SystemTime::now()),
             "?",
             "a missing timestamp stays unknown"
         );
+    }
+
+    #[test]
+    fn the_rendered_age_and_expiry_read_one_wall_sample_per_snapshot() {
+        let sampled = SystemTime::now();
+        let mut snapshot = remote_snapshot(RemoteState::Stale, Duration::from_secs(2), None);
+        let node = &mut snapshot.nodes[0];
+        node.last_updated_at = sampled.checked_sub(Duration::from_secs(179));
+        node.expired = false;
+        snapshot.sampled_at = Some(sampled);
+
+        // The snapshot was built at 179 s; a later real clock must not push the
+        // row over the window while its expiry still says retained.
+        assert_eq!(remote_node_status(node, sampled), "? 179s");
+        assert!(!node.expired, "the same sample decides both");
     }
 
     #[test]
