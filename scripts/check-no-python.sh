@@ -137,27 +137,48 @@ scan_invocations() {
 		qcmd = sep "[ \t]*[\"\047]([^\"\047]*/)?" tokonly "([\"\047]|[ \t])"
 		arm = sep "[ \t]*[\"\047][^\"\047]*" tokonly "[^\"\047]*[\"\047][ \t]*(\\||=>)"
 		word = "([^A-Za-z0-9_.-]|^)" tokonly "([^A-Za-z0-9_.-]|$)"
-		# A command substitution inside double quotes still executes. The token
-		# must be inside the substitution, so a literal beside it stays data.
-		dqsub = "\"\\$\\([^)\"]*" tokonly
+		# A command substitution inside double quotes still executes, and
+		# blank_quotes keeps it; a backtick substitution opens right after the
+		# double quote (the markdown fence `"```python` has an empty first pair).
 		btq = "\"[^\"`]*`[^`]*" tokonly
 	}
 	# Blank quoted text in place, preserving length, so an unquoted token is
-	# still seen next to a quote while a literal inside one is not.
-	function blank_quotes(s,   i, c, q, out) {
+	# still seen next to a quote while a literal inside one is not. A $(...)
+	# inside double quotes is command substitution, so its content stays
+	# visible even though the surrounding string does not.
+	function blank_quotes(s,   i, c, q, cmdsub, depth, out) {
 		out = ""
 		q = ""
+		cmdsub = 0
+		depth = 0
 		for (i = 1; i <= length(s); i++) {
 			c = substr(s, i, 1)
+			if (cmdsub) {
+				if (c == "(") depth++
+				else if (c == ")") {
+					depth--
+					if (depth == 0) cmdsub = 0
+				}
+				out = out c
+				continue
+			}
 			if (q == "") {
 				if (c == "\"" || c == "\047") { q = c; out = out " " }
 				else out = out c
+			} else if (q == "\047") {
+				if (c == "\047") q = ""
+				out = out " "
 			} else if (c == "\\" && i < length(s)) {
 				out = out "  "
 				i++
-			} else if (c == q) {
+			} else if (c == "\"") {
 				q = ""
 				out = out " "
+			} else if (c == "$" && substr(s, i + 1, 1) == "(") {
+				cmdsub = 1
+				depth = 1
+				out = out "("
+				i++
 			} else {
 				out = out " "
 			}
@@ -188,9 +209,9 @@ scan_invocations() {
 		# block-comment continuation line that starts with *.
 		if (line ~ /^[ \t]*(#|\/\/|--|\/\*|\*)/) next
 		if (tolower(line) ~ sink && line ~ tokre) { print n ":" line; next }
-		# A command substitution inside double quotes still executes; a
+		# A backtick substitution inside double quotes still executes; a
 		# single-quoted one is a literal and stays data.
-		if (line ~ dqsub || line ~ btq) { print n ":" line; next }
+		if (line ~ btq) { print n ":" line; next }
 		if (line ~ executor && line ~ tokre) { print n ":" line; next }
 		if (line ~ setupre) { print n ":" line; next }
 		if (line ~ qcmd && line !~ arm) { print n ":" line; next }

@@ -212,7 +212,19 @@ reset_fixture
 printf 'echo "`%s -c 1`"\n' "$py" >"$fixture/repo/scripts/probe.sh"
 expect_rejected 'quoted backtick substitution' 'Python invocation at scripts/probe.sh:1'
 reset_fixture
+printf 'echo "a $(%s -c 1) b"\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'prefixed quoted $() substitution' 'Python invocation at scripts/probe.sh:1'
+reset_fixture
+printf 'value="out=$(%s -c 1)"\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'assigned prefixed quoted $() substitution' 'Python invocation at scripts/probe.sh:1'
+reset_fixture
+printf 'echo "prefix$(%s -c 1)suffix"\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'inline prefixed quoted $() substitution' 'Python invocation at scripts/probe.sh:1'
+reset_fixture
 printf 'literal=\047$(%s -c 1)\047\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_ok
+reset_fixture
+printf 'echo "x" \047$(%s -c 1)\047\n' "$py" >"$fixture/repo/scripts/probe.sh"
 expect_ok
 reset_fixture
 printf 'cp uv.lock dist/\n' >"$fixture/repo/scripts/probe.sh"
