@@ -113,7 +113,13 @@ impl Scan {
             }
         }
         if self.rows.is_empty() {
-            out.push_str("No pending permission requests in reachable bindings.\n");
+            // "No pending" is a claim about reachable bindings; with none
+            // reachable the honest answer is that nothing answered.
+            if self.bindings.iter().any(|binding| binding.status == "ok") {
+                out.push_str("No pending permission requests in reachable bindings.\n");
+            } else {
+                out.push_str("No reachable bindings; see the unavailable lines above.\n");
+            }
             return out;
         }
         out.push_str("SESSION  SOURCE  ACTION  RESOURCE  STATUS  DECISION\n");
