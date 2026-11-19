@@ -113,13 +113,13 @@ pub struct SessionSummary {
     #[serde(skip)]
     pub program_title: Option<String>,
     /// UTC Unix timestamp (ms) of the report behind `program_status`; display
-    /// only, and never serialized. The peer path cannot receive it even before
-    /// a sanitiser runs; freshness uses the monotonic age, never this value.
+    /// only, and never serialized. Freshness also needs the monotonic age as a
+    /// floor: a caller may age this value, but never from it alone.
     #[serde(skip)]
     pub program_status_last_updated_at_ms: Option<u64>,
-    /// Age at copy time, derived from `program_status_last_updated_at_ms`.
-    /// Compatibility value only: re-derive from the timestamp when rendering,
-    /// and never let a list, cache clone or relist reset it.
+    /// Monotonic age in ms at copy time, from the tracker's `Instant`; never
+    /// derived from the wall-clock timestamp. This is the freshness value.
+    /// A relist recomputes it; a cached row keeps the copy it was given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_status_age_ms: Option<u64>,
     /// Local-only policy: this exact instance refuses authenticated cluster
