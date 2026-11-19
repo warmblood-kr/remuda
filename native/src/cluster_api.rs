@@ -961,6 +961,7 @@ mod tests {
             unavailable: false,
             program_status: None,
             program_title: None,
+            program_status_last_updated_at_ms: None,
             program_status_age_ms: None,
             remote_input_disabled: false,
             team: None,
@@ -981,10 +982,15 @@ mod tests {
             progress: None,
         });
         row.program_title = Some("private work summary".into());
+        row.program_status_last_updated_at_ms = Some(1_700_000_000_000);
         let json = serde_json::to_string(&list(vec![row])).expect("serialize listing");
         assert!(
             !json.contains("private work summary") && !json.contains("program_title"),
             "a peer listing must not publish an agent title: {json}"
+        );
+        assert!(
+            json.contains("program_status_last_updated_at_ms"),
+            "the report time is listing metadata like the age: {json}"
         );
     }
 

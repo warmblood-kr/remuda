@@ -18,6 +18,7 @@ fn session(name: &str, instance: &str) -> SessionSummary {
         unavailable: false,
         program_status: None,
         program_title: None,
+        program_status_last_updated_at_ms: None,
         program_status_age_ms: None,
         remote_input_disabled: false,
         team: None,

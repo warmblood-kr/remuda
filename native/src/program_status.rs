@@ -10,7 +10,7 @@
 
 use base64::Engine;
 use remuda_core::agent::{ProgramBlockKind, ProgramState, ProgramStatus, ProgramStatusObservation};
-use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The longest OSC 7501 payload Remuda will inspect. `Strings` already bounds
 /// OSC accumulation; this keeps a direct vt100 path equally bounded.
@@ -24,7 +24,7 @@ const MAX_TITLE_DECODED: usize = 192;
 pub(crate) struct Tracker {
     status: Option<ProgramStatus>,
     title: Option<String>,
-    updated_at: Option<Instant>,
+    observed_at: Option<SystemTime>,
 }
 
 impl Tracker {
@@ -47,25 +47,41 @@ impl Tracker {
             Record::Clear => {
                 self.status = None;
                 self.title = None;
-                self.updated_at = Some(Instant::now());
+                self.observed_at = Some(SystemTime::now());
             }
             Record::Status(status, title) => {
                 self.status = Some(status);
                 self.title = title;
-                self.updated_at = Some(Instant::now());
+                self.observed_at = Some(SystemTime::now());
             }
         }
     }
 
     pub fn observation(&self) -> Option<ProgramStatusObservation> {
         let status = self.status.clone()?;
-        let age = self.updated_at.map(|at| at.elapsed()).unwrap_or_default();
         Some(ProgramStatusObservation {
             status,
-            age,
+            age: self.age(),
             title: self.title.clone(),
+            observed_at_ms: self.observed_at.and_then(unix_millis),
         })
     }
+
+    /// How long ago the last report arrived. A wall clock that jumped backwards
+    /// cannot make the age negative; it reads as just observed.
+    fn age(&self) -> Duration {
+        self.observed_at
+            .and_then(|at| SystemTime::now().duration_since(at).ok())
+            .unwrap_or_default()
+    }
+}
+
+/// A UTC Unix timestamp for the report, or `None` if the host clock is before
+/// the epoch. A relative age is never used to invent one.
+fn unix_millis(at: SystemTime) -> Option<u64> {
+    at.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
 enum Record {
@@ -391,6 +407,55 @@ mod tests {
         assert!(
             status.observation().is_none(),
             "root clear removes the title"
+        );
+    }
+
+    #[test]
+    fn the_absolute_timestamp_is_kept_across_reads_and_never_invented() {
+        let mut status = Tracker::default();
+        assert!(status.observation().is_none());
+        observe(&mut status, "state=working:app=opencode");
+        let first = status.observation().unwrap();
+        let at = first
+            .observed_at_ms
+            .expect("a UTC timestamp for the report");
+        assert!(at > 1_700_000_000_000, "unix milliseconds, not seconds");
+
+        let second = status.observation().unwrap();
+        assert_eq!(
+            second.observed_at_ms,
+            Some(at),
+            "a read must not move the report time"
+        );
+        assert!(
+            second.age >= first.age,
+            "the derived age grows between reads"
+        );
+
+        observe(&mut status, "state=idle");
+        let replaced = status.observation().unwrap();
+        assert!(
+            replaced.observed_at_ms >= Some(at),
+            "a new report replaces the timestamp"
+        );
+    }
+
+    #[test]
+    fn a_pre_epoch_clock_yields_no_timestamp_and_a_future_one_no_negative_age() {
+        assert_eq!(unix_millis(UNIX_EPOCH - Duration::from_secs(1)), None);
+
+        let mut status = Tracker::default();
+        observe(&mut status, "state=working");
+        status.observed_at = Some(SystemTime::now() + Duration::from_secs(60));
+        let skewed = status.observation().unwrap();
+        assert_eq!(
+            skewed.age,
+            Duration::ZERO,
+            "a report from the future reads as just observed"
+        );
+        assert!(
+            skewed.observed_at_ms.is_some(),
+            "the raw value is preserved, not replaced by the clamped age"
         );
     }
 }

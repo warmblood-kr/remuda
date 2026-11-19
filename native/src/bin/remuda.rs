@@ -3287,6 +3287,7 @@ fn sanitize_peer_response(
                 // OSC enrichment rather than publish a stale snapshot as fresh.
                 session.program_status = None;
                 session.program_title = None;
+                session.program_status_last_updated_at_ms = None;
                 session.program_status_age_ms = None;
                 if let Some(team) = &mut session.team {
                     if let Some(kind) = &mut team.agent_kind {
@@ -8288,7 +8289,8 @@ mod cluster_call_tests {
             team: None,
             program_status: None,
             program_title: Some("peer task\u{1b}[31m".into()),
-            program_status_age_ms: None,
+            program_status_last_updated_at_ms: Some(1_700_000_000_000),
+            program_status_age_ms: Some(5),
         }]));
         let Response::Sessions(sessions) = sessions else {
             panic!("expected sanitized sessions");
@@ -8299,6 +8301,11 @@ mod cluster_call_tests {
             sessions[0].program_title, None,
             "peer task text is withheld"
         );
+        assert_eq!(
+            sessions[0].program_status_last_updated_at_ms, None,
+            "the OSC report time is withheld with the status"
+        );
+        assert_eq!(sessions[0].program_status_age_ms, None);
 
         let error = sanitize_peer_response(Response::Error("bad\u{1b}]52;c;clipboard\u{7}".into()));
         assert_eq!(error, Response::Error("bad]52;c;clipboard".into()));
@@ -8890,6 +8897,7 @@ mod tests {
             team: None,
             program_status: None,
             program_title: None,
+            program_status_last_updated_at_ms: None,
             program_status_age_ms: None,
         }
     }

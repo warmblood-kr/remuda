@@ -492,6 +492,10 @@ pub struct ProgramStatus {
 pub struct ProgramStatusObservation {
     pub status: ProgramStatus,
     pub age: core::time::Duration,
+    /// UTC Unix timestamp (ms) of the report that produced `status`. The
+    /// canonical freshness value; `age` is derived from it at read time.
+    /// `None` for older hosts and a clock before the epoch.
+    pub observed_at_ms: Option<u64>,
     /// Bounded, control-free local display text from the same report.
     /// Kept outside [`ProgramStatus`]: that type is serialized in listings,
     /// while an agent's words must not reach a peer or another machine.
