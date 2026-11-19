@@ -376,9 +376,9 @@ fn index_db_warning(
     };
     let undo = |to: u32| {
         if to == 0 {
-            "`remuda vfs export-index` on this build first".to_owned()
+            "`remuda drive export-index` on this build first".to_owned()
         } else {
-            format!("`remuda vfs index-downgrade {to} --yes` on this build first")
+            format!("`remuda drive index-downgrade {to} --yes` on this build first")
         }
     };
     match steps {
@@ -392,7 +392,7 @@ fn index_db_warning(
         None => Some(format!(
             "{candidate} does not say which index.db schema it reads (index.db is at schema \
              {on_disk}). If it reads less, the VFS refuses every call after the reload until \
-             you reload forward again; `remuda vfs index-downgrade VERSION --yes` on this \
+             you reload forward again; `remuda drive index-downgrade VERSION --yes` on this \
              build first avoids that"
         )),
     }
@@ -731,12 +731,12 @@ mod tests {
             "{older}"
         );
         assert!(
-            older.contains("`remuda vfs index-downgrade 2 --yes`"),
+            older.contains("`remuda drive index-downgrade 2 --yes`"),
             "{older}"
         );
         // Step 1 cannot be undone; a build without index.db needs the export.
         let none = index_db_warning("2+b", Some(0), Ok(Some(1))).unwrap();
-        assert!(none.contains("`remuda vfs export-index`"), "{none}");
+        assert!(none.contains("`remuda drive export-index`"), "{none}");
         // A target from before the field: say what is known.
         let unread = index_db_warning("2+b", Some(3), Err("database is locked".into())).unwrap();
         assert!(

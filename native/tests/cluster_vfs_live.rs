@@ -538,6 +538,81 @@ fn put_one_copy(node: &Node, uri: &str, body: &[u8]) {
 }
 
 #[test]
+fn drive_is_primary_and_the_vfs_alias_reads_the_same_store() {
+    let _serial = live_test_guard();
+    let node = Node::start();
+    successful(
+        node.run_with_stdin(
+            &[
+                "drive",
+                "put",
+                "-",
+                "remuda:///alias/one.txt",
+                "--replicas",
+                "1",
+            ],
+            Some(b"one"),
+        ),
+        "drive put",
+    );
+    assert_eq!(
+        successful(
+            node.run(&["vfs", "get", "remuda:///alias/one.txt"]),
+            "vfs get"
+        ),
+        "one"
+    );
+    successful(
+        node.run_with_stdin(
+            &[
+                "vfs",
+                "put",
+                "-",
+                "remuda:///alias/two.txt",
+                "--replicas",
+                "1",
+            ],
+            Some(b"two"),
+        ),
+        "vfs put",
+    );
+    let listed = successful(node.run(&["drive", "ls", "remuda:///alias/"]), "drive ls");
+    assert!(
+        listed.contains("one.txt") && listed.contains("two.txt"),
+        "{listed}"
+    );
+
+    let drive_help = successful(node.run(&["drive", "--help"]), "drive --help");
+    assert!(
+        drive_help.contains("Usage: remuda drive <COMMAND>"),
+        "{drive_help}"
+    );
+    let vfs_help = successful(node.run(&["vfs", "--help"]), "vfs --help");
+    assert!(
+        vfs_help.contains("Usage: remuda vfs <COMMAND>"),
+        "{vfs_help}"
+    );
+    let help = successful(node.run(&["help"]), "help");
+    assert!(help.contains("remuda drive put|get"), "{help}");
+    assert!(help.contains("remuda vfs ..."), "{help}");
+
+    let vfs_put_help = successful(node.run(&["vfs", "help", "put"]), "vfs help put");
+    assert!(
+        vfs_put_help.contains("Example: remuda vfs put"),
+        "{vfs_put_help}"
+    );
+    assert!(
+        !vfs_put_help.contains("Example: remuda drive put"),
+        "{vfs_put_help}"
+    );
+    let missing = node.run(&["vfs", "get", "remuda:///alias/missing"]);
+    assert!(!missing.status.success(), "a missing file must fail");
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(stderr.contains("remuda: vfs get"), "{stderr}");
+    assert!(!stderr.contains("remuda: drive get"), "{stderr}");
+}
+
+#[test]
 fn grep_reads_text_from_vfs_without_a_mount() {
     let _serial = live_test_guard();
     let (a, b, _c) = three_nodes();

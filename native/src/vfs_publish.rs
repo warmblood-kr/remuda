@@ -1,4 +1,4 @@
-//! Preflight for `remuda vfs publish` (#891): turn a local directory into the
+//! Preflight for `remuda drive publish` (#891): turn a local directory into the
 //! list of files a release prefix should hold, or into the reasons it cannot.
 //!
 //! The upload itself is one `put` request per file from the CLI, so this module

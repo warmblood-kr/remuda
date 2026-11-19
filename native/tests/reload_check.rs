@@ -350,7 +350,7 @@ fn a_target_that_reads_an_older_index_db_is_warned_about() {
     assert!(
         lines.iter().any(|l| l
             .starts_with("warning: index.db is at schema 3 but 1.0.0+older reads up to 2;")
-            && l.contains("`remuda vfs index-downgrade 2 --yes`")),
+            && l.contains("`remuda drive index-downgrade 2 --yes`")),
         "{stdout}"
     );
 

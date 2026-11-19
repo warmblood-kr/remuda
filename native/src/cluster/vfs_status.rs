@@ -1,4 +1,4 @@
-//! `remuda vfs status` (#778): the cluster store at a glance.
+//! `remuda drive status` (#778): the cluster store at a glance.
 //!
 //! The report uses only what this node already knows: index counts, kept
 //! conflicts, its own copies, the repair queue, and per peer its health and

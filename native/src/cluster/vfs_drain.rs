@@ -1,4 +1,4 @@
-//! `remuda vfs drain` (#778, design step 6): before a node leaves, every
+//! `remuda drive drain` (#778, design step 6): before a node leaves, every
 //! file it holds must keep its copies on the nodes that remain.
 //!
 //! For each blob held here, drain works out the placement without this node

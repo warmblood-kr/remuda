@@ -489,12 +489,12 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "vfs.put",
-        "Store bytes at a remuda:// URI on this node and tell peers in the background, like `remuda vfs put`. replicas defaults to the vfs setting. This and vfs.rm are the only ways Lua writes the store; the index database is never opened from Lua.",
+        "Store bytes at a remuda:// URI on this node and tell peers in the background, like `remuda drive put`. replicas defaults to the vfs setting. This and vfs.rm are the only ways Lua writes the store; the index database is never opened from Lua.",
         "vfs.put(uri, bytes [, replicas]) -> stat | nil, reason",
     ),
     (
         "vfs.rm",
-        "Delete a stored file everywhere (a tombstone), like `remuda vfs rm`, telling peers in the background.",
+        "Delete a stored file everywhere (a tombstone), like `remuda drive rm`, telling peers in the background.",
         "vfs.rm(uri) -> true | nil, reason",
     ),
     (

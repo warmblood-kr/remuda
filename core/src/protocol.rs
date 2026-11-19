@@ -442,7 +442,7 @@ pub enum Request {
         /// because only the caller knows where the source came from.
         name: Option<String>,
     },
-    /// Run `remuda vfs ARGS…` in the daemon, which owns the VFS index (#778).
+    /// Run `remuda drive ARGS…` in the daemon, which owns the VFS index (#778).
     /// `input_base64` is `put`'s content, read by the CLI. Answered with
     /// [`Response::CommandResult`]. Local only: the remote front refuses it.
     Vfs {

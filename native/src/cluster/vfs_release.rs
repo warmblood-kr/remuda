@@ -1,4 +1,4 @@
-//! `remuda vfs release` (#887): give back the copies this node fetched to read
+//! `remuda drive release` (#887): give back the copies this node fetched to read
 //! and is not responsible for keeping.
 //!
 //! A `get`, `read` or `resolve` stores the blob on the node that read it, and

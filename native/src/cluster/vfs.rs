@@ -580,7 +580,7 @@ impl VfsStore {
         let plan = migrate::planned_downs(&conn, to).map_err(corrupt)?;
         if let Some((number, name, _)) = plan.iter().find(|(_, _, down)| down.is_none()) {
             return Err(corrupt(format!(
-                "index.db step {number} ({name}) cannot be undone; use `remuda vfs export-index` for a remuda older than index.db"
+                "index.db step {number} ({name}) cannot be undone; use `remuda drive export-index` for a remuda older than index.db"
             )));
         }
         let steps: Vec<String> = plan
@@ -1091,7 +1091,7 @@ impl VfsStore {
         self.collect_garbage_older_than(GC_GRACE)
     }
 
-    /// Index figures for `remuda vfs status`: counts, conflicted paths, and
+    /// Index figures for `remuda drive status`: counts, conflicted paths, and
     /// per peer its last pull and the tombstones it has not pulled.
     pub fn index_status(&self, peers: &[String]) -> VfsResult<IndexStatus> {
         let conn = self.index_db()?;

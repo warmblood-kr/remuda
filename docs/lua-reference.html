@@ -216,11 +216,11 @@
 <h2 id="vfs.list">vfs.list</h2>
 <p><code>vfs.list(prefix_uri) -&gt; {stat...} | nil, reason</code> — List stored files whose path starts with the prefix in a remuda:// URI (remuda:/// lists everything), as stat tables sorted by path.</p>
 <h2 id="vfs.put">vfs.put</h2>
-<p><code>vfs.put(uri, bytes [, replicas]) -&gt; stat | nil, reason</code> — Store bytes at a remuda:// URI on this node and tell peers in the background, like <span class="title-ref">remuda vfs put</span>. replicas defaults to the vfs setting. This and vfs.rm are the only ways Lua writes the store; the index database is never opened from Lua.</p>
+<p><code>vfs.put(uri, bytes [, replicas]) -&gt; stat | nil, reason</code> — Store bytes at a remuda:// URI on this node and tell peers in the background, like <span class="title-ref">remuda drive put</span>. replicas defaults to the vfs setting. This and vfs.rm are the only ways Lua writes the store; the index database is never opened from Lua.</p>
 <h2 id="vfs.read">vfs.read</h2>
 <p><code>vfs.read(uri) -&gt; bytes | nil, reason</code> — Return the bytes of a stored file from this node's verified copy. Returns nil, 'not_local: ...' when this node has no copy yet.</p>
 <h2 id="vfs.rm">vfs.rm</h2>
-<p><code>vfs.rm(uri) -&gt; true | nil, reason</code> — Delete a stored file everywhere (a tombstone), like <span class="title-ref">remuda vfs rm</span>, telling peers in the background.</p>
+<p><code>vfs.rm(uri) -&gt; true | nil, reason</code> — Delete a stored file everywhere (a tombstone), like <span class="title-ref">remuda drive rm</span>, telling peers in the background.</p>
 <h2 id="vfs.stat">vfs.stat</h2>
 <p><code>vfs.stat(uri) -&gt; {path, version, sha256, size, mtime, replicas, writer, local, synced_at, conflicts} | nil, reason</code> — Describe a stored file: path, version, sha256, size, mtime, replicas, writer, local (whether this node holds a copy), synced_at (unix time a peer index was last merged here, or nil) and conflicts (concurrent writes kept beside this one, each {version, writer, sha256, size, deleted, mtime}; the next put or rm settles them). A file known here without a local copy still returns its table, with local = false.</p>
 <h2 id="wait_for">wait_for</h2>
