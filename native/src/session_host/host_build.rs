@@ -141,12 +141,15 @@ fn probe_uncached(path: &Path) -> Option<String> {
     (status.success() && !build.is_empty() && !build.contains('\n')).then(|| build.to_owned())
 }
 
-/// Tests run the daemon in-process, so `current_exe` is the test binary under
-/// `target/<profile>/deps/`. Cargo builds the real `remuda` and its host one
-/// directory up; use that daemon for the sibling lookup instead.
-#[cfg(test)]
-pub(super) fn test_profile_daemon(daemon: &Path) -> Option<PathBuf> {
-    let profile = daemon.parent()?.parent()?;
+/// A self-execing test daemon runs under `target/<profile>/deps/`; the real
+/// `remuda` and its host sit one directory up. Production never lives under
+/// `deps/`, so only that test layout is redirected.
+pub(super) fn profile_daemon(daemon: &Path) -> Option<PathBuf> {
+    let deps = daemon.parent()?;
+    if deps.file_name()? != "deps" {
+        return None;
+    }
+    let profile = deps.parent()?;
     let candidate = profile.join(format!("remuda{}", std::env::consts::EXE_SUFFIX));
     candidate.is_file().then_some(candidate)
 }
@@ -237,16 +240,21 @@ mod tests {
     }
 
     #[test]
-    fn a_test_binary_finds_the_host_beside_the_profile_daemon() {
+    fn a_test_daemon_under_deps_uses_the_profile_remuda_for_the_host_lookup() {
         let dir = tempdir();
         let deps = dir.path().join("deps");
         std::fs::create_dir_all(&deps).unwrap();
         let test_binary = deps.join("remuda_native-1");
-        assert_eq!(test_profile_daemon(&test_binary), None);
+        assert_eq!(profile_daemon(&test_binary), None);
         script(&dir.path().join("remuda"), "exit 0");
         assert_eq!(
-            test_profile_daemon(&test_binary).as_deref(),
+            profile_daemon(&test_binary).as_deref(),
             Some(dir.path().join("remuda").as_path())
+        );
+        assert_eq!(
+            profile_daemon(&dir.path().join("remuda")),
+            None,
+            "a real daemon keeps the install layout"
         );
     }
 
