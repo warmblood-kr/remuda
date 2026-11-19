@@ -544,7 +544,7 @@ vfs.list
 vfs.put
 -------
 
-``vfs.put(uri, bytes [, replicas]) -> stat | nil, reason`` — Store bytes at a remuda:// URI on this node and tell peers in the background, like `remuda vfs put`. replicas defaults to the vfs setting. This and vfs.rm are the only ways Lua writes the store; the index database is never opened from Lua.
+``vfs.put(uri, bytes [, replicas]) -> stat | nil, reason`` — Store bytes at a remuda:// URI on this node and tell peers in the background, like `remuda drive put`. replicas defaults to the vfs setting. This and vfs.rm are the only ways Lua writes the store; the index database is never opened from Lua.
 
 vfs.read
 --------
@@ -554,7 +554,7 @@ vfs.read
 vfs.rm
 ------
 
-``vfs.rm(uri) -> true | nil, reason`` — Delete a stored file everywhere (a tombstone), like `remuda vfs rm`, telling peers in the background.
+``vfs.rm(uri) -> true | nil, reason`` — Delete a stored file everywhere (a tombstone), like `remuda drive rm`, telling peers in the background.
 
 vfs.stat
 --------
