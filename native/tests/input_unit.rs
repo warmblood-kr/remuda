@@ -24,6 +24,20 @@ fn daemon_at(path: &Path, dir: &Path) -> spawn::Daemon {
     spawn::spawn_and_wait(command, dir)
 }
 
+/// A daemon whose sessions are in-process, for a contract hosted sessions do
+/// not have. A hosted input act is capped at 8 KiB so an older build can still
+/// read the inventory (docs/concepts/session-host-parity.md); the slow-drain
+/// tests need a 300 KB burst in one act. `hosted_parity_limits` keeps the
+/// hosted refusal tested, so asking for this backend explicitly is a scope, not
+/// a skip.
+fn daemon_at_in_process(path: &Path, dir: &Path) -> spawn::Daemon {
+    debug_assert_eq!(path, daemon::socket_path_in(dir, "s"));
+    let mut command = spawn::base_command(dir);
+    command.env("REMUDA_SUPPRESS_DEPRECATIONS", "1");
+    command.env("REMUDA_EXPERIMENTAL_SESSION_HOST", "0");
+    spawn::spawn_and_wait(command, dir)
+}
+
 fn capture(path: &Path, name: &str) -> String {
     match client::request(path, &Request::Capture { name: name.into() }) {
         Ok(Response::Screen(text)) => text,
@@ -378,11 +392,14 @@ fn wait_text_then_return(socket: &Path, name: &str) {
 /// A child that is slow to drain its input (an agent still starting up) must
 /// still receive the whole task and its Return. type_text reports 'late'
 /// instead of raising, and the Return follows when the text has landed.
+///
+/// In-process contract: the 300 KB burst is one act, and hosted acts are capped
+/// at 8 KiB. See `daemon_at_in_process`.
 #[test]
 fn type_text_delivers_and_submits_when_the_child_drains_slowly() {
     let dir = scratch("slow-drain");
     let socket = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&socket, &dir);
+    let _daemon = daemon_at_in_process(&socket, &dir);
     start_slow_drain(&socket, &dir, "slow-drain");
 
     script::run_source(
