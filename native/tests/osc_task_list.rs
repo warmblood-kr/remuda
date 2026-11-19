@@ -34,6 +34,55 @@ fn listed(daemon: &Parity) -> (String, String, f64, f64) {
     (state, title, updated, age)
 }
 
+fn reported_at(daemon: &Parity) -> Option<f64> {
+    let value = daemon
+        .eval(
+            r#"
+            for _, row in ipairs(remuda.session.list()) do
+              if row.name == "task" and type(row.program_status) == "table"
+                and row.program_status.last_updated_at then
+                return tostring(row.program_status.last_updated_at)
+              end
+            end
+            return ""
+            "#,
+        )
+        .ok()?;
+    value.parse().ok()
+}
+
+fn wait_for_reported_at(daemon: &Parity) -> f64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(at) = reported_at(daemon) {
+            return at;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the report time never reached Lua after the restart"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_hosted_report_time_survives_a_daemon_kill_and_restart() {
+    let mut daemon = Parity::start(Mode::Hosted);
+    daemon.start_command("task", vec!["/bin/sh".into(), "-c".into(), SCRIPT.into()]);
+    let before = wait_for_reported_at(&daemon);
+
+    // A daemon crash must not reset a hosted session's report time: the host
+    // owns the tracker, and the restarted daemon reattaches to it.
+    daemon.kill_daemon();
+    daemon.restart();
+
+    let after = wait_for_reported_at(&daemon);
+    assert_eq!(
+        before, after,
+        "a daemon restart must not move the report time"
+    );
+}
+
 #[test]
 fn task_title_reaches_lua_for_in_process_and_hosted_sessions() {
     for mode in [Mode::InProcess, Mode::Hosted] {
