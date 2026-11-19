@@ -230,10 +230,12 @@ fn sync_files(socket: &Path, command: &str, values: &Map<String, Value>, mut out
         verbose: flag(values, "verbose"),
     };
     let (Some(source), Some(dest)) = (source, dest) else {
-        warn!(
-            out,
-            "remuda: {command} sync: give both SOURCE and DEST, or neither for the cluster sync"
-        );
+        let detail = if options.dry_run || options.verbose {
+            "the two-path form needs both SOURCE and DEST; the cluster sync takes neither"
+        } else {
+            "give both SOURCE and DEST, or neither for the cluster sync"
+        };
+        warn!(out, "remuda: {command} sync: {detail}");
         return finish(out, 2);
     };
     let report = match crate::vfs_sync_files::run(socket, source, dest, options) {
