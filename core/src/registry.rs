@@ -310,9 +310,7 @@ impl Registry {
             return None;
         }
         if let Some(session) = self.get(name) {
-            if session.instance_id() != instance_id
-                || !session.is_running()
-                || session.is_closing()
+            if session.instance_id() != instance_id || !session.is_running() || session.is_closing()
             {
                 return None;
             }
