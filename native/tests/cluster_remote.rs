@@ -2087,12 +2087,15 @@ fn real_remote_cluster_tree_paints_the_peer_hierarchy_and_falls_back_on_fault() 
         "the selected remote target is shown:\n{screen}"
     );
 
-    // Fault: the peer goes away, the rendered view ages out and the tree
-    // falls back to plain List rows without dropping the known sessions.
+    // Fault: the peer goes away. The last rows and their rendered view are
+    // retained and labelled stale with their age; a brief outage must not
+    // degrade the rows to a plain fallback and then repaint them.
     server_node.stop_daemon();
-    wait_for("remote view fallback", Duration::from_secs(20), || {
+    wait_for("remote stale label", Duration::from_secs(20), || {
         let screen = tui.screen_text();
-        screen.contains("tree-parent") && !screen.contains(DETAIL)
+        screen.contains("tree-parent")
+            && screen.contains(DETAIL)
+            && screen.contains("remote live · stale")
     });
     assert!(tui.screen_text().contains("tree-child"));
 }
