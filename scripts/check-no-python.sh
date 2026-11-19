@@ -146,14 +146,32 @@ scan_invocations() {
 	# still seen next to a quote while a literal inside one is not. A $(...)
 	# inside double quotes is command substitution, so its content stays
 	# visible even though the surrounding string does not.
-	function blank_quotes(s,   i, c, q, cmdsub, depth, out) {
+	function blank_quotes(s,   i, c, q, cmdsub, depth, subq, out) {
 		out = ""
 		q = ""
 		cmdsub = 0
 		depth = 0
+		subq = ""
 		for (i = 1; i <= length(s); i++) {
 			c = substr(s, i, 1)
 			if (cmdsub) {
+				if (subq == "\047") {
+					out = out c
+					if (c == "\047") subq = ""
+					continue
+				}
+				if (subq == "\"") {
+					out = out c
+					if (c == "\\" && i < length(s)) {
+						i++
+						out = out substr(s, i, 1)
+					} else if (c == "\"") {
+						subq = ""
+					}
+					continue
+				}
+				if (c == "\047") { subq = "\047"; out = out c; continue }
+				if (c == "\"") { subq = "\""; out = out c; continue }
 				if (c == "(") depth++
 				else if (c == ")") {
 					depth--
