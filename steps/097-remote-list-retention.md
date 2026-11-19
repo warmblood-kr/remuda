@@ -9,16 +9,18 @@ words flipped `● → ? → x → ●` for one blip. Retained rows never expire
 an outage that lasted days kept showing the last list under an `x` glyph, with
 no boundary between "a blip" and "no data".
 
-This step fixes the node state and the timestamp. The tree rendering and the
-stale-action gate are in the stacked TUI step.
+The TUI half is the stacked follow-up PR on this branch: it consumes these
+fields, renders the retained rows, keeps their view, and refuses stale
+actions.
 
 ## Desired outcome
 
 A transient failure keeps the last successful list, labelled stale with its
 age. A fresh success replaces the list in one step. A node whose last success
 is older than a bounded retention window drops the rows and reads unreachable,
-so a prolonged outage cannot pass for a live herd. A new node identity starts
-with no inherited rows.
+so a prolonged outage cannot pass for a live herd. Retained rows are for
+reading; they never authorize keys, a line or a close. A new node identity
+starts with no inherited rows.
 
 ## Expected
 
@@ -45,23 +47,42 @@ with no inherited rows.
   list wholesale and resets the error.
 - Node identity changes are covered by the existing registry reconcile (keys
   differ) and a test asserts the new fingerprint inherits no timestamp or rows.
-- TUI rendering, view retention and stale-action refusal are the stacked TUI
-  step; this step keeps the existing renderer compiling with the new fields.
+- The node row shows `? Ns` while stale and `x Ns` while expired; the pane
+  detail says `unreachable · no fresh data for Ns`.
+- A remote view is kept while its identities still match the retained list and
+  is dropped together with the rows at expiry. A slow reply that still matches
+  is accepted instead of degrading the rows to a plain fallback.
+- `stale_action_refusal` gates keys mode, the composer, buffered keys, the
+  close confirmation and the confirmed close on `Reachable`. A node that has
+  disappeared from the snapshot is refused too, so a confirmation begun before
+  it vanished cannot send. Keys buffered while reachable are re-checked at
+  flush; if the node went stale meanwhile the buffer is dropped, keys mode ends
+  and the notice says why. A refusal restores the composer draft and says which
+  node is stale and for how long.
+- `remote_synced` clears a composer target whose exact session is gone, so
+  expiry cannot leave a reusable authorization behind.
 
 ## Actual
 
-Core-only branch `split/985-core`, rebased on `main` `ec278f3` (80c2c0d).
+Stacked TUI branch `split/985-tui` on `split/985-core`; both rebased on `main`
+`ec278f3` (80c2c0d).
 ```
 $ cargo test -p remuda-native --lib cluster_remote::
-test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 1913 filtered out
+test result: ok. 38 passed; 0 failed
+
+$ cargo test -p remuda-native --lib cluster_tui::
+test result: ok. 236 passed; 0 failed
 
 $ cargo clippy -p remuda-native --lib -- -D warnings
     Finished `dev` profile [unoptimized + debuginfo]
 
 $ REMUDA_EXPERIMENTAL_SESSION_HOST=0 cargo test -p remuda-native --test cluster_remote
-test result: FAILED. 32 passed; 4 failed; 3 ignored (identical to the same-env main baseline)
+test result: FAILED. 32 passed; 4 failed; 3 ignored (same-env main baseline)
+$ REMUDA_EXPERIMENTAL_SESSION_HOST=0 cargo test -p remuda-native --test cluster_tui
+test result: FAILED. 5 passed; 1 failed (same-env main baseline)
 ```
-The remaining integration failures are hosted-only and fail on unmodified main.
-The full 180 s real-path probe belongs to the stacked TUI step; the core model
-has deterministic tests for retain/replace, expiry, identity and the absolute
-timestamp.
+The remaining integration failures are hosted-only or one TUI input test and
+fail on unmodified main. The real-clock probe: success `Reachable` rows=1 with
+the absolute timestamp; failure `Stale` rows=1 with the same timestamp; expiry
+`Unreachable` rows=0; fresh success `Reachable` rows=1 with a newer timestamp;
+a synthetic future timestamp renders `0s`.
