@@ -66,22 +66,24 @@ starts with no inherited rows.
 
 ## Actual
 
-Stacked TUI branch `split/985-tui` on `split/985-core`; both rebased on `main`
-`ec278f3` (80c2c0d).
+Three stacked branches on `main` `ee855c2`: `split/985-core`, `split/985-tui`
+on it, and `split/985-gates` on that; each is a draft PR (#1010, #1011, #1015),
+each under 500 changed lines, and CI reports 19 pass / 10 skip / 0 fail for all
+three.
 ```
 $ cargo test -p remuda-native --lib cluster_remote::
-test result: ok. 38 passed; 0 failed
+test result: ok. 41 passed; 0 failed
 
 $ cargo test -p remuda-native --lib cluster_tui::
-test result: ok. 236 passed; 0 failed
+test result: ok. 239 passed; 0 failed
 
 $ cargo clippy -p remuda-native --lib -- -D warnings
     Finished `dev` profile [unoptimized + debuginfo]
 
 $ REMUDA_EXPERIMENTAL_SESSION_HOST=0 cargo test -p remuda-native --test cluster_remote
-test result: FAILED. 32 passed; 4 failed; 3 ignored (same-env main baseline)
+test result: FAILED. 32 passed; 4 failed; 3 ignored (same-env main ee855c2 baseline)
 $ REMUDA_EXPERIMENTAL_SESSION_HOST=0 cargo test -p remuda-native --test cluster_tui
-test result: FAILED. 5 passed; 1 failed (same-env main baseline)
+test result: FAILED. 5 passed; 1 failed (same-env main ee855c2 baseline)
 ```
 The remaining integration failures are hosted-only or one TUI input test and
 fail on unmodified main. The real-clock probe: success `Reachable` rows=1 with
