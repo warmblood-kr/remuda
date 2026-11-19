@@ -160,14 +160,14 @@ scan_invocations() {
 					if (c == "\047") subq = ""
 					continue
 				}
+				if (c == "\\" && i < length(s)) {
+					i++
+					out = out c substr(s, i, 1)
+					continue
+				}
 				if (subq == "\"") {
 					out = out c
-					if (c == "\\" && i < length(s)) {
-						i++
-						out = out substr(s, i, 1)
-					} else if (c == "\"") {
-						subq = ""
-					}
+					if (c == "\"") subq = ""
 					continue
 				}
 				if (c == "\047") { subq = "\047"; out = out c; continue }

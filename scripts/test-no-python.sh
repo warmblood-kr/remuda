@@ -224,6 +224,9 @@ reset_fixture
 printf 'echo "$(echo \047)\047; %s -c 1)"\n' "$py" >"$fixture/repo/scripts/probe.sh"
 expect_rejected 'a quoted ) inside the substitution' 'Python invocation at scripts/probe.sh:1'
 reset_fixture
+printf 'echo "$(echo \\); %s -c 1)"\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'an escaped ) inside the substitution' 'Python invocation at scripts/probe.sh:1'
+reset_fixture
 printf 'literal=\047$(%s -c 1)\047\n' "$py" >"$fixture/repo/scripts/probe.sh"
 expect_ok
 reset_fixture
