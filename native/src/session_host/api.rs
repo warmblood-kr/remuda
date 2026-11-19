@@ -114,6 +114,10 @@ pub(crate) struct Info {
     /// Local host protocol only; the daemon maps it to a local-only summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_title: Option<String>,
+    /// UTC Unix timestamp (ms) of the report behind `program_status`.
+    /// Absent from older hosts; the daemon must not invent one from the age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_status_last_updated_at_ms: Option<u64>,
     /// Monotonic age at Inspect time; never refreshed by a read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_status_age_ms: Option<u64>,

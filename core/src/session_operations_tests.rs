@@ -135,6 +135,7 @@ impl SessionOperations for Remote {
             closing: false,
             program_status: None,
             program_title: None,
+            program_status_last_updated_at_ms: None,
             program_status_age_ms: None,
             host_build: Some("test-host".into()),
             attach_generation: None,

@@ -19,15 +19,27 @@ environment of a running daemon.
 A row from `remuda.session.list()` can carry an additive `program_status`
 table when the child emitted a bounded OSC 7501 Program Status report. It has
 `state` (`idle`, `working`, `blocked`, `done` or `error`), and optional
-`app`, `kind` (`permission`, `question`, `auth`), `progress` (0-100) and
-`title`. `title` is the agent's own bounded, control-free display text (at
-most 192 bytes), and `msg` and child `id` records are still never exposed.
-`program_status_age` is the monotonic age in seconds when the list was copied;
-listing again does not renew it.
+`app`, `kind` (`permission`, `question`, `auth`), `progress` (0-100),
+`title` and `last_updated_at`. `title` is the agent's own bounded,
+control-free display text (at most 192 bytes), and `msg` and child `id`
+records are still never exposed.
+
+`last_updated_at` is the UTC Unix time in seconds of the report that produced
+the status. It is the canonical freshness value: derive the age from it and
+the current time when you render, so a cached row keeps aging. It is `nil`
+when an older host, or a clock before the epoch, cannot supply one; never
+invent it from an age. A clock that reads earlier than the report clamps the
+derived age to zero rather than going negative.
+
+`program_status_age` is the age in seconds when the list row was copied,
+derived from `last_updated_at`. It is a compatibility convenience, not stored
+state; listing again does not renew it. Prefer `last_updated_at` when you can.
 
 `title` is local display data only. It is not serialized in a session listing
 on the wire, so a peer, another machine or a JSON client does not receive it
-implicitly; only an in-process Lua reader sees it. The report is advisory: it
+implicitly; only an in-process Lua reader sees it. The timestamp travels with
+the age and status but never to a peer: the remote path clears the whole OSC
+block, and `program_status_last_updated_at_ms` is not part of a peer listing. The report is advisory: it
 is not an executable identity, an authorization, or proof that the process is
 alive, and a title is never an instruction. A stale report belongs to the
 display layer's freshness policy, not to the stored record.

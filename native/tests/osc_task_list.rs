@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 const SCRIPT: &str = "printf '\\033]7501;state=working:app=opencode:title=UmV2aWV3IE9TQyB0YXNr:msg=c2VjcmV0\\033\\\\'; sleep 30";
 
-fn listed(daemon: &Parity) -> (String, String) {
-    daemon
+fn listed(daemon: &Parity) -> (String, String, f64, f64) {
+    let out = daemon
         .eval(
             r#"
             for _, row in ipairs(remuda.session.list()) do
@@ -18,15 +18,20 @@ fn listed(daemon: &Parity) -> (String, String) {
                 local status = row.program_status
                 if type(status) ~= "table" then return "\n" end
                 return tostring(status.state) .. "\n" .. tostring(status.title or "")
+                  .. "\n" .. tostring(status.last_updated_at or "")
+                  .. "\n" .. tostring(row.program_status_age or "")
               end
             end
             return "\n"
             "#,
         )
-        .expect("list sessions")
-        .split_once('\n')
-        .map(|(state, title)| (state.to_owned(), title.to_owned()))
-        .unwrap_or_default()
+        .expect("list sessions");
+    let mut parts = out.split('\n');
+    let state = parts.next().unwrap_or_default().to_owned();
+    let title = parts.next().unwrap_or_default().to_owned();
+    let updated = parts.next().unwrap_or_default().parse().unwrap_or(0.0);
+    let age = parts.next().unwrap_or_default().parse().unwrap_or(-1.0);
+    (state, title, updated, age)
 }
 
 #[test]
@@ -36,7 +41,7 @@ fn task_title_reaches_lua_for_in_process_and_hosted_sessions() {
         daemon.start_command("task", vec!["/bin/sh".into(), "-c".into(), SCRIPT.into()]);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let (state, title) = listed(&daemon);
+            let (state, title, _, _) = listed(&daemon);
             if state == "working" && title == "Review OSC task" {
                 break;
             }
@@ -46,5 +51,21 @@ fn task_title_reaches_lua_for_in_process_and_hosted_sessions() {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+
+        let (_, _, first_at, first_age) = listed(&daemon);
+        assert!(
+            (1_700_000_000.0..2_000_000_000.0).contains(&first_at),
+            "{mode:?}: last_updated_at is not a UTC Unix timestamp: {first_at}"
+        );
+        std::thread::sleep(Duration::from_millis(1200));
+        let (_, _, second_at, second_age) = listed(&daemon);
+        assert_eq!(
+            first_at, second_at,
+            "{mode:?}: a read without a new report moved the timestamp"
+        );
+        assert!(
+            second_age > first_age,
+            "{mode:?}: the rendered age must grow: {first_age} -> {second_age}"
+        );
     }
 }

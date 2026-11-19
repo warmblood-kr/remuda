@@ -228,6 +228,22 @@ fn host_reports_a_bounded_task_title_and_hides_message_text() {
         info["program_status"].get("msg").is_none(),
         "message text is never exposed"
     );
+    let at = info["program_status_last_updated_at_ms"]
+        .as_u64()
+        .expect("the host reports an absolute UTC timestamp");
+    assert!(at > 1_700_000_000_000, "unix milliseconds, not seconds");
+
+    let later = host.inspect();
+    assert_eq!(
+        later["program_status_last_updated_at_ms"].as_u64(),
+        Some(at),
+        "Inspect must not move the report time"
+    );
+    assert!(
+        later["program_status_age_ms"].as_u64().unwrap_or(0)
+            >= info["program_status_age_ms"].as_u64().unwrap_or(0),
+        "the age is derived and keeps growing"
+    );
 }
 
 #[test]
