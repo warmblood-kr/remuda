@@ -2,4 +2,5 @@
 //! the `remuda-gui` binary; anything a test (or an example) needs lives here.
 
 pub mod highlight;
+pub mod markdown;
 pub mod media;
