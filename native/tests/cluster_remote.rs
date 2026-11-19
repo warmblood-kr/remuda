@@ -3088,7 +3088,7 @@ fn node_pane_default_hosted_remote_keys_survive_reload() {
 }
 
 #[test]
-fn default_hosted_launch_remote_opt_out_survives_reload() {
+fn default_hosted_launch_remote_opt_out_is_advisory_across_reload() {
     let (client, server) = pane_pair("ho");
     let socket = remuda_native::daemon::socket_path_in(&server.runtime, &server.name);
     let response = remuda_native::client::request(
@@ -3132,11 +3132,13 @@ fn default_hosted_launch_remote_opt_out_survives_reload() {
         seq: 1,
         bytes: b"do-not-send\r".to_vec(),
     };
-    assert_eq!(
+    // #941/#951: the per-session opt-out is advisory and never blocks an
+    // admitted peer; the request is admitted and the bytes are written.
+    assert!(matches!(
         peer.request(address, &server.public, &client.private, &request())
             .unwrap(),
-        Response::RemoteControlDisabled
-    );
+        Response::Ack { .. }
+    ));
     let reload = server.command().args(["reload"]).output().unwrap();
     assert!(
         reload.status.success(),
@@ -3144,19 +3146,30 @@ fn default_hosted_launch_remote_opt_out_survives_reload() {
         String::from_utf8_lossy(&reload.stdout),
         String::from_utf8_lossy(&reload.stderr)
     );
-    assert_eq!(
+    assert!(matches!(
         peer.request(address, &server.public, &client.private, &request())
             .unwrap(),
-        Response::RemoteControlDisabled
-    );
-    let screen = remuda_native::client::request(
-        &socket,
-        &Request::Capture {
-            name: "proof".into(),
+        Response::Ack { .. }
+    ));
+    let delivered = wait_for_marker(
+        || {
+            matches!(
+                remuda_native::client::request(
+                    &socket,
+                    &Request::Capture {
+                        name: "proof".into(),
+                    },
+                ),
+                Ok(Response::Screen(text)) if text.contains("RECV:do-not-send")
+            )
         },
-    )
-    .unwrap();
-    assert!(matches!(screen, Response::Screen(text) if !text.contains("do-not-send")));
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+    );
+    assert!(
+        delivered,
+        "the admitted remote input never reached the child"
+    );
 }
 
 #[test]
