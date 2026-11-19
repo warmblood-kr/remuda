@@ -1119,6 +1119,7 @@ fn hosted_summary(handle: &SessionHandle) -> SessionSummary {
     summary.mouse_tracking = observation.mouse.mode != crate::agent::MouseMode::default();
     summary.program_status = observation.program_status;
     summary.program_title = observation.program_title;
+    summary.program_status_last_updated_at_ms = observation.program_status_last_updated_at_ms;
     summary.program_status_age_ms = observation.program_status_age_ms;
     summary
 }

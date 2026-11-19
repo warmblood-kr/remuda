@@ -2705,6 +2705,7 @@ pub(crate) fn session_rows(
             &row,
             session.program_status,
             session.program_title,
+            session.program_status_last_updated_at_ms,
             session.program_status_age_ms,
         )?;
         rows.set(index + 1, row)?;
@@ -2718,6 +2719,7 @@ fn set_program_status(
     row: &mlua::Table,
     status: Option<remuda_core::agent::ProgramStatus>,
     title: Option<String>,
+    updated_at_ms: Option<u64>,
     age_ms: Option<u64>,
 ) -> mlua::Result<()> {
     if let Some(status) = status {
@@ -2734,6 +2736,11 @@ fn set_program_status(
         }
         if let Some(title) = title {
             value.set("title", title)?;
+        }
+        // Absolute UTC seconds, for display only. Freshness is decided from
+        // `program_status_age`: the wall clock can step backwards.
+        if let Some(ms) = updated_at_ms {
+            value.set("last_updated_at", ms as f64 / 1000.0)?;
         }
         row.set("program_status", value)?;
         // The list draws the same freshness rule the cluster tree uses; a
