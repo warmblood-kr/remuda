@@ -14,20 +14,21 @@ use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fs;
-#[cfg(not(unix))]
-use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::io::Read;
+#[cfg(unix)]
 use std::io::Write;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bound one run before it starts, so a mistyped root cannot run for hours.
 const MAX_FILES: usize = 10_000;
+#[cfg(unix)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Which side is local. Exactly one side is always the store.
@@ -213,6 +214,7 @@ fn local_source_dir(text: &str) -> Result<PathBuf, SyncError> {
 /// A missing destination is accepted and created by the caller after the
 /// store-overlap check. A symlink is refused so writes cannot land outside
 /// the tree.
+#[cfg(unix)]
 fn local_dest_dir(text: &str) -> Result<PathBuf, SyncError> {
     let path = PathBuf::from(text);
     match fs::symlink_metadata(&path) {
@@ -525,6 +527,7 @@ fn vfs_path_conflict(relative: &str, known: &BTreeMap<&str, &VfsRow>) -> Option<
     None
 }
 
+#[cfg(unix)]
 fn vfs_to_local(
     socket: &Path,
     source: &str,
@@ -556,6 +559,20 @@ fn vfs_to_local(
     Ok(report)
 }
 
+#[cfg(not(unix))]
+fn vfs_to_local(
+    _socket: &Path,
+    _source: &str,
+    _dest: &str,
+    _options: Options,
+) -> Result<Report, SyncError> {
+    Err(SyncError::Failed(
+        "sync from the store to a local directory needs no-follow destination writes, which this platform does not have yet; use a Unix node"
+            .to_owned(),
+    ))
+}
+
+#[cfg(unix)]
 fn copy_one_to_local(socket: &Path, prefix: &str, root: &Path, row: &VfsRow, report: &mut Report) {
     match read_existing(root, &row.relative) {
         Ok(Some(bytes)) if bytes.len() as u64 == row.size && sha256_hex(&bytes) == row.sha256 => {
@@ -609,6 +626,7 @@ fn copy_one_to_local(socket: &Path, prefix: &str, root: &Path, row: &VfsRow, rep
 
 /// Fetch one file and insist it still matches the listing. One retry covers a
 /// write that landed between `ls` and `get`; a second mismatch is reported.
+#[cfg(unix)]
 fn fetch_unchanged(socket: &Path, uri: &str, row: &VfsRow) -> Result<Vec<u8>, String> {
     for attempt in 0..2 {
         let (code, bytes, stderr) =
@@ -965,130 +983,7 @@ fn check_final(parent: &OwnedFd, name: &str, display: &Path) -> Result<(), Strin
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn read_existing(root: &Path, relative: &str) -> Result<Option<Vec<u8>>, String> {
-    validate_relative(relative).map_err(|error| error.detail().to_owned())?;
-    let mut current = root.to_path_buf();
-    let parts: Vec<&str> = relative.split('/').collect();
-    let (name, directories) = parts
-        .split_last()
-        .ok_or_else(|| "a destination path has no file name".to_owned())?;
-    for part in directories {
-        current.push(*part);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(format!(
-                    "{} has a symlink component; refusing to follow it",
-                    current.display()
-                ))
-            }
-            Ok(metadata) if !metadata.is_dir() => {
-                return Err(format!("{} is not a directory", current.display()))
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("cannot inspect {}: {error}", current.display())),
-        }
-    }
-    let target = current.join(*name);
-    match fs::symlink_metadata(&target) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
-            "{} is a symlink; not following it",
-            target.display()
-        )),
-        Ok(metadata) if !metadata.is_file() => {
-            Err(format!("{} is not a regular file", target.display()))
-        }
-        Ok(metadata) if metadata.len() > MAX_BLOB_BYTES => Err(format!(
-            "{} is {} bytes; over the {MAX_BLOB_BYTES}-byte limit",
-            target.display(),
-            metadata.len()
-        )),
-        Ok(_) => fs::read(&target)
-            .map(Some)
-            .map_err(|error| format!("cannot read {}: {error}", target.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("cannot inspect {}: {error}", target.display())),
-    }
-}
-
-/// Windows has no portable `openat`; check every existing component and
-/// refuse symlinks, then write beside the target and rename. This is best
-/// effort against a concurrent replacement, unlike the Unix fd walk.
-#[cfg(not(unix))]
-fn write_atomic(root: &Path, relative: &str, bytes: &[u8]) -> Result<(), String> {
-    validate_relative(relative).map_err(|error| error.detail().to_owned())?;
-    let mut current = root.to_path_buf();
-    let parts: Vec<&str> = relative.split('/').collect();
-    let (name, directories) = parts
-        .split_last()
-        .ok_or_else(|| "a destination path has no file name".to_owned())?;
-    for part in directories {
-        current.push(*part);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(format!(
-                    "{} has a symlink component; refusing to follow it",
-                    current.display()
-                ))
-            }
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => return Err(format!("{} is not a directory", current.display())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&current)
-                    .map_err(|error| format!("cannot create {}: {error}", current.display()))?;
-            }
-            Err(error) => return Err(format!("cannot inspect {}: {error}", current.display())),
-        }
-    }
-    let target = current.join(*name);
-    if let Ok(metadata) = fs::symlink_metadata(&target) {
-        if metadata.file_type().is_symlink() {
-            return Err(format!(
-                "{} is a symlink; not writing through it",
-                target.display()
-            ));
-        }
-        if metadata.is_dir() {
-            return Err(format!("{} is a directory", target.display()));
-        }
-    }
-    let temporary = current.join(temporary_name());
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|error| format!("cannot create {}: {error}", temporary.display()))?;
-    let written = file.write_all(bytes).and_then(|_| file.sync_all());
-    drop(file);
-    if let Err(error) = written {
-        let _ = fs::remove_file(&temporary);
-        return Err(format!("cannot write {}: {error}", target.display()));
-    }
-    if let Err(error) = replace_file(&temporary, &target) {
-        let _ = fs::remove_file(&temporary);
-        return Err(format!("cannot replace {}: {error}", target.display()));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
-    match fs::rename(temporary, path) {
-        Ok(()) => Ok(()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            fs::remove_file(path)?;
-            fs::rename(temporary, path)
-        }
-        Err(error) => Err(error),
-    }
-}
-
+#[cfg(unix)]
 fn temporary_name() -> String {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!(".remuda-sync-{}-{sequence}.tmp", std::process::id())
@@ -1184,6 +1079,7 @@ mod tests {
         assert!(validate_relative("a/b").is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_local_write_replaces_the_old_file_without_a_temporary() {
         let root = scratch("atomic");
@@ -1260,6 +1156,7 @@ mod tests {
         fs::remove_dir_all(outside).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_missing_destination_reads_as_absent() {
         let root = scratch("missing");
@@ -1281,6 +1178,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_oversize_destination_is_not_read() {
         let root = scratch("oversize-dest");

@@ -140,6 +140,9 @@ each copied file.
 - The destination is walked without following symlinks. A symlink in any
   component is refused, and the write is made relative to the directory that
   was opened, so replacing a component cannot redirect it outside the tree.
+  Store -> local needs these no-follow directory handles; on a platform
+  without them (currently Windows) it fails closed. Local -> store still
+  works.
 - Store writes are ordinary `put`s, so the usual replication rules apply.
   Exit 75 means the files are stored here but not on every wanted node yet.
 - Symlinks, special files and non-UTF-8 names are skipped and named. Empty

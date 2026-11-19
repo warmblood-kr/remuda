@@ -6,7 +6,9 @@
   destination-only files are never deleted. Symlinks, special files and
   non-UTF-8 names are skipped and named; local writes are temp-file + rename
   through a no-follow directory walk, so a symlink component cannot redirect
-  a write. A file over 64 MiB is a per-file failure and the rest continue.
+  a write. Store -> local needs those handles and fails closed on platforms
+  without them (currently Windows); local -> store still works. A file over
+  64 MiB is a per-file failure and the rest continue.
   Exit 75 means stored here but not on every wanted node. `remuda drive sync`
   with no paths keeps the cluster index sync.
 - VFS: `remuda vfs ls` now lists a directory's immediate children: a
