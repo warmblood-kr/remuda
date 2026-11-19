@@ -15,6 +15,7 @@ fn validate(context: &str, key: &str, action: Option<&str>) -> Result<String, St
     let actions: &[&str] = match context {
         LIST_CONTEXT => &[TOGGLE_LIST, COMPOSE],
         "cluster.tree" => &[
+            "cluster.documents",
             "cluster.detach",
             "cluster.close",
             "cluster.search",
@@ -27,6 +28,17 @@ fn validate(context: &str, key: &str, action: Option<&str>) -> Result<String, St
             "cluster.select",
             "cluster.help",
         ],
+        "cluster.documents" => &[
+            "documents.up",
+            "documents.down",
+            "documents.open",
+            "documents.back",
+            "documents.close",
+            "documents.refresh",
+            "documents.address",
+            "documents.link.next",
+            "documents.link.previous",
+        ],
         "cluster.search" => &[
             "cluster.search.clear",
             "cluster.search.delete",
@@ -38,6 +50,7 @@ fn validate(context: &str, key: &str, action: Option<&str>) -> Result<String, St
             "cluster.help",
         ],
         "cluster.composer" => &[
+            "cluster.documents",
             "cluster.composer.submit",
             "cluster.composer.clear",
             "cluster.composer.back",
