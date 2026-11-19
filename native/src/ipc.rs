@@ -60,7 +60,7 @@ pub(crate) fn wake_captured(handle: WakeHandle) {
     }
 }
 
-fn name(path: &Path) -> io::Result<Name<'_>> {
+pub(crate) fn name(path: &Path) -> io::Result<Name<'_>> {
     #[cfg(unix)]
     {
         // sun_path has room for a trailing NUL, so these are usable bytes.
