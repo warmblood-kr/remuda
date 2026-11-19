@@ -10,7 +10,7 @@
 
 use base64::Engine;
 use remuda_core::agent::{ProgramBlockKind, ProgramState, ProgramStatus, ProgramStatusObservation};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The longest OSC 7501 payload Remuda will inspect. `Strings` already bounds
 /// OSC accumulation; this keeps a direct vt100 path equally bounded.
@@ -24,7 +24,11 @@ const MAX_TITLE_DECODED: usize = 192;
 pub(crate) struct Tracker {
     status: Option<ProgramStatus>,
     title: Option<String>,
+    /// Wall-clock time of the report: display data only.
     observed_at: Option<SystemTime>,
+    /// Monotonic time of the report: the internal freshness age. A wall clock
+    /// step must not be able to revive or expire a report on its own.
+    monotonic_at: Option<Instant>,
 }
 
 impl Tracker {
@@ -48,11 +52,13 @@ impl Tracker {
                 self.status = None;
                 self.title = None;
                 self.observed_at = Some(SystemTime::now());
+                self.monotonic_at = Some(Instant::now());
             }
             Record::Status(status, title) => {
                 self.status = Some(status);
                 self.title = title;
                 self.observed_at = Some(SystemTime::now());
+                self.monotonic_at = Some(Instant::now());
             }
         }
     }
@@ -67,12 +73,11 @@ impl Tracker {
         })
     }
 
-    /// How long ago the last report arrived. A wall clock that jumped backwards
-    /// cannot make the age negative; it reads as just observed.
+    /// How long ago the last report arrived, from the monotonic clock. The
+    /// wall clock is never consulted here, so a backwards or forwards step
+    /// cannot change freshness.
     fn age(&self) -> Duration {
-        self.observed_at
-            .and_then(|at| SystemTime::now().duration_since(at).ok())
-            .unwrap_or_default()
+        self.monotonic_at.map(|at| at.elapsed()).unwrap_or_default()
     }
 }
 
@@ -441,21 +446,35 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_epoch_clock_yields_no_timestamp_and_a_future_one_no_negative_age() {
+    fn a_pre_epoch_clock_yields_no_timestamp() {
         assert_eq!(unix_millis(UNIX_EPOCH - Duration::from_secs(1)), None);
+    }
 
+    #[test]
+    fn a_wall_clock_step_does_not_change_the_freshness_age() {
         let mut status = Tracker::default();
         observe(&mut status, "state=working");
-        status.observed_at = Some(SystemTime::now() + Duration::from_secs(60));
-        let skewed = status.observation().unwrap();
-        assert_eq!(
-            skewed.age,
-            Duration::ZERO,
-            "a report from the future reads as just observed"
+        let first = status.observation().unwrap().age;
+
+        status.observed_at = Some(SystemTime::now() - Duration::from_secs(3600));
+        let back = status.observation().unwrap();
+        assert!(
+            back.age < Duration::from_secs(5),
+            "a backward wall clock must not age the report: {:?}",
+            back.age
+        );
+        assert!(back.age >= first);
+
+        status.observed_at = Some(SystemTime::now() + Duration::from_secs(3600));
+        let ahead = status.observation().unwrap();
+        assert!(
+            ahead.age < Duration::from_secs(5),
+            "a forward wall clock must not rejuvenate or expire it: {:?}",
+            ahead.age
         );
         assert!(
-            skewed.observed_at_ms.is_some(),
-            "the raw value is preserved, not replaced by the clamped age"
+            ahead.observed_at_ms.is_some(),
+            "the raw display value is preserved"
         );
     }
 }
