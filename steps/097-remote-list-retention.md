@@ -58,11 +58,30 @@ A new node identity (new registry fingerprint) starts with no inherited rows.
 
 ## Actual
 
-Base 33f9da8, worktree `work/flicker-cache`; candidate left dirty and untouched.
-`cargo test -p remuda-native --lib cluster_remote::` 37 passed;
-`cluster_tui::` 254 passed. `--test cluster_remote`: 31 passed, 6 failed; the
-same 6 fail on the unmodified base (session creation / hosted setup), and the
-live rows now assert stale retention instead of a 5 s fallback. Full native lib:
-1963 passed, 26 real-daemon `tui_unit` failures that also fail on the base.
-`cargo clippy -p remuda-native --lib -- -D warnings` clean; the `--tests` run
-stops on two pre-existing `session_host/human_wire_tests.rs` lints.
+Source `feat/cluster-remote-retention` (base 33f9da8) and the main port
+`port/cluster-remote-retention-main` (base 3c1a4d8); candidate untouched. The
+main port needed one import-line resolution (`REMOTE_VIEW_TTL`/`WHEEL_ROWS`).
+
+```
+$ cargo test -p remuda-native --lib cluster_remote::      # main port
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 1886 filtered out
+
+$ cargo test -p remuda-native --lib cluster_tui::          # main port
+test result: ok. 235 passed; 0 failed; 0 ignored; 0 measured; 1688 filtered out
+
+$ cargo clippy -p remuda-native --lib -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.81s
+
+$ cargo test -p remuda-native --test cluster_remote       # main port
+test result: FAILED. 30 passed; 6 failed; 3 ignored; 0 measured; 0 filtered out
+
+$ cargo test -p remuda-native --test cluster_tui          # main port
+test result: FAILED. 0 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+All 12 integration failures reproduce individually on unmodified main 3c1a4d8
+at daemon session creation (`Request::New` returns non-`Value`) before any
+remote-list code runs; they are environmental on this runner, not regressions.
+The real-clock probe passed in 188.36 s: `Reachable` rows=1 → `Stale` at 2.02 s
+with rows=1 → expired at 180.01 s with rows=0 → `Reachable` rows=0 (successful
+empty) → `Reachable` rows=1 after a new session.

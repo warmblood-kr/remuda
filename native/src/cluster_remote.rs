@@ -19,11 +19,9 @@ const SELECTED_SYNC_SPACING: Duration = Duration::from_millis(150);
 const SELECTED_SYNC_WAIT: Duration = POLL_INTERVAL;
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
-/// How long a node's last successful session list is kept and shown while
-/// collection keeps failing. A blip keeps the rows (labelled stale); a real
-/// outage past this window drops them so old rows cannot pass for live ones.
-/// The poller retries every `POLL_INTERVAL` (2 s) with backoff up to 30 s, so
-/// three minutes covers many consecutive failures without hiding an outage.
+/// How long a node's last successful list survives failing collection. A blip
+/// keeps rows labelled stale; past this window they drop so old rows cannot
+/// pass for live ones. The poller retries every 2 s, backing off to 30 s.
 pub const REMOTE_RETENTION: Duration = Duration::from_secs(180);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

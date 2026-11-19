@@ -62,11 +62,9 @@ const LOCAL_VIEW_TTL: Duration = Duration::from_secs(30);
 /// still runs every loop, so a stalled node does not get a second timeout.
 const LOCAL_VIEW_REFRESH: Duration = Duration::from_secs(1);
 
-/// Remote rendered views are display-only and refresh more slowly than the
-/// local daemon. A failed view keeps the last valid one for as long as its
-/// rows still match the node's retained list; the node's retention window,
-/// not a separate view TTL, decides when a view and its rows expire. A fresh
-/// success replaces the view on the next refresh.
+/// Remote rendered views are display-only. A failed view keeps the last one
+/// while its rows match the retained list; the node's retention window, not a
+/// separate TTL, expires it, and a fresh success replaces it.
 const REMOTE_VIEW_WIDTH: u16 = 48;
 const REMOTE_VIEW_REFRESH: Duration = Duration::from_secs(2);
 const REMOTE_VIEW_RETRY_BASE: Duration = Duration::from_secs(1);
@@ -705,12 +703,9 @@ impl ClusterUi {
         true
     }
 
-    /// Returns whether the reply produced a usable view. A `false` result makes
-    /// the loader back off so invalid responses are not retried every tick.
-    /// A slow reply that still matches the retained list is accepted: its rows
-    /// are the same identities the tree is already showing, so dropping it
-    /// would only make the rows fall back to plain text while the node is
-    /// briefly unreachable.
+    /// Whether the reply produced a usable view; `false` makes the loader back
+    /// off. A slow reply that still matches the retained list is accepted, so a
+    /// brief outage does not degrade rows to plain text.
     fn remote_view_reply(
         &mut self,
         node_key: &str,
@@ -828,8 +823,7 @@ impl ClusterUi {
 
     /// Why an action must not go to this node right now, if it must not.
     /// Retained rows are for reading: only a node whose last collection
-    /// succeeded may authorize input or a close, so a stale display can never
-    /// send a keystroke or a close to an instance the user cannot see fresh.
+    /// succeeded authorizes input or a close, so stale rows cannot act.
     fn stale_action_refusal(&self, node_key: &str) -> Option<String> {
         let node = self
             .remote_snapshot
