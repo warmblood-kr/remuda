@@ -595,6 +595,21 @@ fn drive_is_primary_and_the_vfs_alias_reads_the_same_store() {
     let help = successful(node.run(&["help"]), "help");
     assert!(help.contains("remuda drive put|get"), "{help}");
     assert!(help.contains("remuda vfs ..."), "{help}");
+
+    let vfs_put_help = successful(node.run(&["vfs", "help", "put"]), "vfs help put");
+    assert!(
+        vfs_put_help.contains("Example: remuda vfs put"),
+        "{vfs_put_help}"
+    );
+    assert!(
+        !vfs_put_help.contains("Example: remuda drive put"),
+        "{vfs_put_help}"
+    );
+    let missing = node.run(&["vfs", "get", "remuda:///alias/missing"]);
+    assert!(!missing.status.success(), "a missing file must fail");
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(stderr.contains("remuda: vfs get"), "{stderr}");
+    assert!(!stderr.contains("remuda: drive get"), "{stderr}");
 }
 
 #[test]

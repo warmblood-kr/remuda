@@ -1208,7 +1208,7 @@ fn bind_address(addr: &str, allow_remote: bool) -> Result<SocketAddr, String> {
     Ok(requested)
 }
 
-/// `remuda drive serve` (or its `remuda drive` alias) from the CLI. Returns
+/// `remuda drive serve` (or its `remuda vfs` alias) from the CLI. Returns
 /// the process exit code.
 pub fn run(
     socket: &Path,

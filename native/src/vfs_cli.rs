@@ -72,9 +72,10 @@ fn verb(
     next: &str,
 ) -> VerbSpec {
     let next = next.replacen("remuda drive ", &format!("remuda {command} "), 1);
+    let about = about.replace("remuda drive ", &format!("remuda {command} "));
     VerbSpec {
         name: name.into(),
-        about: about.into(),
+        about,
         usage: next
             .strip_prefix(&format!("remuda {command} "))
             .map(str::to_owned),
@@ -200,6 +201,21 @@ fn flag(values: &Map<String, Value>, key: &str) -> bool {
     values.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// Daemon-side errors are built with the primary name. When the user invoked
+/// the alias, rewrite those prefixes before forwarding them.
+fn alias_stderr(command: &str, verb: &str, stderr: &[u8]) -> Vec<u8> {
+    if command != "vfs" {
+        return stderr.to_vec();
+    }
+    let text = String::from_utf8_lossy(stderr);
+    text.replace(
+        &format!("remuda: drive {verb}"),
+        &format!("remuda: vfs {verb}"),
+    )
+    .replace("remuda drive ", "remuda vfs ")
+    .into_bytes()
+}
+
 fn fail(out: &mut Out, verb: &str, error: impl std::fmt::Display) -> u8 {
     let command = command_name(out).to_owned();
     warn!(out, "remuda: {command} {verb}: {error}");
@@ -292,7 +308,7 @@ fn parse(args: &[&str], out: &mut Out) -> Result<(String, Map<String, Value>), u
     Ok((verb.to_owned(), report.values))
 }
 
-/// Run `remuda drive ARGS…` (or its `remuda drive` alias) from the CLI: parse
+/// Run `remuda drive ARGS…` (or its `remuda vfs` alias) from the CLI: parse
 /// here, run in the daemon of `server` (socket `socket`), which owns the
 /// index. Never starts a daemon.
 pub fn run(server: &str, socket: &Path, args: &[&str], command: &str) -> ExitCode {
@@ -363,6 +379,7 @@ pub fn run(server: &str, socket: &Path, args: &[&str], command: &str) -> ExitCod
             return finish_fail(command, &verb, format!("daemon request failed: {error}"))
         }
     };
+    let stderr = alias_stderr(command, &verb, &stderr);
     let _ = std::io::stderr().lock().write_all(&stderr);
     if verb == "get" && code == 0 {
         if let Some(dest) = value(&values, "DEST").filter(|dest| *dest != "-") {
@@ -2453,6 +2470,22 @@ mod tests {
             assert!(usage(&verb.name).contains("Usage"), "{}", verb.name);
         }
         assert!(usage("").contains("resolve"));
+    }
+
+    #[test]
+    fn the_alias_help_and_errors_name_vfs() {
+        let put = usage_for("vfs", "put");
+        assert!(put.contains("Example: remuda vfs put"), "{put}");
+        assert!(!put.contains("Example: remuda drive put"), "{put}");
+        let stderr = alias_stderr(
+            "vfs",
+            "get",
+            b"remuda: drive get: no file\nNext: run `remuda drive ls`.",
+        );
+        let text = String::from_utf8(stderr).unwrap();
+        assert!(text.contains("remuda: vfs get"), "{text}");
+        assert!(text.contains("remuda vfs ls"), "{text}");
+        assert!(!text.contains("remuda drive"), "{text}");
     }
 
     #[test]
