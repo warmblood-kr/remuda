@@ -106,28 +106,43 @@ impl Overlay {
         self.scan.rows.get(self.selected)
     }
 
-    /// One line per visible row, with a `>` marker for the selection.
+    /// Why other bindings could not be read. Rendered next to the rows too,
+    /// so a partial list never hides which sessions are missing from it.
+    pub fn unavailable_lines(&self, limit: usize) -> Vec<String> {
+        self.scan
+            .bindings
+            .iter()
+            .filter(|binding| binding.status != "ok")
+            .take(limit)
+            .map(|binding| {
+                format!(
+                    "{}: unavailable ({})",
+                    binding.session,
+                    binding.reason.unwrap_or("?")
+                )
+            })
+            .collect()
+    }
+
+    /// One line per visible row, with a `>` marker for the selection. The
+    /// window follows the selection: a marker outside it would hide the row
+    /// the detail block is describing.
     pub fn lines(&self, height: usize, width: usize) -> Vec<String> {
         let mut lines = Vec::new();
         if self.scan.rows.is_empty() {
             lines.push(self.summary());
-            for binding in self.scan.bindings.iter().filter(|b| b.status != "ok") {
-                lines.push(format!(
-                    "{}: unavailable ({})",
-                    binding.session,
-                    binding.reason.unwrap_or("?")
-                ));
-            }
+            lines.extend(self.unavailable_lines(usize::MAX));
             return lines;
         }
-        for (index, row) in self
-            .scan
-            .rows
-            .iter()
-            .enumerate()
-            .skip(self.scroll)
-            .take(height.max(1))
-        {
+        let height = height.max(1);
+        let start = if self.selected < self.scroll {
+            self.selected
+        } else if self.selected >= self.scroll + height {
+            self.selected + 1 - height
+        } else {
+            self.scroll
+        };
+        for (index, row) in self.scan.rows.iter().enumerate().skip(start).take(height) {
             let marker = if index == self.selected { ">" } else { " " };
             lines.push(truncate(
                 &format!(
@@ -226,12 +241,18 @@ mod tests {
         let overlay = Overlay::new(scan(Vec::new(), 2));
         assert!(overlay.summary().contains("unavailable"));
         assert!(!overlay.summary().contains("No pending"));
-        assert!(overlay.lines(4, 80).iter().any(|line| line.contains("server_pid")));
+        assert!(overlay
+            .lines(4, 80)
+            .iter()
+            .any(|line| line.contains("server_pid")));
     }
 
     #[test]
     fn selection_is_bounded() {
-        let overlay_scan = scan(vec![row("per_1", "a", "bash"), row("per_2", "b", "edit")], 0);
+        let overlay_scan = scan(
+            vec![row("per_1", "a", "bash"), row("per_2", "b", "edit")],
+            0,
+        );
         let mut overlay = Overlay::new(overlay_scan);
         overlay.move_selection(-1);
         assert_eq!(overlay.selected(), 0);
@@ -281,5 +302,29 @@ mod tests {
         overlay.scroll_to(2);
         assert_eq!(overlay.scroll(), 3);
         assert_eq!(overlay.lines(2, 80).len(), 2);
+    }
+
+    #[test]
+    fn the_window_follows_the_selection_without_a_scroll_call() {
+        let rows = (0..5)
+            .map(|index| row(&format!("per_{index}"), "s", "bash"))
+            .collect();
+        let mut overlay = Overlay::new(scan(rows, 0));
+        overlay.move_selection(4);
+        // The TUI never calls `scroll_to`; the marker must still be on screen.
+        let lines = overlay.lines(2, 80);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].starts_with('>'));
+        assert!(lines[1].contains("per_4"));
+    }
+
+    #[test]
+    fn unavailable_reasons_stay_visible_next_to_rows() {
+        let overlay = Overlay::new(scan(vec![row("per_1", "live", "bash")], 2));
+        let lines = overlay.lines(3, 80);
+        assert!(lines[0].contains("per_1"));
+        let reasons = overlay.unavailable_lines(3).join("\n");
+        assert!(reasons.contains("stale0"));
+        assert!(reasons.contains("server_pid"));
     }
 }
