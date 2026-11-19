@@ -9,7 +9,9 @@ fn help() -> ExitCode {
     println!(
         "remuda _native_permissions [--json] [--root DIR]\n\
          Read-only list of pending OpenCode permission requests from Butler bindings.\n\
-         It never replies or writes; credentials and nonces are not printed."
+         It never replies or writes; credentials and nonces are not printed.\n\
+         Exit status is 1 when no binding could be read, so a script cannot\n\
+         mistake an unreachable server for an empty list."
     );
     ExitCode::SUCCESS
 }
@@ -52,5 +54,10 @@ pub fn run(args: &[&str]) -> ExitCode {
     } else {
         print!("{}", scan.to_text());
     }
-    ExitCode::SUCCESS
+    let reachable = scan.bindings.iter().any(|binding| binding.status == "ok");
+    if reachable || scan.bindings.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }

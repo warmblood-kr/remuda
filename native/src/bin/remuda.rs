@@ -51,8 +51,6 @@ extern "C" fn record_join_interrupt(signal: libc::c_int) {
 
 #[path = "remuda/agent_notice.rs"]
 mod agent_notice;
-#[path = "remuda/native_permissions.rs"]
-mod permissions_cli;
 #[cfg(unix)]
 #[path = "remuda/claude_channel.rs"]
 mod claude_channel;
@@ -69,6 +67,8 @@ mod gui_managed;
 mod opencode_adopt;
 #[path = "remuda/opencode_tui.rs"]
 mod opencode_tui;
+#[path = "remuda/native_permissions.rs"]
+mod permissions_cli;
 #[path = "remuda/private_dir.rs"]
 mod private_dir;
 

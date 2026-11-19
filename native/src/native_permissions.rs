@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::net::http_client::{perform, HttpRequest};
@@ -54,7 +55,8 @@ struct Permission {
 
 #[derive(Deserialize)]
 struct PermissionList {
-    #[serde(default)]
+    // No `default`: OpenCode always sends `data`, so a 200 `{}` is a
+    // different service on a reused loopback port, not an empty list.
     data: Vec<Permission>,
 }
 
@@ -246,18 +248,56 @@ fn read_manifest(path: &Path) -> Result<Manifest, &'static str> {
     parse_manifest(&bytes)
 }
 
-fn manifests(root: &Path) -> Vec<(String, PathBuf)> {
+/// Manifest paths plus the problems found while walking the tree. A directory
+/// that exists but cannot be read is an error, never an empty result.
+fn manifests(root: &Path) -> (Vec<(String, PathBuf)>, Vec<BindingStatus>) {
     let mut found = Vec::new();
-    let Ok(sessions) = fs::read_dir(root) else {
-        return found;
-    };
-    for session in sessions.flatten().take(MAX_MANIFESTS) {
-        if !session.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
-            continue;
+    let mut problems = Vec::new();
+    let sessions = match fs::read_dir(root) {
+        Ok(sessions) => sessions,
+        Err(_) => {
+            problems.push(BindingStatus {
+                session: "(bindings)".into(),
+                status: "unavailable",
+                reason: Some("bindings_io"),
+            });
+            return (found, problems);
         }
-        let session_name = session.file_name().to_string_lossy().into_owned();
-        let Ok(nonces) = fs::read_dir(session.path()) else {
-            continue;
+    };
+    let mut seen_sessions = 0usize;
+    for session in sessions.flatten() {
+        seen_sessions += 1;
+        if seen_sessions > MAX_MANIFESTS {
+            problems.push(BindingStatus {
+                session: "(truncated)".into(),
+                status: "unavailable",
+                reason: Some("too_many_bindings"),
+            });
+            break;
+        }
+        let session_name = sanitize(&session.file_name().to_string_lossy(), 128);
+        match session.file_type() {
+            Ok(kind) if kind.is_dir() => {}
+            Ok(_) => continue,
+            Err(_) => {
+                problems.push(BindingStatus {
+                    session: session_name,
+                    status: "unavailable",
+                    reason: Some("bindings_io"),
+                });
+                continue;
+            }
+        }
+        let nonces = match fs::read_dir(session.path()) {
+            Ok(nonces) => nonces,
+            Err(_) => {
+                problems.push(BindingStatus {
+                    session: session_name,
+                    status: "unavailable",
+                    reason: Some("bindings_io"),
+                });
+                continue;
+            }
         };
         for nonce in nonces.flatten().take(MAX_MANIFESTS) {
             if !nonce.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
@@ -273,14 +313,42 @@ fn manifests(root: &Path) -> Vec<(String, PathBuf)> {
         }
     }
     found.sort();
-    found.truncate(MAX_MANIFESTS);
-    found
+    if found.len() > MAX_MANIFESTS {
+        found.truncate(MAX_MANIFESTS);
+        problems.push(BindingStatus {
+            session: "(truncated)".into(),
+            status: "unavailable",
+            reason: Some("too_many_bindings"),
+        });
+    }
+    (found, problems)
+}
+
+/// Format controls (bidi overrides, zero-width joiners) are not covered by
+/// `is_control`, and this text comes from the agent side of the wire.
+fn is_format_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00ad}'
+            | '\u{061c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{1d173}'..='\u{1d17a}'
+    )
 }
 
 fn sanitize(value: &str, limit: usize) -> String {
     let mut out = String::new();
     let mut space = false;
     for ch in value.chars() {
+        // Format controls are invisible, so removing one must not leave a
+        // visible gap where the wire had none.
+        if is_format_control(ch) {
+            continue;
+        }
         if ch.is_control() || ch.is_whitespace() {
             space = !out.is_empty();
             continue;
@@ -312,7 +380,10 @@ fn pending(manifest: &Manifest) -> Result<Vec<Row>, &'static str> {
         method: "GET".into(),
         url,
         headers: vec![
-            ("Authorization".into(), auth_header(&manifest.auth).into_bytes()),
+            (
+                "Authorization".into(),
+                auth_header(&manifest.auth).into_bytes(),
+            ),
             ("Accept".into(), b"application/json".to_vec()),
         ],
         body: Vec::new(),
@@ -353,13 +424,26 @@ fn pending(manifest: &Manifest) -> Result<Vec<Row>, &'static str> {
             decision: "once | reject",
         });
     }
-    rows.sort_by(|a, b| (a.session.as_str(), a.id.as_str()).cmp(&(b.session.as_str(), b.id.as_str())));
+    rows.sort_by(|a, b| {
+        (a.session.as_str(), a.id.as_str()).cmp(&(b.session.as_str(), b.id.as_str()))
+    });
     Ok(rows)
 }
 
 /// Scan one bindings root. The caller decides how often to run it; it is
 /// bounded to at most 256 manifests and a 3 second timeout per request.
 pub fn scan(root: &Path) -> Scan {
+    scan_cancellable(root, None)
+}
+
+/// The same scan, stoppable between manifests. A closed overlay must not keep
+/// sending loopback requests to every binding it can still reach.
+pub fn scan_cancellable(root: &Path, cancel: Option<&AtomicBool>) -> Scan {
+    let cancelled = || {
+        cancel
+            .map(|flag| flag.load(Ordering::Acquire))
+            .unwrap_or(false)
+    };
     if !root.is_dir() {
         return Scan {
             bindings: vec![BindingStatus {
@@ -370,11 +454,15 @@ pub fn scan(root: &Path) -> Scan {
             rows: Vec::new(),
         };
     }
+    let (found, problems) = manifests(root);
     let mut scan = Scan {
-        bindings: Vec::new(),
+        bindings: problems,
         rows: Vec::new(),
     };
-    for (session, path) in manifests(root) {
+    for (session, path) in found {
+        if cancelled() {
+            break;
+        }
         match read_manifest(&path).and_then(|manifest| {
             validate(&manifest)?;
             pending(&manifest)
@@ -403,9 +491,9 @@ pub fn scan(root: &Path) -> Scan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::thread;
+    use crate::net::testing::ScriptedHttpServer;
+
+    const PERMISSION_PATH: &str = "/api/session/ses_abc123/permission";
 
     fn manifest() -> Manifest {
         Manifest {
@@ -426,20 +514,10 @@ mod tests {
         }
     }
 
-    fn serve(status: &str, body: &str) -> (String, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let response = format!(
-            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0u8; 4096];
-            let _ = stream.read(&mut buffer);
-            let _ = stream.write_all(response.as_bytes());
-        });
-        (format!("http://127.0.0.1:{port}"), handle)
+    fn serve(status: u16, body: &str) -> ScriptedHttpServer {
+        let server = ScriptedHttpServer::new().unwrap();
+        server.route_json(PERMISSION_PATH, status, body);
+        server
     }
 
     #[test]
@@ -488,45 +566,58 @@ mod tests {
     }
 
     #[test]
+    fn strips_bidi_and_zero_width_controls() {
+        // Agent-side text can carry a right-to-left override that reorders a
+        // rendered line; it must not reach the terminal.
+        assert_eq!(sanitize("a\u{202e}b\u{200b}c", 20), "abc");
+        assert_eq!(sanitize("line\u{2028}two", 20), "line two");
+    }
+
+    #[test]
     fn reads_pending_rows() {
         let body = r#"{"data":[{"id":"per_1","sessionID":"ses_abc123","action":"bash","resources":["echo hi"],"message":"run it"}]}"#;
-        let (endpoint, handle) = serve("200 OK", body);
+        let server = serve(200, body);
         let mut valid = manifest();
-        valid.endpoint = endpoint;
+        valid.endpoint = server.base_url();
         let rows = pending(&valid).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].action, "bash");
         assert_eq!(rows[0].resources, vec!["echo hi"]);
-        handle.join().unwrap();
     }
 
     #[test]
     fn rejects_mismatched_session() {
         let body =
             r#"{"data":[{"id":"per_1","sessionID":"ses_other","action":"bash","resources":[]}]}"#;
-        let (endpoint, handle) = serve("200 OK", body);
+        let server = serve(200, body);
         let mut valid = manifest();
-        valid.endpoint = endpoint;
+        valid.endpoint = server.base_url();
         assert_eq!(pending(&valid).unwrap_err(), "session_mismatch");
-        handle.join().unwrap();
     }
 
     #[test]
     fn http_errors_are_not_empty() {
-        let (endpoint, handle) = serve("401 Unauthorized", "{}");
+        let server = serve(401, "{}");
         let mut valid = manifest();
-        valid.endpoint = endpoint;
+        valid.endpoint = server.base_url();
         assert_eq!(pending(&valid).unwrap_err(), "http_status");
-        handle.join().unwrap();
     }
 
     #[test]
     fn malformed_is_not_empty() {
-        let (endpoint, handle) = serve("200 OK", "not json");
+        let server = serve(200, "not json");
         let mut valid = manifest();
-        valid.endpoint = endpoint;
+        valid.endpoint = server.base_url();
         assert_eq!(pending(&valid).unwrap_err(), "malformed");
-        handle.join().unwrap();
+    }
+
+    #[test]
+    fn an_empty_object_is_malformed_not_empty() {
+        // A reused loopback port can answer 200 with an unrelated object.
+        let server = serve(200, "{}");
+        let mut valid = manifest();
+        valid.endpoint = server.base_url();
+        assert_eq!(pending(&valid).unwrap_err(), "malformed");
     }
 
     #[test]
@@ -551,5 +642,33 @@ mod tests {
         assert_eq!(scan.bindings.len(), 1);
         assert_eq!(scan.bindings[0].reason, Some("no_root"));
         assert!(scan.to_text().contains("unavailable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_session_is_unavailable_not_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "remuda-perm-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let locked = root.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        // A privileged runner ignores the mode; then this proves nothing.
+        let readable = fs::read_dir(&locked).is_ok();
+        let scan = if readable { None } else { Some(scan(&root)) };
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let Some(scan) = scan else { return };
+        assert!(scan
+            .bindings
+            .iter()
+            .any(|binding| binding.reason == Some("bindings_io")));
+        assert!(!scan.to_text().contains("No pending"));
     }
 }
