@@ -144,7 +144,8 @@ each copied file.
   Exit 75 means the files are stored here but not on every wanted node yet.
 - Symlinks, special files and non-UTF-8 names are skipped and named. Empty
   local directories are not represented in the store. A file over 64 MiB is
-  a per-file failure and the other files continue.
+  a per-file failure and the other files continue. One run is bounded at
+  10,000 files; a larger local tree is refused before writing.
 - Files that exist only on the destination are never deleted. This includes
   files removed from the source: run `remuda drive rm` for those explicitly.
 - A store file cannot also be a directory. A local tree that would create that
