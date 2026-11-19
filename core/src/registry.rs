@@ -112,10 +112,10 @@ pub struct SessionSummary {
     /// client and JSON listings cannot republish an agent's own words.
     #[serde(skip)]
     pub program_title: Option<String>,
-    /// UTC Unix timestamp (ms) of the report behind `program_status`; display
-    /// only, and never serialized. Freshness also needs the monotonic age as a
-    /// floor: a caller may age this value, but never from it alone.
-    #[serde(skip)]
+    /// UTC Unix timestamp (ms) of the report behind `program_status`; local
+    /// display data. A local listing carries it; the remote front strips it
+    /// before encoding a peer response. Freshness also needs the monotonic age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_status_last_updated_at_ms: Option<u64>,
     /// Monotonic age in ms at copy time, from the tracker's `Instant`; never
     /// derived from the wall-clock timestamp. This is the freshness value.

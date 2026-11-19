@@ -127,6 +127,19 @@ pub(crate) fn peer_input_request(request: Request) -> Request {
     }
 }
 
+/// Strip local-only OSC enrichment from a response bound for a peer. The
+/// daemon keeps it for local callers; only the encoded peer frame loses it.
+pub(crate) fn project_for_peer(response: &mut remuda_core::protocol::Response) {
+    if let remuda_core::protocol::Response::Sessions(sessions) = response {
+        for session in sessions {
+            session.program_status = None;
+            session.program_title = None;
+            session.program_status_last_updated_at_ms = None;
+            session.program_status_age_ms = None;
+        }
+    }
+}
+
 fn forward_request_with_timeout(
     path: &Path,
     request: &Request,
@@ -141,8 +154,9 @@ fn forward_request_with_timeout(
     } else {
         None
     };
-    let response = crate::client::request_with_timeout(path, request, timeout)
+    let mut response = crate::client::request_with_timeout(path, request, timeout)
         .map_err(|error| error.to_string())?;
+    project_for_peer(&mut response);
     serde_json::to_vec(&response).map_err(|error| error.to_string())
 }
 
@@ -433,6 +447,57 @@ mod tests {
         );
         let frame = serde_json::to_vec(&request).expect("encode guarded line");
         assert!(decode_frame(&frame).is_ok(), "the new front allows it");
+    }
+
+    fn peer_row() -> remuda_core::SessionSummary {
+        remuda_core::SessionSummary {
+            id: "id-dev".into(),
+            name: "dev".into(),
+            instance_id: Some("instance".into()),
+            output_version: Some(1),
+            alive: true,
+            idle: std::time::Duration::ZERO,
+            output_idle: Some(std::time::Duration::ZERO),
+            size: remuda_core::Size::new(80, 24),
+            attached: false,
+            human_idle: None,
+            mouse_tracking: false,
+            unavailable: false,
+            program_status: Some(remuda_core::agent::ProgramStatus {
+                state: remuda_core::agent::ProgramState::Working,
+                app: Some("opencode".into()),
+                kind: None,
+                progress: None,
+            }),
+            program_title: Some("private work summary".into()),
+            program_status_last_updated_at_ms: Some(1_700_000_000_000),
+            program_status_age_ms: Some(12),
+            remote_input_disabled: false,
+            team: None,
+        }
+    }
+
+    #[test]
+    fn a_peer_frame_carries_no_osc_enrichment() {
+        let mut response = Response::Sessions(vec![peer_row()]);
+        project_for_peer(&mut response);
+        let json = serde_json::to_string(&response).expect("encode peer frame");
+        for leaked in [
+            "private work summary",
+            "program_title",
+            "program_status_last_updated_at_ms",
+            "program_status_age_ms",
+            "program_status",
+        ] {
+            assert!(
+                !json.contains(leaked),
+                "a peer frame must not carry {leaked}: {json}"
+            );
+        }
+        assert!(
+            json.contains("\"dev\""),
+            "the row itself still travels: {json}"
+        );
     }
 
     #[test]
