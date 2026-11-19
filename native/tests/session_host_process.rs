@@ -201,6 +201,25 @@ impl Host {
 fn outcome_request(act: &Value, op: &str) -> Value {
     json!({"op":op,"client":vec![7;16],"sequence":1,"act":act})
 }
+
+#[test]
+fn host_survives_wide_glyph_overwritten_after_resize() {
+    let mut host = Host::start_with(
+        "stty -echo; printf 'host-ready\\n'; read first; printf '\\033[1;79H가'; read second; printf '\\033[1;79Hx'; sleep 0.1; printf '\\033[1;1Hafter'; read third",
+    );
+    let first = json!({"op":"Input", "client":vec![7;16], "sequence":1, "act":{"kind":"Bytes","value":[10]}});
+    assert_eq!(rpc(&host.root, true, first)["result"], "Admitted");
+    host.wait_screen("가");
+    assert_eq!(
+        rpc(&host.root, true, json!({"op":"Resize","rows":24,"cols":79}))["result"],
+        "Ok"
+    );
+    let second = json!({"op":"Input", "client":vec![8;16], "sequence":1, "act":{"kind":"Bytes","value":[10]}});
+    assert_eq!(rpc(&host.root, true, second)["result"], "Admitted");
+    host.wait_screen("after");
+    assert_eq!(host.inspect()["lifecycle"], "Running");
+    host.stop();
+}
 #[test]
 fn controller_sigkill_preserves_child_identity_terminal_and_admitted_input_result() {
     let mut host = Host::start();
