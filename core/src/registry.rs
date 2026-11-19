@@ -107,6 +107,11 @@ pub struct SessionSummary {
     /// report or its instance was replaced; older readers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_status: Option<ProgramStatus>,
+    /// Bounded, control-free title that arrived with `program_status`.
+    /// `serde(skip)` is the boundary: in-process Lua sees it, while peer,
+    /// client and JSON listings cannot republish an agent's own words.
+    #[serde(skip)]
+    pub program_title: Option<String>,
     /// Monotonic age of `program_status` when it was copied out. A list,
     /// cache clone or relist must not reset this; staleness is a display
     /// decision, not a core TTL.
@@ -847,6 +852,7 @@ impl Registry {
                         mouse_tracking: s.mouse_tracking(),
                         unavailable: false,
                         program_status: program.as_ref().map(|o| o.status.clone()),
+                        program_title: program.as_ref().and_then(|o| o.title.clone()),
                         program_status_age_ms: program
                             .map(|o| o.age.as_millis().try_into().unwrap_or(u64::MAX)),
                         remote_input_disabled: false,
@@ -1085,6 +1091,7 @@ fn hosted_summary(handle: &SessionHandle) -> SessionSummary {
         mouse_tracking: false,
         unavailable: false,
         program_status: None,
+        program_title: None,
         program_status_age_ms: None,
         remote_input_disabled: false,
         team: None,
@@ -1102,6 +1109,7 @@ fn hosted_summary(handle: &SessionHandle) -> SessionSummary {
     summary.human_idle = observation.human_idle;
     summary.mouse_tracking = observation.mouse.mode != crate::agent::MouseMode::default();
     summary.program_status = observation.program_status;
+    summary.program_title = observation.program_title;
     summary.program_status_age_ms = observation.program_status_age_ms;
     summary
 }

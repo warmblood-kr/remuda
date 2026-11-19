@@ -2704,6 +2704,7 @@ pub(crate) fn session_rows(
             lua,
             &row,
             session.program_status,
+            session.program_title,
             session.program_status_age_ms,
         )?;
         rows.set(index + 1, row)?;
@@ -2711,11 +2712,12 @@ pub(crate) fn session_rows(
     Ok(Value::Table(rows))
 }
 
-/// Additive OSC 7501 state; free text is never exposed.
+/// Additive OSC 7501 state. `title` is local display text; `msg` stays hidden.
 fn set_program_status(
     lua: &Lua,
     row: &mlua::Table,
     status: Option<remuda_core::agent::ProgramStatus>,
+    title: Option<String>,
     age_ms: Option<u64>,
 ) -> mlua::Result<()> {
     if let Some(status) = status {
@@ -2729,6 +2731,9 @@ fn set_program_status(
         }
         if let Some(progress) = status.progress {
             value.set("progress", progress)?;
+        }
+        if let Some(title) = title {
+            value.set("title", title)?;
         }
         row.set("program_status", value)?;
         // The list draws the same freshness rule the cluster tree uses; a
@@ -2929,6 +2934,7 @@ mod binding_tests {
                     remote_input_disabled: false,
                     team: None,
                     program_status: None,
+                    program_title: None,
                     program_status_age_ms: None,
                 }]),
                 other => panic!("unexpected test request: {other:?}"),

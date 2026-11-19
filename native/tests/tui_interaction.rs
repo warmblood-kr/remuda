@@ -21,6 +21,7 @@ fn ui_with_mouse_tracking(mouse_tracking: bool) -> Ui {
             remote_input_disabled: false,
             team: None,
             program_status: None,
+            program_title: None,
             program_status_age_ms: None,
         }],
         "sh",

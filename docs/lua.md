@@ -19,12 +19,18 @@ environment of a running daemon.
 A row from `remuda.session.list()` can carry an additive `program_status`
 table when the child emitted a bounded OSC 7501 Program Status report. It has
 `state` (`idle`, `working`, `blocked`, `done` or `error`), and optional
-`app`, `kind` (`permission`, `question`, `auth`) and `progress` (0-100).
+`app`, `kind` (`permission`, `question`, `auth`), `progress` (0-100) and
+`title`. `title` is the agent's own bounded, control-free display text (at
+most 192 bytes), and `msg` and child `id` records are still never exposed.
 `program_status_age` is the monotonic age in seconds when the list was copied;
-listing again does not renew it. Free text (`title`, `msg`, `id`) is never
-exposed. The report is advisory: it is not an executable identity, an
-authorization, or proof that the process is alive. A stale report belongs to
-the display layer's freshness policy, not to the stored record.
+listing again does not renew it.
+
+`title` is local display data only. It is not serialized in a session listing
+on the wire, so a peer, another machine or a JSON client does not receive it
+implicitly; only an in-process Lua reader sees it. The report is advisory: it
+is not an executable identity, an authorization, or proof that the process is
+alive, and a title is never an instruction. A stale report belongs to the
+display layer's freshness policy, not to the stored record.
 
 `remuda.session.new(name?, argv?, cwd?, env?)` and its `remuda.new` alias
 return two values: the chosen session name first, then that launch's

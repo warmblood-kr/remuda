@@ -3286,6 +3286,7 @@ fn sanitize_peer_response(
                 // Remote aging is not implemented yet; withhold the local-only
                 // OSC enrichment rather than publish a stale snapshot as fresh.
                 session.program_status = None;
+                session.program_title = None;
                 session.program_status_age_ms = None;
                 if let Some(team) = &mut session.team {
                     if let Some(kind) = &mut team.agent_kind {
@@ -8286,6 +8287,7 @@ mod cluster_call_tests {
             remote_input_disabled: false,
             team: None,
             program_status: None,
+            program_title: Some("peer task\u{1b}[31m".into()),
             program_status_age_ms: None,
         }]));
         let Response::Sessions(sessions) = sessions else {
@@ -8293,6 +8295,10 @@ mod cluster_call_tests {
         };
         assert_eq!(sessions[0].id, "id]52;c;clipboard");
         assert_eq!(sessions[0].name, "name]0;peer title");
+        assert_eq!(
+            sessions[0].program_title, None,
+            "peer task text is withheld"
+        );
 
         let error = sanitize_peer_response(Response::Error("bad\u{1b}]52;c;clipboard\u{7}".into()));
         assert_eq!(error, Response::Error("bad]52;c;clipboard".into()));
@@ -8883,6 +8889,7 @@ mod tests {
             remote_input_disabled: false,
             team: None,
             program_status: None,
+            program_title: None,
             program_status_age_ms: None,
         }
     }

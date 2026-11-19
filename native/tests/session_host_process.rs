@@ -203,6 +203,34 @@ fn outcome_request(act: &Value, op: &str) -> Value {
 }
 
 #[test]
+fn host_reports_a_bounded_task_title_and_hides_message_text() {
+    let script = "stty -echo; printf 'host-ready\\n'; printf '\\033]7501;state=working:app=opencode:title=UmV2aWV3IE9TQyB0YXNr:msg=c2VjcmV0\\033\\\\'; while :; do sleep 1; done";
+    let host = Host::start_with(script);
+    let until = Instant::now() + Duration::from_secs(4);
+    let info = loop {
+        let info = host.inspect();
+        if info["program_title"] == "Review OSC task" {
+            break info;
+        }
+        assert!(
+            Instant::now() < until,
+            "host did not report the title: {info}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(info["program_status"]["state"], "working");
+    assert_eq!(info["program_status"]["app"], "opencode");
+    assert!(
+        info["program_status"].get("title").is_none(),
+        "the title is local observation data, not part of serialized status"
+    );
+    assert!(
+        info["program_status"].get("msg").is_none(),
+        "message text is never exposed"
+    );
+}
+
+#[test]
 fn host_survives_wide_glyph_overwritten_after_resize() {
     let mut host = Host::start_with(
         "stty -echo; printf 'host-ready\\n'; read first; printf '\\033[1;79H가'; read second; printf '\\033[1;79Hx'; sleep 0.1; printf '\\033[1;1Hafter'; read third",
