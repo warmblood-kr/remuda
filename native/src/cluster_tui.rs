@@ -5698,6 +5698,8 @@ mod tests {
                 name: "laptop".into(),
                 state,
                 last_sync_age: Some(age),
+                last_updated_at: None,
+                expired: false,
                 last_error: None,
                 sessions: vec![RemoteSessionSnapshot {
                     name: "build".into(),
