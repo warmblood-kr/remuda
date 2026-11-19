@@ -124,9 +124,10 @@ scan_invocations() {
 	awk -v tok="$python_token" -v piptok="$pip_token" -v uvtok="$uv_token" \
 		-v setup="$setup_token" '
 	BEGIN {
-		tokonly = "(" tok "[0-9]*(\\.[0-9]+)?|" piptok "[0-9]*((\\.[0-9]+)|\\.exe)?|" uvtok ")"
+		tokonly = "(" tok "[0-9]*(\\.[0-9]+)*(\\.[eE][xX][eE])?|" piptok "[0-9]*((\\.[0-9]+)|\\.exe)?|" uvtok "(\\.exe)?)"
 		tokre = "([^A-Za-z0-9_.-]|^)" tokonly "([^A-Za-z0-9_.-]|$)"
-		sink = "(command::new|process::command|subprocess\\.|os\\.(system|exec|spawn|popen)|popen|system\\(|exec\\(|spawn\\(|sh[ \t]+-c|bash[ \t]+-c|eval[ \t]+|[|][ \t]*(sh|bash|zsh|dash)([ \t]|$))"
+		sink = "(command::new|process::command|subprocess\\.|os\\.(system|exec|spawn|popen)|popen|system\\(|exec\\(|spawn\\(|(sh|bash|zsh|dash|ksh)[ \t]+-[A-Za-z]*c|eval[ \t]+|[|][ \t]*((env|command|exec|sudo)[ \t]+)*(sh|bash|zsh|dash|ksh)([ \t]|$))"
+		executor = "(^|[;|&{}]|\\$\\(|`|run:[ \t]*)[ \t]*((sudo|doas|pkexec|env|exec|command|nohup|nice|setsid|stdbuf|timeout|ssh|xargs|watch|systemd-run|strace|ltrace|busybox|chroot|nsenter|osascript|perl|ruby|node|php|lua|docker|docker-compose|podman|kubectl)([ \t]+|$)|gdb[ \t]+--args|-exec[ \t])"
 		setupre = "([^A-Za-z0-9_.-]|^)" setup "([^A-Za-z0-9_.-]|$)"
 		runner = "(sudo|env|exec|xargs|command|nohup|nice|setsid|stdbuf|timeout|chrt|ionice|time|if|then|else|do|while|until)"
 		args = "((-[^ \t]+([ \t]+[A-Za-z0-9_.=&/-]+)?|[0-9]+|[A-Za-z_][A-Za-z0-9_]*=[^ \t]*)[ \t]+)*"
@@ -135,6 +136,29 @@ scan_invocations() {
 		cmd = sep "[ \t]*(" runner "[ \t]+" args ")?" path tokonly "([^A-Za-z0-9_.-]|$)"
 		qcmd = sep "[ \t]*[\"\047]([^\"\047]*/)?" tokonly "([\"\047]|[ \t])"
 		arm = sep "[ \t]*[\"\047][^\"\047]*" tokonly "[^\"\047]*[\"\047][ \t]*(\\||=>)"
+		word = "([^A-Za-z0-9_-]|^)" tokonly "([^A-Za-z0-9_-]|$)"
+	}
+	# Blank quoted text in place, preserving length, so an unquoted token is
+	# still seen next to a quote while a literal inside one is not.
+	function blank_quotes(s,   i, c, q, out) {
+		out = ""
+		q = ""
+		for (i = 1; i <= length(s); i++) {
+			c = substr(s, i, 1)
+			if (q == "") {
+				if (c == "\"" || c == "\047") { q = c; out = out " " }
+				else out = out c
+			} else if (c == "\\" && i < length(s)) {
+				out = out "  "
+				i++
+			} else if (c == q) {
+				q = ""
+				out = out " "
+			} else {
+				out = out " "
+			}
+		}
+		return out
 	}
 	function unquote(s,   i, c, q, out) {
 		out = ""
@@ -156,11 +180,19 @@ scan_invocations() {
 		if (match($0, /^[0-9]+:/) == 0) next
 		n = substr($0, 1, RLENGTH - 1)
 		line = substr($0, RLENGTH + 1)
-		if (line ~ /^[ \t]*#/) next
+		# Comments in the languages this tree carries: #, //, --, /* and a
+		# block-comment continuation line that starts with *.
+		if (line ~ /^[ \t]*(#|\/\/|--|\/\*|\*)/) next
 		if (tolower(line) ~ sink && line ~ tokre) { print n ":" line; next }
+		if (line ~ executor && line ~ tokre) { print n ":" line; next }
 		if (line ~ setupre) { print n ":" line; next }
 		if (line ~ qcmd && line !~ arm) { print n ":" line; next }
 		if (unquote(line) ~ cmd) { print n ":" line; next }
+		# Safety net: the old guard caught a token anywhere, including forms no
+		# runner list names. Keep that width for unquoted text, with a word
+		# boundary that rejects `no-python` and `python_token`, and with quoted
+		# literals blanked so language tags and fences stay data.
+		if (blank_quotes(line) ~ word) { print n ":" line; next }
 	}
 	'
 }

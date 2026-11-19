@@ -138,11 +138,82 @@ expect_rejected 'eval wrapper' 'Python invocation at scripts/probe.sh:1'
 reset_fixture
 printf 'printf %%s "%s -c 1" | sh\n' "$py" >"$fixture/repo/scripts/probe.sh"
 expect_rejected 'pipe to sh' 'Python invocation at scripts/probe.sh:1'
+
+# 8. A quoted token still counts when an executor on the line runs it.
+reset_fixture; printf 'ssh host "%s -c 1"\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'quoted command to ssh' 'Python invocation at scripts/probe.sh:1'
+reset_fixture; printf 'sudo "%s" -c 1\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'quoted command to sudo' 'Python invocation at scripts/probe.sh:1'
+reset_fixture; printf 'xargs -0 "%s" -c 1\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'quoted command to xargs' 'Python invocation at scripts/probe.sh:1'
+reset_fixture; printf 'find . -exec "%s" -c 1 {} ;\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'quoted command to find -exec' 'Python invocation at scripts/probe.sh:1'
+reset_fixture; printf 'docker run --rm "%s" -c 1\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'quoted command to docker run' 'Python invocation at scripts/probe.sh:1'
+reset_fixture; printf 'timeout 5s "%s" -c 1\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'quoted command to timeout' 'Python invocation at scripts/probe.sh:1'
+reset_fixture; printf 'env -S "%s -c 1"\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'quoted command to env' 'Python invocation at scripts/probe.sh:1'
+reset_fixture; printf 'watch "%s -c 1"\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'quoted command to watch' 'Python invocation at scripts/probe.sh:1'
+
+# 7. Unquoted tokens count even when no runner/sink name appears on the line,
+# plus the forms ui-semantics reproduced against the old checker in the #996
+# review. Each of these was base=REJECT before the rewrite.
+for line in \
+	"/usr/bin/env $py -c 1" \
+	"FOO=1 $py -c 1" \
+	"PATH=/x $py -c 1" \
+	"ssh host $py -c 1" \
+	"docker run --rm $py -c 1" \
+	"$py.exe -c 1" \
+	"${py%3}.exe -c 1" \
+	"($py -c 1)" \
+	"case x in a) $py -c 1;; esac" \
+	"! $py -c 1" \
+	"$py.12.1 -c 1" \
+	"u""v.exe run x" \
+	"chroot / $py -c 1" \
+	"watch $py -c 1" \
+	"flock /tmp/l $py -c 1" \
+	"gdb --args $py -c 1" \
+	"make -C . $py -c 1" \
+	"systemd-run $py -c 1" \
+	"strace $py -c 1" \
+	"busybox $py -c 1" \
+	"timeout 5s $py -c 1" \
+	"diff <($py -c 1) /dev/null"; do
+	reset_fixture
+	printf '%s\n' "$line" >"$fixture/repo/scripts/probe.sh"
+	expect_rejected "unlisted form: $line" 'Python invocation at scripts/probe.sh:1'
+done
+for line in "bash -lc \"$py -c 1\"" "sh -ec \"$py -c 1\"" \
+	"ksh -xc \"$py -c 1\"" "printf %s \"$py -c 1\" | env sh" \
+	"printf %s \"$py -c 1\" | command bash"; do
+	reset_fixture
+	printf '%s\n' "$line" >"$fixture/repo/scripts/probe.sh"
+	expect_rejected "combined-flag sink: $line" 'Python invocation at scripts/probe.sh:1'
+done
 for line in "nice -n 5 $py -c 1" "timeout -s KILL 5 $py -c 1" "setsid $py -c 1"; do
 	reset_fixture
 	printf '%s\n' "$line" >"$fixture/repo/scripts/probe.sh"
 	expect_rejected "runner wrapper: $line" 'Python invocation at scripts/probe.sh:1'
 done
+
+# The old checker accepted these; they must stay accepted. python3-config is a
+# different program whose hyphen is a word character, not an invocation.
+reset_fixture
+printf '%s-config --includes\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_ok
+reset_fixture
+mkdir -p "$fixture/repo/native/src"
+{
+	printf '// the guard rejects %s invocations, not prose\n' "$py"
+	printf ' * %s is mentioned only in this block comment\n' "${py%3}"
+} >"$fixture/repo/native/src/probe.rs"
+printf -- '-- %s is not called from this module\n' "$py" >"$fixture/repo/native/src/probe.lua"
+printf 'echo "%s -c 1 is forbidden"\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_ok
 
 # Neither checker is exempt from its own policy. The function is never called.
 reset_fixture
