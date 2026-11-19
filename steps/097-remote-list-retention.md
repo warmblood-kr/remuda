@@ -83,9 +83,15 @@ $ cargo test -p remuda-native --test cluster_tui          # main port
 test result: FAILED. 0 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-All 12 integration failures reproduce individually on unmodified main 3c1a4d8
-at daemon session creation (`Request::New` returns non-`Value`) before any
-remote-list code runs; they are environmental on this runner, not regressions.
-The real-clock probe passed in 188.36 s: `Reachable` rows=1 → `Stale` at 2.02 s
-with rows=1 → expired at 180.01 s with rows=0 → `Reachable` rows=0 (successful
-empty) → `Reachable` rows=1 after a new session.
+Rebased onto current main `ec278f3` (80c2c0d). The 12 default-host integration
+failures reproduce identically on unmodified main at daemon session creation
+(`Request::New` returns non-`Value`) before any remote-list code runs. With
+`REMUDA_EXPERIMENTAL_SESSION_HOST=0` the suites match main exactly: 32 passed /
+4 failed for `cluster_remote`, 5 passed / 1 failed for `cluster_tui`; the
+remaining failures are hosted-only or one TUI input test and fail on main too.
+
+Real-clock same-node probe (private daemons/TUI, short retention): success
+`Reachable` rows=1 with the absolute `last_updated_at`; failure `Stale` rows=1
+with the same timestamp; expiry `Unreachable` rows=0; a fresh success
+`Reachable` rows=1 with a newer timestamp; a synthetic future timestamp
+renders `0s` without panicking.
