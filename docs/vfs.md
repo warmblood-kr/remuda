@@ -6,11 +6,11 @@ write. Each file has a `remuda://` URI. Its content is kept on several nodes
 an operator needs day to day. The design and the wire format are in
 [design-742-cluster-vfs.md](design-742-cluster-vfs.md).
 
-Every `remuda vfs` command runs in the daemon, except `serve`, which runs in
-the CLI process and asks the daemon for each request (see [Reading in a
-browser](#reading-in-a-browser-remuda-vfs-serve)). With no daemon running, any
-of them prints one line saying the daemon is needed and exits 1. None starts a
-daemon on its own.
+Every `remuda vfs` command runs in the daemon, except `serve` and the
+two-path `sync`, which run in the CLI process and ask the daemon for each
+request (see [Reading in a browser](#reading-in-a-browser-remuda-vfs-serve)).
+With no daemon running, any of them prints one line saying the daemon is
+needed and exits 1. None starts a daemon on its own.
 
 ```sh
 remuda vfs put notes.md remuda:///notes.md     # this cluster
@@ -114,6 +114,41 @@ publish finishes the release and reports 75 at the end.
 get remuda:///design/CURRENT` prints the release name. `vfs serve` does not
 resolve it, so open `/NAME/` explicitly. The free-space reserve is checked on
 the filesystem holding `DIR`; the store's own disk belongs to the daemon.
+
+## Syncing a directory: `remuda drive sync`
+
+`sync` copies a directory one way between a local path and a store prefix.
+Exactly one side is `remuda:///`; the other is a local directory. It copies
+missing or changed files and leaves everything else alone. There is no
+`--delete` and no watch mode yet.
+
+```sh
+remuda drive sync ~/shared-a remuda:///dir-a      # local -> store
+remuda drive sync remuda:///dir-a ~/shared-a      # store -> local
+remuda drive sync ~/shared-a remuda:///dir-a --dry-run
+```
+
+`--dry-run` reads and compares files but writes nothing. `--verbose` names
+each copied file.
+
+- Change detection compares size and SHA-256, so a file with the same bytes is
+  not written again. Every run reads the local files; there is no mtime cache
+  yet.
+- A missing local destination directory is created. Local writes go to a
+  temporary file beside the target and are renamed into place, so a reader
+  never sees a partial file and a failure leaves the old file.
+- Store writes are ordinary `put`s, so the usual replication rules apply.
+  Exit 75 means the files are stored here but not on every wanted node yet.
+- Symlinks, special files and non-UTF-8 names are skipped and named. Empty
+  local directories are not represented in the store.
+- Files that exist only on the destination are never deleted. This includes
+  files removed from the source: run `remuda drive rm` for those explicitly.
+- A store file cannot also be a directory. A local tree that would create that
+  collision is reported and skipped, not written.
+- The store does not keep Unix modes, so a file restored from it gets the
+  process's default permissions.
+- `remuda vfs sync SRC DST` is the same command. `remuda drive sync` with no
+  paths keeps the cluster index sync described below.
 
 ## Reading in a browser: `remuda vfs serve`
 

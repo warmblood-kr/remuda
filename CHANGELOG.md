@@ -1,5 +1,12 @@
 # Changelog
 
+- VFS: `remuda drive sync SRC DST [--dry-run] [--verbose]` copies a directory
+  one way between a local path and a `remuda:///` prefix. Exactly one side is
+  the store; missing or changed files are copied by size and SHA-256, and
+  destination-only files are never deleted. Symlinks, special files and
+  non-UTF-8 names are skipped and named; local writes are temp-file + rename.
+  Exit 75 means stored here but not on every wanted node. `remuda drive sync`
+  with no paths keeps the cluster index sync.
 - VFS: `remuda vfs ls` now lists a directory's immediate children: a
   subdirectory prints as `a/`, a file as its name. `-R`/`--recursive` gives the
   old full-path recursive listing. A prefix without a trailing slash no longer
