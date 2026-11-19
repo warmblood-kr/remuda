@@ -51,6 +51,8 @@ extern "C" fn record_join_interrupt(signal: libc::c_int) {
 
 #[path = "remuda/agent_notice.rs"]
 mod agent_notice;
+#[path = "remuda/native_permissions.rs"]
+mod native_permissions;
 #[cfg(unix)]
 #[path = "remuda/claude_channel.rs"]
 mod claude_channel;
@@ -268,6 +270,7 @@ fn dispatch_native_verb(verb: &str, rest: &[&str]) -> Option<ExitCode> {
             ExitCode::SUCCESS
         }
         "_agent_notice" => agent_notice::run(rest),
+        "_native_permissions" => native_permissions::run(rest),
         "_codex_notice" => codex_native::run(rest),
         "_codex_adopt" => codex_native::run_adopt(rest),
         "_opencode_watch" => run_opencode_watch_cli(rest),
