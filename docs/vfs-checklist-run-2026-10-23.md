@@ -22,7 +22,7 @@ schema 2, before #826). `$T` is the scratch home; `$OLD` is the older build.
   [lua-reference](lua-reference.html), `vfs.put`.
 - No auto-start: a VFS command with no daemon fails in one line (item 1).
 - VFS limits and settings: [vfs.md, Limits](vfs.md#limits) and
-  [Settings](vfs.md#settings-remuda-vfs-config).
+  [Settings](vfs.md#settings-remuda-drive-config).
 
 ## Setup
 

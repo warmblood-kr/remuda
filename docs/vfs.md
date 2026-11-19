@@ -1,23 +1,26 @@
-# Cluster files: operating `remuda vfs`
+# Cluster files: operating `remuda drive`
 
-`remuda vfs` stores named files that every node in a cluster can read and
+`remuda drive` stores named files that every node in a cluster can read and
 write. Each file has a `remuda://` URI. Its content is kept on several nodes
 (3 by default), so it outlives any single node. This page covers the commands
 an operator needs day to day. The design and the wire format are in
 [design-742-cluster-vfs.md](design-742-cluster-vfs.md).
 
-Every `remuda vfs` command runs in the daemon, except `serve` and the
+`remuda vfs` remains a compatibility alias: it runs the same commands on the
+same store and URIs.
+
+Every `remuda drive` command runs in the daemon, except `serve` and the
 two-path `sync`, which run in the CLI process and ask the daemon for each
-request (see [Reading in a browser](#reading-in-a-browser-remuda-vfs-serve)).
+request (see [Reading in a browser](#reading-in-a-browser-remuda-drive-serve)).
 With no daemon running, any of them prints one line saying the daemon is
 needed and exits 1. None starts a daemon on its own.
 
 ```sh
-remuda vfs put notes.md remuda:///notes.md     # this cluster
-remuda vfs get remuda:///notes.md              # print it
-remuda vfs ls remuda:///                       # immediate children
-remuda vfs stat remuda:///notes.md             # version, size, copies
-remuda vfs rm remuda:///notes.md               # delete everywhere
+remuda drive put notes.md remuda:///notes.md     # this cluster
+remuda drive get remuda:///notes.md              # print it
+remuda drive ls remuda:///                       # immediate children
+remuda drive stat remuda:///notes.md             # version, size, copies
+remuda drive rm remuda:///notes.md               # delete everywhere
 ```
 
 ## Exit codes
@@ -30,13 +33,13 @@ remuda vfs rm remuda:///notes.md               # delete everywhere
 
 Exit 75 is `EX_TEMPFAIL` from `sysexits.h`. Nothing is rolled back.
 
-## Listing: `remuda vfs ls`
+## Listing: `remuda drive ls`
 
 `ls` shows one directory's immediate children. A subdirectory prints as `a/`,
 a file as its name in that directory:
 
 ```sh
-remuda vfs ls remuda:///design/2026-11-05/
+remuda drive ls remuda:///design/2026-11-05/
 #          assets/
 #       1229  v3      d9298a10d1b0  index.html
 ```
@@ -45,7 +48,7 @@ remuda vfs ls remuda:///design/2026-11-05/
 is what `ls` did before the flag existed:
 
 ```sh
-remuda vfs ls -R remuda:///design/2026-11-05/
+remuda drive ls -R remuda:///design/2026-11-05/
 #   …  design/2026-11-05/assets/site.css
 #   …  design/2026-11-05/index.html
 ```
@@ -62,13 +65,13 @@ A script that expected every row to be a file must check `kind` or pass `-R`,
 which returns only files. `--conflicts` stays recursive but now stops at the
 prefix's components: `ls --conflicts remuda:///a` no longer includes `a2/`.
 
-## Publishing a directory: `remuda vfs publish`
+## Publishing a directory: `remuda drive publish`
 
 A page is usually several files. `publish` uploads a directory as one named
 release and marks it complete only after every file is in:
 
 ```sh
-remuda vfs publish site remuda:///design --release 2026-11-04
+remuda drive publish site remuda:///design --release 2026-11-04
 # Published 12 files (1.4 MiB) as 2026-11-04 to remuda:///design/2026-11-04/.
 ```
 
@@ -97,12 +100,14 @@ remuda vfs publish site remuda:///design --release 2026-11-04
 Exit codes: 0 done; 1 a file failed, the source changed, `COMPLETE` could not
 be written, or `--pointer` could not write `CURRENT` — the message says which,
 so a 1 alone does not prove `COMPLETE` is absent. Fix the cause and publish a
-**new** `--release` name (the old prefix keeps the files it received; `remuda
-vfs ls remuda:///design/NAME/` shows them). When the message says the marker
-could not be confirmed, check `remuda vfs stat remuda:///design/NAME/COMPLETE`;
-if it is there the release is usable. With `--pointer`, also `remuda vfs get
-remuda:///design/CURRENT` and confirm its value names your release, since an
-older pointer can already exist. If the marker is missing, publish a new name.
+**new** `--release` name (the old prefix keeps the files it received;
+`remuda drive ls remuda:///design/NAME/` shows them). When the message says
+the marker could not be confirmed, check
+`remuda drive stat remuda:///design/NAME/COMPLETE`; if it is there the release
+is usable. With `--pointer`, also
+`remuda drive get remuda:///design/CURRENT` and confirm its value names your
+release, since an older pointer can already exist. If the marker is missing,
+publish a new name.
 
 75 means everything was written
 here but the copies wanted are not all there yet: `COMPLETE` exists on this
@@ -110,10 +115,11 @@ node and the release is usable, so wait for the peers rather than republishing.
 A file `put` that returns 75 does not stop the run — its bytes are here — so
 publish finishes the release and reports 75 at the end.
 
-`CURRENT` is written only after `COMPLETE`, and it is a plain file: `remuda vfs
-get remuda:///design/CURRENT` prints the release name. `vfs serve` does not
-resolve it, so open `/NAME/` explicitly. The free-space reserve is checked on
-the filesystem holding `DIR`; the store's own disk belongs to the daemon.
+`CURRENT` is written only after `COMPLETE`, and it is a plain file: `remuda drive
+get remuda:///design/CURRENT` prints the release name. `remuda drive serve`
+does not resolve it, so open `/NAME/` explicitly. The free-space reserve is
+checked on the filesystem holding `DIR`; the store's own disk belongs to the
+daemon.
 
 ## Syncing a directory: `remuda drive sync`
 
@@ -157,13 +163,13 @@ each copied file.
   empty local directory copies nothing.
 - The store does not keep Unix modes, so a file restored from it gets the
   process's default permissions.
-- `remuda vfs sync SRC DST` is the same command. `remuda drive sync` with no
-  paths keeps the cluster index sync described below.
+- `remuda vfs sync SRC DST` is the alias for the same command. `remuda drive
+  sync` with no paths keeps the cluster index sync described below.
 
-## Reading in a browser: `remuda vfs serve`
+## Reading in a browser: `remuda drive serve`
 
 ```sh
-remuda vfs serve --root design
+remuda drive serve --root design
 # Serving remuda:///design at http://127.0.0.1:53412/ (read-only; scripts blocked)
 ```
 
@@ -196,7 +202,7 @@ anyone who can run code in it.
   `..`, `.`, NUL and control characters are refused; the prefix is a component
   boundary, so `--root design` never lists `design-private`.
 - Files up to 32 MiB are served. A larger file answers `413`; reading it needs
-  `remuda vfs get`.
+  `remuda drive get`.
 - `ETag` is the file's sha256, so a reload after a cluster write is cheap. The
   `X-Remuda-Version` response header says which version was served.
 - The port has no authentication, and loopback is not private: **another OS
@@ -206,9 +212,9 @@ anyone who can run code in it.
   `--root` only what you would show them. One viewer is one process, and Ctrl-C
   closes it.
 
-## For tools: `remuda vfs read`
+## For tools: `remuda drive read`
 
-`remuda vfs read URI [--max-bytes N]` prints one JSON envelope and exits 0
+`remuda drive read URI [--max-bytes N]` prints one JSON envelope and exits 0
 whenever it produced one:
 
 ```json
@@ -221,15 +227,15 @@ The code is the same one Lua sees (`not_found`, `too_large`, `no_cluster`,
 answers `too_large` from the index without reading the file. This is what
 `serve` calls; a script that shells out to `get` should use it instead.
 
-## Giving back copies a node fetched: `remuda vfs release`
+## Giving back copies a node fetched: `remuda drive release`
 
 `get`, `read` and `resolve` keep the copy on the node that read it, so a node
 that only looks at files slowly holds a copy of everything it opened. `release`
 gives those back:
 
 ```sh
-remuda vfs release --dry-run     # what would go, and why the rest stays
-remuda vfs release
+remuda drive release --dry-run     # what would go, and why the rest stays
+remuda drive release
 ```
 
 It removes a copy only when this node owes no copy of it (placement does not
@@ -244,21 +250,21 @@ a file of that size, so release trusts admitted peers to be honest about that.
 Releasing is not a delete: the file stays in the store and any node can fetch
 it again.
 
-A copy `remuda vfs resolve` handed to a tool is **pinned** and is not released:
+A copy `remuda drive resolve` handed to a tool is **pinned** and is not released:
 `resolve` promises that path stays valid. The report counts those as `resolved`,
 and `--include-resolved` gives them back when you know the tool is done.
 
 ```sh
-remuda vfs resolve remuda:///butler/guidance/cluster.md   # pin a copy on this node
-remuda vfs release --include-resolved                     # give pinned copies back
+remuda drive resolve remuda:///butler/guidance/cluster.md   # pin a copy on this node
+remuda drive release --include-resolved                     # give pinned copies back
 ```
 
-## Checking health: `remuda vfs status`
+## Checking health: `remuda drive status`
 
 ```text
-$ remuda vfs status --copies
+$ remuda drive status --copies
 Files: 1234 live of 10000; index 1450 of 30000 entries (216 deletes remembered)
-Conflicts: 3 paths (remuda vfs ls --conflicts)
+Conflicts: 3 paths (remuda drive ls --conflicts)
 This node (node-a1b2c3d4): 812 copies, 1.2 GiB; 4 copies waiting to retry
 Peers:
   node-e5f6a7b8  up; pulled from here 2m ago; caps: take
@@ -285,11 +291,11 @@ peers. They fetch their copies on their own a moment later. If a script
 needs the file on more nodes before it goes on:
 
 ```sh
-remuda vfs put report.pdf remuda:///reports/q3.pdf --min-copies 2
+remuda drive put report.pdf remuda:///reports/q3.pdf --min-copies 2
 ```
 
 - `K` counts this node, and it can be at most the copies wanted
-  (`--replicas`, default from `remuda vfs config`).
+  (`--replicas`, default from `remuda drive config`).
 - `put` waits up to 60 s. If fewer than K nodes hold the file by then, it
   prints `committed here, but only N of K copies confirmed in 60 s; still
   replicating` and exits 75. The write stays; the copies keep coming.
@@ -304,10 +310,10 @@ keep their write. Every node picks the same winner, which is what `get`
 returns, and keeps the other write as a **conflict** with its content.
 
 ```sh
-remuda vfs ls --conflicts                        # paths with conflicts
-remuda vfs stat remuda:///notes.md               # shows each conflict's version
-remuda vfs resolve-conflict remuda:///notes.md --keep winner
-remuda vfs resolve-conflict remuda:///notes.md --keep 7    # keep version 7
+remuda drive ls --conflicts                        # paths with conflicts
+remuda drive stat remuda:///notes.md               # shows each conflict's version
+remuda drive resolve-conflict remuda:///notes.md --keep winner
+remuda drive resolve-conflict remuda:///notes.md --keep 7    # keep version 7
 ```
 
 `resolve-conflict` writes the chosen side again, fetching it from a peer if
@@ -326,7 +332,7 @@ remuda cluster leave   # asks first; --yes skips the question
 
 1. It asks another node to revoke this one. That node first checks that
    every file keeps its copies without this one; if not, it refuses.
-2. On a refusal it runs `remuda vfs drain` (below) and asks again.
+2. On a refusal it runs `remuda drive drain` (below) and asks again.
 3. Once a node has revoked it, it moves `<state>/remuda/cluster` to
    `cluster.left-YYYYMMDD` next to it and deletes the node key and
    membership files there. `vfs/` and `audit.jsonl` stay in that folder.
@@ -345,7 +351,7 @@ remuda cluster leave   # asks first; --yes skips the question
   for reading files only. `cluster init --new-identity` sets `vfs/` aside
   the same way, to `cluster.left-YYYYMMDD/vfs` (#862).
 
-To do the two halves by hand: `remuda vfs drain` on the node that leaves,
+To do the two halves by hand: `remuda drive drain` on the node that leaves,
 then `remuda cluster revoke NODE --yes` on another node.
 
 - `drain` asks each node that will hold a file once this one is gone to
@@ -353,7 +359,7 @@ then `remuda cluster revoke NODE --yes` on another node.
   another node, run remuda cluster revoke NODE.` and exits 0.
 - If files are still short after `--timeout` seconds (1–110, default 100),
   it lists the first few and exits 75. The next line says what to do:
-  - run `remuda vfs drain` again; peers are still copying;
+  - run `remuda drive drain` again; peers are still copying;
   - upgrade the nodes it names as too old to take copies; or
   - start or join another node, if no other node is up.
 - `drain` changes no membership. Until the revoke, the node is still a
@@ -367,7 +373,7 @@ comes back and confirms its copies, the stand-ins are deleted again. Files a
 node wrote itself, read with `get`, or handed to a tool with `resolve` are
 never deleted this way.
 
-`remuda vfs sync` runs a full pass now instead of waiting for the next tick:
+`remuda drive sync` runs a full pass now instead of waiting for the next tick:
 
 ```text
 Peers reached 2, unreachable 0; index entries merged 3; copies fetched 1, failed 0, waiting to retry 0, trimmed 1; old blobs removed 0, old deletes forgotten 0.
@@ -376,11 +382,11 @@ Peers reached 2, unreachable 0; index entries merged 3; copies fetched 1, failed
 A copy that fails to fetch is tried again after 30 s, then after twice as
 long each time, up to an hour. `sync` retries them at once.
 
-## Settings: `remuda vfs config`
+## Settings: `remuda drive config`
 
 ```sh
-remuda vfs config                         # show
-remuda vfs config --replicas 2 --tombstone-days 14
+remuda drive config                         # show
+remuda drive config --replicas 2 --tombstone-days 14
 ```
 
 | Setting | Default | What it does |
@@ -409,10 +415,10 @@ come back.
 
 ## Downgrading remuda
 
-- To a build one index schema step older: `remuda vfs index-downgrade
+- To a build one index schema step older: `remuda drive index-downgrade
   VERSION` shows what it would undo; add `--yes` to back up and run it.
   Then start the older remuda.
-- To a build from before SQLite: run `remuda vfs export-index`, stop the
+- To a build from before SQLite: run `remuda drive export-index`, stop the
   daemon, then start the older remuda.
 
 The #778 owner checklist, [vfs-owner-checklist.md](vfs-owner-checklist.md),

@@ -240,7 +240,8 @@ admitted machine can always type into any session, and can resize or close
 sessions while enabled, so join only machines you trust. To turn remote resize
 and close off: `remuda cluster control off`.
 [cluster-demo.md](cluster-demo.md) also covers remote input and revoke.
-[vfs.md](vfs.md) covers files shared across the cluster (`remuda vfs`).
+[vfs.md](vfs.md) covers files shared across the cluster (`remuda drive`;
+`remuda vfs` is the compatibility alias).
 
 ## 6. When something goes wrong
 

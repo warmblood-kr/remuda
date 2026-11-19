@@ -327,7 +327,7 @@ packages/butler/migrations/notes/0013_pins.up.sql
 `remuda db status [MOD]` shows each database's version and steps and
 compares them with the installed files. `remuda db upgrade MOD NAME`
 applies the installed files without waiting for the mod to open the
-database. Like `remuda vfs`, these commands run in the daemon. With no
+database. Like most `remuda drive` commands, these run in the daemon. With no
 daemon running, they fail with one line.
 
 ## JSON values
