@@ -1,5 +1,8 @@
 //! Talking to a daemon, including handing your terminal over to one.
 
+mod deadline;
+pub use deadline::request_with_deadline;
+
 use crate::ipc::{self, Stream, TryClone};
 use crate::reply_limit::max_reply_wire_bytes;
 #[cfg(unix)]
