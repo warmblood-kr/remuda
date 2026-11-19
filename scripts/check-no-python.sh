@@ -115,7 +115,56 @@ $ALLOWLIST
 EOF
 
 # Text guard limit: a name built at run time (p=py""thon3; "$p") is not seen.
-invocation_re="(^|[^[:alnum:]_-])(${python_token}[0-9.]*|${pip_token}[0-9.]*|${uv_token})([^[:alnum:]_-]|$)|${setup_token}|requirements[^[:space:]]*\\.(txt|in)|^#!.*${python_token}"
+# A token is execution only in command position or next to an execution sink.
+# A quoted token elsewhere is data, which keeps language-tag literals
+# (language: Some("python"), tokens(line, "python"), a ```python fence) out of
+# the report. The prefix is a path component list, so a word like `no-python`
+# or `python_token` is not a command word.
+scan_invocations() {
+	awk -v tok="$python_token" -v piptok="$pip_token" -v uvtok="$uv_token" \
+		-v setup="$setup_token" '
+	BEGIN {
+		tokonly = "(" tok "[0-9]*(\\.[0-9]+)?|" piptok "[0-9]*((\\.[0-9]+)|\\.exe)?|" uvtok ")"
+		tokre = "([^A-Za-z0-9_.-]|^)" tokonly "([^A-Za-z0-9_.-]|$)"
+		sink = "(command::new|process::command|subprocess\\.|os\\.(system|exec|spawn|popen)|popen|system\\(|exec\\(|spawn\\(|sh[ \t]+-c|bash[ \t]+-c|eval[ \t]+|[|][ \t]*(sh|bash|zsh|dash)([ \t]|$))"
+		setupre = "([^A-Za-z0-9_.-]|^)" setup "([^A-Za-z0-9_.-]|$)"
+		runner = "(sudo|env|exec|xargs|command|nohup|nice|setsid|stdbuf|timeout|chrt|ionice|time|if|then|else|do|while|until)"
+		args = "((-[^ \t]+([ \t]+[A-Za-z0-9_.=&/-]+)?|[0-9]+|[A-Za-z_][A-Za-z0-9_]*=[^ \t]*)[ \t]+)*"
+		path = "(\\.{0,2}/)?([A-Za-z0-9_.-]+/)*"
+		sep = "(^|[;|&{}]|\\$\\(|`|run:[ \t]*|(-exec|-execdir)[ \t]+)"
+		cmd = sep "[ \t]*(" runner "[ \t]+" args ")?" path tokonly "([^A-Za-z0-9_.-]|$)"
+		qcmd = sep "[ \t]*[\"\047]([^\"\047]*/)?" tokonly "([\"\047]|[ \t])"
+		arm = sep "[ \t]*[\"\047][^\"\047]*" tokonly "[^\"\047]*[\"\047][ \t]*(\\||=>)"
+	}
+	function unquote(s,   i, c, q, out) {
+		out = ""
+		q = ""
+		for (i = 1; i <= length(s); i++) {
+			c = substr(s, i, 1)
+			if (q == "") {
+				if (c == "\"" || c == "\047") { q = c; out = out "Q" }
+				else out = out c
+			} else if (c == "\\" && i < length(s)) {
+				i++
+			} else if (c == q) {
+				q = ""
+			}
+		}
+		return out
+	}
+	{
+		if (match($0, /^[0-9]+:/) == 0) next
+		n = substr($0, 1, RLENGTH - 1)
+		line = substr($0, RLENGTH + 1)
+		if (line ~ /^[ \t]*#/) next
+		if (tolower(line) ~ sink && line ~ tokre) { print n ":" line; next }
+		if (line ~ setupre) { print n ":" line; next }
+		if (line ~ qcmd && line !~ arm) { print n ":" line; next }
+		if (unquote(line) ~ cmd) { print n ":" line; next }
+	}
+	'
+}
+
 while IFS= read -r -d '' file; do
 	[ ! -L "$file" ] && [ -f "$file" ] || continue
 	case "$file" in
@@ -123,12 +172,17 @@ while IFS= read -r -d '' file; do
 		*) [ -x "$file" ] || continue ;;
 	esac
 	if is_allowed_py "$file"; then continue; fi
-	matches=$(grep -anE -- "$invocation_re" "$file") || {
+	lines=$(grep -anE -- '.' "$file") || {
 		status=$?
 		if [ "$status" -ne 1 ]; then
 			echo "check-no-python: cannot scan repository file: $file" >&2
 			exit 1
 		fi
+		lines=''
+	}
+	matches=$(printf '%s\n' "$lines" | scan_invocations) || {
+		echo "check-no-python: cannot scan repository file: $file" >&2
+		exit 1
 	}
 	while IFS=: read -r line_no line; do
 		[ -n "$line_no" ] || continue

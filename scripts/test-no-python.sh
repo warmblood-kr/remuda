@@ -107,6 +107,43 @@ for file in Makefile Dockerfile docs/install.sh native/src/probe.rs .github/acti
 	expect_rejected "$file" "Python invocation at $file:1"
 done
 
+# 5. A language tag, a test name or a token variable is data, not execution.
+reset_fixture
+tag=${py%3}
+mkdir -p "$fixture/repo/gui/src"
+{
+	printf 'let language = Some("%s".into());\n' "$tag"
+	printf 'let found = tokens(line, "%s");\n' "$tag"
+	printf 'let block = parse("```%s\\ndef f(x):\\n    return x\\n```\\n");\n' "$tag"
+	printf 'let token = "$%s_token";\n' "$tag"
+} >"$fixture/repo/gui/src/probe.rs"
+printf 'jobs:\n  no-%s:\n    steps:\n      - run: echo "the %s tag"\n' "$tag" "$tag" \
+	>"$fixture/repo/.github/workflows/tags.yml"
+expect_ok
+
+# 6. An execution sink or a shell wrapper still fails on the same token.
+reset_fixture
+mkdir -p "$fixture/repo/native/src" "$fixture/repo/scripts"
+printf 'let child = Command::new("%s");\n' "$py" >"$fixture/repo/native/src/probe.rs"
+expect_rejected 'Command::new sink' 'Python invocation at native/src/probe.rs:1'
+reset_fixture
+printf 'subprocess.run(["%s"]);\n' "$py" >"$fixture/repo/scripts/probe.js"
+expect_rejected 'subprocess.run sink' 'Python invocation at scripts/probe.js:1'
+reset_fixture
+printf 'sh -c "%s -c 1"\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'sh -c wrapper' 'Python invocation at scripts/probe.sh:1'
+reset_fixture
+printf 'eval "%s -c 1"\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'eval wrapper' 'Python invocation at scripts/probe.sh:1'
+reset_fixture
+printf 'printf %%s "%s -c 1" | sh\n' "$py" >"$fixture/repo/scripts/probe.sh"
+expect_rejected 'pipe to sh' 'Python invocation at scripts/probe.sh:1'
+for line in "nice -n 5 $py -c 1" "timeout -s KILL 5 $py -c 1" "setsid $py -c 1"; do
+	reset_fixture
+	printf '%s\n' "$line" >"$fixture/repo/scripts/probe.sh"
+	expect_rejected "runner wrapper: $line" 'Python invocation at scripts/probe.sh:1'
+done
+
 # Neither checker is exempt from its own policy. The function is never called.
 reset_fixture
 printf '\nunused_probe() { %s -c 1; }\n' "$py" >>"$fixture/repo/scripts/check-no-python.sh"
