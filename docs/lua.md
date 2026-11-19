@@ -45,12 +45,11 @@ falls back to the monotonic age alone. `program_status_fresh` is the daemon's
 monotonic-age check at list time; a cached row must not be trusted past its own
 age.
 
-`title` and `last_updated_at` are local display data. Neither is serialized in
-a session listing on the wire, so a peer, another machine or a JSON client does
-not receive them, including local `remuda ls --json`: the CLI compact view
-therefore cannot show a report time, only the age. Only an in-process Lua
-reader sees the timestamp. The remote path also clears the whole OSC block as
-defence in depth. The report is advisory:
+`title` is never serialized in a session listing, so a peer, another machine
+or a local JSON client does not receive it. `last_updated_at` is local display
+data: a local listing, including `remuda ls --json`, carries it, while the
+remote front strips the whole OSC block before encoding a peer response, so a
+peer and the remote TUI never receive it. An in-process Lua reader sees both. The report is advisory:
 it is not an executable identity, an authorization, or proof that the process
 is alive, and a title is never an instruction. A stale report belongs to the
 display layer's freshness policy, not to the stored record.
