@@ -92,9 +92,19 @@ impl Terminal {
             .checked_add(1)
             .ok_or("terminal generation exhausted")?;
         let count = bytes.len().min(PARSE_BUDGET);
-        self.strings.feed(&bytes[..count], |bytes| {
-            crate::pty::process_output(&mut self.parser, bytes, &self.scrollback_total);
-        });
+        let (rows, cols) = self.parser.screen().size();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.strings.feed(&bytes[..count], |bytes| {
+                crate::pty::process_output(&mut self.parser, bytes, &self.scrollback_total);
+            });
+        }));
+        if result.is_err() {
+            eprintln!("remuda session host: terminal parser panicked; screen reset");
+            self.parser =
+                vt100::Parser::new_with_callbacks(rows, cols, self.history, Queries::default());
+            self.strings = Strings::default();
+            self.scrollback_total.store(0, Ordering::Relaxed);
+        }
         self.generation = next;
         Ok(count)
     }
@@ -106,7 +116,17 @@ impl Terminal {
     }
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), &'static str> {
         let next = self.prepare_resize(rows, cols)?;
-        self.parser.screen_mut().set_size(rows, cols);
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.parser.screen_mut().set_size(rows, cols);
+        }))
+        .is_err()
+        {
+            eprintln!("remuda session host: terminal resize panicked; screen reset");
+            self.parser =
+                vt100::Parser::new_with_callbacks(rows, cols, self.history, Queries::default());
+            self.strings = Strings::default();
+            self.scrollback_total.store(0, Ordering::Relaxed);
+        }
         self.generation = next;
         Ok(())
     }
@@ -226,6 +246,16 @@ mod tests {
             bytes = &bytes[count..];
         }
     }
+    #[test]
+    fn wide_glyph_resize_does_not_kill_host_terminal() {
+        let mut terminal = Terminal::new(24, 80, 10).unwrap();
+        feed(&mut terminal, "\x1b[1;79H가".as_bytes());
+        terminal.resize(24, 79).unwrap();
+        feed(&mut terminal, b"\x1b[1;79Hx");
+        feed(&mut terminal, b"\x1b[1;1Hafter");
+        assert!(terminal.screen().contents().starts_with("after"));
+    }
+
     #[test]
     fn program_status_query_reply_precedes_device_attributes_at_all_splits() {
         let bytes = b"\x1b]7501;?\x1b\\\x1b[c";
