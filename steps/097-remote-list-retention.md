@@ -34,15 +34,19 @@ A new node identity (new registry fingerprint) starts with no inherited rows.
   It is long against a 2 s poll / 30 s backoff and short enough to surface a
   real outage. `RemoteNode::with_retention` lets a caller shorten it; tests use
   a short window instead of waiting.
-- `RemoteNodeSnapshot` carries `last_updated_at` (the last successful list, not
-  a relabel) and `expired`. `Some` with no sessions is a successful empty
-  answer; `None` with sessions empty means no collection ever succeeded.
+- `RemoteNodeSnapshot` carries `last_updated_at` (an absolute wall-clock
+  timestamp of the last successful list or session collection, not a relabel)
+  and `expired`. `Some` with no sessions is a successful empty answer; `None`
+  with sessions empty means no collection ever succeeded. Display age is
+  derived from `last_updated_at` and the current time on every render; a
+  future timestamp from a clock adjustment clamps to `0s`.
 - A failed poll keeps `Stale` while the list is retained; at or past retention
-  `snapshot_at` reports `Unreachable`, clears `sessions`, and keeps
-  `last_sync_age` so the row can say how old the data is.
+  `snapshot_at` reports `Unreachable`, clears `sessions`, and keeps the
+  absolute `last_updated_at` so the row can say how old the data is.
 - A successful list — including an empty one — sets `Reachable`, replaces
-  `sessions` wholesale and resets the error. Expiry is computed from the wall
-  clock on every snapshot, so a stalled poller cannot keep rows looking fresh.
+  `sessions` wholesale and resets the error. Expiry is computed from a
+  separate monotonic `Instant` on every snapshot, so a stalled poller cannot
+  keep rows looking fresh and a wall-clock jump cannot change the window.
 - The node row shows `? Ns` while stale and `x Ns` while expired; the pane
   detail says `unreachable · no fresh data for Ns`.
 - A remote view is kept while its identities still match the retained list and
@@ -64,10 +68,10 @@ main port needed one import-line resolution (`REMOTE_VIEW_TTL`/`WHEEL_ROWS`).
 
 ```
 $ cargo test -p remuda-native --lib cluster_remote::      # main port
-test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 1886 filtered out
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 1887 filtered out
 
 $ cargo test -p remuda-native --lib cluster_tui::          # main port
-test result: ok. 235 passed; 0 failed; 0 ignored; 0 measured; 1688 filtered out
+test result: ok. 236 passed; 0 failed; 0 ignored; 0 measured; 1689 filtered out
 
 $ cargo clippy -p remuda-native --lib -- -D warnings
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.81s

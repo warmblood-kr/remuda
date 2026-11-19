@@ -24,7 +24,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 type QueueIdentity = (Option<String>, String, String, String, u64);
@@ -131,9 +131,16 @@ pub fn status_glyph(state: RemoteState) -> char {
 /// The status cell for a node row: the state glyph, plus how old the retained
 /// list is when the node is not reachable. The age is what makes a stale row
 /// honest instead of a live-looking row with a different glyph.
+/// Derive the displayed age from the absolute collection timestamp on every
+/// render. The snapshot's `last_sync_age` is monotonic bookkeeping for the
+/// retention window, not the public timestamp.
+fn last_updated_age(node: &RemoteNodeSnapshot) -> Option<Duration> {
+    node.last_updated_age_at(SystemTime::now())
+}
+
 fn remote_node_status(node: &RemoteNodeSnapshot) -> String {
     let glyph = status_glyph(node.state);
-    match (node.state, node.last_sync_age) {
+    match (node.state, last_updated_age(node)) {
         (RemoteState::Stale, Some(age)) => format!("{glyph} {}s", age.as_secs()),
         (RemoteState::Unreachable, Some(age)) if node.expired => {
             format!("{glyph} {}s", age.as_secs())
@@ -833,7 +840,7 @@ impl ClusterUi {
         if node.state == RemoteState::Reachable {
             return None;
         }
-        let state = match (node.expired, node.last_sync_age) {
+        let state = match (node.expired, last_updated_age(node)) {
             (true, Some(age)) => format!("unreachable, last updated {}s ago", age.as_secs()),
             (false, Some(age)) => format!("stale, last updated {}s ago", age.as_secs()),
             _ => "not connected".to_owned(),
@@ -2103,7 +2110,11 @@ impl ClusterUi {
         Some(format!(
             "remote {} · {}{} · {} / {}",
             if session.alive { "live" } else { "ended" },
-            remote_state_label(node.state, node.last_sync_age, node.last_error.as_deref()),
+            remote_state_label(
+                node.state,
+                last_updated_age(node),
+                node.last_error.as_deref()
+            ),
             session_error_suffix(session.last_error.as_deref()),
             node.name,
             session.name
@@ -3148,7 +3159,11 @@ impl ClusterUi {
                 Some(format!(
                     "{} · {}",
                     node.name,
-                    remote_state_label(node.state, node.last_sync_age, node.last_error.as_deref())
+                    remote_state_label(
+                        node.state,
+                        last_updated_age(node),
+                        node.last_error.as_deref()
+                    )
                 ))
             }
             TreeSelection::RemoteSession {
@@ -3173,7 +3188,11 @@ impl ClusterUi {
                         self.remote_pending_count(node, session),
                     ),
                     session_error_suffix(session.last_error.as_deref()),
-                    remote_state_label(node.state, node.last_sync_age, node.last_error.as_deref())
+                    remote_state_label(
+                        node.state,
+                        last_updated_age(node),
+                        node.last_error.as_deref()
+                    )
                 ))
             }
         }
@@ -3308,7 +3327,7 @@ impl ClusterUi {
         self.local_targets.iter().any(|identity| identity == target)
             || self
                 .resolve_remote_node(target)
-                .is_ok_and(|node| !node.sessions.is_empty() || node.last_sync_age.is_some())
+                .is_ok_and(|node| !node.sessions.is_empty() || node.last_updated_at.is_some())
     }
 
     fn split_target<'a>(&self, target: &'a str) -> Option<(&'a str, &'a str)> {
@@ -3549,7 +3568,7 @@ fn age_seconds(now: Duration, since: Duration) -> u64 {
 
 fn remote_state_label(
     state: RemoteState,
-    last_sync_age: Option<Duration>,
+    age: Option<Duration>,
     last_error: Option<&str>,
 ) -> String {
     let reason = last_error.map(|error| {
@@ -3564,7 +3583,7 @@ fn remote_state_label(
     });
     match state {
         RemoteState::Reachable => "reachable".into(),
-        RemoteState::Stale => last_sync_age.map_or_else(
+        RemoteState::Stale => age.map_or_else(
             || {
                 format!(
                     "stale · sync age unknown{}",
@@ -3579,7 +3598,7 @@ fn remote_state_label(
                 )
             },
         ),
-        RemoteState::Reconnecting => last_sync_age.map_or_else(
+        RemoteState::Reconnecting => age.map_or_else(
             || format!("reconnecting{}", reason_suffix(reason.as_deref())),
             |age| {
                 format!(
@@ -3589,7 +3608,7 @@ fn remote_state_label(
                 )
             },
         ),
-        RemoteState::Unreachable => last_sync_age.map_or_else(
+        RemoteState::Unreachable => age.map_or_else(
             || format!("unreachable{}", reason_suffix(reason.as_deref())),
             |age| {
                 format!(
@@ -4522,7 +4541,7 @@ mod tests {
     use super::queue::{InputTarget, QueueEvent, QueueState, SendOutcome, MAX_IO_RETRIES};
     use super::{
         help_lines, help_window, is_attention, legend_lines, normalized_terminal_size, present,
-        remote_state_label, render_badge, resize_requires_full_repaint,
+        remote_node_status, remote_state_label, render_badge, resize_requires_full_repaint,
         select_target_with_remote_wait, session_cell, session_glyph, status_glyph, status_style,
         sync_remote_views, terminal_frame, AttentionSignals, Badge, ClusterUi, EndedState,
         LocalViewLoader, RemoteInputTransport, RemoteSelection, RemoteSource, RemoteViewLoader,
@@ -4538,7 +4557,7 @@ mod tests {
     use remuda_core::session_view::{SessionView, ViewEntry};
     use remuda_core::{SessionSummary, Size};
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
 
     fn parsed_frame(frame: &str, cols: u16, rows: u16) -> vt100::Parser {
         let mut parser = vt100::Parser::new(rows, cols, 0);
@@ -5779,7 +5798,7 @@ mod tests {
                 name: "laptop".into(),
                 state,
                 last_sync_age: Some(age),
-                last_updated_at: Instant::now().checked_sub(age),
+                last_updated_at: SystemTime::now().checked_sub(age),
                 expired: false,
                 last_error: None,
                 sessions: vec![RemoteSessionSnapshot {
@@ -9083,8 +9102,7 @@ mod tests {
         let mut expired = expired;
         expired.nodes[0].sessions.clear();
         expired.nodes[0].expired = true;
-        expired.nodes[0].last_updated_at =
-            std::time::Instant::now().checked_sub(Duration::from_secs(200));
+        expired.nodes[0].last_updated_at = SystemTime::now().checked_sub(Duration::from_secs(200));
         source.replace(expired);
         ui.remote_synced(&source);
         assert!(matches!(
@@ -9112,6 +9130,8 @@ mod tests {
         assert!(ui.pending_close.is_some(), "close was confirmed");
         ui.remote_snapshot.nodes[0].state = RemoteState::Stale;
         ui.remote_snapshot.nodes[0].last_sync_age = Some(Duration::from_secs(12));
+        ui.remote_snapshot.nodes[0].last_updated_at =
+            SystemTime::now().checked_sub(Duration::from_secs(12));
         let transport = FakeRemoteInput::new(Response::Ok);
         ui.send_close_pending(
             std::path::Path::new("unused"),
@@ -9272,6 +9292,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
             let mut listing = remote_snapshot(RemoteState::Reachable, Duration::ZERO, None);
             listing.nodes[0].last_sync_age = None;
+            listing.nodes[0].last_updated_at = None;
             let sessions = std::mem::take(&mut listing.nodes[0].sessions);
             producer.replace(listing.clone());
             std::thread::sleep(Duration::from_millis(40));
@@ -9544,6 +9565,33 @@ mod tests {
             ui.input_wait(Instant::now()),
             Duration::ZERO,
             "a remote batch that started waits for no input before its hand-off"
+        );
+    }
+
+    #[test]
+    fn remote_display_age_comes_from_the_absolute_timestamp_not_the_relative_copy() {
+        let now = SystemTime::now();
+        let mut snapshot = remote_snapshot(RemoteState::Stale, Duration::from_secs(999), None);
+        let node = &mut snapshot.nodes[0];
+        node.last_updated_at = now.checked_sub(Duration::from_secs(12));
+        assert_eq!(
+            remote_node_status(node),
+            "? 12s",
+            "display must use last_updated_at, not the 999s monotonic copy"
+        );
+
+        node.last_updated_at = now.checked_add(Duration::from_secs(60));
+        assert_eq!(
+            remote_node_status(node),
+            "? 0s",
+            "future timestamps clamp to zero"
+        );
+
+        node.last_updated_at = None;
+        assert_eq!(
+            remote_node_status(node),
+            "?",
+            "a missing timestamp stays unknown"
         );
     }
 
