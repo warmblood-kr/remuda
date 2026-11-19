@@ -83,7 +83,7 @@ next to `index.db`.
   [lua-reference](lua-reference.html), `vfs.put`.
 - No auto-start: step 1 above.
 - VFS limits and settings: [vfs.md, Limits](vfs.md#limits) and
-  [Settings](vfs.md#settings-remuda-vfs-config).
+  [Settings](vfs.md#settings-remuda-drive-config).
 
 ## Clean up
 

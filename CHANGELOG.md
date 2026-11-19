@@ -1,5 +1,9 @@
 # Changelog
 
+- CLI: `remuda drive` is now the primary name for the cluster file store;
+  `remuda vfs` remains a working compatibility alias. Both use the same
+  `remuda:///` URIs, store and `remuda.vfs` Lua API. Docs and examples use
+  `drive`.
 - VFS: `remuda drive sync SRC DST [--dry-run] [--verbose]` copies a directory
   one way between a local path and a `remuda:///` prefix. Exactly one side is
   the store; missing or changed files are copied by size and SHA-256, and
