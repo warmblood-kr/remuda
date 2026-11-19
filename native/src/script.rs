@@ -2737,8 +2737,8 @@ fn set_program_status(
         if let Some(title) = title {
             value.set("title", title)?;
         }
-        // Absolute UTC seconds. Prefer this over `program_status_age` for a
-        // freshness decision: the age is a snapshot, this keeps moving.
+        // Absolute UTC seconds, for display only. Freshness is decided from
+        // `program_status_age`: the wall clock can step backwards.
         if let Some(ms) = updated_at_ms {
             value.set("last_updated_at", ms as f64 / 1000.0)?;
         }

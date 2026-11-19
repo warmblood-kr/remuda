@@ -25,23 +25,29 @@ control-free display text (at most 192 bytes), and `msg` and child `id`
 records are still never exposed.
 
 `last_updated_at` is the UTC Unix time in seconds of the report that produced
-the status. It is the canonical freshness value: derive the age from it and
-the current time when you render, so a cached row keeps aging. It is `nil`
-when an older host, or a clock before the epoch, cannot supply one; never
-invent it from an age. A clock that reads earlier than the report clamps the
-derived age to zero rather than going negative.
+the status, for display. Derive a displayed age from it and the current time,
+so a cached row keeps aging; it is `nil` when an older host, or a clock before
+the epoch, cannot supply one, and never invent it from an age.
 
-`program_status_age` is the age in seconds when the list row was copied,
-derived from `last_updated_at`. It is a compatibility convenience, not stored
-state; listing again does not renew it. Prefer `last_updated_at` when you can.
+Do not decide freshness from `last_updated_at`. A wall clock can step
+backwards, which would make an old report look recent. `program_status_age` is
+the monotonic age in seconds when the list row was copied (the daemon derives
+it from a monotonic clock, not from the wall clock), and it is the value to
+compare against a freshness limit. It does not renew on a relist; ask for a
+fresh list when you need a fresh reading.
 
-`title` is local display data only. It is not serialized in a session listing
-on the wire, so a peer, another machine or a JSON client does not receive it
-implicitly; only an in-process Lua reader sees it. The timestamp travels with
-the age and status but never to a peer: the remote path clears the whole OSC
-block, and `program_status_last_updated_at_ms` is not part of a peer listing. The report is advisory: it
-is not an executable identity, an authorization, or proof that the process is
-alive, and a title is never an instruction. A stale report belongs to the
+A timestamp later than the current clock is not evidence of freshness: treat
+the displayed age as unknown and keep the row not fresh unless the monotonic
+age independently proves it. A row with only a future timestamp is unknown,
+never fresh. `program_status_fresh` is the daemon's monotonic-age check at
+list time; a cached row must not be trusted past its own age.
+
+`title` and `last_updated_at` are local display data. Neither is serialized in
+a session listing on the wire, so a peer, another machine or a JSON client does
+not receive them; only an in-process Lua reader sees them. The remote path
+also clears the whole OSC block as defence in depth. The report is advisory:
+it is not an executable identity, an authorization, or proof that the process
+is alive, and a title is never an instruction. A stale report belongs to the
 display layer's freshness policy, not to the stored record.
 
 `remuda.session.new(name?, argv?, cwd?, env?)` and its `remuda.new` alias
