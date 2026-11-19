@@ -15,6 +15,7 @@ enum Call {
     Feed(Vec<Step>),
     Batch(u64, Vec<u8>),
     Resize(Size),
+    Policy(bool),
     Terminate,
     Raw(u64, Vec<u8>),
     Snapshot(usize),
@@ -197,6 +198,11 @@ impl SessionOperations for Remote {
         self.shared
             .call(Call::Batch(batch.seq, batch.bytes.to_vec()));
         Ok(InputOutcome::Uncertain)
+    }
+    fn set_remote_input_disabled(&self, disabled: bool) -> Result<()> {
+        self.checked()?;
+        self.shared.call(Call::Policy(disabled));
+        Ok(())
     }
     fn resize(&self, size: Size) -> Result<()> {
         self.checked()?;
@@ -579,14 +585,14 @@ fn hosted_and_local_sessions_share_one_registry_name_space() {
     assert!(registry.hosted("fixture").is_some());
 }
 #[test]
-fn legacy_hosted_launch_opt_out_is_ignored() {
+fn legacy_hosted_launch_opt_out_is_reported_but_not_enforced() {
     let registry = crate::Registry::new();
     let registered = handle(&Shared::new());
     let instance = registered.identity().instance.clone();
     assert!(registry
         .register_hosted_with_remote_input_disabled(registered, true)
         .is_ok());
-    assert!(!registry.remote_input_disabled(&instance));
+    assert!(registry.remote_input_disabled(&instance));
     // A protected registration refused for a taken name writes no policy
     // for the name's existing occupant.
     let plain = crate::Registry::new();
@@ -695,15 +701,19 @@ fn a_recovering_refusal_says_to_try_again() {
 }
 
 #[test]
-fn legacy_hosted_policy_updates_are_noops() {
+fn legacy_hosted_policy_updates_are_reported_but_not_enforced() {
     let registry = crate::Registry::new();
-    let hosted = handle(&Shared::new());
+    let shared = Shared::new();
+    let hosted = handle(&shared);
     let instance = hosted.identity().instance.clone();
     assert!(registry.register_hosted(hosted).is_ok());
+    assert!(!registry.remote_input_disabled(&instance));
     assert!(matches!(
         registry.set_remote_input_opt_out_result("fixture", &instance, true),
         Some(Ok(()))
     ));
+    assert!(registry.remote_input_disabled(&instance));
+    assert_eq!(*shared.calls.lock().unwrap(), vec![Call::Policy(true)]);
 }
 
 #[test]

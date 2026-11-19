@@ -306,12 +306,19 @@ impl Registry {
         instance_id: &str,
         opted_out: bool,
     ) -> Option<crate::session_operations::Result<()>> {
-        let _ = opted_out;
+        if instance_id.is_empty() {
+            return None;
+        }
         if let Some(session) = self.get(name) {
-            return (session.instance_id() == instance_id
-                && session.is_running()
-                && !session.is_closing())
-            .then_some(Ok(()));
+            if session.instance_id() != instance_id
+                || !session.is_running()
+                || session.is_closing()
+            {
+                return None;
+            }
+            return self
+                .mutate_remote_input_policy(instance_id, opted_out)
+                .map(Ok);
         }
         let handle = self.hosted(name)?;
         if handle.identity().instance != instance_id {
@@ -319,13 +326,17 @@ impl Registry {
         }
         match handle.inspect() {
             Ok(observation)
-                if observation.lifecycle == Lifecycle::Running && !observation.closing =>
-            {
-                Some(Ok(()))
-            }
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
+                if observation.lifecycle == Lifecycle::Running && !observation.closing => {}
+            Ok(_) => return None,
+            Err(error) => return Some(Err(error)),
         }
+        // Hosted metadata is retained for reporting, not enforcement (#941);
+        // the host persists it so a restarted daemon can report the same value.
+        if let Err(error) = handle.set_remote_input_disabled(opted_out) {
+            return Some(Err(error));
+        }
+        self.mutate_remote_input_policy(instance_id, opted_out)
+            .map(Ok)
     }
 
     fn mutate_remote_input_policy(&self, instance_id: &str, opted_out: bool) -> Option<()> {
@@ -403,8 +414,13 @@ impl Registry {
             .remove(instance_id);
     }
 
-    pub fn remote_input_disabled(&self, _instance_id: &str) -> bool {
-        false
+    pub fn remote_input_disabled(&self, instance_id: &str) -> bool {
+        self.remote_input_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(instance_id)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// `apply_input_batch` (or `apply_input_line_batch`) for a host-backed
@@ -822,7 +838,7 @@ impl Registry {
     /// A snapshot of every session, sorted by name so callers can diff two
     /// listings without sorting first.
     pub fn list(&self) -> Vec<SessionSummary> {
-        let (mut out, _policy, teams): (Vec<_>, HashMap<_, _>, HashMap<_, _>) = {
+        let (mut out, policy, teams): (Vec<_>, HashMap<_, _>, HashMap<_, _>) = {
             let sessions = self.lock();
             let policy = self
                 .remote_input_policy
@@ -855,7 +871,10 @@ impl Registry {
                         program_title: program.as_ref().and_then(|o| o.title.clone()),
                         program_status_age_ms: program
                             .map(|o| o.age.as_millis().try_into().unwrap_or(u64::MAX)),
-                        remote_input_disabled: false,
+                        remote_input_disabled: policy
+                            .get(s.instance_id())
+                            .copied()
+                            .unwrap_or(false),
                         team: teams.get(s.instance_id()).cloned(),
                     }
                 })
@@ -865,7 +884,10 @@ impl Registry {
         let hosted: Vec<_> = self.hosted_lock().values().map(Arc::clone).collect();
         for handle in hosted {
             let mut summary = hosted_summary(&handle);
-            summary.remote_input_disabled = false;
+            summary.remote_input_disabled = policy
+                .get(&handle.identity().instance)
+                .copied()
+                .unwrap_or(false);
             summary.team = teams.get(&handle.identity().instance).cloned();
             out.push(summary);
         }
@@ -1640,7 +1662,7 @@ mod launch_policy_tests {
         drop(policy);
         registrar.join().unwrap();
         let session = registry.get("launch-policy").expect("registered");
-        assert!(!registry.remote_input_disabled(session.instance_id()));
+        assert!(registry.remote_input_disabled(session.instance_id()));
     }
 }
 

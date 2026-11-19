@@ -3302,14 +3302,14 @@ fn remote_input_is_allowed_for_trusted_peers_even_when_opt_out_was_requested() {
     );
     wait_for(&path, &name, "got:local");
 
-    // The list reports the flag as false: it is not an enforced contract.
+    // The list reports the advisory flag; it is not an enforced contract.
     let listed = match client::request(&path, &Request::List).expect("list") {
         Response::Sessions(rows) => rows,
         other => panic!("unexpected list: {other:?}"),
     };
     assert!(listed
         .iter()
-        .any(|row| row.name == name && !row.remote_input_disabled));
+        .any(|row| row.name == name && row.remote_input_disabled));
     assert_eq!(
         client::request(
             &path,
@@ -3357,7 +3357,7 @@ fn remote_input_is_allowed_for_trusted_peers_even_when_opt_out_was_requested() {
     };
     assert!(listed
         .iter()
-        .any(|row| row.name == name && !row.remote_input_disabled));
+        .any(|row| row.name == name && row.remote_input_disabled));
 }
 
 #[cfg(unix)]
@@ -3395,8 +3395,8 @@ fn a_launch_flag_is_advisory_and_does_not_block_trusted_peers() {
     };
     let row = listed.iter().find(|row| row.name == name).expect("listed");
     assert!(
-        !row.remote_input_disabled,
-        "the flag is not enforced policy"
+        row.remote_input_disabled,
+        "the list reports the advisory flag without enforcing it"
     );
     assert!(matches!(
         client::request(
