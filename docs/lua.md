@@ -25,27 +25,32 @@ control-free display text (at most 192 bytes), and `msg` and child `id`
 records are still never exposed.
 
 `last_updated_at` is the UTC Unix time in seconds of the report that produced
-the status, for display. Derive a displayed age from it and the current time,
-so a cached row keeps aging; it is `nil` when an older host, or a clock before
-the epoch, cannot supply one, and never invent it from an age.
+the status, and it is canonical display data: age a row from it and the current
+time on every render, so a row that is not relisted still ages. It is `nil`
+when an older host, or a clock before the epoch, cannot supply one; never
+invent it from an age.
 
-Do not decide freshness from `last_updated_at`. A wall clock can step
-backwards, which would make an old report look recent. `program_status_age` is
-the monotonic age in seconds when the list row was copied (the daemon derives
-it from a monotonic clock, not from the wall clock), and it is the value to
-compare against a freshness limit. It does not renew on a relist; ask for a
-fresh list when you need a fresh reading.
+For a freshness decision use the larger of that derived age and
+`program_status_age`, the monotonic age in seconds when the list row was copied
+(the daemon derives it from a monotonic clock, not from the wall clock). The
+timestamp keeps a cached row aging; the monotonic value is the floor that stops
+a wall clock which steps backwards from making an old report look recent. A
+relist recomputes the monotonic value; a cached row keeps the copy it was given.
 
-A timestamp later than the current clock is not evidence of freshness: treat
-the displayed age as unknown and keep the row not fresh unless the monotonic
-age independently proves it. A row with only a future timestamp is unknown,
-never fresh. `program_status_fresh` is the daemon's monotonic-age check at
-list time; a cached row must not be trusted past its own age.
+A timestamp later than the current clock is not evidence: allow at most a
+second of rounding, then treat the row as not fresh. A non-positive or
+unparsable timestamp is not fresh either, and a row without a usable monotonic
+age is not fresh even with a plausible timestamp. Only an absent timestamp
+falls back to the monotonic age alone. `program_status_fresh` is the daemon's
+monotonic-age check at list time; a cached row must not be trusted past its own
+age.
 
 `title` and `last_updated_at` are local display data. Neither is serialized in
 a session listing on the wire, so a peer, another machine or a JSON client does
-not receive them; only an in-process Lua reader sees them. The remote path
-also clears the whole OSC block as defence in depth. The report is advisory:
+not receive them, including local `remuda ls --json`: the CLI compact view
+therefore cannot show a report time, only the age. Only an in-process Lua
+reader sees the timestamp. The remote path also clears the whole OSC block as
+defence in depth. The report is advisory:
 it is not an executable identity, an authorization, or proof that the process
 is alive, and a title is never an instruction. A stale report belongs to the
 display layer's freshness policy, not to the stored record.
