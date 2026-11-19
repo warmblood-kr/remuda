@@ -141,17 +141,27 @@ fn probe_uncached(path: &Path) -> Option<String> {
     (status.success() && !build.is_empty() && !build.contains('\n')).then(|| build.to_owned())
 }
 
-/// A self-execing test daemon runs under `target/<profile>/deps/`; the real
-/// `remuda` and its host sit one directory up. Production never lives under
-/// `deps/`, so only that test layout is redirected.
+/// A test daemon runs from a Cargo test binary, not from the shipped `remuda`:
+/// normally `target/<profile>/deps/`, but a harness built beside a build script
+/// lives under `target/<profile>/build/<crate>/<hash>/out/`. The real `remuda`
+/// and its host sit at the profile root. Production markers are neither `deps`
+/// nor `out`, so an installed daemon keeps its own directory.
 pub(super) fn profile_daemon(daemon: &Path) -> Option<PathBuf> {
-    let deps = daemon.parent()?;
-    if deps.file_name()? != "deps" {
+    let parent = daemon.parent()?;
+    let marker = parent.file_name()?.to_str()?;
+    if marker != "deps" && marker != "out" {
         return None;
     }
-    let profile = deps.parent()?;
-    let candidate = profile.join(format!("remuda{}", std::env::consts::EXE_SUFFIX));
-    candidate.is_file().then_some(candidate)
+    let name = format!("remuda{}", std::env::consts::EXE_SUFFIX);
+    let mut dir = parent;
+    for _ in 0..5 {
+        let candidate = dir.join(&name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        dir = dir.parent()?;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -255,6 +265,21 @@ mod tests {
             profile_daemon(&dir.path().join("remuda")),
             None,
             "a real daemon keeps the install layout"
+        );
+    }
+
+    #[test]
+    fn a_test_binary_built_beside_a_build_script_finds_the_profile_daemon() {
+        let dir = tempdir();
+        let out = dir.path().join("build/remuda-native/e5d5e483/out");
+        std::fs::create_dir_all(&out).unwrap();
+        let test_binary = out.join("remuda_native-e5d5e483");
+        assert_eq!(profile_daemon(&test_binary), None);
+        script(&dir.path().join("remuda"), "exit 0");
+        assert_eq!(
+            profile_daemon(&test_binary).as_deref(),
+            Some(dir.path().join("remuda").as_path()),
+            "a build-script harness still anchors at the profile's remuda"
         );
     }
 
