@@ -511,7 +511,7 @@ fn legacy_opt_out_does_not_block_trusted_remote_input() {
     assert!(registry
         .list()
         .iter()
-        .any(|row| row.name == "input-test" && !row.remote_input_disabled));
+        .any(|row| row.name == "input-test" && row.remote_input_disabled));
     let local = InputBatch {
         instance_id: &instance,
         client_id: [8; 16],
@@ -630,7 +630,7 @@ fn remote_input_line_adds_exactly_one_return_and_a_duplicate_adds_none() {
 }
 
 #[test]
-fn legacy_launch_time_opt_out_is_ignored() {
+fn legacy_launch_time_opt_out_is_reported_but_not_enforced() {
     let registry = Registry::new();
     let session = registry
         .register_with_remote_input_disabled(
@@ -638,8 +638,8 @@ fn legacy_launch_time_opt_out_is_ignored() {
             true,
         )
         .expect("register protected");
-    assert!(!registry.remote_input_disabled(session.instance_id()));
-    assert!(!registry.list()[0].remote_input_disabled);
+    assert!(registry.remote_input_disabled(session.instance_id()));
+    assert!(registry.list()[0].remote_input_disabled);
     assert!(matches!(
         registry.apply_remote_input_batch(
             "input-test",
