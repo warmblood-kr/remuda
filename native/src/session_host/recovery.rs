@@ -308,6 +308,21 @@ impl Owner {
             }
         }
     }
+    /// Remove an entry whose host is provably gone and never published an
+    /// exit. The store refuses this when anything is still pending, so a
+    /// result that could still be delivered is never dropped here.
+    pub fn retire_absent(&self, target: Target) -> Result<(), Error> {
+        self.store.commit(
+            self.store.read()?.cursor(),
+            Some(self.fence()),
+            Mutation::Exit {
+                target,
+                operation: model::ExitMutation::RetireAbsent,
+            },
+            Duration::from_secs(1),
+        )?;
+        Ok(())
+    }
     /// Remove an exited, settled entry; the host must already be stopped.
     pub fn retire(&self, target: Target) -> Result<(), Error> {
         self.store.commit(
