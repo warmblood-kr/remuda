@@ -231,7 +231,7 @@ fn sync_files(socket: &Path, command: &str, values: &Map<String, Value>, mut out
     };
     let (Some(source), Some(dest)) = (source, dest) else {
         let detail = if options.dry_run || options.verbose {
-            "the two-path form needs both SOURCE and DEST; the cluster sync takes neither"
+            "`--dry-run` and `--verbose` apply to the two-path form, which needs both SOURCE and DEST; the cluster sync takes no paths and no copy flags."
         } else {
             "give both SOURCE and DEST, or neither for the cluster sync"
         };
