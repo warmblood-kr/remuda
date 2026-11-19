@@ -1899,12 +1899,16 @@ fn input_batches_acknowledge_duplicates_and_check_instance_before_deduplication(
     assert!(running.left_on_its_own(), "daemon should stop cleanly");
 }
 
+/// A 1 MiB write must fill the PTY, time out, and leave reads responsive.
+///
+/// In-process contract: the megabyte is one act, and hosted acts are capped at
+/// 8 KiB. See `spawn::Daemon::spawn_in_process`.
 #[cfg(unix)]
 #[test]
 fn stalled_pty_write_times_out_without_blocking_reads_and_recovers() {
     let runtime = scratch_dir("pty-write-timeout");
     let socket = daemon::socket_path_in(&runtime, "s");
-    let mut running = spawn::Daemon::spawn(&runtime);
+    let mut running = spawn::Daemon::spawn_in_process(&runtime);
     let reader_marker = start_reader_waiting_session(&socket, &runtime);
 
     let bytes = vec![b'\n'; 1024 * 1024];

@@ -91,6 +91,17 @@ impl Daemon {
         spawn_and_wait(base_command(dir), dir)
     }
 
+    /// A daemon whose sessions are in-process, for contracts hosted sessions do
+    /// not have. A hosted input act is capped at 8 KiB
+    /// (docs/concepts/session-host-parity.md); the stalled-write tests need a
+    /// megabyte in one act. `hosted_parity_limits` keeps the hosted refusal
+    /// tested, so this is a scope, not a skip.
+    pub fn spawn_in_process(dir: &Path) -> Self {
+        let mut cmd = base_command(dir);
+        cmd.env("REMUDA_EXPERIMENTAL_SESSION_HOST", "0");
+        spawn_and_wait(cmd, dir)
+    }
+
     /// Like `spawn`, but for the birth-environment-poisoning
     /// scenario itself: a daemon born with `HOME` pinned to a caller-chosen
     /// directory (overriding `base_command`'s default) and NEITHER
