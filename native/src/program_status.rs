@@ -2,8 +2,11 @@
 //!
 //! The protocol is advisory: an agent says whether it is idle, working,
 //! blocked, done or failed. Remuda never treats it as a process identity,
-//! authorization, or proof of liveness. Free text fields (`title`, `msg`,
-//! `id`) are intentionally not retained: base64 is not redaction.
+//! authorization, or proof of liveness.
+//!
+//! The optional `title` is retained as bounded, control-free, local display
+//! text. `msg` and child `id` records are still discarded: a message is often
+//! the question or the user's prompt, and base64 is not redaction.
 
 use base64::Engine;
 use remuda_core::agent::{ProgramBlockKind, ProgramState, ProgramStatus, ProgramStatusObservation};
@@ -15,13 +18,12 @@ const MAX_PAYLOAD: usize = 4096;
 const MAX_APP: usize = 32;
 const MAX_TITLE_ENCODED: usize = 256;
 const MAX_TITLE_DECODED: usize = 192;
-const MAX_MESSAGE_ENCODED: usize = 2732;
-const MAX_MESSAGE_DECODED: usize = 2048;
 
 /// One terminal's last typed status. Queries are observed and ignored.
 #[derive(Default)]
 pub(crate) struct Tracker {
     status: Option<ProgramStatus>,
+    title: Option<String>,
     updated_at: Option<Instant>,
 }
 
@@ -44,10 +46,12 @@ impl Tracker {
         match record {
             Record::Clear => {
                 self.status = None;
+                self.title = None;
                 self.updated_at = Some(Instant::now());
             }
-            Record::Status(status) => {
+            Record::Status(status, title) => {
                 self.status = Some(status);
+                self.title = title;
                 self.updated_at = Some(Instant::now());
             }
         }
@@ -56,13 +60,17 @@ impl Tracker {
     pub fn observation(&self) -> Option<ProgramStatusObservation> {
         let status = self.status.clone()?;
         let age = self.updated_at.map(|at| at.elapsed()).unwrap_or_default();
-        Some(ProgramStatusObservation { status, age })
+        Some(ProgramStatusObservation {
+            status,
+            age,
+            title: self.title.clone(),
+        })
     }
 }
 
 enum Record {
     Clear,
-    Status(ProgramStatus),
+    Status(ProgramStatus, Option<String>),
 }
 
 fn parse(payload: &str) -> Option<Record> {
@@ -71,7 +79,6 @@ fn parse(payload: &str) -> Option<Record> {
     let mut kind = None;
     let mut progress = None;
     let mut title = None;
-    let mut message = None;
     let mut has_id = false;
 
     for field in payload.split(':') {
@@ -93,10 +100,10 @@ fn parse(payload: &str) -> Option<Record> {
             // Root-only slice: an id-bearing report belongs to a child record,
             // so never apply it to the root (and never fall back to root).
             "id" => has_id = true,
-            // Text is validated but never retained. Normalize duplicates first,
-            // then reject controls/oversize in the winning value.
+            // `title` is optional display text; `msg` and other free text stay
+            // discarded. An invalid title drops only the title, never a usable
+            // state: text is decoration, while the state is the reported fact.
             "title" => title = Some(value),
-            "msg" => message = Some(value),
             _ => {}
         }
     }
@@ -104,12 +111,9 @@ fn parse(payload: &str) -> Option<Record> {
     if has_id {
         return None;
     }
-    if let Some(value) = title {
-        valid_text(value, MAX_TITLE_ENCODED, MAX_TITLE_DECODED)?;
-    }
-    if let Some(value) = message {
-        valid_text(value, MAX_MESSAGE_ENCODED, MAX_MESSAGE_DECODED)?;
-    }
+    let title = title
+        .and_then(|value| decode_text(value, MAX_TITLE_ENCODED, MAX_TITLE_DECODED))
+        .filter(|value| !value.is_empty());
     let state = state?;
     if state == ParsedState::Clear {
         return Some(Record::Clear);
@@ -135,12 +139,15 @@ fn parse(payload: &str) -> Option<Record> {
     } else {
         None
     };
-    Some(Record::Status(ProgramStatus {
-        state,
-        app,
-        kind,
-        progress,
-    }))
+    Some(Record::Status(
+        ProgramStatus {
+            state,
+            app,
+            kind,
+            progress,
+        },
+        title,
+    ))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -174,7 +181,7 @@ fn parse_kind(value: &str) -> Option<ProgramBlockKind> {
     }
 }
 
-fn valid_text(value: &str, max_encoded: usize, max_decoded: usize) -> Option<()> {
+fn decode_text(value: &str, max_encoded: usize, max_decoded: usize) -> Option<String> {
     if value.len() > max_encoded {
         return None;
     }
@@ -185,14 +192,28 @@ fn valid_text(value: &str, max_encoded: usize, max_decoded: usize) -> Option<()>
     if decoded.len() > max_decoded {
         return None;
     }
-    let text = std::str::from_utf8(&decoded).ok()?;
+    let text = String::from_utf8(decoded).ok()?;
     if text.chars().any(|c| {
         let n = c as u32;
-        n < 0x20 || n == 0x7f || (0x80..=0x9f).contains(&n) || n == 0x1b
+        n < 0x20 || n == 0x7f || (0x80..=0x9f).contains(&n) || unsafe_format(c)
     }) {
         return None;
     }
-    Some(())
+    Some(text)
+}
+
+/// Unicode format controls can reorder or hide text in a terminal. They are
+/// not ordinary multilingual content; a title carrying one is not displayed.
+fn unsafe_format(c: char) -> bool {
+    let n = c as u32;
+    n == 0x061c
+        || (0x200b..=0x200f).contains(&n)
+        || (0x202a..=0x202e).contains(&n)
+        || (0x2028..=0x2029).contains(&n)
+        || (0x2060..=0x2064).contains(&n)
+        || (0x2066..=0x2069).contains(&n)
+        || n == 0xfeff
+        || (0xfff9..=0xfffb).contains(&n)
 }
 
 fn valid_app(value: &str) -> bool {
@@ -281,77 +302,95 @@ mod tests {
         assert_eq!(observed.status.app, None);
         assert_eq!(observed.status.kind, None);
         assert_eq!(observed.status.progress, None);
-        observe(&mut status, "state=working:future=extension");
         assert_eq!(
-            status.observation().unwrap().status.state,
-            ProgramState::Working
+            observed.title.as_deref(),
+            Some("secret"),
+            "title is retained"
+        );
+        observe(&mut status, "state=working:future=extension");
+        let observed = status.observation().unwrap();
+        assert_eq!(observed.status.state, ProgramState::Working);
+        assert_eq!(
+            observed.title, None,
+            "a later report without a title does not keep the old one"
         );
     }
 
     #[test]
-    fn multilingual_text_is_valid_but_controls_are_rejected() {
+    fn title_is_bounded_clean_multilingual_text() {
         use base64::Engine;
         let b64 = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
         let mut status = Tracker::default();
         observe(
             &mut status,
-            &format!(
-                "state=working:msg={}:title={}",
-                b64("한글 작업"),
-                b64("🚀 배포")
-            ),
+            &format!("state=working:title={}", b64("🚀 배포 — OSC 상태")),
         );
-        assert_eq!(
-            status.observation().unwrap().status.state,
-            ProgramState::Working
-        );
+        let observed = status.observation().unwrap();
+        assert_eq!(observed.status.state, ProgramState::Working);
+        assert_eq!(observed.title.as_deref(), Some("🚀 배포 — OSC 상태"));
+
         observe(
             &mut status,
-            &format!("state=blocked:msg={}", b64("line\u{85}break")),
+            &format!("state=working:title={}", b64(&"x".repeat(193))),
         );
+        let observed = status.observation().unwrap();
         assert_eq!(
-            status.observation().unwrap().status.state,
+            observed.status.state,
             ProgramState::Working,
-            "U+0085 is a control, not ordinary multilingual text"
+            "an oversized title does not erase the state"
         );
-        observe(
-            &mut status,
-            &format!("state=blocked:msg={}", b64("safe\u{1b}[31m")),
-        );
-        assert_eq!(
-            status.observation().unwrap().status.state,
-            ProgramState::Working,
-            "ESC in decoded text rejects the report"
-        );
-        observe(&mut status, "state=blocked:msg=//8=");
-        assert_eq!(
-            status.observation().unwrap().status.state,
-            ProgramState::Working,
-            "invalid UTF-8 rejects the report"
-        );
+        assert_eq!(observed.title, None, "an oversized title is not retained");
     }
 
     #[test]
-    fn child_records_and_bad_text_do_not_replace_the_root() {
+    fn title_controls_format_characters_and_bad_utf8_are_dropped() {
+        use base64::Engine;
+        let b64 = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+        let mut status = Tracker::default();
+        observe(&mut status, &format!("state=working:title={}", b64("safe")));
+        for bad in [
+            "line\u{85}break",
+            "safe\u{1b}[31m",
+            "spoof\u{202e}gnp.exe",
+            "zero\u{200b}width",
+            "para\u{2029}graph",
+        ] {
+            observe(&mut status, &format!("state=blocked:title={}", b64(bad)));
+            let observed = status.observation().unwrap();
+            assert_eq!(
+                observed.status.state,
+                ProgramState::Blocked,
+                "{bad:?} must not erase a usable state"
+            );
+            assert_eq!(observed.title, None, "{bad:?} must not be displayed");
+        }
+        observe(&mut status, "state=blocked:title=//8=");
+        let observed = status.observation().unwrap();
+        assert_eq!(observed.status.state, ProgramState::Blocked);
+        assert_eq!(observed.title, None, "invalid UTF-8 is not displayed");
+    }
+
+    #[test]
+    fn child_records_and_clear_do_not_leak_a_title() {
         let mut status = Tracker::default();
         observe(&mut status, "state=idle");
-        observe(&mut status, "state=working:id=child/1");
+        observe(&mut status, "state=working:id=child/1:title=c2VjcmV0");
+        let observed = status.observation().unwrap();
         assert_eq!(
-            status.observation().unwrap().status.state,
+            observed.status.state,
             ProgramState::Idle,
             "an id-bearing child report must not become root"
         );
+        assert_eq!(observed.title, None, "a child title is not root text");
         observe(&mut status, "state=clear:id=child/1");
         assert!(
             status.observation().is_some(),
             "a child clear is not root clear"
         );
-        observe(&mut status, "state=working:msg=not base64!");
-        observe(&mut status, "state=working:title=SGVsbG8=\x1b");
-        assert_eq!(
-            status.observation().unwrap().status.state,
-            ProgramState::Idle,
-            "invalid free text rejects the whole report"
+        observe(&mut status, "state=clear");
+        assert!(
+            status.observation().is_none(),
+            "root clear removes the title"
         );
     }
 }
