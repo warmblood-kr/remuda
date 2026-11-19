@@ -307,22 +307,24 @@ mod tests {
     #[test]
     fn the_window_follows_the_selection_without_a_scroll_call() {
         let rows = (0..5)
-            .map(|index| row(&format!("per_{index}"), "s", "bash"))
+            .map(|index| row(&format!("per_{index}"), &format!("s{index}"), "bash"))
             .collect();
         let mut overlay = Overlay::new(scan(rows, 0));
         overlay.move_selection(4);
         // The TUI never calls `scroll_to`; the marker must still be on screen.
         let lines = overlay.lines(2, 80);
         assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("s3"));
         assert!(lines[1].starts_with('>'));
-        assert!(lines[1].contains("per_4"));
+        assert!(lines[1].contains("s4"));
     }
 
     #[test]
     fn unavailable_reasons_stay_visible_next_to_rows() {
         let overlay = Overlay::new(scan(vec![row("per_1", "live", "bash")], 2));
         let lines = overlay.lines(3, 80);
-        assert!(lines[0].contains("per_1"));
+        assert!(lines[0].starts_with('>'));
+        assert!(lines[0].contains("live"));
         let reasons = overlay.unavailable_lines(3).join("\n");
         assert!(reasons.contains("stale0"));
         assert!(reasons.contains("server_pid"));
