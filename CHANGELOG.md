@@ -14,7 +14,9 @@
   without them (currently Windows); local -> store still works. A file over
   64 MiB is a per-file failure and the rest continue.
   Exit 75 means stored here but not on every wanted node. `remuda drive sync`
-  with no paths keeps the cluster index sync.
+  with no paths keeps the cluster index sync. The 10,000-file bound applies to
+  a local tree per run; source symlink checks are best effort when the source
+  tree is shared-writable, and the no-path error names `--dry-run`/`--verbose`.
 - VFS: `remuda vfs ls` now lists a directory's immediate children: a
   subdirectory prints as `a/`, a file as its name. `-R`/`--recursive` gives the
   old full-path recursive listing. A prefix without a trailing slash no longer

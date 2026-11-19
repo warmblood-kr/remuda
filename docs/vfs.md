@@ -151,10 +151,13 @@ each copied file.
   works.
 - Store writes are ordinary `put`s, so the usual replication rules apply.
   Exit 75 means the files are stored here but not on every wanted node yet.
-- Symlinks, special files and non-UTF-8 names are skipped and named. Empty
-  local directories are not represented in the store. A file over 64 MiB is
-  a per-file failure and the other files continue. One run is bounded at
-  10,000 files; a larger local tree is refused before writing.
+- Symlinks, special files and non-UTF-8 names are skipped and named. Source
+  checks are best effort: if another process can write the source tree during
+  the run, it could swap a path after the check. The destination is the
+  race-hardened side. Empty local directories are not represented in the
+  store. A file over 64 MiB is a per-file failure and the other files
+  continue. A local tree is bounded at 10,000 files per run; a larger one is
+  refused before writing.
 - Files that exist only on the destination are never deleted. This includes
   files removed from the source: run `remuda drive rm` for those explicitly.
 - A store file cannot also be a directory. A local tree that would create that
