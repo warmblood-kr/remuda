@@ -128,16 +128,15 @@ pub fn status_glyph(state: RemoteState) -> char {
     }
 }
 
-/// The status cell for a node row: the state glyph, plus how old the retained
-/// list is when the node is not reachable. The age is what makes a stale row
-/// honest instead of a live-looking row with a different glyph.
-/// Derive the displayed age from the absolute collection timestamp on every
-/// render. The snapshot's `last_sync_age` is monotonic bookkeeping for the
-/// retention window, not the public timestamp.
+/// Derive display age from the absolute collection timestamp on every render;
+/// the snapshot's `last_sync_age` is monotonic bookkeeping, not the public time.
 fn last_updated_age(node: &RemoteNodeSnapshot) -> Option<Duration> {
     node.last_updated_age_at(SystemTime::now())
 }
 
+/// The status cell for a node row: the state glyph, plus how old the retained
+/// list is when the node is not reachable. The age is what makes a stale row
+/// honest instead of a live-looking row with a different glyph.
 fn remote_node_status(node: &RemoteNodeSnapshot) -> String {
     let glyph = status_glyph(node.state);
     match (node.state, last_updated_age(node)) {

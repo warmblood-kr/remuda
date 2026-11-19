@@ -77,13 +77,9 @@ pub struct RemoteNodeSnapshot {
     pub name: String,
     pub state: RemoteState,
     pub last_sync_age: Option<Duration>,
-    /// When this node's shown session list was last collected successfully,
-    /// as an absolute wall-clock instant (UTC once formatted). `Some` with no
-    /// sessions is a successful empty answer; `None` means no collection has
-    /// ever succeeded, which is not the same thing. Display age is derived
-    /// from this value and the current time; retention uses the separate
-    /// monotonic instant in `RemoteNode`, so wall-clock adjustments cannot
-    /// keep stale rows alive.
+    /// Absolute wall-clock time of the last successful collection (UTC once
+    /// formatted); `None` means none ever succeeded. Display age is derived
+    /// from this, while retention uses the separate monotonic instant.
     pub last_updated_at: Option<SystemTime>,
     /// True once the monotonic `last_sync` is older than the node's retention
     /// window: the retained sessions are dropped and the state reads
@@ -94,9 +90,8 @@ pub struct RemoteNodeSnapshot {
 }
 
 impl RemoteNodeSnapshot {
-    /// How old the last successful collection is against `now`. A timestamp in
-    /// the future (a wall-clock adjustment) clamps to zero rather than going
-    /// negative or panicking; `None` still means no collection ever succeeded.
+    /// Age of `last_updated_at` at `now`; a future timestamp (clock skew)
+    /// clamps to zero. `None` still means no collection ever succeeded.
     pub fn last_updated_age_at(&self, now: SystemTime) -> Option<Duration> {
         self.last_updated_at
             .map(|at| now.duration_since(at).unwrap_or(Duration::ZERO))
