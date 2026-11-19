@@ -9106,6 +9106,49 @@ mod tests {
     }
 
     #[test]
+    fn stale_node_refuses_keys_mode_and_a_confirmed_close() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("body"));
+
+        // The confirmation was begun while the node was reachable; the send
+        // happens after the node went stale and must not reach the peer.
+        ui.key(KeyCode::Char('x'));
+        ui.key(KeyCode::Char('y'));
+        assert!(ui.pending_close.is_some(), "close was confirmed");
+        ui.remote_snapshot.nodes[0].state = RemoteState::Stale;
+        ui.remote_snapshot.nodes[0].last_sync_age = Some(Duration::from_secs(12));
+        let transport = FakeRemoteInput::new(Response::Ok);
+        ui.send_close_pending(
+            std::path::Path::new("unused"),
+            Some(&transport),
+            clock.now(),
+        );
+        assert!(
+            transport.requests.lock().unwrap().is_empty(),
+            "a stale node must not receive a close"
+        );
+        assert!(
+            ui.notice.as_ref().is_some_and(
+                |(notice, _)| notice.contains("close not sent") && notice.contains("stale")
+            ),
+            "the close refusal says why: {:?}",
+            ui.notice
+        );
+
+        // Keys mode cannot be entered from the same stale rows.
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        assert!(ui.remote_keys_mode.is_none());
+        assert!(
+            ui.notice
+                .as_ref()
+                .is_some_and(|(notice, _)| notice.contains("remote input not sent")),
+            "the keys refusal says why: {:?}",
+            ui.notice
+        );
+    }
+
+    #[test]
     fn remote_target_waits_for_first_session_list() {
         let source = std::sync::Arc::new(FakeRemoteSource(Mutex::new(RemoteSnapshot::default())));
         let producer = std::sync::Arc::clone(&source);
