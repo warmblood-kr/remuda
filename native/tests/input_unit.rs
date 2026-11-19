@@ -418,11 +418,14 @@ fn type_text_delivers_and_submits_when_the_child_drains_slowly() {
 
 /// SendLine (CLI send, MCP send) must not report success for a stalled write:
 /// it answers with the pending error, and the Return still follows the text.
+///
+/// In-process contract: the 300 KB burst is one act, and hosted acts are capped
+/// at 8 KiB; `hosted_parity_limits` covers the hosted refusal.
 #[test]
 fn send_line_reports_pending_when_the_child_drains_slowly() {
     let dir = scratch("slow-send");
     let socket = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&socket, &dir);
+    let _daemon = daemon_at_in_process(&socket, &dir);
     start_slow_drain(&socket, &dir, "slow-send");
 
     let response = client::request(
