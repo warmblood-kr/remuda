@@ -604,3 +604,19 @@ fn acquire(fixture: &Fixture) -> Client {
         .then_some(peer)
     })
 }
+
+#[test]
+fn a_registered_host_holds_its_lifetime_lock_until_it_exits() {
+    let fixture = Fixture::new();
+    let mut controller = fixture.controller("none", false, false);
+    fixture.ready();
+    let directory = fixture.root.join("h");
+    match super::super::lifetime::probe(&directory, &fixture.identity, [7; 16]) {
+        super::super::lifetime::Probe::Held => {}
+        _ => panic!("a registered host must hold its lifetime lock"),
+    }
+    let bytes = std::fs::read(directory.join(super::super::lifetime::FILE)).unwrap();
+    let binding: super::super::lifetime::Binding = serde_json::from_slice(&bytes).unwrap();
+    assert!(binding.confirms(&fixture.identity, [7; 16]));
+    kill(&mut controller);
+}
