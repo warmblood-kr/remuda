@@ -308,6 +308,21 @@ impl Owner {
             }
         }
     }
+    /// Remove an entry whose host died without an exit. The caller proved it
+    /// by acquiring the host's lifetime lock, and `nonce` binds that proof to
+    /// this birth; the store refuses a changed phase or anything still busy.
+    pub fn retire_absent(&self, target: Target, nonce: [u8; 16]) -> Result<(), Error> {
+        self.store.commit(
+            self.store.read()?.cursor(),
+            Some(self.fence()),
+            Mutation::Exit {
+                target,
+                operation: model::ExitMutation::RetireAbsent { nonce },
+            },
+            Duration::from_secs(1),
+        )?;
+        Ok(())
+    }
     /// Remove an exited, settled entry; the host must already be stopped.
     pub fn retire(&self, target: Target) -> Result<(), Error> {
         self.store.commit(

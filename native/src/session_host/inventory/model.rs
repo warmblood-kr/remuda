@@ -269,7 +269,15 @@ pub(crate) enum InputMutation {
     },
 }
 pub(crate) enum ExitMutation {
-    Observe { generation: u64 },
+    Observe {
+        generation: u64,
+    },
+    /// Retire a host-backed entry whose host stopped without publishing an
+    /// exit. Only the daemon may ask for it, and only after it acquired the
+    /// host's lifetime lock; the nonce keeps that proof bound to this birth.
+    RetireAbsent {
+        nonce: [u8; 16],
+    },
     Retire,
 }
 pub(crate) struct Applied {
@@ -639,6 +647,34 @@ impl Index {
                     _ => {}
                 }
                 entry.phase = Phase::Exited { generation };
+            }
+            ExitMutation::RetireAbsent { nonce } => {
+                if entry
+                    .birth
+                    .as_ref()
+                    .is_none_or(|birth| birth.nonce() != nonce)
+                {
+                    return Err(Error::StaleFence);
+                }
+                // A published exit has its own path; never take a proof that
+                // was gathered for an entry that has since moved on.
+                if !matches!(entry.phase, Phase::Registered) {
+                    return Err(Error::Unavailable);
+                }
+                if entry.pending.is_some() || entry.streams.iter().any(|s| !s.results.is_empty()) {
+                    return Err(Error::Busy);
+                }
+                self.entries.remove(&target.name);
+                self.tombstones.push_back(Tombstone {
+                    name: target.name.clone(),
+                    identity: target.identity,
+                    // No host published an exit, so there is no generation to
+                    // carry; the identity in the tombstone is what stops reuse.
+                    generation: 0,
+                });
+                while self.tombstones.len() > MAX_TOMBSTONES {
+                    self.tombstones.pop_front();
+                }
             }
             ExitMutation::Retire => {
                 if entry.birth.as_ref().is_some_and(|birth| !birth.retirable()) {
