@@ -9,10 +9,11 @@
 //!
 //! Scope is the subset a reader needs: ATX headings, fenced code, block quotes,
 //! list items with their marker and indentation, thematic breaks, paragraphs,
-//! and inline bold/italic/code/link/image. Tables, setext headings, nested
-//! block structure and raw HTML stay literal. Every loop is bounded by the
-//! source size plus a fixed budget, so malformed delimiters cannot turn a line
-//! into quadratic work.
+//! pipe tables, and inline bold/italic/code/link/image. Setext headings,
+//! nested block structure and raw HTML stay literal. A table starts only at a
+//! block boundary, so a paragraph's last line is never reinterpreted. Every
+//! loop is bounded by the source size plus a fixed budget, so malformed
+//! delimiters cannot turn a line into quadratic work.
 
 /// A source larger than the browser read bound is not styled.
 pub const MAX_SOURCE_BYTES: usize = 1024 * 1024;
@@ -22,6 +23,28 @@ pub const MAX_BLOCKS: usize = 4096;
 const MAX_SPANS: usize = 256;
 /// Recursion through emphasis while parsing one line.
 const MAX_DEPTH: usize = 3;
+/// Most columns a table may have before it renders as literal text.
+const MAX_TABLE_COLUMNS: usize = 32;
+
+/// Per-column table alignment from the delimiter row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Align {
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+/// One cell of a table: inline spans with their original links and images.
+pub type Cell = Vec<Span>;
+
+/// A pipe table with a header row, alignment and zero or more body rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Table {
+    pub align: Vec<Align>,
+    pub header: Vec<Cell>,
+    pub rows: Vec<Vec<Cell>>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockKind {
@@ -31,6 +54,7 @@ pub enum BlockKind {
     Quote,
     Code { language: Option<String> },
     Rule,
+    Table(Table),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -67,8 +91,42 @@ impl Block {
         if !self.code.is_empty() {
             return self.code.join("\n");
         }
+        if let BlockKind::Table(table) = &self.kind {
+            return table_text(table);
+        }
         self.spans.iter().map(|span| span.text.as_str()).collect()
     }
+
+    /// Visit every inline span, including cells of a table.
+    pub fn visit_spans(&self, visit: &mut impl FnMut(&Span)) {
+        if let BlockKind::Table(table) = &self.kind {
+            for cell in table.header.iter().chain(table.rows.iter().flatten()) {
+                for span in cell {
+                    visit(span);
+                }
+            }
+        } else {
+            for span in &self.spans {
+                visit(span);
+            }
+        }
+    }
+}
+
+fn table_text(table: &Table) -> String {
+    fn row(cells: &[Cell]) -> String {
+        cells
+            .iter()
+            .map(|cell| cell.iter().map(|span| span.text.as_str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\t")
+    }
+    let mut out = row(&table.header);
+    for cells in &table.rows {
+        out.push('\n');
+        out.push_str(&row(cells));
+    }
+    out
 }
 
 /// Parse bounded Markdown source. A document over [`MAX_SOURCE_BYTES`] is
@@ -79,6 +137,7 @@ pub fn parse(source: &str) -> Vec<Block> {
     }
     let mut blocks = Vec::new();
     let mut lines = source.lines().peekable();
+    let mut at_block_start = true;
     while let Some(line) = lines.next() {
         if blocks.len() >= MAX_BLOCKS {
             break;
@@ -101,13 +160,16 @@ pub fn parse(source: &str) -> Vec<Block> {
                 code,
                 marker: String::new(),
             });
+            at_block_start = true;
             continue;
         }
         if line.trim().is_empty() {
+            at_block_start = true;
             continue;
         }
         if let Some((level, text)) = heading(line) {
             blocks.push(text_block(BlockKind::Heading(level), text));
+            at_block_start = true;
             continue;
         }
         if rule(line) {
@@ -117,21 +179,154 @@ pub fn parse(source: &str) -> Vec<Block> {
                 code: Vec::new(),
                 marker: String::new(),
             });
+            at_block_start = true;
             continue;
         }
         if let Some(rest) = quote(line) {
             blocks.push(text_block(BlockKind::Quote, rest));
+            at_block_start = true;
             continue;
         }
         if let Some((marker, level, ordered, text)) = list_item(line) {
             let mut block = text_block(BlockKind::List { ordered, level }, text);
             block.marker = marker;
             blocks.push(block);
+            at_block_start = true;
             continue;
         }
+        if at_block_start {
+            if let Some((align, header)) = table_header(line, lines.peek().copied()) {
+                lines.next();
+                let columns = header.len();
+                let mut rows = Vec::new();
+                loop {
+                    let stop = match lines.peek() {
+                        Some(next) => rows.len() >= MAX_BLOCKS || starts_block(next),
+                        None => true,
+                    };
+                    if stop {
+                        break;
+                    }
+                    let row = lines.next().expect("peeked row");
+                    let mut cells = split_cells(row, false).unwrap_or_default();
+                    cells.resize(columns, String::new());
+                    rows.push(cells.iter().map(|cell| inline(cell)).collect());
+                }
+                blocks.push(Block {
+                    kind: BlockKind::Table(Table { align, header, rows }),
+                    spans: Vec::new(),
+                    code: Vec::new(),
+                    marker: String::new(),
+                });
+                at_block_start = true;
+                continue;
+            }
+        }
         blocks.push(text_block(BlockKind::Paragraph, line));
+        at_block_start = false;
     }
     blocks
+}
+
+/// Whether a line starts a block that ends a table body.
+fn starts_block(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.is_empty()
+        || open_fence(line).is_some()
+        || heading(line).is_some()
+        || rule(line)
+        || quote(line).is_some()
+        || list_item(line).is_some()
+}
+
+/// Split one table row into trimmed cell source. `require_pipe` rejects a
+/// single plain line, which is only a valid body row after a table starts.
+fn split_cells(line: &str, require_pipe: bool) -> Option<Vec<String>> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut saw_pipe = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && chars.peek() == Some(&'|') {
+            // A pipe escaped at cell level is content even inside code spans.
+            cell.push('|');
+            chars.next();
+            continue;
+        }
+        if ch == '|' {
+            saw_pipe = true;
+            cells.push(cell.trim().to_owned());
+            cell.clear();
+            continue;
+        }
+        cell.push(ch);
+    }
+    cells.push(cell.trim().to_owned());
+    if require_pipe && !saw_pipe {
+        return None;
+    }
+    if line.starts_with('|') {
+        cells.remove(0);
+    }
+    if ends_with_unescaped_pipe(line) {
+        cells.pop();
+    }
+    if cells.is_empty() {
+        return None;
+    }
+    Some(cells)
+}
+
+/// Parse a header row and its delimiter row. Both must agree on a non-zero
+/// column count within [`MAX_TABLE_COLUMNS`].
+fn table_header(line: &str, next: Option<&str>) -> Option<(Vec<Align>, Vec<Cell>)> {
+    let next = next?;
+    let header = split_cells(line, true)?;
+    let delimiter = split_cells(next, true)?;
+    if header.is_empty()
+        || header.len() != delimiter.len()
+        || header.len() > MAX_TABLE_COLUMNS
+    {
+        return None;
+    }
+    let align = delimiter
+        .iter()
+        .map(|cell| delimiter_align(cell))
+        .collect::<Option<Vec<_>>>()?;
+    Some((align, header.iter().map(|cell| inline(cell)).collect()))
+}
+
+fn ends_with_unescaped_pipe(line: &str) -> bool {
+    if !line.ends_with('|') {
+        return false;
+    }
+    let backslashes = line[..line.len() - 1]
+        .chars()
+        .rev()
+        .take_while(|ch| *ch == '\\')
+        .count();
+    backslashes % 2 == 0
+}
+
+fn delimiter_align(cell: &str) -> Option<Align> {
+    let cell = cell.trim();
+    let left = cell.starts_with(':');
+    let right = cell.ends_with(':');
+    let body = cell.strip_prefix(':').unwrap_or(cell);
+    let body = body.strip_suffix(':').unwrap_or(body);
+    if body.is_empty() || !body.bytes().all(|byte| byte == b'-') {
+        return None;
+    }
+    Some(match (left, right) {
+        (true, true) => Align::Center,
+        (true, false) => Align::Left,
+        (false, true) => Align::Right,
+        (false, false) => Align::None,
+    })
 }
 
 /// A last-resort model when no Markdown source is available: one paragraph per
@@ -652,5 +847,130 @@ mod tests {
             .any(|span| span.text == "굵게" && span.style.bold));
         let text: String = spans.iter().map(|span| span.text.as_str()).collect();
         assert_eq!(text, "한글 굵게 *literal*");
+    }
+
+    fn cell_texts(row: &[Cell]) -> Vec<String> {
+        row.iter()
+            .map(|cell| cell.iter().map(|span| span.text.as_str()).collect())
+            .collect()
+    }
+
+    fn table_of(blocks: &[Block]) -> &Table {
+        match &blocks[0].kind {
+            BlockKind::Table(table) => table,
+            other => panic!("expected a table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn table_headers_alignment_and_body_cells_survive() {
+        let blocks = parse(
+            "| Name | 값 | Note |\n| :--- | :---: | ---: |\n| **a** | `b` | c |\n",
+        );
+        assert_eq!(blocks.len(), 1);
+        let table = table_of(&blocks);
+        assert_eq!(table.align, vec![Align::Left, Align::Center, Align::Right]);
+        assert_eq!(cell_texts(&table.header), vec!["Name", "값", "Note"]);
+        assert_eq!(table.rows.len(), 1);
+        assert!(table.rows[0][0]
+            .iter()
+            .any(|span| span.text == "a" && span.style.bold));
+        assert!(table.rows[0][1]
+            .iter()
+            .any(|span| span.text == "b" && span.style.code));
+        assert_eq!(blocks[0].text(), "Name\t값\tNote\na\tb\tc");
+    }
+
+    #[test]
+    fn table_edge_pipes_are_optional_and_spaces_trim() {
+        let blocks = parse("a | b\n:-- | --:\nc | d\n");
+        let table = table_of(&blocks);
+        assert_eq!(table.align, vec![Align::Left, Align::Right]);
+        assert_eq!(cell_texts(&table.header), vec!["a", "b"]);
+        assert_eq!(cell_texts(&table.rows[0]), vec!["c", "d"]);
+    }
+
+    #[test]
+    fn table_escaped_pipes_are_cells_not_separators() {
+        let blocks = parse("| f\\|oo | b |\n| --- | --- |\n| b `\\|` az | b **\\|** im |\n");
+        let table = table_of(&blocks);
+        assert_eq!(table.header.len(), 2);
+        assert_eq!(cell_texts(&table.header), vec!["f|oo", "b"]);
+        assert!(table.rows[0][0]
+            .iter()
+            .any(|span| span.text == "|" && span.style.code));
+        assert!(table.rows[0][1]
+            .iter()
+            .any(|span| span.text == "|" && span.style.bold));
+        assert_eq!(cell_texts(&table.rows[0]), vec!["b | az", "b | im"]);
+    }
+
+    #[test]
+    fn table_uneven_rows_pad_and_truncate() {
+        let blocks = parse("| a | b |\n| - | - |\n| 1 |\n| 2 | 3 | 4 |\n");
+        let table = table_of(&blocks);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(cell_texts(&table.rows[0]), vec!["1", ""]);
+        assert_eq!(cell_texts(&table.rows[1]), vec!["2", "3"]);
+    }
+
+    #[test]
+    fn table_header_delimiter_mismatch_stays_literal() {
+        let blocks = parse("| abc | def |\n| --- |\n| bar |\n");
+        assert!(blocks
+            .iter()
+            .all(|block| block.kind == BlockKind::Paragraph));
+        assert_eq!(blocks[0].text(), "| abc | def |");
+        assert_eq!(blocks[2].text(), "| bar |");
+    }
+
+    #[test]
+    fn table_ends_at_blank_line_or_another_block() {
+        let blocks = parse("| a | b |\n| - | - |\n| 1 | 2 |\n> quote\n\n# head\n");
+        assert!(matches!(blocks[0].kind, BlockKind::Table(_)));
+        assert_eq!(blocks[1].kind, BlockKind::Quote);
+        assert_eq!(blocks[2].kind, BlockKind::Heading(1));
+    }
+
+    #[test]
+    fn table_plain_line_is_a_one_cell_row_and_header_only_is_valid() {
+        let blocks = parse("| a | b |\n| - | - |\nbar\n\nbaz\n");
+        let table = table_of(&blocks);
+        assert_eq!(cell_texts(&table.rows[0]), vec!["bar", ""]);
+        assert_eq!(blocks[1].text(), "baz");
+
+        let header_only = parse("| a | b |\n| - | - |\n");
+        let table = table_of(&header_only);
+        assert!(table.rows.is_empty());
+    }
+
+    #[test]
+    fn table_does_not_start_inside_a_paragraph() {
+        let blocks = parse("para\n| a | b |\n| - | - |\n");
+        assert!(blocks
+            .iter()
+            .all(|block| block.kind == BlockKind::Paragraph));
+    }
+
+    #[test]
+    fn table_column_cap_falls_back_to_literal_lines() {
+        let header = format!("| {} |\n", vec!["a"; 33].join(" | "));
+        let delimiter = format!("| {} |\n", vec!["-"; 33].join(" | "));
+        let blocks = parse(&(header + &delimiter));
+        assert!(blocks
+            .iter()
+            .all(|block| block.kind == BlockKind::Paragraph));
+    }
+
+    #[test]
+    fn table_cell_images_remain_visible_to_consumers() {
+        let blocks = parse("| ![x](a.png) | b |\n| - | - |\n");
+        let mut images = Vec::new();
+        blocks[0].visit_spans(&mut |span| {
+            if span.style.image {
+                images.push(span.target.clone());
+            }
+        });
+        assert_eq!(images, [Some("a.png".to_owned())]);
     }
 }
