@@ -33,6 +33,7 @@ mod inventory;
 #[cfg(unix)]
 mod latest;
 mod ledger;
+mod lifetime;
 #[cfg(unix)]
 mod owned;
 #[cfg(unix)]

@@ -20,6 +20,9 @@ impl Lease {
             nonce,
         }
     }
+    pub fn nonce(&self) -> [u8; 16] {
+        self.nonce
+    }
     pub fn launch_binding(
         &self,
         index: &Index,

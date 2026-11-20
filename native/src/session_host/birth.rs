@@ -118,6 +118,10 @@ pub(crate) fn run(endpoint_path: &Path) -> io::Result<()> {
     // Unique root claim precedes every child effect; never remove/rebind a root.
     let endpoint = Endpoint::bind(endpoint_path)?;
     endpoint.nonblocking()?;
+    // The lifetime lock precedes publication, so a `Registered` entry implies
+    // that this process held it. Held to exit; children never inherit it.
+    let lifetime = super::lifetime::acquire(endpoint_path, &identity, bootstrap.lease.nonce())
+        .map_err(|error| invalid(format!("host lifetime lock: {error}")))?;
     let gate = Arc::new(Gate::new(store.clone(), bootstrap.lease.clone()));
     let (start, receive) = std::sync::mpsc::sync_channel::<Start>(1);
     // Reserve the essential worker before creating the child. Failure is no-spawn.
@@ -166,7 +170,9 @@ pub(crate) fn run(endpoint_path: &Path) -> io::Result<()> {
         gate.set(PublicationStatus::Unavailable);
     }
     // Post-spawn publication/ACK failures preserve the host and its PTY drain.
-    server.run()
+    let result = server.run();
+    drop(lifetime);
+    result
 }
 struct Start {
     store: Arc<Store>,
