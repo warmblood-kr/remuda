@@ -316,8 +316,30 @@ impl HostSession {
             return Ok(true);
         }
         if !matches!(entry.phase, Phase::Exited { .. }) {
-            // A gone host never publishes an exit; nothing more can settle.
-            return Ok(self.host_gone());
+            // A host that dies without an exit never publishes one. Acquiring
+            // its lifetime lock is the only proof that the process exited; a
+            // held lock, a missing lock or a mismatched binding stays unknown,
+            // so the entry is kept and the caller reports it.
+            let Some(nonce) = entry.birth.as_ref().map(model::Birth::nonce) else {
+                return Ok(false);
+            };
+            let keep =
+                entry.pending.is_some() || entry.streams.iter().any(|s| !s.results.is_empty());
+            let target = self.target();
+            drop(index);
+            return match super::lifetime::probe(&self.endpoint, &self.identity, nonce) {
+                super::lifetime::Probe::Released(held) => {
+                    if keep {
+                        return Ok(false);
+                    }
+                    // The commit re-reads under the store fence and refuses a
+                    // changed phase, a different nonce or a busy entry.
+                    self.owner.retire_absent(target, nonce).map_err(store)?;
+                    drop(held);
+                    Ok(true)
+                }
+                super::lifetime::Probe::Held | super::lifetime::Probe::Unknown => Ok(false),
+            };
         }
         if let Some(pending) = &entry.pending {
             self.owner

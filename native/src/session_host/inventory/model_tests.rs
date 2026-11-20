@@ -959,3 +959,94 @@ fn canceled_unspawned_launches_still_exhaust_lifetime_identity_budget() {
         Err(Error::Exhausted)
     ));
 }
+
+fn hosted(index: &mut Index, fence: Fence) {
+    let mut entry = Entry::reserved(identity(), [4; 16], r#"{"argv":["synthetic"]}"#).unwrap();
+    entry.birth = Some(Birth::new("/private/synthetic-host".into(), [7; 16]).unwrap());
+    apply(
+        index,
+        fence,
+        Mutation::ReserveLaunch {
+            name: "synthetic".into(),
+            entry,
+        },
+    );
+    index.entries.get_mut("synthetic").unwrap().phase = Phase::Registered;
+}
+
+#[test]
+fn retire_absent_requires_the_proven_birth_nonce() {
+    let (mut index, fence) = initial();
+    hosted(&mut index, fence);
+    assert!(matches!(
+        index.apply(
+            index.cursor(),
+            Some(fence),
+            Mutation::Exit {
+                target: target(),
+                operation: ExitMutation::RetireAbsent { nonce: [8; 16] },
+            }
+        ),
+        Err(Error::StaleFence)
+    ));
+    assert!(index.entries.contains_key("synthetic"));
+}
+
+#[test]
+fn retire_absent_refuses_a_reserved_published_or_busy_entry() {
+    let (mut index, fence) = initial();
+    let mut entry = Entry::reserved(identity(), [4; 16], r#"{"argv":["synthetic"]}"#).unwrap();
+    entry.birth = Some(Birth::new("/private/synthetic-host".into(), [7; 16]).unwrap());
+    apply(
+        &mut index,
+        fence,
+        Mutation::ReserveLaunch {
+            name: "synthetic".into(),
+            entry,
+        },
+    );
+    assert!(matches!(
+        index.apply(
+            index.cursor(),
+            Some(fence),
+            Mutation::Exit {
+                target: target(),
+                operation: ExitMutation::RetireAbsent { nonce: [7; 16] },
+            }
+        ),
+        Err(Error::Unavailable)
+    ));
+    index.entries.get_mut("synthetic").unwrap().phase = Phase::Registered;
+    apply(&mut index, fence, reserve(1, 7));
+    assert!(matches!(
+        index.apply(
+            index.cursor(),
+            Some(fence),
+            Mutation::Exit {
+                target: target(),
+                operation: ExitMutation::RetireAbsent { nonce: [7; 16] },
+            }
+        ),
+        Err(Error::Busy)
+    ));
+}
+
+#[test]
+fn retire_absent_removes_a_settled_host_and_tombstones_its_identity() {
+    let (mut index, fence) = initial();
+    hosted(&mut index, fence);
+    apply(
+        &mut index,
+        fence,
+        Mutation::Exit {
+            target: target(),
+            operation: ExitMutation::RetireAbsent { nonce: [7; 16] },
+        },
+    );
+    assert!(!index.entries.contains_key("synthetic"));
+    assert!(index.tombstones.iter().any(|tombstone| {
+        tombstone.name == "synthetic"
+            && tombstone.identity == identity()
+            && tombstone.generation == 0
+    }));
+}

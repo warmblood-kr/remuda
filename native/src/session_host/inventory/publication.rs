@@ -170,6 +170,9 @@ impl Birth {
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
+    pub fn nonce(&self) -> [u8; 16] {
+        self.nonce
+    }
     pub(super) fn validate(&self, phase: Phase) -> Result<()> {
         if self.schema != 1
             || self.endpoint.is_empty()

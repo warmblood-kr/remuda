@@ -1006,3 +1006,66 @@ fn refresh_failure_preserves_acknowledged_geometry_diagnostic() {
     let error = refused("refresh_failed: restore failed; last acknowledged size 511x128");
     assert!(error.to_string().contains("last acknowledged size 511x128"));
 }
+
+/// A host that dies with no exit published still holds its lifetime lock, so
+/// the lock is released and the entry must be retired or its name is held
+/// forever.
+#[test]
+fn teardown_retires_an_entry_whose_host_died_without_an_exit() {
+    let mut fixture = Fixture::new();
+    let session = adapter(&fixture.root);
+    assert!(matches!(
+        session.owner.index().unwrap().entries["synthetic"].phase,
+        Phase::Registered
+    ));
+    // The host process dies hard: no Stop, no exit publication.
+    let host = fixture.host.as_mut().unwrap();
+    host.0.kill().unwrap();
+    let _ = host.0.wait();
+    eventually(
+        "endpoint refuses",
+        || match std::os::unix::net::UnixStream::connect(session.endpoint.join("socket")) {
+            Ok(_) => None,
+            Err(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            )
+            .then_some(()),
+        },
+    );
+    let fresh = adapter(&fixture.root);
+    fresh.teardown(Duration::from_secs(10)).unwrap();
+    assert!(
+        !fresh
+            .owner
+            .index()
+            .unwrap()
+            .entries
+            .contains_key("synthetic"),
+        "a host that died without publishing an exit left its entry behind"
+    );
+}
+
+/// A live host still holds its lifetime lock, so removing its socket is not
+/// evidence of death and must never free the name.
+#[test]
+fn teardown_never_retires_a_live_host_without_a_socket() {
+    let mut fixture = Fixture::new();
+    let session = adapter(&fixture.root);
+    std::fs::remove_file(session.endpoint.join("socket")).unwrap();
+    let fresh = adapter(&fixture.root);
+    assert!(fresh.teardown(Duration::from_secs(1)).is_err());
+    assert!(
+        fresh
+            .owner
+            .index()
+            .unwrap()
+            .entries
+            .contains_key("synthetic"),
+        "a removed socket retired a live host"
+    );
+    // No socket is left for a graceful stop; end the host this test started.
+    let host = fixture.host.as_mut().unwrap();
+    host.0.kill().unwrap();
+    let _ = host.0.wait();
+}
