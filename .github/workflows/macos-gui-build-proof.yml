@@ -1,0 +1,46 @@
+name: macos-gui-build-proof
+
+# This is a GitHub-hosted, nonpublishing proof. The release workflow retains
+# its own stricter triggers and is not used to run untrusted PR code.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/macos-gui-build-proof.yml
+      - scripts/check-macos-gui-build.sh
+      - scripts/check-install-gui.sh
+      - docs/install.sh
+      - Cargo.toml
+      - Cargo.lock
+      - core/**
+      - native/**
+      - gui/**
+      - vendor/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: macos-15
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check arm64 and Metal toolchain
+        run: |
+          set -eu
+          [ "$(uname -m)" = arm64 ] || { echo 'expected arm64 runner' >&2; exit 1; }
+          xcodebuild -version
+          rustc --version
+          cargo --version
+          if ! xcrun metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun metal --version
+          rustup target add aarch64-apple-darwin
+      - name: Build locked binaries and check local archive
+        run: |
+          unset REMUDA_GUI_PROOF_BIN_DIR
+          sh scripts/check-macos-gui-build.sh
