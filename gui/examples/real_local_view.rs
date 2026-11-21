@@ -158,17 +158,14 @@ pub(crate) mod mac {
             bounded(
                 &mut command(
                     &remuda,
-                    &[
-                        "-e",
-                        "remuda.new('local-gui-proof', {'/bin/sh','-c','sleep 60'})",
-                    ],
+                    &["-e", "remuda.new('local-gui-proof', {'/bin/sh'})"],
                     &scratch.0,
                 ),
                 Duration::from_secs(10),
                 true,
             )?;
             bounded(
-                &mut command(
+                command(
                     &cargo,
                     &[
                         "test",
@@ -183,7 +180,8 @@ pub(crate) mod mac {
                         "--exact",
                     ],
                     &scratch.0,
-                ),
+                )
+                .env("REMUDA_GUI_ACCEPTANCE_INPUT", "1"),
                 Duration::from_secs(90),
                 true,
             )

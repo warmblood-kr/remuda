@@ -14,8 +14,14 @@ existing cluster membership and authenticated peer transport.
 
 Refresh updates the lists and clears the current preview. Offline or failed
 requests are shown as stale or unavailable; the preview is a snapshot, not a
-live terminal. Session creation, attachment, keyboard input, terminal styling,
-scrollback navigation and IME are not available in this prototype.
+live terminal. For a current local session, click the line input and type an
+ASCII line, then press Enter to send it. The snapshot refreshes periodically.
+Only one line can be in flight, including across selection changes. A failure
+can leave delivery uncertain; the GUI identifies the original session and
+disables further input. Check it before restarting the GUI. This uses
+instance-bound input and does not attach or reserve the session. Remote input,
+session creation, interactive terminal keys, terminal styling, scrollback
+navigation and IME are not available in this prototype.
 
 The current prototype has been built and exercised on macOS. Other platforms
 have not been validated for this GUI.
@@ -87,7 +93,8 @@ REMUDA_GUI_ACCEPTANCE_REMUDA="$PWD/target/debug/remuda" REMUDA_GUI_ACCEPTANCE_WO
 
 The supervisor uses temporary runtime, config, data and state directories, starts
 an in-process-backend local daemon, and stops it on exit. It verifies an actual
-session reaches the GPUI model and its row is laid out; TestWindow does not
+session reaches the GPUI model, its row is laid out, and a simulated click and
+line submission produce output from the isolated shell. TestWindow does not
 assert physical window pixels, fonts or OS input. The normal GUI test suite
 includes cancellation and failure-path checks. Commands run in separate
 sessions and cleanup signals only their owned process groups; a descendant that
