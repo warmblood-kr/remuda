@@ -961,6 +961,7 @@ mod tests {
             unavailable: false,
             program_status: None,
             program_title: None,
+            program_status_last_updated_at_ms: None,
             program_status_age_ms: None,
             remote_input_disabled: false,
             team: None,
@@ -972,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_title_is_not_serialized_in_a_peer_listing() {
+    fn a_local_listing_carries_the_report_time_but_not_the_title() {
         let mut row = summary("member", Some("instance"));
         row.program_status = Some(remuda_core::agent::ProgramStatus {
             state: remuda_core::agent::ProgramState::Working,
@@ -981,10 +982,15 @@ mod tests {
             progress: None,
         });
         row.program_title = Some("private work summary".into());
+        row.program_status_last_updated_at_ms = Some(1_700_000_000_000);
         let json = serde_json::to_string(&list(vec![row])).expect("serialize listing");
         assert!(
             !json.contains("private work summary") && !json.contains("program_title"),
             "a peer listing must not publish an agent title: {json}"
+        );
+        assert!(
+            json.contains("program_status_last_updated_at_ms"),
+            "a local listing must expose the report time: {json}"
         );
     }
 

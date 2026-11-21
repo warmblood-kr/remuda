@@ -55,6 +55,7 @@ mod tests {
                 team: None,
                 program_status: None,
                 program_title: None,
+                program_status_last_updated_at_ms: None,
                 program_status_age_ms: None,
             },
             "last output".into(),

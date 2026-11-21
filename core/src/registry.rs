@@ -112,9 +112,14 @@ pub struct SessionSummary {
     /// client and JSON listings cannot republish an agent's own words.
     #[serde(skip)]
     pub program_title: Option<String>,
-    /// Monotonic age of `program_status` when it was copied out. A list,
-    /// cache clone or relist must not reset this; staleness is a display
-    /// decision, not a core TTL.
+    /// UTC Unix timestamp (ms) of the report behind `program_status`; local
+    /// display data. A local listing carries it; the remote front strips it
+    /// before encoding a peer response. Freshness also needs the monotonic age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_status_last_updated_at_ms: Option<u64>,
+    /// Monotonic age in ms at copy time, from the tracker's `Instant`; never
+    /// derived from the wall-clock timestamp. This is the freshness value.
+    /// A relist recomputes it; a cached row keeps the copy it was given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_status_age_ms: Option<u64>,
     /// Local-only policy: this exact instance refuses authenticated cluster
@@ -853,6 +858,9 @@ impl Registry {
                         unavailable: false,
                         program_status: program.as_ref().map(|o| o.status.clone()),
                         program_title: program.as_ref().and_then(|o| o.title.clone()),
+                        program_status_last_updated_at_ms: program
+                            .as_ref()
+                            .and_then(|o| o.observed_at_ms),
                         program_status_age_ms: program
                             .map(|o| o.age.as_millis().try_into().unwrap_or(u64::MAX)),
                         remote_input_disabled: false,
@@ -1092,6 +1100,7 @@ fn hosted_summary(handle: &SessionHandle) -> SessionSummary {
         unavailable: false,
         program_status: None,
         program_title: None,
+        program_status_last_updated_at_ms: None,
         program_status_age_ms: None,
         remote_input_disabled: false,
         team: None,
