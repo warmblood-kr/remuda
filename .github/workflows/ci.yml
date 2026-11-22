@@ -12,6 +12,9 @@ on:
     branches: [main]
   pull_request:
   merge_group:
+  schedule:
+    - cron: "23 19 * * *"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,14 +34,23 @@ jobs:
       - run: sh scripts/test-no-python.sh
 
   test:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --locked -p remuda-core --lib
+      - run: cargo test --locked -p remuda-native --test cli_exec --test reload_faults --no-fail-fast
+
+  # Keep the full suite on a daily schedule and allow an on-demand run on main.
+  test-full-linux:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: cargo test --workspace --all-targets --no-fail-fast
 
   test-aarch64-linux:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     # The owner runs remuda on Termux (aarch64 Android). Nothing else here
     # builds for aarch64 Linux, so arch-specific breakage (ring's asm, pty
     # ioctls, atomics) would first show up on the phone. Same arch and kernel
@@ -50,8 +62,8 @@ jobs:
       - run: cargo test --workspace --all-targets --no-fail-fast
 
   build-android:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    # Prove the Termux release build and smoke on main pushes, before this
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    # Prove the Termux release build and smoke in extended CI before this
     # target becomes part of release.yml's strict all-platform publish gate.
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -109,11 +121,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      # The full workspace suite is main-only. Keep the Windows session-host
+      # The full workspace suite is extended. Keep the Windows session-host
       # endpoint tests visible on every pull request that can change them.
       - name: Windows session-host endpoint
         run: cargo test -p remuda-native --lib session_host::windows -- --nocapture
-      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         run: cargo test --workspace --all-targets --no-fail-fast
       - run: pwsh -NoProfile -File scripts/check-install-pair.ps1
 
@@ -136,7 +148,7 @@ jobs:
       - run: BUTLER_REPO="$GITHUB_WORKSPACE/remuda-butler" scripts/check-butler-contract.sh
 
   test-hosted:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     # The native suite with every new session host-backed (#713), the bar for
     # making hosting the default. It also fails when the run leaves a session
     # host alive (leaks use up the machine's pseudo-terminals). Tests of
@@ -159,7 +171,7 @@ jobs:
     # Pull requests opt in with the `ci-macos` label, because macOS runners
     # cost ten times a Linux one.
     if: |
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) ||
       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-macos'))
     runs-on: macos-15
     timeout-minutes: 30
@@ -171,12 +183,11 @@ jobs:
         run: sh scripts/test-hosted-suite.sh hosted
 
   host-compat-n-plus-one:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     # A reload replaces the daemon while session hosts keep running, so a
     # daemon and a host from adjacent builds must work in both directions.
-    # N is the commit this change lands on; N+1 is this checkout. N already
-    # has everything merged before this PR, so a test never assumes N lacks
-    # a feature: it asks N (help, caps) and asserts per answer. One daemon
+    # N is the parent of this checkout. A test never assumes N lacks a feature:
+    # it asks N (help, caps) and asserts per answer. One daemon
     # creates a hosted session, dies, and the other build adopts it.
     # Planting an AcquireWriter sent without the capability check, or a host
     # that refuses a plain Acquire, turns one direction red (steps/061).
@@ -187,10 +198,8 @@ jobs:
         with:
           fetch-depth: 0
       - name: Build N from the base commit
-        env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
         run: |
-          git worktree add "$RUNNER_TEMP/base" "$BASE"
+          git worktree add "$RUNNER_TEMP/base" HEAD^
           cargo build --manifest-path "$RUNNER_TEMP/base/Cargo.toml" --bins --target-dir "$RUNNER_TEMP/base-target"
           mkdir "$RUNNER_TEMP/n"
           cp "$RUNNER_TEMP/base-target/debug/remuda" "$RUNNER_TEMP/base-target/debug/remuda-session-host" "$RUNNER_TEMP/n/"
@@ -202,7 +211,7 @@ jobs:
         run: REMUDA_COMPAT_NO_SKIP=1 REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test db_cli_live -- --ignored older_build
 
   compat-week-old-main:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     # Users update every few days, not every PR, so they cross several schema
     # steps at once. N is the last main commit at least 7 days old (old
     # nightly tags are deleted, so they cannot be used). Each step asks N
@@ -247,7 +256,7 @@ jobs:
           REMUDA_COMPAT_PREVIOUS="$RUNNER_TEMP/n" cargo test -p remuda-native --test session_host_daemon -- --ignored "$filter"
 
   vfs-compat-pre-sqlite:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     # Nodes from before index.db (#778) still run in clusters. Two daemons of
     # this build and one from the last commit before it must sync both ways,
     # and the documented downgrade and re-upgrade must keep every name.
@@ -455,7 +464,7 @@ jobs:
         run: cargo deny check bans licenses sources
 
   code-metrics:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     # Informational only — coverage, lines of code, and per-file complexity.
     # `continue-on-error` at the job level so a metrics-tool hiccup, or a
     # number nobody likes, can never turn this build red. No threshold is
@@ -766,6 +775,5 @@ jobs:
           grep -q "ci.yml: does not parse as YAML" /tmp/out \
             || { echo "::error::check-workflows.py rejected for the wrong reason"; exit 1; }
 
-      - name: the suite still passes once every leak is reverted
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: cargo test --workspace --all-targets
+      - name: negative controls leave the checkout unchanged
+        run: git diff --exit-code
