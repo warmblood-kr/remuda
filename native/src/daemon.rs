@@ -1062,6 +1062,18 @@ fn check_split_lock_alias(alias: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn prepare_split_lock_alias(root: &Path, alias: &Path, target: &Path) -> std::io::Result<()> {
+    crate::session_host::hosted::Hosting::prepare_split_state(root)?;
+    // Reserve one lock path even when legacy and split-state starts race.
+    match std::os::unix::fs::symlink(target, alias) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    check_split_lock_alias(alias, target)
+}
+
 #[cfg(unix)]
 const SOCKET_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 #[cfg(unix)]
@@ -1088,17 +1100,7 @@ impl SocketLock {
                 .map_or_else(|| alias.clone(), |root| root.join("daemon.lock"));
             #[cfg(target_os = "macos")]
             if let Some(root) = state_root.as_ref() {
-                crate::session_host::hosted::Hosting::prepare_split_state(root)?;
-                // Choose the lock inode namespace atomically, including when
-                // a legacy start races a first opt-in start. Legacy diagnostics
-                // can still find the pid through the compatibility alias.
-                match std::os::unix::fs::symlink(&lock_path, &alias) {
-                    Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
-                        return Err(error)
-                    }
-                    _ => {}
-                }
-                check_split_lock_alias(&alias, &lock_path)?;
+                prepare_split_lock_alias(root, &alias, &lock_path)?;
             }
             let mut options = std::fs::OpenOptions::new();
             if cfg!(target_os = "macos") {
