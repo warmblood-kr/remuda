@@ -24,6 +24,8 @@ use std::time::Duration;
 #[serde(deny_unknown_fields)]
 pub(crate) struct Bootstrap {
     pub store: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<PathBuf>,
     pub lease: Lease,
     pub launch: Box<RawValue>,
 }
@@ -116,7 +118,7 @@ pub(crate) fn run(endpoint_path: &Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     // Unique root claim precedes every child effect; never remove/rebind a root.
-    let endpoint = Endpoint::bind(endpoint_path)?;
+    let endpoint = Endpoint::bind_with_socket(endpoint_path, bootstrap.socket.as_deref())?;
     endpoint.nonblocking()?;
     let gate = Arc::new(Gate::new(store.clone(), bootstrap.lease.clone()));
     let (start, receive) = std::sync::mpsc::sync_channel::<Start>(1);
@@ -166,7 +168,20 @@ pub(crate) fn run(endpoint_path: &Path) -> io::Result<()> {
         gate.set(PublicationStatus::Unavailable);
     }
     // Post-spawn publication/ACK failures preserve the host and its PTY drain.
-    server.run()
+    server.run()?;
+    if let Some(socket) = bootstrap.socket.as_deref() {
+        // The server exits only after the controller proves terminal settlement.
+        // A forced host exit leaves the endpoint for inventory recovery.
+        let _ = std::fs::remove_file(socket);
+        if let Some(parent) = socket.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+        for name in ["session.json", "capability", "socket-path"] {
+            let _ = std::fs::remove_file(endpoint_path.join(name));
+        }
+        let _ = std::fs::remove_dir(endpoint_path);
+    }
+    Ok(())
 }
 struct Start {
     store: Arc<Store>,

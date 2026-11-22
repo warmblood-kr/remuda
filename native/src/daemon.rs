@@ -483,7 +483,7 @@ fn open_endpoint(
     Arc<SocketOwnership>,
 )> {
     let (lock, handed) = match handed {
-        Some((listener, lock)) => (SocketLock::adopt(lock)?, Some(listener)),
+        Some((listener, lock)) => (SocketLock::adopt(path, lock)?, Some(listener)),
         None => (SocketLock::acquire(path, runtime)?, None),
     };
     {
@@ -496,10 +496,15 @@ fn open_endpoint(
         refuse_if_listening(path)?;
     }
     // Under the socket lock: a replacement daemon reads what this one wrote.
-    match instance_id::load_or_create(path) {
+    let instance_id_path = lock.state_root.as_ref().map_or_else(
+        || instance_id::path_for(path),
+        |root| root.join("daemon-id"),
+    );
+    match instance_id::load_or_create(&instance_id_path) {
         Ok(id) => {
             let _ = DAEMON_INSTANCE_ID.set(id);
         }
+        Err(error) if lock.state_root.is_some() => return Err(error),
         Err(error) => eprintln!(
             "remuda daemon: no stable daemon id ({error}); sessions get the process ID instead"
         ),
@@ -1030,12 +1035,75 @@ mod publication;
 #[path = "daemon/staged_startup_tests.rs"]
 mod staged_startup_tests;
 
-/// Serialize stale-socket removal and bind for one daemon name. The lock file
-/// stays in the runtime directory; unlinking it would let contenders lock
-/// different inodes while one daemon still owns the old file.
+/// Serialize stale-socket removal and bind for one daemon name. Unlinking the
+/// lock would let contenders lock different inodes while a daemon owns it.
 struct SocketLock {
     #[cfg(unix)]
     _file: std::fs::File,
+    #[cfg(unix)]
+    state_root: Option<PathBuf>,
+}
+
+#[cfg(unix)]
+fn socket_lock_path(socket: &Path) -> PathBuf {
+    let mut name = socket.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+#[cfg(target_os = "macos")]
+fn check_split_lock_alias(alias: &Path, target: &Path) -> std::io::Result<()> {
+    if std::fs::read_link(alias).as_deref().ok() != Some(target) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "separate daemon state requires a fresh daemon namespace or its original state directory",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_split_lock_alias(root: &Path, alias: &Path, target: &Path) -> std::io::Result<()> {
+    crate::session_host::hosted::Hosting::prepare_split_state(root)?;
+    // Reserve one lock path even when legacy and split-state starts race.
+    match std::os::unix::fs::symlink(target, alias) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    check_split_lock_alias(alias, target)
+}
+
+#[cfg(unix)]
+fn open_socket_lock(path: &Path, split: bool) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut options = std::fs::OpenOptions::new();
+    if cfg!(target_os = "macos") {
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| {
+            if cfg!(target_os = "macos") && !split && error.raw_os_error() == Some(libc::ELOOP) {
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "daemon lock location requires its original state directory",
+                )
+            } else {
+                error
+            }
+        })?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("daemon lock is not a regular file"));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -1048,7 +1116,6 @@ impl SocketLock {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
             prepare_socket_path(socket, runtime).map_err(|error| {
                 std::io::Error::new(
@@ -1056,17 +1123,17 @@ impl SocketLock {
                     format!("prepare socket path {}: {error}", socket.display()),
                 )
             })?;
-            let mut lock_name = socket.as_os_str().to_os_string();
-            lock_name.push(".lock");
-            let lock_path = PathBuf::from(lock_name);
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .mode(0o600)
-                .open(&lock_path)?;
-            std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))?;
+            let alias = socket_lock_path(socket);
+            let hosting = crate::session_host::hosted::Hosting::for_socket(socket);
+            let state_root = hosting.split_state_root()?;
+            let lock_path = state_root
+                .as_ref()
+                .map_or_else(|| alias.clone(), |root| root.join("daemon.lock"));
+            #[cfg(target_os = "macos")]
+            if let Some(root) = state_root.as_ref() {
+                prepare_split_lock_alias(root, &alias, &lock_path)?;
+            }
+            let file = open_socket_lock(&lock_path, state_root.is_some())?;
             let started = std::time::Instant::now();
             let deadline = started + SOCKET_LOCK_WAIT;
             let mut announced = false;
@@ -1107,7 +1174,14 @@ impl SocketLock {
                     return Err(error);
                 }
             }
-            Ok(Self { _file: file })
+            #[cfg(target_os = "macos")]
+            if let Some(root) = state_root.as_ref() {
+                hosting.pin_split_state(root)?;
+            }
+            Ok(Self {
+                _file: file,
+                state_root,
+            })
         }
         #[cfg(windows)]
         {
@@ -1120,11 +1194,29 @@ impl SocketLock {
     /// The lock a replaced daemon handed over: already held, since a passed
     /// fd shares its `flock`. It now names this process.
     #[cfg(unix)]
-    fn adopt(lock: std::os::fd::OwnedFd) -> std::io::Result<Self> {
+    fn adopt(socket: &Path, lock: std::os::fd::OwnedFd) -> std::io::Result<Self> {
         use std::os::fd::AsRawFd;
         let file = std::fs::File::from(lock);
+        let state_root =
+            crate::session_host::hosted::Hosting::for_socket(socket).split_state_root()?;
+        #[cfg(target_os = "macos")]
+        if let Some(root) = state_root.as_ref() {
+            use std::os::unix::fs::MetadataExt;
+            let target = root.join("daemon.lock");
+            check_split_lock_alias(&socket_lock_path(socket), &target)?;
+            let expected = std::fs::symlink_metadata(target)?;
+            let held = file.metadata()?;
+            if !expected.is_file() || (expected.dev(), expected.ino()) != (held.dev(), held.ino()) {
+                return Err(std::io::Error::other(
+                    "reload lock does not match the protected daemon lock",
+                ));
+            }
+        }
         Self::name_this_process(file.as_raw_fd())?;
-        Ok(Self { _file: file })
+        Ok(Self {
+            _file: file,
+            state_root,
+        })
     }
 
     /// Write this process's pid into the held lock file `fd`.
@@ -6089,6 +6181,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn split_lock_alias_refuses_legacy_file_and_different_state_root() {
+        let dir = socket_test_dir("split-lock");
+        let alias = dir.join("daemon.sock.lock");
+        let target = dir.join("daemon.lock");
+        std::fs::write(&alias, "legacy lock").unwrap();
+        assert!(super::check_split_lock_alias(&alias, &target).is_err());
+        assert_eq!(std::fs::read_to_string(&alias).unwrap(), "legacy lock");
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(dir.join("other.lock"), &alias).unwrap();
+        assert!(super::check_split_lock_alias(&alias, &target).is_err());
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        super::check_split_lock_alias(&alias, &target).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]

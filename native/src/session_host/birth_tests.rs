@@ -187,6 +187,7 @@ impl Fixture {
         );
         let bootstrap = Bootstrap {
             store: root.join("inventory"),
+            socket: None,
             lease,
             launch: RawValue::from_string(raw).unwrap(),
         };

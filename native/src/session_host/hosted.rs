@@ -84,10 +84,12 @@ mod default_hosting_tests {
     }
 }
 
-/// Private per-daemon state: `<socket>.hosts/` holds the inventory and one
-/// directory per host endpoint. Opened lazily; nothing exists until used.
+/// Private per-daemon state and endpoint roots. In the legacy layout both
+/// roots are `<socket>.hosts/`. Opened lazily; nothing exists until used.
 pub struct Hosting {
-    root: PathBuf,
+    #[cfg(target_os = "macos")]
+    socket: Option<PathBuf>,
+    socket_root: PathBuf,
     hosts: Mutex<Option<Arc<Hosts>>>,
     gate: Arc<Gate>,
     /// Teardowns of closed sessions still running off the request thread.
@@ -96,10 +98,118 @@ pub struct Hosting {
 struct Hosts {
     owner: Arc<Owner>,
     root: PathBuf,
+    socket_root: PathBuf,
     gate: Arc<Gate>,
     /// Opened handles by name, kept for teardown after the Registry drops one.
     open: Mutex<HashMap<String, Arc<HostSession>>>,
 }
+
+fn create_socket_root(path: &Path) -> io::Result<std::fs::File> {
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+        _ => {}
+    }
+    super::unix::directory(path)
+}
+
+#[cfg(target_os = "macos")]
+const STATE_OVERRIDE: &str = "REMUDA_SESSION_HOST_STATE_DIR";
+
+#[cfg(target_os = "macos")]
+fn metadata_if_present(path: &Path) -> io::Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(info) => Ok(Some(info)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_symlink(path: &Path) -> io::Result<Option<PathBuf>> {
+    match std::fs::read_link(path) {
+        Ok(target) => Ok(Some(target)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn managed_default_socket(socket: &Path) -> bool {
+    std::env::var_os("REMUDA_RUNTIME_DIR").is_none()
+        && std::env::var_os("XDG_RUNTIME_DIR").is_none()
+        && socket.parent() == Some(crate::daemon::runtime_dir().join("remuda").as_path())
+}
+
+#[cfg(target_os = "macos")]
+fn default_state_base() -> io::Result<PathBuf> {
+    let home = std::env::home_dir()
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            io::Error::other("session host state requires an absolute home directory")
+        })?;
+    Ok(home
+        .canonicalize()?
+        .join("Library/Application Support/Remuda/session-hosts"))
+}
+
+#[cfg(target_os = "macos")]
+fn is_default_state_root(root: &Path) -> bool {
+    root.file_name()
+        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"default-"))
+}
+
+#[cfg(target_os = "macos")]
+fn boot_namespace() -> io::Result<String> {
+    let mut bytes = [0_u8; 37];
+    let mut size = bytes.len();
+    // SAFETY: the name is a NUL-terminated string and oldp can hold size bytes.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    boot_namespace_for(&bytes[..size.min(bytes.len())])
+}
+
+#[cfg(target_os = "macos")]
+fn boot_namespace_for(bytes: &[u8]) -> io::Result<String> {
+    let Some((0, uuid)) = bytes.split_last() else {
+        return Err(io::Error::other("invalid macOS boot session UUID"));
+    };
+    if uuid.len() != 36
+        || uuid.iter().enumerate().any(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte != b'-'
+            } else {
+                !byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return Err(io::Error::other("invalid macOS boot session UUID"));
+    }
+    Ok(format!("boot-{}", String::from_utf8_lossy(uuid)))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn boot_namespaces_keep_inventory_paths_distinct() {
+    let root = Path::new("/state/default-server");
+    let first = boot_namespace_for(b"88289E9F-B575-4D8C-9529-0D704F52D68A\0").unwrap();
+    let second = boot_namespace_for(b"88289E9F-B575-4D8C-9529-0D704F52D68B\0").unwrap();
+    assert_ne!(
+        root.join(first).join("inventory"),
+        root.join(second).join("inventory")
+    );
+    assert!(boot_namespace_for(b"../../other-boot\0").is_err());
+}
+
 pub struct NewHosted<'a> {
     pub name: &'a str,
     pub session_id: &'a str,
@@ -117,7 +227,9 @@ impl Hosting {
         let mut name = socket.file_name().unwrap_or_default().to_os_string();
         name.push(".hosts");
         Self {
-            root: socket.with_file_name(name),
+            #[cfg(target_os = "macos")]
+            socket: Some(socket.to_owned()),
+            socket_root: socket.with_file_name(name),
             hosts: Mutex::new(None),
             gate: Arc::default(),
             retiring: Arc::default(),
@@ -127,22 +239,150 @@ impl Hosting {
     #[cfg(test)]
     pub(crate) fn at(root: PathBuf) -> Self {
         Self {
-            root,
+            #[cfg(target_os = "macos")]
+            socket: None,
+            socket_root: root,
             hosts: Mutex::new(None),
             gate: Arc::default(),
             retiring: Arc::default(),
         }
     }
+    pub(crate) fn split_state_root(&self) -> io::Result<Option<PathBuf>> {
+        #[cfg(target_os = "macos")]
+        if let Some(socket) = &self.socket {
+            return self.macos_state_root(socket);
+        }
+        Ok(None)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_state_root(&self, socket: &Path) -> io::Result<Option<PathBuf>> {
+        let pin = read_symlink(&self.socket_root.join("state-location"))?;
+        let mut lock_name = socket.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        let lock = PathBuf::from(lock_name);
+        let lock_metadata = metadata_if_present(&lock)?;
+        let alias = match lock_metadata.as_ref() {
+            Some(info) if info.is_symlink() => read_symlink(&lock)?,
+            _ => None,
+        };
+        // An old daemon never wrote a split-state pin or a lock alias.
+        // Keep its namespace even if a cleaner removed inventory files.
+        if pin.is_none()
+            && alias.is_none()
+            && (lock_metadata.is_some()
+                || metadata_if_present(socket)?.is_some()
+                || metadata_if_present(&self.socket_root)?.is_some())
+        {
+            if std::env::var_os(STATE_OVERRIDE).is_some() {
+                return Err(io::Error::other(
+                    "separate session host state requires a fresh daemon namespace",
+                ));
+            }
+            return Ok(None);
+        }
+        let override_dir = std::env::var_os(STATE_OVERRIDE);
+        let base = if let Some(base) = &override_dir {
+            let base = Path::new(base);
+            super::unix::directory(base)?;
+            base.canonicalize()?
+        } else if pin.is_some() || alias.is_some() || managed_default_socket(socket) {
+            default_state_base()?
+        } else {
+            return Ok(None);
+        };
+        if metadata_if_present(&self.socket_root.join("inventory"))?.is_some() {
+            return Err(io::Error::other(
+                "legacy and protected host state both exist",
+            ));
+        }
+
+        let parent = self.socket_root.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "missing socket directory")
+        })?;
+        let name = self
+            .socket_root
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing socket name"))?;
+        let identity = parent.canonicalize()?.join(name);
+        let namespace = hex(&super::inventory::model::hash(
+            identity.as_os_str().as_encoded_bytes(),
+        ));
+        let namespace = if override_dir.is_some() {
+            namespace
+        } else {
+            format!("default-{namespace}")
+        };
+        let requested = base.join(namespace);
+        if pin.as_ref().is_some_and(|path| *path != requested)
+            || alias
+                .as_ref()
+                .is_some_and(|path| *path != requested.join("daemon.lock"))
+        {
+            return Err(io::Error::other(
+                "session host state directory changed; restore the original setting",
+            ));
+        }
+        if pin.is_some() {
+            super::unix::directory(&requested)?;
+        }
+        Ok(Some(requested))
+    }
+
+    fn state_root(&self) -> io::Result<PathBuf> {
+        if let Some(root) = self.split_state_root()? {
+            #[cfg(target_os = "macos")]
+            if is_default_state_root(&root) {
+                return Ok(root.join(boot_namespace()?));
+            }
+            return Ok(root);
+        }
+        Ok(self.socket_root.clone())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn pin_split_state(&self, root: &Path) -> io::Result<()> {
+        let socket_root = create_socket_root(&self.socket_root)?;
+        let pin = self.socket_root.join("state-location");
+        match std::os::unix::fs::symlink(root, &pin) {
+            Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+            _ => {}
+        }
+        if std::fs::read_link(&pin)? != root {
+            return Err(io::Error::other("session host state directory changed"));
+        }
+        // Persist the namespace before publishing its location.
+        if let Some(parent) = root.parent() {
+            super::unix::directory(parent)?.sync_all()?;
+        }
+        socket_root.sync_all()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn prepare_split_state(root: &Path) -> io::Result<()> {
+        if is_default_state_root(root) {
+            let base = default_state_base()?;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(&base)?;
+            super::unix::directory(&base)?.sync_all()?;
+            boot_namespace()?;
+        }
+        create_socket_root(root)?.sync_all()
+    }
+
     fn hosts(&self, create: bool) -> io::Result<Option<Arc<Hosts>>> {
         let mut hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(hosts) = hosts.as_ref() {
             return Ok(Some(hosts.clone()));
         }
-        let inventory = self.root.join("inventory");
+        let root = self.state_root()?;
+        let inventory = root.join("inventory");
         let store = if inventory.exists() {
             Store::open(&inventory)
         } else if create {
-            match std::fs::DirBuilder::new().mode(0o700).create(&self.root) {
+            match std::fs::DirBuilder::new().mode(0o700).create(&root) {
                 Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
                 _ => {}
             }
@@ -156,7 +396,8 @@ impl Hosting {
             .map_err(|error| io::Error::other(format!("session host claim: {error:?}")))?;
         let opened = Arc::new(Hosts {
             owner: Arc::new(owner),
-            root: self.root.clone(),
+            root,
+            socket_root: self.socket_root.clone(),
             gate: Arc::clone(&self.gate),
             open: Mutex::new(HashMap::new()),
         });
@@ -256,7 +497,7 @@ impl Hosting {
     /// Read-only check of every registered host, for a daemon that must not
     /// claim yet (a reload candidate): no fence moves and no lease is taken.
     pub fn preflight(&self) -> io::Result<Vec<Checked>> {
-        let inventory = self.root.join("inventory");
+        let inventory = self.state_root()?.join("inventory");
         if !inventory.exists() {
             return Ok(Vec::new());
         }
@@ -453,8 +694,10 @@ impl Hosts {
         };
         let launch_id = random()?;
         let nonce = random()?;
-        let endpoint = self.root.join(hex(&random::<8>()?));
-        socket_fits(&endpoint.join("socket"))?;
+        let key = hex(&random::<8>()?);
+        let endpoint = self.root.join(&key);
+        let socket = self.socket_root.join(key).join("socket");
+        socket_fits(&socket)?;
         let endpoint_text = endpoint
             .to_str()
             .ok_or("session host path is not UTF-8")?
@@ -482,6 +725,7 @@ impl Hosts {
         };
         let bootstrap = serde_json::to_vec(&Bootstrap {
             store: self.root.join("inventory"),
+            socket: (self.root != self.socket_root).then_some(socket),
             lease: Lease::new(
                 store,
                 Target {

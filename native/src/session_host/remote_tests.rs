@@ -163,6 +163,7 @@ impl Fixture {
         );
         let bootstrap = serde_json::to_vec(&Bootstrap {
             store: root.join("inventory"),
+            socket: None,
             lease,
             launch: RawValue::from_string(raw).unwrap(),
         })

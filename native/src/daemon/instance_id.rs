@@ -1,7 +1,6 @@
 //! A daemon-instance id that outlives one daemon process (reload step 2).
 //!
-//! Kept beside the socket as `<socket>.daemon-id` and read under the socket
-//! lock, so every daemon that serves this socket bakes the same
+//! Read under the socket lock, so every daemon that serves this socket bakes the same
 //! `REMUDA_DAEMON_ID` into its sessions. Host-backed sessions survive their
 //! daemon; the shutdown guard must still recognize them after a restart.
 
@@ -20,15 +19,14 @@ pub(super) fn path_for(socket: &Path) -> PathBuf {
 
 /// The id stored for `socket`. A missing, malformed or symlinked file is
 /// replaced by a fresh random id written owner-only.
-pub(super) fn load_or_create(socket: &Path) -> io::Result<String> {
-    let path = path_for(socket);
-    if let Some(id) = read_valid(&path)? {
+pub(super) fn load_or_create(path: &Path) -> io::Result<String> {
+    if let Some(id) = read_valid(path)? {
         return Ok(id);
     }
     let mut bytes = [0u8; HEX_LEN / 2];
     getrandom::fill(&mut bytes).map_err(|error| io::Error::other(format!("entropy: {error}")))?;
     let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    crate::fs_atomic::write_atomic_exact_mode(&path, id.as_bytes(), 0o600)?;
+    crate::fs_atomic::write_atomic_exact_mode(path, id.as_bytes(), 0o600)?;
     Ok(id)
 }
 
@@ -66,19 +64,19 @@ mod tests {
     #[test]
     fn the_same_socket_keeps_its_id_and_another_socket_gets_its_own() {
         let dir = scratch("stable");
-        let socket = dir.join("s.sock");
-        let first = load_or_create(&socket).unwrap();
+        let path = path_for(&dir.join("s.sock"));
+        let first = load_or_create(&path).unwrap();
         assert_eq!(first.len(), 32);
         assert_eq!(
-            load_or_create(&socket).unwrap(),
+            load_or_create(&path).unwrap(),
             first,
             "a second daemon reads the same id"
         );
-        assert_ne!(load_or_create(&dir.join("t.sock")).unwrap(), first);
-        let mode = std::fs::metadata(path_for(&socket))
-            .unwrap()
-            .permissions()
-            .mode();
+        assert_ne!(
+            load_or_create(&path_for(&dir.join("t.sock"))).unwrap(),
+            first
+        );
+        let mode = std::fs::metadata(path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -86,17 +84,17 @@ mod tests {
     #[test]
     fn a_malformed_or_symlinked_id_file_is_replaced_not_trusted() {
         let dir = scratch("malformed");
-        let socket = dir.join("s.sock");
-        std::fs::write(path_for(&socket), "12345").unwrap();
-        let replaced = load_or_create(&socket).unwrap();
+        let path = path_for(&dir.join("s.sock"));
+        std::fs::write(&path, "12345").unwrap();
+        let replaced = load_or_create(&path).unwrap();
         assert_ne!(replaced, "12345");
-        assert_eq!(load_or_create(&socket).unwrap(), replaced);
+        assert_eq!(load_or_create(&path).unwrap(), replaced);
 
         let target = dir.join("elsewhere");
         std::fs::write(&target, "0123456789abcdef0123456789abcdef").unwrap();
-        std::fs::remove_file(path_for(&socket)).unwrap();
-        std::os::unix::fs::symlink(&target, path_for(&socket)).unwrap();
-        let fresh = load_or_create(&socket).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let fresh = load_or_create(&path).unwrap();
         assert_ne!(
             fresh, "0123456789abcdef0123456789abcdef",
             "a symlink is not followed"
