@@ -1075,6 +1075,38 @@ fn prepare_split_lock_alias(root: &Path, alias: &Path, target: &Path) -> std::io
 }
 
 #[cfg(unix)]
+fn open_socket_lock(path: &Path, split: bool) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut options = std::fs::OpenOptions::new();
+    if cfg!(target_os = "macos") {
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| {
+            if cfg!(target_os = "macos") && !split && error.raw_os_error() == Some(libc::ELOOP) {
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "daemon lock location requires its original state directory",
+                )
+            } else {
+                error
+            }
+        })?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("daemon lock is not a regular file"));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(unix)]
 const SOCKET_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 #[cfg(unix)]
 const SOCKET_LOCK_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1084,7 +1116,6 @@ impl SocketLock {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
             prepare_socket_path(socket, runtime).map_err(|error| {
                 std::io::Error::new(
@@ -1102,34 +1133,7 @@ impl SocketLock {
             if let Some(root) = state_root.as_ref() {
                 prepare_split_lock_alias(root, &alias, &lock_path)?;
             }
-            let mut options = std::fs::OpenOptions::new();
-            if cfg!(target_os = "macos") {
-                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-            }
-            let file = options
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .mode(0o600)
-                .open(&lock_path)
-                .map_err(|error| {
-                    if cfg!(target_os = "macos")
-                        && state_root.is_none()
-                        && error.raw_os_error() == Some(libc::ELOOP)
-                    {
-                        std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            "daemon lock location requires its original state directory",
-                        )
-                    } else {
-                        error
-                    }
-                })?;
-            if !file.metadata()?.is_file() {
-                return Err(std::io::Error::other("daemon lock is not a regular file"));
-            }
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            let file = open_socket_lock(&lock_path, state_root.is_some())?;
             let started = std::time::Instant::now();
             let deadline = started + SOCKET_LOCK_WAIT;
             let mut announced = false;

@@ -309,9 +309,14 @@ fn separate_host_state_survives_runtime_cleanup_and_daemon_replacement() {
         std::fs::read_to_string(instance_file).unwrap(),
         daemon_identity
     );
+    close_split_host(&path, &state, identity);
+}
+
+#[cfg(target_os = "macos")]
+fn close_split_host(path: &Path, state: &Path, identity: String) {
     assert_eq!(
         request(
-            &path,
+            path,
             &Request::Close {
                 name: "work".into(),
                 instance_id: Some(identity),
@@ -321,7 +326,7 @@ fn separate_host_state_survives_runtime_cleanup_and_daemon_replacement() {
         Response::Ok,
     );
     let deadline = Instant::now() + PATIENCE;
-    while regular_files(&state)
+    while regular_files(state)
         .iter()
         .any(|file| file.file_name().unwrap() == "capability")
     {
