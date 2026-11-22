@@ -74,10 +74,19 @@ lowercase hexadecimal. This helps diagnose terminal-specific wheel behavior.
 
 On macOS, fresh daemons at Remuda's built-in runtime path keep their sockets
 there and store locks, session-host credentials, and recovery records under
-`~/Library/Application Support/Remuda/session-hosts/`. Host state belongs to
-the current boot, so a restart can rediscover running hosts and a system
-reboot starts with an empty session inventory. Old boot directories may
-remain on disk.
+`~/Library/Application Support/Remuda/session-hosts/`. On Linux, fresh
+daemons keep their sockets under `$XDG_RUNTIME_DIR/remuda/` or the existing
+`/tmp/remuda-$USER/remuda/` fallback, and store state under
+`${XDG_STATE_HOME:-$HOME/.local/state}/remuda/session-hosts/`.
+
+Host state belongs to the current boot, so a daemon restart can rediscover
+running hosts and a system reboot starts with an empty session inventory.
+Old boot directories may remain on disk. On Linux, protected state also
+belongs to its original PID namespace for that boot. Restart Remuda inside
+the same container to recover its sessions. A replacement container sharing
+the previous container's state and socket paths needs a fresh daemon
+namespace. Remuda refuses protected state when its procfs does not show
+the local PID namespace or access to PID 1's start time is restricted.
 
 An existing daemon namespace keeps its legacy layout while its socket,
 lock, or host directory is present. To switch, end its sessions, confirm
@@ -88,10 +97,11 @@ place. To downgrade a protected namespace to a build that predates split
 state, drain and stop it first, then move its runtime entries aside so
 the older build starts with a fresh inventory.
 
-Custom socket or runtime paths use the legacy layout by default. To opt in,
-set `REMUDA_SESSION_HOST_STATE_DIR` to a private absolute directory owned
-by your user with mode `0700` before starting a fresh namespace. Use the
-same setting on subsequent starts, including after a restart.
+Explicit socket paths and `REMUDA_RUNTIME_DIR` overrides use the legacy
+layout by default. To opt in on macOS or Linux, set
+`REMUDA_SESSION_HOST_STATE_DIR` to a private absolute directory owned by
+your user with mode `0700` before starting a fresh namespace. Use the same
+setting on subsequent starts, including after a restart.
 
 ## Cascading spawn
 

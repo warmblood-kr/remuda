@@ -87,7 +87,7 @@ mod default_hosting_tests {
 /// Private per-daemon state and endpoint roots. In the legacy layout both
 /// roots are `<socket>.hosts/`. Opened lazily; nothing exists until used.
 pub struct Hosting {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     socket: Option<PathBuf>,
     socket_root: PathBuf,
     hosts: Mutex<Option<Arc<Hosts>>>,
@@ -112,10 +112,10 @@ fn create_socket_root(path: &Path) -> io::Result<std::fs::File> {
     super::unix::directory(path)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const STATE_OVERRIDE: &str = "REMUDA_SESSION_HOST_STATE_DIR";
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn metadata_if_present(path: &Path) -> io::Result<Option<std::fs::Metadata>> {
     match std::fs::symlink_metadata(path) {
         Ok(info) => Ok(Some(info)),
@@ -124,7 +124,7 @@ fn metadata_if_present(path: &Path) -> io::Result<Option<std::fs::Metadata>> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn read_symlink(path: &Path) -> io::Result<Option<PathBuf>> {
     match std::fs::read_link(path) {
         Ok(target) => Ok(Some(target)),
@@ -133,10 +133,10 @@ fn read_symlink(path: &Path) -> io::Result<Option<PathBuf>> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn managed_default_socket(socket: &Path) -> bool {
     std::env::var_os("REMUDA_RUNTIME_DIR").is_none()
-        && std::env::var_os("XDG_RUNTIME_DIR").is_none()
+        && (!cfg!(target_os = "macos") || std::env::var_os("XDG_RUNTIME_DIR").is_none())
         && socket.parent() == Some(crate::daemon::runtime_dir().join("remuda").as_path())
 }
 
@@ -152,7 +152,14 @@ fn default_state_base() -> io::Result<PathBuf> {
         .join("Library/Application Support/Remuda/session-hosts"))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "linux")]
+#[path = "linux_state.rs"]
+mod linux_state;
+
+#[cfg(target_os = "linux")]
+use linux_state::default_state_base;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn is_default_state_root(root: &Path) -> bool {
     root.file_name()
         .is_some_and(|name| name.as_encoded_bytes().starts_with(b"default-"))
@@ -227,7 +234,7 @@ impl Hosting {
         let mut name = socket.file_name().unwrap_or_default().to_os_string();
         name.push(".hosts");
         Self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             socket: Some(socket.to_owned()),
             socket_root: socket.with_file_name(name),
             hosts: Mutex::new(None),
@@ -239,7 +246,7 @@ impl Hosting {
     #[cfg(test)]
     pub(crate) fn at(root: PathBuf) -> Self {
         Self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             socket: None,
             socket_root: root,
             hosts: Mutex::new(None),
@@ -248,15 +255,15 @@ impl Hosting {
         }
     }
     pub(crate) fn split_state_root(&self) -> io::Result<Option<PathBuf>> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(socket) = &self.socket {
-            return self.macos_state_root(socket);
+            return self.unix_split_state_root(socket);
         }
         Ok(None)
     }
 
-    #[cfg(target_os = "macos")]
-    fn macos_state_root(&self, socket: &Path) -> io::Result<Option<PathBuf>> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn unix_split_state_root(&self, socket: &Path) -> io::Result<Option<PathBuf>> {
         let pin = read_symlink(&self.socket_root.join("state-location"))?;
         let mut lock_name = socket.as_os_str().to_os_string();
         lock_name.push(".lock");
@@ -329,6 +336,15 @@ impl Hosting {
         Ok(Some(requested))
     }
 
+    #[cfg(target_os = "linux")]
+    fn state_root(&self) -> io::Result<PathBuf> {
+        match self.split_state_root()? {
+            Some(root) => linux_state::boot_state_root(&root, false),
+            None => Ok(self.socket_root.clone()),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn state_root(&self) -> io::Result<PathBuf> {
         if let Some(root) = self.split_state_root()? {
             #[cfg(target_os = "macos")]
@@ -340,8 +356,10 @@ impl Hosting {
         Ok(self.socket_root.clone())
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn pin_split_state(&self, root: &Path) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        linux_state::boot_state_root(root, true)?;
         let socket_root = create_socket_root(&self.socket_root)?;
         let pin = self.socket_root.join("state-location");
         match std::os::unix::fs::symlink(root, &pin) {
@@ -358,7 +376,7 @@ impl Hosting {
         socket_root.sync_all()
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn prepare_split_state(root: &Path) -> io::Result<()> {
         if is_default_state_root(root) {
             let base = default_state_base()?;
@@ -367,9 +385,13 @@ impl Hosting {
                 .recursive(true)
                 .create(&base)?;
             super::unix::directory(&base)?.sync_all()?;
+            #[cfg(target_os = "macos")]
             boot_namespace()?;
         }
-        create_socket_root(root)?.sync_all()
+        create_socket_root(root)?.sync_all()?;
+        #[cfg(target_os = "linux")]
+        linux_state::boot_state_root(root, false)?;
+        Ok(())
     }
 
     fn hosts(&self, create: bool) -> io::Result<Option<Arc<Hosts>>> {
