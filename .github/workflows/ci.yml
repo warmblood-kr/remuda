@@ -186,7 +186,8 @@ jobs:
     if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     # A reload replaces the daemon while session hosts keep running, so a
     # daemon and a host from adjacent builds must work in both directions.
-    # N is the parent of this checkout. A test never assumes N lacks a feature:
+    # N precedes the latest build change, ignoring release-index-only commits.
+    # A test never assumes N lacks a feature:
     # it asks N (help, caps) and asserts per answer. One daemon
     # creates a hosted session, dies, and the other build adopts it.
     # Planting an AcquireWriter sent without the capability check, or a host
@@ -199,7 +200,8 @@ jobs:
           fetch-depth: 0
       - name: Build N from the base commit
         run: |
-          git worktree add "$RUNNER_TEMP/base" HEAD^
+          current=$(git log -1 --format=%H -- Cargo.toml Cargo.lock .cargo core native vendor)
+          git worktree add "$RUNNER_TEMP/base" "$current^"
           cargo build --manifest-path "$RUNNER_TEMP/base/Cargo.toml" --bins --target-dir "$RUNNER_TEMP/base-target"
           mkdir "$RUNNER_TEMP/n"
           cp "$RUNNER_TEMP/base-target/debug/remuda" "$RUNNER_TEMP/base-target/debug/remuda-session-host" "$RUNNER_TEMP/n/"
