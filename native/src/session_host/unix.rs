@@ -4,6 +4,7 @@ use super::channel::{Channel, Key, LocalIo};
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -63,6 +64,10 @@ fn trusted_ancestors(path: &Path) -> io::Result<()> {
 }
 impl Endpoint {
     pub fn bind(path: &Path) -> io::Result<Self> {
+        Self::bind_with_socket(path, None)
+    }
+
+    pub fn bind_with_socket(path: &Path, socket: Option<&Path>) -> io::Result<Self> {
         if !path.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -82,7 +87,24 @@ impl Endpoint {
             .open(path.join("capability"))?;
         file.write_all(&key.0)?;
         file.sync_all()?;
-        let socket = path.join("socket");
+        let socket = match socket {
+            Some(socket) => {
+                let parent = socket.parent().ok_or_else(denied)?;
+                if socket.file_name() != Some(std::ffi::OsStr::new("socket")) || parent == path {
+                    return Err(denied());
+                }
+                socket_path_bytes(socket)?;
+                trusted_ancestors(parent)?;
+                DirBuilder::new().mode(0o700).create(parent)?;
+                self::directory(parent)?;
+                crate::fs_atomic::write_atomic_lua_private(
+                    &path.join("socket-path"),
+                    socket.as_os_str().as_bytes(),
+                )?;
+                socket.to_path_buf()
+            }
+            None => path.join("socket"),
+        };
         let listener = UnixListener::bind(&socket)?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
         directory.sync_all()?;
@@ -127,6 +149,43 @@ impl Endpoint {
         &self.path
     }
 }
+fn socket_path_bytes(socket: &Path) -> io::Result<()> {
+    let bytes = socket.as_os_str().as_bytes();
+    if !socket.is_absolute()
+        || bytes.len() > crate::staged_socket::SOCKET_PATH_LIMIT
+        || bytes.contains(&0)
+    {
+        return Err(denied());
+    }
+    Ok(())
+}
+fn socket_path(path: &Path) -> io::Result<PathBuf> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path.join("socket-path"))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(path.join("socket")),
+        Err(error) => return Err(error),
+    };
+    let info = file.metadata()?;
+    let limit = crate::staged_socket::SOCKET_PATH_LIMIT;
+    if !info.is_file()
+        || info.uid() != uid()
+        || info.mode() & 0o7777 != 0o600
+        || info.nlink() != 1
+        || info.len() > limit as u64
+    {
+        return Err(denied());
+    }
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    let socket = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+    socket_path_bytes(&socket)?;
+    directory(socket.parent().ok_or_else(denied)?)?;
+    Ok(socket)
+}
 pub(crate) fn connect(path: &Path) -> io::Result<Channel<UnixStream>> {
     let until = Instant::now() + Duration::from_secs(2);
     let _directory = directory(path)?;
@@ -145,7 +204,7 @@ pub(crate) fn connect(path: &Path) -> io::Result<Channel<UnixStream>> {
     }
     let mut key = Key([0; 32]);
     file.read_exact(&mut key.0)?;
-    let socket = path.join("socket");
+    let socket = socket_path(path)?;
     let info = std::fs::symlink_metadata(&socket)?;
     if !info.file_type().is_socket() || info.uid() != uid() || info.mode() & 0o7777 != 0o600 {
         return Err(denied());

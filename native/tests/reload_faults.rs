@@ -163,6 +163,176 @@ fn wait_for(path: &Path, name: &str, needle: &str) {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[cfg(target_os = "macos")]
+fn hosted_instance(path: &Path) -> String {
+    let Response::Sessions(sessions) = request(path, &Request::List) else {
+        panic!("expected a session list");
+    };
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    assert!(
+        sessions[0].alive && !sessions[0].unavailable,
+        "{sessions:?}"
+    );
+    sessions[0].instance_id.clone().expect("host instance")
+}
+
+#[cfg(target_os = "macos")]
+fn regular_files(path: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.file_type().unwrap();
+        if kind.is_dir() {
+            files.extend(regular_files(&entry.path()));
+        } else if kind.is_file() {
+            files.push(entry.path());
+        }
+    }
+    files
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_host_becomes_unreachable_when_cleanup_removes_its_capability() {
+    let root = Root::new("legacy-cleanup");
+    let path = root.socket();
+    let mut daemon = Daemon::spawn(&root, true, &[]);
+    new_session(&path, "work");
+    let identity = hosted_instance(&path);
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+
+    let key = regular_files(&path.with_file_name("s.sock.hosts"))
+        .into_iter()
+        .find(|file| file.file_name().unwrap() == "capability")
+        .expect("legacy capability next to the host socket");
+    assert!(key.with_file_name("socket").exists());
+    std::fs::remove_file(key).unwrap();
+    let _daemon = Daemon::spawn(&root, true, &[]);
+    let Response::Sessions(sessions) = request(&path, &Request::List) else {
+        panic!("expected a session list");
+    };
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    assert_eq!(sessions[0].instance_id.as_deref(), Some(identity.as_str()));
+    assert!(sessions[0].unavailable, "{sessions:?}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn separate_host_state_survives_runtime_cleanup_and_daemon_replacement() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = Root::new("split-cleanup");
+    let state = root.0.join("host-state");
+    // The production state and runtime roots are siblings. The sweep below is
+    // confined to the daemon's runtime namespace, never the fixture state.
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&state)
+        .unwrap();
+    let layout = [("REMUDA_SESSION_HOST_STATE_DIR", state.to_str().unwrap())];
+    let path = root.socket();
+    let mut daemon = Daemon::spawn(&root, true, &layout);
+    new_session(&path, "work");
+    let identity = hosted_instance(&path);
+    let hosts = host_pids(&root);
+    assert_eq!(hosts.len(), 1, "{hosts:?}");
+    assert_eq!(
+        send_line(&path, "work", "echo BEFORE-$((6*7))"),
+        Response::Ok
+    );
+    wait_for(&path, "work", "BEFORE-42");
+
+    let files = regular_files(&state);
+    for name in [
+        "capability",
+        "session.json",
+        "inventory.json",
+        "inventory.lock",
+        "daemon.lock",
+        "daemon-id",
+    ] {
+        assert!(
+            files.iter().any(|file| file.file_name().unwrap() == name),
+            "{files:?}"
+        );
+    }
+    let lock = path.with_file_name("s.sock.lock");
+    assert!(std::fs::read_link(&lock).is_ok());
+    let lock_inode = std::fs::metadata(&lock).unwrap().ino();
+    let instance_file = files
+        .iter()
+        .find(|file| file.file_name().unwrap() == "daemon-id")
+        .unwrap();
+    let daemon_identity = std::fs::read_to_string(instance_file).unwrap();
+    for file in regular_files(path.parent().unwrap()) {
+        // Model expiration of every regular file in the isolated socket tree.
+        // The cleaner preserves sockets and symlinks.
+        std::fs::remove_file(file).unwrap();
+    }
+    assert_eq!(std::fs::metadata(&lock).unwrap().ino(), lock_inode);
+    assert_eq!(root.lock_pid(), daemon.0.id());
+    let contender = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock)
+        .unwrap();
+    assert!(matches!(
+        contender.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+
+    let _replacement = Daemon::spawn(&root, true, &layout);
+    assert_eq!(hosted_instance(&path), identity);
+    assert_eq!(host_pids(&root), hosts);
+    assert_eq!(std::fs::metadata(&lock).unwrap().ino(), lock_inode);
+    assert_eq!(
+        std::fs::read_to_string(instance_file).unwrap(),
+        daemon_identity
+    );
+    wait_for(&path, "work", "BEFORE-42");
+    assert_eq!(
+        send_line(&path, "work", "echo AFTER-$((8*9))"),
+        Response::Ok
+    );
+    wait_for(&path, "work", "AFTER-72");
+
+    let reload = root.remuda(&["reload"]);
+    assert!(reload.status.success(), "{:?}", text(&reload));
+    assert_eq!(hosted_instance(&path), identity);
+    assert_eq!(host_pids(&root), hosts);
+    assert_eq!(std::fs::metadata(&lock).unwrap().ino(), lock_inode);
+    assert_eq!(
+        std::fs::read_to_string(instance_file).unwrap(),
+        daemon_identity
+    );
+    assert_eq!(
+        request(
+            &path,
+            &Request::Close {
+                name: "work".into(),
+                instance_id: Some(identity),
+                confirm: Some(true),
+            }
+        ),
+        Response::Ok,
+    );
+    let deadline = Instant::now() + PATIENCE;
+    while regular_files(&state)
+        .iter()
+        .any(|file| file.file_name().unwrap() == "capability")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "retired capability was not removed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn text(out: &Output) -> (String, String) {
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),

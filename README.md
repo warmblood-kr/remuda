@@ -72,6 +72,27 @@ To record the bytes your terminal sends while attached, set
 appends one line per input read, with a Unix timestamp and the bytes in
 lowercase hexadecimal. This helps diagnose terminal-specific wheel behavior.
 
+On macOS, fresh daemons at Remuda's built-in runtime path keep their sockets
+there and store locks, session-host credentials, and recovery records under
+`~/Library/Application Support/Remuda/session-hosts/`. Host state belongs to
+the current boot, so a restart can rediscover running hosts and a system
+reboot starts with an empty session inventory. Old boot directories may
+remain on disk.
+
+An existing daemon namespace keeps its legacy layout while its socket,
+lock, or host directory is present. To switch, end its sessions, confirm
+their hosts have exited, and stop its daemon. Move that namespace's old
+`<server>.sock`, `<server>.sock.lock`, and `<server>.sock.hosts` entries
+aside if present, then restart. Leave neighboring daemon namespaces in
+place. To downgrade a protected namespace to a build that predates split
+state, drain and stop it first, then move its runtime entries aside so
+the older build starts with a fresh inventory.
+
+Custom socket or runtime paths use the legacy layout by default. To opt in,
+set `REMUDA_SESSION_HOST_STATE_DIR` to a private absolute directory owned
+by your user with mode `0700` before starting a fresh namespace. Use the
+same setting on subsequent starts, including after a restart.
+
 ## Cascading spawn
 
 ![A terminal session tree: butler has spawned a lead session, which has in
