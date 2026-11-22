@@ -1051,7 +1051,7 @@ fn socket_lock_path(socket: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn check_split_lock_alias(alias: &Path, target: &Path) -> std::io::Result<()> {
     if std::fs::read_link(alias).as_deref().ok() != Some(target) {
         return Err(std::io::Error::new(
@@ -1062,7 +1062,7 @@ fn check_split_lock_alias(alias: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn prepare_split_lock_alias(root: &Path, alias: &Path, target: &Path) -> std::io::Result<()> {
     crate::session_host::hosted::Hosting::prepare_split_state(root)?;
     // Reserve one lock path even when legacy and split-state starts race.
@@ -1079,7 +1079,7 @@ fn open_socket_lock(path: &Path, split: bool) -> std::io::Result<std::fs::File> 
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let mut options = std::fs::OpenOptions::new();
-    if cfg!(target_os = "macos") {
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options
@@ -1090,7 +1090,10 @@ fn open_socket_lock(path: &Path, split: bool) -> std::io::Result<std::fs::File> 
         .mode(0o600)
         .open(path)
         .map_err(|error| {
-            if cfg!(target_os = "macos") && !split && error.raw_os_error() == Some(libc::ELOOP) {
+            if cfg!(any(target_os = "macos", target_os = "linux"))
+                && !split
+                && error.raw_os_error() == Some(libc::ELOOP)
+            {
                 std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
                     "daemon lock location requires its original state directory",
@@ -1129,7 +1132,7 @@ impl SocketLock {
             let lock_path = state_root
                 .as_ref()
                 .map_or_else(|| alias.clone(), |root| root.join("daemon.lock"));
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             if let Some(root) = state_root.as_ref() {
                 prepare_split_lock_alias(root, &alias, &lock_path)?;
             }
@@ -1174,7 +1177,7 @@ impl SocketLock {
                     return Err(error);
                 }
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             if let Some(root) = state_root.as_ref() {
                 hosting.pin_split_state(root)?;
             }
@@ -1199,7 +1202,7 @@ impl SocketLock {
         let file = std::fs::File::from(lock);
         let state_root =
             crate::session_host::hosted::Hosting::for_socket(socket).split_state_root()?;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(root) = state_root.as_ref() {
             use std::os::unix::fs::MetadataExt;
             let target = root.join("daemon.lock");

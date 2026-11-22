@@ -164,7 +164,7 @@ fn wait_for(path: &Path, name: &str, needle: &str) {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn hosted_instance(path: &Path) -> String {
     let Response::Sessions(sessions) = request(path, &Request::List) else {
         panic!("expected a session list");
@@ -177,7 +177,7 @@ fn hosted_instance(path: &Path) -> String {
     sessions[0].instance_id.clone().expect("host instance")
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn regular_files(path: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(path).unwrap() {
@@ -192,7 +192,7 @@ fn regular_files(path: &Path) -> Vec<PathBuf> {
     files
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn legacy_host_becomes_unreachable_when_cleanup_removes_its_capability() {
     let root = Root::new("legacy-cleanup");
@@ -218,7 +218,7 @@ fn legacy_host_becomes_unreachable_when_cleanup_removes_its_capability() {
     assert!(sessions[0].unavailable, "{sessions:?}");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn separate_host_state_survives_runtime_cleanup_and_daemon_replacement() {
     use std::os::unix::fs::MetadataExt;
@@ -312,7 +312,7 @@ fn separate_host_state_survives_runtime_cleanup_and_daemon_replacement() {
     close_split_host(&path, &state, identity);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn close_split_host(path: &Path, state: &Path, identity: String) {
     assert_eq!(
         request(
