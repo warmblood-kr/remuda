@@ -68,7 +68,7 @@ rustls-platform-verifier = { version = "0.7", default-features = false }
 sha2 = "0.10"
 regex = "1.12.3"
 base64 = "0.22"
-url = "2.5"
+url = "2.5.9"
 serde_json = { version = "1.0.140", features = ["raw_value"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 getrandom = "=0.3.4"
