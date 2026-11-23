@@ -223,8 +223,9 @@ fn gui_command(server: &str, args: &[&str]) -> ExitCode {
     launch_gui()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn launch_gui() -> ExitCode {
+    #[cfg(target_os = "macos")]
     use std::os::unix::process::CommandExt;
     let executable = match std::env::current_exe() {
         Ok(path) => path,
@@ -232,10 +233,17 @@ fn launch_gui() -> ExitCode {
     };
     let sibling = match gui_managed::choose(&executable, dist::BUILD_VERSION) {
         Ok(Some(path)) => path,
-        Ok(None) => executable.with_file_name("remuda-gui"),
+        Ok(None) => executable.with_file_name(gui_managed::EXECUTABLE),
         Err(error) => return fail(format!("cannot locate managed GUI: {error}")),
     };
-    let error = std::process::Command::new(&sibling).exec();
+    let mut command = std::process::Command::new(&sibling);
+    #[cfg(target_os = "macos")]
+    let error = command.exec();
+    #[cfg(windows)]
+    let error = match command.spawn() {
+        Ok(_) => return ExitCode::SUCCESS,
+        Err(error) => error,
+    };
     if error.kind() == std::io::ErrorKind::NotFound {
         fail(format!("GUI executable is not installed beside remuda at {}. Build it with `cargo build --release --locked --manifest-path gui/Cargo.toml` and install it beside remuda.", sibling.display()))
     } else {
@@ -246,9 +254,9 @@ fn launch_gui() -> ExitCode {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn launch_gui() -> ExitCode {
-    fail("remuda gui is currently supported on macOS only")
+    fail("remuda gui is supported on macOS and Windows")
 }
 
 /// Hidden native verbs are not user-facing CLI commands. One role function

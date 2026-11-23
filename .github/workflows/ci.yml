@@ -113,6 +113,8 @@ jobs:
       # endpoint tests visible on every pull request that can change them.
       - name: Windows session-host endpoint
         run: cargo test -p remuda-native --lib session_host::windows -- --nocapture
+      - name: Windows local GUI launcher
+        run: cargo test --locked -p remuda-native --test gui_launcher
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: cargo test --workspace --all-targets --no-fail-fast
       - run: pwsh -NoProfile -File scripts/check-install-pair.ps1
