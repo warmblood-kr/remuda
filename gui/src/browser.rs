@@ -10,6 +10,9 @@ use remuda_native::{CommandBuilder, PtyAgent};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const TERMINAL_LINE_HEIGHT: f32 = 18.0;
+const TERMINAL_CELL_WIDTH: f32 = 8.0;
+
 struct Document {
     request: DocumentRequest,
     title: String,
@@ -67,7 +70,7 @@ pub fn open(
                                     cx.notify();
                                 }
                                 if !browser.document_active {
-                                    browser.refresh_terminal(cx);
+                                    browser.refresh_terminal(window, cx);
                                 }
                             })
                         })
@@ -101,8 +104,15 @@ impl Browser {
         self.document_active = true;
     }
 
-    fn refresh_terminal(&mut self, cx: &mut Context<Self>) {
+    fn refresh_terminal(&mut self, window: &Window, cx: &mut Context<Self>) {
         if let Some(terminal) = self.terminal.as_mut() {
+            let viewport = window.viewport_size();
+            let cols = ((f32::from(viewport.width) - 24.0) / TERMINAL_CELL_WIDTH) as u16;
+            let rows = ((f32::from(viewport.height) - 72.0) / TERMINAL_LINE_HEIGHT) as u16;
+            let size = Size::for_viewport(cols, rows);
+            if terminal.size() != size && terminal.is_alive() {
+                let _ = terminal.resize(size);
+            }
             if let Ok(screen) = terminal.screen_text() {
                 if screen != self.terminal_text {
                     self.terminal_text = screen;
@@ -127,6 +137,11 @@ impl Browser {
             "down" => b"\x1b[B",
             "right" => b"\x1b[C",
             "left" => b"\x1b[D",
+            "home" => b"\x1b[H",
+            "end" => b"\x1b[F",
+            "delete" => b"\x1b[3~",
+            "pageup" => b"\x1b[5~",
+            "pagedown" => b"\x1b[6~",
             key_name
                 if key.modifiers.control
                     && key_name.len() == 1
@@ -257,7 +272,7 @@ impl Render for Browser {
                 tabs.child(
                     div()
                         .id("document-tab")
-                            .debug_selector(|| "browser-document-tab".into())
+                        .debug_selector(|| "browser-document-tab".into())
                         .p_2()
                         .cursor_pointer()
                         .child(document.title.clone())
@@ -307,6 +322,8 @@ impl Render for Browser {
                     .bg(rgb(0x101216))
                     .text_color(rgb(0xe8eaf0))
                     .font_family(if cfg!(windows) { "Consolas" } else { "Menlo" })
+                    .text_size(px(13.0))
+                    .line_height(px(TERMINAL_LINE_HEIGHT))
                     .children(
                         self.terminal_text
                             .lines()
