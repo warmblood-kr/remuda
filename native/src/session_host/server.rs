@@ -9,6 +9,7 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 const MAX_CONNECTIONS: usize = 16;
 const MAX_SNAPSHOT: usize = super::api::MAX_SNAPSHOT_BYTES;
@@ -65,9 +66,33 @@ impl Server {
         server
     }
     pub fn run(self: Arc<Self>) -> io::Result<()> {
+        const CAPABILITY_CHECK_PERIOD: Duration = Duration::from_secs(30);
         self.endpoint.nonblocking()?;
+        let mut next_capability_check = Instant::now() + CAPABILITY_CHECK_PERIOD;
+        let mut capability_repair: Option<JoinHandle<()>> = None;
         while !self.stop.load(Ordering::Acquire) {
-            self.frames.expire(Instant::now());
+            let now = Instant::now();
+            self.frames.expire(now);
+            if now >= next_capability_check {
+                if capability_repair
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished)
+                {
+                    capability_repair = None;
+                }
+                if capability_repair.is_none()
+                    && self.endpoint.capability_missing().unwrap_or(false)
+                {
+                    let endpoint = self.endpoint.clone();
+                    capability_repair = std::thread::Builder::new()
+                        .name("session-host-capability".into())
+                        .spawn(move || {
+                            let _ = endpoint.restore_missing_capability();
+                        })
+                        .ok();
+                }
+                next_capability_check = now + CAPABILITY_CHECK_PERIOD;
+            }
             match self.endpoint.accept_stream() {
                 Ok(stream) => {
                     let Some(permit) = Permit::connection(self.connections.clone()) else {

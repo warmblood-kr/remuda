@@ -25,6 +25,7 @@ use remuda_core::session_operations::{
 };
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -56,6 +57,7 @@ pub(crate) struct HostSession {
     endpoint: PathBuf,
     client: [u8; 16],
     acts: Mutex<()>,
+    teardown_failed: AtomicBool,
     gate: Arc<super::gate::Gate>,
 }
 impl HostSession {
@@ -80,6 +82,7 @@ impl HostSession {
             endpoint: PathBuf::from(birth.endpoint()),
             client,
             acts: Mutex::new(()),
+            teardown_failed: AtomicBool::new(false),
             gate: Arc::default(),
         };
         session.identity().validate()?;
@@ -90,6 +93,15 @@ impl HostSession {
     pub fn gated(mut self, gate: Arc<super::gate::Gate>) -> Self {
         self.gate = gate;
         self
+    }
+    pub fn matches_instance(&self, instance: &str) -> bool {
+        self.identity.instance == instance
+    }
+    pub fn note_teardown_failure(&self) {
+        self.teardown_failed.store(true, Ordering::Relaxed);
+    }
+    pub fn claim_teardown_retry(&self, identity: &HostIdentity) -> bool {
+        self.identity == *identity && self.teardown_failed.swap(false, Ordering::Relaxed)
     }
     fn target(&self) -> Target {
         Target {
@@ -317,7 +329,7 @@ impl HostSession {
         }
         if !matches!(entry.phase, Phase::Exited { .. }) {
             // A gone host never publishes an exit; nothing more can settle.
-            return Ok(self.host_gone());
+            return Ok(self.listener_missing());
         }
         if let Some(pending) = &entry.pending {
             self.owner
@@ -339,7 +351,7 @@ impl HostSession {
         }
         // A host already stopped (say, before a crash) has no listener left;
         // the store still refuses Retire unless the exit is settled.
-        if !*stopped && !self.host_gone() {
+        if !*stopped && !self.listener_missing() {
             let mut client = self.controller()?;
             // Stop refuses while raw input is unretired; a gone viewer's is ours.
             discard_abandoned(&mut client);
@@ -352,8 +364,6 @@ impl HostSession {
         self.owner.retire(self.target()).map_err(store)?;
         Ok(true)
     }
-    /// No listener at the endpoint: the host process is gone. Any other
-    /// failure (a slow or busy host) is not proof.
     fn wait_for_frame(&self, version: u64, timeout: Duration) -> Result<VersionedSnapshot> {
         let until = Instant::now() + timeout;
         let mut client = self.viewer()?;
@@ -383,14 +393,9 @@ impl HostSession {
             }
         }
     }
-    fn host_gone(&self) -> bool {
-        match std::os::unix::net::UnixStream::connect(self.endpoint.join("socket")) {
-            Ok(_) => false,
-            Err(error) => matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ),
-        }
+    /// Observe the listener without inferring that the child exited.
+    fn listener_missing(&self) -> bool {
+        super::unix::listener_missing(&self.endpoint)
     }
     /// Non-input control (resize, close, stop) is not reserved in the store.
     /// A fencing host refuses a superseded owner atomically; the store check
@@ -777,12 +782,12 @@ impl SessionOperations for HostSession {
     fn refresh(&self) -> Result<()> {
         self.control(Request::Refresh)
     }
-    /// After Close, or when the host is provably gone (its PTY closed with
-    /// it), the close intent is recorded so a restart does not re-register.
+    /// Record close intent after Close or a missing listener. Retirement
+    /// still requires a settled exit in the inventory.
     fn terminate(&self) -> Result<()> {
         match self.control(Request::Close) {
             Ok(()) => {}
-            Err(Error::Unavailable(Unavailable::Transport)) if self.host_gone() => {}
+            Err(Error::Unavailable(Unavailable::Transport)) if self.listener_missing() => {}
             Err(error) => return Err(error),
         }
         // Best effort: an exited child is torn down by discovery anyway.
@@ -806,7 +811,7 @@ impl SessionOperations for HostSession {
         match self.wait_for_frame(version, timeout) {
             // The child exited and the host stopped with it mid-wait: that is
             // the exit an in-process wait reports, not a transport fault.
-            Err(Error::Unavailable(Unavailable::Transport)) if self.host_gone() => {
+            Err(Error::Unavailable(Unavailable::Transport)) if self.listener_missing() => {
                 Err(Error::Agent(AgentError::Exited))
             }
             result => result,

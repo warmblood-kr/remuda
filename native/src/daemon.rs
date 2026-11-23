@@ -1517,7 +1517,7 @@ pub(crate) fn reap_and_notify(registry: &Registry, image: &Image) -> Vec<String>
     let hosted = registry.reap_hosted_with_exit_info();
     for (name, id, instance_id, reason, exit_info) in &hosted {
         #[cfg(unix)]
-        image.session_hosts().retire_closed(name);
+        image.session_hosts().retire_closed(name, instance_id);
         notify_exited(image, name, id, instance_id, reason, exit_info.as_ref());
     }
     let mut dead = dead;
@@ -1559,9 +1559,11 @@ fn close_hosted(
         None => registry.close(name)?,
     };
     if let Ok(true) = closed {
-        #[cfg(unix)]
-        image.session_hosts().retire_closed(name);
         let identity = handle.identity();
+        #[cfg(unix)]
+        image
+            .session_hosts()
+            .retire_closed(name, &identity.instance);
         notify_exited(
             image,
             name,
@@ -3802,8 +3804,14 @@ fn handle_new_hosted(
     request: &crate::session_host::hosted::NewHosted<'_>,
     return_instance_id: bool,
 ) -> std::io::Result<()> {
-    // The same refusal an in-process `new` gives, before any host starts.
-    if registry.get(request.name).is_some() || registry.hosted(request.name).is_some() {
+    if registry.hosted(request.name).is_some() {
+        let reason = image
+            .session_hosts()
+            .name_reservation(request.name)
+            .unwrap_or_else(|| format!("name taken: {}", request.name));
+        return reply(stream, &Response::error(reason));
+    }
+    if registry.get(request.name).is_some() {
         return reply(
             stream,
             &Response::error(format!("name taken: {}", request.name)),

@@ -220,6 +220,194 @@ fn legacy_host_becomes_unreachable_when_cleanup_removes_its_capability() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+fn live_host_restores_its_missing_capability_and_reattaches() {
+    let root = Root::new("restore-key");
+    let path = root.socket();
+    let mut daemon = Daemon::spawn(&root, true, &[]);
+    new_session(&path, "work");
+    let instance = hosted_instance(&path);
+    let host = host_pids(&root);
+    assert_eq!(host.len(), 1);
+    assert_eq!(
+        send_line(&path, "work", "echo BEFORE-$((3*7))"),
+        Response::Ok
+    );
+    wait_for(&path, "work", "BEFORE-21");
+
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    let capability = regular_files(&path.with_file_name("s.sock.hosts"))
+        .into_iter()
+        .find(|file| file.file_name().unwrap() == "capability")
+        .unwrap();
+    std::fs::remove_file(&capability).unwrap();
+    let _replacement = Daemon::spawn(&root, true, &[]);
+    let Response::Sessions(unreachable) = request(&path, &Request::List) else {
+        panic!("expected a session list");
+    };
+    assert_eq!(unreachable.len(), 1, "{unreachable:?}");
+    assert_eq!(
+        unreachable[0].instance_id.as_deref(),
+        Some(instance.as_str())
+    );
+    assert!(unreachable[0].unavailable, "{unreachable:?}");
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !capability.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "live host did not restore authentication"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    assert_eq!(hosted_instance(&path), instance);
+    assert_eq!(host_pids(&root), host);
+    wait_for(&path, "work", "BEFORE-21");
+    assert_eq!(
+        send_line(&path, "work", "echo AFTER-$((6*7))"),
+        Response::Ok
+    );
+    wait_for(&path, "work", "AFTER-42");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn starting_a_closed_dead_host_name_reports_the_persisted_instance() {
+    let root = Root::new("stale-name");
+    let path = root.socket();
+    let mut daemon = Daemon::spawn(&root, true, &[]);
+    new_session(&path, "work");
+    let instance = hosted_instance(&path);
+    let start = Request::New {
+        name: Some("work".into()),
+        command: vec!["/bin/sh".into()],
+        size: Size::new(80, 24),
+        cwd: Some("/".into()),
+        env: None,
+    };
+    let assert_reservation = |closing| {
+        let response = request(&path, &start);
+        let Response::Error(reason) = response else {
+            panic!("expected a name-reservation refusal, got {response:?}");
+        };
+        assert!(
+            reason.contains("name taken: work; still reserved in the host inventory"),
+            "{reason}"
+        );
+        assert!(reason.contains(&format!("instance {instance}")), "{reason}");
+        assert!(reason.contains("phase Registered"), "{reason}");
+        assert!(
+            reason.contains(&format!("close requested: {closing}")),
+            "{reason}"
+        );
+    };
+    assert_reservation(false);
+    let hosts = host_pids(&root);
+    assert_eq!(hosts.len(), 1, "{hosts:?}");
+    let host = hosts[0];
+    // SAFETY: the sole host started in this fixture's private runtime.
+    assert_eq!(unsafe { libc::kill(host as i32, libc::SIGKILL) }, 0);
+    let deadline = Instant::now() + PATIENCE;
+    while alive(host) {
+        assert!(Instant::now() < deadline, "the fixture host never died");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        request(
+            &path,
+            &Request::Close {
+                name: "work".into(),
+                instance_id: Some(instance.clone()),
+                confirm: Some(true),
+            },
+        ),
+        Response::Ok,
+    );
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+
+    let _replacement = Daemon::spawn(&root, true, &[]);
+    assert_eq!(request(&path, &Request::List), Response::Sessions(vec![]));
+    let inventory = path.with_file_name("s.sock.hosts/inventory/inventory.json");
+    let before = std::fs::read(&inventory).unwrap();
+    assert_reservation(true);
+    assert_eq!(std::fs::read(&inventory).unwrap(), before);
+    assert_eq!(request(&path, &Request::List), Response::Sessions(vec![]));
+    assert!(
+        host_pids(&root).is_empty(),
+        "the retry launched another host"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn start_retries_retirement_after_discovery_cleanup_failed() {
+    let root = Root::new("retry-retire");
+    let path = root.socket();
+    let mut daemon = Daemon::spawn(&root, true, &[]);
+    new_session(&path, "work");
+    let old_instance = hosted_instance(&path);
+    let trigger = root.0.join("exit-now");
+    assert_eq!(
+        send_line(
+            &path,
+            "work",
+            &format!(
+                "while [ ! -f '{}' ]; do sleep 0.05; done; exit",
+                trigger.display()
+            ),
+        ),
+        Response::Ok
+    );
+    let hosts = path.with_file_name("s.sock.hosts");
+    let capability = regular_files(&hosts)
+        .into_iter()
+        .find(|file| file.file_name().unwrap() == "capability")
+        .unwrap();
+    let saved = root.0.join("saved-capability");
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    std::fs::rename(&capability, &saved).unwrap();
+    std::fs::write(trigger, b"").unwrap();
+    let inventory = hosts.join("inventory/inventory.json");
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&inventory).unwrap()).unwrap();
+        let entry = &index["entries"]["work"];
+        if entry["phase"].get("Exited").is_some() && !entry["birth"]["progress"]["end"].is_null() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host did not record exit and terminal end"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let _replacement = Daemon::spawn(&root, true, &[]);
+    assert_eq!(request(&path, &Request::List), Response::Sessions(vec![]));
+    // Discovery teardown has a 10 s budget. Keep authentication unavailable
+    // until that attempt can no longer reap the incumbent.
+    std::thread::sleep(Duration::from_secs(11));
+    std::fs::rename(saved, capability).unwrap();
+    new_session(&path, "work");
+    let new_instance = hosted_instance(&path);
+    assert_ne!(new_instance, old_instance);
+    let stale_close = request(
+        &path,
+        &Request::Close {
+            name: "work".into(),
+            instance_id: Some(old_instance),
+            confirm: Some(true),
+        },
+    );
+    assert!(matches!(stale_close, Response::Error(_)), "{stale_close:?}");
+    assert_eq!(hosted_instance(&path), new_instance);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
 fn separate_host_state_survives_runtime_cleanup_and_daemon_replacement() {
     use std::os::unix::fs::MetadataExt;
 

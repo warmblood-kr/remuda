@@ -31,6 +31,14 @@ pub const OPT_IN: &str = "REMUDA_EXPERIMENTAL_SESSION_HOST";
 const CLIENT: [u8; 16] = *b"remuda-daemon-01";
 const PUBLISH_DEADLINE: Duration = Duration::from_secs(10);
 const TEARDOWN_DEADLINE: Duration = Duration::from_secs(10);
+
+fn describe_reservation(name: &str, entry: &Entry) -> String {
+    let closing = entry.metadata.contains_key(super::recovery::CLOSING);
+    format!(
+        "name taken: {name}; still reserved in the host inventory (instance {}, phase {:?}, close requested: {closing}); use a different name for a separate session",
+        entry.identity.instance, entry.phase,
+    )
+}
 /// Left out of every session child's environment, hosted or in-process: the
 /// session-host switch and the daemon's systemd/launchd service handles.
 pub(crate) const DAEMON_ONLY: &[&str] = &[
@@ -448,7 +456,7 @@ impl Hosting {
             {
                 let hosts = hosts.clone();
                 let name = name.clone();
-                std::thread::spawn(move || hosts.teardown(&name, session));
+                std::thread::spawn(move || hosts.teardown(&name, session, TEARDOWN_DEADLINE));
                 continue;
             }
             let Ok(handle) = SessionHandle::hosted(session) else {
@@ -487,6 +495,15 @@ impl Hosting {
             .register_hosted_with_remote_input_disabled(handle, request.remote_input_disabled)
             .map(|_| ())
             .map_err(|_| format!("name taken: {}", request.name))
+    }
+
+    pub(crate) fn name_reservation(&self, name: &str) -> Option<String> {
+        let hosts = self.hosts(false).ok()??;
+        let index = hosts.owner.index().ok()?;
+        index
+            .entries
+            .get(name)
+            .map(|entry| describe_reservation(name, entry))
     }
 
     /// Claim the inventory again under a newer epoch, then show every open
@@ -590,7 +607,7 @@ impl Hosting {
 
     /// After the Registry closed `name`: stop its host and retire its entry,
     /// off the request thread. Unknown names are ignored.
-    pub fn retire_closed(&self, name: &str) {
+    pub fn retire_closed(&self, name: &str, instance: &str) {
         let Ok(Some(hosts)) = self.hosts(false) else {
             return;
         };
@@ -599,13 +616,14 @@ impl Hosting {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(name)
+            .filter(|session| session.matches_instance(instance))
             .cloned();
         if let Some(session) = session {
             let name = name.to_owned();
             let retiring = Arc::clone(&self.retiring);
             *retiring.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
             std::thread::spawn(move || {
-                hosts.teardown(&name, session);
+                hosts.teardown(&name, session, TEARDOWN_DEADLINE);
                 let (count, done) = &*retiring;
                 *count.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
                 done.notify_all();
@@ -685,12 +703,14 @@ impl Hosts {
             .insert(name.to_owned(), session.clone());
         Ok(session)
     }
-    fn teardown(&self, name: &str, session: Arc<HostSession>) {
-        if session.teardown(TEARDOWN_DEADLINE).is_ok() {
+    fn teardown(&self, name: &str, session: Arc<HostSession>, deadline: Duration) {
+        if session.teardown(deadline).is_ok() {
             let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
             if open.get(name).is_some_and(|s| Arc::ptr_eq(s, &session)) {
                 open.remove(name);
             }
+        } else {
+            session.note_teardown_failure();
         }
     }
     fn spawn(self: &Arc<Self>, request: &NewHosted<'_>) -> Result<Arc<HostSession>, String> {
@@ -702,11 +722,8 @@ impl Hosts {
         // A name the registry no longer holds can still have an entry while
         // its closed host is torn down. Wait for that, as a close of an
         // in-process session frees its name at once.
-        if !self.wait_released(request.name)? {
-            return Err(format!(
-                "session name {} is still held by a closing host-backed session",
-                request.name
-            ));
+        if let Some(reason) = self.wait_released(request.name)? {
+            return Err(reason);
         }
         let raw = serde_json::to_string(&launch).map_err(|e| e.to_string())?;
         let identity = HostIdentity {
@@ -799,25 +816,43 @@ impl Hosts {
             )),
         }
     }
-    /// True once `name` has no inventory entry, waiting up to the teardown
-    /// deadline for a closing host to retire it.
-    fn wait_released(&self, name: &str) -> Result<bool, String> {
+    /// Wait for retirement and describe the exact reservation on timeout.
+    fn wait_released(&self, name: &str) -> Result<Option<String>, String> {
         let until = Instant::now() + TEARDOWN_DEADLINE;
+        let mut retried = false;
         loop {
-            let held = self
+            let index = self
                 .owner
                 .index()
-                .map_err(|error| format!("session host inventory: {error:?}"))?
-                .entries
-                .contains_key(name);
-            if !held {
-                return Ok(true);
+                .map_err(|error| format!("session host inventory: {error:?}"))?;
+            let Some(entry) = index.entries.get(name) else {
+                return Ok(None);
+            };
+            let remaining = until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(Some(describe_reservation(name, entry)));
             }
-            if Instant::now() >= until {
-                return Ok(false);
+            if !retried && entry.retirement_generation().is_ok() {
+                if let Some(session) = self.claim_teardown_retry(name, &entry.identity) {
+                    retried = true;
+                    self.teardown(name, session, remaining);
+                    continue;
+                }
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+    fn claim_teardown_retry(
+        &self,
+        name: &str,
+        identity: &HostIdentity,
+    ) -> Option<Arc<HostSession>> {
+        self.open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .filter(|session| session.claim_teardown_retry(identity))
+            .cloned()
     }
     fn published(&self, name: &str, exit: &mpsc::Receiver<ExitStatus>) -> Result<(), Published> {
         let until = Instant::now() + PUBLISH_DEADLINE;
