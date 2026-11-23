@@ -34,13 +34,13 @@ REMUDA_GUI_BUILD_CLI=/absolute/path/to/remuda REMUDA_GUI_BUILD_HOST=/absolute/pa
 
 Pass those same version/build variables to this test's Cargo invocation too.
 
-On macOS, `remuda gui` launches `remuda-gui` from the same directory as the
-resolved `remuda` executable. The GUI is not yet included in release archives:
-build it with `cargo build --release --locked --manifest-path gui/Cargo.toml`,
-then place `gui/target/release/remuda-gui` beside the installed `remuda`.
-The built-in GUI does not support named servers (`remuda -s NAME gui`) yet.
-An installed mod declaring the `gui` command keeps precedence; in that case,
-run the sibling `remuda-gui` executable directly to open this GUI.
+On Apple Silicon, the [one-line CLI install](../README.md#install) installs
+the matching GUI from the same checksummed release archive. Run `remuda --gui`
+to open it. The GUI supports the default server. `remuda gui` also opens it
+when no installed mod owns that command.
+
+For local builds, place `gui/target/release/remuda-gui` next to the CLI
+executable. A missing or unreachable daemon is displayed in the window.
 
 The launcher can also use a managed GUI at
 `<install-dir>/.remuda-gui/builds/build-<build>/remuda-gui`, where `<build>` is
@@ -48,11 +48,8 @@ the complete build string printed after `remuda ` by `remuda --version`. A
 manual `remuda-gui` sibling takes precedence. Managed build entries must never
 be modified or removed while a window may be running; the launcher starts the
 build-specific path so that window's helper processes keep the same executable.
-No installer currently creates or prunes this layout. A window opened earlier
-from a mutable sibling is not retroactively pinned by this launcher.
-Selection checks the existing path components, but does not protect against
-another process replacing them concurrently; future installation must keep
-managed entries stable, including while a GUI is starting or running.
+The one-line installer publishes a verified build-specific entry and keeps
+existing entries stable for running windows and rollback.
 
 To run the macOS launcher rollback test, build `remuda` twice from the same
 checkout with distinct `REMUDA_BUILD` values, save both binaries, and run:

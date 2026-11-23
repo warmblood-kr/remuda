@@ -162,6 +162,24 @@ jobs:
         # ship as one pair from one build or not at all.
         run: cargo build --release --bin remuda --bin remuda-session-host --target ${{ matrix.target }}
 
+      - name: build matching macOS GUI
+        if: matrix.target == 'aarch64-apple-darwin'
+        env:
+          REMUDA_VERSION: ${{ needs.plan.outputs.version }}
+          REMUDA_BUILD: gha.${{ github.run_number }}.${{ github.run_attempt }}.${{ github.sha }}
+        run: |
+          set -eu
+          target="${{ matrix.target }}"
+          cargo build --release --locked --features installer-probe-experimental --bin remuda-installer-probe --target "$target"
+          cargo build --release --locked --manifest-path gui/Cargo.toml --target-dir target --target "$target"
+          binaries="target/$target/release"
+          build="$REMUDA_VERSION+$REMUDA_BUILD"
+          "$binaries/remuda-installer-probe" --verify-cli --verified-archive-v1 "$binaries/remuda" "$build"
+          "$binaries/remuda-installer-probe" --verify-host --verified-archive-v1 "$binaries/remuda-session-host" "$build"
+          "$binaries/remuda-installer-probe" --verify --verified-archive-v1 "$binaries/remuda-gui" "$build"
+          printf '%s\n' remuda-gui-archive-v1 >"$binaries/remuda-gui.contract"
+          printf '%s\n' "$build" >"$binaries/remuda-gui.build"
+
       - name: the binary reports the version it was built with
         # A build-time env var that silently fails to reach the binary produces
         # a release whose assets are named one thing and whose --version says
@@ -197,12 +215,14 @@ jobs:
           set -eu
           name="remuda-${{ needs.plan.outputs.version }}-${{ matrix.target }}"
           mkdir -p dist
-          tar -czf "dist/$name.tar.gz" -C "target/${{ matrix.target }}/release" \
-            ${{ matrix.bin }} ${{ matrix.host }}
-          # A tarball missing either half of the pair is a release that fails
-          # only later, on the opt-in host path, in a user's terminal.
+          binaries="target/${{ matrix.target }}/release"
+          set -- ${{ matrix.bin }} ${{ matrix.host }}
+          if [ "${{ matrix.target }}" = aarch64-apple-darwin ]; then
+            set -- "$@" remuda-gui remuda-gui.contract remuda-gui.build remuda-installer-probe
+          fi
+          tar -czf "dist/$name.tar.gz" -C "$binaries" "$@"
           listed=$(tar -tzf "dist/$name.tar.gz" | sort | tr '\n' ' ')
-          want=$(printf '%s\n' ${{ matrix.bin }} ${{ matrix.host }} | sort | tr '\n' ' ')
+          want=$(printf '%s\n' "$@" | sort | tr '\n' ' ')
           [ "$listed" = "$want" ] || { echo "::error::$name.tar.gz holds '$listed', want '$want'"; exit 1; }
           # Binary size per target, so a dependency's cost is a number (#778).
           size=$(wc -c < "target/${{ matrix.target }}/release/${{ matrix.bin }}" | tr -d ' ')

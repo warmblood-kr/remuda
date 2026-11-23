@@ -116,7 +116,7 @@ fn starts_interactive_client(args: &[String]) -> bool {
     if !report.ok {
         return false;
     }
-    if cli_flag(&report.values, "help") {
+    if cli_flag(&report.values, "help") || cli_flag(&report.values, "gui") {
         return false;
     }
     if report
@@ -169,6 +169,9 @@ fn run_cli(args: Vec<String>) -> ExitCode {
         return help_command();
     }
     let server = flags.server.as_str();
+    if flags.gui_requested {
+        return gui_command(server, &[]);
+    }
     let stdin_enabled = flags.stdin_enabled;
     let eval_code = flags.eval_code.as_deref();
     let argv: Vec<&str> = eval_code.map_or_else(
@@ -911,7 +914,8 @@ const USAGE: &str = "\
 remuda — terminal orchestration for coding agents
 
   remuda                         open the session screen
-  remuda gui                     open the separately built macOS GUI
+  remuda --gui                   open the macOS GUI
+  remuda gui                     open the GUI (or an installed gui mod)
   remuda run [-n NAME] COMMAND   start and enter a session
   remuda attach NAME             enter a session; Ctrl-\\ detaches (exit 2 if attached elsewhere)
                                  Ctrl-] toggles mouse; wheel scrolls history
@@ -6483,6 +6487,7 @@ struct CheckedCliFlags {
     stdin_enabled: bool,
     eval_code: Option<String>,
     help_requested: bool,
+    gui_requested: bool,
     args: Vec<String>,
 }
 
@@ -6531,6 +6536,7 @@ fn dispatch_cli_spec() -> remuda_native::cli_parse::Spec {
                     Some("CODE"),
                     "Evaluate Lua code in the running daemon",
                 ),
+                option("gui", None, None, "Open the macOS GUI"),
                 option("version", Some('V'), None, "Print the CLI version"),
                 option("help", Some('h'), None, "Print help"),
             ],
@@ -6567,6 +6573,7 @@ fn checked_cli_flags(args: &[String]) -> Result<CheckedCliFlags, ExitCode> {
             stdin_enabled: false,
             eval_code: None,
             help_requested,
+            gui_requested: false,
             args: vec![],
         });
     }
@@ -6590,6 +6597,14 @@ fn checked_cli_flags(args: &[String]) -> Result<CheckedCliFlags, ExitCode> {
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
     let version_requested = cli_flag(&report.values, "version");
+    let gui_requested = cli_flag(&report.values, "gui");
+    if gui_requested
+        && (stdin_enabled || eval_code.is_some() || version_requested || !args.is_empty())
+    {
+        return Err(fail(
+            "--gui cannot be combined with another command or option; use remuda --gui",
+        ));
+    }
     if (eval_code.is_some() || version_requested) && !args.is_empty() {
         return Err(fail(if eval_code.is_some() {
             "remuda: -e accepts one CODE argument; command arguments cannot follow it\nUsage: remuda -e CODE"
@@ -6616,6 +6631,7 @@ fn checked_cli_flags(args: &[String]) -> Result<CheckedCliFlags, ExitCode> {
         stdin_enabled,
         eval_code,
         help_requested,
+        gui_requested,
         args,
     })
 }

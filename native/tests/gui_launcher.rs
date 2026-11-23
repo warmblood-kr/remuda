@@ -74,7 +74,7 @@ mod macos {
         std::fs::copy(env!("CARGO_BIN_EXE_gui_path_probe"), &selected).unwrap();
         let mut child = scratch
             .command()
-            .arg("gui")
+            .arg("--gui")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -275,6 +275,10 @@ mod macos {
             &["gui", "unexpected"][..],
             &["-s", "other", "gui"][..],
             &["--stdin", "gui"][..],
+            &["-s", "other", "--gui"][..],
+            &["--gui", "unexpected"][..],
+            &["--stdin", "--gui"][..],
+            &["--gui", "--version"][..],
         ] {
             let output = scratch.command().args(args).output().unwrap();
             assert!(!output.status.success());
@@ -364,6 +368,8 @@ mod macos {
             .unwrap();
         assert_ne!(output.status.code(), Some(38));
         assert!(String::from_utf8_lossy(&output.stderr).contains("no daemon running"));
+        let builtin = scratch.command().arg("--gui").output().unwrap();
+        assert_eq!(builtin.status.code(), Some(38));
         assert!(!scratch.0.join("runtime").exists());
     }
     #[test]

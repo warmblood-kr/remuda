@@ -128,6 +128,10 @@ Set `REMUDA_INSTALL_DIR` to put Remuda elsewhere. This installs the mod without
 asking you to create a Matrix token or config; the command ends by printing
 `Next: remuda butler doctor`.
 
+On Apple Silicon, the CLI archive also installs the matching desktop GUI.
+Run `remuda --gui` to open it. The window uses the default local daemon
+and shows a disconnected state if it is unavailable.
+
 Nightly does not publish an ARM Linux (`aarch64-linux`) or Intel Mac
 (`x86_64-apple-darwin`) binary; build from source on those platforms.
 
