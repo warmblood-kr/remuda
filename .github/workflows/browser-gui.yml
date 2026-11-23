@@ -25,16 +25,23 @@ jobs:
           - platform: macos-arm64
             runner: macos-15
             executable: remuda-gui
+            cli: remuda
           - platform: windows-x64
             runner: windows-latest
             executable: remuda-gui.exe
+            cli: remuda.exe
     steps:
       - uses: actions/checkout@v4
       - run: cargo build --locked --manifest-path gui/Cargo.toml
+      - run: cargo build --locked -p remuda-native --bin remuda
       - shell: bash
-        run: ./gui/target/debug/${{ matrix.executable }} --internal-build-id
+        run: |
+          ./gui/target/debug/${{ matrix.executable }} --internal-build-id
+          ./target/debug/${{ matrix.cli }} browser --help
+          mkdir browser-artifact
+          cp ./gui/target/debug/${{ matrix.executable }} ./target/debug/${{ matrix.cli }} browser-artifact/
       - uses: actions/upload-artifact@v4
         with:
           name: remuda-browser-${{ matrix.platform }}
-          path: gui/target/debug/${{ matrix.executable }}
+          path: browser-artifact/
           if-no-files-found: error

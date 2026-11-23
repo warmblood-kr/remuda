@@ -2,12 +2,12 @@ use std::io::{self, IsTerminal};
 use std::process::{Command, ExitCode};
 
 const USAGE: &str =
-    "Usage: remuda browser [USER@]HOST\n       remuda browser open-document REQUEST_ID VFS_URI";
+    "Usage: remuda browser\n       remuda browser [USER@]HOST\n       remuda browser open-document REQUEST_ID VFS_URI";
 
 pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode {
     if matches!(args, ["-h" | "--help" | "help"]) {
         println!(
-            "{USAGE}\n\nOpen the remote Remuda TUI through SSH. An SSH config alias is also accepted.\nThe remote login account must have remuda on its PATH."
+            "{USAGE}\n\nOpen the native VFS document reader with REMUDA_BROWSER_CLIENT set.\nWith a host or SSH config alias, open the remote Remuda TUI through SSH.\nThe remote login account must have remuda on its PATH."
         );
         return ExitCode::SUCCESS;
     }
@@ -18,6 +18,9 @@ pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode 
     }
     if let ["open-document", request_id, uri] = args {
         return publish_document(request_id, uri);
+    }
+    if args.is_empty() {
+        return launch_reader();
     }
     let [destination] = args else {
         return super::fail(USAGE);
@@ -45,6 +48,32 @@ pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode 
             .map_or(ExitCode::FAILURE, ExitCode::from),
         Err(error) => super::fail(format!("remuda browser: could not run ssh: {error}")),
     }
+}
+
+fn launch_reader() -> ExitCode {
+    if std::env::var_os("REMUDA_BROWSER_CLIENT").is_none() {
+        return super::fail("REMUDA_BROWSER_CLIENT must identify the Browser reader credentials");
+    }
+    #[cfg(target_os = "macos")]
+    return super::launch_gui();
+
+    #[cfg(windows)]
+    {
+        let executable = match std::env::current_exe() {
+            Ok(path) => path.with_file_name("remuda-gui.exe"),
+            Err(error) => return super::fail(format!("cannot locate remuda-gui.exe: {error}")),
+        };
+        match Command::new(&executable).spawn() {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(error) => super::fail(format!(
+                "cannot launch Browser at {}: {error}",
+                executable.display()
+            )),
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    super::fail("The native Browser reader is supported on macOS and Windows")
 }
 
 fn publish_document(id: &str, uri: &str) -> ExitCode {
