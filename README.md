@@ -58,6 +58,27 @@ works, including aliases for hosts that use a custom SSH port. The client
 machine needs the Remuda CLI and an SSH client. It can launch Browser without
 a local daemon or cluster membership.
 
+### Open a VFS document for a Browser reader
+
+For an isolated setup, start the serving node with `REMUDA_BROWSER_POLICY`
+pointing to a JSON file with `publisher` and `browser` (distinct Base64
+X25519 public keys) and `document` (the permitted canonical
+`remuda:///path`). The listener loads this policy when it starts.
+
+Give the reader and Butler separate owner-only JSON credential files, each
+with `endpoint` (IP and port), `server` (the serving node's Base64
+public key), and `private` (that client's Base64 X25519 private key).
+Launch `remuda-gui` with `REMUDA_BROWSER_CLIENT` pointing to the reader's
+file. From Butler, point the same variable at the publisher file and run
+`remuda browser open-document REQUEST_ID remuda:///path`. The command
+reports the display result as JSON. Use the same request ID when retrying
+the same document. An `unknown` result means Browser could have received
+the request, but the command could not confirm display.
+
+This configuration serves one active Browser and one bounded UTF-8
+document. Recent results are held in memory on the serving node. The GUI
+uses its user credential directly over the pinned listener connection.
+
 Direct attach enables terminal mouse input by default. The wheel scrolls the
 session's retained history when its program has mouse reporting off; when the
 program tracks the mouse, reports go to that program. Press `Ctrl-]` to toggle

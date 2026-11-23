@@ -1,7 +1,8 @@
 use std::io::{self, IsTerminal};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "Usage: remuda browser [USER@]HOST";
+const USAGE: &str =
+    "Usage: remuda browser [USER@]HOST\n       remuda browser open-document REQUEST_ID VFS_URI";
 
 pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode {
     if matches!(args, ["-h" | "--help" | "help"]) {
@@ -14,6 +15,9 @@ pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode 
         return super::fail(format!(
             "{USAGE}\nLocal --server and --stdin options are unsupported."
         ));
+    }
+    if let ["open-document", request_id, uri] = args {
+        return publish_document(request_id, uri);
     }
     let [destination] = args else {
         return super::fail(USAGE);
@@ -40,6 +44,50 @@ pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode 
             .and_then(|code| u8::try_from(code).ok())
             .map_or(ExitCode::FAILURE, ExitCode::from),
         Err(error) => super::fail(format!("remuda browser: could not run ssh: {error}")),
+    }
+}
+
+fn publish_document(id: &str, uri: &str) -> ExitCode {
+    use remuda_native::net::browser::{Client, DocumentRequest, Operation, Outcome, Reply};
+    use std::time::{Duration, Instant};
+
+    let client = match Client::from_env() {
+        Ok(Some(client)) => client,
+        Ok(None) => {
+            return super::fail("REMUDA_BROWSER_CLIENT must identify the publisher credentials")
+        }
+        Err(error) => return super::fail(format!("Browser publisher credentials: {error}")),
+    };
+    let operation = Operation::Publish {
+        request: DocumentRequest {
+            id: id.into(),
+            uri: uri.into(),
+        },
+    };
+    let deadline = Instant::now() + Duration::from_secs(17);
+    let result = loop {
+        match client.send(&operation) {
+            Ok(Reply::Outcome(Outcome::Pending)) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Ok(Reply::Outcome(Outcome::Pending)) | Err(_) => break "unknown",
+            Ok(Reply::Outcome(Outcome::Displayed)) => break "displayed",
+            Ok(Reply::Outcome(Outcome::NoActiveBrowser)) => break "no_active_browser",
+            Ok(Reply::Outcome(Outcome::Unknown)) => break "unknown",
+            Ok(Reply::Outcome(Outcome::ReadFailed)) => break "read_failed",
+            Ok(Reply::Outcome(Outcome::Busy)) => break "busy",
+            Ok(Reply::Outcome(Outcome::ConflictingRequest)) => break "conflicting_request",
+            Ok(_) => break "denied",
+        }
+    };
+    println!(
+        "{}",
+        serde_json::json!({ "request_id": id, "uri": uri, "status": result })
+    );
+    if result == "displayed" {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 

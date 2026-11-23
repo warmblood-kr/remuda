@@ -5,6 +5,7 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 use std::{sync::mpsc, time::Duration};
 
+mod browser_document;
 #[allow(dead_code)]
 mod input_helper;
 mod preview;
@@ -839,8 +840,19 @@ fn main() {
                 .map_or(1, |fp| peer_worker(&fp, tagged)),
         );
     }
-    Application::new().run(|cx: &mut App| {
+    let browser = match remuda_native::net::browser::Client::from_env() {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("Browser credentials: {error}");
+            std::process::exit(1);
+        }
+    };
+    Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1000.), px(650.)), cx);
+        if let Some(browser) = browser {
+            browser_document::open(cx, bounds, browser);
+            return;
+        }
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
