@@ -702,11 +702,8 @@ impl Hosts {
         // A name the registry no longer holds can still have an entry while
         // its closed host is torn down. Wait for that, as a close of an
         // in-process session frees its name at once.
-        if !self.wait_released(request.name)? {
-            return Err(format!(
-                "session name {} is still held by a closing host-backed session",
-                request.name
-            ));
+        if let Some(reason) = self.wait_released(request.name)? {
+            return Err(reason);
         }
         let raw = serde_json::to_string(&launch).map_err(|e| e.to_string())?;
         let identity = HostIdentity {
@@ -799,22 +796,23 @@ impl Hosts {
             )),
         }
     }
-    /// True once `name` has no inventory entry, waiting up to the teardown
-    /// deadline for a closing host to retire it.
-    fn wait_released(&self, name: &str) -> Result<bool, String> {
+    /// Wait for retirement and describe the exact reservation on timeout.
+    fn wait_released(&self, name: &str) -> Result<Option<String>, String> {
         let until = Instant::now() + TEARDOWN_DEADLINE;
         loop {
-            let held = self
+            let index = self
                 .owner
                 .index()
-                .map_err(|error| format!("session host inventory: {error:?}"))?
-                .entries
-                .contains_key(name);
-            if !held {
-                return Ok(true);
-            }
+                .map_err(|error| format!("session host inventory: {error:?}"))?;
+            let Some(entry) = index.entries.get(name) else {
+                return Ok(None);
+            };
             if Instant::now() >= until {
-                return Ok(false);
+                let closing = entry.metadata.contains_key(super::recovery::CLOSING);
+                return Ok(Some(format!(
+                    "session name {name} is still reserved in the host inventory (instance {}, phase {:?}, close requested: {closing}); use a different name for a separate session",
+                    entry.identity.instance, entry.phase,
+                )));
             }
             std::thread::sleep(Duration::from_millis(20));
         }

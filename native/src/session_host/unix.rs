@@ -186,6 +186,19 @@ fn socket_path(path: &Path) -> io::Result<PathBuf> {
     directory(socket.parent().ok_or_else(denied)?)?;
     Ok(socket)
 }
+
+pub(super) fn listener_missing(path: &Path) -> bool {
+    let Ok(socket) = socket_path(path) else {
+        return false;
+    };
+    connect_until(&socket, Instant::now() + Duration::from_millis(100)).is_err_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+        )
+    })
+}
+
 pub(crate) fn connect(path: &Path) -> io::Result<Channel<UnixStream>> {
     let until = Instant::now() + Duration::from_secs(2);
     let _directory = directory(path)?;
@@ -352,6 +365,25 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn split_listener_probe_uses_the_runtime_socket_even_without_a_key() {
+        let root = PathBuf::from("/tmp").join(format!(
+            "rd-probe-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let _cleanup = Cleanup(root.clone());
+        let state = root.join("state");
+        let socket = root.join("runtime/socket");
+        let endpoint = Endpoint::bind_with_socket(&state, Some(&socket)).unwrap();
+
+        std::fs::remove_file(state.join("capability")).unwrap();
+        assert!(!listener_missing(&state));
+        drop(endpoint);
+        assert!(listener_missing(&state));
+    }
+
     #[test]
     fn private_endpoint_mutually_authenticates_and_never_rebinds_existing_path() {
         let path = std::env::temp_dir().join(format!(
