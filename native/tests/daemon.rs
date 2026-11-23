@@ -6312,7 +6312,7 @@ fn terminal_origin_outside_stop_succeeds_with_readable_ancestry() {
         })
         .expect("open shell terminal");
     let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
-    command.args(["-s", "s", "stop", "-f", "--yes"]);
+    command.args(["-s", "s", "stop", "-f"]);
     command.env("REMUDA_RUNTIME_DIR", &dir);
     command.env("REMUDA_NO_UPDATE_CHECK", "1");
     let mut child = pty
@@ -6372,6 +6372,8 @@ fn stop_refuses_to_kill_a_live_session_without_being_told_twice() {
         "the daemon died despite refusing"
     );
 
+    assert!(said.contains("add `--force` to the same command"), "{said}");
+
     // Outside a hosted session, -f remains the no-prompt path for a live herd.
     let forced = remuda(&dir, &["-s", "s", "stop", "-f"]);
     assert!(
@@ -6385,7 +6387,7 @@ fn stop_refuses_to_kill_a_live_session_without_being_told_twice() {
 
 #[cfg(unix)]
 #[test]
-fn a_session_cannot_force_stop_its_own_daemon_without_an_explicit_override() {
+fn force_stop_requires_a_caller_outside_the_target_daemon_sessions() {
     let dir = scratch_dir("stop-inside");
     let path = daemon::socket_path_in(&dir, "s");
     let mut daemon = Daemon::spawn(&dir);
@@ -6403,7 +6405,7 @@ fn a_session_cannot_force_stop_its_own_daemon_without_an_explicit_override() {
             command: vec![
                 "sh".into(),
                 "-c".into(),
-                format!("'{binary}' -s s stop -f --yes; sleep 30"),
+                format!("'{binary}' -s s stop --force; sleep 30"),
             ],
             size: Size::new(100, 30),
             cwd: None,
@@ -6428,37 +6430,16 @@ fn a_session_cannot_force_stop_its_own_daemon_without_an_explicit_override() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(
-        screen.contains("--i-am-inside"),
-        "missing explicit override guidance: {screen}"
+        screen.contains("terminal outside"),
+        "missing outside-terminal guidance: {screen}"
     );
     assert!(
         remuda_native::ipc::connect(&path).is_ok(),
         "the daemon died"
     );
-    let stopped = client::request(
-        &path,
-        &Request::New {
-            name: Some("override".into()),
-            command: vec![
-                binary.into(),
-                "-s".into(),
-                "s".into(),
-                "stop".into(),
-                "-f".into(),
-                "--yes".into(),
-                "--i-am-inside".into(),
-            ],
-            size: Size::new(100, 30),
-            cwd: None,
-            env: None,
-        },
-    )
-    .expect("request override session");
-    assert!(matches!(stopped, Response::Value(_)));
-    assert!(
-        daemon.left_on_its_own(),
-        "daemon did not exit after override"
-    );
+    let stopped = remuda(&dir, &["-s", "s", "stop", "--force"]);
+    assert!(stopped.status.success(), "{stopped:?}");
+    assert!(daemon.left_on_its_own(), "daemon did not exit");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -6518,7 +6499,7 @@ fn shutdown_uses_peer_ancestry_when_session_environment_is_stripped() {
     let binary = env!("CARGO_BIN_EXE_remuda");
     let test_binary = std::env::current_exe().expect("integration test binary path");
     let cli = format!(
-        "/usr/bin/env -i PATH='{}' REMUDA_RUNTIME_DIR='{}' '{}' -s s stop -f --yes; sleep 30",
+        "/usr/bin/env -i PATH='{}' REMUDA_RUNTIME_DIR='{}' '{}' -s s stop -f; sleep 30",
         path_value, runtime, binary
     );
     let raw = format!(
@@ -6558,7 +6539,7 @@ fn shutdown_uses_peer_ancestry_when_session_environment_is_stripped() {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert!(cli_screen.contains("--i-am-inside"), "{cli_screen}");
+    assert!(cli_screen.contains("terminal outside"), "{cli_screen}");
 
     let deadline = Instant::now() + PATIENCE;
     let raw_screen = loop {
@@ -6697,7 +6678,6 @@ fn a_session_can_stop_a_different_private_daemon() {
                 "s".into(),
                 "stop".into(),
                 "-f".into(),
-                "--yes".into(),
             ],
             size: Size::new(80, 24),
             cwd: None,

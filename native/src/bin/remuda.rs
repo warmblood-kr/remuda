@@ -859,11 +859,8 @@ remuda — a pty manager you can attach to
   remuda reload [--check]       hand the daemon's socket and host-backed
                                   sessions to this build (Unix); --check only
                                   says whether it could, and changes nothing
-  remuda stop [-f] [--yes] [--keep-sessions] [--i-am-inside]  stop the daemon;
-                                  its sessions and Lua image end with it.
-                                  --keep-sessions leaves host-backed sessions
-                                  running. Unverifiable callers are refused;
-                                  --i-am-inside overrides the guard.
+  remuda stop [-f|--force]         stop the daemon and end its sessions;
+                                  see remuda stop --help for confirmation options
   remuda --version              the version this binary was built with
 
 Four verbs, not ten. A verb is here only if it needs a terminal, must survive
@@ -926,9 +923,7 @@ remuda — terminal orchestration for coding agents
   remuda resize NAME COLS ROWS   resize a session (cols 20..1000, rows 24..500)
   remuda upgrade [--channel stable|nightly]  replace the CLI binary, then reload
   remuda reload [--check]        move the daemon onto this build; host-backed sessions keep running
-  remuda stop [-f] [--yes] [--keep-sessions] [--i-am-inside]  stop the daemon (sessions end;
-                                  --keep-sessions keeps host-backed ones running)
-                                  --i-am-inside overrides hosted or unverifiable identity checks.
+  remuda stop [-f|--force]          stop the daemon and end its sessions
 
   remuda mod install OWNER/REPO  install a mod from GitHub
   remuda mod list | info NAME    inspect installed mods
@@ -5815,8 +5810,8 @@ fn fate(path: &Path, name: &str) -> String {
     }
 }
 
-/// `stop [-f]`: stop this server's daemon, ending its sessions, host-backed
-/// ones too unless `--keep-sessions`. Where a reload cannot move the daemon
+/// `stop [-f|--force]`: stop this server's daemon, ending its sessions, host-backed
+/// ones too. Where a reload cannot move the daemon
 /// onto a new build, this is the way.
 fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     let values = match parse_top_level_cli(&stop_cli_spec(), "stop", args) {
@@ -5824,9 +5819,6 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         Err(code) => return code,
     };
     let force = cli_flag(&values, "force");
-    let yes = cli_flag(&values, "yes");
-    let inside_override = cli_flag(&values, "i-am-inside");
-    let keep_sessions = cli_flag(&values, "keep-sessions");
     match remuda_native::ipc::connect(path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => return fail(error),
@@ -5849,20 +5841,19 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         }
     }
     let sessions = session_count(path);
-    if !yes && !force && sessions > 0 {
-        if let Err(refusal) = confirm_losses(path, keep_sessions) {
+    if !force && sessions > 0 {
+        if let Err(refusal) = confirm_losses(path) {
             return fail(refusal);
         }
-    }
-    if sessions > 0 {
-        eprintln!("remuda: {}", stop_notice(sessions, keep_sessions));
+    } else if sessions > 0 {
+        eprintln!("remuda: {}", stop_notice(sessions));
     }
     let shutdown = Request::Shutdown {
         requester_daemon_id: std::env::var("REMUDA_DAEMON_ID").ok(),
         requester_session_id: std::env::var("REMUDA_SESSION_ID").ok(),
         requester_session_name: std::env::var("REMUDA_SESSION_NAME").ok(),
-        override_hosted: inside_override,
-        keep_sessions,
+        override_hosted: false,
+        keep_sessions: false,
     };
     match stop_daemon(path, shutdown) {
         Ok(()) => {
@@ -5871,9 +5862,13 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Err(e) if e.starts_with("cannot stop this daemon") => fail(format!(
-            "{e}\nNext: to stop it intentionally, run `remuda -s {server} stop -f --yes --i-am-inside` using the same runtime directory. This intentionally ends its sessions."
-        )),
+        Err(e) if e.starts_with("cannot stop this daemon") => {
+            // Older daemons still suggest the removed CLI override.
+            let reason = e.trim_end_matches("; pass --i-am-inside to override");
+            fail(format!(
+                "{reason}\nRetry from a terminal outside this daemon's sessions, using the same server and runtime directory."
+            ))
+        }
         Err(e) => fail(e),
     }
 }
@@ -5889,45 +5884,15 @@ fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
             usage: None,
             args: vec![],
             next: "remuda stop --help".into(),
-            options: vec![
-                OptionSpec {
-                    long: "force".into(),
-                    short: Some('f'),
-                    value: None,
-                    help: "Skip confirmation; identity checks still apply".into(),
-                    global: false,
-                    required: false,
-                    repeat_policy: Default::default(),
-                },
-                OptionSpec {
-                    long: "yes".into(),
-                    short: None,
-                    value: None,
-                    help: "Confirm ending all sessions; identity checks still apply".into(),
-                    global: false,
-                    required: false,
-                    repeat_policy: Default::default(),
-                },
-                OptionSpec {
-                    long: "keep-sessions".into(),
-                    short: None,
-                    value: None,
-                    help: "Leave host-backed sessions running for the next daemon".into(),
-                    global: false,
-                    required: false,
-                    repeat_policy: Default::default(),
-                },
-                OptionSpec {
-                    long: "i-am-inside".into(),
-                    short: None,
-                    value: None,
-                    help: "Override hosted or unverifiable identity checks; ends all sessions"
-                        .into(),
-                    global: false,
-                    required: false,
-                    repeat_policy: Default::default(),
-                },
-            ],
+            options: vec![OptionSpec {
+                long: "force".into(),
+                short: Some('f'),
+                value: None,
+                help: "Stop without prompting; caller checks still apply".into(),
+                global: false,
+                required: false,
+                repeat_policy: Default::default(),
+            }],
         }],
     }
 }
@@ -5976,22 +5941,14 @@ fn session_count(path: &Path) -> usize {
 }
 
 /// The one line `stop` prints: what ends, and how to keep it.
-fn stop_notice(sessions: usize, keep_sessions: bool) -> String {
-    if keep_sessions {
-        format!(
-            "stopping the daemon; of its {sessions} session(s), host-backed ones keep running and the rest end"
-        )
-    } else {
-        format!(
-            "stopping ends {sessions} session(s); to keep them, run `remuda reload` (or `remuda stop --keep-sessions` for host-backed ones)"
-        )
-    }
+fn stop_notice(sessions: usize) -> String {
+    format!("stopping ends {sessions} session(s); use `remuda reload` to keep host-backed sessions running")
 }
 
 /// Name what dies before it dies. Killing the daemon takes every session's
 /// process and scrollback and the whole Lua image with it, so an empty herd is
 /// the only case that goes without asking.
-fn confirm_losses(path: &Path, keep_sessions: bool) -> Result<(), String> {
+fn confirm_losses(path: &Path) -> Result<(), String> {
     let live = match remuda_native::client::request(path, &Request::List) {
         Ok(Response::Sessions(sessions)) => sessions,
         // It cannot even list. That is itself the reason someone typed this.
@@ -6006,19 +5963,13 @@ fn confirm_losses(path: &Path, keep_sessions: bool) -> Result<(), String> {
         .iter()
         .map(|s| format!("{} ({})", s.name, if s.alive { "live" } else { "dead" }))
         .collect();
-    let fate = if keep_sessions {
-        "; host-backed ones keep running, the rest go with it"
-    } else {
-        " go with it"
-    };
-    eprintln!(
-        "remuda: {} session(s){fate}: {}",
-        names.len(),
-        names.join(", ")
-    );
-    eprintln!("remuda: their processes, their last screens and the Lua image are all lost.");
+    eprintln!("remuda: sessions on this daemon: {}", names.join(", "));
+    eprintln!("remuda: {}", stop_notice(names.len()));
+    eprintln!("remuda: ended sessions lose their processes and last screens. The daemon's Lua image is lost.");
     if !std::io::stdin().is_terminal() {
-        return Err("nothing to ask on — `remuda stop -f --yes` if that is what you want".into());
+        return Err(
+            "confirmation requires a terminal; add `--force` to the same command to skip it".into(),
+        );
     }
     eprint!("remuda: type y to go ahead: ");
     let mut answer = String::new();

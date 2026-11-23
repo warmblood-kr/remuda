@@ -109,4 +109,4 @@ again. Processes started from Lua (`remuda.process`) are stopped.
   or `remuda run`) starts one that finds them again. `remuda ls` does not
   start one; it says no daemon is running.
 - **Do not use `remuda stop` to update.** It ends host-backed sessions too.
-  `remuda stop --keep-sessions` leaves them running for the next daemon.
+  Use `remuda reload` to leave host-backed sessions running.

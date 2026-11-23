@@ -10,7 +10,7 @@ fn default_session_keeps_process_and_output_across_reload() {
     struct StopReloaded<'a>(&'a Parity);
     impl Drop for StopReloaded<'_> {
         fn drop(&mut self) {
-            let _ = self.0.cli(&["stop", "-f", "--yes"]);
+            let _ = self.0.cli(&["stop", "-f"]);
         }
     }
     let _cleanup = StopReloaded(&daemon);

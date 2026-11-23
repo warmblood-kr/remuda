@@ -22,7 +22,7 @@ impl Drop for AutostartDaemonGuard {
         let pids = daemon_pids_for_runtime(&self.runtime);
 
         let _ = Command::new(env!("CARGO_BIN_EXE_remuda"))
-            .args(["-s", "s", "stop", "-f", "--yes"])
+            .args(["-s", "s", "stop", "-f"])
             .env("REMUDA_RUNTIME_DIR", &self.runtime)
             .env("XDG_RUNTIME_DIR", &self.runtime)
             .env("XDG_DATA_HOME", self.runtime.join("data"))
