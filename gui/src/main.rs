@@ -5,7 +5,7 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 use std::{sync::mpsc, time::Duration};
 
-mod browser_document;
+mod browser;
 #[allow(dead_code)]
 mod input_helper;
 mod preview;
@@ -840,7 +840,22 @@ fn main() {
                 .map_or(1, |fp| peer_worker(&fp, tagged)),
         );
     }
-    let browser = match remuda_native::net::browser::Client::from_env() {
+    let destination = if std::env::args().nth(1).as_deref() == Some("--browser") {
+        match std::env::args().nth(2) {
+            Some(host) if remuda_native::net::browser::valid_ssh_destination(&host) => Some(host),
+            _ => {
+                eprintln!("Expected a Browser SSH hostname, IP address or config alias");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+    let browser = match destination
+        .as_ref()
+        .map(|_| remuda_native::net::browser::Client::from_env())
+        .transpose()
+    {
         Ok(client) => client,
         Err(error) => {
             eprintln!("Browser credentials: {error}");
@@ -849,8 +864,8 @@ fn main() {
     };
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1000.), px(650.)), cx);
-        if let Some(browser) = browser {
-            browser_document::open(cx, bounds, browser);
+        if let Some(destination) = destination {
+            browser::open(cx, bounds, destination, browser.flatten());
             return;
         }
         cx.open_window(

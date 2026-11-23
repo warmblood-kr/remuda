@@ -1,13 +1,14 @@
+use remuda_native::net::browser::{ssh_arguments, valid_ssh_destination as valid_destination};
 use std::io::{self, IsTerminal};
 use std::process::{Command, ExitCode};
 
 const USAGE: &str =
-    "Usage: remuda browser [USER@]HOST\n       remuda browser open-document REQUEST_ID VFS_URI";
+    "Usage: remuda browser [USER@]HOST\n       remuda browser --gui [USER@]HOST\n       remuda browser open-document REQUEST_ID VFS_URI";
 
 pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode {
     if matches!(args, ["-h" | "--help" | "help"]) {
         println!(
-            "{USAGE}\n\nOpen the remote Remuda TUI through SSH. An SSH config alias is also accepted.\nThe remote login account must have remuda on its PATH."
+            "{USAGE}\n\nConnect to Remuda through SSH. Use --gui for the native client on macOS or Windows.\nAn SSH config alias is accepted. The remote login account must have remuda on its PATH."
         );
         return ExitCode::SUCCESS;
     }
@@ -18,6 +19,12 @@ pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode 
     }
     if let ["open-document", request_id, uri] = args {
         return publish_document(request_id, uri);
+    }
+    if let ["--gui", destination] = args {
+        if !valid_destination(destination) {
+            return super::fail(USAGE);
+        }
+        return launch_gui(destination);
     }
     let [destination] = args else {
         return super::fail(USAGE);
@@ -34,9 +41,7 @@ pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode 
     // Keep the command on the server fixed. Host trust and user authentication
     // use the user's SSH configuration and known_hosts.
     match Command::new("ssh")
-        .args(["-a", "-x", "-o", "ClearAllForwardings=yes", "-t", "--"])
-        .arg(destination)
-        .arg("remuda")
+        .args(ssh_arguments(destination))
         .status()
     {
         Ok(status) => status
@@ -45,6 +50,33 @@ pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode 
             .map_or(ExitCode::FAILURE, ExitCode::from),
         Err(error) => super::fail(format!("remuda browser: could not run ssh: {error}")),
     }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn launch_gui(destination: &str) -> ExitCode {
+    let executable = match std::env::current_exe() {
+        Ok(path) => path.with_file_name(if cfg!(windows) {
+            "remuda-gui.exe"
+        } else {
+            "remuda-gui"
+        }),
+        Err(error) => return super::fail(format!("cannot locate Remuda Browser: {error}")),
+    };
+    match Command::new(&executable)
+        .args(["--browser", destination])
+        .spawn()
+    {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(error) => super::fail(format!(
+            "cannot launch Remuda Browser at {}: {error}",
+            executable.display()
+        )),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn launch_gui(_: &str) -> ExitCode {
+    super::fail("The native Remuda Browser is supported on macOS and Windows")
 }
 
 fn publish_document(id: &str, uri: &str) -> ExitCode {
@@ -89,24 +121,6 @@ fn publish_document(id: &str, uri: &str) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
-}
-
-fn valid_destination(destination: &str) -> bool {
-    fn name(value: &str) -> bool {
-        value
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphanumeric)
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    }
-    let host = match destination.split_once('@') {
-        Some((user, host)) if name(user) => host,
-        Some(_) => return false,
-        None => destination,
-    };
-    name(host) || host.parse::<std::net::Ipv6Addr>().is_ok()
 }
 
 #[cfg(test)]

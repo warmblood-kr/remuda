@@ -68,8 +68,11 @@ X25519 public keys) and `document` (the permitted canonical
 Give the reader and Butler separate owner-only JSON credential files, each
 with `endpoint` (IP and port), `server` (the serving node's Base64
 public key), and `private` (that client's Base64 X25519 private key).
-Launch `remuda-gui` with `REMUDA_BROWSER_CLIENT` pointing to the reader's
-file. From Butler, point the same variable at the publisher file and run
+On macOS or Windows, put `remuda-gui` (`remuda-gui.exe` on Windows) beside
+`remuda`. Set `REMUDA_BROWSER_CLIENT` to the reader's credential file and run
+`remuda browser --gui HOST`, using the same SSH host or alias as the terminal
+client. A document request opens a tab beside the live SSH terminal. From
+Butler, point the same variable at the publisher file and run
 `remuda browser open-document REQUEST_ID remuda:///path`. The command
 reports the display result as JSON. Use the same request ID when retrying
 the same document. An `unknown` result means Browser could have received

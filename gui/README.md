@@ -1,5 +1,16 @@
 # Remuda GUI
 
+On Apple silicon macOS and x64 Windows, the `browser-gui` CI workflow builds
+the CLI and native GUI together. Keep both extracted executables beside each
+other. On macOS, restore executable permissions with `chmod +x remuda remuda-gui`.
+Run `./remuda browser --gui HOST` on macOS or `.\remuda.exe browser --gui HOST`
+in PowerShell. Use an SSH host or alias for a machine running Remuda. The
+native Browser opens the remote Remuda terminal and can receive
+[VFS document-open requests](../README.md#open-a-vfs-document-for-a-browser-reader)
+in the same window. Browser mode does not need a local daemon or cluster membership.
+
+## Local session prototype
+
 From the repository root, run the standalone GPUI prototype:
 
 ```sh

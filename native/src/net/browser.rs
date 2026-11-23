@@ -214,3 +214,35 @@ impl Client {
         serde_json::from_slice(&response).map_err(|_| ClientError::BadResponse)
     }
 }
+
+/// Arguments shared by Browser's native and terminal SSH clients.
+pub fn ssh_arguments(destination: &str) -> [&str; 8] {
+    [
+        "-a",
+        "-x",
+        "-o",
+        "ClearAllForwardings=yes",
+        "-t",
+        "--",
+        destination,
+        "remuda",
+    ]
+}
+
+pub fn valid_ssh_destination(destination: &str) -> bool {
+    fn name(value: &str) -> bool {
+        value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    }
+    let host = match destination.split_once('@') {
+        Some((user, host)) if name(user) => host,
+        Some(_) => return false,
+        None => destination,
+    };
+    name(host) || host.parse::<std::net::Ipv6Addr>().is_ok()
+}
