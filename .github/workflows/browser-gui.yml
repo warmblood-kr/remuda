@@ -32,16 +32,36 @@ jobs:
             cli: remuda.exe
     steps:
       - uses: actions/checkout@v4
-      - run: cargo build --locked --manifest-path gui/Cargo.toml
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (!$fxc) { throw 'Windows SDK shader compiler fxc.exe was not found' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      - if: runner.os == 'Windows'
+        run: cargo build --release --locked --manifest-path gui/Cargo.toml
+      - if: runner.os == 'macOS'
+        run: cargo build --locked --manifest-path gui/Cargo.toml
       - run: cargo build --locked -p remuda-native --bin remuda
       - if: runner.os == 'macOS'
         run: cargo test --locked --manifest-path gui/Cargo.toml --bin remuda-gui bus_document_reuses_one_tab_beside_the_terminal
-      - shell: bash
+      - if: runner.os == 'macOS'
+        shell: bash
         run: |
           ./gui/target/debug/${{ matrix.executable }} --internal-build-id
           ./target/debug/${{ matrix.cli }} browser --help
           mkdir browser-artifact
           cp ./gui/target/debug/${{ matrix.executable }} ./target/debug/${{ matrix.cli }} browser-artifact/
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ./gui/target/release/${{ matrix.executable }} --internal-build-id
+          if ($LASTEXITCODE -ne 0) { throw "GUI build-ID probe exited with $LASTEXITCODE" }
+          & ./target/debug/${{ matrix.cli }} browser --help
+          if ($LASTEXITCODE -ne 0) { throw "CLI help exited with $LASTEXITCODE" }
+          New-Item -ItemType Directory browser-artifact
+          Copy-Item ./gui/target/release/${{ matrix.executable }}, ./target/debug/${{ matrix.cli }} browser-artifact/
       - uses: actions/upload-artifact@v4
         with:
           name: remuda-browser-${{ matrix.platform }}
