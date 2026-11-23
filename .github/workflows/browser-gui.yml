@@ -1,0 +1,40 @@
+name: browser-gui
+
+on:
+  pull_request:
+    paths: &browser_paths
+      - '.github/workflows/browser-gui.yml'
+      - 'gui/**'
+      - 'core/**'
+      - 'native/**'
+      - 'vendor/**'
+      - 'Cargo.*'
+  push:
+    branches: [main]
+    paths: *browser_paths
+
+jobs:
+  build:
+    name: Build Browser for ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-15
+            executable: remuda-gui
+          - platform: windows-x64
+            runner: windows-latest
+            executable: remuda-gui.exe
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --locked --manifest-path gui/Cargo.toml
+      - shell: bash
+        run: ./gui/target/debug/${{ matrix.executable }} --internal-build-id
+      - uses: actions/upload-artifact@v4
+        with:
+          name: remuda-browser-${{ matrix.platform }}
+          path: gui/target/debug/${{ matrix.executable }}
+          if-no-files-found: error
