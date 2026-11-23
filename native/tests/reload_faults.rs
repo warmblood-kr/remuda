@@ -289,6 +289,73 @@ fn starting_a_closed_dead_host_name_reports_the_persisted_instance() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+fn start_retries_retirement_after_discovery_cleanup_failed() {
+    let root = Root::new("retry-retire");
+    let path = root.socket();
+    let mut daemon = Daemon::spawn(&root, true, &[]);
+    new_session(&path, "work");
+    let old_instance = hosted_instance(&path);
+    let trigger = root.0.join("exit-now");
+    assert_eq!(
+        send_line(
+            &path,
+            "work",
+            &format!(
+                "while [ ! -f '{}' ]; do sleep 0.05; done; exit",
+                trigger.display()
+            ),
+        ),
+        Response::Ok
+    );
+    let hosts = path.with_file_name("s.sock.hosts");
+    let capability = regular_files(&hosts)
+        .into_iter()
+        .find(|file| file.file_name().unwrap() == "capability")
+        .unwrap();
+    let saved = root.0.join("saved-capability");
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    std::fs::rename(&capability, &saved).unwrap();
+    std::fs::write(trigger, b"").unwrap();
+    let inventory = hosts.join("inventory/inventory.json");
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&inventory).unwrap()).unwrap();
+        let entry = &index["entries"]["work"];
+        if entry["phase"].get("Exited").is_some() && !entry["birth"]["progress"]["end"].is_null() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host did not record exit and terminal end"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let _replacement = Daemon::spawn(&root, true, &[]);
+    assert_eq!(request(&path, &Request::List), Response::Sessions(vec![]));
+    // Discovery teardown has a 10 s budget. Keep authentication unavailable
+    // until that attempt can no longer reap the incumbent.
+    std::thread::sleep(Duration::from_secs(11));
+    std::fs::rename(saved, capability).unwrap();
+    new_session(&path, "work");
+    let new_instance = hosted_instance(&path);
+    assert_ne!(new_instance, old_instance);
+    let stale_close = request(
+        &path,
+        &Request::Close {
+            name: "work".into(),
+            instance_id: Some(old_instance),
+            confirm: Some(true),
+        },
+    );
+    assert!(matches!(stale_close, Response::Error(_)), "{stale_close:?}");
+    assert_eq!(hosted_instance(&path), new_instance);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
 fn separate_host_state_survives_runtime_cleanup_and_daemon_replacement() {
     use std::os::unix::fs::MetadataExt;
 

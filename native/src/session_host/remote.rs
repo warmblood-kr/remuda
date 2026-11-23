@@ -25,6 +25,7 @@ use remuda_core::session_operations::{
 };
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -56,6 +57,7 @@ pub(crate) struct HostSession {
     endpoint: PathBuf,
     client: [u8; 16],
     acts: Mutex<()>,
+    teardown_failed: AtomicBool,
     gate: Arc<super::gate::Gate>,
 }
 impl HostSession {
@@ -80,6 +82,7 @@ impl HostSession {
             endpoint: PathBuf::from(birth.endpoint()),
             client,
             acts: Mutex::new(()),
+            teardown_failed: AtomicBool::new(false),
             gate: Arc::default(),
         };
         session.identity().validate()?;
@@ -90,6 +93,15 @@ impl HostSession {
     pub fn gated(mut self, gate: Arc<super::gate::Gate>) -> Self {
         self.gate = gate;
         self
+    }
+    pub fn matches_instance(&self, instance: &str) -> bool {
+        self.identity.instance == instance
+    }
+    pub fn note_teardown_failure(&self) {
+        self.teardown_failed.store(true, Ordering::Relaxed);
+    }
+    pub fn claim_teardown_retry(&self, identity: &HostIdentity) -> bool {
+        self.identity == *identity && self.teardown_failed.swap(false, Ordering::Relaxed)
     }
     fn target(&self) -> Target {
         Target {

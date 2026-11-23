@@ -150,6 +150,19 @@ impl Entry {
             birth: None,
         })
     }
+
+    pub fn retirement_generation(&self) -> Result<u64> {
+        let Phase::Exited { generation } = self.phase else {
+            return Err(Error::Unavailable);
+        };
+        if self.birth.as_ref().is_some_and(|birth| !birth.retirable()) {
+            return Err(Error::Unavailable);
+        }
+        if self.pending.is_some() || self.streams.iter().any(|stream| !stream.results.is_empty()) {
+            return Err(Error::Busy);
+        }
+        Ok(generation)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -641,15 +654,7 @@ impl Index {
                 entry.phase = Phase::Exited { generation };
             }
             ExitMutation::Retire => {
-                if entry.birth.as_ref().is_some_and(|birth| !birth.retirable()) {
-                    return Err(Error::Unavailable);
-                }
-                let Phase::Exited { generation } = entry.phase else {
-                    return Err(Error::Unavailable);
-                };
-                if entry.pending.is_some() || entry.streams.iter().any(|s| !s.results.is_empty()) {
-                    return Err(Error::Busy);
-                }
+                let generation = entry.retirement_generation()?;
                 self.entries.remove(&target.name);
                 self.tombstones.push_back(Tombstone {
                     name: target.name.clone(),

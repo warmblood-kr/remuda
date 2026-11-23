@@ -1517,7 +1517,7 @@ pub(crate) fn reap_and_notify(registry: &Registry, image: &Image) -> Vec<String>
     let hosted = registry.reap_hosted_with_exit_info();
     for (name, id, instance_id, reason, exit_info) in &hosted {
         #[cfg(unix)]
-        image.session_hosts().retire_closed(name);
+        image.session_hosts().retire_closed(name, instance_id);
         notify_exited(image, name, id, instance_id, reason, exit_info.as_ref());
     }
     let mut dead = dead;
@@ -1559,9 +1559,11 @@ fn close_hosted(
         None => registry.close(name)?,
     };
     if let Ok(true) = closed {
-        #[cfg(unix)]
-        image.session_hosts().retire_closed(name);
         let identity = handle.identity();
+        #[cfg(unix)]
+        image
+            .session_hosts()
+            .retire_closed(name, &identity.instance);
         notify_exited(
             image,
             name,
