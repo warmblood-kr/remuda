@@ -76,6 +76,7 @@ pub enum Focus {
 pub enum Action {
     Nothing,
     Quit,
+    BrowseCluster,
     Restart,
     /// Bytes for the focused session's pty, already encoded.
     Type(Vec<u8>),
@@ -123,6 +124,8 @@ enum WordClass {
 }
 
 pub struct Ui {
+    node_header: bool,
+    cluster_browser: bool,
     pub sessions: Vec<SessionSummary>,
     pub selected: usize,
     /// A mouse selection can move focus without making the list scroll under
@@ -206,6 +209,8 @@ struct ScrollState {
 impl Ui {
     pub fn new(sessions: Vec<SessionSummary>, shell: &str, notice: Option<String>) -> Self {
         Self {
+            node_header: false,
+            cluster_browser: false,
             sessions,
             selected: 0,
             list_first_visible: None,
@@ -359,7 +364,9 @@ impl Ui {
         let Some(first) = self.list_first_visible else {
             return;
         };
-        let visible = (self.preview_rows as usize / self.session_rows).max(1);
+        let visible = (self.preview_rows.saturating_sub(self.node_header_rows()) as usize
+            / self.session_rows)
+            .max(1);
         let max_first = self.sessions.len().saturating_sub(visible);
         let mut first = first.min(max_first);
         if self.selected < first {
@@ -390,6 +397,14 @@ impl Ui {
             match self.mode.clone() {
                 Mode::Prompt(buffer) => self.prompt_key(key, buffer),
                 Mode::Confirm(name) => self.confirm_key(key, name),
+                Mode::Browse
+                    if self.cluster_browser
+                        && !self.visual
+                        && key.code == KeyCode::F(6)
+                        && key.modifiers.is_empty() =>
+                {
+                    Action::BrowseCluster
+                }
                 Mode::Browse => self.browse_key(key),
             }
         };
@@ -514,8 +529,13 @@ impl Ui {
         self.click_session_pane(event.kind, row, col - preview_offset, body, preview_w)
     }
 
+    fn node_header_rows(&self) -> u16 {
+        u16::from(self.node_header)
+    }
+
     fn scroll_list(&mut self, delta: isize, body: u16) {
-        let visible = (body as usize / self.session_rows).max(1);
+        let visible =
+            (body.saturating_sub(self.node_header_rows()) as usize / self.session_rows).max(1);
         let max_first = self.sessions.len().saturating_sub(visible);
         let first = list_viewport(self, body);
         let first = first.saturating_add_signed(delta).min(max_first);
@@ -595,11 +615,12 @@ impl Ui {
         if !matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
             return Action::Nothing;
         }
-        if row < 1 || row > body {
+        let header = self.node_header_rows();
+        if row <= header || row > body {
             return Action::Nothing;
         }
         let viewport = list_viewport(self, body);
-        let index = ((row - 1) as usize / self.session_rows) + viewport;
+        let index = ((row - header - 1) as usize / self.session_rows) + viewport;
         if index >= self.sessions.len() {
             return Action::Nothing;
         }
@@ -1452,7 +1473,14 @@ fn content_list_width(ui: &Ui, usable: u16) -> u16 {
                 .max()
                 .unwrap_or(0)
         });
-    let wanted = longest.saturating_add(2).min(u16::MAX as usize) as u16;
+    let longest = longest.max(if ui.cluster_browser {
+        visible_width(CLUSTER_NODE_LABEL)
+    } else {
+        0
+    });
+    let wanted = longest
+        .saturating_add(2 + 2 * usize::from(ui.node_header_rows()))
+        .min(u16::MAX as usize) as u16;
     wanted.clamp(16, 40).min(usable)
 }
 
@@ -2169,6 +2197,27 @@ mod visual_mode_tests {
     }
 
     #[test]
+    fn node_header_does_not_select_a_session() {
+        let mut ui = ui();
+        ui.node_header = true;
+        let cluster_key = KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE);
+        assert_eq!(ui.on_key(cluster_key), Action::Nothing);
+        ui.cluster_browser = true;
+        assert_eq!(ui.on_key(cluster_key), Action::BrowseCluster);
+        let mut click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(super::node_list_row(&ui, 0, 29, 20).starts_with("This device"));
+        assert!(super::node_list_row(&ui, 1, 29, 20).starts_with("  "));
+        assert_eq!(ui.on_mouse(click, 100, 30), Action::Nothing);
+        click.row = 1;
+        assert_eq!(ui.on_mouse(click, 100, 30), Action::Focus("agent".into()));
+    }
+
+    #[test]
     fn permissions_overlay_is_modal_for_the_mouse() {
         let mut ui = ui();
         ui.focus = Focus::List;
@@ -2360,13 +2409,8 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
     let mut out = String::from("\x1b[H\x1b[2J");
     for row in 0..body {
         out.push_str(&format!("\x1b[{};1H", row + 1));
-        // Start list rows at the top now that the pane header moved to the footer.
         if ui.list_visible {
-            let left = list_row(
-                ui,
-                row as usize + list_viewport(ui, body) * ui.session_rows,
-                list_w,
-            );
+            let left = node_list_row(ui, row, body, list_w);
             out.push_str(&fit(&left, list_w));
         }
         out.push_str(divider);
@@ -2729,11 +2773,7 @@ pub fn render_styled(
     for row in 0..body {
         out.push_str(&format!("\x1b[{};1H\x1b[K", row + 1));
         if ui.list_visible {
-            let left = list_row(
-                ui,
-                row as usize + list_viewport(ui, body) * ui.session_rows,
-                list_w,
-            );
+            let left = node_list_row(ui, row, body, list_w);
             out.push_str(&fit(&left, list_w));
         }
         out.push_str(divider);
@@ -2812,7 +2852,7 @@ fn widest(ui: &Ui) -> u16 {
 /// The first session shown in the list, based on Lua's rows-per-session
 /// contract rather than a native presentation policy.
 fn list_viewport(ui: &Ui, body: u16) -> usize {
-    let visible = body as usize / ui.session_rows;
+    let visible = body.saturating_sub(ui.node_header_rows()) as usize / ui.session_rows;
     if visible == 0 {
         return 0;
     }
@@ -2844,6 +2884,26 @@ pub fn pane_size(ui: &Ui, cols: u16, rows: u16) -> Size {
 /// `live`/`dead` — the one field the whole list exists to show.
 // Lua owns the content, spacing, and colour of every list row.  The cursor is
 // intentionally still per-viewer state, never buffer content.
+const CLUSTER_NODE_LABEL: &str = "This device · F6 cluster";
+
+fn node_list_row(ui: &Ui, row: u16, body: u16, width: u16) -> String {
+    let viewport = list_viewport(ui, body) * ui.session_rows;
+    if !ui.node_header {
+        return list_row(ui, usize::from(row) + viewport, width);
+    }
+    if row == 0 {
+        let label = if ui.cluster_browser && usize::from(width) >= visible_width(CLUSTER_NODE_LABEL)
+        {
+            CLUSTER_NODE_LABEL
+        } else {
+            "This device"
+        };
+        return fit(label, width);
+    }
+    let index = usize::from(row - 1) + viewport;
+    format!("  {}", list_row(ui, index, width.saturating_sub(2)))
+}
+
 fn list_row(ui: &Ui, row: usize, width: u16) -> String {
     if ui.sessions.is_empty() {
         // The empty herd says what it is and what to do about it. It does not
@@ -3216,6 +3276,7 @@ fn refresh_list_text<P: SessionPort + ?Sized>(
 ) {
     if !path.has_lua() {
         let (width, _) = ui_layout(ui, cols);
+        let width = width.saturating_sub(2 * ui.node_header_rows());
         let selection = selected_name
             .and_then(|name| ui.sessions.iter().find(|s| s.name == name))
             .and_then(|s| {
@@ -3490,6 +3551,27 @@ pub fn run_port<P: SessionPort + ?Sized>(
     server: &str,
     notice: Option<String>,
 ) -> std::io::Result<()> {
+    run_node_port(local, port, server, notice, None).map(|_| ())
+}
+
+/// Return true when the user opens the cluster tree from the local session list.
+pub fn run_local_browser(
+    path: &Path,
+    server: &str,
+    notice: Option<String>,
+    cluster_browser: bool,
+) -> std::io::Result<bool> {
+    run_node_port(path, path, server, notice, Some(cluster_browser))
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_node_port<P: SessionPort + ?Sized>(
+    local: &Path,
+    port: &P,
+    server: &str,
+    notice: Option<String>,
+    browser: Option<bool>,
+) -> std::io::Result<bool> {
     let path = port;
     let keymap = crate::keybindings::fetch(local, Duration::from_secs(3))
         .map_err(|error| std::io::Error::other(format!("key bindings unavailable: {error}")))?;
@@ -3509,6 +3591,10 @@ pub fn run_port<P: SessionPort + ?Sized>(
     // failure if nothing else already explains why nothing works.
     let mut ui = Ui::new(sessions, &shell, notice.or(list_err));
     ui.set_keymap(keymap);
+    if let Some(cluster_browser) = browser {
+        ui.cluster_browser = cluster_browser;
+        ui.node_header = true;
+    }
     let mut painted = String::new();
     // The exclusive hold on the focused session, and the name it was taken on.
     // Its `Drop` is the detach, so letting it fall out of scope is the release.
@@ -3672,7 +3758,8 @@ pub fn run_port<P: SessionPort + ?Sized>(
         skip_list = matches!(action, Action::Type(_));
         match action {
             Action::Nothing => {}
-            Action::Quit => return Ok(()),
+            Action::Quit => return Ok(false),
+            Action::BrowseCluster => return Ok(true),
             Action::Restart if !path.restartable() => {
                 ui.notice = Some(format!("restart remuda on {} itself", path.label()));
             }

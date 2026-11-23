@@ -133,6 +133,7 @@ type JoinAdmitter = Arc<dyn Fn(&[u8], Option<&str>) -> io::Result<()> + Send + S
 type FrameDispatcher = Arc<dyn Fn(&[u8], &[u8]) -> io::Result<Vec<u8>> + Send + Sync>;
 
 struct ListenerState {
+    browser: Option<super::browser::Service>,
     responder_private: Zeroizing<Vec<u8>>,
     replay: Arc<Mutex<replay::ReplayWindow>>,
     unknown_replay: Arc<Mutex<replay::ReplayWindow>>,
@@ -449,6 +450,7 @@ pub(crate) fn bind_with_security(
             join_tokens,
             admit_join: Arc::new(cluster::admit_join_locked),
             audit: Arc::new(cluster::audit::AuditSink::default_state_dir()),
+            browser: super::browser::Service::configured()?,
         }),
         authorize,
         dispatch,
@@ -1444,12 +1446,28 @@ fn handle_connection_with(stream: TcpStream, context: ConnectionHandlerContext) 
             b"request capacity reached",
         ));
     }
-    if let Err((status, body)) =
-        check_request_replay(&state, remote_addr, admitted, &peer_fp, &opened)
-    {
+    let browser_authenticated = !admitted
+        && state
+            .browser
+            .as_ref()
+            .is_some_and(|service| service.authenticates(&opened.payload, &opened.peer_static));
+    if let Err((status, body)) = check_request_replay(
+        &state,
+        remote_addr,
+        admitted || browser_authenticated,
+        &peer_fp,
+        &opened,
+    ) {
         return ignore_response_error(write_http_response(stream, status, body));
     }
     if !admitted {
+        if let Some(reply) = state
+            .browser
+            .as_ref()
+            .and_then(|browser| browser.dispatch(&opened.payload, &opened.peer_static))
+        {
+            return send_encrypted_response(stream, opened, &reply);
+        }
         return handle_unadmitted_peer(stream, state, opened, &peer_fp);
     }
     handle_admitted_request(
@@ -2164,6 +2182,7 @@ mod tests {
                 join_tokens,
                 admit_join,
                 audit: Arc::new(cluster::audit::AuditSink::Off),
+                browser: None,
             });
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = stop.clone();
@@ -2246,6 +2265,7 @@ mod tests {
                 join_tokens,
                 admit_join: Arc::new(cluster::admit_join_locked),
                 audit: Arc::new(cluster::audit::AuditSink::at(&state_dir)),
+                browser: None,
             });
             let test_state = state.clone();
             let listener = Listener {

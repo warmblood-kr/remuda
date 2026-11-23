@@ -145,16 +145,30 @@ impl ClusterClient {
         our_static_private: &[u8],
         request: &Request,
     ) -> Result<Response, ClientError> {
+        let payload = serde_json::to_vec(request).map_err(|_| ClientError::BadResponse)?;
+        let view = matches!(request, Request::RenderedSessionList { .. });
+        let response =
+            self.request_payload(peer, pinned_peer_static, our_static_private, &payload, view)?;
+        serde_json::from_slice(&response).map_err(|_| ClientError::BadResponse)
+    }
+
+    pub(super) fn request_payload(
+        &self,
+        peer: SocketAddr,
+        pinned_peer_static: &[u8],
+        our_static_private: &[u8],
+        payload: &[u8],
+        view: bool,
+    ) -> Result<Vec<u8>, ClientError> {
         let deadline = Instant::now() + self.timeouts.total;
         frame::reject_low_order_dh(our_static_private, pinned_peer_static)
             .map_err(|_| ClientError::Crypto)?;
-        let payload = serde_json::to_vec(request).map_err(|_| ClientError::BadResponse)?;
         if payload.len() > frame::MAX_REQUEST_PAYLOAD {
             return Err(ClientError::RequestTooLarge);
         }
         let timestamp = self.clock.unix_seconds().min(i64::MAX as u64) as i64;
         let sealed =
-            frame::seal_request(our_static_private, pinned_peer_static, timestamp, &payload)
+            frame::seal_request(our_static_private, pinned_peer_static, timestamp, payload)
                 .map_err(|_| ClientError::Crypto)?;
         let body = sealed.message.clone();
         let connect_timeout = remaining(deadline)?
@@ -162,7 +176,6 @@ impl ClusterClient {
             .max(Duration::from_millis(1));
         let mut stream = TcpStream::connect_timeout(&peer, connect_timeout).map_err(map_io)?;
         let remaining_total = remaining(deadline)?;
-        let view = matches!(request, Request::RenderedSessionList { .. });
         self.exchange(&mut stream, sealed, &body, remaining_total, view)
     }
 
@@ -173,7 +186,7 @@ impl ClusterClient {
         body: &[u8],
         watchdog_after: Duration,
         view: bool,
-    ) -> Result<Response, ClientError> {
+    ) -> Result<Vec<u8>, ClientError> {
         let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let timer_stream = stream.try_clone().map_err(map_io)?;
         let timer_flag = timed_out.clone();
@@ -200,7 +213,7 @@ impl ClusterClient {
         sealed: frame::SealedRequest,
         body: &[u8],
         view: bool,
-    ) -> Result<Response, ClientError> {
+    ) -> Result<Vec<u8>, ClientError> {
         stream
             .set_write_timeout(Some(self.timeouts.read))
             .map_err(map_io)?;
@@ -221,7 +234,7 @@ impl ClusterClient {
         if view && plaintext.len() > 32768 {
             return Err(ClientError::BadResponse);
         }
-        serde_json::from_slice(&plaintext).map_err(|_| ClientError::BadResponse)
+        Ok(plaintext)
     }
 }
 

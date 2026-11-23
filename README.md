@@ -51,6 +51,37 @@ byte, so it carries no inter-key timing for a stack of nested ttys to mangle.
 agent's own TUI — can swallow `Ctrl-\` before remuda sees it. `remuda attach`
 has always had that ceiling and this shares it.
 
+Use `remuda browser user@host` from a terminal to open Remuda on a remote
+machine. The client uses your SSH configuration and host verification. The
+remote login account needs `remuda` on its PATH. An SSH config alias also
+works, including aliases for hosts that use a custom SSH port. The client
+machine needs the Remuda CLI and an SSH client. It can launch Browser without
+a local daemon or cluster membership.
+
+### Open a VFS document for a Browser reader
+
+For an isolated setup, start the serving node with `REMUDA_BROWSER_POLICY`
+pointing to a JSON file with `publisher` and `browser` (distinct Base64
+X25519 public keys) and `document` (the permitted canonical
+`remuda:///path`). The listener loads this policy when it starts.
+
+Give the reader and Butler separate owner-only JSON credential files, each
+with `endpoint` (IP and port), `server` (the serving node's Base64
+public key), and `private` (that client's Base64 X25519 private key).
+On macOS or Windows, install [the Browser nightly](#install-the-browser-nightly).
+Set `REMUDA_BROWSER_CLIENT` to the reader's credential file and run
+`remuda browser --gui HOST`, using the same SSH host or alias as the terminal
+client. A document request opens a tab beside the live SSH terminal. From
+Butler, point the same variable at the publisher file and run
+`remuda browser open-document REQUEST_ID remuda:///path`. The command
+reports the display result as JSON. Use the same request ID when retrying
+the same document. An `unknown` result means Browser could have received
+the request, but the command could not confirm display.
+
+This configuration serves one active Browser and one bounded UTF-8
+document. Recent results are held in memory on the serving node. The GUI
+uses its user credential directly over the pinned listener connection.
+
 Direct attach enables terminal mouse input by default. The wheel scrolls the
 session's retained history when its program has mouse reporting off; when the
 program tracks the mouse, reports go to that program. Press `Ctrl-]` to toggle
@@ -117,6 +148,26 @@ sidebar](docs/remuda-cascading-spawn.png)
 The butler spawns a lead; a worker can spawn its own workers (cascading).
 
 ## Install
+
+### Install the Browser nightly
+
+On Apple silicon macOS and x64 Windows, the nightly includes the matching native
+Browser. Use an SSH hostname or alias in place of `HOST`. This uses your
+existing SSH configuration and requires a remote Remuda node.
+
+**macOS**
+
+```sh
+curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly sh && "$HOME/.local/bin/remuda" browser --gui HOST
+```
+
+**Windows (PowerShell)**
+
+```powershell
+$env:REMUDA_CHANNEL='nightly'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex; if ($?) { remuda browser --gui HOST }
+```
+
+### Install Remuda with Butler
 
 No stable release has been published yet (see [Channels](#channels) below),
 so install from `nightly` — every commit on `main`:

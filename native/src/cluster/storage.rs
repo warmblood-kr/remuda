@@ -139,7 +139,7 @@ pub(super) fn check_directory_type(dir: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-pub(super) fn check_private_file(file: &File, description: &str, path: &Path) -> io::Result<()> {
+pub(crate) fn check_private_file(file: &File, description: &str, path: &Path) -> io::Result<()> {
     super::windows_security::secure_or_upgrade(file, path, false)
         .map(|_| ())
         .map_err(|error| {
@@ -265,7 +265,7 @@ pub(super) fn check_directory_type(dir: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-pub(super) fn check_private_file(file: &File, description: &str, path: &Path) -> io::Result<()> {
+pub(crate) fn check_private_file(file: &File, description: &str, path: &Path) -> io::Result<()> {
     check_private_metadata(&file.metadata()?, description, path)
 }
 

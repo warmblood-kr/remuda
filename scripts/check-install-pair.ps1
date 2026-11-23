@@ -33,13 +33,18 @@ function tar {
     if (-not $global:noHost) {
         Set-Content -Path (Join-Path $args[3] 'remuda-session-host.exe') -Value "host $global:build"
     }
+    if ($global:withGui) {
+        Set-Content -Path (Join-Path $args[3] 'remuda-gui.exe') -Value "gui $global:build"
+        Set-Content -Path (Join-Path $args[3] 'remuda-gui.build') -Value "9.9.9+$global:build"
+    }
     $global:LASTEXITCODE = 0
 }
 
 $failures = @()
-function Install-Build($name, $build, [switch]$NoHost) {
+function Install-Build($name, $build, [switch]$NoHost, [switch]$WithGui) {
     $global:build = $build
     $global:noHost = $NoHost
+    $global:withGui = $WithGui
     try {
         & { Get-Content -Raw $script | Invoke-Expression } *>&1 | Out-Null
     } catch {
@@ -76,9 +81,10 @@ try {
     Has $n 'remuda.exe.prev' $null; Has $n 'remuda-session-host.exe.prev' $null
 
     $n = 'upgrade'
-    Install-Build $n 2
+    Install-Build $n 2 -WithGui
     Has $n 'remuda.exe' 'remuda 2'; Has $n 'remuda-session-host.exe' 'host 2'
     Has $n 'remuda.exe.prev' 'remuda 1'; Has $n 'remuda-session-host.exe.prev' 'host 1'
+    Has $n '.remuda-gui/builds/build-9.9.9+2/remuda-gui.exe' 'gui 2'
 
     $n = 'release without a host'
     Install-Build $n 3 -NoHost
@@ -86,9 +92,11 @@ try {
     Has $n 'remuda.exe.prev' 'remuda 2'; Has $n 'remuda-session-host.exe.prev' 'host 2'
 
     $n = 'pair after a hostless release'
-    Install-Build $n 4
+    Install-Build $n 4 -WithGui
     Has $n 'remuda.exe' 'remuda 4'; Has $n 'remuda-session-host.exe' 'host 4'
     Has $n 'remuda.exe.prev' 'remuda 3'; Has $n 'remuda-session-host.exe.prev' $null
+    Has $n '.remuda-gui/builds/build-9.9.9+2/remuda-gui.exe' 'gui 2'
+    Has $n '.remuda-gui/builds/build-9.9.9+4/remuda-gui.exe' 'gui 4'
 
     $leftover = @(Get-ChildItem -Force -Path $installDir -Filter '.*' -File)
     if ($leftover) { $failures += "staging files left behind: $($leftover.Name -join ', ')" }

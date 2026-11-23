@@ -2,8 +2,14 @@
 //! Managed entries must remain immutable for the lifetime of running windows.
 use std::path::{Path, PathBuf};
 
+pub(super) const EXECUTABLE: &str = if cfg!(windows) {
+    "remuda-gui.exe"
+} else {
+    "remuda-gui"
+};
+
 pub(super) fn choose(exe: &Path, build: &str) -> Result<Option<PathBuf>, String> {
-    let sibling = exe.with_file_name("remuda-gui");
+    let sibling = exe.with_file_name(EXECUTABLE);
     match std::fs::symlink_metadata(&sibling) {
         Ok(_) => return Ok(Some(sibling)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -25,7 +31,7 @@ pub(super) fn choose(exe: &Path, build: &str) -> Result<Option<PathBuf>, String>
         (".remuda-gui".to_string(), true),
         ("builds".to_string(), true),
         (format!("build-{build}"), true),
-        ("remuda-gui".to_string(), false),
+        (EXECUTABLE.to_string(), false),
     ] {
         path.push(component);
         let metadata = match std::fs::symlink_metadata(&path) {
@@ -34,14 +40,21 @@ pub(super) fn choose(exe: &Path, build: &str) -> Result<Option<PathBuf>, String>
             Err(e) => return Err(format!("cannot inspect {}: {e}", path.display())),
         };
         let kind = metadata.file_type();
-        if kind.is_symlink() || (directory && !kind.is_dir()) || (!directory && !kind.is_file()) {
+        #[cfg(windows)]
+        let reparse_point = {
+            use std::os::windows::fs::MetadataExt;
+            metadata.file_attributes() & 0x400 != 0
+        };
+        #[cfg(not(windows))]
+        let reparse_point = kind.is_symlink();
+        if reparse_point || (directory && !kind.is_dir()) || (!directory && !kind.is_file()) {
             return Err(format!("invalid managed GUI entry: {}", path.display()));
         }
     }
     Ok(Some(path))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;

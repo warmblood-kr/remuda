@@ -1,6 +1,8 @@
 //! Network boundary for the native host. Socket access is confined to this module.
 
 pub mod advertise_addr;
+pub mod browser;
+mod browser_delivery;
 pub mod cluster_client;
 pub mod frame;
 pub mod http_client;

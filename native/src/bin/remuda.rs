@@ -51,6 +51,8 @@ extern "C" fn record_join_interrupt(signal: libc::c_int) {
 
 #[path = "remuda/agent_notice.rs"]
 mod agent_notice;
+#[path = "remuda/browser.rs"]
+mod browser;
 #[cfg(unix)]
 #[path = "remuda/claude_channel.rs"]
 mod claude_channel;
@@ -60,7 +62,7 @@ mod codex_native;
 mod codex_tui;
 #[path = "remuda/codex_tunnel.rs"]
 mod codex_tunnel;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[path = "remuda/gui_managed.rs"]
 mod gui_managed;
 #[path = "remuda/opencode_adopt.rs"]
@@ -135,9 +137,10 @@ fn starts_interactive_client(args: &[String]) -> bool {
     };
     match command_args.first().copied() {
         None => true,
-        Some("daemon" | "run" | "attach" | "_codex_tui" | "_opencode_tui" | "_claude_channel") => {
-            true
-        }
+        Some(
+            "browser" | "daemon" | "run" | "attach" | "_codex_tui" | "_opencode_tui"
+            | "_claude_channel",
+        ) => true,
         Some("cluster") => command_args.get(1).is_some_and(|verb| *verb == "remote"),
         _ => false,
     }
@@ -175,6 +178,10 @@ fn run_cli(args: Vec<String>) -> ExitCode {
         || flags.args.iter().map(String::as_str).collect(),
         |code| vec!["-e", code],
     );
+
+    if argv.first() == Some(&"browser") {
+        return browser::run(&argv[1..], server, stdin_enabled);
+    }
 
     // GUI is a client of an existing daemon; launching it must not probe,
     // start, reload, or initialize the daemon or cluster.
@@ -299,10 +306,7 @@ fn dispatch_cli_command(
     match command {
         "" if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
             with_daemon(server, path, |path| {
-                match remuda_native::tui::run(path, server, skew.clone()) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => fail(format!("tui: {e}")),
-                }
+                run_default_browser(server, path, skew.clone())
             })
         }
         "" | "-h" | "--help" => help_command(),
@@ -833,6 +837,8 @@ remuda — a pty manager you can attach to
   remuda cluster nodes            list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster leave [--yes]    leave the cluster; another node revokes this one
+  remuda browser [USER@]HOST      open remote Remuda over SSH
+  remuda browser --gui HOST      open the native Remuda client
   remuda cluster remote [node[/session]] a node's session screen, or the cluster tree
   remuda cluster listen [--bind ADDR] [--allow-public] configure the daemon listener
                                   --foreground holds the listener in this terminal
@@ -938,6 +944,8 @@ remuda — terminal orchestration for coding agents
   remuda cluster nodes           list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster leave [--yes]    leave the cluster; another node revokes this one
+  remuda browser [USER@]HOST      open remote Remuda over SSH
+  remuda browser --gui HOST      open the native Remuda client
   remuda cluster remote [node[/session]] a node's session screen, or the cluster tree
   remuda cluster listen [--bind ADDR] [--allow-public] configure the daemon listener
                                   --foreground holds the listener in this terminal
@@ -2907,6 +2915,31 @@ fn safe_fingerprint_field(value: &str, token: &str) -> String {
         value.to_owned()
     } else {
         "the supplied fingerprint".into()
+    }
+}
+
+fn run_default_browser(server: &str, path: &Path, mut notice: Option<String>) -> ExitCode {
+    loop {
+        let clustered = match remuda_native::cluster::snapshot() {
+            Ok(snapshot) => snapshot.is_some(),
+            Err(error) => {
+                if notice.is_none() {
+                    notice = Some(format!("cluster unavailable: {error}"));
+                }
+                false
+            }
+        };
+        match remuda_native::tui::run_local_browser(path, server, notice.take(), clustered) {
+            Ok(false) => return ExitCode::SUCCESS,
+            Ok(true) => {
+                let node = remote_node_label(remuda_native::hostname::hostname);
+                let result = cluster_remote(server, path, &node, None);
+                if result != ExitCode::SUCCESS {
+                    return result;
+                }
+            }
+            Err(error) => return fail(format!("tui: {error}")),
+        }
     }
 }
 
