@@ -465,13 +465,24 @@ mod macos {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 #[test]
 fn gui_reports_unsupported_without_starting_a_daemon() {
     let scratch = Scratch::new("unsupported");
     scratch.install_cli();
     let output = scratch.command().arg("gui").output().unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("macOS only"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("macOS and Windows"));
+    scratch.assert_untouched();
+}
+
+#[cfg(windows)]
+#[test]
+fn gui_reports_missing_windows_executable_without_starting_a_daemon() {
+    let scratch = Scratch::new("windows-missing");
+    scratch.install_cli();
+    let output = scratch.command().arg("gui").output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("remuda-gui.exe"));
     scratch.assert_untouched();
 }

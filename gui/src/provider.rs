@@ -96,13 +96,95 @@ pub fn output(
     result
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn output(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    fn drain(
+        pipe: impl Read + Send + 'static,
+        limit: usize,
+    ) -> mpsc::Receiver<Result<Vec<u8>, String>> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = pipe
+                .take(limit as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| error.to_string())
+                .and_then(|_| {
+                    if bytes.len() > limit {
+                        Err("Provider output limit exceeded".into())
+                    } else {
+                        Ok(bytes)
+                    }
+                });
+            let _ = sender.send(result);
+        });
+        receiver
+    }
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let stdout = drain(child.stdout.take().expect("piped stdout"), STDOUT_LIMIT);
+    let stderr = drain(child.stderr.take().expect("piped stderr"), STDERR_LIMIT);
+    let deadline = Instant::now() + timeout;
+    let result = (|| {
+        let receive = |pipe: mpsc::Receiver<Result<Vec<u8>, String>>| {
+            pipe.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|error| format!("Provider response: {error}"))?
+        };
+        let out = receive(stdout)?;
+        let err = receive(stderr)?;
+        loop {
+            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+                return if status.success() {
+                    Ok(out)
+                } else {
+                    Err(String::from_utf8_lossy(&err).into_owned())
+                };
+            }
+            if Instant::now() >= deadline {
+                return Err("Provider request timed out".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    result
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn output(
     _program: impl AsRef<std::ffi::OsStr>,
     _args: &[&str],
     _timeout: Duration,
 ) -> Result<Vec<u8>, String> {
     Err("Bounded GUI provider is unavailable on this platform".into())
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn windows_worker_captures_output_and_propagates_failure() {
+        let out = output("cmd.exe", &["/d", "/c", "echo provider-ok"], TIMEOUT).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap().trim(), "provider-ok");
+        assert!(output("cmd.exe", &["/d", "/c", "exit 9"], TIMEOUT).is_err());
+    }
 }
 
 #[cfg(all(test, unix))]

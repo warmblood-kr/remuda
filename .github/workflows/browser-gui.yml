@@ -41,9 +41,35 @@ jobs:
           "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
       - if: runner.os == 'Windows'
         run: cargo build --release --locked --manifest-path gui/Cargo.toml
+      - if: runner.os == 'Windows'
+        run: cargo test --release --locked --manifest-path gui/Cargo.toml --bin remuda-gui provider::windows_tests
       - if: runner.os == 'macOS'
         run: cargo build --locked --manifest-path gui/Cargo.toml
       - run: cargo build --locked -p remuda-native --bin remuda
+      - name: Read sessions through the Windows local node
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = New-Item -ItemType Directory (Join-Path $env:RUNNER_TEMP ('remuda-gui-' + [guid]::NewGuid()))
+          foreach ($entry in @{ REMUDA_RUNTIME_DIR='run'; XDG_CONFIG_HOME='config'; XDG_DATA_HOME='data'; XDG_STATE_HOME='state'; XDG_CACHE_HOME='cache' }.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($entry.Key, (Join-Path $root.FullName $entry.Value))
+          }
+          $env:REMUDA_NO_UPDATE_CHECK = '1'
+          $daemon = Start-Process -FilePath ./target/debug/${{ matrix.cli }} -ArgumentList daemon -PassThru
+          try {
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              $sessions = & ./gui/target/release/${{ matrix.executable }} --internal-list-worker
+              if ($LASTEXITCODE -eq 0) { break }
+              Start-Sleep -Milliseconds 200
+            }
+            if ($LASTEXITCODE -ne 0 -or $sessions -ne '[]') { throw 'GUI could not read the local node session list' }
+            $nodes = & ./gui/target/release/${{ matrix.executable }} --internal-nodes-worker
+            if ($LASTEXITCODE -ne 0 -or $nodes -ne '[]') { throw 'An unconfigured cluster should have no peer rows' }
+          } finally {
+            Stop-Process -Id $daemon.Id -ErrorAction SilentlyContinue
+            $daemon.WaitForExit()
+            Remove-Item -LiteralPath $root.FullName -Force -Recurse
+          }
       - if: runner.os == 'macOS'
         run: cargo test --locked --manifest-path gui/Cargo.toml --bin remuda-gui bus_document_reuses_one_tab_beside_the_terminal
       - if: runner.os == 'macOS'
