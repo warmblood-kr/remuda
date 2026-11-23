@@ -51,6 +51,8 @@ extern "C" fn record_join_interrupt(signal: libc::c_int) {
 
 #[path = "remuda/agent_notice.rs"]
 mod agent_notice;
+#[path = "remuda/browser.rs"]
+mod browser;
 #[cfg(unix)]
 #[path = "remuda/claude_channel.rs"]
 mod claude_channel;
@@ -135,9 +137,10 @@ fn starts_interactive_client(args: &[String]) -> bool {
     };
     match command_args.first().copied() {
         None => true,
-        Some("daemon" | "run" | "attach" | "_codex_tui" | "_opencode_tui" | "_claude_channel") => {
-            true
-        }
+        Some(
+            "browser" | "daemon" | "run" | "attach" | "_codex_tui" | "_opencode_tui"
+            | "_claude_channel",
+        ) => true,
         Some("cluster") => command_args.get(1).is_some_and(|verb| *verb == "remote"),
         _ => false,
     }
@@ -175,6 +178,10 @@ fn run_cli(args: Vec<String>) -> ExitCode {
         || flags.args.iter().map(String::as_str).collect(),
         |code| vec!["-e", code],
     );
+
+    if argv.first() == Some(&"browser") {
+        return browser::run(&argv[1..], server, stdin_enabled);
+    }
 
     // GUI is a client of an existing daemon; launching it must not probe,
     // start, reload, or initialize the daemon or cluster.
@@ -830,6 +837,7 @@ remuda — a pty manager you can attach to
   remuda cluster nodes            list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster leave [--yes]    leave the cluster; another node revokes this one
+  remuda browser [USER@]HOST      open remote Remuda over SSH
   remuda cluster remote [node[/session]] a node's session screen, or the cluster tree
   remuda cluster listen [--bind ADDR] [--allow-public] configure the daemon listener
                                   --foreground holds the listener in this terminal
@@ -935,6 +943,7 @@ remuda — terminal orchestration for coding agents
   remuda cluster nodes           list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster leave [--yes]    leave the cluster; another node revokes this one
+  remuda browser [USER@]HOST      open remote Remuda over SSH
   remuda cluster remote [node[/session]] a node's session screen, or the cluster tree
   remuda cluster listen [--bind ADDR] [--allow-public] configure the daemon listener
                                   --foreground holds the listener in this terminal

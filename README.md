@@ -51,6 +51,13 @@ byte, so it carries no inter-key timing for a stack of nested ttys to mangle.
 agent's own TUI — can swallow `Ctrl-\` before remuda sees it. `remuda attach`
 has always had that ceiling and this shares it.
 
+Use `remuda browser user@host` from a terminal to open Remuda on a remote
+machine. The client uses your SSH configuration and host verification. The
+remote login account needs `remuda` on its PATH. An SSH config alias also
+works, including aliases for hosts that use a custom SSH port. The client
+machine needs the Remuda CLI and an SSH client. It can launch Browser without
+a local daemon or cluster membership.
+
 Direct attach enables terminal mouse input by default. The wheel scrolls the
 session's retained history when its program has mouse reporting off; when the
 program tracks the mouse, reports go to that program. Press `Ctrl-]` to toggle
