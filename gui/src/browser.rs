@@ -63,9 +63,7 @@ pub fn open(
                             view.update(cx, |browser, cx| {
                                 if let Ok(document) = browser.documents.try_recv() {
                                     window.activate_window();
-                                    browser.document = Some(document);
-                                    browser.pending_presentation = true;
-                                    browser.document_active = true;
+                                    browser.open_document(document);
                                     cx.notify();
                                 }
                                 if !browser.document_active {
@@ -97,6 +95,12 @@ pub fn open(
 }
 
 impl Browser {
+    fn open_document(&mut self, document: Document) {
+        self.document = Some(document);
+        self.pending_presentation = true;
+        self.document_active = true;
+    }
+
     fn refresh_terminal(&mut self, cx: &mut Context<Self>) {
         if let Some(terminal) = self.terminal.as_mut() {
             if let Ok(screen) = terminal.screen_text() {
@@ -239,6 +243,7 @@ impl Render for Browser {
             .child(
                 div()
                     .id("terminal-tab")
+                    .debug_selector(|| "browser-terminal-tab".into())
                     .p_2()
                     .cursor_pointer()
                     .child("Terminal")
@@ -252,6 +257,7 @@ impl Render for Browser {
                 tabs.child(
                     div()
                         .id("document-tab")
+                            .debug_selector(|| "browser-document-tab".into())
                         .p_2()
                         .cursor_pointer()
                         .child(document.title.clone())
@@ -282,6 +288,7 @@ impl Render for Browser {
             view = view.child(
                 div()
                     .id("browser-document")
+                    .debug_selector(|| "browser-document-body".into())
                     .flex_1()
                     .min_h_0()
                     .w_full()
@@ -308,5 +315,43 @@ impl Render for Browser {
             );
         }
         view
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn bus_document_reuses_one_tab_beside_the_terminal(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| Browser {
+            documents: mpsc::channel().1,
+            displayed: mpsc::channel().0,
+            document: None,
+            pending_presentation: false,
+            document_active: false,
+            terminal: None,
+            terminal_text: String::new(),
+            focus: cx.focus_handle(),
+        });
+
+        assert!(cx.debug_bounds("browser-terminal-tab").is_some());
+        assert!(cx.debug_bounds("browser-document-tab").is_none());
+        for _ in 0..2 {
+            view.update(cx, |browser, cx| {
+                browser.open_document(Document {
+                    request: DocumentRequest {
+                        id: "reading".into(),
+                        uri: "remuda:///pilot/reading.md".into(),
+                    },
+                    title: "Reading appointment".into(),
+                    body: "Meet in the library at noon.".into(),
+                });
+                cx.notify();
+            });
+            assert!(cx.debug_bounds("browser-terminal-tab").is_some());
+            assert!(cx.debug_bounds("browser-document-tab").is_some());
+            assert!(cx.debug_bounds("browser-document-body").is_some());
+        }
     }
 }

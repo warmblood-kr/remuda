@@ -34,6 +34,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo build --locked --manifest-path gui/Cargo.toml
       - run: cargo build --locked -p remuda-native --bin remuda
+      - if: runner.os == 'macOS'
+        run: cargo test --locked --manifest-path gui/Cargo.toml --bin remuda-gui bus_document_reuses_one_tab_beside_the_terminal
       - shell: bash
         run: |
           ./gui/target/debug/${{ matrix.executable }} --internal-build-id
