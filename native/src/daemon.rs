@@ -49,13 +49,16 @@ use portable_pty::CommandBuilder;
 pub(crate) const MAX_CONCURRENT_SYNCS: usize = 16;
 static ACTIVE_SYNCS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_NEW_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static LIFECYCLE_CHANGE: Mutex<()> = Mutex::new(());
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct NewRequestInFlight;
 
 impl NewRequestInFlight {
-    fn start() -> Self {
+    fn start() -> Option<Self> {
         ACTIVE_NEW_REQUESTS.fetch_add(1, Ordering::SeqCst);
-        Self
+        let in_flight = Self;
+        (!SHUTTING_DOWN.load(Ordering::SeqCst)).then_some(in_flight)
     }
 }
 
@@ -65,7 +68,7 @@ impl Drop for NewRequestInFlight {
     }
 }
 
-fn wait_for_new_requests() {
+fn wait_for_new_requests() -> usize {
     const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
     while ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst) != 0 && std::time::Instant::now() < deadline {
@@ -77,6 +80,7 @@ fn wait_for_new_requests() {
             "remuda: continuing shutdown with {still_in_flight} New request(s) still in flight"
         );
     }
+    still_in_flight
 }
 
 /// Longest a caller found in no session waits for in-flight `new` requests:
@@ -385,7 +389,7 @@ fn serve_from(
     match image.session_hosts().discover(&registry) {
         Ok(names) if !names.is_empty() => {
             eprintln!(
-                "remuda daemon: rediscovered session hosts: {}",
+                "remuda daemon: restored session host registrations: {}",
                 names.join(", ")
             );
             for name in &names {
@@ -2082,18 +2086,11 @@ const HOST_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
 /// `stop` ends host-backed sessions as it ends in-process ones, unless the
 /// caller keeps them; `reload` is the way to carry them to a new daemon.
 #[cfg(unix)]
-fn close_session_hosts(registry: &Registry, image: &Image) {
-    let (closed, left) = image
-        .session_hosts()
-        .close_all(registry, HOST_CLOSE_DEADLINE);
-    if closed > 0 {
-        eprintln!("remuda daemon: stop closed {closed} host-backed session(s)");
-    }
-    if !left.is_empty() {
-        eprintln!(
-            "remuda daemon: still closing at exit: {}; the next daemon finishes them",
-            left.join(", ")
-        );
+fn close_session_hosts(image: &Image) -> Result<(), String> {
+    match image.session_hosts().close_all(HOST_CLOSE_DEADLINE) {
+        Ok(left) if left.is_empty() => Ok(()),
+        Ok(left) => Err(format!("unresolved session hosts: {}", left.join(", "))),
+        Err(error) => Err(format!("could not verify session host inventory: {error}")),
     }
 }
 
@@ -2259,7 +2256,25 @@ fn handle_request(
             &stream,
             &Response::SessionHostBuilds(registry.hosted_builds()),
         ),
+        Request::SessionHostReservations => {
+            #[cfg(unix)]
+            let response = match image.session_hosts().reserved_names() {
+                Ok(names) => Response::Value(serde_json::to_string(&names)?),
+                Err(error) => Response::error(error.to_string()),
+            };
+            #[cfg(windows)]
+            let response = Response::Value("[]".into());
+            reply(&stream, &response)
+        }
         Request::Reload { binary, check } => {
+            let Ok(_lifecycle) = LIFECYCLE_CHANGE.try_lock() else {
+                let reason = if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                    "daemon shutdown is in progress"
+                } else {
+                    "another reload is already in progress"
+                };
+                return reply(&stream, &Response::error(reason));
+            };
             let (response, replaced) = reload(image, registry, &listener_task, &binary, check);
             reply(&stream, &response)?;
             if replaced {
@@ -3511,7 +3526,7 @@ fn handle_shutdown(
         };
         let classify = || match process_ancestry::peer_pid(&stream) {
             Ok(Some(peer_pid)) => {
-                let session_pids = match session_process_ids(registry) {
+                let session_pids = match session_process_ids(registry, image) {
                     Ok(pids) => pids,
                     Err(error) => {
                         eprintln!("remuda: shutdown {error}; refusing unverifiable requester");
@@ -3558,27 +3573,56 @@ fn handle_shutdown(
         verdict,
         |reason| refuse_shutdown(&stream, reason),
         || {
-            image.shutdown_pending_replies();
-            reply(&stream, &Response::Ok)?;
-            // A session can request this shutdown as soon as its process starts. Let
-            // every already-running New handler flush its response before the daemon exits.
-            wait_for_new_requests();
-            #[cfg(windows)]
-            let _ = keep_sessions;
-            #[cfg(unix)]
-            if !keep_sessions {
-                close_session_hosts(registry, image);
-            }
-            reap_processes_before_exit(image);
-            anti_entropy.stop_and_join();
-            socket_owner.cleanup();
-            // After the socket is gone, so `stop` returns at once; an act the
-            // host is running still gets its answer instead of a cut.
-            #[cfg(unix)]
-            drain_session_hosts(image);
-            std::process::exit(0);
+            let Ok(_lifecycle) = LIFECYCLE_CHANGE.try_lock() else {
+                return reply(
+                    &stream,
+                    &Response::error("daemon stop or reload is already in progress"),
+                );
+            };
+            finish_shutdown(&stream, image, &socket_owner, &anti_entropy, keep_sessions);
         },
     )
+}
+
+fn finish_shutdown(
+    stream: &Stream,
+    image: &Image,
+    socket_owner: &SocketOwnership,
+    anti_entropy: &AntiEntropyTask,
+    keep_sessions: bool,
+) -> ! {
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    image.shutdown_pending_replies();
+    let new_requests = wait_for_new_requests();
+    let mut failures = Vec::new();
+    if new_requests != 0 && !keep_sessions {
+        failures.push(format!("{new_requests} session start(s) still in progress"));
+    }
+    #[cfg(unix)]
+    if !keep_sessions {
+        if let Err(error) = close_session_hosts(image) {
+            failures.push(error);
+        }
+    }
+    reap_processes_before_exit(image);
+    anti_entropy.stop_and_join();
+    socket_owner.cleanup();
+    let response = if failures.is_empty() {
+        Response::Ok
+    } else {
+        Response::error(format!(
+            "daemon stopped with incomplete session host cleanup: {}. \
+             Restart in the same runtime and retry stop once ownership can be verified. \
+             If the reservation persists, verify the host processes are gone before \
+             backing up the entire host inventory directory.",
+            failures.join("; ")
+        ))
+    };
+    // The stop requester may disconnect while cleanup is in progress.
+    let _ = reply(stream, &response);
+    #[cfg(unix)]
+    drain_session_hosts(image);
+    std::process::exit(if failures.is_empty() { 0 } else { 1 });
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3603,13 +3647,25 @@ fn own_daemon_ids() -> Vec<String> {
 
 /// Child process IDs of every live session, legacy and host-backed. A
 /// host that cannot report its child makes the ancestry unverifiable.
-fn session_process_ids(registry: &Registry) -> Result<Vec<u32>, String> {
+fn session_process_ids(registry: &Registry, image: &Image) -> Result<Vec<u32>, String> {
+    #[cfg(windows)]
+    let _ = image;
     let mut pids = registry.live_process_ids();
-    let hosted = registry
-        .hosted_handles()
-        .into_iter()
-        .map(|handle| (handle.identity().name.clone(), handle.inspect()));
-    pids.extend(hosted_child_pids(hosted)?);
+    let handles = registry.hosted_handles();
+    let mut observed = Vec::new();
+    for handle in handles {
+        let identity = handle.identity();
+        let observation = handle.inspect();
+        #[cfg(unix)]
+        if observation.is_err() {
+            if let Some(child) = image.session_hosts().dead_host_child(identity) {
+                pids.push(child);
+                continue;
+            }
+        }
+        observed.push((identity.name.clone(), observation));
+    }
+    pids.extend(hosted_child_pids(observed)?);
     Ok(pids)
 }
 
@@ -3843,7 +3899,9 @@ fn handle_new(
     image: &Image,
     request: NewSessionRequest,
 ) -> std::io::Result<()> {
-    let _in_flight = NewRequestInFlight::start();
+    let Some(_in_flight) = NewRequestInFlight::start() else {
+        return reply(&stream, &Response::error("daemon shutdown is in progress"));
+    };
     let NewSessionRequest {
         name,
         command,

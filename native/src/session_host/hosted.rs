@@ -13,7 +13,7 @@ use super::inventory::disk::Store;
 use super::inventory::model::{Birth, Entry, Lease, Phase, Target};
 use super::recovery::Owner;
 use super::remote::{Announced, HostSession};
-use remuda_core::session_operations::SessionHandle;
+use remuda_core::session_operations::{SessionHandle, SessionOperations};
 use remuda_core::{Registry, Size};
 use serde_json::value::RawValue;
 use std::collections::HashMap;
@@ -171,6 +171,20 @@ use linux_state::default_state_base;
 fn is_default_state_root(root: &Path) -> bool {
     root.file_name()
         .is_some_and(|name| name.as_encoded_bytes().starts_with(b"default-"))
+}
+
+/// A process ID proves nothing if the recorded owner used another kernel
+/// boot or PID namespace, even if both can see the inventory on disk.
+pub(super) fn owner_namespace() -> io::Result<String> {
+    #[cfg(target_os = "macos")]
+    return boot_namespace();
+    #[cfg(target_os = "linux")]
+    return linux_state::owner_namespace();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "unsupported host PID namespace",
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -409,16 +423,19 @@ impl Hosting {
         }
         let root = self.state_root()?;
         let inventory = root.join("inventory");
-        let store = if inventory.exists() {
-            Store::open(&inventory)
-        } else if create {
-            match std::fs::DirBuilder::new().mode(0o700).create(&root) {
-                Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
-                _ => {}
+        let store = match std::fs::symlink_metadata(&inventory) {
+            Ok(_) => Store::open(&inventory),
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !create => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+                    Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
+                        return Err(error)
+                    }
+                    _ => {}
+                }
+                Store::create(&inventory)
             }
-            Store::create(&inventory)
-        } else {
-            return Ok(None);
+            Err(error) => return Err(error),
         }
         .map_err(|error| io::Error::other(format!("session host inventory: {error:?}")))?;
         // One writer claim per daemon process: older owners are fenced from here.
@@ -506,6 +523,40 @@ impl Hosting {
             .map(|entry| describe_reservation(name, entry))
     }
 
+    pub(crate) fn reserved_names(&self) -> io::Result<Vec<String>> {
+        let Some(hosts) = self.hosts(false)? else {
+            return Ok(Vec::new());
+        };
+        let index = hosts
+            .owner
+            .index()
+            .map_err(|error| io::Error::other(format!("session host inventory: {error:?}")))?;
+        Ok(index.entries.into_keys().collect())
+    }
+
+    /// A dead host cannot Inspect, but its recorded child may still anchor
+    /// requester ancestry. Require a match against the registry's full identity.
+    pub(crate) fn dead_host_child(
+        &self,
+        identity: &remuda_core::session_operations::Identity,
+    ) -> Option<u32> {
+        let hosts = self.hosts(false).ok()??;
+        let index = hosts.owner.index().ok()?;
+        let entry = index.entries.get(&identity.name)?;
+        if identity.host != Some(entry.identity.host)
+            || identity.id != entry.identity.session
+            || identity.instance != entry.identity.instance
+        {
+            return None;
+        }
+        let birth = entry.birth.as_ref()?;
+        let process =
+            super::unix::recorded_owner(Path::new(birth.endpoint()), &entry.identity).ok()?;
+        super::unix::owner_exited(process.host)
+            .then_some(process.child)
+            .flatten()
+    }
+
     /// Claim the inventory again under a newer epoch, then show every open
     /// host the new writer, fencing any daemon that claimed since. Returns
     /// each host's answer; none before this daemon opened its inventory.
@@ -559,45 +610,34 @@ impl Hosting {
         self.gate.drain(deadline)
     }
 
-    /// For `stop`: close every host-backed session, then wait up to
-    /// `deadline` for each host to stop. Returns how many were closed and the
-    /// names still closing at the deadline (the next daemon finishes those).
-    pub fn close_all(&self, registry: &Registry, deadline: Duration) -> (usize, Vec<String>) {
-        let Ok(Some(hosts)) = self.hosts(false) else {
-            return (0, Vec::new());
+    /// Stop each instance in the inventory, including hosts that discovery
+    /// could not register. A worker that misses the deadline stays unresolved.
+    pub fn close_all(&self, deadline: Duration) -> io::Result<Vec<String>> {
+        let Some(hosts) = self.hosts(false)? else {
+            return Ok(Vec::new());
         };
-        let open: Vec<_> = hosts
-            .open
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|(name, session)| (name.clone(), session.clone()))
-            .collect();
-        // A human attached, or detaching a moment ago, makes the host refuse
-        // Close; stop ends that session anyway, as it ends an in-process one.
-        let closed = open
-            .iter()
-            .filter(|(name, session)| match registry.close(name) {
-                Some(Ok(true)) => true,
-                // Retry even when nothing was revoked: a detach may have
-                // released the grant between the refusal and the revoke.
-                Some(Err(_)) if session.revoke_human().is_ok() => {
-                    matches!(registry.close(name), Some(Ok(true)))
+        let index = hosts
+            .owner
+            .index()
+            .map_err(|error| io::Error::other(format!("session host inventory: {error:?}")))?;
+        let until = Instant::now() + deadline;
+        let mut unresolved = std::collections::BTreeSet::new();
+        let (done, results) = mpsc::channel();
+        for (name, entry) in index.entries {
+            unresolved.insert(name.clone());
+            let hosts = hosts.clone();
+            let done = done.clone();
+            let _ = std::thread::Builder::new().spawn(move || {
+                if hosts.stop_instance(&name, &entry.identity, until) {
+                    let _ = done.send(name);
                 }
-                _ => false,
-            })
-            .count();
-        let waits: Vec<_> = open
-            .into_iter()
-            .map(|(name, session)| {
-                std::thread::spawn(move || session.teardown(deadline).err().map(|_| name))
-            })
-            .collect();
-        let left = waits
-            .into_iter()
-            .filter_map(|wait| wait.join().ok().flatten())
-            .collect();
-        (closed, left)
+            });
+        }
+        drop(done);
+        while let Ok(name) = results.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            unresolved.remove(&name);
+        }
+        Ok(unresolved.into_iter().collect())
     }
 
     /// Admit host-backed work again after a drain, for a reload rolled back.
@@ -713,6 +753,41 @@ impl Hosts {
             session.note_teardown_failure();
         }
     }
+    fn stop_instance(&self, name: &str, identity: &HostIdentity, until: Instant) -> bool {
+        loop {
+            let target = Target {
+                name: name.into(),
+                identity: identity.clone(),
+            };
+            if self.owner.retire_dead(target).ok() == Some(true) {
+                return true;
+            }
+            let open = self
+                .open
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(name)
+                .filter(|session| session.matches_identity(identity))
+                .cloned();
+            let session = open.or_else(|| {
+                HostSession::open(self.owner.clone(), name, CLIENT)
+                    .ok()
+                    .filter(|session| session.matches_identity(identity))
+                    .map(|session| Arc::new(session.gated(self.gate.clone())))
+            });
+            if let Some(session) = session {
+                if session.terminate().is_err() && session.revoke_human().is_ok() {
+                    let _ = session.terminate();
+                }
+                return session.stop(until).is_ok();
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn spawn(self: &Arc<Self>, request: &NewHosted<'_>) -> Result<Arc<HostSession>, String> {
         let _pass = self.gate.enter().map_err(|error| error.to_string())?;
         let launch = launch(request)?;

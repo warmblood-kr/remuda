@@ -369,6 +369,8 @@ pub enum Request {
     /// hosts outlive daemons, so builds can differ (#713). Older daemons
     /// answer `bad request`.
     SessionHostBuilds,
+    /// Local inventory reservation names as a JSON array in [`Response::Value`].
+    SessionHostReservations,
     /// Probe the authenticated per-session remote-input opt-out (#276), as
     /// [`Response::Ok`]. A daemon older than this variant cannot parse it, so a
     /// sender refuses instead of assuming its peer enforces the flag.

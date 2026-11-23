@@ -97,6 +97,9 @@ impl HostSession {
     pub fn matches_instance(&self, instance: &str) -> bool {
         self.identity.instance == instance
     }
+    pub fn matches_identity(&self, identity: &HostIdentity) -> bool {
+        &self.identity == identity
+    }
     pub fn note_teardown_failure(&self) {
         self.teardown_failed.store(true, Ordering::Relaxed);
     }
@@ -301,10 +304,22 @@ impl HostSession {
     /// by its key, retire retained results, stop the host, then retire the
     /// inventory entry. Every step is idempotent, so a later retry may resume.
     pub fn teardown(&self, deadline: Duration) -> Result<()> {
-        let until = Instant::now() + deadline;
+        self.teardown_until(Instant::now() + deadline, false)
+    }
+
+    /// Unlike ordinary close, daemon stop may discard an abandoned host's
+    /// reservation even when that host could not publish its final state.
+    pub fn stop(&self, until: Instant) -> Result<()> {
+        self.teardown_until(until, true)
+    }
+
+    fn teardown_until(&self, until: Instant, shutdown: bool) -> Result<()> {
         let mut stopped = false;
+        let mut pid = super::unix::recorded_owner(&self.endpoint, &self.identity)
+            .ok()
+            .map(|process| process.host);
         loop {
-            match self.teardown_step(&mut stopped) {
+            match self.teardown_step(&mut stopped, &mut pid, shutdown) {
                 Ok(true) => return Ok(()),
                 Ok(false) => {}
                 Err(error) if Instant::now() >= until => return Err(error),
@@ -316,10 +331,18 @@ impl HostSession {
             std::thread::sleep(MAX_POLL);
         }
     }
-    fn teardown_step(&self, stopped: &mut bool) -> Result<bool> {
+    fn teardown_step(
+        &self,
+        stopped: &mut bool,
+        pid: &mut Option<libc::pid_t>,
+        shutdown: bool,
+    ) -> Result<bool> {
         // An act in flight here (say, input that ended the child) collects and
         // settles its own result first; teardown only resolves orphaned keys.
         let _serial = self.acts.lock().unwrap_or_else(|e| e.into_inner());
+        if shutdown && self.owner.retire_dead(self.target()).map_err(store)? {
+            return Ok(true);
+        }
         let index = self.owner.index().map_err(store)?;
         let Some(entry) = index.entries.get(&self.name) else {
             return Ok(true);
@@ -328,8 +351,7 @@ impl HostSession {
             return Ok(true);
         }
         if !matches!(entry.phase, Phase::Exited { .. }) {
-            // A gone host never publishes an exit; nothing more can settle.
-            return Ok(self.listener_missing());
+            return Ok(false);
         }
         if let Some(pending) = &entry.pending {
             self.owner
@@ -349,10 +371,11 @@ impl HostSession {
                     .map_err(store)?;
             }
         }
-        // A host already stopped (say, before a crash) has no listener left;
-        // the store still refuses Retire unless the exit is settled.
-        if !*stopped && !self.listener_missing() {
+        if !*stopped && !pid.is_some_and(super::unix::owner_exited) && !self.listener_missing() {
             let mut client = self.controller()?;
+            if pid.is_none() {
+                *pid = client.peer_pid();
+            }
             // Stop refuses while raw input is unretired; a gone viewer's is ours.
             discard_abandoned(&mut client);
             match client.request(&Request::Stop).map_err(transport)? {
@@ -360,6 +383,9 @@ impl HostSession {
                 Response::Error { code } => return Err(refused(&code)),
                 _ => return Err(Error::Protocol("unexpected host stop reply")),
             }
+        }
+        if !pid.is_some_and(super::unix::owner_exited) {
+            return Ok(false);
         }
         self.owner.retire(self.target()).map_err(store)?;
         Ok(true)

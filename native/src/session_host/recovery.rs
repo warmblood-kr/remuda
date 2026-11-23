@@ -277,11 +277,14 @@ impl Owner {
         let until = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let index = self.store.read()?;
-            if index
+            let entry = index
                 .entries
                 .get(&target.name)
-                .is_some_and(|entry| entry.metadata.contains_key(CLOSING))
-            {
+                .ok_or(Error::Data(model::Error::Unavailable))?;
+            if entry.identity != target.identity {
+                return Err(Error::Data(model::Error::Conflict));
+            }
+            if entry.metadata.contains_key(CLOSING) {
                 return Ok(());
             }
             let update = model::MetadataUpdate {
@@ -310,8 +313,16 @@ impl Owner {
     }
     /// Remove an exited, settled entry; the host must already be stopped.
     pub fn retire(&self, target: Target) -> Result<(), Error> {
+        let index = self.store.read()?;
+        let identity = target.identity.clone();
+        let endpoint = index
+            .entries
+            .get(&target.name)
+            .filter(|entry| entry.identity == identity)
+            .and_then(|entry| entry.birth.as_ref())
+            .map(|birth| Path::new(birth.endpoint()));
         self.store.commit(
-            self.store.read()?.cursor(),
+            index.cursor(),
             Some(self.fence()),
             Mutation::Exit {
                 target,
@@ -319,7 +330,44 @@ impl Owner {
             },
             Duration::from_secs(1),
         )?;
+        if let Some(endpoint) = endpoint {
+            super::unix::remove_owner_record(endpoint, &identity);
+        }
         Ok(())
+    }
+    /// Explicit stop can retire an abandoned instance even if it died before
+    /// publishing a settled exit. Check the proof against the same revision
+    /// and identity used by the fenced mutation.
+    pub fn retire_dead(&self, target: Target) -> Result<bool, Error> {
+        let index = self.store.read()?;
+        let Some(entry) = index.entries.get(&target.name) else {
+            return Ok(true);
+        };
+        if entry.identity != target.identity {
+            return Ok(true);
+        }
+        let Some(birth) = &entry.birth else {
+            return Ok(false);
+        };
+        let endpoint = Path::new(birth.endpoint());
+        if !super::unix::recorded_owner(endpoint, &entry.identity)
+            .is_ok_and(|process| super::unix::owner_exited(process.host))
+        {
+            return Ok(false);
+        }
+        self.store.commit(
+            index.cursor(),
+            Some(self.fence()),
+            Mutation::Exit {
+                target,
+                operation: model::ExitMutation::RetireDead {
+                    launch: entry.launch,
+                },
+            },
+            Duration::from_secs(1),
+        )?;
+        super::unix::remove_owner_record(endpoint, &entry.identity);
+        Ok(true)
     }
     /// Publish that the caller received this exact result; then it may be GC'd.
     pub fn consume(

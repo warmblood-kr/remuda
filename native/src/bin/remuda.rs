@@ -7062,28 +7062,53 @@ fn daemon_start_error(path: &Path, stderr_path: &Path, offset: u64, separator: &
     format!("daemon did not come up at {} — {said}", path.display())
 }
 
-/// A daemon that was just started lists only what it found again: sessions
-/// whose hosts outlived the earlier daemon (#713).
-fn found_sessions(path: &Path) -> Vec<String> {
-    match remuda_native::client::request(path, &Request::List) {
-        Ok(Response::Sessions(sessions)) => sessions.into_iter().map(|s| s.name).collect(),
-        _ => Vec::new(),
+/// Report live sessions separately from registrations whose host could not
+/// be reached. An unavailable session stays visible for inspection.
+fn report_started_daemon(server: &str, path: &Path) {
+    let Ok(Response::Sessions(sessions)) = remuda_native::client::request(path, &Request::List)
+    else {
+        eprintln!("remuda: started a daemon for {server:?}; could not verify session state");
+        return;
+    };
+    let mut running = Vec::new();
+    let mut unavailable = std::collections::BTreeSet::new();
+    for session in sessions {
+        if session.unavailable {
+            unavailable.insert(session.name);
+        } else if session.alive {
+            running.push(session.name);
+        }
     }
-}
-
-/// The line an autostart prints. Host-backed sessions survive a daemon that
-/// died, so it names the ones found instead of calling them gone.
-fn started_notice(server: &str, found: &[String]) -> String {
-    if found.is_empty() {
-        format!(
-            "remuda: started a daemon for {server:?}: none was running (sessions of an earlier daemon, if any, are gone)"
-        )
+    let inventory = remuda_native::client::request(path, &Request::SessionHostReservations);
+    match inventory {
+        Ok(Response::Value(names)) => {
+            if let Ok(names) = serde_json::from_str::<Vec<String>>(&names) {
+                unavailable.extend(names.into_iter().filter(|name| !running.contains(name)));
+            }
+        }
+        // A daemon from an earlier build may not recognize this request.
+        Ok(Response::Error(error)) if error.contains("session host") => {
+            eprintln!("remuda: could not verify session host inventory: {error}");
+        }
+        _ => {}
+    }
+    eprint!("remuda: started a daemon for {server:?}: none was running");
+    if !running.is_empty() {
+        eprintln!(
+            "; it found {} host-backed session(s) still running: {} (in-process sessions of an earlier daemon, if any, are gone)",
+            running.len(),
+            running.join(", ")
+        );
+    } else if unavailable.is_empty() {
+        eprintln!(" (sessions of an earlier daemon, if any, are gone)");
     } else {
-        format!(
-            "remuda: started a daemon for {server:?}: none was running; it found {} host-backed session(s) still running: {} (in-process sessions of an earlier daemon, if any, are gone)",
-            found.len(),
-            found.join(", ")
-        )
+        eprintln!();
+    }
+    if !unavailable.is_empty() {
+        eprintln!(
+            "remuda: session host status unverified; names remain reserved: {}",
+            unavailable.into_iter().collect::<Vec<_>>().join(", ")
+        );
     }
 }
 
@@ -7195,7 +7220,7 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
         if remuda_native::ipc::connect(path).is_ok() {
             // "remuda should always come up in daemon mode" — it already did.
             // What was missing was the line saying so.
-            eprintln!("{}", started_notice(server, &found_sessions(path)));
+            report_started_daemon(server, path);
             return Ok(());
         }
         // If it has already exited, waiting out the deadline only delays the

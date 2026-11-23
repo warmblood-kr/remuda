@@ -177,6 +177,9 @@ pub(crate) struct Client {
     capabilities: Vec<String>,
 }
 impl Client {
+    pub fn peer_pid(&self) -> Option<libc::pid_t> {
+        self.channel.socket().and_then(super::unix::peer_pid)
+    }
     pub fn open(path: &Path, role: Role) -> io::Result<Self> {
         // Expected intent comes from private local metadata, not server echo.
         let manifest = manifest(path)?;

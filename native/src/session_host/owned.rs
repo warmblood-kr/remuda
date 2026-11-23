@@ -102,6 +102,9 @@ impl Owned {
             instance: self.session.instance_id().into(),
         }
     }
+    pub fn child_pid(&self) -> Option<u32> {
+        self.pid
+    }
     pub fn inspect(&self) -> Result<super::api::Info, AgentError> {
         let alive = self.session.is_alive();
         let exit = self.session.exit_info();

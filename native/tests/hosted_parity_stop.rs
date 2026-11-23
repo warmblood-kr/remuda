@@ -75,14 +75,106 @@ fn stop_ends_every_session_in_both_backends() {
             assert!(Instant::now() < deadline, "{mode:?}: child outlived stop");
             std::thread::sleep(Duration::from_millis(20));
         }
-        let deadline = Instant::now() + PATIENCE;
-        while daemon.hosts_running() > 0 {
-            assert!(Instant::now() < deadline, "{mode:?}: a host outlived stop");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert_eq!(daemon.hosts_running(), 0, "{mode:?}: a host outlived stop");
         daemon.restart();
         assert!(names(&daemon).is_empty(), "{mode:?}: {:?}", names(&daemon));
+        daemon.shell("keeper");
+        stop(&daemon, false);
     }
+}
+
+/// Locate the single reserved host belonging to this isolated daemon.
+fn owner_record(daemon: &Parity) -> (std::path::PathBuf, i32) {
+    let inventory_root = daemon.socket().with_file_name("s.sock.hosts");
+    std::fs::read_dir(inventory_root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            let path = entry.path().join("owner.json");
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            Some((path, i32::try_from(record["host"].as_i64()?).ok()?))
+        })
+        .expect("test host recorded its PID")
+}
+
+fn kill_host(pid: i32) {
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    let until = Instant::now() + PATIENCE;
+    while alive(pid) {
+        assert!(Instant::now() < until, "test host did not exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn stop_retires_an_already_dead_hosts_reservation() {
+    let mut daemon = Parity::start(Mode::Hosted);
+    let previous = daemon.shell("keeper");
+    let (_, pid) = owner_record(&daemon);
+    kill_host(pid);
+
+    stop(&daemon, false);
+    daemon.restart();
+    assert_ne!(daemon.shell("keeper"), previous);
+    stop(&daemon, false);
+}
+
+#[test]
+fn stop_uses_authenticated_process_identity_for_a_live_pre_upgrade_host() {
+    let mut daemon = Parity::start(Mode::Hosted);
+    let old = daemon.shell("keeper");
+    let (record, _) = owner_record(&daemon);
+    std::fs::remove_file(record).unwrap();
+
+    stop(&daemon, false);
+    assert_eq!(
+        daemon.hosts_running(),
+        0,
+        "the pre-upgrade host outlived stop"
+    );
+    daemon.restart();
+    assert_ne!(daemon.shell("keeper"), old);
+    stop(&daemon, false);
+}
+
+#[test]
+fn stop_reports_and_preserves_a_reservation_with_unverifiable_ownership() {
+    let mut daemon = Parity::start(Mode::Hosted);
+    daemon.shell("keeper");
+    let (record, pid) = owner_record(&daemon);
+    kill_host(pid);
+    // Reproduce a pre-upgrade record. The inventory itself is untouched.
+    std::fs::remove_file(record).unwrap();
+    daemon.kill_daemon();
+    let out = daemon.cli(&["-e", "return 1"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("session host status unverified; names remain reserved: keeper"),
+        "{stderr}"
+    );
+
+    let out = daemon.cli(&["stop", "-f", "--i-am-inside"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("unresolved session hosts: keeper"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Restart in the same runtime"), "{stderr}");
+    assert!(remuda_native::ipc::connect(&daemon.socket()).is_err());
+
+    let out = daemon.cli(&["-e", "return 1"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("names remain reserved: keeper"), "{stderr}");
+    let out = daemon.cli(&["stop", "-f", "--i-am-inside", "--keep-sessions"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
