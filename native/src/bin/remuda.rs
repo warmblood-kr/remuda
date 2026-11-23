@@ -62,7 +62,7 @@ mod codex_native;
 mod codex_tui;
 #[path = "remuda/codex_tunnel.rs"]
 mod codex_tunnel;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[path = "remuda/gui_managed.rs"]
 mod gui_managed;
 #[path = "remuda/opencode_adopt.rs"]

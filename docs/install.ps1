@@ -171,6 +171,49 @@ try {
     $installDir = (Get-Item -Force -LiteralPath $installDir).FullName
     $installed = Join-Path $installDir 'remuda.exe'
 
+    # Keep each Browser GUI beside its build ID so running windows and CLI
+    # rollback keep their matching binary. Older releases have no GUI payload.
+    $gui = Join-Path $tmp 'remuda-gui.exe'
+    $guiIdFile = Join-Path $tmp 'remuda-gui.build'
+    if ((Test-Path -LiteralPath $gui) -or (Test-Path -LiteralPath $guiIdFile)) {
+        foreach ($path in @($gui, $guiIdFile)) {
+            if (!(Test-Path -LiteralPath $path -PathType Leaf) -or
+                ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                Die "invalid GUI archive member: $path"
+            }
+        }
+        if ((Get-Item -LiteralPath $guiIdFile).Length -gt 201) { Die 'invalid GUI build identifier' }
+        $guiBuild = [IO.File]::ReadAllText($guiIdFile).TrimEnd([char[]]"`r`n")
+        if ($guiBuild.Length -gt 200 -or
+            $guiBuild -cnotmatch ('^' + [regex]::Escape($version) + '\+[A-Za-z0-9._+-]+$')) {
+            Die 'GUI build does not match release version'
+        }
+        $guiSlot = $installDir
+        foreach ($component in @('.remuda-gui', 'builds', "build-$guiBuild")) {
+            $guiSlot = Join-Path $guiSlot $component
+            [IO.Directory]::CreateDirectory($guiSlot) | Out-Null
+            if ((Get-Item -LiteralPath $guiSlot -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                Die "invalid managed GUI directory: $guiSlot"
+            }
+        }
+        $slotGui = Join-Path $guiSlot 'remuda-gui.exe'
+        $stagedGui = Join-Path $guiSlot ('.incoming-' + [guid]::NewGuid())
+        try {
+            [IO.File]::Copy($gui, $stagedGui)
+            try { [IO.File]::Move($stagedGui, $slotGui) } catch [IO.IOException] {
+                if (!(Test-Path -LiteralPath $slotGui -PathType Leaf)) { throw }
+            }
+            if (((Get-Item -LiteralPath $slotGui -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                [Convert]::ToBase64String($sha256.ComputeHash([IO.File]::ReadAllBytes($slotGui))) -cne
+                [Convert]::ToBase64String($sha256.ComputeHash([IO.File]::ReadAllBytes($gui)))) {
+                Die "managed GUI build collision: $slotGui"
+            }
+        } finally {
+            [IO.File]::Delete($stagedGui)
+        }
+        Write-Host "install.ps1: Browser GUI -> $slotGui"
+    }
+
     # remuda.exe and remuda-session-host.exe are one pair: the daemon starts the
     # host from beside itself. A release older than the pair has no host, and
     # then no host from a different build may stay beside the new daemon either.

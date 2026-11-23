@@ -68,8 +68,8 @@ X25519 public keys) and `document` (the permitted canonical
 Give the reader and Butler separate owner-only JSON credential files, each
 with `endpoint` (IP and port), `server` (the serving node's Base64
 public key), and `private` (that client's Base64 X25519 private key).
-On macOS or Windows, put `remuda-gui` (`remuda-gui.exe` on Windows) beside
-`remuda`. Set `REMUDA_BROWSER_CLIENT` to the reader's credential file and run
+On macOS or Windows, install [the Browser nightly](#install-the-browser-nightly).
+Set `REMUDA_BROWSER_CLIENT` to the reader's credential file and run
 `remuda browser --gui HOST`, using the same SSH host or alias as the terminal
 client. A document request opens a tab beside the live SSH terminal. From
 Butler, point the same variable at the publisher file and run
@@ -148,6 +148,26 @@ sidebar](docs/remuda-cascading-spawn.png)
 The butler spawns a lead; a worker can spawn its own workers (cascading).
 
 ## Install
+
+### Install the Browser nightly
+
+On Apple silicon macOS and x64 Windows, the nightly includes the matching native
+Browser. Use an SSH hostname or alias in place of `HOST`. This uses your
+existing SSH configuration and requires a remote Remuda node.
+
+**macOS**
+
+```sh
+curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly sh && "$HOME/.local/bin/remuda" browser --gui HOST
+```
+
+**Windows (PowerShell)**
+
+```powershell
+$env:REMUDA_CHANNEL='nightly'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex; if ($?) { remuda browser --gui HOST }
+```
+
+### Install Remuda with Butler
 
 No stable release has been published yet (see [Channels](#channels) below),
 so install from `nightly` — every commit on `main`:

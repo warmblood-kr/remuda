@@ -1,11 +1,9 @@
 # Remuda GUI
 
-On Apple silicon macOS and x64 Windows, the `browser-gui` CI workflow builds
-the CLI and native GUI together. Keep both extracted executables beside each
-other. On macOS, restore executable permissions with `chmod +x remuda remuda-gui`.
-Run `./remuda browser --gui HOST` on macOS or `.\remuda.exe browser --gui HOST`
-in PowerShell. Use an SSH host or alias for a machine running Remuda. The
-native Browser opens the remote Remuda terminal and can receive
+On Apple silicon macOS and x64 Windows, the [nightly installer](../README.md#install-the-browser-nightly)
+installs the CLI and the matching native GUI together. Run
+`remuda browser --gui HOST` with an SSH host or alias for a machine running Remuda.
+The native Browser opens the remote Remuda terminal and can receive
 [VFS document-open requests](../README.md#open-a-vfs-document-for-a-browser-reader)
 in the same window. Browser mode does not need a local daemon or cluster membership.
 
@@ -46,8 +44,8 @@ REMUDA_GUI_BUILD_CLI=/absolute/path/to/remuda REMUDA_GUI_BUILD_HOST=/absolute/pa
 Pass those same version/build variables to this test's Cargo invocation too.
 
 On macOS, `remuda gui` launches `remuda-gui` from the same directory as the
-resolved `remuda` executable. The GUI is not yet included in release archives:
-build it with `cargo build --release --locked --manifest-path gui/Cargo.toml`,
+resolved `remuda` executable. To build and install the GUI manually, run
+`cargo build --release --locked --manifest-path gui/Cargo.toml`,
 then place `gui/target/release/remuda-gui` beside the installed `remuda`.
 The built-in GUI does not support named servers (`remuda -s NAME gui`) yet.
 An installed mod declaring the `gui` command keeps precedence; in that case,
@@ -59,7 +57,7 @@ the complete build string printed after `remuda ` by `remuda --version`. A
 manual `remuda-gui` sibling takes precedence. Managed build entries must never
 be modified or removed while a window may be running; the launcher starts the
 build-specific path so that window's helper processes keep the same executable.
-No installer currently creates or prunes this layout. A window opened earlier
+The nightly installer creates these entries. A window opened earlier
 from a mutable sibling is not retroactively pinned by this launcher.
 Selection checks the existing path components, but does not protect against
 another process replacing them concurrently; future installation must keep

@@ -54,12 +54,13 @@ pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode 
 
 #[cfg(any(target_os = "macos", windows))]
 fn launch_gui(destination: &str) -> ExitCode {
-    let executable = match std::env::current_exe() {
-        Ok(path) => path.with_file_name(if cfg!(windows) {
-            "remuda-gui.exe"
-        } else {
-            "remuda-gui"
-        }),
+    let cli = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => return super::fail(format!("cannot locate Remuda Browser: {error}")),
+    };
+    let executable = match super::gui_managed::choose(&cli, remuda_native::dist::BUILD_VERSION) {
+        Ok(Some(path)) => path,
+        Ok(None) => return super::fail("Remuda Browser GUI is missing from this installation. Install a nightly that includes the GUI."),
         Err(error) => return super::fail(format!("cannot locate Remuda Browser: {error}")),
     };
     match Command::new(&executable)
