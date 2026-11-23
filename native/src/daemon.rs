@@ -3802,8 +3802,14 @@ fn handle_new_hosted(
     request: &crate::session_host::hosted::NewHosted<'_>,
     return_instance_id: bool,
 ) -> std::io::Result<()> {
-    // The same refusal an in-process `new` gives, before any host starts.
-    if registry.get(request.name).is_some() || registry.hosted(request.name).is_some() {
+    if registry.hosted(request.name).is_some() {
+        let reason = image
+            .session_hosts()
+            .name_reservation(request.name)
+            .unwrap_or_else(|| format!("name taken: {}", request.name));
+        return reply(stream, &Response::error(reason));
+    }
+    if registry.get(request.name).is_some() {
         return reply(
             stream,
             &Response::error(format!("name taken: {}", request.name)),

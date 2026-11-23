@@ -220,6 +220,75 @@ fn legacy_host_becomes_unreachable_when_cleanup_removes_its_capability() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+fn starting_a_closed_dead_host_name_reports_the_persisted_instance() {
+    let root = Root::new("stale-name");
+    let path = root.socket();
+    let mut daemon = Daemon::spawn(&root, true, &[]);
+    new_session(&path, "work");
+    let instance = hosted_instance(&path);
+    let start = Request::New {
+        name: Some("work".into()),
+        command: vec!["/bin/sh".into()],
+        size: Size::new(80, 24),
+        cwd: Some("/".into()),
+        env: None,
+    };
+    let assert_reservation = |closing| {
+        let response = request(&path, &start);
+        let Response::Error(reason) = response else {
+            panic!("expected a name-reservation refusal, got {response:?}");
+        };
+        assert!(
+            reason.contains("name taken: work; still reserved in the host inventory"),
+            "{reason}"
+        );
+        assert!(reason.contains(&format!("instance {instance}")), "{reason}");
+        assert!(reason.contains("phase Registered"), "{reason}");
+        assert!(
+            reason.contains(&format!("close requested: {closing}")),
+            "{reason}"
+        );
+    };
+    assert_reservation(false);
+    let hosts = host_pids(&root);
+    assert_eq!(hosts.len(), 1, "{hosts:?}");
+    let host = hosts[0];
+    // SAFETY: the sole host started in this fixture's private runtime.
+    assert_eq!(unsafe { libc::kill(host as i32, libc::SIGKILL) }, 0);
+    let deadline = Instant::now() + PATIENCE;
+    while alive(host) {
+        assert!(Instant::now() < deadline, "the fixture host never died");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        request(
+            &path,
+            &Request::Close {
+                name: "work".into(),
+                instance_id: Some(instance.clone()),
+                confirm: Some(true),
+            },
+        ),
+        Response::Ok,
+    );
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+
+    let _replacement = Daemon::spawn(&root, true, &[]);
+    assert_eq!(request(&path, &Request::List), Response::Sessions(vec![]));
+    let inventory = path.with_file_name("s.sock.hosts/inventory/inventory.json");
+    let before = std::fs::read(&inventory).unwrap();
+    assert_reservation(true);
+    assert_eq!(std::fs::read(&inventory).unwrap(), before);
+    assert_eq!(request(&path, &Request::List), Response::Sessions(vec![]));
+    assert!(
+        host_pids(&root).is_empty(),
+        "the retry launched another host"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
 fn separate_host_state_survives_runtime_cleanup_and_daemon_replacement() {
     use std::os::unix::fs::MetadataExt;
 

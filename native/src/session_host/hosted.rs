@@ -31,6 +31,14 @@ pub const OPT_IN: &str = "REMUDA_EXPERIMENTAL_SESSION_HOST";
 const CLIENT: [u8; 16] = *b"remuda-daemon-01";
 const PUBLISH_DEADLINE: Duration = Duration::from_secs(10);
 const TEARDOWN_DEADLINE: Duration = Duration::from_secs(10);
+
+fn describe_reservation(name: &str, entry: &Entry) -> String {
+    let closing = entry.metadata.contains_key(super::recovery::CLOSING);
+    format!(
+        "name taken: {name}; still reserved in the host inventory (instance {}, phase {:?}, close requested: {closing}); use a different name for a separate session",
+        entry.identity.instance, entry.phase,
+    )
+}
 /// Left out of every session child's environment, hosted or in-process: the
 /// session-host switch and the daemon's systemd/launchd service handles.
 pub(crate) const DAEMON_ONLY: &[&str] = &[
@@ -489,6 +497,15 @@ impl Hosting {
             .map_err(|_| format!("name taken: {}", request.name))
     }
 
+    pub(crate) fn name_reservation(&self, name: &str) -> Option<String> {
+        let hosts = self.hosts(false).ok()??;
+        let index = hosts.owner.index().ok()?;
+        index
+            .entries
+            .get(name)
+            .map(|entry| describe_reservation(name, entry))
+    }
+
     /// Claim the inventory again under a newer epoch, then show every open
     /// host the new writer, fencing any daemon that claimed since. Returns
     /// each host's answer; none before this daemon opened its inventory.
@@ -808,11 +825,7 @@ impl Hosts {
                 return Ok(None);
             };
             if Instant::now() >= until {
-                let closing = entry.metadata.contains_key(super::recovery::CLOSING);
-                return Ok(Some(format!(
-                    "session name {name} is still reserved in the host inventory (instance {}, phase {:?}, close requested: {closing}); use a different name for a separate session",
-                    entry.identity.instance, entry.phase,
-                )));
+                return Ok(Some(describe_reservation(name, entry)));
             }
             std::thread::sleep(Duration::from_millis(20));
         }
