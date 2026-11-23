@@ -1,9 +1,10 @@
 //! Private Unix endpoint preparation; never reuse/remove a live or stale path
 //! automatically. Same-UID code is explicitly outside this isolation boundary.
 use super::channel::{Channel, Key, LocalIo};
+use std::ffi::{CString, OsStr};
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 pub(crate) struct Endpoint {
     listener: UnixListener,
     key: Key,
-    _directory: File,
+    directory: File,
     path: PathBuf,
 }
 fn denied() -> io::Error {
@@ -111,7 +112,7 @@ impl Endpoint {
         Ok(Self {
             listener,
             key,
-            _directory: directory,
+            directory,
             path: path.to_owned(),
         })
     }
@@ -121,6 +122,38 @@ impl Endpoint {
     }
     pub fn nonblocking(&self) -> io::Result<()> {
         self.listener.set_nonblocking(true)
+    }
+    pub fn capability_missing(&self) -> io::Result<bool> {
+        let fd = self.directory.as_raw_fd();
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the descriptor is held by the endpoint and stat is writable.
+        if unsafe {
+            libc::fstatat(
+                fd,
+                c"capability".as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
+        {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::NotFound => Ok(true),
+            _ => Err(error),
+        }
+    }
+    pub fn restore_missing_capability(&self) -> io::Result<()> {
+        if !self.capability_missing()? {
+            return Ok(());
+        }
+        let original = self.directory.metadata()?;
+        let current = directory(&self.path)?.metadata()?;
+        if (original.dev(), original.ino()) != (current.dev(), current.ino()) {
+            return Err(denied());
+        }
+        publish_capability(&self.directory, &self.key)
     }
     pub fn wait_connection(&self, timeout: Duration) {
         let mut descriptor = libc::pollfd {
@@ -149,6 +182,51 @@ impl Endpoint {
         &self.path
     }
 }
+
+fn publish_capability(directory: &File, key: &Key) -> io::Result<()> {
+    let mut random = [0; 8];
+    getrandom::fill(&mut random).map_err(|_| io::Error::other("host entropy unavailable"))?;
+    let name = format!(".capability-{:016x}.tmp", u64::from_ne_bytes(random));
+    let temp = CString::new(name.as_bytes()).map_err(io::Error::other)?;
+    let fd = directory.as_raw_fd();
+    // SAFETY: the exclusive create is relative to the held directory.
+    let key_fd = unsafe {
+        libc::openat(
+            fd,
+            temp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if key_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new descriptor owned by this call.
+    let mut file = unsafe { File::from_raw_fd(key_fd) };
+    let result = (|| {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(&key.0)?;
+        file.sync_all()?;
+        crate::staged_socket::rename_noreplace(
+            directory,
+            OsStr::new(&name),
+            OsStr::new("capability"),
+        )
+    })();
+    match result {
+        Ok(()) => directory.sync_all(),
+        Err(error) => {
+            // SAFETY: remove only the unpublished private name we created.
+            unsafe { libc::unlinkat(fd, temp.as_ptr(), 0) };
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 fn socket_path_bytes(socket: &Path) -> io::Result<()> {
     let bytes = socket.as_os_str().as_bytes();
     if !socket.is_absolute()
@@ -385,6 +463,38 @@ mod tests {
     }
 
     #[test]
+    fn capability_restoration_refuses_a_replaced_directory() {
+        let root = PathBuf::from("/tmp").join(format!(
+            "rd-cap-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let _cleanup = Cleanup(root.clone());
+        let endpoint_path = root.join("state");
+        let endpoint = Endpoint::bind(&endpoint_path).unwrap();
+        let capability = endpoint_path.join("capability");
+        std::fs::remove_file(&capability).unwrap();
+        endpoint.restore_missing_capability().unwrap();
+        assert!(std::fs::read(&capability).unwrap() == endpoint.key.0);
+        assert_eq!(capability.metadata().unwrap().mode() & 0o7777, 0o600);
+        std::fs::remove_file(&capability).unwrap();
+        let moved = root.join("moved");
+        std::fs::rename(&endpoint_path, &moved).unwrap();
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&endpoint_path)
+            .unwrap();
+
+        assert_eq!(
+            endpoint.restore_missing_capability().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(!endpoint_path.join("capability").exists());
+        assert!(!moved.join("capability").exists());
+    }
+
+    #[test]
     fn private_endpoint_mutually_authenticates_and_never_rebinds_existing_path() {
         let path = std::env::temp_dir().join(format!(
             "rm-host-auth-{}-{}",
@@ -425,7 +535,7 @@ mod tests {
         let endpoint = Endpoint::bind(&root).unwrap();
         for fd in [
             endpoint.listener.as_raw_fd(),
-            endpoint._directory.as_raw_fd(),
+            endpoint.directory.as_raw_fd(),
         ] {
             assert_ne!(
                 unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
@@ -441,9 +551,20 @@ mod tests {
         std::fs::rename(&capability, root.join("saved")).unwrap();
         std::os::unix::fs::symlink(root.join("saved"), &capability).unwrap();
         assert!(connect(&root).is_err());
+        endpoint.restore_missing_capability().unwrap();
+        assert!(std::fs::symlink_metadata(&capability)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         std::fs::remove_file(&capability).unwrap();
         std::fs::create_dir(&capability).unwrap();
         assert!(connect(&root).is_err());
+        endpoint.restore_missing_capability().unwrap();
+        assert!(capability.is_dir());
+        std::fs::remove_dir(&capability).unwrap();
+        std::fs::write(&capability, b"malformed").unwrap();
+        endpoint.restore_missing_capability().unwrap();
+        assert_eq!(std::fs::read(&capability).unwrap(), b"malformed");
         drop(endpoint);
         drop(cleanup);
     }

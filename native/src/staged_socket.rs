@@ -310,7 +310,7 @@ fn chmod_socket_nofollow(
     chmod_receipted(parent, name, expected, mode)
 }
 
-fn rename_noreplace(parent: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
+pub(crate) fn rename_noreplace(parent: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
     rename_noreplace_between(parent, from, parent, to)
 }
 

@@ -220,6 +220,58 @@ fn legacy_host_becomes_unreachable_when_cleanup_removes_its_capability() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+fn live_host_restores_its_missing_capability_and_reattaches() {
+    let root = Root::new("restore-key");
+    let path = root.socket();
+    let mut daemon = Daemon::spawn(&root, true, &[]);
+    new_session(&path, "work");
+    let instance = hosted_instance(&path);
+    let host = host_pids(&root);
+    assert_eq!(host.len(), 1);
+    assert_eq!(
+        send_line(&path, "work", "echo BEFORE-$((3*7))"),
+        Response::Ok
+    );
+    wait_for(&path, "work", "BEFORE-21");
+
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    let capability = regular_files(&path.with_file_name("s.sock.hosts"))
+        .into_iter()
+        .find(|file| file.file_name().unwrap() == "capability")
+        .unwrap();
+    std::fs::remove_file(&capability).unwrap();
+    let _replacement = Daemon::spawn(&root, true, &[]);
+    let Response::Sessions(unreachable) = request(&path, &Request::List) else {
+        panic!("expected a session list");
+    };
+    assert_eq!(unreachable.len(), 1, "{unreachable:?}");
+    assert_eq!(
+        unreachable[0].instance_id.as_deref(),
+        Some(instance.as_str())
+    );
+    assert!(unreachable[0].unavailable, "{unreachable:?}");
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !capability.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "live host did not restore authentication"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    assert_eq!(hosted_instance(&path), instance);
+    assert_eq!(host_pids(&root), host);
+    wait_for(&path, "work", "BEFORE-21");
+    assert_eq!(
+        send_line(&path, "work", "echo AFTER-$((6*7))"),
+        Response::Ok
+    );
+    wait_for(&path, "work", "AFTER-42");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
 fn starting_a_closed_dead_host_name_reports_the_persisted_instance() {
     let root = Root::new("stale-name");
     let path = root.socket();

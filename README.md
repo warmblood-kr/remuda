@@ -103,6 +103,11 @@ layout by default. To opt in on macOS or Linux, set
 your user with mode `0700` before starting a fresh namespace. Use the same
 setting on subsequent starts, including after a restart.
 
+On Linux and macOS, a running host can recreate a missing authentication file
+from the key it already holds if the original private directory is intact.
+The host checks about every 30 seconds and leaves existing files untouched.
+Use session close to end access to the host.
+
 ## Cascading spawn
 
 ![A terminal session tree: butler has spawned a lead session, which has in
