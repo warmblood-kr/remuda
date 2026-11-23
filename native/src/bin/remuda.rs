@@ -299,10 +299,7 @@ fn dispatch_cli_command(
     match command {
         "" if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
             with_daemon(server, path, |path| {
-                match remuda_native::tui::run(path, server, skew.clone()) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => fail(format!("tui: {e}")),
-                }
+                run_default_browser(server, path, skew.clone())
             })
         }
         "" | "-h" | "--help" => help_command(),
@@ -2907,6 +2904,31 @@ fn safe_fingerprint_field(value: &str, token: &str) -> String {
         value.to_owned()
     } else {
         "the supplied fingerprint".into()
+    }
+}
+
+fn run_default_browser(server: &str, path: &Path, mut notice: Option<String>) -> ExitCode {
+    loop {
+        let clustered = match remuda_native::cluster::snapshot() {
+            Ok(snapshot) => snapshot.is_some(),
+            Err(error) => {
+                if notice.is_none() {
+                    notice = Some(format!("cluster unavailable: {error}"));
+                }
+                false
+            }
+        };
+        match remuda_native::tui::run_local_browser(path, server, notice.take(), clustered) {
+            Ok(false) => return ExitCode::SUCCESS,
+            Ok(true) => {
+                let node = remote_node_label(remuda_native::hostname::hostname);
+                let result = cluster_remote(server, path, &node, None);
+                if result != ExitCode::SUCCESS {
+                    return result;
+                }
+            }
+            Err(error) => return fail(format!("tui: {error}")),
+        }
     }
 }
 
