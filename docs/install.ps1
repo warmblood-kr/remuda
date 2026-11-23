@@ -24,6 +24,17 @@ function Die($message) {
     throw "install.ps1: $message"
 }
 
+function File-Sha256($path) {
+    $stream = [IO.File]::OpenRead($path)
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try {
+        return [BitConverter]::ToString($hash.ComputeHash($stream)) -replace '-', ''
+    } finally {
+        $stream.Dispose()
+        $hash.Dispose()
+    }
+}
+
 # `-UseBasicParsing` for Windows PowerShell 5.1, which is what a fresh machine
 # has. With $ErrorActionPreference = 'Stop' a 404 raises rather than writing an
 # error page to the output file — the shell script's `curl | sh` bug, avoided.
@@ -141,14 +152,7 @@ try {
 
     # Not Get-FileHash: Windows PowerShell started underneath PowerShell 7 -
     # `remuda upgrade` typed into pwsh - does not find it. .NET is always there.
-    $download = [IO.File]::OpenRead((Join-Path $tmp $asset))
-    $sha256 = [Security.Cryptography.SHA256]::Create()
-    try {
-        $actual = [BitConverter]::ToString($sha256.ComputeHash($download)) -replace '-', ''
-    } finally {
-        $download.Dispose()
-        $sha256.Dispose()
-    }
+    $actual = File-Sha256 (Join-Path $tmp $asset)
     if ($actual -ine $expected) {
         Die "checksum mismatch on $asset - refusing to install"
     }
@@ -204,8 +208,7 @@ try {
                 if (!(Test-Path -LiteralPath $slotGui -PathType Leaf)) { throw }
             }
             if (((Get-Item -LiteralPath $slotGui -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -or
-                [Convert]::ToBase64String($sha256.ComputeHash([IO.File]::ReadAllBytes($slotGui))) -cne
-                [Convert]::ToBase64String($sha256.ComputeHash([IO.File]::ReadAllBytes($gui)))) {
+                (File-Sha256 $slotGui) -cne (File-Sha256 $gui)) {
                 Die "managed GUI build collision: $slotGui"
             }
         } finally {
