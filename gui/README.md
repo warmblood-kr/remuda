@@ -1,33 +1,5 @@
 # Remuda GUI
 
-## Browser document reader
-
-The same VFS document reader builds for Apple silicon macOS and x64 Windows.
-The `browser-gui` CI workflow builds both executables and publishes them as
-`remuda-browser-macos-arm64` and `remuda-browser-windows-x64` artifacts.
-Use the [Browser reader setup](../README.md#open-a-vfs-document-for-a-browser-reader)
-to obtain the reader credential, then launch the extracted executable.
-
-On macOS:
-
-```sh
-REMUDA_BROWSER_CLIENT="$HOME/path/to/reader.json" ./remuda-gui
-```
-
-On Windows in PowerShell:
-
-```powershell
-$env:REMUDA_BROWSER_CLIENT = 'C:\path\to\reader.json'
-.\remuda-gui.exe
-```
-
-The reader credential must be accessible only to its owner. On macOS use
-mode `0600`. On Windows use an owner-only NTFS access control list. Close
-the reader on one computer before switching to the other because the serving
-node delivers to one active reader at a time.
-
-## Session prototype
-
 From the repository root, run the standalone GPUI prototype:
 
 ```sh
