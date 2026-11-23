@@ -606,21 +606,58 @@ impl LocalGui {
         }
     }
 }
+impl LocalGui {
+    fn render_node_sessions(
+        peer: Option<&str>,
+        rows: &[Session],
+        loading: bool,
+        unavailable: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .pl_4()
+            .when(loading, |d| {
+                d.child(div().text_sm().child("Loading sessions…"))
+            })
+            .when(unavailable, |d| {
+                d.child(div().text_sm().child("Sessions unavailable"))
+            })
+            .when(!loading && !unavailable && rows.is_empty(), |d| {
+                d.child(div().text_sm().child("No sessions"))
+            })
+            .children(rows.iter().cloned().enumerate().map(|(index, session)| {
+                let status = if unavailable || session.unavailable {
+                    "unavailable"
+                } else if session.alive {
+                    "running"
+                } else {
+                    "exited"
+                };
+                let name = label(&session.name);
+                let peer = peer.map(str::to_owned);
+                div()
+                    .id(SharedString::from(format!("session-{index}")))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.selected_peer == peer {
+                            this.select_session(session.clone());
+                            cx.notify();
+                        }
+                    }))
+                    .debug_selector(move || format!("session-{index}"))
+                    .py_1()
+                    .child(div().child(name))
+                    .child(div().text_sm().text_color(rgb(0x8a95a5)).child(status))
+            }))
+    }
+}
+
 impl Render for LocalGui {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = if self.selected_peer.is_some() && self.remote_loading {
-            "PEER SESSIONS · LOADING"
-        } else if self.selected_peer.is_some() && self.remote_error {
-            "PEER SESSIONS · STALE"
-        } else if self.selected_peer.is_some() {
-            "PEER SESSIONS"
-        } else if self.loading {
-            "LOCAL SESSIONS · LOADING"
-        } else if self.error {
-            "LOCAL SESSIONS · STALE"
-        } else {
-            "LOCAL SESSIONS"
-        };
+        let expanded_peer = self.selected_peer.as_ref().and_then(|fingerprint| {
+            self.peers
+                .iter()
+                .position(|peer| &peer.fingerprint == fingerprint)
+        });
         div()
             .size_full()
             .flex()
@@ -664,6 +701,15 @@ impl Render for LocalGui {
                                 cx.notify();
                             })),
                     )
+                    .when(self.selected_peer.is_none(), |d| {
+                        d.child(Self::render_node_sessions(
+                            None,
+                            &self.sessions,
+                            self.loading,
+                            self.error,
+                            cx,
+                        ))
+                    })
                     .children(self.peers.iter().cloned().enumerate().map(|(index, peer)| {
                         let enabled = self.peer_current(&peer.fingerprint);
                         let fingerprint = peer.fingerprint.clone();
@@ -671,7 +717,7 @@ impl Render for LocalGui {
                         let identity = label(&peer.fingerprint);
                         let id = SharedString::from(format!("node-{}-{index}", peer.fingerprint));
                         let debug = format!("node-peer-{index}");
-                        div()
+                        let header = div()
                             .id(id)
                             .debug_selector(move || debug.clone())
                             .py_2()
@@ -688,39 +734,17 @@ impl Render for LocalGui {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.select_peer(fingerprint.clone());
                                 cx.notify();
-                            }))
-                    }))
-                    .child(div().pt_4().text_sm().child(title))
-                    .children(
-                        (if self.selected_peer.is_some() {
-                            &self.remote_sessions
-                        } else {
-                            &self.sessions
+                            }));
+                        div().child(header).when(expanded_peer == Some(index), |d| {
+                            d.child(Self::render_node_sessions(
+                                Some(&peer.fingerprint),
+                                &self.remote_sessions,
+                                self.remote_loading,
+                                self.remote_error,
+                                cx,
+                            ))
                         })
-                        .clone()
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, session)| {
-                            let status = if session.unavailable {
-                                "unavailable"
-                            } else if session.alive {
-                                "running"
-                            } else {
-                                "exited"
-                            };
-                            let selected = session.clone();
-                            div()
-                                .id(SharedString::from(format!("session-{index}")))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.select_session(selected.clone());
-                                    cx.notify();
-                                }))
-                                .debug_selector(move || format!("session-{index}"))
-                                .py_2()
-                                .child(div().child(label(&session.name)))
-                                .child(div().text_sm().text_color(rgb(0x8a95a5)).child(status))
-                        }),
-                    ),
+                    })),
             )
             .child(
                 div()
@@ -1079,7 +1103,11 @@ mod tests {
             gui.sessions = vec![row("local")];
             gui
         });
+        let local = cx.debug_bounds("node-local").unwrap();
+        let local_session = cx.debug_bounds("session-0").expect("local child rendered");
         let peer = cx.debug_bounds("node-peer-0").unwrap();
+        assert!(local_session.origin.x > local.origin.x);
+        assert!(local_session.origin.y > local.origin.y && local_session.origin.y < peer.origin.y);
         cx.simulate_click(peer.center(), gpui::Modifiers::none());
         view.update(cx, |gui, cx| {
             gui.remote_sessions = vec![row("remote-1"), row("remote-2")];
@@ -1090,6 +1118,10 @@ mod tests {
             cx.debug_bounds("session-1").is_some(),
             "both remote rows rendered"
         );
+        let peer = cx.debug_bounds("node-peer-0").unwrap();
+        let remote_session = cx.debug_bounds("session-0").unwrap();
+        assert!(remote_session.origin.x > peer.origin.x);
+        assert!(remote_session.origin.y > peer.origin.y);
         let local = cx.debug_bounds("node-local").unwrap();
         cx.simulate_click(local.center(), gpui::Modifiers::none());
         assert!(cx.debug_bounds("session-0").is_some());
