@@ -57,7 +57,7 @@ fn an_auto_started_daemon_does_not_share_the_launching_console() {
     let said = String::from_utf8_lossy(&started.stderr).into_owned();
     let after = console_pids();
     // Stop it before judging, so a failure leaves no daemon behind.
-    let _ = remuda(&dir, &["stop", "-f", "--yes"]);
+    let _ = remuda(&dir, &["stop", "-f"]);
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(started.status.success(), "{said}");

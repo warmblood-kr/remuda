@@ -3804,7 +3804,7 @@ fn refuse_hosted_shutdown(stream: &Stream, identity: &str) -> std::io::Result<()
     reply(
         stream,
         &Response::error(format!(
-            "cannot stop this daemon from one of its own sessions ({identity}); pass --i-am-inside to override"
+            "cannot stop this daemon from one of its own sessions ({identity})"
         )),
     )
 }
@@ -3817,7 +3817,7 @@ fn refuse_unverifiable_shutdown(stream: &Stream, details: &str) -> std::io::Resu
 }
 
 fn unverifiable_shutdown_message(details: &str) -> String {
-    format!("cannot stop this daemon: {details}; pass --i-am-inside to override")
+    format!("cannot stop this daemon: {details}")
 }
 
 fn refuse_shutdown(stream: &Stream, reason: &ShutdownRefusal) -> std::io::Result<()> {
@@ -5083,10 +5083,6 @@ mod tests {
         };
         let message = super::unverifiable_shutdown_message(&details);
         assert!(message.contains("process enumeration denied"), "{message}");
-        assert!(
-            message.contains("pass --i-am-inside to override"),
-            "{message}"
-        );
     }
 
     #[test]
@@ -5264,9 +5260,9 @@ mod tests {
         });
 
         let expected = [
-            "cannot stop this daemon: cannot verify requester (pid 7: denied); pass --i-am-inside to override",
-            "cannot stop this daemon: cannot read requester identity (peer process ID unavailable); pass --i-am-inside to override",
-            "cannot stop this daemon: cannot read requester identity (credential lookup failed); pass --i-am-inside to override",
+            "cannot stop this daemon: cannot verify requester (pid 7: denied)",
+            "cannot stop this daemon: cannot read requester identity (peer process ID unavailable)",
+            "cannot stop this daemon: cannot read requester identity (credential lookup failed)",
         ];
         for message in expected {
             let response = read_adapter_response(&socket_path);
@@ -5317,7 +5313,7 @@ mod tests {
         assert_eq!(
             response,
             Response::error(
-                "cannot stop this daemon from one of its own sessions (session process ancestry); pass --i-am-inside to override"
+                "cannot stop this daemon from one of its own sessions (session process ancestry)"
             )
         );
         server.join().expect("join refusal adapter server");

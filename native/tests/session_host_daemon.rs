@@ -529,16 +529,11 @@ fn an_agent_hosted_by_an_earlier_daemon_cannot_stop_its_replacement() {
     assert_eq!(daemon_id_in(&path, "fresh"), stable);
 
     // Inherited identity: the hosted agent's REMUDA_* environment is intact.
-    let screen = run_in(
-        &path,
-        "agent",
-        &format!("'{binary}' -s s stop -f --yes"),
-        "A",
-    );
+    let screen = run_in(&path, "agent", &format!("'{binary}' -s s stop -f"), "A");
     assert!(screen.contains("cannot stop this daemon"), "{screen}");
     // Stripped identity: only the host child's pid in its ancestry refuses it.
     let stripped = format!(
-        "/usr/bin/env -i PATH=\"$PATH\" REMUDA_RUNTIME_DIR=\"$REMUDA_RUNTIME_DIR\" '{binary}' -s s stop -f --yes"
+        "/usr/bin/env -i PATH=\"$PATH\" REMUDA_RUNTIME_DIR=\"$REMUDA_RUNTIME_DIR\" '{binary}' -s s stop -f"
     );
     let screen = run_in(&path, "agent", &stripped, "B");
     assert!(screen.contains("cannot stop this daemon"), "{screen}");

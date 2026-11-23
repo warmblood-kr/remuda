@@ -1,6 +1,4 @@
-//! `remuda stop` ends every session, host-backed ones too; `--keep-sessions`
-//! leaves host-backed ones running for the next daemon (#713, #843). Same
-//! scenario on both backends; see `daemon_support/parity.rs`.
+//! `remuda stop` ends every session on both backends.
 #![cfg(unix)]
 
 use remuda_core::protocol::{Request, Response};
@@ -45,12 +43,8 @@ fn sleeper(daemon: &Parity) -> i32 {
     }
 }
 
-fn stop(daemon: &Parity, keep: bool) -> String {
-    let mut args = vec!["stop", "-f"];
-    if keep {
-        args.push("--keep-sessions");
-    }
-    let out = daemon.cli(&args);
+fn stop(daemon: &Parity) -> String {
+    let out = daemon.cli(&["stop", "-f"]);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
         out.status.success(),
@@ -65,9 +59,9 @@ fn stop_ends_every_session_in_both_backends() {
     for mode in MODES {
         let mut daemon = Parity::start(mode);
         let child = sleeper(&daemon);
-        let stderr = stop(&daemon, false);
+        let stderr = stop(&daemon);
         assert!(
-            stderr.contains("stopping ends 1 session(s)") && stderr.contains("--keep-sessions"),
+            stderr.contains("stopping ends 1 session(s)") && stderr.contains("remuda reload"),
             "{mode:?}: notice: {stderr}"
         );
         let deadline = Instant::now() + PATIENCE;
@@ -79,7 +73,7 @@ fn stop_ends_every_session_in_both_backends() {
         daemon.restart();
         assert!(names(&daemon).is_empty(), "{mode:?}: {:?}", names(&daemon));
         daemon.shell("keeper");
-        stop(&daemon, false);
+        stop(&daemon);
     }
 }
 
@@ -114,10 +108,10 @@ fn stop_retires_an_already_dead_hosts_reservation() {
     let (_, pid) = owner_record(&daemon);
     kill_host(pid);
 
-    stop(&daemon, false);
+    stop(&daemon);
     daemon.restart();
     assert_ne!(daemon.shell("keeper"), previous);
-    stop(&daemon, false);
+    stop(&daemon);
 }
 
 #[test]
@@ -127,7 +121,7 @@ fn stop_uses_authenticated_process_identity_for_a_live_pre_upgrade_host() {
     let (record, _) = owner_record(&daemon);
     std::fs::remove_file(record).unwrap();
 
-    stop(&daemon, false);
+    stop(&daemon);
     assert_eq!(
         daemon.hosts_running(),
         0,
@@ -135,7 +129,7 @@ fn stop_uses_authenticated_process_identity_for_a_live_pre_upgrade_host() {
     );
     daemon.restart();
     assert_ne!(daemon.shell("keeper"), old);
-    stop(&daemon, false);
+    stop(&daemon);
 }
 
 #[test]
@@ -155,9 +149,18 @@ fn stop_reports_and_preserves_a_reservation_with_unverifiable_ownership() {
         "{stderr}"
     );
 
-    let out = daemon.cli(&["stop", "-f", "--i-am-inside"]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "{stderr}");
+    // Exercise inventory cleanup directly because the caller guard can also
+    // refuse when session ownership is unverifiable.
+    let response = daemon.request(&Request::Shutdown {
+        requester_daemon_id: None,
+        requester_session_id: None,
+        requester_session_name: None,
+        override_hosted: true,
+        keep_sessions: false,
+    });
+    let Response::Error(stderr) = response else {
+        panic!("expected an unresolved shutdown, got {response:?}");
+    };
     assert!(
         stderr.contains("unresolved session hosts: keeper"),
         "{stderr}"
@@ -169,41 +172,6 @@ fn stop_reports_and_preserves_a_reservation_with_unverifiable_ownership() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
     assert!(stderr.contains("names remain reserved: keeper"), "{stderr}");
-    let out = daemon.cli(&["stop", "-f", "--i-am-inside", "--keep-sessions"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[test]
-fn stop_keep_sessions_keeps_only_host_backed_ones() {
-    for mode in MODES {
-        let mut daemon = Parity::start(mode);
-        let child = sleeper(&daemon);
-        let stderr = stop(&daemon, true);
-        assert!(
-            stderr.contains("host-backed ones keep running"),
-            "{mode:?}: notice: {stderr}"
-        );
-        daemon.restart();
-        match mode {
-            Mode::Hosted => {
-                assert!(alive(child), "hosted: child ended with --keep-sessions");
-                assert_eq!(names(&daemon), ["keeper"]);
-            }
-            Mode::Default => unreachable!("MODES contains only explicitly selected backends"),
-            Mode::InProcess => {
-                let deadline = Instant::now() + PATIENCE;
-                while alive(child) {
-                    assert!(Instant::now() < deadline, "in-process: child outlived stop");
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                assert!(names(&daemon).is_empty(), "{:?}", names(&daemon));
-            }
-        }
-    }
 }
 
 /// `close` returns before the host has stopped; a SIGTERM right after must
@@ -289,7 +257,7 @@ fn an_ended_attach_tells_a_lost_daemon_from_an_ended_session() {
             Mode::InProcess => Aftermath::Ended,
         };
         assert_eq!(aftermath(&daemon.socket(), "keeper"), expected, "{mode:?}");
-        stop(&daemon, false);
+        stop(&daemon);
     }
 }
 
@@ -324,7 +292,7 @@ fn stop_ends_a_session_a_human_is_attached_to() {
         let mut daemon = Parity::start(mode);
         let child = sleeper(&daemon);
         let _attached = attach(&daemon, "keeper");
-        stop(&daemon, false);
+        stop(&daemon);
         let deadline = Instant::now() + PATIENCE;
         while alive(child) {
             assert!(Instant::now() < deadline, "{mode:?}: child outlived stop");

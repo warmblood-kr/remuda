@@ -121,7 +121,7 @@ impl Drop for SessionAutoStartScratch {
             command.args(["-s", server]);
         }
         let _ = command
-            .args(["stop", "-f", "--yes"])
+            .args(["stop", "-f"])
             .env("REMUDA_RUNTIME_DIR", &self.root)
             .env("XDG_RUNTIME_DIR", &self.root)
             .env("HOME", &self.root)
@@ -489,14 +489,7 @@ fn invalid_mod_list_format_does_not_touch_the_filesystem_or_daemon() {
 
 #[test]
 fn stop_parser_handles_valid_flags_help_and_errors_before_connecting() {
-    for args in [
-        &["stop"][..],
-        &["stop", "-f"],
-        &["stop", "--force"],
-        &["stop", "--yes"],
-        &["stop", "--i-am-inside"],
-        &["stop", "-f", "--yes", "--i-am-inside"],
-    ] {
+    for args in [&["stop"][..], &["stop", "-f"], &["stop", "--force"]] {
         let dir = scratch("stop-valid");
         let out = remuda(&dir, args);
         assert!(out.status.success(), "{args:?}: {out:?}");
@@ -509,6 +502,9 @@ fn stop_parser_handles_valid_flags_help_and_errors_before_connecting() {
 
     for (tag, args, code) in [
         ("stop-bogus-flag", &["stop", "--bogus"][..], Some(2)),
+        ("stop-removed-yes", &["stop", "--yes"], Some(2)),
+        ("stop-removed-override", &["stop", "--i-am-inside"], Some(2)),
+        ("stop-removed-keep", &["stop", "--keep-sessions"], Some(2)),
         ("stop-extra-arg", &["stop", "stray"], Some(2)),
         ("stop-help", &["stop", "--help"], Some(0)),
     ] {

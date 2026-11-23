@@ -57,7 +57,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         if self.root.join("bin/remuda").exists() {
-            let _ = self.cli(&["stop", "-f", "--yes"]);
+            let _ = self.cli(&["stop", "-f"]);
         }
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();

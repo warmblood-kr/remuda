@@ -63,7 +63,7 @@ fn default_reload_preserves_instance_shell_pid_and_input() {
     struct StopCandidate<'a>(&'a Parity);
     impl Drop for StopCandidate<'_> {
         fn drop(&mut self) {
-            let _ = self.0.cli(&["stop", "-f", "--yes"]);
+            let _ = self.0.cli(&["stop", "-f"]);
         }
     }
     let _cleanup = StopCandidate(&daemon);
@@ -131,7 +131,7 @@ fn cli_run_default_session_survives_reload_and_accepts_input() {
     struct Cleanup<'a>(&'a Parity);
     impl Drop for Cleanup<'_> {
         fn drop(&mut self) {
-            let _ = self.0.cli(&["stop", "-f", "--yes"]);
+            let _ = self.0.cli(&["stop", "-f"]);
         }
     }
     let _cleanup = Cleanup(&daemon);

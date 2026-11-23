@@ -190,7 +190,7 @@ pub(crate) mod mac {
         })();
         // Stop gracefully when possible, but never wait indefinitely.
         let _ = bounded(
-            &mut command(&remuda, &["stop", "-f", "--yes"], &scratch.0),
+            &mut command(&remuda, &["stop", "-f"], &scratch.0),
             Duration::from_secs(2),
             false,
         );

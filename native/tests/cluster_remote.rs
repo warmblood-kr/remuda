@@ -445,7 +445,7 @@ impl Drop for Node {
         if self.bounded_inprocess_cleanup {
             if let Ok(mut stop) = self
                 .command()
-                .args(["stop", "-f", "--yes"])
+                .args(["stop", "-f"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -464,7 +464,7 @@ impl Drop for Node {
                 }
             }
         } else {
-            let _ = self.command().args(["stop", "-f", "--yes"]).output();
+            let _ = self.command().args(["stop", "-f"]).output();
         }
         self.stop_daemon();
         if !self.bounded_inprocess_cleanup {

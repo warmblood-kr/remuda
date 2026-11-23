@@ -71,7 +71,7 @@ fn stop_cli_succeeds_after_its_parent_exits() {
     let script = scratch.0.join("stop.cmd");
     let launcher_stderr = scratch.0.join("launcher-stderr.txt");
     let body = format!(
-        "@echo off\r\nstart \"\" /b {} -s s stop -f --yes > {} 2>&1\r\n",
+        "@echo off\r\nstart \"\" /b {} -s s stop -f > {} 2>&1\r\n",
         cmd_quote(exe),
         cmd_quote(&output)
     );

@@ -55,7 +55,7 @@ impl ModHome {
 
 impl Drop for ModHome {
     fn drop(&mut self) {
-        let _ = self.remuda(&["stop", "-f", "--yes"]);
+        let _ = self.remuda(&["stop", "-f"]);
         hosts::stop_hosts_under(&self.0);
         let _ = fs::remove_dir_all(&self.0);
     }

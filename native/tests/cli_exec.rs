@@ -871,6 +871,6 @@ fn eval_accepts_lua_source_starting_with_a_comment() {
         "nil",
         "invalid argv must not execute CODE"
     );
-    run(&["stop", "-f", "--yes"]);
+    run(&["stop", "-f"]);
     let _ = fs::remove_dir_all(&dir);
 }

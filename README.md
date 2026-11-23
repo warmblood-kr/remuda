@@ -275,33 +275,23 @@ Where a reload cannot help (Windows, or the cases above), the cure is one verb,
 and it takes the herd with it:
 
 ```sh
-remuda stop           # names any live session and asks first; -f skips the ask
+remuda stop           # list sessions and ask before ending them
+remuda stop --force   # stop without prompting (-f)
 ```
 
-`stop` ends host-backed sessions too and says how many end. To keep them,
-`remuda reload` instead, or `remuda stop --keep-sessions`, which stops the
-daemon and leaves host-backed sessions running for the next one (in-process
-sessions still end). A daemon older than this change ignores the flag and
-keeps the old behaviour: its `stop` leaves host-backed sessions running.
+`stop` ends both host-backed and in-process sessions. Use `remuda reload`
+to keep host-backed sessions running across a daemon replacement. Older
+daemons may leave host-backed sessions running after a stop.
 
-The shutdown guard refuses a stop from one of this daemon's sessions and refuses
-when it cannot verify the caller's ancestry. `-f` and `--yes` only skip the
-confirmation prompt. If this is the intended daemon, use the same server and
-runtime selection with `remuda -s NAME stop -f --yes --i-am-inside`; this
-intentionally ends its sessions. The guard is advisory, not authentication:
-it does not authenticate the caller or make same-user access an authorization
-boundary, and it claims no isolation. A caller whose parent has already exited
-reads as outside, so that loss of ancestry is accepted and the stop proceeds;
-a caller whose ancestry cannot be read is unverifiable and is refused.
+Run `stop` from a terminal outside the target daemon's sessions. The daemon
+refuses callers from its own sessions and callers whose ancestry it cannot
+verify, including when `--force` is used. The caller check is advisory.
 
-If the daemon is responsive, use that override rather than killing it. For a
-stuck Unix daemon, verify its PID first, then `kill -CONT PID` if it is stopped
-or `kill PID` to request graceful termination; `kill -KILL PID` is a last resort
-that can skip cleanup. On Windows, identify the process in Task Manager or
-`Get-Process` before terminating it; forced process termination can skip
-cleanup there too. The override only works when the request reaches the
-responsive intended daemon. It cannot fix a wrong runtime path, socket access
-failure, or a hung daemon. "No daemon running" means the selected endpoint is
+For a stuck Unix daemon, verify its PID first, then `kill -CONT PID` if it is
+stopped or `kill PID` to request graceful termination. `kill -KILL PID` is a
+last resort that can skip cleanup. On Windows, identify the process in Task
+Manager or `Get-Process` before terminating it.
+"No daemon running" means the selected endpoint is
 unavailable, not proof that no process remains. Do not unlink a socket that
 may belong to a live daemon. An installed Butler poller may start the daemon
 again after it stops.
