@@ -115,6 +115,10 @@ fn closed() -> io::Error {
     )
 }
 impl<T: LocalIo> Channel<T> {
+    #[cfg(unix)]
+    pub fn socket(&self) -> Option<&T> {
+        self.io.as_ref().map(|io| &io.inner)
+    }
     pub fn authenticate(io: T, key: &Key, initiator: bool) -> io::Result<Self> {
         Self::authenticate_until(io, key, initiator, Instant::now() + TIMEOUT)
     }

@@ -11,8 +11,7 @@ pub(super) fn default_state_base() -> io::Result<PathBuf> {
 }
 
 pub(super) fn boot_state_root(root: &Path, create: bool) -> io::Result<PathBuf> {
-    let boot = read_proc("/proc/sys/kernel/random/boot_id")?;
-    let directory = root.join(boot_name(boot.trim())?);
+    let directory = root.join(current_boot()?);
     let identity = pid_namespace()?;
     let marker = directory.join("pid-namespace");
     if create {
@@ -42,6 +41,15 @@ pub(super) fn boot_state_root(root: &Path, create: bool) -> io::Result<PathBuf> 
         }
     }
     Ok(directory)
+}
+
+pub(super) fn owner_namespace() -> io::Result<String> {
+    Ok(format!("{}:{}", current_boot()?, pid_namespace()?))
+}
+
+fn current_boot() -> io::Result<String> {
+    let boot = read_proc("/proc/sys/kernel/random/boot_id")?;
+    boot_name(boot.trim())
 }
 
 fn read_proc(path: &str) -> io::Result<String> {

@@ -758,6 +758,37 @@ fn a_drained_gate_refuses_acts_and_control_before_any_effect_but_reads_go_on() {
 }
 
 #[test]
+fn stop_retires_an_exact_dead_closing_instance_under_the_current_fence() {
+    use crate::session_host::hosted::Hosting;
+    let mut fixture = Fixture::new();
+    let old = adapter(&fixture.root);
+    old.owner.mark_closing(old.target()).unwrap();
+    assert!(!old.owner.retire_dead(old.target()).unwrap());
+
+    let host = &mut fixture.host.as_mut().unwrap().0;
+    host.kill().unwrap();
+    host.wait().unwrap();
+
+    let store = || Store::open(&fixture.root.join("inventory")).unwrap();
+    let current = Owner::claim(store()).unwrap();
+    assert!(matches!(
+        old.owner.retire_dead(old.target()),
+        Err(StoreError::Data(model::Error::StaleFence))
+    ));
+    let index = current.index().unwrap();
+    assert_eq!(index.entries["synthetic"].phase, Phase::Registered);
+    assert!(index.entries["synthetic"]
+        .metadata
+        .contains_key(super::super::recovery::CLOSING));
+
+    let hosts = Hosting::at(fixture.root.clone());
+    assert!(hosts.close_all(Duration::from_secs(2)).unwrap().is_empty());
+    let index = store().read().unwrap();
+    assert!(!index.entries.contains_key("synthetic"));
+    assert_eq!(index.tombstones.back().unwrap().identity, old.identity);
+}
+
+#[test]
 fn teardown_leaves_an_in_flight_act_its_own_result() {
     let mut fixture = Fixture::new();
     let session = Arc::new(adapter(&fixture.root));

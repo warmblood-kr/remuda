@@ -282,8 +282,14 @@ pub(crate) enum InputMutation {
     },
 }
 pub(crate) enum ExitMutation {
-    Observe { generation: u64 },
+    Observe {
+        generation: u64,
+    },
     Retire,
+    /// The controller confirmed the recorded host process no longer exists.
+    RetireDead {
+        launch: [u8; 16],
+    },
 }
 pub(crate) struct Applied {
     pub next: Index,
@@ -639,7 +645,7 @@ impl Index {
         operation: ExitMutation,
     ) -> Result<(Option<String>, EventKind)> {
         let entry = self.entry(&target.name, &target.identity)?;
-        match operation {
+        let generation = match operation {
             ExitMutation::Observe { generation } => {
                 if entry.birth.is_some() {
                     return Err(Error::Invalid("host publisher lease required"));
@@ -652,19 +658,27 @@ impl Index {
                     _ => {}
                 }
                 entry.phase = Phase::Exited { generation };
+                return Ok((Some(target.name), EventKind::Exit));
             }
-            ExitMutation::Retire => {
-                let generation = entry.retirement_generation()?;
-                self.entries.remove(&target.name);
-                self.tombstones.push_back(Tombstone {
-                    name: target.name.clone(),
-                    identity: target.identity,
-                    generation,
-                });
-                while self.tombstones.len() > MAX_TOMBSTONES {
-                    self.tombstones.pop_front();
+            ExitMutation::Retire => entry.retirement_generation()?,
+            ExitMutation::RetireDead { launch } => {
+                if entry.launch != launch {
+                    return Err(Error::Conflict);
+                }
+                match entry.phase {
+                    Phase::Exited { generation } => generation,
+                    _ => 0,
                 }
             }
+        };
+        self.entries.remove(&target.name);
+        self.tombstones.push_back(Tombstone {
+            name: target.name.clone(),
+            identity: target.identity,
+            generation,
+        });
+        while self.tombstones.len() > MAX_TOMBSTONES {
+            self.tombstones.pop_front();
         }
         Ok((Some(target.name), EventKind::Exit))
     }

@@ -120,6 +120,7 @@ pub(crate) fn run(endpoint_path: &Path) -> io::Result<()> {
     // Unique root claim precedes every child effect; never remove/rebind a root.
     let endpoint = Endpoint::bind_with_socket(endpoint_path, bootstrap.socket.as_deref())?;
     endpoint.nonblocking()?;
+    super::unix::record_owner(endpoint_path, identity.clone(), None)?;
     let gate = Arc::new(Gate::new(store.clone(), bootstrap.lease.clone()));
     let (start, receive) = std::sync::mpsc::sync_channel::<Start>(1);
     // Reserve the essential worker before creating the child. Failure is no-spawn.
@@ -179,7 +180,8 @@ pub(crate) fn run(endpoint_path: &Path) -> io::Result<()> {
         for name in ["session.json", "capability", "socket-path"] {
             let _ = std::fs::remove_file(endpoint_path.join(name));
         }
-        let _ = std::fs::remove_dir(endpoint_path);
+        // The controller removes the owner record and its directory after
+        // verifying this process exited and retiring the reservation.
     }
     Ok(())
 }
@@ -210,6 +212,11 @@ fn pause(start: &Start, delay: &mut Duration) {
 }
 fn publish(start: Start) {
     let mut delay = Duration::from_millis(10);
+    if let Some(child) = start.host.child_pid() {
+        while super::unix::record_owner(&start.root, start.host.identity(), Some(child)).is_err() {
+            pause(&start, &mut delay);
+        }
+    }
     loop {
         if crate::fs_atomic::write_atomic_lua_private(
             &start.root.join("session.json"),

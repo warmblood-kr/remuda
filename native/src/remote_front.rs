@@ -365,6 +365,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::Mkdir { .. } => Err(refusal("Mkdir")),
         Request::RemoveDirAll { .. } => Err(refusal("RemoveDirAll")),
         Request::Version => Err(refusal("Version")),
+        Request::SessionHostReservations => Err(refusal("SessionHostReservations")),
         Request::SessionHostBuilds => Err(refusal("SessionHostBuilds")),
         Request::Reload { .. } => Err(refusal("Reload")),
         Request::SocketPublication => Err(refusal("SocketPublication")),

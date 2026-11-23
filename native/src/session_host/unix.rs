@@ -265,6 +265,178 @@ fn socket_path(path: &Path) -> io::Result<PathBuf> {
     Ok(socket)
 }
 
+/// PID from the same socket that passed the host identity handshake. Older
+/// live hosts do not have an owner record, but can still be stopped safely.
+pub(super) fn peer_pid(socket: &UnixStream) -> Option<libc::pid_t> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut size = std::mem::size_of_val(&pid) as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut pid as *mut libc::pid_t).cast(),
+                &mut size,
+            )
+        };
+        (result == 0 && pid > 0).then_some(pid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+        let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                credentials.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        if result != 0 || size as usize != std::mem::size_of::<libc::ucred>() {
+            return None;
+        }
+        let pid = unsafe { credentials.assume_init() }.pid;
+        (pid > 0).then_some(pid)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = socket;
+        None
+    }
+}
+
+/// The reserved host publishes its PID after claiming the one-use endpoint
+/// and before creating any child. Keep this record through process exit.
+pub(super) const OWNER_RECORD: &str = "owner.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OwnerProcess {
+    identity: super::api::Identity,
+    namespace: Option<String>,
+    pub host: libc::pid_t,
+    pub child: Option<u32>,
+}
+
+pub(super) fn record_owner(
+    path: &Path,
+    identity: super::api::Identity,
+    child: Option<u32>,
+) -> io::Result<()> {
+    let process = OwnerProcess {
+        identity,
+        namespace: super::hosted::owner_namespace().ok(),
+        host: std::process::id() as libc::pid_t,
+        child,
+    };
+    crate::fs_atomic::write_atomic_lua_private(
+        &path.join(OWNER_RECORD),
+        &serde_json::to_vec(&process)?,
+    )
+}
+
+pub(super) fn recorded_owner(
+    path: &Path,
+    identity: &super::api::Identity,
+) -> io::Result<OwnerProcess> {
+    directory(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path.join(OWNER_RECORD))?;
+    let info = file.metadata()?;
+    if !info.is_file() || info.uid() != uid() || info.mode() & 0o7777 != 0o600 || info.nlink() != 1
+    {
+        return Err(denied());
+    }
+    const MAX_RECORD: u64 = 4096;
+    let mut bytes = Vec::new();
+    file.take(MAX_RECORD + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RECORD {
+        return Err(denied());
+    }
+    let process: OwnerProcess = serde_json::from_slice(&bytes)?;
+    if process.identity != *identity
+        || process.namespace.as_deref() != Some(super::hosted::owner_namespace()?.as_str())
+        || process.host <= 0
+        || process.child == Some(0)
+    {
+        return Err(denied());
+    }
+    Ok(process)
+}
+
+// Only the fenced retirement path calls this, after confirming host exit.
+pub(super) fn remove_owner_record(path: &Path, identity: &super::api::Identity) {
+    if recorded_owner(path, identity).is_ok() {
+        let _ = std::fs::remove_file(path.join(OWNER_RECORD));
+        let _ = std::fs::remove_dir(path);
+    }
+}
+
+/// A recycled PID or an unreadable process leaves ownership uncertain.
+pub(super) fn owner_exited(pid: libc::pid_t) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid, 0) } == -1 {
+        return io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    }
+    // A zombie already exited. Its parent may not have collected it yet.
+    child_exited(pid) || owner_is_zombie(pid)
+}
+
+fn child_exited(pid: libc::pid_t) -> bool {
+    // WNOWAIT leaves collection to the thread or process that owns the child.
+    let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut status,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    result == 0 && status.si_signo == libc::SIGCHLD
+}
+
+#[cfg(target_os = "macos")]
+fn owner_is_zombie(pid: libc::pid_t) -> bool {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let result = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    result == size && unsafe { info.assume_init() }.pbi_status == libc::SZOMB
+}
+
+#[cfg(target_os = "linux")]
+fn owner_is_zombie(pid: libc::pid_t) -> bool {
+    // comm can contain whitespace and parentheses. The state follows its last ')'.
+    std::fs::read(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let end = stat.iter().rposition(|byte| *byte == b')')?;
+            stat.get(end + 1..end + 4).map(|state| state == b" Z ")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn owner_is_zombie(_: libc::pid_t) -> bool {
+    false
+}
+
 pub(super) fn listener_missing(path: &Path) -> bool {
     let Ok(socket) = socket_path(path) else {
         return false;
