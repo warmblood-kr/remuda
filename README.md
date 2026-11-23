@@ -68,7 +68,7 @@ X25519 public keys) and `document` (the permitted canonical
 Give the reader and Butler separate owner-only JSON credential files, each
 with `endpoint` (IP and port), `server` (the serving node's Base64
 public key), and `private` (that client's Base64 X25519 private key).
-Launch `remuda browser` with `REMUDA_BROWSER_CLIENT` pointing to the reader's
+Launch `remuda-gui` with `REMUDA_BROWSER_CLIENT` pointing to the reader's
 file. From Butler, point the same variable at the publisher file and run
 `remuda browser open-document REQUEST_ID remuda:///path`. The command
 reports the display result as JSON. Use the same request ID when retrying

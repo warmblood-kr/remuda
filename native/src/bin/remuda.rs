@@ -837,7 +837,6 @@ remuda — a pty manager you can attach to
   remuda cluster nodes            list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster leave [--yes]    leave the cluster; another node revokes this one
-  remuda browser                 open the native VFS document reader
   remuda browser [USER@]HOST      open remote Remuda over SSH
   remuda cluster remote [node[/session]] a node's session screen, or the cluster tree
   remuda cluster listen [--bind ADDR] [--allow-public] configure the daemon listener
@@ -944,7 +943,6 @@ remuda — terminal orchestration for coding agents
   remuda cluster nodes           list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster leave [--yes]    leave the cluster; another node revokes this one
-  remuda browser                 open the native VFS document reader
   remuda browser [USER@]HOST      open remote Remuda over SSH
   remuda cluster remote [node[/session]] a node's session screen, or the cluster tree
   remuda cluster listen [--bind ADDR] [--allow-public] configure the daemon listener
