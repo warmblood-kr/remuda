@@ -78,6 +78,7 @@ jobs:
         shell: bash
         run: |
           ./gui/target/debug/${{ matrix.executable }} --internal-build-id
+          ./gui/target/debug/${{ matrix.executable }} --internal-font-check
           ./target/debug/${{ matrix.cli }} browser --help
           ./target/debug/${{ matrix.cli }} tray --help
           mkdir browser-artifact
