@@ -231,6 +231,7 @@ pub(crate) struct Browser {
     terminal: Option<PtyAgent>,
     screen: Screen,
     terminal_scroll: terminal_view::HistoryScroll,
+    terminal_selection: terminal_view::TextSelection,
     panel_bounds: Rc<Cell<Option<Bounds<gpui::Pixels>>>>,
     viewport: Viewport,
     focus: FocusHandle,
@@ -342,6 +343,7 @@ impl Browser {
             terminal,
             screen,
             terminal_scroll: Default::default(),
+            terminal_selection: Default::default(),
             panel_bounds: Default::default(),
             viewport: Default::default(),
             focus,
@@ -545,11 +547,13 @@ impl Browser {
                     let _ = terminal.resize(size);
                 }
             }
-            if let Ok(screen) = terminal
-                .screen_cells_at(self.terminal_scroll.offset)
+            let scroll = self.terminal_scroll.offset;
+            if let Ok(mut screen) = terminal
+                .screen_cells_at(scroll)
                 .map_err(|e| e.to_string())
                 .and_then(Screen::from_cells)
             {
+                screen.wrapped = terminal.row_wrapped_at(scroll).unwrap_or_default();
                 if screen != self.screen {
                     self.screen = screen;
                     cx.notify();
@@ -605,6 +609,13 @@ impl Browser {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .terminal_selection
+            .copy(&event.keystroke, Some(&self.screen), cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
         if let Some(input) = crate::live_session::key_bytes(&event.keystroke) {
             if let Some(terminal) = self.terminal.as_mut() {
                 self.last_input = Some(Instant::now());
@@ -886,11 +897,14 @@ impl Browser {
             .min_h_0()
             .overflow_hidden()
             .track_focus(&self.focus)
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.active = Content::Terminal;
-                this.focus.focus(window);
-                cx.notify();
-            }))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.active = Content::Terminal;
+                    this.focus.focus(window);
+                    cx.notify();
+                }),
+            )
             .on_key_down(cx.listener(Self::key_down))
             .on_scroll_wheel(cx.listener(|this, event, _, cx| this.scroll_terminal(event, cx)))
             .child(
@@ -902,7 +916,7 @@ impl Browser {
                 .size_full(),
             )
             .child(terminal_view::measure(self.viewport.clone()))
-            .child(self.screen.view_with_links(Some(open)))
+            .child(self.screen.view(&self.terminal_selection, Some(open)))
             .into_any_element()
     }
 
@@ -1350,6 +1364,7 @@ mod tests {
                 terminal: None,
                 screen: Screen::default(),
                 terminal_scroll: Default::default(),
+                terminal_selection: Default::default(),
                 panel_bounds: Default::default(),
                 viewport: Default::default(),
                 focus,

@@ -11,6 +11,7 @@ use std::{
 
 mod browser;
 mod browser_media;
+mod clipboard_image;
 mod cluster_status;
 #[allow(dead_code)]
 mod input_helper;
@@ -25,6 +26,8 @@ mod provider;
 mod session_tree;
 #[cfg(any(target_os = "macos", windows))]
 mod tray;
+#[cfg(windows)]
+mod windows_input;
 
 const WORKER_ABI: &str = "--remuda-gui-worker-abi-1";
 const PREVIEW_ABI: &str = "--remuda-gui-preview-abi-2";
@@ -358,6 +361,7 @@ struct LocalGui {
     live_notice: Option<&'static str>,
     preview_failed: bool,
     line_input: Option<line_input::LineInput>,
+    clipboard_images: clipboard_image::ClipboardImages,
     line_history: HashMap<Selection, line_input::LineHistory>,
     viewport: terminal_view::Viewport,
     requested_size: Option<remuda_core::agent::Size>,
@@ -371,6 +375,7 @@ struct LocalGui {
     selection: Option<Selection>,
     preview: Option<Screen>,
     terminal_scroll: terminal_view::HistoryScroll,
+    terminal_selection: terminal_view::TextSelection,
     preview_generation: u64,
     preview_busy: bool,
     preview_pending: Option<(u64, Selection)>,
@@ -422,6 +427,7 @@ impl LocalGui {
             live_notice: None,
             preview_failed: false,
             line_input: None,
+            clipboard_images: Default::default(),
             line_history: HashMap::new(),
             viewport: Default::default(),
             requested_size: None,
@@ -435,6 +441,7 @@ impl LocalGui {
             selection: None,
             preview: None,
             terminal_scroll: Default::default(),
+            terminal_selection: Default::default(),
             preview_generation: 0,
             preview_busy: false,
             preview_pending: None,
@@ -478,6 +485,7 @@ impl LocalGui {
         self.selection = None;
         self.preview = None;
         self.terminal_scroll = Default::default();
+        self.terminal_selection.clear();
         self.preview_received = None;
         self.preview_failed = false;
     }
@@ -609,6 +617,13 @@ impl LocalGui {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .terminal_selection
+            .copy(&event.keystroke, self.preview.as_ref(), cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
         if let Some(documents) = &self.documents {
             documents.update(cx, |docs, _| docs.mark_terminal_input());
         }
@@ -620,6 +635,18 @@ impl LocalGui {
             return;
         };
         let modifiers = event.keystroke.modifiers;
+        let paste = event.keystroke.key == "v"
+            && (modifiers.platform || (modifiers.control && (modifiers.shift || cfg!(windows))));
+        let clipboard = (paste
+            && !self
+                .line_input
+                .as_ref()
+                .is_some_and(|editor| editor.composing()))
+        .then(|| {
+            cx.read_from_clipboard()
+                .or_else(clipboard_image::read_fallback)
+        })
+        .flatten();
         if event.keystroke.key == "\\" && modifiers.control && !modifiers.alt && !modifiers.platform
         {
             self.detach();
@@ -634,6 +661,20 @@ impl LocalGui {
         {
             self.detach();
             self.live_notice = Some("Session unavailable · detached");
+        } else if let Some(image) = clipboard.as_ref().and_then(clipboard_image::first_image) {
+            use live_session::Submit;
+            self.live_notice = Some(
+                if self.selection.as_ref().is_some_and(|s| s.peer.is_some()) {
+                    "Clipboard images require a session on this device"
+                } else {
+                    match self.clipboard_images.paste(image, live) {
+                        Ok(Submit::Queued) => "Pasting image into the terminal…",
+                        Ok(Submit::Busy) => "Previous input pending · image was not pasted",
+                        Ok(_) => "Input unavailable · image was not pasted",
+                        Err(reason) => reason,
+                    }
+                },
+            );
         } else if let Some(editor) = &mut self.line_input {
             if editor.composing() {
                 return;
@@ -658,12 +699,12 @@ impl LocalGui {
                     };
                 }
                 "enter" if modifiers.shift => editor.insert("\n"),
-                "v" if modifiers.platform || (modifiers.control && modifiers.shift) => {
-                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                "v" if paste => {
+                    if let Some(text) = clipboard.as_ref().and_then(|item| item.text()) {
                         editor.insert(&text.replace("\r\n", "\n").replace('\r', "\n"));
                     }
                 }
-                _ if event.keystroke.key_char.is_some()
+                _ if (event.keystroke.key_char.is_some() || event.keystroke.key == "space")
                     && !modifiers.control
                     && !modifiers.platform =>
                 {
@@ -766,6 +807,9 @@ impl LocalGui {
                 Some(live_session::Event::Applied) => {
                     self.live_notice = Some("Input sent · Ctrl+\\ detaches");
                     self.next_live_preview = Instant::now();
+                }
+                Some(live_session::Event::PasteUnavailable) => {
+                    self.live_notice = Some("The terminal does not accept bracketed paste");
                 }
                 Some(live_session::Event::NotAcknowledged) => {
                     self.detach();
@@ -1299,6 +1343,8 @@ fn open_local_window(cx: &mut App, bounds: Bounds<gpui::Pixels>) -> gpui::AnyWin
             |window, cx| {
                 #[cfg(target_os = "macos")]
                 macos_lifecycle::install_window(window, cx, macos_lifecycle::WindowKind::Remuda);
+                #[cfg(windows)]
+                windows_input::install(window);
                 let focus = cx.focus_handle();
                 focus.focus(window);
                 let window = window.window_handle();
@@ -1808,11 +1854,11 @@ mod tests {
             gui.tree_focus = Some(focus);
             gui
         });
-        cx.simulate_keystrokes("enter h i");
+        cx.simulate_keystrokes("enter h space i");
         assert!(cx.debug_bounds("line-composer").is_some());
         assert_eq!(
             cx.read(|app| view.read(app).line_input.as_ref().unwrap().bytes()),
-            b"hi\r"
+            b"h i\r"
         );
         cx.simulate_keystrokes("escape");
         assert!(cx.read(|app| view.read(app).line_input.is_none()));
@@ -1975,6 +2021,50 @@ mod tests {
             let gui = view.read(app);
             gui.tree_scroll.offset().y < px(0.) && gui.terminal_scroll.offset == 0
         }));
+    }
+
+    #[gpui::test]
+    fn detached_terminal_drag_focuses_the_pane_and_copies(cx: &mut gpui::TestAppContext) {
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let mut gui = LocalGui::new();
+            gui.sessions = vec![row("agent")];
+            gui.preview_busy = true;
+            gui.select_session(None, gui.sessions[0].clone());
+            gui.preview = Some(
+                Screen::from_cells(vec![vec![remuda_core::agent::StyledCell {
+                    text: "shell output".into(),
+                    ..Default::default()
+                }]])
+                .unwrap(),
+            );
+            let sidebar = cx.focus_handle();
+            sidebar.focus(window);
+            gui.tree_focus = Some(sidebar);
+            gui
+        });
+        let screen = cx.debug_bounds("selectable-terminal").unwrap();
+        let start = gpui::point(screen.left() + px(1.), screen.center().y);
+        let end = gpui::point(screen.left() + px(150.), screen.center().y);
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: start,
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::MouseMoveEvent {
+            pressed_button: Some(gpui::MouseButton::Left),
+            position: end,
+            ..Default::default()
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: end,
+            ..Default::default()
+        });
+        cx.simulate_keystrokes("ctrl-shift-c");
+        assert_eq!(
+            cx.read(|app| app.read_from_clipboard().unwrap().text().unwrap()),
+            "shell output"
+        );
     }
 
     #[gpui::test]
