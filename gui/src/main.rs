@@ -1381,13 +1381,21 @@ mod tests {
             gui.live_focus = Some(focus);
             gui.documents = Some(documents);
             gui.sessions = vec![row("research")];
-            gui.preview = Some("terminal output".into());
+            gui.preview = Some(
+                terminal_view::Screen::from_cells(vec![vec![remuda_core::agent::StyledCell {
+                    text: "terminal output".into(),
+                    hyperlink: Some("remuda:///docs/guide.md".into()),
+                    ..Default::default()
+                }]])
+                .unwrap(),
+            );
             gui
         });
         cx.simulate_resize(gpui::size(px(840.), px(620.)));
         assert!(cx.debug_bounds("local-sessions-tab").is_some());
         assert!(cx.debug_bounds("local-drive-tab").is_some());
         assert!(cx.debug_bounds("session-0").is_some());
+        assert!(cx.debug_bounds("terminal-link-0-0").is_some());
         view.update_in(cx, |gui, window, cx| {
             gui.documents
                 .as_ref()
@@ -1405,7 +1413,7 @@ mod tests {
         assert!(cx.read(|app| {
             let gui = view.read(app);
             !gui.documents.as_ref().unwrap().read(app).showing_document()
-                && gui.preview.as_ref().unwrap().text == "terminal output"
+                && gui.preview.as_ref().unwrap().text.trim_end() == "terminal output"
         }));
     }
 

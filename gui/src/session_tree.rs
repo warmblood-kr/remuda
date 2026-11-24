@@ -629,6 +629,9 @@ impl Render for LocalGui {
             tree.w(px(sidebar)).h_full()
         };
         let docs = self.documents.clone();
+        let open_terminal_link = docs
+            .as_ref()
+            .map(|docs| browser::Browser::terminal_link_handler(docs.downgrade()));
         let workspace_wide = browser::Browser::wide(window);
         let document_selected = docs
             .as_ref()
@@ -1090,7 +1093,9 @@ impl Render for LocalGui {
                                                                 .when_some(
                                                                     self.preview.as_ref(),
                                                                     |d, screen| {
-                                                                        d.child(screen.view())
+                                                                        d.child(screen.view_with_links(
+                                                                            open_terminal_link.clone(),
+                                                                        ))
                                                                     },
                                                                 ),
                                                         ),

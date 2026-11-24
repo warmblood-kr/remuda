@@ -856,10 +856,10 @@ impl Browser {
             .into_any_element()
     }
 
-    fn terminal_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let panel_bounds = self.panel_bounds.clone();
-        let browser = cx.entity().downgrade();
-        let open: terminal_view::LinkHandler = std::rc::Rc::new(move |uri, _, cx| {
+    pub(crate) fn terminal_link_handler(
+        browser: gpui::WeakEntity<Self>,
+    ) -> terminal_view::LinkHandler {
+        std::rc::Rc::new(move |uri, _, cx| {
             use remuda_native::terminal_link::Target;
             match Target::parse(uri) {
                 Some(Target::Drive(_)) => {
@@ -871,7 +871,12 @@ impl Browser {
                 Some(Target::GitHub(url)) => cx.open_url(url.as_str()),
                 None => {}
             }
-        });
+        })
+    }
+
+    fn terminal_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let panel_bounds = self.panel_bounds.clone();
+        let open = Self::terminal_link_handler(cx.entity().downgrade());
         div()
             .id("browser-terminal")
             .debug_selector(|| "browser-terminal".into())

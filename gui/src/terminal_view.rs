@@ -56,10 +56,6 @@ impl Screen {
         })
     }
 
-    pub(crate) fn view(&self) -> AnyElement {
-        self.view_with_links(None)
-    }
-
     pub(crate) fn view_with_links(&self, open: Option<LinkHandler>) -> AnyElement {
         let body = div()
             .font_family(FONT)
