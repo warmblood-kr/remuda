@@ -102,6 +102,7 @@ pub(crate) fn key_bytes(key: &Keystroke) -> Option<Vec<u8>> {
     }
     let bytes: &[u8] = match key.key.as_str() {
         "enter" => b"\r",
+        "space" => b" ",
         "escape" => b"\x1b",
         "tab" if modifiers.shift => b"\x1b[Z",
         "tab" => b"\t",
@@ -131,6 +132,8 @@ mod tests {
             ..Keystroke::default()
         };
         assert_eq!(key_bytes(&key).as_deref(), Some(&b"\r"[..]));
+        key.key = "space".into();
+        assert_eq!(key_bytes(&key).as_deref(), Some(&b" "[..]));
         key.key = "c".into();
         key.key_char = Some("c".into());
         key.modifiers.control = true;

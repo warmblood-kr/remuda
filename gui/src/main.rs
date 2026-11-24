@@ -26,6 +26,8 @@ mod provider;
 mod session_tree;
 #[cfg(any(target_os = "macos", windows))]
 mod tray;
+#[cfg(windows)]
+mod windows_input;
 
 const WORKER_ABI: &str = "--remuda-gui-worker-abi-1";
 const PREVIEW_ABI: &str = "--remuda-gui-preview-abi-2";
@@ -702,7 +704,7 @@ impl LocalGui {
                         editor.insert(&text.replace("\r\n", "\n").replace('\r', "\n"));
                     }
                 }
-                _ if event.keystroke.key_char.is_some()
+                _ if (event.keystroke.key_char.is_some() || event.keystroke.key == "space")
                     && !modifiers.control
                     && !modifiers.platform =>
                 {
@@ -1341,6 +1343,8 @@ fn open_local_window(cx: &mut App, bounds: Bounds<gpui::Pixels>) -> gpui::AnyWin
             |window, cx| {
                 #[cfg(target_os = "macos")]
                 macos_lifecycle::install_window(window, cx, macos_lifecycle::WindowKind::Remuda);
+                #[cfg(windows)]
+                windows_input::install(window);
                 let focus = cx.focus_handle();
                 focus.focus(window);
                 let window = window.window_handle();
@@ -1850,11 +1854,11 @@ mod tests {
             gui.tree_focus = Some(focus);
             gui
         });
-        cx.simulate_keystrokes("enter h i");
+        cx.simulate_keystrokes("enter h space i");
         assert!(cx.debug_bounds("line-composer").is_some());
         assert_eq!(
             cx.read(|app| view.read(app).line_input.as_ref().unwrap().bytes()),
-            b"hi\r"
+            b"h i\r"
         );
         cx.simulate_keystrokes("escape");
         assert!(cx.read(|app| view.read(app).line_input.is_none()));
