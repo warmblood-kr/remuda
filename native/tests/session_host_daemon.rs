@@ -201,7 +201,7 @@ fn without_the_opt_in_new_sessions_stay_in_process() {
 }
 
 #[test]
-fn a_launch_flag_protects_a_hosted_instance() {
+fn a_launch_flag_is_reported_for_a_hosted_instance() {
     let root = Root::new();
     let _daemon = Daemon::spawn(&root, true);
     let path = root.socket();
@@ -230,6 +230,8 @@ fn a_launch_flag_protects_a_hosted_instance() {
             .any(|row| row.name == name && row.remote_input_disabled),
         "the launch-time opt-out is missing from the hosted listing: {listed:?}"
     );
+    // #941/#951: the flag is reported, not enforced; an admitted peer's input
+    // is always accepted.
     assert_eq!(
         request(
             &path,
@@ -242,7 +244,7 @@ fn a_launch_flag_protects_a_hosted_instance() {
                 line: true,
             }
         ),
-        Response::RemoteControlDisabled
+        Response::Ack { duplicate: false }
     );
     assert_eq!(
         request(
