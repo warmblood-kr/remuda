@@ -3,6 +3,7 @@
 use gpui::{div, img, prelude::*, px, rgb, AnyElement, App, RenderImage, Window};
 use image::{Frame, ImageFormat, ImageReader, RgbaImage};
 use remuda_native::document_html::{self, Target};
+use remuda_native::document_markdown::LineStyle;
 use std::{io::Cursor, sync::Arc};
 
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
@@ -19,7 +20,7 @@ pub(crate) struct Document {
 
 #[derive(Clone)]
 enum Body {
-    Text(document_html::Document, Vec<InlineImage>),
+    Text(document_html::Document, Vec<InlineImage>, Vec<LineStyle>),
     Image(Raster),
 }
 
@@ -82,11 +83,13 @@ pub(crate) fn decode(path: &str, bytes: &[u8]) -> Result<Document, String> {
     }
     let source =
         std::str::from_utf8(bytes).map_err(|_| "This document format is unsupported".to_owned())?;
-    let (mut projected, mut images) = if lower.ends_with(".html") || lower.ends_with(".htm") {
-        document_html::parse_with_images(path, source)?
-    } else {
-        remuda_native::document_markdown::parse_with_images(path, source)?
-    };
+    let (mut projected, mut images, mut styles) =
+        if lower.ends_with(".html") || lower.ends_with(".htm") {
+            let (document, images) = document_html::parse_with_images(path, source)?;
+            (document, images, Vec::new())
+        } else {
+            remuda_native::document_markdown::parse_styled(path, source)?
+        };
     let title = if projected.title.is_empty() {
         filename.into()
     } else {
@@ -94,6 +97,9 @@ pub(crate) fn decode(path: &str, bytes: &[u8]) -> Result<Document, String> {
     };
     if projected.lines.first() == Some(&title) {
         projected.lines.remove(0);
+        if !styles.is_empty() {
+            styles.remove(0);
+        }
         for image in &mut images {
             image.line = image.line.saturating_sub(1);
         }
@@ -107,7 +113,7 @@ pub(crate) fn decode(path: &str, bytes: &[u8]) -> Result<Document, String> {
         .collect();
     Ok(Document {
         title,
-        body: Body::Text(projected, images),
+        body: Body::Text(projected, images, styles),
     })
 }
 
@@ -128,7 +134,7 @@ impl Document {
             Body::Image(raster) => {
                 let _ = window.drop_image(raster.image.clone());
             }
-            Body::Text(_, assets) => {
+            Body::Text(_, assets, _) => {
                 for raster in assets.iter().filter_map(|asset| asset.preview.as_ref()) {
                     let _ = window.drop_image(raster.image.clone());
                 }
@@ -144,7 +150,7 @@ impl Document {
     /// read worker so an image never delays rendering the document text.
     pub(crate) fn asset_paths(&self) -> impl Iterator<Item = &str> {
         let images = match &self.body {
-            Body::Text(_, images) => images.as_slice(),
+            Body::Text(_, images, _) => images.as_slice(),
             Body::Image(_) => &[],
         };
         images
@@ -162,7 +168,7 @@ impl Document {
         // opened in the full document panel.
         const INLINE_PREVIEWS: usize = 4;
         const INLINE_PIXELS: f64 = 1_250_000.0;
-        let Body::Text(_, images) = &mut self.body else {
+        let Body::Text(_, images, _) = &mut self.body else {
             return;
         };
         let mut previews = std::collections::HashMap::<String, Option<Raster>>::new();
@@ -194,13 +200,31 @@ impl Document {
     ) -> AnyElement {
         match &self.body {
             Body::Image(image) => image.render(viewport_width, zoom),
-            Body::Text(document, images) => {
+            Body::Text(document, images, styles) => {
                 // Render only the inert VFS projection. Treat link targets as
                 // typed local paths; the receiver rechecks read authorization.
                 let mut body = div().flex().flex_col().gap_2();
                 let mut pending = images.iter().enumerate().peekable();
                 for (line_index, line) in document.lines.iter().enumerate() {
-                    body = body.child(div().min_h(px(12.)).child(line.clone()));
+                    let style = styles.get(line_index).copied().unwrap_or_default();
+                    let block = div().min_h(px(12.)).child(line.clone());
+                    let block = match style {
+                        LineStyle::Heading(level) => block
+                            .pt_2()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_size(px(if level <= 2 { 20. } else { 16. })),
+                        LineStyle::Quote => block
+                            .pl_3()
+                            .border_l_2()
+                            .border_color(rgb(0xa8b5c2))
+                            .text_color(rgb(0x465565)),
+                        LineStyle::Code => block
+                            .px_3()
+                            .bg(rgb(0xe8edf1))
+                            .font_family(if cfg!(windows) { "Consolas" } else { "Menlo" }),
+                        LineStyle::Body => block,
+                    };
+                    body = body.child(block);
                     while pending
                         .peek()
                         .is_some_and(|(_, image)| image.source.line <= line_index)
@@ -447,7 +471,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(html.title, "Plan");
-        let Body::Text(html, _) = html.body else {
+        let Body::Text(html, ..) = html.body else {
             panic!("expected text projection")
         };
         assert!(html.lines.iter().any(|line| line.contains("Visible")));
@@ -457,7 +481,7 @@ mod tests {
             b"# Plan\n[Local](next.md) [External](https://example.com)",
         )
         .unwrap();
-        let Body::Text(markdown, _) = markdown.body else {
+        let Body::Text(markdown, ..) = markdown.body else {
             panic!("expected text projection")
         };
         assert_eq!(
@@ -495,7 +519,7 @@ mod tests {
                 Some(png.clone())
             });
             assert_eq!(requests, ["docs/image.png"]);
-            let Body::Text(_, images) = document.body else {
+            let Body::Text(_, images, _) = document.body else {
                 panic!("expected text")
             };
             let first = &images[0].preview.as_ref().unwrap().image;

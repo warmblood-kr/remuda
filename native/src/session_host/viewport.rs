@@ -75,7 +75,12 @@ impl Viewport {
     /// The `compact-view-v1` form: each row as runs of neighbouring cells
     /// that share a style, default fields left out. Exact cells come back
     /// from [`Viewport::decode`].
+    #[cfg(test)]
     pub fn encode_compact(&self) -> io::Result<Vec<u8>> {
+        self.encode_compact_with_links(false)
+    }
+
+    pub fn encode_compact_with_links(&self, links: bool) -> io::Result<Vec<u8>> {
         self.validate()?;
         let runs = self
             .cells
@@ -83,7 +88,7 @@ impl Viewport {
             .map(|row| {
                 let mut runs: Vec<Run> = Vec::new();
                 for cell in row {
-                    let style = Style::of(cell);
+                    let style = Style::of(cell, links);
                     match runs.last_mut() {
                         Some(run) if run.style == style => run.c.push(cell.text.clone()),
                         _ => runs.push(Run {
@@ -190,6 +195,8 @@ struct Run {
 }
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
 struct Style {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hyperlink: Option<String>,
     #[serde(default, skip_serializing_if = "is_default")]
     fg: Color,
     #[serde(default, skip_serializing_if = "is_default")]
@@ -208,8 +215,9 @@ struct Style {
     wide: bool,
 }
 impl Style {
-    fn of(cell: &StyledCell) -> Self {
+    fn of(cell: &StyledCell, links: bool) -> Self {
         Self {
+            hyperlink: if links { cell.hyperlink.clone() } else { None },
             fg: cell.fg,
             bg: cell.bg,
             bold: cell.bold,
@@ -223,6 +231,7 @@ impl Style {
     fn cell(&self, text: String) -> StyledCell {
         StyledCell {
             text,
+            hyperlink: self.hyperlink.clone(),
             fg: self.fg,
             bg: self.bg,
             bold: self.bold,

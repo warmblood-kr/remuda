@@ -75,6 +75,17 @@ directory grant includes its descendants. Each client file contains
 key), and `private` (that client's Base64 private key). SSH authentication
 and Browser Drive authentication are configured independently.
 
+For a file served directly from the listener machine, set a `source_file`
+grant, for example
+`"source_file": {"uri":"remuda:///source/plan.md","path":"/absolute/plan.md"}`.
+Give viewers the URI using `remuda browser link`. The authenticated Browser
+reads this exact file through the Drive chunk protocol without making a
+Drive copy. The alias is used for direct opens and does not appear in Drive
+listings. The service opens a regular file when it loads its policy, reads
+in-place changes, and accepts files up to 1 MiB. Reload the listener policy
+after replacing the file or to revoke its alias. Use an absolute path in a
+directory controlled by the listener operator.
+
 Use one policy without relay fields when the publisher and Browser connect
 to one listener. For cross-node delivery, both listeners must be admitted to
 the same cluster and carry the matching document or directory grant:
@@ -89,10 +100,33 @@ write its document into the granted Drive location. After publication succeeds
 and the session reports the canonical URI, the coordinator runs
 `remuda browser open-document REQUEST_ID VFS_URI` using its publisher
 credential. The command returns structured JSON. Report `displayed` when it
-arrives. For `no_active_browser`, `read_failed`, `denied`, or `unknown`,
-report the actual result and return the URI so the owner can open it manually.
+arrives. For any other status, including `no_active_browser`, `read_failed`,
+`denied`, `busy`, `conflicting_request`, or `unknown`, report the actual result and return the URI so the owner can open it manually.
 Keep only one designated Browser active for a given route. Reuse the request ID
 when checking the outcome of the same request.
+
+For example, a session asked to write and open a design document can run:
+
+```sh
+remuda vfs put ./design.md 'remuda:///project/design.md'
+```
+
+After the upload succeeds, report `remuda:///project/design.md` to the Butler
+coordinator. Choose a path inside the Browser route's approved Drive grant.
+If the deployment requires a specific replication count, follow that
+configuration and wait for the requested copies before reporting readiness.
+
+The Butler coordinator keeps the request ID with the task and invokes:
+
+```sh
+request_id=$(uuidgen)
+remuda browser open-document "$request_id" 'remuda:///project/design.md'
+```
+
+Use a distinct ID for each new open and reuse the same ID when checking
+one request again. The coordinator runs with its existing publisher-side
+`REMUDA_BROWSER_CLIENT` configuration. The writing session needs VFS access
+and reports the URI through its existing Butler handoff.
 
 ## Menu bar and system tray
 

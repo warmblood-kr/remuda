@@ -4,7 +4,7 @@ use gpui::{AnyElement, MouseButton};
 
 enum Entry<'a> {
     Node(Option<(usize, &'a Peer)>),
-    Session(Option<(usize, &'a Peer)>, usize, &'a Session, bool),
+    Session(Option<(usize, &'a Peer)>, usize, &'a Session, bool, usize),
     Message(&'static str),
 }
 
@@ -14,13 +14,53 @@ impl Entry<'_> {
             Self::Node(peer) => Some(TreeRow::Node(
                 peer.map(|(_, peer)| peer.fingerprint.clone()),
             )),
-            Self::Session(peer, _, row, _) => Some(TreeRow::session(
+            Self::Session(peer, _, row, _, _) => Some(TreeRow::session(
                 peer.map(|(_, peer)| peer.fingerprint.clone()),
                 row,
             )),
             Self::Message(_) => None,
         }
     }
+}
+
+fn team_order(rows: &[Session]) -> Vec<(usize, usize)> {
+    let by_identity: std::collections::HashMap<_, _> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| Some(((row.name.as_str(), row.instance_id.as_deref()?), index)))
+        .collect();
+    let mut children = vec![Vec::new(); rows.len()];
+    let mut roots = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let parent = row.leader.as_ref().and_then(|leader| {
+            by_identity.get(&(leader.name.as_str(), leader.instance_id.as_str()))
+        });
+        match parent {
+            Some(&parent) if parent != index => children[parent].push(index),
+            _ => roots.push(index),
+        }
+    }
+    let mut result = Vec::with_capacity(rows.len());
+    let mut stack: Vec<_> = roots.into_iter().rev().map(|index| (index, 0)).collect();
+    let mut listed = vec![false; rows.len()];
+    while let Some((index, depth)) = stack.pop() {
+        listed[index] = true;
+        result.push((index, depth));
+        stack.extend(
+            children[index]
+                .iter()
+                .rev()
+                .map(|&child| (child, depth + 1)),
+        );
+    }
+    // Cyclic claims have no root. Keep every affected session selectable.
+    result.extend(
+        listed
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &listed)| (!listed).then_some((index, 0))),
+    );
+    result
 }
 
 impl LocalGui {
@@ -95,10 +135,12 @@ impl LocalGui {
                 entries.push(Entry::Message("No sessions"));
             }
             entries.extend(
-                rows.iter()
-                    .enumerate()
-                    .filter(|(_, row)| matches(row))
-                    .map(|(index, row)| Entry::Session(peer, index, row, unavailable)),
+                team_order(rows)
+                    .into_iter()
+                    .filter(|&(index, _)| matches(&rows[index]))
+                    .map(|(index, depth)| {
+                        Entry::Session(peer, index, &rows[index], unavailable, depth)
+                    }),
             );
         }
         entries
@@ -155,6 +197,9 @@ impl LocalGui {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.drive_selected {
+            return;
+        }
         let key = &event.keystroke;
         let printable = key.key_char.as_deref().or_else(|| {
             (key.key.chars().count() == 1 && !key.modifiers.control && !key.modifiers.platform)
@@ -362,7 +407,7 @@ impl LocalGui {
                     }))
                     .into_any_element()
             }
-            Entry::Session(peer, index, session, unavailable) => {
+            Entry::Session(peer, index, session, unavailable, depth) => {
                 let fp = peer.map(|(_, peer)| peer.fingerprint.clone());
                 let key = peer.map_or_else(
                     || format!("session-{index}"),
@@ -459,7 +504,10 @@ impl LocalGui {
                             cx.notify();
                         }));
                 }
-                div().pl_5().child(item).into_any_element()
+                div()
+                    .pl(px(20. + depth.min(8) as f32 * 12.))
+                    .child(item)
+                    .into_any_element()
             }
         }
     }
@@ -586,9 +634,11 @@ impl Render for LocalGui {
             .as_ref()
             .is_some_and(|docs| docs.read(cx).showing_document());
         let split = workspace_wide
-            && docs
-                .as_ref()
-                .is_some_and(|docs| docs.read(cx).has_document());
+            && self.selection.is_some()
+            && docs.as_ref().is_some_and(|docs| {
+                let docs = docs.read(cx);
+                docs.has_document() && docs.split_requested()
+            });
         let drive = if self.drive_selected {
             docs.as_ref()
                 .map(|docs| docs.update(cx, |docs, cx| docs.drive_listing(cx)))
@@ -603,7 +653,7 @@ impl Render for LocalGui {
         } else {
             None
         };
-        let content_tabs = docs.as_ref().filter(|_| !split).map(|docs| {
+        let content_tabs = docs.as_ref().map(|docs| {
             let unread = docs.read(cx).unseen_document();
             div()
                 .flex()
@@ -635,6 +685,19 @@ impl Render for LocalGui {
                         }
                         cx.notify();
                     })),
+                )
+                .when(
+                    workspace_wide && self.selection.is_some() && docs.read(cx).has_document(),
+                    |bar| {
+                        bar.child(button("local-split-tab", "Side by side", split).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(docs) = &this.documents {
+                                    docs.update(cx, |docs, _| docs.select_split());
+                                }
+                                cx.notify();
+                            }),
+                        ))
+                    },
                 )
         });
         let entries = self.entries();
@@ -675,17 +738,18 @@ impl Render for LocalGui {
                             .pb_2()
                             .child(
                                 button("local-sessions-tab", "Sessions", !self.drive_selected)
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(cx.listener(|this, _, window, cx| {
                                         this.drive_selected = false;
+                                        if let Some(focus) = &this.tree_focus { focus.focus(window); }
                                         cx.notify();
                                     })),
                             )
                             .child(
                                 button("local-drive-tab", "Drive", self.drive_selected).on_click(
-                                    cx.listener(|this, _, _, cx| {
+                                    cx.listener(|this, _, window, cx| {
                                         this.drive_selected = true;
                                         if let Some(docs) = &this.documents {
-                                            docs.update(cx, |docs, _| docs.select_drive());
+                                            docs.update(cx, |docs, _| docs.select_drive(window));
                                         }
                                         cx.notify();
                                     }),
@@ -1098,5 +1162,64 @@ impl Render for FullName {
             .bg(rgb(0x303a49))
             .text_color(rgb(0xe8eaf0))
             .child(self.0.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remuda_core::registry::TeamLeader;
+
+    #[test]
+    fn team_rows_follow_exact_leaders_with_nested_members_and_no_cycle_loss() {
+        let row = |name: &str, leader: Option<(&str, &str)>| Session {
+            name: name.into(),
+            instance_id: Some(name.into()),
+            alive: true,
+            unavailable: false,
+            decoration: None,
+            leader: leader.map(|(name, instance)| TeamLeader {
+                name: name.into(),
+                instance_id: instance.into(),
+            }),
+        };
+        let rows = [
+            row("grandchild", Some(("member", "member"))),
+            row("stale", Some(("lead", "old-instance"))),
+            row("member", Some(("lead", "lead"))),
+            row("other-member", Some(("lead", "lead"))),
+            row("lead", None),
+            row("cycle-a", Some(("cycle-b", "cycle-b"))),
+            row("cycle-b", Some(("cycle-a", "cycle-a"))),
+        ];
+        assert_eq!(
+            team_order(&rows),
+            vec![(1, 0), (4, 0), (2, 1), (0, 2), (3, 1), (5, 0), (6, 0)]
+        );
+    }
+
+    #[test]
+    fn worker_preserves_peer_team_relations_without_affecting_other_nodes() {
+        let peer_row = |name: &str, instance: &str, team: serde_json::Value| {
+            serde_json::from_value(serde_json::json!({
+                "name": name, "instance_id": instance, "alive": true,
+                "idle": {"secs": 0, "nanos": 0},
+                "size": {"cols": 80, "rows": 24}, "attached": false, "team": team
+            }))
+            .unwrap()
+        };
+        let member = peer_row(
+            "member",
+            "member-instance",
+            serde_json::json!({"depth": 1, "leader": {
+                "name": "lead", "instance_id": "lead-instance"
+            }}),
+        );
+        let leader = peer_row("lead", "lead-instance", serde_json::Value::Null);
+        let sessions = session_rows(vec![member, leader], None);
+        let payload = serde_json::to_vec(&sessions).unwrap();
+        let decoded: Vec<Session> = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(team_order(&decoded), vec![(1, 0), (0, 1)]);
+        assert_eq!(team_order(&decoded[..1]), vec![(0, 0)]);
     }
 }

@@ -2522,7 +2522,25 @@ pub(crate) fn render_styled_row(cells: &[StyledCell]) -> String {
     let mut out = String::new();
     let mut current: Option<&StyledCell> = None;
     let mut styled_at_all = false;
+    let mut link = None;
     for cell in cells {
+        if !cell.text.is_empty() {
+            let candidate = cell.hyperlink.as_deref();
+            if candidate != link {
+                let next =
+                    candidate.filter(|uri| crate::terminal_link::Target::parse(uri).is_some());
+                if link.is_some() {
+                    out.push_str("\x1b]8;;\x1b\\");
+                }
+                if let Some(uri) = next {
+                    out.push_str("\x1b]8;;");
+                    out.push_str(uri);
+                    out.push_str("\x1b\\");
+                }
+                link = next;
+            }
+        }
+
         let changed = match current {
             None => !is_plain(cell),
             Some(prev) => !same_style(prev, cell),
@@ -2534,6 +2552,9 @@ pub(crate) fn render_styled_row(cells: &[StyledCell]) -> String {
         }
         out.push_str(&cell.text);
         current = Some(cell);
+    }
+    if link.is_some() {
+        out.push_str("\x1b]8;;\x1b\\");
     }
     if styled_at_all {
         out.push_str("\x1b[0m");
@@ -2662,9 +2683,16 @@ fn char_width(c: char) -> usize {
 /// draws — `fit`'s plain char count would under-count it by 1. See steps/023.
 pub(crate) fn visible_width(s: &str) -> usize {
     let mut width = 0;
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\x1b' {
+        if c == '\x1b' && chars.peek() == Some(&']') {
+            chars.next();
+            while let Some(skip) = chars.next() {
+                if skip == '\x07' || (skip == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                    break;
+                }
+            }
+        } else if c == '\x1b' {
             for skip in chars.by_ref() {
                 if skip == 'm' {
                     break;

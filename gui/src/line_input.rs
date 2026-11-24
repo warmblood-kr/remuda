@@ -1,16 +1,39 @@
-use gpui::{div, prelude::*, px, rgb, Keystroke};
+use gpui::{
+    canvas, div, fill, point, prelude::*, px, rgb, size, Bounds, Keystroke, Pixels, StyledText,
+    TextLayout,
+};
 use remuda_native::strict_input::MAX_BATCH;
-use std::ops::Range;
+use std::{cell::RefCell, collections::VecDeque, ops::Range, rc::Rc};
 use unicode_segmentation::UnicodeSegmentation;
+
+const HISTORY_LIMIT: usize = 100;
+pub(crate) type LineHistory = Rc<RefCell<VecDeque<String>>>;
+
+struct HistoryRecall {
+    index: usize,
+    draft: String,
+    draft_cursor: usize,
+}
 
 #[derive(Default)]
 pub(crate) struct LineInput {
     text: String,
     cursor: usize,
     marked: Option<Range<usize>>,
+    history: LineHistory,
+    recall: Option<HistoryRecall>,
+    preferred_x: Option<Pixels>,
+    layout: Rc<RefCell<Option<TextLayout>>>,
 }
 
 impl LineInput {
+    pub(crate) fn with_history(history: LineHistory) -> Self {
+        Self {
+            history,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn insert(&mut self, text: &str) {
         self.replace(None, text, false);
     }
@@ -50,6 +73,7 @@ impl LineInput {
             .or_else(|| self.marked.clone())
             .unwrap_or(self.cursor..self.cursor);
         if self.text.len() - range.len() + text.len() < MAX_BATCH {
+            self.preferred_x = None;
             let end = range.start + text.len();
             self.marked = (mark && !text.is_empty()).then_some(range.start..end);
             self.text.replace_range(range, &text);
@@ -66,6 +90,16 @@ impl LineInput {
     }
 
     pub(crate) fn edit(&mut self, key: &Keystroke) {
+        let modifiers = key.modifiers;
+        let name = key.key.as_str();
+        if !modifiers.modified() && matches!(name, "up" | "down") {
+            let up = name == "up";
+            if !self.move_vertical(up) {
+                self.recall_history(up);
+            }
+            return;
+        }
+        self.preferred_x = None;
         let left = self.text[..self.cursor]
             .grapheme_indices(true)
             .next_back()
@@ -74,7 +108,25 @@ impl LineInput {
             .graphemes(true)
             .next()
             .map_or(self.cursor, |g| self.cursor + g.len());
-        match key.key.as_str() {
+        let emacs = modifiers.control && !modifiers.platform && !modifiers.alt && !modifiers.shift;
+        let line_start = self.text[..self.cursor].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = self.text[self.cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |i| self.cursor + i);
+        match name {
+            "a" if emacs => self.cursor = line_start,
+            "e" if emacs => self.cursor = line_end,
+            "f" if emacs => self.cursor = right,
+            "b" if emacs => self.cursor = left,
+            "k" if emacs => {
+                // At the end of a logical line, kill its newline.
+                let end = if line_end == self.cursor {
+                    (line_end + 1).min(self.text.len())
+                } else {
+                    line_end
+                };
+                self.text.drain(self.cursor..end);
+            }
             "left" => self.cursor = left,
             "right" => self.cursor = right,
             "home" => self.cursor = 0,
@@ -95,6 +147,97 @@ impl LineInput {
         }
     }
 
+    fn move_vertical(&mut self, up: bool) -> bool {
+        let layout = self.layout.borrow();
+        let Some(layout) = layout.as_ref() else {
+            return false;
+        };
+        let Some(position) = layout.position_for_index(self.cursor) else {
+            return false;
+        };
+        let height = layout.line_height();
+        let row_offset = if up { -0.5 } else { 1.5 };
+        let y = position.y + height * row_offset;
+        let bounds = layout.bounds();
+        if y < bounds.top() || y >= bounds.bottom() {
+            return false;
+        }
+        let x = *self.preferred_x.get_or_insert(position.x - bounds.left());
+        let x = x + bounds.left();
+        let index = layout
+            .index_for_position(point(x, y))
+            .unwrap_or_else(|index| index);
+        let row_y = y - height * 0.5;
+        let mut boundaries = self
+            .text
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .chain([self.text.len()])
+            .peekable();
+        let mut previous = None;
+        let mut closest = None;
+        while boundaries.peek().is_some_and(|&boundary| boundary <= index) {
+            previous = closest;
+            closest = boundaries.next();
+        }
+        // The layout maps an edge of a wrapped row to the adjacent row's byte
+        // index. Only consider caret positions that land on the intended row.
+        let index = [previous, closest, boundaries.next()]
+            .into_iter()
+            .flatten()
+            .filter_map(|index| {
+                layout
+                    .position_for_index(index)
+                    .map(|position| (index, position))
+            })
+            .filter(|(_, position)| (position.y - row_y).abs() < px(0.5))
+            .min_by(|(_, a), (_, b)| {
+                (a.x - x)
+                    .abs()
+                    .partial_cmp(&(b.x - x).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(index, _)| index);
+        if let Some(index) = index {
+            self.cursor = index;
+        }
+        true
+    }
+
+    fn recall_history(&mut self, up: bool) {
+        let history = self.history.borrow();
+        if history.is_empty() {
+            return;
+        }
+        self.preferred_x = None;
+        match (&mut self.recall, up) {
+            (None, false) => return,
+            (None, true) => {
+                self.recall = Some(HistoryRecall {
+                    index: history.len() - 1,
+                    draft: std::mem::take(&mut self.text),
+                    draft_cursor: self.cursor,
+                });
+            }
+            (Some(recall), true) => {
+                if recall.index == 0 {
+                    return;
+                }
+                recall.index -= 1;
+            }
+            (Some(recall), false) if recall.index + 1 < history.len() => recall.index += 1,
+            (Some(_), false) => {
+                let recall = self.recall.take().unwrap();
+                self.text = recall.draft;
+                self.cursor = recall.draft_cursor;
+                return;
+            }
+        }
+        self.text
+            .clone_from(&history[self.recall.as_ref().unwrap().index]);
+        self.cursor = self.text.len();
+    }
+
     pub(crate) fn bytes(&self) -> Vec<u8> {
         let mut bytes = self.text.as_bytes().to_vec();
         bytes.push(b'\r');
@@ -103,15 +246,31 @@ impl LineInput {
 
     pub(crate) fn queued(&mut self) {
         self.marked = None;
+        if !self.text.trim().is_empty() {
+            let mut history = self.history.borrow_mut();
+            if history.back() != Some(&self.text) {
+                if history.len() == HISTORY_LIMIT {
+                    history.pop_front();
+                }
+                history.push_back(std::mem::take(&mut self.text));
+            }
+        }
         self.text.clear();
         self.cursor = 0;
+        self.recall = None;
+        self.preferred_x = None;
     }
 
     pub(crate) fn view(&self, focused: bool) -> impl IntoElement {
-        let mut display = self.text.clone();
-        if focused && !display.is_empty() {
-            display.insert(self.cursor, '│');
-        }
+        let empty = self.text.is_empty();
+        let display = StyledText::new(if empty {
+            "Type locally · Enter sends · Esc closes".to_string()
+        } else {
+            self.text.clone()
+        });
+        let layout = display.layout().clone();
+        let layout_cache = self.layout.clone();
+        let cursor = self.cursor;
         div()
             .id("line-composer")
             .debug_selector(|| "line-composer".into())
@@ -122,25 +281,54 @@ impl LineInput {
             .py_1()
             .text_sm()
             .bg(rgb(0x233145))
-            .child(if display.is_empty() {
+            .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .when(focused, |d| {
+                    .relative()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .when(empty, |d| d.pl_1().text_color(rgb(0xb5beca)))
+                    .child(display)
+                    .when(empty && focused, |d| {
                         d.child(
                             div()
-                                .debug_selector(|| "line-composer-caret".into())
+                                .absolute()
+                                .left_0()
+                                .top(px(2.))
                                 .w(px(2.))
                                 .h(px(14.))
-                                .bg(rgb(0xe8f2ff)),
+                                .bg(rgb(0xe8f2ff))
+                                .debug_selector(|| "line-composer-caret".into()),
                         )
                     })
-                    .text_color(rgb(0xb5beca))
-                    .child("Type locally · Enter sends · Esc closes")
-            } else {
-                div().min_w_0().whitespace_normal().child(display)
-            })
+                    .child(
+                        canvas(
+                            move |_, _, _| {
+                                let caret = (!empty && focused)
+                                    .then(|| {
+                                        let origin = layout.position_for_index(cursor)?
+                                            + point(px(0.), px(2.));
+                                        Some(Bounds {
+                                            origin,
+                                            size: size(
+                                                px(2.),
+                                                (layout.line_height() - px(4.)).max(px(1.)),
+                                            ),
+                                        })
+                                    })
+                                    .flatten();
+                                *layout_cache.borrow_mut() = (!empty).then_some(layout);
+                                caret
+                            },
+                            |_, caret, window, _| {
+                                if let Some(bounds) = caret {
+                                    window.paint_quad(fill(bounds, rgb(0xe8f2ff)));
+                                }
+                            },
+                        )
+                        .absolute()
+                        .size_full(),
+                    ),
+            )
     }
 }
 
@@ -280,5 +468,60 @@ mod tests {
             cx.read(|app| view.read(app).0.bytes()),
             format!("{value}\r").as_bytes()
         );
+    }
+
+    #[gpui::test]
+    fn wrapped_draft_moves_by_visual_row_without_changing_text_geometry(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let value = "Wide 꽜 🙂 좁은 i Ω ".repeat(8);
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut editor = LineInput::default();
+            editor.insert(&value);
+            Draft(editor)
+        });
+        let bottom = cx.read(|app| {
+            let editor = &view.read(app).0;
+            let layout = editor.layout.borrow();
+            let layout = layout.as_ref().unwrap();
+            (
+                layout.bounds(),
+                layout.position_for_index("Wide 꽜 🙂".len()).unwrap(),
+                layout.position_for_index(editor.cursor).unwrap(),
+            )
+        });
+        view.update(cx, |draft, cx| {
+            draft.0.edit(&Keystroke::parse("up").unwrap());
+            cx.notify();
+        });
+        let after_up = cx.read(|app| {
+            let editor = &view.read(app).0;
+            let layout = editor.layout.borrow();
+            let layout = layout.as_ref().unwrap();
+            let caret = layout.position_for_index(editor.cursor).unwrap();
+            assert_eq!(layout.bounds(), bottom.0);
+            assert_eq!(
+                layout.position_for_index("Wide 꽜 🙂".len()).unwrap(),
+                bottom.1
+            );
+            assert!((bottom.2.y - caret.y - layout.line_height()).abs() < px(0.5));
+            assert_eq!(editor.text, value);
+            caret
+        });
+        view.update(cx, |draft, cx| {
+            draft.0.edit(&Keystroke::parse("left").unwrap());
+            cx.notify();
+        });
+        cx.read(|app| {
+            let editor = &view.read(app).0;
+            let layout = editor.layout.borrow();
+            let layout = layout.as_ref().unwrap();
+            assert_eq!(layout.bounds(), bottom.0);
+            assert_eq!(
+                layout.position_for_index("Wide 꽜 🙂".len()).unwrap(),
+                bottom.1,
+            );
+            assert!(layout.position_for_index(editor.cursor).unwrap().x < after_up.x);
+        });
     }
 }

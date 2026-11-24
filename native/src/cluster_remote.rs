@@ -1390,6 +1390,7 @@ mod tests {
     fn screen(text: &str) -> ScreenSnapshot {
         ScreenSnapshot {
             cells: vec![vec![StyledCell {
+                hyperlink: None,
                 text: text.into(),
                 fg: Color::Default,
                 bg: Color::Default,
@@ -1432,6 +1433,7 @@ mod tests {
 
         let snapshot = to_screen_snapshot(remuda_core::protocol::StyledScreen {
             rows: vec![vec![remuda_core::protocol::StyledRun {
+                hyperlink: None,
                 text: "\u{1b}]52;c;aGk=\u{7}safe\u{009b}31m\u{202e}".into(),
                 fg: Color::Default,
                 bg: Color::Default,

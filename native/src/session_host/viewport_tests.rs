@@ -211,3 +211,28 @@ fn a_compact_row_longer_than_the_screen_is_refused_before_expanding() {
 fn terminal_view(mut terminal: Terminal) -> Viewport {
     terminal.viewport(0)
 }
+
+#[test]
+fn compact_links_are_preserved_only_for_negotiated_viewers() {
+    let mut terminal = Terminal::new(3, 12, 10).unwrap();
+    feed(
+        &mut terminal,
+        b"\x1b]8;;remuda:///guide.md\x1b\\Guide\x1b]8;;\x1b\\!",
+    );
+    let view = terminal.viewport(0);
+    let linked = Viewport::decode(&view.encode_compact_with_links(true).unwrap()).unwrap();
+    assert_eq!(linked.cells, view.cells);
+    assert_eq!(
+        linked.cells[0][0].hyperlink.as_deref(),
+        Some("remuda:///guide.md")
+    );
+    assert_eq!(linked.cells[0][5].hyperlink, None);
+
+    let legacy = Viewport::decode(&view.encode_compact().unwrap()).unwrap();
+    assert_eq!(legacy.cells[0][0].text, "G");
+    assert!(legacy
+        .cells
+        .iter()
+        .flatten()
+        .all(|cell| cell.hyperlink.is_none()));
+}

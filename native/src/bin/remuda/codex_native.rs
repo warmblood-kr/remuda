@@ -5,7 +5,7 @@
 //! identity is the first owner declaration; it is not proof of historical
 //! ancestry or of which TUI is current.
 //!
-//! Version pin: installed `codex-cli 0.166.0`. `thread/queue/add`,
+//! Minimum verified stable release: `codex-cli 0.166.0`. `thread/queue/add`,
 //! `thread/read` and `thread/loaded/list` are experimental there, so the
 //! client must initialize with `capabilities.experimentalApi = true`.
 
@@ -22,7 +22,7 @@ use std::time::Duration;
 
 pub(crate) const PROTOCOL: &str = "codex-app-server-v1";
 pub(crate) const PIN_SCHEMA: u64 = 1;
-pub(crate) const PINNED_VERSION: &str = "0.166.0";
+const MIN_CODEX_VERSION: [u64; 3] = [0, 166, 0];
 pub(crate) const MODE_ADD_ONLY: &str = "queue-add";
 const MAX_MANIFEST: u64 = 64 * 1024;
 const MAX_MESSAGES: usize = 64;
@@ -92,11 +92,26 @@ impl Published {
 }
 
 pub(crate) fn version_supported(version: &str) -> bool {
-    version == PINNED_VERSION
+    let mut components = version.split('.');
+    let mut release = [0; 3];
+    for number in &mut release {
+        let Some(component) = components.next() else {
+            return false;
+        };
+        if !component.bytes().all(|byte| byte.is_ascii_digit())
+            || (component.len() > 1 && component.starts_with('0'))
+        {
+            return false;
+        }
+        let Ok(value) = component.parse() else {
+            return false;
+        };
+        *number = value;
+    }
+    components.next().is_none() && release >= MIN_CODEX_VERSION
 }
 
-/// Exact measured version, parsed from the initialize response's user agent
-/// (`<client>/<version> (<platform>)`), not a loose prefix match.
+/// Supported stable version from the initialize response's user agent.
 pub(crate) fn server_version(initialize: &Value) -> Option<&str> {
     let user_agent = initialize.pointer("/result/userAgent")?.as_str()?;
     let after_client = user_agent.split_once('/')?.1;
@@ -630,7 +645,7 @@ fn fingerprint_still(socket: &Path, live: LiveIdentity) -> bool {
 }
 
 /// The non-mutating preflight shared by adoption and delivery: initialize,
-/// require the exact measured build, then the declared UUID as the root-user
+/// require the minimum stable release, then the declared UUID as the root-user
 /// thread loaded on this peer. It writes no turn, queue item or key.
 #[cfg(unix)]
 fn preflight(
@@ -1035,11 +1050,17 @@ mod tests {
     }
 
     #[test]
-    fn version_gate_is_the_exact_measured_build() {
+    fn version_gate_accepts_stable_releases_at_or_above_the_minimum() {
         assert!(version_supported("0.166.0"));
         assert!(!version_supported("0.166"));
-        assert!(!version_supported("0.166.1"));
-        assert!(!version_supported("0.167.0"));
+        assert!(version_supported("0.166.1"));
+        assert!(version_supported("0.171.0"));
+        assert!(version_supported("1.0.0"));
+        assert!(!version_supported("0.165.99"));
+        assert!(!version_supported("0.171.0-alpha.1"));
+        assert!(!version_supported("0.0171.0"));
+        assert!(!version_supported("0.171.+0"));
+        assert!(!version_supported("0.171.0.1"));
         assert!(!version_supported(""));
     }
 
@@ -1051,7 +1072,7 @@ mod tests {
         .expect("fixture");
         assert_eq!(server_version(&init), Some("0.166.0"));
         let other = json!({"result":{"userAgent":"x/0.167.0 (Linux)"}});
-        assert_eq!(server_version(&other), None);
+        assert_eq!(server_version(&other), Some("0.167.0"));
         assert_eq!(server_version(&json!({"result":{}})), None);
     }
 

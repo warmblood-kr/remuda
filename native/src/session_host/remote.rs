@@ -530,7 +530,9 @@ impl HostSession {
         let until = Instant::now() + CONTROL_DEADLINE;
         let (snapshot, generation, bytes, pages) = loop {
             // An older host knows only `Viewport`, within the legacy history.
-            let request = if client.offers(super::api::COMPACT_VIEW) {
+            let request = if client.offers(super::api::VIEW_LINKS) {
+                Request::ViewportLinks { scrollback: offset }
+            } else if client.offers(super::api::COMPACT_VIEW) {
                 Request::ViewportCompact { scrollback: offset }
             } else if client.offers(super::api::DEEP_HISTORY) {
                 Request::ViewportDeep { scrollback: offset }

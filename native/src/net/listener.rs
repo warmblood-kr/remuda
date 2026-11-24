@@ -4232,6 +4232,7 @@ mod tests {
     #[test]
     fn wide_blank_screen_is_trimmed_to_fit_the_frame() {
         let run = |text: &str, wide| remuda_core::protocol::StyledRun {
+            hyperlink: None,
             text: text.into(),
             fg: Color::Default,
             bg: Color::Default,

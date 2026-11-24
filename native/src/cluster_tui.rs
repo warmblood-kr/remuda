@@ -3471,14 +3471,35 @@ fn terminal_frame(frame: &str) -> String {
 
 // vt100 stores one base scalar plus combining marks in each cell; diffs inherit that cell limit.
 fn present(prev: Option<&vt100::Screen>, next: &vt100::Screen) -> Vec<u8> {
-    match prev {
+    let mut output = match prev {
         Some(prev) if prev.size() == next.size() => next.contents_diff(prev),
         _ => {
             let mut output = b"\x1b[2J\x1b[H".to_vec();
             output.extend(next.contents_formatted());
             output
         }
+    };
+    // vt100's ANSI formatter omits OSC metadata. Repaint linked rows after
+    // its normal diff, preserving the cursor and attributes it established.
+    let (rows, cols) = next.size();
+    let mut linked_rows = (0..rows)
+        .filter(|&row| {
+            (0..cols).any(|col| {
+                next.cell(row, col)
+                    .is_some_and(|cell| cell.hyperlink().is_some())
+            })
+        })
+        .peekable();
+    if linked_rows.peek().is_some() {
+        let cells = crate::pty::styled_cells_in(next, rows, cols);
+        output.extend_from_slice(b"\x1b7");
+        for row in linked_rows {
+            output.extend(format!("\x1b[{};1H\x1b[0m", row + 1).bytes());
+            output.extend(styled_screen_row(&cells[usize::from(row)]).bytes());
+        }
+        output.extend_from_slice(b"\x1b8");
     }
+    output
 }
 
 const FULL_REPAINT_INTERVAL: Duration = Duration::from_secs(5);
@@ -5602,6 +5623,18 @@ mod tests {
     }
 
     #[test]
+    fn presenter_preserves_osc_link_metadata() {
+        let uri = "https://github.com/org/project";
+        let frame = format!("\x1b]8;;{uri}\x1b\\Link\x1b]8;;\x1b\\!");
+        let next = parsed_frame(&frame, 10, 2);
+        let rendered = present(None, next.screen());
+        let mut terminal = vt100::Parser::new(2, 10, 0);
+        terminal.process(&rendered);
+        assert_eq!(terminal.screen().cell(0, 0).unwrap().hyperlink(), Some(uri));
+        assert_eq!(terminal.screen().cell(0, 4).unwrap().hyperlink(), None);
+    }
+
+    #[test]
     fn presenter_preserves_wrap_pending_cursor_state() {
         let previous = parsed_frame("abc", 4, 2);
         let next = parsed_frame("abcd", 4, 2);
@@ -5687,6 +5720,7 @@ mod tests {
     fn remote_screen(text: &str) -> ScreenSnapshot {
         ScreenSnapshot {
             cells: vec![vec![StyledCell {
+                hyperlink: None,
                 text: text.into(),
                 fg: Color::Default,
                 bg: Color::Default,
@@ -5845,6 +5879,7 @@ mod tests {
             cells: (0..rows)
                 .map(|row| {
                     vec![StyledCell {
+                        hyperlink: None,
                         text: format!("body-row-{row}"),
                         fg: Color::Default,
                         bg: Color::Default,
