@@ -10,6 +10,7 @@ use std::{
 };
 
 mod browser;
+mod browser_media;
 mod cluster_status;
 #[allow(dead_code)]
 mod input_helper;

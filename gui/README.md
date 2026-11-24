@@ -38,6 +38,57 @@ find nodes or sessions, **!** for attention rows, and **?** for keyboard help.
 Drag the divider on wide windows. Narrow windows place the session below the
 tree. Offline peers retain their last known screen and show its age.
 
+## Browser Drive and document opens
+
+`remuda browser --gui HOST` keeps the remote terminal connected over SSH.
+Choose **Drive** in the sidebar to browse authorized folders and open a file.
+The session navigation supplied by the remote terminal stays available in the
+**Sessions** workspace. A wide window shows the terminal and reader next to
+each other. A narrow window uses **Terminal** and **Document** tabs. An incoming
+document can open beside terminal input. In narrow mode, recent terminal input
+keeps the terminal selected and marks the document tab.
+
+The reader supports Markdown, static HTML, PNG, JPEG, GIF (first frame), and WebP.
+VFS links and embedded images use the same read authorization as Drive.
+HTML is rendered as read-only content. Large images fit the pane first and can
+be zoomed and scrolled. Closing or replacing a document releases its rendered
+resources.
+
+### Provisioning the Browser route
+
+The Browser service is opt-in. Configure `REMUDA_BROWSER_POLICY` on the
+listener processes and `REMUDA_BROWSER_CLIENT` on the Browser and publisher,
+pointing to their respective JSON files. Use separate 32-byte X25519 publisher
+and Browser key pairs. Credential files carry the private key and must have
+restricted permissions. Keep them on their respective clients.
+
+A listener policy contains `publisher` and `browser` public keys in Base64
+and an exact canonical `document` (such as `remuda:///project/plan.md`), an
+explicit `directory` grant (such as `remuda:///project`), or both. The
+directory grant includes its descendants. Each client file contains
+`endpoint` (listener address and port), `server` (listener's Base64 public
+key), and `private` (that client's Base64 private key). SSH authentication
+and Browser Drive authentication are configured independently.
+
+Use one policy without relay fields when the publisher and Browser connect
+to one listener. For cross-node delivery, both listeners must be admitted to
+the same cluster and carry the matching document or directory grant:
+
+- On publisher-side node A, add `route_to` with B's full fingerprint and
+  give the publisher A's address and pinned public key.
+- On Browser-side node B, add `relay_publisher` with A's Base64 node
+  public key and give the Browser B's address and pinned public key.
+
+With a live Browser, the Butler coordinator asks the selected session to
+write its document into the granted Drive location. After publication succeeds
+and the session reports the canonical URI, the coordinator runs
+`remuda browser open-document REQUEST_ID VFS_URI` using its publisher
+credential. The command returns structured JSON. Report `displayed` when it
+arrives. For `no_active_browser`, `read_failed`, `denied`, or `unknown`,
+report the actual result and return the URI so the owner can open it manually.
+Keep only one designated Browser active for a given route. Reuse the request ID
+when checking the outcome of the same request.
+
 ## Menu bar and system tray
 
 Run `remuda tray` on macOS or Windows to start the default daemon if needed

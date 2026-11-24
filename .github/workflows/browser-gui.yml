@@ -71,7 +71,7 @@ jobs:
             Remove-Item -LiteralPath $root.FullName -Force -Recurse
           }
       - if: runner.os == 'macOS'
-        run: cargo test --locked --manifest-path gui/Cargo.toml --bin remuda-gui bus_document_reuses_one_tab_beside_the_terminal
+        run: cargo test --locked --manifest-path gui/Cargo.toml --bin remuda-gui drive_and_bus_open_the_same_reader_across_layouts
       - if: runner.os == 'macOS'
         run: cargo test --locked --manifest-path gui/Cargo.toml --bin remuda-gui peer_branches_fold_independently_and_preserve_the_preview
       - if: runner.os == 'macOS'

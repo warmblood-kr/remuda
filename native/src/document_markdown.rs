@@ -11,7 +11,7 @@
 //! cap. The TUI read path (`documents::fetch`) enforces the 1 MiB document
 //! limit; a GUI or any other adapter must bound the source before calling.
 
-use crate::document_html::{resolve, Document, Link};
+use crate::document_html::{resolve, Document, Image, Link, MAX_IMAGES};
 use std::collections::HashMap;
 
 const MAX_LINES: usize = 4092;
@@ -23,6 +23,20 @@ const INLINE_WORK: usize = 8;
 /// Project Markdown source into inert title, text lines and typed local links.
 /// Callers must bound `source`; this parser has no inherent byte cap.
 pub fn parse(path: &str, source: &str) -> Result<Document, String> {
+    project(path, source, None)
+}
+
+pub fn parse_with_images(path: &str, source: &str) -> Result<(Document, Vec<Image>), String> {
+    let mut images = Vec::new();
+    let document = project(path, source, Some(&mut images))?;
+    Ok((document, images))
+}
+
+fn project(
+    path: &str,
+    source: &str,
+    mut images: Option<&mut Vec<Image>>,
+) -> Result<Document, String> {
     let definitions = definitions(source);
     let mut document = Document::default();
     let mut fence: Option<(char, usize)> = None;
@@ -37,7 +51,13 @@ pub fn parse(path: &str, source: &str) -> Result<Document, String> {
         }
         if let Some(open) = opens_fence(line) {
             fence = Some(open);
-        } else if let Some(projected) = project_line(path, line, &definitions, &mut document)? {
+        } else if let Some(projected) = project_line(
+            path,
+            line,
+            &definitions,
+            &mut document,
+            images.as_deref_mut(),
+        )? {
             push(&mut document, &projected, true)?;
         }
     }
@@ -66,6 +86,7 @@ fn project_line(
     line: &str,
     definitions: &HashMap<String, String>,
     document: &mut Document,
+    images: Option<&mut Vec<Image>>,
 ) -> Result<Option<String>, String> {
     if definition(line).is_some() {
         return Ok(None);
@@ -77,7 +98,7 @@ fn project_line(
             if level == 1 && document.title.is_empty() {
                 document.title = crate::text::strip_terminal_controls(text.trim()).into_owned();
             }
-            return Ok(Some(inline(path, text, definitions, document)?));
+            return Ok(Some(inline(path, text, definitions, document, images)?));
         }
         if is_thematic_break(rest) {
             return Ok(Some(String::new()));
@@ -86,17 +107,17 @@ fn project_line(
             let quoted = quoted.strip_prefix(' ').unwrap_or(quoted);
             return Ok(Some(format!(
                 "| {}",
-                inline(path, quoted, definitions, document)?
+                inline(path, quoted, definitions, document, images)?
             )));
         }
     }
     if let Some((prefix, text)) = list_item(line) {
         return Ok(Some(format!(
             "{prefix}{}",
-            inline(path, text, definitions, document)?
+            inline(path, text, definitions, document, images)?
         )));
     }
-    Ok(Some(inline(path, line, definitions, document)?))
+    Ok(Some(inline(path, line, definitions, document, images)?))
 }
 
 fn heading(line: &str) -> Option<(usize, &str)> {
@@ -163,12 +184,14 @@ fn inline(
     text: &str,
     definitions: &HashMap<String, String>,
     document: &mut Document,
+    images: Option<&mut Vec<Image>>,
 ) -> Result<String, String> {
     let mut out = String::new();
     Inline {
         path,
         definitions,
         document,
+        images,
         budget: text
             .chars()
             .count()
@@ -184,6 +207,7 @@ struct Inline<'a> {
     path: &'a str,
     definitions: &'a HashMap<String, String>,
     document: &'a mut Document,
+    images: Option<&'a mut Vec<Image>>,
     /// Characters this line may still inspect. Malformed input must not turn
     /// repeated delimiter scans into quadratic work, so the total scan work per
     /// line is bounded; when it runs out the rest of the line stays literal.
@@ -429,11 +453,22 @@ impl Inline<'_> {
             out.push('!');
             return index + 1;
         };
-        let Some((target_end, _)) = self.parenthesized(chars, label_end + 1) else {
+        let Some((target_end, raw)) = self.parenthesized(chars, label_end + 1) else {
             out.push('!');
             return index + 1;
         };
         let alt: String = chars[label_start + 1..label_end].iter().collect();
+        if let (Some(images), Some(src)) =
+            (self.images.as_deref_mut(), raw.split_whitespace().next())
+        {
+            if images.len() < MAX_IMAGES {
+                images.push(Image {
+                    label: shared_label(&alt),
+                    target: resolve(self.path, src.trim_matches(['<', '>'])),
+                    line: self.document.lines.len(),
+                });
+            }
+        }
         image_placeholder(&alt, out);
         target_end + 1
     }

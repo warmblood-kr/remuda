@@ -4973,15 +4973,18 @@ name = "remuda-gui"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "image",
  "libc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "png 0.18.1",
  "raw-window-handle",
  "remuda-core",
  "remuda-native",
  "serde",
  "serde_json",
+ "smallvec",
  "unicode-segmentation",
  "windows-sys 0.61.2",
 ]

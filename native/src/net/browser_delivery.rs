@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 const SINK_TTL: Duration = Duration::from_secs(5);
-const DELIVERY_TTL: Duration = Duration::from_secs(15);
+pub const DELIVERY_TTL: Duration = Duration::from_secs(60);
 const MAX_RESULTS: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
