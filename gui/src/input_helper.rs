@@ -10,6 +10,9 @@ use std::{
 };
 
 const DEADLINE: Duration = Duration::from_secs(8);
+// The frame flag only changes the local worker's input mode. An older worker
+// refuses this as an oversized frame before handing bytes to the daemon.
+const PASTE_IMAGE: u32 = 1 << 31;
 const READY: &[u8] = b"remuda-input-v1\n";
 
 // One watchdog bounds startup and any partially read frame or active write.
@@ -32,6 +35,7 @@ fn serve<T: InputTransport>(
     mut input: StrictInput<T>,
     watch: mpsc::Sender<bool>,
     line: Option<bool>,
+    local_session: Option<&str>,
 ) -> i32 {
     let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
@@ -54,7 +58,9 @@ fn serve<T: InputTransport>(
         if stdin.read_exact(&mut header[1..]).is_err() {
             return 1;
         }
-        let length = u32::from_be_bytes(header) as usize;
+        let header = u32::from_be_bytes(header);
+        let paste_image = header & PASTE_IMAGE != 0;
+        let length = (header & !PASTE_IMAGE) as usize;
         if length == 0 || length > MAX_BATCH {
             return 1;
         }
@@ -62,9 +68,27 @@ fn serve<T: InputTransport>(
         if stdin.read_exact(&mut bytes).is_err() {
             return 1;
         }
-        let result = match line {
-            Some(remote) => input.send_line(&bytes, remote),
-            None => input.send(&bytes),
+        let result = if paste_image {
+            let Some(bytes) = local_session
+                .filter(|name| bracketed_paste_enabled(name))
+                .and_then(|_| image_paste_bytes(&bytes))
+            else {
+                if stdout
+                    .write_all(&[2])
+                    .and_then(|()| stdout.flush())
+                    .is_err()
+                {
+                    return 1;
+                }
+                let _ = watch.send(false);
+                continue;
+            };
+            input.send(&bytes)
+        } else {
+            match line {
+                Some(remote) => input.send_line(&bytes, remote),
+                None => input.send(&bytes),
+            }
         };
         let ack = u8::from(result == InputResult::Applied);
         if stdout
@@ -79,6 +103,29 @@ fn serve<T: InputTransport>(
     }
 }
 
+fn bracketed_paste_enabled(name: &str) -> bool {
+    use remuda_core::protocol::{Request, Response};
+    LocalInput(remuda_native::daemon::socket_path("default"))
+        .send(&Request::MouseState { name: name.into() })
+        .is_ok_and(|reply| matches!(reply, Response::MouseState(state) if state.bracketed_paste))
+}
+
+fn image_paste_bytes(path: &[u8]) -> Option<Vec<u8>> {
+    let path = std::str::from_utf8(path).ok()?;
+    if !std::path::Path::new(path).is_absolute()
+        || path.chars().any(char::is_control)
+        || path.contains('"')
+        || path.len() > MAX_BATCH - 14
+    {
+        return None;
+    }
+    if path.chars().any(char::is_whitespace) {
+        Some([b"\x1b[200~\"", path.as_bytes(), b"\"\x1b[201~"].concat())
+    } else {
+        Some([b"\x1b[200~", path.as_bytes(), b"\x1b[201~"].concat())
+    }
+}
+
 pub fn worker(args: &[String]) -> i32 {
     if args.len() != 4 || args[2].is_empty() || args[3].is_empty() {
         return 1;
@@ -90,25 +137,31 @@ pub fn worker(args: &[String]) -> i32 {
     match args[0].as_str() {
         "local" | "line-local" if args[1].is_empty() => StrictInput::new(
             LocalInput(remuda_native::daemon::socket_path("default")),
-            name,
+            name.clone(),
             instance,
         )
         .map_or(1, |input| {
-            serve(input, watch, (args[0] == "line-local").then_some(false))
+            serve(
+                input,
+                watch,
+                (args[0] == "line-local").then_some(false),
+                Some(&name),
+            )
         }),
         "peer" | "line-peer" if !args[1].is_empty() => PeerInput::new(args[1].clone())
             .and_then(|peer| StrictInput::new(peer, name, instance))
             .map_or(1, |input| {
-                serve(input, watch, (args[0] == "line-peer").then_some(true))
+                serve(input, watch, (args[0] == "line-peer").then_some(true), None)
             }),
         _ => 1,
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
     Applied,
     NotAcknowledged,
+    PasteUnavailable,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Submit {
@@ -127,16 +180,12 @@ struct State {
 }
 
 impl State {
-    fn complete(&mut self, result: bool, events: &mpsc::SyncSender<Event>) {
+    fn complete(&mut self, result: Event, events: &mpsc::SyncSender<Event>) {
         if self.busy && !self.completed {
             self.completed = true;
-            let _ = events.try_send(if result {
-                Event::Applied
-            } else {
-                Event::NotAcknowledged
-            });
+            let _ = events.try_send(result);
         }
-        if !result {
+        if result == Event::NotAcknowledged {
             self.stopped = true;
         }
     }
@@ -181,7 +230,10 @@ impl InputHelper {
                     command.creation_flags(CREATE_NO_WINDOW);
                 }
                 let Ok(mut child) = command.spawn() else {
-                    worker_state.lock().unwrap().complete(false, &worker_events);
+                    worker_state
+                        .lock()
+                        .unwrap()
+                        .complete(Event::NotAcknowledged, &worker_events);
                     return;
                 };
                 let mut stdin = child.stdin.take().unwrap();
@@ -227,6 +279,14 @@ impl InputHelper {
         })
     }
     pub fn submit(&self, bytes: &[u8]) -> Submit {
+        self.submit_frame(bytes, 0)
+    }
+
+    pub(crate) fn paste_image_path(&self, path: &str) -> Submit {
+        self.submit_frame(path.as_bytes(), PASTE_IMAGE)
+    }
+
+    fn submit_frame(&self, bytes: &[u8], flags: u32) -> Submit {
         if bytes.is_empty() || bytes.len() > MAX_BATCH {
             return Submit::Invalid;
         }
@@ -242,7 +302,10 @@ impl InputHelper {
         {
             state.started = Some(Instant::now());
         }
-        if self.tx.try_send(bytes.to_vec()).is_err() {
+        let mut frame = Vec::with_capacity(4 + bytes.len());
+        frame.extend_from_slice(&((bytes.len() as u32) | flags).to_be_bytes());
+        frame.extend_from_slice(bytes);
+        if self.tx.try_send(frame).is_err() {
             state.stopped = true;
             return Submit::Stopped;
         }
@@ -293,17 +356,17 @@ fn guarded_write(
 fn exchange(
     input: &mut std::process::ChildStdin,
     output: &mut std::process::ChildStdout,
-    bytes: &[u8],
+    frame: &[u8],
     state: &Mutex<State>,
     ready: &mut bool,
-) -> bool {
+) -> Event {
     use std::os::fd::AsRawFd;
     let fds = [input.as_raw_fd(), output.as_raw_fd()];
     for fd in fds {
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-                return false;
+                return Event::NotAcknowledged;
             }
         }
     }
@@ -311,7 +374,7 @@ fn exchange(
     let mut received = 0;
     while !*ready {
         if state.lock().unwrap().stopped || Instant::now() >= end {
-            return false;
+            return Event::NotAcknowledged;
         }
         let mut buf = [0; 1];
         match output.read(&mut buf) {
@@ -322,38 +385,35 @@ fn exchange(
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            _ => return false,
+            _ => return Event::NotAcknowledged,
         }
     }
-    let mut frame = Vec::with_capacity(4 + bytes.len());
-    frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-    frame.extend_from_slice(bytes);
     let mut written = 0;
     while written < frame.len() {
         if Instant::now() >= end {
-            return false;
+            return Event::NotAcknowledged;
         }
         match guarded_write(state, || input.write(&frame[written..])) {
-            None => return false,
-            Some(Ok(0)) => return false,
+            None => return Event::NotAcknowledged,
+            Some(Ok(0)) => return Event::NotAcknowledged,
             Some(Ok(n)) => written += n,
             Some(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10))
             }
-            Some(Err(_)) => return false,
+            Some(Err(_)) => return Event::NotAcknowledged,
         }
     }
     loop {
         if state.lock().unwrap().stopped || Instant::now() >= end {
-            return false;
+            return Event::NotAcknowledged;
         }
         let mut ack = [0];
         match output.read(&mut ack) {
-            Ok(1) => return ack[0] == 1,
+            Ok(1) => return decode_ack(ack[0]),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10))
             }
-            _ => return false,
+            _ => return Event::NotAcknowledged,
         }
     }
 }
@@ -388,25 +448,26 @@ fn watch_windows_child(mut child: std::process::Child, state: &Mutex<State>) {
 fn exchange(
     input: &mut std::process::ChildStdin,
     output: &mut std::process::ChildStdout,
-    bytes: &[u8],
+    frame: &[u8],
     state: &Mutex<State>,
     ready: &mut bool,
-) -> bool {
+) -> Event {
     if !*ready {
         let mut startup = [0; READY.len()];
         if output.read_exact(&mut startup).is_err() || startup != READY {
-            return false;
+            return Event::NotAcknowledged;
         }
         *ready = true;
     }
     if state.lock().unwrap().stopped {
-        return false;
+        return Event::NotAcknowledged;
     }
     let mut ack = [0];
-    input.write_all(&(bytes.len() as u32).to_be_bytes()).is_ok()
-        && input.write_all(bytes).is_ok()
-        && output.read_exact(&mut ack).is_ok()
-        && ack == [1]
+    if input.write_all(frame).is_ok() && output.read_exact(&mut ack).is_ok() {
+        decode_ack(ack[0])
+    } else {
+        Event::NotAcknowledged
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -416,14 +477,62 @@ fn exchange(
     _: &[u8],
     _: &Mutex<State>,
     _: &mut bool,
-) -> bool {
-    false
+) -> Event {
+    Event::NotAcknowledged
+}
+
+fn decode_ack(ack: u8) -> Event {
+    match ack {
+        1 => Event::Applied,
+        2 => Event::PasteUnavailable,
+        _ => Event::NotAcknowledged,
+    }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::path::Path;
+    #[test]
+    fn image_paste_sends_one_bracketed_path_and_no_return() {
+        assert_eq!(
+            image_paste_bytes(b"/tmp/screenshot.png").unwrap(),
+            b"\x1b[200~/tmp/screenshot.png\x1b[201~"
+        );
+        assert_eq!(
+            image_paste_bytes(b"/tmp/screen shot.png").unwrap(),
+            b"\x1b[200~\"/tmp/screen shot.png\"\x1b[201~"
+        );
+        assert!(image_paste_bytes(b"screenshot.png").is_none());
+        assert!(image_paste_bytes(b"/tmp/screenshot.png\r").is_none());
+        assert!(image_paste_bytes(b"/tmp/screenshot.png\x1b[201~").is_none());
+    }
+
+    #[test]
+    fn paste_refusal_does_not_stop_the_input_helper() {
+        let helper = InputHelper::start(
+            Path::new("/bin/sh"),
+            &[
+                "-c",
+                "printf 'remuda-input-v1\\n'; dd bs=1 count=23 of=/dev/null 2>/dev/null; printf '\\002'; dd bs=1 count=5 of=/dev/null 2>/dev/null; printf '\\001'",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            helper.paste_image_path("/tmp/screenshot.png"),
+            Submit::Queued
+        );
+        assert_eq!(
+            helper.recv_event_timeout(Duration::from_secs(3)).unwrap(),
+            Event::PasteUnavailable
+        );
+        assert_eq!(helper.submit(b"x"), Submit::Queued);
+        assert_eq!(
+            helper.recv_event_timeout(Duration::from_secs(3)).unwrap(),
+            Event::Applied
+        );
+    }
+
     #[test]
     fn unconsumed_completion_blocks_further_batches() {
         let helper = InputHelper::start(
@@ -614,7 +723,7 @@ mod tests {
         let sender = StrictInput::new(Stall, "s".into(), "i".into()).unwrap();
         let watch = watchdog();
         let _ = watch.send(true);
-        std::process::exit(serve(sender, watch, None));
+        std::process::exit(serve(sender, watch, None, None));
     }
     #[test]
     #[ignore = "child fixture for startup deadline"]

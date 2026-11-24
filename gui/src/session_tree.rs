@@ -1079,7 +1079,7 @@ impl Render for LocalGui {
                                                         .child(
                                                             div()
                                                                 .id("terminal-cells")
-                                                                .on_click(cx.listener(
+                                                                .on_mouse_down(MouseButton::Left, cx.listener(
                                                                     |this, _, window, _| {
                                                                         if let Some(focus) =
                                                                             &this.live_focus
@@ -1093,7 +1093,8 @@ impl Render for LocalGui {
                                                                 .when_some(
                                                                     self.preview.as_ref(),
                                                                     |d, screen| {
-                                                                        d.child(screen.view_with_links(
+                                                                        d.child(screen.view(
+                                                                            &self.terminal_selection,
                                                                             open_terminal_link.clone(),
                                                                         ))
                                                                     },

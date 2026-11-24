@@ -4972,6 +4972,7 @@ dependencies = [
 name = "remuda-gui"
 version = "0.1.0"
 dependencies = [
+ "clipboard-win",
  "gpui",
  "image",
  "libc",
@@ -4985,6 +4986,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "tempfile",
  "unicode-segmentation",
  "windows-sys 0.61.2",
 ]
