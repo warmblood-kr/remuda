@@ -15,6 +15,8 @@ mod cluster_status;
 mod input_helper;
 mod line_input;
 mod live_session;
+#[cfg(target_os = "macos")]
+mod macos_lifecycle;
 mod preview;
 mod terminal_view;
 use terminal_view::Screen;
@@ -1138,18 +1140,88 @@ fn main() {
             std::process::exit(1);
         }
     };
-    Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1000.), px(650.)), cx);
+    #[cfg(target_os = "macos")]
+    if destination.is_none() {
+        use std::{cell::Cell, rc::Rc};
+        let primary = match macos_lifecycle::PrimaryWindow::acquire() {
+            Ok(Some(primary)) => primary,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("remuda gui: cannot open the Remuda window: {error}");
+                std::process::exit(1);
+            }
+        };
+        let window = Rc::new(Cell::new(None));
+        let app = Application::new();
+        let reopen = window.clone();
+        app.on_reopen(move |cx| show_local_window(&reopen, cx));
+        app.run(move |cx| {
+            macos_lifecycle::install_menu(cx, macos_lifecycle::WindowKind::Remuda);
+            show_local_window(&window, cx);
+            cx.spawn(async move |cx| loop {
+                gpui::Timer::after(Duration::from_millis(150)).await;
+                if primary.take_open_request()
+                    && cx.update(|cx| show_local_window(&window, cx)).is_err()
+                {
+                    break;
+                }
+            })
+            .detach();
+        });
+        return;
+    }
+    let app = Application::new();
+    #[cfg(target_os = "macos")]
+    app.on_reopen(|cx| {
+        if let Some(window) = cx.windows().first().copied() {
+            macos_lifecycle::activate(window, cx);
+        }
+    });
+    app.run(move |cx: &mut App| {
+        let bounds = default_window_bounds(cx);
         if let Some(destination) = destination {
+            #[cfg(target_os = "macos")]
+            {
+                macos_lifecycle::install_menu(cx, macos_lifecycle::WindowKind::Browser);
+                cx.on_window_closed(|cx| {
+                    if cx.windows().is_empty() {
+                        cx.quit();
+                    }
+                })
+                .detach();
+            }
             browser::open(cx, bounds, destination, browser.flatten());
             return;
         }
-        cx.open_window(
+        open_local_window(cx, bounds);
+        cx.activate(true);
+    });
+}
+
+fn default_window_bounds(cx: &App) -> Bounds<gpui::Pixels> {
+    Bounds::centered(None, size(px(1000.), px(650.)), cx)
+}
+
+#[cfg(target_os = "macos")]
+fn show_local_window(window: &std::cell::Cell<Option<gpui::AnyWindowHandle>>, cx: &mut App) {
+    let handle = window
+        .get()
+        .filter(|handle| cx.windows().contains(handle))
+        .unwrap_or_else(|| open_local_window(cx, default_window_bounds(cx)));
+    window.set(Some(handle));
+    macos_lifecycle::activate(handle, cx);
+}
+
+fn open_local_window(cx: &mut App, bounds: Bounds<gpui::Pixels>) -> gpui::AnyWindowHandle {
+    let window = cx
+        .open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
             |window, cx| {
+                #[cfg(target_os = "macos")]
+                macos_lifecycle::install_window(window, cx, macos_lifecycle::WindowKind::Remuda);
                 let focus = cx.focus_handle();
                 focus.focus(window);
                 let window = window.window_handle();
@@ -1179,13 +1251,36 @@ fn main() {
             },
         )
         .unwrap();
-        cx.activate(true);
-    });
+    window.into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn local_gui_reuses_the_open_window_and_recreates_a_closed_one(cx: &mut gpui::TestAppContext) {
+        let window = std::cell::Cell::new(None);
+        let first = cx.update(|app| {
+            show_local_window(&window, app);
+            let first = window.get().unwrap();
+            show_local_window(&window, app);
+            assert!(window.get() == Some(first));
+            assert_eq!(app.windows().len(), 1);
+            first
+                .update(app, |_, window, _| window.remove_window())
+                .unwrap();
+            first
+        });
+        cx.run_until_parked();
+        cx.update(|app| {
+            assert!(app.windows().is_empty());
+            show_local_window(&window, app);
+            assert!(window.get() != Some(first));
+            assert_eq!(app.windows().len(), 1);
+        });
+    }
+
     #[test]
     fn worker_reply_rejects_legacy_and_wrong_abi() {
         assert_eq!(

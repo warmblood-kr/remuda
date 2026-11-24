@@ -14,10 +14,11 @@ unicode-segmentation = "1"
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
 objc2 = "0.6"
+raw-window-handle = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSApplication", "NSButton", "NSControl", "NSImage", "NSMenu", "NSMenuItem",
     "NSResponder", "NSRunningApplication", "NSStatusBar", "NSStatusBarButton",
-    "NSStatusItem", "NSView", "objc2-core-foundation",
+    "NSStatusItem", "NSView", "NSScreen", "NSWindow", "objc2-core-foundation",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSString"] }
 [target.'cfg(windows)'.dependencies]
