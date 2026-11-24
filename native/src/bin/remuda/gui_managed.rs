@@ -15,6 +15,10 @@ pub(super) fn choose(exe: &Path, build: &str) -> Result<Option<PathBuf>, String>
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("cannot inspect {}: {e}", sibling.display())),
     }
+    choose_managed(exe, build)
+}
+
+pub(super) fn choose_managed(exe: &Path, build: &str) -> Result<Option<PathBuf>, String> {
     if build.is_empty()
         || build.len() > 200
         || !build

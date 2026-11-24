@@ -157,6 +157,7 @@ mkdir -p "$install_dir" "$data_dir"
 
 # A new macOS GUI archive must opt into a bounded build-ID probe. Old archives
 # have none of these members and keep the original installation path.
+gui_deferred=no
 stage_gui() {
 	[ "$target" = aarch64-apple-darwin ] || return 0
 	present=no
@@ -215,6 +216,10 @@ stage_gui() {
 	store="$install_dir/.remuda-gui"
 	builds="$store/builds"
 	slot="$builds/build-$gui_build"
+	for dir in "$store" "$builds" "$slot"; do
+		[ ! -L "$dir" ] || die "managed GUI path is a symlink: $dir"
+		[ ! -e "$dir" ] || [ -d "$dir" ] || die "managed GUI path is not a directory: $dir"
+	done
 	old_present=no
 	old_known=no
 	for file in remuda remuda-session-host; do
@@ -248,9 +253,8 @@ stage_gui() {
 	fi
 	if [ "$old_present" = yes ] && [ "$old_known" = no ]; then
 		[ ! -e "$slot" ] && [ ! -L "$slot" ] || die "cannot safely select existing GUI slot for an unverified installed pair: $slot"
-		echo "install.sh: GUI deferred — installed CLI/host provenance is unknown; continuing core-only upgrade" >&2
-		echo "install.sh: existing core host handling still applies; build-key identity remains unverified" >&2
-		echo "install.sh: retry while this channel still points to the same release; inspect any retained-host collision" >&2
+		gui_deferred=yes
+		echo "install.sh: installed CLI/host provenance is unknown; will stage GUI after installing the verified pair" >&2
 		return 0
 	fi
 	slot_new=no
@@ -345,6 +349,14 @@ for bin in $host remuda; do
 done
 [ -n "$host" ] || rm -f "$install_dir/remuda-session-host"
 [ -z "$host" ] || keep_versioned "$install_dir/remuda-session-host"
+if [ "$gui_deferred" = yes ]; then
+	# Check actual installed bytes after landing both members. Keep the same
+	# collision and provenance checks as a normal GUI install.
+	if ! cmp -s remuda "$install_dir/remuda" || ! cmp -s remuda-session-host "$install_dir/remuda-session-host"; then
+		die "GUI staging stopped because the installed CLI or host changed"
+	fi
+	stage_gui
+fi
 # shellcheck disable=SC2012 # build names are checked above: no odd characters
 ls -t "$install_dir"/remuda-session-host-* 2>/dev/null | tail -n +4 | while IFS= read -r old; do
 	rm -f "$old"

@@ -4974,10 +4974,14 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "libc",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "remuda-core",
  "remuda-native",
  "serde",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

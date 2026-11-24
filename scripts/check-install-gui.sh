@@ -153,7 +153,7 @@ for changed in remuda remuda-session-host; do
 	same "$install_root/$changed" "$tmp/unmanaged-before"
 	[ ! -e "$install_root/.remuda-gui" ]
 done
-# Unknown old pair: publish only core, report deferral, and preserve manual GUI.
+# Unknown old pair: prove the new pair before staging GUI, and preserve manual GUI.
 publish u
 install_root="$tmp/unknown path \$(literal)"
 mkdir "$install_root"
@@ -164,9 +164,8 @@ printf 'manual GUI\n' >"$install_root/remuda-gui"
 REMUDA_INSTALL_DIR="$install_root"
 export REMUDA_INSTALL_DIR
 install_ok
-grep -q 'GUI deferred.*provenance is unknown' "$tmp/out"
-grep -q 'build-key identity remains unverified' "$tmp/out"
-[ ! -e "$(slot u)" ]
+grep -q 'provenance is unknown; will stage GUI after installing the verified pair' "$tmp/out"
+same "$(slot u)" "$tmp/pkg/remuda-gui"
 [ "$(cat "$install_root/remuda-gui")" = 'manual GUI' ]
 [ ! -e "$tmp/old-cli-called" ]
 [ -e "$tmp/old-host-called" ] # Existing core-only keep_versioned behavior.
@@ -187,8 +186,24 @@ printf 'corrupt\n' >"$install_root/.remuda-gui/builds/build-$FAKE_VERSION+a/prov
 REMUDA_INSTALL_DIR="$install_root"
 export REMUDA_INSTALL_DIR
 install_ok
-grep -q 'GUI deferred.*provenance is unknown' "$tmp/out"
-[ ! -e "$(slot b)" ]
+grep -q 'provenance is unknown; will stage GUI after installing the verified pair' "$tmp/out"
+same "$(slot b)" "$tmp/pkg/remuda-gui"
+REMUDA_INSTALL_DIR="$tmp/bin"
+export REMUDA_INSTALL_DIR
+
+# Refuse a blocked managed path before changing an unknown installed pair.
+publish u
+install_root="$tmp/unknown-blocked-store"
+mkdir "$install_root"
+printf 'old cli\n' >"$install_root/remuda"
+printf 'old host\n' >"$install_root/remuda-session-host"
+ln -s "$tmp/not-present" "$install_root/.remuda-gui"
+REMUDA_INSTALL_DIR="$install_root"
+export REMUDA_INSTALL_DIR
+install_fails
+[ "$(cat "$install_root/remuda")" = 'old cli' ]
+[ "$(cat "$install_root/remuda-session-host")" = 'old host' ]
+[ ! -e "$install_root/remuda.prev" ] && [ ! -e "$install_root/remuda-session-host.prev" ]
 REMUDA_INSTALL_DIR="$tmp/bin"
 export REMUDA_INSTALL_DIR
 

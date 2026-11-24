@@ -182,6 +182,12 @@ fn run_cli(args: Vec<String>) -> ExitCode {
     if argv.first() == Some(&"browser") {
         return browser::run(&argv[1..], server, stdin_enabled);
     }
+    if argv.first() == Some(&"tray") {
+        if stdin_enabled || server != "default" {
+            return fail("remuda tray uses the default daemon and does not accept --stdin");
+        }
+        return tray_command(&argv[1..]);
+    }
 
     // GUI is a client of an existing daemon; launching it must not probe,
     // start, reload, or initialize the daemon or cluster.
@@ -221,6 +227,46 @@ fn gui_command(server: &str, args: &[&str]) -> ExitCode {
         return fail("remuda gui currently supports only the default server");
     }
     launch_gui()
+}
+
+fn tray_command(args: &[&str]) -> ExitCode {
+    if matches!(args, ["-h" | "--help" | "help"]) {
+        println!("Usage: remuda tray\nStart the desktop tray and connect to the default daemon.");
+        return ExitCode::SUCCESS;
+    }
+    if let Err(code) = ensure_no_args("tray", args) {
+        return code;
+    }
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        let cli = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(error) => return fail(format!("cannot find installed Remuda: {error}")),
+        };
+        let gui =
+            match gui_managed::choose_managed(&cli, dist::BUILD_VERSION).and_then(|path| {
+                if path.is_some() {
+                    Ok(path)
+                } else {
+                    gui_managed::choose(&cli, dist::BUILD_VERSION)
+                }
+            }) {
+                Ok(Some(path)) => path,
+                Ok(None) => return fail(
+                    "Remuda tray requires the matching native GUI. Install the desktop nightly.",
+                ),
+                Err(error) => return fail(error),
+            };
+        if let Err(error) = ensure_daemon("default", &daemon::socket_path("default")) {
+            return fail(error);
+        }
+        match std::process::Command::new(gui).arg("--tray").spawn() {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(error) => fail(format!("cannot start Remuda tray: {error}")),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    fail("remuda tray is supported on macOS and Windows")
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -847,6 +893,7 @@ remuda — a pty manager you can attach to
   remuda cluster leave [--yes]    leave the cluster; another node revokes this one
   remuda browser [USER@]HOST      open remote Remuda over SSH
   remuda browser --gui HOST      open the native Remuda client
+  remuda tray                    start the desktop tray and default daemon
   remuda cluster remote [node[/session]] a node's session screen, or the cluster tree
   remuda cluster listen [--bind ADDR] [--allow-public] configure the daemon listener
                                   --foreground holds the listener in this terminal
@@ -922,7 +969,7 @@ const USAGE: &str = "\
 remuda — terminal orchestration for coding agents
 
   remuda                         open the session screen
-  remuda gui                     open the separately built macOS GUI
+  remuda gui                     open the native node GUI
   remuda run [-n NAME] COMMAND   start and enter a session
   remuda attach NAME             enter a session; Ctrl-\\ detaches (exit 2 if attached elsewhere)
                                  Ctrl-] toggles mouse; wheel scrolls history
@@ -949,6 +996,7 @@ remuda — terminal orchestration for coding agents
   remuda cluster leave [--yes]    leave the cluster; another node revokes this one
   remuda browser [USER@]HOST      open remote Remuda over SSH
   remuda browser --gui HOST      open the native Remuda client
+  remuda tray                    start the desktop tray and default daemon
   remuda cluster remote [node[/session]] a node's session screen, or the cluster tree
   remuda cluster listen [--bind ADDR] [--allow-public] configure the daemon listener
                                   --foreground holds the listener in this terminal
