@@ -178,16 +178,19 @@ fn check_gui_inputs(
     wait_for("GUI composed lines", Duration::from_secs(10), || {
         let Ok(Response::Screen(text)) = remuda_native::client::request(
             socket,
-            &Request::Capture { name: "proof".into() },
+            &Request::Capture {
+                name: "proof".into(),
+            },
         ) else {
             return false;
         };
         let text = text.replace('\n', "");
         ["line-local", "line-peer"].into_iter().all(|kind| {
-            ["one", "two"].into_iter().all(|line| {
-                text.matches(&format!("INPUT:bridge-{kind}-{line}")).count() == 1
-            })
-        }) && !text.contains("bridge-wrong") && !text.contains("bridge-retry")
+            ["one", "two"]
+                .into_iter()
+                .all(|line| text.matches(&format!("INPUT:bridge-{kind}-{line}")).count() == 1)
+        }) && !text.contains("bridge-wrong")
+            && !text.contains("bridge-retry")
     });
 }
 
