@@ -100,6 +100,9 @@ fn exercise_gui_input(gui: &std::ffi::OsStr, node: &Node, kind: &str, fp: &str, 
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     let mut output = child.stdout.take().unwrap();
+    let mut ready = [0; b"remuda-input-v1\n".len()];
+    output.read_exact(&mut ready).unwrap();
+    assert_eq!(&ready, b"remuda-input-v1\n");
     for suffix in ["one", "two"] {
         let text = format!("{kind}-{suffix}\r");
         input.write_all(&(text.len() as u32).to_be_bytes()).unwrap();

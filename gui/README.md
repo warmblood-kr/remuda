@@ -21,16 +21,20 @@ an available session with a known instance ID to see a read-only text snapshot.
 Local-only use does not require cluster initialization. Remote access uses the
 existing cluster membership and authenticated peer transport.
 
-Refresh updates the lists and clears the current preview. Offline or failed
-requests are shown as stale or unavailable; the preview is a snapshot, not a
-live terminal. Session creation, attachment, keyboard input, terminal styling,
-scrollback navigation and IME are not available in this prototype.
+Refresh updates the lists. Offline peers retain their last known screen and
+show its age. **Attach** or **K** enables keyboard input to the selected
+session instance and refreshes its text screen. **Detach** or **Ctrl+\\** leaves
+the session running. Remote input uses the existing cluster control policy.
+The GUI currently displays refreshed plain-text screens.
 
 Use `remuda gui` on macOS or Windows to open this view. With a configured
 cluster, expand an admitted node to browse its sessions. Each node folds
 independently, and folding leaves the open snapshot in place. Use Up and Down
 to move within the tree, Left and Right to fold and unfold, and Enter to open
-a session. The preview shows the selected node, session, and snapshot age.
+a session. Use **/** to find nodes or sessions, **!** for attention rows, and
+**?** for keyboard help. Drag the divider on wide windows. Narrow windows
+place the session below the tree. The preview shows the selected node, session,
+and snapshot age.
 Without a cluster, the view shows your local sessions.
 
 ## Menu bar and system tray
@@ -119,7 +123,7 @@ creates a new session is outside that scope.
 Read-only GUI workers accept legacy requests as well as ABI-tagged requests.
 New GUI windows require a matching response envelope and show a restart notice
 on an incompatible response. The input bridge requires its ready greeting
-before sending bytes; input is not connected to the GUI yet. These markers
+before sending bytes from an attached GUI session. These markers
 identify a protocol revision, not an exact executable build. Changes to either
 protocol must update the marker and exercise both directions of compatibility.
 An already-running pre-fence GUI cannot be retroactively protected; do not use

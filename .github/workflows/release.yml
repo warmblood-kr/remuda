@@ -203,6 +203,7 @@ jobs:
           [ "$got" = "$build" ] || { echo "::error::GUI build ID was '$got'"; exit 1; }
           printf '%s\n' "$build" > "$output/remuda-gui.build"
           if [ "$RUNNER_OS" = macOS ]; then
+            "$output/$gui" --internal-font-check
             cargo build --release --locked -p remuda-native --features installer-probe-experimental --bin remuda-installer-probe --target "$target"
             printf '%s\n' remuda-gui-archive-v1 > "$output/remuda-gui.contract"
           fi

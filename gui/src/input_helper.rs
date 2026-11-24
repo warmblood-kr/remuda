@@ -106,14 +106,33 @@ pub enum Submit {
     Invalid,
     Stopped,
 }
+#[derive(Default)]
 struct State {
     stopped: bool,
     busy: bool,
     completed: bool,
+    #[cfg(windows)]
+    started: Option<Instant>,
+}
+
+impl State {
+    fn complete(&mut self, result: bool, events: &mpsc::SyncSender<Event>) {
+        if self.busy && !self.completed {
+            self.completed = true;
+            let _ = events.try_send(if result {
+                Event::Applied
+            } else {
+                Event::NotAcknowledged
+            });
+        }
+        if !result {
+            self.stopped = true;
+        }
+    }
 }
 
 /// One helper and one outstanding batch, with no further buffered input.
-/// `stop` prevents future dispatch; bytes already handed to the pipe may land.
+/// `stop` prevents new dispatch; an in-flight batch may still land.
 /// Events never contain input bytes. Drop requests stop and cleanup is asynchronous.
 pub struct InputHelper {
     tx: mpsc::SyncSender<Vec<u8>>,
@@ -125,53 +144,70 @@ pub struct InputHelper {
 impl InputHelper {
     pub fn start(program: &std::path::Path, args: &[&str]) -> std::io::Result<Self> {
         use std::process::{Command, Stdio};
-        let mut child = Command::new(program)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = child.stdout.take().unwrap();
+        let program = program.to_owned();
+        let args: Vec<_> = args.iter().map(|arg| (*arg).to_owned()).collect();
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
         let (events, results) = mpsc::sync_channel(1);
-        let state = Arc::new(Mutex::new(State {
-            stopped: false,
-            busy: false,
-            completed: false,
-        }));
+        let state = Arc::new(Mutex::new(State::default()));
         let worker_state = state.clone();
         let worker_events = events.clone();
-        std::thread::spawn(move || {
-            let mut ready = false;
-            for bytes in rx {
+        std::thread::Builder::new()
+            .name("gui-input".into())
+            .spawn(move || {
+                if worker_state.lock().unwrap().stopped {
+                    return;
+                }
+                let mut command = Command::new(program);
+                command
+                    .args(args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null());
+                #[cfg(windows)]
                 {
-                    let s = worker_state.lock().unwrap();
+                    use std::os::windows::process::CommandExt;
+                    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+                    command.creation_flags(CREATE_NO_WINDOW);
+                }
+                let Ok(mut child) = command.spawn() else {
+                    worker_state.lock().unwrap().complete(false, &worker_events);
+                    return;
+                };
+                let mut stdin = child.stdin.take().unwrap();
+                let mut stdout = child.stdout.take().unwrap();
+                #[cfg(windows)]
+                let child_watch = {
+                    let state = worker_state.clone();
+                    std::thread::spawn(move || watch_windows_child(child, &state))
+                };
+                let mut ready = false;
+                for bytes in rx {
+                    {
+                        let s = worker_state.lock().unwrap();
+                        if s.stopped {
+                            break;
+                        }
+                    }
+                    let result =
+                        exchange(&mut stdin, &mut stdout, &bytes, &worker_state, &mut ready);
+                    let mut s = worker_state.lock().unwrap();
+                    s.complete(result, &worker_events);
                     if s.stopped {
                         break;
                     }
                 }
-                let result = exchange(&mut stdin, &mut stdout, &bytes, &worker_state, &mut ready);
-                let mut s = worker_state.lock().unwrap();
-                if s.busy && !s.completed {
-                    s.completed = true;
-                    if !result {
-                        s.stopped = true;
-                    }
-                    let _ = worker_events.try_send(if result {
-                        Event::Applied
-                    } else {
-                        Event::NotAcknowledged
-                    });
+                drop(stdin);
+                #[cfg(not(windows))]
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
                 }
-                if s.stopped {
-                    break;
+                #[cfg(windows)]
+                {
+                    worker_state.lock().unwrap().stopped = true;
+                    let _ = child_watch.join();
                 }
-            }
-            drop(stdin);
-            let _ = child.kill();
-            let _ = child.wait();
-        });
+            })?;
         Ok(Self {
             tx,
             state,
@@ -191,6 +227,10 @@ impl InputHelper {
             return Submit::Busy;
         }
         state.busy = true;
+        #[cfg(windows)]
+        {
+            state.started = Some(Instant::now());
+        }
         if self.tx.try_send(bytes.to_vec()).is_err() {
             state.stopped = true;
             return Submit::Stopped;
@@ -306,7 +346,59 @@ fn exchange(
         }
     }
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn watch_windows_child(mut child: std::process::Child, state: &Mutex<State>) {
+    loop {
+        let stop = {
+            let state = state.lock().unwrap();
+            state.stopped
+                || (state.busy
+                    && !state.completed
+                    && state
+                        .started
+                        .is_some_and(|start| start.elapsed() >= DEADLINE))
+        };
+        if stop {
+            let _ = child.kill();
+            break;
+        }
+        if !matches!(child.try_wait(), Ok(None)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.wait();
+}
+
+// Windows subprocess pipes use blocking I/O; a separate watcher owns the
+// child's lifetime so a stalled worker releases both pipes. The currentness
+// check commits the single batch to this exact helper before detach can win.
+#[cfg(windows)]
+fn exchange(
+    input: &mut std::process::ChildStdin,
+    output: &mut std::process::ChildStdout,
+    bytes: &[u8],
+    state: &Mutex<State>,
+    ready: &mut bool,
+) -> bool {
+    if !*ready {
+        let mut startup = [0; READY.len()];
+        if output.read_exact(&mut startup).is_err() || startup != READY {
+            return false;
+        }
+        *ready = true;
+    }
+    if state.lock().unwrap().stopped {
+        return false;
+    }
+    let mut ack = [0];
+    input.write_all(&(bytes.len() as u32).to_be_bytes()).is_ok()
+        && input.write_all(bytes).is_ok()
+        && output.read_exact(&mut ack).is_ok()
+        && ack == [1]
+}
+
+#[cfg(not(any(unix, windows)))]
 fn exchange(
     _: &mut std::process::ChildStdin,
     _: &mut std::process::ChildStdout,

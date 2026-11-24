@@ -6,14 +6,17 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 mod browser;
+mod cluster_status;
 #[allow(dead_code)]
 mod input_helper;
+mod live_session;
 mod preview;
 mod provider;
+mod session_tree;
 #[cfg(any(target_os = "macos", windows))]
 mod tray;
 
@@ -233,6 +236,19 @@ struct PeerSessions {
 
 struct LocalGui {
     tree_focus: Option<gpui::FocusHandle>,
+    tree_scroll: gpui::ScrollHandle,
+    search: Option<String>,
+    attention_only: bool,
+    show_help: bool,
+    sidebar_width: f32,
+    resize_start: Option<(f32, f32)>,
+    node_status: Option<cluster_status::ClusterStatus>,
+    peer_status: HashMap<String, cluster_status::PeerStatus>,
+    live: Option<live_session::LiveSession>,
+    live_focus: Option<gpui::FocusHandle>,
+    live_notice: Option<&'static str>,
+    preview_failed: bool,
+    next_live_preview: Instant,
     focused_row: TreeRow,
     local_expanded: bool,
     expanded_peers: std::collections::HashSet<String>,
@@ -276,6 +292,19 @@ impl LocalGui {
         let (remote_sender, remote_results) = mpsc::channel();
         Self {
             tree_focus: None,
+            tree_scroll: gpui::ScrollHandle::new(),
+            search: None,
+            attention_only: false,
+            show_help: false,
+            sidebar_width: 266.,
+            resize_start: None,
+            node_status: None,
+            peer_status: HashMap::new(),
+            live: None,
+            live_focus: None,
+            live_notice: None,
+            preview_failed: false,
+            next_live_preview: Instant::now(),
             focused_row: TreeRow::Node(None),
             local_expanded: true,
             expanded_peers: Default::default(),
@@ -312,15 +341,21 @@ impl LocalGui {
             remote_results,
         }
     }
-    fn clear_preview(&mut self) {
+    fn cancel_preview_request(&mut self) {
         self.preview_generation = self
             .preview_generation
             .checked_add(1)
             .expect("generation exhausted");
+        self.preview_pending = None;
+    }
+    fn clear_preview(&mut self) {
+        self.cancel_preview_request();
+        self.detach();
+        self.live_notice = None;
         self.selection = None;
         self.preview = None;
         self.preview_received = None;
-        self.preview_pending = None;
+        self.preview_failed = false;
     }
     fn selection_current(&self, s: &Selection) -> bool {
         let rows = if let Some(fp) = &s.peer {
@@ -357,9 +392,147 @@ impl LocalGui {
         if !self.selection_current(&s) {
             return;
         }
-        self.selection = Some(s.clone());
-        self.preview_pending = Some((self.preview_generation, s));
-        self.launch_preview();
+        self.selection = Some(s);
+        self.schedule_preview();
+    }
+    fn schedule_preview(&mut self) {
+        if let Some(s) = self.selection.clone().filter(|s| self.selection_current(s)) {
+            self.preview_pending = Some((self.preview_generation, s));
+            self.launch_preview();
+        }
+    }
+    fn detach(&mut self) {
+        if let Some(live) = self.live.take() {
+            live.stop();
+            self.live_notice = Some("Detached · session keeps running");
+        }
+    }
+
+    fn selected_peer_offline(&self) -> bool {
+        self.selection
+            .as_ref()
+            .and_then(|s| s.peer.as_deref())
+            .and_then(|fp| self.peer_status.get(fp))
+            .is_some_and(|status| {
+                matches!(
+                    status.state,
+                    cluster_status::Reachability::Offline
+                        | cluster_status::Reachability::Connecting
+                )
+            })
+    }
+
+    fn attach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_peer_offline() {
+            return;
+        }
+        if let Some(selection) = self
+            .selection
+            .as_ref()
+            .filter(|s| self.selection_current(s))
+        {
+            match live_session::LiveSession::new(selection) {
+                Ok(live) => {
+                    self.live = Some(live);
+                    self.live_notice = Some("Input enabled · Ctrl+\\ detaches");
+                    self.next_live_preview = Instant::now();
+                    if let Some(focus) = &self.live_focus {
+                        focus.focus(window);
+                    }
+                }
+                Err(_) => {
+                    self.live_notice =
+                        Some("Could not attach. Check session and input permissions.")
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    fn live_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(live) = &self.live else {
+            return;
+        };
+        let modifiers = event.keystroke.modifiers;
+        if event.keystroke.key == "\\" && modifiers.control && !modifiers.alt && !modifiers.platform
+        {
+            self.detach();
+            if let Some(focus) = &self.tree_focus {
+                focus.focus(window);
+            }
+        } else if self.selected_peer_offline()
+            || !self
+                .selection
+                .as_ref()
+                .is_some_and(|selection| self.selection_current(selection))
+        {
+            self.detach();
+            self.live_notice = Some("Session unavailable · detached");
+        } else if let Some(bytes) = live_session::key_bytes(&event.keystroke) {
+            self.live_notice = match live.submit(&bytes) {
+                live_session::Submit::Queued => Some("Input pending"),
+                live_session::Submit::Busy => Some("Input still pending · key was not sent"),
+                live_session::Submit::Invalid => Some("Unsupported input"),
+                live_session::Submit::Stopped => Some("Input unavailable · detach and reconnect"),
+            };
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn tick(&mut self, window: &Window) {
+        self.drain();
+        let was_offline = self.selected_peer_offline();
+        if let Some(status) = &self.node_status {
+            self.peer_status = status.snapshot();
+        }
+        let offline = self.selected_peer_offline();
+        if was_offline && !offline {
+            if let Some(fp) = self.selection.as_ref().and_then(|s| s.peer.clone()) {
+                self.refresh_peer(fp);
+            }
+        }
+        if self.live.is_some()
+            && (offline
+                || self.preview_failed
+                || !self
+                    .selection
+                    .as_ref()
+                    .is_some_and(|selection| self.selection_current(selection)))
+        {
+            self.detach();
+            self.live_notice = Some("Session unavailable · detached");
+        }
+        if self.live.is_some()
+            && !self
+                .live_focus
+                .as_ref()
+                .is_some_and(|focus| focus.is_focused(window))
+        {
+            self.detach();
+        }
+        if let Some(live) = &self.live {
+            match live.poll() {
+                Some(live_session::Event::Applied) => {
+                    self.live_notice = Some("Input sent · Ctrl+\\ detaches");
+                    self.next_live_preview = Instant::now();
+                }
+                Some(live_session::Event::NotAcknowledged) => {
+                    self.detach();
+                    self.live_notice = Some("Input outcome unconfirmed · detached");
+                }
+                None => {}
+            }
+        }
+        if self.live.is_some() && Instant::now() >= self.next_live_preview && !self.preview_busy {
+            self.next_live_preview = Instant::now() + Duration::from_millis(400);
+            self.schedule_preview();
+        }
     }
     fn launch_preview(&mut self) {
         if self.preview_busy {
@@ -408,7 +581,17 @@ impl LocalGui {
         });
     }
     fn refresh_nodes(&mut self) {
-        self.clear_preview();
+        if self
+            .selection
+            .as_ref()
+            .and_then(|s| s.peer.as_deref())
+            .is_some_and(|fp| !peer_is_unique(&self.peers, fp))
+        {
+            self.clear_preview();
+        } else {
+            self.cancel_preview_request();
+            self.detach();
+        }
         self.remote_pending.clear();
         for sessions in self.remote_sessions.values_mut() {
             sessions.loading = false;
@@ -509,7 +692,8 @@ impl LocalGui {
         });
     }
     fn refresh(&mut self) {
-        self.clear_preview();
+        self.cancel_preview_request();
+        self.detach();
         self.generation = self
             .generation
             .checked_add(1)
@@ -554,14 +738,25 @@ impl LocalGui {
                 && self.selection.as_ref() == Some(&selection)
                 && self.selection_current(&selection)
             {
-                self.preview_received = result.as_ref().ok().map(|_| Instant::now());
-                self.preview = Some(result.unwrap_or_else(|error| {
-                    if error == STALE_HELPER {
-                        self.helper_changed = true;
-                        return STALE_HELPER.into();
+                match result {
+                    Ok(body) => {
+                        self.preview_received = Some(Instant::now());
+                        self.preview = Some(body);
+                        self.preview_failed = false;
                     }
-                    "Snapshot unavailable. The session or node may have disconnected.".into()
-                }));
+                    Err(error) => {
+                        self.helper_changed |= error == STALE_HELPER;
+                        self.preview_failed = true;
+                        if self.preview.is_none() {
+                            self.preview = Some(if error == STALE_HELPER {
+                                STALE_HELPER.into()
+                            } else {
+                                "Snapshot unavailable. The session or node may have disconnected."
+                                    .into()
+                            });
+                        }
+                    }
+                }
             }
             self.launch_preview();
         }
@@ -573,6 +768,9 @@ impl LocalGui {
                     Ok(rows) => {
                         self.sessions = rows;
                         self.error = false;
+                        if self.selection.as_ref().is_some_and(|s| s.peer.is_none()) {
+                            self.schedule_preview();
+                        }
                     }
                     Err(error) => {
                         self.helper_changed |= error == STALE_HELPER;
@@ -597,6 +795,14 @@ impl LocalGui {
                     }
                 }
                 if !self.nodes_error {
+                    if self
+                        .selection
+                        .as_ref()
+                        .and_then(|s| s.peer.as_deref())
+                        .is_some_and(|fp| !peer_is_unique(&self.peers, fp))
+                    {
+                        self.clear_preview();
+                    }
                     let peers = &self.peers;
                     self.expanded_peers.retain(|fp| peer_is_unique(peers, fp));
                     self.remote_sessions
@@ -604,7 +810,11 @@ impl LocalGui {
                     let expanded = self
                         .peers
                         .iter()
-                        .filter(|p| self.expanded_peers.contains(&p.fingerprint))
+                        .filter(|p| {
+                            self.expanded_peers.contains(&p.fingerprint)
+                                || self.selection.as_ref().and_then(|s| s.peer.as_ref())
+                                    == Some(&p.fingerprint)
+                        })
                         .map(|p| p.fingerprint.clone())
                         .collect::<Vec<_>>();
                     for fp in expanded {
@@ -627,6 +837,11 @@ impl LocalGui {
                         Ok(rows) => {
                             sessions.rows = rows;
                             sessions.error = false;
+                            if self.selection.as_ref().and_then(|s| s.peer.as_deref())
+                                == Some(fp.as_str())
+                            {
+                                self.schedule_preview();
+                            }
                         }
                         Err(error) => {
                             self.helper_changed |= error == STALE_HELPER;
@@ -639,423 +854,18 @@ impl LocalGui {
         }
     }
 }
-impl LocalGui {
-    fn tree_rows(&self) -> Vec<TreeRow> {
-        let mut rows = vec![TreeRow::Node(None)];
-        if self.local_expanded {
-            rows.extend(self.sessions.iter().map(|row| TreeRow::session(None, row)));
-        }
-        for peer in &self.peers {
-            let fp = Some(peer.fingerprint.clone());
-            rows.push(TreeRow::Node(fp.clone()));
-            if self.expanded_peers.contains(&peer.fingerprint) {
-                if let Some(sessions) = self.remote_sessions.get(&peer.fingerprint) {
-                    rows.extend(
-                        sessions
-                            .rows
-                            .iter()
-                            .map(|row| TreeRow::session(fp.clone(), row)),
-                    );
-                }
-            }
-        }
-        rows
-    }
-
-    fn open_focused_session(&mut self, peer: Option<String>, name: &str, instance: Option<&str>) {
-        let rows = match peer.as_deref() {
-            Some(fp) => self
-                .remote_sessions
-                .get(fp)
-                .map(|state| state.rows.as_slice())
-                .unwrap_or_default(),
-            None => &self.sessions,
-        };
-        if let Some(row) = rows
-            .iter()
-            .find(|row| row.name == name && row.instance_id.as_deref() == instance)
-            .cloned()
-        {
-            self.select_session(peer, row);
-        }
-    }
-
-    fn tree_key(
-        &mut self,
-        event: &gpui::KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let rows = self.tree_rows();
-        let position = rows
-            .iter()
-            .position(|row| row == &self.focused_row)
-            .unwrap_or_default();
-        let current = rows[position].clone();
-        match (event.keystroke.key.as_str(), current) {
-            ("up", _) => self.focused_row = rows[position.saturating_sub(1)].clone(),
-            ("down", _) => self.focused_row = rows[(position + 1).min(rows.len() - 1)].clone(),
-            ("left", TreeRow::Node(peer) | TreeRow::Session(peer, _, _)) => {
-                self.focused_row = TreeRow::Node(peer.clone());
-                self.set_expanded(peer, false);
-            }
-            ("right", TreeRow::Node(peer)) => self.set_expanded(peer, true),
-            ("enter" | "space", TreeRow::Node(peer)) => {
-                let expanded = self.is_expanded(peer.as_deref());
-                self.set_expanded(peer, !expanded);
-            }
-            ("enter" | "space", TreeRow::Session(peer, name, instance)) => {
-                self.open_focused_session(peer, &name, instance.as_deref());
-            }
-            _ => return,
-        }
-        cx.stop_propagation();
-        cx.notify();
-        window.refresh();
-    }
-
-    fn render_node(
-        &self,
-        peer: Option<String>,
-        text: String,
-        status: &'static str,
-        key: String,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let expanded = self.is_expanded(peer.as_deref());
-        let can_open = expanded || peer.as_deref().map_or(true, |fp| self.peer_current(fp));
-        let row = TreeRow::Node(peer.clone());
-        let focused = self.focused_row == row;
-        let debug = key.clone();
-        div()
-            .id(SharedString::from(key))
-            .debug_selector(move || debug.clone())
-            .flex()
-            .items_center()
-            .gap_2()
-            .min_w_0()
-            .px_2()
-            .py_1()
-            .rounded_sm()
-            .when(focused, |d| d.bg(rgb(0x303a49)))
-            .when(can_open, |d| {
-                d.cursor_pointer().hover(|d| d.bg(rgb(0x2a3340)))
-            })
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(rgb(0x9bb0c6))
-                    .child(if expanded { "▾" } else { "▸" }),
-            )
-            .child(div().flex_1().min_w_0().truncate().child(text))
-            .when(!status.is_empty(), |d| {
-                d.child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(rgb(0xb5beca))
-                        .child(status),
-                )
-            })
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if let Some(focus) = &this.tree_focus {
-                    focus.focus(window);
-                }
-                this.focused_row = row.clone();
-                let expanded = this.is_expanded(peer.as_deref());
-                this.set_expanded(peer.clone(), !expanded);
-                cx.notify();
-            }))
-    }
-
-    fn render_node_sessions(
-        &self,
-        peer: Option<String>,
-        key: &str,
-        rows: &[Session],
-        loading: bool,
-        unavailable: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let focus = self.tree_focus.clone();
-        div()
-            .pl_5()
-            .when(loading || unavailable || rows.is_empty(), |d| {
-                d.child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .text_xs()
-                        .text_color(rgb(0xb5beca))
-                        .child(if loading {
-                            "Loading sessions…"
-                        } else if unavailable && !rows.is_empty() {
-                            "Session list may be stale"
-                        } else if unavailable {
-                            "Sessions unavailable"
-                        } else {
-                            "No sessions"
-                        }),
-                )
-            })
-            .children(rows.iter().cloned().enumerate().map(|(index, session)| {
-                let (status, dot) = if unavailable || session.unavailable {
-                    ("Unavailable", 0xd1a163)
-                } else if session.alive {
-                    ("Running", 0x65d89b)
-                } else {
-                    ("Exited", 0x9ca8b6)
-                };
-                let active = self.selection.as_ref().is_some_and(|selection| {
-                    selection.peer == peer
-                        && selection.name == session.name
-                        && session.instance_id.as_deref() == Some(&selection.instance)
-                });
-                let row = TreeRow::session(peer.clone(), &session);
-                let focused = self.focused_row == row;
-                let name = display_label(&session.name);
-                let peer = peer.clone();
-                let focus = focus.clone();
-                let debug = format!("{key}-{index}");
-                div()
-                    .id(SharedString::from(debug.clone()))
-                    .debug_selector(move || debug.clone())
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .min_w_0()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .hover(|d| d.bg(rgb(0x2a3340)))
-                    .when(active, |d| d.bg(rgb(0x233e57)))
-                    .when(focused, |d| d.border_1().border_color(rgb(0x799ebe)))
-                    .child(div().flex_none().text_xs().text_color(rgb(dot)).child("●"))
-                    .child(div().flex_1().min_w_0().truncate().child(name))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(rgb(0xb5beca))
-                            .child(status),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(focus) = &focus {
-                            focus.focus(window);
-                        }
-                        this.focused_row = row.clone();
-                        this.select_session(peer.clone(), session.clone());
-                        cx.notify();
-                    }))
-            }))
-    }
-}
-
-impl TreeRow {
-    fn session(peer: Option<String>, row: &Session) -> Self {
-        Self::Session(peer, row.name.clone(), row.instance_id.clone())
-    }
-}
-
-fn display_label(value: &str) -> String {
-    let escaped = label(value);
-    escaped[1..escaped.len() - 1].to_owned()
-}
-
-impl Render for LocalGui {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let focus = self
-            .tree_focus
-            .get_or_insert_with(|| cx.focus_handle())
-            .clone();
-        let peer = self
-            .selection
-            .as_ref()
-            .and_then(|selection| selection.peer.as_deref())
-            .and_then(|fp| self.peers.iter().find(|peer| peer.fingerprint == fp));
-        let node = peer.map_or_else(|| "This device".into(), |peer| display_label(&peer.label));
-        let title = self.selection.as_ref().map_or_else(
-            || "Session preview".into(),
-            |selection| format!("{node} / {}", display_label(&selection.name)),
-        );
-        let detail = if let Some(at) = self.preview_received {
-            let status = if self
-                .selection
-                .as_ref()
-                .is_some_and(|selection| !self.selection_current(selection))
-            {
-                "Last read-only snapshot · session not currently verified"
-            } else {
-                "Read-only snapshot"
-            };
-            format!("{status} · received {}s ago", at.elapsed().as_secs())
-        } else if self.selection.is_some() && self.preview.is_none() {
-            "Loading read-only snapshot…".into()
-        } else {
-            "Read-only snapshot".into()
-        };
-        div()
-            .size_full()
-            .flex()
-            .bg(rgb(0x101216))
-            .text_color(rgb(0xe8eaf0))
-            .when(cfg!(target_os = "macos"), |root| root.font_family("Menlo"))
-            .child(
-                div()
-                    .id("session-sidebar")
-                    .w(px(300.))
-                    .flex_none()
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .bg(rgb(0x191d24))
-                    .p_3()
-                    .track_focus(&focus)
-                    .on_key_down(cx.listener(Self::tree_key))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .pb_2()
-                            .child(div().text_lg().child(if self.peers.is_empty() {
-                                "Nodes"
-                            } else {
-                                "Cluster"
-                            }))
-                            .child(
-                                div()
-                                    .id("refresh")
-                                    .debug_selector(|| "refresh".into())
-                                    .px_2()
-                                    .py_1()
-                                    .cursor_pointer()
-                                    .hover(|d| d.bg(rgb(0x2a3340)))
-                                    .child("Refresh")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.refresh();
-                                        this.refresh_nodes();
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .when(self.helper_changed, |d| {
-                        d.child(
-                            div()
-                                .id("helper-changed")
-                                .debug_selector(|| "helper-changed".into())
-                                .child(STALE_HELPER),
-                        )
-                    })
-                    .when(self.nodes_loading || self.nodes_error, |d| {
-                        d.child(div().text_xs().pb_2().child(if self.nodes_loading {
-                            "Loading nodes…"
-                        } else {
-                            "Node list may be stale"
-                        }))
-                    })
-                    .child(
-                        div()
-                            .id("node-tree")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .child(self.render_node(
-                                None,
-                                "This device".into(),
-                                "",
-                                "node-local".into(),
-                                cx,
-                            ))
-                            .when(self.local_expanded, |d| {
-                                d.child(self.render_node_sessions(
-                                    None,
-                                    "session",
-                                    &self.sessions,
-                                    self.loading,
-                                    self.error,
-                                    cx,
-                                ))
-                            })
-                            .children(self.peers.iter().enumerate().map(|(index, peer)| {
-                                let fp = &peer.fingerprint;
-                                let sessions = self.remote_sessions.get(fp);
-                                let status = if !peer.admitted {
-                                    "Revoked"
-                                } else if sessions.is_some_and(|s| s.error) {
-                                    "Unavailable"
-                                } else {
-                                    ""
-                                };
-                                div()
-                                    .child(self.render_node(
-                                        Some(fp.clone()),
-                                        display_label(&peer.label),
-                                        status,
-                                        format!("node-peer-{index}"),
-                                        cx,
-                                    ))
-                                    .when(self.expanded_peers.contains(fp), |d| {
-                                        d.child(self.render_node_sessions(
-                                            Some(fp.clone()),
-                                            &format!("peer-session-{index}"),
-                                            sessions.map(|s| s.rows.as_slice()).unwrap_or_default(),
-                                            sessions.is_some_and(|s| s.loading),
-                                            !self.peer_current(fp)
-                                                || sessions.is_some_and(|s| s.error),
-                                            cx,
-                                        ))
-                                    })
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .p_4()
-                    .child(
-                        div()
-                            .id("preview-title")
-                            .debug_selector(|| "preview-title".into())
-                            .text_lg()
-                            .truncate()
-                            .child(title),
-                    )
-                    .child(div().text_sm().text_color(rgb(0xb5beca)).child(detail))
-                    .when_some(peer, |d, peer| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0xb5beca))
-                                .truncate()
-                                .child(display_label(&peer.fingerprint)),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id("preview")
-                            .debug_selector(|| "preview".into())
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .pt_4()
-                            .font_family(if cfg!(windows) { "Consolas" } else { "Menlo" })
-                            .child(self.preview.clone().unwrap_or_else(|| {
-                                if self.selection.is_some() {
-                                    String::new()
-                                } else {
-                                    "Select a session to view its screen.".into()
-                                }
-                            })),
-                    ),
-            )
-    }
-}
 fn main() {
+    #[cfg(target_os = "macos")]
+    if std::env::args().nth(1).as_deref() == Some("--internal-font-check") {
+        Application::headless().run(|app| {
+            let has_fonts = !app.text_system().all_font_names().is_empty();
+            if !has_fonts {
+                eprintln!("GPUI macOS text backend did not enumerate any fonts");
+            }
+            std::process::exit(i32::from(!has_fonts));
+        });
+        return;
+    }
     #[cfg(any(target_os = "macos", windows))]
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--browser-picker")) {
         tray::pick_browser();
@@ -1149,17 +959,21 @@ fn main() {
             |window, cx| {
                 let focus = cx.focus_handle();
                 focus.focus(window);
+                let window = window.window_handle();
                 cx.new(|cx| {
                     let mut gui = LocalGui::new();
                     gui.tree_focus = Some(focus);
+                    gui.node_status = cluster_status::ClusterStatus::start().ok();
                     gui.refresh();
                     gui.refresh_nodes();
                     cx.spawn(async move |weak, cx| loop {
                         gpui::Timer::after(Duration::from_millis(150)).await;
-                        if weak
-                            .update(cx, |this: &mut LocalGui, cx| {
-                                this.drain();
-                                cx.notify();
+                        if window
+                            .update(cx, |_, window, cx| {
+                                weak.update(cx, |this: &mut LocalGui, cx| {
+                                    this.tick(window);
+                                    cx.notify();
+                                })
                             })
                             .is_err()
                         {
@@ -1395,6 +1209,34 @@ mod tests {
             assert!(gui.remote_sessions["a"].rows.is_empty());
         }
     }
+    #[gpui::test]
+    fn tree_filters_navigation_without_discarding_the_preview(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new();
+            let mut ended = row("test-runner");
+            ended.alive = false;
+            gui.sessions = vec![row("codex-main"), ended];
+            gui.preview = Some("saved screen".into());
+            gui
+        });
+        let find = cx.debug_bounds("tree-find").unwrap();
+        cx.simulate_click(find.center(), gpui::Modifiers::none());
+        cx.simulate_keystrokes("r u n n e r down");
+        assert!(cx.read(|app| {
+            let gui = view.read(app);
+            gui.search.as_deref() == Some("runner")
+                && gui.tree_rows().len() == 2
+                && matches!(&gui.focused_row, TreeRow::Session(_, name, _) if name == "test-runner")
+                && gui.preview.as_deref() == Some("saved screen")
+        }));
+        cx.simulate_keystrokes("escape");
+        let attention = cx.debug_bounds("tree-filter").unwrap();
+        cx.simulate_click(attention.center(), gpui::Modifiers::none());
+        assert!(
+            cx.read(|app| view.read(app).attention_only && view.read(app).tree_rows().len() == 2)
+        );
+    }
+
     #[gpui::test]
     fn peer_branches_fold_independently_and_preserve_the_preview(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, _| {
