@@ -27,6 +27,7 @@ const CAPS: &[&str] = &[
     super::api::WRITER_FENCE,
     super::api::DEEP_HISTORY,
     super::api::COMPACT_VIEW,
+    super::api::VIEW_LINKS,
     super::api::SCREEN_REFRESH,
 ];
 pub(crate) struct Server {
@@ -192,6 +193,7 @@ impl Server {
             latest: None,
             deep: false,
             compact: false,
+            links: false,
         };
         loop {
             let bytes = channel.receive()?;
@@ -260,6 +262,7 @@ struct Connection {
     deep: bool,
     /// ... and wanted its cells as style runs (`ViewportCompact`).
     compact: bool,
+    links: bool,
 }
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -368,6 +371,7 @@ impl Connection {
             | Request::Viewport { .. }
             | Request::ViewportDeep { .. }
             | Request::ViewportCompact { .. }
+            | Request::ViewportLinks { .. }
             | Request::Page { .. }
             | Request::Acknowledge { .. }
             | Request::AcknowledgeViewport { .. }
@@ -552,15 +556,19 @@ impl Connection {
         match request {
             Request::Snapshot => self.begin_snapshot(None),
             Request::Viewport { scrollback } => {
-                (self.deep, self.compact) = (false, false);
+                (self.deep, self.compact, self.links) = (false, false, false);
                 self.begin_snapshot(Some(scrollback))
             }
             Request::ViewportDeep { scrollback } => {
-                (self.deep, self.compact) = (true, false);
+                (self.deep, self.compact, self.links) = (true, false, false);
                 self.begin_snapshot(Some(scrollback))
             }
             Request::ViewportCompact { scrollback } => {
-                (self.deep, self.compact) = (true, true);
+                (self.deep, self.compact, self.links) = (true, true, false);
+                self.begin_snapshot(Some(scrollback))
+            }
+            Request::ViewportLinks { scrollback } => {
+                (self.deep, self.compact, self.links) = (true, true, true);
                 self.begin_snapshot(Some(scrollback))
             }
             Request::Page { snapshot, index } => self.page(snapshot, index),
@@ -681,8 +689,11 @@ impl Connection {
             }
             // Expensive encoding is outside the parser lock, with an in-write cap.
             let bytes = if self.compact {
-                view.encode_compact()
+                view.encode_compact_with_links(self.links)
             } else {
+                for cell in view.cells.iter_mut().flatten() {
+                    cell.hyperlink = None;
+                }
                 view.encode()
             }
             .map_err(|_| "typed_capture_budget_or_bounds")?;

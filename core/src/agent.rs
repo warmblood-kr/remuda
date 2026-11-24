@@ -190,6 +190,8 @@ pub enum Color {
 #[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub struct StyledCell {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperlink: Option<String>,
     pub fg: Color,
     pub bg: Color,
     pub bold: bool,

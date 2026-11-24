@@ -8403,6 +8403,7 @@ mod cluster_call_tests {
 
         let capture = sanitize_peer_response(Response::StyledScreen {
             rows: vec![vec![StyledRun {
+                hyperlink: None,
                 text: "screen\u{1b}]0;peer title\u{7}".into(),
                 fg: Color::default(),
                 bg: Color::default(),

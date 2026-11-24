@@ -79,6 +79,8 @@ struct Session {
     unavailable: bool,
     #[serde(default)]
     decoration: Option<SessionDecoration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    leader: Option<remuda_core::registry::TeamLeader>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +96,7 @@ fn session_rows(
     let view = view.filter(|view| view.validate().is_ok());
     rows.into_iter()
         .map(|row| {
+            let team = row.team.filter(|team| team.validate().is_ok());
             let decoration = row.instance_id.as_ref().and_then(|instance| {
                 let entry = view
                     .as_ref()?
@@ -135,19 +138,17 @@ fn session_rows(
             let decoration = decoration
                 .filter(|value| !value.detail.is_empty() || value.glyph != "●")
                 .or_else(|| {
-                    row.team
-                        .filter(|team| team.validate().is_ok())
-                        .and_then(|team| {
-                            let detail = [team.agent_kind, team.model]
-                                .into_iter()
-                                .flatten()
-                                .collect::<Vec<_>>()
-                                .join(" · ");
-                            (!detail.is_empty()).then(|| SessionDecoration {
-                                glyph: "●".into(),
-                                detail,
-                            })
+                    team.as_ref().and_then(|team| {
+                        let detail = [team.agent_kind.as_deref(), team.model.as_deref()]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        (!detail.is_empty()).then(|| SessionDecoration {
+                            glyph: "●".into(),
+                            detail,
                         })
+                    })
                 });
             Session {
                 name: row.name,
@@ -155,6 +156,7 @@ fn session_rows(
                 alive: row.alive,
                 unavailable: row.unavailable,
                 decoration,
+                leader: team.and_then(|team| team.leader),
             }
         })
         .collect()
@@ -315,7 +317,7 @@ fn label(value: &str) -> String {
     text
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Selection {
     peer: Option<String>,
     name: String,
@@ -356,6 +358,7 @@ struct LocalGui {
     live_notice: Option<&'static str>,
     preview_failed: bool,
     line_input: Option<line_input::LineInput>,
+    line_history: HashMap<Selection, line_input::LineHistory>,
     viewport: terminal_view::Viewport,
     requested_size: Option<remuda_core::agent::Size>,
     next_session_refresh: Instant,
@@ -419,6 +422,7 @@ impl LocalGui {
             live_notice: None,
             preview_failed: false,
             line_input: None,
+            line_history: HashMap::new(),
             viewport: Default::default(),
             requested_size: None,
             next_session_refresh: Instant::now() + Duration::from_secs(5),
@@ -574,9 +578,15 @@ impl LocalGui {
         {
             match live_session::LiveSession::new(selection, compose) {
                 Ok(live) => {
+                    let history = compose.then(|| {
+                        self.line_history
+                            .entry(selection.clone())
+                            .or_default()
+                            .clone()
+                    });
                     self.detach();
                     self.live = Some(live);
-                    self.line_input = compose.then(line_input::LineInput::default);
+                    self.line_input = history.map(line_input::LineInput::with_history);
                     self.live_notice =
                         (!compose).then_some("Direct input enabled · Ctrl+\\ detaches");
                     self.next_live_preview = Instant::now();
@@ -1371,13 +1381,21 @@ mod tests {
             gui.live_focus = Some(focus);
             gui.documents = Some(documents);
             gui.sessions = vec![row("research")];
-            gui.preview = Some("terminal output".into());
+            gui.preview = Some(
+                terminal_view::Screen::from_cells(vec![vec![remuda_core::agent::StyledCell {
+                    text: "terminal output".into(),
+                    hyperlink: Some("remuda:///docs/guide.md".into()),
+                    ..Default::default()
+                }]])
+                .unwrap(),
+            );
             gui
         });
         cx.simulate_resize(gpui::size(px(840.), px(620.)));
         assert!(cx.debug_bounds("local-sessions-tab").is_some());
         assert!(cx.debug_bounds("local-drive-tab").is_some());
         assert!(cx.debug_bounds("session-0").is_some());
+        assert!(cx.debug_bounds("terminal-link-0-0").is_some());
         view.update_in(cx, |gui, window, cx| {
             gui.documents
                 .as_ref()
@@ -1386,12 +1404,16 @@ mod tests {
             cx.notify();
         });
         assert!(cx.debug_bounds("browser-document-body").is_some());
+        cx.simulate_resize(gpui::size(px(1420.), px(720.)));
+        view.update(cx, |_, cx| cx.notify());
+        assert!(cx.debug_bounds("browser-document-body").unwrap().size.width > px(1000.));
+
         let terminal = cx.debug_bounds("local-terminal-tab").unwrap();
         cx.simulate_click(terminal.center(), gpui::Modifiers::none());
         assert!(cx.read(|app| {
             let gui = view.read(app);
             !gui.documents.as_ref().unwrap().read(app).showing_document()
-                && gui.preview.as_ref().unwrap().text == "terminal output"
+                && gui.preview.as_ref().unwrap().text.trim_end() == "terminal output"
         }));
     }
 
@@ -1740,6 +1762,7 @@ mod tests {
             alive: true,
             unavailable: false,
             decoration: None,
+            leader: None,
         }
     }
     #[test]
@@ -1793,6 +1816,43 @@ mod tests {
         );
         cx.simulate_keystrokes("escape");
         assert!(cx.read(|app| view.read(app).line_input.is_none()));
+    }
+
+    #[gpui::test]
+    fn composer_keys_edit_lines_and_restore_draft_after_recalling_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut gui = LocalGui::new();
+            gui.sessions = vec![row("agent")];
+            gui.preview_busy = true;
+            gui.focused_row = TreeRow::session(None, &gui.sessions[0]);
+            let focus = cx.focus_handle();
+            focus.focus(window);
+            gui.tree_focus = Some(focus);
+            gui
+        });
+        cx.simulate_keystrokes("enter");
+        view.update(cx, |gui, cx| {
+            let editor = gui.line_input.as_mut().unwrap();
+            editor.insert("previous input");
+            editor.queued();
+            cx.notify();
+        });
+        cx.simulate_keystrokes("escape enter a b c shift-enter x y z ctrl-a ctrl-f up");
+        // Keep the same column in the first line. Backspace proves the
+        // cursor moved into the draft before Up reaches the history.
+        cx.simulate_keystrokes("backspace ctrl-e ctrl-b up");
+        assert_eq!(
+            cx.read(|app| view.read(app).line_input.as_ref().unwrap().bytes()),
+            b"previous input\r",
+        );
+        // Down restores the original draft and its cursor between b and c.
+        cx.simulate_keystrokes("down ctrl-k");
+        assert_eq!(
+            cx.read(|app| view.read(app).line_input.as_ref().unwrap().bytes()),
+            b"b\nxyz\r",
+        );
     }
 
     #[test]

@@ -23,6 +23,12 @@ remuda drive stat remuda:///notes.md             # version, size, copies
 remuda drive rm remuda:///notes.md               # delete everywhere
 ```
 
+To print a portable link to a Drive document, use
+`remuda browser link remuda:///notes.md "Meeting notes"`. The command emits an
+OSC 8 link on a terminal and includes the address in plain text when redirected.
+Opening a Drive link requires a client that handles Remuda URIs and has read
+access to the document.
+
 ## Exit codes
 
 | Code | Meaning |

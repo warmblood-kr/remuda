@@ -666,6 +666,8 @@ impl Response {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct StyledRun {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperlink: Option<String>,
     pub fg: Color,
     pub bg: Color,
     pub bold: bool,
@@ -710,6 +712,7 @@ pub fn collapse_runs(row: &[StyledCell]) -> Vec<StyledRun> {
                 && r.italic == cell.italic
                 && r.underline == cell.underline
                 && r.inverse == cell.inverse
+                && (r.hyperlink == cell.hyperlink || (r.wide && cell.text.is_empty()))
                 // A wide glyph's empty continuation joins its run, so a
                 // CJK row stays one run, not two per glyph (#589).
                 && (r.wide == cell.wide || (r.wide && cell.text.is_empty()))
@@ -719,6 +722,7 @@ pub fn collapse_runs(row: &[StyledCell]) -> Vec<StyledRun> {
         } else {
             runs.push(StyledRun {
                 text: cell.text.clone(),
+                hyperlink: cell.hyperlink.clone(),
                 fg: cell.fg,
                 bg: cell.bg,
                 bold: cell.bold,
@@ -741,6 +745,7 @@ pub fn expand_runs(runs: &[StyledRun]) -> Vec<StyledCell> {
         .flat_map(|run| {
             run.text.chars().map(move |c| StyledCell {
                 text: c.to_string(),
+                hyperlink: run.hyperlink.clone(),
                 fg: run.fg,
                 bg: run.bg,
                 bold: run.bold,

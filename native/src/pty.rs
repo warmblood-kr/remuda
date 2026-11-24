@@ -902,6 +902,10 @@ pub(crate) fn styled_cells_in(
                     };
                     StyledCell {
                         text,
+                        hyperlink: cell
+                            .and_then(vt100::Cell::hyperlink)
+                            .filter(|uri| crate::terminal_link::Target::parse(uri).is_some())
+                            .map(str::to_owned),
                         wide: cell.is_some_and(|c| c.is_wide()),
                         fg: color(cell.map_or(vt100::Color::Default, |c| c.fgcolor())),
                         bg: color(cell.map_or(vt100::Color::Default, |c| c.bgcolor())),

@@ -22,6 +22,7 @@ pub(crate) const DEEP_HISTORY: &str = "deep-history-v1";
 /// style runs ([`super::viewport::Viewport::encode_compact`]), a few KB
 /// instead of ~130 bytes per cell.
 pub(crate) const COMPACT_VIEW: &str = "compact-view-v1";
+pub(crate) const VIEW_LINKS: &str = "view-links-v1";
 /// AcquireWriter is understood; the host refuses any writer older than one seen.
 pub(crate) const WRITER_FENCE: &str = "writer-fence-v1";
 pub(crate) const SCREEN_REFRESH: &str = "screen-refresh-v1";
@@ -175,6 +176,9 @@ pub(crate) enum Request {
     },
     /// Only sent to a host advertising COMPACT_VIEW; older hosts reject it.
     ViewportCompact {
+        scrollback: u16,
+    },
+    ViewportLinks {
         scrollback: u16,
     },
     AcknowledgeViewport {

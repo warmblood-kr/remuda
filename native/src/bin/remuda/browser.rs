@@ -3,7 +3,7 @@ use std::io::{self, IsTerminal};
 use std::process::{Command, ExitCode};
 
 const USAGE: &str =
-    "Usage: remuda browser [USER@]HOST\n       remuda browser --gui [USER@]HOST\n       remuda browser open-document REQUEST_ID VFS_URI";
+    "Usage: remuda browser [USER@]HOST\n       remuda browser --gui [USER@]HOST\n       remuda browser open-document REQUEST_ID VFS_URI\n       remuda browser link URI [LABEL]";
 
 pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode {
     if matches!(args, ["-h" | "--help" | "help"]) {
@@ -16,6 +16,19 @@ pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode 
         return super::fail(format!(
             "{USAGE}\nLocal --server and --stdin options are unsupported."
         ));
+    }
+    if let ["link", uri] | ["link", uri, _] = args {
+        return match terminal_link(
+            uri,
+            args.get(2).copied().unwrap_or(uri),
+            io::stdout().is_terminal(),
+        ) {
+            Ok(link) => {
+                println!("{link}");
+                ExitCode::SUCCESS
+            }
+            Err(reason) => super::fail(reason),
+        };
     }
     if let ["open-document", request_id, uri] = args {
         return publish_document(request_id, uri);
@@ -147,5 +160,55 @@ mod tests {
         ] {
             assert!(!valid_destination(destination), "{destination:?}");
         }
+    }
+}
+
+// Only portable targets are emitted. In particular, file URLs could refer to
+// a different file when the viewer is on the other end of an SSH connection.
+fn terminal_link(uri: &str, label: &str, interactive: bool) -> Result<String, &'static str> {
+    if label.is_empty() || label.len() > 2048 || label.chars().any(char::is_control) {
+        return Err("Invalid terminal link label");
+    }
+    remuda_native::terminal_link::Target::parse(uri)
+        .ok_or("Terminal links require a Remuda Drive URI or an HTTPS GitHub URL")?;
+
+    if interactive {
+        Ok(format!("\x1b]8;;{uri}\x1b\\{label}\x1b]8;;\x1b\\"))
+    } else if label == uri {
+        Ok(uri.to_owned())
+    } else {
+        Ok(format!("{label} ({uri})"))
+    }
+}
+
+#[cfg(test)]
+mod terminal_link_tests {
+    use super::terminal_link;
+
+    #[test]
+    fn portable_links_emit_framed_osc_only_for_terminals() {
+        let uri = "https://github.com/example/project/pull/42";
+        assert_eq!(
+            terminal_link(uri, "Review", true).unwrap(),
+            "\x1b]8;;https://github.com/example/project/pull/42\x1b\\Review\x1b]8;;\x1b\\"
+        );
+        assert_eq!(
+            terminal_link("remuda://team/docs/guide.md", "Guide", false).unwrap(),
+            "Guide (remuda://team/docs/guide.md)"
+        );
+    }
+
+    #[test]
+    fn unsafe_targets_and_terminal_controls_are_rejected() {
+        for uri in [
+            "file:///tmp/guide.md",
+            "https://github.com.evil.invalid/project",
+            "https://github.com@evil.invalid/project",
+            "remuda:///../guide.md",
+            "remuda:///guide.md\x1b\\",
+        ] {
+            assert!(terminal_link(uri, "Guide", true).is_err(), "{uri:?}");
+        }
+        assert!(terminal_link("remuda:///guide.md", "Guide\x07", true).is_err());
     }
 }

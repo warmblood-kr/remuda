@@ -701,6 +701,7 @@ use remuda_native::net::browser::{
     Client as BrowserClient, DocumentRequest, Operation, Outcome, Reply,
 };
 
+const LIVE_SOURCE_URI: &str = "remuda:///source/live.md";
 const RELAY_DOCUMENT: &str = "remuda:///pilot/design.md";
 const RELAY_SOURCE: &str = "# Isolated design
 ";
@@ -820,6 +821,8 @@ impl BrowserRelayFixture {
                 "route_to": egress.fingerprint(),
             }),
         );
+        let live_source = egress.root.join("live.md");
+        fs::write(&live_source, "live source bytes").unwrap();
         set_browser_policy(
             &mut egress,
             serde_json::json!({
@@ -827,6 +830,7 @@ impl BrowserRelayFixture {
                 "browser": browser_key,
                 "document": RELAY_DOCUMENT,
                 "directory": directory,
+                "source_file": {"uri": LIVE_SOURCE_URI, "path": live_source},
                 "relay_publisher": encoding::encode_base64(&ingress.public),
             }),
         );
@@ -921,6 +925,20 @@ impl BrowserRelayFixture {
             self.sink.read_file(RELAY_DOCUMENT).unwrap(),
             RELAY_SOURCE.as_bytes()
         );
+        assert_eq!(
+            self.sink.read_file(LIVE_SOURCE_URI).unwrap(),
+            b"live source bytes"
+        );
+        fs::write(self.egress.root.join("live.md"), "updated source bytes").unwrap();
+        assert_eq!(
+            self.sink.read_file(LIVE_SOURCE_URI).unwrap(),
+            b"updated source bytes"
+        );
+        assert!(matches!(
+            self.direct.read_file(LIVE_SOURCE_URI),
+            Err(remuda_native::net::browser::DriveReadError::Denied)
+        ));
+        assert!(self.unauthorized.read_file(LIVE_SOURCE_URI).is_err());
     }
 
     fn verify_desktop(&self, gui: &std::ffi::OsStr, args: &[&str]) {

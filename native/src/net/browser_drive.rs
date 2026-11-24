@@ -8,7 +8,11 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use remuda_core::vfs::{validate_path, validate_sha256, VfsUri};
 use serde::{Deserialize, Serialize};
 use std::{
-    fmt, io,
+    fmt,
+    fs::File,
+    io::{self, Read, Seek},
+    path::PathBuf,
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -63,13 +67,110 @@ impl fmt::Display for DriveReadError {
 
 impl std::error::Error for DriveReadError {}
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SourceFile {
+    uri: String,
+    path: PathBuf,
+}
+
+struct SourceGrant {
+    alias: String,
+    file: Mutex<File>,
+}
+
+impl SourceGrant {
+    fn open(source: SourceFile) -> io::Result<Self> {
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid Browser source file");
+        let alias = local_path(&source.uri).ok_or_else(invalid)?;
+        if !source.path.is_absolute() || !std::fs::symlink_metadata(&source.path)?.is_file() {
+            return Err(invalid());
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let file = options.open(source.path)?;
+        if !file.metadata()?.is_file() {
+            return Err(invalid());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+            if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(invalid());
+            }
+        }
+        Ok(Self {
+            alias,
+            file: Mutex::new(file),
+        })
+    }
+
+    fn read_chunk(
+        &self,
+        offset: u64,
+        revision: Option<&str>,
+    ) -> Result<DriveChunk, DriveReadError> {
+        const MAX_SOURCE_BYTES: usize = 1024 * 1024;
+        if offset != 0 && revision.is_none() {
+            return Err(DriveReadError::Unavailable);
+        }
+        let mut file = self.file.lock().map_err(|_| DriveReadError::Unavailable)?;
+        file.rewind().map_err(|_| DriveReadError::Unavailable)?;
+        let mut bytes = Vec::new();
+        (&mut *file)
+            .take((MAX_SOURCE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| DriveReadError::Unavailable)?;
+        if bytes.len() > MAX_SOURCE_BYTES {
+            return Err(DriveReadError::Unavailable);
+        }
+        let current = vfs::sha256_hex(&bytes);
+        if revision.is_some_and(|expected| expected != current) {
+            return Err(DriveReadError::Changed);
+        }
+        let size = bytes.len() as u64;
+        if offset != 0 && offset >= size {
+            return Err(DriveReadError::Unavailable);
+        }
+        let end = (offset + CHUNK_BYTES as u64).min(size);
+        Ok(DriveChunk {
+            revision: current,
+            offset,
+            size,
+            data_b64: STANDARD.encode(&bytes[offset as usize..end as usize]),
+        })
+    }
+}
+
 pub(super) struct DriveGrant {
     document: Option<String>,
     directory: Option<String>,
+    source: Option<SourceGrant>,
 }
 
 impl DriveGrant {
+    #[cfg(test)]
     pub(super) fn new(document: Option<&str>, directory: Option<&str>) -> io::Result<Self> {
+        Self::with_source(document, directory, None)
+    }
+
+    pub(super) fn with_source(
+        document: Option<&str>,
+        directory: Option<&str>,
+        source: Option<SourceFile>,
+    ) -> io::Result<Self> {
         let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid Browser Drive grant");
         let document = document
             .map(|value| local_path(value).ok_or_else(invalid))
@@ -77,18 +178,28 @@ impl DriveGrant {
         let directory = directory
             .map(|value| local_path(value).ok_or_else(invalid))
             .transpose()?;
-        if document.is_none() && directory.is_none() {
+        if document.is_none() && directory.is_none() && source.is_none() {
             return Err(invalid());
         }
         Ok(Self {
             document,
             directory,
+            source: source.map(SourceGrant::open).transpose()?,
         })
+    }
+
+    pub(super) fn is_source(&self, uri: &str) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(|source| local_path(uri).is_some_and(|path| path == source.alias))
     }
 
     pub(super) fn authorizes_document(&self, uri: &str) -> bool {
         local_path(uri).is_some_and(|path| {
-            self.document.as_deref() == Some(&path)
+            self.source
+                .as_ref()
+                .is_some_and(|source| source.alias == path)
+                || self.document.as_deref() == Some(&path)
                 || self
                     .directory
                     .as_deref()
@@ -205,6 +316,11 @@ impl DriveGrant {
         if !self.authorizes_document(uri) {
             return Err(DriveReadError::Denied);
         }
+        if let Some(source) = &self.source {
+            if local_path(uri).is_some_and(|path| path == source.alias) {
+                return source.read_chunk(offset, revision);
+            }
+        }
         let store = VfsStore::open_default().map_err(|_| DriveReadError::Unavailable)?;
         read_store_chunk(&store, uri, offset, revision)
     }
@@ -309,6 +425,7 @@ pub fn list_local_drive(
     DriveGrant {
         document: None,
         directory: None,
+        source: None,
     }
     .list_index(&index, Some(&directory), after)
 }
@@ -445,6 +562,7 @@ mod tests {
         let local = DriveGrant {
             document: None,
             directory: None,
+            source: None,
         };
         let mut index = VfsIndex::default();
         for (path, deleted) in [
@@ -614,4 +732,52 @@ mod tests {
             Err(DriveReadError::InvalidResponse)
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn source_alias_reads_current_file_over_drive_chunks_without_a_store() {
+    let path = std::env::temp_dir().join(format!("remuda-source-grant-{}", std::process::id()));
+    let mut fixture = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(path.clone());
+    let uri = "remuda:///source/guide.md";
+    let body = vec![b'a'; CHUNK_BYTES + 1];
+    use std::io::Write;
+    fixture.write_all(&body).unwrap();
+    let grant = DriveGrant::with_source(
+        None,
+        None,
+        Some(SourceFile {
+            uri: uri.into(),
+            path,
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        grant.read_chunk("remuda:///source/other.md", 0, None),
+        Err(DriveReadError::Denied)
+    );
+    let first = grant.read_chunk(uri, 0, None).unwrap();
+    let second = grant
+        .read_chunk(uri, CHUNK_BYTES as u64, Some(&first.revision))
+        .unwrap();
+    let mut arrived = STANDARD.decode(first.data_b64).unwrap();
+    arrived.extend(STANDARD.decode(second.data_b64).unwrap());
+    assert_eq!(arrived, body);
+    fixture.rewind().unwrap();
+    fixture.write_all(b"b").unwrap();
+    assert_eq!(
+        grant.read_chunk(uri, CHUNK_BYTES as u64, Some(&first.revision)),
+        Err(DriveReadError::Changed)
+    );
 }

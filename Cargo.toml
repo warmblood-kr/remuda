@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["core", "native"]
-exclude = ["vendor/portable-pty"]
+exclude = ["vendor/portable-pty", "vendor/vt100"]
 
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }

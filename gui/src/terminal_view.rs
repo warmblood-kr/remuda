@@ -3,6 +3,8 @@ use remuda_core::agent::{Color, Size, StyledCell};
 use serde::{Deserialize, Serialize};
 use std::{cell::Cell, rc::Rc};
 
+pub(crate) type LinkHandler = Rc<dyn Fn(&str, &mut gpui::Window, &mut gpui::App)>;
+
 const FONT_SIZE: f32 = 13.;
 const LINE_HEIGHT: f32 = 17.;
 const FONT: &str = if cfg!(windows) { "Consolas" } else { "Menlo" };
@@ -54,7 +56,7 @@ impl Screen {
         })
     }
 
-    pub(crate) fn view(&self) -> AnyElement {
+    pub(crate) fn view_with_links(&self, open: Option<LinkHandler>) -> AnyElement {
         let body = div()
             .font_family(FONT)
             .text_size(px(FONT_SIZE))
@@ -66,24 +68,45 @@ impl Screen {
         if self.rows.is_empty() {
             return body.child(self.text.clone()).into_any_element();
         }
-        body.children(self.rows.iter().map(|row| {
+        body.children(self.rows.iter().enumerate().map(|(row_index, row)| {
             div()
                 .flex()
                 .h(px(LINE_HEIGHT))
-                .children(row.iter().map(|run| {
+                .children(row.iter().enumerate().map(|(run_index, run)| {
                     let (fg, bg) = if run.inverse {
                         (color(run.bg, BG), color(run.fg, FG))
                     } else {
                         (color(run.fg, FG), color(run.bg, BG))
                     };
-                    div()
+                    let element = div()
                         .flex_none()
                         .text_color(rgb(fg))
                         .bg(rgb(bg))
                         .when(run.bold, |d| d.font_weight(FontWeight::BOLD))
                         .when(run.italic, |d| d.italic())
                         .when(run.underline, |d| d.underline())
-                        .child(run.text.clone())
+                        .child(run.text.clone());
+                    match (open.as_ref(), run.hyperlink.as_deref()) {
+                        (Some(open), Some(uri))
+                            if remuda_native::terminal_link::Target::parse(uri).is_some() =>
+                        {
+                            let open = open.clone();
+                            let uri = uri.to_owned();
+                            element
+                                .id(gpui::SharedString::from(format!(
+                                    "terminal-link-{row_index}-{run_index}"
+                                )))
+                                .debug_selector(|| format!("terminal-link-{row_index}-{run_index}"))
+                                .cursor_pointer()
+                                .underline()
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    open(&uri, window, cx);
+                                })
+                                .into_any_element()
+                        }
+                        _ => element.into_any_element(),
+                    }
                 }))
         }))
         .into_any_element()

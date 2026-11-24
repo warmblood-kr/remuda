@@ -309,6 +309,7 @@ mod tests {
 
     fn cell(text: &str) -> StyledCell {
         StyledCell {
+            hyperlink: None,
             text: text.into(),
             fg: Color::Default,
             bg: Color::Default,

@@ -81,6 +81,7 @@ struct Policy {
     browser: String,
     document: Option<String>,
     directory: Option<String>,
+    source_file: Option<drive::SourceFile>,
     /// Exact fingerprint of the node serving the user's active Browser.
     route_to: Option<String>,
     /// Static public key of the node allowed to relay this user's opens.
@@ -119,7 +120,11 @@ impl Service {
         let publisher = key(&policy.publisher)?;
         let browser = key(&policy.browser)?;
         let relay_publisher = policy.relay_publisher.as_deref().map(key).transpose()?;
-        let drive = DriveGrant::new(policy.document.as_deref(), policy.directory.as_deref())?;
+        let drive = DriveGrant::with_source(
+            policy.document.as_deref(),
+            policy.directory.as_deref(),
+            policy.source_file,
+        )?;
         let valid_route = policy.route_to.as_deref().is_none_or(|fingerprint| {
             fingerprint.strip_prefix("SHA256:").is_some_and(|digest| {
                 digest.len() == 43
@@ -191,7 +196,10 @@ impl Service {
             return Reply::Denied;
         }
         if let Operation::Read { uri } = &operation {
-            return if peer == self.browser && self.drive.authorizes_document(uri) {
+            return if peer == self.browser
+                && self.drive.authorizes_document(uri)
+                && !self.drive.is_source(uri)
+            {
                 read_document(uri).map_or(Reply::ReadFailed, Reply::Document)
             } else {
                 Reply::Denied

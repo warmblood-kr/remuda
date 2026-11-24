@@ -846,6 +846,7 @@ mod tests {
     fn plain_run(text: &str) -> StyledRun {
         use remuda_core::agent::Color;
         StyledRun {
+            hyperlink: None,
             text: text.to_owned(),
             fg: Color::Default,
             bg: Color::Default,

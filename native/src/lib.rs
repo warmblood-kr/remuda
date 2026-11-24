@@ -59,6 +59,7 @@ pub(crate) mod sqlite_migrate;
 mod staged_socket;
 pub(crate) mod storage;
 pub mod strict_input;
+pub mod terminal_link;
 pub mod text;
 pub mod tick;
 pub mod tui;

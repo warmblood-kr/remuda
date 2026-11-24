@@ -23,19 +23,58 @@ const INLINE_WORK: usize = 8;
 /// Project Markdown source into inert title, text lines and typed local links.
 /// Callers must bound `source`; this parser has no inherent byte cap.
 pub fn parse(path: &str, source: &str) -> Result<Document, String> {
-    project(path, source, None)
+    project(path, source, None, None)
 }
 
 pub fn parse_with_images(path: &str, source: &str) -> Result<(Document, Vec<Image>), String> {
     let mut images = Vec::new();
-    let document = project(path, source, Some(&mut images))?;
+    let document = project(path, source, Some(&mut images), None)?;
     Ok((document, images))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LineStyle {
+    #[default]
+    Body,
+    Heading(usize),
+    Quote,
+    Code,
+}
+
+pub fn parse_styled(
+    path: &str,
+    source: &str,
+) -> Result<(Document, Vec<Image>, Vec<LineStyle>), String> {
+    let mut images = Vec::new();
+    let mut styles = Vec::new();
+    let document = project(path, source, Some(&mut images), Some(&mut styles))?;
+    Ok((document, images, styles))
+}
+
+#[cfg(test)]
+#[test]
+fn styled_projection_preserves_block_roles() {
+    let source = "# Title\n\n## Section\n> Quoted\n```\n  code\n```";
+    let (document, _, styles) = parse_styled("guide.md", source).unwrap();
+    assert_eq!(document.lines.len(), styles.len());
+    assert_eq!(
+        styles,
+        [
+            LineStyle::Heading(1),
+            LineStyle::Body,
+            LineStyle::Heading(2),
+            LineStyle::Quote,
+            LineStyle::Code,
+        ]
+    );
+    assert_eq!(document.lines.last().unwrap(), "  code");
 }
 
 fn project(
     path: &str,
     source: &str,
     mut images: Option<&mut Vec<Image>>,
+    mut styles: Option<&mut Vec<LineStyle>>,
 ) -> Result<Document, String> {
     let definitions = definitions(source);
     let mut document = Document::default();
@@ -46,6 +85,9 @@ fn project(
                 fence = None;
             } else {
                 push(&mut document, line, false)?;
+                if let Some(styles) = &mut styles {
+                    styles.push(LineStyle::Code);
+                }
             }
             continue;
         }
@@ -58,7 +100,28 @@ fn project(
             &mut document,
             images.as_deref_mut(),
         )? {
+            let index = document.lines.len();
             push(&mut document, &projected, true)?;
+            if document.lines.len() > index {
+                if let Some(styles) = &mut styles {
+                    let trimmed = line.trim_start_matches(' ');
+                    let style = if line.len() - trimmed.len() <= 3 {
+                        heading(trimmed).map_or_else(
+                            || {
+                                if trimmed.starts_with('>') {
+                                    LineStyle::Quote
+                                } else {
+                                    LineStyle::Body
+                                }
+                            },
+                            |(level, _)| LineStyle::Heading(level),
+                        )
+                    } else {
+                        LineStyle::Body
+                    };
+                    styles.push(style);
+                }
+            }
         }
     }
     Ok(document)
