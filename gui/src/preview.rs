@@ -3,16 +3,18 @@ use remuda_native::session_preview::{capture, IdentityPolicy, PreviewFrame};
 use std::time::{Duration, Instant};
 
 fn styled(frame: PreviewFrame) -> Result<crate::terminal_view::Screen, String> {
-    crate::terminal_view::Screen::from_cells(frame.cells)
+    let mut screen = crate::terminal_view::Screen::from_cells(frame.cells)?;
+    screen.scrollback_len = frame.scrollback_len;
+    Ok(screen)
 }
 
-fn fetch(s: &Selection) -> Result<crate::terminal_view::Screen, String> {
+fn fetch(s: &Selection, scroll: usize) -> Result<crate::terminal_view::Screen, String> {
     let result = match &s.peer {
         None => capture(
             remuda_native::daemon::socket_path("default").as_path(),
             &s.name,
             Some(&s.instance),
-            0,
+            scroll,
             IdentityPolicy::Strict,
         )
         .and_then(styled),
@@ -28,8 +30,14 @@ fn fetch(s: &Selection) -> Result<crate::terminal_view::Screen, String> {
             let port = remuda_native::tui::RemotePort::system(fp).map_err(|e| e.to_string())?;
             let deadline = Instant::now() + Duration::from_secs(4);
             let text = loop {
-                match capture(&port, &s.name, Some(&s.instance), 0, IdentityPolicy::Strict)
-                    .and_then(styled)
+                match capture(
+                    &port,
+                    &s.name,
+                    Some(&s.instance),
+                    scroll,
+                    IdentityPolicy::Strict,
+                )
+                .and_then(styled)
                 {
                     Ok(text) => break Ok(text),
                     Err(e) if Instant::now() >= deadline => break Err(e),
@@ -46,7 +54,7 @@ fn fetch(s: &Selection) -> Result<crate::terminal_view::Screen, String> {
 }
 
 pub fn worker(args: &[String], abi: Option<&str>) -> i32 {
-    if !matches!(args.len(), 4 | 5) || args[2].is_empty() || args[3].is_empty() {
+    if !matches!(args.len(), 4..=6) || args[2].is_empty() || args[3].is_empty() {
         return 1;
     }
     let peer = match args[0].as_str() {
@@ -64,7 +72,12 @@ pub fn worker(args: &[String], abi: Option<&str>) -> i32 {
         .get(4)
         .filter(|value| !value.is_empty())
         .is_some_and(|value| !resize(&s, value));
-    match fetch(&s) {
+    let scroll = match args.get(5).map(|value| value.parse::<usize>()) {
+        Some(Ok(scroll)) => scroll.min(10_000),
+        None => 0,
+        Some(Err(_)) => return 1,
+    };
+    match fetch(&s, scroll) {
         Ok(mut screen) if abi == Some(super::PREVIEW_ABI) => {
             screen.resize_refused = resize_refused;
             super::write_worker_reply_with_abi(&screen, abi)

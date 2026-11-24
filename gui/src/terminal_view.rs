@@ -14,6 +14,8 @@ pub(crate) struct Screen {
     pub text: String,
     #[serde(default)]
     pub resize_refused: bool,
+    #[serde(default)]
+    pub scrollback_len: usize,
     pub rows: Vec<Vec<remuda_core::protocol::StyledRun>>,
 }
 
@@ -85,6 +87,32 @@ impl Screen {
                 }))
         }))
         .into_any_element()
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct HistoryScroll {
+    pub offset: usize,
+    fraction: f32,
+}
+
+impl HistoryScroll {
+    pub(crate) fn apply(&mut self, delta: gpui::ScrollDelta, limit: usize) -> bool {
+        let whole = self.wheel_lines(delta);
+        self.shift(whole, limit)
+    }
+
+    pub(crate) fn wheel_lines(&mut self, delta: gpui::ScrollDelta) -> isize {
+        let lines = f32::from(delta.pixel_delta(px(LINE_HEIGHT)).y) / LINE_HEIGHT;
+        self.fraction += lines;
+        let whole = self.fraction.trunc() as isize;
+        self.fraction -= whole as f32;
+        whole
+    }
+
+    pub(crate) fn shift(&mut self, whole: isize, limit: usize) -> bool {
+        let next = remuda_native::mouse::scroll_offset(self.offset, whole, limit).min(limit);
+        std::mem::replace(&mut self.offset, next) != next
     }
 }
 

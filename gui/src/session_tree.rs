@@ -184,7 +184,7 @@ impl LocalGui {
                             if peer == &selection.peer && name == &selection.name
                                 && instance == &selection.instance)
                 {
-                    self.attach_input(window, cx, true);
+                    self.open_session_composer(window, cx);
                 }
             }
             ("k", _) if self.search.is_none() => {
@@ -450,6 +450,12 @@ impl LocalGui {
                             }
                             this.focused_row = row.clone();
                             this.select_session(fp.clone(), session.clone());
+                            if matches!((&this.focused_row, &this.selection),
+                                (TreeRow::Session(peer, name, Some(instance)), Some(selected))
+                                    if peer == &selected.peer && name == &selected.name && instance == &selected.instance)
+                            {
+                                this.open_session_composer(window, cx);
+                            }
                             cx.notify();
                         }));
                 }
@@ -574,6 +580,63 @@ impl Render for LocalGui {
         } else {
             tree.w(px(sidebar)).h_full()
         };
+        let docs = self.documents.clone();
+        let workspace_wide = browser::Browser::wide(window);
+        let document_selected = docs
+            .as_ref()
+            .is_some_and(|docs| docs.read(cx).showing_document());
+        let split = workspace_wide
+            && docs
+                .as_ref()
+                .is_some_and(|docs| docs.read(cx).has_document());
+        let drive = if self.drive_selected {
+            docs.as_ref()
+                .map(|docs| docs.update(cx, |docs, cx| docs.drive_listing(cx)))
+        } else {
+            None
+        };
+        let pane_width = if narrow { width } else { width - sidebar - 5. };
+        let document_width = if split { pane_width / 2. } else { pane_width };
+        let document = if split || document_selected {
+            docs.as_ref()
+                .map(|docs| docs.update(cx, |docs, cx| docs.document_panel(document_width, cx)))
+        } else {
+            None
+        };
+        let content_tabs = docs.as_ref().filter(|_| !split).map(|docs| {
+            let unread = docs.read(cx).unseen_document();
+            div()
+                .flex()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .child(
+                    button("local-terminal-tab", "Terminal", !document_selected).on_click(
+                        cx.listener(|this, _, window, cx| {
+                            if let Some(docs) = &this.documents {
+                                docs.update(cx, |docs, _| docs.select_terminal());
+                            }
+                            if let Some(focus) = &this.live_focus {
+                                focus.focus(window);
+                            }
+                            cx.notify();
+                        }),
+                    ),
+                )
+                .child(
+                    button(
+                        "local-document-tab",
+                        if unread { "Document •" } else { "Document" },
+                        document_selected,
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if let Some(docs) = &this.documents {
+                            docs.update(cx, |docs, _| docs.select_document(window));
+                        }
+                        cx.notify();
+                    })),
+                )
+        });
         let entries = self.entries();
         let empty = entries.is_empty();
         let show_help = self.show_help;
@@ -604,163 +667,195 @@ impl Render for LocalGui {
                 }),
             )
             .child(
-                tree.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .pb_2()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .flex()
-                                .gap_2()
-                                .items_center()
-                                .child(div().text_sm().child(if self.peers.is_empty() {
-                                    "Sessions"
-                                } else {
-                                    "Cluster"
-                                }))
-                                .when(!self.peers.is_empty(), |d| {
-                                    d.child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(0x9bb0c6))
-                                            .whitespace_nowrap()
-                                            .child(format!("{connected}/{total} online")),
-                                    )
-                                }),
-                        )
-                        .child(
-                            button("refresh", "Refresh", false)
-                                .debug_selector(|| "refresh".into())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.refresh();
-                                    this.refresh_nodes();
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_1()
-                        .pb_2()
-                        .child(
-                            button("tree-find", "Find /", self.search.is_some()).on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    if this.search.is_some() {
-                                        this.search = None;
-                                    } else {
-                                        this.focus_search(window);
-                                    }
-                                    cx.notify();
-                                }),
+                tree.when(docs.is_some(), |tree| {
+                    tree.child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .pb_2()
+                            .child(
+                                button("local-sessions-tab", "Sessions", !self.drive_selected)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.drive_selected = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                button("local-drive-tab", "Drive", self.drive_selected).on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.drive_selected = true;
+                                        if let Some(docs) = &this.documents {
+                                            docs.update(cx, |docs, _| docs.select_drive());
+                                        }
+                                        cx.notify();
+                                    }),
+                                ),
                             ),
-                        )
-                        .child(button("tree-filter", "Attention !", filtered).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.attention_only = !this.attention_only;
-                                if this.attention_only {
-                                    this.refresh_filter_data();
-                                }
-                                if let Some(focus) = &this.tree_focus {
-                                    focus.focus(window);
-                                }
-                                cx.notify();
-                            }),
-                        ))
-                        .child(
-                            button("tree-help", "Keys ?", show_help).on_click(cx.listener(
-                                |this, _, window, cx| {
-                                    this.show_help = !this.show_help;
+                    )
+                })
+                .when_some(drive, |tree, drive| tree.child(drive))
+                .when(!self.drive_selected, |tree| {
+                    tree.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .pb_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(div().text_sm().child(if self.peers.is_empty() {
+                                        "Sessions"
+                                    } else {
+                                        "Cluster"
+                                    }))
+                                    .when(!self.peers.is_empty(), |d| {
+                                        d.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x9bb0c6))
+                                                .whitespace_nowrap()
+                                                .child(format!("{connected}/{total} online")),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                button("refresh", "Refresh", false)
+                                    .debug_selector(|| "refresh".into())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.refresh();
+                                        this.refresh_nodes();
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_1()
+                            .pb_2()
+                            .child(
+                                button("tree-find", "Find /", self.search.is_some()).on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        if this.search.is_some() {
+                                            this.search = None;
+                                        } else {
+                                            this.focus_search(window);
+                                        }
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(button("tree-filter", "Attention !", filtered).on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.attention_only = !this.attention_only;
+                                    if this.attention_only {
+                                        this.refresh_filter_data();
+                                    }
                                     if let Some(focus) = &this.tree_focus {
                                         focus.focus(window);
                                     }
                                     cx.notify();
-                                },
-                            )),
-                        ),
-                )
-                .when_some(self.search.as_ref(), |d, query| {
-                    d.child(
-                        div()
-                            .id("tree-query")
-                            .debug_selector(|| "tree-query".into())
-                            .pb_2()
-                            .text_sm()
-                            .text_color(rgb(0xadcceb))
-                            .child(if query.is_empty() {
-                                "Type a node or session name…".into()
-                            } else {
-                                format!("Find: {query}")
-                            }),
-                    )
-                })
-                .when(self.helper_changed, |d| {
-                    d.child(
-                        div()
-                            .id("helper-changed")
-                            .debug_selector(|| "helper-changed".into())
-                            .child(STALE_HELPER),
-                    )
-                })
-                .when(self.nodes_loading || self.nodes_error, |d| {
-                    d.child(div().text_xs().pb_1().child(if self.nodes_loading {
-                        "Loading nodes…"
-                    } else {
-                        "Node list may be stale"
-                    }))
-                })
-                .when(show_help, |d| {
-                    d.child(
-                        div()
-                            .id("tree-shortcuts")
-                            .debug_selector(|| "tree-shortcuts".into())
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .text_sm()
-                            .text_color(rgb(0xb5beca))
-                            .children(
-                                [
-                                    "↑ ↓   Move",
-                                    "← →   Fold / unfold",
-                                    "Enter   Compose line / Fold node",
-                                    "K   Direct input",
-                                    "Ctrl+\\   Detach",
-                                    "Esc   Close line input, search, or help",
-                                    "/   Find",
-                                    "!   Attention",
-                                    "?   Keys",
-                                ]
-                                .map(|text| div().py_1().child(text)),
+                                }),
+                            ))
+                            .child(
+                                button("tree-help", "Keys ?", show_help).on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.show_help = !this.show_help;
+                                        if let Some(focus) = &this.tree_focus {
+                                            focus.focus(window);
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
                             ),
                     )
-                })
-                .when(!show_help, |d| {
-                    d.child(
-                        div()
-                            .id("node-tree")
-                            .debug_selector(|| "node-tree".into())
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.tree_scroll)
-                            .children(
-                                entries
-                                    .into_iter()
-                                    .map(|entry| self.render_entry(entry, cx)),
-                            )
-                            .when(empty, |d| {
-                                d.child(
-                                    div().p_2().text_sm().child("No matching sessions or nodes"),
+                    .when_some(self.search.as_ref(), |d, query| {
+                        d.child(
+                            div()
+                                .id("tree-query")
+                                .debug_selector(|| "tree-query".into())
+                                .pb_2()
+                                .text_sm()
+                                .text_color(rgb(0xadcceb))
+                                .child(if query.is_empty() {
+                                    "Type a node or session name…".into()
+                                } else {
+                                    format!("Find: {query}")
+                                }),
+                        )
+                    })
+                    .when(self.helper_changed, |d| {
+                        d.child(
+                            div()
+                                .id("helper-changed")
+                                .debug_selector(|| "helper-changed".into())
+                                .child(STALE_HELPER),
+                        )
+                    })
+                    .when(self.nodes_loading || self.nodes_error, |d| {
+                        d.child(div().text_xs().pb_1().child(if self.nodes_loading {
+                            "Loading nodes…"
+                        } else {
+                            "Node list may be stale"
+                        }))
+                    })
+                    .when(show_help, |d| {
+                        d.child(
+                            div()
+                                .id("tree-shortcuts")
+                                .debug_selector(|| "tree-shortcuts".into())
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .text_sm()
+                                .text_color(rgb(0xb5beca))
+                                .children(
+                                    [
+                                        "↑ ↓   Move",
+                                        "← →   Fold / unfold",
+                                        "Enter   Compose line / Fold node",
+                                        "K   Direct input",
+                                        "Ctrl+\\   Detach",
+                                        "Esc   Close line input, search, or help",
+                                        "/   Find",
+                                        "!   Attention",
+                                        "?   Keys",
+                                    ]
+                                    .map(|text| div().py_1().child(text)),
+                                ),
+                        )
+                    })
+                    .when(!show_help, |d| {
+                        d.child(
+                            div()
+                                .id("node-tree")
+                                .debug_selector(|| "node-tree".into())
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.tree_scroll)
+                                .children(
+                                    entries
+                                        .into_iter()
+                                        .map(|entry| self.render_entry(entry, cx)),
                                 )
-                            }),
-                    )
+                                .when(empty, |d| {
+                                    d.child(
+                                        div()
+                                            .p_2()
+                                            .text_sm()
+                                            .child("No matching sessions or nodes"),
+                                    )
+                                }),
+                        )
+                    })
                 }),
             )
             .when(!narrow, |root| {
@@ -784,105 +879,191 @@ impl Render for LocalGui {
             })
             .child(
                 div()
-                    .id("session-pane")
-                    .debug_selector(|| "session-pane".into())
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
                     .flex()
                     .flex_col()
-                    .p_4()
-                    .child(
-                        div()
-                            .id("preview-title")
-                            .debug_selector(|| "preview-title".into())
-                            .text_lg()
-                            .child(title),
-                    )
-                    .when_some(detail, |d, detail| {
-                        d.child(div().text_sm().text_color(rgb(0xb5beca)).child(detail))
-                    })
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .when_some(content_tabs, |d, tabs| d.child(tabs))
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .py_1()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(
-                                        if self.preview_failed
-                                            || (!current && self.preview_received.is_some())
-                                        {
-                                            0xe7c279
-                                        } else {
-                                            0xb5beca
-                                        },
-                                    ))
-                                    .child(snapshot),
-                            )
-                            .when(live, |d| {
-                                d.child(button("detach-session", "Detach", true).on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.detach();
-                                        if let Some(focus) = &this.tree_focus {
-                                            focus.focus(window);
-                                        }
-                                        cx.notify();
-                                    }),
-                                ))
-                            })
-                            .when(!live && current, |d| {
-                                d.child(button("attach-session", "Compose", true).on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.attach_input(window, cx, true)
-                                    }),
-                                ))
-                            }),
-                    )
-                    .when_some(self.live_notice, |d, notice| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0xadcceb))
-                                .pb_1()
-                                .child(notice),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id("preview")
-                            .debug_selector(|| "preview".into())
                             .flex_1()
                             .min_h_0()
-                            .flex()
-                            .flex_col()
-                            .border_t_1()
-                            .border_color(rgb(if live { 0x799ebe } else { 0x262e3a }))
-                            .track_focus(&input_focus)
-                            .on_key_down(cx.listener(Self::live_key))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .relative()
-                                    .overflow_hidden()
-                                    .child(crate::terminal_view::measure(self.viewport.clone()))
-                                    .child(
-                                        div()
-                                            .id("terminal-cells")
-                                            .size_full()
-                                            .overflow_scroll()
-                                            .when_some(self.preview.as_ref(), |d, screen| {
-                                                d.child(screen.view())
-                                            }),
+                            .min_w_0()
+                            .when(split || !document_selected, |d| {
+                                d.child(
+                                    div()
+                                        .id("session-pane")
+                                        .debug_selector(|| "session-pane".into())
+                                        .flex_1()
+                                        .min_w_0()
+                                        .min_h_0()
+                                        .flex()
+                                        .flex_col()
+                                        .p_4()
+                                        .child(
+                                            div()
+                                                .id("preview-title")
+                                                .debug_selector(|| "preview-title".into())
+                                                .text_lg()
+                                                .child(title),
+                                        )
+                                        .when_some(detail, |d, detail| {
+                                            d.child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(rgb(0xb5beca))
+                                                    .child(detail),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .gap_2()
+                                                .py_1()
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(rgb(
+                                                            if self.preview_failed
+                                                                || (!current
+                                                                    && self
+                                                                        .preview_received
+                                                                        .is_some())
+                                                            {
+                                                                0xe7c279
+                                                            } else {
+                                                                0xb5beca
+                                                            },
+                                                        ))
+                                                        .child(snapshot),
+                                                )
+                                                .when(live, |d| {
+                                                    d.child(
+                                                        button("detach-session", "Detach", true)
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.detach();
+                                                                    if let Some(focus) =
+                                                                        &this.tree_focus
+                                                                    {
+                                                                        focus.focus(window);
+                                                                    }
+                                                                    cx.notify();
+                                                                },
+                                                            )),
+                                                    )
+                                                })
+                                                .when(!live && current, |d| {
+                                                    d.child(
+                                                        button("attach-session", "Compose", true)
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.attach_input(
+                                                                        window, cx, true,
+                                                                    )
+                                                                },
+                                                            )),
+                                                    )
+                                                }),
+                                        )
+                                        .when_some(self.live_notice, |d, notice| {
+                                            d.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0xadcceb))
+                                                    .pb_1()
+                                                    .child(notice),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .id("preview")
+                                                .debug_selector(|| "preview".into())
+                                                .flex_1()
+                                                .min_h_0()
+                                                .flex()
+                                                .flex_col()
+                                                .border_t_1()
+                                                .border_color(rgb(if live {
+                                                    0x799ebe
+                                                } else {
+                                                    0x262e3a
+                                                }))
+                                                .track_focus(&input_focus)
+                                                .on_key_down(cx.listener(Self::live_key))
+                                                .on_scroll_wheel(cx.listener(
+                                                    |this, event, _, cx| {
+                                                        this.scroll_terminal(event, cx)
+                                                    },
+                                                ))
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_h_0()
+                                                        .relative()
+                                                        .overflow_hidden()
+                                                        .child(crate::terminal_view::measure(
+                                                            self.viewport.clone(),
+                                                        ))
+                                                        .child(
+                                                            div()
+                                                                .id("terminal-cells")
+                                                                .on_click(cx.listener(
+                                                                    |this, _, window, _| {
+                                                                        if let Some(focus) =
+                                                                            &this.live_focus
+                                                                        {
+                                                                            focus.focus(window);
+                                                                        }
+                                                                    },
+                                                                ))
+                                                                .size_full()
+                                                                .overflow_scroll()
+                                                                .when_some(
+                                                                    self.preview.as_ref(),
+                                                                    |d, screen| {
+                                                                        d.child(screen.view())
+                                                                    },
+                                                                ),
+                                                        ),
+                                                )
+                                                .when_some(
+                                                    self.line_input.as_ref(),
+                                                    |d, editor| {
+                                                        let view = cx.entity();
+                                                        let focus = input_focus.clone();
+                                                        d.child(
+                                    div().id("composer-focus-target").relative()
+                                                        .child(editor.view(input_focus.is_focused(window)))
+                                                        .on_click(cx.listener(|this, _, window, cx| {
+                                                            if let Some(focus) = &this.live_focus { focus.focus(window); }
+                                                            cx.notify();
+                                                        }))
+                                                        .child(
+                                        gpui::canvas(
+                                            |_, _, _| (),
+                                            move |bounds, _, window, app| {
+                                                window.handle_input(
+                                                    &focus,
+                                                    gpui::ElementInputHandler::new(bounds, view),
+                                                    app,
+                                                );
+                                            },
+                                        )
+                                        .absolute()
+                                        .size_full(),
                                     ),
-                            )
-                            .when_some(self.line_input.as_ref(), |d, editor| {
-                                d.child(editor.view())
-                            }),
+                                )
+                                                    },
+                                                ),
+                                        ),
+                                )
+                            })
+                            .when_some(document, |d, doc| d.child(doc)),
                     ),
             )
     }

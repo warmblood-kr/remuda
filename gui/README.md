@@ -40,6 +40,11 @@ tree. Offline peers retain their last known screen and show its age.
 
 ## Browser Drive and document opens
 
+The **Open Remuda** window also has **Sessions** and **Drive** in its sidebar.
+It uses the same document pane and presentation receipts as Browser.
+Without a Browser credential, its Drive uses the local account’s VFS access.
+With a credential, Drive and document delivery use that configured route.
+
 `remuda browser --gui HOST` keeps the remote terminal connected over SSH.
 Choose **Drive** in the sidebar to browse authorized folders and open a file.
 The session navigation supplied by the remote terminal stays available in the
