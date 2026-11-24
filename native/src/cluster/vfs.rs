@@ -531,6 +531,10 @@ impl VfsStore {
         ))
     }
 
+    pub(crate) fn live_entry(&self, path: &str) -> VfsResult<Option<VfsEntry>> {
+        Ok(vfs_index_db::get(&self.index_db()?, path)?.filter(|entry| !entry.deleted))
+    }
+
     pub fn load_index(&self) -> VfsResult<VfsIndex> {
         vfs_index_db::load(&self.index_db()?)
     }

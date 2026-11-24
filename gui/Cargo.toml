@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 gpui = { version = "=0.2.2", default-features = false }
 libc = "0.2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+png = "0.18"
+smallvec = "1"
 remuda-core = { path = "../core" }
 remuda-native = { path = "../native" }
 serde = { version = "1", features = ["derive"] }

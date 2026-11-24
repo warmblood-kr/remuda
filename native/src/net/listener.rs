@@ -1446,28 +1446,25 @@ fn handle_connection_with(stream: TcpStream, context: ConnectionHandlerContext) 
             b"request capacity reached",
         ));
     }
-    let browser_authenticated = !admitted
-        && state
-            .browser
-            .as_ref()
-            .is_some_and(|service| service.authenticates(&opened.payload, &opened.peer_static));
+    let browser = state
+        .browser
+        .as_ref()
+        .filter(|service| service.authenticates(&opened.payload, &opened.peer_static, admitted));
     if let Err((status, body)) = check_request_replay(
         &state,
         remote_addr,
-        admitted || browser_authenticated,
+        admitted || browser.is_some(),
         &peer_fp,
         &opened,
     ) {
         return ignore_response_error(write_http_response(stream, status, body));
     }
+    if let Some(reply) =
+        browser.and_then(|service| service.dispatch(&opened.payload, &opened.peer_static, admitted))
+    {
+        return send_encrypted_response(stream, opened, &reply);
+    }
     if !admitted {
-        if let Some(reply) = state
-            .browser
-            .as_ref()
-            .and_then(|browser| browser.dispatch(&opened.payload, &opened.peer_static))
-        {
-            return send_encrypted_response(stream, opened, &reply);
-        }
         return handle_unadmitted_peer(stream, state, opened, &peer_fp);
     }
     handle_admitted_request(

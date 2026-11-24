@@ -617,6 +617,444 @@ fn admit_pair(left: &Node, right: &Node) {
     }
 }
 
+fn prove_native_browser_receipt(
+    gui: &std::ffi::OsStr,
+    args: &[&str],
+    fixture: &Path,
+    credential: &Path,
+    documents: &[(&str, &str)],
+    publish: impl Fn(&str, &str) -> (bool, String),
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct BrowserProcess(Child);
+    impl Drop for BrowserProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let runtime = fixture.join("runtime");
+    let home = fixture.join("home");
+    let state = fixture.join("state");
+    let shim = fixture.join("bin");
+    fs::create_dir_all(&runtime).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&shim).unwrap();
+    let ssh = shim.join("ssh");
+    fs::write(
+        &ssh,
+        "#!/bin/sh\nprintf 'ISOLATED_BROWSER_TERMINAL\\n'\nwhile IFS= read -r line; do printf '%s\\n' \"$line\"; done\n",
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    let log = fixture.join("browser.log");
+    let path =
+        std::env::join_paths([shim, PathBuf::from("/usr/bin"), PathBuf::from("/bin")]).unwrap();
+    let mut process = BrowserProcess(
+        Command::new(gui)
+            .args(args)
+            .env_clear()
+            .env("PATH", path)
+            .env("HOME", &home)
+            .env("USER", "isolated-fixture")
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_CONFIG_HOME", fixture.join("config"))
+            .env("XDG_DATA_HOME", fixture.join("data"))
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("REMUDA_RUNTIME_DIR", &runtime)
+            .env("REMUDA_BROWSER_CLIENT", credential)
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    eprintln!("isolated native Browser pid={}", process.0.id());
+    for &(id, uri) in documents {
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            let started = Instant::now();
+            let (success, status) = publish(id, uri);
+            eprintln!("native Browser {uri}: {status} ({:?})", started.elapsed());
+            if success {
+                assert_eq!(status, "displayed");
+                break;
+            }
+            let exited = process.0.try_wait().unwrap();
+            assert!(
+                status == "no_active_browser" && Instant::now() < deadline && exited.is_none(),
+                "native Browser failed for {uri}: delivery={status}, process={exited:?}, log={}",
+                fs::read_to_string(&log).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(publish(id, uri), (true, "displayed".into()));
+    }
+    assert!(process.0.try_wait().unwrap().is_none());
+    assert!(!remuda_native::daemon::socket_path_in(&runtime, "default").exists());
+    assert!(!state.join("remuda/cluster").exists());
+}
+
+use remuda_native::net::browser::{
+    Client as BrowserClient, DocumentRequest, Operation, Outcome, Reply,
+};
+
+const RELAY_DOCUMENT: &str = "remuda:///pilot/design.md";
+const RELAY_SOURCE: &str = "# Isolated design
+";
+
+fn browser_test_key() -> snow::Keypair {
+    let params = "Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap();
+    snow::Builder::new(params).generate_keypair().unwrap()
+}
+
+fn set_browser_policy(node: &mut Node, policy: serde_json::Value) {
+    let path = node.root.join("browser-policy.json");
+    fs::write(&path, serde_json::to_vec(&policy).unwrap()).unwrap();
+    node.env.push((
+        "REMUDA_BROWSER_POLICY".into(),
+        path.to_str().unwrap().into(),
+    ));
+    node.restart_daemon();
+}
+
+fn browser_test_client(
+    directory: &Path,
+    filename: &str,
+    endpoint: SocketAddr,
+    server: &[u8],
+    private: &[u8],
+) -> BrowserClient {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = directory.join(filename);
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    serde_json::to_writer(
+        file,
+        &serde_json::json!({
+            "endpoint": endpoint,
+            "server": encoding::encode_base64(server),
+            "private": encoding::encode_base64(private),
+        }),
+    )
+    .unwrap();
+    BrowserClient::from_file(&path).unwrap()
+}
+
+fn register_endpoint(node: &Node, peer: &Node, endpoint: SocketAddr) {
+    let path = node.state.join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == peer.fingerprint())
+        .unwrap()
+        .endpoint = Some(endpoint.to_string());
+    fs::write(&path, serde_json::to_vec(&registry).unwrap()).unwrap();
+}
+
+fn put_fixture_doc(node: &Node, source: &Path, uri: &str, replicated: bool) {
+    let mut command = node.command();
+    command.args(["vfs", "put"]).arg(source).arg(uri);
+    command.args(["--replicas", if replicated { "2" } else { "1" }]);
+    if replicated {
+        command.arg("--wait");
+    }
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "put {uri}: {output:?}");
+}
+
+struct BrowserRelayFixture {
+    ingress: Node,
+    egress: Node,
+    author: BrowserClient,
+    sink: BrowserClient,
+    unauthorized: BrowserClient,
+    direct: BrowserClient,
+}
+
+fn relay_publish_request(id: &str, uri: &str) -> Operation {
+    Operation::Publish {
+        request: DocumentRequest {
+            id: id.into(),
+            uri: uri.into(),
+        },
+    }
+}
+
+fn relay_poll() -> Operation {
+    Operation::Poll {
+        instance: "desktop".into(),
+    }
+}
+
+impl BrowserRelayFixture {
+    fn new(desktop: bool) -> Self {
+        let mut ingress = Node::start_with_binary_env_named(
+            "browser-ingress",
+            PathBuf::from(env!("CARGO_BIN_EXE_remuda")),
+            Vec::new(),
+            Some("default"),
+        );
+        let mut egress = Node::start("browser-egress");
+        admit_pair(&ingress, &egress);
+        let publisher = browser_test_key();
+        let browser = browser_test_key();
+        let pubkey = encoding::encode_base64(&publisher.public);
+        let browser_key = encoding::encode_base64(&browser.public);
+        let directory = desktop.then_some("remuda:///pilot");
+        set_browser_policy(
+            &mut ingress,
+            serde_json::json!({
+                "publisher": pubkey,
+                "browser": browser_key,
+                "document": RELAY_DOCUMENT,
+                "directory": directory,
+                "route_to": egress.fingerprint(),
+            }),
+        );
+        set_browser_policy(
+            &mut egress,
+            serde_json::json!({
+                "publisher": pubkey,
+                "browser": browser_key,
+                "document": RELAY_DOCUMENT,
+                "directory": directory,
+                "relay_publisher": encoding::encode_base64(&ingress.public),
+            }),
+        );
+        let sink_listener = Listener::start(&egress);
+        register_endpoint(&ingress, &egress, sink_listener.address);
+        let publisher_listener = Listener::start(&ingress);
+        register_endpoint(&egress, &ingress, publisher_listener.address);
+        assert_ne!(publisher_listener.address, sink_listener.address);
+
+        let source = ingress.root.join("design.md");
+        fs::write(&source, RELAY_SOURCE).unwrap();
+        put_fixture_doc(&ingress, &source, RELAY_DOCUMENT, true);
+
+        let author = browser_test_client(
+            &ingress.root,
+            "publisher.key",
+            publisher_listener.address,
+            &ingress.public,
+            &publisher.private,
+        );
+        // The Browser client has no node identity or local daemon dependency.
+        let sink = browser_test_client(
+            &ingress.root,
+            "browser.key",
+            sink_listener.address,
+            &egress.public,
+            &browser.private,
+        );
+        let unauthorized = browser_test_client(
+            &ingress.root,
+            "outside.key",
+            sink_listener.address,
+            &egress.public,
+            &browser_test_key().private,
+        );
+        let direct = browser_test_client(
+            &ingress.root,
+            "direct.key",
+            sink_listener.address,
+            &egress.public,
+            &publisher.private,
+        );
+        Self {
+            ingress,
+            egress,
+            author,
+            sink,
+            unauthorized,
+            direct,
+        }
+    }
+
+    fn publish(&self, id: &str, uri: &str) -> (bool, String) {
+        let output = self
+            .ingress
+            .command()
+            .env(
+                "REMUDA_BROWSER_CLIENT",
+                self.ingress.root.join("publisher.key"),
+            )
+            .args(["browser", "open-document", id, uri])
+            .output()
+            .unwrap();
+        let reply: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|_| panic!("unexpected open-document reply: {output:?}"));
+        (
+            output.status.success(),
+            reply["status"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    fn verify_access(&self) {
+        assert!(matches!(
+            self.direct
+                .send(&relay_publish_request("isolated-design", RELAY_DOCUMENT)),
+            Ok(Reply::Denied)
+        ));
+        assert!(self.unauthorized.send(&relay_poll()).is_err());
+        assert_eq!(
+            self.publish("isolated-design", RELAY_DOCUMENT),
+            (false, "no_active_browser".into())
+        );
+        assert!(matches!(
+            self.direct.send(&Operation::List { directory: None }),
+            Ok(Reply::Denied)
+        ));
+        assert!(matches!(
+            self.sink.send(&Operation::List { directory: None }),
+            Ok(Reply::Directory(list)) if list.entries.len() == 1 && list.entries[0].uri == RELAY_DOCUMENT
+        ));
+        assert_eq!(
+            self.sink.read_file(RELAY_DOCUMENT).unwrap(),
+            RELAY_SOURCE.as_bytes()
+        );
+    }
+
+    fn verify_desktop(&self, gui: &std::ffi::OsStr, args: &[&str]) {
+        let html = "remuda:///pilot/design.html";
+        let html_source = self.egress.root.join("design.html");
+        fs::write(
+            &html_source,
+            format!(
+                "<title>Isolated HTML design</title><h1>Design rendered in the native reader</h1><!--{}-->",
+                " ".repeat(70 * 1024)
+            ),
+        )
+        .unwrap();
+        put_fixture_doc(&self.egress, &html_source, html, false);
+        let mut documents = vec![("isolated-design", RELAY_DOCUMENT), ("isolated-html", html)];
+        if let Some(image) = std::env::var_os("REMUDA_GUI_DOCUMENT_ACCEPTANCE_IMAGE") {
+            let image_uri = "remuda:///pilot/large.png";
+            put_fixture_doc(&self.egress, Path::new(&image), image_uri, false);
+            documents.push(("isolated-image", image_uri));
+        }
+        prove_native_browser_receipt(
+            gui,
+            args,
+            &self.ingress.root.join("desktop"),
+            &self.ingress.root.join("browser.key"),
+            &documents,
+            |id, uri| self.publish(id, uri),
+        );
+    }
+
+    fn verify_transport(&self) {
+        let request = DocumentRequest {
+            id: "isolated-design".into(),
+            uri: RELAY_DOCUMENT.into(),
+        };
+        let publish = relay_publish_request(&request.id, &request.uri);
+        let poll = relay_poll();
+        assert!(matches!(self.sink.send(&poll), Ok(Reply::Event(None))));
+        assert!(matches!(
+            self.author.send(&publish),
+            Ok(Reply::Outcome(Outcome::Pending))
+        ));
+        let received = self.sink.send(&poll);
+        assert!(matches!(received, Ok(Reply::Event(Some(event))) if event == request));
+        assert!(matches!(
+            self.sink.send(&Operation::Read { uri: request.uri.clone() }),
+            Ok(Reply::Document(source)) if source == RELAY_SOURCE
+        ));
+        assert!(matches!(
+            self.sink.send(&Operation::Read {
+                uri: "remuda:///private/another.md".into(),
+            }),
+            Ok(Reply::Denied)
+        ));
+        assert!(matches!(
+            self.author.send(&publish),
+            Ok(Reply::Outcome(Outcome::Pending))
+        ));
+        assert!(matches!(
+            self.sink.send(&Operation::Finish {
+                instance: "desktop".into(),
+                request,
+                outcome: Outcome::Displayed,
+            }),
+            Ok(Reply::Accepted)
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                self.author.send(&publish),
+                Ok(Reply::Outcome(Outcome::Displayed))
+            ));
+            assert!(matches!(self.sink.send(&poll), Ok(Reply::Event(None))));
+        }
+        assert_eq!(
+            self.publish("isolated-design", RELAY_DOCUMENT),
+            (true, "displayed".into())
+        );
+    }
+
+    fn verify_revocation(&self) {
+        // The configured relay key alone must never outlive cluster membership.
+        let registry_path = self
+            .egress
+            .state
+            .join("remuda/cluster/authorized_nodes.json");
+        let mut registry: Registry =
+            serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+        registry
+            .authorized_nodes
+            .iter_mut()
+            .find(|entry| entry.node_fp == self.ingress.fingerprint())
+            .unwrap()
+            .state = NodeState::Revoked;
+        fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+        assert!(matches!(
+            self.author.send(&Operation::Publish {
+                request: DocumentRequest {
+                    id: "revoked-relay".into(),
+                    uri: RELAY_DOCUMENT.into(),
+                },
+            }),
+            Ok(Reply::Outcome(Outcome::Unknown))
+        ));
+        assert!(matches!(
+            self.sink.send(&relay_poll()),
+            Ok(Reply::Event(None))
+        ));
+    }
+}
+
+#[test]
+fn browser_open_crosses_distinct_admitted_listeners_and_returns_receipt() {
+    let harness = std::env::var_os("REMUDA_GUI_DOCUMENT_ACCEPTANCE_TEST_BIN");
+    let gui = std::env::var_os("REMUDA_GUI_DOCUMENT_ACCEPTANCE_BIN");
+    let fixture = BrowserRelayFixture::new(gui.is_some() || harness.is_some());
+    fixture.verify_access();
+    if let Some(harness) = harness {
+        fixture.verify_desktop(
+            &harness,
+            &[
+                "--ignored",
+                "--exact",
+                "browser::tests::daemonless_receipt_acceptance",
+                "--nocapture",
+            ],
+        );
+    } else if let Some(gui) = gui {
+        fixture.verify_desktop(&gui, &["--browser", "isolated-fixture"]);
+    } else {
+        fixture.verify_transport();
+        fixture.verify_revocation();
+    }
+}
+
 fn proof_session(
     source: &dyn RemoteSource,
 ) -> Option<remuda_native::cluster_remote::RemoteSessionSnapshot> {

@@ -81,7 +81,9 @@ fn launch_gui(_: &str) -> ExitCode {
 }
 
 fn publish_document(id: &str, uri: &str) -> ExitCode {
-    use remuda_native::net::browser::{Client, DocumentRequest, Operation, Outcome, Reply};
+    use remuda_native::net::browser::{
+        Client, DocumentRequest, Operation, Outcome, Reply, DELIVERY_TTL,
+    };
     use std::time::{Duration, Instant};
 
     let client = match Client::from_env() {
@@ -97,7 +99,7 @@ fn publish_document(id: &str, uri: &str) -> ExitCode {
             uri: uri.into(),
         },
     };
-    let deadline = Instant::now() + Duration::from_secs(17);
+    let deadline = Instant::now() + DELIVERY_TTL + Duration::from_secs(2);
     let result = loop {
         match client.send(&operation) {
             Ok(Reply::Outcome(Outcome::Pending)) if Instant::now() < deadline => {

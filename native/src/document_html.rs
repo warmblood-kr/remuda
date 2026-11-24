@@ -7,6 +7,7 @@ use scraper::{Html, Node};
 pub const MAX_HTML_BYTES: usize = 128 * 1024;
 const MAX_NODES: usize = 20_000;
 const MAX_LINKS: usize = 128;
+pub(crate) const MAX_IMAGES: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Link {
@@ -21,9 +22,33 @@ pub struct Document {
     pub links: Vec<Link>,
 }
 
+/// Image reference in the inert projection. UI callers may fetch only
+/// authorized VFS targets and decide when to load or render the image.
+#[derive(Clone, Debug)]
+pub struct Image {
+    pub label: String,
+    pub target: Target,
+    /// Paragraph position in the corresponding projected line list.
+    pub line: usize,
+}
+
 /// Parse HTML5 into inert title, text blocks and typed local links.
 /// This projection executes no scripts, CSS, forms or resource loads.
 pub fn parse(path: &str, source: &str) -> Result<Document, String> {
+    project(path, source, None)
+}
+
+pub fn parse_with_images(path: &str, source: &str) -> Result<(Document, Vec<Image>), String> {
+    let mut images = Vec::new();
+    let document = project(path, source, Some(&mut images))?;
+    Ok((document, images))
+}
+
+fn project(
+    path: &str,
+    source: &str,
+    mut images: Option<&mut Vec<Image>>,
+) -> Result<Document, String> {
     if source.len() > MAX_HTML_BYTES {
         return Err("HTML exceeds the 128 KiB limit".into());
     }
@@ -60,6 +85,21 @@ pub fn parse(path: &str, source: &str) -> Result<Document, String> {
                 if name == "title" {
                     in_title = true;
                 }
+                if name == "img" {
+                    if let (Some(images), Some(src)) = (images.as_deref_mut(), element.attr("src"))
+                    {
+                        if images.len() < MAX_IMAGES {
+                            images.push(Image {
+                                label: clean(element.attr("alt").unwrap_or("Image"))
+                                    .chars()
+                                    .take(512)
+                                    .collect(),
+                                target: resolve(path, src),
+                                line: result.lines.len(),
+                            });
+                        }
+                    }
+                }
                 let mut link = None;
                 if name == "a" {
                     if let Some(href) = element.attr("href") {
@@ -94,6 +134,11 @@ pub fn parse(path: &str, source: &str) -> Result<Document, String> {
         }
     }
     flush(&mut result, &mut text)?;
+    finalize(&mut result, images);
+    Ok(result)
+}
+
+fn finalize(result: &mut Document, images: Option<&mut Vec<Image>>) {
     result.title = clean(&result.title).chars().take(512).collect();
     for link in &mut result.links {
         link.label = clean(&link.label).chars().take(512).collect();
@@ -104,8 +149,12 @@ pub fn parse(path: &str, source: &str) -> Result<Document, String> {
     if !result.title.is_empty() {
         result.lines.insert(0, String::new());
         result.lines.insert(0, result.title.clone());
+        if let Some(images) = images {
+            for image in images {
+                image.line += 2;
+            }
+        }
     }
-    Ok(result)
 }
 
 fn close(
