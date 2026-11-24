@@ -260,7 +260,30 @@ fn tray_command(args: &[&str]) -> ExitCode {
         if let Err(error) = ensure_daemon("default", &daemon::socket_path("default")) {
             return fail(error);
         }
-        match std::process::Command::new(gui).arg("--tray").spawn() {
+        use std::process::{Command, Stdio};
+        let mut command = Command::new(gui);
+        command
+            .arg("--tray")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: The child only calls the async-signal-safe setsid before exec.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        }
+        #[cfg(windows)]
+        daemon::own_console(&mut command);
+        match command.spawn() {
             Ok(_) => ExitCode::SUCCESS,
             Err(error) => fail(format!("cannot start Remuda tray: {error}")),
         }
