@@ -3,7 +3,11 @@ use gpui::{
     WindowBounds, WindowOptions,
 };
 use serde::{Deserialize, Serialize};
-use std::{sync::mpsc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
 mod browser;
 #[allow(dead_code)]
@@ -211,7 +215,26 @@ type PreviewResult = (u64, Selection, Result<String, String>);
 
 type RemoteResult = (u64, u64, String, Result<Vec<Session>, String>);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TreeRow {
+    Node(Option<String>),
+    Session(Option<String>, String, Option<String>),
+}
+
+#[derive(Default)]
+struct PeerSessions {
+    rows: Vec<Session>,
+    loading: bool,
+    error: bool,
+    generation: u64,
+}
+
 struct LocalGui {
+    tree_focus: Option<gpui::FocusHandle>,
+    focused_row: TreeRow,
+    local_expanded: bool,
+    expanded_peers: std::collections::HashSet<String>,
+    preview_received: Option<Instant>,
     helper_changed: bool,
     selection: Option<Selection>,
     preview: Option<String>,
@@ -229,7 +252,6 @@ struct LocalGui {
     sender: mpsc::Sender<(u64, Result<Vec<Session>, String>)>,
     results: mpsc::Receiver<(u64, Result<Vec<Session>, String>)>,
     peers: Vec<Peer>,
-    selected_peer: Option<String>,
     nodes_loading: bool,
     nodes_error: bool,
     nodes_generation: u64,
@@ -237,12 +259,10 @@ struct LocalGui {
     nodes_pending: bool,
     nodes_sender: mpsc::Sender<(u64, Result<Vec<Peer>, String>)>,
     nodes_results: mpsc::Receiver<(u64, Result<Vec<Peer>, String>)>,
-    remote_sessions: Vec<Session>,
-    remote_error: bool,
-    remote_loading: bool,
+    remote_sessions: HashMap<String, PeerSessions>,
     remote_generation: u64,
     remote_busy: bool,
-    remote_pending: Option<(u64, u64, String)>,
+    remote_pending: VecDeque<(u64, u64, String)>,
     remote_sender: mpsc::Sender<RemoteResult>,
     remote_results: mpsc::Receiver<RemoteResult>,
 }
@@ -253,6 +273,11 @@ impl LocalGui {
         let (nodes_sender, nodes_results) = mpsc::channel();
         let (remote_sender, remote_results) = mpsc::channel();
         Self {
+            tree_focus: None,
+            focused_row: TreeRow::Node(None),
+            local_expanded: true,
+            expanded_peers: Default::default(),
+            preview_received: None,
             helper_changed: false,
             selection: None,
             preview: None,
@@ -270,7 +295,6 @@ impl LocalGui {
             sender,
             results,
             peers: vec![],
-            selected_peer: None,
             nodes_loading: false,
             nodes_error: false,
             nodes_generation: 0,
@@ -278,12 +302,10 @@ impl LocalGui {
             nodes_pending: false,
             nodes_sender,
             nodes_results,
-            remote_sessions: vec![],
-            remote_error: false,
-            remote_loading: false,
+            remote_sessions: HashMap::new(),
             remote_generation: 0,
             remote_busy: false,
-            remote_pending: None,
+            remote_pending: VecDeque::new(),
             remote_sender,
             remote_results,
         }
@@ -295,17 +317,18 @@ impl LocalGui {
             .expect("generation exhausted");
         self.selection = None;
         self.preview = None;
+        self.preview_received = None;
         self.preview_pending = None;
     }
     fn selection_current(&self, s: &Selection) -> bool {
-        if s.peer != self.selected_peer {
-            return false;
-        }
         let rows = if let Some(fp) = &s.peer {
-            if !self.peer_current(fp) || self.remote_loading || self.remote_error {
+            let Some(sessions) = self.remote_sessions.get(fp) else {
+                return false;
+            };
+            if !self.peer_current(fp) || sessions.loading || sessions.error {
                 return false;
             }
-            &self.remote_sessions
+            &sessions.rows
         } else {
             if self.loading || self.error {
                 return false;
@@ -319,13 +342,13 @@ impl LocalGui {
             && !s.instance.is_empty()
             && matching[0].instance_id.as_deref() == Some(s.instance.as_str())
     }
-    fn select_session(&mut self, row: Session) {
+    fn select_session(&mut self, peer: Option<String>, row: Session) {
         self.clear_preview();
         let Some(instance) = row.instance_id else {
             return;
         };
         let s = Selection {
-            peer: self.selected_peer.clone(),
+            peer,
             name: row.name,
             instance,
         };
@@ -384,7 +407,11 @@ impl LocalGui {
     }
     fn refresh_nodes(&mut self) {
         self.clear_preview();
-        self.invalidate_remote();
+        self.remote_pending.clear();
+        for sessions in self.remote_sessions.values_mut() {
+            sessions.loading = false;
+            sessions.error = true;
+        }
         self.nodes_generation = self
             .nodes_generation
             .checked_add(1)
@@ -418,57 +445,51 @@ impl LocalGui {
     fn peer_current(&self, fingerprint: &str) -> bool {
         !self.nodes_loading && !self.nodes_error && peer_is_unique(&self.peers, fingerprint)
     }
-    fn select_peer(&mut self, fingerprint: String) {
-        if self.peer_current(&fingerprint) {
-            if self.selected_peer.as_ref() != Some(&fingerprint) {
-                self.remote_sessions.clear();
+    fn set_expanded(&mut self, peer: Option<String>, expanded: bool) {
+        match peer {
+            None => self.local_expanded = expanded,
+            Some(fp) if expanded && self.peer_current(&fp) => {
+                if self.expanded_peers.insert(fp.clone()) {
+                    self.refresh_peer(fp);
+                }
             }
-            self.selected_peer = Some(fingerprint);
-            self.refresh_peer();
+            Some(fp) if !expanded => {
+                self.expanded_peers.remove(&fp);
+            }
+            Some(_) => {}
         }
     }
-    fn invalidate_remote(&mut self) {
-        self.clear_preview();
-        self.remote_generation = self
-            .remote_generation
-            .checked_add(1)
-            .expect("generation exhausted");
-        self.remote_pending = None;
-        self.remote_loading = false;
-        if self.selected_peer.is_some() {
-            self.remote_error = true;
-        }
+    fn is_expanded(&self, peer: Option<&str>) -> bool {
+        peer.map_or(self.local_expanded, |fp| self.expanded_peers.contains(fp))
     }
-    fn refresh_peer(&mut self) {
-        self.clear_preview();
-        let Some(fp) = self
-            .selected_peer
-            .clone()
-            .filter(|fp| self.peer_current(fp))
-        else {
+    fn refresh_peer(&mut self, fp: String) {
+        if !self.peer_current(&fp) {
             return;
-        };
+        }
         self.remote_generation = self
             .remote_generation
             .checked_add(1)
             .expect("generation exhausted");
-        self.remote_loading = true;
-        self.remote_pending = Some((self.remote_generation, self.nodes_generation, fp));
+        let sessions = self.remote_sessions.entry(fp.clone()).or_default();
+        sessions.loading = true;
+        sessions.generation = self.remote_generation;
+        self.remote_pending.retain(|(_, _, queued)| queued != &fp);
+        self.remote_pending
+            .push_back((self.remote_generation, self.nodes_generation, fp));
         self.launch_peer();
     }
     fn launch_peer(&mut self) {
         if self.remote_busy {
             return;
         }
-        let Some((generation, directory, fp)) = self.remote_pending.take() else {
-            return;
+        let (generation, directory, fp) = loop {
+            let Some((generation, directory, fp)) = self.remote_pending.pop_front() else {
+                return;
+            };
+            if directory == self.nodes_generation && self.peer_current(&fp) {
+                break (generation, directory, fp);
+            }
         };
-        if directory != self.nodes_generation
-            || self.selected_peer.as_ref() != Some(&fp)
-            || !self.peer_current(&fp)
-        {
-            return;
-        }
         self.remote_busy = true;
         let sender = self.remote_sender.clone();
         std::thread::spawn(move || {
@@ -531,11 +552,13 @@ impl LocalGui {
                 && self.selection.as_ref() == Some(&selection)
                 && self.selection_current(&selection)
             {
+                self.preview_received = result.as_ref().ok().map(|_| Instant::now());
                 self.preview = Some(result.unwrap_or_else(|error| {
                     if error == STALE_HELPER {
                         self.helper_changed = true;
+                        return STALE_HELPER.into();
                     }
-                    "Preview unavailable; if the GUI was updated, restart it".into()
+                    "Snapshot unavailable. The session or node may have disconnected.".into()
                 }));
             }
             self.launch_preview();
@@ -571,35 +594,42 @@ impl LocalGui {
                         self.nodes_error = true;
                     }
                 }
-                if self
-                    .selected_peer
-                    .as_ref()
-                    .is_some_and(|fp| !self.peer_current(fp))
-                {
-                    self.selected_peer = None;
-                }
-                if !self.nodes_error && self.selected_peer.is_some() {
-                    self.refresh_peer();
+                if !self.nodes_error {
+                    let peers = &self.peers;
+                    self.expanded_peers.retain(|fp| peer_is_unique(peers, fp));
+                    self.remote_sessions
+                        .retain(|fp, _| peer_is_unique(peers, fp));
+                    let expanded = self
+                        .peers
+                        .iter()
+                        .filter(|p| self.expanded_peers.contains(&p.fingerprint))
+                        .map(|p| p.fingerprint.clone())
+                        .collect::<Vec<_>>();
+                    for fp in expanded {
+                        self.refresh_peer(fp);
+                    }
                 }
             }
             self.launch_nodes();
         }
         while let Ok((generation, directory, fp, result)) = self.remote_results.try_recv() {
             self.remote_busy = false;
-            if generation == self.remote_generation
-                && directory == self.nodes_generation
-                && self.selected_peer.as_ref() == Some(&fp)
-                && self.peer_current(&fp)
-            {
-                self.remote_loading = false;
-                match result {
-                    Ok(rows) => {
-                        self.remote_sessions = rows;
-                        self.remote_error = false;
-                    }
-                    Err(error) => {
-                        self.helper_changed |= error == STALE_HELPER;
-                        self.remote_error = true;
+            if directory == self.nodes_generation && self.peer_current(&fp) {
+                if let Some(sessions) = self
+                    .remote_sessions
+                    .get_mut(&fp)
+                    .filter(|state| state.generation == generation)
+                {
+                    sessions.loading = false;
+                    match result {
+                        Ok(rows) => {
+                            sessions.rows = rows;
+                            sessions.error = false;
+                        }
+                        Err(error) => {
+                            self.helper_changed |= error == STALE_HELPER;
+                            sessions.error = true;
+                        }
                     }
                 }
             }
@@ -608,72 +638,305 @@ impl LocalGui {
     }
 }
 impl LocalGui {
+    fn tree_rows(&self) -> Vec<TreeRow> {
+        let mut rows = vec![TreeRow::Node(None)];
+        if self.local_expanded {
+            rows.extend(self.sessions.iter().map(|row| TreeRow::session(None, row)));
+        }
+        for peer in &self.peers {
+            let fp = Some(peer.fingerprint.clone());
+            rows.push(TreeRow::Node(fp.clone()));
+            if self.expanded_peers.contains(&peer.fingerprint) {
+                if let Some(sessions) = self.remote_sessions.get(&peer.fingerprint) {
+                    rows.extend(
+                        sessions
+                            .rows
+                            .iter()
+                            .map(|row| TreeRow::session(fp.clone(), row)),
+                    );
+                }
+            }
+        }
+        rows
+    }
+
+    fn open_focused_session(&mut self, peer: Option<String>, name: &str, instance: Option<&str>) {
+        let rows = match peer.as_deref() {
+            Some(fp) => self
+                .remote_sessions
+                .get(fp)
+                .map(|state| state.rows.as_slice())
+                .unwrap_or_default(),
+            None => &self.sessions,
+        };
+        if let Some(row) = rows
+            .iter()
+            .find(|row| row.name == name && row.instance_id.as_deref() == instance)
+            .cloned()
+        {
+            self.select_session(peer, row);
+        }
+    }
+
+    fn tree_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rows = self.tree_rows();
+        let position = rows
+            .iter()
+            .position(|row| row == &self.focused_row)
+            .unwrap_or_default();
+        let current = rows[position].clone();
+        match (event.keystroke.key.as_str(), current) {
+            ("up", _) => self.focused_row = rows[position.saturating_sub(1)].clone(),
+            ("down", _) => self.focused_row = rows[(position + 1).min(rows.len() - 1)].clone(),
+            ("left", TreeRow::Node(peer) | TreeRow::Session(peer, _, _)) => {
+                self.focused_row = TreeRow::Node(peer.clone());
+                self.set_expanded(peer, false);
+            }
+            ("right", TreeRow::Node(peer)) => self.set_expanded(peer, true),
+            ("enter" | "space", TreeRow::Node(peer)) => {
+                let expanded = self.is_expanded(peer.as_deref());
+                self.set_expanded(peer, !expanded);
+            }
+            ("enter" | "space", TreeRow::Session(peer, name, instance)) => {
+                self.open_focused_session(peer, &name, instance.as_deref());
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+        window.refresh();
+    }
+
+    fn render_node(
+        &self,
+        peer: Option<String>,
+        text: String,
+        status: &'static str,
+        key: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let expanded = self.is_expanded(peer.as_deref());
+        let can_open = expanded || peer.as_deref().map_or(true, |fp| self.peer_current(fp));
+        let row = TreeRow::Node(peer.clone());
+        let focused = self.focused_row == row;
+        let debug = key.clone();
+        div()
+            .id(SharedString::from(key))
+            .debug_selector(move || debug.clone())
+            .flex()
+            .items_center()
+            .gap_2()
+            .min_w_0()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .when(focused, |d| d.bg(rgb(0x303a49)))
+            .when(can_open, |d| {
+                d.cursor_pointer().hover(|d| d.bg(rgb(0x2a3340)))
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(0x9bb0c6))
+                    .child(if expanded { "▾" } else { "▸" }),
+            )
+            .child(div().flex_1().min_w_0().truncate().child(text))
+            .when(!status.is_empty(), |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(rgb(0xb5beca))
+                        .child(status),
+                )
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if let Some(focus) = &this.tree_focus {
+                    focus.focus(window);
+                }
+                this.focused_row = row.clone();
+                let expanded = this.is_expanded(peer.as_deref());
+                this.set_expanded(peer.clone(), !expanded);
+                cx.notify();
+            }))
+    }
+
     fn render_node_sessions(
-        peer: Option<&str>,
+        &self,
+        peer: Option<String>,
+        key: &str,
         rows: &[Session],
         loading: bool,
         unavailable: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let focus = self.tree_focus.clone();
         div()
-            .pl_4()
-            .when(loading, |d| {
-                d.child(div().text_sm().child("Loading sessions…"))
-            })
-            .when(unavailable, |d| {
-                d.child(div().text_sm().child("Sessions unavailable"))
-            })
-            .when(!loading && !unavailable && rows.is_empty(), |d| {
-                d.child(div().text_sm().child("No sessions"))
+            .pl_5()
+            .when(loading || unavailable || rows.is_empty(), |d| {
+                d.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(rgb(0xb5beca))
+                        .child(if loading {
+                            "Loading sessions…"
+                        } else if unavailable && !rows.is_empty() {
+                            "Session list may be stale"
+                        } else if unavailable {
+                            "Sessions unavailable"
+                        } else {
+                            "No sessions"
+                        }),
+                )
             })
             .children(rows.iter().cloned().enumerate().map(|(index, session)| {
-                let status = if unavailable || session.unavailable {
-                    "unavailable"
+                let (status, dot) = if unavailable || session.unavailable {
+                    ("Unavailable", 0xd1a163)
                 } else if session.alive {
-                    "running"
+                    ("Running", 0x65d89b)
                 } else {
-                    "exited"
+                    ("Exited", 0x9ca8b6)
                 };
-                let name = label(&session.name);
-                let peer = peer.map(str::to_owned);
+                let active = self.selection.as_ref().is_some_and(|selection| {
+                    selection.peer == peer
+                        && selection.name == session.name
+                        && session.instance_id.as_deref() == Some(&selection.instance)
+                });
+                let row = TreeRow::session(peer.clone(), &session);
+                let focused = self.focused_row == row;
+                let name = display_label(&session.name);
+                let peer = peer.clone();
+                let focus = focus.clone();
+                let debug = format!("{key}-{index}");
                 div()
-                    .id(SharedString::from(format!("session-{index}")))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.selected_peer == peer {
-                            this.select_session(session.clone());
-                            cx.notify();
-                        }
-                    }))
-                    .debug_selector(move || format!("session-{index}"))
+                    .id(SharedString::from(debug.clone()))
+                    .debug_selector(move || debug.clone())
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .px_2()
                     .py_1()
-                    .child(div().child(name))
-                    .child(div().text_sm().text_color(rgb(0x8a95a5)).child(status))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(0x2a3340)))
+                    .when(active, |d| d.bg(rgb(0x233e57)))
+                    .when(focused, |d| d.border_1().border_color(rgb(0x799ebe)))
+                    .child(div().flex_none().text_xs().text_color(rgb(dot)).child("●"))
+                    .child(div().flex_1().min_w_0().truncate().child(name))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(rgb(0xb5beca))
+                            .child(status),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(focus) = &focus {
+                            focus.focus(window);
+                        }
+                        this.focused_row = row.clone();
+                        this.select_session(peer.clone(), session.clone());
+                        cx.notify();
+                    }))
             }))
     }
 }
 
+impl TreeRow {
+    fn session(peer: Option<String>, row: &Session) -> Self {
+        Self::Session(peer, row.name.clone(), row.instance_id.clone())
+    }
+}
+
+fn display_label(value: &str) -> String {
+    let escaped = label(value);
+    escaped[1..escaped.len() - 1].to_owned()
+}
+
 impl Render for LocalGui {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let expanded_peer = self.selected_peer.as_ref().and_then(|fingerprint| {
-            self.peers
-                .iter()
-                .position(|peer| &peer.fingerprint == fingerprint)
-        });
+        let focus = self
+            .tree_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+        let peer = self
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.peer.as_deref())
+            .and_then(|fp| self.peers.iter().find(|peer| peer.fingerprint == fp));
+        let node = peer.map_or_else(|| "This device".into(), |peer| display_label(&peer.label));
+        let title = self.selection.as_ref().map_or_else(
+            || "Session preview".into(),
+            |selection| format!("{node} / {}", display_label(&selection.name)),
+        );
+        let detail = if let Some(at) = self.preview_received {
+            let status = if self
+                .selection
+                .as_ref()
+                .is_some_and(|selection| !self.selection_current(selection))
+            {
+                "Last read-only snapshot · session not currently verified"
+            } else {
+                "Read-only snapshot"
+            };
+            format!("{status} · received {}s ago", at.elapsed().as_secs())
+        } else if self.selection.is_some() && self.preview.is_none() {
+            "Loading read-only snapshot…".into()
+        } else {
+            "Read-only snapshot".into()
+        };
         div()
             .size_full()
             .flex()
             .bg(rgb(0x101216))
             .text_color(rgb(0xe8eaf0))
-            .font_family("Menlo")
             .child(
                 div()
+                    .id("session-sidebar")
                     .w(px(300.))
+                    .flex_none()
                     .h_full()
                     .flex()
                     .flex_col()
                     .bg(rgb(0x191d24))
-                    .p_4()
-                    .child(div().text_lg().child("REMUDA"))
+                    .p_3()
+                    .track_focus(&focus)
+                    .on_key_down(cx.listener(Self::tree_key))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .pb_2()
+                            .child(div().text_lg().child(if self.peers.is_empty() {
+                                "Nodes"
+                            } else {
+                                "Cluster"
+                            }))
+                            .child(
+                                div()
+                                    .id("refresh")
+                                    .debug_selector(|| "refresh".into())
+                                    .px_2()
+                                    .py_1()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(rgb(0x2a3340)))
+                                    .child("Refresh")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.refresh();
+                                        this.refresh_nodes();
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
                     .when(self.helper_changed, |d| {
                         d.child(
                             div()
@@ -682,115 +945,108 @@ impl Render for LocalGui {
                                 .child(STALE_HELPER),
                         )
                     })
-                    .child(div().pt_4().text_sm().child(if self.nodes_loading {
-                        "NODES · LOADING"
-                    } else if self.nodes_error {
-                        "NODES · STALE"
-                    } else {
-                        "NODES"
-                    }))
+                    .when(self.nodes_loading || self.nodes_error, |d| {
+                        d.child(div().text_xs().pb_2().child(if self.nodes_loading {
+                            "Loading nodes…"
+                        } else {
+                            "Node list may be stale"
+                        }))
+                    })
                     .child(
                         div()
-                            .id("node-local")
-                            .debug_selector(|| "node-local".into())
-                            .py_2()
-                            .cursor_pointer()
-                            .child("This device")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.invalidate_remote();
-                                this.selected_peer = None;
-                                cx.notify();
-                            })),
-                    )
-                    .when(self.selected_peer.is_none(), |d| {
-                        d.child(Self::render_node_sessions(
-                            None,
-                            &self.sessions,
-                            self.loading,
-                            self.error,
-                            cx,
-                        ))
-                    })
-                    .children(self.peers.iter().cloned().enumerate().map(|(index, peer)| {
-                        let enabled = self.peer_current(&peer.fingerprint);
-                        let fingerprint = peer.fingerprint.clone();
-                        let name = label(&peer.label);
-                        let identity = label(&peer.fingerprint);
-                        let id = SharedString::from(format!("node-{}-{index}", peer.fingerprint));
-                        let debug = format!("node-peer-{index}");
-                        let header = div()
-                            .id(id)
-                            .debug_selector(move || debug.clone())
-                            .py_2()
-                            .cursor_pointer()
-                            .child(name)
-                            .child(div().text_sm().child(identity))
-                            .child(div().text_sm().child(if !peer.admitted {
-                                "revoked"
-                            } else if enabled {
-                                "admitted"
-                            } else {
-                                "unavailable"
-                            }))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_peer(fingerprint.clone());
-                                cx.notify();
-                            }));
-                        div().child(header).when(expanded_peer == Some(index), |d| {
-                            d.child(Self::render_node_sessions(
-                                Some(&peer.fingerprint),
-                                &self.remote_sessions,
-                                self.remote_loading,
-                                self.remote_error,
+                            .id("node-tree")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .child(self.render_node(
+                                None,
+                                "This device".into(),
+                                "",
+                                "node-local".into(),
                                 cx,
                             ))
-                        })
-                    })),
+                            .when(self.local_expanded, |d| {
+                                d.child(self.render_node_sessions(
+                                    None,
+                                    "session",
+                                    &self.sessions,
+                                    self.loading,
+                                    self.error,
+                                    cx,
+                                ))
+                            })
+                            .children(self.peers.iter().enumerate().map(|(index, peer)| {
+                                let fp = &peer.fingerprint;
+                                let sessions = self.remote_sessions.get(fp);
+                                let status = if !peer.admitted {
+                                    "Revoked"
+                                } else if sessions.is_some_and(|s| s.error) {
+                                    "Unavailable"
+                                } else {
+                                    ""
+                                };
+                                div()
+                                    .child(self.render_node(
+                                        Some(fp.clone()),
+                                        display_label(&peer.label),
+                                        status,
+                                        format!("node-peer-{index}"),
+                                        cx,
+                                    ))
+                                    .when(self.expanded_peers.contains(fp), |d| {
+                                        d.child(self.render_node_sessions(
+                                            Some(fp.clone()),
+                                            &format!("peer-session-{index}"),
+                                            sessions.map(|s| s.rows.as_slice()).unwrap_or_default(),
+                                            sessions.is_some_and(|s| s.loading),
+                                            !self.peer_current(fp)
+                                                || sessions.is_some_and(|s| s.error),
+                                            cx,
+                                        ))
+                                    })
+                            })),
+                    ),
             )
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
                     .p_4()
-                    .child(div().child(if self.selected_peer.is_some() {
-                        "Read-only peer session list"
-                    } else {
-                        "Read-only local session list"
-                    }))
-                    .when(self.selected_peer.is_some() && self.remote_error, |d| {
+                    .child(
+                        div()
+                            .id("preview-title")
+                            .debug_selector(|| "preview-title".into())
+                            .text_lg()
+                            .truncate()
+                            .child(title),
+                    )
+                    .child(div().text_sm().text_color(rgb(0xb5beca)).child(detail))
+                    .when_some(peer, |d, peer| {
                         d.child(
                             div()
-                                .text_color(rgb(0xf28787))
-                                .child("Peer unavailable; listed sessions may be stale."),
-                        )
-                    })
-                    .when(self.selected_peer.is_none() && self.error, |d| {
-                        d.child(
-                            div()
-                                .text_color(rgb(0xf28787))
-                                .child("Local daemon unavailable; listed sessions may be stale."),
+                                .text_xs()
+                                .text_color(rgb(0xb5beca))
+                                .truncate()
+                                .child(display_label(&peer.fingerprint)),
                         )
                     })
                     .child(
                         div()
                             .id("preview")
                             .debug_selector(|| "preview".into())
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
                             .pt_4()
-                            .overflow_hidden()
+                            .font_family(if cfg!(windows) { "Consolas" } else { "Menlo" })
                             .child(self.preview.clone().unwrap_or_else(|| {
-                                "Select a session for a read-only snapshot.".into()
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id("refresh")
-                            .debug_selector(|| "refresh".into())
-                            .pt_4()
-                            .cursor_pointer()
-                            .child("Refresh")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.refresh();
-                                this.refresh_nodes();
-                                cx.notify();
+                                if self.selection.is_some() {
+                                    String::new()
+                                } else {
+                                    "Select a session to view its screen.".into()
+                                }
                             })),
                     ),
             )
@@ -873,9 +1129,12 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| {
+            |window, cx| {
+                let focus = cx.focus_handle();
+                focus.focus(window);
                 cx.new(|cx| {
                     let mut gui = LocalGui::new();
+                    gui.tree_focus = Some(focus);
                     gui.refresh();
                     gui.refresh_nodes();
                     cx.spawn(async move |weak, cx| loop {
@@ -977,7 +1236,7 @@ mod tests {
             assert!(cx.read(|app| view.read(app).sessions.is_empty()));
             return;
         }
-        assert!(cx.read(|app| view.read(app).selected_peer.is_none()));
+        assert!(cx.read(|app| view.read(app).expanded_peers.is_empty()));
         assert_eq!(
             cx.read(|app| view.read(app).sessions.len()),
             1,
@@ -1029,11 +1288,11 @@ mod tests {
         let mut gui = LocalGui::new();
         gui.remote_busy = true;
         gui.peers = vec![peer("full-a", "same"), peer("full-b", "same")];
-        gui.select_peer("full-a".into());
-        assert_eq!(gui.selected_peer.as_deref(), Some("full-a"));
+        gui.set_expanded(Some("full-a".into()), true);
+        assert!(gui.expanded_peers.contains("full-a"));
         gui.nodes_loading = true;
-        gui.select_peer("full-b".into());
-        assert_eq!(gui.selected_peer.as_deref(), Some("full-a"));
+        gui.set_expanded(Some("full-b".into()), true);
+        assert!(!gui.expanded_peers.contains("full-b"));
         gui.nodes_loading = false;
         gui.nodes_error = true;
         assert!(!gui.peer_current("full-a"));
@@ -1049,57 +1308,55 @@ mod tests {
         assert!(!gui.peer_current("full-b"));
     }
     #[test]
-    fn late_peer_reply_is_discarded_when_directory_or_selection_changes() {
+    fn peers_load_independently_and_directory_changes_discard_late_replies() {
         let mut gui = LocalGui::new();
-        gui.peers = vec![peer("a", "a"), peer("b", "b")];
+        gui.peers = vec![peer("a", "alpha"), peer("b", "beta")];
         gui.remote_busy = true;
-        gui.select_peer("a".into());
-        let (old, directory, fp) = gui.remote_pending.take().unwrap();
-        gui.select_peer("b".into());
-        assert!(gui.remote_sessions.is_empty());
-        gui.remote_pending = None;
+        gui.set_expanded(Some("a".into()), true);
+        gui.set_expanded(Some("b".into()), true);
+        let (a, directory, a_fp) = gui.remote_pending.pop_front().unwrap();
+        let (b, _, b_fp) = gui.remote_pending.pop_front().unwrap();
         gui.remote_sender
-            .send((old, directory, fp, Ok(vec![row("wrong")])))
+            .send((a, directory, a_fp, Ok(vec![row("session-a")])))
             .unwrap();
         gui.drain();
-        assert!(gui.remote_sessions.is_empty());
-        gui.remote_busy = true;
-        gui.select_peer("b".into());
-        let (old, directory, fp) = gui.remote_pending.take().unwrap();
+        assert_eq!(gui.remote_sessions["a"].rows[0].name, "session-a");
+        assert!(gui.remote_sessions["b"].loading);
+
         gui.nodes_busy = true;
         gui.refresh_nodes();
-        gui.nodes_pending = false;
         gui.remote_sender
-            .send((old, directory, fp, Ok(vec![row("wrong")])))
+            .send((b, directory, b_fp, Ok(vec![row("stale")])))
             .unwrap();
         gui.drain();
-        assert!(gui.remote_sessions.is_empty());
-        assert!(gui.remote_error);
+        assert!(gui.remote_sessions["b"].rows.is_empty());
+        assert!(gui.remote_sessions["a"].error);
     }
     #[test]
     fn peer_failure_retains_stale_rows_and_exact_instance_identity() {
         let mut gui = LocalGui::new();
         gui.peers = vec![peer("a", "a")];
         gui.remote_busy = true;
-        gui.select_peer("a".into());
-        let (generation, directory, fp) = gui.remote_pending.take().unwrap();
+        gui.set_expanded(Some("a".into()), true);
+        let (generation, directory, fp) = gui.remote_pending.pop_front().unwrap();
         gui.remote_sender
             .send((generation, directory, fp, Ok(vec![row("proof")])))
             .unwrap();
         gui.drain();
         assert_eq!(
-            gui.remote_sessions[0].instance_id.as_deref(),
+            gui.remote_sessions["a"].rows[0].instance_id.as_deref(),
             Some("instance")
         );
         gui.remote_busy = true;
-        gui.refresh_peer();
-        let (generation, directory, fp) = gui.remote_pending.take().unwrap();
+        gui.refresh_peer("a".into());
+        let (generation, directory, fp) = gui.remote_pending.pop_front().unwrap();
         gui.remote_sender
             .send((generation, directory, fp, Err("offline".into())))
             .unwrap();
         gui.drain();
-        assert!(gui.remote_error && !gui.remote_loading);
-        assert_eq!(gui.remote_sessions[0].name, "proof");
+        let peer = &gui.remote_sessions["a"];
+        assert!(peer.error && !peer.loading);
+        assert_eq!(peer.rows[0].name, "proof");
     }
     #[test]
     fn queued_peer_work_is_not_dispatched_after_revocation_or_duplicate() {
@@ -1107,7 +1364,7 @@ mod tests {
             let mut gui = LocalGui::new();
             gui.peers = vec![peer("a", "a")];
             gui.remote_busy = true;
-            gui.select_peer("a".into());
+            gui.set_expanded(Some("a".into()), true);
             if duplicate {
                 gui.peers.push(peer("a", "duplicate"));
             } else {
@@ -1117,52 +1374,74 @@ mod tests {
                 .send((0, 0, "old".into(), Ok(vec![])))
                 .unwrap();
             gui.drain();
-            assert!(!gui.remote_busy && gui.remote_pending.is_none());
-            assert!(gui.remote_sessions.is_empty());
+            assert!(!gui.remote_busy && gui.remote_pending.is_empty());
+            assert!(gui.remote_sessions["a"].rows.is_empty());
         }
     }
     #[gpui::test]
-    fn peer_rows_render_and_local_navigation_restores_local_rows(cx: &mut gpui::TestAppContext) {
+    fn peer_branches_fold_independently_and_preserve_the_preview(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, _| {
             let mut gui = LocalGui::new();
+            gui.preview_busy = true;
             gui.remote_busy = true;
-            gui.peers = vec![peer("a", "a")];
+            gui.peers = vec![peer("a", "alpha"), peer("b", "beta")];
             gui.sessions = vec![row("local")];
             gui
         });
-        let local = cx.debug_bounds("node-local").unwrap();
-        let local_session = cx.debug_bounds("session-0").expect("local child rendered");
-        let peer = cx.debug_bounds("node-peer-0").unwrap();
-        assert!(local_session.origin.x > local.origin.x);
-        assert!(local_session.origin.y > local.origin.y && local_session.origin.y < peer.origin.y);
-        cx.simulate_click(peer.center(), gpui::Modifiers::none());
+        for key in ["node-peer-0", "node-peer-1"] {
+            let node = cx.debug_bounds(key).unwrap();
+            cx.simulate_click(node.center(), gpui::Modifiers::none());
+        }
         view.update(cx, |gui, cx| {
-            gui.remote_sessions = vec![row("remote-1"), row("remote-2")];
-            gui.remote_loading = false;
+            for (id, row_name) in [("a", "remote-a"), ("b", "remote-b")] {
+                let state = gui.remote_sessions.get_mut(id).unwrap();
+                state.rows = vec![row(row_name)];
+                state.loading = false;
+            }
             cx.notify();
         });
-        assert!(
-            cx.debug_bounds("session-1").is_some(),
-            "both remote rows rendered"
+        let alpha = cx.debug_bounds("node-peer-0").unwrap();
+        let child = cx.debug_bounds("peer-session-0-0").unwrap();
+        assert!(child.origin.x > alpha.origin.x && child.origin.y > alpha.origin.y);
+        assert!(cx.debug_bounds("session-0").is_some());
+        assert!(cx.debug_bounds("peer-session-1-0").is_some());
+        cx.simulate_click(child.center(), gpui::Modifiers::none());
+        view.update(cx, |gui, cx| {
+            let (generation, target) = gui.preview_pending.take().unwrap();
+            gui.preview_sender
+                .send((generation, target, Ok("test snapshot".into())))
+                .unwrap();
+            gui.drain();
+            cx.notify();
+        });
+        cx.simulate_keystrokes("left");
+        let alpha_session = TreeRow::session(Some("a".into()), &row("remote-a"));
+        let beta_session = TreeRow::session(Some("b".into()), &row("remote-b"));
+        assert!(cx.read(|app| {
+            let visible = view.read(app).tree_rows();
+            !visible.contains(&alpha_session) && visible.contains(&beta_session)
+        }));
+        assert!(cx.read(|app| view.read(app).preview_received.is_some()));
+        assert_eq!(
+            cx.read(|app| view.read(app).preview.clone()).as_deref(),
+            Some("test snapshot")
         );
-        let peer = cx.debug_bounds("node-peer-0").unwrap();
-        let remote_session = cx.debug_bounds("session-0").unwrap();
-        assert!(remote_session.origin.x > peer.origin.x);
-        assert!(remote_session.origin.y > peer.origin.y);
+        cx.simulate_keystrokes("right");
+        assert!(cx.read(|app| view.read(app).tree_rows().contains(&alpha_session)));
+        cx.simulate_keystrokes("down");
+        assert!(cx.read(|app| view.read(app).focused_row == alpha_session));
         let local = cx.debug_bounds("node-local").unwrap();
         cx.simulate_click(local.center(), gpui::Modifiers::none());
-        assert!(cx.debug_bounds("session-0").is_some());
-        assert!(cx.read(|app| view.read(app).selected_peer.is_none()));
-        assert_eq!(
-            cx.read(|app| view.read(app).sessions[0].name.clone()),
-            "local"
-        );
+        assert!(cx.read(|app| {
+            let gui = view.read(app);
+            !gui.local_expanded && gui.tree_rows().contains(&beta_session)
+        }));
     }
     #[test]
     fn node_replies_reject_old_generations_and_mark_errors_stale() {
         let mut gui = LocalGui::new();
         gui.peers = vec![peer("full-a", "first")];
-        gui.selected_peer = Some("full-a".into());
+        gui.expanded_peers.insert("full-a".into());
         gui.nodes_busy = true;
         gui.refresh_nodes();
         let old = gui.nodes_generation;
@@ -1182,7 +1461,7 @@ mod tests {
         gui.drain();
         assert!(gui.nodes_error);
         assert_eq!(gui.peers[0].fingerprint, "full-a");
-        assert!(gui.selected_peer.is_none());
+        assert!(gui.expanded_peers.contains("full-a"));
         assert!(!gui.peer_current("full-a"));
     }
     fn row(name: &str) -> Session {
@@ -1227,9 +1506,9 @@ mod tests {
         let mut gui = LocalGui::new();
         gui.preview_busy = true;
         gui.sessions = vec![row("one"), row("two")];
-        gui.select_session(row("one"));
+        gui.select_session(None, row("one"));
         let (old, selected) = gui.preview_pending.take().unwrap();
-        gui.select_session(row("two"));
+        gui.select_session(None, row("two"));
         gui.preview_pending = None;
         gui.preview_sender
             .send((old, selected, Ok("stale".into())))
@@ -1237,7 +1516,7 @@ mod tests {
         gui.drain();
         assert!(gui.preview.is_none());
         gui.preview_busy = true;
-        gui.select_session(row("one"));
+        gui.select_session(None, row("one"));
         let (generation, selection) = gui.preview_pending.take().unwrap();
         gui.sessions[0].instance_id = Some("replacement".into());
         gui.preview_sender
@@ -1246,11 +1525,11 @@ mod tests {
         gui.drain();
         assert!(gui.preview.is_none());
         gui.sessions = vec![row("one"), row("one")];
-        gui.select_session(row("one"));
+        gui.select_session(None, row("one"));
         assert!(gui.selection.is_none());
         gui.sessions = vec![row("one")];
         gui.error = true;
-        gui.select_session(row("one"));
+        gui.select_session(None, row("one"));
         assert!(gui.selection.is_none());
     }
     #[gpui::test]
@@ -1282,9 +1561,14 @@ mod tests {
         let mut gui = LocalGui::new();
         gui.preview_busy = true;
         gui.peers = vec![peer("full", "peer")];
-        gui.selected_peer = Some("full".into());
-        gui.remote_sessions = vec![row("one")];
-        gui.select_session(row("one"));
+        gui.remote_sessions.insert(
+            "full".into(),
+            PeerSessions {
+                rows: vec![row("one")],
+                ..Default::default()
+            },
+        );
+        gui.select_session(Some("full".into()), row("one"));
         gui.peers[0].admitted = false;
         gui.preview_sender
             .send((
@@ -1311,30 +1595,24 @@ mod tests {
         assert_eq!(label("한글"), "\"한글\"");
     }
     #[gpui::test]
-    fn node_selection_navigates_locally_and_refuses_stale_peers(cx: &mut gpui::TestAppContext) {
+    fn stale_node_cannot_reopen_after_it_is_collapsed(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, _| {
             let mut gui = LocalGui::new();
             gui.remote_busy = true;
             gui.peers = vec![peer("full-a", "peer")];
-            gui.sessions = vec![row("local")];
             gui
         });
-        let button = cx.debug_bounds("node-peer-0").expect("peer rendered");
+        let button = cx.debug_bounds("node-peer-0").unwrap();
         cx.simulate_click(button.center(), gpui::Modifiers::none());
-        assert_eq!(
-            cx.read(|app| view.read(app).selected_peer.clone()),
-            Some("full-a".into())
-        );
-        let local = cx.debug_bounds("node-local").expect("local rendered");
-        cx.simulate_click(local.center(), gpui::Modifiers::none());
-        assert!(cx.read(|app| view.read(app).selected_peer.is_none()));
+        assert!(cx.read(|app| view.read(app).expanded_peers.contains("full-a")));
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
         view.update(cx, |gui, cx| {
             gui.nodes_loading = true;
             cx.notify();
         });
         let button = cx.debug_bounds("node-peer-0").unwrap();
         cx.simulate_click(button.center(), gpui::Modifiers::none());
-        assert!(cx.read(|app| view.read(app).selected_peer.is_none()));
+        assert!(cx.read(|app| view.read(app).expanded_peers.is_empty()));
     }
     #[gpui::test]
     fn refresh_click_starts_new_generation(cx: &mut gpui::TestAppContext) {
