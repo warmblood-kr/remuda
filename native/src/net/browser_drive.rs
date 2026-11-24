@@ -129,7 +129,11 @@ impl DriveGrant {
         let cursor = after.map(parse_cursor).transpose()?;
         let entries: Box<dyn Iterator<Item = DriveEntry> + '_> = match directory {
             Some(dir) => {
-                let prefix = format!("{dir}/");
+                let prefix = if dir.is_empty() {
+                    String::new()
+                } else {
+                    format!("{dir}/")
+                };
                 let children = index.children(&prefix);
                 Box::new(
                     children
@@ -157,7 +161,9 @@ impl DriveGrant {
             ),
         };
         let mut page = DriveListing {
-            directory: directory.map(|path| VfsUri::format("", path)),
+            directory: directory
+                .filter(|path| !path.is_empty())
+                .map(|path| VfsUri::format("", path)),
             entries: Vec::new(),
             complete: true,
             next: None,
@@ -286,6 +292,44 @@ fn read_store_chunk(
     })
 }
 
+/// Node-side browsing uses the same local-account access as the VFS CLI.
+/// These helpers are in-process only and do not extend any listener grant.
+pub fn list_local_drive(
+    directory: Option<&str>,
+    after: Option<&str>,
+) -> Result<DriveListing, DriveReadError> {
+    let directory = match directory {
+        Some(uri) => local_path(uri).ok_or(DriveReadError::Denied)?,
+        None => String::new(),
+    };
+    let store = VfsStore::open_default().map_err(|_| DriveReadError::Unavailable)?;
+    let index = store
+        .load_index()
+        .map_err(|_| DriveReadError::Unavailable)?;
+    DriveGrant {
+        document: None,
+        directory: None,
+    }
+    .list_index(&index, Some(&directory), after)
+}
+
+pub fn read_local_drive(uri: &str) -> Result<Vec<u8>, DriveReadError> {
+    let path = local_path(uri).ok_or(DriveReadError::Denied)?;
+    let store = VfsStore::open_default().map_err(|_| DriveReadError::Unavailable)?;
+    let index = store
+        .load_index()
+        .map_err(|_| DriveReadError::Unavailable)?;
+    let entry = index.live(&path).ok_or(DriveReadError::Unavailable)?;
+    let bytes = match store.read_blob(&entry.sha256) {
+        Ok(bytes) => bytes,
+        Err(error) if matches!(error.kind, VfsErrorKind::NotLocal | VfsErrorKind::Corrupt) => {
+            vfs_sync::fetch_blob(&store, entry).map_err(|_| DriveReadError::Unavailable)?
+        }
+        Err(_) => return Err(DriveReadError::Unavailable),
+    };
+    Ok(bytes)
+}
+
 impl Client {
     /// Load one authorized pinned document off the GUI thread.
     pub fn read_file(&self, uri: &str) -> Result<Vec<u8>, DriveReadError> {
@@ -394,6 +438,34 @@ mod tests {
             vv: Default::default(),
             conflicts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn node_drive_root_lists_live_children_without_creating_a_browser_grant() {
+        let local = DriveGrant {
+            document: None,
+            directory: None,
+        };
+        let mut index = VfsIndex::default();
+        for (path, deleted) in [
+            ("design/a.md", false),
+            ("deleted/a.md", true),
+            ("readme.md", false),
+        ] {
+            index
+                .entries
+                .insert(path.into(), entry(path.into(), deleted));
+        }
+        let root = local.list_index(&index, Some(""), None).unwrap();
+        assert!(root.directory.is_none());
+        assert_eq!(
+            root.entries
+                .iter()
+                .map(|row| (row.name.as_str(), row.is_directory))
+                .collect::<Vec<_>>(),
+            [("design", true), ("readme.md", false)]
+        );
+        assert!(!local.authorizes_document("remuda:///readme.md"));
     }
 
     #[test]

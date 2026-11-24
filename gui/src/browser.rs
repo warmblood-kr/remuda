@@ -26,6 +26,44 @@ struct Document {
     request: Option<DocumentRequest>,
 }
 
+enum DriveSource {
+    Remote(Arc<Client>),
+    Local,
+}
+
+impl DriveSource {
+    fn read(&self, uri: &str) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Remote(client) => client.read_file(uri),
+            Self::Local => remuda_native::net::browser::read_local_drive(uri),
+        }
+        .map_err(|error| error.to_string())
+    }
+    fn list(
+        &self,
+        directory: Option<String>,
+        after: Option<String>,
+    ) -> Result<DriveResult, String> {
+        let append = after.is_some();
+        match self {
+            Self::Remote(client) => list(
+                client,
+                match after {
+                    Some(after) => Operation::ListMore { directory, after },
+                    None => Operation::List { directory },
+                },
+                append,
+            ),
+            Self::Local => remuda_native::net::browser::list_local_drive(
+                directory.as_deref(),
+                after.as_deref(),
+            )
+            .map(|listing| DriveResult::Directory(listing, append))
+            .map_err(|error| error.to_string()),
+        }
+    }
+}
+
 enum DriveAction {
     List(Option<String>),
     More(Option<String>, String),
@@ -48,19 +86,17 @@ struct Drive {
 }
 
 impl Drive {
-    fn new(client: Arc<Client>) -> Self {
+    fn new(source: Arc<DriveSource>) -> Self {
         let (actions, incoming) = mpsc::sync_channel(2);
         let (return_result, results) = mpsc::channel();
         std::thread::spawn(move || {
             while let Ok((id, action)) = incoming.recv() {
                 let result = match action {
-                    DriveAction::List(directory) => {
-                        list(&client, Operation::List { directory }, false)
+                    DriveAction::List(directory) => source.list(directory, None),
+                    DriveAction::More(directory, after) => source.list(directory, Some(after)),
+                    DriveAction::Open(uri) => {
+                        read(|uri| source.read(uri), uri, None).map(DriveResult::Document)
                     }
-                    DriveAction::More(directory, after) => {
-                        list(&client, Operation::ListMore { directory, after }, true)
-                    }
-                    DriveAction::Open(uri) => read(&client, uri, None).map(DriveResult::Document),
                 };
                 if return_result.send((id, result)).is_err() {
                     break;
@@ -107,12 +143,12 @@ struct Assets {
 }
 
 impl Assets {
-    fn new(client: Arc<Client>) -> Self {
+    fn new(source: Arc<DriveSource>) -> Self {
         let (requests, input) = mpsc::sync_channel::<AssetJob>(1);
         let (output, results) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             while let Ok((generation, mut media)) = input.recv() {
-                media.load_assets(|path| client.read_file(&format!("remuda:///{path}")).ok());
+                media.load_assets(|path| source.read(&format!("remuda:///{path}")).ok());
                 if output.send((generation, media)).is_err() {
                     break;
                 }
@@ -128,8 +164,9 @@ enum Content {
     Document,
 }
 
-struct Browser {
+pub(crate) struct Browser {
     destination: String,
+    embedded: bool,
     documents: mpsc::Receiver<Document>,
     displayed: mpsc::Sender<DocumentRequest>,
     document: Option<Document>,
@@ -140,12 +177,16 @@ struct Browser {
     drive: Option<Drive>,
     assets: Option<Assets>,
     document_generation: u64,
+    document_scroll: gpui::ScrollHandle,
+    drive_scroll: gpui::ScrollHandle,
     zoom: f32,
     last_input: Option<Instant>,
     split_fraction: f32,
     dragging_split: bool,
     terminal: Option<PtyAgent>,
     screen: Screen,
+    terminal_scroll: terminal_view::HistoryScroll,
+    panel_bounds: Rc<Cell<Option<Bounds<gpui::Pixels>>>>,
     viewport: Viewport,
     focus: FocusHandle,
     document_focus: FocusHandle,
@@ -157,14 +198,6 @@ pub fn open(
     destination: String,
     client: Option<Client>,
 ) {
-    let (send_document, documents) = mpsc::sync_channel(1);
-    let (displayed, results) = mpsc::channel();
-    let (drive, assets) = client.map_or((None, None), |client| {
-        let client = Arc::new(client);
-        let poller = client.clone();
-        std::thread::spawn(move || serve(poller, send_document, results));
-        (Some(Drive::new(client.clone())), Some(Assets::new(client)))
-    });
     let mut command = CommandBuilder::new("ssh");
     command.args(ssh_arguments(&destination));
     command.env("TERM", "xterm-256color");
@@ -211,28 +244,15 @@ pub fn open(
                     }
                 })
                 .detach();
-                Browser {
+                Browser::new(
                     destination,
-                    documents,
-                    displayed,
-                    document: None,
-                    pending_presentation: None,
-                    painted: Default::default(),
-                    active: Content::Terminal,
-                    show_drive: false,
-                    drive,
-                    assets,
-                    document_generation: 0,
-                    zoom: 1.,
-                    last_input: None,
-                    split_fraction: 0.5,
-                    dragging_split: false,
+                    false,
+                    client,
                     terminal,
                     screen,
-                    viewport: Default::default(),
                     focus,
                     document_focus,
-                }
+                )
             })
         },
     )
@@ -241,16 +261,125 @@ pub fn open(
 }
 
 impl Browser {
-    fn wide(window: &Window) -> bool {
+    fn new(
+        destination: String,
+        embedded: bool,
+        client: Option<Client>,
+        terminal: Option<PtyAgent>,
+        screen: Screen,
+        focus: FocusHandle,
+        document_focus: FocusHandle,
+    ) -> Self {
+        let (send_document, documents) = mpsc::sync_channel(1);
+        let (displayed, results) = mpsc::channel();
+        let remote = client.map(Arc::new);
+        if let Some(poller) = remote.clone() {
+            std::thread::spawn(move || serve(poller, send_document, results));
+        }
+        let source = remote
+            .map(DriveSource::Remote)
+            .or_else(|| embedded.then_some(DriveSource::Local))
+            .map(Arc::new);
+        let drive = source.clone().map(Drive::new);
+        let assets = source.map(Assets::new);
+        Self {
+            destination,
+            embedded,
+            documents,
+            displayed,
+            document: None,
+            pending_presentation: None,
+            painted: Default::default(),
+            active: Content::Terminal,
+            show_drive: false,
+            drive,
+            assets,
+            document_generation: 0,
+            document_scroll: Default::default(),
+            drive_scroll: Default::default(),
+            zoom: 1.,
+            last_input: None,
+            split_fraction: 0.5,
+            dragging_split: false,
+            terminal,
+            screen,
+            terminal_scroll: Default::default(),
+            panel_bounds: Default::default(),
+            viewport: Default::default(),
+            focus,
+            document_focus,
+        }
+    }
+
+    pub(crate) fn local(client: Option<Client>, focus: FocusHandle, cx: &mut App) -> Self {
+        Self::new(
+            String::new(),
+            true,
+            client,
+            None,
+            Screen::default(),
+            focus,
+            cx.focus_handle(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_test_document(&mut self, window: &mut Window) {
+        let uri = "remuda:///pilot/plan.md".to_owned();
+        let media = browser_media::decode("pilot/plan.md", b"# Design plan").unwrap();
+        self.open_document(
+            Document {
+                uri,
+                media,
+                request: None,
+            },
+            true,
+            window,
+        );
+    }
+
+    pub(crate) fn mark_terminal_input(&mut self) {
+        self.last_input = Some(Instant::now());
+    }
+
+    pub(crate) fn showing_document(&self) -> bool {
+        self.active == Content::Document
+    }
+    pub(crate) fn has_document(&self) -> bool {
+        self.document.is_some()
+    }
+    pub(crate) fn unseen_document(&self) -> bool {
+        self.pending_presentation.is_some() && !self.painted.get()
+    }
+    pub(crate) fn owns_document_focus(&self, window: &Window) -> bool {
+        self.document_focus.is_focused(window)
+    }
+    pub(crate) fn select_terminal(&mut self) {
+        self.active = Content::Terminal;
+    }
+    pub(crate) fn select_document(&mut self, window: &mut Window) {
+        self.active = Content::Document;
+        self.document_focus.focus(window);
+    }
+    pub(crate) fn select_drive(&mut self) {
+        self.show_drive = true;
+        if let Some(drive) = &mut self.drive {
+            if drive.listing.is_none() && !drive.pending {
+                drive.list();
+            }
+        }
+    }
+
+    pub(crate) fn wide(window: &Window) -> bool {
         f32::from(window.viewport_size().width) >= SPLIT_WIDTH
     }
 
-    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.painted.get() && self.pending_presentation.take().is_some() {
             cx.notify();
         }
         if let Ok(document) = self.documents.try_recv() {
-            let typing = self.focus.is_focused(window)
+            let typing = (self.embedded || self.focus.is_focused(window))
                 && self
                     .last_input
                     .is_some_and(|last| last.elapsed() < Duration::from_secs(2));
@@ -311,6 +440,7 @@ impl Browser {
             .is_none_or(|current| current.uri != document.uri)
         {
             self.zoom = 1.;
+            self.document_scroll.set_offset(gpui::point(px(0.), px(0.)));
         }
         if let Some(request) = document.request.clone() {
             self.pending_presentation = Some(request);
@@ -353,7 +483,7 @@ impl Browser {
                 }
             }
             if let Ok(screen) = terminal
-                .screen_cells()
+                .screen_cells_at(self.terminal_scroll.offset)
                 .map_err(|e| e.to_string())
                 .and_then(Screen::from_cells)
             {
@@ -363,6 +493,52 @@ impl Browser {
                 }
             }
         }
+    }
+
+    fn scroll_terminal(&mut self, event: &gpui::ScrollWheelEvent, cx: &mut Context<Self>) {
+        use remuda_core::agent::MouseMode;
+        use remuda_native::mouse::{route_mouse_event, MouseAction, SgrMouse};
+
+        let Some(terminal) = &mut self.terminal else {
+            return;
+        };
+        let lines = self.terminal_scroll.wheel_lines(event.delta);
+        if lines == 0 {
+            return;
+        }
+        let mouse = terminal.mouse_state();
+        if mouse.mode != MouseMode::None && self.terminal_scroll.offset == 0 {
+            if let Some(bounds) = self.panel_bounds.get() {
+                let size = terminal.size();
+                let cell = |relative: gpui::Pixels, extent: gpui::Pixels, count: u16| {
+                    (f32::from(relative) / f32::from(extent) * f32::from(count))
+                        .clamp(0., f32::from(count.saturating_sub(1))) as u16
+                        + 1
+                };
+                let wheel = SgrMouse {
+                    button: if lines > 0 { 64 } else { 65 },
+                    x: cell(
+                        event.position.x - bounds.left(),
+                        bounds.size.width,
+                        size.cols(),
+                    ),
+                    y: cell(
+                        event.position.y - bounds.top(),
+                        bounds.size.height,
+                        size.rows(),
+                    ),
+                    release: false,
+                };
+                if let MouseAction::Forward(input) = route_mouse_event(wheel, mouse, true, 0) {
+                    for _ in 0..lines.unsigned_abs().min(8) {
+                        let _ = terminal.write(&input);
+                    }
+                }
+            }
+        } else if self.terminal_scroll.shift(lines, terminal.scrollback_len()) {
+            self.refresh_terminal(cx);
+        }
+        cx.stop_propagation();
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -384,6 +560,7 @@ impl Browser {
     fn visit(&mut self, uri: String, directory: bool) {
         if let Some(drive) = &mut self.drive {
             if directory {
+                self.drive_scroll.set_offset(gpui::point(px(0.), px(0.)));
                 drive.location.push(Some(uri));
                 drive.list();
             } else {
@@ -419,101 +596,7 @@ impl Browser {
                 )),
             );
         let body = if self.show_drive {
-            self.drive
-                .as_ref()
-                .map(|drive| {
-                    let path = drive
-                        .listing
-                        .as_ref()
-                        .and_then(|list| list.directory.clone());
-                    div()
-                        .id("drive-entries")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .p_2()
-                        .when(drive.location.len() > 1, |d| {
-                            d.child(button("drive-up", "↑ Parent folder", false).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    if let Some(drive) = &mut this.drive {
-                                        drive.location.pop();
-                                        drive.list();
-                                    }
-                                    cx.notify();
-                                }),
-                            ))
-                        })
-                        .when_some(path, |d, path| {
-                            d.child(div().text_xs().truncate().child(path))
-                        })
-                        .when(drive.pending, |d| d.child(div().p_2().child("Loading…")))
-                        .when_some(drive.error.clone(), |d, error| {
-                            d.child(div().p_2().child(error).child(
-                                button("drive-retry", "Reload folder", false).on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        if let Some(drive) = &mut this.drive {
-                                            drive.list();
-                                        }
-                                        cx.notify();
-                                    }),
-                                ),
-                            ))
-                        })
-                        .when_some(
-                            drive.listing.as_ref().filter(|_| !drive.pending),
-                            |d, listing| {
-                                d.children(listing.entries.iter().map(|entry| {
-                                    let uri = entry.uri.clone();
-                                    let is_directory = entry.is_directory;
-                                    let label = if is_directory {
-                                        format!("▸ {}", entry.name)
-                                    } else {
-                                        entry.name.clone()
-                                    };
-                                    button(
-                                        gpui::SharedString::from(format!("drive:{uri}")),
-                                        label,
-                                        false,
-                                    )
-                                    .truncate()
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.visit(uri.clone(), is_directory);
-                                            cx.notify();
-                                        },
-                                    ))
-                                }))
-                                .when(listing.entries.is_empty(), |d| {
-                                    d.child(div().p_2().child("No documents"))
-                                })
-                                .when(!listing.complete, |d| {
-                                    d.child(button("drive-more", "Load more", false).on_click(
-                                        cx.listener(|this, _, _, cx| {
-                                            if let Some(drive) = &mut this.drive {
-                                                let next = drive
-                                                    .listing
-                                                    .as_ref()
-                                                    .and_then(|listing| listing.next.clone());
-                                                if let Some(after) = next {
-                                                    let directory =
-                                                        drive.location.last().cloned().flatten();
-                                                    drive.send(DriveAction::More(directory, after));
-                                                }
-                                            }
-                                            cx.notify();
-                                        }),
-                                    ))
-                                })
-                            },
-                        )
-                        .into_any_element()
-                })
-                .unwrap_or_else(|| {
-                    div()
-                        .p_3()
-                        .child("Drive connection is not configured.")
-                        .into_any_element()
-                })
+            self.drive_listing(cx)
         } else {
             div()
                 .p_2()
@@ -543,7 +626,109 @@ impl Browser {
             .into_any_element()
     }
 
+    pub(crate) fn drive_listing(&self, cx: &mut Context<Self>) -> AnyElement {
+        self.drive
+            .as_ref()
+            .map(|drive| {
+                let path = drive
+                    .listing
+                    .as_ref()
+                    .and_then(|list| list.directory.clone());
+                div()
+                    .id("drive-entries")
+                    .track_scroll(&self.drive_scroll)
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_2()
+                    .when(drive.location.len() > 1, |d| {
+                        d.child(
+                            button("drive-up", "↑ Parent folder", false).on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    if let Some(drive) = &mut this.drive {
+                                        drive.location.pop();
+                                        drive.list();
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                    })
+                    .when_some(path, |d, path| {
+                        d.child(div().text_xs().truncate().child(path))
+                    })
+                    .when(drive.pending, |d| d.child(div().p_2().child("Loading…")))
+                    .when_some(drive.error.clone(), |d, error| {
+                        d.child(div().p_2().child(error).child(
+                            button("drive-retry", "Reload folder", false).on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    if let Some(drive) = &mut this.drive {
+                                        drive.list();
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        ))
+                    })
+                    .when_some(
+                        drive.listing.as_ref().filter(|_| !drive.pending),
+                        |d, listing| {
+                            d.children(listing.entries.iter().map(|entry| {
+                                let uri = entry.uri.clone();
+                                let is_directory = entry.is_directory;
+                                let label = if is_directory {
+                                    format!("▸ {}", entry.name)
+                                } else {
+                                    entry.name.clone()
+                                };
+                                button(
+                                    gpui::SharedString::from(format!("drive:{uri}")),
+                                    label,
+                                    false,
+                                )
+                                .truncate()
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.visit(uri.clone(), is_directory);
+                                        cx.notify();
+                                    },
+                                ))
+                            }))
+                            .when(listing.entries.is_empty(), |d| {
+                                d.child(div().p_2().child("No documents"))
+                            })
+                            .when(!listing.complete, |d| {
+                                d.child(button("drive-more", "Load more", false).on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        if let Some(drive) = &mut this.drive {
+                                            let next = drive
+                                                .listing
+                                                .as_ref()
+                                                .and_then(|listing| listing.next.clone());
+                                            if let Some(after) = next {
+                                                let directory =
+                                                    drive.location.last().cloned().flatten();
+                                                drive.send(DriveAction::More(directory, after));
+                                            }
+                                        }
+                                        cx.notify();
+                                    }),
+                                ))
+                            })
+                        },
+                    )
+                    .into_any_element()
+            })
+            .unwrap_or_else(|| {
+                div()
+                    .p_3()
+                    .child("Drive connection is not configured.")
+                    .into_any_element()
+            })
+    }
+
     fn terminal_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let panel_bounds = self.panel_bounds.clone();
         div()
             .id("browser-terminal")
             .debug_selector(|| "browser-terminal".into())
@@ -559,15 +744,21 @@ impl Browser {
                 cx.notify();
             }))
             .on_key_down(cx.listener(Self::key_down))
+            .on_scroll_wheel(cx.listener(|this, event, _, cx| this.scroll_terminal(event, cx)))
+            .child(
+                gpui::canvas(
+                    move |bounds, _, _| panel_bounds.set(Some(bounds)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
             .child(terminal_view::measure(self.viewport.clone()))
             .child(self.screen.view())
             .into_any_element()
     }
 
-    fn document_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let width = f32::from(window.viewport_size().width);
-        let wide = Self::wide(window);
-        let pane_width = (width - SIDEBAR_WIDTH) * if wide { 1. - self.split_fraction } else { 1. };
+    pub(crate) fn document_panel(&mut self, pane_width: f32, cx: &mut Context<Self>) -> AnyElement {
         let Some(document) = self.document.as_ref() else {
             return div()
                 .flex_1()
@@ -618,6 +809,7 @@ impl Browser {
             .flex()
             .flex_col()
             .bg(rgb(0xf7f7f5))
+            .text_color(rgb(0x1c2327))
             .relative()
             .track_focus(&self.document_focus)
             .child(
@@ -668,6 +860,8 @@ impl Browser {
                     .flex_1()
                     .min_h_0()
                     .overflow_scroll()
+                    .track_scroll(&self.document_scroll)
+                    .debug_selector(|| "browser-document-scroll".into())
                     .p_6()
                     .child(body),
             )
@@ -700,7 +894,11 @@ fn serve(
     // Keep the active subscription alive while a document downloads or decodes.
     std::thread::spawn(move || {
         while let Ok(request) = requests.recv() {
-            let result = read(&reader, request.uri.clone(), Some(request.clone()));
+            let result = read(
+                |uri| reader.read_file(uri).map_err(|error| error.to_string()),
+                request.uri.clone(),
+                Some(request.clone()),
+            );
 
             if loaded.send((request, result)).is_err() {
                 break;
@@ -756,14 +954,14 @@ fn serve(
 }
 
 fn read(
-    client: &Client,
+    load: impl FnOnce(&str) -> Result<Vec<u8>, String>,
     uri: String,
     request: Option<DocumentRequest>,
 ) -> Result<Document, String> {
     let path = remuda_core::vfs::VfsUri::parse(&uri)
         .map_err(|error| error.to_string())?
         .path;
-    let bytes = client.read_file(&uri).map_err(|error| error.to_string())?;
+    let bytes = load(&uri)?;
     let media = browser_media::decode(&path, &bytes)?;
     Ok(Document {
         uri,
@@ -796,6 +994,12 @@ impl Render for Browser {
                 .as_ref()
                 .is_some_and(|doc| doc.uri == request.uri)
         });
+        let available = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH;
+        let document_width = if wide {
+            (available - 5.) * (1. - self.split_fraction)
+        } else {
+            available
+        };
         let mut content = div()
             .flex()
             .flex_1()
@@ -841,7 +1045,7 @@ impl Render for Browser {
             });
         if wide {
             let terminal = self.terminal_panel(cx);
-            let document = self.document_panel(window, cx);
+            let document = self.document_panel(document_width, cx);
             let width = (f32::from(window.viewport_size().width) - SIDEBAR_WIDTH - 5.)
                 * self.split_fraction;
             content = content.child(
@@ -875,7 +1079,7 @@ impl Render for Browser {
                     .child(document),
             );
         } else if self.active == Content::Document {
-            content = content.child(self.document_panel(window, cx));
+            content = content.child(self.document_panel(document_width, cx));
         } else {
             content = content.child(self.terminal_panel(cx));
         }
@@ -955,6 +1159,7 @@ mod tests {
             focus.focus(window);
             Browser {
                 destination: "pilot".into(),
+                embedded: false,
                 documents,
                 displayed,
                 document: None,
@@ -973,12 +1178,16 @@ mod tests {
                 }),
                 assets: None,
                 document_generation: 0,
+                document_scroll: Default::default(),
+                drive_scroll: Default::default(),
                 zoom: 1.,
                 last_input: None,
                 split_fraction: 0.5,
                 dragging_split: false,
                 terminal: None,
                 screen: Screen::default(),
+                terminal_scroll: Default::default(),
+                panel_bounds: Default::default(),
                 viewport: Default::default(),
                 focus,
                 document_focus: cx.focus_handle(),
@@ -1036,5 +1245,29 @@ mod tests {
             terminal.right() <= doc.left(),
             "{terminal:?} overlaps {doc:?}"
         );
+        view.update_in(cx, |browser, window, cx| {
+            let markdown = (0..90)
+                .map(|line| format!("Paragraph {line}\n\n"))
+                .collect::<String>();
+            let media = browser_media::decode("pilot/long.md", markdown.as_bytes()).unwrap();
+            browser.open_document(
+                Document {
+                    uri: "remuda:///pilot/long.md".into(),
+                    media,
+                    request: None,
+                },
+                true,
+                window,
+            );
+            cx.notify();
+        });
+        let reader = cx.debug_bounds("browser-document-scroll").unwrap();
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: reader.center(),
+            delta: gpui::ScrollDelta::Lines(gpui::point(0., -6.)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        assert!(cx.read(|app| view.read(app).document_scroll.offset().y < px(0.)));
     }
 }

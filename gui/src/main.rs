@@ -351,6 +351,8 @@ struct LocalGui {
     peer_status: HashMap<String, cluster_status::PeerStatus>,
     live: Option<live_session::LiveSession>,
     live_focus: Option<gpui::FocusHandle>,
+    documents: Option<gpui::Entity<browser::Browser>>,
+    drive_selected: bool,
     live_notice: Option<&'static str>,
     preview_failed: bool,
     line_input: Option<line_input::LineInput>,
@@ -365,6 +367,7 @@ struct LocalGui {
     helper_changed: bool,
     selection: Option<Selection>,
     preview: Option<Screen>,
+    terminal_scroll: terminal_view::HistoryScroll,
     preview_generation: u64,
     preview_busy: bool,
     preview_pending: Option<(u64, Selection)>,
@@ -411,6 +414,8 @@ impl LocalGui {
             peer_status: HashMap::new(),
             live: None,
             live_focus: None,
+            documents: None,
+            drive_selected: false,
             live_notice: None,
             preview_failed: false,
             line_input: None,
@@ -425,6 +430,7 @@ impl LocalGui {
             helper_changed: false,
             selection: None,
             preview: None,
+            terminal_scroll: Default::default(),
             preview_generation: 0,
             preview_busy: false,
             preview_pending: None,
@@ -467,6 +473,7 @@ impl LocalGui {
         self.live_notice = None;
         self.selection = None;
         self.preview = None;
+        self.terminal_scroll = Default::default();
         self.preview_received = None;
         self.preview_failed = false;
     }
@@ -493,8 +500,8 @@ impl LocalGui {
             && matching[0].instance_id.as_deref() == Some(s.instance.as_str())
     }
     fn select_session(&mut self, peer: Option<String>, row: Session) {
-        self.clear_preview();
         let Some(instance) = row.instance_id else {
+            self.clear_preview();
             return;
         };
         let s = Selection {
@@ -503,8 +510,13 @@ impl LocalGui {
             instance,
         };
         if !self.selection_current(&s) {
+            self.clear_preview();
             return;
         }
+        if self.selection.as_ref() == Some(&s) {
+            return;
+        }
+        self.clear_preview();
         self.selection = Some(s);
         self.schedule_preview();
     }
@@ -535,6 +547,20 @@ impl LocalGui {
                         | cluster_status::Reachability::Connecting
                 )
             })
+    }
+
+    fn open_session_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(docs) = &self.documents {
+            docs.update(cx, |docs, _| docs.select_terminal());
+        }
+        if self.line_input.is_some() && self.live.is_some() {
+            if let Some(focus) = &self.live_focus {
+                focus.focus(window);
+            }
+            cx.notify();
+        } else {
+            self.attach_input(window, cx, true);
+        }
     }
 
     fn attach_input(&mut self, window: &mut Window, cx: &mut Context<Self>, compose: bool) {
@@ -573,7 +599,14 @@ impl LocalGui {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(documents) = &self.documents {
+            documents.update(cx, |docs, _| docs.mark_terminal_input());
+        }
         let Some(live) = &self.live else {
+            if event.keystroke.key == "enter" && !event.keystroke.modifiers.modified() {
+                self.open_session_composer(window, cx);
+                cx.stop_propagation();
+            }
             return;
         };
         let modifiers = event.keystroke.modifiers;
@@ -592,6 +625,9 @@ impl LocalGui {
             self.detach();
             self.live_notice = Some("Session unavailable · detached");
         } else if let Some(editor) = &mut self.line_input {
+            if editor.composing() {
+                return;
+            }
             match event.keystroke.key.as_str() {
                 "escape" => {
                     self.detach();
@@ -617,6 +653,12 @@ impl LocalGui {
                         editor.insert(&text.replace("\r\n", "\n").replace('\r', "\n"));
                     }
                 }
+                _ if event.keystroke.key_char.is_some()
+                    && !modifiers.control
+                    && !modifiers.platform =>
+                {
+                    return
+                }
                 _ => editor.edit(&event.keystroke),
             }
         } else if let Some(bytes) = live_session::key_bytes(&event.keystroke) {
@@ -631,7 +673,23 @@ impl LocalGui {
         cx.notify();
     }
 
-    fn tick(&mut self, window: &Window) {
+    fn scroll_terminal(&mut self, event: &gpui::ScrollWheelEvent, cx: &mut Context<Self>) {
+        let limit = self
+            .preview
+            .as_ref()
+            .map_or(0, |screen| screen.scrollback_len);
+        if self.terminal_scroll.apply(event.delta, limit) {
+            self.cancel_preview_request();
+            self.schedule_preview();
+            cx.notify();
+            cx.stop_propagation();
+        }
+    }
+
+    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(documents) = &self.documents {
+            documents.update(cx, |docs, cx| docs.tick(window, cx));
+        }
         self.drain();
         if Instant::now() >= self.next_session_refresh {
             self.next_session_refresh = Instant::now() + Duration::from_secs(5);
@@ -679,7 +737,13 @@ impl LocalGui {
             self.detach();
             self.live_notice = Some("Session unavailable · detached");
         }
+        let reading_document = self.documents.as_ref().is_some_and(|docs| {
+            let docs = docs.read(cx);
+            docs.owns_document_focus(window)
+                || (!browser::Browser::wide(window) && docs.showing_document())
+        });
         if self.live.is_some()
+            && !reading_document
             && !self
                 .live_focus
                 .as_ref()
@@ -725,6 +789,7 @@ impl LocalGui {
         let size_arg = resize
             .map(|size| format!("{}x{}", size.cols(), size.rows()))
             .unwrap_or_default();
+        let scroll = self.terminal_scroll.offset.to_string();
         self.preview_busy = true;
         let sender = self.preview_sender.clone();
         std::thread::spawn(move || {
@@ -746,6 +811,7 @@ impl LocalGui {
                             &selection.name,
                             &selection.instance,
                             &size_arg,
+                            &scroll,
                             PREVIEW_ABI,
                         ],
                         provider::TIMEOUT,
@@ -1092,7 +1158,7 @@ fn main() {
         let mut args = std::env::args().skip(2).collect::<Vec<_>>();
         let abi = match (args.len(), args.last().map(String::as_str)) {
             (5, Some(WORKER_ABI)) => Some(WORKER_ABI),
-            (6, Some(PREVIEW_ABI)) => Some(PREVIEW_ABI),
+            (6 | 7, Some(PREVIEW_ABI)) => Some(PREVIEW_ABI),
             (4, _) => None,
             _ => std::process::exit(1),
         };
@@ -1229,6 +1295,18 @@ fn open_local_window(cx: &mut App, bounds: Bounds<gpui::Pixels>) -> gpui::AnyWin
                 cx.new(|cx| {
                     let mut gui = LocalGui::new();
                     gui.tree_focus = Some(focus);
+                    let live_focus = cx.focus_handle();
+                    gui.live_focus = Some(live_focus.clone());
+                    let client = match remuda_native::net::browser::Client::from_env() {
+                        Ok(client) => client,
+                        Err(error) => {
+                            eprintln!("Remuda Drive credentials: {error}");
+                            None
+                        }
+                    };
+                    gui.documents =
+                        Some(cx.new(|cx| browser::Browser::local(client, live_focus, cx)));
+
                     gui.node_status = cluster_status::ClusterStatus::start().ok();
                     gui.refresh();
                     gui.refresh_nodes();
@@ -1237,7 +1315,7 @@ fn open_local_window(cx: &mut App, bounds: Bounds<gpui::Pixels>) -> gpui::AnyWin
                         if window
                             .update(cx, |_, window, cx| {
                                 weak.update(cx, |this: &mut LocalGui, cx| {
-                                    this.tick(window);
+                                    this.tick(window, cx);
                                     cx.notify();
                                 })
                             })
@@ -1280,6 +1358,41 @@ mod tests {
             assert!(window.get() != Some(first));
             assert_eq!(app.windows().len(), 1);
         });
+    }
+
+    #[gpui::test]
+    fn open_remuda_keeps_the_session_when_showing_drive_and_documents(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let focus = cx.focus_handle();
+            let documents = cx.new(|cx| browser::Browser::local(None, focus.clone(), cx));
+            let mut gui = LocalGui::new();
+            gui.live_focus = Some(focus);
+            gui.documents = Some(documents);
+            gui.sessions = vec![row("research")];
+            gui.preview = Some("terminal output".into());
+            gui
+        });
+        cx.simulate_resize(gpui::size(px(840.), px(620.)));
+        assert!(cx.debug_bounds("local-sessions-tab").is_some());
+        assert!(cx.debug_bounds("local-drive-tab").is_some());
+        assert!(cx.debug_bounds("session-0").is_some());
+        view.update_in(cx, |gui, window, cx| {
+            gui.documents
+                .as_ref()
+                .unwrap()
+                .update(cx, |docs, _| docs.seed_test_document(window));
+            cx.notify();
+        });
+        assert!(cx.debug_bounds("browser-document-body").is_some());
+        let terminal = cx.debug_bounds("local-terminal-tab").unwrap();
+        cx.simulate_click(terminal.center(), gpui::Modifiers::none());
+        assert!(cx.read(|app| {
+            let gui = view.read(app);
+            !gui.documents.as_ref().unwrap().read(app).showing_document()
+                && gui.preview.as_ref().unwrap().text == "terminal output"
+        }));
     }
 
     #[test]
@@ -1562,6 +1675,9 @@ mod tests {
             gui.drain();
             cx.notify();
         });
+        view.update_in(cx, |gui, window, _| {
+            gui.tree_focus.as_ref().unwrap().focus(window)
+        });
         cx.simulate_keystrokes("left");
         let alpha_session = TreeRow::session(Some("a".into()), &row("remote-a"));
         let beta_session = TreeRow::session(Some("b".into()), &row("remote-b"));
@@ -1757,6 +1873,18 @@ mod tests {
             gui.drain();
             cx.notify();
         });
+        assert!(cx.debug_bounds("line-composer").is_some());
+        view.update_in(cx, |gui, window, _| {
+            gui.tree_focus.as_ref().unwrap().focus(window)
+        });
+        let editor = cx.debug_bounds("line-composer").unwrap();
+        cx.simulate_click(editor.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("line-composer-caret").is_some());
+        cx.simulate_keystrokes("a");
+        assert_eq!(
+            cx.read(|app| view.read(app).line_input.as_ref().unwrap().bytes()),
+            b"a\r"
+        );
         assert!(cx.debug_bounds("preview").is_some());
         assert_eq!(
             cx.read(|app| view
@@ -1768,6 +1896,56 @@ mod tests {
             Some("screen text")
         );
     }
+    #[gpui::test]
+    fn session_sidebar_scrolls_without_scrolling_the_terminal(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new();
+            gui.sessions = (0..70).map(|i| row(&format!("agent-{i}"))).collect();
+            gui
+        });
+        cx.simulate_resize(gpui::size(px(1000.), px(540.)));
+        let tree = cx.debug_bounds("node-tree").unwrap();
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: tree.center(),
+            delta: gpui::ScrollDelta::Lines(gpui::point(0., -6.)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        assert!(cx.read(|app| {
+            let gui = view.read(app);
+            gui.tree_scroll.offset().y < px(0.) && gui.terminal_scroll.offset == 0
+        }));
+    }
+
+    #[gpui::test]
+    fn detached_terminal_enter_and_wheel_use_the_selected_session(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut gui = LocalGui::new();
+            gui.sessions = vec![row("agent")];
+            gui.preview_busy = true;
+            gui.select_session(None, gui.sessions[0].clone());
+            gui.preview = Some(Screen {
+                scrollback_len: 12,
+                ..Screen::default()
+            });
+            let focus = cx.focus_handle();
+            focus.focus(window);
+            gui.live_focus = Some(focus);
+            gui
+        });
+        let terminal = cx.debug_bounds("preview").unwrap();
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: terminal.center(),
+            delta: gpui::ScrollDelta::Lines(gpui::point(0., 3.)),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        assert_eq!(cx.read(|app| view.read(app).terminal_scroll.offset), 3);
+        cx.simulate_keystrokes("enter");
+        assert!(cx.debug_bounds("line-composer").is_some());
+        assert!(cx.read(|app| view.read(app).line_input.is_some()));
+    }
+
     #[test]
     fn preview_peer_revocation_and_refresh_discard_queued_work() {
         let mut gui = LocalGui::new();

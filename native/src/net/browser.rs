@@ -18,7 +18,9 @@ use zeroize::Zeroizing;
 #[path = "browser_drive.rs"]
 mod drive;
 use drive::DriveGrant;
-pub use drive::{DriveChunk, DriveEntry, DriveListing, DriveReadError};
+pub use drive::{
+    list_local_drive, read_local_drive, DriveChunk, DriveEntry, DriveListing, DriveReadError,
+};
 
 const ENVELOPE: &[u8] = b"remuda-browser-v1\n";
 const MAX_DOCUMENT_BYTES: u64 = 64 * 1024;
