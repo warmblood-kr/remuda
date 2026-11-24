@@ -27,8 +27,11 @@ live terminal. Session creation, attachment, keyboard input, terminal styling,
 scrollback navigation and IME are not available in this prototype.
 
 Use `remuda gui` on macOS or Windows to open this view. With a configured
-cluster, choose an admitted node to browse its sessions. Without a cluster,
-the view shows your local sessions.
+cluster, expand an admitted node to browse its sessions. Each node folds
+independently, and folding leaves the open snapshot in place. Use Up and Down
+to move within the tree, Left and Right to fold and unfold, and Enter to open
+a session. The preview shows the selected node, session, and snapshot age.
+Without a cluster, the view shows your local sessions.
 
 The internal `remuda-gui --internal-build-id` probe prints the build identifier
 embedded by `remuda-native` and exits before opening a window or reading state.

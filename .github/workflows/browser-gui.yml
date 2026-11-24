@@ -73,6 +73,8 @@ jobs:
       - if: runner.os == 'macOS'
         run: cargo test --locked --manifest-path gui/Cargo.toml --bin remuda-gui bus_document_reuses_one_tab_beside_the_terminal
       - if: runner.os == 'macOS'
+        run: cargo test --locked --manifest-path gui/Cargo.toml --bin remuda-gui peer_branches_fold_independently_and_preserve_the_preview
+      - if: runner.os == 'macOS'
         shell: bash
         run: |
           ./gui/target/debug/${{ matrix.executable }} --internal-build-id
