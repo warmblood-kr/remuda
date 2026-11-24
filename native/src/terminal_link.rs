@@ -5,7 +5,7 @@ use remuda_core::vfs::VfsUri;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Target {
     Drive(VfsUri),
-    GitHub(url::Url),
+    Web(url::Url),
 }
 
 impl Target {
@@ -16,13 +16,14 @@ impl Target {
         if uri.starts_with("remuda://") {
             return VfsUri::parse(uri).ok().map(Self::Drive);
         }
-        if !uri.starts_with("https://github.com/")
+        if !(uri.starts_with("https://") || uri.starts_with("http://"))
             || uri.chars().any(|ch| ch.is_whitespace() || ch == '\\')
         {
             return None;
         }
         let url = url::Url::parse(uri).ok()?;
-        (url.host_str() == Some("github.com")).then_some(Self::GitHub(url))
+        (url.host().is_some() && url.username().is_empty() && url.password().is_none())
+            .then_some(Self::Web(url))
     }
 }
 
@@ -41,13 +42,11 @@ mod tests {
     }
 
     #[test]
-    fn github_target_preserves_review_anchor() {
-        let Some(Target::GitHub(url)) =
-            Target::parse("https://github.com/org/repo/pull/42#discussion_r1")
-        else {
-            panic!("expected GitHub target");
+    fn web_target_preserves_document_anchor() {
+        let Some(Target::Web(url)) = Target::parse("https://example.org/guide#keyboard") else {
+            panic!("expected web target");
         };
-        assert_eq!(url.fragment(), Some("discussion_r1"));
+        assert_eq!(url.fragment(), Some("keyboard"));
     }
 }
 
