@@ -228,6 +228,10 @@ fn render_run(
                 .debug_selector(|| format!("terminal-link-{row_index}-{run_index}"))
                 .cursor_pointer()
                 .underline()
+                .when(
+                    !run.inverse && run.fg == Color::Default && run.bg == Color::Default,
+                    |d| d.text_color(rgb(0x8bc3ff)),
+                )
                 .on_click(move |event, window, cx| {
                     cx.stop_propagation();
                     let moved = matches!(event, gpui::ClickEvent::Mouse(click)
@@ -558,7 +562,7 @@ mod tests {
             focus.focus(window);
             let screen = Screen::from_cells(vec![vec![StyledCell {
                 text: "한글 🌿 terminal".into(),
-                hyperlink: Some("https://github.com/warmblood-kr/remuda".into()),
+                hyperlink: Some("https://example.org/remuda/guide".into()),
                 ..Default::default()
             }]])
             .unwrap();

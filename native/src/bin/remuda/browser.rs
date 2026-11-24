@@ -170,7 +170,7 @@ fn terminal_link(uri: &str, label: &str, interactive: bool) -> Result<String, &'
         return Err("Invalid terminal link label");
     }
     remuda_native::terminal_link::Target::parse(uri)
-        .ok_or("Terminal links require a Remuda Drive URI or an HTTPS GitHub URL")?;
+        .ok_or("Terminal links require a Remuda Drive URI or an HTTP(S) URL")?;
 
     if interactive {
         Ok(format!("\x1b]8;;{uri}\x1b\\{label}\x1b]8;;\x1b\\"))
@@ -202,7 +202,8 @@ mod terminal_link_tests {
     fn unsafe_targets_and_terminal_controls_are_rejected() {
         for uri in [
             "file:///tmp/guide.md",
-            "https://github.com.evil.invalid/project",
+            "javascript:alert(1)",
+            "https://",
             "https://github.com@evil.invalid/project",
             "remuda:///../guide.md",
             "remuda:///guide.md\x1b\\",

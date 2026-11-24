@@ -879,7 +879,7 @@ impl Browser {
                         cx.notify();
                     });
                 }
-                Some(Target::GitHub(url)) => cx.open_url(url.as_str()),
+                Some(Target::Web(url)) => cx.open_url(url.as_str()),
                 None => {}
             }
         })
