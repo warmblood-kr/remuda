@@ -33,6 +33,14 @@ to move within the tree, Left and Right to fold and unfold, and Enter to open
 a session. The preview shows the selected node, session, and snapshot age.
 Without a cluster, the view shows your local sessions.
 
+## Menu bar and system tray
+
+Run `remuda tray` on macOS or Windows to start the default daemon if needed
+and show the Remuda icon. **Open Remuda** opens the node GUI for the same daemon
+used by the CLI. **Open Browser…** asks for an SSH host or alias and opens the
+remote client. **Quit Tray** removes the icon. Open windows, the daemon, and its
+sessions keep running. The desktop nightly includes the tray in `remuda-gui`.
+
 The internal `remuda-gui --internal-build-id` probe prints the build identifier
 embedded by `remuda-native` and exits before opening a window or reading state.
 It identifies a build but does not authenticate the executable. Older GUI

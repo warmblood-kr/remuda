@@ -79,6 +79,7 @@ jobs:
         run: |
           ./gui/target/debug/${{ matrix.executable }} --internal-build-id
           ./target/debug/${{ matrix.cli }} browser --help
+          ./target/debug/${{ matrix.cli }} tray --help
           mkdir browser-artifact
           cp ./gui/target/debug/${{ matrix.executable }} ./target/debug/${{ matrix.cli }} browser-artifact/
       - if: runner.os == 'Windows'
@@ -88,6 +89,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "GUI build-ID probe exited with $LASTEXITCODE" }
           & ./target/debug/${{ matrix.cli }} browser --help
           if ($LASTEXITCODE -ne 0) { throw "CLI help exited with $LASTEXITCODE" }
+          & ./target/debug/${{ matrix.cli }} tray --help
+          if ($LASTEXITCODE -ne 0) { throw "Tray help exited with $LASTEXITCODE" }
           New-Item -ItemType Directory browser-artifact
           Copy-Item ./gui/target/release/${{ matrix.executable }}, ./target/debug/${{ matrix.cli }} browser-artifact/
       - uses: actions/upload-artifact@v4

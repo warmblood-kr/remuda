@@ -14,6 +14,8 @@ mod browser;
 mod input_helper;
 mod preview;
 mod provider;
+#[cfg(any(target_os = "macos", windows))]
+mod tray;
 
 const WORKER_ABI: &str = "--remuda-gui-worker-abi-1";
 const STALE_HELPER: &str = "GUI helper version changed; restart the GUI";
@@ -898,6 +900,7 @@ impl Render for LocalGui {
             .flex()
             .bg(rgb(0x101216))
             .text_color(rgb(0xe8eaf0))
+            .when(cfg!(target_os = "macos"), |root| root.font_family("Menlo"))
             .child(
                 div()
                     .id("session-sidebar")
@@ -1053,6 +1056,20 @@ impl Render for LocalGui {
     }
 }
 fn main() {
+    #[cfg(any(target_os = "macos", windows))]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--browser-picker")) {
+        tray::pick_browser();
+        return;
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--tray")) {
+        #[cfg(any(target_os = "macos", windows))]
+        std::process::exit(tray::main());
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            eprintln!("The Remuda tray is available on macOS and Windows");
+            std::process::exit(2);
+        }
+    }
     if std::env::args().nth(1).as_deref() == Some("--internal-build-id") {
         use std::io::Write;
         if std::env::args().len() != 2 {
