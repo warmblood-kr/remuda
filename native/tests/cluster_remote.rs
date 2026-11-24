@@ -173,6 +173,22 @@ fn check_gui_inputs(
         Duration::from_secs(10),
         || matches!(remuda_native::client::request(socket, &Request::Capture { name: "proof".into() }), Ok(Response::Screen(text)) if text.contains("INPUT:local-one") && text.contains("INPUT:local-two") && text.contains("INPUT:peer-one") && text.contains("INPUT:peer-two") && text.contains("INPUT:bridge-local-one") && text.contains("INPUT:bridge-local-two") && text.contains("INPUT:bridge-peer-one") && text.contains("INPUT:bridge-peer-two") && !text.contains("bridge-wrong") && !text.contains("bridge-retry")),
     );
+    exercise_gui_bridge(server, "line-local", "", instance);
+    exercise_gui_bridge(client, "line-peer", &server.fingerprint(), instance);
+    wait_for("GUI composed lines", Duration::from_secs(10), || {
+        let Ok(Response::Screen(text)) = remuda_native::client::request(
+            socket,
+            &Request::Capture { name: "proof".into() },
+        ) else {
+            return false;
+        };
+        let text = text.replace('\n', "");
+        ["line-local", "line-peer"].into_iter().all(|kind| {
+            ["one", "two"].into_iter().all(|line| {
+                text.matches(&format!("INPUT:bridge-{kind}-{line}")).count() == 1
+            })
+        }) && !text.contains("bridge-wrong") && !text.contains("bridge-retry")
+    });
 }
 
 // Run via gui/tests/peer_list_acceptance.sh; the GUI binary is built separately.
