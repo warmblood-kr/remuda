@@ -17,25 +17,26 @@ cargo run --locked --manifest-path gui/Cargo.toml
 
 The GUI reads sessions from the existing default local daemon. It also lists
 known cluster nodes; select an admitted peer to see its sessions, then select
-an available session with a known instance ID to see a read-only text snapshot.
-Local-only use does not require cluster initialization. Remote access uses the
-existing cluster membership and authenticated peer transport.
+an available session with a known instance ID to see a read-only terminal
+snapshot with its original colors. Local-only use does not require cluster
+initialization. Remote access uses the existing cluster membership and
+authenticated peer transport. Session icons and Butler details use the same
+display snapshot as the cluster TUI when the node supplies it.
 
-Refresh updates the lists. Offline peers retain their last known screen and
-show its age. **Attach** or **K** enables keyboard input to the selected
-session instance and refreshes its text screen. **Detach** or **Ctrl+\\** leaves
-the session running. Remote input uses the existing cluster control policy.
-The GUI currently displays refreshed plain-text screens.
+In the session tree, **Enter** on a session or the **Compose** button opens
+local line input. **Enter** in the editor submits the draft as one operation.
+**Shift+Enter** inserts a newline. **Esc** closes the editor. Use **K** in the
+tree for direct keyboard input. **Detach** or **Ctrl+\** closes input and
+leaves the session running. While input is active, the terminal follows the
+visible panel size when the local daemon or peer permits resizing.
 
 Use `remuda gui` on macOS or Windows to open this view. With a configured
 cluster, expand an admitted node to browse its sessions. Each node folds
 independently, and folding leaves the open snapshot in place. Use Up and Down
-to move within the tree, Left and Right to fold and unfold, and Enter to open
-a session. Use **/** to find nodes or sessions, **!** for attention rows, and
-**?** for keyboard help. Drag the divider on wide windows. Narrow windows
-place the session below the tree. The preview shows the selected node, session,
-and snapshot age.
-Without a cluster, the view shows your local sessions.
+to move within the tree and Left and Right to fold and unfold. Use **/** to
+find nodes or sessions, **!** for attention rows, and **?** for keyboard help.
+Drag the divider on wide windows. Narrow windows place the session below the
+tree. Offline peers retain their last known screen and show its age.
 
 ## Menu bar and system tray
 

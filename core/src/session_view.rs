@@ -15,6 +15,13 @@ pub struct ViewEntry {
     pub lines: Vec<String>,
 }
 
+impl ViewEntry {
+    /// Read a row for a frontend that renders its own styles.
+    pub fn plain_line(&self, index: usize) -> Option<String> {
+        safe_line(self.lines.get(index)?)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionView {
     sessions: Vec<SessionSummary>,

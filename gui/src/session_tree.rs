@@ -66,7 +66,14 @@ impl LocalGui {
             let node_matches = name.to_lowercase().contains(&query);
             let matches = |row: &Session| {
                 (node_matches || row.name.to_lowercase().contains(&query))
-                    && (!self.attention_only || flagged || !row.alive || row.unavailable)
+                    && (!self.attention_only
+                        || flagged
+                        || !row.alive
+                        || row.unavailable
+                        || row
+                            .decoration
+                            .as_ref()
+                            .is_some_and(|status| status.glyph == "!"))
             };
             if filtering
                 && !(node_matches && (!self.attention_only || flagged))
@@ -169,11 +176,20 @@ impl LocalGui {
             }
             ("enter" | "space", _) if self.show_help => self.show_help = false,
             ("enter" | "up" | "down" | "left" | "right" | "home" | "end", _) => {
-                self.move_tree(&key.key)
+                self.move_tree(&key.key);
+                if key.key == "enter"
+                    && self.search.is_none()
+                    && matches!((&self.focused_row, &self.selection),
+                        (TreeRow::Session(peer, name, Some(instance)), Some(selection))
+                            if peer == &selection.peer && name == &selection.name
+                                && instance == &selection.instance)
+                {
+                    self.attach_input(window, cx, true);
+                }
             }
             ("k", _) if self.search.is_none() => {
                 if self.live.is_none() {
-                    self.attach(window, cx);
+                    self.attach_input(window, cx, false);
                 }
             }
             (_, Some(text))
@@ -299,7 +315,12 @@ impl LocalGui {
                     || self.search.as_ref().is_some_and(|query| !query.is_empty());
                 let focused = self.focused_row == TreeRow::Node(fp.clone());
                 let debug = key.clone();
-                let full_name = name.clone();
+                let full_name = format!("{name} · {status}");
+                let glyph = match status.split(" · ").next() {
+                    Some("Online" | "Local") => "●",
+                    Some("Connecting" | "Unknown") => "○",
+                    _ => "!",
+                };
                 div()
                     .id(SharedString::from(key))
                     .debug_selector(move || debug.clone())
@@ -326,15 +347,9 @@ impl LocalGui {
                                 "▸"
                             }),
                     )
+                    .child(div().flex_none().text_color(rgb(color)).child(glyph))
                     .child(div().flex_1().min_w_0().truncate().child(name))
                     .tooltip(move |_, app| app.new(|_| FullName(full_name.clone())).into())
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(rgb(color))
-                            .child(status),
-                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(focus) = &this.tree_focus {
                             focus.focus(window);
@@ -365,11 +380,27 @@ impl LocalGui {
                 } else if session.alive {
                     ("Running", 0x65d89b)
                 } else {
-                    ("Exited", 0x9ca8b6)
+                    ("Exited", 0xffad9f)
                 };
                 let openable = session.alive && !session.unavailable && !unavailable;
                 let name = display_label(&session.name);
-                let full_name = name.clone();
+                let (glyph, detail) = match session.decoration.as_ref().filter(|_| openable) {
+                    Some(decoration) => (decoration.glyph.clone(), decoration.detail.clone()),
+                    None if unavailable || session.unavailable => ("!".into(), String::new()),
+                    None if session.alive => ("●".into(), String::new()),
+                    None => ("●".into(), String::new()),
+                };
+                let (status, dot) = match glyph.as_str() {
+                    "🏇" => ("Working", dot),
+                    "○" => ("Idle", dot),
+                    "!" if openable => ("Needs attention", 0xffad9f),
+                    _ => (status, dot),
+                };
+                let full_name = if detail.is_empty() {
+                    format!("{name} · {status}")
+                } else {
+                    format!("{name} · {status} · {detail}")
+                };
                 let session = session.clone();
                 let debug = key.clone();
                 let mut item = div()
@@ -386,16 +417,29 @@ impl LocalGui {
                     .border_1()
                     .border_color(rgb(if focused { 0x799ebe } else { 0x191d24 }))
                     .when(selected, |d| d.bg(rgb(0x233e57)))
-                    .child(div().flex_none().text_xs().text_color(rgb(dot)).child("●"))
-                    .child(div().flex_1().min_w_0().truncate().child(name))
-                    .tooltip(move |_, app| app.new(|_| FullName(full_name.clone())).into())
                     .child(
                         div()
                             .flex_none()
-                            .text_xs()
-                            .text_color(rgb(0xb5beca))
-                            .child(status),
-                    );
+                            .w(px(18.))
+                            .text_color(rgb(dot))
+                            .child(glyph),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().truncate().child(name))
+                            .when(!detail.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(rgb(0xb5beca))
+                                        .child(detail),
+                                )
+                            }),
+                    )
+                    .tooltip(move |_, app| app.new(|_| FullName(full_name.clone())).into());
                 if openable {
                     item = item
                         .cursor_pointer()
@@ -462,6 +506,18 @@ impl Render for LocalGui {
             || "Session".into(),
             |s| format!("{node} / {}", display_label(&s.name)),
         );
+        let detail = self.selection.as_ref().and_then(|selection| {
+            let rows = match &selection.peer {
+                Some(peer) => &self.remote_sessions.get(peer)?.rows,
+                None => &self.sessions,
+            };
+            let row = rows.iter().find(|row| {
+                row.name == selection.name
+                    && row.instance_id.as_deref() == Some(selection.instance.as_str())
+            })?;
+            let detail = &row.decoration.as_ref()?.detail;
+            (!detail.is_empty()).then(|| detail.clone())
+        });
         let current = self
             .selection
             .as_ref()
@@ -469,7 +525,12 @@ impl Render for LocalGui {
         let current = current && !self.selected_peer_offline();
         let snapshot = if let Some(at) = self.preview_received {
             if live {
-                format!("Live input · screen {} ago", compact_age(at.elapsed()))
+                let mode = if self.line_input.is_some() {
+                    "Line input"
+                } else {
+                    "Direct input"
+                };
+                format!("{mode} · screen {} ago", compact_age(at.elapsed()))
             } else if self.preview_failed || !current {
                 format!("Last known screen · {} ago", compact_age(at.elapsed()))
             } else {
@@ -668,10 +729,10 @@ impl Render for LocalGui {
                                 [
                                     "↑ ↓   Move",
                                     "← →   Fold / unfold",
-                                    "Enter   Preview",
-                                    "K   Attach",
+                                    "Enter   Compose line / Fold node",
+                                    "K   Direct input",
                                     "Ctrl+\\   Detach",
-                                    "Esc   Close search or help",
+                                    "Esc   Close line input, search, or help",
                                     "/   Find",
                                     "!   Attention",
                                     "?   Keys",
@@ -738,6 +799,9 @@ impl Render for LocalGui {
                             .text_lg()
                             .child(title),
                     )
+                    .when_some(detail, |d, detail| {
+                        d.child(div().text_sm().text_color(rgb(0xb5beca)).child(detail))
+                    })
                     .child(
                         div()
                             .flex()
@@ -771,8 +835,10 @@ impl Render for LocalGui {
                                 ))
                             })
                             .when(!live && current, |d| {
-                                d.child(button("attach-session", "Attach", true).on_click(
-                                    cx.listener(|this, _, window, cx| this.attach(window, cx)),
+                                d.child(button("attach-session", "Compose", true).on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.attach_input(window, cx, true)
+                                    }),
                                 ))
                             }),
                     )
@@ -791,17 +857,32 @@ impl Render for LocalGui {
                             .debug_selector(|| "preview".into())
                             .flex_1()
                             .min_h_0()
-                            .overflow_scroll()
-                            .pt_3()
+                            .flex()
+                            .flex_col()
                             .border_t_1()
                             .border_color(rgb(if live { 0x799ebe } else { 0x262e3a }))
-                            .font_family(if cfg!(windows) { "Consolas" } else { "Menlo" })
-                            .text_size(px(13.))
-                            .line_height(px(17.))
-                            .whitespace_nowrap()
                             .track_focus(&input_focus)
                             .on_key_down(cx.listener(Self::live_key))
-                            .child(self.preview.clone().unwrap_or_default()),
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .relative()
+                                    .overflow_hidden()
+                                    .child(crate::terminal_view::measure(self.viewport.clone()))
+                                    .child(
+                                        div()
+                                            .id("terminal-cells")
+                                            .size_full()
+                                            .overflow_scroll()
+                                            .when_some(self.preview.as_ref(), |d, screen| {
+                                                d.child(screen.view())
+                                            }),
+                                    ),
+                            )
+                            .when_some(self.line_input.as_ref(), |d, editor| {
+                                d.child(editor.view())
+                            }),
                     ),
             )
     }

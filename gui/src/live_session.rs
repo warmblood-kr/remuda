@@ -13,7 +13,7 @@ pub(crate) struct LiveSession {
 }
 
 impl LiveSession {
-    pub(crate) fn new(selection: &Selection) -> io::Result<Self> {
+    pub(crate) fn new(selection: &Selection, compose: bool) -> io::Result<Self> {
         if selection.name.is_empty() || selection.instance.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -21,10 +21,11 @@ impl LiveSession {
             ));
         }
         let peer = selection.peer.as_deref().unwrap_or_default();
-        let kind = if selection.peer.is_some() {
-            "peer"
-        } else {
-            "local"
+        let kind = match (selection.peer.is_some(), compose) {
+            (false, false) => "local",
+            (true, false) => "peer",
+            (false, true) => "line-local",
+            (true, true) => "line-peer",
         };
         let input = InputHelper::start(
             &std::env::current_exe()?,
@@ -54,6 +55,10 @@ impl LiveSession {
             }
             result => result,
         }
+    }
+
+    pub(crate) fn submit_line(&self, bytes: &[u8]) -> Submit {
+        self.input.submit(bytes)
     }
 
     /// Poll only while the view is still attached and authorized. A successful

@@ -2,31 +2,11 @@ use crate::{discover_peers, peer_is_unique, worker_deadline, Selection};
 use remuda_native::session_preview::{capture, IdentityPolicy, PreviewFrame};
 use std::time::{Duration, Instant};
 
-fn plain(frame: PreviewFrame) -> Result<String, String> {
-    let mut text = String::new();
-    for row in frame.cells {
-        for cell in row {
-            for ch in cell.text.chars() {
-                if ch.is_control()
-                    || remuda_core::protocol::is_secret_prompt_format_or_separator(ch)
-                {
-                    continue;
-                }
-                if ch.len_utf8() > 65_536usize.saturating_sub(text.len()) {
-                    return Err("too large".into());
-                }
-                text.push(ch);
-            }
-        }
-        if text.len() == 65_536 {
-            return Err("too large".into());
-        }
-        text.push('\n');
-    }
-    Ok(text)
+fn styled(frame: PreviewFrame) -> Result<crate::terminal_view::Screen, String> {
+    crate::terminal_view::Screen::from_cells(frame.cells)
 }
 
-fn fetch(s: &Selection) -> Result<String, String> {
+fn fetch(s: &Selection) -> Result<crate::terminal_view::Screen, String> {
     let result = match &s.peer {
         None => capture(
             remuda_native::daemon::socket_path("default").as_path(),
@@ -35,7 +15,7 @@ fn fetch(s: &Selection) -> Result<String, String> {
             0,
             IdentityPolicy::Strict,
         )
-        .and_then(plain),
+        .and_then(styled),
         Some(fp) => {
             if !peer_is_unique(&discover_peers().map_err(|e| e.to_string())?, fp) {
                 return Err("peer unavailable".into());
@@ -49,7 +29,7 @@ fn fetch(s: &Selection) -> Result<String, String> {
             let deadline = Instant::now() + Duration::from_secs(4);
             let text = loop {
                 match capture(&port, &s.name, Some(&s.instance), 0, IdentityPolicy::Strict)
-                    .and_then(plain)
+                    .and_then(styled)
                 {
                     Ok(text) => break Ok(text),
                     Err(e) if Instant::now() >= deadline => break Err(e),
@@ -65,8 +45,8 @@ fn fetch(s: &Selection) -> Result<String, String> {
     result
 }
 
-pub fn worker(args: &[String], tagged: bool) -> i32 {
-    if args.len() != 4 || args[2].is_empty() || args[3].is_empty() {
+pub fn worker(args: &[String], abi: Option<&str>) -> i32 {
+    if !matches!(args.len(), 4 | 5) || args[2].is_empty() || args[3].is_empty() {
         return 1;
     }
     let peer = match args[0].as_str() {
@@ -80,21 +60,56 @@ pub fn worker(args: &[String], tagged: bool) -> i32 {
         name: args[2].clone(),
         instance: args[3].clone(),
     };
+    let resize_refused = args
+        .get(4)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| !resize(&s, value));
     match fetch(&s) {
-        Ok(text) => super::write_worker_reply(&text, tagged),
+        Ok(mut screen) if abi == Some(super::PREVIEW_ABI) => {
+            screen.resize_refused = resize_refused;
+            super::write_worker_reply_with_abi(&screen, abi)
+        }
+        Ok(screen) => super::write_worker_reply_with_abi(&screen.text, abi),
         Err(_) => 1,
     }
+}
+
+fn resize(selection: &Selection, dimensions: &str) -> bool {
+    use remuda_core::{
+        agent::Size,
+        protocol::{Request, Response},
+    };
+    use remuda_native::strict_input::{InputTransport, LocalInput, PeerInput};
+
+    let Some(size) = dimensions
+        .split_once('x')
+        .and_then(|(cols, rows)| Some(Size::for_viewport(cols.parse().ok()?, rows.parse().ok()?)))
+    else {
+        return false;
+    };
+    let request = Request::ResizeSession {
+        name: selection.name.clone(),
+        instance_id: selection.instance.clone(),
+        size,
+    };
+    let response = match &selection.peer {
+        Some(peer) => PeerInput::new(peer.clone()).and_then(|mut peer| peer.send(&request)),
+        None => LocalInput(remuda_native::daemon::socket_path("default")).send(&request),
+    };
+    matches!(response, Ok(Response::Ok))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remuda_core::agent::{Cursor, StyledCell};
+    use remuda_core::agent::{Color, Cursor, StyledCell};
     #[test]
     fn text_removes_controls_and_directional_formatting() {
         let frame = PreviewFrame {
             cells: vec![vec![StyledCell {
                 text: "a\u{1b}\u{202e}b".into(),
+                fg: Color::Idx(2),
+                bg: Color::Rgb(0, 0, 32),
                 ..Default::default()
             }]],
             wrapped: vec![],
@@ -108,6 +123,9 @@ mod tests {
             instance_id: Some("1".into()),
             output_version: None,
         };
-        assert_eq!(plain(frame).unwrap(), "ab\n");
+        let screen = styled(frame).unwrap();
+        assert_eq!(screen.text, "ab\n");
+        assert_eq!(screen.rows[0][0].fg, Color::Idx(2));
+        assert_eq!(screen.rows[0][0].bg, Color::Rgb(0, 0, 32));
     }
 }

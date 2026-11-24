@@ -13,14 +13,18 @@ mod browser;
 mod cluster_status;
 #[allow(dead_code)]
 mod input_helper;
+mod line_input;
 mod live_session;
 mod preview;
+mod terminal_view;
+use terminal_view::Screen;
 mod provider;
 mod session_tree;
 #[cfg(any(target_os = "macos", windows))]
 mod tray;
 
 const WORKER_ABI: &str = "--remuda-gui-worker-abi-1";
+const PREVIEW_ABI: &str = "--remuda-gui-preview-abi-2";
 const STALE_HELPER: &str = "GUI helper version changed; restart the GUI";
 
 #[derive(Serialize, Deserialize)]
@@ -30,11 +34,15 @@ struct WorkerReply<T> {
 }
 
 fn write_worker_reply<T: Serialize>(payload: &T, tagged: bool) -> i32 {
-    let result = if tagged {
+    write_worker_reply_with_abi(payload, tagged.then_some(WORKER_ABI))
+}
+
+fn write_worker_reply_with_abi<T: Serialize>(payload: &T, abi: Option<&str>) -> i32 {
+    let result = if let Some(abi) = abi {
         serde_json::to_writer(
             std::io::stdout(),
             &WorkerReply {
-                abi: WORKER_ABI.to_owned(),
+                abi: abi.to_owned(),
                 payload,
             },
         )
@@ -45,9 +53,16 @@ fn write_worker_reply<T: Serialize>(payload: &T, tagged: bool) -> i32 {
 }
 
 fn read_worker_reply<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    read_worker_reply_with_abi(bytes, WORKER_ABI)
+}
+
+fn read_worker_reply_with_abi<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    abi: &str,
+) -> Result<T, String> {
     let reply: WorkerReply<T> =
         serde_json::from_slice(bytes).map_err(|_| STALE_HELPER.to_string())?;
-    if reply.abi != WORKER_ABI {
+    if reply.abi != abi {
         return Err(STALE_HELPER.to_string());
     }
     Ok(reply.payload)
@@ -59,7 +74,90 @@ struct Session {
     instance_id: Option<String>,
     alive: bool,
     unavailable: bool,
+    #[serde(default)]
+    decoration: Option<SessionDecoration>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionDecoration {
+    glyph: String,
+    detail: String,
+}
+
+fn session_rows(
+    rows: Vec<remuda_core::SessionSummary>,
+    view: Option<remuda_core::session_view::SessionView>,
+) -> Vec<Session> {
+    let view = view.filter(|view| view.validate().is_ok());
+    rows.into_iter()
+        .map(|row| {
+            let decoration = row.instance_id.as_ref().and_then(|instance| {
+                let entry = view
+                    .as_ref()?
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.name == row.name && &entry.instance_id == instance)?;
+                let line = entry.plain_line(0)?;
+                let line = line.trim_start();
+                let (glyph, name_and_detail) = ["🏇", "○", "●", "!"]
+                    .into_iter()
+                    .find_map(|glyph| {
+                        line.strip_prefix(glyph).and_then(|rest| {
+                            let rest = rest.trim_start();
+                            rest.strip_prefix(&row.name)
+                                .filter(|suffix| suffix.is_empty() || suffix.starts_with(' '))
+                                .map(|_| (glyph, rest))
+                        })
+                    })
+                    .unwrap_or(("●", line));
+                let mut detail = name_and_detail
+                    .strip_prefix(&row.name)?
+                    .trim()
+                    .trim_start_matches('·')
+                    .trim()
+                    .to_owned();
+                for line in (1..entry.lines.len()).filter_map(|i| entry.plain_line(i)) {
+                    if !line.trim().is_empty() {
+                        if !detail.is_empty() {
+                            detail.push_str(" · ");
+                        }
+                        detail.push_str(line.trim());
+                    }
+                }
+                Some(SessionDecoration {
+                    glyph: glyph.into(),
+                    detail,
+                })
+            });
+            let decoration = decoration
+                .filter(|value| !value.detail.is_empty() || value.glyph != "●")
+                .or_else(|| {
+                    row.team
+                        .filter(|team| team.validate().is_ok())
+                        .and_then(|team| {
+                            let detail = [team.agent_kind, team.model]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>()
+                                .join(" · ");
+                            (!detail.is_empty()).then(|| SessionDecoration {
+                                glyph: "●".into(),
+                                detail,
+                            })
+                        })
+                });
+            Session {
+                name: row.name,
+                instance_id: row.instance_id,
+                alive: row.alive,
+                unavailable: row.unavailable,
+                decoration,
+            }
+        })
+        .collect()
+}
+
+const SESSION_VIEW_WIDTH: u16 = 120;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Peer {
@@ -84,16 +182,17 @@ fn worker(tagged: bool) -> i32 {
         Ok(remuda_core::protocol::Response::Sessions(rows)) => rows,
         _ => return 1,
     };
-    let sessions: Vec<_> = rows
-        .into_iter()
-        .map(|s| Session {
-            name: s.name,
-            instance_id: s.instance_id,
-            alive: s.alive,
-            unavailable: s.unavailable,
-        })
-        .collect();
-    write_worker_reply(&sessions, tagged)
+    let view = match remuda_native::client::request_with_timeout(
+        &path,
+        &remuda_core::protocol::Request::RenderedSessionList {
+            width: SESSION_VIEW_WIDTH,
+        },
+        Duration::from_secs(2),
+    ) {
+        Ok(remuda_core::protocol::Response::RenderedSessionList(view)) => Some(view),
+        _ => None,
+    };
+    write_worker_reply(&session_rows(rows, view), tagged)
 }
 
 fn peer_is_unique(peers: &[Peer], fingerprint: &str) -> bool {
@@ -139,18 +238,21 @@ fn peer_worker(fingerprint: &str, tagged: bool) -> i32 {
         else {
             return Err(());
         };
+        let view = match ClusterClient::system().request(
+            address,
+            &pinned_static_key,
+            &private,
+            &Request::RenderedSessionList {
+                width: SESSION_VIEW_WIDTH,
+            },
+        ) {
+            Ok(Response::RenderedSessionList(view)) => Some(view),
+            _ => None,
+        };
         if !peer_is_unique(&discover_peers().map_err(|_| ())?, fingerprint) {
             return Err(());
         }
-        Ok(rows
-            .into_iter()
-            .map(|s| Session {
-                name: s.name,
-                instance_id: s.instance_id,
-                alive: s.alive,
-                unavailable: s.unavailable,
-            })
-            .collect())
+        Ok(session_rows(rows, view))
     };
     match list() {
         Ok(rows) => write_worker_reply(&rows, tagged),
@@ -216,7 +318,7 @@ struct Selection {
     name: String,
     instance: String,
 }
-type PreviewResult = (u64, Selection, Result<String, String>);
+type PreviewResult = (u64, Selection, Result<Screen, String>);
 
 type RemoteResult = (u64, u64, String, Result<Vec<Session>, String>);
 
@@ -248,6 +350,10 @@ struct LocalGui {
     live_focus: Option<gpui::FocusHandle>,
     live_notice: Option<&'static str>,
     preview_failed: bool,
+    line_input: Option<line_input::LineInput>,
+    viewport: terminal_view::Viewport,
+    requested_size: Option<remuda_core::agent::Size>,
+    next_session_refresh: Instant,
     next_live_preview: Instant,
     focused_row: TreeRow,
     local_expanded: bool,
@@ -255,7 +361,7 @@ struct LocalGui {
     preview_received: Option<Instant>,
     helper_changed: bool,
     selection: Option<Selection>,
-    preview: Option<String>,
+    preview: Option<Screen>,
     preview_generation: u64,
     preview_busy: bool,
     preview_pending: Option<(u64, Selection)>,
@@ -304,6 +410,10 @@ impl LocalGui {
             live_focus: None,
             live_notice: None,
             preview_failed: false,
+            line_input: None,
+            viewport: Default::default(),
+            requested_size: None,
+            next_session_refresh: Instant::now() + Duration::from_secs(5),
             next_live_preview: Instant::now(),
             focused_row: TreeRow::Node(None),
             local_expanded: true,
@@ -402,6 +512,8 @@ impl LocalGui {
         }
     }
     fn detach(&mut self) {
+        self.line_input = None;
+        self.requested_size = None;
         if let Some(live) = self.live.take() {
             live.stop();
             self.live_notice = Some("Detached · session keeps running");
@@ -422,7 +534,7 @@ impl LocalGui {
             })
     }
 
-    fn attach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn attach_input(&mut self, window: &mut Window, cx: &mut Context<Self>, compose: bool) {
         if self.selected_peer_offline() {
             return;
         }
@@ -431,10 +543,13 @@ impl LocalGui {
             .as_ref()
             .filter(|s| self.selection_current(s))
         {
-            match live_session::LiveSession::new(selection) {
+            match live_session::LiveSession::new(selection, compose) {
                 Ok(live) => {
+                    self.detach();
                     self.live = Some(live);
-                    self.live_notice = Some("Input enabled · Ctrl+\\ detaches");
+                    self.line_input = compose.then(line_input::LineInput::default);
+                    self.live_notice =
+                        (!compose).then_some("Direct input enabled · Ctrl+\\ detaches");
                     self.next_live_preview = Instant::now();
                     if let Some(focus) = &self.live_focus {
                         focus.focus(window);
@@ -473,6 +588,34 @@ impl LocalGui {
         {
             self.detach();
             self.live_notice = Some("Session unavailable · detached");
+        } else if let Some(editor) = &mut self.line_input {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    self.detach();
+                    if let Some(focus) = &self.tree_focus {
+                        focus.focus(window);
+                    }
+                }
+                "enter" if !modifiers.modified() => {
+                    self.live_notice = match live.submit_line(&editor.bytes()) {
+                        live_session::Submit::Queued => {
+                            editor.queued();
+                            Some("Sending line…")
+                        }
+                        live_session::Submit::Busy => {
+                            Some("Previous line pending · draft retained")
+                        }
+                        _ => Some("Line could not be sent · draft retained"),
+                    };
+                }
+                "enter" if modifiers.shift => editor.insert("\n"),
+                "v" if modifiers.platform || (modifiers.control && modifiers.shift) => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        editor.insert(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                    }
+                }
+                _ => editor.edit(&event.keystroke),
+            }
         } else if let Some(bytes) = live_session::key_bytes(&event.keystroke) {
             self.live_notice = match live.submit(&bytes) {
                 live_session::Submit::Queued => Some("Input pending"),
@@ -487,6 +630,31 @@ impl LocalGui {
 
     fn tick(&mut self, window: &Window) {
         self.drain();
+        if Instant::now() >= self.next_session_refresh {
+            self.next_session_refresh = Instant::now() + Duration::from_secs(5);
+            if !self.busy {
+                self.pending = true;
+                self.launch();
+            }
+            if !self.remote_busy {
+                let selected_peer = self.selection.as_ref().and_then(|s| s.peer.as_ref());
+                let visible: Vec<_> =
+                    self.peers
+                        .iter()
+                        .filter(|p| {
+                            (self.expanded_peers.contains(&p.fingerprint)
+                                || selected_peer == Some(&p.fingerprint))
+                                && !self.peer_status.get(&p.fingerprint).is_some_and(|s| {
+                                    s.state == cluster_status::Reachability::Offline
+                                })
+                        })
+                        .map(|p| p.fingerprint.clone())
+                        .collect();
+                for peer in visible {
+                    self.queue_peer_refresh(peer, false);
+                }
+            }
+        }
         let was_offline = self.selected_peer_offline();
         if let Some(status) = &self.node_status {
             self.peer_status = status.snapshot();
@@ -544,6 +712,16 @@ impl LocalGui {
         if self.selection.as_ref() != Some(&selection) || !self.selection_current(&selection) {
             return;
         }
+        let resize = self
+            .viewport
+            .get()
+            .filter(|size| self.live.is_some() && self.requested_size != Some(*size));
+        if resize.is_some() {
+            self.requested_size = resize;
+        }
+        let size_arg = resize
+            .map(|size| format!("{}x{}", size.cols(), size.rows()))
+            .unwrap_or_default();
         self.preview_busy = true;
         let sender = self.preview_sender.clone();
         std::thread::spawn(move || {
@@ -564,14 +742,15 @@ impl LocalGui {
                             peer,
                             &selection.name,
                             &selection.instance,
-                            WORKER_ABI,
+                            &size_arg,
+                            PREVIEW_ABI,
                         ],
                         provider::TIMEOUT,
                     )
                 })
-                .and_then(|bytes| read_worker_reply::<String>(&bytes))
+                .and_then(|bytes| read_worker_reply_with_abi::<Screen>(&bytes, PREVIEW_ABI))
                 .and_then(|s| {
-                    if s.len() <= 65_536 {
+                    if s.text.len() <= 65_536 {
                         Ok(s)
                     } else {
                         Err("too large".into())
@@ -648,6 +827,10 @@ impl LocalGui {
         peer.map_or(self.local_expanded, |fp| self.expanded_peers.contains(fp))
     }
     fn refresh_peer(&mut self, fp: String) {
+        self.queue_peer_refresh(fp, true);
+    }
+
+    fn queue_peer_refresh(&mut self, fp: String, foreground: bool) {
         if !self.peer_current(&fp) {
             return;
         }
@@ -656,7 +839,7 @@ impl LocalGui {
             .checked_add(1)
             .expect("generation exhausted");
         let sessions = self.remote_sessions.entry(fp.clone()).or_default();
-        sessions.loading = true;
+        sessions.loading |= foreground;
         sessions.generation = self.remote_generation;
         self.remote_pending.retain(|(_, _, queued)| queued != &fp);
         self.remote_pending
@@ -741,6 +924,9 @@ impl LocalGui {
                 match result {
                     Ok(body) => {
                         self.preview_received = Some(Instant::now());
+                        if body.resize_refused && self.live.is_some() {
+                            self.live_notice = Some("Terminal resize unavailable");
+                        }
                         self.preview = Some(body);
                         self.preview_failed = false;
                     }
@@ -749,10 +935,12 @@ impl LocalGui {
                         self.preview_failed = true;
                         if self.preview.is_none() {
                             self.preview = Some(if error == STALE_HELPER {
-                                STALE_HELPER.into()
+                                Screen {
+                                    text: STALE_HELPER.into(),
+                                    ..Screen::default()
+                                }
                             } else {
-                                "Snapshot unavailable. The session or node may have disconnected."
-                                    .into()
+                                Screen { text: "Snapshot unavailable. The session or node may have disconnected.".into(), ..Screen::default() }
                             });
                         }
                     }
@@ -899,11 +1087,16 @@ fn main() {
     }
     if std::env::args().nth(1).as_deref() == Some("--internal-preview-worker") {
         let mut args = std::env::args().skip(2).collect::<Vec<_>>();
-        let tagged = args.len() == 5 && args.last().map(String::as_str) == Some(WORKER_ABI);
-        if tagged {
+        let abi = match (args.len(), args.last().map(String::as_str)) {
+            (5, Some(WORKER_ABI)) => Some(WORKER_ABI),
+            (6, Some(PREVIEW_ABI)) => Some(PREVIEW_ABI),
+            (4, _) => None,
+            _ => std::process::exit(1),
+        };
+        if abi.is_some() {
             args.pop();
         }
-        std::process::exit(preview::worker(&args, tagged));
+        std::process::exit(preview::worker(&args, abi));
     }
     if std::env::args().nth(1).as_deref() == Some("--internal-list-worker") {
         std::process::exit(worker(
@@ -1227,7 +1420,7 @@ mod tests {
             gui.search.as_deref() == Some("runner")
                 && gui.tree_rows().len() == 2
                 && matches!(&gui.focused_row, TreeRow::Session(_, name, _) if name == "test-runner")
-                && gui.preview.as_deref() == Some("saved screen")
+                && gui.preview.as_ref().map(|screen| screen.text.as_str()) == Some("saved screen")
         }));
         cx.simulate_keystrokes("escape");
         let attention = cx.debug_bounds("tree-filter").unwrap();
@@ -1282,7 +1475,12 @@ mod tests {
         }));
         assert!(cx.read(|app| view.read(app).preview_received.is_some()));
         assert_eq!(
-            cx.read(|app| view.read(app).preview.clone()).as_deref(),
+            cx.read(|app| view
+                .read(app)
+                .preview
+                .as_ref()
+                .map(|screen| screen.text.clone()))
+                .as_deref(),
             Some("test snapshot")
         );
         cx.simulate_keystrokes("right");
@@ -1329,8 +1527,62 @@ mod tests {
             instance_id: Some("instance".into()),
             alive: true,
             unavailable: false,
+            decoration: None,
         }
     }
+    #[test]
+    fn butler_display_data_requires_matching_instance_and_removes_style_codes() {
+        use remuda_core::session_view::{SessionView, ViewEntry};
+
+        let summary: remuda_core::SessionSummary = serde_json::from_value(serde_json::json!({
+            "name": "agent",
+            "instance_id": "new",
+            "alive": true,
+            "idle": { "secs": 0, "nanos": 0 },
+            "size": { "cols": 80, "rows": 24 },
+            "attached": false,
+        }))
+        .unwrap();
+        let entry = ViewEntry {
+            name: "agent".into(),
+            instance_id: "new".into(),
+            lines: vec!["🏇 \x1b[1magent\x1b[0m  \x1b[2mCodex · model-a · 23K 18%\x1b[0m".into()],
+        };
+        let view = SessionView::new(vec![summary.clone()], 1, vec![entry.clone()]);
+        let rows = session_rows(vec![summary.clone()], Some(view.clone()));
+        let decoration = rows[0].decoration.as_ref().unwrap();
+        assert_eq!(decoration.glyph, "🏇");
+        assert_eq!(decoration.detail, "Codex · model-a · 23K 18%");
+
+        let mut replacement = summary;
+        replacement.instance_id = Some("replacement".into());
+        assert!(session_rows(vec![replacement], Some(view))[0]
+            .decoration
+            .is_none());
+    }
+
+    #[gpui::test]
+    fn enter_on_a_session_opens_a_local_draft(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut gui = LocalGui::new();
+            gui.sessions = vec![row("agent")];
+            gui.preview_busy = true;
+            gui.focused_row = TreeRow::session(None, &gui.sessions[0]);
+            let focus = cx.focus_handle();
+            focus.focus(window);
+            gui.tree_focus = Some(focus);
+            gui
+        });
+        cx.simulate_keystrokes("enter h i");
+        assert!(cx.debug_bounds("line-composer").is_some());
+        assert_eq!(
+            cx.read(|app| view.read(app).line_input.as_ref().unwrap().bytes()),
+            b"hi\r"
+        );
+        cx.simulate_keystrokes("escape");
+        assert!(cx.read(|app| view.read(app).line_input.is_none()));
+    }
+
     #[test]
     fn stale_reply_is_ignored_and_failure_preserves_old_rows() {
         let mut gui = LocalGui::new();
@@ -1411,7 +1663,12 @@ mod tests {
         });
         assert!(cx.debug_bounds("preview").is_some());
         assert_eq!(
-            cx.read(|app| view.read(app).preview.clone()).as_deref(),
+            cx.read(|app| view
+                .read(app)
+                .preview
+                .as_ref()
+                .map(|screen| screen.text.clone()))
+                .as_deref(),
             Some("screen text")
         );
     }

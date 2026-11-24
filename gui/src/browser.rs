@@ -10,8 +10,7 @@ use remuda_native::{CommandBuilder, PtyAgent};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const TERMINAL_LINE_HEIGHT: f32 = 18.0;
-const TERMINAL_CELL_WIDTH: f32 = 8.0;
+use crate::terminal_view::{self, Screen, Viewport};
 
 struct Document {
     request: DocumentRequest,
@@ -26,7 +25,8 @@ struct Browser {
     pending_presentation: bool,
     document_active: bool,
     terminal: Option<PtyAgent>,
-    terminal_text: String,
+    screen: Screen,
+    viewport: Viewport,
     focus: FocusHandle,
 }
 
@@ -45,9 +45,15 @@ pub fn open(
     command.args(ssh_arguments(&destination));
     command.env("TERM", "xterm-256color");
     command.env_remove("REMUDA_BROWSER_CLIENT");
-    let (terminal, terminal_text) = match PtyAgent::spawn(command, Size::new(100, 30)) {
-        Ok(terminal) => (Some(terminal), String::new()),
-        Err(error) => (None, format!("Could not connect to {destination}: {error}")),
+    let (terminal, screen) = match PtyAgent::spawn(command, Size::new(100, 30)) {
+        Ok(terminal) => (Some(terminal), Screen::default()),
+        Err(error) => (
+            None,
+            Screen {
+                text: format!("Could not connect to {destination}: {error}"),
+                ..Screen::default()
+            },
+        ),
     };
     app.open_window(
         WindowOptions {
@@ -70,7 +76,7 @@ pub fn open(
                                     cx.notify();
                                 }
                                 if !browser.document_active {
-                                    browser.refresh_terminal(window, cx);
+                                    browser.refresh_terminal(cx);
                                 }
                             })
                         })
@@ -87,7 +93,8 @@ pub fn open(
                     pending_presentation: false,
                     document_active: false,
                     terminal,
-                    terminal_text,
+                    screen,
+                    viewport: Default::default(),
                     focus,
                 }
             })
@@ -104,18 +111,20 @@ impl Browser {
         self.document_active = true;
     }
 
-    fn refresh_terminal(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn refresh_terminal(&mut self, cx: &mut Context<Self>) {
         if let Some(terminal) = self.terminal.as_mut() {
-            let viewport = window.viewport_size();
-            let cols = ((f32::from(viewport.width) - 24.0) / TERMINAL_CELL_WIDTH) as u16;
-            let rows = ((f32::from(viewport.height) - 72.0) / TERMINAL_LINE_HEIGHT) as u16;
-            let size = Size::for_viewport(cols, rows);
-            if terminal.size() != size && terminal.is_alive() {
-                let _ = terminal.resize(size);
+            if let Some(size) = self.viewport.get() {
+                if terminal.size() != size && terminal.is_alive() {
+                    let _ = terminal.resize(size);
+                }
             }
-            if let Ok(screen) = terminal.screen_text() {
-                if screen != self.terminal_text {
-                    self.terminal_text = screen;
+            if let Ok(screen) = terminal
+                .screen_cells()
+                .map_err(|e| e.to_string())
+                .and_then(Screen::from_cells)
+            {
+                if screen != self.screen {
+                    self.screen = screen;
                     cx.notify();
                 }
             }
@@ -155,7 +164,10 @@ impl Browser {
         if !input.is_empty() {
             if let Some(terminal) = self.terminal.as_mut() {
                 if let Err(error) = terminal.write(input) {
-                    self.terminal_text = error.to_string();
+                    self.screen = Screen {
+                        text: error.to_string(),
+                        ..Screen::default()
+                    };
                     cx.notify();
                 }
             }
@@ -318,17 +330,11 @@ impl Render for Browser {
             view = view.child(
                 div()
                     .flex_1()
-                    .p_3()
-                    .bg(rgb(0x101216))
-                    .text_color(rgb(0xe8eaf0))
-                    .font_family(if cfg!(windows) { "Consolas" } else { "Menlo" })
-                    .text_size(px(13.0))
-                    .line_height(px(TERMINAL_LINE_HEIGHT))
-                    .children(
-                        self.terminal_text
-                            .lines()
-                            .map(|line| div().whitespace_nowrap().child(line.to_owned())),
-                    ),
+                    .min_h_0()
+                    .relative()
+                    .overflow_hidden()
+                    .child(terminal_view::measure(self.viewport.clone()))
+                    .child(self.screen.view()),
             );
         }
         view
@@ -348,7 +354,8 @@ mod tests {
             pending_presentation: false,
             document_active: false,
             terminal: None,
-            terminal_text: String::new(),
+            screen: Screen::default(),
+            viewport: Default::default(),
             focus: cx.focus_handle(),
         });
 

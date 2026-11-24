@@ -89,6 +89,14 @@ impl<T: InputTransport> StrictInput<T> {
     }
     /// Never retries: NotAcknowledged includes outcomes where delivery is unknown.
     pub fn send(&mut self, bytes: &[u8]) -> InputResult {
+        self.send_batch(bytes, None)
+    }
+
+    pub fn send_line(&mut self, bytes: &[u8], remote: bool) -> InputResult {
+        self.send_batch(bytes, Some(remote))
+    }
+
+    fn send_batch(&mut self, bytes: &[u8], line: Option<bool>) -> InputResult {
         if self.stopped {
             return InputResult::Stopped;
         }
@@ -99,12 +107,33 @@ impl<T: InputTransport> StrictInput<T> {
             self.stopped = true;
             return InputResult::Stopped;
         };
-        let request = Request::Input {
-            name: self.name.clone(),
-            instance_id: self.instance.clone(),
-            client_id: self.client_id.clone(),
-            seq: self.next,
-            bytes: bytes.to_vec(),
+        let name = self.name.clone();
+        let instance_id = self.instance.clone();
+        let client_id = self.client_id.clone();
+        let seq = self.next;
+        let bytes = bytes.to_vec();
+        let request = match line {
+            Some(true) => Request::RemoteInputLine {
+                name,
+                instance_id,
+                client_id,
+                seq,
+                bytes,
+            },
+            Some(false) => Request::InputLine {
+                name,
+                instance_id,
+                client_id,
+                seq,
+                bytes,
+            },
+            None => Request::Input {
+                name,
+                instance_id,
+                client_id,
+                seq,
+                bytes,
+            },
         };
         match self.transport.send(&request) {
             Ok(Response::Ack { duplicate: false }) => {
@@ -193,6 +222,54 @@ mod tests {
         );
         assert_eq!(client_id, other);
     }
+    #[test]
+    fn composed_line_uses_the_instance_bound_line_request() {
+        for remote in [false, true] {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let mut sender = StrictInput::new(
+                Fake {
+                    requests: requests.clone(),
+                    replies: [Ok(Response::Ack { duplicate: false })].into(),
+                },
+                "agent".into(),
+                "current".into(),
+            )
+            .unwrap();
+            assert_eq!(
+                sender.send_line("한 줄\r".as_bytes(), remote),
+                InputResult::Applied
+            );
+            let requests = requests.lock().unwrap();
+            let (name, instance_id, bytes) = match (remote, requests.as_slice()) {
+                (
+                    true,
+                    [Request::RemoteInputLine {
+                        name,
+                        instance_id,
+                        seq: 1,
+                        bytes,
+                        ..
+                    }],
+                )
+                | (
+                    false,
+                    [Request::InputLine {
+                        name,
+                        instance_id,
+                        seq: 1,
+                        bytes,
+                        ..
+                    }],
+                ) => (name, instance_id, bytes),
+                _ => panic!("expected exactly one matching line request"),
+            };
+            assert_eq!(
+                (name.as_str(), instance_id.as_str(), bytes.as_slice()),
+                ("agent", "current", "한 줄\r".as_bytes())
+            );
+        }
+    }
+
     #[test]
     fn unexpected_duplicate_ack_stops_without_retrying_or_advancing() {
         let requests = Arc::new(Mutex::new(Vec::new()));

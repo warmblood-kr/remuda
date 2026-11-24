@@ -28,7 +28,11 @@ fn watchdog() -> mpsc::Sender<bool> {
     });
     watch
 }
-fn serve<T: InputTransport>(mut input: StrictInput<T>, watch: mpsc::Sender<bool>) -> i32 {
+fn serve<T: InputTransport>(
+    mut input: StrictInput<T>,
+    watch: mpsc::Sender<bool>,
+    line: Option<bool>,
+) -> i32 {
     let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
     if stdout
@@ -58,7 +62,10 @@ fn serve<T: InputTransport>(mut input: StrictInput<T>, watch: mpsc::Sender<bool>
         if stdin.read_exact(&mut bytes).is_err() {
             return 1;
         }
-        let result = input.send(&bytes);
+        let result = match line {
+            Some(remote) => input.send_line(&bytes, remote),
+            None => input.send(&bytes),
+        };
         let ack = u8::from(result == InputResult::Applied);
         if stdout
             .write_all(&[ack])
@@ -81,15 +88,19 @@ pub fn worker(args: &[String]) -> i32 {
     let name = args[2].clone();
     let instance = args[3].clone();
     match args[0].as_str() {
-        "local" if args[1].is_empty() => StrictInput::new(
+        "local" | "line-local" if args[1].is_empty() => StrictInput::new(
             LocalInput(remuda_native::daemon::socket_path("default")),
             name,
             instance,
         )
-        .map_or(1, |input| serve(input, watch)),
-        "peer" if !args[1].is_empty() => PeerInput::new(args[1].clone())
+        .map_or(1, |input| {
+            serve(input, watch, (args[0] == "line-local").then_some(false))
+        }),
+        "peer" | "line-peer" if !args[1].is_empty() => PeerInput::new(args[1].clone())
             .and_then(|peer| StrictInput::new(peer, name, instance))
-            .map_or(1, |input| serve(input, watch)),
+            .map_or(1, |input| {
+                serve(input, watch, (args[0] == "line-peer").then_some(true))
+            }),
         _ => 1,
     }
 }
@@ -603,7 +614,7 @@ mod tests {
         let sender = StrictInput::new(Stall, "s".into(), "i".into()).unwrap();
         let watch = watchdog();
         let _ = watch.send(true);
-        std::process::exit(serve(sender, watch));
+        std::process::exit(serve(sender, watch, None));
     }
     #[test]
     #[ignore = "child fixture for startup deadline"]
