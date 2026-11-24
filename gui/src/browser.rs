@@ -61,6 +61,13 @@ pub fn open(
             ..Default::default()
         },
         |window, app| {
+            window.set_window_title("Remuda Browser");
+            #[cfg(target_os = "macos")]
+            crate::macos_lifecycle::install_window(
+                window,
+                app,
+                crate::macos_lifecycle::WindowKind::Browser,
+            );
             let focus = app.focus_handle();
             focus.focus(window);
             let window = window.window_handle();

@@ -46,6 +46,13 @@ used by the CLI. **Open Browser…** asks for an SSH host or alias and opens the
 remote client. **Quit Tray** removes the icon. Open windows, the daemon, and its
 sessions keep running. The desktop nightly includes the tray in `remuda-gui`.
 
+On macOS, closing the Remuda window leaves the GUI available in the Dock.
+Click the Dock icon, choose **Open Remuda** in the tray, or run `remuda gui`
+to reopen or raise that window. Remuda and Browser remember their window
+positions and sizes separately. **Cmd+Q** quits the foreground GUI.
+**Quit Tray** removes the menu bar icon. The Remuda daemon and its sessions
+continue running in either case.
+
 The internal `remuda-gui --internal-build-id` probe prints the build identifier
 embedded by `remuda-native` and exits before opening a window or reading state.
 It identifies a build but does not authenticate the executable. Older GUI
