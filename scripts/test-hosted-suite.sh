@@ -5,7 +5,8 @@
 # hundred leaks use up the machine's pseudo-terminals.
 #
 # A run's hosts are the processes whose argv[0] is this checkout's own host
-# binary (target/debug or target/debug/deps). Many tests pick their own /tmp
+# binary in target/debug (also recognize copies left by older scripts in
+# target/debug/deps). Many tests pick their own /tmp
 # paths, so TMPDIR cannot tell them apart. The run refuses to start while any
 # such host is alive; any alive at the end are listed, stopped, and fail it.
 #
@@ -43,10 +44,8 @@ if [ -n "$before" ]; then
     exit 2
 fi
 cargo build --bins || exit 2
-# Test binaries look for the host next to themselves. Remove first: on macOS,
-# copying over an existing binary keeps a stale signature and it is killed.
-rm -f "$TEST_HOST"
-cp "$HOST" "$TEST_HOST" || exit 2
+# The daemon finds its matching host beside the profile's remuda binary.
+# Cargo may place test executables under build/*/out instead of deps.
 
 # Short base: a Unix socket path must fit in sun_path (104 bytes on macOS).
 run=$(mktemp -d /tmp/rh.XXXXXX)

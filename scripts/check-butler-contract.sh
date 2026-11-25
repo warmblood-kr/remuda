@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run remuda-butler's live-reload contract against THIS core checkout.
 #
-# Builds the core here, puts it first on PATH, and runs remuda-butler's
-# tests/live_reload.sh twice: with an explicit private daemon and with a
+# Builds the CLI and session host here, puts them first on PATH, and runs
+# remuda-butler's tests/live_reload.sh twice: with an explicit daemon and with a
 # CLI-auto-started one (AUTOSTART=1). Everything runs on a private -s server
 # with scratch HOME/XDG dirs; the operator's default daemon is never touched.
 #
@@ -32,7 +32,8 @@ fi
 git -C "$BUTLER_REPO" rev-parse --verify --quiet "$OLD_REF^{commit}" >/dev/null \
   || { echo "BUTLER_REPO lacks $OLD_REF (shallow clone?)" >&2; exit 2; }
 
-cargo build --quiet --manifest-path "$CORE/Cargo.toml" -p remuda-native --bin remuda
+cargo build --quiet --manifest-path "$CORE/Cargo.toml" -p remuda-native \
+  --bin remuda --bin remuda-session-host
 export PATH="$CORE/target/debug:$PATH"
 export REMUDA_NO_UPDATE_CHECK=1
 unset REMUDA_SERVER
