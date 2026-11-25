@@ -23,10 +23,14 @@ mod macos_lifecycle;
 mod preview;
 mod terminal_view;
 use terminal_view::Screen;
+#[cfg(target_os = "macos")]
+mod macos_icon;
 mod provider;
 mod session_tree;
 #[cfg(any(target_os = "macos", windows))]
 mod tray;
+#[cfg(windows)]
+mod windows_icon;
 #[cfg(windows)]
 mod windows_input;
 
@@ -1542,7 +1546,11 @@ fn open_local_window(cx: &mut App, bounds: Bounds<gpui::Pixels>) -> gpui::AnyWin
                 #[cfg(target_os = "macos")]
                 macos_lifecycle::install_window(window, cx, macos_lifecycle::WindowKind::Remuda);
                 #[cfg(windows)]
-                windows_input::install(window);
+                {
+                    window.set_window_title("Remuda");
+                    windows_icon::install(window);
+                    windows_input::install(window);
+                }
                 let focus = cx.focus_handle();
                 focus.focus(window, cx);
                 let window = window.window_handle();

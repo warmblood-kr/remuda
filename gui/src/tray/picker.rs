@@ -16,6 +16,10 @@ pub(super) fn open() {
             },
             |window, cx| {
                 window.set_window_title("Open Remuda Browser");
+                #[cfg(windows)]
+                crate::windows_icon::install(window);
+                #[cfg(target_os = "macos")]
+                crate::macos_icon::install();
                 let focus = cx.focus_handle();
                 focus.focus(window, cx);
                 cx.new(|_| Picker {

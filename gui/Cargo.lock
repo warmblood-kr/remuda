@@ -6308,6 +6308,7 @@ name = "remuda-gui"
 version = "0.1.0"
 dependencies = [
  "clipboard-win",
+ "embed-resource",
  "gpui-kit",
  "gpui-pre",
  "image",

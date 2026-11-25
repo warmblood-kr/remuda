@@ -268,6 +268,8 @@ pub fn open(
         },
         |window, app| {
             window.set_window_title("Remuda Browser");
+            #[cfg(windows)]
+            crate::windows_icon::install(window);
             #[cfg(target_os = "macos")]
             crate::macos_lifecycle::install_window(
                 window,
