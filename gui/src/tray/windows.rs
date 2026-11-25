@@ -75,9 +75,12 @@ pub(super) fn run() -> io::Result<()> {
 
 fn run_icon(window: HWND) -> io::Result<()> {
     // SAFETY: The caller's thread owns the window and keeps it alive throughout
-    // the message loop. The stock icon belongs to the system.
+    // the message loop. The icon handle lives for the process.
     unsafe {
-        let icon = LoadIconW(null_mut(), IDI_APPLICATION);
+        let mut icon = crate::windows_icon::small();
+        if icon.is_null() {
+            icon = LoadIconW(null_mut(), IDI_APPLICATION);
+        }
         if icon.is_null() {
             return Err(io::Error::last_os_error());
         }

@@ -24,7 +24,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSResponder", "NSRunningApplication", "NSStatusBar", "NSStatusBarButton",
     "NSStatusItem", "NSView", "NSScreen", "NSWindow", "objc2-core-foundation",
 ] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSString"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSData", "NSString"] }
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4"
 windows-sys = { version = "0.61.2", features = [
@@ -37,3 +37,6 @@ gpui = { package = "gpui-pre", version = "=0.3.14", default-features = false, fe
 gpui-kit = { version = "=0.11.0", default-features = false, features = ["test-support"] }
 [patch.crates-io]
 portable-pty = { path = "../vendor/portable-pty" }
+
+[build-dependencies]
+embed-resource = "3.0.12"

@@ -240,6 +240,7 @@ pub(crate) fn save_window(handle: AnyWindowHandle, cx: &mut App, kind: WindowKin
 }
 
 pub(crate) fn install_menu(cx: &mut App, kind: WindowKind) {
+    crate::macos_icon::install();
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-w", CloseWindow, None),

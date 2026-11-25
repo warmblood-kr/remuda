@@ -1,7 +1,6 @@
 use objc2::{define_class, msg_send, rc::Retained, runtime::AnyObject, sel, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSStatusBar,
-    NSVariableStatusItemLength,
+    NSApplication, NSApplicationActivationPolicy, NSMenu, NSStatusBar, NSVariableStatusItemLength,
 };
 use objc2_foundation::{ns_string, MainThreadMarker, NSObject};
 use std::io;
@@ -76,11 +75,7 @@ pub(super) fn run() -> io::Result<()> {
     let button = item
         .button(mtm)
         .ok_or_else(|| io::Error::other("cannot create the macOS status button"))?;
-    if let Some(icon) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-        ns_string!("terminal"),
-        Some(ns_string!("Remuda")),
-    ) {
-        icon.setTemplate(true);
+    if let Some(icon) = crate::macos_icon::tray(mtm) {
         button.setImage(Some(&icon));
     } else {
         button.setTitle(ns_string!("Remuda"));
