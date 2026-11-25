@@ -2,7 +2,7 @@ use gpui::{
     div, prelude::*, px, rgb, AnyElement, App, Bounds, Context, FocusHandle, KeyDownEvent, Window,
     WindowBounds, WindowOptions,
 };
-use gpui_kit::base::{Button, Tab, Tabs};
+use gpui_kit::base::{Button, ScrollbarMode, Tab, Tabs};
 use remuda_core::agent::{AgentProcess, Size};
 use remuda_native::net::browser::{
     ssh_arguments, Client, DocumentRequest, DriveListing, Operation, Outcome, Reply,
@@ -886,7 +886,7 @@ impl Browser {
                     ),
                 )
             });
-        crate::scroll_area(&self.drive_scroll, entries).into_any_element()
+        crate::scroll_area(&self.drive_scroll, ScrollbarMode::Always, entries).into_any_element()
     }
 
     pub(crate) fn terminal_link_handler(
@@ -1043,6 +1043,7 @@ impl Browser {
             )
             .child(crate::scroll_area(
                 &self.document_scroll,
+                ScrollbarMode::Always,
                 div()
                     .id(gpui::SharedString::from(format!(
                         "document:{}",
