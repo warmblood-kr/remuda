@@ -1,6 +1,7 @@
 use super::*;
 use cluster_status::Reachability;
 use gpui::{AnyElement, MouseButton};
+use gpui_kit::base::{Tab, Tabs};
 
 fn render_node_metric(
     metric: remuda_native::node_status::Metric,
@@ -258,7 +259,12 @@ impl LocalGui {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.drive_selected {
+        if self.drive_selected
+            || self
+                .sidebar_tabs_focus
+                .as_ref()
+                .is_some_and(|focus| focus.contains_focused(window, cx))
+        {
             return;
         }
         let key = &event.keystroke;
@@ -863,6 +869,14 @@ impl Render for LocalGui {
         } else {
             None
         };
+        let sidebar_tabs_focus = self
+            .sidebar_tabs_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+        let content_tabs_focus = self
+            .content_tabs_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
         let content_tabs = docs.as_ref().map(|docs| {
             let unread = docs.read(cx).unseen_document();
             div()
@@ -871,29 +885,39 @@ impl Render for LocalGui {
                 .px_3()
                 .py_1()
                 .child(
-                    button("local-terminal-tab", "Terminal", !document_selected).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.node_details_requested = false;
-                            if let Some(docs) = &this.documents {
-                                docs.update(cx, |docs, _| docs.select_terminal());
-                            }
-                            this.focus_terminal_input(window, cx);
-                            cx.notify();
-                        }),
-                    ),
-                )
-                .child(
-                    button(
-                        "local-document-tab",
-                        if unread { "Document •" } else { "Document" },
-                        document_selected,
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if let Some(docs) = &this.documents {
-                            docs.update(cx, |docs, cx| docs.select_document(window, cx));
-                        }
-                        cx.notify();
-                    })),
+                    Tabs::new("local-content-tabs")
+                        .track_focus(&content_tabs_focus)
+                        .flex()
+                        .gap_2()
+                        .child(
+                            tab("local-terminal-tab", "Terminal", !document_selected).on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.node_details_requested = false;
+                                    if let Some(docs) = &this.documents {
+                                        docs.update(cx, |docs, _| docs.select_terminal());
+                                    }
+                                    this.focus_terminal_input(window, cx);
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                        .child(
+                            tab(
+                                "local-document-tab",
+                                if unread { "Document •" } else { "Document" },
+                                document_selected,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    if let Some(docs) = &this.documents {
+                                        docs.update(cx, |docs, cx| {
+                                            docs.select_document(window, cx)
+                                        });
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        ),
                 )
                 .when(
                     workspace_wide && self.selection.is_some() && docs.read(cx).has_document(),
@@ -920,6 +944,13 @@ impl Render for LocalGui {
             .bg(rgb(0x101216))
             .text_color(rgb(0xe8eaf0))
             .when(cfg!(target_os = "macos"), |root| root.font_family("Menlo"))
+            // Leave the PTY's plain Tab and Shift+Tab handling intact.
+            .capture_key_down(|event, window, cx| {
+                crate::workspace_tab_navigation(event, window, cx, true)
+            })
+            .on_key_down(|event, window, cx| {
+                crate::workspace_tab_navigation(event, window, cx, false)
+            })
             .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
                 if let Some((origin, width)) = this.resize_start {
                     if event.pressed_button == Some(MouseButton::Left) {
@@ -941,12 +972,13 @@ impl Render for LocalGui {
             .child(
                 tree.when(docs.is_some(), |tree| {
                     tree.child(
-                        div()
+                        Tabs::new("local-sidebar-tabs")
+                            .track_focus(&sidebar_tabs_focus)
                             .flex()
                             .gap_2()
                             .pb_2()
                             .child(
-                                button("local-sessions-tab", "Sessions", !self.drive_selected)
+                                tab("local-sessions-tab", "Sessions", !self.drive_selected)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.drive_selected = false;
                                         if let Some(focus) = &this.tree_focus { focus.focus(window, cx); }
@@ -954,7 +986,7 @@ impl Render for LocalGui {
                                     })),
                             )
                             .child(
-                                button("local-drive-tab", "Drive", self.drive_selected).on_click(
+                                tab("local-drive-tab", "Drive", self.drive_selected).on_click(
                                     cx.listener(|this, _, window, cx| {
                                         this.drive_selected = true;
                                         if let Some(docs) = &this.documents {
@@ -1315,6 +1347,24 @@ impl Render for LocalGui {
                     ),
             )
     }
+}
+
+fn tab(id: &'static str, text: &'static str, active: bool) -> Tab {
+    Tab::new(id)
+        .debug_selector(move || id.into())
+        .selected(active)
+        .styles(|style| style.selected(|style| style.bg(rgb(0x233e57))))
+        .flex_none()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .text_xs()
+        .bg(rgb(0x252d38))
+        .text_color(rgb(0xe8eaf0))
+        .cursor_pointer()
+        .hover(|d| d.bg(rgb(0x34445a)))
+        .focus_visible(|d| d.bg(rgb(0x34445a)).text_color(rgb(0xffffff)))
+        .child(text)
 }
 
 fn button(id: &'static str, text: &'static str, active: bool) -> gpui::Stateful<gpui::Div> {
