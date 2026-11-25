@@ -274,13 +274,15 @@ pub fn open(
                 crate::macos_lifecycle::WindowKind::Browser,
             );
             let focus = app.focus_handle();
-            focus.focus(window);
+            focus.focus(window, app);
             let handle = window.window_handle();
             app.new(|cx: &mut Context<Browser>| {
                 cx.observe_window_activation(window, |_, _, cx| cx.notify())
                     .detach();
                 cx.spawn(async move |view, cx| loop {
-                    gpui::Timer::after(Duration::from_millis(100)).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
                     if handle
                         .update(cx, |_, window, cx| {
                             view.update(cx, |browser, cx| browser.tick(window, cx))
@@ -366,7 +368,7 @@ impl Browser {
     }
 
     #[cfg(test)]
-    pub(crate) fn seed_test_document(&mut self, window: &mut Window) {
+    pub(crate) fn seed_test_document(&mut self, window: &mut Window, cx: &mut App) {
         let uri = "remuda:///pilot/plan.md".to_owned();
         let media = browser_media::decode("pilot/plan.md", b"# Design plan").unwrap();
         self.open_document(
@@ -377,6 +379,7 @@ impl Browser {
             },
             true,
             window,
+            cx,
         );
     }
 
@@ -400,14 +403,14 @@ impl Browser {
         self.active = Content::Terminal;
         self.split = false;
     }
-    pub(crate) fn select_document(&mut self, window: &mut Window) {
+    pub(crate) fn select_document(&mut self, window: &mut Window, cx: &mut App) {
         self.active = Content::Document;
         self.split = false;
-        self.document_focus.focus(window);
+        self.document_focus.focus(window, cx);
     }
-    pub(crate) fn select_drive(&mut self, window: &mut Window) {
+    pub(crate) fn select_drive(&mut self, window: &mut Window, cx: &mut App) {
         self.show_drive = true;
-        self.drive_focus.focus(window);
+        self.drive_focus.focus(window, cx);
         if let Some(drive) = &mut self.drive {
             if !drive.listings.contains_key(&None) {
                 drive.request_listing(None, None);
@@ -441,7 +444,7 @@ impl Browser {
             if typing && Self::wide(window) && !self.showing_document() {
                 self.split = true;
             }
-            self.open_document(document, !typing, window);
+            self.open_document(document, !typing, window, cx);
             cx.notify();
             window.refresh();
         }
@@ -471,9 +474,9 @@ impl Browser {
                     Ok(DriveResult::Document(document)) => {
                         drive.last_action = None;
                         let drive_had_focus = self.drive_focus.is_focused(window);
-                        self.open_document(document, true, window);
+                        self.open_document(document, true, window, cx);
                         if drive_had_focus {
-                            self.drive_focus.focus(window);
+                            self.drive_focus.focus(window, cx);
                         }
                         cx.notify();
                         break;
@@ -498,7 +501,13 @@ impl Browser {
         }
     }
 
-    fn open_document(&mut self, document: Document, focus: bool, window: &mut Window) {
+    fn open_document(
+        &mut self,
+        document: Document,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         if self
             .document
             .as_ref()
@@ -525,19 +534,19 @@ impl Browser {
         if focus {
             self.active = Content::Document;
             if !Self::wide(window) {
-                self.document_focus.focus(window);
+                self.document_focus.focus(window, cx);
             }
         }
     }
 
-    fn close_document(&mut self, window: &mut Window) {
+    fn close_document(&mut self, window: &mut Window, cx: &mut App) {
         if let Some(document) = self.document.take() {
             document.media.release_images(window);
         }
         self.document_generation = self.document_generation.wrapping_add(1);
         self.pending_presentation = None;
         self.active = Content::Terminal;
-        self.focus.focus(window);
+        self.focus.focus(window, cx);
     }
 
     fn refresh_terminal(&mut self, cx: &mut Context<Self>) {
@@ -562,7 +571,7 @@ impl Browser {
         }
     }
 
-    fn scroll_terminal(&mut self, event: &gpui::ScrollWheelEvent, cx: &mut Context<Self>) {
+    fn scroll_terminal(&mut self, event: &gpui::ScrollEvent, cx: &mut Context<Self>) {
         use remuda_core::agent::MouseMode;
         use remuda_native::mouse::{route_mouse_event, MouseAction, SgrMouse};
 
@@ -718,7 +727,7 @@ impl Browser {
                 button("sessions-mode", "Sessions", !self.show_drive).on_click(cx.listener(
                     |this, _, window, cx| {
                         this.show_drive = false;
-                        this.focus.focus(window);
+                        this.focus.focus(window, cx);
                         cx.notify();
                     },
                 )),
@@ -726,7 +735,7 @@ impl Browser {
             .child(
                 button("drive-mode", "Drive", self.show_drive).on_click(cx.listener(
                     |this, _, window, cx| {
-                        this.select_drive(window);
+                        this.select_drive(window, cx);
                         cx.notify();
                     },
                 )),
@@ -741,7 +750,7 @@ impl Browser {
                         .truncate()
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.active = Content::Terminal;
-                            this.focus.focus(window);
+                            this.focus.focus(window, cx);
                             cx.notify();
                         })),
                 )
@@ -786,7 +795,7 @@ impl Browser {
                 ))
             })
             .collect::<Vec<_>>();
-        div()
+        let entries = div()
             .id("drive-entries")
             .track_scroll(&self.drive_scroll)
             .track_focus(&self.drive_focus)
@@ -819,7 +828,7 @@ impl Browser {
                 .ml(px((*depth).min(12) as f32 * 14.))
                 .truncate()
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.drive_focus.focus(window);
+                    this.drive_focus.focus(window, cx);
                     this.visit(uri.clone(), directory);
                     cx.notify();
                 }))
@@ -836,7 +845,7 @@ impl Browser {
                 )
                 .truncate()
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.drive_focus.focus(window);
+                    this.drive_focus.focus(window, cx);
                     if let Some(drive) = &mut this.drive {
                         drive.request_listing(directory.clone(), Some(after.clone()));
                     }
@@ -863,8 +872,8 @@ impl Browser {
                             })),
                     ),
                 )
-            })
-            .into_any_element()
+            });
+        crate::scroll_area(&self.drive_scroll, entries).into_any_element()
     }
 
     pub(crate) fn terminal_link_handler(
@@ -901,12 +910,12 @@ impl Browser {
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
                     this.active = Content::Terminal;
-                    this.focus.focus(window);
+                    this.focus.focus(window, cx);
                     cx.notify();
                 }),
             )
             .on_key_down(cx.listener(Self::key_down))
-            .on_scroll_wheel(cx.listener(|this, event, _, cx| this.scroll_terminal(event, cx)))
+            .on_scroll(cx.listener(|this, event, _, cx| this.scroll_terminal(event, cx)))
             .child(
                 gpui::canvas(
                     move |bounds, _, _| panel_bounds.set(Some(bounds)),
@@ -1007,13 +1016,14 @@ impl Browser {
                     .child(
                         button("close-document", "Close", false).on_click(cx.listener(
                             |this, _, window, cx| {
-                                this.close_document(window);
+                                this.close_document(window, cx);
                                 cx.notify();
                             },
                         )),
                     ),
             )
-            .child(
+            .child(crate::scroll_area(
+                &self.document_scroll,
                 div()
                     .id(gpui::SharedString::from(format!(
                         "document:{}",
@@ -1026,7 +1036,7 @@ impl Browser {
                     .debug_selector(|| "browser-document-scroll".into())
                     .p_6()
                     .child(body),
-            )
+            ))
             .when_some(presentation, |d, marker| d.child(marker))
             .into_any_element()
     }
@@ -1181,7 +1191,7 @@ impl Render for Browser {
                                 .debug_selector(|| "browser-terminal-tab".into())
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.select_terminal();
-                                    this.focus.focus(window);
+                                    this.focus.focus(window, cx);
                                     cx.notify();
                                 })),
                         )
@@ -1198,7 +1208,7 @@ impl Render for Browser {
                             .debug_selector(|| "browser-document-tab".into())
                             .on_click(cx.listener(
                                 |this, _, window, cx| {
-                                    this.select_document(window);
+                                    this.select_document(window, cx);
                                     cx.notify();
                                 },
                             )),
@@ -1331,7 +1341,7 @@ mod tests {
         let (displayed, receipt) = mpsc::channel();
         let (view, cx) = cx.add_window_view(|window, cx| {
             let focus = cx.focus_handle();
-            focus.focus(window);
+            focus.focus(window, cx);
             Browser {
                 destination: "pilot".into(),
                 embedded: false,
@@ -1445,15 +1455,17 @@ mod tests {
                 },
                 true,
                 window,
+                cx,
             );
             cx.notify();
         });
         let reader = cx.debug_bounds("browser-document-scroll").unwrap();
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: reader.center(),
             delta: gpui::ScrollDelta::Lines(gpui::point(0., -6.)),
             modifiers: gpui::Modifiers::none(),
             touch_phase: gpui::TouchPhase::Moved,
+            source: gpui::ScrollSource::Pointer,
         });
         assert!(cx.read(|app| view.read(app).document_scroll.offset().y < px(0.)));
 
@@ -1472,7 +1484,7 @@ mod tests {
                     next: None,
                 },
             );
-            browser.select_drive(window);
+            browser.select_drive(window, cx);
             cx.notify();
         });
         cx.simulate_keystrokes("down right");

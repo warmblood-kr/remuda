@@ -559,7 +559,7 @@ mod tests {
         let fixture_clicks = clicks.clone();
         let (_, cx) = cx.add_window_view(move |window, cx| {
             let focus = cx.focus_handle();
-            focus.focus(window);
+            focus.focus(window, cx);
             let screen = Screen::from_cells(vec![vec![StyledCell {
                 text: "한글 🌿 terminal".into(),
                 hyperlink: Some("https://example.org/remuda/guide".into()),

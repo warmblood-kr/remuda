@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 [workspace]
 [dependencies]
-gpui = { version = "=0.2.2", default-features = false }
+gpui = { package = "gpui-pre", version = "=0.3.14", default-features = false }
+gpui-kit = { version = "=0.11.0", default-features = false }
 libc = "0.2"
 raw-window-handle = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
@@ -17,7 +18,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 unicode-segmentation = "1"
 [target.'cfg(target_os = "macos")'.dependencies]
-gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSApplication", "NSButton", "NSControl", "NSImage", "NSMenu", "NSMenuItem",
@@ -33,6 +33,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging",
 ] }
 [dev-dependencies]
-gpui = { version = "=0.2.2", default-features = false, features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "=0.3.14", default-features = false, features = ["test-support"] }
+gpui-kit = { version = "=0.11.0", default-features = false, features = ["test-support"] }
 [patch.crates-io]
 portable-pty = { path = "../vendor/portable-pty" }

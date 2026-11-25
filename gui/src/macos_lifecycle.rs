@@ -262,6 +262,7 @@ pub(crate) fn install_menu(cx: &mut App, kind: WindowKind) {
     });
     cx.set_menus(vec![Menu {
         name: "Remuda".into(),
+        disabled: false,
         items: vec![
             MenuItem::action("Close Window", CloseWindow),
             MenuItem::separator(),
