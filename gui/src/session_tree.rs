@@ -1,7 +1,7 @@
 use super::*;
 use cluster_status::Reachability;
 use gpui::{AnyElement, MouseButton};
-use gpui_kit::base::{Tab, Tabs};
+use gpui_kit::base::{Button, Tab, Tabs};
 
 fn render_node_metric(
     metric: remuda_native::node_status::Metric,
@@ -264,6 +264,10 @@ impl LocalGui {
                 .sidebar_tabs_focus
                 .as_ref()
                 .is_some_and(|focus| focus.contains_focused(window, cx))
+            || self
+                .refresh_focus
+                .as_ref()
+                .is_some_and(|focus| focus.is_focused(window))
         {
             return;
         }
@@ -754,6 +758,14 @@ impl Render for LocalGui {
             .live_focus
             .get_or_insert_with(|| cx.focus_handle())
             .clone();
+        let refresh_focus = self
+            .refresh_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+        let session_action_focus = self
+            .session_action_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
         let viewport = window.viewport_size();
         let width = f32::from(viewport.width);
         let narrow = width < 700.;
@@ -1030,11 +1042,16 @@ impl Render for LocalGui {
                                     }),
                             )
                             .child(
-                                button("refresh", "Refresh", false)
-                                    .debug_selector(|| "refresh".into())
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                action_button("refresh", "Refresh", false)
+                                    .track_focus(&refresh_focus)
+                                    .on_click(cx.listener(|this, event, window, cx| {
                                         this.refresh();
                                         this.refresh_nodes();
+                                        if !matches!(event, gpui::ClickEvent::Keyboard(_)) {
+                                            if let Some(focus) = &this.tree_focus {
+                                                focus.focus(window, cx);
+                                            }
+                                        }
                                         cx.notify();
                                     })),
                             ),
@@ -1250,7 +1267,8 @@ impl Render for LocalGui {
                                                 )
                                                 .when(live, |d| {
                                                     d.child(
-                                                        button("detach-session", "Detach", true)
+                                                        action_button("detach-session", "Detach", true)
+                                                            .track_focus(&session_action_focus)
                                                             .on_click(cx.listener(
                                                                 |this, _, window, cx| {
                                                                     this.detach();
@@ -1266,7 +1284,8 @@ impl Render for LocalGui {
                                                 })
                                                 .when(!live && current, |d| {
                                                     d.child(
-                                                        button("attach-session", "Compose", true)
+                                                        action_button("attach-session", "Compose", true)
+                                                            .track_focus(&session_action_focus)
                                                             .on_click(cx.listener(
                                                                 |this, _, window, cx| {
                                                                     this.attach_input(
@@ -1360,6 +1379,23 @@ fn tab(id: &'static str, text: &'static str, active: bool) -> Tab {
         .rounded_sm()
         .text_xs()
         .bg(rgb(0x252d38))
+        .text_color(rgb(0xe8eaf0))
+        .cursor_pointer()
+        .hover(|d| d.bg(rgb(0x34445a)))
+        .focus_visible(|d| d.bg(rgb(0x34445a)).text_color(rgb(0xffffff)))
+        .child(text)
+}
+
+fn action_button(id: &'static str, text: &'static str, emphasized: bool) -> Button {
+    Button::new(id)
+        .debug_selector(move || id.into())
+        .flex_none()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .text_xs()
+        .line_height(gpui::TextStyle::default().line_height)
+        .bg(rgb(if emphasized { 0x233e57 } else { 0x252d38 }))
         .text_color(rgb(0xe8eaf0))
         .cursor_pointer()
         .hover(|d| d.bg(rgb(0x34445a)))

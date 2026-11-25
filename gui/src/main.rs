@@ -391,6 +391,8 @@ struct LocalGui {
     live_focus: Option<gpui::FocusHandle>,
     sidebar_tabs_focus: Option<gpui::FocusHandle>,
     content_tabs_focus: Option<gpui::FocusHandle>,
+    refresh_focus: Option<gpui::FocusHandle>,
+    session_action_focus: Option<gpui::FocusHandle>,
     documents: Option<gpui::Entity<browser::Browser>>,
     drive_selected: bool,
     live_notice: Option<&'static str>,
@@ -461,6 +463,8 @@ impl LocalGui {
             live_focus: None,
             sidebar_tabs_focus: None,
             content_tabs_focus: None,
+            refresh_focus: None,
+            session_action_focus: None,
             documents: None,
             drive_selected: false,
             live_notice: None,
@@ -880,17 +884,22 @@ impl LocalGui {
         }
         let reading_document = self.documents.as_ref().is_some_and(|docs| {
             let docs = docs.read(cx);
-            docs.owns_document_focus(window)
+            docs.owns_document_focus(window, cx)
                 || (!browser::Browser::wide(window) && docs.showing_document())
         });
-        // A focused tab header does not mean the user activated another pane.
-        let navigating_tabs = [&self.sidebar_tabs_focus, &self.content_tabs_focus]
-            .into_iter()
-            .flatten()
-            .any(|focus| focus.contains_focused(window, cx));
+        // Focusing a workspace control does not activate another pane.
+        let navigating_controls = [
+            &self.sidebar_tabs_focus,
+            &self.content_tabs_focus,
+            &self.refresh_focus,
+            &self.session_action_focus,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|focus| focus.contains_focused(window, cx));
         if self.live.is_some()
             && !reading_document
-            && !navigating_tabs
+            && !navigating_controls
             && !self
                 .live_focus
                 .as_ref()
@@ -1680,12 +1689,19 @@ mod tests {
                 b"draft\r"
             );
         });
-        cx.simulate_keystrokes("tab end");
+        cx.simulate_keystrokes("tab tab end");
+        view.update_in(cx, |gui, window, cx| {
+            assert!(gui
+                .content_tabs_focus
+                .as_ref()
+                .unwrap()
+                .contains_focused(window, cx));
+        });
         view.read_with(cx, |gui, app| {
             assert!(!gui.drive_selected);
             assert!(!gui.documents.as_ref().unwrap().read(app).showing_document());
         });
-        cx.simulate_keystrokes("shift-tab");
+        cx.simulate_keystrokes("shift-tab shift-tab");
         view.update_in(cx, |gui, window, cx| {
             assert!(gui
                 .sidebar_tabs_focus
@@ -1704,7 +1720,7 @@ mod tests {
 
         let terminal = cx.debug_bounds("local-terminal-tab").unwrap();
         cx.simulate_click(terminal.center(), gpui::Modifiers::none());
-        cx.simulate_keystrokes("ctrl-shift-tab end space");
+        cx.simulate_keystrokes("ctrl-shift-tab shift-tab end space");
         cx.simulate_event(gpui::KeyUpEvent {
             keystroke: gpui::Keystroke::parse("space").unwrap(),
         });
@@ -2524,6 +2540,57 @@ mod tests {
         assert!(cx.read(|app| view.read(app).expanded_peers.is_empty()));
     }
     #[gpui::test]
+    fn session_action_buttons_keep_the_connection_until_detach_is_activated(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new();
+            gui.sessions = vec![row("agent")];
+            gui.preview_busy = true;
+            gui.select_session(None, gui.sessions[0].clone());
+            gui
+        });
+        assert!(cx.debug_bounds("attach-session").is_some());
+        view.update_in(cx, |gui, window, cx| {
+            gui.session_action_focus.as_ref().unwrap().focus(window, cx);
+        });
+        cx.simulate_keystrokes("enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        assert!(cx.debug_bounds("line-composer").is_some());
+        view.update_in(cx, |gui, window, cx| {
+            assert!(gui
+                .live_focus
+                .as_ref()
+                .unwrap()
+                .contains_focused(window, cx));
+            gui.line_input.as_ref().unwrap().insert("draft", window, cx);
+            gui.session_action_focus.as_ref().unwrap().focus(window, cx);
+            gui.tick(window, cx);
+            assert_eq!(
+                gui.line_input.as_ref().unwrap().bytes(cx).unwrap(),
+                b"draft\r"
+            );
+        });
+        cx.simulate_keystrokes("space");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("space").unwrap(),
+        });
+        assert!(cx.debug_bounds("line-composer").is_none());
+        view.update_in(cx, |gui, window, _| {
+            assert!(gui.live.is_none());
+            assert!(gui.tree_focus.as_ref().unwrap().is_focused(window));
+        });
+        let compose = cx.debug_bounds("attach-session").unwrap();
+        cx.simulate_click(compose.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("line-composer").is_some());
+        let detach = cx.debug_bounds("detach-session").unwrap();
+        cx.simulate_click(detach.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("line-composer").is_none());
+    }
+
+    #[gpui::test]
     fn refresh_click_starts_new_generation(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, _| {
             let mut gui = LocalGui::new();
@@ -2539,5 +2606,18 @@ mod tests {
             cx.read(|app| view.read(app).sessions[0].name.clone()),
             "local"
         );
+        view.update_in(cx, |gui, window, cx| {
+            assert!(gui.tree_focus.as_ref().unwrap().is_focused(window));
+            gui.refresh_focus.as_ref().unwrap().focus(window, cx);
+        });
+        cx.simulate_keystrokes("enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        view.update_in(cx, |gui, window, _| {
+            assert_eq!(gui.generation, 2);
+            assert!(!gui.node_details_requested);
+            assert!(gui.refresh_focus.as_ref().unwrap().is_focused(window));
+        });
     }
 }
