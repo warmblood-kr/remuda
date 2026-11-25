@@ -2,7 +2,11 @@ use super::*;
 use cluster_status::Reachability;
 use gpui::{AnyElement, MouseButton};
 
-fn render_node_metric(metric: remuda_native::node_status::Metric, stale: bool) -> impl IntoElement {
+fn render_node_metric(
+    metric: remuda_native::node_status::Metric,
+    stale: bool,
+    compact: bool,
+) -> impl IntoElement {
     let value = if let Some(usage) = metric.capacity {
         const GIB: f64 = 1_073_741_824.0;
         format!(
@@ -16,37 +20,47 @@ fn render_node_metric(metric: remuda_native::node_status::Metric, stale: bool) -
             .map_or_else(|| "Unavailable".into(), |value| format!("{value}%"))
     };
     let color = if stale { 0xe7c279 } else { 0x7bdda8 };
-    div()
-        .flex()
-        .items_center()
-        .gap_3()
-        .py_1()
-        .text_sm()
-        .child(div().w(px(94.)).flex_none().child(metric.label))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .h(px(6.))
-                .rounded_full()
-                .bg(rgb(0x282f38))
-                .when_some(metric.percent, |el, percent| {
-                    el.child(
-                        div()
-                            .w(gpui::relative(f32::from(percent) / 100.))
-                            .h_full()
-                            .rounded_full()
-                            .bg(rgb(color)),
-                    )
-                }),
-        )
-        .child(
-            div()
-                .w(px(135.))
-                .flex_none()
-                .text_color(rgb(0xb5beca))
-                .child(value),
-        )
+    let bar = div().h(px(6.)).rounded_full().bg(rgb(0x282f38)).when_some(
+        metric.percent,
+        |el, percent| {
+            el.child(
+                div()
+                    .w(gpui::relative(f32::from(percent) / 100.))
+                    .h_full()
+                    .rounded_full()
+                    .bg(rgb(color)),
+            )
+        },
+    );
+    let label = div().flex_none().child(metric.label);
+    let value = div()
+        .flex_none()
+        .whitespace_nowrap()
+        .text_color(rgb(0xb5beca))
+        .debug_selector(|| format!("node-metric-value-{}", metric.label))
+        .child(value);
+    let row = div().flex().py_1().text_sm();
+    if compact {
+        row.flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_x_3()
+                    .child(label)
+                    .child(value),
+            )
+            .child(bar.w_full())
+    } else {
+        row.items_center()
+            .gap_3()
+            .child(label.w(px(94.)))
+            .child(bar.flex_1().min_w_0())
+            .child(value.min_w(px(135.)).text_right())
+    }
 }
 
 enum Entry<'a> {
@@ -359,7 +373,11 @@ impl LocalGui {
         }
     }
 
-    fn selected_node_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn selected_node_panel(
+        &self,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         if !self.showing_node_details() {
             return None;
         }
@@ -468,7 +486,7 @@ impl LocalGui {
                         .children(
                             details
                                 .metrics
-                                .map(|metric| render_node_metric(metric, details.stale)),
+                                .map(|metric| render_node_metric(metric, details.stale, compact)),
                         ),
                 )
                 .child(div().pt_3().pb_1().child("Sessions"))
@@ -836,7 +854,7 @@ impl Render for LocalGui {
         let pane_width = if narrow { width } else { width - sidebar - 5. };
         let document_width = if split { pane_width / 2. } else { pane_width };
         let node_panel = (!self.drive_selected && !document_selected)
-            .then(|| self.selected_node_panel(cx))
+            .then(|| self.selected_node_panel(width < 360., cx))
             .flatten();
         let showing_node = node_panel.is_some();
         let document = if split || document_selected {
@@ -1335,6 +1353,51 @@ impl Render for FullName {
 mod tests {
     use super::*;
     use remuda_core::registry::TeamLeader;
+
+    struct MeterLayout;
+
+    impl Render for MeterLayout {
+        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let compact = window.viewport_size().width < px(360.);
+            let disk = remuda_core::protocol::ResourceUsage {
+                used_bytes: (362.8 * 1_073_741_824.) as u64,
+                total_bytes: (460.4 * 1_073_741_824.) as u64,
+            };
+            div()
+                .size_full()
+                .font_family("Menlo")
+                .child(render_node_metric(
+                    remuda_native::node_status::Metric {
+                        label: "CPU",
+                        percent: Some(15),
+                        capacity: None,
+                    },
+                    false,
+                    compact,
+                ))
+                .child(render_node_metric(
+                    remuda_native::node_status::Metric {
+                        label: "System disk",
+                        percent: Some(79),
+                        capacity: Some(disk),
+                    },
+                    false,
+                    compact,
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn capacity_value_stays_on_one_line_at_narrow_and_wide_widths(cx: &mut gpui::TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| MeterLayout);
+        for width in [260., 320., 420., 720.] {
+            cx.simulate_resize(gpui::size(px(width), px(300.)));
+            let cpu = cx.debug_bounds("node-metric-value-CPU").unwrap();
+            let disk = cx.debug_bounds("node-metric-value-System disk").unwrap();
+            assert_eq!(disk.size.height, cpu.size.height, "viewport {width}");
+            assert!(disk.right() <= px(width), "viewport {width}: {disk:?}");
+        }
+    }
 
     #[test]
     fn team_rows_follow_exact_leaders_with_nested_members_and_no_cycle_loss() {
