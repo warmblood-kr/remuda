@@ -2246,7 +2246,7 @@ mod tests {
             gui
         });
         cx.simulate_resize(gpui::size(px(1000.), px(540.)));
-        let tree = cx.debug_bounds("node-tree").unwrap();
+        let tree = cx.read(|app| view.read(app).tree_scroll.bounds());
         cx.simulate_event(gpui::ScrollEvent {
             position: tree.center(),
             delta: gpui::ScrollDelta::Lines(gpui::point(0., -6.)),
