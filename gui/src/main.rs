@@ -392,6 +392,8 @@ struct LocalGui {
     sidebar_tabs_focus: Option<gpui::FocusHandle>,
     content_tabs_focus: Option<gpui::FocusHandle>,
     refresh_focus: Option<gpui::FocusHandle>,
+    attention_focus: Option<gpui::FocusHandle>,
+    keys_focus: Option<gpui::FocusHandle>,
     session_action_focus: Option<gpui::FocusHandle>,
     documents: Option<gpui::Entity<browser::Browser>>,
     drive_selected: bool,
@@ -464,6 +466,8 @@ impl LocalGui {
             sidebar_tabs_focus: None,
             content_tabs_focus: None,
             refresh_focus: None,
+            attention_focus: None,
+            keys_focus: None,
             session_action_focus: None,
             documents: None,
             drive_selected: false,
@@ -892,6 +896,8 @@ impl LocalGui {
             &self.sidebar_tabs_focus,
             &self.content_tabs_focus,
             &self.refresh_focus,
+            &self.attention_focus,
+            &self.keys_focus,
             &self.session_action_focus,
         ]
         .into_iter()
@@ -1689,7 +1695,7 @@ mod tests {
                 b"draft\r"
             );
         });
-        cx.simulate_keystrokes("tab tab end");
+        cx.simulate_keystrokes("tab tab tab tab end");
         view.update_in(cx, |gui, window, cx| {
             assert!(gui
                 .content_tabs_focus
@@ -1701,7 +1707,7 @@ mod tests {
             assert!(!gui.drive_selected);
             assert!(!gui.documents.as_ref().unwrap().read(app).showing_document());
         });
-        cx.simulate_keystrokes("shift-tab shift-tab");
+        cx.simulate_keystrokes("shift-tab shift-tab shift-tab shift-tab");
         view.update_in(cx, |gui, window, cx| {
             assert!(gui
                 .sidebar_tabs_focus
@@ -2024,6 +2030,67 @@ mod tests {
         assert!(
             cx.read(|app| view.read(app).attention_only && view.read(app).tree_rows().len() == 2)
         );
+    }
+
+    #[gpui::test]
+    fn sidebar_toggles_preserve_tree_shortcuts_and_focus(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut gui = LocalGui::new();
+            let mut failed = row("failed");
+            failed.alive = false;
+            gui.sessions = vec![row("agent"), failed];
+            gui.preview_busy = true;
+            gui.select_session(None, gui.sessions[0].clone());
+            let live_focus = cx.focus_handle();
+            gui.live_focus = Some(live_focus);
+            gui.open_session_composer(window, cx);
+            gui.line_input.as_ref().unwrap().insert("draft", window, cx);
+            gui
+        });
+        view.update_in(cx, |gui, window, cx| {
+            gui.attention_focus.as_ref().unwrap().focus(window, cx);
+            gui.tick(window, cx);
+            assert_eq!(
+                gui.line_input.as_ref().unwrap().bytes(cx).unwrap(),
+                b"draft\r"
+            );
+        });
+        cx.simulate_keystrokes("enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        view.update_in(cx, |gui, window, _| {
+            assert!(gui.attention_only);
+            assert_eq!(gui.tree_rows().len(), 2);
+            assert!(gui.local_expanded);
+            assert!(!gui.node_details_requested);
+            assert_eq!(gui.selection.as_ref().unwrap().name, "agent");
+            assert!(gui.tree_focus.as_ref().unwrap().is_focused(window));
+        });
+        cx.simulate_keystrokes("!");
+        assert!(!view.read_with(cx, |gui, _| gui.attention_only));
+        let attention = cx.debug_bounds("tree-filter").unwrap();
+        cx.simulate_click(attention.center(), gpui::Modifiers::none());
+        assert!(view.read_with(cx, |gui, _| gui.attention_only));
+
+        view.update_in(cx, |gui, window, cx| {
+            gui.keys_focus.as_ref().unwrap().focus(window, cx);
+        });
+        cx.simulate_keystrokes("space");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("space").unwrap(),
+        });
+        assert!(cx.debug_bounds("tree-shortcuts").is_some());
+        view.update_in(cx, |gui, window, _| {
+            assert!(gui.tree_focus.as_ref().unwrap().is_focused(window));
+        });
+        cx.simulate_keystrokes("escape");
+        assert!(cx.debug_bounds("tree-shortcuts").is_none());
+        cx.simulate_keystrokes("?");
+        assert!(cx.debug_bounds("tree-shortcuts").is_some());
+        let keys = cx.debug_bounds("tree-help").unwrap();
+        cx.simulate_click(keys.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("tree-shortcuts").is_none());
     }
 
     #[gpui::test]

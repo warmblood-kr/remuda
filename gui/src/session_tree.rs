@@ -1,7 +1,7 @@
 use super::*;
 use cluster_status::Reachability;
 use gpui::{AnyElement, MouseButton};
-use gpui_kit::base::{Button, Tab, Tabs};
+use gpui_kit::base::{Button, Tab, Tabs, Toggle};
 
 fn render_node_metric(
     metric: remuda_native::node_status::Metric,
@@ -212,6 +212,13 @@ impl LocalGui {
         self.entries().iter().filter_map(Entry::target).collect()
     }
 
+    fn set_attention(&mut self, enabled: bool) {
+        self.attention_only = enabled;
+        if enabled {
+            self.refresh_filter_data();
+        }
+    }
+
     fn refresh_filter_data(&mut self) {
         let missing: Vec<_> = self
             .peers
@@ -264,10 +271,10 @@ impl LocalGui {
                 .sidebar_tabs_focus
                 .as_ref()
                 .is_some_and(|focus| focus.contains_focused(window, cx))
-            || self
-                .refresh_focus
-                .as_ref()
-                .is_some_and(|focus| focus.is_focused(window))
+            || [&self.refresh_focus, &self.attention_focus, &self.keys_focus]
+                .into_iter()
+                .flatten()
+                .any(|focus| focus.is_focused(window))
         {
             return;
         }
@@ -281,12 +288,7 @@ impl LocalGui {
             ("escape", _) if self.search.is_some() => self.search = None,
             (_, Some("/")) if self.search.is_none() => self.focus_search(window, cx),
             (_, Some("?")) if self.search.is_none() => self.show_help = !self.show_help,
-            (_, Some("!")) if self.search.is_none() => {
-                self.attention_only = !self.attention_only;
-                if self.attention_only {
-                    self.refresh_filter_data();
-                }
-            }
+            (_, Some("!")) if self.search.is_none() => self.set_attention(!self.attention_only),
             ("backspace", _) if self.search.is_some() => {
                 self.search.as_mut().unwrap().pop();
             }
@@ -766,6 +768,14 @@ impl Render for LocalGui {
             .session_action_focus
             .get_or_insert_with(|| cx.focus_handle())
             .clone();
+        let attention_focus = self
+            .attention_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+        let keys_focus = self
+            .keys_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
         let viewport = window.viewport_size();
         let width = f32::from(viewport.width);
         let narrow = width < 700.;
@@ -1074,28 +1084,33 @@ impl Render for LocalGui {
                                     }),
                                 ),
                             )
-                            .child(button("tree-filter", "Attention !", filtered).on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.attention_only = !this.attention_only;
-                                    if this.attention_only {
-                                        this.refresh_filter_data();
-                                    }
-                                    if let Some(focus) = &this.tree_focus {
-                                        focus.focus(window, cx);
-                                    }
-                                    cx.notify();
-                                }),
-                            ))
                             .child(
-                                button("tree-help", "Keys ?", show_help).on_click(cx.listener(
-                                    |this, _, window, cx| {
-                                        this.show_help = !this.show_help;
-                                        if let Some(focus) = &this.tree_focus {
-                                            focus.focus(window, cx);
-                                        }
-                                        cx.notify();
-                                    },
-                                )),
+                                sidebar_toggle("tree-filter", "Attention !", filtered)
+                                    .track_focus(&attention_focus)
+                                    .on_change({
+                                        let activate = cx.listener(|this, pressed: &bool, window, cx| {
+                                            this.set_attention(*pressed);
+                                            if let Some(focus) = &this.tree_focus {
+                                                focus.focus(window, cx);
+                                            }
+                                            cx.notify();
+                                        });
+                                        move |pressed, _, window, cx| activate(&pressed, window, cx)
+                                    }),
+                            )
+                            .child(
+                                sidebar_toggle("tree-help", "Keys ?", show_help)
+                                    .track_focus(&keys_focus)
+                                    .on_change({
+                                        let activate = cx.listener(|this, pressed: &bool, window, cx| {
+                                            this.show_help = *pressed;
+                                            if let Some(focus) = &this.tree_focus {
+                                                focus.focus(window, cx);
+                                            }
+                                            cx.notify();
+                                        });
+                                        move |pressed, _, window, cx| activate(&pressed, window, cx)
+                                    }),
                             ),
                     )
                     .when_some(self.search.as_ref(), |d, query| {
@@ -1396,6 +1411,25 @@ fn action_button(id: &'static str, text: &'static str, emphasized: bool) -> Butt
         .text_xs()
         .line_height(gpui::TextStyle::default().line_height)
         .bg(rgb(if emphasized { 0x233e57 } else { 0x252d38 }))
+        .text_color(rgb(0xe8eaf0))
+        .cursor_pointer()
+        .hover(|d| d.bg(rgb(0x34445a)))
+        .focus_visible(|d| d.bg(rgb(0x34445a)).text_color(rgb(0xffffff)))
+        .child(text)
+}
+
+fn sidebar_toggle(id: &'static str, text: &'static str, pressed: bool) -> Toggle {
+    Toggle::new(id)
+        .debug_selector(move || id.into())
+        .pressed(pressed)
+        .styles(|styles| styles.pressed(|style| style.bg(rgb(0x233e57))))
+        .flex_none()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .text_xs()
+        .line_height(gpui::TextStyle::default().line_height)
+        .bg(rgb(0x252d38))
         .text_color(rgb(0xe8eaf0))
         .cursor_pointer()
         .hover(|d| d.bg(rgb(0x34445a)))
