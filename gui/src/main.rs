@@ -1495,8 +1495,12 @@ fn workspace_tab_navigation(
     cx.stop_propagation();
 }
 
-fn scroll_area(scroll: &gpui::ScrollHandle, content: impl IntoElement) -> impl IntoElement {
-    use gpui_kit::base::{Scrollbar, ScrollbarMode};
+fn scroll_area(
+    scroll: &gpui::ScrollHandle,
+    mode: gpui_kit::base::ScrollbarMode,
+    content: impl IntoElement,
+) -> impl IntoElement {
+    use gpui_kit::base::Scrollbar;
     div()
         .relative()
         .flex()
@@ -1505,16 +1509,12 @@ fn scroll_area(scroll: &gpui::ScrollHandle, content: impl IntoElement) -> impl I
         .min_h_0()
         .min_w_0()
         .child(content)
-        .child(
-            Scrollbar::vertical(scroll)
-                .mode(ScrollbarMode::Always)
-                .styles(|styles| {
-                    styles
-                        .thumb(|thumb| thumb.bg(rgb(0x647083)))
-                        .thumb_hover(|thumb| thumb.bg(rgb(0x8a9bb2)))
-                        .thumb_active(|thumb| thumb.bg(rgb(0xadcceb)))
-                }),
-        )
+        .child(Scrollbar::vertical(scroll).mode(mode).styles(|styles| {
+            styles
+                .thumb(|thumb| thumb.bg(rgb(0x647083)))
+                .thumb_hover(|thumb| thumb.bg(rgb(0x8a9bb2)))
+                .thumb_active(|thumb| thumb.bg(rgb(0xadcceb)))
+        }))
 }
 
 fn default_window_bounds(cx: &App) -> Bounds<gpui::Pixels> {

@@ -1172,6 +1172,7 @@ impl Render for LocalGui {
                     .when(!show_help, |d| {
                         d.child(crate::scroll_area(
                             &self.tree_scroll,
+                            gpui_kit::base::ScrollbarMode::Scrolling,
                             div()
                                 .id("node-tree")
                                 .debug_selector(|| "node-tree".into())
