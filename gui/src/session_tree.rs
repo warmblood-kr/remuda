@@ -381,7 +381,7 @@ impl LocalGui {
     fn open_node_details(&mut self, cx: &mut Context<Self>) {
         self.node_details_requested = true;
         if let Some(documents) = &self.documents {
-            documents.update(cx, |docs, _| docs.select_terminal());
+            documents.update(cx, |docs, cx| docs.select_terminal(cx));
         }
     }
 
@@ -889,6 +889,9 @@ impl Render for LocalGui {
             docs.as_ref()
                 .map(|docs| docs.update(cx, |docs, cx| docs.document_panel(document_width, cx)))
         } else {
+            if let Some(docs) = &docs {
+                docs.update(cx, |docs, cx| docs.hide_native_document(cx));
+            }
             None
         };
         let sidebar_tabs_focus = self
@@ -916,7 +919,7 @@ impl Render for LocalGui {
                                 cx.listener(|this, _, window, cx| {
                                     this.node_details_requested = false;
                                     if let Some(docs) = &this.documents {
-                                        docs.update(cx, |docs, _| docs.select_terminal());
+                                        docs.update(cx, |docs, cx| docs.select_terminal(cx));
                                     }
                                     this.focus_terminal_input(window, cx);
                                     cx.notify();
