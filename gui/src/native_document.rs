@@ -23,23 +23,18 @@ use wry::{
 const SCHEME: &str = "remuda-preview";
 const QUEUE_DEPTH: usize = 16;
 
-pub(crate) fn supported() -> bool {
-    // Keep the installed reader as the default until both native platforms
-    // pass foreground and end-to-end document delivery checks.
-    if !env_enabled("REMUDA_NATIVE_DOCUMENT_WEBVIEW") {
-        return false;
-    }
-    // GPUI's Windows DirectComposition target can cover child HWNDs. Respect
-    // its startup setting without changing the renderer for other windows.
-    #[cfg(windows)]
-    return env_enabled("GPUI_DISABLE_DIRECT_COMPOSITION");
-
-    #[cfg(target_os = "macos")]
-    true
+pub(crate) fn enabled() -> bool {
+    !std::env::var("REMUDA_NATIVE_DOCUMENT_WEBVIEW")
+        .is_ok_and(|value| value == "false" || value == "0")
 }
 
-fn env_enabled(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| value == "true" || value == "1")
+#[cfg(windows)]
+pub(crate) fn configure_platform() {
+    if enabled() {
+        // GPUI's DirectComposition target can cover the child WebView2 HWND.
+        // Configure GPUI before creating the platform and any of its windows.
+        std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "1");
+    }
 }
 
 pub(crate) type ReadAsset = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;

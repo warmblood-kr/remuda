@@ -1449,6 +1449,8 @@ fn main() {
         });
         return;
     }
+    #[cfg(windows)]
+    native_document::configure_platform();
     let app = gpui_kit::application();
     #[cfg(target_os = "macos")]
     app.on_reopen(|cx| {

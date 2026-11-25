@@ -441,7 +441,7 @@ impl Browser {
         let assets = source.clone().map(Assets::new);
         #[cfg(any(target_os = "macos", windows))]
         let native_html = NativeHtml {
-            source: source.filter(|_| native_document::supported()),
+            source: source.filter(|_| native_document::enabled()),
             ..NativeHtml::default()
         };
         Self {
@@ -685,10 +685,9 @@ impl Browser {
         #[cfg(any(target_os = "macos", windows))]
         {
             self.native_html.clear(cx);
-            self.native_html.selected = self.pending_presentation.is_some()
-                && document.html.is_some()
-                && self.native_html.source.is_some();
-            if self.native_html.selected {
+            self.native_html.selected =
+                document.html.is_some() && self.native_html.source.is_some();
+            if self.native_html.selected && self.pending_presentation.is_some() {
                 self.native_html.receipt_deadline =
                     Some(Instant::now() + remuda_native::net::browser::DELIVERY_TTL);
             }
