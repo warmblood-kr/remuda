@@ -43,6 +43,13 @@ jobs:
         run: cargo build --release --locked --manifest-path gui/Cargo.toml
       - if: runner.os == 'Windows'
         run: cargo test --release --locked --manifest-path gui/Cargo.toml --bin remuda-gui provider::windows_tests
+      - name: Verify Kit composer and scrollbar behavior on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo test --release --locked --manifest-path gui/Cargo.toml --bin remuda-gui line_input::tests
+          cargo test --release --locked --manifest-path gui/Cargo.toml --bin remuda-gui composer_keys_edit_lines_and_restore_draft_after_recalling_history
+          cargo test --release --locked --manifest-path gui/Cargo.toml --bin remuda-gui session_sidebar_scrolls_without_scrolling_the_terminal
       - if: runner.os == 'macOS'
         run: cargo build --locked --manifest-path gui/Cargo.toml
       - run: cargo build --locked -p remuda-native --bin remuda

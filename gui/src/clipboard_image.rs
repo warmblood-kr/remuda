@@ -7,7 +7,7 @@ const MAX_DECODE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) fn first_image(item: &ClipboardItem) -> Option<&Image> {
     item.entries().iter().find_map(|entry| match entry {
         ClipboardEntry::Image(image) => Some(image),
-        ClipboardEntry::String(_) => None,
+        ClipboardEntry::String(_) | ClipboardEntry::ExternalPaths(_) => None,
     })
 }
 

@@ -1,6 +1,6 @@
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, SharedString, Window,
-    WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size, App, Bounds, Context, SharedString, Window, WindowBounds,
+    WindowOptions,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -566,9 +566,7 @@ impl LocalGui {
             docs.update(cx, |docs, _| docs.select_terminal());
         }
         if self.line_input.is_some() && self.live.is_some() {
-            if let Some(focus) = &self.live_focus {
-                focus.focus(window);
-            }
+            self.focus_terminal_input(window, cx);
             cx.notify();
         } else {
             self.attach_input(window, cx, true);
@@ -594,13 +592,12 @@ impl LocalGui {
                     });
                     self.detach();
                     self.live = Some(live);
-                    self.line_input = history.map(line_input::LineInput::with_history);
+                    self.line_input = history
+                        .map(|history| line_input::LineInput::with_history(history, window, cx));
                     self.live_notice =
                         (!compose).then_some("Direct input enabled · Ctrl+\\ detaches");
                     self.next_live_preview = Instant::now();
-                    if let Some(focus) = &self.live_focus {
-                        focus.focus(window);
-                    }
+                    self.focus_terminal_input(window, cx);
                 }
                 Err(_) => {
                     self.live_notice =
@@ -611,120 +608,172 @@ impl LocalGui {
         }
     }
 
+    fn focus_terminal_input(&self, window: &mut Window, cx: &mut App) {
+        if let Some(input) = &self.line_input {
+            input.focus(window, cx);
+        } else if let Some(focus) = &self.live_focus {
+            focus.focus(window, cx);
+        }
+    }
+
+    fn input_current(&mut self) -> bool {
+        if self.selected_peer_offline()
+            || !self
+                .selection
+                .as_ref()
+                .is_some_and(|s| self.selection_current(s))
+        {
+            self.detach();
+            self.live_notice = Some("Session unavailable · detached");
+            return false;
+        }
+        true
+    }
+
+    fn close_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .line_input
+            .as_ref()
+            .is_some_and(|editor| editor.composing(window, cx))
+        {
+            return;
+        }
+        self.detach();
+        if let Some(focus) = &self.tree_focus {
+            focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.input_current() {
+            cx.notify();
+            return;
+        }
+        let (Some(live), Some(editor)) = (&self.live, &mut self.line_input) else {
+            return;
+        };
+        if editor.composing(window, cx) {
+            return;
+        }
+        self.live_notice = Some(match editor.bytes(cx) {
+            Ok(bytes) => match live.submit_line(&bytes) {
+                live_session::Submit::Queued => {
+                    editor.queued(window, cx);
+                    "Sending line…"
+                }
+                live_session::Submit::Busy => "Previous line pending · draft retained",
+                _ => "Line could not be sent · draft retained",
+            },
+            Err(reason) => reason,
+        });
+        self.mark_terminal_input(cx);
+        cx.notify();
+    }
+
+    fn paste_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.input_current() {
+            cx.notify();
+            return;
+        }
+        let Some(editor) = &self.line_input else {
+            return;
+        };
+        if editor.composing(window, cx) {
+            return;
+        }
+        if let Some(clipboard) = cx
+            .read_from_clipboard()
+            .or_else(clipboard_image::read_fallback)
+        {
+            if let Some(image) = clipboard_image::first_image(&clipboard) {
+                self.paste_terminal_image(image);
+            } else if let Some(text) = clipboard.text() {
+                editor.insert(&text.replace("\r\n", "\n").replace('\r', "\n"), window, cx);
+            }
+        }
+        self.mark_terminal_input(cx);
+        cx.notify();
+    }
+
+    fn paste_terminal_image(&mut self, image: &gpui::Image) {
+        use live_session::Submit;
+        let Some(live) = &self.live else { return };
+        self.live_notice = Some(
+            if self.selection.as_ref().is_some_and(|s| s.peer.is_some()) {
+                "Clipboard images require a session on this device"
+            } else {
+                match self.clipboard_images.paste(image, live) {
+                    Ok(Submit::Queued) => "Pasting image into the terminal…",
+                    Ok(Submit::Busy) => "Previous input pending · image was not pasted",
+                    Ok(_) => "Input unavailable · image was not pasted",
+                    Err(reason) => reason,
+                }
+            },
+        );
+    }
+
+    fn mark_terminal_input(&self, cx: &mut App) {
+        if let Some(documents) = &self.documents {
+            documents.update(cx, |docs, _| docs.mark_terminal_input());
+        }
+    }
+
     fn live_key(
         &mut self,
         event: &gpui::KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .terminal_selection
-            .copy(&event.keystroke, self.preview.as_ref(), cx)
-        {
+        let key = &event.keystroke;
+        if self.terminal_selection.copy(key, self.preview.as_ref(), cx) {
             cx.stop_propagation();
             return;
         }
-        if let Some(documents) = &self.documents {
-            documents.update(cx, |docs, _| docs.mark_terminal_input());
-        }
-        let Some(live) = &self.live else {
-            if event.keystroke.key == "enter" && !event.keystroke.modifiers.modified() {
+        self.mark_terminal_input(cx);
+        if self.live.is_none() {
+            if key.key == "enter" && !key.modifiers.modified() {
                 self.open_session_composer(window, cx);
                 cx.stop_propagation();
             }
             return;
-        };
-        let modifiers = event.keystroke.modifiers;
-        let paste = event.keystroke.key == "v"
-            && (modifiers.platform || (modifiers.control && (modifiers.shift || cfg!(windows))));
-        let clipboard = (paste
-            && !self
-                .line_input
-                .as_ref()
-                .is_some_and(|editor| editor.composing()))
-        .then(|| {
-            cx.read_from_clipboard()
-                .or_else(clipboard_image::read_fallback)
-        })
-        .flatten();
-        if event.keystroke.key == "\\" && modifiers.control && !modifiers.alt && !modifiers.platform
-        {
+        }
+        let modifiers = key.modifiers;
+        if key.key == "\\" && modifiers.control && !modifiers.alt && !modifiers.platform {
             self.detach();
             if let Some(focus) = &self.tree_focus {
-                focus.focus(window);
+                focus.focus(window, cx);
             }
-        } else if self.selected_peer_offline()
-            || !self
-                .selection
-                .as_ref()
-                .is_some_and(|selection| self.selection_current(selection))
-        {
-            self.detach();
-            self.live_notice = Some("Session unavailable · detached");
-        } else if let Some(image) = clipboard.as_ref().and_then(clipboard_image::first_image) {
-            use live_session::Submit;
-            self.live_notice = Some(
-                if self.selection.as_ref().is_some_and(|s| s.peer.is_some()) {
-                    "Clipboard images require a session on this device"
-                } else {
-                    match self.clipboard_images.paste(image, live) {
-                        Ok(Submit::Queued) => "Pasting image into the terminal…",
-                        Ok(Submit::Busy) => "Previous input pending · image was not pasted",
-                        Ok(_) => "Input unavailable · image was not pasted",
-                        Err(reason) => reason,
-                    }
-                },
-            );
-        } else if let Some(editor) = &mut self.line_input {
-            if editor.composing() {
+        } else if self.input_current() {
+            if self.line_input.is_some() {
+                // The Kit editor is the sole owner of text and IME events.
                 return;
             }
-            match event.keystroke.key.as_str() {
-                "escape" => {
-                    self.detach();
-                    if let Some(focus) = &self.tree_focus {
-                        focus.focus(window);
-                    }
-                }
-                "enter" if !modifiers.modified() => {
-                    self.live_notice = match live.submit_line(&editor.bytes()) {
-                        live_session::Submit::Queued => {
-                            editor.queued();
-                            Some("Sending line…")
-                        }
-                        live_session::Submit::Busy => {
-                            Some("Previous line pending · draft retained")
-                        }
-                        _ => Some("Line could not be sent · draft retained"),
-                    };
-                }
-                "enter" if modifiers.shift => editor.insert("\n"),
-                "v" if paste => {
-                    if let Some(text) = clipboard.as_ref().and_then(|item| item.text()) {
-                        editor.insert(&text.replace("\r\n", "\n").replace('\r', "\n"));
-                    }
-                }
-                _ if (event.keystroke.key_char.is_some() || event.keystroke.key == "space")
-                    && !modifiers.control
-                    && !modifiers.platform =>
-                {
-                    return
-                }
-                _ => editor.edit(&event.keystroke),
+            let paste = key.key == "v"
+                && (modifiers.platform
+                    || (modifiers.control && (modifiers.shift || cfg!(windows))));
+            let clipboard = paste
+                .then(|| {
+                    cx.read_from_clipboard()
+                        .or_else(clipboard_image::read_fallback)
+                })
+                .flatten();
+            if let Some(image) = clipboard.as_ref().and_then(clipboard_image::first_image) {
+                self.paste_terminal_image(image);
+            } else if let Some(bytes) = live_session::key_bytes(key) {
+                self.live_notice = Some(match self.live.as_ref().unwrap().submit(&bytes) {
+                    live_session::Submit::Queued => "Input pending",
+                    live_session::Submit::Busy => "Input still pending · key was not sent",
+                    live_session::Submit::Invalid => "Unsupported input",
+                    live_session::Submit::Stopped => "Input unavailable · detach and reconnect",
+                });
             }
-        } else if let Some(bytes) = live_session::key_bytes(&event.keystroke) {
-            self.live_notice = match live.submit(&bytes) {
-                live_session::Submit::Queued => Some("Input pending"),
-                live_session::Submit::Busy => Some("Input still pending · key was not sent"),
-                live_session::Submit::Invalid => Some("Unsupported input"),
-                live_session::Submit::Stopped => Some("Input unavailable · detach and reconnect"),
-            };
         }
         cx.stop_propagation();
         cx.notify();
     }
 
-    fn scroll_terminal(&mut self, event: &gpui::ScrollWheelEvent, cx: &mut Context<Self>) {
+    fn scroll_terminal(&mut self, event: &gpui::ScrollEvent, cx: &mut Context<Self>) {
         let limit = self
             .preview
             .as_ref()
@@ -798,9 +847,19 @@ impl LocalGui {
             && !self
                 .live_focus
                 .as_ref()
-                .is_some_and(|focus| focus.is_focused(window))
+                .is_some_and(|focus| focus.contains_focused(window, cx))
         {
             self.detach();
+        }
+        if !reading_document
+            && self.line_input.is_some()
+            && self
+                .live_focus
+                .as_ref()
+                .is_some_and(|focus| focus.is_focused(window))
+        {
+            // Closing a shared document can return focus to the terminal pane.
+            self.focus_terminal_input(window, cx);
         }
         if let Some(live) = &self.live {
             match live.poll() {
@@ -1168,7 +1227,7 @@ impl LocalGui {
 fn main() {
     #[cfg(target_os = "macos")]
     if std::env::args().nth(1).as_deref() == Some("--internal-font-check") {
-        Application::headless().run(|app| {
+        gpui_kit::platform::headless().run(|app| {
             let has_fonts = !app.text_system().all_font_names().is_empty();
             if !has_fonts {
                 eprintln!("GPUI macOS text backend did not enumerate any fonts");
@@ -1273,25 +1332,25 @@ fn main() {
             }
         };
         let window = Rc::new(Cell::new(None));
-        let app = Application::new();
+        let app = gpui_kit::application();
         let reopen = window.clone();
         app.on_reopen(move |cx| show_local_window(&reopen, cx));
         app.run(move |cx| {
             macos_lifecycle::install_menu(cx, macos_lifecycle::WindowKind::Remuda);
             show_local_window(&window, cx);
             cx.spawn(async move |cx| loop {
-                gpui::Timer::after(Duration::from_millis(150)).await;
-                if primary.take_open_request()
-                    && cx.update(|cx| show_local_window(&window, cx)).is_err()
-                {
-                    break;
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                if primary.take_open_request() {
+                    cx.update(|cx| show_local_window(&window, cx));
                 }
             })
             .detach();
         });
         return;
     }
-    let app = Application::new();
+    let app = gpui_kit::application();
     #[cfg(target_os = "macos")]
     app.on_reopen(|cx| {
         if let Some(window) = cx.windows().first().copied() {
@@ -1304,7 +1363,7 @@ fn main() {
             #[cfg(target_os = "macos")]
             {
                 macos_lifecycle::install_menu(cx, macos_lifecycle::WindowKind::Browser);
-                cx.on_window_closed(|cx| {
+                cx.on_window_closed(|cx, _| {
                     if cx.windows().is_empty() {
                         cx.quit();
                     }
@@ -1317,6 +1376,28 @@ fn main() {
         open_local_window(cx, bounds);
         cx.activate(true);
     });
+}
+
+fn scroll_area(scroll: &gpui::ScrollHandle, content: impl IntoElement) -> impl IntoElement {
+    use gpui_kit::base::{Scrollbar, ScrollbarMode};
+    div()
+        .relative()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .child(content)
+        .child(
+            Scrollbar::vertical(scroll)
+                .mode(ScrollbarMode::Always)
+                .styles(|styles| {
+                    styles
+                        .thumb(|thumb| thumb.bg(rgb(0x647083)))
+                        .thumb_hover(|thumb| thumb.bg(rgb(0x8a9bb2)))
+                        .thumb_active(|thumb| thumb.bg(rgb(0xadcceb)))
+                }),
+        )
 }
 
 fn default_window_bounds(cx: &App) -> Bounds<gpui::Pixels> {
@@ -1346,7 +1427,7 @@ fn open_local_window(cx: &mut App, bounds: Bounds<gpui::Pixels>) -> gpui::AnyWin
                 #[cfg(windows)]
                 windows_input::install(window);
                 let focus = cx.focus_handle();
-                focus.focus(window);
+                focus.focus(window, cx);
                 let window = window.window_handle();
                 cx.new(|cx| {
                     let mut gui = LocalGui::new();
@@ -1367,7 +1448,9 @@ fn open_local_window(cx: &mut App, bounds: Bounds<gpui::Pixels>) -> gpui::AnyWin
                     gui.refresh();
                     gui.refresh_nodes();
                     cx.spawn(async move |weak, cx| loop {
-                        gpui::Timer::after(Duration::from_millis(150)).await;
+                        cx.background_executor()
+                            .timer(Duration::from_millis(150))
+                            .await;
                         if window
                             .update(cx, |_, window, cx| {
                                 weak.update(cx, |this: &mut LocalGui, cx| {
@@ -1446,7 +1529,7 @@ mod tests {
             gui.documents
                 .as_ref()
                 .unwrap()
-                .update(cx, |docs, _| docs.seed_test_document(window));
+                .update(cx, |docs, cx| docs.seed_test_document(window, cx));
             cx.notify();
         });
         assert!(cx.debug_bounds("browser-document-body").is_some());
@@ -1743,8 +1826,8 @@ mod tests {
             gui.drain();
             cx.notify();
         });
-        view.update_in(cx, |gui, window, _| {
-            gui.tree_focus.as_ref().unwrap().focus(window)
+        view.update_in(cx, |gui, window, cx| {
+            gui.tree_focus.as_ref().unwrap().focus(window, cx)
         });
         cx.simulate_keystrokes("left");
         let alpha_session = TreeRow::session(Some("a".into()), &row("remote-a"));
@@ -1850,14 +1933,20 @@ mod tests {
             gui.preview_busy = true;
             gui.focused_row = TreeRow::session(None, &gui.sessions[0]);
             let focus = cx.focus_handle();
-            focus.focus(window);
+            focus.focus(window, cx);
             gui.tree_focus = Some(focus);
             gui
         });
         cx.simulate_keystrokes("enter h space i");
         assert!(cx.debug_bounds("line-composer").is_some());
         assert_eq!(
-            cx.read(|app| view.read(app).line_input.as_ref().unwrap().bytes()),
+            cx.read(|app| view
+                .read(app)
+                .line_input
+                .as_ref()
+                .unwrap()
+                .bytes(app)
+                .unwrap()),
             b"h i\r"
         );
         cx.simulate_keystrokes("escape");
@@ -1874,15 +1963,15 @@ mod tests {
             gui.preview_busy = true;
             gui.focused_row = TreeRow::session(None, &gui.sessions[0]);
             let focus = cx.focus_handle();
-            focus.focus(window);
+            focus.focus(window, cx);
             gui.tree_focus = Some(focus);
             gui
         });
         cx.simulate_keystrokes("enter");
-        view.update(cx, |gui, cx| {
+        view.update_in(cx, |gui, window, cx| {
             let editor = gui.line_input.as_mut().unwrap();
-            editor.insert("previous input");
-            editor.queued();
+            editor.insert("previous input", window, cx);
+            editor.queued(window, cx);
             cx.notify();
         });
         cx.simulate_keystrokes("escape enter a b c shift-enter x y z ctrl-a ctrl-f up");
@@ -1890,13 +1979,25 @@ mod tests {
         // cursor moved into the draft before Up reaches the history.
         cx.simulate_keystrokes("backspace ctrl-e ctrl-b up");
         assert_eq!(
-            cx.read(|app| view.read(app).line_input.as_ref().unwrap().bytes()),
+            cx.read(|app| view
+                .read(app)
+                .line_input
+                .as_ref()
+                .unwrap()
+                .bytes(app)
+                .unwrap()),
             b"previous input\r",
         );
         // Down restores the original draft and its cursor between b and c.
         cx.simulate_keystrokes("down ctrl-k");
         assert_eq!(
-            cx.read(|app| view.read(app).line_input.as_ref().unwrap().bytes()),
+            cx.read(|app| view
+                .read(app)
+                .line_input
+                .as_ref()
+                .unwrap()
+                .bytes(app)
+                .unwrap()),
             b"b\nxyz\r",
         );
     }
@@ -1980,15 +2081,27 @@ mod tests {
             cx.notify();
         });
         assert!(cx.debug_bounds("line-composer").is_some());
-        view.update_in(cx, |gui, window, _| {
-            gui.tree_focus.as_ref().unwrap().focus(window)
+        view.update_in(cx, |gui, window, cx| {
+            gui.tree_focus.as_ref().unwrap().focus(window, cx)
         });
         let editor = cx.debug_bounds("line-composer").unwrap();
         cx.simulate_click(editor.center(), gpui::Modifiers::none());
-        assert!(cx.debug_bounds("line-composer-caret").is_some());
+        view.update_in(cx, |gui, window, cx| {
+            let editor = gui.line_input.as_ref().unwrap().state.read(cx);
+            assert!(gpui::Focusable::focus_handle(editor, cx).is_focused(window));
+            assert!(editor
+                .cursor_layout()
+                .is_some_and(|(bounds, _)| bounds.size.height > px(0.)));
+        });
         cx.simulate_keystrokes("a");
         assert_eq!(
-            cx.read(|app| view.read(app).line_input.as_ref().unwrap().bytes()),
+            cx.read(|app| view
+                .read(app)
+                .line_input
+                .as_ref()
+                .unwrap()
+                .bytes(app)
+                .unwrap()),
             b"a\r"
         );
         assert!(cx.debug_bounds("preview").is_some());
@@ -2011,15 +2124,24 @@ mod tests {
         });
         cx.simulate_resize(gpui::size(px(1000.), px(540.)));
         let tree = cx.debug_bounds("node-tree").unwrap();
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: tree.center(),
             delta: gpui::ScrollDelta::Lines(gpui::point(0., -6.)),
             modifiers: gpui::Modifiers::none(),
             touch_phase: gpui::TouchPhase::Moved,
+            source: gpui::ScrollSource::Pointer,
         });
+        let offset = cx.read(|app| {
+            let gui = view.read(app);
+            assert_eq!(gui.terminal_scroll.offset, 0);
+            assert!(gui.tree_scroll.offset().y < px(0.));
+            gui.tree_scroll.offset().y
+        });
+        let track = gpui::point(tree.right() - px(6.), tree.bottom() - px(10.));
+        cx.simulate_click(track, gpui::Modifiers::none());
         assert!(cx.read(|app| {
             let gui = view.read(app);
-            gui.tree_scroll.offset().y < px(0.) && gui.terminal_scroll.offset == 0
+            gui.tree_scroll.offset().y < offset && gui.terminal_scroll.offset == 0
         }));
     }
 
@@ -2038,7 +2160,7 @@ mod tests {
                 .unwrap(),
             );
             let sidebar = cx.focus_handle();
-            sidebar.focus(window);
+            sidebar.focus(window, cx);
             gui.tree_focus = Some(sidebar);
             gui
         });
@@ -2079,16 +2201,17 @@ mod tests {
                 ..Screen::default()
             });
             let focus = cx.focus_handle();
-            focus.focus(window);
+            focus.focus(window, cx);
             gui.live_focus = Some(focus);
             gui
         });
         let terminal = cx.debug_bounds("preview").unwrap();
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: terminal.center(),
             delta: gpui::ScrollDelta::Lines(gpui::point(0., 3.)),
             modifiers: gpui::Modifiers::none(),
             touch_phase: gpui::TouchPhase::Moved,
+            source: gpui::ScrollSource::Pointer,
         });
         assert_eq!(cx.read(|app| view.read(app).terminal_scroll.offset), 3);
         cx.simulate_keystrokes("enter");

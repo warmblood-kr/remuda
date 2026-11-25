@@ -169,11 +169,11 @@ impl LocalGui {
         }
     }
 
-    fn focus_search(&mut self, window: &mut Window) {
+    fn focus_search(&mut self, window: &mut Window, cx: &mut App) {
         self.search.get_or_insert_with(String::new);
         self.refresh_filter_data();
         if let Some(focus) = &self.tree_focus {
-            focus.focus(window);
+            focus.focus(window, cx);
         }
     }
 
@@ -208,7 +208,7 @@ impl LocalGui {
         match (key.key.as_str(), printable) {
             ("escape", _) if self.show_help => self.show_help = false,
             ("escape", _) if self.search.is_some() => self.search = None,
-            (_, Some("/")) if self.search.is_none() => self.focus_search(window),
+            (_, Some("/")) if self.search.is_none() => self.focus_search(window, cx),
             (_, Some("?")) if self.search.is_none() => self.show_help = !self.show_help,
             (_, Some("!")) if self.search.is_none() => {
                 self.attention_only = !self.attention_only;
@@ -397,7 +397,7 @@ impl LocalGui {
                     .tooltip(move |_, app| app.new(|_| FullName(full_name.clone())).into())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(focus) = &this.tree_focus {
-                            focus.focus(window);
+                            focus.focus(window, cx);
                         }
                         this.focused_row = TreeRow::Node(fp.clone());
                         if !filtering {
@@ -491,7 +491,7 @@ impl LocalGui {
                         .hover(|d| d.bg(rgb(0x2a3340)))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             if let Some(focus) = &this.tree_focus {
-                                focus.focus(window);
+                                focus.focus(window, cx);
                             }
                             this.focused_row = row.clone();
                             this.select_session(fp.clone(), session.clone());
@@ -669,9 +669,7 @@ impl Render for LocalGui {
                             if let Some(docs) = &this.documents {
                                 docs.update(cx, |docs, _| docs.select_terminal());
                             }
-                            if let Some(focus) = &this.live_focus {
-                                focus.focus(window);
-                            }
+                            this.focus_terminal_input(window, cx);
                             cx.notify();
                         }),
                     ),
@@ -684,7 +682,7 @@ impl Render for LocalGui {
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
                         if let Some(docs) = &this.documents {
-                            docs.update(cx, |docs, _| docs.select_document(window));
+                            docs.update(cx, |docs, cx| docs.select_document(window, cx));
                         }
                         cx.notify();
                     })),
@@ -743,7 +741,7 @@ impl Render for LocalGui {
                                 button("local-sessions-tab", "Sessions", !self.drive_selected)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.drive_selected = false;
-                                        if let Some(focus) = &this.tree_focus { focus.focus(window); }
+                                        if let Some(focus) = &this.tree_focus { focus.focus(window, cx); }
                                         cx.notify();
                                     })),
                             )
@@ -752,7 +750,7 @@ impl Render for LocalGui {
                                     cx.listener(|this, _, window, cx| {
                                         this.drive_selected = true;
                                         if let Some(docs) = &this.documents {
-                                            docs.update(cx, |docs, _| docs.select_drive(window));
+                                            docs.update(cx, |docs, cx| docs.select_drive(window, cx));
                                         }
                                         cx.notify();
                                     }),
@@ -813,7 +811,7 @@ impl Render for LocalGui {
                                         if this.search.is_some() {
                                             this.search = None;
                                         } else {
-                                            this.focus_search(window);
+                                            this.focus_search(window, cx);
                                         }
                                         cx.notify();
                                     }),
@@ -826,7 +824,7 @@ impl Render for LocalGui {
                                         this.refresh_filter_data();
                                     }
                                     if let Some(focus) = &this.tree_focus {
-                                        focus.focus(window);
+                                        focus.focus(window, cx);
                                     }
                                     cx.notify();
                                 }),
@@ -836,7 +834,7 @@ impl Render for LocalGui {
                                     |this, _, window, cx| {
                                         this.show_help = !this.show_help;
                                         if let Some(focus) = &this.tree_focus {
-                                            focus.focus(window);
+                                            focus.focus(window, cx);
                                         }
                                         cx.notify();
                                     },
@@ -900,7 +898,8 @@ impl Render for LocalGui {
                         )
                     })
                     .when(!show_help, |d| {
-                        d.child(
+                        d.child(crate::scroll_area(
+                            &self.tree_scroll,
                             div()
                                 .id("node-tree")
                                 .debug_selector(|| "node-tree".into())
@@ -921,7 +920,7 @@ impl Render for LocalGui {
                                             .child("No matching sessions or nodes"),
                                     )
                                 }),
-                        )
+                        ))
                     })
                 }),
             )
@@ -1017,7 +1016,7 @@ impl Render for LocalGui {
                                                                     if let Some(focus) =
                                                                         &this.tree_focus
                                                                     {
-                                                                        focus.focus(window);
+                                                                        focus.focus(window, cx);
                                                                     }
                                                                     cx.notify();
                                                                 },
@@ -1062,7 +1061,7 @@ impl Render for LocalGui {
                                                 }))
                                                 .track_focus(&input_focus)
                                                 .on_key_down(cx.listener(Self::live_key))
-                                                .on_scroll_wheel(cx.listener(
+                                                .on_scroll(cx.listener(
                                                     |this, event, _, cx| {
                                                         this.scroll_terminal(event, cx)
                                                     },
@@ -1080,12 +1079,8 @@ impl Render for LocalGui {
                                                             div()
                                                                 .id("terminal-cells")
                                                                 .on_mouse_down(MouseButton::Left, cx.listener(
-                                                                    |this, _, window, _| {
-                                                                        if let Some(focus) =
-                                                                            &this.live_focus
-                                                                        {
-                                                                            focus.focus(window);
-                                                                        }
+                                                                    |this, _, window, cx| {
+                                                                        this.focus_terminal_input(window, cx);
                                                                     },
                                                                 ))
                                                                 .size_full()
@@ -1101,35 +1096,9 @@ impl Render for LocalGui {
                                                                 ),
                                                         ),
                                                 )
-                                                .when_some(
-                                                    self.line_input.as_ref(),
-                                                    |d, editor| {
-                                                        let view = cx.entity();
-                                                        let focus = input_focus.clone();
-                                                        d.child(
-                                    div().id("composer-focus-target").relative()
-                                                        .child(editor.view(input_focus.is_focused(window)))
-                                                        .on_click(cx.listener(|this, _, window, cx| {
-                                                            if let Some(focus) = &this.live_focus { focus.focus(window); }
-                                                            cx.notify();
-                                                        }))
-                                                        .child(
-                                        gpui::canvas(
-                                            |_, _, _| (),
-                                            move |bounds, _, window, app| {
-                                                window.handle_input(
-                                                    &focus,
-                                                    gpui::ElementInputHandler::new(bounds, view),
-                                                    app,
-                                                );
-                                            },
-                                        )
-                                        .absolute()
-                                        .size_full(),
-                                    ),
-                                )
-                                                    },
-                                                ),
+                                                .when_some(self.line_input.as_ref(), |d, editor| {
+                                                    d.child(editor.view(cx))
+                                                }),
                                         ),
                                 )
                             })

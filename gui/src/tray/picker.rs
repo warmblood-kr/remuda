@@ -1,12 +1,12 @@
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, FocusHandle, KeyDownEvent,
-    Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size, App, Bounds, Context, FocusHandle, KeyDownEvent, Window,
+    WindowBounds, WindowOptions,
 };
 use remuda_native::net::browser::valid_ssh_destination;
 use std::{path::Path, process::Command};
 
 pub(super) fn open() {
-    Application::new().run(move |app: &mut App| {
+    gpui_kit::application().run(move |app: &mut App| {
         let bounds = Bounds::centered(None, size(px(440.), px(175.)), app);
         let opened = app.open_window(
             WindowOptions {
@@ -17,7 +17,7 @@ pub(super) fn open() {
             |window, cx| {
                 window.set_window_title("Open Remuda Browser");
                 let focus = cx.focus_handle();
-                focus.focus(window);
+                focus.focus(window, cx);
                 cx.new(|_| Picker {
                     host: String::new(),
                     replace: false,
@@ -31,7 +31,7 @@ pub(super) fn open() {
             app.quit();
             return;
         }
-        app.on_window_closed(|app| app.quit()).detach();
+        app.on_window_closed(|app, _| app.quit()).detach();
         app.activate(true);
     });
 }
