@@ -17,6 +17,8 @@ use std::{
 };
 
 use crate::browser_media;
+#[cfg(any(target_os = "macos", windows))]
+use crate::native_document;
 use crate::terminal_view::{self, Screen, Viewport};
 
 const SPLIT_WIDTH: f32 = 1120.;
@@ -26,6 +28,8 @@ struct Document {
     uri: String,
     media: browser_media::Document,
     request: Option<DocumentRequest>,
+    #[cfg(any(target_os = "macos", windows))]
+    html: Option<Arc<[u8]>>,
 }
 
 enum DriveSource {
@@ -210,6 +214,30 @@ enum Content {
     Document,
 }
 
+#[cfg(any(target_os = "macos", windows))]
+#[derive(Default)]
+struct NativeHtml {
+    source: Option<Arc<DriveSource>>,
+    selected: bool,
+    failed: bool,
+    opening: bool,
+    preview: Option<native_document::Preview>,
+    receipt_deadline: Option<Instant>,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+impl NativeHtml {
+    fn clear(&mut self, cx: &App) {
+        if let Some(mut preview) = self.preview.take() {
+            preview.hide(cx);
+        }
+        self.selected = false;
+        self.failed = false;
+        self.opening = false;
+        self.receipt_deadline = None;
+    }
+}
+
 pub(crate) struct Browser {
     destination: String,
     embedded: bool,
@@ -222,6 +250,8 @@ pub(crate) struct Browser {
     show_drive: bool,
     drive: Option<Drive>,
     assets: Option<Assets>,
+    #[cfg(any(target_os = "macos", windows))]
+    native_html: NativeHtml,
     document_generation: u64,
     document_scroll: gpui::ScrollHandle,
     drive_scroll: gpui::ScrollHandle,
@@ -325,7 +355,12 @@ impl Browser {
             .or_else(|| embedded.then_some(DriveSource::Local))
             .map(Arc::new);
         let drive = source.clone().map(Drive::new);
-        let assets = source.map(Assets::new);
+        let assets = source.clone().map(Assets::new);
+        #[cfg(any(target_os = "macos", windows))]
+        let native_html = NativeHtml {
+            source: source.filter(|_| native_document::supported()),
+            ..NativeHtml::default()
+        };
         Self {
             destination,
             embedded,
@@ -338,6 +373,8 @@ impl Browser {
             show_drive: false,
             drive,
             assets,
+            #[cfg(any(target_os = "macos", windows))]
+            native_html,
             document_generation: 0,
             document_scroll: Default::default(),
             drive_scroll: Default::default(),
@@ -379,6 +416,8 @@ impl Browser {
                 uri,
                 media,
                 request: None,
+                #[cfg(any(target_os = "macos", windows))]
+                html: None,
             },
             true,
             window,
@@ -402,9 +441,10 @@ impl Browser {
     pub(crate) fn owns_document_focus(&self, window: &Window, cx: &App) -> bool {
         self.document_focus.contains_focused(window, cx)
     }
-    pub(crate) fn select_terminal(&mut self) {
+    pub(crate) fn select_terminal(&mut self, cx: &App) {
         self.active = Content::Terminal;
         self.split = false;
+        self.hide_native_document(cx);
     }
     pub(crate) fn select_document(&mut self, window: &mut Window, cx: &mut App) {
         self.active = Content::Document;
@@ -434,6 +474,20 @@ impl Browser {
     pub(crate) fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.painted.get() && self.pending_presentation.take().is_some() {
             cx.notify();
+        }
+        #[cfg(any(target_os = "macos", windows))]
+        if self.native_html.selected && self.pending_presentation.is_some() {
+            if self
+                .native_html
+                .receipt_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                self.pending_presentation = None;
+                cx.notify();
+            } else if self.native_html.preview.is_some() {
+                // Check the native view on the next real Document paint.
+                window.refresh();
+            }
         }
         if let Ok(document) = self.documents.try_recv() {
             let typing = (self.embedded || self.focus.is_focused(window))
@@ -519,11 +573,27 @@ impl Browser {
             self.zoom = 1.;
             self.document_scroll.set_offset(gpui::point(px(0.), px(0.)));
         }
-        if let Some(request) = document.request.clone() {
-            self.pending_presentation = Some(request);
+        if document.request.is_some()
+            || self
+                .document
+                .as_ref()
+                .is_none_or(|current| current.uri != document.uri)
+        {
+            self.pending_presentation = document.request.clone();
             self.painted = Default::default();
         }
         self.document_generation = self.document_generation.wrapping_add(1);
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            self.native_html.clear(cx);
+            self.native_html.selected = self.pending_presentation.is_some()
+                && document.html.is_some()
+                && self.native_html.source.is_some();
+            if self.native_html.selected {
+                self.native_html.receipt_deadline =
+                    Some(Instant::now() + remuda_native::net::browser::DELIVERY_TTL);
+            }
+        }
         if document.media.asset_paths().next().is_some() {
             if let Some(assets) = &self.assets {
                 let _ = assets
@@ -547,6 +617,8 @@ impl Browser {
             document.media.release_images(window);
         }
         self.document_generation = self.document_generation.wrapping_add(1);
+        #[cfg(any(target_os = "macos", windows))]
+        self.native_html.clear(cx);
         self.pending_presentation = None;
         self.active = Content::Terminal;
         self.focus.focus(window, cx);
@@ -944,6 +1016,119 @@ impl Browser {
             .into_any_element()
     }
 
+    pub(crate) fn hide_native_document(&mut self, cx: &App) {
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            self.native_html.opening = false;
+            if let Some(preview) = &mut self.native_html.preview {
+                preview.hide(cx);
+            }
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let _ = cx;
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    fn native_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.weak_entity();
+        let generation = self.document_generation;
+        let element = self
+            .native_html
+            .preview
+            .as_ref()
+            .map(|preview| preview.element(cx));
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .children(element)
+            .child(
+                gpui::canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, app| {
+                        if bounds.intersect(&window.content_mask().bounds).is_empty() {
+                            return;
+                        }
+                        let _ = view.update(app, |this, cx| {
+                            if this.document_generation != generation || !this.native_html.selected
+                            {
+                                return;
+                            }
+                            if let Some(preview) = &this.native_html.preview {
+                                if this.pending_presentation.is_some()
+                                    && !this.painted.get()
+                                    && preview.observe_presentation(cx)
+                                {
+                                    this.acknowledge_document(generation);
+                                }
+                                return;
+                            }
+                            if this.native_html.opening {
+                                return;
+                            }
+                            this.native_html.opening = true;
+                            let view = view.clone();
+                            window.on_next_frame(move |window, app| {
+                                let _ = view.update(app, |this, cx| {
+                                    if this.document_generation != generation
+                                        || !std::mem::take(&mut this.native_html.opening)
+                                    {
+                                        return;
+                                    }
+                                    let Some(document) = &this.document else {
+                                        return;
+                                    };
+                                    let Some(html) = document.html.clone() else {
+                                        return;
+                                    };
+                                    let Some(source) = this.native_html.source.clone() else {
+                                        return;
+                                    };
+                                    let asset: native_document::ReadAsset =
+                                        Arc::new(move |uri| source.read(uri).ok());
+                                    match native_document::Preview::open(
+                                        window,
+                                        cx,
+                                        &document.uri,
+                                        html,
+                                        asset,
+                                    ) {
+                                        Ok(preview) => this.native_html.preview = Some(preview),
+                                        Err(error) => {
+                                            eprintln!("remuda: native document preview: {error}");
+                                            this.native_html.selected = false;
+                                            this.native_html.failed = true;
+                                            this.pending_presentation = None;
+                                        }
+                                    }
+                                    cx.notify();
+                                });
+                            });
+                        });
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
+            .into_any_element()
+    }
+
+    fn acknowledge_document(&self, generation: u64) {
+        if generation != self.document_generation {
+            return;
+        }
+        if let Some(request) = self.pending_presentation.as_ref().filter(|request| {
+            self.document
+                .as_ref()
+                .is_some_and(|document| request.uri == document.uri)
+        }) {
+            if !self.painted.replace(true) {
+                let _ = self.displayed.send(request.clone());
+            }
+        }
+    }
+
     pub(crate) fn document_panel(&mut self, pane_width: f32, cx: &mut Context<Self>) -> AnyElement {
         let Some(document) = self.document.as_ref() else {
             return div()
@@ -952,29 +1137,29 @@ impl Browser {
                 .child("Open a document from Drive")
                 .into_any_element();
         };
-        let presentation = self
-            .pending_presentation
-            .clone()
-            .filter(|request| request.uri == document.uri && !self.painted.get())
-            .map(|request| {
-                let painted = self.painted.clone();
-                let displayed = self.displayed.clone();
-                gpui::canvas(
-                    |_, _, _| (),
-                    move |bounds, _, _, _| {
-                        if bounds.size.width > px(0.)
-                            && bounds.size.height > px(0.)
-                            && !painted.replace(true)
-                        {
-                            let _ = displayed.send(request);
-                        }
-                    },
-                )
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-            });
+        #[cfg(any(target_os = "macos", windows))]
+        let reader_active = !self.native_html.selected;
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let reader_active = true;
+        let presentation = (reader_active
+            && self.pending_presentation.is_some()
+            && !self.painted.get())
+        .then(|| {
+            let view = cx.weak_entity();
+            let generation = self.document_generation;
+            gpui::canvas(
+                |_, _, _| (),
+                move |bounds, _, _, app| {
+                    if bounds.size.width > px(0.) && bounds.size.height > px(0.) {
+                        let _ = view.update(app, |this, _| this.acknowledge_document(generation));
+                    }
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+        });
         let view = cx.weak_entity();
         let body = document.media.render(
             (pane_width - 48.).max(100.),
@@ -986,6 +1171,57 @@ impl Browser {
                 });
             },
         );
+        let fallback = || {
+            crate::scroll_area(
+                &self.document_scroll,
+                ScrollbarMode::Always,
+                div()
+                    .id(gpui::SharedString::from(format!(
+                        "document:{}",
+                        document.uri
+                    )))
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_scroll()
+                    .track_scroll(&self.document_scroll)
+                    .debug_selector(|| "browser-document-scroll".into())
+                    .p_6()
+                    .child(body),
+            )
+            .into_any_element()
+        };
+        #[cfg(any(target_os = "macos", windows))]
+        let (body, preview_button) = if self.native_html.source.is_some() && document.html.is_some()
+        {
+            let label = if self.native_html.selected {
+                "Reader"
+            } else {
+                "Native preview"
+            };
+            let button = action_button("native-preview", label).on_click(cx.listener(
+                |this, _, window, cx| {
+                    this.native_html.selected = !this.native_html.selected;
+                    this.native_html.failed = false;
+                    if !this.native_html.selected {
+                        this.pending_presentation = None;
+                        this.hide_native_document(cx);
+                    }
+                    this.document_focus.focus(window, cx);
+                    cx.notify();
+                },
+            ));
+            let body = if self.native_html.selected {
+                self.native_panel(cx)
+            } else {
+                fallback()
+            };
+            (body, Some(button))
+        } else {
+            (fallback(), None)
+        };
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let body = fallback();
+
         div()
             .id("browser-document")
             .debug_selector(|| "browser-document-body".into())
@@ -1034,6 +1270,19 @@ impl Browser {
                             },
                         )))
                     })
+                    .when_some(
+                        {
+                            #[cfg(any(target_os = "macos", windows))]
+                            {
+                                preview_button
+                            }
+                            #[cfg(not(any(target_os = "macos", windows)))]
+                            {
+                                None::<Button>
+                            }
+                        },
+                        |toolbar, button| toolbar.child(button),
+                    )
                     .child(
                         action_button("close-document", "Close").on_click(cx.listener(
                             |this, _, window, cx| {
@@ -1043,22 +1292,20 @@ impl Browser {
                         )),
                     ),
             )
-            .child(crate::scroll_area(
-                &self.document_scroll,
-                ScrollbarMode::Always,
-                div()
-                    .id(gpui::SharedString::from(format!(
-                        "document:{}",
-                        document.uri
-                    )))
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_scroll()
-                    .track_scroll(&self.document_scroll)
-                    .debug_selector(|| "browser-document-scroll".into())
-                    .p_6()
-                    .child(body),
-            ))
+            .when(
+                {
+                    #[cfg(any(target_os = "macos", windows))]
+                    {
+                        self.native_html.failed
+                    }
+                    #[cfg(not(any(target_os = "macos", windows)))]
+                    {
+                        false
+                    }
+                },
+                |panel| panel.child(div().px_3().py_2().child("Native preview unavailable")),
+            )
+            .child(body)
             .when_some(presentation, |d, marker| d.child(marker))
             .into_any_element()
     }
@@ -1157,10 +1404,18 @@ fn read(
         .path;
     let bytes = load(&uri)?;
     let media = browser_media::decode(&path, &bytes)?;
+    #[cfg(any(target_os = "macos", windows))]
+    let html = (request.is_none()
+        && path.rsplit_once('.').is_some_and(|(_, extension)| {
+            extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
+        }))
+    .then(|| Arc::from(bytes));
     Ok(Document {
         uri,
         media,
         request,
+        #[cfg(any(target_os = "macos", windows))]
+        html,
     })
 }
 
@@ -1239,7 +1494,7 @@ impl Render for Browser {
                         tab("terminal-tab", "Terminal", self.active == Content::Terminal)
                             .debug_selector(|| "browser-terminal-tab".into())
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.select_terminal();
+                                this.select_terminal(cx);
                                 this.focus.focus(window, cx);
                                 cx.notify();
                             })),
@@ -1312,6 +1567,7 @@ impl Render for Browser {
         } else if self.active == Content::Document {
             content = content.child(self.document_panel(document_width, cx));
         } else {
+            self.hide_native_document(cx);
             content = content.child(self.terminal_panel(cx));
         }
         div()
@@ -1383,6 +1639,8 @@ mod tests {
             media: browser_media::decode("pilot/plan.md", b"# Design plan\n\nMake it readable.")
                 .unwrap(),
             request,
+            #[cfg(any(target_os = "macos", windows))]
+            html: None,
         }
     }
 
@@ -1417,6 +1675,8 @@ mod tests {
                     error: None,
                 }),
                 assets: None,
+                #[cfg(any(target_os = "macos", windows))]
+                native_html: NativeHtml::default(),
                 document_generation: 0,
                 document_scroll: Default::default(),
                 drive_scroll: Default::default(),
@@ -1482,6 +1742,10 @@ mod tests {
             browser.tick(window, cx);
             assert!(browser.active == Content::Terminal);
             assert_eq!(browser.pending_presentation, Some(request.clone()));
+            browser.acknowledge_document(browser.document_generation.wrapping_sub(1));
+            browser.pending_presentation.as_mut().unwrap().uri = "remuda:///old".into();
+            browser.acknowledge_document(browser.document_generation);
+            browser.pending_presentation = Some(request.clone());
         });
         assert!(
             receipt.try_recv().is_err(),
@@ -1545,6 +1809,8 @@ mod tests {
                     uri: "remuda:///pilot/long.md".into(),
                     media,
                     request: None,
+                    #[cfg(any(target_os = "macos", windows))]
+                    html: None,
                 },
                 true,
                 window,
@@ -1647,6 +1913,8 @@ mod tests {
                     uri: "remuda:///pilot/image.png".into(),
                     media: browser_media::decode("pilot/image.png", png.get_ref()).unwrap(),
                     request: None,
+                    #[cfg(any(target_os = "macos", windows))]
+                    html: None,
                 },
                 true,
                 window,

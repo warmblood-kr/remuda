@@ -20,6 +20,8 @@ mod line_input;
 mod live_session;
 #[cfg(target_os = "macos")]
 mod macos_lifecycle;
+#[cfg(any(target_os = "macos", windows))]
+mod native_document;
 mod preview;
 mod terminal_view;
 use terminal_view::Screen;
@@ -615,7 +617,7 @@ impl LocalGui {
 
     fn open_session_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(docs) = &self.documents {
-            docs.update(cx, |docs, _| docs.select_terminal());
+            docs.update(cx, |docs, cx| docs.select_terminal(cx));
         }
         if self.line_input.is_some() && self.live.is_some() {
             self.focus_terminal_input(window, cx);
