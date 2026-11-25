@@ -197,6 +197,8 @@ pub struct HostBuild {
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Request {
+    /// Read-only resource usage for the node running this daemon.
+    NodeStatus,
     /// Every session this node holds.
     List,
     /// One bounded Lua-rendered view and its exact session snapshot.
@@ -482,7 +484,23 @@ pub enum Step {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct NodeMetrics {
+    /// Sample age on the serving node, independent of wall-clock skew.
+    pub age_ms: u64,
+    pub cpu_percent: Option<u8>,
+    pub memory: Option<ResourceUsage>,
+    pub system_disk: Option<ResourceUsage>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct ResourceUsage {
+    pub used_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Response {
+    NodeStatus(Option<NodeMetrics>),
     Sessions(Vec<SessionSummary>),
     /// Answer to [`Request::SessionHostBuilds`], sorted by name.
     SessionHostBuilds(Vec<HostBuild>),

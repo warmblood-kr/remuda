@@ -205,6 +205,7 @@ pub struct ClusterUi {
     remote_expanded: HashSet<String>,
     remote_selected: Option<RemoteSelection>,
     local_node_selected: bool,
+    node_status: crate::node_status::Status,
     remote_active: Option<RemoteSelection>,
     remote_keys_mode: Option<RemoteSelection>,
     remote_key_buffers: VecDeque<RemoteKeyBuffer>,
@@ -577,6 +578,7 @@ impl ClusterUi {
             remote_expanded: HashSet::new(),
             remote_selected: None,
             local_node_selected: false,
+            node_status: crate::node_status::Status::default(),
             remote_active: None,
             remote_keys_mode: None,
             remote_key_buffers: VecDeque::new(),
@@ -1070,8 +1072,7 @@ impl ClusterUi {
             });
             self.selected = selected_index.unwrap_or(self.selected);
             self.active = active_index.unwrap_or(self.active);
-            self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
-            self.active = self.active.min(self.sessions.len().saturating_sub(1));
+            self.clamp_session_cursor();
         }
         self.retain_local_view();
         self.sync_completed(at);
@@ -1202,8 +1203,7 @@ impl ClusterUi {
                     || session.instance_id != ended.summary.instance_id
             });
         }
-        self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
-        self.active = self.active.min(self.sessions.len().saturating_sub(1));
+        self.clamp_session_cursor();
         self.last_frame = None;
         self.retain_local_view();
     }
@@ -1405,7 +1405,7 @@ impl ClusterUi {
         let screen_rows = height.saturating_sub(reserved);
         let screen_end = frame.len() + screen_rows;
         frame.extend(
-            visible_remote_pane_lines(&pane_body, self.remote_active.is_some(), screen_rows)
+            visible_remote_pane_lines(&pane_body, self.showing_remote_screen(), screen_rows)
                 .into_iter()
                 .map(str::to_string),
         );
@@ -1715,7 +1715,7 @@ impl ClusterUi {
             right.clear();
         }
         right.extend(
-            visible_remote_pane_lines(&pane_body, self.remote_active.is_some(), screen_rows)
+            visible_remote_pane_lines(&pane_body, self.showing_remote_screen(), screen_rows)
                 .into_iter()
                 .map(str::to_string),
         );
@@ -2098,7 +2098,57 @@ impl ClusterUi {
         rows
     }
 
+    fn clamp_session_cursor(&mut self) {
+        let last = self.sessions.len().saturating_sub(1);
+        self.selected = self.selected.min(last);
+        self.active = self.active.min(last);
+    }
+
+    fn status_node(&self, path: &Path) -> Option<crate::node_status::Node> {
+        use crate::node_status::Node;
+        match self.current_tree_selection() {
+            TreeSelection::LocalNode => Some(Node::local(path)),
+            TreeSelection::RemoteNode(node) => Some(Node::Peer(node)),
+            _ => None,
+        }
+    }
+
+    fn update_node_status(&mut self, path: &Path) {
+        self.node_status.update(self.status_node(path));
+    }
+
+    fn showing_remote_screen(&self) -> bool {
+        self.remote_active.is_some()
+            && matches!(
+                self.current_tree_selection(),
+                TreeSelection::LocalSession(_) | TreeSelection::RemoteSession { .. }
+            )
+    }
+
     fn remote_pane(&self, local_header: String, local_screen: &str) -> (String, String) {
+        let node_name = match self.current_tree_selection() {
+            TreeSelection::LocalNode => Some(self.node.as_str()),
+            TreeSelection::RemoteNode(ref key) => self
+                .remote_snapshot
+                .nodes
+                .iter()
+                .find(|node| &node.registry_key == key)
+                .map(|node| node.name.as_str()),
+            _ => None,
+        };
+        if let Some(name) = node_name {
+            return (
+                if self.sessions.is_empty()
+                    && matches!(self.current_tree_selection(), TreeSelection::LocalNode)
+                {
+                    format!("Node status · {name} · no sessions")
+                } else {
+                    format!("{name} · Node status")
+                },
+                self.node_status.lines().join("\n"),
+            );
+        }
+
         match &self.remote_active {
             Some(active) => match self.remote_session(active) {
                 Some((_, session)) => (
@@ -4427,6 +4477,7 @@ fn run_loop(
         // Read before syncing: an update landing during sync/render wakes the wait.
         let seen = wake();
         ui.remote_synced(remote_source);
+        ui.update_node_status(path);
         sync_remote_views(&mut ui, &mut remote_views, clock.now());
         if let Some(port) = remote_calls.as_mut() {
             ui.apply_remote_replies(port, clock.now());
@@ -4439,8 +4490,7 @@ fn run_loop(
         } else {
             remote_selection.clear();
         }
-        ui.selected = ui.selected.min(ui.sessions.len().saturating_sub(1));
-        ui.active = ui.active.min(ui.sessions.len().saturating_sub(1));
+        ui.clamp_session_cursor();
         let terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
         let (cols, rows) = normalized_terminal_size(terminal_size.0, terminal_size.1);
         resize_active_pane(
