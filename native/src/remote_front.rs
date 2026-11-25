@@ -294,6 +294,7 @@ fn write_response(stream: &mut crate::ipc::Stream, reply: Vec<u8>) -> std::io::R
 pub fn authorize(request: &Request) -> Result<(), String> {
     match request {
         Request::List
+        | Request::NodeStatus
         | Request::RenderedSessionList { width: 1..=512 }
         | Request::RemoteInputSupport
         | Request::CaptureStyled { .. }

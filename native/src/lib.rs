@@ -37,6 +37,7 @@ pub mod mouse;
 pub mod native_permissions;
 #[allow(clippy::disallowed_types)]
 pub mod net;
+pub mod node_status;
 pub mod packages;
 pub mod pending;
 pub mod permission_overlay;

@@ -2218,6 +2218,10 @@ fn handle_request(
     accepted: std::time::SystemTime,
 ) -> std::io::Result<()> {
     match request {
+        Request::NodeStatus => reply(
+            &stream,
+            &Response::NodeStatus(crate::node_status::metrics()),
+        ),
         Request::List => {
             // A session's child runs before `new` registers it, and a
             // host-backed one (#713) only once its host published, so a

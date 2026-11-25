@@ -125,6 +125,9 @@ enum WordClass {
 
 pub struct Ui {
     node_header: bool,
+    node_header_label: &'static str,
+    node_selected: bool,
+    node_status: crate::node_status::Status,
     cluster_browser: bool,
     pub sessions: Vec<SessionSummary>,
     pub selected: usize,
@@ -210,6 +213,9 @@ impl Ui {
     pub fn new(sessions: Vec<SessionSummary>, shell: &str, notice: Option<String>) -> Self {
         Self {
             node_header: false,
+            node_header_label: "This device",
+            node_selected: false,
+            node_status: crate::node_status::Status::default(),
             cluster_browser: false,
             sessions,
             selected: 0,
@@ -346,7 +352,9 @@ impl Ui {
     }
 
     pub fn selected(&self) -> Option<&SessionSummary> {
-        self.sessions.get(self.selected)
+        (!self.node_selected)
+            .then(|| self.sessions.get(self.selected))
+            .flatten()
     }
 
     /// Keep the cursor on a real row after the herd changes underneath it.
@@ -616,6 +624,10 @@ impl Ui {
             return Action::Nothing;
         }
         let header = self.node_header_rows();
+        if header == 1 && row == 1 {
+            self.select_node_header();
+            return Action::Nothing;
+        }
         if row <= header || row > body {
             return Action::Nothing;
         }
@@ -626,6 +638,7 @@ impl Ui {
         }
         self.list_first_visible = Some(viewport);
         self.selected = index;
+        self.node_selected = false;
         self.pan = 0;
         self.focus_session()
     }
@@ -862,6 +875,16 @@ impl Ui {
         true
     }
 
+    fn select_node_header(&mut self) {
+        self.focus = Focus::List;
+        self.node_selected = true;
+        self.visual = false;
+        self.selecting_text = false;
+        self.text_selection = None;
+        self.compose_target = None;
+        self.pan = 0;
+    }
+
     fn browse_key(&mut self, key: KeyEvent) -> Action {
         // The modal permissions list is handled in `on_key`; this map only
         // runs while the list is free to act.
@@ -883,11 +906,21 @@ impl Ui {
             KeyCode::Char('c') if ctrl => Action::Quit,
             KeyCode::Char('q') => Action::Quit,
             KeyCode::Up | KeyCode::Char('k') => {
+                if self.node_header && (self.node_selected || self.selected == 0) {
+                    self.select_node_header();
+                    return Action::Nothing;
+                }
                 self.selected = self.selected.saturating_sub(1);
                 self.pan = 0;
                 Action::Nothing
             }
             KeyCode::Down | KeyCode::Char('j') => {
+                if self.node_selected && !self.sessions.is_empty() {
+                    self.node_selected = false;
+                    self.selected = 0;
+                    self.track_list_selection();
+                    return Action::Nothing;
+                }
                 if self.selected + 1 < self.sessions.len() {
                     self.selected += 1;
                 }
@@ -908,7 +941,7 @@ impl Ui {
             }
             KeyCode::Char('x') => self.kill_selected(),
             KeyCode::Char('y') => self.copy_action(),
-            KeyCode::Char('v') => {
+            KeyCode::Char('v') if !self.node_selected => {
                 self.visual = true;
                 self.selecting_text = false;
                 self.text_selection = None;
@@ -2197,7 +2230,7 @@ mod visual_mode_tests {
     }
 
     #[test]
-    fn node_header_does_not_select_a_session() {
+    fn node_header_shows_status_and_session_navigation_restores_the_preview() {
         let mut ui = ui();
         ui.node_header = true;
         let cluster_key = KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE);
@@ -2213,6 +2246,18 @@ mod visual_mode_tests {
         assert!(super::node_list_row(&ui, 0, 29, 20).starts_with("This device"));
         assert!(super::node_list_row(&ui, 1, 29, 20).starts_with("  "));
         assert_eq!(ui.on_mouse(click, 100, 30), Action::Nothing);
+        assert!(ui.selected().is_none());
+        assert!(super::render(&ui, "", "test", 100, 30).contains("System disk"));
+        assert_eq!(
+            ui.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Action::Nothing
+        );
+        assert_eq!(ui.selected().unwrap().name, "agent");
+        assert_eq!(
+            ui.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            Action::Nothing
+        );
+        assert!(ui.selected().is_none());
         click.row = 1;
         assert_eq!(ui.on_mouse(click, 100, 30), Action::Focus("agent".into()));
     }
@@ -2400,7 +2445,11 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
         ""
     };
 
-    let (mut lines, cut) = crop(screen, preview_w, body, ui.pan);
+    let (mut lines, cut) = if ui.node_selected {
+        (ui.node_status.lines().into(), false)
+    } else {
+        crop(screen, preview_w, body, ui.pan)
+    };
     if let Some(indicator) = scrollback_indicator(ui) {
         if let Some(first) = lines.first_mut() {
             *first = indicator;
@@ -2780,7 +2829,11 @@ pub fn render_styled(
         .and_then(|session| ui.scrollback.get(&session.name))
         .is_some_and(|state| state.offset > 0);
     let row_offset = preview_row_offset(cells, cursor, body, preserve_history);
-    let (mut lines, cut) = crop_styled_at_offset(&selected, preview_w, body, ui.pan, row_offset);
+    let (mut lines, cut) = if ui.node_selected {
+        (ui.node_status.lines().into(), false)
+    } else {
+        crop_styled_at_offset(&selected, preview_w, body, ui.pan, row_offset)
+    };
     if let Some(indicator) = scrollback_indicator(ui) {
         if let Some(first) = lines.first_mut() {
             *first = indicator;
@@ -2924,9 +2977,14 @@ fn node_list_row(ui: &Ui, row: u16, body: u16, width: u16) -> String {
         {
             CLUSTER_NODE_LABEL
         } else {
-            "This device"
+            ui.node_header_label
         };
-        return fit(label, width);
+        let label = fit(label, width);
+        return if ui.node_selected {
+            format!("\x1b[7m{label}\x1b[0m")
+        } else {
+            label
+        };
     }
     let index = usize::from(row - 1) + viewport;
     format!("  {}", list_row(ui, index, width.saturating_sub(2)))
@@ -3196,7 +3254,7 @@ fn refresh<P: SessionPort + ?Sized>(
         sync_shown_session(path, ui, shown, selection_moved);
     }
     resize_held_shown_session(path, ui, shown, held, cols, rows);
-    let (cells, wrapped, cursor) = if ui.daemon_gone.is_some() {
+    let (cells, wrapped, cursor) = if ui.daemon_gone.is_some() || ui.node_selected {
         (Vec::new(), Vec::new(), hidden)
     } else {
         match shown.as_ref() {
@@ -3579,7 +3637,8 @@ pub fn run_port<P: SessionPort + ?Sized>(
     server: &str,
     notice: Option<String>,
 ) -> std::io::Result<()> {
-    run_node_port(local, port, server, notice, None).map(|_| ())
+    let browser = port.remote_node().is_some().then_some(false);
+    run_node_port(local, port, server, notice, browser).map(|_| ())
 }
 
 /// Return true when the user opens the cluster tree from the local session list.
@@ -3622,7 +3681,15 @@ fn run_node_port<P: SessionPort + ?Sized>(
     if let Some(cluster_browser) = browser {
         ui.cluster_browser = cluster_browser;
         ui.node_header = true;
+        ui.node_selected = ui.sessions.is_empty();
     }
+    let status_node = port.remote_node().map_or_else(
+        || crate::node_status::Node::local(local),
+        |node| {
+            ui.node_header_label = "Remote node";
+            crate::node_status::Node::Peer(node)
+        },
+    );
     let mut painted = String::new();
     // The exclusive hold on the focused session, and the name it was taken on.
     // Its `Drop` is the detach, so letting it fall out of scope is the release.
@@ -3657,6 +3724,8 @@ fn run_node_port<P: SessionPort + ?Sized>(
         if should_refresh(force_refresh, last_refresh.elapsed(), tick) {
             force_refresh = false;
             last_refresh = Instant::now();
+            ui.node_status
+                .update(ui.node_selected.then(|| status_node.clone()));
             (cols, rows) = refresh(
                 path,
                 server,

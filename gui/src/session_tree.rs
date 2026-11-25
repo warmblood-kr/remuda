@@ -2,6 +2,53 @@ use super::*;
 use cluster_status::Reachability;
 use gpui::{AnyElement, MouseButton};
 
+fn render_node_metric(metric: remuda_native::node_status::Metric, stale: bool) -> impl IntoElement {
+    let value = if let Some(usage) = metric.capacity {
+        const GIB: f64 = 1_073_741_824.0;
+        format!(
+            "{:.1} / {:.1} GiB",
+            usage.used_bytes as f64 / GIB,
+            usage.total_bytes as f64 / GIB
+        )
+    } else {
+        metric
+            .percent
+            .map_or_else(|| "Unavailable".into(), |value| format!("{value}%"))
+    };
+    let color = if stale { 0xe7c279 } else { 0x7bdda8 };
+    div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .py_1()
+        .text_sm()
+        .child(div().w(px(94.)).flex_none().child(metric.label))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h(px(6.))
+                .rounded_full()
+                .bg(rgb(0x282f38))
+                .when_some(metric.percent, |el, percent| {
+                    el.child(
+                        div()
+                            .w(gpui::relative(f32::from(percent) / 100.))
+                            .h_full()
+                            .rounded_full()
+                            .bg(rgb(color)),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .w(px(135.))
+                .flex_none()
+                .text_color(rgb(0xb5beca))
+                .child(value),
+        )
+}
+
 enum Entry<'a> {
     Node(Option<(usize, &'a Peer)>),
     Session(Option<(usize, &'a Peer)>, usize, &'a Session, bool, usize),
@@ -222,6 +269,11 @@ impl LocalGui {
             ("enter" | "space", _) if self.show_help => self.show_help = false,
             ("enter" | "up" | "down" | "left" | "right" | "home" | "end", _) => {
                 self.move_tree(&key.key);
+                if matches!(self.focused_row, TreeRow::Node(_)) {
+                    self.open_node_details(cx);
+                } else {
+                    self.node_details_requested = false;
+                }
                 if key.key == "enter"
                     && self.search.is_none()
                     && matches!((&self.focused_row, &self.selection),
@@ -232,7 +284,7 @@ impl LocalGui {
                     self.open_session_composer(window, cx);
                 }
             }
-            ("k", _) if self.search.is_none() => {
+            ("k", _) if self.search.is_none() && !self.showing_node_details() => {
                 if self.live.is_none() {
                     self.attach_input(window, cx, false);
                 }
@@ -298,6 +350,138 @@ impl LocalGui {
             }
             _ => {}
         }
+    }
+
+    fn open_node_details(&mut self, cx: &mut Context<Self>) {
+        self.node_details_requested = true;
+        if let Some(documents) = &self.documents {
+            documents.update(cx, |docs, _| docs.select_terminal());
+        }
+    }
+
+    fn selected_node_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.showing_node_details() {
+            return None;
+        }
+        let TreeRow::Node(peer) = &self.focused_row else {
+            return None;
+        };
+        let name = peer.as_ref().map_or_else(
+            || "This device".into(),
+            |fp| {
+                self.peers
+                    .iter()
+                    .find(|peer| peer.fingerprint == *fp)
+                    .map_or_else(|| display_label(fp), |peer| display_label(&peer.label))
+            },
+        );
+        let peer_entry = peer
+            .as_ref()
+            .and_then(|fp| self.peers.iter().find(|p| &p.fingerprint == fp));
+        let details = self
+            .selected_status_target()
+            .map_or_else(remuda_native::node_status::Status::unavailable, |node| {
+                self.selected_node_status.details_for(&node)
+            });
+        let (reachability, reachability_color) = self.node_status_label(peer_entry);
+        let caption = if (details.health == "Status unavailable" || details.stale)
+            && matches!(
+                reachability.split(" · ").next(),
+                Some("Offline" | "Revoked")
+            ) {
+            reachability.split(" · ").next().unwrap_or(&reachability)
+        } else {
+            details.health
+        };
+        let status = details.age.map_or_else(
+            || caption.to_owned(),
+            |age| format!("{caption} · updated {} ago", compact_age(age)),
+        );
+        let (rows, rows_unavailable, rows_loading) = match peer {
+            None => (self.sessions.as_slice(), self.error, self.loading),
+            Some(fp) => self.remote_sessions.get(fp).map_or(
+                (&[][..], !self.peer_current(fp), false),
+                |state| {
+                    (
+                        state.rows.as_slice(),
+                        state.error || !self.peer_current(fp),
+                        state.loading,
+                    )
+                },
+            ),
+        };
+        let rows = rows.iter().cloned().enumerate().map(|(index, row)| {
+            let state = if rows_unavailable || row.unavailable {
+                "Unavailable"
+            } else if row.alive {
+                "Running"
+            } else {
+                "Exited"
+            };
+            let enabled = state == "Running";
+            let fp = peer.clone();
+            div()
+                .id(SharedString::from(format!("node-detail-session-{index}")))
+                .flex()
+                .justify_between()
+                .gap_2()
+                .py_1()
+                .child(div().truncate().child(display_label(&row.name)))
+                .child(div().flex_none().text_color(rgb(0xb5beca)).child(state))
+                .when(enabled, |el| {
+                    el.cursor_pointer()
+                        .hover(|el| el.bg(rgb(0x2a3340)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.focused_row = TreeRow::session(fp.clone(), &row);
+                            this.select_session(fp.clone(), row.clone());
+                            cx.notify();
+                        }))
+                })
+        });
+        Some(
+            div()
+                .id("selected-node-status")
+                .debug_selector(|| "selected-node-status".into())
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .overflow_y_scroll()
+                .p_4()
+                .child(div().text_lg().child(name))
+                .child(
+                    div()
+                        .text_sm()
+                        .py_2()
+                        .text_color(rgb(if details.stale {
+                            0xe7c279
+                        } else {
+                            reachability_color
+                        }))
+                        .child(status),
+                )
+                .child(
+                    div()
+                        .border_t_1()
+                        .border_b_1()
+                        .border_color(rgb(0x354454))
+                        .py_2()
+                        .children(
+                            details
+                                .metrics
+                                .map(|metric| render_node_metric(metric, details.stale)),
+                        ),
+                )
+                .child(div().pt_3().pb_1().child("Sessions"))
+                .when(rows_loading, |el| el.child("Loading sessions…"))
+                .when(rows_unavailable, |el| {
+                    el.child("Session list unavailable or stale")
+                })
+                .when(
+                    rows.len() == 0 && !rows_loading && !rows_unavailable,
+                    |el| el.child("No sessions"),
+                )
+                .children(rows),
+        )
     }
 
     fn node_status_label(&self, peer: Option<&Peer>) -> (String, u32) {
@@ -400,6 +584,7 @@ impl LocalGui {
                             focus.focus(window, cx);
                         }
                         this.focused_row = TreeRow::Node(fp.clone());
+                        this.open_node_details(cx);
                         if !filtering {
                             this.set_expanded(fp.clone(), !this.is_expanded(fp.as_deref()));
                         }
@@ -650,6 +835,10 @@ impl Render for LocalGui {
         };
         let pane_width = if narrow { width } else { width - sidebar - 5. };
         let document_width = if split { pane_width / 2. } else { pane_width };
+        let node_panel = (!self.drive_selected && !document_selected)
+            .then(|| self.selected_node_panel(cx))
+            .flatten();
+        let showing_node = node_panel.is_some();
         let document = if split || document_selected {
             docs.as_ref()
                 .map(|docs| docs.update(cx, |docs, cx| docs.document_panel(document_width, cx)))
@@ -666,6 +855,7 @@ impl Render for LocalGui {
                 .child(
                     button("local-terminal-tab", "Terminal", !document_selected).on_click(
                         cx.listener(|this, _, window, cx| {
+                            this.node_details_requested = false;
                             if let Some(docs) = &this.documents {
                                 docs.update(cx, |docs, _| docs.select_terminal());
                             }
@@ -951,13 +1141,14 @@ impl Render for LocalGui {
                     .min_h_0()
                     .min_w_0()
                     .when_some(content_tabs, |d, tabs| d.child(tabs))
+                    .when_some(node_panel, |d, panel| d.child(panel))
                     .child(
                         div()
                             .flex()
                             .flex_1()
                             .min_h_0()
                             .min_w_0()
-                            .when(split || !document_selected, |d| {
+                            .when(!showing_node && (split || !document_selected), |d| {
                                 d.child(
                                     div()
                                         .id("session-pane")

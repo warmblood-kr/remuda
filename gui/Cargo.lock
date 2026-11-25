@@ -6353,6 +6353,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "snow",
+ "sysinfo",
  "unicode-segmentation",
  "unicode-width 0.2.2",
  "url",

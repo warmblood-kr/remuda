@@ -317,6 +317,21 @@ fn stopped_daemon_input_becomes_uncertain_and_later_input_recovers() {
     assert!(matches!(close, Response::Ok));
 }
 
+#[cfg(unix)]
+#[test]
+fn empty_cluster_tree_shows_live_local_node_status() {
+    let mut daemon = PrivateDaemon::start();
+    daemon.wait_ready();
+    let tui = TuiPty::start(&daemon.runtime);
+    let screen = tui.wait_for("updated", Duration::from_secs(12));
+    assert!(screen.contains("Node status"), "{screen}");
+    assert!(screen.contains("Daemon reachable"), "{screen}");
+    assert!(
+        screen.contains("CPU") && screen.contains("Memory") && screen.contains("System disk"),
+        "{screen}"
+    );
+}
+
 #[test]
 fn local_tree_lists_and_captures_a_session_from_a_private_daemon() {
     let mut daemon = PrivateDaemon::start();

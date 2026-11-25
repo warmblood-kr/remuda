@@ -59,6 +59,7 @@ bench = false
 required-features = ["installer-probe-experimental"]
 
 [dependencies]
+sysinfo = { version = "=0.31.4", default-features = false, features = ["system", "disk"] }
 clap = { version = "4.6", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions", "string"] }
 crossterm = "0.29.0"
 interprocess = "2.4.4"

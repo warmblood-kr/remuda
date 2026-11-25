@@ -456,6 +456,151 @@ fn start_proof_session(server: &Node) -> String {
 }
 
 #[test]
+fn node_status_samples_through_local_ipc_and_authenticated_peer() {
+    use remuda_core::protocol::{NodeMetrics, Request, Response};
+    use remuda_native::net::cluster_client::ClusterClient;
+
+    let client = Node::start("client");
+    let server = Node::start("server");
+    admit_pair(&client, &server);
+    let (_listener, address) = listener(&server);
+    let path = remuda_native::daemon::socket_path_in(&server.runtime, &server.name);
+
+    fn wait_for_sample(mut request: impl FnMut() -> Response) -> NodeMetrics {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match request() {
+                Response::NodeStatus(Some(sample)) => return sample,
+                Response::NodeStatus(None) => {}
+                other => panic!("unexpected node status: {other:?}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "node did not publish its metrics"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    let client_transport = ClusterClient::system();
+    let remote = wait_for_sample(|| {
+        client_transport
+            .request(
+                address,
+                &server.public,
+                &client.private,
+                &Request::NodeStatus,
+            )
+            .unwrap()
+    });
+    let local =
+        wait_for_sample(|| remuda_native::client::request(&path, &Request::NodeStatus).unwrap());
+    assert!(remote.age_ms < 15_000);
+    assert!(local.age_ms < 15_000);
+    assert!(remote.cpu_percent.is_some_and(|value| value <= 100));
+    assert!(remote
+        .memory
+        .is_some_and(|usage| usage.used_bytes <= usage.total_bytes));
+    assert!(remote
+        .system_disk
+        .is_some_and(|usage| usage.used_bytes <= usage.total_bytes));
+    assert_eq!(
+        remote.memory.unwrap().total_bytes,
+        local.memory.unwrap().total_bytes,
+    );
+}
+
+#[test]
+fn node_status_in_the_remote_tui_retains_stale_metrics_and_recovers() {
+    use std::io::Read;
+
+    let client = Node::start("client");
+    let server = Node::start("server");
+    admit_pair(&client, &server);
+    let (_listener, address) = listener(&server);
+    let fingerprint = server.fingerprint();
+    set_endpoint(&client, &fingerprint, address);
+
+    let base = client.command();
+    let mut command = portable_pty::CommandBuilder::new(base.get_program());
+    command.args(base.get_args());
+    command.args(["cluster", "remote", &fingerprint]);
+    for (key, value) in base.get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        }
+    }
+    let pty = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut child = pty.slave.spawn_command(command).unwrap();
+    drop(pty.slave);
+    let mut reader = pty.master.try_clone_reader().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0; 4096];
+        while let Ok(len) = reader.read(&mut chunk) {
+            if len == 0 || send.send(chunk[..len].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut parser = vt100::Parser::new(24, 100, 0);
+    let mut wait_for = |expected: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Ok(chunk) =
+            receive.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            parser.process(&chunk);
+            let text = parser.screen().contents();
+            if text.contains(expected) {
+                return Some(text);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        None
+    };
+    let live = wait_for("Daemon reachable · updated");
+    let server_pid = server.daemon.id() as libc::pid_t;
+    let stopped = unsafe { libc::kill(server_pid, libc::SIGSTOP) } == 0;
+    let stale = wait_for("Daemon status stale");
+    let resumed = unsafe { libc::kill(server_pid, libc::SIGCONT) } == 0;
+    let recovered = wait_for("Daemon reachable · updated");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(pty.master);
+    reader.join().unwrap();
+    assert!(
+        stopped && resumed,
+        "could not suspend or resume the fixture daemon"
+    );
+    let live = live.unwrap_or_else(|| {
+        panic!(
+            "remote metrics never appeared: {}",
+            parser.screen().contents()
+        )
+    });
+    assert!(
+        live.contains("Remote node") && live.contains("CPU") && live.contains("Memory"),
+        "{live}"
+    );
+    assert!(
+        stale.is_some_and(|text| text.contains("% (stale)")),
+        "remote metrics were not marked stale"
+    );
+    assert!(recovered.is_some(), "remote metrics did not recover");
+}
+
+#[test]
 fn cluster_call_lists_and_captures_through_the_black_box_cli() {
     let client = Node::start("client");
     let server = Node::start("server");

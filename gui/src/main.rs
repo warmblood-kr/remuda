@@ -2,6 +2,7 @@ use gpui::{
     div, prelude::*, px, rgb, size, App, Bounds, Context, SharedString, Window, WindowBounds,
     WindowOptions,
 };
+use remuda_native::node_status::{Node as StatusNode, Status as NodeMetricsStatus};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
@@ -295,6 +296,36 @@ fn peers_from_snapshot(snapshot: Option<remuda_native::cluster::ClusterSnapshot>
         .collect()
 }
 
+fn node_status_worker(peer: Option<String>) -> i32 {
+    worker_deadline();
+    let node = peer.map_or_else(
+        || StatusNode::Local(remuda_native::daemon::socket_path("default")),
+        StatusNode::Peer,
+    );
+    match node.request() {
+        Ok(sample) => write_worker_reply(&sample, true),
+        Err(_) => 1,
+    }
+}
+
+fn fetch_node_status(
+    node: StatusNode,
+) -> std::io::Result<Option<remuda_core::protocol::NodeMetrics>> {
+    #[cfg(test)]
+    let path = std::env::var_os("REMUDA_GUI_ACCEPTANCE_WORKER")
+        .map(std::path::PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(std::env::current_exe)?;
+    #[cfg(not(test))]
+    let path = std::env::current_exe()?;
+    let mut args = vec!["--internal-status-worker", WORKER_ABI];
+    if let StatusNode::Peer(fp) = &node {
+        args.push(fp);
+    }
+    let bytes = provider::output(&path, &args, provider::TIMEOUT).map_err(std::io::Error::other)?;
+    read_worker_reply(&bytes).map_err(std::io::Error::other)
+}
+
 fn nodes_worker(tagged: bool) -> i32 {
     worker_deadline();
     match discover_peers() {
@@ -353,6 +384,8 @@ struct LocalGui {
     sidebar_width: f32,
     resize_start: Option<(f32, f32)>,
     node_status: Option<cluster_status::ClusterStatus>,
+    selected_node_status: NodeMetricsStatus,
+    node_details_requested: bool,
     peer_status: HashMap<String, cluster_status::PeerStatus>,
     live: Option<live_session::LiveSession>,
     live_focus: Option<gpui::FocusHandle>,
@@ -419,6 +452,8 @@ impl LocalGui {
             sidebar_width: 266.,
             resize_start: None,
             node_status: None,
+            selected_node_status: NodeMetricsStatus::default(),
+            node_details_requested: false,
             peer_status: HashMap::new(),
             live: None,
             live_focus: None,
@@ -512,6 +547,7 @@ impl LocalGui {
             && matching[0].instance_id.as_deref() == Some(s.instance.as_str())
     }
     fn select_session(&mut self, peer: Option<String>, row: Session) {
+        self.node_details_requested = false;
         let Some(instance) = row.instance_id else {
             self.clear_preview();
             return;
@@ -791,6 +827,7 @@ impl LocalGui {
             documents.update(cx, |docs, cx| docs.tick(window, cx));
         }
         self.drain();
+        self.update_selected_node_status();
         if Instant::now() >= self.next_session_refresh {
             self.next_session_refresh = Instant::now() + Duration::from_secs(5);
             if !self.busy {
@@ -1096,6 +1133,29 @@ impl LocalGui {
             let _ = sender.send((generation, result));
         });
     }
+    fn showing_node_details(&self) -> bool {
+        matches!(self.focused_row, TreeRow::Node(_)) && self.node_details_requested
+    }
+
+    fn selected_status_target(&self) -> Option<StatusNode> {
+        if !self.showing_node_details() || self.drive_selected {
+            return None;
+        }
+        match &self.focused_row {
+            TreeRow::Node(None) => Some(StatusNode::Local(remuda_native::daemon::socket_path(
+                "default",
+            ))),
+            TreeRow::Node(Some(fp)) if self.peer_current(fp) => Some(StatusNode::Peer(fp.clone())),
+            _ => None,
+        }
+    }
+
+    fn update_selected_node_status(&mut self) {
+        let node = self.selected_status_target();
+        self.selected_node_status
+            .update_with(node, fetch_node_status);
+    }
+
     fn drain(&mut self) {
         while let Ok((generation, selection, result)) = self.preview_results.try_recv() {
             self.preview_busy = false;
@@ -1284,6 +1344,14 @@ fn main() {
         std::process::exit(worker(
             std::env::args().nth(2).as_deref() == Some(WORKER_ABI),
         ));
+    }
+    if std::env::args().nth(1).as_deref() == Some("--internal-status-worker") {
+        let tagged = std::env::args().nth(2).as_deref() == Some(WORKER_ABI);
+        std::process::exit(if tagged {
+            node_status_worker(std::env::args().nth(3))
+        } else {
+            1
+        });
     }
     if std::env::args().nth(1).as_deref() == Some("--internal-nodes-worker") {
         std::process::exit(nodes_worker(
@@ -1634,6 +1702,35 @@ mod tests {
             cx.debug_bounds("session-0").is_some(),
             "exact local session row was not laid out"
         );
+        let node = cx.debug_bounds("node-local").unwrap();
+        cx.simulate_click(node.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("selected-node-status").is_some());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            view.update(cx, |gui, cx| {
+                gui.update_selected_node_status();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let sampled = cx.read(|app| {
+                let gui = view.read(app);
+                let target = gui.selected_status_target().unwrap();
+                let details = gui.selected_node_status.details_for(&target);
+                details.age.is_some()
+                    && details
+                        .metrics
+                        .iter()
+                        .all(|metric| metric.percent.is_some())
+            });
+            if sampled {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "live metrics did not reach the GUI"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
     fn peer(fp: &str, name: &str) -> Peer {
         Peer {
@@ -1788,6 +1885,32 @@ mod tests {
         assert!(
             cx.read(|app| view.read(app).attention_only && view.read(app).tree_rows().len() == 2)
         );
+    }
+
+    #[gpui::test]
+    fn node_selection_shows_details_and_session_selection_restores_the_pane(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut gui = LocalGui::new();
+            gui.preview_busy = true;
+            gui.remote_busy = true;
+            gui.sessions = vec![row("local")];
+            gui.peers = vec![peer("a", "alpha")];
+            gui
+        });
+        cx.simulate_resize(gpui::size(px(1000.), px(650.)));
+        let peer = cx.debug_bounds("node-peer-0").unwrap();
+        cx.simulate_click(peer.center(), gpui::Modifiers::none());
+        assert!(cx.read(|app| view.read(app).showing_node_details()));
+        assert!(cx.debug_bounds("selected-node-status").is_some());
+        let session = cx.debug_bounds("session-0").unwrap();
+        cx.simulate_click(session.center(), gpui::Modifiers::none());
+        assert!(cx.read(|app| {
+            let gui = view.read(app);
+            !gui.showing_node_details() && gui.selection.as_ref().is_some_and(|s| s.name == "local")
+        }));
+        assert!(cx.debug_bounds("session-pane").is_some());
     }
 
     #[gpui::test]
