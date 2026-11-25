@@ -49,8 +49,7 @@ impl DriveSource {
         &self,
         directory: Option<String>,
         after: Option<String>,
-    ) -> Result<DriveResult, String> {
-        let append = after.is_some();
+    ) -> Result<DriveListing, String> {
         match self {
             Self::Remote(client) => list(
                 client,
@@ -58,13 +57,11 @@ impl DriveSource {
                     Some(after) => Operation::ListMore { directory, after },
                     None => Operation::List { directory },
                 },
-                append,
             ),
             Self::Local => remuda_native::net::browser::list_local_drive(
                 directory.as_deref(),
                 after.as_deref(),
             )
-            .map(|listing| DriveResult::Directory(listing, append))
             .map_err(|error| error.to_string()),
         }
     }
@@ -75,11 +72,20 @@ enum DriveAction {
     List(Option<String>),
     More(Option<String>, String),
     Open(String),
+    Refresh(Vec<RefreshDirectory>),
+}
+
+#[derive(Clone)]
+struct RefreshDirectory {
+    directory: Option<String>,
+    parent: Option<String>,
+    loaded_entries: usize,
 }
 
 enum DriveResult {
     Directory(DriveListing, bool),
     Document(Document),
+    Refreshed(HashMap<Option<String>, DriveListing>),
 }
 
 struct Drive {
@@ -101,8 +107,18 @@ impl Drive {
         std::thread::spawn(move || {
             while let Ok((id, action)) = incoming.recv() {
                 let result = match action {
-                    DriveAction::List(directory) => source.list(directory, None),
-                    DriveAction::More(directory, after) => source.list(directory, Some(after)),
+                    DriveAction::List(directory) => source
+                        .list(directory, None)
+                        .map(|listing| DriveResult::Directory(listing, false)),
+                    DriveAction::More(directory, after) => source
+                        .list(directory, Some(after))
+                        .map(|listing| DriveResult::Directory(listing, true)),
+                    DriveAction::Refresh(directories) => {
+                        refresh_drive(directories, |directory, after| {
+                            source.list(directory, after)
+                        })
+                        .map(DriveResult::Refreshed)
+                    }
                     DriveAction::Open(uri) => {
                         read(|uri| source.read(uri), uri, None).map(DriveResult::Document)
                     }
@@ -142,6 +158,36 @@ impl Drive {
         });
     }
 
+    fn refresh(&mut self) {
+        if self.pending {
+            return;
+        }
+        let mut directories = vec![RefreshDirectory {
+            directory: None,
+            parent: None,
+            loaded_entries: self
+                .listings
+                .get(&None)
+                .map_or(0, |page| page.entries.len()),
+        }];
+        directories.extend(self.rows().into_iter().filter_map(|(parent, _, entry)| {
+            if !entry.is_directory || !self.expanded.contains(&entry.uri) {
+                return None;
+            }
+            let directory = Some(entry.uri);
+            let loaded_entries = self
+                .listings
+                .get(&directory)
+                .map_or(0, |page| page.entries.len());
+            Some(RefreshDirectory {
+                directory,
+                parent,
+                loaded_entries,
+            })
+        }));
+        self.send(DriveAction::Refresh(directories));
+    }
+
     fn rows(
         &self,
     ) -> Vec<(
@@ -177,9 +223,46 @@ impl Drive {
     }
 }
 
-fn list(client: &Client, operation: Operation, append: bool) -> Result<DriveResult, String> {
+fn refresh_drive(
+    directories: Vec<RefreshDirectory>,
+    mut list: impl FnMut(Option<String>, Option<String>) -> Result<DriveListing, String>,
+) -> Result<HashMap<Option<String>, DriveListing>, String> {
+    let mut refreshed: HashMap<Option<String>, DriveListing> = HashMap::new();
+    for RefreshDirectory {
+        directory,
+        parent,
+        loaded_entries,
+    } in directories
+    {
+        if let Some(uri) = &directory {
+            let still_visible = refreshed.get(&parent).is_some_and(|page| {
+                page.entries
+                    .iter()
+                    .any(|entry| entry.is_directory && &entry.uri == uri)
+            });
+            if !still_visible {
+                continue;
+            }
+        }
+        let mut page = list(directory.clone(), None)?;
+        while page.entries.len() < loaded_entries {
+            let Some(after) = page.next.take() else { break };
+            let mut next = list(directory.clone(), Some(after.clone()))?;
+            if next.next.as_ref() == Some(&after) || next.entries.is_empty() {
+                return Err("Drive pagination did not advance".into());
+            }
+            page.entries.append(&mut next.entries);
+            page.next = next.next;
+            page.complete = next.complete;
+        }
+        refreshed.insert(directory, page);
+    }
+    Ok(refreshed)
+}
+
+fn list(client: &Client, operation: Operation) -> Result<DriveListing, String> {
     match client.send(&operation) {
-        Ok(Reply::Directory(listing)) => Ok(DriveResult::Directory(listing, append)),
+        Ok(Reply::Directory(listing)) => Ok(listing),
         Ok(Reply::Denied) => Err("Drive access was denied".into()),
         _ => Err("Could not load this Drive folder".into()),
     }
@@ -527,6 +610,22 @@ impl Browser {
                             }
                         }
                         drive.listings.insert(directory, listing);
+                    }
+                    Ok(DriveResult::Refreshed(listings)) => {
+                        drive.last_action = None;
+                        drive
+                            .expanded
+                            .retain(|uri| listings.contains_key(&Some(uri.clone())));
+                        drive.listings = listings;
+                        if let Some(selected) = &drive.selected {
+                            if !drive
+                                .listings
+                                .values()
+                                .any(|page| page.entries.iter().any(|entry| &entry.uri == selected))
+                            {
+                                drive.selected = None;
+                            }
+                        }
                     }
                     Ok(DriveResult::Document(document)) => {
                         drive.last_action = None;
@@ -960,7 +1059,26 @@ impl Browser {
                     ),
                 )
             });
-        crate::scroll_area(&self.drive_scroll, ScrollbarMode::Always, entries).into_any_element()
+        let refresh = action_button("drive-refresh", "Refresh")
+            .disabled(drive.pending)
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let Some(drive) = &mut this.drive {
+                    drive.refresh();
+                    cx.notify();
+                }
+            }));
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(div().flex_none().px_2().child(refresh))
+            .child(crate::scroll_area(
+                &self.drive_scroll,
+                ScrollbarMode::Always,
+                entries,
+            ))
+            .into_any_element()
     }
 
     pub(crate) fn terminal_link_handler(
@@ -1613,6 +1731,56 @@ impl Render for Browser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_reloads_visible_folders_and_uses_fresh_pagination() {
+        use remuda_native::net::browser::DriveEntry;
+
+        let folder = "remuda:///folder".to_owned();
+        let removed = "remuda:///gone".to_owned();
+        let new_file = "remuda:///folder/new.md".to_owned();
+        let entry = |uri: &str, is_directory| DriveEntry {
+            name: uri.rsplit('/').next().unwrap().into(),
+            uri: uri.into(),
+            is_directory,
+        };
+        let plan = vec![
+            RefreshDirectory {
+                directory: None,
+                parent: None,
+                loaded_entries: 2,
+            },
+            RefreshDirectory {
+                directory: Some(folder.clone()),
+                parent: None,
+                loaded_entries: 1,
+            },
+            RefreshDirectory {
+                directory: Some(removed.clone()),
+                parent: None,
+                loaded_entries: 1,
+            },
+        ];
+        let listings = refresh_drive(plan, |directory, after| {
+            let (entries, next) = match (directory.as_deref(), after.as_deref()) {
+                (None, None) => (vec![entry("remuda:///a.md", false)], Some("fresh".into())),
+                (None, Some("fresh")) => (vec![entry(&folder, true)], None),
+                (Some(uri), None) if uri == folder => (vec![entry(&new_file, false)], None),
+                other => panic!("unexpected refresh request {other:?}"),
+            };
+            Ok(DriveListing {
+                directory,
+                entries,
+                complete: next.is_none(),
+                next,
+            })
+        })
+        .unwrap();
+        assert_eq!(listings[&None].entries.len(), 2);
+        assert!(listings[&None].complete);
+        assert_eq!(listings[&Some(folder)].entries[0].uri, new_file);
+        assert!(!listings.contains_key(&Some(removed)));
+    }
 
     #[gpui::test]
     #[ignore = "launched by the isolated two-listener document acceptance"]
