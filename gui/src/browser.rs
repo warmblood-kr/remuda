@@ -2,6 +2,7 @@ use gpui::{
     div, prelude::*, px, rgb, AnyElement, App, Bounds, Context, FocusHandle, KeyDownEvent, Window,
     WindowBounds, WindowOptions,
 };
+use gpui_kit::base::{Tab, Tabs};
 use remuda_core::agent::{AgentProcess, Size};
 use remuda_native::net::browser::{
     ssh_arguments, Client, DocumentRequest, DriveListing, Operation, Outcome, Reply,
@@ -719,12 +720,12 @@ impl Browser {
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let switcher = div()
+        let switcher = Tabs::new("browser-sidebar-tabs")
             .flex()
             .gap_1()
             .p_2()
             .child(
-                button("sessions-mode", "Sessions", !self.show_drive).on_click(cx.listener(
+                tab("sessions-mode", "Sessions", !self.show_drive).on_click(cx.listener(
                     |this, _, window, cx| {
                         this.show_drive = false;
                         this.focus.focus(window, cx);
@@ -733,7 +734,7 @@ impl Browser {
                 )),
             )
             .child(
-                button("drive-mode", "Drive", self.show_drive).on_click(cx.listener(
+                tab("drive-mode", "Drive", self.show_drive).on_click(cx.listener(
                     |this, _, window, cx| {
                         this.select_drive(window, cx);
                         cx.notify();
@@ -1142,6 +1143,20 @@ fn read(
     })
 }
 
+fn tab(id: &'static str, label: &'static str, selected: bool) -> Tab {
+    Tab::new(id)
+        .debug_selector(move || id.into())
+        .selected(selected)
+        .styles(|style| style.selected(|style| style.bg(rgb(0x365370)).text_color(rgb(0xf4f6fc))))
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(|d| d.bg(rgb(0x52647a)).text_color(rgb(0xf4f6fc)))
+        .focus_visible(|d| d.bg(rgb(0x52647a)).text_color(rgb(0xf4f6fc)))
+        .child(label)
+}
+
 fn button(
     id: impl Into<gpui::ElementId>,
     label: impl Into<gpui::SharedString>,
@@ -1179,42 +1194,38 @@ impl Render for Browser {
             .min_w_0()
             .min_h_0()
             .flex_col()
-            .when(true, |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .p_2()
-                        .bg(rgb(0xe5e8e8))
-                        .child(
-                            button("terminal-tab", "Terminal", self.active == Content::Terminal)
-                                .debug_selector(|| "browser-terminal-tab".into())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.select_terminal();
-                                    this.focus.focus(window, cx);
-                                    cx.notify();
-                                })),
+            .child(
+                Tabs::new("browser-content-tabs")
+                    .flex()
+                    .gap_2()
+                    .p_2()
+                    .bg(rgb(0xe5e8e8))
+                    .child(
+                        tab("terminal-tab", "Terminal", self.active == Content::Terminal)
+                            .debug_selector(|| "browser-terminal-tab".into())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.select_terminal();
+                                this.focus.focus(window, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        tab(
+                            "document-tab",
+                            if has_unseen {
+                                "Document •"
+                            } else {
+                                "Document"
+                            },
+                            self.active == Content::Document,
                         )
-                        .child(
-                            button(
-                                "document-tab",
-                                if has_unseen {
-                                    "Document •"
-                                } else {
-                                    "Document"
-                                },
-                                self.active == Content::Document,
-                            )
-                            .debug_selector(|| "browser-document-tab".into())
-                            .on_click(cx.listener(
-                                |this, _, window, cx| {
-                                    this.select_document(window, cx);
-                                    cx.notify();
-                                },
-                            )),
-                        ),
-                )
-            })
+                        .debug_selector(|| "browser-document-tab".into())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.select_document(window, cx);
+                            cx.notify();
+                        })),
+                    ),
+            )
             .when(
                 Self::wide(window) && self.document.is_some() && self.terminal.is_some(),
                 |d| {
@@ -1296,6 +1307,13 @@ impl Render for Browser {
                     this.dragging_split = false;
                 }),
             )
+            // Leave the PTY's plain Tab and Shift+Tab handling intact.
+            .capture_key_down(|event, window, cx| {
+                crate::workspace_tab_navigation(event, window, cx, true)
+            })
+            .on_key_down(|event, window, cx| {
+                crate::workspace_tab_navigation(event, window, cx, false)
+            })
             .child(self.sidebar(cx))
             .child(content)
     }
@@ -1387,6 +1405,34 @@ mod tests {
         assert!(cx.debug_bounds("browser-terminal-tab").is_some());
         assert!(cx.debug_bounds("browser-document-tab").is_some());
         assert!(cx.debug_bounds("browser-document-body").is_none());
+        cx.update(|window, app| window.draw(app).clear(app));
+        cx.simulate_keystrokes("ctrl-tab end");
+        assert!(view.read_with(cx, |browser, _| !browser.show_drive));
+        cx.simulate_keystrokes("enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        assert!(view.read_with(cx, |browser, _| browser.show_drive));
+        let (listing_id, listing) = drive_commands.try_recv().unwrap();
+        assert!(matches!(listing, DriveAction::List(None)));
+        send_drive_result
+            .send((
+                listing_id,
+                Ok(DriveResult::Directory(
+                    DriveListing {
+                        directory: None,
+                        entries: Vec::new(),
+                        complete: true,
+                        next: None,
+                    },
+                    false,
+                )),
+            ))
+            .unwrap();
+        view.update_in(cx, |browser, window, cx| browser.tick(window, cx));
+        let sessions = cx.debug_bounds("sessions-mode").unwrap();
+        cx.simulate_click(sessions.center(), gpui::Modifiers::none());
+        assert!(view.read_with(cx, |browser, _| !browser.show_drive));
 
         let request = DocumentRequest {
             id: "requested-plan".into(),
@@ -1432,6 +1478,18 @@ mod tests {
         });
         assert!(cx.debug_bounds("browser-document-body").is_some());
         assert_eq!(receipt.try_recv().ok(), Some(request.clone()));
+        let terminal = cx.debug_bounds("browser-terminal-tab").unwrap();
+        cx.simulate_click(terminal.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("browser-document-body").is_none());
+        cx.simulate_keystrokes("ctrl-shift-tab end space");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("space").unwrap(),
+        });
+        assert!(cx.debug_bounds("browser-document-body").is_some());
+        assert!(
+            receipt.try_recv().is_err(),
+            "switching tabs cannot report a duplicate receipt"
+        );
 
         cx.simulate_resize(gpui::size(px(1420.), px(720.)));
         view.update_in(cx, |browser, window, cx| {

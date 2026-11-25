@@ -389,6 +389,8 @@ struct LocalGui {
     peer_status: HashMap<String, cluster_status::PeerStatus>,
     live: Option<live_session::LiveSession>,
     live_focus: Option<gpui::FocusHandle>,
+    sidebar_tabs_focus: Option<gpui::FocusHandle>,
+    content_tabs_focus: Option<gpui::FocusHandle>,
     documents: Option<gpui::Entity<browser::Browser>>,
     drive_selected: bool,
     live_notice: Option<&'static str>,
@@ -457,6 +459,8 @@ impl LocalGui {
             peer_status: HashMap::new(),
             live: None,
             live_focus: None,
+            sidebar_tabs_focus: None,
+            content_tabs_focus: None,
             documents: None,
             drive_selected: false,
             live_notice: None,
@@ -879,8 +883,14 @@ impl LocalGui {
             docs.owns_document_focus(window)
                 || (!browser::Browser::wide(window) && docs.showing_document())
         });
+        // A focused tab header does not mean the user activated another pane.
+        let navigating_tabs = [&self.sidebar_tabs_focus, &self.content_tabs_focus]
+            .into_iter()
+            .flatten()
+            .any(|focus| focus.contains_focused(window, cx));
         if self.live.is_some()
             && !reading_document
+            && !navigating_tabs
             && !self
                 .live_focus
                 .as_ref()
@@ -1446,6 +1456,30 @@ fn main() {
     });
 }
 
+fn workspace_tab_navigation(
+    event: &gpui::KeyDownEvent,
+    window: &mut Window,
+    cx: &mut App,
+    from_terminal: bool,
+) {
+    let key = &event.keystroke;
+    let modifiers = key.modifiers;
+    if key.key != "tab"
+        || modifiers.control != from_terminal
+        || modifiers.alt
+        || modifiers.platform
+        || modifiers.function
+    {
+        return;
+    }
+    if modifiers.shift {
+        window.focus_prev(cx);
+    } else {
+        window.focus_next(cx);
+    }
+    cx.stop_propagation();
+}
+
 fn scroll_area(scroll: &gpui::ScrollHandle, content: impl IntoElement) -> impl IntoElement {
     use gpui_kit::base::{Scrollbar, ScrollbarMode};
     div()
@@ -1612,6 +1646,95 @@ mod tests {
             !gui.documents.as_ref().unwrap().read(app).showing_document()
                 && gui.preview.as_ref().unwrap().text.trim_end() == "terminal output"
         }));
+    }
+
+    #[gpui::test]
+    fn workspace_tabs_keep_navigation_out_of_the_local_composer(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let input_focus = cx.focus_handle();
+            let documents = cx.new(|cx| browser::Browser::local(None, input_focus.clone(), cx));
+            let mut gui = LocalGui::new();
+            gui.live_focus = Some(input_focus);
+            gui.documents = Some(documents);
+            gui.sessions = vec![row("agent")];
+            gui.preview_busy = true;
+            gui.select_session(None, gui.sessions[0].clone());
+            gui.open_session_composer(window, cx);
+            gui.line_input.as_ref().unwrap().insert("draft", window, cx);
+            gui
+        });
+        cx.simulate_resize(gpui::size(px(840.), px(620.)));
+        cx.update(|window, app| window.draw(app).clear(app));
+        cx.simulate_keystrokes("ctrl-tab end home right");
+        view.update_in(cx, |gui, window, cx| {
+            assert!(gui
+                .sidebar_tabs_focus
+                .as_ref()
+                .unwrap()
+                .contains_focused(window, cx));
+            gui.tick(window, cx);
+            assert!(!gui.drive_selected);
+            assert!(gui.live.is_some());
+            assert_eq!(
+                gui.line_input.as_ref().unwrap().bytes(cx).unwrap(),
+                b"draft\r"
+            );
+        });
+        cx.simulate_keystrokes("tab end");
+        view.read_with(cx, |gui, app| {
+            assert!(!gui.drive_selected);
+            assert!(!gui.documents.as_ref().unwrap().read(app).showing_document());
+        });
+        cx.simulate_keystrokes("shift-tab");
+        view.update_in(cx, |gui, window, cx| {
+            assert!(gui
+                .sidebar_tabs_focus
+                .as_ref()
+                .unwrap()
+                .contains_focused(window, cx));
+        });
+        cx.simulate_keystrokes("end enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        assert!(view.read_with(cx, |gui, _| gui.drive_selected));
+        let sessions = cx.debug_bounds("local-sessions-tab").unwrap();
+        cx.simulate_click(sessions.center(), gpui::Modifiers::none());
+        assert!(view.read_with(cx, |gui, _| !gui.drive_selected));
+
+        let terminal = cx.debug_bounds("local-terminal-tab").unwrap();
+        cx.simulate_click(terminal.center(), gpui::Modifiers::none());
+        cx.simulate_keystrokes("ctrl-shift-tab end space");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("space").unwrap(),
+        });
+        assert!(view.read_with(cx, |gui, app| gui
+            .documents
+            .as_ref()
+            .unwrap()
+            .read(app)
+            .showing_document()));
+
+        view.update_in(cx, |gui, window, cx| {
+            gui.documents
+                .as_ref()
+                .unwrap()
+                .update(cx, |docs, cx| docs.seed_test_document(window, cx));
+            cx.notify();
+        });
+        cx.simulate_resize(gpui::size(px(1119.), px(720.)));
+        assert!(cx.debug_bounds("local-split-tab").is_none());
+        assert!(cx.debug_bounds("browser-document-body").is_some());
+        assert!(cx.debug_bounds("session-pane").is_none());
+        cx.simulate_resize(gpui::size(px(1120.), px(720.)));
+        let split = cx.debug_bounds("local-split-tab").unwrap();
+        cx.simulate_click(split.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("browser-document-body").is_some());
+        assert!(cx.debug_bounds("session-pane").is_some());
+        let terminal = cx.debug_bounds("local-terminal-tab").unwrap();
+        cx.simulate_click(terminal.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("browser-document-body").is_none());
+        assert!(cx.debug_bounds("session-pane").is_some());
     }
 
     #[test]
