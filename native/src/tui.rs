@@ -537,6 +537,10 @@ impl Ui {
         self.click_session_pane(event.kind, row, col - preview_offset, body, preview_w)
     }
 
+    fn node_status_visible(&self) -> bool {
+        self.node_selected || (self.node_header && self.sessions.is_empty())
+    }
+
     fn node_header_rows(&self) -> u16 {
         u16::from(self.node_header)
     }
@@ -2230,6 +2234,23 @@ mod visual_mode_tests {
     }
 
     #[test]
+    fn the_first_session_replaces_automatic_node_status_but_preserves_explicit_selection() {
+        let mut ui = ui();
+        ui.node_header = true;
+        let sessions = std::mem::take(&mut ui.sessions);
+        assert!(ui.node_status_visible());
+        ui.sessions = sessions;
+        assert!(!ui.node_status_visible());
+        assert_eq!(ui.selected().unwrap().name, "agent");
+
+        let sessions = std::mem::take(&mut ui.sessions);
+        ui.select_node_header();
+        ui.sessions = sessions;
+        assert!(ui.node_status_visible());
+        assert!(ui.selected().is_none());
+    }
+
+    #[test]
     fn node_header_shows_status_and_session_navigation_restores_the_preview() {
         let mut ui = ui();
         ui.node_header = true;
@@ -2445,7 +2466,7 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
         ""
     };
 
-    let (mut lines, cut) = if ui.node_selected {
+    let (mut lines, cut) = if ui.node_status_visible() {
         (ui.node_status.lines().into(), false)
     } else {
         crop(screen, preview_w, body, ui.pan)
@@ -2829,7 +2850,7 @@ pub fn render_styled(
         .and_then(|session| ui.scrollback.get(&session.name))
         .is_some_and(|state| state.offset > 0);
     let row_offset = preview_row_offset(cells, cursor, body, preserve_history);
-    let (mut lines, cut) = if ui.node_selected {
+    let (mut lines, cut) = if ui.node_status_visible() {
         (ui.node_status.lines().into(), false)
     } else {
         crop_styled_at_offset(&selected, preview_w, body, ui.pan, row_offset)
@@ -2980,7 +3001,7 @@ fn node_list_row(ui: &Ui, row: u16, body: u16, width: u16) -> String {
             ui.node_header_label
         };
         let label = fit(label, width);
-        return if ui.node_selected {
+        return if ui.node_status_visible() {
             format!("\x1b[7m{label}\x1b[0m")
         } else {
             label
@@ -3254,7 +3275,7 @@ fn refresh<P: SessionPort + ?Sized>(
         sync_shown_session(path, ui, shown, selection_moved);
     }
     resize_held_shown_session(path, ui, shown, held, cols, rows);
-    let (cells, wrapped, cursor) = if ui.daemon_gone.is_some() || ui.node_selected {
+    let (cells, wrapped, cursor) = if ui.daemon_gone.is_some() || ui.node_status_visible() {
         (Vec::new(), Vec::new(), hidden)
     } else {
         match shown.as_ref() {
@@ -3681,7 +3702,6 @@ fn run_node_port<P: SessionPort + ?Sized>(
     if let Some(cluster_browser) = browser {
         ui.cluster_browser = cluster_browser;
         ui.node_header = true;
-        ui.node_selected = ui.sessions.is_empty();
     }
     let status_node = port.remote_node().map_or_else(
         || crate::node_status::Node::local(local),
@@ -3725,7 +3745,7 @@ fn run_node_port<P: SessionPort + ?Sized>(
             force_refresh = false;
             last_refresh = Instant::now();
             ui.node_status
-                .update(ui.node_selected.then(|| status_node.clone()));
+                .update(ui.node_status_visible().then(|| status_node.clone()));
             (cols, rows) = refresh(
                 path,
                 server,
