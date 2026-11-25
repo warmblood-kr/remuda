@@ -2,7 +2,7 @@ use gpui::{
     div, prelude::*, px, rgb, AnyElement, App, Bounds, Context, FocusHandle, KeyDownEvent, Window,
     WindowBounds, WindowOptions,
 };
-use gpui_kit::base::{Tab, Tabs};
+use gpui_kit::base::{Button, Tab, Tabs};
 use remuda_core::agent::{AgentProcess, Size};
 use remuda_native::net::browser::{
     ssh_arguments, Client, DocumentRequest, DriveListing, Operation, Outcome, Reply,
@@ -397,8 +397,8 @@ impl Browser {
     pub(crate) fn unseen_document(&self) -> bool {
         self.pending_presentation.is_some() && !self.painted.get()
     }
-    pub(crate) fn owns_document_focus(&self, window: &Window) -> bool {
-        self.document_focus.is_focused(window)
+    pub(crate) fn owns_document_focus(&self, window: &Window, cx: &App) -> bool {
+        self.document_focus.contains_focused(window, cx)
     }
     pub(crate) fn select_terminal(&mut self) {
         self.active = Content::Terminal;
@@ -661,7 +661,10 @@ impl Browser {
         }
     }
 
-    fn drive_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn drive_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.drive_focus.is_focused(window) {
+            return;
+        }
         let Some(drive) = &mut self.drive else {
             return;
         };
@@ -861,13 +864,22 @@ impl Browser {
             .when_some(drive.error.clone(), |d, error| {
                 d.child(
                     div().p_2().child(error).child(
-                        button("drive-retry", "Retry", false)
-                            .debug_selector(|| "drive-retry".into())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(drive) = &mut this.drive {
-                                    if let Some(action) = drive.last_action.clone() {
-                                        drive.send(action);
-                                    }
+                        action_button("drive-retry", "Retry")
+                            .justify_start()
+                            .disabled(drive.pending || drive.last_action.is_none())
+                            .on_click(cx.listener(|this, event, window, cx| {
+                                let Some(drive) =
+                                    this.drive.as_mut().filter(|drive| !drive.pending)
+                                else {
+                                    return;
+                                };
+                                let Some(action) = drive.last_action.clone() else {
+                                    return;
+                                };
+                                drive.send(action);
+                                if drive.pending || !matches!(event, gpui::ClickEvent::Keyboard(_))
+                                {
+                                    this.drive_focus.focus(window, cx);
                                 }
                                 cx.notify();
                             })),
@@ -999,23 +1011,29 @@ impl Browser {
                             .child(document.media.title.clone()),
                     )
                     .when(document.media.is_image(), |d| {
-                        d.child(button("zoom-in", "+", false).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.zoom = (this.zoom * 1.25).min(8.);
+                        d.child(
+                            action_button("zoom-in", "+")
+                                .accessibility_label("Zoom in")
+                                .on_click(cx.listener(|this, event, window, cx| {
+                                    this.zoom = (this.zoom * 1.25).min(8.);
+                                    if !matches!(event, gpui::ClickEvent::Keyboard(_)) {
+                                        this.document_focus.focus(window, cx);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(action_button("zoom-fit", "Fit").on_click(cx.listener(
+                            |this, event, window, cx| {
+                                this.zoom = 1.;
+                                if !matches!(event, gpui::ClickEvent::Keyboard(_)) {
+                                    this.document_focus.focus(window, cx);
+                                }
                                 cx.notify();
                             },
                         )))
-                        .child(
-                            button("zoom-fit", "Fit", false).on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    this.zoom = 1.;
-                                    cx.notify();
-                                },
-                            )),
-                        )
                     })
                     .child(
-                        button("close-document", "Close", false).on_click(cx.listener(
+                        action_button("close-document", "Close").on_click(cx.listener(
                             |this, _, window, cx| {
                                 this.close_document(window, cx);
                                 cx.notify();
@@ -1152,6 +1170,20 @@ fn tab(id: &'static str, label: &'static str, selected: bool) -> Tab {
         .py_1()
         .rounded_sm()
         .cursor_pointer()
+        .hover(|d| d.bg(rgb(0x52647a)).text_color(rgb(0xf4f6fc)))
+        .focus_visible(|d| d.bg(rgb(0x52647a)).text_color(rgb(0xf4f6fc)))
+        .child(label)
+}
+
+fn action_button(id: &'static str, label: &'static str) -> Button {
+    Button::new(id)
+        .debug_selector(move || id.into())
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .line_height(gpui::TextStyle::default().line_height)
+        .cursor_pointer()
+        .styles(|style| style.disabled(|style| style.opacity(0.55)))
         .hover(|d| d.bg(rgb(0x52647a)).text_color(rgb(0xf4f6fc)))
         .focus_visible(|d| d.bg(rgb(0x52647a)).text_color(rgb(0xf4f6fc)))
         .child(label)
@@ -1552,9 +1584,24 @@ mod tests {
             .send((id, Err("Temporary failure".into())))
             .unwrap();
         view.update_in(cx, |browser, window, cx| browser.tick(window, cx));
+        view.update(cx, |browser, cx| {
+            browser.drive.as_mut().unwrap().pending = true;
+            cx.notify();
+        });
         let retry = cx.debug_bounds("drive-retry").unwrap();
         cx.simulate_click(retry.center(), gpui::Modifiers::none());
+        assert!(drive_commands.try_recv().is_err());
+        view.update_in(cx, |browser, window, cx| {
+            browser.drive.as_mut().unwrap().pending = false;
+            browser.drive_focus.focus(window, cx);
+            cx.notify();
+        });
+        cx.simulate_keystrokes("tab enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
         let (id, command) = drive_commands.try_recv().unwrap();
+        assert!(drive_commands.try_recv().is_err());
         assert!(matches!(command, DriveAction::List(Some(uri)) if uri == folder));
         send_drive_result
             .send((
@@ -1587,5 +1634,45 @@ mod tests {
             cx.read(|app| view.read(app).drive.as_ref().unwrap().rows().len()),
             1
         );
+
+        let image = image::DynamicImage::new_rgba8(32, 24);
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        view.update_in(cx, |browser, window, cx| {
+            browser.open_document(
+                Document {
+                    uri: "remuda:///pilot/image.png".into(),
+                    media: browser_media::decode("pilot/image.png", png.get_ref()).unwrap(),
+                    request: None,
+                },
+                true,
+                window,
+                cx,
+            );
+            browser.document_focus.focus(window, cx);
+            cx.notify();
+        });
+        let zoom = cx.debug_bounds("zoom-in").unwrap();
+        cx.simulate_click(zoom.center(), gpui::Modifiers::none());
+        assert_eq!(view.read_with(cx, |browser, _| browser.zoom), 1.25);
+        view.update_in(cx, |browser, window, _| {
+            assert!(browser.document_focus.is_focused(window))
+        });
+        cx.simulate_keystrokes("tab tab space");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("space").unwrap(),
+        });
+        assert_eq!(view.read_with(cx, |browser, _| browser.zoom), 1.);
+        view.update_in(cx, |browser, window, cx| {
+            assert!(browser.owns_document_focus(window, cx))
+        });
+        cx.simulate_keystrokes("tab enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        assert!(cx.debug_bounds("browser-document-body").is_none());
+        view.update_in(cx, |browser, window, _| {
+            assert!(browser.focus.is_focused(window))
+        });
     }
 }
