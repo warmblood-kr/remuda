@@ -1,6 +1,9 @@
-use objc2::{define_class, msg_send, rc::Retained, runtime::AnyObject, sel, MainThreadOnly};
+use objc2::{
+    define_class, msg_send, rc::Retained, runtime::AnyObject, sel, DefinedClass, MainThreadOnly,
+};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSMenu, NSStatusBar, NSVariableStatusItemLength,
+    NSAlert, NSApplication, NSApplicationActivationPolicy, NSMenu, NSStatusBar,
+    NSVariableStatusItemLength,
 };
 use objc2_foundation::{ns_string, MainThreadMarker, NSObject};
 use std::io;
@@ -10,6 +13,7 @@ define_class!(
     // target on the main thread.
     #[unsafe(super = NSObject)]
     #[thread_kind = MainThreadOnly]
+    #[ivars = std::cell::Cell<super::Action>]
     struct TrayActions;
 
     impl TrayActions {
@@ -23,22 +27,28 @@ define_class!(
             super::open_browser();
         }
 
+        #[unsafe(method(upgradeRemuda:))]
+        fn upgrade(&self, _sender: &AnyObject) {
+            self.ivars().set(super::Action::Upgrade);
+            NSApplication::sharedApplication(self.mtm()).stop(None);
+        }
+
         #[unsafe(method(quitRemudaTray:))]
         fn quit_tray(&self, _sender: &AnyObject) {
-            NSApplication::sharedApplication(self.mtm()).terminate(None);
+            NSApplication::sharedApplication(self.mtm()).stop(None);
         }
     }
 );
 
 impl TrayActions {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
-        let this = Self::alloc(mtm);
-        // SAFETY: NSObject's designated initializer requires no arguments.
-        unsafe { msg_send![this, init] }
+        let this = Self::alloc(mtm).set_ivars(Default::default());
+        // SAFETY: The ivars are initialized and NSObject's init takes no arguments.
+        unsafe { msg_send![super(this), init] }
     }
 }
 
-pub(super) fn run() -> io::Result<()> {
+pub(super) fn run() -> io::Result<super::Action> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| io::Error::other("the tray requires the main thread"))?;
     let app = NSApplication::sharedApplication(mtm);
@@ -63,6 +73,12 @@ pub(super) fn run() -> io::Result<()> {
             ns_string!(""),
         );
         browser.setTarget(Some(&target));
+        let upgrade = menu.addItemWithTitle_action_keyEquivalent(
+            ns_string!("Upgrade Remuda"),
+            Some(sel!(upgradeRemuda:)),
+            ns_string!(""),
+        );
+        upgrade.setTarget(Some(&target));
         let quit = menu.addItemWithTitle_action_keyEquivalent(
             ns_string!("Quit Tray"),
             Some(sel!(quitRemudaTray:)),
@@ -82,5 +98,15 @@ pub(super) fn run() -> io::Result<()> {
     }
     item.setMenu(Some(&menu));
     app.run();
-    Ok(())
+    status_bar.removeStatusItem(&item);
+    Ok(target.ivars().get())
+}
+
+pub(super) fn upgrade_error(message: &str) {
+    if let Some(mtm) = MainThreadMarker::new() {
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(ns_string!("Remuda upgrade needs attention"));
+        alert.setInformativeText(&objc2_foundation::NSString::from_str(message));
+        alert.runModal();
+    }
 }

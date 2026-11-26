@@ -14,10 +14,11 @@ use windows_sys::{
             },
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-                DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW,
+                DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, MessageBoxW,
                 PostMessageW, RegisterClassW, SetForegroundWindow, TrackPopupMenu,
-                UnregisterClassW, IDI_APPLICATION, MF_STRING, MSG, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-                WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
+                UnregisterClassW, IDI_APPLICATION, MB_ICONWARNING, MB_OK, MF_STRING, MSG,
+                TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_NULL,
+                WM_RBUTTONUP, WNDCLASSW,
             },
         },
     },
@@ -28,8 +29,9 @@ const MENU_ACTION: u32 = WM_APP + 2;
 const OPEN_REMUDA: usize = 1;
 const QUIT_TRAY: usize = 2;
 const OPEN_BROWSER: usize = 3;
+const UPGRADE_REMUDA: usize = 4;
 
-pub(super) fn run() -> io::Result<()> {
+pub(super) fn run() -> io::Result<super::Action> {
     // SAFETY: Use a process-owned class and hidden window on this thread. The
     // class name is static, and the class is unregistered after its window ends.
     unsafe {
@@ -73,7 +75,7 @@ pub(super) fn run() -> io::Result<()> {
     }
 }
 
-fn run_icon(window: HWND) -> io::Result<()> {
+fn run_icon(window: HWND) -> io::Result<super::Action> {
     // SAFETY: The caller's thread owns the window and keeps it alive throughout
     // the message loop. The icon handle lives for the process.
     unsafe {
@@ -107,7 +109,7 @@ fn run_icon(window: HWND) -> io::Result<()> {
     }
 }
 
-fn run_message_loop(window: HWND) -> io::Result<()> {
+fn run_message_loop(window: HWND) -> io::Result<super::Action> {
     // SAFETY: GetMessageW fills a writable MSG. When it succeeds, dispatch
     // messages on the thread that created the window.
     unsafe {
@@ -115,12 +117,13 @@ fn run_message_loop(window: HWND) -> io::Result<()> {
         loop {
             match GetMessageW(&mut message, null_mut(), 0, 0) {
                 -1 => return Err(io::Error::last_os_error()),
-                0 => return Ok(()),
+                0 => return Ok(super::Action::Quit),
                 _ if message.hwnd == window && message.message == MENU_ACTION => {
                     match message.wParam {
                         OPEN_REMUDA => super::open_remuda(),
                         OPEN_BROWSER => super::open_browser(),
-                        QUIT_TRAY => return Ok(()),
+                        QUIT_TRAY => return Ok(super::Action::Quit),
+                        UPGRADE_REMUDA => return Ok(super::Action::Upgrade),
                         _ => {}
                     }
                 }
@@ -160,6 +163,7 @@ unsafe fn show_menu(window: HWND) {
         let mut cursor = POINT::default();
         if AppendMenuW(menu, MF_STRING, OPEN_REMUDA, w!("Open Remuda")) != 0
             && AppendMenuW(menu, MF_STRING, OPEN_BROWSER, w!("Open Browser…")) != 0
+            && AppendMenuW(menu, MF_STRING, UPGRADE_REMUDA, w!("Upgrade Remuda")) != 0
             && AppendMenuW(menu, MF_STRING, QUIT_TRAY, w!("Quit Tray")) != 0
             && GetCursorPos(&mut cursor) != 0
         {
@@ -180,5 +184,18 @@ unsafe fn show_menu(window: HWND) {
             }
         }
         DestroyMenu(menu);
+    }
+}
+
+pub(super) fn upgrade_error(message: &str) {
+    let text: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: The UTF-16 text remains valid until the modal dialog returns.
+    unsafe {
+        MessageBoxW(
+            null_mut(),
+            text.as_ptr(),
+            w!("Remuda upgrade needs attention"),
+            MB_OK | MB_ICONWARNING,
+        );
     }
 }
