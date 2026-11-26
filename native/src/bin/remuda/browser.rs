@@ -3,7 +3,7 @@ use std::io::{self, IsTerminal};
 use std::process::{Command, ExitCode};
 
 const USAGE: &str =
-    "Usage: remuda browser [USER@]HOST\n       remuda browser --gui [USER@]HOST\n       remuda browser open-document REQUEST_ID VFS_URI\n       remuda browser link URI [LABEL]";
+    "Usage: remuda browser [USER@]HOST\n       remuda browser --gui [USER@]HOST\n       remuda browser open-document [--session] REQUEST_ID URI\n       remuda browser link URI [LABEL]";
 
 pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode {
     if matches!(args, ["-h" | "--help" | "help"]) {
@@ -31,7 +31,10 @@ pub(super) fn run(args: &[&str], server: &str, stdin_enabled: bool) -> ExitCode 
         };
     }
     if let ["open-document", request_id, uri] = args {
-        return publish_document(request_id, uri);
+        return publish_document(request_id, uri, false);
+    }
+    if let ["open-document", "--session", request_id, uri] = args {
+        return publish_document(request_id, uri, true);
     }
     if let ["--gui", destination] = args {
         if !valid_destination(destination) {
@@ -93,45 +96,76 @@ fn launch_gui(_: &str) -> ExitCode {
     super::fail("The native Remuda Browser is supported on macOS and Windows")
 }
 
-fn publish_document(id: &str, uri: &str) -> ExitCode {
+fn publish_document(id: &str, uri: &str, session_only: bool) -> ExitCode {
+    use remuda_core::protocol::{Request, Response};
     use remuda_native::net::browser::{
         Client, DocumentRequest, Operation, Outcome, Reply, DELIVERY_TTL,
     };
     use std::time::{Duration, Instant};
 
-    let client = match Client::from_env() {
-        Ok(Some(client)) => client,
-        Ok(None) => {
-            return super::fail("REMUDA_BROWSER_CLIENT must identify the publisher credentials")
+    let client = if session_only {
+        None
+    } else {
+        match Client::from_env() {
+            Ok(client) => client,
+            Err(error) => return super::fail(format!("Browser publisher credentials: {error}")),
         }
-        Err(error) => return super::fail(format!("Browser publisher credentials: {error}")),
     };
     let operation = Operation::Publish {
         request: DocumentRequest {
             id: id.into(),
             uri: uri.into(),
+            origin: None,
         },
     };
+    let request = Request::BrowserPublishDocument {
+        id: id.into(),
+        uri: uri.into(),
+    };
+    let mut origin = None;
+    let socket = remuda_native::daemon::socket_path("default");
     let deadline = Instant::now() + DELIVERY_TTL + Duration::from_secs(2);
     let result = loop {
-        match client.send(&operation) {
-            Ok(Reply::Outcome(Outcome::Pending)) if Instant::now() < deadline => {
+        let outcome = match &client {
+            Some(client) => match client.send(&operation) {
+                Ok(Reply::Outcome(outcome)) => Some(outcome),
+                Ok(_) => None,
+                Err(_) => Some(Outcome::Unknown),
+            },
+            None => match remuda_native::client::request_with_deadline(
+                &socket,
+                &request,
+                Duration::from_secs(4),
+            ) {
+                Ok(Response::BrowserDocumentPublished {
+                    origin: verified,
+                    outcome,
+                }) => {
+                    origin = Some(verified);
+                    Some(outcome)
+                }
+                Ok(_) => None,
+                Err(_) => Some(Outcome::Unknown),
+            },
+        };
+        match outcome {
+            Some(Outcome::Pending) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(200));
             }
-            Ok(Reply::Outcome(Outcome::Pending)) | Err(_) => break "unknown",
-            Ok(Reply::Outcome(Outcome::Displayed)) => break "displayed",
-            Ok(Reply::Outcome(Outcome::NoActiveBrowser)) => break "no_active_browser",
-            Ok(Reply::Outcome(Outcome::Unknown)) => break "unknown",
-            Ok(Reply::Outcome(Outcome::ReadFailed)) => break "read_failed",
-            Ok(Reply::Outcome(Outcome::Busy)) => break "busy",
-            Ok(Reply::Outcome(Outcome::ConflictingRequest)) => break "conflicting_request",
-            Ok(_) => break "denied",
+            Some(Outcome::Pending | Outcome::Unknown) => break "unknown",
+            Some(Outcome::Displayed) => break "displayed",
+            Some(Outcome::NoActiveBrowser) => break "no_active_browser",
+            Some(Outcome::ReadFailed) => break "read_failed",
+            Some(Outcome::Busy) => break "busy",
+            Some(Outcome::ConflictingRequest) => break "conflicting_request",
+            None => break "denied",
         }
     };
-    println!(
-        "{}",
-        serde_json::json!({ "request_id": id, "uri": uri, "status": result })
-    );
+    let mut receipt = serde_json::json!({ "request_id": id, "uri": uri, "status": result });
+    if let Some(origin) = origin {
+        receipt["origin"] = serde_json::json!(origin);
+    }
+    println!("{receipt}");
     if result == "displayed" {
         ExitCode::SUCCESS
     } else {
@@ -169,8 +203,10 @@ fn terminal_link(uri: &str, label: &str, interactive: bool) -> Result<String, &'
     if label.is_empty() || label.len() > 2048 || label.chars().any(char::is_control) {
         return Err("Invalid terminal link label");
     }
-    remuda_native::terminal_link::Target::parse(uri)
-        .ok_or("Terminal links require a Remuda Drive URI or an HTTP(S) URL")?;
+    use remuda_native::terminal_link::Target;
+    if !matches!(Target::parse(uri), Some(Target::Drive(_) | Target::Web(_))) {
+        return Err("Terminal links require a Remuda Drive URI or an HTTP(S) URL");
+    }
 
     if interactive {
         Ok(format!("\x1b]8;;{uri}\x1b\\{label}\x1b]8;;\x1b\\"))

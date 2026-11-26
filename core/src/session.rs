@@ -15,6 +15,7 @@ use crate::input::{
 use crate::protocol::Step;
 use core::time::Duration;
 use std::borrow::Borrow;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex};
@@ -699,6 +700,7 @@ enum BurstWriteMode {
 pub struct Session {
     id: String,
     name: String,
+    launch_workdir: Option<PathBuf>,
     agent: Mutex<Box<dyn AgentProcess>>,
     size: Mutex<Size>,
     clock: Arc<dyn Clock>,
@@ -892,6 +894,7 @@ impl Session {
         Self {
             id,
             name,
+            launch_workdir: None,
             agent: Mutex::new(agent),
             size: Mutex::new(size),
             clock,
@@ -916,6 +919,16 @@ impl Session {
             input_rate: Mutex::new(InputRateLimiter::default()),
             clear_input_rate: Mutex::new(ClearInputRateLimiter::default()),
         }
+    }
+
+    /// Record the canonical launch directory, when supplied by the launcher.
+    pub fn with_launch_workdir(mut self, workdir: Option<PathBuf>) -> Self {
+        self.launch_workdir = workdir.filter(|path| path.is_absolute());
+        self
+    }
+
+    pub(crate) fn launch_workdir(&self) -> Option<&Path> {
+        self.launch_workdir.as_deref()
     }
 
     pub fn id(&self) -> &str {

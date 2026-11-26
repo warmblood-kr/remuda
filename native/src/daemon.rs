@@ -661,9 +661,12 @@ fn anti_entropy_interval() -> Duration {
 
 const LISTENER_HOST_LOCK_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
+type BrowserServiceSlot = Arc<Mutex<Option<Arc<crate::net::browser::Service>>>>;
+
 pub struct ListenerTask {
     daemon_path: PathBuf,
     status: Arc<Mutex<ListenerStatus>>,
+    browser: BrowserServiceSlot,
     stop: std::sync::mpsc::Sender<()>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -696,6 +699,8 @@ impl ListenerTask {
         detector: AutoAddressDetector,
     ) -> Self {
         let status = Arc::new(Mutex::new(ListenerStatus::Off));
+        let browser = BrowserServiceSlot::default();
+        let browser_for_thread = browser.clone();
         let (stop, stopped) = std::sync::mpsc::channel();
         let (ready, startup) = std::sync::mpsc::channel();
         let status_for_thread = Arc::clone(&status);
@@ -712,6 +717,7 @@ impl ListenerTask {
                     retry_interval,
                     detector,
                     &ready,
+                    &browser_for_thread,
                 );
                 if let Err(reason) = result {
                     set_listener_status(&status_for_thread, ListenerStatus::Failed(reason));
@@ -732,6 +738,7 @@ impl ListenerTask {
         let task = Self {
             daemon_path,
             status,
+            browser,
             stop,
             thread: Mutex::new(thread),
         };
@@ -829,6 +836,16 @@ impl DaemonListenerControl {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .status()
+    }
+
+    fn browser_service(&self) -> Option<Arc<crate::net::browser::Service>> {
+        self.task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .browser
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     fn reload(&self) -> ListenerStatus {
@@ -960,6 +977,7 @@ fn start_listener(
     retry_interval: Duration,
     detector: AutoAddressDetector,
     ready: &std::sync::mpsc::Sender<()>,
+    browser: &BrowserServiceSlot,
 ) -> Result<(), String> {
     let stopped = Arc::new(Mutex::new(stopped));
     let security = crate::net::listener::ListenerSecurityResources::new();
@@ -1017,9 +1035,11 @@ fn start_listener(
             &security,
         )
         .map_err(|error| format!("bind cluster listener: {error}"))?;
+        *browser.lock().unwrap_or_else(|error| error.into_inner()) = listener.browser_service();
         let result = serve_bound_listener(
             listener, host_lock, auto, status, &stopped, ready, &detector,
         );
+        *browser.lock().unwrap_or_else(|error| error.into_inner()) = None;
         if result? {
             continue;
         }
@@ -2530,6 +2550,31 @@ fn handle_request(
             capture_styled(&stream, registry, &name, scrollback)
         }
 
+        Request::ReadSessionFile {
+            name,
+            instance_id,
+            uri,
+            offset,
+            revision,
+        } => {
+            let response = match registry.launch_workdir(&name, &instance_id) {
+                Some(root) => crate::net::browser::read_session_file_chunk(
+                    &name,
+                    &root,
+                    &uri,
+                    offset,
+                    revision.as_deref(),
+                ),
+                None => Response::error("session file access denied"),
+            };
+            reply(&stream, &response)
+        }
+        Request::BrowserPublishDocument { id, uri } => {
+            let caller = caller_context(&stream, registry, accepted);
+            let response = publish_browser_document(&listener_task, registry, caller, id, uri);
+            reply(&stream, &response)
+        }
+
         Request::Sync {
             name,
             instance_id,
@@ -2679,6 +2724,42 @@ fn escaped_mod_command_error(error: &str) -> String {
         escaped.push_str("...");
     }
     escaped
+}
+
+fn publish_browser_document(
+    listener: &DaemonListenerControl,
+    registry: &Registry,
+    caller: crate::image::CallerContext,
+    id: String,
+    uri: String,
+) -> Response {
+    let (crate::image::CallerKind::Session, Some(session), Some(instance_id)) =
+        (caller.kind, caller.session, caller.instance_id)
+    else {
+        return Response::error("Browser publication requires a live session caller");
+    };
+    if registry
+        .validate_live_instance(&session, &instance_id)
+        .is_err()
+    {
+        return Response::error("Browser publication requires a live session caller");
+    }
+    let Some(service) = listener.browser_service() else {
+        return Response::error("Browser publication requires a configured listener");
+    };
+    if uri.starts_with("file://") {
+        let Some(root) = registry.launch_workdir(&session, &instance_id) else {
+            return Response::error("session file access denied");
+        };
+        let access = crate::net::browser::read_session_file_chunk(&session, &root, &uri, 0, None);
+        if !matches!(access, Response::Value(_)) {
+            return access;
+        }
+    }
+    match service.publish_from_session(id, uri, session, instance_id) {
+        Some((origin, outcome)) => Response::BrowserDocumentPublished { origin, outcome },
+        None => Response::error("Browser publication is outside the listener grant"),
+    }
 }
 
 fn caller_context(
@@ -4249,9 +4330,11 @@ fn spawn(
     for arg in &argv[1..] {
         builder.arg(arg);
     }
-    match cwd {
-        Some(cwd) => builder.cwd(cwd),
-        None => {
+    let launch_workdir = explicit_launch_workdir(cwd);
+    match (cwd, &launch_workdir) {
+        (Some(_), Some(workdir)) => builder.cwd(workdir),
+        (Some(cwd), None) => builder.cwd(cwd),
+        (None, _) => {
             if let Ok(cwd) = std::env::current_dir() {
                 builder.cwd(cwd);
             }
@@ -4283,7 +4366,19 @@ fn spawn(
         session_id,
         Box::new(agent),
         Arc::new(SystemClock::new()),
-    ))
+    )
+    .with_launch_workdir(launch_workdir))
+}
+
+/// An omitted working directory inherits the daemon's directory for launch
+/// compatibility and confers no file access.
+pub(crate) fn explicit_launch_workdir(cwd: Option<&str>) -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(cwd?);
+    if !path.is_absolute() {
+        return None;
+    }
+    let path = path.canonicalize().ok()?;
+    path.is_dir().then_some(path)
 }
 
 /// The file portable-pty will find for `program` (portable-pty 0.9.0,

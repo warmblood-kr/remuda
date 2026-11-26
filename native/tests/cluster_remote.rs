@@ -810,6 +810,7 @@ fn relay_publish_request(id: &str, uri: &str) -> Operation {
         request: DocumentRequest {
             id: id.into(),
             uri: uri.into(),
+            origin: None,
         },
     }
 }
@@ -854,7 +855,7 @@ impl BrowserRelayFixture {
                 "browser": browser_key,
                 "document": RELAY_DOCUMENT,
                 "directory": directory,
-                "source_file": {"uri": LIVE_SOURCE_URI, "path": live_source},
+                "source_file": {"uri": LIVE_SOURCE_URI, "path": live_source, "allow_cluster_read": true},
                 "relay_publisher": encoding::encode_base64(&ingress.public),
             }),
         );
@@ -926,6 +927,25 @@ impl BrowserRelayFixture {
         )
     }
 
+    fn verify_linked_source(&self, revoked: bool) {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "linked_source_fixture_client"])
+            .env("REMUDA_LINK_FIXTURE_NODE", self.egress.fingerprint())
+            .env(
+                "REMUDA_LINK_FIXTURE_REVOKED",
+                if revoked { "1" } else { "0" },
+            )
+            .env("REMUDA_LINK_FIXTURE_FILE", self.egress.root.join("live.md"))
+            .env("REMUDA_RUNTIME_DIR", &self.ingress.runtime)
+            .env("XDG_STATE_HOME", &self.ingress.state)
+            .env("XDG_CONFIG_HOME", self.ingress.root.join("config"))
+            .env("XDG_DATA_HOME", self.ingress.root.join("data"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
     fn verify_access(&self) {
         assert!(matches!(
             self.direct
@@ -953,6 +973,18 @@ impl BrowserRelayFixture {
             self.sink.read_file(LIVE_SOURCE_URI).unwrap(),
             b"live source bytes"
         );
+        let linked = url::Url::from_file_path(self.egress.root.join("live.md")).unwrap();
+        assert_eq!(
+            self.sink
+                .read_source(&self.egress.fingerprint(), linked.as_str())
+                .unwrap(),
+            b"live source bytes"
+        );
+        assert!(matches!(
+            self.sink
+                .read_source(&self.ingress.fingerprint(), linked.as_str()),
+            Err(remuda_native::net::browser::DriveReadError::Denied)
+        ));
         fs::write(self.egress.root.join("live.md"), "updated source bytes").unwrap();
         assert_eq!(
             self.sink.read_file(LIVE_SOURCE_URI).unwrap(),
@@ -998,6 +1030,7 @@ impl BrowserRelayFixture {
         let request = DocumentRequest {
             id: "isolated-design".into(),
             uri: RELAY_DOCUMENT.into(),
+            origin: None,
         };
         let publish = relay_publish_request(&request.id, &request.uri);
         let poll = relay_poll();
@@ -1058,11 +1091,13 @@ impl BrowserRelayFixture {
             .unwrap()
             .state = NodeState::Revoked;
         fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+        self.verify_linked_source(true);
         assert!(matches!(
             self.author.send(&Operation::Publish {
                 request: DocumentRequest {
                     id: "revoked-relay".into(),
                     uri: RELAY_DOCUMENT.into(),
+                    origin: None,
                 },
             }),
             Ok(Reply::Outcome(Outcome::Unknown))
@@ -1075,11 +1110,38 @@ impl BrowserRelayFixture {
 }
 
 #[test]
+#[ignore = "run by the isolated two-node file-link fixture"]
+fn linked_source_fixture_client() {
+    use remuda_native::net::browser::{read_cluster_source, DriveReadError};
+    let node = std::env::var("REMUDA_LINK_FIXTURE_NODE").unwrap();
+    let file = PathBuf::from(std::env::var_os("REMUDA_LINK_FIXTURE_FILE").unwrap());
+    let uri = url::Url::from_file_path(&file).unwrap();
+    if std::env::var("REMUDA_LINK_FIXTURE_REVOKED").as_deref() == Ok("1") {
+        assert!(read_cluster_source(&node, uri.as_str()).is_err());
+        return;
+    }
+    assert_eq!(
+        read_cluster_source(&node, uri.as_str()).unwrap(),
+        b"updated source bytes"
+    );
+    let different = url::Url::from_file_path(file.with_file_name("design.md")).unwrap();
+    assert_eq!(
+        read_cluster_source(&node, different.as_str()),
+        Err(DriveReadError::Denied)
+    );
+    assert_eq!(
+        read_cluster_source("unregistered", uri.as_str()),
+        Err(DriveReadError::Denied)
+    );
+}
+
+#[test]
 fn browser_open_crosses_distinct_admitted_listeners_and_returns_receipt() {
     let harness = std::env::var_os("REMUDA_GUI_DOCUMENT_ACCEPTANCE_TEST_BIN");
     let gui = std::env::var_os("REMUDA_GUI_DOCUMENT_ACCEPTANCE_BIN");
     let fixture = BrowserRelayFixture::new(gui.is_some() || harness.is_some());
     fixture.verify_access();
+    fixture.verify_linked_source(false);
     if let Some(harness) = harness {
         fixture.verify_desktop(
             &harness,
@@ -1096,6 +1158,287 @@ fn browser_open_crosses_distinct_admitted_listeners_and_returns_receipt() {
         fixture.verify_transport();
         fixture.verify_revocation();
     }
+}
+
+#[test]
+fn session_browser_open_uses_verified_origin_and_returns_the_relay_receipt() {
+    let fixture = BrowserRelayFixture::new(false);
+    let ingress = &fixture.ingress;
+    let outside = ingress
+        .command()
+        .env("REMUDA_SESSION", "claimed")
+        .env("REMUDA_SESSION_NAME", "claimed")
+        .env_remove("REMUDA_BROWSER_CLIENT")
+        .args(["browser", "open-document", "from-outside", RELAY_DOCUMENT])
+        .output()
+        .unwrap();
+    assert!(!outside.status.success());
+    let outside: serde_json::Value = serde_json::from_slice(&outside.stdout).unwrap();
+    assert_eq!(outside["status"], "denied");
+    assert!(outside.get("origin").is_none());
+
+    let poll = relay_poll();
+    assert!(matches!(fixture.sink.send(&poll), Ok(Reply::Event(None))));
+    let receipt_path = ingress.root.join("session-browser-receipt.json");
+    let denied_path = ingress.root.join("session-browser-denied.json");
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
+    ingress.start_named_session(
+        "document-author",
+        &format!(
+            "unset REMUDA_BROWSER_CLIENT; \
+             export REMUDA_SESSION_NAME=claimed; \
+             {cli} browser open-document from-agent {uri} > {receipt}; \
+             {cli} browser open-document out-of-scope remuda:///private/note.md > {denied}",
+            cli = quote(ingress.binary.to_str().unwrap()),
+            uri = quote(RELAY_DOCUMENT),
+            receipt = quote(receipt_path.to_str().unwrap()),
+            denied = quote(denied_path.to_str().unwrap()),
+        ),
+    );
+    let mut event = None;
+    assert!(wait_for_marker(
+        || {
+            if let Ok(Reply::Event(Some(request))) = fixture.sink.send(&poll) {
+                event = Some(request);
+            }
+            event.is_some()
+        },
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+    ));
+    let request = event.unwrap();
+    assert_eq!(request.id, "from-agent");
+    assert_eq!(request.uri, RELAY_DOCUMENT);
+    let origin = request.origin.clone().unwrap();
+    assert_eq!(origin.node, ingress.fingerprint());
+    assert_eq!(origin.session, "document-author");
+    let ingress_socket = remuda_native::daemon::socket_path_in(&ingress.runtime, &ingress.name);
+    let Response::Sessions(sessions) =
+        remuda_native::client::request(&ingress_socket, &Request::List).unwrap()
+    else {
+        panic!("expected source session list");
+    };
+    assert!(sessions.iter().any(|session| {
+        session.name == origin.session
+            && session.instance_id.as_deref() == Some(origin.instance_id.as_str())
+    }));
+    assert!(matches!(
+        fixture.author.send(&Operation::Publish {
+            request: request.clone()
+        }),
+        Ok(Reply::Denied)
+    ));
+    assert_eq!(
+        fixture.sink.read_file(RELAY_DOCUMENT).unwrap(),
+        RELAY_SOURCE.as_bytes()
+    );
+    assert!(matches!(
+        fixture.sink.send(&Operation::Finish {
+            instance: "desktop".into(),
+            request,
+            outcome: Outcome::Displayed,
+        }),
+        Ok(Reply::Accepted)
+    ));
+    let mut receipt = None;
+    let mut denied = None;
+    assert!(wait_for_marker(
+        || {
+            let read = |path| {
+                fs::read(path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            };
+            receipt = read(&receipt_path);
+            denied = read(&denied_path);
+            receipt.is_some() && denied.is_some()
+        },
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+    ));
+    let receipt = receipt.unwrap();
+    assert_eq!(receipt["status"], "displayed");
+    assert_eq!(receipt["origin"], serde_json::to_value(origin).unwrap());
+    assert_eq!(denied.unwrap()["status"], "denied");
+    assert!(matches!(fixture.sink.send(&poll), Ok(Reply::Event(None))));
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end source, transport, and viewer scenario"
+)]
+fn workdir_document_publication_reaches_the_browser_with_its_verified_origin() {
+    let fixture = BrowserRelayFixture::new(false);
+    let source = &fixture.ingress;
+    let workdir = source.root.join("document-project");
+    fs::create_dir(&workdir).unwrap();
+    let file = url::Url::from_file_path(workdir.join("new.md")).unwrap();
+    let outside = source.root.join("unshared.md");
+    fs::write(&outside, b"not shared").unwrap();
+    let outside_uri = url::Url::from_file_path(&outside).unwrap();
+    let poll = relay_poll();
+    assert!(matches!(fixture.sink.send(&poll), Ok(Reply::Event(None))));
+    assert!(matches!(
+        fixture
+            .author
+            .send(&relay_publish_request("file-via-legacy-key", file.as_str())),
+        Ok(Reply::Denied)
+    ));
+    let receipt = workdir.join("receipt.json");
+    let denied = workdir.join("denied.json");
+    let script = format!(
+        "printf 'workdir delivery' > new.md; \
+         \"$0\" browser open-document --session from-workdir '{}' > receipt.json; \
+         \"$0\" browser open-document --session outside-workdir '{}' > denied.json; sleep 20",
+        file.as_str(),
+        outside_uri.as_str()
+    );
+    let lua = format!(
+        "remuda.session.new('document-workdir', {{'/bin/sh', '-c', {}, {}}}, {})",
+        serde_json::to_string(&script).unwrap(),
+        serde_json::to_string(&source.binary).unwrap(),
+        serde_json::to_string(&workdir).unwrap(),
+    );
+    let launch = source.command().args(["-e", &lua]).output().unwrap();
+    assert!(launch.status.success(), "{launch:?}");
+    let mut request = None;
+    assert!(wait_for_marker(
+        || {
+            if let Ok(Reply::Event(Some(event))) = fixture.sink.send(&poll) {
+                request = Some(event);
+            }
+            request.is_some()
+        },
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+    ));
+    let request = request.unwrap();
+    let origin = request.origin.as_ref().unwrap();
+    assert_eq!(origin.node, source.fingerprint());
+    assert_eq!(origin.session, "document-workdir");
+    assert_eq!(request.id, "from-workdir");
+    assert_eq!(request.uri, file.as_str());
+    let endpoint = fs::read(
+        fixture
+            .egress
+            .state
+            .join("remuda/cluster/authorized_nodes.json"),
+    )
+    .unwrap();
+    let registry: Registry = serde_json::from_slice(&endpoint).unwrap();
+    let address = registry
+        .authorized_nodes
+        .iter()
+        .find(|node| node.node_fp == origin.node)
+        .unwrap()
+        .endpoint
+        .as_deref()
+        .unwrap()
+        .parse::<SocketAddr>()
+        .unwrap();
+    let remote = ClusterClient::system();
+    let read = |request| remote.request(address, &source.public, &fixture.egress.private, &request);
+    let bytes = remuda_native::net::browser::read_session_file_using(
+        &origin.session,
+        &origin.instance_id,
+        &request.uri,
+        read,
+    )
+    .unwrap();
+    assert_eq!(bytes, b"workdir delivery");
+    assert!(matches!(
+        fixture.sink.send(&Operation::Finish {
+            instance: "desktop".into(),
+            request: request.clone(),
+            outcome: Outcome::Displayed,
+        }),
+        Ok(Reply::Accepted)
+    ));
+    let parse_receipt = |path: &Path| {
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    };
+    assert!(wait_for_marker(
+        || parse_receipt(&receipt).is_some() && parse_receipt(&denied).is_some(),
+        Duration::from_secs(8),
+        Duration::from_millis(100),
+    ));
+    let receipt = parse_receipt(&receipt).unwrap();
+    assert_eq!(receipt["status"], "displayed");
+    assert_eq!(
+        receipt["origin"],
+        serde_json::to_value(&request.origin).unwrap()
+    );
+    assert_eq!(parse_receipt(&denied).unwrap()["status"], "denied");
+    assert!(matches!(fixture.sink.send(&poll), Ok(Reply::Event(None))));
+}
+
+#[test]
+#[ignore = "requires the remuda-gui test binary"]
+fn daemonless_gui_opens_workdir_document_with_one_tab_and_returns_receipt() {
+    let gui = std::env::var_os("REMUDA_GUI_DOCUMENT_ACCEPTANCE_TEST_BIN").unwrap();
+    let fixture = BrowserRelayFixture::new(false);
+    let source = &fixture.ingress;
+    let workdir = source.root.join("gui-project");
+    fs::create_dir(&workdir).unwrap();
+    let file = url::Url::from_file_path(workdir.join("new.md")).unwrap();
+    let uri = file.as_str();
+    let script = format!(
+        "printf '# GUI project preview\\n' > new.md; while IFS= read -r request; do \
+         \"$0\" browser open-document --session gui-workdir '{}' > receipt.tmp; \
+         mv receipt.tmp receipt.json; done",
+        uri
+    );
+    let lua = format!(
+        "remuda.session.new('gui-author', {{'/bin/sh', '-c', {}, {}}}, {})",
+        serde_json::to_string(&script).unwrap(),
+        serde_json::to_string(&source.binary).unwrap(),
+        serde_json::to_string(&workdir).unwrap(),
+    );
+    let launch = source.command().args(["-e", &lua]).output().unwrap();
+    assert!(launch.status.success(), "{launch:?}");
+    let socket = remuda_native::daemon::socket_path_in(&source.runtime, &source.name);
+    let receipt = workdir.join("receipt.json");
+    prove_native_browser_receipt(
+        &gui,
+        &[
+            "--ignored",
+            "--exact",
+            "browser::tests::daemonless_workdir_receipt_acceptance",
+            "--nocapture",
+        ],
+        &source.root.join("workdir-desktop"),
+        &source.root.join("browser.key"),
+        source,
+        &[("gui-workdir", uri)],
+        |_, _| {
+            let _ = fs::remove_file(&receipt);
+            assert!(matches!(
+                remuda_native::client::request(
+                    &socket,
+                    &Request::SendLine {
+                        name: "gui-author".into(),
+                        text: "open".into(),
+                    }
+                ),
+                Ok(Response::Ok)
+            ));
+            let read = || {
+                let bytes = fs::read(&receipt).ok()?;
+                let receipt: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                Some(receipt["status"].as_str()?.to_owned())
+            };
+            assert!(wait_for_marker(
+                || read().is_some(),
+                Duration::from_secs(8),
+                Duration::from_millis(100)
+            ));
+            let status = read().unwrap();
+            (status == "displayed", status)
+        },
+    );
 }
 
 fn proof_session(
@@ -1294,6 +1637,127 @@ fn wait_for(label: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end source, transport, and viewer scenario"
+)]
+fn remote_tui_click_opens_new_session_workdir_file_then_honors_opt_out() {
+    let fixture = BrowserRelayFixture::new(false);
+    let work = fixture.egress.root.join("workdir");
+    fs::create_dir(&work).unwrap();
+    let file = url::Url::from_file_path(work.join("new.md")).unwrap();
+    let script = format!(
+        "printf 'default workdir source\\n' > new.md; printf '\\033]8;;%s\\007OPEN-SOURCE\\033]8;;\\007\\n' '{}'; sleep 30",
+        file.as_str(),
+    );
+    let lua = format!(
+        "remuda.session.new('proof', {{'/bin/sh', '-c', {}}}, {})",
+        serde_json::to_string(&script).unwrap(),
+        serde_json::to_string(&work).unwrap(),
+    );
+    let start = fixture
+        .egress
+        .command()
+        .args(["-e", &lua])
+        .output()
+        .unwrap();
+    assert!(start.status.success(), "{start:?}");
+    use std::io::{BufRead as _, BufReader};
+    let socket =
+        remuda_native::daemon::socket_path_in(&fixture.egress.runtime, &fixture.egress.name);
+    let Response::Sessions(rows) = remuda_native::client::request(&socket, &Request::List).unwrap()
+    else {
+        panic!("session list unavailable");
+    };
+    let instance = rows
+        .iter()
+        .find(|row| row.name == "proof")
+        .unwrap()
+        .instance_id
+        .as_deref()
+        .unwrap();
+    let mut workspace = fixture
+        .egress
+        .command()
+        .arg("_browser-workspace")
+        .env_remove("REMUDA_BROWSER_CLIENT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = workspace.stdin.take().unwrap();
+    let mut output = BufReader::new(workspace.stdout.take().unwrap());
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(
+        line.as_bytes(),
+        remuda_native::remote_front::WORKSPACE_HELLO
+    );
+    let mut fetch = |request: Request| {
+        serde_json::to_writer(&mut input, &request).unwrap();
+        writeln!(&mut input).unwrap();
+        input.flush().unwrap();
+        line.clear();
+        output.read_line(&mut line).unwrap();
+        serde_json::from_str::<Response>(&line)
+    };
+    use remuda_native::net::browser::{read_session_file_using, DriveReadError};
+    let uri = file.as_str();
+    let outside = fixture.egress.root.join("outside.md");
+    fs::write(&outside, b"private").unwrap();
+    let outside = url::Url::from_file_path(outside).unwrap();
+    assert!(matches!(
+        read_session_file_using("proof", "wrong-instance", uri, &mut fetch),
+        Err(DriveReadError::Denied)
+    ));
+    assert!(matches!(
+        read_session_file_using("proof", instance, outside.as_str(), &mut fetch),
+        Err(DriveReadError::Denied)
+    ));
+    let target = format!("{}/proof", fixture.egress.fingerprint());
+    let mut tui = RemoteTui::start(&fixture.ingress, Some(&target));
+    tui.wait_for("OPEN-SOURCE", Duration::from_secs(10));
+    let mut parser = vt100::Parser::new(tui.rows, tui.cols, 0);
+    parser.process(&tui.output.lock().unwrap());
+    let screen = parser.screen();
+    let (row, col) = (0..tui.rows)
+        .flat_map(|row| (0..tui.cols.saturating_sub(11)).map(move |col| (row, col)))
+        .find(|&(row, col)| {
+            "OPEN-SOURCE".chars().enumerate().all(|(index, ch)| {
+                screen
+                    .cell(row, col + index as u16)
+                    .is_some_and(|cell| cell.contents().starts_with(ch))
+            })
+        })
+        .expect("remote file hyperlink was painted");
+    assert!(screen.cell(row, col).unwrap().hyperlink().is_none());
+    let (row, col) = (row + 1, col + 1);
+    write!(tui.writer, "\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m").unwrap();
+    tui.wait_for("default workdir source", Duration::from_secs(10));
+    assert_eq!(
+        read_session_file_using("proof", instance, uri, &mut fetch).unwrap(),
+        b"default workdir source\n"
+    );
+    tui.writer.write_all(b"\x1b").unwrap();
+    tui.wait_for("OPEN-SOURCE", Duration::from_secs(3));
+    let config = fixture.egress.root.join("config/remuda");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("session-file-policy.json"),
+        br#"{"denied_sessions":["proof"]}"#,
+    )
+    .unwrap();
+    write!(tui.writer, "\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m").unwrap();
+    tui.wait_for("Document access was denied", Duration::from_secs(10));
+    assert!(matches!(
+        read_session_file_using("proof", instance, uri, &mut fetch),
+        Err(DriveReadError::Denied)
+    ));
+    drop(input);
+    assert!(workspace.wait().unwrap().success());
 }
 
 #[test]

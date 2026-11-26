@@ -26,6 +26,7 @@ const SIDEBAR_WIDTH: f32 = 208.;
 
 struct Document {
     uri: String,
+    source_node: Option<String>,
     revision: String,
     media: browser_media::Document,
     request: Option<DocumentRequest>,
@@ -36,11 +37,13 @@ struct Document {
 enum DriveSource {
     Remote(Arc<Client>),
     Local,
+    SessionFilesOnly,
 }
 
 impl DriveSource {
     fn read(&self, uri: &str) -> Result<Vec<u8>, String> {
         match self {
+            Self::SessionFilesOnly => return Err("No Drive credentials configured.".into()),
             Self::Remote(client) => client.read_file(uri),
             Self::Local => remuda_native::net::browser::read_local_drive(uri),
         }
@@ -52,6 +55,7 @@ impl DriveSource {
         after: Option<String>,
     ) -> Result<DriveListing, String> {
         match self {
+            Self::SessionFilesOnly => Err("No Drive credentials configured.".into()),
             Self::Remote(client) => list(
                 client,
                 match after {
@@ -69,10 +73,32 @@ impl DriveSource {
 }
 
 #[derive(Clone)]
+pub(crate) enum FileLinkOrigin {
+    Local,
+    ClusterPeer {
+        peer: String,
+        session: String,
+        instance: String,
+    },
+    LocalSession {
+        node: String,
+        session: String,
+        instance: String,
+    },
+    BrowserPeer {
+        workspace: crate::ssh_workspace::SshWorkspace,
+        session: String,
+        instance: String,
+    },
+    Unavailable,
+}
+
+#[derive(Clone)]
 enum DriveAction {
     List(Option<String>),
     More(Option<String>, String),
     Open(String),
+    OpenFile(url::Url, FileLinkOrigin),
     Refresh(Vec<RefreshDirectory>),
 }
 
@@ -122,6 +148,9 @@ impl Drive {
                     }
                     DriveAction::Open(uri) => {
                         read(|uri| source.read(uri), uri, None).map(DriveResult::Document)
+                    }
+                    DriveAction::OpenFile(url, origin) => {
+                        read_linked_file(url, origin).map(DriveResult::Document)
                     }
                 };
                 if return_result.send((id, result)).is_err() {
@@ -338,7 +367,7 @@ impl DocumentTab {
 enum BrowserMode {
     Standalone,
     Local,
-    Ssh,
+    Ssh(crate::ssh_workspace::SshWorkspace),
 }
 
 pub(crate) struct Browser {
@@ -348,6 +377,7 @@ pub(crate) struct Browser {
     displayed: mpsc::Sender<DocumentRequest>,
     document_tabs: Vec<DocumentTab>,
     document_index: usize,
+    link_error: Option<String>,
     active: Content,
     show_drive: bool,
     drive: Option<Drive>,
@@ -455,13 +485,23 @@ impl Browser {
         let (displayed, results) = mpsc::channel();
         let remote = client.map(Arc::new);
         if let Some(poller) = remote.clone() {
-            std::thread::spawn(move || serve(poller, send_document, results));
+            let origin = match &mode {
+                BrowserMode::Standalone => DeliveryConnection::Unsupported,
+                BrowserMode::Local => DeliveryConnection::Local,
+                BrowserMode::Ssh(workspace) => DeliveryConnection::Ssh(workspace.clone()),
+            };
+            std::thread::spawn(move || serve(poller, origin, send_document, results));
         }
         let source = remote
             .map(DriveSource::Remote)
             .or_else(|| matches!(mode, BrowserMode::Local).then_some(DriveSource::Local))
             .map(Arc::new);
-        let drive = source.clone().map(Drive::new);
+        let drive = source
+            .clone()
+            .or_else(|| {
+                matches!(mode, BrowserMode::Ssh(_)).then(|| Arc::new(DriveSource::SessionFilesOnly))
+            })
+            .map(Drive::new);
         let assets = source.clone().map(Assets::new);
         #[cfg(any(target_os = "macos", windows))]
         let native_source = source.filter(|_| native_document::enabled());
@@ -472,6 +512,7 @@ impl Browser {
             displayed,
             document_tabs: Vec::new(),
             document_index: 0,
+            link_error: None,
             active: Content::Terminal,
             show_drive: false,
             drive,
@@ -507,10 +548,15 @@ impl Browser {
         )
     }
 
-    pub(crate) fn ssh(client: Option<Client>, focus: FocusHandle, cx: &mut App) -> Self {
+    pub(crate) fn ssh(
+        workspace: crate::ssh_workspace::SshWorkspace,
+        client: Option<Client>,
+        focus: FocusHandle,
+        cx: &mut App,
+    ) -> Self {
         Self::new(
             String::new(),
-            BrowserMode::Ssh,
+            BrowserMode::Ssh(workspace),
             client,
             None,
             Screen::default(),
@@ -675,6 +721,12 @@ impl Browser {
                         cx.notify();
                         break;
                     }
+                    Err(error) if matches!(drive.last_action, Some(DriveAction::OpenFile(..))) => {
+                        self.link_error = Some(error);
+                        self.active = Content::Document;
+                        self.split = false;
+                        drive.last_action = None;
+                    }
                     Err(error) => drive.error = Some(error),
                 }
                 cx.notify();
@@ -704,14 +756,14 @@ impl Browser {
         window: &mut Window,
         cx: &mut App,
     ) {
+        self.link_error = None;
         let mut document = document;
         let request = document.request.take();
         #[cfg(any(target_os = "macos", windows))]
         let native_enabled = self.native_source.is_some();
-        let existing = self
-            .document_tabs
-            .iter()
-            .position(|tab| tab.document.uri == document.uri);
+        let existing = self.document_tabs.iter().position(|tab| {
+            tab.document.uri == document.uri && tab.document.source_node == document.source_node
+        });
         if let Some(index) = existing
             .filter(|&index| self.document_tabs[index].document.revision == document.revision)
         {
@@ -729,7 +781,9 @@ impl Browser {
         } else {
             self.hide_native_document(cx);
             self.document_generation = self.document_generation.wrapping_add(1);
-            if document.media.asset_paths().next().is_some() {
+            if document.uri.starts_with("remuda://")
+                && document.media.asset_paths().next().is_some()
+            {
                 if let Some(assets) = &self.assets {
                     let _ = assets
                         .requests
@@ -1146,6 +1200,7 @@ impl Browser {
 
     pub(crate) fn terminal_link_handler(
         browser: gpui::WeakEntity<Self>,
+        origin: FileLinkOrigin,
     ) -> terminal_view::LinkHandler {
         std::rc::Rc::new(move |uri, _, cx| {
             use remuda_native::terminal_link::Target;
@@ -1157,6 +1212,28 @@ impl Browser {
                     });
                 }
                 Some(Target::Web(url)) => cx.open_url(url.as_str()),
+                Some(Target::File(url)) => {
+                    let _ = browser.update(cx, |this, cx| {
+                        let error = match (&mut this.drive, &origin) {
+                            (_, FileLinkOrigin::Unavailable) | (None, _) => Some(
+                                "This connection cannot read files from the session's host.".into(),
+                            ),
+                            (Some(drive), _) if drive.pending => {
+                                Some("A document is already loading. Try again.".into())
+                            }
+                            (Some(drive), _) => {
+                                drive.send(DriveAction::OpenFile(url, origin.clone()));
+                                drive.error.take()
+                            }
+                        };
+                        if let Some(error) = error {
+                            this.link_error = Some(error);
+                            this.active = Content::Document;
+                            this.split = false;
+                        }
+                        cx.notify();
+                    });
+                }
                 None => {}
             }
         })
@@ -1164,7 +1241,8 @@ impl Browser {
 
     fn terminal_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let panel_bounds = self.panel_bounds.clone();
-        let open = Self::terminal_link_handler(cx.entity().downgrade());
+        let open =
+            Self::terminal_link_handler(cx.entity().downgrade(), FileLinkOrigin::Unavailable);
         div()
             .id("browser-terminal")
             .debug_selector(|| "browser-terminal".into())
@@ -1300,11 +1378,15 @@ impl Browser {
         else {
             return;
         };
-        if let Some(request) = tab
-            .pending_presentation
-            .as_ref()
-            .filter(|r| r.uri == tab.document.uri)
-        {
+        if let Some(request) = tab.pending_presentation.as_ref().filter(|request| {
+            request.uri == tab.document.uri
+                && tab.document.source_node.as_ref().is_none_or(|node| {
+                    request
+                        .origin
+                        .as_ref()
+                        .is_some_and(|origin| &origin.node == node)
+                })
+        }) {
             if !painted.replace(true) {
                 let _ = self.displayed.send(request.clone());
             }
@@ -1369,6 +1451,25 @@ impl Browser {
         if dragging {
             self.hide_native_document(cx);
         }
+        if let Some(error) = self.link_error.clone() {
+            self.hide_native_document(cx);
+            return div()
+                .flex_1()
+                .p_6()
+                .child(error)
+                .child(
+                    action_button("dismiss-file-link-error", "Dismiss").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.link_error = None;
+                            if !this.has_document() {
+                                this.select_terminal(cx);
+                            }
+                            cx.notify();
+                        },
+                    )),
+                )
+                .into_any_element();
+        }
         let Some(tab) = self.document_tab() else {
             return div()
                 .flex_1()
@@ -1401,10 +1502,14 @@ impl Browser {
             .size_full()
         });
         let view = cx.weak_entity();
+        let can_open_drive_links = document.uri.starts_with("remuda://");
         let body = document.media.render(
             (pane_width - 48.).max(100.),
             tab.zoom,
             move |path, _, app| {
+                if !can_open_drive_links {
+                    return;
+                }
                 let _ = view.update(app, |this, cx| {
                     this.visit(format!("remuda:///{path}"), false);
                     cx.notify();
@@ -1575,8 +1680,70 @@ impl Drop for Browser {
     }
 }
 
+enum DeliveryConnection {
+    Unsupported,
+    Local,
+    Ssh(crate::ssh_workspace::SshWorkspace),
+}
+
+impl DeliveryConnection {
+    fn read(&self, client: &Client, request: DocumentRequest) -> Result<Document, String> {
+        if !request.uri.starts_with("file://") {
+            return read(
+                |uri| client.read_file(uri).map_err(|error| error.to_string()),
+                request.uri.clone(),
+                Some(request),
+            );
+        }
+        let Some(origin) = request.origin.as_ref() else {
+            return Err("Document source is missing.".into());
+        };
+        let session = origin.session.clone();
+        let instance = origin.instance_id.clone();
+        let origin = match self {
+            Self::Local
+                if remuda_native::cluster::nodes()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|(local, _)| local.node_fp == origin.node) =>
+            {
+                FileLinkOrigin::LocalSession {
+                    node: origin.node.clone(),
+                    session,
+                    instance,
+                }
+            }
+            Self::Local => FileLinkOrigin::ClusterPeer {
+                peer: origin.node.clone(),
+                session,
+                instance,
+            },
+            Self::Ssh(workspace) if workspace.source_node() == Some(&origin.node) => {
+                FileLinkOrigin::BrowserPeer {
+                    workspace: workspace.clone(),
+                    session,
+                    instance,
+                }
+            }
+            Self::Ssh(_) | Self::Unsupported => {
+                return Err("Document source is not connected.".into())
+            }
+        };
+        let Some(remuda_native::terminal_link::Target::File(url)) =
+            remuda_native::terminal_link::Target::parse(&request.uri)
+        else {
+            return Err("Invalid source file URI.".into());
+        };
+        let mut document = read_linked_file(url, origin)?;
+        document.uri.clone_from(&request.uri);
+        document.request = Some(request);
+        Ok(document)
+    }
+}
+
 fn serve(
     client: Arc<Client>,
+    connection: DeliveryConnection,
     documents: mpsc::SyncSender<Document>,
     results: mpsc::Receiver<DocumentRequest>,
 ) {
@@ -1591,11 +1758,7 @@ fn serve(
     // Keep the active subscription alive while a document downloads or decodes.
     std::thread::spawn(move || {
         while let Ok(request) = requests.recv() {
-            let result = read(
-                |uri| reader.read_file(uri).map_err(|error| error.to_string()),
-                request.uri.clone(),
-                Some(request.clone()),
-            );
+            let result = connection.read(&reader, request.clone());
 
             if loaded.send((request, result)).is_err() {
                 break;
@@ -1650,6 +1813,93 @@ fn serve(
     }
 }
 
+fn read_linked_file(url: url::Url, origin: FileLinkOrigin) -> Result<Document, String> {
+    use std::io::Read as _;
+    let (source_node, bytes) = match origin {
+        FileLinkOrigin::Local => {
+            let path = url.to_file_path().map_err(|_| "Invalid local file path")?;
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NONBLOCK);
+            }
+            if !std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                return Err("The link does not point to a readable regular file.".into());
+            }
+            let file = options.open(path).map_err(|error| error.to_string())?;
+            if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+                return Err("The link does not point to a regular file.".into());
+            }
+            let mut bytes = Vec::new();
+            file.take(1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| error.to_string())?;
+            if bytes.len() > 1024 * 1024 {
+                return Err("The linked file exceeds the 1 MiB preview limit.".into());
+            }
+            (None, bytes)
+        }
+        FileLinkOrigin::LocalSession {
+            node,
+            session,
+            instance,
+        } => {
+            let socket = remuda_native::daemon::socket_path("default");
+            let bytes = remuda_native::net::browser::read_session_file_using(
+                &session,
+                &instance,
+                url.as_str(),
+                |request| remuda_native::client::request(&socket, &request),
+            )
+            .map_err(|error| error.to_string())?;
+            (Some(node), bytes)
+        }
+        FileLinkOrigin::ClusterPeer {
+            peer,
+            session,
+            instance,
+        } => {
+            let bytes = remuda_native::net::browser::read_cluster_session_file(
+                &peer,
+                &session,
+                &instance,
+                url.as_str(),
+            )
+            .map_err(|error| error.to_string())?;
+            (Some(peer), bytes)
+        }
+        FileLinkOrigin::BrowserPeer {
+            workspace,
+            session,
+            instance,
+        } => {
+            let bytes = remuda_native::net::browser::read_session_file_using(
+                &session,
+                &instance,
+                url.as_str(),
+                |request| workspace.request(&request),
+            )
+            .map_err(|error| error.to_string())?;
+            let source = workspace
+                .source_node()
+                .unwrap_or_else(|| workspace.destination());
+            (Some(source.to_owned()), bytes)
+        }
+        FileLinkOrigin::Unavailable => return Err("No file access to the session's host.".into()),
+    };
+    Ok(Document {
+        uri: url.to_string(),
+        source_node,
+        revision: remuda_native::cluster::vfs::sha256_hex(&bytes),
+        media: browser_media::decode(url.path(), &bytes)?,
+        request: None,
+        #[cfg(any(target_os = "macos", windows))]
+        html: None,
+    })
+}
+
 fn read(
     load: impl FnOnce(&str) -> Result<Vec<u8>, String>,
     uri: String,
@@ -1670,6 +1920,7 @@ fn read(
         .then(|| Arc::from(bytes));
     Ok(Document {
         uri,
+        source_node: None,
         revision,
         media,
         request,
@@ -1859,6 +2110,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_file_link_reads_a_document_without_falling_back_for_remote_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("linked file.md");
+        std::fs::write(&source, "# Linked document").unwrap();
+        let uri = url::Url::from_file_path(source).unwrap();
+        let document = read_linked_file(uri.clone(), FileLinkOrigin::Local).unwrap();
+        assert_eq!(document.media.title, "Linked document");
+        assert!(read_linked_file(uri, FileLinkOrigin::Unavailable).is_err());
+    }
+
+    #[test]
     fn refresh_reloads_visible_folders_and_uses_fresh_pagination() {
         use remuda_native::net::browser::DriveEntry;
 
@@ -1916,6 +2178,7 @@ mod tests {
         let request = DocumentRequest {
             id: "example".into(),
             uri: uri.into(),
+            origin: None,
         };
         for source in [None, Some(request)] {
             let result = read(|_| Ok(html.to_vec()), uri.into(), source.clone()).unwrap();
@@ -1939,6 +2202,33 @@ mod tests {
             cx.background_executor
                 .advance_clock(Duration::from_millis(120));
             cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[gpui::test]
+    #[ignore = "launched by the isolated session workdir Browser acceptance"]
+    fn daemonless_workdir_receipt_acceptance(cx: &mut gpui::TestAppContext) {
+        let workspace = crate::ssh_workspace::SshWorkspace::connect("fixture").unwrap();
+        let client = Client::from_env().unwrap().unwrap();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let focus = cx.focus_handle();
+            focus.focus(window, cx);
+            Browser::ssh(workspace, Some(client), focus, cx)
+        });
+        let end = Instant::now() + Duration::from_secs(40);
+        while Instant::now() < end {
+            cx.background_executor
+                .advance_clock(Duration::from_millis(120));
+            cx.run_until_parked();
+            view.update_in(cx, |browser, window, cx| {
+                browser.tick(window, cx);
+                if let Some(tab) = browser.document_tab() {
+                    assert_eq!(browser.document_tabs.len(), 1);
+                    assert_eq!(tab.document.media.title, "GUI project preview");
+                }
+            });
+            cx.update(|window, app| window.draw(app).clear(app));
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -1968,6 +2258,7 @@ mod tests {
                 displayed,
                 document_tabs: Vec::new(),
                 document_index: 0,
+                link_error: None,
                 active: Content::Terminal,
                 show_drive: false,
                 drive: Some(Drive {
@@ -2036,6 +2327,7 @@ mod tests {
         let request = DocumentRequest {
             id: "requested-plan".into(),
             uri: document(None).uri,
+            origin: None,
         };
         send_document
             .send(document(Some(request.clone())))
@@ -2290,6 +2582,7 @@ mod tests {
         let update = DocumentRequest {
             id: "updated-plan".into(),
             uri: request.uri.clone(),
+            origin: None,
         };
         view.update_in(cx, |browser, window, cx| {
             browser.open_document(document(None), true, window, cx);

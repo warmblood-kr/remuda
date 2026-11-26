@@ -5,6 +5,7 @@ use remuda_native::{
     net::browser::valid_ssh_destination,
     remote_front::{
         MAX_FRAME_BYTES, MAX_WORKSPACE_RESPONSE_BYTES, WORKSPACE_COMMAND, WORKSPACE_HELLO,
+        WORKSPACE_IDENTITY_REQUEST,
     },
     strict_input::InputTransport,
 };
@@ -19,7 +20,7 @@ use std::{
 };
 
 struct Job {
-    request: Request,
+    request: Vec<u8>,
     cancelled: Option<Arc<AtomicBool>>,
     deadline: Instant,
     reply: mpsc::SyncSender<io::Result<Response>>,
@@ -46,6 +47,7 @@ impl Drop for Connection {
 pub(crate) struct SshWorkspace {
     connection: Arc<Connection>,
     destination: Arc<str>,
+    source_node: Option<Arc<str>>,
 }
 
 impl SshWorkspace {
@@ -124,19 +126,31 @@ impl SshWorkspace {
                 let _ = child.kill();
                 let _ = child.wait();
             })?;
-        let workspace = Self {
+        let mut workspace = Self {
             connection,
             destination: destination.into(),
+            source_node: None,
         };
         // Probe an existing daemon. A greeting alone only proves remote CLI support.
         match workspace.request(&Request::List)? {
-            Response::Sessions(_) => Ok(workspace),
+            Response::Sessions(_) => {
+                if let Ok(Response::Value(node)) =
+                    workspace.dispatch_frame(WORKSPACE_IDENTITY_REQUEST.to_vec(), None)
+                {
+                    workspace.source_node = Some(node.into());
+                }
+                Ok(workspace)
+            }
             _ => Err(io::Error::other("SSH workspace session list unavailable")),
         }
     }
 
     pub(crate) fn destination(&self) -> &str {
         &self.destination
+    }
+
+    pub(crate) fn source_node(&self) -> Option<&str> {
+        self.source_node.as_deref()
     }
 
     pub(crate) fn sessions(&self) -> Result<Vec<crate::Session>, String> {
@@ -191,7 +205,7 @@ impl SshWorkspace {
         Ok(screen)
     }
 
-    fn request(&self, request: &Request) -> io::Result<Response> {
+    pub(crate) fn request(&self, request: &Request) -> io::Result<Response> {
         self.dispatch(request, None)
     }
 
@@ -200,12 +214,20 @@ impl SshWorkspace {
         request: &Request,
         cancelled: Option<Arc<AtomicBool>>,
     ) -> io::Result<Response> {
+        self.dispatch_frame(serde_json::to_vec(request)?, cancelled)
+    }
+
+    fn dispatch_frame(
+        &self,
+        request: Vec<u8>,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> io::Result<Response> {
         let (reply, result) = mpsc::sync_channel(1);
         let timeout = crate::provider::TIMEOUT;
         self.connection
             .jobs
             .try_send(Job {
-                request: request.clone(),
+                request,
                 cancelled,
                 deadline: Instant::now() + timeout,
                 reply,
@@ -249,13 +271,12 @@ fn frame(input: &mut impl BufRead, limit: usize) -> io::Result<Vec<u8>> {
 fn exchange(
     output: &mut impl Write,
     input: &mut impl BufRead,
-    request: &Request,
+    json: &[u8],
 ) -> io::Result<Response> {
-    let json = serde_json::to_vec(request)?;
     if json.len() > MAX_FRAME_BYTES {
         return Err(io::Error::other("SSH workspace request too large"));
     }
-    output.write_all(&json)?;
+    output.write_all(json)?;
     output.write_all(b"\n")?;
     output.flush()?;
     serde_json::from_slice(&frame(input, MAX_WORKSPACE_RESPONSE_BYTES + 1)?)

@@ -1,5 +1,6 @@
 //! Live delivery state for one user's active Browser.
 
+pub use remuda_core::protocol::{BrowserDocumentOrigin, BrowserDocumentOutcome as Outcome};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -11,17 +12,8 @@ const MAX_RESULTS: usize = 64;
 pub struct DocumentRequest {
     pub id: String,
     pub uri: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub enum Outcome {
-    Pending,
-    Displayed,
-    ReadFailed,
-    NoActiveBrowser,
-    Unknown,
-    Busy,
-    ConflictingRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<BrowserDocumentOrigin>,
 }
 
 struct Sink {
@@ -50,7 +42,7 @@ impl Delivery {
             .iter()
             .find(|(prior, _)| prior.id == request.id)
         {
-            return if prior.uri == request.uri {
+            return if *prior == request {
                 *outcome
             } else {
                 Outcome::ConflictingRequest
@@ -159,6 +151,7 @@ mod tests {
         DocumentRequest {
             id: "first".into(),
             uri: "remuda:///pilot/reading.md".into(),
+            origin: None,
         }
     }
 

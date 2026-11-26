@@ -323,6 +323,16 @@ pub enum Request {
         #[serde(default)]
         scrollback: usize,
     },
+    /// Read a bounded chunk from this exact agent instance's launch workdir.
+    ReadSessionFile {
+        name: String,
+        instance_id: String,
+        uri: String,
+        offset: u64,
+        revision: Option<String>,
+    },
+    /// Publish through this daemon's Browser listener as the verified IPC caller.
+    BrowserPublishDocument { id: String, uri: String },
     /// Wait for a newer styled screen, returning the current frame on timeout.
     Sync {
         name: String,
@@ -499,7 +509,29 @@ pub struct ResourceUsage {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct BrowserDocumentOrigin {
+    pub node: String,
+    pub session: String,
+    pub instance_id: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum BrowserDocumentOutcome {
+    Pending,
+    Displayed,
+    ReadFailed,
+    NoActiveBrowser,
+    Unknown,
+    Busy,
+    ConflictingRequest,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Response {
+    BrowserDocumentPublished {
+        origin: BrowserDocumentOrigin,
+        outcome: BrowserDocumentOutcome,
+    },
     NodeStatus(Option<NodeMetrics>),
     Sessions(Vec<SessionSummary>),
     /// Answer to [`Request::SessionHostBuilds`], sorted by name.

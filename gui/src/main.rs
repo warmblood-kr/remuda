@@ -1625,9 +1625,11 @@ fn open_workspace(
                     let live_focus = cx.focus_handle();
                     gui.live_focus = Some(live_focus.clone());
                     if let Some((connection, client)) = external {
-                        gui.ssh = Some(connection);
+                        gui.ssh = Some(connection.clone());
                         gui.documents =
-                            Some(cx.new(|cx| browser::Browser::ssh(client, live_focus, cx)));
+                            Some(cx.new(|cx| {
+                                browser::Browser::ssh(connection, client, live_focus, cx)
+                            }));
                     } else {
                         let client = match remuda_native::net::browser::Client::from_env() {
                             Ok(client) => client,
@@ -1740,6 +1742,46 @@ mod tests {
             !gui.documents.as_ref().unwrap().read(app).showing_document()
                 && gui.preview.as_ref().unwrap().text.trim_end() == "terminal output"
         }));
+    }
+
+    #[gpui::test]
+    fn clicking_local_terminal_file_link_opens_the_document_pane(cx: &mut gpui::TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("guide.md");
+        std::fs::write(&path, "# Opened from terminal").unwrap();
+        let uri = url::Url::from_file_path(path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let focus = cx.focus_handle();
+            let mut gui = LocalGui::new();
+            gui.documents = Some(cx.new(|cx| browser::Browser::local(None, focus, cx)));
+            gui.preview_busy = true;
+            gui.sessions = vec![row("local")];
+            gui.select_session(None, gui.sessions[0].clone());
+            gui.preview = Some(
+                terminal_view::Screen::from_cells(vec![vec![remuda_core::agent::StyledCell {
+                    text: "Open guide".into(),
+                    hyperlink: Some(uri.to_string()),
+                    ..Default::default()
+                }]])
+                .unwrap(),
+            );
+            gui
+        });
+        cx.simulate_resize(gpui::size(px(840.), px(620.)));
+        let link = cx.debug_bounds("terminal-link-0-0").unwrap();
+        cx.simulate_click(link.center(), gpui::Modifiers::none());
+        let timeout = Instant::now() + Duration::from_secs(3);
+        while cx.debug_bounds("browser-document-body").is_none() {
+            assert!(Instant::now() < timeout, "the linked document did not open");
+            view.update_in(cx, |gui, window, cx| {
+                gui.documents
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |docs, cx| docs.tick(window, cx));
+                cx.notify();
+            });
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[gpui::test]

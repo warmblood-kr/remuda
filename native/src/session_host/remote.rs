@@ -55,6 +55,7 @@ pub(crate) struct HostSession {
     name: String,
     identity: HostIdentity,
     endpoint: PathBuf,
+    launch_workdir: Option<PathBuf>,
     client: [u8; 16],
     acts: Mutex<()>,
     teardown_failed: AtomicBool,
@@ -80,6 +81,7 @@ impl HostSession {
             name: name.into(),
             identity: entry.identity.clone(),
             endpoint: PathBuf::from(birth.endpoint()),
+            launch_workdir: super::recovery::launch_workdir(entry),
             client,
             acts: Mutex::new(()),
             teardown_failed: AtomicBool::new(false),
@@ -94,6 +96,10 @@ impl HostSession {
         self.gate = gate;
         self
     }
+    pub(crate) fn launch_workdir(&self) -> Option<PathBuf> {
+        self.launch_workdir.clone()
+    }
+
     pub fn matches_instance(&self, instance: &str) -> bool {
         self.identity.instance == instance
     }

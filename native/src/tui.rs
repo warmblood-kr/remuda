@@ -2589,6 +2589,12 @@ fn push_color(out: &mut String, color: Color, fg: bool) {
 /// One row of styled cells as text plus minimal SGR — see steps/020 for the
 /// shape this has to satisfy (byte-identity when plain; minimal when not).
 pub(crate) fn render_styled_row(cells: &[StyledCell]) -> String {
+    render_preview_row(cells, false)
+}
+
+/// File targets may travel inside a Remuda frame, where Remuda can resolve the
+/// originating node. Do not emit them back out as host-terminal hyperlinks.
+pub(crate) fn render_preview_row(cells: &[StyledCell], file_links: bool) -> String {
     let mut out = String::new();
     let mut current: Option<&StyledCell> = None;
     let mut styled_at_all = false;
@@ -2597,8 +2603,14 @@ pub(crate) fn render_styled_row(cells: &[StyledCell]) -> String {
         if !cell.text.is_empty() {
             let candidate = cell.hyperlink.as_deref();
             if candidate != link {
-                let next =
-                    candidate.filter(|uri| crate::terminal_link::Target::parse(uri).is_some());
+                let next = candidate.filter(|uri| {
+                    use crate::terminal_link::Target;
+                    match Target::parse(uri) {
+                        Some(Target::Drive(_) | Target::Web(_)) => true,
+                        Some(Target::File(_)) => file_links,
+                        None => false,
+                    }
+                });
                 if link.is_some() {
                     out.push_str("\x1b]8;;\x1b\\");
                 }

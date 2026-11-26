@@ -2825,6 +2825,9 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::MouseState(_) => Err(mlua::Error::runtime(
             "mouse state is not exposed to scripts",
         )),
+        Response::BrowserDocumentPublished { .. } => Err(mlua::Error::runtime(
+            "Browser publication is not exposed to scripts",
+        )),
         Response::ClusterRegistryPage { .. }
         | Response::ClusterRegistryAck { .. }
         | Response::ClusterVfsIndexPage { .. }
