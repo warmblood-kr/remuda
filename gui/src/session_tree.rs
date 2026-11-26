@@ -385,6 +385,13 @@ impl LocalGui {
         }
     }
 
+    fn primary_node_label(&self) -> String {
+        self.ssh.as_ref().map_or_else(
+            || "This device".into(),
+            |ssh| display_label(ssh.destination()),
+        )
+    }
+
     fn selected_node_panel(
         &self,
         compact: bool,
@@ -397,7 +404,7 @@ impl LocalGui {
             return None;
         };
         let name = peer.as_ref().map_or_else(
-            || "This device".into(),
+            || self.primary_node_label(),
             |fp| {
                 self.peers
                     .iter()
@@ -520,6 +527,8 @@ impl LocalGui {
                 ("Offline".into(), 0xffad9f)
             } else if self.loading {
                 ("Connecting".into(), 0xe7c279)
+            } else if self.ssh.is_some() {
+                ("Online".into(), 0x7bdda8)
             } else {
                 ("Local".into(), 0x9bb0c6)
             };
@@ -564,7 +573,7 @@ impl LocalGui {
                 .into_any_element(),
             Entry::Node(peer) => {
                 let (name, key) = peer.map_or_else(
-                    || ("This device".into(), "node-local".into()),
+                    || (self.primary_node_label(), "node-local".into()),
                     |(index, peer)| (display_label(&peer.label), format!("node-peer-{index}")),
                 );
                 let (status, color) = self.node_status_label(peer.map(|(_, p)| p));

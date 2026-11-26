@@ -321,6 +321,12 @@ impl NativeHtml {
     }
 }
 
+enum BrowserMode {
+    Standalone,
+    Local,
+    Ssh,
+}
+
 pub(crate) struct Browser {
     destination: String,
     embedded: bool,
@@ -409,7 +415,15 @@ pub fn open(
                     }
                 })
                 .detach();
-                Browser::new(destination, false, client, terminal, screen, focus, cx)
+                Browser::new(
+                    destination,
+                    BrowserMode::Standalone,
+                    client,
+                    terminal,
+                    screen,
+                    focus,
+                    cx,
+                )
             })
         },
     )
@@ -420,7 +434,7 @@ pub fn open(
 impl Browser {
     fn new(
         destination: String,
-        embedded: bool,
+        mode: BrowserMode,
         client: Option<Client>,
         terminal: Option<PtyAgent>,
         screen: Screen,
@@ -435,7 +449,7 @@ impl Browser {
         }
         let source = remote
             .map(DriveSource::Remote)
-            .or_else(|| embedded.then_some(DriveSource::Local))
+            .or_else(|| matches!(mode, BrowserMode::Local).then_some(DriveSource::Local))
             .map(Arc::new);
         let drive = source.clone().map(Drive::new);
         let assets = source.clone().map(Assets::new);
@@ -446,7 +460,7 @@ impl Browser {
         };
         Self {
             destination,
-            embedded,
+            embedded: !matches!(mode, BrowserMode::Standalone),
             documents,
             displayed,
             document: None,
@@ -481,7 +495,19 @@ impl Browser {
     pub(crate) fn local(client: Option<Client>, focus: FocusHandle, cx: &mut App) -> Self {
         Self::new(
             String::new(),
-            true,
+            BrowserMode::Local,
+            client,
+            None,
+            Screen::default(),
+            focus,
+            cx,
+        )
+    }
+
+    pub(crate) fn ssh(client: Option<Client>, focus: FocusHandle, cx: &mut App) -> Self {
+        Self::new(
+            String::new(),
+            BrowserMode::Ssh,
             client,
             None,
             Screen::default(),

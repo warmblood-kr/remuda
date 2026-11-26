@@ -5,7 +5,10 @@ use remuda_native::strict_input::{
 };
 use std::{
     io::{Read, Write},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -199,6 +202,7 @@ pub struct InputHelper {
     state: Arc<Mutex<State>>,
     event_tx: mpsc::SyncSender<Event>,
     events: mpsc::Receiver<Event>,
+    remote_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl InputHelper {
@@ -206,76 +210,132 @@ impl InputHelper {
         use std::process::{Command, Stdio};
         let program = program.to_owned();
         let args: Vec<_> = args.iter().map(|arg| (*arg).to_owned()).collect();
-        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
+        Self::start_worker(move |rx, worker_state, worker_events| {
+            if worker_state.lock().unwrap().stopped {
+                return;
+            }
+            let mut command = Command::new(program);
+            command
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+                command.creation_flags(CREATE_NO_WINDOW);
+            }
+            let Ok(mut child) = command.spawn() else {
+                worker_state
+                    .lock()
+                    .unwrap()
+                    .complete(Event::NotAcknowledged, &worker_events);
+                return;
+            };
+            let mut stdin = child.stdin.take().unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            #[cfg(windows)]
+            let child_watch = {
+                let state = worker_state.clone();
+                std::thread::spawn(move || watch_windows_child(child, &state))
+            };
+            let mut ready = false;
+            for bytes in rx {
+                {
+                    let s = worker_state.lock().unwrap();
+                    if s.stopped {
+                        break;
+                    }
+                }
+                let result = exchange(&mut stdin, &mut stdout, &bytes, &worker_state, &mut ready);
+                let mut s = worker_state.lock().unwrap();
+                s.complete(result, &worker_events);
+                if s.stopped {
+                    break;
+                }
+            }
+            drop(stdin);
+            #[cfg(not(windows))]
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            #[cfg(windows)]
+            {
+                worker_state.lock().unwrap().stopped = true;
+                let _ = child_watch.join();
+            }
+        })
+    }
+
+    pub(crate) fn with_remote_input(
+        workspace: crate::ssh_workspace::SshWorkspace,
+        name: String,
+        instance: String,
+        compose: bool,
+    ) -> std::io::Result<Self> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let transport = crate::ssh_workspace::SshInput {
+            workspace,
+            cancelled: cancelled.clone(),
+        };
+        let mut input = StrictInput::new(transport, name, instance)?;
+        let mut helper = Self::start_worker(move |rx, state, events| {
+            for frame in rx {
+                if state.lock().unwrap().stopped {
+                    break;
+                }
+                let result = match frame
+                    .get(..4)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u32::from_be_bytes)
+                {
+                    Some(length) if length & PASTE_IMAGE != 0 => Event::PasteUnavailable,
+                    Some(_) => {
+                        let result = if compose {
+                            input.send_line(&frame[4..], true)
+                        } else {
+                            input.send(&frame[4..])
+                        };
+                        if result == InputResult::Applied {
+                            Event::Applied
+                        } else {
+                            Event::NotAcknowledged
+                        }
+                    }
+                    None => Event::NotAcknowledged,
+                };
+                let mut state = state.lock().unwrap();
+                state.complete(result, &events);
+                if state.stopped {
+                    break;
+                }
+            }
+        })?;
+        helper.remote_cancel = Some(cancelled);
+        Ok(helper)
+    }
+
+    fn start_worker(
+        worker: impl FnOnce(mpsc::Receiver<Vec<u8>>, Arc<Mutex<State>>, mpsc::SyncSender<Event>)
+            + Send
+            + 'static,
+    ) -> std::io::Result<Self> {
+        let (tx, rx) = mpsc::sync_channel(1);
         let (events, results) = mpsc::sync_channel(1);
         let state = Arc::new(Mutex::new(State::default()));
         let worker_state = state.clone();
         let worker_events = events.clone();
         std::thread::Builder::new()
             .name("gui-input".into())
-            .spawn(move || {
-                if worker_state.lock().unwrap().stopped {
-                    return;
-                }
-                let mut command = Command::new(program);
-                command
-                    .args(args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null());
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-                    command.creation_flags(CREATE_NO_WINDOW);
-                }
-                let Ok(mut child) = command.spawn() else {
-                    worker_state
-                        .lock()
-                        .unwrap()
-                        .complete(Event::NotAcknowledged, &worker_events);
-                    return;
-                };
-                let mut stdin = child.stdin.take().unwrap();
-                let mut stdout = child.stdout.take().unwrap();
-                #[cfg(windows)]
-                let child_watch = {
-                    let state = worker_state.clone();
-                    std::thread::spawn(move || watch_windows_child(child, &state))
-                };
-                let mut ready = false;
-                for bytes in rx {
-                    {
-                        let s = worker_state.lock().unwrap();
-                        if s.stopped {
-                            break;
-                        }
-                    }
-                    let result =
-                        exchange(&mut stdin, &mut stdout, &bytes, &worker_state, &mut ready);
-                    let mut s = worker_state.lock().unwrap();
-                    s.complete(result, &worker_events);
-                    if s.stopped {
-                        break;
-                    }
-                }
-                drop(stdin);
-                #[cfg(not(windows))]
-                {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                #[cfg(windows)]
-                {
-                    worker_state.lock().unwrap().stopped = true;
-                    let _ = child_watch.join();
-                }
-            })?;
+            .spawn(move || worker(rx, worker_state, worker_events))?;
         Ok(Self {
             tx,
             state,
             event_tx: events,
             events: results,
+            remote_cancel: None,
         })
     }
     pub fn submit(&self, bytes: &[u8]) -> Submit {
@@ -320,6 +380,9 @@ impl InputHelper {
         Ok(event)
     }
     pub fn stop(&self) {
+        if let Some(cancelled) = &self.remote_cancel {
+            cancelled.store(true, Ordering::Release);
+        }
         let mut state = self.state.lock().unwrap();
         state.stopped = true;
         if state.busy && !state.completed {
@@ -570,6 +633,7 @@ mod tests {
             })),
             event_tx,
             events,
+            remote_cancel: None,
         };
         assert_eq!(helper.submit(b"x"), Submit::Queued);
         helper.stop();

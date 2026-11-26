@@ -43,6 +43,22 @@ impl LiveSession {
         })
     }
 
+    pub(crate) fn ssh(
+        connection: crate::ssh_workspace::SshWorkspace,
+        selection: &Selection,
+        compose: bool,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            input: InputHelper::with_remote_input(
+                connection,
+                selection.name.clone(),
+                selection.instance.clone(),
+                compose,
+            )?,
+            pending: RefCell::new(Vec::new()),
+        })
+    }
+
     pub(crate) fn submit(&self, bytes: &[u8]) -> Submit {
         match self.input.submit(bytes) {
             Submit::Busy => {
