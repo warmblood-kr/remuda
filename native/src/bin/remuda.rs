@@ -273,6 +273,7 @@ fn tray_command(args: &[&str]) -> ExitCode {
         let mut command = Command::new(gui);
         command
             .arg("--tray")
+            .env(dist::TRAY_CLI_ENV, cli)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
